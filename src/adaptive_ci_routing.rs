@@ -641,40 +641,22 @@ impl RoutingRecommendationV1 {
     #[must_use]
     pub fn render_human(&self) -> String {
         let mut out = format!(
-            "workload: {} / {}
-policy: {:?}
-authority: recommendation_only
-automatic routing: disabled
-",
+            "workload: {} / {}\\npolicy: {:?}\\nauthority: recommendation_only\\nautomatic routing: disabled\\n",
             self.workload.project.as_str(),
             self.workload.profile.as_str(),
             self.policy.mode
         );
         match &self.choice {
             Some(choice) => {
-                out.push_str(&format!("choice: {}
-", choice.as_str()));
+                out.push_str(&format!("choice: {}\\n", choice.as_str()));
                 if let Some(prediction) = self
                     .predictions
                     .iter()
                     .find(|prediction| &prediction.pool_id == choice)
                 {
-                    out.push_str("basis:
-");
+                    out.push_str("basis:\\n");
                     out.push_str(&format!(
-                        "  compatible hot state: {:?}
-  predicted completion: {}-{} ms
-  queue: {}-{} ms
-  preparation: {}-{} ms
-  execution: {}-{} ms
-  settlement: {}-{} ms
-  comparable validated runs: {}
-  marginal money cost: {}-{} microUSD
-  allowance consumption: {}-{} units
-  pressure after admission: {:?}
-  failure rate: {}/1000
-  fallback rate: {}/1000
-",
+                        "  compatible hot state: {:?}\\n  predicted completion: {}-{} ms\\n  queue: {}-{} ms\\n  preparation: {}-{} ms\\n  execution: {}-{} ms\\n  settlement: {}-{} ms\\n  comparable validated runs: {}\\n  marginal money cost: {}-{} microUSD\\n  allowance consumption: {}-{} units\\n  pressure after admission: {:?}\\n  failure rate: {}/1000\\n  fallback rate: {}/1000\\n",
                         prediction.hot_state.class,
                         prediction.completion.total.p50,
                         prediction.completion.total.p90,
@@ -697,20 +679,17 @@ automatic routing: disabled
                     ));
                     if prediction.hot_state.source == LocalityEvidenceSource::RemoteAdvisory {
                         out.push_str(
-                            "  locality source: remote advisory; pool eligibility remains independently declared
-",
+                            "  locality source: remote advisory; pool eligibility remains independently declared\\n",
                         );
                     }
                     if let Some(remaining) = prediction.projected_allowance_remaining_ppm {
                         out.push_str(&format!(
-                            "  projected allowance remaining: {remaining}/1000000
-"
+                            "  projected allowance remaining: {remaining}/1000000\\n"
                         ));
                     }
                     if let Some(contention) = &prediction.contention {
                         out.push_str(&format!(
-                            "  contention: {}/{} validated in {} ms; p90 {} ms; pressure {:?}
-",
+                            "  contention: {}/{} validated in {} ms; p90 {} ms; pressure {:?}\\n",
                             contention.validated_completions,
                             contention.offered_tasks,
                             contention.elapsed_millis,
@@ -720,19 +699,16 @@ automatic routing: disabled
                     }
                 }
             }
-            None => out.push_str("choice: abstained
-"),
+            None => out.push_str("choice: abstained\\n"),
         }
         if self.predictions.len() > 1 {
-            out.push_str("alternatives:
-");
+            out.push_str("alternatives:\\n");
             for prediction in &self.predictions {
                 if self.choice.as_ref() == Some(&prediction.pool_id) {
                     continue;
                 }
                 out.push_str(&format!(
-                    "  {}: {}-{} ms, {}-{} microUSD, {:?}
-",
+                    "  {}: {}-{} ms, {}-{} microUSD, {:?}\\n",
                     prediction.pool_id.as_str(),
                     prediction.completion.total.p50,
                     prediction.completion.total.p90,
@@ -743,12 +719,10 @@ automatic routing: disabled
             }
         }
         if !self.exclusions.is_empty() {
-            out.push_str("excluded:
-");
+            out.push_str("excluded:\\n");
             for exclusion in &self.exclusions {
                 out.push_str(&format!(
-                    "  {}: {:?}
-",
+                    "  {}: {:?}\\n",
                     exclusion.pool_id.as_str(),
                     exclusion.reason
                 ));
@@ -877,8 +851,7 @@ pub fn recommend_ci_pool(
     predictions.sort_by(|left, right| left.pool_id.cmp(&right.pool_id));
     exclusions.sort_by(|left, right| left.pool_id.cmp(&right.pool_id));
 
-    let choice =
-        select_candidate(&evaluated, policy).map(|entry| entry.prediction.pool_id.clone());
+    let choice = select_candidate(&evaluated, policy).map(|entry| entry.prediction.pool_id.clone());
     let status = if choice.is_some() {
         RecommendationStatus::Recommended
     } else {
@@ -1259,12 +1232,10 @@ fn contention_cmp(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Orde
                 u128::from(left.validated_completions) * u128::from(right.elapsed_millis);
             let right_rate =
                 u128::from(right.validated_completions) * u128::from(left.elapsed_millis);
-            right_rate
-                .cmp(&left_rate)
-                .then_with(|| {
-                    left.final_result_p90_millis
-                        .cmp(&right.final_result_p90_millis)
-                })
+            right_rate.cmp(&left_rate).then_with(|| {
+                left.final_result_p90_millis
+                    .cmp(&right.final_result_p90_millis)
+            })
         }
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
@@ -1354,8 +1325,7 @@ mod tests {
             eligibility: PoolEligibility::Eligible,
             hot_state: HotStateEvidenceV1 {
                 class: heat,
-                state_identity: (heat == HotStateClass::HotExact)
-                    .then(|| id("state:main-xcode27")),
+                state_identity: (heat == HotStateClass::HotExact).then(|| id("state:main-xcode27")),
                 source: LocalityEvidenceSource::LocalAccepted,
             },
             pressure_after_admission: HostPressureClass::Low,
@@ -1426,30 +1396,12 @@ mod tests {
     fn missing_stale_and_insufficient_evidence_are_explicit() {
         let workload = workload();
         let candidates = vec![
-            pool(
-                "owned",
-                PoolAccountingClass::Owned,
-                HotStateClass::HotExact,
-            ),
-            pool(
-                "stale",
-                PoolAccountingClass::Owned,
-                HotStateClass::HotExact,
-            ),
-            pool(
-                "thin",
-                PoolAccountingClass::Owned,
-                HotStateClass::HotExact,
-            ),
+            pool("owned", PoolAccountingClass::Owned, HotStateClass::HotExact),
+            pool("stale", PoolAccountingClass::Owned, HotStateClass::HotExact),
+            pool("thin", PoolAccountingClass::Owned, HotStateClass::HotExact),
         ];
-        let mut observations = three_successes(
-            &workload,
-            "stale",
-            HotStateClass::HotExact,
-            60_000,
-            0,
-            0,
-        );
+        let mut observations =
+            three_successes(&workload, "stale", HotStateClass::HotExact, 60_000, 0, 0);
         for observation in &mut observations {
             observation.observed_at_millis = NOW - 40 * 24 * 60 * 60 * 1_000;
         }
@@ -1482,8 +1434,7 @@ mod tests {
             entry.pool_id == id("stale") && entry.reason == PoolExclusionReason::StaleEvidence
         }));
         assert!(report.exclusions.iter().any(|entry| {
-            entry.pool_id == id("thin")
-                && entry.reason == PoolExclusionReason::InsufficientEvidence
+            entry.pool_id == id("thin") && entry.reason == PoolExclusionReason::InsufficientEvidence
         }));
     }
 
@@ -1491,25 +1442,15 @@ mod tests {
     fn economy_prefers_owned_when_delay_is_inside_explicit_slack() {
         let workload = workload();
         let candidates = vec![
-            pool(
-                "owned",
-                PoolAccountingClass::Owned,
-                HotStateClass::HotExact,
-            ),
+            pool("owned", PoolAccountingClass::Owned, HotStateClass::HotExact),
             pool(
                 "hosted",
                 PoolAccountingClass::PaidBurst,
                 HotStateClass::Cold,
             ),
         ];
-        let mut observations = three_successes(
-            &workload,
-            "owned",
-            HotStateClass::HotExact,
-            75_000,
-            0,
-            0,
-        );
+        let mut observations =
+            three_successes(&workload, "owned", HotStateClass::HotExact, 75_000, 0, 0);
         observations.extend(three_successes(
             &workload,
             "hosted",
@@ -1538,11 +1479,7 @@ mod tests {
         let workload = workload();
         let candidates = vec![
             pool("owned", PoolAccountingClass::Owned, HotStateClass::Cold),
-            pool(
-                "burst",
-                PoolAccountingClass::PaidBurst,
-                HotStateClass::Cold,
-            ),
+            pool("burst", PoolAccountingClass::PaidBurst, HotStateClass::Cold),
         ];
         let mut observations =
             three_successes(&workload, "owned", HotStateClass::Cold, 180_000, 0, 0);
@@ -1674,19 +1611,14 @@ mod tests {
 
         assert_eq!(report.choice, Some(id("owned")));
         assert!(report.exclusions.iter().any(|entry| {
-            entry.pool_id == id("included")
-                && entry.reason == PoolExclusionReason::AllowanceReserve
+            entry.pool_id == id("included") && entry.reason == PoolExclusionReason::AllowanceReserve
         }));
     }
 
     #[test]
     fn contention_evidence_rejects_semantic_mismatch_and_critical_pressure() {
         let workload = workload();
-        let mut bad = pool(
-            "bad",
-            PoolAccountingClass::Owned,
-            HotStateClass::HotExact,
-        );
+        let mut bad = pool("bad", PoolAccountingClass::Owned, HotStateClass::HotExact);
         bad.contention = Some(ContentionEvidenceV1 {
             window_count: 4,
             offered_tasks: 16,
@@ -1700,8 +1632,7 @@ mod tests {
             unfinished: 1,
             peak_pressure: HostPressureClass::Critical,
         });
-        let observations =
-            three_successes(&workload, "bad", HotStateClass::HotExact, 40_000, 0, 0);
+        let observations = three_successes(&workload, "bad", HotStateClass::HotExact, 40_000, 0, 0);
 
         let report = recommend_ci_pool(
             &workload,
@@ -1796,8 +1727,14 @@ mod tests {
                 peak_pressure: HostPressureClass::Moderate,
             }),
         };
-        let observations =
-            three_successes(&workload, "owned-native-linux", HotStateClass::Warm, 55_000, 0, 0);
+        let observations = three_successes(
+            &workload,
+            "owned-native-linux",
+            HotStateClass::Warm,
+            55_000,
+            0,
+            0,
+        );
 
         let report = recommend_ci_pool(
             &workload,
@@ -1819,11 +1756,7 @@ mod tests {
     #[test]
     fn human_and_json_explain_the_same_recommendation() {
         let workload = workload();
-        let candidate = pool(
-            "owned",
-            PoolAccountingClass::Owned,
-            HotStateClass::HotExact,
-        );
+        let candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::HotExact);
         let observations =
             three_successes(&workload, "owned", HotStateClass::HotExact, 60_000, 0, 0);
         let report = recommend_ci_pool(
