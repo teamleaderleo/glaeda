@@ -107,6 +107,7 @@ def collect_macos(
     glaeda: Path,
     min_free_gib: int,
     hardware_class: str,
+    cache_root: Path | None,
 ) -> dict[str, Any]:
     if platform.system() != "Darwin":
         raise BootstrapError("macOS bootstrap requires Darwin")
@@ -129,6 +130,13 @@ def collect_macos(
         "gitVersion": git,
     }
     free_gib = disk_free_gib(cmux_root)
+    cache_required = True
+    cache_ready = (
+        cache_root is not None
+        and cache_root.is_dir()
+        and os.access(cache_root, os.W_OK | os.X_OK)
+    )
+    cache_free_gib = disk_free_gib(cache_root) if cache_ready and cache_root else 0
     cpus = os.cpu_count() or 0
     memory_gib = mac_total_memory_gib()
     return {
@@ -157,6 +165,11 @@ def collect_macos(
             "git": git.startswith("git version "),
             "glaedaExecutable": glaeda.is_file() and os.access(glaeda, os.X_OK),
             "diskAdmission": free_gib >= min_free_gib,
+            "nativeCacheRoot": (not cache_required) or cache_ready,
+            "nativeCacheDiskAdmission": (
+                (not cache_required)
+                or (cache_ready and cache_free_gib >= min_free_gib)
+            ),
             "unattendedPower": mac_sleep_disabled_on_ac(pmset),
         },
         "observed": {
@@ -164,6 +177,11 @@ def collect_macos(
                 f"ge-{min_free_gib}" if free_gib >= min_free_gib else f"lt-{min_free_gib}"
             ),
             "xcodePin": pin,
+            "nativeCacheFreeDiskGiBClass": (
+                f"ge-{min_free_gib}"
+                if cache_ready and cache_free_gib >= min_free_gib
+                else f"lt-{min_free_gib}"
+            ),
             "logicalCpuClass": "ge-8" if cpus >= 8 else "lt-8",
             "totalMemoryGiBClass": (
                 "ge-16" if memory_gib >= 16 else "lt-16"
@@ -344,6 +362,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--glaeda", type=Path, required=True)
     p.add_argument("--hardware-class", required=True)
     p.add_argument("--role", action="append", required=True)
+    p.add_argument(
+        "--cache-root",
+        type=Path,
+        help="Existing operator-owned native build/cache root; path is never emitted",
+    )
     p.add_argument("--min-free-gib", type=int)
     return p
 
@@ -353,6 +376,22 @@ def main() -> int:
         args = parser().parse_args()
         cmux_root = args.cmux_root.resolve(strict=True)
         glaeda = args.glaeda.resolve(strict=True)
+        cache_root = (
+            args.cache_root.resolve(strict=True)
+            if args.cache_root is not None
+            else None
+        )
+        if (
+            args.platform == "macos"
+            and any(
+                role in {"cmux_macos_native_build", "artifact_cache"}
+                for role in args.role
+            )
+            and cache_root is None
+        ):
+            raise BootstrapError(
+                "macOS native-build/cache roles require --cache-root"
+            )
         minimum = args.min_free_gib or (120 if args.platform == "macos" else 40)
         if minimum <= 0:
             raise BootstrapError("minimum free disk must be positive")
@@ -362,6 +401,7 @@ def main() -> int:
                 glaeda,
                 minimum,
                 args.hardware_class,
+                cache_root,
             )
             if args.platform == "macos"
             else collect_linux(
