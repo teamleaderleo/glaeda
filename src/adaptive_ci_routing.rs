@@ -1081,9 +1081,7 @@ fn predict_pool(
             .iter()
             .map(|observation| observation.marginal_cost_microusd),
     );
-    let allowance_units = quantiles(
-        fresh.iter().map(|observation| observation.allowance_units),
-    );
+    let allowance_units = quantiles(fresh.iter().map(|observation| observation.allowance_units));
     let resource = ResourcePredictionV1 {
         cpu_millicores_p90: quantiles(
             fresh
@@ -1976,11 +1974,7 @@ mod tests {
     #[test]
     fn failed_attempt_cost_counts_toward_spend_ceiling() {
         let workload = workload();
-        let candidate = pool(
-            "burst",
-            PoolAccountingClass::PaidBurst,
-            HotStateClass::Cold,
-        );
+        let candidate = pool("burst", PoolAccountingClass::PaidBurst, HotStateClass::Cold);
         let mut observations =
             three_successes(&workload, "burst", HotStateClass::Cold, 40_000, 0, 0);
         observations.push(observation(
@@ -2064,8 +2058,7 @@ mod tests {
             unfinished: 0,
             peak_pressure: HostPressureClass::High,
         });
-        let observations =
-            three_successes(&workload, "owned", HotStateClass::Warm, 40_000, 0, 0);
+        let observations = three_successes(&workload, "owned", HotStateClass::Warm, 40_000, 0, 0);
         let mut policy = RoutingPolicyV1::economy(60_000);
         policy.max_pressure = HostPressureClass::Moderate;
 
