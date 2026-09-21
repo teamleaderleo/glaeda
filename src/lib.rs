@@ -2,6 +2,8 @@
 pub mod actions_runner_readiness;
 /// Pure recommendation-only adaptive CI pool routing from bounded evidence.
 pub mod adaptive_ci_routing;
+/// Pure deterministic optimization discovery from bounded verification observations.
+pub mod adaptive_verification_compiler;
 pub mod artifact;
 /// Pure, path-free classification of explicit hot-state inventory observations.
 pub mod cache_inventory;
