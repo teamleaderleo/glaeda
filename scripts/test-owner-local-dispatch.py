@@ -89,6 +89,60 @@ def repo_query_request() -> semantic.SemanticRequest:
     )
 
 
+def repo_query_report(compiled: semantic.CompiledRequest) -> dict[str, object]:
+    patch_text = "diff\n"
+    return {
+        "document_type": "glaeda-resident-repo-query",
+        "schema_version": 1,
+        "profile_id": "repo-query/v1",
+        "profile_generation": compiled.resolved_operation["profile_generation"],
+        "authority": "observation_only",
+        "request_digest": compiled.resolved_operation["request_digest"],
+        "repository": "github.com/" + SOURCE["repository"],
+        "object_format": "sha1",
+        "requested_base": compiled.resolved_operation["base_commit"],
+        "head": SOURCE["commit"],
+        "head_tree": SOURCE["tree"],
+        "merge_base": "4" * 40,
+        "base_is_ancestor": True,
+        "commits_since_merge_base": 1,
+        "changed_files": [
+            {
+                "path": "src/lib.rs",
+                "insertions": 2,
+                "deletions": 0,
+                "binary": False,
+            }
+        ],
+        "changed_files_status": "complete",
+        "changed_files_observed": 1,
+        "changed_files_omitted": 0,
+        "diff_summary": {
+            "files_changed": 1,
+            "text_files": 1,
+            "binary_files": 0,
+            "insertions": 2,
+            "deletions": 0,
+        },
+        "patch": {
+            "bytes": len(patch_text.encode("utf-8")),
+            "sha256": semantic.sha256(patch_text.encode("utf-8")),
+            "included": True,
+            "omitted_bytes": 0,
+            "text": patch_text,
+        },
+        "blobs": [],
+        "path_history": [],
+        "objects": [],
+        "metrics": {
+            "git_processes": 13,
+            "git_stdout_bytes": 100,
+            "git_wall_microseconds": 200,
+            "complete_wall_microseconds": 300,
+        },
+    }
+
+
 def workload_receipt(compiled: semantic.CompiledRequest) -> dict[str, object]:
     assert compiled.internal is not None
     return focused.receipt(
@@ -211,17 +265,7 @@ class OwnerLocalDispatchTests(unittest.TestCase):
     def test_repo_query_uses_only_installed_checkout_and_fixed_argv(self) -> None:
         semantic_request = repo_query_request()
         compiled = semantic.compile_request(semantic_request)
-        report = {
-            "document_type": "glaeda-resident-repo-query",
-            "schema_version": 1,
-            "profile_id": "repo-query/v1",
-            "profile_generation": "sha256:" + "b" * 64,
-            "authority": "observation_only",
-            "repository": "github.com/" + SOURCE["repository"],
-            "requested_base": "3" * 40,
-            "head": SOURCE["commit"],
-            "head_tree": SOURCE["tree"],
-        }
+        report = repo_query_report(compiled)
         completed = subprocess.CompletedProcess(
             [],
             0,
