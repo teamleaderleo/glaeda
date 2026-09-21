@@ -1,8 +1,8 @@
 """Internal owned-Linux task mechanics; no remote CLI or request deserializer.
 
-Only checked-in adapters supply commands, mounts, and resource properties. This
-module grants no caller or execution authority. The verifier is its sole production
-consumer until physical parity is accepted.
+Only checked-in adapters supply commands, mounts, network classes, and resource
+properties. This module grants no caller or semantic execution authority; each
+adapter must bind its own reviewed workload identity and admission contract.
 """
 from __future__ import annotations
 
