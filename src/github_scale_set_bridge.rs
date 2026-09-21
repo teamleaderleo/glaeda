@@ -295,8 +295,7 @@ fn validate_private_key_metadata(metadata: &std::fs::Metadata) -> Result<(), Sca
         || metadata.nlink() != 1
         || metadata.len() == 0
         || metadata.len() > MAX_PRIVATE_KEY_BYTES as u64
-        || mode & 0o7077 != 0
-        || mode & 0o400 == 0
+        || !matches!(mode & 0o7777, 0o400 | 0o600)
     {
         return Err(ScaleSetBridgeError::new("unsafe_github_app_private_key"));
     }
