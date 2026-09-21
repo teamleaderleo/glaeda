@@ -370,6 +370,26 @@ class FleetTests(unittest.TestCase):
             result["environment_class"],
         )
 
+    def test_acceptance_receipt_execution_binding_is_closed(self):
+        e = enrollment()
+        receipt = finalized(e)
+
+        missing_attempt = copy.deepcopy(receipt)
+        missing_attempt["localExecutionAttemptSha256"] = None
+        with self.assertRaisesRegex(
+            f.FleetError,
+            "local execution evidence is inconsistent",
+        ):
+            f.validate_acceptance_receipt(missing_attempt)
+
+        external_with_attempt = copy.deepcopy(receipt)
+        external_with_attempt["executionClass"] = f.EXTERNAL_EVIDENCE_CLASS
+        with self.assertRaisesRegex(
+            f.FleetError,
+            "local execution evidence is inconsistent",
+        ):
+            f.validate_acceptance_receipt(external_with_attempt)
+
     def test_external_semantic_evidence_cannot_mint_accepted_receipt(self):
         e = enrollment()
         receipt = f.finalize_acceptance(
