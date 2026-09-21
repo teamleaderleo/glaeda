@@ -455,9 +455,6 @@ def validate_cmux_semantic_result(
         raise FleetError("passed CMUX result is inconsistent")
     if doc["result"] == "failed" and doc["exit_code"] == 0 and not missing:
         raise FleetError("failed CMUX result is inconsistent")
-    if doc["result"] == "timed_out" and doc["exit_code"] != 124:
-        raise FleetError("timed-out CMUX result is inconsistent")
-
     timings = doc["stage_timings"]
     if (
         not isinstance(timings, list)
@@ -483,13 +480,8 @@ def validate_cmux_semantic_result(
     if (
         not isinstance(resource["resource_class"], str)
         or not resource["resource_class"]
-        or (
-            resource["cpu_count"] is not None
-            and (
-                type(resource["cpu_count"]) is not int
-                or resource["cpu_count"] <= 0
-            )
-        )
+        or type(resource["cpu_count"]) is not int
+        or resource["cpu_count"] <= 0
         or (
             resource["memory_bytes"] is not None
             and (
