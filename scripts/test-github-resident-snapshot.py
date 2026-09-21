@@ -124,10 +124,11 @@ def reusable_state_summary(
     recent_hit="within_hour",
     revalidation_required=False,
 ):
+    generation_digest = generation if len(generation) == 64 else generation * 64
     return {
         "schema_version": 1,
         "cache_class": cache_class,
-        "generation": "sha256:" + generation * 64,
+        "generation": "sha256:" + generation_digest,
         "heat": heat,
         "size": size,
         "recent_hit": recent_hit,
@@ -233,6 +234,47 @@ class ResidentSnapshotPureTests(unittest.TestCase):
         self.assertTrue(
             accepted["payload"]["projects"][0]["reusable_states"][0]["revalidation_required"]
         )
+
+    def test_cardinality_is_governed_by_document_bytes_not_magic_counts(self):
+        nodes = [
+            {
+                "id": f"node-{index:016x}",
+                "key_id": f"key-{index:016x}",
+                "ssh_public_key": fake_public_key("A"),
+                "os_class": "linux",
+                "architecture_class": "x86_64",
+            }
+            for index in range(1, 15)
+        ]
+        reviewed = MODULE.validate_trust(trust(nodes=nodes))
+        self.assertEqual(len(reviewed["nodes"]), 14)
+
+        summaries = [
+            reusable_state_summary(generation=f"{index:064x}")
+            for index in range(1, 25)
+        ]
+        snapshot = build_unsigned(project_state=project_state(*summaries))
+        self.assertEqual(
+            len(snapshot["payload"]["projects"][0]["reusable_states"]),
+            24,
+        )
+        self.assertLessEqual(len(MODULE.canonical_json(snapshot)), MODULE.MAX_NODE_BYTES)
+
+        base = fake_signed(build_unsigned())
+        fleet_nodes = []
+        for index in range(1, 15):
+            entry = json.loads(json.dumps(base))
+            entry["payload"]["node"]["id"] = f"node-{index:016x}"
+            entry["payload"]["producer"]["key_id"] = f"key-{index:016x}"
+            entry["signature"]["key_id"] = f"key-{index:016x}"
+            fleet_nodes.append(entry)
+        fleet = {
+            "document_type": MODULE.FLEET_DOCUMENT,
+            "schema_version": 1,
+            "nodes": fleet_nodes,
+        }
+        MODULE.validate_fleet(fleet)
+        self.assertLessEqual(len(MODULE.canonical_json(fleet)), MODULE.MAX_FLEET_BYTES)
 
     def test_admission_reduces_only_to_bounded_classes(self):
         expected = {
