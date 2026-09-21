@@ -543,6 +543,49 @@ def restart_disposition(
     return "return_settlement"
 
 
+
+def validate_external_terminal(
+    receipt: dict[str, object],
+    accepted: AcceptedRequest,
+) -> str:
+    external.validate_replay(receipt, accepted.external_request)
+    terminal = receipt.get("state")
+    if terminal not in TERMINAL_EXTERNAL_STATES:
+        raise DispatchRefusal(
+            "invalid_external_receipt",
+            "external receipt is not terminal",
+        )
+    resolved = receipt.get("resolved_workload")
+    workload_digest = receipt.get("workload_receipt_sha256")
+    refusal_code = receipt.get("refusal_code")
+    expected_resolved = accepted.accepted_document["resolved_workload"]
+    if terminal in {"succeeded", "failed", "timed_out", "cleanup_incomplete"}:
+        valid = (
+            resolved == expected_resolved
+            and isinstance(workload_digest, str)
+            and SHA256_PATTERN.fullmatch(workload_digest) is not None
+            and refusal_code is None
+        )
+    elif terminal == "ambiguous":
+        valid = (
+            resolved == expected_resolved
+            and workload_digest is None
+            and refusal_code == "ambiguous_execution"
+        )
+    else:
+        valid = (
+            resolved is None
+            and workload_digest is None
+            and isinstance(refusal_code, str)
+            and TOKEN_PATTERN.fullmatch(refusal_code) is not None
+        )
+    if not valid:
+        raise DispatchRefusal(
+            "invalid_external_receipt",
+            "external terminal receipt fields are inconsistent",
+        )
+    return terminal
+
 def settle_from_external(
     value: dict[str, object],
     accepted: AcceptedRequest,
@@ -563,13 +606,7 @@ def settle_from_external(
             "terminal settlement requires a durable launching state",
         )
 
-    external.validate_replay(external_receipt, accepted.external_request)
-    terminal = external_receipt.get("state")
-    if terminal not in TERMINAL_EXTERNAL_STATES:
-        raise DispatchRefusal(
-            "invalid_external_receipt",
-            "external receipt is not terminal",
-        )
+    terminal = validate_external_terminal(external_receipt, accepted)
     digest = sha256(canonical_bytes(external_receipt) + b"\n")
     state = "terminal"
     if terminal == "refused":
