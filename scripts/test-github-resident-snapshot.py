@@ -454,13 +454,15 @@ class ResidentSnapshotSigningAndTransportTests(unittest.TestCase):
         self.assertEqual(stale["nodes"][0]["requests"], [])
 
     def test_signed_snapshot_and_fleet_byte_measurements(self):
-        signed, trust_value, _ = self.one_signed()
+        signed, trust_value, _ = self.one_signed(
+            project=project_state(reusable_state_summary())
+        )
         fleet = {"document_type": MODULE.FLEET_DOCUMENT, "schema_version": 1, "nodes": [signed]}
         node_bytes = len(MODULE.canonical_json(signed))
         fleet_bytes = len(MODULE.canonical_json(fleet))
         self.assertLessEqual(node_bytes, MODULE.MAX_NODE_BYTES)
         self.assertLessEqual(fleet_bytes, MODULE.MAX_FLEET_BYTES)
-        print(f"MEASURE github_resident_snapshot node_bytes={node_bytes} fleet_bytes={fleet_bytes} agent_reads=2 successful_write_remote_round_trips=2 idle_refresh_seconds={MODULE.DEFAULT_REFRESH_INTERVAL_SECONDS}")
+        print(f"MEASURE github_resident_snapshot node_bytes={node_bytes} fleet_bytes={fleet_bytes} reusable_state_count=1 agent_reads=2 successful_write_remote_round_trips=2 idle_refresh_seconds={MODULE.DEFAULT_REFRESH_INTERVAL_SECONDS}")
 
     def test_two_nodes_can_publish_concurrently_and_converge(self):
         remote = self.root / "remote.git"
