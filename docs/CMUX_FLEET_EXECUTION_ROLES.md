@@ -280,12 +280,12 @@ The compact status projection exposes only fleet concepts:
 node cmux-mac-001
 eligible:
   cmux_macos_native_build
-  cmux_macos_test
 temporarily unavailable:
-  artifact_cache: fleet_acceptance_pending
+  cmux_macos_test: fleet_acceptance_pending
+  artifact_cache: node_capability_missing
 capacity:
-  mac_app_host_test_slot: 2
   mac_native_build_lane: 1
+  mac_native_heavy_slot: 2
 preferred:
   cmux_macos_compile_admission
 background:
