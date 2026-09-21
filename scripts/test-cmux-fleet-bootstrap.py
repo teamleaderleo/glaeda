@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import importlib.util
 from pathlib import Path
+import json
+import tempfile
 import unittest
 
 MODULE_PATH = Path(__file__).with_name("cmux_fleet_bootstrap.py")
@@ -11,7 +13,6 @@ SPEC.loader.exec_module(b)
 
 A = "sha256:" + "a" * 64
 B = "sha256:" + "b" * 64
-W = "sha256:" + "e" * 64
 
 
 def observation(platform="macos", failed=()):
@@ -46,8 +47,13 @@ def observation(platform="macos", failed=()):
         "osVersionClass": "macos-26" if platform == "macos" else "ubuntu-24.04",
         "glaedaGeneration": A,
         "toolchainGeneration": B,
-        "roleWorkloadGenerations": {
-            "cmux_macos_native_build" if platform == "macos" else "cmux_linux_ci": W
+        "roleProfiles": {
+            "cmux_macos_native_build" if platform == "macos" else "cmux_linux_ci":
+                dict(
+                    b.ROLE_PROFILES[
+                        "cmux_macos_native_build" if platform == "macos" else "cmux_linux_ci"
+                    ]
+                )
         },
         "checks": checks,
         "observed": {},
@@ -64,8 +70,8 @@ class Tests(unittest.TestCase):
         self.assertTrue(result["eligibleForEnrollment"])
         self.assertEqual(result["authority"], "observation_only")
         self.assertEqual(
-            result["roleWorkloadGenerations"],
-            {"cmux_macos_native_build": W},
+            result["roleProfiles"],
+            {"cmux_macos_native_build": dict(b.ROLE_PROFILES["cmux_macos_native_build"])},
         )
 
     def test_linux_ready(self):
@@ -142,15 +148,61 @@ class Tests(unittest.TestCase):
         self.assertFalse(b.zig_version_compatible("0.17.0", "0.16.0"))
         self.assertFalse(b.zig_version_compatible("nightly", "0.16.0"))
 
-    def test_workload_generation_must_cover_exact_roles(self):
+    def test_role_profiles_must_cover_exact_roles(self):
         observed = observation()
-        observed["roleWorkloadGenerations"] = {}
-        with self.assertRaisesRegex(b.BootstrapError, "workload generations"):
+        observed["roleProfiles"] = {}
+        with self.assertRaisesRegex(b.BootstrapError, "role profiles"):
             b.evaluate(
                 observed,
                 ["cmux_macos_native_build"],
                 "cmux-mac-build-large",
             )
+
+    def test_profile_registry_binds_role_generation_and_architecture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry = root / b.CMUX_PROFILE_REGISTRY
+            registry.parent.mkdir(parents=True)
+            registry.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "repository": b.CMUX_REPOSITORY,
+                        "result_contract": b.CMUX_RESULT_CONTRACT,
+                        "profiles": [
+                            {
+                                "id": "cmux.macos.dev-check",
+                                "generation": 1,
+                                "platform": {
+                                    "os": "macos",
+                                    "architectures": ["arm64"],
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                b.role_profiles(
+                    root,
+                    ["cmux_macos_native_build"],
+                    "macos",
+                    "arm64",
+                ),
+                {
+                    "cmux_macos_native_build": dict(
+                        b.ROLE_PROFILES["cmux_macos_native_build"]
+                    )
+                },
+            )
+            with self.assertRaisesRegex(b.BootstrapError, "incompatible"):
+                b.role_profiles(
+                    root,
+                    ["cmux_macos_native_build"],
+                    "macos",
+                    "x86_64",
+                )
 
     def test_power_posture_parser(self):
         raw = (
