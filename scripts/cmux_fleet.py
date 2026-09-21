@@ -1186,8 +1186,6 @@ def accept_local(
                         source_tree,
                         "--state-class",
                         "cold",
-                        "--state-root",
-                        str(state_root),
                         "--result",
                         str(result_path),
                     ],
