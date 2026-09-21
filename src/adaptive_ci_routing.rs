@@ -1035,8 +1035,8 @@ pub fn recommend_ci_pool(
         .filter(|entry| choice.as_ref() != Some(&entry.prediction.pool_id))
         .cloned()
         .collect::<Vec<_>>();
-    let fallback =
-        select_candidate(&fallback_candidates, policy).map(|entry| entry.prediction.pool_id.clone());
+    let fallback = select_candidate(&fallback_candidates, policy)
+        .map(|entry| entry.prediction.pool_id.clone());
     let status = if choice.is_some() {
         RecommendationStatus::Recommended
     } else {
@@ -1083,9 +1083,13 @@ fn predict_pool(
                 && observation.pool_id == candidate.pool.pool_id
                 && observation.execution_class == candidate.pool.execution_class
                 && observation.hot_state == candidate.hot_state.class
-                && candidate.hot_state.state_identity.as_ref().is_none_or(|identity| {
-                    observation.hot_state_identity.as_ref() == Some(identity)
-                })
+                && candidate
+                    .hot_state
+                    .state_identity
+                    .as_ref()
+                    .is_none_or(|identity| {
+                        observation.hot_state_identity.as_ref() == Some(identity)
+                    })
         })
         .collect();
     if matching.is_empty() {
@@ -1560,8 +1564,7 @@ mod tests {
             execution_class: id("macos-arm64"),
             observed_at_millis: NOW - age_millis,
             hot_state: heat,
-            hot_state_identity: (heat == HotStateClass::HotExact)
-                .then(|| id("state:main-xcode27")),
+            hot_state_identity: (heat == HotStateClass::HotExact).then(|| id("state:main-xcode27")),
             timing: ObservationTimingV1 {
                 queue_millis: 5_000,
                 start_millis: 5_000,
@@ -1727,8 +1730,7 @@ mod tests {
         ];
         let mut observations =
             three_successes(&workload, "owned", HotStateClass::Cold, 75_000, 0, 0);
-        let mut burst =
-            three_successes(&workload, "burst", HotStateClass::Cold, 20_000, 90_000, 0);
+        let mut burst = three_successes(&workload, "burst", HotStateClass::Cold, 20_000, 90_000, 0);
         burst[0].timing.execution_millis = 20_000;
         burst[1].timing.execution_millis = 20_000;
         burst[2].timing.execution_millis = 400_000;
