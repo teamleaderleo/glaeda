@@ -601,6 +601,28 @@ class RoleModelTests(unittest.TestCase):
         with self.assertRaisesRegex(m.RoleModelError, 'operation and role disagree'):
             m.validate_preference(preference)
 
+    def test_accepted_capacity_requires_all_offered_work_settled(self):
+        node = linux_node()
+        receipt = capacity(
+            node,
+            'cmux_linux_ci',
+            'medium',
+            'linux_medium_slot',
+            4,
+            unfinished=1,
+        )
+        with self.assertRaisesRegex(
+            m.RoleModelError,
+            'all offered work settled',
+        ):
+            m.validate_capacity(receipt)
+
+        receipt['result'] = 'rejected'
+        self.assertEqual(
+            m.validate_capacity(receipt)['measurement']['unfinishedWork'],
+            1,
+        )
+
     def test_capacity_receipt_records_contention_window_fields_without_remote_raw_cpu_ram(self):
         node = linux_node()
         receipt = capacity(node, 'cmux_linux_ci', 'medium', 'linux_medium_slot', 4)
