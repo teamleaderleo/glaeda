@@ -494,11 +494,11 @@ impl ContentionEvidenceV1 {
             + u64::from(self.semantic_mismatches)
             + u64::from(self.failures)
             + u64::from(self.unfinished);
-        if terminal_partition > u64::from(self.offered_tasks) {
+        if terminal_partition != u64::from(self.offered_tasks) {
             return Err(error(
                 "contention",
                 "routing_contention_terminal_partition_invalid",
-                "contention terminal counts cannot exceed offered work",
+                "contention terminal counts must exactly cover offered work",
             ));
         }
         if self.final_result_p90_millis < self.final_result_p50_millis {
@@ -2775,6 +2775,29 @@ mod tests {
             final_result_p50_millis: 20_000,
             final_result_p90_millis: 30_000,
             semantic_mismatches: 1,
+            failures: 1,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::Low,
+        };
+
+        assert_eq!(
+            evidence.validate().unwrap_err().code,
+            "routing_contention_terminal_partition_invalid"
+        );
+    }
+
+    #[test]
+    fn missing_contention_outcomes_are_rejected() {
+        let evidence = ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 4,
+            validated_completions: 2,
+            elapsed_millis: 60_000,
+            final_result_p50_millis: 20_000,
+            final_result_p90_millis: 30_000,
+            semantic_mismatches: 0,
             failures: 1,
             fallbacks: 0,
             unfinished: 0,
