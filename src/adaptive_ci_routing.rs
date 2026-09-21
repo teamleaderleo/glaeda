@@ -1946,6 +1946,7 @@ mod tests {
         );
         for observation in &mut observations {
             observation.execution_class = id("native-linux-x86_64");
+            observation.hot_state_identity = Some(id("state:rust-main"));
         }
 
         let report = recommend_ci_pool(
