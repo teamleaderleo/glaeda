@@ -70,31 +70,34 @@ class ContractTests(unittest.TestCase):
         )
         self.assertNotEqual(left.request_sha256, right.request_sha256)
 
-    def test_explicit_semantic_identity_partitions_physical_execution(self) -> None:
-        left = module.compile_request(module.decode_request(raw()))
-        first = copy.deepcopy(BASE)
-        first["semantic_request_id"] = "accepted-1054-request-0001"
-        second = copy.deepcopy(first)
-        second["semantic_request_id"] = "accepted-1054-request-0002"
-        compiled_first = module.compile_request(module.decode_request(raw(first)))
-        compiled_second = module.compile_request(module.decode_request(raw(second)))
+    def test_internal_semantic_identity_partitions_physical_execution(self) -> None:
+        request = module.decode_request(raw())
+        legacy = module.compile_request(request)
+        compiled_first = module.compile_request(
+            request,
+            semantic_request_id="accepted-1054-request-0001",
+        )
+        compiled_second = module.compile_request(
+            request,
+            semantic_request_id="accepted-1054-request-0002",
+        )
         self.assertNotEqual(
-            left.internal.command_fingerprint,
+            legacy.internal.command_fingerprint,
             compiled_first.internal.command_fingerprint,
         )
         self.assertNotEqual(
             compiled_first.internal.command_fingerprint,
             compiled_second.internal.command_fingerprint,
         )
-        self.assertNotEqual(compiled_first.request_sha256, compiled_second.request_sha256)
+        self.assertEqual(compiled_first.request_sha256, compiled_second.request_sha256)
 
-    def test_legacy_request_without_semantic_identity_keeps_fixture_contract(self) -> None:
+    def test_external_request_cannot_supply_semantic_execution_identity(self) -> None:
         request = module.decode_request(raw())
-        self.assertIsNone(request.semantic_request_id)
-        self.assertEqual(
-            module.request_document(request),
-            BASE,
-        )
+        self.assertEqual(module.request_document(request), BASE)
+        widened = copy.deepcopy(BASE)
+        widened["semantic_request_id"] = "accepted-1054-request-0001"
+        with self.assertRaisesRegex(module.ContractRefusal, "unsupported fields"):
+            module.decode_request(raw(widened))
 
     def test_rejects_caller_workspace_and_execution_controls(self) -> None:
         forbidden = {
