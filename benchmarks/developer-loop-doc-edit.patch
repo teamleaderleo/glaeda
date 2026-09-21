@@ -1,9 +1,10 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 1434db4..ae43e71 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -1,3 +1,4 @@
+@@ -1,5 +1,6 @@
 +/// Benchmark fixture: one source-only edit with unchanged behavior.
  /// Read-only observation of one configured official Actions runner.
  pub mod actions_runner_readiness;
+ /// Pure deterministic optimization discovery from bounded verification observations.
+ pub mod adaptive_verification_compiler;
  pub mod artifact;
