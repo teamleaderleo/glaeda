@@ -102,7 +102,12 @@ def mac_sleep_disabled_on_ac(raw: str) -> bool:
     return False
 
 
-def collect_macos(cmux_root: Path, glaeda: Path, min_free_gib: int) -> dict[str, Any]:
+def collect_macos(
+    cmux_root: Path,
+    glaeda: Path,
+    min_free_gib: int,
+    hardware_class: str,
+) -> dict[str, Any]:
     if platform.system() != "Darwin":
         raise BootstrapError("macOS bootstrap requires Darwin")
     version = platform.mac_ver()[0]
@@ -124,6 +129,8 @@ def collect_macos(cmux_root: Path, glaeda: Path, min_free_gib: int) -> dict[str,
         "gitVersion": git,
     }
     free_gib = disk_free_gib(cmux_root)
+    cpus = os.cpu_count() or 0
+    memory_gib = mac_total_memory_gib()
     return {
         "platform": "macos",
         "architecture": normalize_arch(platform.machine()),
@@ -132,6 +139,12 @@ def collect_macos(cmux_root: Path, glaeda: Path, min_free_gib: int) -> dict[str,
         "toolchainGeneration": digest_bytes(canonical(toolchain)),
         "checks": {
             "supportedOs": major in {15, 26},
+            "hardwareCapability": hardware_class_ready(
+                "macos",
+                hardware_class,
+                cpus,
+                memory_gib,
+            ),
             "cmuxCheckout": (cmux_root / ".git").exists()
             and (cmux_root / ".xcode-version").is_file(),
             "xcodePin": bool(
@@ -151,6 +164,10 @@ def collect_macos(cmux_root: Path, glaeda: Path, min_free_gib: int) -> dict[str,
                 f"ge-{min_free_gib}" if free_gib >= min_free_gib else f"lt-{min_free_gib}"
             ),
             "xcodePin": pin,
+            "logicalCpuClass": "ge-8" if cpus >= 8 else "lt-8",
+            "totalMemoryGiBClass": (
+                "ge-16" if memory_gib >= 16 else "lt-16"
+            ),
         },
     }
 
@@ -165,11 +182,36 @@ def read_os_release() -> tuple[str, str]:
     return values.get("ID", ""), values.get("VERSION_ID", "")
 
 
-def memory_available_gib() -> int:
+def linux_memory_gib(field: str) -> int:
     for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
-        if line.startswith("MemAvailable:"):
+        if line.startswith(field + ":"):
             return int(line.split()[1]) // (1024**2)
-    raise BootstrapError("MemAvailable is unavailable")
+    raise BootstrapError(f"{field} is unavailable")
+
+
+def mac_total_memory_gib() -> int:
+    raw = run([executable("sysctl"), "-n", "hw.memsize"])
+    return int(raw) // (1024**3)
+
+
+def hardware_class_ready(
+    platform_name: str,
+    hardware_class: str,
+    cpus: int,
+    memory_gib: int,
+) -> bool:
+    minimums = {
+        ("macos", "cmux-mac-build-large"): (8, 16),
+        ("macos", "cmux-mac-test-large"): (8, 16),
+        ("linux", "cmux-linux-ci-medium"): (4, 8),
+        ("linux", "cmux-linux-agent-medium"): (4, 8),
+    }
+    required = minimums.get((platform_name, hardware_class))
+    return (
+        required is not None
+        and cpus >= required[0]
+        and memory_gib >= required[1]
+    )
 
 
 def collect_linux(
@@ -177,6 +219,7 @@ def collect_linux(
     glaeda: Path,
     min_free_gib: int,
     roles: list[str],
+    hardware_class: str,
 ) -> dict[str, Any]:
     if platform.system() != "Linux":
         raise BootstrapError("Linux bootstrap requires Linux")
@@ -205,7 +248,9 @@ def collect_linux(
         Path(f"/proc/pressure/{name}").is_file()
         for name in ("cpu", "memory", "io")
     )
-    available_gib = memory_available_gib()
+    available_gib = linux_memory_gib("MemAvailable")
+    total_gib = linux_memory_gib("MemTotal")
+    cpus = os.cpu_count() or 0
     free_gib = disk_free_gib(cmux_root)
     return {
         "platform": "linux",
@@ -215,6 +260,12 @@ def collect_linux(
         "toolchainGeneration": digest_bytes(canonical(toolchain)),
         "checks": {
             "supportedOs": supported_distro and kernel_major >= 6,
+            "hardwareCapability": hardware_class_ready(
+                "linux",
+                hardware_class,
+                cpus,
+                total_gib,
+            ),
             "cmuxCheckout": (cmux_root / ".git").exists(),
             "git": git.startswith("git version "),
             "glaedaExecutable": glaeda.is_file() and os.access(glaeda, os.X_OK),
@@ -230,7 +281,13 @@ def collect_linux(
             "freeDiskGiBClass": (
                 f"ge-{min_free_gib}" if free_gib >= min_free_gib else f"lt-{min_free_gib}"
             ),
-            "availableMemoryGiBClass": "ge-8" if available_gib >= 8 else "lt-8",
+            "availableMemoryGiBClass": (
+                "ge-8" if available_gib >= 8 else "lt-8"
+            ),
+            "logicalCpuClass": "ge-4" if cpus >= 4 else "lt-4",
+            "totalMemoryGiBClass": (
+                "ge-8" if total_gib >= 8 else "lt-8"
+            ),
         },
     }
 
@@ -300,9 +357,20 @@ def main() -> int:
         if minimum <= 0:
             raise BootstrapError("minimum free disk must be positive")
         observation = (
-            collect_macos(cmux_root, glaeda, minimum)
+            collect_macos(
+                cmux_root,
+                glaeda,
+                minimum,
+                args.hardware_class,
+            )
             if args.platform == "macos"
-            else collect_linux(cmux_root, glaeda, minimum, args.role)
+            else collect_linux(
+                cmux_root,
+                glaeda,
+                minimum,
+                args.role,
+                args.hardware_class,
+            )
         )
         sys.stdout.buffer.write(
             canonical(evaluate(observation, args.role, args.hardware_class))
