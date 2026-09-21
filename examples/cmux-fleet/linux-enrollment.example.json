@@ -10,6 +10,9 @@
   "supportedToolchainGenerations": [
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
   ],
+  "roleWorkloadGenerations": {
+    "cmux_linux_ci": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
   "allowedExecutionRoles": [
     "cmux_linux_ci"
   ],
