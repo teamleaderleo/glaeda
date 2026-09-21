@@ -75,6 +75,8 @@ pub mod execution_admission;
 pub mod execution_capacity;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
+/// Pure bounded failure classification, diagnostic probes, remedies, and preflight learning.
+pub mod failure_diagnostic;
 /// Pure model-derived frontier-inference workload vocabulary and synthetic sensitivity fixtures.
 pub mod frontier_inference_workload;
 /// Pure Git index-v2 stat-cache patching for CoW task materialization.
@@ -346,6 +348,8 @@ pub mod resident_repo_query;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod resident_sandbox_catalog;
 pub mod resource;
+/// Pure evidence-driven lifecycle and retention policy for expensive reusable state.
+pub mod reusable_state_lifecycle;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;
 /// Strict, bounded, nonblocking, descriptor-relative, identity-bound observation of reviewed Podman sources.
