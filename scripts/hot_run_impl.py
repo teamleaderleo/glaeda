@@ -1763,16 +1763,6 @@ def ensure_hot_state_value_records_root(namespace_root: Path) -> Path:
     return root
 
 
-def hot_state_value_record_path(
-    namespace_root: Path, state_identity: str
-) -> Path:
-    if not state_identity_name(state_identity):
-        raise RuntimeError("hot-state value record state identity is invalid")
-    return hot_state_value_records_root(namespace_root) / (
-        state_identity + HOT_STATE_VALUE_RECORD_SUFFIX
-    )
-
-
 def read_hot_state_value_record(
     namespace_root: Path, state_identity: str
 ) -> dict[str, object] | None:
