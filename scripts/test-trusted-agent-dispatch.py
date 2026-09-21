@@ -60,16 +60,16 @@ def external_terminal(
     state: str = "succeeded",
 ) -> dict[str, object]:
     compiled = external.compile_request(item.external_request)
+    if state == "refused":
+        return external.refused_receipt(
+            item.external_request,
+            external.ContractRefusal("fixture_refusal", "fixture refusal"),
+        )
+    if state == "ambiguous":
+        return external.ambiguous_receipt(compiled)
     receipt = external.planned_receipt(compiled)
     receipt["state"] = state
-    receipt["workload_receipt_sha256"] = (
-        "sha256:" + "a" * 64
-        if state not in {"refused", "ambiguous"}
-        else None
-    )
-    receipt["refusal_code"] = (
-        "ambiguous_execution" if state == "ambiguous" else None
-    )
+    receipt["workload_receipt_sha256"] = "sha256:" + "a" * 64
     return receipt
 
 
