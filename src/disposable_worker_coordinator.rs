@@ -962,7 +962,7 @@ mod tests {
             .reserve(reservation())
             .unwrap()
     }
-    fn runner_started_reservation() -> DisposableAttemptReservation {
+    fn runner_registered_reservation() -> DisposableAttemptReservation {
         let reserved = reservation();
         let runner = ScaleSetRunnerReference::new(
             ScaleSetRunnerId::new(77).unwrap(),
@@ -987,13 +987,21 @@ mod tests {
             .record_jit_generation_started()
             .unwrap()
             .record_registration(&runner)
-            .unwrap()
-            .record_runner_start_started()
             .unwrap();
         DisposableAttemptReservation::new(
             attempt,
             reserved.resources(),
             reserved.prepared_template_identity().clone(),
+        )
+        .unwrap()
+    }
+
+    fn runner_started_reservation() -> DisposableAttemptReservation {
+        let registered = runner_registered_reservation();
+        DisposableAttemptReservation::new(
+            registered.attempt().record_runner_start_started().unwrap(),
+            registered.resources(),
+            registered.prepared_template_identity().clone(),
         )
         .unwrap()
     }
@@ -1017,6 +1025,17 @@ mod tests {
             busy_runners: 0,
             idle_runners: 0,
         }
+    }
+
+    #[test]
+    fn lost_jit_after_runner_registration_routes_directly_to_cleanup() {
+        let reservation = runner_registered_reservation();
+        assert!(reservation.attempt().runner_id().is_some());
+        assert!(!reservation.attempt().runner_start_started());
+        assert_eq!(
+            operation_for(&reservation).unwrap(),
+            CoordinatorOperation::Cleanup
+        );
     }
 
     #[test]
