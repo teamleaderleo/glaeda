@@ -69,7 +69,6 @@ MAX_HOT_STATE_VALUE_CATALOG_V1_BYTES = 256 * 1024
 MAX_HOT_STATE_VALUE_RECORD_BYTES = 8 * 1024
 MAX_HOT_STATE_CREATING_ENTRIES = 2
 MAX_HOT_STATE_DELETE_ENTRIES = 2048
-MAX_HOT_STATE_DELETE_DEPTH = 128
 HOT_STATE_RETIRE_START_USED_PERCENT = 90
 HOT_STATE_RETIRE_STOP_USED_PERCENT = 85
 RENAME_NOREPLACE = 1
@@ -1356,78 +1355,148 @@ def delete_directory_contents_bounded(
     descriptor: int,
     expected_device: int,
     budget: DeleteBudget,
-    depth: int,
     *,
     preserve_manifest: bool,
 ) -> bool:
-    if depth > MAX_HOT_STATE_DELETE_DEPTH:
-        return False
+    # Keep the caller's root descriptor open. Child descriptors are held only
+    # while their exact directory is on the DFS stack, so arbitrary tree depth
+    # is governed by real OS descriptor capacity rather than a protocol limit.
+    stack: list[tuple[int, os.ScandirIterator[str], int | None, str | None, bool, bool]] = []
     try:
-        with os.scandir(descriptor) as entries:
-            for entry in entries:
-                if preserve_manifest and entry.name == HOT_STATE_MANIFEST:
-                    continue
+        try:
+            root_entries = os.scandir(descriptor)
+        except OSError:
+            return False
+        stack.append(
+            (
+                descriptor,
+                root_entries,
+                None,
+                None,
+                preserve_manifest,
+                False,
+            )
+        )
+        while stack:
+            (
+                current_descriptor,
+                entries,
+                parent_descriptor,
+                name_in_parent,
+                preserve_current_manifest,
+                owns_descriptor,
+            ) = stack[-1]
+            try:
+                entry = next(entries)
+            except StopIteration:
+                if parent_descriptor is None:
+                    entries.close()
+                    stack.pop()
+                    return True
                 if budget.remaining_entries <= 0:
                     return False
+                entries.close()
+                stack.pop()
+                if owns_descriptor:
+                    os.close(current_descriptor)
+                assert name_in_parent is not None
                 try:
-                    details = os.stat(
-                        entry.name, dir_fd=descriptor, follow_symlinks=False
-                    )
+                    os.rmdir(name_in_parent, dir_fd=parent_descriptor)
                 except FileNotFoundError:
                     continue
-                if details.st_uid != os.getuid() or details.st_dev != expected_device:
+                except OSError:
                     return False
-                if stat.S_ISDIR(details.st_mode) and not stat.S_ISLNK(details.st_mode):
-                    try:
-                        child = os.open(
-                            entry.name,
-                            os.O_RDONLY
-                            | os.O_DIRECTORY
-                            | os.O_CLOEXEC
-                            | os.O_NOFOLLOW,
-                            dir_fd=descriptor,
-                        )
-                    except OSError:
-                        return False
-                    try:
-                        pinned = os.fstat(child)
-                        if (
-                            pinned.st_dev != expected_device
-                            or pinned.st_uid != os.getuid()
-                            or pinned.st_ino != details.st_ino
-                        ):
-                            return False
-                        complete = delete_directory_contents_bounded(
-                            child,
-                            expected_device,
-                            budget,
-                            depth + 1,
-                            preserve_manifest=False,
-                        )
-                    finally:
+                budget.remaining_entries -= 1
+                continue
+            except OSError:
+                return False
+
+            if (
+                preserve_current_manifest
+                and entry.name == HOT_STATE_MANIFEST
+            ):
+                continue
+            if budget.remaining_entries <= 0:
+                return False
+            try:
+                details = os.stat(
+                    entry.name,
+                    dir_fd=current_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            if details.st_uid != os.getuid() or details.st_dev != expected_device:
+                return False
+
+            if stat.S_ISDIR(details.st_mode) and not stat.S_ISLNK(details.st_mode):
+                try:
+                    child = os.open(
+                        entry.name,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_CLOEXEC
+                        | os.O_NOFOLLOW,
+                        dir_fd=current_descriptor,
+                    )
+                except OSError:
+                    return False
+                try:
+                    pinned = os.fstat(child)
+                    if (
+                        pinned.st_dev != expected_device
+                        or pinned.st_uid != os.getuid()
+                        or pinned.st_ino != details.st_ino
+                    ):
                         os.close(child)
-                    if not complete or budget.remaining_entries <= 0:
                         return False
-                    try:
-                        os.rmdir(entry.name, dir_fd=descriptor)
-                    except FileNotFoundError:
-                        continue
-                    except OSError:
-                        return False
-                    budget.remaining_entries -= 1
-                elif stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode):
-                    try:
-                        os.unlink(entry.name, dir_fd=descriptor)
-                    except FileNotFoundError:
-                        continue
-                    except OSError:
-                        return False
-                    budget.remaining_entries -= 1
-                else:
+                    child_entries = os.scandir(child)
+                except OSError:
+                    os.close(child)
                     return False
-    except OSError:
-        return False
-    return True
+                stack.append(
+                    (
+                        child,
+                        child_entries,
+                        current_descriptor,
+                        entry.name,
+                        False,
+                        True,
+                    )
+                )
+                continue
+
+            if stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode):
+                try:
+                    os.unlink(entry.name, dir_fd=current_descriptor)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return False
+                budget.remaining_entries -= 1
+                continue
+            return False
+        return True
+    finally:
+        for (
+            current_descriptor,
+            entries,
+            _,
+            _,
+            _,
+            owns_descriptor,
+        ) in reversed(stack):
+            try:
+                entries.close()
+            except OSError:
+                pass
+            if owns_descriptor:
+                try:
+                    os.close(current_descriptor)
+                except OSError:
+                    pass
 
 
 def retirement_record_name(retired_name: str, state_identity: str) -> str:
@@ -2357,7 +2426,6 @@ def delete_retired_state_bounded(
             state_descriptor,
             state_details.st_dev,
             budget,
-            0,
             preserve_manifest=True,
         )
         if not complete or budget.remaining_entries <= 0:
