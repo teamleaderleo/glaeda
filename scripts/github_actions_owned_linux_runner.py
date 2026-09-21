@@ -680,7 +680,7 @@ def run_once(arguments: argparse.Namespace) -> int:
         unit = unit_name(request)
         binding = admission_binding(request, command_root)
         gate = owned_admission.Reservation(
-            arguments.admission_root, request.assignment_fingerprint(), unit, binding
+            owned_admission.CANONICAL_ROOT, request.assignment_fingerprint(), unit, binding
         )
         with gate as admission:
             task_root = command_root / "task"
@@ -820,7 +820,7 @@ def settle(arguments: argparse.Namespace) -> int:
                 raise Refusal("task cleanup is incomplete")
 
         owned_admission.recover(
-            arguments.admission_root,
+            owned_admission.CANONICAL_ROOT,
             request.assignment_fingerprint(),
             unit,
             admission_binding(request, command_root),
@@ -834,7 +834,6 @@ def settle(arguments: argparse.Namespace) -> int:
 
 def add_identity_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--state-root", required=True)
-    parser.add_argument("--admission-root", required=True)
     parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--assignment-id", required=True)
     parser.add_argument("--repository", required=True)
