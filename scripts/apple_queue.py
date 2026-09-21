@@ -122,9 +122,14 @@ def validate_result(result):
         raise native.Refusal("invalid native exit status")
     for key in ("source_before", "source_after"):
         source = result[key]
-        if source is not None and (not isinstance(source, dict) or set(source) != {"commit", "clean"}
+        if source is None:
+            continue
+        if (not isinstance(source, dict) or set(source) not in ({"commit", "clean"}, {"commit", "tree", "clean"})
                 or type(source["clean"]) is not bool or not isinstance(source["commit"], str)
                 or not re.fullmatch(r"[a-f0-9]{40,64}", source["commit"])):
+            raise native.Refusal("invalid source observation")
+        if ("tree" in source and (not isinstance(source["tree"], str)
+                or not re.fullmatch(r"[a-f0-9]{40,64}", source["tree"]))):
             raise native.Refusal("invalid source observation")
 
 
