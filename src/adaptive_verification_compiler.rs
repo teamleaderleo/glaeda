@@ -3037,9 +3037,8 @@ mod tests {
     #[test]
     fn repository_candidate_identity_survives_additional_evidence() {
         let observations = cmux_case_observations();
-        let first =
-            compile_verification_optimizations("cmux-ci", "macos-full", &observations, &[])
-                .unwrap();
+        let first = compile_verification_optimizations("cmux-ci", "macos-full", &observations, &[])
+            .unwrap();
         let candidate = first
             .candidates()
             .iter()
@@ -3092,13 +3091,9 @@ mod tests {
             .unwrap(),
         );
 
-        let second = compile_verification_optimizations(
-            "cmux-ci",
-            "macos-full",
-            &extended,
-            &[experiment],
-        )
-        .unwrap();
+        let second =
+            compile_verification_optimizations("cmux-ci", "macos-full", &extended, &[experiment])
+                .unwrap();
         let candidate = second
             .candidates()
             .iter()
