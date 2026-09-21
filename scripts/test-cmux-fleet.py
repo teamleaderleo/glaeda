@@ -124,6 +124,14 @@ class FleetTests(unittest.TestCase):
                 enrollment("linux", roles=["cmux_macos_native_build"])
             )
 
+    def test_eligible_transition_requires_current_acceptance(self):
+        e = enrollment(state="enrolling")
+        with self.assertRaisesRegex(f.FleetError, "accepted role receipt"):
+            f.transition(e, "eligible", None)
+        receipt = f.finalize_acceptance(e, evidence())
+        eligible = f.transition(e, "eligible", None, [receipt])
+        self.assertEqual(eligible["state"], "eligible")
+
     def test_quarantine_and_reenroll_path(self):
         e = enrollment()
         q = f.transition(e, "quarantined", "service_mismatch")
