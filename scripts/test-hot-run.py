@@ -1064,6 +1064,60 @@ class HotRunTests(unittest.TestCase):
             )
             self.assertFalse(stale.exists())
 
+    def test_success_record_keeps_caller_namespace_lease_held(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, _, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "u" * 64
+            )
+            namespace["publish_implicit_state_base"](state, document)
+            (state / "lock").touch(mode=0o600)
+            lease = namespace["open_private_lock"](
+                namespace_root / namespace["HOT_STATE_NAMESPACE_LOCK"],
+                "hot-state namespace lock",
+            )
+            contender = None
+            try:
+                fcntl.flock(lease, fcntl.LOCK_SH)
+                self.assertEqual(
+                    namespace["record_successful_hot_state_use"](
+                        namespace_root,
+                        state,
+                        "created",
+                        "sha256:" + "2" * 64,
+                        None,
+                        None,
+                        namespace["ExecutionObservation"](0.1, 0.0),
+                        lease,
+                    ),
+                    "recorded",
+                )
+                contender = namespace["open_private_lock"](
+                    namespace_root / namespace["HOT_STATE_NAMESPACE_LOCK"],
+                    "hot-state namespace lock",
+                )
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(
+                        contender,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                value_lock = (
+                    namespace_root / namespace["HOT_STATE_VALUE_LOCK"]
+                )
+                self.assertTrue(value_lock.is_file())
+                self.assertEqual(
+                    stat.S_IMODE(value_lock.stat().st_mode),
+                    0o600,
+                )
+            finally:
+                if contender is not None:
+                    os.close(contender)
+                fcntl.flock(lease, fcntl.LOCK_UN)
+                os.close(lease)
+
     def test_value_record_parent_symlink_is_never_followed(self) -> None:
         namespace = load_hot_run()
         with tempfile.TemporaryDirectory() as directory:
