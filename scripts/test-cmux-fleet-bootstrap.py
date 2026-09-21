@@ -81,7 +81,7 @@ class Tests(unittest.TestCase):
         with self.assertRaisesRegex(b.BootstrapError, "incompatible"):
             b.evaluate(
                 observation("linux"),
-                ["cmux_macos_test"],
+                ["cmux_macos_native_build"],
                 "cmux-linux-ci-medium",
             )
 
@@ -118,6 +118,14 @@ class Tests(unittest.TestCase):
                 256,
             )
         )
+
+    def test_role_without_workload_refused(self):
+        with self.assertRaisesRegex(b.BootstrapError, "reviewed v1 acceptance workload"):
+            b.evaluate(
+                observation(),
+                ["artifact_cache"],
+                "cmux-mac-build-large",
+            )
 
     def test_power_posture_parser(self):
         raw = (
