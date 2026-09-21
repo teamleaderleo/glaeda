@@ -380,7 +380,6 @@ def external_document(request: DispatchRequest) -> dict[str, object]:
         "document_type": external.REQUEST_DOCUMENT_TYPE,
         "schema_version": external.REQUEST_SCHEMA_VERSION,
         "external_request_ref": request.request_id,
-        "semantic_request_id": semantic_request_id(request),
         "source": {
             "repository": request.repository,
             "commit": request.commit,
@@ -415,7 +414,10 @@ def accept_request(
     external_request = external.decode_request(
         canonical_bytes(external_document(request)) + b"\n"
     )
-    compiled = external.compile_request(external_request)
+    compiled = external.compile_request(
+        external_request,
+        semantic_request_id=semantic_request_id(request),
+    )
     planned = external.planned_receipt(compiled)
     resolved = planned.get("resolved_workload")
     if not isinstance(resolved, dict):
