@@ -282,7 +282,7 @@ eligible:
   cmux_macos_native_build
   cmux_macos_test
 temporarily unavailable:
-  artifact_cache: role_canary_pending
+  artifact_cache: fleet_acceptance_pending
 capacity:
   mac_app_host_test_slot: 2
   mac_native_build_lane: 1
