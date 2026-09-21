@@ -845,10 +845,11 @@ def producer_manifest_document(
         ),
     )
     return {
-        "schema_version": HOT_STATE_SCHEMA_VERSION,
-        "producer": HOT_STATE_PRODUCER,
+        "schema_version": HOT_STATE_MANIFEST_SCHEMA_VERSION,
+        "producer": HOT_STATE_MANIFEST_PRODUCER,
         "state_identity": state_base.name,
         "reconstructible": True,
+        "namespace_lease_protocol": HOT_STATE_NAMESPACE_LEASE_PROTOCOL,
         "cache_views": [
             {"path": os.fspath(spec.path), "mode": spec.mode}
             for spec in cache_specs
@@ -869,19 +870,34 @@ def canonical_manifest_bytes(document: dict[str, object]) -> bytes:
 def validate_manifest_document(
     document: object, expected_state_identity: str
 ) -> dict[str, object]:
-    if not isinstance(document, dict) or set(document) != {
+    if not isinstance(document, dict):
+        raise RuntimeError("hot-state producer manifest has an unsupported shape")
+    legacy_keys = {
         "schema_version",
         "producer",
         "state_identity",
         "reconstructible",
         "cache_views",
         "generation_objects",
-    }:
-        raise RuntimeError("hot-state producer manifest has an unsupported shape")
+    }
+    current_keys = legacy_keys | {"namespace_lease_protocol"}
+    legacy = (
+        set(document) == legacy_keys
+        and document.get("schema_version")
+        == HOT_STATE_MANIFEST_LEGACY_SCHEMA_VERSION
+        and document.get("producer") == HOT_STATE_MANIFEST_LEGACY_PRODUCER
+    )
+    current = (
+        set(document) == current_keys
+        and document.get("schema_version") == HOT_STATE_MANIFEST_SCHEMA_VERSION
+        and document.get("producer") == HOT_STATE_MANIFEST_PRODUCER
+        and document.get("namespace_lease_protocol")
+        == HOT_STATE_NAMESPACE_LEASE_PROTOCOL
+    )
+    if not legacy and not current:
+        raise RuntimeError("hot-state producer manifest identity is not accepted")
     if (
-        document["schema_version"] != HOT_STATE_SCHEMA_VERSION
-        or document["producer"] != HOT_STATE_PRODUCER
-        or document["state_identity"] != expected_state_identity
+        document["state_identity"] != expected_state_identity
         or not state_identity_name(expected_state_identity)
         or document["reconstructible"] is not True
     ):
@@ -959,6 +975,17 @@ def validate_manifest_document(
             ):
                 raise RuntimeError("hot-state producer manifest generation is invalid")
     return document
+
+
+def manifest_has_full_execution_namespace_lease(
+    document: dict[str, object],
+) -> bool:
+    return (
+        document.get("schema_version") == HOT_STATE_MANIFEST_SCHEMA_VERSION
+        and document.get("producer") == HOT_STATE_MANIFEST_PRODUCER
+        and document.get("namespace_lease_protocol")
+        == HOT_STATE_NAMESPACE_LEASE_PROTOCOL
+    )
 
 
 def recompute_manifest_state_identity(document: dict[str, object]) -> str:
