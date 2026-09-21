@@ -307,4 +307,163 @@ def validate_project_state(value: object, trust: dict[str, Any], profile_ids: se
         commit = bounded_string(source["commit_oid"], OID_RE, "project state commit")
         tree = bounded_string(source["tree_oid"], OID_RE, "project state tree")
         if item["heat_class"] not in HEAT_CLASSES or item["dependency_build_state_class"] not in BUILD_STATE_CLASSES:
-            raise SnapshotError("project state
+            raise SnapshotError("project state class is invalid")
+        active = integer(item["active_task_count"], "project active task count", 0, 32)
+        verification_profiles = exact_list(item["verification_profiles"], "project verification profiles", MAX_PROFILES)
+        if any(not isinstance(profile, str) or VERIFICATION_PROFILE_RE.fullmatch(profile) is None for profile in verification_profiles):
+            raise SnapshotError("project verification profile is invalid")
+        receipt = item["recent_compatible_receipt_ref"]
+        if receipt is not None:
+            bounded_string(receipt, SHA256_RE, "recent receipt reference")
+        projects.append({
+            "repository": repository,
+            "source": {"commit_oid": commit, "tree_oid": tree},
+            "heat_class": item["heat_class"],
+            "verification_profiles": sorted(set(verification_profiles)),
+            "dependency_build_state_class": item["dependency_build_state_class"],
+            "active_task_count": active,
+            "recent_compatible_receipt_ref": receipt,
+        })
+    return sorted(projects, key=lambda item: str(item["repository"]))
+
+
+def validate_request_state(value: object, trust: dict[str, Any], profile_ids: set[str]) -> list[dict[str, object]]:
+    doc = exact_object(value, "request state input")
+    exact_keys(doc, {"document_type", "schema_version", "requests"}, "request state input")
+    if doc["document_type"] != "glaeda-github-request-state-input" or doc["schema_version"] != 1:
+        raise SnapshotError("request state input version is unsupported")
+    repositories = set(trust["repositories"])
+    requests: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for raw in exact_list(doc["requests"], "request state", MAX_REQUESTS):
+        item = exact_object(raw, "request state")
+        exact_keys(
+            item,
+            {"request_id", "source", "profile", "state", "terminal_receipt_ref", "elapsed_class", "estimate_class"},
+            "request state",
+        )
+        request_id = bounded_string(item["request_id"], REQUEST_RE, "request id")
+        if request_id in seen:
+            raise SnapshotError("request ids must be unique")
+        seen.add(request_id)
+        source = exact_object(item["source"], "request source")
+        exact_keys(source, {"repository", "commit_oid", "tree_oid"}, "request source")
+        if source["repository"] not in repositories:
+            raise SnapshotError("request repository is absent from the reviewed allowlist")
+        commit = bounded_string(source["commit_oid"], OID_RE, "request commit")
+        tree = bounded_string(source["tree_oid"], OID_RE, "request tree")
+        if item["profile"] not in profile_ids or item["state"] not in REQUEST_STATES:
+            raise SnapshotError("request profile or state is invalid")
+        if item["elapsed_class"] not in DURATION_CLASSES or item["estimate_class"] not in DURATION_CLASSES:
+            raise SnapshotError("request duration class is invalid")
+        receipt = item["terminal_receipt_ref"]
+        if item["state"] == "terminal":
+            bounded_string(receipt, SHA256_RE, "terminal receipt reference")
+        elif receipt is not None:
+            raise SnapshotError("non-terminal request cannot claim a terminal receipt")
+        requests.append({
+            "request_id": request_id,
+            "source": {"repository": source["repository"], "commit_oid": commit, "tree_oid": tree},
+            "profile": item["profile"],
+            "state": item["state"],
+            "terminal_receipt_ref": receipt,
+            "elapsed_class": item["elapsed_class"],
+            "estimate_class": item["estimate_class"],
+        })
+    return sorted(requests, key=lambda item: str(item["request_id"]))
+
+
+def build_unsigned_snapshot(
+    capability: object,
+    admission: object,
+    trust_value: object,
+    *,
+    public_node_id: str,
+    producer_generation: int,
+    snapshot_sequence: int,
+    observed_at: dt.datetime,
+    published_at: dt.datetime,
+    maximum_useful_age_seconds: int = DEFAULT_USEFUL_AGE_SECONDS,
+    project_state: object | None = None,
+    request_state: object | None = None,
+) -> dict[str, object]:
+    trust = validate_trust(trust_value)
+    public_node_id = bounded_string(public_node_id, NODE_RE, "public node id")
+    reviewed = trust_node(trust, public_node_id)
+    producer_generation = integer(producer_generation, "producer generation", 1, 2**31 - 1)
+    snapshot_sequence = integer(snapshot_sequence, "snapshot sequence", 1, 2**63 - 1)
+    maximum_useful_age_seconds = integer(
+        maximum_useful_age_seconds, "maximum useful age", MIN_USEFUL_AGE_SECONDS, MAX_USEFUL_AGE_SECONDS
+    )
+    if published_at < observed_at:
+        raise SnapshotError("published_at precedes observed_at")
+    node, profiles, projects, glaeda_generation, capability_observed_at = capability_projection(
+        capability,
+        trust=trust,
+        public_node_id=public_node_id,
+        observed_at=observed_at,
+        published_at=published_at,
+    )
+    effective_observed_at = min(observed_at, capability_observed_at)
+    if published_at < effective_observed_at:
+        raise SnapshotError("published_at precedes observed evidence")
+    node.update(admission_projection(admission))
+    profile_ids = {str(profile["id"]) for profile in profiles}
+    if project_state is not None:
+        projects = validate_project_state(project_state, trust, profile_ids)
+    else:
+        active = integer(node["active_work_count"], "node active work count", 0, 32)
+        if len(projects) == 1:
+            projects[0]["active_task_count"] = active
+    requests = [] if request_state is None else validate_request_state(request_state, trust, profile_ids)
+    active_work_count = integer(node["active_work_count"], "node active work count", 0, 32)
+    active_request_count = sum(item["state"] in {"preparing", "running"} for item in requests)
+    active_project_count = sum(int(item["active_task_count"]) for item in projects)
+    if active_request_count > active_work_count or active_project_count > active_work_count:
+        raise SnapshotError("published active work disagrees with local admission evidence")
+    unsigned = {
+        "document_type": NODE_DOCUMENT,
+        "schema_version": SCHEMA_VERSION,
+        "payload": {
+            "authority": {
+                "advisory_only": True,
+                "authorizes_dispatch": False,
+                "authorizes_execution": False,
+                "authorizes_host_selection": False,
+                "authorizes_cleanup": False,
+            },
+            "freshness": {
+                "snapshot_sequence": snapshot_sequence,
+                "observed_at": format_time(effective_observed_at),
+                "published_at": format_time(published_at),
+                "producer_generation": producer_generation,
+                "maximum_useful_age_seconds": maximum_useful_age_seconds,
+            },
+            "producer": {
+                "glaeda_generation": glaeda_generation,
+                "key_id": reviewed["key_id"],
+            },
+            "node": node,
+            "profiles": sorted(profiles, key=lambda item: str(item["id"])),
+            "projects": sorted(projects, key=lambda item: str(item["repository"])),
+            "requests": requests,
+        },
+    }
+    validate_unsigned_snapshot(unsigned, trust, check_freshness=False)
+    return unsigned
+
+
+def validate_unsigned_snapshot(
+    value: object,
+    trust_value: object,
+    *,
+    now: dt.datetime | None = None,
+    check_freshness: bool = True,
+) -> dict[str, Any]:
+    trust = validate_trust(trust_value)
+    value = exact_object(value, "node snapshot")
+    exact_keys(value, {"document_type", "schema_version", "payload"}, "node snapshot")
+    if value["document_type"] != NODE_DOCUMENT or value["schema_version"] != SCHEMA_VERSION:
+        raise SnapshotError("node snapshot version is unsupported")
+    payload = exact_object(value["payload"], "node payload")
+    exact_keys(payload, {"authority", "freshness", "pr
