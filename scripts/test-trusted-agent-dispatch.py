@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""Contract tests for trusted-agent dispatch."""
+from __future__ import annotations
+
+import copy
+import datetime as dt
+import unittest
+
+import external_execution_request as external
+import trusted_agent_dispatch as dispatch
+
+NOW = dt.datetime(2026, 9, 21, 10, 0, tzinfo=dt.timezone.utc)
+PRINCIPAL = "github-mailbox-writers:teamleaderleo/glaeda-dispatch"
+BINDING = "github-private-repo-write-policy:teamleaderleo/glaeda-dispatch"
+
+
+def base_document() -> dict[str, object]:
+    value: dict[str, object] = {
+        "document_type": dispatch.REQUEST_DOCUMENT_TYPE,
+        "schema_version": 1,
+        "request_id": "dispatch-967-proof",
+        "source": {
+            "repository": "teamleaderleo/glaeda",
+            "commit": "1" * 40,
+            "tree": "2" * 40,
+        },
+        "operation": {
+            "kind": "verify_named",
+            "profile": "verify-focused/v1",
+        },
+        "caller": {
+            "principal": PRINCIPAL,
+            "provenance_binding": BINDING,
+        },
+        "created_at": "2026-09-21T09:55:00Z",
+        "expires_at": "2026-09-21T10:25:00Z",
+        "supersession": {"policy": "none"},
+    }
+    value["request_fingerprint"] = dispatch.fingerprint_document(value)
+    return value
+
+
+def raw(value: dict[str, object] | None = None) -> bytes:
+    chosen = base_document() if value is None else value
+    return dispatch.canonical_bytes(chosen) + b"\n"
+
+
+def accepted(
+    value: dict[str, object] | None = None,
+) -> dispatch.AcceptedRequest:
+    request = dispatch.decode_request(raw(value), now=NOW)
+    return dispatch.accept_request(
+        request,
+        dispatch.ProvenanceEvidence(PRINCIPAL, BINDING),
+    )
+
+
+def external_terminal(
+    item: dispatch.AcceptedRequest,
+    state: str = "succeeded",
+) -> dict[str, object]:
+    compiled = external.compile_request(item.external_request)
+    receipt = external.planned_receipt(compiled)
+    receipt["state"] = state
+    receipt["workload_receipt_sha256"] = (
+        "sha256:" + "a" * 64
+        if state not in {"refused", "ambiguous"}
+        else None
+    )
+    receipt["refusal_code"] = (
+        "ambiguous_execution" if state == "ambiguous" else None
+    )
+    return receipt
+
+
+class TrustedDispatchTests(unittest.TestCase):
+    def test_accepts_exact_request_and_compiles_reviewed_workload(self) -> None:
+        item = accepted()
+        self.assertEqual(
+            item.accepted_document["resolved_workload"]["id"],
+            "verify-focused/v1",
+        )
+        self.assertEqual(
+            item.accepted_document["authority"],
+            dispatch.AUTHORITY,
+        )
+        self.assertEqual(
+            item.accepted_document["caller"]["principal"],
+            PRINCIPAL,
+        )
+        self.assertLessEqual(
+            len(dispatch.canonical_bytes(item.accepted_document) + b"\n"),
+            4096,
+        )
+
+    def test_observed_provenance_is_separate_from_request_bytes(self) -> None:
+        request = dispatch.decode_request(raw(), now=NOW)
+        with self.assertRaisesRegex(
+            dispatch.DispatchRefusal,
+            "observed provenance",
+        ):
+            dispatch.accept_request(
+                request,
+                dispatch.ProvenanceEvidence(
+                    "github-user:commit-author",
+                    BINDING,
+                ),
+            )
+
+    def test_fingerprint_detects_semantic_drift(self) -> None:
+        value = base_document()
+        value["source"]["commit"] = "3" * 40
+        with self.assertRaisesRegex(
+            dispatch.DispatchRefusal,
+            "fingerprint",
+        ):
+            dispatch.decode_request(raw(value), now=NOW)
+
+    def test_stale_future_malformed_and_supersession_refuse(self) -> None:
+        expired = base_document()
+        expired["created_at"] = "2026-09-21T08:00:00Z"
+        expired["expires_at"] = "2026-09-21T08:30:00Z"
+        expired["request_fingerprint"] = dispatch.fingerprint_document(expired)
+        with self.assertRaisesRegex(dispatch.DispatchRefusal, "expired"):
+            dispatch.decode_request(raw(expired), now=NOW)
+
+        future = base_document()
+        future["created_at"] = "2026-09-21T10:06:00Z"
+        future["expires_at"] = "2026-09-21T10:30:00Z"
+        future["request_fingerprint"] = dispatch.fingerprint_document(future)
+        with self.assertRaisesRegex(dispatch.DispatchRefusal, "future"):
+            dispatch.decode_request(raw(future), now=NOW)
+
+        superseded = base_document()
+        superseded["supersession"] = {"policy": "latest_wins"}
+        superseded["request_fingerprint"] = dispatch.fingerprint_document(
+            superseded
+        )
+        with self.assertRaisesRegex(
+            dispatch.DispatchRefusal,
+            "supersession",
+        ):
+            dispatch.decode_request(raw(superseded), now=NOW)
+
+        with self.assertRaisesRegex(dispatch.DispatchRefusal, "valid JSON"):
+            dispatch.decode_request(b"{\n", now=NOW)
+
+    def test_request_vocabulary_rejects_shell_and_backend_fields(self) -> None:
+        for field, value in {
+            "argv": ["sh", "-c", "id"],
+            "backend": "big-red",
+            "environment": {"TOKEN": "x"},
+        }.items():
+            with self.subTest(field=field):
+                document = base_document()
+                document[field] = value
+                document["request_fingerprint"] = (
+                    dispatch.fingerprint_document(document)
+                )
+                with self.assertRaisesRegex(
+                    dispatch.DispatchRefusal,
+                    "unsupported fields",
+                ):
+                    dispatch.decode_request(raw(document), now=NOW)
+
+    def test_launch_mark_is_required_before_terminal_and_restart_reconciles(
+        self,
+    ) -> None:
+        item = accepted()
+        initial = dispatch.initial_lifecycle(item)
+        self.assertEqual(
+            dispatch.restart_disposition(initial, item),
+            "launch_after_durable_mark",
+        )
+        with self.assertRaisesRegex(dispatch.DispatchRefusal, "launch"):
+            dispatch.settle_from_external(
+                initial,
+                item,
+                external_terminal(item),
+            )
+
+        launching = dispatch.mark_launching(initial, item)
+        self.assertEqual(
+            dispatch.restart_disposition(launching, item),
+            "reconcile_only",
+        )
+        self.assertIs(dispatch.mark_launching(launching, item), launching)
+
+        settled = dispatch.settle_from_external(
+            launching,
+            item,
+            external_terminal(item),
+        )
+        self.assertEqual(
+            dispatch.restart_disposition(settled, item),
+            "return_settlement",
+        )
+        with self.assertRaisesRegex(
+            dispatch.DispatchRefusal,
+            "another execution",
+        ):
+            dispatch.mark_launching(settled, item)
+
+    def test_ambiguous_settlement_never_becomes_fresh_execution(self) -> None:
+        item = accepted()
+        launching = dispatch.mark_launching(
+            dispatch.initial_lifecycle(item),
+            item,
+        )
+        ambiguous = dispatch.settle_from_external(
+            launching,
+            item,
+            external_terminal(item, "ambiguous"),
+        )
+        self.assertEqual(ambiguous["state"], "ambiguous")
+        self.assertEqual(
+            dispatch.restart_disposition(ambiguous, item),
+            "reconcile_only",
+        )
+        self.assertFalse(
+            ambiguous["authority"]["authorizes_redispatch"]
+        )
+
+    def test_exact_settlement_replay_is_idempotent_and_drift_conflicts(
+        self,
+    ) -> None:
+        item = accepted()
+        launching = dispatch.mark_launching(
+            dispatch.initial_lifecycle(item),
+            item,
+        )
+        receipt = external_terminal(item)
+        settled = dispatch.settle_from_external(
+            launching,
+            item,
+            receipt,
+        )
+        self.assertEqual(
+            dispatch.settle_from_external(settled, item, receipt),
+            settled,
+        )
+        drift = copy.deepcopy(receipt)
+        drift["state"] = "failed"
+        with self.assertRaisesRegex(
+            dispatch.DispatchRefusal,
+            "different receipt",
+        ):
+            dispatch.settle_from_external(settled, item, drift)
+
+    def test_bounded_result_contains_no_logs_paths_environment_or_credentials(
+        self,
+    ) -> None:
+        item = accepted()
+        launching = dispatch.mark_launching(
+            dispatch.initial_lifecycle(item),
+            item,
+        )
+        settled = dispatch.settle_from_external(
+            launching,
+            item,
+            external_terminal(item),
+        )
+        result = dispatch.result_document(settled, item)
+        encoded = dispatch.canonical_bytes(result) + b"\n"
+        self.assertLessEqual(len(encoded), 4096)
+        self.assertFalse(result["contains_credentials"])
+        self.assertFalse(result["contains_private_content"])
+        self.assertEqual(set(result), dispatch.RESULT_KEYS)
+        for forbidden in (
+            b"/home/",
+            b"stderr",
+            b"stdout",
+            b"environment",
+            b"TOKEN",
+        ):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_accepted_identity_cannot_change_across_restart(self) -> None:
+        item = accepted()
+        existing = copy.deepcopy(item.accepted_document)
+        self.assertEqual(
+            dispatch.validate_accepted(existing, item),
+            existing,
+        )
+        existing["source"]["tree"] = "f" * 40
+        with self.assertRaisesRegex(
+            dispatch.DispatchRefusal,
+            "changed",
+        ):
+            dispatch.validate_accepted(existing, item)
+
+
+if __name__ == "__main__":
+    unittest.main()
