@@ -746,6 +746,22 @@ class RoleModelTests(unittest.TestCase):
             1,
         )
 
+    def test_accepted_capacity_cannot_hide_settled_unvalidated_work(self):
+        node = linux_node()
+        receipt = capacity(
+            node,
+            'cmux_linux_ci',
+            'medium',
+            'linux_medium_slot',
+            4,
+        )
+        receipt['measurement']['validatedCompletions'] = 7
+        with self.assertRaisesRegex(
+            m.RoleModelError,
+            'every settled task validated',
+        ):
+            m.validate_capacity(receipt)
+
     def test_accepted_capacity_cannot_exceed_measured_simultaneous_work(self):
         node = linux_node()
         receipt = capacity(
