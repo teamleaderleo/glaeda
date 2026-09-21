@@ -47,6 +47,7 @@ JIT_LAUNCHER_SHA256 = (
     "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
 )
 TRUSTED_REPOSITORY = "teamleaderleo/quarry"
+TRUSTED_RUNNER_LABEL = "glaeda-big-red-trusted"
 MAX_JIT_BYTES = 64 * 1024
 MAX_RUNNER_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_RUNNER_ENTRIES = 50_000
@@ -72,6 +73,7 @@ PROFILE_SPEC = {
     "profile_id": PROFILE_ID,
     "trust_class": "owner_trusted_internal_repository",
     "repository": TRUSTED_REPOSITORY,
+    "runner_label": TRUSTED_RUNNER_LABEL,
     "runner_version": RUNNER_VERSION,
     "runner_archive_sha256": RUNNER_ARCHIVE_SHA256,
     "resource_class": RESOURCE_CLASS,
@@ -101,6 +103,7 @@ class Request:
     attempt_id: str
     assignment_id: str
     repository: str
+    runner_label: str
     workflow_run_id: int
     job_id: str
     runner_id: int
@@ -115,6 +118,7 @@ class Request:
                     "attempt_id": self.attempt_id,
                     "assignment_id": self.assignment_id,
                     "repository": self.repository,
+                    "runner_label": self.runner_label,
                     "workflow_run_id": self.workflow_run_id,
                     "job_id": self.job_id,
                     "runner_id": self.runner_id,
@@ -150,6 +154,8 @@ def normalize(arguments: argparse.Namespace) -> Request:
         raise Refusal("runner transaction identity is invalid")
     if arguments.repository != TRUSTED_REPOSITORY:
         raise Refusal("repository is outside the reviewed owner-trusted canary")
+    if arguments.runner_label != TRUSTED_RUNNER_LABEL:
+        raise Refusal("runner label is outside the reviewed owner-trusted canary")
     if type(arguments.workflow_run_id) is not int or arguments.workflow_run_id <= 0:
         raise Refusal("workflow run identity is invalid")
     if type(arguments.runner_id) is not int or arguments.runner_id <= 0:
@@ -162,6 +168,7 @@ def normalize(arguments: argparse.Namespace) -> Request:
         arguments.attempt_id,
         arguments.assignment_id,
         arguments.repository,
+        arguments.runner_label,
         arguments.workflow_run_id,
         arguments.job_id,
         arguments.runner_id,
@@ -169,8 +176,6 @@ def normalize(arguments: argparse.Namespace) -> Request:
         arguments.runner_generation,
         arguments.expires_at_unix_ms,
     )
-    if time.time_ns() // 1_000_000 >= request.expires_at_unix_ms:
-        raise Refusal("runner attempt is expired")
     return request
 
 
@@ -319,7 +324,7 @@ def read_jit_secret() -> bytearray:
             raise Refusal("JIT input is empty")
         allowed = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-"
         allowed_set = set(allowed)
-        if any(value not in allowed_set for value in buffer[: offset - 1]):
+        if any(buffer[index] not in allowed_set for index in range(offset - 1)):
             raise Refusal("JIT input contains invalid characters")
         del buffer[offset:]
         return buffer
@@ -456,6 +461,7 @@ def base_identity(request: Request) -> dict[str, object]:
         "attempt_id": request.attempt_id,
         "assignment_id": request.assignment_id,
         "repository": request.repository,
+        "runner_label": request.runner_label,
         "workflow_run_id": request.workflow_run_id,
         "job_id": request.job_id,
         "runner_id": request.runner_id,
@@ -569,6 +575,8 @@ def run_once(arguments: argparse.Namespace) -> int:
             if not matches_request(intent, request):
                 raise Refusal("runner intent conflicts with exact attempt")
             raise Refusal("previous runner start is ambiguous; redispatch refused")
+        if time.time_ns() // 1_000_000 >= request.expires_at_unix_ms:
+            raise Refusal("runner attempt is expired")
 
         unit = unit_name(request)
         binding = admission_binding(request, command_root)
@@ -678,6 +686,7 @@ def add_identity_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--assignment-id", required=True)
     parser.add_argument("--repository", required=True)
+    parser.add_argument("--runner-label", required=True)
     parser.add_argument("--workflow-run-id", type=int, required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--runner-id", type=int, required=True)
