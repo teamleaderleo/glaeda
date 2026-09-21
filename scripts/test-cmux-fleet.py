@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import copy
+import json
 import importlib.util
 from pathlib import Path
 import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
 
 MODULE_PATH = Path(__file__).with_name("cmux_fleet.py")
 SPEC = importlib.util.spec_from_file_location("cmux_fleet", MODULE_PATH)
@@ -221,6 +225,24 @@ class FleetTests(unittest.TestCase):
                 operator_fleet_scope="cmux-founders",
                 enrollment_generation=1,
             )
+
+    def test_versioned_schema_and_examples_parse(self):
+        schema = json.loads(
+            (ROOT / "examples/cmux-fleet/enrollment-v1.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertFalse(schema["additionalProperties"])
+        for name in (
+            "macos-enrollment.example.json",
+            "linux-enrollment.example.json",
+        ):
+            document = json.loads(
+                (ROOT / "examples/cmux-fleet" / name).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(f.validate_enrollment(document), document)
 
     def test_fingerprint_is_canonical(self):
         e = enrollment()
