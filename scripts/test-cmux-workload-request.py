@@ -52,6 +52,7 @@ def cmux_result(request: module.Request) -> dict[str, object]:
             "generation": request.profile_generation,
         },
         "semantic_validator": "cmux.ci-guard/v1",
+        "environment_class": "isolated-portable",
         "expected_result_class": "cmux.ci-guard-result/v1",
         "result": "passed",
         "parameters": request.parameters,
@@ -248,6 +249,10 @@ class CmuxWorkloadRequestTests(unittest.TestCase):
         semantic = cmux_result(request)
         semantic["benchmark"]["semantic_comparison_key"] = "sha256:" + "f" * 64
         cases.append(("semantic comparison", semantic))
+
+        environment = cmux_result(request)
+        environment["environment_class"] = "isolated-build"
+        cases.append(("semantic comparison", environment))
 
         cleanup = cmux_result(request)
         cleanup["cleanup"] = {"state": "forced", "process_group_settled": False}

@@ -23,6 +23,7 @@ A = "sha256:" + "a" * 64
 B = "sha256:" + "b" * 64
 C = "sha256:" + "c" * 64
 D = "sha256:" + "d" * 64
+E = "sha256:" + "e" * 64
 COMMIT = "1" * 40
 
 
@@ -63,6 +64,25 @@ def enrollment(os_family="macos", state="eligible", roles=None):
     }
 
 
+def bootstrap_for(enrollment_value, toolchain=A):
+    return {
+        "schema": f.BOOTSTRAP_SCHEMA,
+        "platform": enrollment_value["os"]["family"],
+        "architecture": enrollment_value["architecture"],
+        "osVersionClass": enrollment_value["os"]["versionClass"],
+        "hardwareCapabilityClass": enrollment_value["hardwareCapabilityClass"],
+        "roles": list(enrollment_value["allowedExecutionRoles"]),
+        "glaedaGeneration": enrollment_value["glaedaGeneration"],
+        "toolchainGeneration": toolchain,
+        "roleProfiles": copy.deepcopy(enrollment_value["roleProfiles"]),
+        "checks": {"ready": True},
+        "observed": {},
+        "eligibleForEnrollment": True,
+        "blockingChecks": [],
+        "authority": "observation_only",
+    }
+
+
 def cmux_result(
     role="cmux_macos_native_build",
     *,
@@ -93,6 +113,11 @@ def cmux_result(
         },
         "profile": chosen_profile,
         "semantic_validator": "cmux.fixture/v1",
+        "environment_class": (
+            "isolated-build"
+            if role == "cmux_macos_native_build"
+            else "isolated-portable"
+        ),
         "expected_result_class": "cmux.fixture-result/v1",
         "result": state,
         "parameters": {},
@@ -137,13 +162,23 @@ def cmux_result(
     return result
 
 
-def finalized(enrollment_value, role=None, *, result=None, toolchain=A):
+def finalized(
+    enrollment_value,
+    role=None,
+    *,
+    result=None,
+    toolchain=A,
+    post_bootstrap=None,
+):
     role = role or enrollment_value["allowedExecutionRoles"][0]
     return f.finalize_acceptance(
         enrollment_value,
         role,
         toolchain,
         result or cmux_result(role),
+        post_bootstrap or bootstrap_for(enrollment_value, toolchain),
+        execution_class=f.LOCAL_EXECUTION_CLASS,
+        local_execution_attempt_sha256=E,
     )
 
 
@@ -200,6 +235,30 @@ class FleetTests(unittest.TestCase):
             v for v in status["roles"] if v["role"] == "cmux_macos_native_build"
         )
         self.assertEqual(native["reason"], "acceptance_enrollment_stale")
+
+    def test_fleet_contract_change_stales_acceptance(self):
+        e = enrollment()
+        receipt = finalized(e)
+        self.assertEqual(
+            receipt["glaedaFleetContractGeneration"],
+            f.fleet_contract_generation(),
+        )
+        with mock.patch.object(
+            f,
+            "fleet_contract_generation",
+            return_value=D,
+        ):
+            status = f.node_status(e, [receipt])
+        native = next(
+            value
+            for value in status["roles"]
+            if value["role"] == "cmux_macos_native_build"
+        )
+        self.assertFalse(native["eligible"])
+        self.assertEqual(
+            native["reason"],
+            "acceptance_glaeda_contract_stale",
+        )
 
     def test_profile_policy_change_requires_fresh_enrollment(self):
         e = enrollment()
@@ -261,7 +320,13 @@ class FleetTests(unittest.TestCase):
     def test_acceptance_binds_current_identity(self):
         e = enrollment()
         with self.assertRaisesRegex(f.FleetError, "toolchain generation"):
-            f.finalize_acceptance(e, "cmux_macos_native_build", D, cmux_result())
+            f.finalize_acceptance(
+                e,
+                "cmux_macos_native_build",
+                D,
+                cmux_result(),
+                bootstrap_for(e, D),
+            )
 
         wrong_profile = {
             "id": "cmux.macos.dev-check",
@@ -280,8 +345,217 @@ class FleetTests(unittest.TestCase):
                 "cmux_macos_native_build",
                 A,
                 cmux_result(),
+                bootstrap_for(e),
                 D,
+                execution_class=f.LOCAL_EXECUTION_CLASS,
+                local_execution_attempt_sha256=E,
             )
+
+    def test_acceptance_requires_fresh_matching_post_bootstrap(self):
+        e = enrollment()
+
+        changed_toolchain = bootstrap_for(e, B)
+        with self.assertRaisesRegex(
+            f.FleetError,
+            "post-acceptance bootstrap toolchain differs",
+        ):
+            finalized(e, post_bootstrap=changed_toolchain)
+
+        changed_glaeda = bootstrap_for(e)
+        changed_glaeda["glaedaGeneration"] = D
+        with self.assertRaisesRegex(
+            f.FleetError,
+            "post-acceptance bootstrap differs",
+        ):
+            finalized(e, post_bootstrap=changed_glaeda)
+
+        changed_hardware = bootstrap_for(e)
+        changed_hardware["hardwareCapabilityClass"] = "cmux-mac-other"
+        with self.assertRaisesRegex(
+            f.FleetError,
+            "post-acceptance bootstrap differs",
+        ):
+            finalized(e, post_bootstrap=changed_hardware)
+
+    def test_acceptance_receipt_binds_post_bootstrap_and_cmux_context(self):
+        e = enrollment()
+        result = cmux_result()
+        receipt = finalized(e, result=result)
+        self.assertEqual(
+            receipt["postBootstrapSha256"],
+            f.digest(bootstrap_for(e)),
+        )
+        self.assertEqual(
+            receipt["cmuxToolchainIdentity"],
+            result["toolchain"]["identity"],
+        )
+        self.assertEqual(
+            receipt["cmuxEnvironmentClass"],
+            result["environment_class"],
+        )
+        self.assertEqual(
+            receipt["glaedaFleetContractGeneration"],
+            f.fleet_contract_generation(),
+        )
+
+    def test_acceptance_receipt_execution_binding_is_closed(self):
+        e = enrollment()
+        receipt = finalized(e)
+
+        missing_attempt = copy.deepcopy(receipt)
+        missing_attempt["localExecutionAttemptSha256"] = None
+        with self.assertRaisesRegex(
+            f.FleetError,
+            "local execution evidence is inconsistent",
+        ):
+            f.validate_acceptance_receipt(missing_attempt)
+
+        external_with_attempt = copy.deepcopy(receipt)
+        external_with_attempt["executionClass"] = f.EXTERNAL_EVIDENCE_CLASS
+        with self.assertRaisesRegex(
+            f.FleetError,
+            "local execution evidence is inconsistent",
+        ):
+            f.validate_acceptance_receipt(external_with_attempt)
+
+    def test_external_semantic_evidence_cannot_mint_accepted_receipt(self):
+        e = enrollment()
+        receipt = f.finalize_acceptance(
+            e,
+            "cmux_macos_native_build",
+            A,
+            cmux_result(),
+            bootstrap_for(e),
+        )
+        self.assertEqual(receipt["executionClass"], f.EXTERNAL_EVIDENCE_CLASS)
+        self.assertIsNone(receipt["localExecutionAttemptSha256"])
+        self.assertEqual(receipt["result"], "rejected")
+        self.assertFalse(f.node_status(e, [receipt])["routingCandidateEligible"])
+
+    def test_accept_local_binds_profile_run_to_this_node(self):
+        e = enrollment("linux", state="enrolling")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            root.chmod(0o700)
+            enrollment_path = root / "enrollment.json"
+            enrollment_path.write_bytes(f.canonical(e))
+            enrollment_path.chmod(0o600)
+
+            cmux_root = root / "cmux"
+            runner = cmux_root / "scripts/ci/cmux_workload_profile.py"
+            runner.parent.mkdir(parents=True)
+            runner.write_text("# fixture\n", encoding="utf-8")
+
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+
+            result = cmux_result("cmux_linux_ci")
+            post = bootstrap_for(e)
+
+            def fake_run(argv, **kwargs):
+                if "cmux_workload_profile.py" in str(argv[1]):
+                    self.assertIn("--state-class", argv)
+                    self.assertEqual(argv[argv.index("--state-class") + 1], "cold")
+                    self.assertNotIn("--state-root", argv)
+                    result_path = Path(argv[argv.index("--result") + 1])
+                    result_path.write_bytes(f.canonical(result))
+                    result_path.chmod(0o600)
+                    return __import__("subprocess").CompletedProcess(argv, 0)
+                if "cmux_fleet_bootstrap.py" in str(argv[1]):
+                    return __import__("subprocess").CompletedProcess(
+                        argv,
+                        0,
+                        stdout=f.canonical(post),
+                        stderr=b"",
+                    )
+                raise AssertionError(argv)
+
+            with (
+                mock.patch.object(
+                    f,
+                    "_git_oid",
+                    side_effect=[COMMIT, "2" * 40],
+                ),
+                mock.patch.object(f.subprocess, "run", side_effect=fake_run),
+            ):
+                receipt = f.accept_local(
+                    enrollment_path,
+                    cmux_root,
+                    glaeda,
+                    "cmux_linux_ci",
+                )
+
+        self.assertEqual(receipt["result"], "accepted")
+        self.assertEqual(receipt["executionClass"], f.LOCAL_EXECUTION_CLASS)
+        self.assertRegex(
+            receipt["localExecutionAttemptSha256"],
+            r"^sha256:[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            receipt["cmuxSemanticResultSha256"],
+            f.digest(result),
+        )
+
+    def test_accept_local_refuses_fleet_contract_replacement(self):
+        e = enrollment("linux", state="enrolling")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            root.chmod(0o700)
+            enrollment_path = root / "enrollment.json"
+            enrollment_path.write_bytes(f.canonical(e))
+            enrollment_path.chmod(0o600)
+
+            cmux_root = root / "cmux"
+            runner = cmux_root / "scripts/ci/cmux_workload_profile.py"
+            runner.parent.mkdir(parents=True)
+            runner.write_text("# fixture\n", encoding="utf-8")
+
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+
+            result = cmux_result("cmux_linux_ci")
+            post = bootstrap_for(e)
+
+            def fake_run(argv, **kwargs):
+                if "cmux_workload_profile.py" in str(argv[1]):
+                    result_path = Path(argv[argv.index("--result") + 1])
+                    result_path.write_bytes(f.canonical(result))
+                    result_path.chmod(0o600)
+                    return __import__("subprocess").CompletedProcess(argv, 0)
+                if "cmux_fleet_bootstrap.py" in str(argv[1]):
+                    return __import__("subprocess").CompletedProcess(
+                        argv,
+                        0,
+                        stdout=f.canonical(post),
+                        stderr=b"",
+                    )
+                raise AssertionError(argv)
+
+            with (
+                mock.patch.object(
+                    f,
+                    "_git_oid",
+                    side_effect=[COMMIT, "2" * 40],
+                ),
+                mock.patch.object(f.subprocess, "run", side_effect=fake_run),
+                mock.patch.object(
+                    f,
+                    "fleet_contract_generation",
+                    side_effect=[A, D],
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    f.FleetError,
+                    "fleet contract changed during local acceptance",
+                ):
+                    f.accept_local(
+                        enrollment_path,
+                        cmux_root,
+                        glaeda,
+                        "cmux_linux_ci",
+                    )
 
     def test_failed_settlement_rejects_role(self):
         e = enrollment()
@@ -336,6 +610,10 @@ class FleetTests(unittest.TestCase):
         semantic = cmux_result()
         semantic["benchmark"]["semantic_comparison_key"] = D
         cases.append(("semantic comparison", semantic))
+
+        environment = cmux_result()
+        environment["environment_class"] = "isolated-portable"
+        cases.append(("semantic comparison", environment))
 
         passed_forced = cmux_result()
         passed_forced["cleanup"] = {
@@ -576,12 +854,16 @@ class FleetTests(unittest.TestCase):
                 exact_digest,
                 "sha256:" + __import__("hashlib").sha256(raw).hexdigest(),
             )
+            e = enrollment()
             receipt = f.finalize_acceptance(
-                enrollment(),
+                e,
                 "cmux_macos_native_build",
                 A,
                 loaded,
+                bootstrap_for(e),
                 exact_digest,
+                execution_class=f.LOCAL_EXECUTION_CLASS,
+                local_execution_attempt_sha256=E,
             )
             self.assertEqual(receipt["cmuxSemanticResultSha256"], exact_digest)
 
