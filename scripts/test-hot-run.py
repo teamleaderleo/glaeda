@@ -1052,6 +1052,35 @@ class HotRunTests(unittest.TestCase):
             )
             self.assertFalse(stale.exists())
 
+    def test_value_record_parent_symlink_is_never_followed(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            outside = fixture / "outside"
+            outside.mkdir(mode=0o700)
+            sentinel = outside / ("a" * 64 + ".json")
+            sentinel.write_text("preserve\n", encoding="utf-8")
+            sentinel.chmod(0o600)
+            (namespace_root / ".value-records-v2").symlink_to(outside)
+
+            with self.assertRaisesRegex(
+                RuntimeError, "value-record root is not owner-private"
+            ):
+                namespace["read_hot_state_value_record"](
+                    namespace_root, "a" * 64
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "value-record root is not owner-private"
+            ):
+                namespace["remove_hot_state_value_record"](
+                    namespace_root, "a" * 64
+                )
+            self.assertEqual(
+                sentinel.read_text(encoding="utf-8"), "preserve\n"
+            )
+
     def test_successful_use_rebuilds_corrupt_generation_value_record(self) -> None:
         namespace = load_hot_run()
         with tempfile.TemporaryDirectory() as directory:
