@@ -293,6 +293,21 @@ class FleetTests(unittest.TestCase):
                 self.assertEqual(receipt["cmuxSemanticResultState"], state)
                 self.assertFalse(f.node_status(e, [receipt])["routingCandidateEligible"])
 
+    def test_timed_out_result_preserves_actual_child_exit_code(self):
+        e = enrollment()
+        result = cmux_result(state="timed_out")
+        result["exit_code"] = -15
+        receipt = finalized(e, result=result)
+        self.assertEqual(receipt["result"], "rejected")
+        self.assertEqual(receipt["cmuxSemanticResultState"], "timed_out")
+
+    def test_cmux_semantic_result_requires_positive_cpu_count(self):
+        e = enrollment()
+        result = cmux_result()
+        result["resource_summary"]["cpu_count"] = None
+        with self.assertRaisesRegex(f.FleetError, "resource summary"):
+            finalized(e, result=result)
+
     def test_cmux_semantic_result_rejects_inconsistent_evidence(self):
         e = enrollment()
         cases = []
