@@ -15,9 +15,8 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 use crate::disposable_attempt_catalog::DisposableAttemptReservation;
-use crate::disposable_clone_runtime::CloneRuntimeClock;
-use crate::owned_linux_jit_runtime::OwnedLinuxJitRuntime;
 use crate::disposable_attempt_state::DisposableAttemptRevision;
+use crate::disposable_clone_runtime::CloneRuntimeClock;
 use crate::disposable_worker_reconciler::{
     DisposableAttemptId, DisposableAttemptPhase, DisposableVmIdentity,
 };
@@ -28,6 +27,7 @@ use crate::github_scale_set_bridge::{
 use crate::github_scale_set_protocol::ScaleSetRunnerName;
 use crate::github_scale_set_protocol::ScaleSetRunnerReference;
 use crate::lima_observation::{LIMACTL_SAFE_HOME, LIMACTL_SAFE_PATH};
+use crate::owned_linux_jit_runtime::OwnedLinuxJitRuntime;
 use crate::process::{CommandSpec, TimedCommandExecutor};
 
 const MAX_PRIVATE_PATH_BYTES: usize = 1_024;
