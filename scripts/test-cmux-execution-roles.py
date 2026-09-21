@@ -40,6 +40,12 @@ def mac_node(state='eligible', generation=7, xcode='apple-xcode-26-sdk-26', memo
             'native_release_build',
             'native_xcode_build',
         }),
+        'roleAcceptances': {
+            'cmux_macos_native_build': {
+                'profile': dict(m.fleet.ROLE_PROFILES['cmux_macos_native_build']),
+                'receiptSha256': PREF,
+            },
+        },
         'pressure': pressure or {
             'cpu': 'normal',
             'memory': 'normal',
@@ -78,6 +84,12 @@ def linux_node(state='eligible', generation=4, memory='large'):
             'task_isolation',
             'web_ci',
         }),
+        'roleAcceptances': {
+            'cmux_linux_ci': {
+                'profile': dict(m.fleet.ROLE_PROFILES['cmux_linux_ci']),
+                'receiptSha256': PREF,
+            },
+        },
         'pressure': {
             'cpu': 'normal',
             'memory': 'normal',
@@ -87,7 +99,17 @@ def linux_node(state='eligible', generation=4, memory='large'):
     }
 
 
-def canary(node, role, *, result='accepted', toolchain=None, capabilities=None, profiles=None):
+def canary(
+    node,
+    role,
+    *,
+    result='accepted',
+    toolchain=None,
+    capabilities=None,
+    profiles=None,
+    profile=None,
+    acceptance_digest=None,
+):
     if capabilities is None:
         capabilities = set(m.ROLE_REQUIREMENTS[role]['requiredCapabilities'])
     if role == 'cmux_macos_native_build':
@@ -98,6 +120,15 @@ def canary(node, role, *, result='accepted', toolchain=None, capabilities=None, 
         capabilities |= {'linux_ci', 'web_ci', 'background_verification'}
     if role == 'cmux_linux_agent':
         capabilities |= {'linux_agent', 'build_helper'}
+    current = node.get('roleAcceptances', {}).get(role)
+    selected_profile = profile or (
+        copy.deepcopy(current['profile'])
+        if current is not None
+        else {'id': 'reserved.placeholder', 'generation': 1}
+    )
+    selected_digest = acceptance_digest or (
+        current['receiptSha256'] if current is not None else PREF
+    )
     return {
         'schema': m.ROLE_CANARY_SCHEMA,
         'nodeId': node['nodeId'],
@@ -109,8 +140,8 @@ def canary(node, role, *, result='accepted', toolchain=None, capabilities=None, 
         ),
         'acceptedCapabilities': sorted(capabilities),
         'acceptedResourceProfiles': profiles or ['large', 'medium', 'small'],
-        'workloadGeneration': GEN,
-        'acceptanceReceiptSha256': PREF,
+        'profile': selected_profile,
+        'acceptanceReceiptSha256': selected_digest,
         'result': result,
     }
 
@@ -273,13 +304,42 @@ class RoleModelTests(unittest.TestCase):
             'role_canary_enrollment_stale',
         )
 
-    def test_role_canary_binds_exact_acceptance_receipt(self):
+    def test_role_canary_binds_exact_current_fleet_acceptance(self):
         node = mac_node()
         receipt = canary(node, 'cmux_macos_native_build')
         self.assertEqual(receipt['acceptanceReceiptSha256'], PREF)
-        receipt['acceptanceReceiptSha256'] = 'acceptance-latest'
-        with self.assertRaisesRegex(m.RoleModelError, 'acceptance receipt digest'):
-            m.validate_role_canary(receipt)
+        self.assertEqual(
+            receipt['profile'],
+            m.fleet.ROLE_PROFILES['cmux_macos_native_build'],
+        )
+
+        stale_digest = copy.deepcopy(receipt)
+        stale_digest['acceptanceReceiptSha256'] = GEN
+        eligibility = m.role_eligibility(node, [stale_digest])
+        self.assertEqual(
+            eligibility['cmux_macos_native_build']['reason'],
+            'role_canary_acceptance_stale',
+        )
+
+        stale_profile = copy.deepcopy(receipt)
+        stale_profile['profile']['generation'] += 1
+        eligibility = m.role_eligibility(node, [stale_profile])
+        self.assertEqual(
+            eligibility['cmux_macos_native_build']['reason'],
+            'role_canary_profile_stale',
+        )
+
+    def test_reserved_role_cannot_install_fake_current_acceptance(self):
+        node = mac_node()
+        node['roleAcceptances']['cmux_macos_test'] = {
+            'profile': {'id': 'cmux.macos.app-host-test-shard', 'generation': 1},
+            'receiptSha256': GEN,
+        }
+        with self.assertRaisesRegex(
+            m.RoleModelError,
+            'not reviewed by fleet enrollment',
+        ):
+            m.validate_node(node)
 
     def test_failed_role_canary_refuses(self):
         node = mac_node()
@@ -298,76 +358,37 @@ class RoleModelTests(unittest.TestCase):
         eligibility = m.role_eligibility(upgraded, [receipt])
         self.assertEqual(eligibility['cmux_macos_native_build']['reason'], 'role_canary_pending')
 
-    def test_multiple_roles_share_one_scarce_slot(self):
+    def test_future_mac_test_role_stays_pending_without_fleet_acceptance(self):
         node = mac_node()
         canaries = [
             canary(node, 'cmux_macos_native_build'),
             canary(node, 'cmux_macos_test'),
         ]
-        caps = mac_compile_capacities(node, 'large') + mac_test_capacities(node, 'large')
-        compile_req = workload(
-            'cmux_macos_compile_admission', 'cmux_macos_native_build', 'macos', 'arm64',
-            {'native_xcode_build'}, toolchain='apple-xcode-26-sdk-26', profile='large'
+        roles = m.role_eligibility(node, canaries)
+        self.assertTrue(roles['cmux_macos_native_build']['eligible'])
+        self.assertFalse(roles['cmux_macos_test']['eligible'])
+        self.assertEqual(
+            roles['cmux_macos_test']['reason'],
+            'fleet_acceptance_pending',
         )
-        test_req = workload(
-            'cmux_macos_app_host_test', 'cmux_macos_test', 'macos', 'arm64',
-            {'app_host_test'}, toolchain='apple-xcode-26-sdk-26', profile='large'
-        )
-        admitted = m.local_admission(compile_req, node, canaries, caps, [])
-        self.assertTrue(admitted['accepted'])
-        self.assertEqual(admitted['authority'], 'admission_only')
-        self.assertEqual(admitted['leaseBoundary'], 'physical_execution_lease')
-        compile_lease = physical_lease(
-            node,
-            'compile-1',
-            ['mac_native_build_lane', 'mac_native_heavy_slot'],
-            owner='github-actions',
-        )
-        compile_refused = m.local_admission(
-            compile_req,
-            node,
-            canaries,
-            caps,
-            [compile_lease],
-        )
-        self.assertFalse(compile_refused['accepted'])
-        first_test = m.local_admission(test_req, node, canaries, caps, [compile_lease])
-        self.assertTrue(first_test['accepted'])
-        test_lease = physical_lease(
-            node,
-            'test-1',
-            ['mac_app_host_test_slot', 'mac_native_heavy_slot'],
-            owner='cmux-build',
-        )
-        refused = m.local_admission(
-            test_req,
-            node,
-            canaries,
-            caps,
-            [compile_lease, test_lease],
-        )
-        self.assertFalse(refused['accepted'])
-        self.assertEqual(refused['reason'], 'physical_slot_unavailable')
-        self.assertIn('mac_native_heavy_slot', refused['slotClaims'])
 
-    def test_two_app_host_shards_fit_but_shared_heavy_limit_blocks_third(self):
-        node = mac_node()
-        canaries = [canary(node, 'cmux_macos_test')]
-        caps = mac_test_capacities(node)
         req = workload(
-            'cmux_macos_app_host_test', 'cmux_macos_test', 'macos', 'arm64',
-            {'app_host_test'}, toolchain='apple-xcode-26-sdk-26'
+            'cmux_macos_app_host_test',
+            'cmux_macos_test',
+            'macos',
+            'arm64',
+            {'app_host_test'},
+            toolchain='apple-xcode-26-sdk-26',
         )
-        first = physical_lease(
-            node, 'test-1', ['mac_app_host_test_slot', 'mac_native_heavy_slot']
+        decision = m.local_admission(
+            req,
+            node,
+            canaries,
+            mac_test_capacities(node),
+            [],
         )
-        self.assertTrue(m.local_admission(req, node, canaries, caps, [first])['accepted'])
-        second = physical_lease(
-            node, 'test-2', ['mac_app_host_test_slot', 'mac_native_heavy_slot'], owner='direct-agent'
-        )
-        refused = m.local_admission(req, node, canaries, caps, [first, second])
-        self.assertFalse(refused['accepted'])
-        self.assertEqual(refused['reason'], 'physical_slot_unavailable')
+        self.assertFalse(decision['accepted'])
+        self.assertEqual(decision['reason'], 'fleet_acceptance_pending')
 
     def test_four_linux_medium_jobs_are_the_measured_limit(self):
         node = linux_node()
@@ -428,7 +449,7 @@ class RoleModelTests(unittest.TestCase):
         )
         decision = m.local_admission(req, node, canaries, caps, [])
         self.assertFalse(decision['accepted'])
-        self.assertEqual(decision['reason'], 'role_canary_pending')
+        self.assertEqual(decision['reason'], 'fleet_acceptance_pending')
 
     def test_unknown_fresh_pressure_refuses_local_admission(self):
         node = mac_node()
@@ -468,7 +489,7 @@ class RoleModelTests(unittest.TestCase):
         caps = [capacity(node, 'cmux_linux_ci', 'medium', 'linux_medium_slot', 4)]
         self.assertEqual(m.select_eligible(req, node, canaries, caps), (False, 'resource_profile_unmeasured'))
 
-    def test_background_profile_still_requires_measurement(self):
+    def test_background_role_stays_pending_until_fleet_acceptance_exists(self):
         node = linux_node()
         canaries = [canary(node, 'background_replay', profiles=['small'])]
         req = workload(
@@ -476,12 +497,19 @@ class RoleModelTests(unittest.TestCase):
             {'background_replay'}, profile='small', memory='small'
         )
         req['minimumCpuClass'] = 'small'
+        evidence = [
+            capacity(
+                node,
+                'background_replay',
+                'small',
+                'background_replay_slot',
+                4,
+            )
+        ]
         self.assertEqual(
-            m.select_eligible(req, node, canaries, []),
-            (False, 'resource_profile_unmeasured'),
+            m.select_eligible(req, node, canaries, evidence),
+            (False, 'fleet_acceptance_pending'),
         )
-        evidence = [capacity(node, 'background_replay', 'small', 'background_replay_slot', 4)]
-        self.assertEqual(m.select_eligible(req, node, canaries, evidence), (True, 'eligible'))
 
     def test_accepted_capacity_refuses_unknown_or_critical_pressure(self):
         node = linux_node()
@@ -542,14 +570,17 @@ class RoleModelTests(unittest.TestCase):
         self.assertNotIn('ramBytes', validated)
         self.assertNotIn('cgroup', validated)
 
-    def test_one_mac_and_one_linux_can_each_hold_two_roles(self):
+    def test_only_current_fleet_accepted_roles_are_eligible(self):
         mac = mac_node()
         mac_roles = m.role_eligibility(mac, [
             canary(mac, 'cmux_macos_native_build'),
             canary(mac, 'cmux_macos_test'),
         ])
         self.assertTrue(mac_roles['cmux_macos_native_build']['eligible'])
-        self.assertTrue(mac_roles['cmux_macos_test']['eligible'])
+        self.assertEqual(
+            mac_roles['cmux_macos_test']['reason'],
+            'fleet_acceptance_pending',
+        )
 
         linux = linux_node()
         linux_roles = m.role_eligibility(linux, [
@@ -557,7 +588,10 @@ class RoleModelTests(unittest.TestCase):
             canary(linux, 'cmux_linux_agent'),
         ])
         self.assertTrue(linux_roles['cmux_linux_ci']['eligible'])
-        self.assertTrue(linux_roles['cmux_linux_agent']['eligible'])
+        self.assertEqual(
+            linux_roles['cmux_linux_agent']['reason'],
+            'fleet_acceptance_pending',
+        )
 
     def test_preferred_is_advisory_and_separate_from_eligibility(self):
         node = mac_node()
@@ -583,11 +617,8 @@ class RoleModelTests(unittest.TestCase):
 
     def test_compact_operator_status_hides_internal_objects(self):
         node = mac_node(state='active')
-        canaries = [
-            canary(node, 'cmux_macos_native_build'),
-            canary(node, 'cmux_macos_test'),
-        ]
-        caps = mac_compile_capacities(node) + mac_test_capacities(node)
+        canaries = [canary(node, 'cmux_macos_native_build')]
+        caps = mac_compile_capacities(node)
         status = m.operator_status(node, canaries, caps)
         human = m.render_status(status)
         self.assertIn('node cmux-mac-001', human)
@@ -595,7 +626,6 @@ class RoleModelTests(unittest.TestCase):
         self.assertIn('mac_native_build_lane: 1', human)
         self.assertIn('state: active', human)
         self.assertNotIn('capabilityGeneration', human)
-        self.assertNotIn('workloadGeneration', human)
 
     def test_unknown_workload_capability_refuses(self):
         req = workload(
