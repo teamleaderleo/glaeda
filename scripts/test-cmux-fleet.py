@@ -93,6 +93,11 @@ def cmux_result(
         },
         "profile": chosen_profile,
         "semantic_validator": "cmux.fixture/v1",
+        "environment_class": (
+            "isolated-build"
+            if role == "cmux_macos_native_build"
+            else "isolated-portable"
+        ),
         "expected_result_class": "cmux.fixture-result/v1",
         "result": state,
         "parameters": {},
@@ -336,6 +341,10 @@ class FleetTests(unittest.TestCase):
         semantic = cmux_result()
         semantic["benchmark"]["semantic_comparison_key"] = D
         cases.append(("semantic comparison", semantic))
+
+        environment = cmux_result()
+        environment["environment_class"] = "isolated-portable"
+        cases.append(("semantic comparison", environment))
 
         passed_forced = cmux_result()
         passed_forced["cleanup"] = {
