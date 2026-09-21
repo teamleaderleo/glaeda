@@ -115,6 +115,45 @@ def request_state(state="running", receipt=None):
     }
 
 
+def reusable_state_summary(
+    *,
+    cache_class="incremental_build_state",
+    generation="7",
+    heat="hot",
+    size="medium",
+    recent_hit="within_hour",
+    revalidation_required=False,
+):
+    return {
+        "schema_version": 1,
+        "cache_class": cache_class,
+        "generation": "sha256:" + generation * 64,
+        "heat": heat,
+        "size": size,
+        "recent_hit": recent_hit,
+        "revalidation_required": revalidation_required,
+    }
+
+
+def project_state(*states):
+    return {
+        "document_type": "glaeda-github-project-heat-input",
+        "schema_version": 1,
+        "projects": [
+            {
+                "repository": "teamleaderleo/glaeda",
+                "source": {"commit_oid": "1" * 40, "tree_oid": "2" * 40},
+                "heat_class": "resident_hot",
+                "verification_profiles": ["glaeda.required", "verify-focused/v1"],
+                "dependency_build_state_class": "resident_generation",
+                "reusable_states": list(states),
+                "active_task_count": 0,
+                "recent_compatible_receipt_ref": None,
+            }
+        ],
+    }
+
+
 def build_unsigned(**changes):
     values = {
         "capability": capability(),
@@ -153,6 +192,7 @@ class ResidentSnapshotPureTests(unittest.TestCase):
         self.assertEqual(payload["node"]["pressure_class"], "low")
         self.assertEqual(payload["node"]["capacity_class"], "available")
         self.assertEqual(payload["projects"][0]["heat_class"], "resident_hot")
+        self.assertEqual(payload["projects"][0]["reusable_states"], [])
         self.assertEqual(payload["requests"][0]["state"], "queued")
         self.assertEqual(payload["authority"], {
             "advisory_only": True,
@@ -166,6 +206,33 @@ class ResidentSnapshotPureTests(unittest.TestCase):
         text = raw.decode()
         for forbidden in ("private-hostname", "/home/", "/Users/", "argv", "environment", "pid", "command"):
             self.assertNotIn(forbidden, text.lower())
+
+    def test_reusable_state_summary_matches_lifecycle_public_contract(self):
+        summary = reusable_state_summary()
+        snapshot = build_unsigned(project_state=project_state(summary))
+        published = snapshot["payload"]["projects"][0]["reusable_states"]
+        self.assertEqual(published, [summary])
+        raw = MODULE.canonical_json(snapshot).decode()
+        for forbidden in ("/home/", "/Users/", "target/", "node_modules", "credential", "command_output"):
+            self.assertNotIn(forbidden.lower(), raw.lower())
+
+        duplicate = reusable_state_summary()
+        with self.assertRaisesRegex(MODULE.SnapshotError, "identities must be unique"):
+            build_unsigned(project_state=project_state(summary, duplicate))
+
+        requires_reset = reusable_state_summary(revalidation_required=True)
+        with self.assertRaisesRegex(MODULE.SnapshotError, "revalidation requires cold heat"):
+            build_unsigned(project_state=project_state(requires_reset))
+
+        cold_reset = reusable_state_summary(
+            heat="cold",
+            recent_hit="within_day",
+            revalidation_required=True,
+        )
+        accepted = build_unsigned(project_state=project_state(cold_reset))
+        self.assertTrue(
+            accepted["payload"]["projects"][0]["reusable_states"][0]["revalidation_required"]
+        )
 
     def test_admission_reduces_only_to_bounded_classes(self):
         expected = {
@@ -292,7 +359,17 @@ class ResidentSnapshotSigningAndTransportTests(unittest.TestCase):
         public = Path(str(path) + ".pub").read_text(encoding="ascii").strip()
         return path, public
 
-    def one_signed(self, *, now=BASE_TIME, sequence=1, generation=1, hot=True, request=None, admission_value=None):
+    def one_signed(
+        self,
+        *,
+        now=BASE_TIME,
+        sequence=1,
+        generation=1,
+        hot=True,
+        request=None,
+        admission_value=None,
+        project=None,
+    ):
         key, public = self.key(f"key-{sequence}-{generation}")
         trust_value = trust(nodes=[{
             "id": "node-1111111111111111",
@@ -309,6 +386,7 @@ class ResidentSnapshotSigningAndTransportTests(unittest.TestCase):
             snapshot_sequence=sequence,
             observed_at=now,
             published_at=now,
+            project_state=project,
             request_state=request if request is not None else request_state(state="queued"),
         )
         return MODULE.sign_snapshot(unsigned, trust_value, private_key=key, ssh_keygen=SSH_KEYGEN), trust_value, key
@@ -329,6 +407,25 @@ class ResidentSnapshotSigningAndTransportTests(unittest.TestCase):
         self.assertEqual(view["nodes"][0]["freshness_class"], "unknown")
         self.assertEqual(view["nodes"][0]["reason"], "untrusted")
         self.assertEqual(view["nodes"][0]["projects"], [])
+
+    def test_reusable_state_summary_round_trips_to_agent_view(self):
+        summary = reusable_state_summary(
+            cache_class="package_manager_state",
+            generation="8",
+            heat="warm",
+            size="small",
+            recent_hit="within_day",
+        )
+        signed, trust_value, _ = self.one_signed(project=project_state(summary))
+        fleet = {"document_type": MODULE.FLEET_DOCUMENT, "schema_version": 1, "nodes": [signed]}
+        view = MODULE.consume_fleet(
+            fleet,
+            trust_value,
+            now=BASE_TIME + dt.timedelta(seconds=10),
+            ssh_keygen=SSH_KEYGEN,
+        )
+        project = view["nodes"][0]["projects"][0]
+        self.assertEqual(project["reusable_states"], [summary])
 
     def test_node_dies_after_available_and_lost_terminal_update_degrade_to_unknown(self):
         signed, trust_value, key = self.one_signed(
