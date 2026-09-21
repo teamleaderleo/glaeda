@@ -61,6 +61,7 @@ SOURCE_KEYS = {"repository", "commit", "tree"}
 OPERATION_KEYS = {"kind", "profile"}
 CALLER_KEYS = {"principal", "provenance_binding"}
 SUPERSESSION_KEYS = {"policy"}
+PROJECTION_KEYS = REQUEST_KEYS - {"request_fingerprint"}
 ACCEPTED_KEYS = {
     "document_type",
     "schema_version",
@@ -317,6 +318,43 @@ def decode_request(
         request_fingerprint=fingerprint,
     )
 
+
+
+def decode_projection(
+    raw: bytes,
+    *,
+    now: dt.datetime | None = None,
+    allow_expired: bool = False,
+) -> DispatchRequest:
+    if len(raw) > MAX_REQUEST_BYTES:
+        raise DispatchRefusal(
+            "oversized_request",
+            "dispatch projection exceeds its fixed ceiling",
+        )
+    try:
+        value = json.loads(raw, parse_constant=reject_json_constant)
+    except (UnicodeError, ValueError) as error:
+        raise DispatchRefusal(
+            "invalid_request",
+            "dispatch projection is not valid JSON",
+        ) from error
+    if not isinstance(value, dict) or set(value) != PROJECTION_KEYS:
+        raise DispatchRefusal(
+            "invalid_request",
+            "dispatch projection has unsupported fields",
+        )
+    if canonical_bytes(value) + b"\n" != raw:
+        raise DispatchRefusal(
+            "noncanonical_request",
+            "dispatch projection is not canonical JSON",
+        )
+    complete = dict(value)
+    complete["request_fingerprint"] = fingerprint_document(value)
+    return decode_request(
+        canonical_bytes(complete) + b"\n",
+        now=now,
+        allow_expired=allow_expired,
+    )
 
 def request_document(request: DispatchRequest) -> dict[str, object]:
     value = identity_document(request)
@@ -592,9 +630,10 @@ def result_document(
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
-    value.add_argument("command", choices=("accept",))
+    value.add_argument("command", choices=("accept", "accept-projection"))
     value.add_argument("--principal", required=True)
     value.add_argument("--provenance-binding", required=True)
+    value.add_argument("--allow-expired", action="store_true")
     return value
 
 
@@ -602,7 +641,10 @@ def main() -> int:
     arguments = parser().parse_args()
     raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
     try:
-        request = decode_request(raw)
+        if arguments.command == "accept-projection":
+            request = decode_projection(raw, allow_expired=arguments.allow_expired)
+        else:
+            request = decode_request(raw, allow_expired=arguments.allow_expired)
         accepted = accept_request(
             request,
             ProvenanceEvidence(
