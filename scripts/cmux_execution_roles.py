@@ -247,8 +247,7 @@ def _sorted_tokens(
     if (
         not isinstance(value, list)
         or len(value) > 64
-        or any(not isinstance(v, str) for v in value)
-    ):
+        or any(not isinstance(v, str) for v in value)    ):
         raise RoleModelError(f"{label} is invalid")
     if value != sorted(set(value)):
         raise RoleModelError(f"{label} must be sorted and unique")
@@ -256,6 +255,22 @@ def _sorted_tokens(
         _token(item, label)
         if allowed is not None and item not in allowed:
             raise RoleModelError(f"{label} contains an unsupported value")
+    return value
+
+
+def _sha_map(
+    value: object,
+    label: str,
+    *,
+    allowed_keys: set[str] | None = None,
+) -> dict[str, str]:
+    if not isinstance(value, dict) or len(value) > 64:
+        raise RoleModelError(f"{label} is invalid")
+    for key, generation in value.items():
+        _token(key, label)
+        _sha(generation, label)
+        if allowed_keys is not None and key not in allowed_keys:
+            raise RoleModelError(f"{label} contains an unsupported key")
     return value
 
 
@@ -274,11 +289,13 @@ def validate_node(value: object) -> dict[str, Any]:
             "architecture",
             "osVersionClass",
             "enrollmentGeneration",
+            "glaedaGeneration",
             "cpuClass",
             "memoryClass",
             "diskClass",
             "capabilityGeneration",
             "toolchainProfiles",
+            "roleWorkloadGenerations",
             "capabilities",
             "pressure",
         },
@@ -296,6 +313,7 @@ def validate_node(value: object) -> dict[str, Any]:
         raise RoleModelError("node architecture is unsupported")
     _token(doc["osVersionClass"], "OS version class")
     _positive_int(doc["enrollmentGeneration"], "enrollment generation")
+    _sha(doc["glaedaGeneration"], "Glaeda generation")
     if doc["cpuClass"] not in CPU_CLASSES:
         raise RoleModelError("CPU class is unsupported")
     if doc["memoryClass"] not in MEMORY_CLASSES:
@@ -303,7 +321,14 @@ def validate_node(value: object) -> dict[str, Any]:
     if doc["diskClass"] not in DISK_CLASSES:
         raise RoleModelError("disk class is unsupported")
     _positive_int(doc["capabilityGeneration"], "capability generation")
-    _sorted_tokens(doc["toolchainProfiles"], "toolchain profiles")
+    _sha_map(doc["toolchainProfiles"], "toolchain profiles")
+    workload_generations = _sha_map(
+        doc["roleWorkloadGenerations"],
+        "role workload generations",
+        allowed_keys=set(ROLES),
+    )
+    if not workload_generations:
+        raise RoleModelError("at least one enrolled role workload generation is required")
     _sorted_tokens(doc["capabilities"], "node capabilities")
     pressure = _exact(
         doc["pressure"], {"cpu", "memory", "swap", "thermal"}, "pressure"
@@ -327,9 +352,11 @@ def validate_role_canary(value: object) -> dict[str, Any]:
             "schema",
             "nodeId",
             "enrollmentGeneration",
+            "glaedaGeneration",
             "capabilityGeneration",
             "role",
             "toolchainProfile",
+            "toolchainGeneration",
             "acceptedCapabilities",
             "acceptedResourceProfiles",
             "workloadGeneration",
@@ -342,14 +369,20 @@ def validate_role_canary(value: object) -> dict[str, Any]:
     if not isinstance(doc["nodeId"], str) or NODE_RE.fullmatch(doc["nodeId"]) is None:
         raise RoleModelError("role canary nodeId is invalid")
     _positive_int(doc["enrollmentGeneration"], "role canary enrollment generation")
+    _sha(doc["glaedaGeneration"], "role canary Glaeda generation")
     _positive_int(
         doc["capabilityGeneration"], "role canary capability generation"
     )
     if doc["role"] not in ROLES:
         raise RoleModelError("role canary role is unsupported")
-    _token(
+    profile = _token(
         doc["toolchainProfile"], "role canary toolchain profile", optional=True
     )
+    generation = doc["toolchainGeneration"]
+    if generation is not None:
+        _sha(generation, "role canary toolchain generation")
+    if (profile is None) != (generation is None):
+        raise RoleModelError("role canary toolchain profile/generation must be paired")
     _sorted_tokens(doc["acceptedCapabilities"], "accepted capabilities")
     _sorted_tokens(
         doc["acceptedResourceProfiles"],
@@ -369,8 +402,12 @@ def validate_capacity(value: object) -> dict[str, Any]:
             "schema",
             "nodeId",
             "enrollmentGeneration",
+            "glaedaGeneration",
             "capabilityGeneration",
             "role",
+            "workloadGeneration",
+            "toolchainProfile",
+            "toolchainGeneration",
             "resourceProfile",
             "slotClass",
             "maxConcurrent",
@@ -385,9 +422,19 @@ def validate_capacity(value: object) -> dict[str, Any]:
     if not isinstance(doc["nodeId"], str) or NODE_RE.fullmatch(doc["nodeId"]) is None:
         raise RoleModelError("capacity nodeId is invalid")
     _positive_int(doc["enrollmentGeneration"], "capacity enrollment generation")
+    _sha(doc["glaedaGeneration"], "capacity Glaeda generation")
     _positive_int(doc["capabilityGeneration"], "capacity generation")
     if doc["role"] not in ROLES:
         raise RoleModelError("capacity role is unsupported")
+    _sha(doc["workloadGeneration"], "capacity workload generation")
+    profile = _token(
+        doc["toolchainProfile"], "capacity toolchain profile", optional=True
+    )
+    generation = doc["toolchainGeneration"]
+    if generation is not None:
+        _sha(generation, "capacity toolchain generation")
+    if (profile is None) != (generation is None):
+        raise RoleModelError("capacity toolchain profile/generation must be paired")
     if doc["resourceProfile"] not in RESOURCE_PROFILES:
         raise RoleModelError("resource profile is unsupported")
     _token(doc["slotClass"], "slot class")
@@ -497,8 +544,7 @@ def validate_preference(value: object) -> dict[str, Any]:
         raise RoleModelError("preference nodeId is invalid")
     if doc["role"] not in ROLES:
         raise RoleModelError("preference role is unsupported")
-    _sha(doc["evidenceGeneration"], "preference evidence generation")
-    if doc["preference"] not in {"preferred", "neutral"}:
+    _sha(doc["evidenceGeneration"], "preference evidence generation")    if doc["preference"] not in {"preferred", "neutral"}:
         raise RoleModelError("preference value is unsupported")
     if doc["authority"] != "observation_only":
         raise RoleModelError(
@@ -522,7 +568,7 @@ def role_eligibility(
 
     results: dict[str, dict[str, Any]] = {}
     capabilities = set(node["capabilities"])
-    toolchains = set(node["toolchainProfiles"])
+    toolchains = node["toolchainProfiles"]
     for role in ROLES:
         requirement = ROLE_REQUIREMENTS[role]
         if node["state"] not in ROUTABLE_STATES:
@@ -542,6 +588,13 @@ def role_eligibility(
             results[role] = {
                 "eligible": False,
                 "reason": "architecture_mismatch",
+            }
+            continue
+        expected_workload = node["roleWorkloadGenerations"].get(role)
+        if expected_workload is None:
+            results[role] = {
+                "eligible": False,
+                "reason": "role_not_enrolled",
             }
             continue
         if not _class_at_least(
@@ -599,6 +652,18 @@ def role_eligibility(
                 "reason": "role_canary_enrollment_stale",
             }
             continue
+        if canary["glaedaGeneration"] != node["glaedaGeneration"]:
+            results[role] = {
+                "eligible": False,
+                "reason": "role_canary_glaeda_stale",
+            }
+            continue
+        if canary["workloadGeneration"] != expected_workload:
+            results[role] = {
+                "eligible": False,
+                "reason": "role_canary_workload_stale",
+            }
+            continue
         if canary["capabilityGeneration"] != node["capabilityGeneration"]:
             results[role] = {
                 "eligible": False,
@@ -615,22 +680,56 @@ def role_eligibility(
             continue
         if requirement["requiresToolchainProfile"]:
             profile = canary["toolchainProfile"]
-            if profile is None or profile not in toolchains:
+            generation = canary["toolchainGeneration"]
+            if (
+                profile is None
+                or generation is None
+                or toolchains.get(profile) != generation
+            ):
                 results[role] = {
                     "eligible": False,
                     "reason": "toolchain_canary_pending",
                 }
                 continue
+        elif (
+            canary["toolchainProfile"] is not None
+            or canary["toolchainGeneration"] is not None
+        ):
+            results[role] = {
+                "eligible": False,
+                "reason": "role_canary_context_mismatch",
+            }
+            continue
         results[role] = {
             "eligible": True,
             "reason": "accepted",
+            "glaedaGeneration": canary["glaedaGeneration"],
+            "workloadGeneration": canary["workloadGeneration"],
             "toolchainProfile": canary["toolchainProfile"],
+            "toolchainGeneration": canary["toolchainGeneration"],
             "acceptedCapabilities": canary["acceptedCapabilities"],
             "acceptedResourceProfiles": canary[
                 "acceptedResourceProfiles"
             ],
         }
     return results
+
+
+def _capacity_matches_context(
+    node: dict[str, Any],
+    receipt: dict[str, Any],
+    role_status: dict[str, Any],
+) -> bool:
+    return (
+        role_status.get("eligible") is True
+        and receipt["nodeId"] == node["nodeId"]
+        and receipt["enrollmentGeneration"] == node["enrollmentGeneration"]
+        and receipt["glaedaGeneration"] == node["glaedaGeneration"]
+        and receipt["capabilityGeneration"] == node["capabilityGeneration"]
+        and receipt["workloadGeneration"] == role_status["workloadGeneration"]
+        and receipt["toolchainProfile"] == role_status["toolchainProfile"]
+        and receipt["toolchainGeneration"] == role_status["toolchainGeneration"]
+    )
 
 
 def measured_slot_capacity(
@@ -649,14 +748,10 @@ def measured_slot_capacity(
             raise RoleModelError(
                 "capacity evidence belongs to a different node"
             )
-        if receipt["enrollmentGeneration"] != node["enrollmentGeneration"]:
-            continue
-        if receipt["capabilityGeneration"] != node["capabilityGeneration"]:
+        role = receipt["role"]
+        if not _capacity_matches_context(node, receipt, eligibility[role]):
             continue
         if receipt["result"] != "accepted":
-            continue
-        role = receipt["role"]
-        if not eligibility[role]["eligible"]:
             continue
         if (
             receipt["resourceProfile"]
@@ -697,11 +792,8 @@ def _profile_has_capacity(
     for value in capacity_values:
         receipt = validate_capacity(value)
         if (
-            receipt["nodeId"] != node["nodeId"]
-            or receipt["enrollmentGeneration"] != node["enrollmentGeneration"]
-            or receipt["capabilityGeneration"]
-            != node["capabilityGeneration"]
-            or receipt["role"] != role
+            receipt["role"] != role
+            or not _capacity_matches_context(node, receipt, eligibility[role])
             or receipt["resourceProfile"]
             != workload["resourceProfile"]
             or receipt["result"] != "accepted"
@@ -747,8 +839,7 @@ def select_eligible(
         return False, "insufficient_memory_class"
     if not set(workload["requiredCapabilities"]).issubset(
         node["capabilities"]
-    ):
-        return False, "node_capability_missing"
+    ):        return False, "node_capability_missing"
     if not set(workload["requiredCapabilities"]).issubset(
         eligibility[role].get("acceptedCapabilities", [])
     ):
@@ -769,17 +860,17 @@ def select_eligible(
 def _workload_slot_capacities(
     node: dict[str, Any],
     workload: dict[str, Any],
+    eligibility: dict[str, dict[str, Any]],
     capacity_values: Iterable[object],
 ) -> dict[str, int]:
     capacities: dict[str, int] = {}
     for value in capacity_values:
         receipt = validate_capacity(value)
         if (
-            receipt["nodeId"] != node["nodeId"]
-            or receipt["enrollmentGeneration"] != node["enrollmentGeneration"]
-            or receipt["capabilityGeneration"]
-            != node["capabilityGeneration"]
-            or receipt["role"] != workload["role"]
+            receipt["role"] != workload["role"]
+            or not _capacity_matches_context(
+                node, receipt, eligibility[workload["role"]]
+            )
             or receipt["resourceProfile"]
             != workload["resourceProfile"]
             or receipt["result"] != "accepted"
@@ -840,7 +931,10 @@ def local_admission(
             "slotClaims": [],
         }
 
-    capacities = _workload_slot_capacities(node, workload, capacity_values)
+    eligibility = role_eligibility(node, canary_values)
+    capacities = _workload_slot_capacities(
+        node, workload, eligibility, capacity_values
+    )
     claims = list(_slot_claims(workload))
     for slot in claims:
         if capacities.get(slot, 0) <= held_slots.get(slot, 0):
