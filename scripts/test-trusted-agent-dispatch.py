@@ -88,6 +88,11 @@ class TrustedDispatchTests(unittest.TestCase):
             item.accepted_document["caller"]["principal"],
             PRINCIPAL,
         )
+        compiled = external.compile_request(item.external_request)
+        self.assertEqual(
+            item.accepted_document["workload_command_fingerprint"],
+            compiled.internal.command_fingerprint,
+        )
         self.assertLessEqual(
             len(dispatch.canonical_bytes(item.accepted_document) + b"\n"),
             4096,
