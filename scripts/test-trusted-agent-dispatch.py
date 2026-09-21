@@ -93,6 +93,17 @@ class TrustedDispatchTests(unittest.TestCase):
             4096,
         )
 
+    def test_transport_projection_gets_the_same_deterministic_identity(self) -> None:
+        document = base_document()
+        expected = dispatch.decode_request(raw(document), now=NOW)
+        projection = dict(document)
+        projection.pop("request_fingerprint")
+        derived = dispatch.decode_projection(
+            dispatch.canonical_bytes(projection) + b"\n",
+            now=NOW,
+        )
+        self.assertEqual(derived, expected)
+
     def test_observed_provenance_is_separate_from_request_bytes(self) -> None:
         request = dispatch.decode_request(raw(), now=NOW)
         with self.assertRaisesRegex(
