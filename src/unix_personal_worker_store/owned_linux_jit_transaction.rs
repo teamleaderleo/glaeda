@@ -43,9 +43,9 @@ impl UnixPersonalWorkerStore {
                 "owned_linux_task_exists_before_authorization",
             ));
         }
-        let now = clock
-            .epoch_millis()
-            .map_err(|_| DisposableCloneRuntimeError::observation("owned_linux_clock_unavailable"))?;
+        let now = clock.epoch_millis().map_err(|_| {
+            DisposableCloneRuntimeError::observation("owned_linux_clock_unavailable")
+        })?;
         let action = if now > reservation.attempt().not_after() {
             DisposableAttemptCatalogAction::BeginUnprovisionedRelease
         } else {
@@ -74,14 +74,14 @@ impl UnixPersonalWorkerStore {
         }
         runtime.validate_reservation_generation(reservation)?;
 
-        let now = clock
-            .epoch_millis()
-            .map_err(|_| DisposableCloneRuntimeError::observation("owned_linux_clock_unavailable"))?;
+        let now = clock.epoch_millis().map_err(|_| {
+            DisposableCloneRuntimeError::observation("owned_linux_clock_unavailable")
+        })?;
         let physical = runtime.probe(reservation, executor)?;
         let observed = admission.observe(&current, reservation)?;
-        let observed_at = clock
-            .epoch_millis()
-            .map_err(|_| DisposableCloneRuntimeError::observation("owned_linux_clock_unavailable"))?;
+        let observed_at = clock.epoch_millis().map_err(|_| {
+            DisposableCloneRuntimeError::observation("owned_linux_clock_unavailable")
+        })?;
         observed.validate_identity_and_freshness_for(&current, reservation, observed_at)?;
         let cleanup = !observed.capacity_reserved()
             || observed.cancellation_requested()
@@ -116,9 +116,9 @@ impl UnixPersonalWorkerStore {
             }
         };
 
-        let command_now = clock
-            .epoch_millis()
-            .map_err(|_| DisposableCloneRuntimeError::observation("owned_linux_clock_unavailable"))?;
+        let command_now = clock.epoch_millis().map_err(|_| {
+            DisposableCloneRuntimeError::observation("owned_linux_clock_unavailable")
+        })?;
         if command_now > reservation.attempt().not_after() {
             runtime.cleanup(reservation, executor)?;
             return self.publish_owned_linux_action(
@@ -129,7 +129,9 @@ impl UnixPersonalWorkerStore {
         }
         let started = current
             .checkpoint_clone_started(attempt_id, reservation.attempt().revision())
-            .map_err(|_| DisposableCloneRuntimeError::recovery("owned_linux_start_checkpoint_refused"))?;
+            .map_err(|_| {
+                DisposableCloneRuntimeError::recovery("owned_linux_start_checkpoint_refused")
+            })?;
         started.validate_successor_of(&current).map_err(|_| {
             DisposableCloneRuntimeError::recovery("owned_linux_start_checkpoint_invalid")
         })?;
@@ -148,10 +150,14 @@ impl UnixPersonalWorkerStore {
                 started_reservation.attempt().revision(),
                 identity.clone(),
             )
-            .map_err(|_| DisposableCloneRuntimeError::recovery("owned_linux_identity_bind_refused"))?;
-        bound.validate_recovery_successor_of(&started).map_err(|_| {
-            DisposableCloneRuntimeError::recovery("owned_linux_identity_bind_invalid")
-        })?;
+            .map_err(|_| {
+                DisposableCloneRuntimeError::recovery("owned_linux_identity_bind_refused")
+            })?;
+        bound
+            .validate_recovery_successor_of(&started)
+            .map_err(|_| {
+                DisposableCloneRuntimeError::recovery("owned_linux_identity_bind_invalid")
+            })?;
         self.publish_owned_linux_catalog(
             &bound,
             "owned_linux_identity_stage_failed",
@@ -161,8 +167,9 @@ impl UnixPersonalWorkerStore {
             .find_active(attempt_id)
             .ok_or_else(|| DisposableCloneRuntimeError::durable("owned_linux_attempt_missing"))?
             .attempt();
-        let command_identity = Sha256Digest::parse(identity.as_str())
-            .map_err(|_| DisposableCloneRuntimeError::recovery("owned_linux_identity_digest_invalid"))?;
+        let command_identity = Sha256Digest::parse(identity.as_str()).map_err(|_| {
+            DisposableCloneRuntimeError::recovery("owned_linux_identity_digest_invalid")
+        })?;
         Ok(DisposableCloneTransactionOutcome::Completed(
             DisposableCloneRuntimeReceipt::from_owned_linux(
                 attempt_id,
@@ -208,12 +215,13 @@ impl UnixPersonalWorkerStore {
                 );
             }
             let observed = runtime.confirm(reservation, executor)?;
-            let identity = crate::disposable_worker_reconciler::DisposableVmIdentity::parse(&observed)
-                .map_err(|_| {
-                    DisposableCloneRuntimeError::recovery(
-                        "owned_linux_recovered_task_identity_invalid",
-                    )
-                })?;
+            let identity =
+                crate::disposable_worker_reconciler::DisposableVmIdentity::parse(&observed)
+                    .map_err(|_| {
+                        DisposableCloneRuntimeError::recovery(
+                            "owned_linux_recovered_task_identity_invalid",
+                        )
+                    })?;
             let bound = current
                 .bind_vm_identity_after_clone(
                     attempt_id,
@@ -223,9 +231,11 @@ impl UnixPersonalWorkerStore {
                 .map_err(|_| {
                     DisposableCloneRuntimeError::recovery("owned_linux_identity_bind_refused")
                 })?;
-            bound.validate_recovery_successor_of(&current).map_err(|_| {
-                DisposableCloneRuntimeError::recovery("owned_linux_identity_bind_invalid")
-            })?;
+            bound
+                .validate_recovery_successor_of(&current)
+                .map_err(|_| {
+                    DisposableCloneRuntimeError::recovery("owned_linux_identity_bind_invalid")
+                })?;
             self.publish_owned_linux_catalog(
                 &bound,
                 "owned_linux_identity_stage_failed",
@@ -250,9 +260,9 @@ impl UnixPersonalWorkerStore {
 
         runtime.confirm(reservation, executor)?;
         let observed = admission.observe(&current, reservation)?;
-        let observed_at = clock
-            .epoch_millis()
-            .map_err(|_| DisposableCloneRuntimeError::observation("owned_linux_clock_unavailable"))?;
+        let observed_at = clock.epoch_millis().map_err(|_| {
+            DisposableCloneRuntimeError::observation("owned_linux_clock_unavailable")
+        })?;
         observed.validate_identity_and_freshness_for(&current, reservation, observed_at)?;
         let action = if !observed.capacity_reserved()
             || observed.cancellation_requested()
@@ -274,9 +284,9 @@ impl UnixPersonalWorkerStore {
     ) -> Result<DisposableCleanupTransactionOutcome, DisposableCloneRuntimeError> {
         let _lock = self.prepare_owned_linux_transaction("owned_linux_cleanup")?;
         let current = self.load_owned_linux_catalog("owned_linux_cleanup")?;
-        let reservation = current
-            .find_active(attempt_id)
-            .ok_or_else(|| DisposableCloneRuntimeError::durable("owned_linux_cleanup_attempt_missing"))?;
+        let reservation = current.find_active(attempt_id).ok_or_else(|| {
+            DisposableCloneRuntimeError::durable("owned_linux_cleanup_attempt_missing")
+        })?;
         runtime.validate_reservation_generation(reservation)?;
         let phase = reservation.attempt().phase();
 
@@ -291,7 +301,9 @@ impl UnixPersonalWorkerStore {
         if phase == DisposableAttemptPhase::Complete {
             let retired = current
                 .retire_complete(attempt_id, reservation.attempt().revision())
-                .map_err(|_| DisposableCloneRuntimeError::recovery("owned_linux_retirement_refused"))?;
+                .map_err(|_| {
+                    DisposableCloneRuntimeError::recovery("owned_linux_retirement_refused")
+                })?;
             retired.validate_successor_of(&current).map_err(|_| {
                 DisposableCloneRuntimeError::recovery("owned_linux_retirement_invalid")
             })?;
@@ -381,7 +393,9 @@ impl UnixPersonalWorkerStore {
                 self.publish_owned_linux_cleanup_action(
                     &current,
                     attempt_id,
-                    DisposableAttemptCatalogAction::AdvanceCleanup(DisposableAttemptPhase::Complete),
+                    DisposableAttemptCatalogAction::AdvanceCleanup(
+                        DisposableAttemptPhase::Complete,
+                    ),
                 )
             }
             _ => Err(DisposableCloneRuntimeError::recovery(
@@ -399,16 +413,21 @@ impl UnixPersonalWorkerStore {
             .map_err(|_| DisposableCloneRuntimeError::durable(prefix))?;
         synchronize_directory(&self.directory, "personal worker store directory")
             .map_err(|_| DisposableCloneRuntimeError::durable(prefix))?;
-        super::disposable_template_generation::refuse_unsettled(self)
-            .map_err(|_| DisposableCloneRuntimeError::recovery("owned_linux_template_recovery_required"))?;
-        super::scale_set_delivery_recovery::refuse_unsettled(self)
-            .map_err(|_| DisposableCloneRuntimeError::recovery("owned_linux_delivery_recovery_required"))?;
-        super::lima_authority::refuse_unsettled_lima_authority(self)
-            .map_err(|_| DisposableCloneRuntimeError::recovery("owned_linux_lima_recovery_required"))?;
-        self.refuse_unsettled_personal_worker_state()
-            .map_err(|_| DisposableCloneRuntimeError::recovery("owned_linux_worker_recovery_required"))?;
-        self.recover_catalog_locked()
-            .map_err(|_| DisposableCloneRuntimeError::recovery("owned_linux_catalog_recovery_failed"))?;
+        super::disposable_template_generation::refuse_unsettled(self).map_err(|_| {
+            DisposableCloneRuntimeError::recovery("owned_linux_template_recovery_required")
+        })?;
+        super::scale_set_delivery_recovery::refuse_unsettled(self).map_err(|_| {
+            DisposableCloneRuntimeError::recovery("owned_linux_delivery_recovery_required")
+        })?;
+        super::lima_authority::refuse_unsettled_lima_authority(self).map_err(|_| {
+            DisposableCloneRuntimeError::recovery("owned_linux_lima_recovery_required")
+        })?;
+        self.refuse_unsettled_personal_worker_state().map_err(|_| {
+            DisposableCloneRuntimeError::recovery("owned_linux_worker_recovery_required")
+        })?;
+        self.recover_catalog_locked().map_err(|_| {
+            DisposableCloneRuntimeError::recovery("owned_linux_catalog_recovery_failed")
+        })?;
         Ok(lock)
     }
 
@@ -445,10 +464,12 @@ impl UnixPersonalWorkerStore {
             "owned_linux_checkpoint_stage_failed",
             "owned_linux_checkpoint_publish_ambiguous",
         )?;
-        Ok(DisposableCloneTransactionOutcome::RegistrationCheckpointed {
-            attempt_id: attempt_id.as_str().to_owned(),
-            phase,
-        })
+        Ok(
+            DisposableCloneTransactionOutcome::RegistrationCheckpointed {
+                attempt_id: attempt_id.as_str().to_owned(),
+                phase,
+            },
+        )
     }
 
     fn publish_owned_linux_cleanup_action(
@@ -457,18 +478,22 @@ impl UnixPersonalWorkerStore {
         attempt_id: &DisposableAttemptId,
         action: DisposableAttemptCatalogAction,
     ) -> Result<DisposableCleanupTransactionOutcome, DisposableCloneRuntimeError> {
-        let reservation = current
-            .find_active(attempt_id)
-            .ok_or_else(|| DisposableCloneRuntimeError::durable("owned_linux_cleanup_attempt_missing"))?;
+        let reservation = current.find_active(attempt_id).ok_or_else(|| {
+            DisposableCloneRuntimeError::durable("owned_linux_cleanup_attempt_missing")
+        })?;
         let next = current
             .replace_attempt(attempt_id, reservation.attempt().revision(), action)
-            .map_err(|_| DisposableCloneRuntimeError::recovery("owned_linux_cleanup_checkpoint_refused"))?;
+            .map_err(|_| {
+                DisposableCloneRuntimeError::recovery("owned_linux_cleanup_checkpoint_refused")
+            })?;
         next.validate_successor_of(current).map_err(|_| {
             DisposableCloneRuntimeError::recovery("owned_linux_cleanup_checkpoint_invalid")
         })?;
         let phase = next
             .find_active(attempt_id)
-            .ok_or_else(|| DisposableCloneRuntimeError::durable("owned_linux_cleanup_attempt_missing"))?
+            .ok_or_else(|| {
+                DisposableCloneRuntimeError::durable("owned_linux_cleanup_attempt_missing")
+            })?
             .attempt()
             .phase();
         self.publish_owned_linux_catalog(
