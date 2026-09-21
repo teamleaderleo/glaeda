@@ -553,23 +553,10 @@ def launch(arguments: argparse.Namespace) -> int:
             inherit_stdin=True,
             emit_failure_tail=False,
         )
-    terminal, code, elapsed, settled, output_bytes, output_sha256 = observation
-    receipt = {
-        "document_type": "glaeda-owned-linux-jit-run-receipt",
-        "schema_version": SCHEMA_VERSION,
-        "task_identity_sha256": task_identity,
-        "profile": PROFILE,
-        "network": NETWORK.value,
-        "terminal": terminal,
-        "exit_code": code,
-        "elapsed_millis": int(elapsed * 1000),
-        "settled": settled,
-        "runner_output_bytes": output_bytes,
-        "runner_output_sha256": output_sha256,
-        "jit_transport": "inherited_stdin_only",
-        "failure_tail_emitted": False,
-    }
-    emit(receipt)
+    terminal, code, _, settled, _, _ = observation
+    # The secret-bearing runner command is deliberately silent. GitHub owns the
+    # canonical job/log surface; durable terminal evidence arrives through the
+    # Scale Set delivery ledger, and probe/cleanup have separate bounded receipts.
     return 0 if terminal == "succeeded" and code == 0 and settled else 70
 
 
