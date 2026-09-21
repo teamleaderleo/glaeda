@@ -3691,11 +3691,6 @@ def run(
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RuntimeError("this task's hot state is already in use") from error
-        if namespace_lock_fd is not None:
-            fcntl.flock(namespace_lock_fd, fcntl.LOCK_UN)
-            os.close(namespace_lock_fd)
-            namespace_lock_fd = None
-
         private_copy_candidates: list[tuple[CacheSpec, Path, Path]] = []
         for spec in cache_specs:
             resident_cache = resident / spec.path
@@ -3906,6 +3901,10 @@ def run(
             ),
             observation_consumer=execution_observations.append,
         )
+        if namespace_lock_fd is not None:
+            fcntl.flock(namespace_lock_fd, fcntl.LOCK_UN)
+            os.close(namespace_lock_fd)
+            namespace_lock_fd = None
         if (
             exit_code == 0
             and implicit_worktree_identity is not None
