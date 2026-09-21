@@ -9,12 +9,16 @@ The caller fixture is intentionally CMUX-shaped only at the correlation layer:
 CMUX work object
   work ref: cmux:work:1050
   request ref: cmux:exec:1050:fixture-1
+  Glaeda semantic request: cmux-1050-fixture-0001
   exact Git source: teamleaderleo/glaeda + commit/tree
   useful operation: verify_focused
   requested capability: credentialless_project
         |
         v
 glaeda-external-execution-request/v1
+        |
+        v
+provider-neutral glaeda-semantic-request/v1
         |
         v
 scripts/external_execution_request.py plan
@@ -44,8 +48,8 @@ cmp /tmp/glaeda-external-result.json \
 ```
 
 The contract suite also covers unknown/forbidden field refusal, unsupported operation/capability
-refusal, caller-ref/reuse non-authority, matching terminal receipt projection, ambiguity and replay
-conflict:
+refusal, caller-ref/reuse non-authority, explicit semantic request identity, matching terminal
+receipt projection, ambiguity and replay conflict:
 
 ```sh
 python3 scripts/test-external-execution-request.py
