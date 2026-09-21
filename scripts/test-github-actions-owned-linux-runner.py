@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 import argparse
 import io
 import json
@@ -137,6 +137,30 @@ class OwnedLinuxJitRunnerTests(unittest.TestCase):
         self.assertEqual(secret, bytearray(len(secret)))
         self.assertIs(observed["emit_failure_tail"], False)
         self.assertEqual(observed["retain_limit"], 0)
+
+    def test_reflected_jit_bytes_never_reach_failure_output(self):
+        python = Path("/usr/bin/python3")
+        if not python.is_file():
+            self.skipTest("system Python is unavailable")
+        secret_value = b"JIT-REFLECTION-SENTINEL-1010\n"
+        secret = bytearray(secret_value)
+        captured = io.StringIO()
+        script = (
+            "import os,sys; data=sys.stdin.buffer.read(); "
+            "os.write(1,data); os.write(2,data); raise SystemExit(7)"
+        )
+        with redirect_stderr(captured):
+            terminal, code, _, _, output_bytes, _ = owned_task.execute_secret_stdin(
+                [str(python), "-c", script],
+                unit="glaeda-jit-secret-reflection-test-absent.service",
+                deadline_seconds=10,
+                label="jit-reflection-test",
+                secret_stdin=secret,
+            )
+        self.assertEqual((terminal, code), ("failed", 7))
+        self.assertEqual(output_bytes, len(secret_value) * 2)
+        self.assertEqual(secret, bytearray(len(secret)))
+        self.assertNotIn("JIT-REFLECTION-SENTINEL-1010", captured.getvalue())
 
     def test_sandbox_uses_trusted_egress_and_only_task_private_runner_mounts(self):
         with tempfile.TemporaryDirectory() as raw:
