@@ -56,7 +56,7 @@ impl ArtifactArchitecture {
         match self {
             Self::PlatformIndependent => true,
             Self::Universal => matches!(consumer, Self::Arm64 | Self::X86_64 | Self::Universal),
-            exact => exact as u8 == consumer as u8,
+            exact => exact == consumer,
         }
     }
 }
@@ -464,7 +464,11 @@ fn hash_optional_digest(hasher: &mut Sha256, label: &[u8], value: Option<&Sha256
 }
 
 fn digest_bytes(bytes: &[u8]) -> Result<Sha256Digest, ImmutableArtifactDistributionError> {
-    Sha256Digest::parse(&format!("sha256:{bytes:x}"))
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Sha256Digest::parse(&format!("sha256:{hex}"))
         .map_err(|_| ImmutableArtifactDistributionError::DigestEncoding)
 }
 
