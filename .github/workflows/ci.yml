@@ -62,6 +62,7 @@ jobs:
               Path("smolrunner"),
               Path("scripts/bootstrap"),
               Path("scripts/benchmark-hot-state-fanout"),
+              Path("scripts/benchmark-pnpm-task-dependencies"),
               Path("scripts/benchmark-linker-throughput"),
               Path("scripts/hot-observe"),
               Path("scripts/hot-pressure-shadow"),
@@ -71,15 +72,15 @@ jobs:
               Path("scripts/verify-focused"),
               Path("scripts/verify-required"),
               Path("scripts/verify_focused_impl.py"),
+              Path("scripts/external_execution_request.py"),
+              Path("scripts/test-external-execution-request.py"),
+              Path("scripts/trusted_agent_dispatch.py"),
+              Path("scripts/test-trusted-agent-dispatch.py"),
               Path("scripts/provider_neutral_request.py"),
               Path("scripts/owner_local_dispatch.py"),
               Path("scripts/owner-local-dispatch"),
               Path("scripts/test-provider-neutral-request.py"),
               Path("scripts/test-owner-local-dispatch.py"),
-              Path("scripts/external_execution_request.py"),
-              Path("scripts/test-external-execution-request.py"),
-              Path("scripts/trusted_agent_dispatch.py"),
-              Path("scripts/test-trusted-agent-dispatch.py"),
               Path("scripts/owned_linux_task.py"),
               Path("scripts/owned_linux_admission.py"),
               Path("scripts/owned-admission-control"),
@@ -89,6 +90,7 @@ jobs:
               Path("scripts/test-hot-run.py"),
               Path("scripts/test-hot-pressure-shadow.py"),
               Path("scripts/test-benchmark-hot-state-fanout.py"),
+              Path("scripts/test-benchmark-pnpm-task-dependencies.py"),
               Path("scripts/test-benchmark-linker-throughput.py"),
               Path("scripts/test-hot-observe.py"),
               Path("scripts/test-verify.py"),
@@ -112,15 +114,16 @@ jobs:
           bash scripts/test-bootstrap.sh
           python3 scripts/test-benchmark-developer-loop.py
           python3 scripts/test-benchmark-hot-state-fanout.py
+          python3 scripts/test-benchmark-pnpm-task-dependencies.py
           python3 scripts/test-benchmark-linker-throughput.py
           python3 scripts/test-hot-observe.py
           python3 scripts/test-hot-pressure-shadow.py
           python3 scripts/test-hot-run.py
           python3 scripts/test-verify-focused.py
-          python3 scripts/test-provider-neutral-request.py
-          python3 scripts/test-owner-local-dispatch.py
           python3 scripts/test-external-execution-request.py
           python3 scripts/test-trusted-agent-dispatch.py
+          python3 scripts/test-provider-neutral-request.py
+          python3 scripts/test-owner-local-dispatch.py
           python3 scripts/test-owned-linux-admission.py
           python3 scripts/test-verify.py
           python3 scripts/test-verify-changed-rustfmt.py
