@@ -1085,7 +1085,12 @@ def write_producer_manifest(directory: Path, encoded: bytes) -> None:
     fsync_directory(directory)
 
 
-def rename_noreplace(source: Path, destination: Path) -> None:
+def rename_noreplace_at(
+    source_directory: int,
+    source_name: str,
+    destination_directory: int,
+    destination_name: str,
+) -> None:
     # Keep ctypes off the warm path; it is needed only for publication or retirement.
     import ctypes
 
@@ -1102,15 +1107,28 @@ def rename_noreplace(source: Path, destination: Path) -> None:
     )
     rename.restype = ctypes.c_int
     result = rename(
-        -100,
-        os.fsencode(source),
-        -100,
-        os.fsencode(destination),
+        source_directory,
+        os.fsencode(source_name),
+        destination_directory,
+        os.fsencode(destination_name),
         RENAME_NOREPLACE,
     )
     if result != 0:
         error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number), os.fspath(destination))
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            destination_name,
+        )
+
+
+def rename_noreplace(source: Path, destination: Path) -> None:
+    rename_noreplace_at(
+        -100,
+        os.fspath(source),
+        -100,
+        os.fspath(destination),
+    )
 
 
 def fsync_directory(path: Path) -> None:
@@ -1351,6 +1369,15 @@ def close_retirement_locks(locks: list[RetirementLock] | None) -> None:
             os.close(lock.descriptor)
 
 
+def promoted_delete_name(
+    details: os.stat_result, attempt: int
+) -> str:
+    return (
+        f".delete-v2-{details.st_ino:016x}-"
+        f"{details.st_ctime_ns:016x}-{attempt:02x}"
+    )
+
+
 def delete_directory_contents_bounded(
     descriptor: int,
     expected_device: int,
@@ -1358,145 +1385,168 @@ def delete_directory_contents_bounded(
     *,
     preserve_manifest: bool,
 ) -> bool:
-    # Keep the caller's root descriptor open. Child descriptors are held only
-    # while their exact directory is on the DFS stack, so arbitrary tree depth
-    # is governed by real OS descriptor capacity rather than a protocol limit.
-    stack: list[tuple[int, os.ScandirIterator[str], int | None, str | None, bool, bool]] = []
-    try:
+    # Nested directories are promoted to the held retired-root descriptor one
+    # level at a time. Each unlink, promotion, or rmdir spends one work unit.
+    # No call needs a descriptor chain proportional to tree depth; the mutated
+    # retired tree plus its retirement record is the continuation state.
+    while budget.remaining_entries > 0:
+        selected_name: str | None = None
         try:
-            root_entries = os.scandir(descriptor)
+            with os.scandir(descriptor) as entries:
+                for entry in entries:
+                    if preserve_manifest and entry.name == HOT_STATE_MANIFEST:
+                        continue
+                    selected_name = entry.name
+                    break
         except OSError:
             return False
-        stack.append(
-            (
-                descriptor,
-                root_entries,
-                None,
-                None,
-                preserve_manifest,
-                False,
+        if selected_name is None:
+            return True
+
+        try:
+            details = os.stat(
+                selected_name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
             )
-        )
-        while stack:
-            (
-                current_descriptor,
-                entries,
-                parent_descriptor,
-                name_in_parent,
-                preserve_current_manifest,
-                owns_descriptor,
-            ) = stack[-1]
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        if details.st_uid != os.getuid() or details.st_dev != expected_device:
+            return False
+
+        if stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode):
             try:
-                entry = next(entries)
-            except StopIteration:
-                if parent_descriptor is None:
-                    entries.close()
-                    stack.pop()
-                    return True
-                if budget.remaining_entries <= 0:
-                    return False
-                entries.close()
-                stack.pop()
-                if owns_descriptor:
-                    os.close(current_descriptor)
-                assert name_in_parent is not None
+                os.unlink(selected_name, dir_fd=descriptor)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            budget.remaining_entries -= 1
+            continue
+
+        if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
+            return False
+
+        try:
+            child = os.open(
+                selected_name,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+        except OSError:
+            return False
+        try:
+            pinned = os.fstat(child)
+            if (
+                pinned.st_dev != expected_device
+                or pinned.st_uid != os.getuid()
+                or pinned.st_ino != details.st_ino
+            ):
+                return False
+
+            child_name: str | None = None
+            try:
+                with os.scandir(child) as child_entries:
+                    for child_entry in child_entries:
+                        child_name = child_entry.name
+                        break
+            except OSError:
+                return False
+
+            if child_name is None:
                 try:
-                    os.rmdir(name_in_parent, dir_fd=parent_descriptor)
+                    os.rmdir(selected_name, dir_fd=descriptor)
                 except FileNotFoundError:
                     continue
                 except OSError:
                     return False
                 budget.remaining_entries -= 1
                 continue
-            except OSError:
-                return False
 
-            if (
-                preserve_current_manifest
-                and entry.name == HOT_STATE_MANIFEST
-            ):
-                continue
-            if budget.remaining_entries <= 0:
-                return False
             try:
-                details = os.stat(
-                    entry.name,
-                    dir_fd=current_descriptor,
+                child_details = os.stat(
+                    child_name,
+                    dir_fd=child,
                     follow_symlinks=False,
                 )
             except FileNotFoundError:
                 continue
             except OSError:
                 return False
-            if details.st_uid != os.getuid() or details.st_dev != expected_device:
+            if (
+                child_details.st_uid != os.getuid()
+                or child_details.st_dev != expected_device
+            ):
                 return False
 
-            if stat.S_ISDIR(details.st_mode) and not stat.S_ISLNK(details.st_mode):
+            if (
+                stat.S_ISREG(child_details.st_mode)
+                or stat.S_ISLNK(child_details.st_mode)
+            ):
                 try:
-                    child = os.open(
-                        entry.name,
-                        os.O_RDONLY
-                        | os.O_DIRECTORY
-                        | os.O_CLOEXEC
-                        | os.O_NOFOLLOW,
-                        dir_fd=current_descriptor,
-                    )
-                except OSError:
-                    return False
-                try:
-                    pinned = os.fstat(child)
-                    if (
-                        pinned.st_dev != expected_device
-                        or pinned.st_uid != os.getuid()
-                        or pinned.st_ino != details.st_ino
-                    ):
-                        os.close(child)
-                        return False
-                    child_entries = os.scandir(child)
-                except OSError:
-                    os.close(child)
-                    return False
-                stack.append(
-                    (
-                        child,
-                        child_entries,
-                        current_descriptor,
-                        entry.name,
-                        False,
-                        True,
-                    )
-                )
-                continue
-
-            if stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode):
-                try:
-                    os.unlink(entry.name, dir_fd=current_descriptor)
+                    os.unlink(child_name, dir_fd=child)
                 except FileNotFoundError:
                     continue
                 except OSError:
                     return False
                 budget.remaining_entries -= 1
                 continue
-            return False
-        return True
-    finally:
-        for (
-            current_descriptor,
-            entries,
-            _,
-            _,
-            _,
-            owns_descriptor,
-        ) in reversed(stack):
-            try:
-                entries.close()
-            except OSError:
-                pass
-            if owns_descriptor:
+
+            if (
+                not stat.S_ISDIR(child_details.st_mode)
+                or stat.S_ISLNK(child_details.st_mode)
+            ):
+                return False
+
+            promoted_name: str | None = None
+            for attempt in range(256):
+                candidate = promoted_delete_name(child_details, attempt)
                 try:
-                    os.close(current_descriptor)
+                    rename_noreplace_at(
+                        child,
+                        child_name,
+                        descriptor,
+                        candidate,
+                    )
+                except FileExistsError:
+                    continue
                 except OSError:
-                    pass
+                    return False
+                promoted_name = candidate
+                break
+            if promoted_name is None:
+                return False
+            try:
+                promoted = os.stat(
+                    promoted_name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                return False
+            if (
+                not stat.S_ISDIR(promoted.st_mode)
+                or stat.S_ISLNK(promoted.st_mode)
+                or promoted.st_uid != os.getuid()
+                or promoted.st_dev != child_details.st_dev
+                or promoted.st_ino != child_details.st_ino
+            ):
+                return False
+            try:
+                os.fsync(child)
+                os.fsync(descriptor)
+            except OSError:
+                return False
+            budget.remaining_entries -= 1
+        finally:
+            os.close(child)
+
+    return False
 
 
 def retirement_record_name(retired_name: str, state_identity: str) -> str:
