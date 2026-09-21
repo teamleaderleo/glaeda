@@ -178,7 +178,7 @@ thermal behavior
 unfinished work
 ```
 
-Only current accepted receipts contribute capacity. Missing, stale, rejected, or wrong-profile evidence produces `resource_profile_unmeasured`. The #760-style cohort counts must reconcile, all offered work must settle, and an accepted `maxConcurrent=N` requires at least N simultaneously observed tasks and N validated completions. Accepted capacity also requires bounded CPU/memory pressure; unknown or critical CPU/memory evidence grants zero slots. Rejected measurements may retain unfinished-work counts for diagnosis but grant no capacity.
+Only current accepted receipts contribute capacity. Missing, stale, rejected, or wrong-profile evidence produces `resource_profile_unmeasured`. The #760-style cohort counts must reconcile, all offered work must settle, and an accepted `maxConcurrent=N` requires at least N simultaneously observed tasks and N validated completions. When an operation claims multiple scarce slots, every required slot must be present in one complete `contentionEvidenceGeneration`; the reducer never assembles a synthetic capacity claim from unrelated measurement generations. Accepted capacity also requires bounded CPU/memory pressure; unknown or critical CPU/memory evidence grants zero slots. Rejected measurements may retain unfinished-work counts for diagnosis but grant no capacity.
 
 This can express measurements such as:
 
