@@ -164,6 +164,109 @@ class OwnedLinuxJitRunnerTests(unittest.TestCase):
         self.assertIs(observed["emit_failure_tail"], False)
         self.assertEqual(observed["retain_limit"], 0)
 
+    def test_jit_secret_zeroizes_if_intent_publication_fails(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            args = arguments(root)
+            admission = FakeAdmission()
+            secret = bytearray(b"JITSECRET-PUBLISH-FAIL\n")
+
+            def prepare(task_root):
+                task_root.mkdir(parents=True)
+
+            def extract(task_root):
+                runner_root = task_root / "runner"
+                runner_root.mkdir()
+                return runner_root
+
+            def launcher(task_root):
+                path = task_root / "launcher"
+                path.write_text("#!/bin/sh\n", encoding="utf-8")
+                return path
+
+            with (
+                mock.patch.object(
+                    runner.owned_admission,
+                    "Reservation",
+                    return_value=admission,
+                ),
+                mock.patch.object(
+                    runner.owned_task,
+                    "prepare_task",
+                    side_effect=prepare,
+                ),
+                mock.patch.object(
+                    runner.owned_task,
+                    "remove_task",
+                ),
+                mock.patch.object(
+                    runner,
+                    "extract_reviewed_runner",
+                    side_effect=extract,
+                ),
+                mock.patch.object(
+                    runner,
+                    "reviewed_launcher",
+                    side_effect=launcher,
+                ),
+                mock.patch.object(
+                    runner,
+                    "sandbox_command",
+                    return_value=["fixed-runner"],
+                ),
+                mock.patch.object(
+                    runner,
+                    "read_jit_secret",
+                    return_value=secret,
+                ),
+                mock.patch.object(
+                    runner,
+                    "publish",
+                    side_effect=Refusal("intent publication failed"),
+                ),
+            ):
+                with self.assertRaisesRegex(Refusal, "intent publication failed"):
+                    runner.run_once(args)
+
+            self.assertEqual(secret, bytearray(len(secret)))
+            self.assertTrue(admission.released)
+            self.assertFalse(admission.launch_attempted)
+
+    def test_state_document_read_refuses_identity_change(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "receipt.json"
+            value = {"schema_version": 1, "state": "fixture"}
+            path.write_bytes(runner.canonical_bytes(value) + b"\n")
+            path.chmod(0o600)
+            original_fstat = runner.os.fstat
+            calls = 0
+
+            def changed_fstat(descriptor):
+                nonlocal calls
+                calls += 1
+                observed = original_fstat(descriptor)
+                if calls == 2:
+                    fields = list(observed)
+                    fields[8] += 1
+                    return os.stat_result(fields)
+                return observed
+
+            with mock.patch.object(runner.os, "fstat", side_effect=changed_fstat):
+                with self.assertRaisesRegex(Refusal, "changed while reading"):
+                    runner.read_document(path)
+
+    def test_state_document_read_refuses_symlink(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            target = root / "receipt.json"
+            value = {"schema_version": 1, "state": "fixture"}
+            target.write_bytes(runner.canonical_bytes(value) + b"\n")
+            target.chmod(0o600)
+            alias = root / "alias.json"
+            alias.symlink_to(target)
+            with self.assertRaisesRegex(Refusal, "unsafe document"):
+                runner.read_document(alias)
+
     def test_reflected_jit_bytes_never_reach_failure_output(self):
         python = Path("/usr/bin/python3")
         if not python.is_file():
