@@ -2042,9 +2042,17 @@ def record_successful_hot_state_use(
         catalog = read_hot_state_value_catalog(namespace_root)
         sequence = catalog["next_use_sequence"]
         assert isinstance(sequence, int)
-        prior_document = read_hot_state_value_record(
-            namespace_root, state_base.name
-        )
+        try:
+            prior_document = read_hot_state_value_record(
+                namespace_root, state_base.name
+            )
+        except RuntimeError:
+            # This successful use has already rebound the exact live state to
+            # its current producer manifest. Corrupt value metadata has no
+            # authority of its own and can be replaced from that fresh fact.
+            ensure_hot_state_value_records_root(namespace_root)
+            remove_hot_state_value_record(namespace_root, state_base.name)
+            prior_document = None
         prior = None
         if prior_document is not None:
             prior = {
