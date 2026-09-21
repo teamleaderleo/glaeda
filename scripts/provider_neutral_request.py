@@ -348,9 +348,11 @@ def compile_request(request: SemanticRequest) -> CompiledRequest:
             tree=request.source.tree,
             operation=external.OPERATION_VERIFY_FOCUSED,
             requested_capability_class=focused.EXECUTION_IDENTITY_CLASS,
+        )
+        workload = external.compile_request(
+            workload_request,
             semantic_request_id=request.request_id,
         )
-        workload = external.compile_request(workload_request)
     except external.ContractRefusal as error:
         raise ContractRefusal(error.code, str(error)) from error
     internal = workload.internal
