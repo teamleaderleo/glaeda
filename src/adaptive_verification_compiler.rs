@@ -3110,9 +3110,8 @@ mod tests {
     #[test]
     fn contradictory_experiment_subject_has_zero_promotion_authority() {
         let observations = cmux_case_observations();
-        let first =
-            compile_verification_optimizations("cmux-ci", "macos-full", &observations, &[])
-                .unwrap();
+        let first = compile_verification_optimizations("cmux-ci", "macos-full", &observations, &[])
+            .unwrap();
         let candidate = first
             .candidates()
             .iter()
