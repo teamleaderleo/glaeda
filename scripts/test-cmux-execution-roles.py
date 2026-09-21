@@ -195,7 +195,7 @@ def workload(operation, role, platform, architecture, capabilities, *, toolchain
 class RoleModelTests(unittest.TestCase):
     def test_closed_role_vocabulary_keeps_workload_specialization_as_capabilities(self):
         self.assertEqual(
-            set(m.ROLES),            {
+            set(m.ROLES),\n            {
                 'artifact_cache',
                 'background_replay',
                 'benchmark',
@@ -357,7 +357,6 @@ class RoleModelTests(unittest.TestCase):
         decision = m.local_admission(req, node, canaries, caps, {})
         self.assertFalse(decision['accepted'])
         self.assertEqual(decision['reason'], 'role_canary_pending')
-
     def test_node_pressure_between_selection_and_local_admission_vetoes(self):
         selected = mac_node()
         canaries = [canary(selected, 'cmux_macos_native_build')]
@@ -401,7 +400,7 @@ class RoleModelTests(unittest.TestCase):
         )
 
     def test_background_profile_still_requires_measurement(self):
-        node = linux_node()        canaries = [canary(node, 'background_replay', profiles=['small'])]
+        node = linux_node()\n        canaries = [canary(node, 'background_replay', profiles=['small'])]
         req = workload(
             'background_replay', 'background_replay', 'linux', 'x86_64',
             {'background_replay'}, profile='small', memory='small'
