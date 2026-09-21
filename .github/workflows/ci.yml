@@ -76,6 +76,12 @@ jobs:
               Path("scripts/owned_linux_admission.py"),
               Path("scripts/owned-admission-control"),
               Path("scripts/test-owned-linux-admission.py"),
+              Path("scripts/cmux_fleet.py"),
+              Path("scripts/cmux_fleet_bootstrap.py"),
+              Path("scripts/test-cmux-fleet.py"),
+              Path("scripts/test-cmux-fleet-bootstrap.py"),
+              Path("scripts/cmux_workload_request.py"),
+              Path("scripts/test-cmux-workload-request.py"),
               Path("scripts/test-verify-focused.py"),
               Path("scripts/verify-changed-rustfmt"),
               Path("scripts/test-hot-run.py"),
@@ -102,6 +108,9 @@ jobs:
           sh -n scripts/hot-run
           bash -n scripts/benchmark-developer-loop
           bash -n scripts/test-bootstrap.sh
+          bash -n scripts/cmux-fleet
+          bash -n scripts/cmux-fleet-bootstrap-macos
+          bash -n scripts/cmux-fleet-bootstrap-linux
           bash scripts/test-bootstrap.sh
           python3 scripts/test-benchmark-developer-loop.py
           python3 scripts/test-benchmark-hot-state-fanout.py
@@ -112,6 +121,9 @@ jobs:
           python3 scripts/test-hot-run.py
           python3 scripts/test-verify-focused.py
           python3 scripts/test-owned-linux-admission.py
+          python3 scripts/test-cmux-fleet.py
+          python3 scripts/test-cmux-fleet-bootstrap.py
+          python3 scripts/test-cmux-workload-request.py
           python3 scripts/test-verify.py
           python3 scripts/test-verify-changed-rustfmt.py
           python3 scripts/test-front-door.py
