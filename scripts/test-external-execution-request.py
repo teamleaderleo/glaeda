@@ -15,6 +15,7 @@ BASE = {
     "document_type": "glaeda-external-execution-request",
     "schema_version": 1,
     "external_request_ref": "cmux:exec:1050:fixture-1",
+    "semantic_request_id": "cmux-1050-fixture-0001",
     "source": {
         "repository": "teamleaderleo/glaeda",
         "commit": "0409c2f4e82385d0770bb2b34f34fd3e6e2dbc36",
@@ -66,6 +67,16 @@ class ContractTests(unittest.TestCase):
         changed["reuse_hint"] = "no_preference"
         right = module.compile_request(module.decode_request(raw(changed)))
         self.assertEqual(
+            left.internal.command_fingerprint, right.internal.command_fingerprint
+        )
+        self.assertNotEqual(left.request_sha256, right.request_sha256)
+
+    def test_semantic_request_id_is_the_explicit_physical_work_identity(self) -> None:
+        left = module.compile_request(module.decode_request(raw()))
+        changed = copy.deepcopy(BASE)
+        changed["semantic_request_id"] = "cmux-1050-fixture-0002"
+        right = module.compile_request(module.decode_request(raw(changed)))
+        self.assertNotEqual(
             left.internal.command_fingerprint, right.internal.command_fingerprint
         )
         self.assertNotEqual(left.request_sha256, right.request_sha256)
