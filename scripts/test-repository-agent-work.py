@@ -266,7 +266,7 @@ class RepositoryAgentWorkTests(unittest.TestCase):
         bad['verification_results'][0]['source'] = copy.deepcopy(
             request['source']['head']
         )
-        with self.assertRaisesRegex(w.ContractRefusal, 'different source tree'):
+        with self.assertRaisesRegex(w.ContractRefusal, 'different exact source'):
             w.decode_receipt(raw(receipt(request, bad)), request)
 
         bad = copy.deepcopy(result)
