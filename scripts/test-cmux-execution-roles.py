@@ -31,8 +31,18 @@ def fleet_acceptance(node_id, enrollment_generation, role):
         'profile': dict(m.fleet.ROLE_PROFILES[role]),
         'toolchainGeneration': GEN,
         'glaedaGeneration': PREF,
+        'glaedaFleetContractGeneration': m.fleet.fleet_contract_generation(),
         'cmuxSemanticResultSha256': GEN,
         'cmuxSemanticResultState': 'passed',
+        'cmuxEnvironmentClass': (
+            'isolated-build'
+            if role == 'cmux_macos_native_build'
+            else 'isolated-portable'
+        ),
+        'cmuxToolchainIdentity': PREF,
+        'postBootstrapSha256': GEN,
+        'executionClass': m.fleet.LOCAL_EXECUTION_CLASS,
+        'localExecutionAttemptSha256': PREF,
         'processSettlement': 'complete',
         'result': 'accepted',
     }
