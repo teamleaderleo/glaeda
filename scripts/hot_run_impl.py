@@ -1619,7 +1619,12 @@ def validate_hot_state_value_catalog_v1(document: object) -> dict[str, object]:
     ):
         raise RuntimeError("hot-state v1 value catalog identity is not accepted")
     for state_identity, record in states.items():
-        validate_hot_state_value_record_fields(state_identity, record, sequence)
+        validate_hot_state_value_record_fields(
+            state_identity,
+            record,
+            sequence,
+            value_ticket_required=False,
+        )
     return document
 
 
@@ -1663,6 +1668,8 @@ def validate_hot_state_value_record_fields(
     state_identity: object,
     record: object,
     maximum_sequence: int | None = None,
+    *,
+    value_ticket_required: bool = True,
 ) -> dict[str, object]:
     record_keys = {
         "manifest_device",
@@ -1673,8 +1680,9 @@ def validate_hot_state_value_record_fields(
         "value_identity",
         "reconstruction_elapsed_ns",
         "reuse_elapsed_ns",
-        "value_ticket_sequence",
     }
+    if value_ticket_required:
+        record_keys.add("value_ticket_sequence")
     if (
         not isinstance(state_identity, str)
         or not state_identity_name(state_identity)
@@ -1688,7 +1696,7 @@ def validate_hot_state_value_record_fields(
         "manifest_creation_witness_ns",
         "last_successful_use_sequence",
         "successful_use_count",
-        "value_ticket_sequence",
+        *("value_ticket_sequence",) if value_ticket_required else (),
     ):
         value = record[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1696,7 +1704,10 @@ def validate_hot_state_value_record_fields(
     if (
         record["last_successful_use_sequence"] == 0
         or record["successful_use_count"] == 0
-        or record["value_ticket_sequence"] == 0
+        or (
+            value_ticket_required
+            and record["value_ticket_sequence"] == 0
+        )
         or (
             maximum_sequence is not None
             and record["last_successful_use_sequence"] > maximum_sequence
