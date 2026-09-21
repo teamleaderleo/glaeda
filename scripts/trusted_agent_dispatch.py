@@ -3,8 +3,9 @@
 
 The request carries exact source identity, one closed semantic operation, caller/provenance
 correlation, and a bounded lifetime. Caller bytes never grant execution authority. Acceptance
-requires separately observed provenance evidence, then compiles to the caller-neutral external
-execution adapter. Physical attempt identity, backend, resources, reusable-state eligibility,
+requires separately observed provenance evidence, then compiles through the provider-neutral Glaeda
+semantic request and the caller-neutral external workload adapter. Physical attempt identity,
+backend, resources, reusable-state eligibility,
 process lifecycle, and recovery remain Glaeda-owned.
 """
 from __future__ import annotations
@@ -32,8 +33,6 @@ MAX_LIFETIME = dt.timedelta(hours=1)
 MAX_FUTURE_SKEW = dt.timedelta(minutes=5)
 OPERATION_KIND = "verify_named"
 PROFILE_ID = "verify-focused/v1"
-EXTERNAL_OPERATION = "verify_focused"
-CAPABILITY_CLASS = "credentialless_project"
 SUPERSESSION_POLICY = "none"
 AUTHORITY = {
     "authorizes_execution": False,
@@ -361,6 +360,7 @@ def decode_projection(
         now=now,
         allow_expired=allow_expired,
     )
+
 
 def request_document(request: DispatchRequest) -> dict[str, object]:
     value = identity_document(request)
