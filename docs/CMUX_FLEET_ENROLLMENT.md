@@ -76,10 +76,13 @@ cargo build --locked --release
 GLAEDA_BIN="$PWD/target/release/glaeda"
 CMUX_ROOT=/absolute/path/to/cmux
 CMUX_CACHE_ROOT=/absolute/path/to/cmux-native-cache
-BOOTSTRAP=/tmp/cmux-fleet-bootstrap.json
-ENROLLMENT=/tmp/cmux-fleet-enrollment.json
-ACCEPTANCE_EVIDENCE=/tmp/cmux-fleet-acceptance-evidence.json
-ACCEPTANCE=/tmp/cmux-fleet-acceptance.json
+FLEET_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet"
+umask 077
+install -d -m 700 "$FLEET_ROOT" "$FLEET_ROOT/acceptance"
+BOOTSTRAP="$(mktemp)"
+ACCEPTANCE_EVIDENCE="$(mktemp)"
+ENROLLMENT="$FLEET_ROOT/enrollment.json"
+ACCEPTANCE="$FLEET_ROOT/acceptance/cmux_macos_native_build.json"
 NODE_ID=cmux-mac-001
 
 bash scripts/cmux-fleet-bootstrap-macos \
@@ -90,11 +93,14 @@ bash scripts/cmux-fleet-bootstrap-macos \
   --role cmux_macos_native_build \
   > "$BOOTSTRAP"
 
+ENROLLMENT_NEXT="$(mktemp "$FLEET_ROOT/.enrollment.XXXXXX")"
 python3 scripts/cmux_fleet.py enroll "$BOOTSTRAP" \
   --node-id "$NODE_ID" \
   --scope cmux-founders \
   --generation 1 \
-  > "$ENROLLMENT"
+  > "$ENROLLMENT_NEXT"
+chmod 600 "$ENROLLMENT_NEXT"
+mv "$ENROLLMENT_NEXT" "$ENROLLMENT"
 
 CMUX_COMMIT="$(git -C "$CMUX_ROOT" rev-parse HEAD)"
 bash "$CMUX_ROOT/scripts/fleet-accept-macos-native-build" \
@@ -105,13 +111,18 @@ bash "$CMUX_ROOT/scripts/fleet-accept-macos-native-build" \
   --toolchain-generation "$(jq -r '.supportedToolchainGenerations[0]' "$ENROLLMENT")" \
   --output "$ACCEPTANCE_EVIDENCE"
 
+ACCEPTANCE_NEXT="$(mktemp "$FLEET_ROOT/acceptance/.cmux_macos_native_build.XXXXXX")"
 python3 scripts/cmux_fleet.py finalize-acceptance \
-  "$ENROLLMENT" "$ACCEPTANCE_EVIDENCE" > "$ACCEPTANCE"
+  "$ENROLLMENT" "$ACCEPTANCE_EVIDENCE" > "$ACCEPTANCE_NEXT"
+chmod 600 "$ACCEPTANCE_NEXT"
+mv "$ACCEPTANCE_NEXT" "$ACCEPTANCE"
 
+ENROLLMENT_NEXT="$(mktemp "$FLEET_ROOT/.enrollment.XXXXXX")"
 python3 scripts/cmux_fleet.py transition "$ENROLLMENT" --to eligible \
   --acceptance "$ACCEPTANCE" \
-  > "$ENROLLMENT.next"
-mv "$ENROLLMENT.next" "$ENROLLMENT"
+  > "$ENROLLMENT_NEXT"
+chmod 600 "$ENROLLMENT_NEXT"
+mv "$ENROLLMENT_NEXT" "$ENROLLMENT"
 
 bash scripts/cmux-fleet status "$ENROLLMENT" \
   --acceptance "$ACCEPTANCE"
@@ -125,10 +136,13 @@ The macOS bootstrap verifies the operator-owned native cache root is writable an
 cargo build --locked --release
 GLAEDA_BIN="$PWD/target/release/glaeda"
 CMUX_ROOT=/absolute/path/to/cmux
-BOOTSTRAP=/tmp/cmux-fleet-bootstrap.json
-ENROLLMENT=/tmp/cmux-fleet-enrollment.json
-ACCEPTANCE_EVIDENCE=/tmp/cmux-fleet-acceptance-evidence.json
-ACCEPTANCE=/tmp/cmux-fleet-acceptance.json
+FLEET_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet"
+umask 077
+install -d -m 700 "$FLEET_ROOT" "$FLEET_ROOT/acceptance"
+BOOTSTRAP="$(mktemp)"
+ACCEPTANCE_EVIDENCE="$(mktemp)"
+ENROLLMENT="$FLEET_ROOT/enrollment.json"
+ACCEPTANCE="$FLEET_ROOT/acceptance/cmux_linux_ci.json"
 NODE_ID=cmux-linux-001
 
 bash scripts/cmux-fleet-bootstrap-linux \
@@ -138,11 +152,14 @@ bash scripts/cmux-fleet-bootstrap-linux \
   --role cmux_linux_ci \
   > "$BOOTSTRAP"
 
+ENROLLMENT_NEXT="$(mktemp "$FLEET_ROOT/.enrollment.XXXXXX")"
 python3 scripts/cmux_fleet.py enroll "$BOOTSTRAP" \
   --node-id "$NODE_ID" \
   --scope cmux-founders \
   --generation 1 \
-  > "$ENROLLMENT"
+  > "$ENROLLMENT_NEXT"
+chmod 600 "$ENROLLMENT_NEXT"
+mv "$ENROLLMENT_NEXT" "$ENROLLMENT"
 
 CMUX_COMMIT="$(git -C "$CMUX_ROOT" rev-parse HEAD)"
 bash "$CMUX_ROOT/scripts/fleet-accept-linux-ci" \
@@ -153,13 +170,18 @@ bash "$CMUX_ROOT/scripts/fleet-accept-linux-ci" \
   --toolchain-generation "$(jq -r '.supportedToolchainGenerations[0]' "$ENROLLMENT")" \
   --output "$ACCEPTANCE_EVIDENCE"
 
+ACCEPTANCE_NEXT="$(mktemp "$FLEET_ROOT/acceptance/.cmux_linux_ci.XXXXXX")"
 python3 scripts/cmux_fleet.py finalize-acceptance \
-  "$ENROLLMENT" "$ACCEPTANCE_EVIDENCE" > "$ACCEPTANCE"
+  "$ENROLLMENT" "$ACCEPTANCE_EVIDENCE" > "$ACCEPTANCE_NEXT"
+chmod 600 "$ACCEPTANCE_NEXT"
+mv "$ACCEPTANCE_NEXT" "$ACCEPTANCE"
 
+ENROLLMENT_NEXT="$(mktemp "$FLEET_ROOT/.enrollment.XXXXXX")"
 python3 scripts/cmux_fleet.py transition "$ENROLLMENT" --to eligible \
   --acceptance "$ACCEPTANCE" \
-  > "$ENROLLMENT.next"
-mv "$ENROLLMENT.next" "$ENROLLMENT"
+  > "$ENROLLMENT_NEXT"
+chmod 600 "$ENROLLMENT_NEXT"
+mv "$ENROLLMENT_NEXT" "$ENROLLMENT"
 
 bash scripts/cmux-fleet status "$ENROLLMENT" \
   --acceptance "$ACCEPTANCE"
@@ -167,27 +189,52 @@ bash scripts/cmux-fleet status "$ENROLLMENT" \
 
 The Linux acceptance archives the exact commit into a private temporary tree, runs the CMUX self-hosted-runner guard and Linux routing unittest there, verifies the archive artifact, rechecks the canonical checkout, and refuses a surviving acceptance process group.
 
+After either onboarding path, remove only the transient evidence files:
+
+```bash
+rm -f "$BOOTSTRAP" "$ACCEPTANCE_EVIDENCE"
+```
+
+The canonical enrollment and finalized role receipts stay under `$FLEET_ROOT` across reboot. They contain no credentials or project secrets.
+
 ## Drain, quarantine, recover, and retire
 
 Drain before planned operator work:
 
 ```bash
+ENROLLMENT_NEXT="$(mktemp "$FLEET_ROOT/.enrollment.XXXXXX")"
 python3 scripts/cmux_fleet.py transition "$ENROLLMENT" --to draining \
-  > "$ENROLLMENT.next"
-mv "$ENROLLMENT.next" "$ENROLLMENT"
+  > "$ENROLLMENT_NEXT"
+chmod 600 "$ENROLLMENT_NEXT"
+mv "$ENROLLMENT_NEXT" "$ENROLLMENT"
 bash scripts/cmux-fleet status "$ENROLLMENT" --acceptance "$ACCEPTANCE"
 ```
 
 Quarantine on a concrete reviewed reason:
 
 ```bash
+ENROLLMENT_NEXT="$(mktemp "$FLEET_ROOT/.enrollment.XXXXXX")"
 python3 scripts/cmux_fleet.py transition "$ENROLLMENT" \
   --to quarantined --reason toolchain_mismatch \
-  > "$ENROLLMENT.next"
-mv "$ENROLLMENT.next" "$ENROLLMENT"
+  > "$ENROLLMENT_NEXT"
+chmod 600 "$ENROLLMENT_NEXT"
+mv "$ENROLLMENT_NEXT" "$ENROLLMENT"
 ```
 
-After a toolchain, OS, hardware class, or Glaeda update, rerun bootstrap and create a fresh enrollment with generation N+1. Old acceptance receipts then become stale by construction. Retire with `--to retired`.
+After a toolchain, OS, hardware class, or Glaeda update, rerun bootstrap and create a fresh enrollment with generation N+1. Old acceptance receipts then become stale by construction.
+
+Rollback an onboarding before routing, or retire an active node, by preserving the record in the terminal `retired` state:
+
+```bash
+ENROLLMENT_NEXT="$(mktemp "$FLEET_ROOT/.enrollment.XXXXXX")"
+python3 scripts/cmux_fleet.py transition "$ENROLLMENT" --to retired \
+  > "$ENROLLMENT_NEXT"
+chmod 600 "$ENROLLMENT_NEXT"
+mv "$ENROLLMENT_NEXT" "$ENROLLMENT"
+bash scripts/cmux-fleet status "$ENROLLMENT"
+```
+
+This leaves an auditable local tombstone and zero routable roles.
 
 ## Operator-owned prerequisite changes
 
