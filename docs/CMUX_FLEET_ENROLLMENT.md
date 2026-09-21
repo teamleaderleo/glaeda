@@ -26,6 +26,9 @@ The role vocabulary is stable enough to name future work:
 | `artifact_cache` | reserved | acceptance workload must land first |
 | `background_replay` | reserved | acceptance workload must land first |
 | `benchmark` | reserved | acceptance workload must land first |
+| `diagnostic` | reserved | acceptance workload must land first |
+
+Execution capabilities, reviewed resource profiles, physical lease claims, and placement preference are defined in `docs/CMUX_EXECUTION_ROLES.md`.
 
 The v1 enrollment validator and bootstrap refuse reserved roles. A role becomes enrolable only when an exact reviewed workload exists; this keeps "advertised" equivalent to "can be proven." For supported roles, eligibility then requires node state `eligible` plus a current accepted receipt matching node ID, enrollment generation, Glaeda generation, enrolled toolchain generation, and the role's current reviewed workload generation.
 
