@@ -272,15 +272,58 @@ pub enum LocalityEvidenceSource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HotStateEvidenceV1 {
-    pub class: HotStateClass,
+    class: HotStateClass,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub state_identity: Option<RoutingId>,
-    pub source: LocalityEvidenceSource,
+    state_identity: Option<RoutingId>,
+    source: LocalityEvidenceSource,
+}
+
+impl HotStateEvidenceV1 {
+    /// Construct bounded locality evidence without granting pool eligibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when exact-hot locality lacks the exact reusable-state identity that made
+    /// the observation comparable.
+    pub fn new(
+        class: HotStateClass,
+        state_identity: Option<RoutingId>,
+        source: LocalityEvidenceSource,
+    ) -> Result<Self, RoutingError> {
+        if class == HotStateClass::HotExact && state_identity.is_none() {
+            return Err(error(
+                "hot_state.state_identity",
+                "routing_exact_hot_identity_missing",
+                "exact-hot locality requires an exact state identity",
+            ));
+        }
+        Ok(Self {
+            class,
+            state_identity,
+            source,
+        })
+    }
+
+    #[must_use]
+    pub const fn class(&self) -> HotStateClass {
+        self.class
+    }
+
+    #[must_use]
+    pub const fn state_identity(&self) -> Option<&RoutingId> {
+        self.state_identity.as_ref()
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> LocalityEvidenceSource {
+        self.source
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostPressureClass {
+    NotApplicable,
     Low,
     Moderate,
     High,
@@ -291,7 +334,7 @@ pub enum HostPressureClass {
 impl HostPressureClass {
     const fn policy_rank(self) -> u8 {
         match self {
-            Self::Low => 0,
+            Self::NotApplicable | Self::Low => 0,
             Self::Moderate => 1,
             Self::High => 2,
             Self::Critical => 3,
@@ -474,6 +517,8 @@ pub struct RoutingObservationV1 {
     pub execution_class: RoutingId,
     pub observed_at_millis: u64,
     pub hot_state: HotStateClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hot_state_identity: Option<RoutingId>,
     pub timing: ObservationTimingV1,
     pub outcome: ObservationOutcome,
     pub resource: ResourceEnvelopeV1,
@@ -654,11 +699,14 @@ impl RoutingPolicyV1 {
                 "policy ratios exceed their bounded range",
             ));
         }
-        if self.max_pressure == HostPressureClass::Unknown {
+        if matches!(
+            self.max_pressure,
+            HostPressureClass::Unknown | HostPressureClass::NotApplicable
+        ) {
             return Err(error(
                 "policy.max_pressure",
                 "routing_policy_unknown_pressure_ceiling",
-                "policy pressure ceiling must be an observed pressure class",
+                "policy pressure ceiling must be a local observed pressure class",
             ));
         }
         Ok(())
@@ -714,6 +762,8 @@ pub struct RoutingRecommendationV1 {
     pub status: RecommendationStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub choice: Option<RoutingId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<RoutingId>,
     pub predictions: Vec<PoolPredictionV1>,
     pub exclusions: Vec<PoolExclusionV1>,
 }
@@ -731,6 +781,9 @@ impl RoutingRecommendationV1 {
         match &self.choice {
             Some(choice) => {
                 out.push_str(&format!("choice: {}\n", choice.as_str()));
+                if let Some(fallback) = &self.fallback {
+                    out.push_str(&format!("fallback: {}\n", fallback.as_str()));
+                }
                 if let Some(prediction) = self
                     .predictions
                     .iter()
@@ -877,6 +930,15 @@ pub fn recommend_ci_pool(
     }
     for observation in observations {
         observation.timing.validate()?;
+        if observation.hot_state == HotStateClass::HotExact
+            && observation.hot_state_identity.is_none()
+        {
+            return Err(error(
+                "observations.hot_state_identity",
+                "routing_exact_hot_observation_identity_missing",
+                "exact-hot observations require an exact state identity",
+            ));
+        }
     }
 
     let mut predictions = Vec::new();
@@ -968,6 +1030,13 @@ pub fn recommend_ci_pool(
     exclusions.sort_by(|left, right| left.pool_id.cmp(&right.pool_id));
 
     let choice = select_candidate(&evaluated, policy).map(|entry| entry.prediction.pool_id.clone());
+    let fallback_candidates = evaluated
+        .iter()
+        .filter(|entry| choice.as_ref() != Some(&entry.prediction.pool_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let fallback =
+        select_candidate(&fallback_candidates, policy).map(|entry| entry.prediction.pool_id.clone());
     let status = if choice.is_some() {
         RecommendationStatus::Recommended
     } else {
@@ -982,6 +1051,7 @@ pub fn recommend_ci_pool(
         policy,
         status,
         choice,
+        fallback,
         predictions,
         exclusions,
     })
@@ -994,6 +1064,7 @@ enum EvidenceRefusal {
     Insufficient,
 }
 
+#[derive(Clone)]
 struct EvaluatedCandidate {
     prediction: PoolPredictionV1,
 }
@@ -1012,6 +1083,9 @@ fn predict_pool(
                 && observation.pool_id == candidate.pool.pool_id
                 && observation.execution_class == candidate.pool.execution_class
                 && observation.hot_state == candidate.hot_state.class
+                && candidate.hot_state.state_identity.as_ref().is_none_or(|identity| {
+                    observation.hot_state_identity.as_ref() == Some(identity)
+                })
         })
         .collect();
     if matching.is_empty() {
@@ -1446,12 +1520,17 @@ mod tests {
             )
             .unwrap(),
             eligibility: PoolEligibility::Eligible,
-            hot_state: HotStateEvidenceV1 {
-                class: heat,
-                state_identity: (heat == HotStateClass::HotExact).then(|| id("state:main-xcode27")),
-                source: LocalityEvidenceSource::LocalAccepted,
+            hot_state: HotStateEvidenceV1::new(
+                heat,
+                (heat == HotStateClass::HotExact).then(|| id("state:main-xcode27")),
+                LocalityEvidenceSource::LocalAccepted,
+            )
+            .unwrap(),
+            pressure_after_admission: if accounting_class == PoolAccountingClass::Owned {
+                HostPressureClass::Low
+            } else {
+                HostPressureClass::NotApplicable
             },
-            pressure_after_admission: HostPressureClass::Low,
             allowance: None,
             contention: None,
         }
@@ -1474,6 +1553,8 @@ mod tests {
             execution_class: id("macos-arm64"),
             observed_at_millis: NOW - age_millis,
             hot_state: heat,
+            hot_state_identity: (heat == HotStateClass::HotExact)
+                .then(|| id("state:main-xcode27")),
             timing: ObservationTimingV1 {
                 queue_millis: 5_000,
                 start_millis: 5_000,
@@ -1832,11 +1913,12 @@ mod tests {
             )
             .unwrap(),
             eligibility: PoolEligibility::Eligible,
-            hot_state: HotStateEvidenceV1 {
-                class: HotStateClass::Warm,
-                state_identity: Some(id("state:rust-main")),
-                source: LocalityEvidenceSource::LocalAccepted,
-            },
+            hot_state: HotStateEvidenceV1::new(
+                HotStateClass::Warm,
+                Some(id("state:rust-main")),
+                LocalityEvidenceSource::LocalAccepted,
+            )
+            .unwrap(),
             pressure_after_admission: HostPressureClass::Moderate,
             allowance: None,
             contention: Some(ContentionEvidenceV1 {
@@ -2150,6 +2232,80 @@ mod tests {
         assert!(report.exclusions.iter().any(|entry| {
             entry.pool_id == id("flaky") && entry.reason == PoolExclusionReason::FallbackAbovePolicy
         }));
+    }
+
+    #[test]
+    fn exact_hot_state_generation_fences_old_history() {
+        let workload = workload();
+        let mut candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::HotExact);
+        candidate.hot_state = HotStateEvidenceV1::new(
+            HotStateClass::HotExact,
+            Some(id("state:new-xcode-generation")),
+            LocalityEvidenceSource::LocalAccepted,
+        )
+        .unwrap();
+        let observations =
+            three_successes(&workload, "owned", HotStateClass::HotExact, 40_000, 0, 0);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::latency(0),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, RecommendationStatus::Abstained);
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("owned") && entry.reason == PoolExclusionReason::MissingEvidence
+        }));
+    }
+
+    #[test]
+    fn exact_hot_claim_requires_state_identity() {
+        let error = HotStateEvidenceV1::new(
+            HotStateClass::HotExact,
+            None,
+            LocalityEvidenceSource::LocalAccepted,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "routing_exact_hot_identity_missing");
+    }
+
+    #[test]
+    fn recommendation_names_policy_eligible_fallback() {
+        let workload = workload();
+        let candidates = vec![
+            pool("hot", PoolAccountingClass::Owned, HotStateClass::HotExact),
+            pool("cold", PoolAccountingClass::Owned, HotStateClass::Cold),
+        ];
+        let mut observations =
+            three_successes(&workload, "hot", HotStateClass::HotExact, 30_000, 0, 0);
+        observations.extend(three_successes(
+            &workload,
+            "cold",
+            HotStateClass::Cold,
+            70_000,
+            0,
+            0,
+        ));
+
+        let report = recommend_ci_pool(
+            &workload,
+            &candidates,
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::latency(0),
+        )
+        .unwrap();
+
+        assert_eq!(report.choice, Some(id("hot")));
+        assert_eq!(report.fallback, Some(id("cold")));
+        assert!(report.render_human().contains("fallback: cold"));
     }
 
     #[test]
