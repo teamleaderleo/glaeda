@@ -270,6 +270,19 @@ class FleetTests(unittest.TestCase):
         with self.assertRaisesRegex(f.FleetError, "differs from enrolled role profile"):
             finalized(e, result=cmux_result(profile=wrong_profile))
 
+    def test_acceptance_rejects_detached_semantic_result_digest(self):
+        e = enrollment()
+        with self.assertRaisesRegex(
+            f.FleetError, "semantic result digest does not match"
+        ):
+            f.finalize_acceptance(
+                e,
+                "cmux_macos_native_build",
+                A,
+                cmux_result(),
+                D,
+            )
+
     def test_failed_settlement_rejects_role(self):
         e = enrollment()
         receipt = finalized(
