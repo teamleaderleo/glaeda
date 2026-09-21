@@ -502,14 +502,28 @@ def validate_lifecycle(
                 "lifecycle_identity_conflict",
                 "nonterminal lifecycle carries settlement",
             )
-    elif (
-        terminal not in TERMINAL_EXTERNAL_STATES
-        or not isinstance(digest, str)
-        or SHA256_PATTERN.fullmatch(digest) is None
-    ):
+        return value
+
+    if not isinstance(digest, str) or SHA256_PATTERN.fullmatch(digest) is None:
         raise DispatchRefusal(
             "lifecycle_identity_conflict",
             "terminal lifecycle settlement is invalid",
+        )
+    if state == "refused":
+        valid_terminal = terminal == "refused"
+    elif state == "ambiguous":
+        valid_terminal = terminal == "ambiguous"
+    else:
+        valid_terminal = terminal in {
+            "succeeded",
+            "failed",
+            "timed_out",
+            "cleanup_incomplete",
+        }
+    if not valid_terminal:
+        raise DispatchRefusal(
+            "lifecycle_identity_conflict",
+            "lifecycle state and terminal class disagree",
         )
     return value
 
