@@ -13,7 +13,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::disposable_attempt_catalog::{
-    DisposableAttemptCatalog, DisposableAttemptCatalogDocument, DisposableAttemptReservation,
+    DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
+    DisposableAttemptReservation,
 };
 use crate::disposable_clone_runtime::{
     CloneRuntimeClock, DisposableCleanupRunnerSource, DisposableCleanupTransactionOutcome,
@@ -298,6 +299,29 @@ impl DisposableWorkerCoordinator {
             return Ok(DisposableWorkerCoordinatorDisposition::Idle);
         };
         let attempt_id = reservation.attempt().attempt_id().clone();
+        let now = clock
+            .epoch_millis()
+            .map_err(|_| coordinator_error("disposable_clock_unavailable"))?;
+        if requires_post_start_deadline_cleanup(reservation, now) {
+            let mut durable = DisposableAttemptCatalog::new(open_catalog(&self.state_root)?);
+            let (next, _) = durable
+                .transition(
+                    catalog.revision(),
+                    &attempt_id,
+                    reservation.attempt().revision(),
+                    DisposableAttemptCatalogAction::BeginCleanup,
+                )
+                .map_err(|_| coordinator_error("disposable_deadline_cleanup_checkpoint_failed"))?;
+            let phase = next
+                .find_active(&attempt_id)
+                .ok_or_else(|| coordinator_error("disposable_attempt_missing_after_deadline"))?
+                .attempt()
+                .phase();
+            return Ok(DisposableWorkerCoordinatorDisposition::CleanupCheckpointed {
+                attempt_id: attempt_id.as_str().to_owned(),
+                phase,
+            });
+        }
         match operation_for(reservation)? {
             CoordinatorOperation::AuthorizeClone => {
                 let mut store = open_catalog(&self.state_root)?;
@@ -504,6 +528,22 @@ enum CoordinatorOperation {
     RunRunner,
     Cleanup,
     Wait,
+}
+
+fn requires_post_start_deadline_cleanup(
+    reservation: &DisposableAttemptReservation,
+    now: EpochMillis,
+) -> bool {
+    let attempt = reservation.attempt();
+    attempt.runner_start_started()
+        && now > attempt.not_after()
+        && matches!(
+            attempt.phase(),
+            DisposableAttemptPhase::Registering
+                | DisposableAttemptPhase::Waiting
+                | DisposableAttemptPhase::Assigned
+                | DisposableAttemptPhase::Running
+        )
 }
 
 fn operation_for(
