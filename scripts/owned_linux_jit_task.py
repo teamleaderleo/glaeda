@@ -353,12 +353,10 @@ def prepare(arguments: argparse.Namespace) -> int:
                 _write_private(root / TASK_DOCUMENT, _expected_document(task_identity, identity))
             _validate_task_state(arguments, task_identity, identity)
         except BaseException:
-            try:
-                if root.exists():
-                    _repairable_preparing_root(root, task_identity, identity)
-                    task.remove_task(root)
-            finally:
-                reservation.release()
+            if root.exists():
+                _repairable_preparing_root(root, task_identity, identity)
+                task.remove_task(root)
+            reservation.release()
             raise
     emit(
         {
