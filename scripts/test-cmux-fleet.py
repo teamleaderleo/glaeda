@@ -165,6 +165,45 @@ class FleetTests(unittest.TestCase):
         linux = next(v for v in status["roles"] if v["role"] == "cmux_linux_ci")
         self.assertTrue(linux["eligible"])
 
+    def test_enrollment_is_derived_from_accepted_bootstrap(self):
+        bootstrap = {
+            "schema": f.BOOTSTRAP_SCHEMA,
+            "platform": "macos",
+            "architecture": "arm64",
+            "osVersionClass": "macos-26",
+            "hardwareCapabilityClass": "cmux-mac-build-large",
+            "roles": ["cmux_macos_native_build"],
+            "glaedaGeneration": C,
+            "toolchainGeneration": A,
+            "checks": {"ready": True},
+            "observed": {},
+            "eligibleForEnrollment": True,
+            "blockingChecks": [],
+            "authority": "observation_only",
+        }
+        result = f.enrollment_from_bootstrap(
+            bootstrap,
+            node_id="cmux-fixture-002",
+            operator_fleet_scope="cmux-founders",
+            enrollment_generation=1,
+        )
+        self.assertEqual(result["state"], "enrolling")
+        self.assertEqual(result["supportedToolchainGenerations"], [A])
+
+    def test_blocked_bootstrap_cannot_enroll(self):
+        bootstrap = {
+            "schema": f.BOOTSTRAP_SCHEMA,
+            "authority": "observation_only",
+            "eligibleForEnrollment": False,
+        }
+        with self.assertRaisesRegex(f.FleetError, "blocking checks"):
+            f.enrollment_from_bootstrap(
+                bootstrap,
+                node_id="cmux-fixture-002",
+                operator_fleet_scope="cmux-founders",
+                enrollment_generation=1,
+            )
+
     def test_fingerprint_is_canonical(self):
         e = enrollment()
         self.assertEqual(f.digest(copy.deepcopy(e)), f.digest(e))
