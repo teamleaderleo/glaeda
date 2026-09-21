@@ -11,6 +11,7 @@
     "os",
     "hardwareCapabilityClass",
     "supportedToolchainGenerations",
+    "roleWorkloadGenerations",
     "allowedExecutionRoles",
     "operatorFleetScope",
     "enrollmentGeneration",
@@ -126,6 +127,25 @@
           ]
         }
       ]
+    },
+    "roleWorkloadGenerations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cmux_macos_native_build"
+      ],
+      "properties": {
+        "cmux_macos_native_build": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "cmux_linux_ci": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      },
+      "minProperties": 1,
+      "maxProperties": 2
     }
   },
   "allOf": [
@@ -201,6 +221,60 @@
                   "cmux_macos_test"
                 ]
               }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "os": {
+            "properties": {
+              "family": {
+                "const": "macos"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "roleWorkloadGenerations": {
+            "required": [
+              "cmux_macos_native_build"
+            ],
+            "not": {
+              "required": [
+                "cmux_linux_ci"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "os": {
+            "properties": {
+              "family": {
+                "const": "linux"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "roleWorkloadGenerations": {
+            "required": [
+              "cmux_linux_ci"
+            ],
+            "not": {
+              "required": [
+                "cmux_macos_native_build"
+              ]
             }
           }
         }
