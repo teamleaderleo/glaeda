@@ -15,6 +15,11 @@ SPEC.loader.exec_module(m)
 
 GEN = 'sha256:' + 'a' * 64
 PREF = 'sha256:' + 'b' * 64
+TOOLCHAIN = 'sha256:' + 'c' * 64
+GLAEDA = 'sha256:' + 'd' * 64
+ALT_WORKLOAD = 'sha256:' + 'e' * 64
+ALT_TOOLCHAIN = 'sha256:' + 'f' * 64
+ALT_GLAEDA = 'sha256:' + '1' * 64
 
 
 def mac_node(state='eligible', generation=7, xcode='apple-xcode-26-sdk-26', memory='large', pressure=None):
@@ -26,11 +31,18 @@ def mac_node(state='eligible', generation=7, xcode='apple-xcode-26-sdk-26', memo
         'architecture': 'arm64',
         'osVersionClass': 'macos-26',
         'enrollmentGeneration': 3,
+        'glaedaGeneration': GLAEDA,
         'cpuClass': 'large',
         'memoryClass': memory,
         'diskClass': 'large',
         'capabilityGeneration': generation,
-        'toolchainProfiles': [xcode],
+        'toolchainProfiles': {xcode: TOOLCHAIN},
+        'roleWorkloadGenerations': {
+            'benchmark': GEN,
+            'cmux_macos_native_build': GEN,
+            'cmux_macos_test': GEN,
+            'diagnostic': GEN,
+        },
         'capabilities': sorted({
             'apple_silicon',
             'app_host_test',
@@ -58,11 +70,20 @@ def linux_node(state='eligible', generation=4, memory='large'):
         'architecture': 'x86_64',
         'osVersionClass': 'ubuntu-24.04',
         'enrollmentGeneration': 2,
+        'glaedaGeneration': GLAEDA,
         'cpuClass': 'large',
         'memoryClass': memory,
         'diskClass': 'large',
         'capabilityGeneration': generation,
-        'toolchainProfiles': ['linux-rust-ci-2026-09'],
+        'toolchainProfiles': {'linux-rust-ci-2026-09': TOOLCHAIN},
+        'roleWorkloadGenerations': {
+            'artifact_cache': GEN,
+            'background_replay': GEN,
+            'benchmark': GEN,
+            'cmux_linux_agent': GEN,
+            'cmux_linux_ci': GEN,
+            'diagnostic': GEN,
+        },
         'capabilities': sorted({
             'artifact_service',
             'background_replay',
@@ -98,29 +119,46 @@ def canary(node, role, *, result='accepted', toolchain=None, capabilities=None, 
         capabilities |= {'linux_ci', 'web_ci', 'background_verification'}
     if role == 'cmux_linux_agent':
         capabilities |= {'linux_agent', 'build_helper'}
+    requires_toolchain = m.ROLE_REQUIREMENTS[role]['requiresToolchainProfile']
+    default_toolchain = next(iter(node['toolchainProfiles'])) if requires_toolchain else None
+    profile = toolchain if toolchain is not None else default_toolchain
+    toolchain_generation = (
+        node['toolchainProfiles'].get(profile) if profile is not None else None
+    )
     return {
         'schema': m.ROLE_CANARY_SCHEMA,
         'nodeId': node['nodeId'],
         'enrollmentGeneration': node['enrollmentGeneration'],
+        'glaedaGeneration': node['glaedaGeneration'],
         'capabilityGeneration': node['capabilityGeneration'],
         'role': role,
-        'toolchainProfile': toolchain if toolchain is not None else (
-            node['toolchainProfiles'][0] if m.ROLE_REQUIREMENTS[role]['requiresToolchainProfile'] else None
-        ),
+        'toolchainProfile': profile,
+        'toolchainGeneration': toolchain_generation,
         'acceptedCapabilities': sorted(capabilities),
         'acceptedResourceProfiles': profiles or ['large', 'medium', 'small'],
-        'workloadGeneration': GEN,
+        'workloadGeneration': node['roleWorkloadGenerations'][role],
         'result': result,
     }
 
 
 def capacity(node, role, profile, slot, concurrent, *, result='accepted', pressure='normal', unfinished=0):
+    requires_toolchain = m.ROLE_REQUIREMENTS[role]['requiresToolchainProfile']
+    toolchain_profile = next(iter(node['toolchainProfiles'])) if requires_toolchain else None
+    toolchain_generation = (
+        node['toolchainProfiles'].get(toolchain_profile)
+        if toolchain_profile is not None
+        else None
+    )
     return {
         'schema': m.CAPACITY_SCHEMA,
         'nodeId': node['nodeId'],
         'enrollmentGeneration': node['enrollmentGeneration'],
+        'glaedaGeneration': node['glaedaGeneration'],
         'capabilityGeneration': node['capabilityGeneration'],
         'role': role,
+        'workloadGeneration': node['roleWorkloadGenerations'][role],
+        'toolchainProfile': toolchain_profile,
+        'toolchainGeneration': toolchain_generation,
         'resourceProfile': profile,
         'slotClass': slot,
         'maxConcurrent': concurrent,
@@ -157,8 +195,7 @@ def workload(operation, role, platform, architecture, capabilities, *, toolchain
 class RoleModelTests(unittest.TestCase):
     def test_closed_role_vocabulary_keeps_workload_specialization_as_capabilities(self):
         self.assertEqual(
-            set(m.ROLES),
-            {
+            set(m.ROLES),            {
                 'artifact_cache',
                 'background_replay',
                 'benchmark',
@@ -228,6 +265,36 @@ class RoleModelTests(unittest.TestCase):
         self.assertEqual(
             eligibility['cmux_macos_native_build']['reason'],
             'role_canary_enrollment_stale',
+        )
+
+    def test_role_workload_generation_change_invalidates_canary(self):
+        node = mac_node()
+        receipt = canary(node, 'cmux_macos_native_build')
+        node['roleWorkloadGenerations']['cmux_macos_native_build'] = ALT_WORKLOAD
+        eligibility = m.role_eligibility(node, [receipt])
+        self.assertEqual(
+            eligibility['cmux_macos_native_build']['reason'],
+            'role_canary_workload_stale',
+        )
+
+    def test_glaeda_generation_change_invalidates_canary(self):
+        node = mac_node()
+        receipt = canary(node, 'cmux_macos_native_build')
+        node['glaedaGeneration'] = ALT_GLAEDA
+        eligibility = m.role_eligibility(node, [receipt])
+        self.assertEqual(
+            eligibility['cmux_macos_native_build']['reason'],
+            'role_canary_glaeda_stale',
+        )
+
+    def test_exact_toolchain_generation_change_invalidates_canary(self):
+        node = mac_node()
+        receipt = canary(node, 'cmux_macos_native_build')
+        node['toolchainProfiles']['apple-xcode-26-sdk-26'] = ALT_TOOLCHAIN
+        eligibility = m.role_eligibility(node, [receipt])
+        self.assertEqual(
+            eligibility['cmux_macos_native_build']['reason'],
+            'toolchain_canary_pending',
         )
 
     def test_failed_role_canary_refuses(self):
@@ -316,9 +383,25 @@ class RoleModelTests(unittest.TestCase):
         caps = [capacity(node, 'cmux_linux_ci', 'medium', 'linux_medium_slot', 4)]
         self.assertEqual(m.select_eligible(req, node, canaries, caps), (False, 'resource_profile_unmeasured'))
 
-    def test_background_profile_still_requires_measurement(self):
+    def test_stale_capacity_evidence_refuses_after_workload_generation_change(self):
         node = linux_node()
-        canaries = [canary(node, 'background_replay', profiles=['small'])]
+        canaries = [canary(node, 'cmux_linux_ci')]
+        old_capacity = capacity(
+            node, 'cmux_linux_ci', 'medium', 'linux_medium_slot', 4
+        )
+        node['roleWorkloadGenerations']['cmux_linux_ci'] = ALT_WORKLOAD
+        canaries = [canary(node, 'cmux_linux_ci')]
+        req = workload(
+            'cmux_linux_ci_admission', 'cmux_linux_ci', 'linux', 'x86_64',
+            {'linux_ci'}, toolchain='linux-rust-ci-2026-09'
+        )
+        self.assertEqual(
+            m.select_eligible(req, node, canaries, [old_capacity]),
+            (False, 'resource_profile_unmeasured'),
+        )
+
+    def test_background_profile_still_requires_measurement(self):
+        node = linux_node()        canaries = [canary(node, 'background_replay', profiles=['small'])]
         req = workload(
             'background_replay', 'background_replay', 'linux', 'x86_64',
             {'background_replay'}, profile='small', memory='small'
