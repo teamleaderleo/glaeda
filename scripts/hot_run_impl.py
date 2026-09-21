@@ -862,6 +862,18 @@ def producer_manifest_document(
     }
 
 
+def manifest_generation_contract_equal(
+    expected: dict[str, object],
+    observed: dict[str, object],
+) -> bool:
+    return (
+        expected.get("state_identity") == observed.get("state_identity")
+        and expected.get("reconstructible") == observed.get("reconstructible")
+        and expected.get("cache_views") == observed.get("cache_views")
+        and expected.get("generation_objects") == observed.get("generation_objects")
+    )
+
+
 def canonical_manifest_bytes(document: dict[str, object]) -> bytes:
     encoded = (
         json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
@@ -1193,13 +1205,23 @@ def publish_implicit_state_base(
                 "implicit hot-state generation is not an owner-private directory"
             )
         try:
-            _, observed = read_producer_manifest(state_base, state_base.name)
+            observed_manifest, observed = read_producer_manifest(
+                state_base, state_base.name
+            )
         except FileNotFoundError:
             raise RuntimeError(
                 "implicit hot-state generation collides with manifestless state"
             )
-        if observed != encoded:
+        if observed != encoded and not manifest_generation_contract_equal(
+            expected_manifest, observed_manifest
+        ):
             raise RuntimeError("hot-state producer manifest conflicts with this generation")
+        enqueue_hot_state_reconcile_ticket(
+            state_base.parent,
+            "state",
+            state_base.name,
+            state_base.name,
+        )
         return "reused"
 
     namespace_root = state_base.parent
@@ -1208,6 +1230,12 @@ def publish_implicit_state_base(
             f"{HOT_STATE_CREATING_PREFIX}{state_base.name}-"
             f"{os.getpid()}-{time.time_ns()}-{attempt}"
         )
+        enqueue_hot_state_reconcile_ticket(
+            namespace_root,
+            "creating",
+            state_base.name,
+            staging.name,
+        )
         try:
             staging.mkdir(mode=0o700)
             break
@@ -1215,8 +1243,15 @@ def publish_implicit_state_base(
             continue
     else:
         raise RuntimeError("could not allocate a hot-state publication stage")
-    # A failed publication leaves this exact producer-owned stage as bounded recovery debt.
+    # Tickets are published before mutation so a crash leaves either a
+    # harmless stale ticket or exact recovery debt.
     write_producer_manifest(staging, encoded)
+    enqueue_hot_state_reconcile_ticket(
+        namespace_root,
+        "state",
+        state_base.name,
+        state_base.name,
+    )
     rename_noreplace(staging, state_base)
     fsync_directory(namespace_root)
     return "created"
