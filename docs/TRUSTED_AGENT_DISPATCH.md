@@ -200,3 +200,6 @@ source, dispatch, and resident-service generations.
 This lane adds no heat-aware placement, adaptive routing, generic SSH, remote shell, second execution
 engine, GitHub node snapshot mirror, merge authority, or alternate physical scheduler. #970 remains
 advisory history; current local admission decides every launch.
+
+
+Accepted caller identity is part of physical replay partitioning: the full dispatch fingerprint derives a bounded `semantic_request_id`, and #1050 includes that identity in the workload fingerprint. Equal source/profile requests from different caller namespaces therefore remain distinct physical work unless a later explicit reusable-result contract says otherwise.
