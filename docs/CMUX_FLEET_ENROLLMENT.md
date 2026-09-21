@@ -26,6 +26,7 @@ The role vocabulary is stable enough to name future work:
 | `artifact_cache` | reserved | acceptance workload must land first |
 | `background_replay` | reserved | acceptance workload must land first |
 | `benchmark` | reserved | acceptance workload must land first |
+| `diagnostic` | reserved | acceptance workload must land first |
 
 The v1 enrollment validator and bootstrap refuse reserved roles. A role becomes enrolable only when its repository-owned CMUX profile is present at the reviewed generation in the exact CMUX checkout. For supported roles, eligibility then requires node state `eligible` plus a current accepted receipt matching node ID, enrollment generation, Glaeda generation, enrolled toolchain generation, and the role's exact profile ID/generation.
 
