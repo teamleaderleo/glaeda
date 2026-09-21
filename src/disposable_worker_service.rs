@@ -35,9 +35,7 @@ use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_bridge::{ScaleSetBridgeClient, ScaleSetBridgeConfig};
 use crate::lima_observation::LimaObservationClock;
 #[cfg(target_os = "linux")]
-use crate::owned_linux_jit_enrollment::{
-    OwnedLinuxJitEnrollment, OwnedLinuxJitEnrollmentParts,
-};
+use crate::owned_linux_jit_enrollment::{OwnedLinuxJitEnrollment, OwnedLinuxJitEnrollmentParts};
 use crate::personal_worker_store::PersonalWorkerStoreErrorKind;
 use crate::process::ProcessExecutor;
 use crate::unix_personal_worker_store::{DisposableWorkerServiceLock, UnixPersonalWorkerStore};
