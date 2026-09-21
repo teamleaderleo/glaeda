@@ -108,6 +108,26 @@ def cmux_digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(cmux_canonical_bytes(value)).hexdigest()
 
 
+def _file_sha256(path: Path) -> str:
+    digest_value = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest_value.update(chunk)
+    except OSError as error:
+        raise FleetError("Glaeda fleet contract file is unavailable") from error
+    return "sha256:" + digest_value.hexdigest()
+
+
+def fleet_contract_generation() -> str:
+    root = Path(__file__).resolve().parent
+    files = {
+        "cmux_fleet.py": _file_sha256(root / "cmux_fleet.py"),
+        "cmux_fleet_bootstrap.py": _file_sha256(root / "cmux_fleet_bootstrap.py"),
+    }
+    return digest(files)
+
+
 def exact_keys(value: object, keys: set[str], label: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != keys:
         raise FleetError(f"{label} has unknown or missing fields")
@@ -507,7 +527,8 @@ def validate_cmux_semantic_result(
 
 ACCEPTANCE_RECEIPT_KEYS = {
     "schema", "nodeId", "enrollmentGeneration", "role", "source", "profile",
-    "toolchainGeneration", "glaedaGeneration", "cmuxSemanticResultSha256",
+    "toolchainGeneration", "glaedaGeneration", "glaedaFleetContractGeneration",
+    "cmuxSemanticResultSha256",
     "cmuxSemanticResultState", "cmuxEnvironmentClass", "cmuxToolchainIdentity",
     "postBootstrapSha256", "executionClass", "localExecutionAttemptSha256",
     "processSettlement", "result",
@@ -545,6 +566,10 @@ def validate_acceptance_receipt(value: object) -> dict[str, Any]:
         raise FleetError("acceptance receipt profile is not the reviewed role profile")
     sha256(doc["toolchainGeneration"], "acceptance receipt toolchain generation")
     sha256(doc["glaedaGeneration"], "acceptance receipt Glaeda generation")
+    sha256(
+        doc["glaedaFleetContractGeneration"],
+        "acceptance receipt Glaeda fleet contract generation",
+    )
     sha256(doc["cmuxSemanticResultSha256"], "CMUX semantic result digest")
     sha256(doc["cmuxToolchainIdentity"], "CMUX semantic toolchain identity")
     sha256(doc["postBootstrapSha256"], "post-acceptance bootstrap digest")
@@ -590,6 +615,8 @@ def acceptance_matches_enrollment(enrollment: dict[str, Any], receipt: dict[str,
         return False, "acceptance_enrollment_stale"
     if receipt.get("glaedaGeneration") != enrollment["glaedaGeneration"]:
         return False, "acceptance_glaeda_stale"
+    if receipt.get("glaedaFleetContractGeneration") != fleet_contract_generation():
+        return False, "acceptance_glaeda_contract_stale"
     if receipt.get("toolchainGeneration") not in enrollment["supportedToolchainGenerations"]:
         return False, "acceptance_toolchain_stale"
     if receipt.get("profile") != enrollment["roleProfiles"].get(role):
@@ -683,6 +710,7 @@ def finalize_acceptance(
         "profile": semantic["profile"],
         "toolchainGeneration": toolchain_generation,
         "glaedaGeneration": enrollment["glaedaGeneration"],
+        "glaedaFleetContractGeneration": fleet_contract_generation(),
         "cmuxSemanticResultSha256": cmux_result_sha256,
         "cmuxSemanticResultState": semantic["result"],
         "cmuxEnvironmentClass": semantic["environment_class"],
