@@ -84,6 +84,8 @@ jobs:
               Path("scripts/test-cmux-fleet-bootstrap.py"),
               Path("scripts/cmux_workload_request.py"),
               Path("scripts/test-cmux-workload-request.py"),
+              Path("scripts/repository_agent_work.py"),
+              Path("scripts/test-repository-agent-work.py"),
               Path("scripts/test-verify-focused.py"),
               Path("scripts/verify-changed-rustfmt"),
               Path("scripts/test-hot-run.py"),
@@ -127,6 +129,7 @@ jobs:
           python3 scripts/test-cmux-fleet-bootstrap.py
           python3 scripts/test-cmux-execution-roles.py
           python3 scripts/test-cmux-workload-request.py
+          python3 scripts/test-repository-agent-work.py
           python3 scripts/test-verify.py
           python3 scripts/test-verify-changed-rustfmt.py
           python3 scripts/test-front-door.py
