@@ -12,7 +12,7 @@ The caller continues to own the human work item, worker brief, responsibility, a
 
 ## Request contract
 
-`scripts/repository_agent_work.py` accepts `glaeda-repository-agent-work-request/v1`.
+`scripts/repository_agent_work.py` accepts `document_type = glaeda-repository-agent-work-request` with `schema_version = 1`.
 
 Every request binds:
 
@@ -136,7 +136,7 @@ The plan grants zero host selection, publication, merge, release, deploy, redisp
 
 ## Receipt contract
 
-`glaeda-repository-agent-work-receipt/v1` binds:
+`document_type = glaeda-repository-agent-work-receipt` with `schema_version = 1` binds:
 
 - request digest;
 - exact operation/source;
