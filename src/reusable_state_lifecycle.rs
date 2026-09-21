@@ -366,11 +366,13 @@ impl ReusableStateMetrics {
 
     #[must_use]
     pub fn hit_rate_basis_points(&self) -> u16 {
-        if self.lookups == 0 {
-            0
-        } else {
-            u16::try_from(self.hits.saturating_mul(10_000) / self.lookups).unwrap_or(10_000)
-        }
+        u16::try_from(
+            self.hits
+                .saturating_mul(10_000)
+                .checked_div(self.lookups)
+                .unwrap_or(0),
+        )
+        .unwrap_or(10_000)
     }
 }
 
@@ -724,11 +726,11 @@ impl ReusableStatePromotionPolicy {
             return Err(ReusableStatePolicyError::InvalidPromotionPolicy);
         }
         let metrics = &generation.metrics;
-        let reset_rate = if metrics.lookups == 0 {
-            u64::MAX
-        } else {
-            metrics.reset_invalidation_count.saturating_mul(1_000) / metrics.lookups
-        };
+        let reset_rate = metrics
+            .reset_invalidation_count
+            .saturating_mul(1_000)
+            .checked_div(metrics.lookups)
+            .unwrap_or(u64::MAX);
         Ok(
             generation.publication == ReusableStatePublicationState::Complete
                 && generation.integrity == ReusableStateIntegrityState::Verified
