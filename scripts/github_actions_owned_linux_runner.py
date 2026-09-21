@@ -10,7 +10,7 @@ and cleanup/release reconciliation.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 import argparse
 import fcntl
@@ -233,6 +233,49 @@ def ensure_private_child(parent: Path, name: str) -> Path:
         ):
             raise Refusal("runner state contains an unsafe filesystem object")
     return path
+
+
+def existing_private_child(parent: Path, name: str) -> Path:
+    path = parent / name
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise Refusal("exact runner assignment state is unavailable") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or path.resolve(strict=True) != path
+    ):
+        raise Refusal("runner state contains an unsafe assignment directory")
+    return path
+
+
+@contextmanager
+def launch_fence(directory: Path):
+    path = directory / "launch.lock"
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size != 0
+    ):
+        os.close(descriptor)
+        raise Refusal("runner launch fence is unsafe")
+    lock = os.fdopen(descriptor, "r+b", buffering=0)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
 
 
 def open_lock(directory: Path) -> IO[bytes]:
@@ -517,6 +560,17 @@ def intent_document(request: Request) -> dict[str, object]:
     }
 
 
+def cancellation_document(request: Request) -> dict[str, object]:
+    return {
+        "document_type": "glaeda-owned-linux-jit-runner-cancellation",
+        "schema_version": SCHEMA_VERSION,
+        "phase": "github_cancellation_observed",
+        "identity": base_identity(request),
+        "command_fingerprint": request.fingerprint(),
+        "authorizes_redispatch": False,
+    }
+
+
 def exit_document(
     request: Request,
     terminal: str,
@@ -594,6 +648,7 @@ def run_once(arguments: argparse.Namespace) -> int:
         final_path = command_root / "receipt.json"
         exit_path = command_root / "runner-exit.json"
         intent_path = command_root / "intent.json"
+        cancellation_path = command_root / "cancellation.json"
         final = read_document(final_path)
         if final is not None:
             if not matches_request(final, request):
@@ -610,6 +665,11 @@ def run_once(arguments: argparse.Namespace) -> int:
             if not matches_request(intent, request):
                 raise Refusal("runner intent conflicts with exact attempt")
             raise Refusal("previous runner start is ambiguous; redispatch refused")
+        cancellation = read_document(cancellation_path)
+        if cancellation is not None:
+            if not matches_request(cancellation, request):
+                raise Refusal("runner cancellation conflicts with exact attempt")
+            raise Refusal("cancelled assignment cannot be redispatched")
         if time.time_ns() // 1_000_000 >= request.expires_at_unix_ms:
             raise Refusal("runner attempt is expired")
 
@@ -627,6 +687,19 @@ def run_once(arguments: argparse.Namespace) -> int:
                 secret = read_jit_secret()
                 publish(intent_path, intent_document(request), replace=False)
                 started = time.monotonic()
+                @contextmanager
+                def guarded_launch():
+                    with launch_fence(command_root):
+                        cancellation = read_document(cancellation_path)
+                        if cancellation is not None:
+                            if not matches_request(cancellation, request):
+                                raise Refusal(
+                                    "runner cancellation conflicts with exact attempt"
+                                )
+                            raise Refusal("assignment was cancelled before runner start")
+                        with admission.launch():
+                            yield
+
                 terminal, code, elapsed, settled, output_bytes, output_digest = (
                     owned_task.execute_secret_stdin(
                         sandbox_command(task_root, runner_root, launcher, request),
@@ -634,7 +707,7 @@ def run_once(arguments: argparse.Namespace) -> int:
                         deadline_seconds=DEADLINE_SECONDS,
                         label="github-actions-jit-runner",
                         secret_stdin=secret,
-                        launch_guard=admission.launch,
+                        launch_guard=guarded_launch,
                     )
                 )
                 if not settled:
@@ -662,6 +735,46 @@ def run_once(arguments: argparse.Namespace) -> int:
                         intent_path.unlink()
                     sync_directory(command_root)
                     admission.release()
+
+
+def cancel(arguments: argparse.Namespace) -> int:
+    request = normalize(arguments)
+    state_root = private_directory(arguments.state_root)
+    command_root = existing_private_child(
+        state_root, request.assignment_fingerprint()[7:]
+    )
+    intent_path = command_root / "intent.json"
+    exit_path = command_root / "runner-exit.json"
+    final_path = command_root / "receipt.json"
+    cancellation_path = command_root / "cancellation.json"
+
+    final = read_document(final_path)
+    if final is not None:
+        if not matches_request(final, request):
+            raise Refusal("terminal receipt conflicts with exact runner attempt")
+        raise Refusal("runner attempt is already terminal")
+    existing_exit = read_document(exit_path)
+    if existing_exit is not None:
+        if not matches_request(existing_exit, request):
+            raise Refusal("runner exit receipt conflicts with exact attempt")
+        raise Refusal("runner already exited; continue authoritative settlement")
+    intent = read_document(intent_path)
+    if intent is None or not matches_request(intent, request):
+        raise Refusal("exact runner-start checkpoint is unavailable")
+
+    cancellation = read_document(cancellation_path)
+    if cancellation is None:
+        publish(cancellation_path, cancellation_document(request), replace=False)
+    elif not matches_request(cancellation, request):
+        raise Refusal("runner cancellation conflicts with exact attempt")
+
+    unit = unit_name(request)
+    with launch_fence(command_root):
+        owned_task.stop_unit(unit)
+        if not owned_task.unit_absent(unit):
+            raise Refusal("cancelled runner process tree remains alive")
+    emit(cancellation_document(request))
+    return 0
 
 
 def settle(arguments: argparse.Namespace) -> int:
@@ -736,6 +849,8 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("profile")
     run = commands.add_parser("run")
     add_identity_arguments(run)
+    cancelled = commands.add_parser("cancel")
+    add_identity_arguments(cancelled)
     settled = commands.add_parser("settle")
     add_identity_arguments(settled)
     settled.add_argument(
@@ -771,6 +886,8 @@ def main() -> int:
             return 0
         if arguments.command == "run":
             return run_once(arguments)
+        if arguments.command == "cancel":
+            return cancel(arguments)
         return settle(arguments)
     except (OSError, RuntimeError, tarfile.TarError) as error:
         refuse(error)
