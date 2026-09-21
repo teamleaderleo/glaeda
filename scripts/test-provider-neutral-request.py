@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import unittest
 
 import provider_neutral_request as module
@@ -258,7 +259,7 @@ class ProviderNeutralRequestTests(unittest.TestCase):
 
     def test_noncanonical_request_is_refused(self) -> None:
         value = document()
-        pretty = (module.json.dumps(value, indent=2) + "\n").encode()
+        pretty = (json.dumps(value, indent=2) + "\n").encode()
         with self.assertRaisesRegex(module.ContractRefusal, "canonical"):
             module.decode_request(pretty)
 
