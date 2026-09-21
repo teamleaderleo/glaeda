@@ -700,6 +700,12 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
     cargo_root = exact_directory(arguments.cargo_root, "Cargo root")
     rustup_root = exact_directory(arguments.rustup_root, "rustup root")
     state_root = private_state_directory(arguments.state_root)
+    admission_root = getattr(arguments, "admission_root", None)
+    if (
+        admission_root is not None
+        and Path(admission_root) != owned_admission.CANONICAL_ROOT
+    ):
+        raise Refusal("local admission root does not match the canonical shared owner")
     verify_resident_source(repository_root, request)
     command_root = ensure_private_child(state_root, request.command_fingerprint[7:])
     with open_lock(command_root):
