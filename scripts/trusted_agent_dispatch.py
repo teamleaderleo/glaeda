@@ -569,7 +569,13 @@ def validate_external_terminal(
     receipt: dict[str, object],
     accepted: AcceptedRequest,
 ) -> str:
-    external.validate_replay(receipt, accepted.external_request)
+    try:
+        external.validate_replay(receipt, accepted.external_request)
+    except external.ContractRefusal as error:
+        raise DispatchRefusal(
+            "invalid_external_receipt",
+            str(error),
+        ) from error
     terminal = receipt.get("state")
     if terminal not in TERMINAL_EXTERNAL_STATES:
         raise DispatchRefusal(
