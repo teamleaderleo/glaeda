@@ -571,7 +571,7 @@ class ResidentSnapshotSigningAndTransportTests(unittest.TestCase):
             os_class="macos",
             architecture="arm64",
         )
-        update_time = BASE_TIME + dt.timedelta(seconds=30)
+        update_time = BASE_TIME + dt.timedelta(seconds=10)
         new_b = self.signed_for(
             current_trust,
             key_b,
