@@ -88,9 +88,54 @@ class TrustedDispatchTests(unittest.TestCase):
             item.accepted_document["caller"]["principal"],
             PRINCIPAL,
         )
+        compiled = external.compile_request(item.external_request)
+        self.assertEqual(
+            item.accepted_document["workload_command_fingerprint"],
+            compiled.internal.command_fingerprint,
+        )
+        self.assertEqual(
+            item.accepted_document["semantic_request_id"],
+            dispatch.semantic_request_id(item.request),
+        )
         self.assertLessEqual(
             len(dispatch.canonical_bytes(item.accepted_document) + b"\n"),
             4096,
+        )
+
+    def test_same_external_id_is_partitioned_by_caller_namespace(self) -> None:
+        first = accepted()
+        replay = accepted()
+        self.assertEqual(
+            first.accepted_document["semantic_request_id"],
+            replay.accepted_document["semantic_request_id"],
+        )
+        self.assertEqual(
+            first.accepted_document["workload_command_fingerprint"],
+            replay.accepted_document["workload_command_fingerprint"],
+        )
+
+        changed = base_document()
+        changed["caller"] = {
+            "principal": "cmux-ci:teamleaderleo/glaeda",
+            "provenance_binding": "cmux-controller:reviewed-local",
+        }
+        changed["request_fingerprint"] = dispatch.fingerprint_document(changed)
+        request = dispatch.decode_request(raw(changed), now=NOW)
+        other = dispatch.accept_request(
+            request,
+            dispatch.ProvenanceEvidence(
+                "cmux-ci:teamleaderleo/glaeda",
+                "cmux-controller:reviewed-local",
+            ),
+        )
+        self.assertEqual(first.request.request_id, other.request.request_id)
+        self.assertNotEqual(
+            first.accepted_document["semantic_request_id"],
+            other.accepted_document["semantic_request_id"],
+        )
+        self.assertNotEqual(
+            first.accepted_document["workload_command_fingerprint"],
+            other.accepted_document["workload_command_fingerprint"],
         )
 
     def test_transport_projection_gets_the_same_deterministic_identity(self) -> None:
