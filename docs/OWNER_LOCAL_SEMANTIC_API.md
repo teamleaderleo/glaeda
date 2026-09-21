@@ -174,6 +174,51 @@ cleanup_incomplete
 `receipt.inspect` is the thin-connector name for validating this closed receipt. The implementation
 is `inspect_receipt()`; inspection grants no replay, cleanup or execution authority.
 
+## Direct local adapter
+
+`scripts/owner_local_dispatch.py` is the local owner/CLI front door. It reads one canonical
+`glaeda-semantic-request/v1` from stdin and returns one semantic receipt. It accepts no cwd,
+executable, host path, environment, credential, mount, cgroup, sudo or shell field.
+
+The fixed local installation file is
+`~/.config/glaeda/owner-local-v1.json`, mode `0600`, owned by the local account. It binds reviewed
+repository identities to resident checkout paths and names the installed `glaeda-repo-query`
+binary. Those bindings are machine-owner configuration and never appear in the remote request.
+
+Example local installation shape:
+
+```json
+{
+  "document_type": "glaeda-owner-local-installation",
+  "schema_version": 1,
+  "repo_query_program": "/operator/installed/glaeda-repo-query",
+  "repositories": [
+    {
+      "repository": "teamleaderleo/glaeda",
+      "checkout": "/operator/resident/glaeda"
+    }
+  ]
+}
+```
+
+Operation behavior is composition only:
+
+- `capabilities` returns from the pure semantic contract and needs no installation file;
+- `status` invokes the existing read-only owned-admission observer and needs no repository binding;
+- `repo_query` invokes only the installed `glaeda-repo-query` with fixed argv derived from the
+  semantic source/base/patch ceiling and the local repository binding;
+- `verify_named` pre-observes owned admission, then invokes the existing `verify-focused` front
+  door with Glaeda-resolved profile generation and command fingerprint.
+
+New accepted Git requests and local requests use the same fixed
+`provider-neutral-verify-v1` verifier state family. Sharing the same accepted semantic request id
+therefore reaches the same verifier receipt/intent identity; separate request ids remain separate
+physical work. Legacy pre-#967 Git launch journals keep their old state family for reconcile-only
+compatibility.
+
+A future MCP/connector adapter only authenticates the owner, serializes this semantic request, sends
+it to the fixed local front door, and returns the receipt. It gains no local path or process API.
+
 ## Transport adapters
 
 A transport compiles into the same semantic request and returns the same semantic receipt.
@@ -210,7 +255,8 @@ with Glaeda.
 | node held | status reports wait/refusal; fresh verification does not launch |
 | node draining | status reports wait; fresh verification does not launch |
 | node pressured/capacity-limited | status reports wait; fresh verification does not launch |
-| requested resident source unavailable/cold | physical adapter refuses/waits according to its reviewed source contract |
+| node offline | Git request stays durable/pending; direct connector/CLI reports transport unavailability; no physical state transition is inferred |
+| requested resident source unavailable/cold | local adapter refuses without fetching, cloning or selecting another checkout |
 | duplicate exact request | replay the matching receipt |
 | request id reused with drifted semantics | refuse `request_conflict` |
 | surviving intent without terminal truth | return `ambiguous`; never infer permission to redispatch |
@@ -221,9 +267,10 @@ uncertain attempt.
 ## Physical dogfood
 
 The direct Git transport has already demonstrated named focused verification through the existing
-Glaeda verifier without a GitHub Actions allocation. #1054 and the #967 dispatch integration now own
-the authenticated Git lifecycle above this semantic seam. The next same-semantics comparison should
-carry one explicit accepted semantic `request_id` through:
+Glaeda verifier without a GitHub Actions allocation. #1054 and the #967 dispatch integration own
+the authenticated Git lifecycle above this semantic seam; the local adapter now exposes the same
+semantic operation family without GitHub. The next same-semantics comparison should carry one
+explicit accepted semantic `request_id` through:
 
 1. direct Git/owner-local dispatch;
 2. GitHub Actions using the same named verification operation and exact source;
