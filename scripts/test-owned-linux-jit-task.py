@@ -42,6 +42,8 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
         self.task_root = self.tasks / ("a" * 32)
         self.fingerprint = "sha256:" + "b" * 64
         self.binding = "sha256:" + "c" * 64
+        self.available_memory = 24 * 1024**3
+        self.logical_cpus = 16
         self.policy = {
             "schema_version": 1,
             "generation": "d" * 64,
@@ -66,8 +68,8 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
                 "authority": "observation_only",
                 "scope": "current_execution_context",
                 "observed_at_unix_millis": time.time_ns() // 1_000_000,
-                "memory": {"available_bytes": 24 * 1024**3},
-                "cpu": {"logical_cpus": 16},
+                "memory": {"available_bytes": self.available_memory},
+                "cpu": {"logical_cpus": self.logical_cpus},
                 "pressure": {kind: {"avg10_micros": 0} for kind in ("cpu", "memory", "io")},
             }
         observation = json.loads(raw)["observation"]
@@ -141,7 +143,7 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
         self.assertEqual(command[env_index + 1], "-i")
         return ("succeeded", 0, 1.25, True, 731, "sha256:" + "1" * 64)
 
-    def test_prepare_is_durable_private_and_duplicate_refuses(self):
+    def test_prepare_is_private_and_exact_restart_is_idempotent(self):
         receipt = self.prepare()
         self.assertRegex(receipt["task_identity_sha256"], r"^sha256:[0-9a-f]{64}$")
         self.assertEqual(receipt["profile"], jit.PROFILE)
@@ -149,8 +151,61 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
         self.assertEqual((self.task_root / "task.json").stat().st_mode & 0o777, 0o600)
         for name in ("work", "diag", "home"):
             self.assertEqual((self.task_root / name).stat().st_mode & 0o777, 0o700)
-        with self.assertRaisesRegex(task.Refusal, "exact recovery"):
-            jit.prepare(self.args("prepare"))
+        replay = []
+        with mock.patch.object(jit, "emit", side_effect=replay.append):
+            self.assertEqual(jit.prepare(self.args("prepare")), 0)
+        self.assertEqual(replay[0]["task_identity_sha256"], receipt["task_identity_sha256"])
+
+    def test_different_assignment_cannot_reuse_preparing_reservation(self):
+        self.prepare()
+        for field, value in (
+            ("binding_sha256", "sha256:" + "9" * 64),
+            ("command_fingerprint", "sha256:" + "8" * 64),
+        ):
+            arguments = self.args("prepare")
+            setattr(arguments, field, value)
+            with self.subTest(field=field):
+                with self.assertRaises(task.Refusal):
+                    jit.prepare(arguments)
+        self.assertTrue((self.admission / "reservation.json").exists())
+        self.assertTrue(self.task_root.exists())
+
+    def test_controller_restart_repairs_bounded_partial_preparation(self):
+        arguments = self.args("prepare")
+        reservation = admission.Reservation(
+            arguments.admission_root,
+            arguments.command_fingerprint,
+            arguments.unit,
+            arguments.binding_sha256,
+        )
+        with reservation:
+            pass
+        task.prepare_task(self.task_root)
+        (self.task_root / "work").mkdir(mode=0o700)
+        receipt = []
+        with mock.patch.object(jit, "emit", side_effect=receipt.append):
+            self.assertEqual(jit.prepare(arguments), 0)
+        self.assertEqual(receipt[0]["reservation_phase"], "preparing")
+        for name in ("work", "diag", "home"):
+            self.assertEqual((self.task_root / name).stat().st_mode & 0o777, 0o700)
+        self.assertEqual((self.task_root / "task.json").stat().st_mode & 0o777, 0o600)
+
+    def test_unknown_partial_state_refuses_repair_and_preserves_reservation(self):
+        arguments = self.args("prepare")
+        reservation = admission.Reservation(
+            arguments.admission_root,
+            arguments.command_fingerprint,
+            arguments.unit,
+            arguments.binding_sha256,
+        )
+        with reservation:
+            pass
+        task.prepare_task(self.task_root)
+        (self.task_root / "unexpected").write_text("foreign")
+        with self.assertRaisesRegex(task.Refusal, "unknown state"):
+            jit.prepare(arguments)
+        self.assertTrue((self.admission / "reservation.json").exists())
+        self.assertTrue((self.task_root / "unexpected").exists())
 
     def test_controller_restart_resumes_exact_preparation_and_keeps_capacity(self):
         prepared = self.prepare()
@@ -216,6 +271,28 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
                 with self.assertRaisesRegex(task.Refusal, "deadline"):
                     jit.launch(arguments)
                 execute.assert_not_called()
+
+    def test_insufficient_resource_admission_refuses_before_task_creation(self):
+        self.available_memory = 8 * 1024**3
+        with self.assertRaisesRegex(admission.Deferred, "capacity unavailable"):
+            jit.prepare(self.args("prepare"))
+        self.assertFalse(self.task_root.exists())
+        self.assertFalse((self.admission / "reservation.json").exists())
+
+    def test_probe_distinguishes_exact_preparing_and_absent(self):
+        self.prepare()
+        emitted = []
+        with mock.patch.object(jit, "emit", side_effect=emitted.append):
+            self.assertEqual(jit.probe(self.args("probe")), 0)
+        self.assertEqual(emitted[0]["state"], "present")
+        self.assertEqual(emitted[0]["reservation_phase"], "preparing")
+        with mock.patch.object(task, "unit_absent", return_value=True), mock.patch.object(jit, "emit"):
+            self.assertEqual(jit.cleanup(self.args("cleanup")), 0)
+        emitted = []
+        with mock.patch.object(jit, "emit", side_effect=emitted.append):
+            self.assertEqual(jit.probe(self.args("probe")), 0)
+        self.assertEqual(emitted[0]["state"], "absent")
+        self.assertIsNone(emitted[0]["reservation_phase"])
 
     def test_hold_and_drain_refuse_prepare_before_task_creation(self):
         for state in ("held", "draining"):
