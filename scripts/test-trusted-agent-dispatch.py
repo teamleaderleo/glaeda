@@ -97,7 +97,12 @@ class TrustedDispatchTests(unittest.TestCase):
         item = accepted()
         semantic_id = item.accepted_document["semantic_request_id"]
         self.assertRegex(semantic_id, r"^accepted-[a-f0-9]{55}$")
+        self.assertEqual(item.semantic_request.request_id, semantic_id)
         self.assertEqual(item.external_request.semantic_request_id, semantic_id)
+        self.assertEqual(
+            item.accepted_document["semantic_request_sha256"],
+            item.semantic_request_sha256,
+        )
 
         changed = base_document()
         changed["request_id"] = "dispatch-967-proof-two"
