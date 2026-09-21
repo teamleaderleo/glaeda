@@ -16,6 +16,7 @@ B = "sha256:" + "b" * 64
 def observation(platform="macos", failed=()):
     checks = {
         "supportedOs": True,
+        "hardwareCapability": True,
         "git": True,
         "glaedaExecutable": True,
         "diskAdmission": True,
@@ -83,6 +84,40 @@ class Tests(unittest.TestCase):
                 ["cmux_macos_test"],
                 "cmux-linux-ci-medium",
             )
+
+    def test_reviewed_hardware_classes_have_minimums(self):
+        self.assertTrue(
+            b.hardware_class_ready(
+                "macos",
+                "cmux-mac-build-large",
+                8,
+                16,
+            )
+        )
+        self.assertFalse(
+            b.hardware_class_ready(
+                "macos",
+                "cmux-mac-build-large",
+                4,
+                16,
+            )
+        )
+        self.assertTrue(
+            b.hardware_class_ready(
+                "linux",
+                "cmux-linux-ci-medium",
+                4,
+                8,
+            )
+        )
+        self.assertFalse(
+            b.hardware_class_ready(
+                "linux",
+                "unknown",
+                64,
+                256,
+            )
+        )
 
     def test_power_posture_parser(self):
         raw = (
