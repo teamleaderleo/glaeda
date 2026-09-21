@@ -10,9 +10,6 @@
   "supportedToolchainGenerations": [
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   ],
-  "roleWorkloadGenerations": {
-    "cmux_macos_native_build": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-  },
   "allowedExecutionRoles": [
     "cmux_macos_native_build"
   ],
@@ -20,5 +17,11 @@
   "enrollmentGeneration": 1,
   "glaedaGeneration": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "state": "enrolling",
-  "quarantineReason": null
+  "quarantineReason": null,
+  "roleProfiles": {
+    "cmux_macos_native_build": {
+      "id": "cmux.macos.dev-check",
+      "generation": 1
+    }
+  }
 }
