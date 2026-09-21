@@ -1374,16 +1374,16 @@ def main() -> int:
                 )
             )
         elif args.command == "accept-local":
-            emit(
-                accept_local(
-                    args.enrollment,
-                    args.cmux_root,
-                    args.glaeda,
-                    args.role,
-                    args.cache_root,
-                    args.min_free_gib,
-                )
+            receipt = accept_local(
+                args.enrollment,
+                args.cmux_root,
+                args.glaeda,
+                args.role,
+                args.cache_root,
+                args.min_free_gib,
             )
+            emit(receipt)
+            return 0 if receipt["result"] == "accepted" else 1
         elif args.command == "finalize-acceptance":
             cmux_result, cmux_result_sha256 = load_cmux_semantic_result(args.cmux_result)
             post_bootstrap = load(args.post_bootstrap)
