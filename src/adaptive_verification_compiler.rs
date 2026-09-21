@@ -10,6 +10,8 @@ use std::fmt;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
+use crate::reusable_state_lifecycle::ReusableStateClass;
+
 pub const ADAPTIVE_VERIFICATION_COMPILER_SCHEMA_VERSION: u8 = 1;
 pub const MAX_VERIFICATION_OBSERVATIONS: usize = 512;
 pub const MAX_OPTIMIZATION_EXPERIMENTS: usize = 64;
@@ -141,6 +143,28 @@ impl OptimizationClass {
                 | Self::RunTestWithoutRebuild
         )
     }
+
+    /// Map reusable-work recommendations into the shared #21 reusable-state family vocabulary.
+    ///
+    /// This mapping grants no publication or consumption authority. A physical generation still
+    /// starts in `reusable_state_lifecycle` under a reviewed publisher and its full identity
+    /// contract.
+    #[must_use]
+    pub const fn reusable_state_class(self) -> Option<ReusableStateClass> {
+        match self {
+            Self::ReuseExactCompiledProduct
+            | Self::RetainLocalImmutableArtifact
+            | Self::SplitConsumerArtifact
+            | Self::RunTestWithoutRebuild => Some(ReusableStateClass::ImmutableCompiledProduct),
+            Self::ReuseDependencyGeneration | Self::BakePreparedTool => {
+                Some(ReusableStateClass::PreparedDependencyGeneration)
+            }
+            Self::MoveStaticGuardEarlier
+            | Self::ParallelizeIndependentChecks
+            | Self::IsolateFlakyOrHangingSuite
+            | Self::SkipIrrelevantPlatformLane => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -187,7 +211,8 @@ pub enum OptimizationNextAction {
     StateExactValidityInputs,
     RunControlledAb,
     GatherCompatibleTrials,
-    ReuseOnExactFingerprint,
+    HandOffToReusableStateLifecycle,
+    EmitRepositoryRecommendation,
     InvestigateRegression,
     None,
 }
@@ -198,8 +223,11 @@ impl OptimizationNextAction {
             Self::StateExactValidityInputs => "state the missing exact validity inputs",
             Self::RunControlledAb => "run a controlled A/B comparison",
             Self::GatherCompatibleTrials => "gather additional compatible controlled trials",
-            Self::ReuseOnExactFingerprint => {
-                "reuse only on the exact validity fingerprint and keep measuring"
+            Self::HandOffToReusableStateLifecycle => {
+                "hand the exact candidate to the shared reusable-state lifecycle"
+            }
+            Self::EmitRepositoryRecommendation => {
+                "emit the repository-side recommendation; keep workflow mutation manual"
             }
             Self::InvestigateRegression => "fall back and investigate the measured regression",
             Self::None => "no further action",
@@ -842,6 +870,8 @@ pub struct OptimizationCandidate {
     class: OptimizationClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     subject_identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reusable_state_class: Option<ReusableStateClass>,
     lifecycle: OptimizationLifecycle,
     confidence: OptimizationConfidence,
     validity: ValidityFingerprint,
@@ -860,6 +890,11 @@ impl OptimizationCandidate {
     #[must_use]
     pub const fn class(&self) -> OptimizationClass {
         self.class
+    }
+
+    #[must_use]
+    pub const fn reusable_state_class(&self) -> Option<ReusableStateClass> {
+        self.reusable_state_class
     }
 
     #[must_use]
@@ -1569,6 +1604,7 @@ fn build_candidate(
         candidate_id,
         class,
         subject_identity,
+        reusable_state_class: class.reusable_state_class(),
         lifecycle,
         confidence,
         validity,
@@ -1716,10 +1752,15 @@ fn decide_lifecycle(
         })
         .count();
     if successful_controlled >= 3 {
+        let next_action = if class.requires_exact_validity() {
+            OptimizationNextAction::HandOffToReusableStateLifecycle
+        } else {
+            OptimizationNextAction::EmitRepositoryRecommendation
+        };
         (
             OptimizationLifecycle::Preferred,
             OptimizationConfidence::PreferredEvidence,
-            OptimizationNextAction::ReuseOnExactFingerprint,
+            next_action,
         )
     } else if successful_controlled >= 2 {
         (
@@ -2752,6 +2793,7 @@ mod tests {
         assert!(human.contains("restore/transfer overhead:"));
         assert!(json.contains("\"document_type\": \"adaptive_verification_compiler_receipt\""));
         assert!(json.contains("\"validity\""));
+        assert!(json.contains("\"reusable_state_class\": \"immutable_compiled_product\""));
         assert!(json.contains("\"missing_cost_inputs\""));
     }
 
