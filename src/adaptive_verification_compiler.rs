@@ -678,6 +678,8 @@ pub struct OptimizationExperiment {
     class: OptimizationClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     subject_identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bound_candidate_id: Option<String>,
     baseline_elapsed_millis: u64,
     candidate_elapsed_millis: u64,
     restore_transfer_overhead_millis: u64,
@@ -745,6 +747,7 @@ impl OptimizationExperiment {
             profile: profile.to_owned(),
             class,
             subject_identity: subject_identity.map(str::to_owned),
+            bound_candidate_id: None,
             baseline_elapsed_millis,
             candidate_elapsed_millis,
             restore_transfer_overhead_millis,
@@ -758,6 +761,33 @@ impl OptimizationExperiment {
             controlled,
             evidence_ref: evidence_ref.to_owned(),
         })
+    }
+
+    /// Bind this trial to one exact deterministic candidate identity.
+    ///
+    /// Unbound trials remain retained receipt evidence but carry zero lifecycle-promotion authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded public error for an invalid candidate identity.
+    pub fn bind_candidate(
+        mut self,
+        candidate_id: &str,
+    ) -> Result<Self, AdaptiveVerificationCompilerError> {
+        validate_label(candidate_id)?;
+        if !candidate_id.starts_with("avc-") {
+            return Err(error(
+                "verification_candidate_binding_invalid",
+                "experiment candidate binding must use an adaptive compiler candidate identity",
+            ));
+        }
+        self.bound_candidate_id = Some(candidate_id.to_owned());
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn bound_candidate_id(&self) -> Option<&str> {
+        self.bound_candidate_id.as_deref()
     }
 
     fn net_gain_millis(&self) -> i64 {
@@ -1636,14 +1666,17 @@ fn build_candidate(
     evidence.dedup_by(|left, right| left.observation_id == right.observation_id);
 
     let validity = build_validity(class, &evidence);
+    let candidate_id = candidate_id(
+        class,
+        subject_identity.as_deref(),
+        validity.fingerprint.as_deref(),
+        &evidence,
+    );
     let matched_experiments = experiments
         .iter()
         .filter(|experiment| {
             experiment.class == class
-                && experiment
-                    .subject_identity
-                    .as_deref()
-                    .is_none_or(|subject| subject_identity.as_deref() == Some(subject))
+                && experiment.bound_candidate_id.as_deref() == Some(candidate_id.as_str())
         })
         .collect::<Vec<_>>();
     let experiment_summary = summarize_experiments(&matched_experiments);
@@ -1651,12 +1684,6 @@ fn build_candidate(
         decide_lifecycle(class, &validity, &matched_experiments);
     let utility = estimate_utility(class, subject_identity.as_deref(), &evidence, observations);
 
-    let candidate_id = candidate_id(
-        class,
-        subject_identity.as_deref(),
-        validity.fingerprint.as_deref(),
-        &evidence,
-    );
     OptimizationCandidate {
         candidate_id,
         class,
