@@ -222,7 +222,7 @@ jobs:
               echo "filesystem=$fs"
               echo "source_commit=$SOURCE_COMMIT"
               echo "source_tree=$(git -C "$SOURCE" rev-parse HEAD^{tree})"
-              echo "source_manifest_package_manager=$(python3 -c 'import json; print(json.load(open(\"target-src/package.json\"))["packageManager"])\')"
+              echo "source_manifest_package_manager=$(cd "$SOURCE" && node -p 'require("./package.json").packageManager || ""')"
               echo "glaeda_commit=$(git rev-parse HEAD)"
               echo "kernel=$(uname -srvm)"
               echo "git=$(git --version)"
