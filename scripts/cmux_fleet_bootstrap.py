@@ -104,6 +104,14 @@ def disk_free_gib(path: Path) -> int:
     return shutil.disk_usage(path).free // (1024**3)
 
 
+def role_workload_generations(cmux_root: Path, roles: list[str]) -> dict[str, str]:
+    workload = cmux_root / "scripts/fleet_acceptance.py"
+    if not workload.is_file():
+        raise BootstrapError("CMUX fleet acceptance workload is unavailable")
+    generation = digest_file(workload)
+    return {role: generation for role in sorted(set(roles))}
+
+
 def mac_sleep_disabled_on_ac(raw: str) -> bool:
     in_ac = False
     for line in raw.splitlines():
@@ -469,6 +477,17 @@ def evaluate(
         or any(type(value) is not bool for value in checks.values())
     ):
         raise BootstrapError("bootstrap checks are invalid")
+    workload_generations = observation.get("roleWorkloadGenerations")
+    if (
+        not isinstance(workload_generations, dict)
+        or set(workload_generations) != set(roles)
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+            for value in workload_generations.values()
+        )
+    ):
+        raise BootstrapError("role workload generations are invalid")
     failures = sorted(key for key, passed in checks.items() if not passed)
     result = {
         "schema": SCHEMA,
@@ -479,6 +498,7 @@ def evaluate(
         "roles": roles,
         "glaedaGeneration": observation["glaedaGeneration"],
         "toolchainGeneration": observation["toolchainGeneration"],
+        "roleWorkloadGenerations": workload_generations,
         "checks": checks,
         "observed": observation.get("observed", {}),
         "eligibleForEnrollment": not failures,
@@ -546,6 +566,10 @@ def main() -> int:
                 args.role,
                 args.hardware_class,
             )
+        )
+        observation["roleWorkloadGenerations"] = role_workload_generations(
+            cmux_root,
+            args.role,
         )
         sys.stdout.buffer.write(
             canonical(evaluate(observation, args.role, args.hardware_class))
