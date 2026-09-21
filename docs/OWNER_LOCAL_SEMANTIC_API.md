@@ -77,11 +77,22 @@ The canonical request bytes also produce `request_sha256`.
 Rules:
 
 - same `request_id` + same canonical semantics may replay one existing receipt;
-- same `request_id` + different semantics is `request_conflict`;
+- same `request_id` + different source/profile semantics is `request_conflict` for source-executing work;
 - different request ids remain different physical work even when source/profile bytes happen to
   match;
 - two transports share physical work only when both deliberately carry the same accepted Glaeda
   `request_id` and the same request digest.
+
+For `verify_named`, Glaeda durably binds the accepted semantic request id to the resolved physical
+command fingerprint, exact source, and profile in the shared provider-neutral verifier state **before**
+returning an admission wait. The verifier repeats that binding check at its launch boundary. Exact
+replay keeps the binding; drift fails closed. The direct Git bridge and owner-local adapter use the
+same verifier state family, so an intentionally shared accepted request identity converges on the
+same physical receipt instead of relying on transport-local inference.
+
+Read-only `capabilities`, `status`, and `repo_query` remain repeatable observations and do not create
+a physical execution binding. Their receipts still carry request identity/digest for client-side
+correlation and replay validation.
 
 For `verify_named`, the semantic request compiles through #1050's reviewed
 `verify-focused/v1` adapter. The accepted semantic request identity is included in the verifier
@@ -118,12 +129,13 @@ The semantic request names exact repository/base/head/tree identities and a boun
 A host adapter invokes the existing fixed `glaeda-repo-query` / `repo-query/v1` implementation
 against its operator-owned resident checkout mapping.
 
-The semantic layer accepts only a matching typed report:
+The local adapter maps semantic `owner/repo` identity into repo-query's canonical
+`github.com/owner/repo` project identity. The semantic layer accepts only a matching typed report:
 
 - `document_type=glaeda-resident-repo-query`;
 - `profile_id=repo-query/v1`;
 - `authority=observation_only`;
-- exact requested repository/base/head/tree;
+- exact canonical project plus requested base/head/tree;
 - bounded result bytes.
 
 No Git argv, ref, fetch, remote URL or checkout path enters the semantic request.
@@ -172,7 +184,9 @@ cleanup_incomplete
 ```
 
 `receipt.inspect` is the thin-connector name for validating this closed receipt. The implementation
-is `inspect_receipt()`; inspection grants no replay, cleanup or execution authority.
+is `inspect_receipt()`; it validates the operation-specific resolved contract and typed result,
+recomputes the result digest, and recomputes the semantic request digest whenever the receipt carries
+enough accepted semantics to do so. Inspection grants no replay, cleanup or execution authority.
 
 ## Direct local adapter
 
@@ -208,8 +222,9 @@ Operation behavior is composition only:
 - `status` invokes the existing read-only owned-admission observer and needs no repository binding;
 - `repo_query` invokes only the installed `glaeda-repo-query` with fixed argv derived from the
   semantic source/base/patch ceiling and the local repository binding;
-- `verify_named` pre-observes owned admission, then invokes the existing `verify-focused` front
-  door with Glaeda-resolved profile generation and command fingerprint.
+- `verify_named` first durably binds the accepted semantic request identity, pre-observes owned
+  admission, then invokes the existing `verify-focused` front door with the same semantic id,
+  Glaeda-resolved profile generation and command fingerprint.
 
 New accepted Git requests and local requests use the same fixed
 `provider-neutral-verify-v1` verifier state family. Sharing the same accepted semantic request id
@@ -258,8 +273,8 @@ with Glaeda.
 | node pressured/capacity-limited | status reports wait; fresh verification does not launch |
 | node offline | Git request stays durable/pending; direct connector/CLI reports transport unavailability; no physical state transition is inferred |
 | requested resident source unavailable/cold | local adapter refuses without fetching, cloning or selecting another checkout |
-| duplicate exact request | replay the matching receipt |
-| request id reused with drifted semantics | refuse `request_conflict` |
+| duplicate exact source-executing request | shared semantic binding + verifier state replay the matching physical receipt |
+| source-executing request id reused with drifted semantics | refuse `request_conflict` before a fresh launch |
 | surviving intent without terminal truth | return `ambiguous`; never infer permission to redispatch |
 
 Transport loss never changes the physical admission state. A transport retry cannot create a second
