@@ -54,7 +54,7 @@ States are:
 
 Supported recovery paths also include `draining -> eligible` and `quarantined -> enrolling`. Every transition into `eligible` requires at least one current accepted role receipt. Leaving quarantine advances the enrollment generation, so every pre-quarantine acceptance receipt becomes stale immediately.
 
-Automatic routing reads `scripts/cmux-fleet status`. A node in `draining`, `quarantined`, or `retired` produces zero eligible roles even when an older acceptance receipt exists. An `eligible` node still produces zero eligible roles when its acceptance evidence is absent, rejected, or stale.
+Automatic routing reads `scripts/cmux-fleet status`. The status projection includes only bounded architecture, OS class, hardware class, accepted toolchain generations, Glaeda generation, fleet scope, lifecycle state, and per-role eligibility. A node in `draining`, `quarantined`, or `retired` produces zero eligible roles even when an older acceptance receipt exists. An `eligible` node still produces zero eligible roles when its acceptance evidence is absent, rejected, or stale. Live pressure/heat remains a separate fresh local admission veto: #970 may publish advisory bounded snapshots, while #546/local execution admission re-observes the machine before dispatch. A fleet status record never overrides disk, memory, pressure, service, or operator holds observed locally.
 
 Reviewed quarantine reasons are:
 
