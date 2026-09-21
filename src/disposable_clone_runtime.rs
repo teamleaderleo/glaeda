@@ -1055,6 +1055,43 @@ impl ConfirmedDisposableWorker {
     }
 }
 
+impl crate::disposable_runner_runtime::DisposableRunnerTargetRuntime
+    for DisposableCloneRuntime
+{
+    type Confirmation = ConfirmedDisposableWorker;
+
+    fn confirm_runner_target(
+        &self,
+        reservation: &DisposableAttemptReservation,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<
+        Self::Confirmation,
+        crate::disposable_runner_runtime::DisposableRunnerRuntimeError,
+    > {
+        self.confirm_ready_worker(reservation, executor, clock)
+            .map_err(|_| {
+                crate::disposable_runner_runtime::DisposableRunnerRuntimeError::observation(
+                    "runner_target_not_ready",
+                )
+            })
+    }
+
+    fn reconfirm_runner_target(
+        &self,
+        confirmation: &Self::Confirmation,
+        _reservation: &DisposableAttemptReservation,
+        _executor: &impl TimedCommandExecutor,
+        _clock: &impl CloneRuntimeClock,
+    ) -> Result<(), crate::disposable_runner_runtime::DisposableRunnerRuntimeError> {
+        confirmation.confirm_current().map_err(|_| {
+            crate::disposable_runner_runtime::DisposableRunnerRuntimeError::observation(
+                "runner_target_identity_drift",
+            )
+        })
+    }
+}
+
 pub(crate) trait CloneRuntimeClock: LimaObservationClock {
     fn epoch_millis(&self) -> io::Result<EpochMillis>;
 }
