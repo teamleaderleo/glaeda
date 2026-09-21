@@ -4,7 +4,7 @@
 //! semantic validation, execution truth, publication mechanics, locking, and deletion authority.
 //! This layer answers whether an exact generation has earned reuse and retention.
 
-use std::{cmp::Ordering, fmt};
+use std::{cmp::Ordering, collections::{BTreeMap, BTreeSet}, fmt};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -12,9 +12,6 @@ use sha2::{Digest, Sha256};
 use crate::artifact::{RepositoryRef, Sha256Digest};
 
 pub const REUSABLE_STATE_LIFECYCLE_SCHEMA_VERSION: u8 = 1;
-pub const MAX_REUSABLE_STATE_BYTES: u64 = 1 << 50;
-pub const MAX_REUSABLE_STATE_GENERATIONS_PER_PLAN: usize = 256;
-pub const MAX_REUSABLE_STATE_EVICTIONS_PER_PASS: usize = 64;
 const MAX_METRIC: u64 = 1_000_000_000_000;
 const MAX_DURATION_MILLIS: u64 = 365 * 24 * 60 * 60 * 1_000;
 const HOUR_MILLIS: u64 = 60 * 60 * 1_000;
@@ -315,12 +312,6 @@ impl ReusableStateMetrics {
             if duration > MAX_DURATION_MILLIS {
                 return Err(ReusableStatePolicyError::MetricOutOfRange);
             }
-        }
-        if [self.bytes_read, self.bytes_written, self.storage_size_bytes]
-            .into_iter()
-            .any(|bytes| bytes > MAX_REUSABLE_STATE_BYTES)
-        {
-            return Err(ReusableStatePolicyError::MetricOutOfRange);
         }
         Ok(())
     }
@@ -880,6 +871,131 @@ pub fn evaluate_reusable_state_consumption(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReusableStateSupersession {
+    pub cache_class: ReusableStateClass,
+    pub predecessor: ReusableStateGenerationId,
+    pub successor: ReusableStateGenerationId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReusableStateSupersessionDisposition {
+    AutomaticCleanup,
+    DeferredInUse,
+    PreserveNonReconstructible,
+    PreserveUniqueLocalWork,
+    PreserveMustRetain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReusableStateSupersessionEntry {
+    pub cache_class: ReusableStateClass,
+    pub predecessor: ReusableStateGenerationId,
+    pub successor: ReusableStateGenerationId,
+    pub disposition: ReusableStateSupersessionDisposition,
+    pub storage_size_bytes: u64,
+    pub in_use_consumers: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReusableStateSupersessionPlan {
+    pub schema_version: u8,
+    pub selected_bytes: u64,
+    pub entries: Vec<ReusableStateSupersessionEntry>,
+}
+
+/// Plan unattended cleanup for explicit family-owned supersession edges.
+///
+/// A family owner must name the exact predecessor and successor. This layer never infers
+/// supersession from age, path, mutable labels, source proximity, or directory presence. A healthy
+/// preferred successor is required before the predecessor can become cleanup-eligible. Physical
+/// deletion remains with the family executor and must re-check its leases/identity immediately
+/// before whole-generation retirement.
+///
+/// # Errors
+///
+/// Returns an error for duplicate generation identities, malformed supersession edges, a missing
+/// generation, a class mismatch, an unavailable successor, or byte-accounting overflow.
+pub fn plan_reusable_state_supersession_cleanup(
+    generations: &[ReusableStateGeneration],
+    supersessions: &[ReusableStateSupersession],
+) -> Result<ReusableStateSupersessionPlan, ReusableStatePolicyError> {
+    let mut by_id = BTreeMap::new();
+    for generation in generations {
+        if by_id
+            .insert(generation.generation.clone(), generation)
+            .is_some()
+        {
+            return Err(ReusableStatePolicyError::DuplicateGeneration);
+        }
+    }
+
+    let mut seen_predecessors = BTreeSet::new();
+    let mut selected_bytes = 0_u64;
+    let mut entries = Vec::with_capacity(supersessions.len());
+
+    for supersession in supersessions {
+        if supersession.predecessor == supersession.successor
+            || !seen_predecessors.insert(supersession.predecessor.clone())
+        {
+            return Err(ReusableStatePolicyError::InvalidSupersession);
+        }
+        let predecessor = by_id
+            .get(&supersession.predecessor)
+            .ok_or(ReusableStatePolicyError::SupersessionGenerationMissing)?;
+        let successor = by_id
+            .get(&supersession.successor)
+            .ok_or(ReusableStatePolicyError::SupersessionGenerationMissing)?;
+        if predecessor.identity.state_class != supersession.cache_class
+            || successor.identity.state_class != supersession.cache_class
+        {
+            return Err(ReusableStatePolicyError::SupersessionClassMismatch);
+        }
+        if successor.lifecycle != ReusableStateLifecycle::Preferred
+            || successor.publication != ReusableStatePublicationState::Complete
+            || successor.integrity != ReusableStateIntegrityState::Verified
+            || successor.revalidation_required
+        {
+            return Err(ReusableStatePolicyError::SupersessionSuccessorUnavailable);
+        }
+
+        let retention = predecessor.retention;
+        let disposition = if retention.unique_local_work {
+            ReusableStateSupersessionDisposition::PreserveUniqueLocalWork
+        } else if retention.must_retain {
+            ReusableStateSupersessionDisposition::PreserveMustRetain
+        } else if !retention.reconstructible {
+            ReusableStateSupersessionDisposition::PreserveNonReconstructible
+        } else if retention.in_use_consumers > 0 {
+            ReusableStateSupersessionDisposition::DeferredInUse
+        } else {
+            selected_bytes = selected_bytes
+                .checked_add(predecessor.metrics.storage_size_bytes)
+                .ok_or(ReusableStatePolicyError::MetricOutOfRange)?;
+            ReusableStateSupersessionDisposition::AutomaticCleanup
+        };
+        entries.push(ReusableStateSupersessionEntry {
+            cache_class: supersession.cache_class,
+            predecessor: supersession.predecessor.clone(),
+            successor: supersession.successor.clone(),
+            disposition,
+            storage_size_bytes: predecessor.metrics.storage_size_bytes,
+            in_use_consumers: retention.in_use_consumers,
+        });
+    }
+    entries.sort_by(|left, right| {
+        left.predecessor
+            .cmp(&right.predecessor)
+            .then_with(|| left.successor.cmp(&right.successor))
+    });
+    Ok(ReusableStateSupersessionPlan {
+        schema_version: REUSABLE_STATE_LIFECYCLE_SCHEMA_VERSION,
+        selected_bytes,
+        entries,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ReusableStateDiskBudget {
     pub low_watermark_bytes: u64,
@@ -890,12 +1006,10 @@ pub struct ReusableStateDiskBudget {
 impl ReusableStateDiskBudget {
     /// # Errors
     ///
-    /// Returns an error for reversed/unbounded watermarks or an unbounded pass size.
+    /// Returns an error for reversed watermarks or a zero-sized reconciliation pass.
     pub fn validate(self) -> Result<(), ReusableStatePolicyError> {
         if self.low_watermark_bytes >= self.high_watermark_bytes
-            || self.high_watermark_bytes > MAX_REUSABLE_STATE_BYTES
             || self.max_evictions_per_pass == 0
-            || self.max_evictions_per_pass > MAX_REUSABLE_STATE_EVICTIONS_PER_PASS
         {
             Err(ReusableStatePolicyError::InvalidDiskBudget)
         } else {
@@ -933,9 +1047,6 @@ pub fn plan_reusable_state_eviction(
     generations: &[ReusableStateGeneration],
 ) -> Result<ReusableStateEvictionPlan, ReusableStatePolicyError> {
     budget.validate()?;
-    if generations.len() > MAX_REUSABLE_STATE_GENERATIONS_PER_PLAN {
-        return Err(ReusableStatePolicyError::TooManyGenerations);
-    }
     let before_bytes = generations.iter().try_fold(0_u64, |sum, generation| {
         generation.metrics.validate()?;
         sum.checked_add(generation.metrics.storage_size_bytes)
@@ -1191,7 +1302,11 @@ pub enum ReusableStatePolicyError {
     GenerationInUse,
     InvalidPromotionPolicy,
     InvalidDiskBudget,
-    TooManyGenerations,
+    DuplicateGeneration,
+    InvalidSupersession,
+    SupersessionGenerationMissing,
+    SupersessionClassMismatch,
+    SupersessionSuccessorUnavailable,
 }
 
 impl fmt::Display for ReusableStatePolicyError {
@@ -1210,6 +1325,10 @@ mod tests {
 
     fn digest(hex: char) -> Sha256Digest {
         Sha256Digest::parse(&format!("sha256:{}", hex.to_string().repeat(64))).unwrap()
+    }
+
+    fn indexed_digest(index: usize) -> Sha256Digest {
+        Sha256Digest::parse(&format!("sha256:{index:064x}")).unwrap()
     }
 
     fn identity(class: ReusableStateClass) -> ReusableStateIdentityContract {
@@ -1612,6 +1731,170 @@ mod tests {
                 .unwrap(),
             ReusableStateRecommendation::Revalidate
         );
+    }
+
+    #[test]
+    fn explicit_supersession_selects_reconstructible_predecessor_automatically() {
+        let mut predecessor = preferred(candidate(
+            ReusableStateClass::ImmutableCompiledProduct,
+            metrics(4, 4, 20_000, 2_000, 600_000_000, 2, 4),
+        ));
+        predecessor.generation = ReusableStateGenerationId(digest('b'));
+        let mut successor = preferred(candidate(
+            ReusableStateClass::ImmutableCompiledProduct,
+            metrics(4, 4, 20_000, 1_500, 610_000_000, 2, 4),
+        ));
+        successor.generation = ReusableStateGenerationId(digest('c'));
+
+        let plan = plan_reusable_state_supersession_cleanup(
+            &[predecessor.clone(), successor.clone()],
+            &[ReusableStateSupersession {
+                cache_class: ReusableStateClass::ImmutableCompiledProduct,
+                predecessor: predecessor.generation.clone(),
+                successor: successor.generation.clone(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(plan.selected_bytes, 600_000_000);
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(
+            plan.entries[0].disposition,
+            ReusableStateSupersessionDisposition::AutomaticCleanup
+        );
+    }
+
+    #[test]
+    fn superseded_in_use_generation_defers_until_consumers_release() {
+        let mut predecessor = preferred(candidate(
+            ReusableStateClass::IncrementalBuildState,
+            metrics(4, 4, 20_000, 2_000, 900, 2, 4),
+        ));
+        predecessor.generation = ReusableStateGenerationId(digest('b'));
+        predecessor.retention.in_use_consumers = 2;
+        let mut successor = preferred(candidate(
+            ReusableStateClass::IncrementalBuildState,
+            metrics(4, 4, 20_000, 1_500, 950, 2, 4),
+        ));
+        successor.generation = ReusableStateGenerationId(digest('c'));
+        let plan = plan_reusable_state_supersession_cleanup(
+            &[predecessor.clone(), successor.clone()],
+            &[ReusableStateSupersession {
+                cache_class: ReusableStateClass::IncrementalBuildState,
+                predecessor: predecessor.generation.clone(),
+                successor: successor.generation.clone(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(plan.selected_bytes, 0);
+        assert_eq!(
+            plan.entries[0].disposition,
+            ReusableStateSupersessionDisposition::DeferredInUse
+        );
+        assert_eq!(plan.entries[0].in_use_consumers, 2);
+    }
+
+    #[test]
+    fn supersession_preserves_unique_or_required_local_state() {
+        let successor = preferred(candidate(
+            ReusableStateClass::ProjectLocalApprovedHotState,
+            metrics(4, 4, 20_000, 1_500, 950, 2, 4),
+        ));
+        for (unique_local_work, must_retain, expected) in [
+            (
+                true,
+                true,
+                ReusableStateSupersessionDisposition::PreserveUniqueLocalWork,
+            ),
+            (
+                false,
+                true,
+                ReusableStateSupersessionDisposition::PreserveMustRetain,
+            ),
+            (
+                false,
+                false,
+                ReusableStateSupersessionDisposition::PreserveNonReconstructible,
+            ),
+        ] {
+            let mut predecessor = candidate(
+                ReusableStateClass::ProjectLocalApprovedHotState,
+                metrics(3, 3, 10_000, 2_000, 900, 2, 3),
+            );
+            predecessor.generation = ReusableStateGenerationId(digest('b'));
+            predecessor.retention = ReusableStateRetentionFacts {
+                reconstructible: false,
+                unique_local_work,
+                must_retain,
+                in_use_consumers: 0,
+            };
+            let plan = plan_reusable_state_supersession_cleanup(
+                &[predecessor.clone(), successor.clone()],
+                &[ReusableStateSupersession {
+                    cache_class: ReusableStateClass::ProjectLocalApprovedHotState,
+                    predecessor: predecessor.generation.clone(),
+                    successor: successor.generation.clone(),
+                }],
+            )
+            .unwrap();
+            assert_eq!(plan.entries[0].disposition, expected);
+        }
+    }
+
+    #[test]
+    fn supersession_requires_explicit_edge_and_healthy_preferred_successor() {
+        let mut predecessor = candidate(
+            ReusableStateClass::ContainerLayer,
+            metrics(3, 3, 10_000, 2_000, 900, 2, 3),
+        );
+        predecessor.generation = ReusableStateGenerationId(digest('b'));
+        let mut candidate_successor = candidate(
+            ReusableStateClass::ContainerLayer,
+            metrics(3, 3, 10_000, 1_500, 950, 2, 3),
+        );
+        candidate_successor.generation = ReusableStateGenerationId(digest('c'));
+
+        let no_edge =
+            plan_reusable_state_supersession_cleanup(&[predecessor.clone()], &[]).unwrap();
+        assert!(no_edge.entries.is_empty());
+        assert_eq!(no_edge.selected_bytes, 0);
+
+        assert_eq!(
+            plan_reusable_state_supersession_cleanup(
+                &[predecessor.clone(), candidate_successor.clone()],
+                &[ReusableStateSupersession {
+                    cache_class: ReusableStateClass::ContainerLayer,
+                    predecessor: predecessor.generation.clone(),
+                    successor: candidate_successor.generation.clone(),
+                }],
+            )
+            .unwrap_err(),
+            ReusableStatePolicyError::SupersessionSuccessorUnavailable
+        );
+    }
+
+    #[test]
+    fn eviction_planner_has_no_global_generation_or_selection_ceiling() {
+        let mut generations = Vec::new();
+        for index in 1..=300 {
+            let mut generation = candidate(
+                ReusableStateClass::ContainerLayer,
+                metrics(3, 0, 1_000, 1_000, 1, 2, 0),
+            );
+            generation.lifecycle = ReusableStateLifecycle::Retired;
+            generation.generation = ReusableStateGenerationId(indexed_digest(index));
+            generations.push(generation);
+        }
+        let plan = plan_reusable_state_eviction(
+            ReusableStateDiskBudget {
+                low_watermark_bytes: 1,
+                high_watermark_bytes: 2,
+                max_evictions_per_pass: 300,
+            },
+            &generations,
+        )
+        .unwrap();
+        assert_eq!(plan.selected.len(), 299);
+        assert!(plan.budget_satisfied);
     }
 
     #[test]
