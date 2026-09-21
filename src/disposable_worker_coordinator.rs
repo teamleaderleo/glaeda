@@ -962,48 +962,71 @@ mod tests {
             .reserve(reservation())
             .unwrap()
     }
-    fn runner_registered_reservation() -> DisposableAttemptReservation {
-        let reserved = reservation();
-        let runner = ScaleSetRunnerReference::new(
-            ScaleSetRunnerId::new(77).unwrap(),
-            reserved.attempt().runner_name().clone(),
-        );
-        let attempt = reserved
-            .attempt()
-            .authorize_clone()
-            .unwrap()
-            .record_clone_started()
-            .unwrap()
+    fn runner_registered_catalog() -> DisposableAttemptCatalogDocument {
+        let mut catalog = catalog();
+        let attempt_id = catalog.active()[0].attempt().attempt_id().clone();
+        for action in [
+            crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::AuthorizeClone,
+            crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::RecordCloneStarted,
+        ] {
+            let revision = catalog.active()[0].attempt().revision();
+            catalog = catalog
+                .replace_attempt(&attempt_id, revision, action)
+                .unwrap();
+        }
+        let revision = catalog.active()[0].attempt().revision();
+        catalog = catalog
             .bind_vm_identity_after_clone(
+                &attempt_id,
+                revision,
                 crate::disposable_worker_reconciler::DisposableVmIdentity::parse(&format!(
                     "sha256:{}",
                     "55".repeat(32)
                 ))
                 .unwrap(),
             )
-            .unwrap()
-            .begin_registration()
-            .unwrap()
-            .record_jit_generation_started()
-            .unwrap()
-            .record_registration(&runner)
             .unwrap();
-        DisposableAttemptReservation::new(
-            attempt,
-            reserved.resources(),
-            reserved.prepared_template_identity().clone(),
-        )
-        .unwrap()
+        for action in [
+            crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::BeginRegistration,
+            crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::RecordJitGenerationStarted,
+        ] {
+            let revision = catalog.active()[0].attempt().revision();
+            catalog = catalog
+                .replace_attempt(&attempt_id, revision, action)
+                .unwrap();
+        }
+        let runner = ScaleSetRunnerReference::new(
+            ScaleSetRunnerId::new(77).unwrap(),
+            catalog.active()[0].attempt().runner_name().clone(),
+        );
+        let revision = catalog.active()[0].attempt().revision();
+        catalog
+            .replace_attempt(
+                &attempt_id,
+                revision,
+                crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::RecordRegistration(
+                    runner,
+                ),
+            )
+            .unwrap()
+    }
+
+    fn runner_registered_reservation() -> DisposableAttemptReservation {
+        runner_registered_catalog().active()[0].clone()
     }
 
     fn runner_started_reservation() -> DisposableAttemptReservation {
-        let registered = runner_registered_reservation();
-        DisposableAttemptReservation::new(
-            registered.attempt().record_runner_start_started().unwrap(),
-            registered.resources(),
-            registered.prepared_template_identity().clone(),
-        )
-        .unwrap()
+        let catalog = runner_registered_catalog();
+        let reservation = &catalog.active()[0];
+        catalog
+            .replace_attempt(
+                reservation.attempt().attempt_id(),
+                reservation.attempt().revision(),
+                crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+            )
+            .unwrap()
+            .active()[0]
+            .clone()
     }
 
     fn unavailable_storage_error() -> crate::disposable_host_storage::DisposableHostStorageError {
