@@ -26,6 +26,7 @@ The reducer cannot invent a new workflow mutation.
 Each observation names one workload/profile and carries:
 
 - stage and elapsed milliseconds;
+- a bounded comparable-sample count when the producer supplies an aggregate median/summary;
 - cold/warm/reuse class;
 - bytes read, written, and transferred when measured;
 - artifact-transfer backend when observed (for example a local broker, R2, or GitHub artifact transport);
@@ -136,15 +137,29 @@ That is direct evidence for exact reusable preparation. The fixture records it a
 
 ### Measured rejection
 
-The matched artifact-layer experiment referenced from #13095/#13201 reconstructed the same 5,050-path product:
+cmux #12985 proposed exact reuse of bundled resource/helper products through an input/output
+fingerprint. Its private Airbench campaign produced matched samples on the same commit/toolchain:
+
+| workload | main | candidate | samples |
+| --- | ---: | ---: | ---: |
+| no-op warm build | 11.2 s median | 66.2 s median | 4 / 4 |
+| one-file warm edit | 39.2 s | 94.9 s | 4 / 4 |
+
+The skip path hashed all 5,901 files in the Ghostty worktree, adding roughly 55–56 seconds. The
+fixture retains the four-sample no-op observation as one bounded aggregate and records the controlled
+11.2 s → 66.2 s comparison. The exact-product candidate is therefore `demoted`.
+
+The separate #13095/#13201 layer-format measurement remains useful discovery evidence:
 
 - aggregate: 432,884,327 bytes;
 - four split layers: 432,926,479 bytes;
 - delta: +42,152 bytes, about 0.01%;
-- pack/validation: 4.252 s;
-- restore/validation: 2.762 s.
+- one layer pack/validation: 4.252 s;
+- one layer restore/validation: 2.762 s.
 
-Splitting alone therefore supplied no byte saving while adding publication work. The fixture records the split-only candidate as `demoted`. A later selective-consumer measurement can create fresh evidence; this result prevents promotion from plausibility alone.
+Those figures establish that splitting alone is size-neutral. They do not form an aggregate-vs-layer
+end-to-end timing comparison, so the `split_consumer_artifact` candidate remains `candidate` /
+experiment-required until selective-consumer transfer savings are measured.
 
 ## Output
 
@@ -158,6 +173,6 @@ The tests also cover:
 - promotion after multiple compatible controlled trials;
 - demotion after a measured regression;
 - the real cmux exact-restore experiment remaining in the experimenting state;
-- the measured split-only rejection;
+- the measured #12985 exact-product reuse regression, while the split-only format stays experiment-required;
 - identical typed-source JSON and human rendering;
 - duplicate and mixed-scope evidence refusal.
