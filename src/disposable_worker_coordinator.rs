@@ -37,6 +37,7 @@ use crate::github_scale_set_delivery_controller::{
     consume_with_bridge_capacity_at_revision, reconcile_and_ack_delivery,
 };
 use crate::github_scale_set_protocol::{ScaleSetRunnerName, ScaleSetRunnerReference};
+use crate::owned_linux_jit_runtime::OwnedLinuxJitRuntime;
 use crate::process::TimedCommandExecutor;
 use crate::unix_personal_worker_store::UnixPersonalWorkerStore;
 use crate::unix_personal_worker_store::disposable_runner_transaction::DisposableRunnerTransactionOutcome;
@@ -173,6 +174,40 @@ impl DisposableWorkerCoordinator {
         executor: &impl TimedCommandExecutor,
         clock: &impl CloneRuntimeClock,
     ) -> Result<DisposableWorkerCoordinatorDisposition, DisposableWorkerCoordinatorError> {
+        self.supervise_backend(
+            bridge,
+            PhysicalBackend::Lima(clone_runtime),
+            runner_runtime,
+            executor,
+            clock,
+        )
+    }
+
+    pub(crate) fn supervise_owned_linux_with_bridge<B: DisposableWorkerServiceBridge>(
+        &self,
+        bridge: &mut B,
+        runtime: &OwnedLinuxJitRuntime,
+        runner_runtime: &DisposableRunnerRuntime,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<DisposableWorkerCoordinatorDisposition, DisposableWorkerCoordinatorError> {
+        self.supervise_backend(
+            bridge,
+            PhysicalBackend::OwnedLinux(runtime),
+            runner_runtime,
+            executor,
+            clock,
+        )
+    }
+
+    fn supervise_backend<B: DisposableWorkerServiceBridge>(
+        &self,
+        bridge: &mut B,
+        backend: PhysicalBackend<'_>,
+        runner_runtime: &DisposableRunnerRuntime,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<DisposableWorkerCoordinatorDisposition, DisposableWorkerCoordinatorError> {
         if has_delivery_recovery(&self.state_root)? {
             let observed_at = clock
                 .epoch_millis()
@@ -192,7 +227,9 @@ impl DisposableWorkerCoordinator {
             return Err(coordinator_error("disposable_capacity_invariant_violated"));
         }
 
-        if catalog.active().is_empty() {
+        if catalog.active().is_empty()
+            && let PhysicalBackend::Lima(clone_runtime) = backend
+        {
             let template = clone_runtime
                 .reconcile_template_once(executor, clock)
                 .map_err(map_clone_error)?;
@@ -264,58 +301,98 @@ impl DisposableWorkerCoordinator {
         match operation_for(reservation)? {
             CoordinatorOperation::AuthorizeClone => {
                 let mut store = open_catalog(&self.state_root)?;
-                map_clone_outcome(
-                    store
+                let outcome = match backend {
+                    PhysicalBackend::Lima(clone_runtime) => store
                         .authorize_disposable_clone_transaction(
                             clone_runtime,
                             &attempt_id,
                             executor,
                             clock,
-                        )
-                        .map_err(map_clone_error)?,
-                )
+                        ),
+                    PhysicalBackend::OwnedLinux(runtime) => store
+                        .authorize_owned_linux_task_transaction(
+                            runtime,
+                            &attempt_id,
+                            executor,
+                            clock,
+                        ),
+                }
+                .map_err(map_clone_error)?;
+                map_clone_outcome(outcome)
             }
             CoordinatorOperation::ExecuteClone => {
                 self.with_live_admission(bridge, clock, |admission| {
                     let mut store = open_catalog(&self.state_root)?;
-                    store
-                        .execute_disposable_clone_transaction(
-                            clone_runtime,
-                            &attempt_id,
-                            admission,
-                            executor,
-                            clock,
-                        )
-                        .map_err(map_clone_error)
+                    match backend {
+                        PhysicalBackend::Lima(clone_runtime) => store
+                            .execute_disposable_clone_transaction(
+                                clone_runtime,
+                                &attempt_id,
+                                admission,
+                                executor,
+                                clock,
+                            ),
+                        PhysicalBackend::OwnedLinux(runtime) => store
+                            .execute_owned_linux_task_transaction(
+                                runtime,
+                                &attempt_id,
+                                admission,
+                                executor,
+                                clock,
+                            ),
+                    }
+                    .map_err(map_clone_error)
                 })
             }
             CoordinatorOperation::CheckpointRegistration => {
                 self.with_live_admission(bridge, clock, |admission| {
                     let mut store = open_catalog(&self.state_root)?;
-                    store
-                        .checkpoint_disposable_registration_transaction(
-                            clone_runtime,
-                            &attempt_id,
-                            admission,
-                            executor,
-                            clock,
-                        )
-                        .map_err(map_clone_error)
+                    match backend {
+                        PhysicalBackend::Lima(clone_runtime) => store
+                            .checkpoint_disposable_registration_transaction(
+                                clone_runtime,
+                                &attempt_id,
+                                admission,
+                                executor,
+                                clock,
+                            ),
+                        PhysicalBackend::OwnedLinux(runtime) => store
+                            .checkpoint_owned_linux_registration_transaction(
+                                runtime,
+                                &attempt_id,
+                                admission,
+                                executor,
+                                clock,
+                            ),
+                    }
+                    .map_err(map_clone_error)
                 })
             }
             CoordinatorOperation::RunRunner => {
                 let mut source = LiveRunnerSource { bridge };
                 let mut store = open_catalog(&self.state_root)?;
-                match store
-                    .execute_disposable_runner_transaction(
-                        runner_runtime,
-                        clone_runtime,
-                        &attempt_id,
-                        &mut source,
-                        executor,
-                        clock,
-                    )
-                    .map_err(map_runner_error)?
+                let outcome = match backend {
+                    PhysicalBackend::Lima(clone_runtime) => store
+                        .execute_disposable_runner_transaction(
+                            runner_runtime,
+                            clone_runtime,
+                            &attempt_id,
+                            &mut source,
+                            executor,
+                            clock,
+                        ),
+                    PhysicalBackend::OwnedLinux(runtime) => store
+                        .execute_disposable_runner_transaction(
+                            runner_runtime,
+                            runtime,
+                            &attempt_id,
+                            &mut source,
+                            executor,
+                            clock,
+                        ),
+                }
+                .map_err(map_runner_error)?;
+                match outcome
                 {
                     DisposableRunnerTransactionOutcome::RegistrationRecovered { attempt_id } => Ok(
                         DisposableWorkerCoordinatorDisposition::RunnerRegistrationRecovered {
@@ -332,17 +409,25 @@ impl DisposableWorkerCoordinator {
             CoordinatorOperation::Cleanup => {
                 let mut source = LiveRunnerSource { bridge };
                 let mut store = open_catalog(&self.state_root)?;
-                map_cleanup_outcome(
-                    store
+                let outcome = match backend {
+                    PhysicalBackend::Lima(clone_runtime) => store
                         .execute_disposable_cleanup_transaction(
                             clone_runtime,
                             &attempt_id,
                             &mut source,
                             executor,
                             clock,
-                        )
-                        .map_err(map_clone_error)?,
-                )
+                        ),
+                    PhysicalBackend::OwnedLinux(runtime) => store
+                        .execute_owned_linux_cleanup_transaction(
+                            runtime,
+                            &attempt_id,
+                            &mut source,
+                            executor,
+                        ),
+                }
+                .map_err(map_clone_error)?;
+                map_cleanup_outcome(outcome)
             }
             CoordinatorOperation::Wait => Ok(DisposableWorkerCoordinatorDisposition::Idle),
         }
@@ -384,6 +469,12 @@ impl DisposableWorkerCoordinator {
             result => map_clone_outcome(result?),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum PhysicalBackend<'a> {
+    Lima(&'a DisposableCloneRuntime),
+    OwnedLinux(&'a OwnedLinuxJitRuntime),
 }
 
 fn advertised_capacity(
