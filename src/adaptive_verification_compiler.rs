@@ -2793,7 +2793,7 @@ mod tests {
             "cmux-ci",
             "macos-full",
             OptimizationClass::ReuseExactCompiledProduct,
-            Some("tree-a"),
+            Some("app-host-v2"),
             120_000,
             121_000,
             0,
