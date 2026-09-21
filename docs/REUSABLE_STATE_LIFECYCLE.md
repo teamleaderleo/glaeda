@@ -159,6 +159,50 @@ stop_publishing
 A generation with enough observations and zero/negative measured net time gets `stop_publishing`
 before it can become preferred.
 
+## Automatic supersession cleanup
+
+Supersession is explicit family evidence, never a guess from age, names, paths, source proximity, or
+directory presence.
+
+A family owner can state:
+
+```text
+exact generation B supersedes exact generation A
+```
+
+The shared planner accepts that edge only when B is already a healthy `preferred` generation with
+complete verified publication and no revalidation debt. It then classifies A:
+
+```text
+reconstructible + no consumers + no must-retain/unique work
+  -> automatic_cleanup
+
+reconstructible + active consumers
+  -> deferred_in_use
+
+unique local work
+  -> preserve_unique_local_work
+
+must-retain state
+  -> preserve_must_retain
+
+non-reconstructible state
+  -> preserve_non_reconstructible
+```
+
+A normal family reconciliation loop can run this on every meaningful generation/lease transition.
+No operator action is required for a safe superseded generation: once the final consumer lease
+releases, the next reconciliation selects the complete predecessor generation for retirement.
+
+The generic layer still performs no filesystem mutation. Family executors consume
+`automatic_cleanup` selections and must freshly re-check the exact object identity and every
+consumer/transfer lease before atomic whole-generation retirement. #914/#965 are the current
+physical precedent: no-replace rename, durable retirement debt, incremental no-follow deletion, and
+crash recovery.
+
+There is deliberately no generic inference that "newer" means "supersedes." Families that want
+automatic replacement cleanup must provide the exact predecessor/successor edge.
+
 ## Disk budget and eviction
 
 `plan_reusable_state_eviction` is a pure whole-generation planner. It performs no deletion.
@@ -173,8 +217,11 @@ in_use_consumers: 0
 ```
 
 Pressure starts at the configured high watermark and aims for the low watermark. Selection is
-bounded per pass and deterministic: retired/demoted generations first, then lower net time saved,
-older useful hits, larger reclaimable size, and generation identity.
+caller-budgeted per reconciliation pass and deterministic: retired/demoted generations first, then
+lower net time saved, older useful hits, larger reclaimable size, and generation identity. The
+shared policy has no fixed maximum generation count or maximum selection count; a caller can choose
+a small per-pass work budget and resume on the next reconciliation without imposing a total catalog
+ceiling.
 
 This composes with #926's already-merged physical Cargo-target retirement path, which owns locked
 rename/delete, lease fencing, crash recovery, and its 90%/85% host-pressure hysteresis. The generic
