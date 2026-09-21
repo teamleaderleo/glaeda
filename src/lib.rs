@@ -1,8 +1,8 @@
 /// Read-only observation of one configured official Actions runner.
 pub mod actions_runner_readiness;
-pub mod artifact;
 /// Pure deterministic optimization discovery from bounded verification observations.
 pub mod adaptive_verification_compiler;
+pub mod artifact;
 /// Pure, path-free classification of explicit hot-state inventory observations.
 pub mod cache_inventory;
 /// Positive-only Linux process and mount reference observation for one Cargo target.
