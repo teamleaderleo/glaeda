@@ -95,13 +95,22 @@ def _exact_absolute_path(value: object, label: str, *, directory: bool) -> Path:
         raise LocalRefusal("installation_invalid", f"{label} is unavailable") from error
     if resolved != path or stat.S_ISLNK(metadata.st_mode):
         raise LocalRefusal("installation_invalid", f"{label} is not canonical")
+    writable_by_others = bool(stat.S_IMODE(metadata.st_mode) & 0o022)
     if directory:
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise LocalRefusal("installation_invalid", f"{label} is not a directory")
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or writable_by_others
+        ):
+            raise LocalRefusal(
+                "installation_invalid",
+                f"{label} is not an owner-controlled directory",
+            )
     elif (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != os.getuid()
         or metadata.st_nlink != 1
+        or writable_by_others
         or not os.access(path, os.X_OK)
     ):
         raise LocalRefusal("installation_invalid", f"{label} is not an owned executable")
