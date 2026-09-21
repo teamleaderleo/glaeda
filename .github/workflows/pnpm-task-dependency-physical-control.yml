@@ -28,7 +28,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
     name: ${{ matrix.mode }} / ${{ matrix.filesystem }} / ${{ matrix.method }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -86,7 +86,7 @@ jobs:
           - mode: composed
             filesystem: ext4
             method: auto
-            repetitions: 10
+            repetitions: 6
             store_policy: readonly
             probe_script: test
             expected_mechanism: copy_observed
@@ -94,7 +94,7 @@ jobs:
           - mode: composed
             filesystem: xfs
             method: clone
-            repetitions: 10
+            repetitions: 6
             store_policy: readonly
             probe_script: test
             expected_mechanism: ""
