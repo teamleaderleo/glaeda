@@ -40,11 +40,18 @@ Required fields are:
 
 Optional fields are:
 
+- `semantic_request_id`: accepted provider-neutral Glaeda request identity. When present, it is
+  included in the reviewed workload fingerprint so independent accepted requests cannot silently
+  alias physical execution.
 - `reuse_hint`: `no_preference` or `prefer_valid_reuse`. This is advisory only.
 - `correlation.work_ref`: bounded caller-owned work identity used only in the external receipt.
 
 The external request reference, caller work reference and reuse hint are deliberately absent from
 the physical execution fingerprint. Changing those fields cannot mint another execution identity.
+`semantic_request_id` is different: it is a workload-owned accepted identity and intentionally
+partitions physical replay. Existing v1 callers that omit it retain the legacy fingerprint contract,
+which keeps the current CMUX fixture byte-compatible while #1012 callers migrate explicitly.
+
 The complete canonical external document is separately hashed as `request_sha256` so reuse of one
 external request reference with drifted semantics is detectable.
 
@@ -107,6 +114,7 @@ copy private command output, host state or internal attempt data.
 | `operation=verify_focused` | resolves to Glaeda-owned `verify-focused/v1` |
 | `requested_capability_class=credentialless_project` | must match the profile's reviewed execution identity |
 | caller refs / reuse hint | correlation/advisory only; excluded from physical fingerprint |
+| optional `semantic_request_id` | accepted provider-neutral identity; included in physical fingerprint |
 
 Glaeda resolves the current `verify-focused/v1` generation by hashing the checked-in fixed profile
 spec. The current profile owns its four-CPU / 8 GiB ceiling, task-private build state, read-only
@@ -116,7 +124,8 @@ request.
 
 The adapter derives an internal `command_fingerprint` from exact source, semantic operation,
 capability class and the Glaeda-resolved workload id/generation under the domain
-`glaeda-external-verify-focused-binding-v1`.
+`glaeda-external-verify-focused-binding-v1`. When an accepted `semantic_request_id` is present,
+that identity is part of the fingerprint as well.
 
 Immediately before physical work, the existing verifier re-resolves the exact commit/tree and
 canonical repository origin. The installed admission adapter independently observes current local
@@ -130,11 +139,12 @@ run.
 
 ## Replay, ambiguity and recovery
 
-Three identities stay separate:
+Four identities stay separate:
 
 1. caller correlation: `external_request_ref` and optional `correlation.work_ref`;
-2. external semantic request: `request_sha256` over the canonical external document;
-3. Glaeda physical execution: the derived workload request/fingerprint plus Glaeda durable state.
+2. external adapter document: `request_sha256` over the canonical external document;
+3. optional accepted provider-neutral identity: `semantic_request_id`;
+4. Glaeda physical execution: the derived workload request/fingerprint plus Glaeda durable state.
 
 Exact replay of an existing external receipt requires the same external request reference and the
 same canonical request digest. Reusing the reference with drifted semantics is a conflict.
