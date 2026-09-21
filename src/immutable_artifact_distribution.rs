@@ -436,7 +436,9 @@ impl fmt::Display for ImmutableArtifactDistributionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InvalidProducerProvenance => "immutable artifact producer provenance is invalid",
-            Self::InvalidObjectSize => {\n                "immutable artifact object size is outside the reviewed bound"\n            }
+            Self::InvalidObjectSize => {
+                "immutable artifact object size is outside the reviewed bound"
+            }
             Self::InvalidDuration => "immutable artifact duration is outside the reviewed bound",
             Self::DigestEncoding => "immutable artifact identity digest could not be encoded",
         })
@@ -526,7 +528,10 @@ mod tests {
     fn object_digest_is_transport_independent_and_binds_provenance() {
         let exact = object();
         let same = object();
-        assert_eq!(\n            exact.digest().expect("digest"),\n            same.digest().expect("digest")\n        );
+        assert_eq!(
+            exact.digest().expect("digest"),
+            same.digest().expect("digest")
+        );
 
         let mut different = object();
         different.producer.artifact_id += 1;
@@ -627,7 +632,10 @@ mod tests {
             4_321,
         )
         .expect("observation");
-        assert_eq!(\n            observation.source,\n            ImmutableArtifactSourceClass::TrustedPeer\n        );
+        assert_eq!(
+            observation.source,
+            ImmutableArtifactSourceClass::TrustedPeer
+        );
         assert_eq!(observation.bytes_transferred, 606_055_512);
 
         assert!(
