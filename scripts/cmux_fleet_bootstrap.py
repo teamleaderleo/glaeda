@@ -16,6 +16,7 @@ from typing import Any
 
 SCHEMA = "glaeda-cmux-fleet-bootstrap/v1"
 MAX_OUTPUT_BYTES = 16 * 1024
+MAX_COMMAND_OUTPUT_BYTES = 16 * 1024
 ENROLLABLE_ROLES = {
     "cmux_macos_native_build",
     "cmux_linux_ci",
@@ -56,6 +57,14 @@ def run(
     timeout: int = 10,
     cwd: Path | None = None,
 ) -> str:
+    environment = {
+        "LC_ALL": "C",
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+    }
+    for name in ("HOME", "CARGO_HOME", "RUSTUP_HOME", "DEVELOPER_DIR"):
+        value = os.environ.get(name)
+        if value:
+            environment[name] = value
     result = subprocess.run(
         argv,
         check=False,
@@ -63,13 +72,14 @@ def run(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        env={
-            "LC_ALL": "C",
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
-        },
+        env=environment,
         timeout=timeout,
         text=True,
     )
+    if len(result.stdout.encode("utf-8", errors="replace")) > MAX_COMMAND_OUTPUT_BYTES:
+        raise BootstrapError(
+            f"required command output is too large: {Path(argv[0]).name}"
+        )
     if result.returncode != 0:
         raise BootstrapError(f"required command failed: {Path(argv[0]).name}")
     return result.stdout.strip()
