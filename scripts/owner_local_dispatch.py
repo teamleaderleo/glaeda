@@ -31,7 +31,6 @@ MAX_REPOSITORIES = 32
 INSTALLATION_KEYS = {
     "document_type",
     "schema_version",
-    "repo_query_program",
     "repositories",
 }
 REPOSITORY_KEYS = {"repository", "checkout"}
@@ -39,6 +38,7 @@ AMBIGUOUS_PROBLEM = "previous physical execution is ambiguous; redispatch refuse
 HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 CONTROL_ROOT = Path(__file__).resolve().parent.parent
 INSTALLATION_PATH = HOME / ".config" / "glaeda" / "owner-local-v1.json"
+REPO_QUERY_PROGRAM = HOME / ".local" / "bin" / "glaeda-repo-query"
 SHARED_VERIFY_STATE_ROOT = (
     HOME / ".local" / "state" / "glaeda" / "provider-neutral-verify-v1"
 )
@@ -63,7 +63,6 @@ class RepositoryBinding:
 
 @dataclass(frozen=True)
 class Installation:
-    repo_query_program: Path
     repositories: tuple[RepositoryBinding, ...]
 
     def checkout_for(self, repository: str) -> Path:
@@ -206,13 +205,14 @@ def load_installation(path: Path = INSTALLATION_PATH) -> Installation:
                 ),
             )
         )
-    return Installation(
-        _exact_absolute_path(
-            value["repo_query_program"],
-            "repo query program",
-            directory=False,
-        ),
-        tuple(repositories),
+    return Installation(tuple(repositories))
+
+
+def installed_repo_query_program() -> Path:
+    return _exact_absolute_path(
+        os.fspath(REPO_QUERY_PROGRAM),
+        "repo query program",
+        directory=False,
     )
 
 
@@ -306,7 +306,7 @@ def run_repo_query(
     checkout = installation.checkout_for(request.source.repository)
     completed = _run(
         [
-            os.fspath(installation.repo_query_program),
+            os.fspath(installed_repo_query_program()),
             "--checkout",
             os.fspath(checkout),
             "--project",
