@@ -98,13 +98,14 @@ A role becomes eligible only when:
 - platform and architecture match;
 - reviewed CPU/memory/disk classes meet the role minimum;
 - the node advertises every role prerequisite capability;
+- the node carries a current #1056-reviewed role acceptance identity: exact CMUX profile ID/generation plus exact finalized acceptance-receipt SHA-256;
 - a role canary exists for the current enrollment and capability generation;
-- the role-canary projection binds the exact #1056 acceptance-receipt SHA-256;
+- the canary names that exact current #1056 profile and acceptance-receipt digest;
 - the canary result is `accepted`;
 - the canary accepted every role prerequisite capability;
 - an exact current toolchain profile is bound when the role requires one.
 
-Enrollment alone therefore grants zero role eligibility.
+Enrollment or a canary alone therefore grants zero role eligibility. Roles reserved by #1056 remain non-routable here even if this vocabulary already names their future capability/slot classes.
 
 ## Toolchain generations
 
@@ -153,7 +154,7 @@ large
 exclusive
 ```
 
-A role canary states which of those profiles were accepted. A separate capacity receipt must then prove the profile on the exact current node generation.
+A role canary states which resource profiles were accepted for the exact current #1056 role profile/receipt. A separate capacity receipt must then prove the resource profile on the exact current node generation.
 
 ## Measured resource profiles
 
@@ -314,7 +315,7 @@ Operators do not need task IDs, cgroup values, host paths, cache directories, pr
 - preference remaining advisory;
 - background preference remaining separate;
 - workload carrying no machine selector or raw CPU/RAM/cgroup control;
-- one Mac with two roles and one Linux node with two roles;
+- current #1056-admitted Mac/Linux roles becoming eligible while reserved future roles remain `fleet_acceptance_pending`;
 - compact operator status.
 
 ## Physical acceptance later
