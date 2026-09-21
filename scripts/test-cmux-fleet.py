@@ -497,6 +497,66 @@ class FleetTests(unittest.TestCase):
             f.digest(result),
         )
 
+    def test_accept_local_refuses_fleet_contract_replacement(self):
+        e = enrollment("linux", state="enrolling")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            root.chmod(0o700)
+            enrollment_path = root / "enrollment.json"
+            enrollment_path.write_bytes(f.canonical(e))
+            enrollment_path.chmod(0o600)
+
+            cmux_root = root / "cmux"
+            runner = cmux_root / "scripts/ci/cmux_workload_profile.py"
+            runner.parent.mkdir(parents=True)
+            runner.write_text("# fixture\n", encoding="utf-8")
+
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+
+            result = cmux_result("cmux_linux_ci")
+            post = bootstrap_for(e)
+
+            def fake_run(argv, **kwargs):
+                if "cmux_workload_profile.py" in str(argv[1]):
+                    result_path = Path(argv[argv.index("--result") + 1])
+                    result_path.write_bytes(f.canonical(result))
+                    result_path.chmod(0o600)
+                    return __import__("subprocess").CompletedProcess(argv, 0)
+                if "cmux_fleet_bootstrap.py" in str(argv[1]):
+                    return __import__("subprocess").CompletedProcess(
+                        argv,
+                        0,
+                        stdout=f.canonical(post),
+                        stderr=b"",
+                    )
+                raise AssertionError(argv)
+
+            with (
+                mock.patch.object(
+                    f,
+                    "_git_oid",
+                    side_effect=[COMMIT, "2" * 40],
+                ),
+                mock.patch.object(f.subprocess, "run", side_effect=fake_run),
+                mock.patch.object(
+                    f,
+                    "fleet_contract_generation",
+                    side_effect=[A, D],
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    f.FleetError,
+                    "fleet contract changed during local acceptance",
+                ):
+                    f.accept_local(
+                        enrollment_path,
+                        cmux_root,
+                        glaeda,
+                        "cmux_linux_ci",
+                    )
+
     def test_failed_settlement_rejects_role(self):
         e = enrollment()
         receipt = finalized(
