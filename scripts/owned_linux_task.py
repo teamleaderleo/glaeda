@@ -20,9 +20,10 @@ import time
 
 class TaskNetwork(Enum):
     NONE = "none"
-    # Trusted first-party GitHub Actions only. This deliberately shares the host
-    # network namespace while retaining user/PID/IPC/UTS/cgroup/mount isolation.
-    # Hostile-LAN/domain filtering is a separate reviewed boundary.
+    # Trusted first-party GitHub Actions only. The task shares host routing only
+    # after the caller has verified the exact root-owned external egress-authority
+    # marker. That marker binds a separately reviewed host firewall/gateway which
+    # denies private/link-local egress; this helper does not create that authority.
     GITHUB_ACTIONS_TRUSTED_EGRESS = "github_actions_trusted_egress"
 
 
