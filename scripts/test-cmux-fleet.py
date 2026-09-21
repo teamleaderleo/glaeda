@@ -23,6 +23,7 @@ A = "sha256:" + "a" * 64
 B = "sha256:" + "b" * 64
 C = "sha256:" + "c" * 64
 D = "sha256:" + "d" * 64
+E = "sha256:" + "e" * 64
 COMMIT = "1" * 40
 
 
@@ -176,6 +177,8 @@ def finalized(
         toolchain,
         result or cmux_result(role),
         post_bootstrap or bootstrap_for(enrollment_value, toolchain),
+        execution_class=f.LOCAL_EXECUTION_CLASS,
+        local_execution_attempt_sha256=E,
     )
 
 
@@ -320,6 +323,8 @@ class FleetTests(unittest.TestCase):
                 cmux_result(),
                 bootstrap_for(e),
                 D,
+                execution_class=f.LOCAL_EXECUTION_CLASS,
+                local_execution_attempt_sha256=E,
             )
 
     def test_acceptance_requires_fresh_matching_post_bootstrap(self):
@@ -363,6 +368,82 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(
             receipt["cmuxEnvironmentClass"],
             result["environment_class"],
+        )
+
+    def test_external_semantic_evidence_cannot_mint_accepted_receipt(self):
+        e = enrollment()
+        receipt = f.finalize_acceptance(
+            e,
+            "cmux_macos_native_build",
+            A,
+            cmux_result(),
+            bootstrap_for(e),
+        )
+        self.assertEqual(receipt["executionClass"], f.EXTERNAL_EVIDENCE_CLASS)
+        self.assertIsNone(receipt["localExecutionAttemptSha256"])
+        self.assertEqual(receipt["result"], "rejected")
+        self.assertFalse(f.node_status(e, [receipt])["routingCandidateEligible"])
+
+    def test_accept_local_binds_profile_run_to_this_node(self):
+        e = enrollment("linux", state="enrolling")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            root.chmod(0o700)
+            enrollment_path = root / "enrollment.json"
+            enrollment_path.write_bytes(f.canonical(e))
+            enrollment_path.chmod(0o600)
+
+            cmux_root = root / "cmux"
+            runner = cmux_root / "scripts/ci/cmux_workload_profile.py"
+            runner.parent.mkdir(parents=True)
+            runner.write_text("# fixture\n", encoding="utf-8")
+
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+
+            result = cmux_result("cmux_linux_ci")
+            post = bootstrap_for(e)
+
+            def fake_run(argv, **kwargs):
+                if "cmux_workload_profile.py" in str(argv[1]):
+                    result_path = Path(argv[argv.index("--result") + 1])
+                    result_path.write_bytes(f.canonical(result))
+                    result_path.chmod(0o600)
+                    return __import__("subprocess").CompletedProcess(argv, 0)
+                if "cmux_fleet_bootstrap.py" in str(argv[1]):
+                    return __import__("subprocess").CompletedProcess(
+                        argv,
+                        0,
+                        stdout=f.canonical(post),
+                        stderr=b"",
+                    )
+                raise AssertionError(argv)
+
+            with (
+                mock.patch.object(
+                    f,
+                    "_git_oid",
+                    side_effect=[COMMIT, "2" * 40],
+                ),
+                mock.patch.object(f.subprocess, "run", side_effect=fake_run),
+            ):
+                receipt = f.accept_local(
+                    enrollment_path,
+                    cmux_root,
+                    glaeda,
+                    "cmux_linux_ci",
+                )
+
+        self.assertEqual(receipt["result"], "accepted")
+        self.assertEqual(receipt["executionClass"], f.LOCAL_EXECUTION_CLASS)
+        self.assertRegex(
+            receipt["localExecutionAttemptSha256"],
+            r"^sha256:[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            receipt["cmuxSemanticResultSha256"],
+            f.digest(result),
         )
 
     def test_failed_settlement_rejects_role(self):
@@ -670,6 +751,8 @@ class FleetTests(unittest.TestCase):
                 loaded,
                 bootstrap_for(e),
                 exact_digest,
+                execution_class=f.LOCAL_EXECUTION_CLASS,
+                local_execution_attempt_sha256=E,
             )
             self.assertEqual(receipt["cmuxSemanticResultSha256"], exact_digest)
 
