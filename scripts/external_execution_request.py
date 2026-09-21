@@ -232,6 +232,14 @@ def compile_request(
     *,
     semantic_request_id: str | None = None,
 ) -> CompiledRequest:
+    if semantic_request_id is not None and (
+        not isinstance(semantic_request_id, str)
+        or SEMANTIC_REQUEST_ID_PATTERN.fullmatch(semantic_request_id) is None
+    ):
+        raise ContractRefusal(
+            "invalid_request",
+            "accepted semantic request identity is invalid",
+        )
     if request.operation != OPERATION_VERIFY_FOCUSED:
         raise ContractRefusal(
             "unsupported_operation", "operation is not admitted by this adapter"
@@ -239,14 +247,6 @@ def compile_request(
     if request.requested_capability_class != focused.EXECUTION_IDENTITY_CLASS:
         raise ContractRefusal(
             "unsupported_capability", "requested capability is not admitted by this adapter"
-        )
-    if semantic_request_id is not None and (
-        not isinstance(semantic_request_id, str)
-        or SEMANTIC_REQUEST_ID_PATTERN.fullmatch(semantic_request_id) is None
-    ):
-        raise ContractRefusal(
-            "invalid_semantic_identity",
-            "accepted semantic request identity is invalid",
         )
     profile = focused.FOCUSED_PROFILE
     generation = focused.profile_generation(profile)
@@ -364,6 +364,116 @@ def terminal_receipt(
     )
 
 
+def validate_receipt(value: dict[str, object]) -> dict[str, object]:
+    if len(canonical_bytes(value) + b"\n") > MAX_RECEIPT_BYTES:
+        raise ContractRefusal(
+            "invalid_existing_receipt",
+            "existing external receipt exceeds its fixed ceiling",
+        )
+    expected_source_keys = {"repository", "commit", "tree"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != RECEIPT_KEYS
+        or value.get("document_type") != RECEIPT_DOCUMENT_TYPE
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != RECEIPT_SCHEMA_VERSION
+        or value.get("authority") != AUTHORITY
+    ):
+        raise ContractRefusal(
+            "invalid_existing_receipt", "existing external receipt is invalid"
+        )
+    external_ref = value.get("external_request_ref")
+    operation = value.get("operation")
+    request_digest = value.get("request_sha256")
+    source = value.get("source")
+    correlation = value.get("correlation")
+    if (
+        not isinstance(external_ref, str)
+        or len(external_ref.encode("utf-8")) > MAX_REFERENCE_BYTES
+        or TOKEN_PATTERN.fullmatch(external_ref) is None
+        or not isinstance(operation, str)
+        or len(operation.encode("utf-8")) > MAX_REFERENCE_BYTES
+        or TOKEN_PATTERN.fullmatch(operation) is None
+        or not isinstance(request_digest, str)
+        or SHA256_PATTERN.fullmatch(request_digest) is None
+        or not isinstance(source, dict)
+        or set(source) != expected_source_keys
+        or not isinstance(source.get("repository"), str)
+        or REPOSITORY_PATTERN.fullmatch(source["repository"]) is None
+        or not isinstance(source.get("commit"), str)
+        or OID_PATTERN.fullmatch(source["commit"]) is None
+        or not isinstance(source.get("tree"), str)
+        or OID_PATTERN.fullmatch(source["tree"]) is None
+    ):
+        raise ContractRefusal(
+            "invalid_existing_receipt", "existing external receipt is invalid"
+        )
+    if correlation is not None:
+        if (
+            not isinstance(correlation, dict)
+            or set(correlation) != CORRELATION_KEYS
+            or not isinstance(correlation.get("work_ref"), str)
+            or len(correlation["work_ref"].encode("utf-8")) > MAX_REFERENCE_BYTES
+            or TOKEN_PATTERN.fullmatch(correlation["work_ref"]) is None
+        ):
+            raise ContractRefusal(
+                "invalid_existing_receipt", "existing external receipt is invalid"
+            )
+
+    state = value.get("state")
+    resolved = value.get("resolved_workload")
+    workload_digest = value.get("workload_receipt_sha256")
+    refusal = value.get("refusal_code")
+    terminal_states = {"succeeded", "failed", "timed_out", "cleanup_incomplete"}
+    supported_states = {"planned", "refused", "ambiguous", *terminal_states}
+    if state not in supported_states:
+        raise ContractRefusal(
+            "invalid_existing_receipt", "existing external receipt state is invalid"
+        )
+
+    expected_resolved = {
+        "id": focused.FOCUSED_PROFILE.profile_id,
+        "generation": focused.profile_generation(focused.FOCUSED_PROFILE),
+        "capability_class": focused.EXECUTION_IDENTITY_CLASS,
+    }
+    if state == "refused":
+        valid = (
+            resolved is None
+            and workload_digest is None
+            and isinstance(refusal, str)
+            and len(refusal.encode("utf-8")) <= MAX_REFERENCE_BYTES
+            and TOKEN_PATTERN.fullmatch(refusal) is not None
+        )
+    elif state == "planned":
+        valid = (
+            operation == OPERATION_VERIFY_FOCUSED
+            and resolved == expected_resolved
+            and workload_digest is None
+            and refusal is None
+        )
+    elif state == "ambiguous":
+        valid = (
+            operation == OPERATION_VERIFY_FOCUSED
+            and resolved == expected_resolved
+            and workload_digest is None
+            and refusal == "ambiguous_execution"
+        )
+    else:
+        valid = (
+            operation == OPERATION_VERIFY_FOCUSED
+            and resolved == expected_resolved
+            and isinstance(workload_digest, str)
+            and SHA256_PATTERN.fullmatch(workload_digest) is not None
+            and refusal is None
+        )
+    if not valid:
+        raise ContractRefusal(
+            "invalid_existing_receipt",
+            "existing external receipt state fields are inconsistent",
+        )
+    return value
+
+
 def validate_replay(
     existing_receipt: dict[str, object], request: ExternalRequest
 ) -> dict[str, object]:
@@ -375,16 +485,7 @@ def validate_replay(
     expected_correlation = (
         {"work_ref": request.work_ref} if request.work_ref is not None else None
     )
-    if (
-        set(existing_receipt) != RECEIPT_KEYS
-        or existing_receipt.get("document_type") != RECEIPT_DOCUMENT_TYPE
-        or type(existing_receipt.get("schema_version")) is not int
-        or existing_receipt.get("schema_version") != RECEIPT_SCHEMA_VERSION
-        or existing_receipt.get("authority") != AUTHORITY
-    ):
-        raise ContractRefusal(
-            "invalid_existing_receipt", "existing external receipt is invalid"
-        )
+    validate_receipt(existing_receipt)
     if existing_receipt.get("external_request_ref") != request.external_request_ref:
         raise ContractRefusal(
             "external_request_mismatch",
