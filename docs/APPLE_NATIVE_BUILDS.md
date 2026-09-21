@@ -15,6 +15,25 @@ From a configured project:
 /path/to/glaeda/scripts/apple-build run --profile app
 ```
 
+For CI or another caller that already owns an immutable Git source decision, direct
+native execution can bind that decision at admission:
+
+```sh
+glaeda-apple run --profile app \
+  --expected-commit <commit> \
+  --expected-tree <tree> \
+  --require-clean-source
+```
+
+These options apply to direct `run`/`warm`/`check`/dependency execution. Glaeda
+validates the requested commit/tree and clean worktree before creating or reusing
+cache state under the build lock, and validates the same source again after the
+native command. A mismatch refuses the run. A post-launch mismatch leaves the
+in-flight generation blocked for the existing exact-run recovery/quarantine path.
+The source contract adds execution authority only for the requested Git identity;
+cache contents still grant none. Queue requests intentionally retain their existing
+latest-checkout semantics.
+
 `warm` and `run` execute the same real build. Every invocation executes its native
 command; a previous receipt never substitutes for validation. `plan` probes the
 checkout and selected Apple toolchain and creates no project state. JSON receipts
