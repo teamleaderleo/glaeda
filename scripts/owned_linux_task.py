@@ -461,9 +461,10 @@ def _run_bounded(
             if separate_stderr and key.fd != stdout_fd:
                 err_digest.update(chunk)
                 err_bytes += len(chunk)
-                err_tail.extend(chunk)
-                if len(err_tail) > FAILURE_TAIL_BYTES:
-                    del err_tail[:-FAILURE_TAIL_BYTES]
+                if emit_failure_tail:
+                    err_tail.extend(chunk)
+                    if len(err_tail) > FAILURE_TAIL_BYTES:
+                        del err_tail[:-FAILURE_TAIL_BYTES]
                 if err_bytes > MAX_SOURCE_OUTPUT_BYTES and not err_exceeded:
                     err_exceeded = True
                     stop_unit(unit)
@@ -474,9 +475,10 @@ def _run_bounded(
                 retained.extend(chunk[: retain_limit - len(retained)])
             if output_bytes > retain_limit:
                 overflow = True
-            tail.extend(chunk)
-            if len(tail) > FAILURE_TAIL_BYTES:
-                del tail[:-FAILURE_TAIL_BYTES]
+            if emit_failure_tail:
+                tail.extend(chunk)
+                if len(tail) > FAILURE_TAIL_BYTES:
+                    del tail[:-FAILURE_TAIL_BYTES]
             if output_bytes > MAX_SOURCE_OUTPUT_BYTES and not output_exceeded:
                 output_exceeded = True
                 stop_unit(unit)
