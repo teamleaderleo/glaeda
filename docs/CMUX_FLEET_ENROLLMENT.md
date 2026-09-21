@@ -88,6 +88,12 @@ mv "$GLAEDA_INSTALL_ROOT/.glaeda.next" "$GLAEDA_BIN"
 
 CMUX_ROOT=/absolute/path/to/cmux
 CMUX_CACHE_ROOT=/absolute/path/to/cmux-native-cache
+(
+  cd "$CMUX_ROOT"
+  ./scripts/setup.sh
+)
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 FLEET_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet"
 umask 077
 install -d -m 700 "$FLEET_ROOT" "$FLEET_ROOT/acceptance"
@@ -119,8 +125,8 @@ bash "$CMUX_ROOT/scripts/fleet-accept-macos-native-build" \
   --commit "$CMUX_COMMIT" \
   --node-id "$NODE_ID" \
   --enrollment-generation 1 \
-  --glaeda-generation "$(jq -r .glaedaGeneration "$ENROLLMENT")" \
-  --toolchain-generation "$(jq -r '.supportedToolchainGenerations[0]' "$ENROLLMENT")" \
+  --glaeda-generation "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["glaedaGeneration"])' "$ENROLLMENT")" \
+  --toolchain-generation "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["supportedToolchainGenerations"][0])' "$ENROLLMENT")" \
   --output "$ACCEPTANCE_EVIDENCE"
 
 ACCEPTANCE_NEXT="$(mktemp "$FLEET_ROOT/acceptance/.cmux_macos_native_build.XXXXXX")"
@@ -140,7 +146,7 @@ bash scripts/cmux-fleet status "$ENROLLMENT" \
   --acceptance "$ACCEPTANCE"
 ```
 
-The macOS bootstrap verifies the operator-owned native cache root is writable and has the same disk headroom threshold without publishing its path. The acceptance creates a fresh private DerivedData root, runs an exact clean Debug build with code signing disabled, verifies the produced `cmux DEV` executable is Mach-O, rechecks the canonical checkout, and refuses a surviving acceptance process group.
+The macOS preparation reuses CMUX's reviewed `scripts/setup.sh` for submodules, the pinned Rust toolchain, Zig compatibility, GhosttyKit, and the Xcode Metal component check. The bootstrap re-observes those prerequisites read-only, requires a clean canonical checkout, and verifies the operator-owned native cache root is writable with the same disk headroom threshold without publishing its path. The acceptance creates a fresh private DerivedData root, runs an exact clean Debug build with code signing disabled, verifies the produced `cmux DEV` executable is Mach-O, rechecks the canonical checkout, and refuses a surviving acceptance process group.
 
 ## Onboard Linux
 
@@ -188,8 +194,8 @@ bash "$CMUX_ROOT/scripts/fleet-accept-linux-ci" \
   --commit "$CMUX_COMMIT" \
   --node-id "$NODE_ID" \
   --enrollment-generation 1 \
-  --glaeda-generation "$(jq -r .glaedaGeneration "$ENROLLMENT")" \
-  --toolchain-generation "$(jq -r '.supportedToolchainGenerations[0]' "$ENROLLMENT")" \
+  --glaeda-generation "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["glaedaGeneration"])' "$ENROLLMENT")" \
+  --toolchain-generation "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["supportedToolchainGenerations"][0])' "$ENROLLMENT")" \
   --output "$ACCEPTANCE_EVIDENCE"
 
 ACCEPTANCE_NEXT="$(mktemp "$FLEET_ROOT/acceptance/.cmux_linux_ci.XXXXXX")"
