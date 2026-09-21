@@ -54,12 +54,19 @@ HOT_STATE_RETIREMENT_RECORD_PREFIX = ".retirement-v1-"
 HOT_STATE_RETIREMENT_RECORD_SUFFIX = ".json"
 HOT_STATE_VALUE_CATALOG = ".value-catalog-v1.json"
 HOT_STATE_VALUE_CATALOG_STAGING = ".value-catalog-v1.json.creating"
-HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION = 1
-HOT_STATE_VALUE_CATALOG_PRODUCER = "glaeda-hot-run-value-catalog-v1"
+HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION = 2
+HOT_STATE_VALUE_CATALOG_PRODUCER = "glaeda-hot-run-value-catalog-v2"
+HOT_STATE_VALUE_CATALOG_V1_SCHEMA_VERSION = 1
+HOT_STATE_VALUE_CATALOG_V1_PRODUCER = "glaeda-hot-run-value-catalog-v1"
+HOT_STATE_VALUE_RECORDS = ".value-records-v2"
+HOT_STATE_VALUE_RECORD_SCHEMA_VERSION = 1
+HOT_STATE_VALUE_RECORD_PRODUCER = "glaeda-hot-run-value-record-v1"
+HOT_STATE_VALUE_RECORD_SUFFIX = ".json"
+HOT_STATE_VALUE_RECORD_STAGING_SUFFIX = ".creating"
 MAX_HOT_STATE_MANIFEST_BYTES = 32 * 1024
-MAX_HOT_STATE_VALUE_CATALOG_BYTES = 256 * 1024
-MAX_HOT_STATE_NAMESPACE_ENTRIES = 256
-MAX_HOT_STATE_RUNTIME_ENTRIES = 64
+MAX_HOT_STATE_VALUE_CATALOG_BYTES = 32 * 1024
+MAX_HOT_STATE_VALUE_CATALOG_V1_BYTES = 256 * 1024
+MAX_HOT_STATE_VALUE_RECORD_BYTES = 8 * 1024
 MAX_HOT_STATE_CREATING_ENTRIES = 2
 MAX_HOT_STATE_DELETE_ENTRIES = 2048
 MAX_HOT_STATE_DELETE_DEPTH = 128
@@ -1240,76 +1247,78 @@ def manifest_generation_reachable(document: dict[str, object]) -> bool | None:
 
 
 def acquire_retirement_locks(state: Path) -> list[RetirementLock] | None:
-    lock_paths: list[Path] = []
-    direct_lock = state / "lock"
-    try:
-        direct_lock.lstat()
-    except FileNotFoundError:
-        pass
-    except OSError:
-        return None
-    else:
-        lock_paths.append(direct_lock)
-    try:
-        entries = scan_directory_bounded(state, MAX_HOT_STATE_RUNTIME_ENTRIES)
-    except OSError:
-        return None
-    if entries is None:
-        return None
-    for entry in entries:
-        if not entry.name.startswith("runtime-"):
-            continue
-        identity = entry.name.removeprefix("runtime-")
-        try:
-            details = entry.stat(follow_symlinks=False)
-        except OSError:
-            return None
-        if (
-            not state_identity_name(identity)
-            or not stat.S_ISDIR(details.st_mode)
-            or stat.S_ISLNK(details.st_mode)
-            or details.st_uid != os.getuid()
-            or stat.S_IMODE(details.st_mode) != 0o700
-        ):
-            return None
-        runtime_lock = state / entry.name / "lock"
-        try:
-            runtime_lock.lstat()
-        except OSError:
-            return None
-        lock_paths.append(runtime_lock)
-
     locks: list[RetirementLock] = []
-    acquired_all = False
     pending_descriptor: int | None = None
-    try:
-        for path in lock_paths:
-            try:
-                pending_descriptor = os.open(
-                    path, os.O_CLOEXEC | os.O_NOFOLLOW | os.O_RDWR
-                )
-                details = os.fstat(pending_descriptor)
-                if (
-                    not stat.S_ISREG(details.st_mode)
-                    or details.st_uid != os.getuid()
-                    or details.st_nlink != 1
-                    or stat.S_IMODE(details.st_mode) != 0o600
-                ):
-                    return None
-                fcntl.flock(
-                    pending_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
-                )
-            except OSError:
-                return None
-            locks.append(
-                RetirementLock(
-                    path,
-                    pending_descriptor,
-                    details.st_dev,
-                    details.st_ino,
-                )
+    acquired_all = False
+
+    def acquire(path: Path) -> bool:
+        nonlocal pending_descriptor
+        try:
+            pending_descriptor = os.open(
+                path, os.O_CLOEXEC | os.O_NOFOLLOW | os.O_RDWR
             )
-            pending_descriptor = None
+            details = os.fstat(pending_descriptor)
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_uid != os.getuid()
+                or details.st_nlink != 1
+                or stat.S_IMODE(details.st_mode) != 0o600
+            ):
+                return False
+            fcntl.flock(pending_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        locks.append(
+            RetirementLock(
+                path,
+                pending_descriptor,
+                details.st_dev,
+                details.st_ino,
+            )
+        )
+        pending_descriptor = None
+        return True
+
+    try:
+        direct_lock = state / "lock"
+        try:
+            direct_lock.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return None
+        else:
+            if not acquire(direct_lock):
+                return None
+
+        try:
+            with os.scandir(state) as entries:
+                for entry in entries:
+                    if not entry.name.startswith("runtime-"):
+                        continue
+                    identity = entry.name.removeprefix("runtime-")
+                    try:
+                        details = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        return None
+                    if (
+                        not state_identity_name(identity)
+                        or not stat.S_ISDIR(details.st_mode)
+                        or stat.S_ISLNK(details.st_mode)
+                        or details.st_uid != os.getuid()
+                        or stat.S_IMODE(details.st_mode) != 0o700
+                    ):
+                        return None
+                    runtime_lock = state / entry.name / "lock"
+                    try:
+                        runtime_lock.lstat()
+                    except OSError:
+                        return None
+                    if not acquire(runtime_lock):
+                        return None
+        except OSError:
+            return None
+
         acquired_all = True
         return locks
     finally:
@@ -1318,7 +1327,6 @@ def acquire_retirement_locks(state: Path) -> list[RetirementLock] | None:
         if not acquired_all:
             for lock in reversed(locks):
                 os.close(lock.descriptor)
-
 
 def retirement_locks_unchanged(locks: list[RetirementLock]) -> bool:
     for lock in locks:
@@ -1534,8 +1542,37 @@ def empty_hot_state_value_catalog() -> dict[str, object]:
         "retire_start_used_percent": HOT_STATE_RETIRE_START_USED_PERCENT,
         "retire_stop_used_percent": HOT_STATE_RETIRE_STOP_USED_PERCENT,
         "next_use_sequence": 0,
-        "states": {},
     }
+
+
+def validate_hot_state_value_catalog_v1(document: object) -> dict[str, object]:
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "producer",
+        "pressure_active",
+        "retire_start_used_percent",
+        "retire_stop_used_percent",
+        "next_use_sequence",
+        "states",
+    }:
+        raise RuntimeError("hot-state v1 value catalog has an unsupported shape")
+    sequence = document["next_use_sequence"]
+    states = document["states"]
+    if (
+        document["schema_version"] != HOT_STATE_VALUE_CATALOG_V1_SCHEMA_VERSION
+        or document["producer"] != HOT_STATE_VALUE_CATALOG_V1_PRODUCER
+        or not isinstance(document["pressure_active"], bool)
+        or document["retire_start_used_percent"] != HOT_STATE_RETIRE_START_USED_PERCENT
+        or document["retire_stop_used_percent"] != HOT_STATE_RETIRE_STOP_USED_PERCENT
+        or isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or sequence < 0
+        or not isinstance(states, dict)
+    ):
+        raise RuntimeError("hot-state v1 value catalog identity is not accepted")
+    for state_identity, record in states.items():
+        validate_hot_state_value_record_fields(state_identity, record, sequence)
+    return document
 
 
 def validate_hot_state_value_catalog(document: object) -> dict[str, object]:
@@ -1546,33 +1583,28 @@ def validate_hot_state_value_catalog(document: object) -> dict[str, object]:
         "retire_start_used_percent",
         "retire_stop_used_percent",
         "next_use_sequence",
-        "states",
     }:
         raise RuntimeError("hot-state value catalog has an unsupported shape")
     sequence = document["next_use_sequence"]
-    states = document["states"]
-    start_percent = document["retire_start_used_percent"]
-    stop_percent = document["retire_stop_used_percent"]
     if (
-        isinstance(document["schema_version"], bool)
-        or not isinstance(document["schema_version"], int)
-        or document["schema_version"] != HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION
+        document["schema_version"] != HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION
         or document["producer"] != HOT_STATE_VALUE_CATALOG_PRODUCER
         or not isinstance(document["pressure_active"], bool)
-        or isinstance(start_percent, bool)
-        or not isinstance(start_percent, int)
-        or start_percent != HOT_STATE_RETIRE_START_USED_PERCENT
-        or isinstance(stop_percent, bool)
-        or not isinstance(stop_percent, int)
-        or stop_percent != HOT_STATE_RETIRE_STOP_USED_PERCENT
+        or document["retire_start_used_percent"] != HOT_STATE_RETIRE_START_USED_PERCENT
+        or document["retire_stop_used_percent"] != HOT_STATE_RETIRE_STOP_USED_PERCENT
         or isinstance(sequence, bool)
         or not isinstance(sequence, int)
         or sequence < 0
-        or sequence > (1 << 63) - 1
-        or not isinstance(states, dict)
-        or len(states) > MAX_HOT_STATE_NAMESPACE_ENTRIES
     ):
         raise RuntimeError("hot-state value catalog identity is not accepted")
+    return document
+
+
+def validate_hot_state_value_record_fields(
+    state_identity: object,
+    record: object,
+    maximum_sequence: int | None = None,
+) -> dict[str, object]:
     record_keys = {
         "manifest_device",
         "manifest_inode",
@@ -1583,54 +1615,94 @@ def validate_hot_state_value_catalog(document: object) -> dict[str, object]:
         "reconstruction_elapsed_ns",
         "reuse_elapsed_ns",
     }
-    integer_keys = record_keys - {
+    if (
+        not isinstance(state_identity, str)
+        or not state_identity_name(state_identity)
+        or not isinstance(record, dict)
+        or set(record) != record_keys
+    ):
+        raise RuntimeError("hot-state value record is invalid")
+    for key in (
+        "manifest_device",
+        "manifest_inode",
+        "manifest_creation_witness_ns",
+        "last_successful_use_sequence",
+        "successful_use_count",
+    ):
+        value = record[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError("hot-state value record is invalid")
+    if (
+        record["last_successful_use_sequence"] == 0
+        or record["successful_use_count"] == 0
+        or (
+            maximum_sequence is not None
+            and record["last_successful_use_sequence"] > maximum_sequence
+        )
+    ):
+        raise RuntimeError("hot-state value record sequence is invalid")
+    value_identity = record["value_identity"]
+    if value_identity is not None and (
+        not isinstance(value_identity, str)
+        or not state_identity_name(value_identity)
+    ):
+        raise RuntimeError("hot-state value record value identity is invalid")
+    for key in ("reconstruction_elapsed_ns", "reuse_elapsed_ns"):
+        value = record[key]
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+        ):
+            raise RuntimeError("hot-state value record timing is invalid")
+    if value_identity is None and (
+        record["reconstruction_elapsed_ns"] is not None
+        or record["reuse_elapsed_ns"] is not None
+    ):
+        raise RuntimeError("hot-state value record timing is unbound")
+    return record
+
+
+def hot_state_value_record_document(
+    state_identity: str, record: dict[str, object]
+) -> dict[str, object]:
+    validate_hot_state_value_record_fields(state_identity, record)
+    return {
+        "schema_version": HOT_STATE_VALUE_RECORD_SCHEMA_VERSION,
+        "producer": HOT_STATE_VALUE_RECORD_PRODUCER,
+        "state_identity": state_identity,
+        **record,
+    }
+
+
+def validate_hot_state_value_record(document: object) -> dict[str, object]:
+    if not isinstance(document, dict):
+        raise RuntimeError("hot-state value record has an unsupported shape")
+    expected_keys = {
+        "schema_version",
+        "producer",
+        "state_identity",
+        "manifest_device",
+        "manifest_inode",
+        "manifest_creation_witness_ns",
+        "last_successful_use_sequence",
+        "successful_use_count",
         "value_identity",
         "reconstruction_elapsed_ns",
         "reuse_elapsed_ns",
     }
-    for state_identity, record in states.items():
-        if (
-            not isinstance(state_identity, str)
-            or not state_identity_name(state_identity)
-            or not isinstance(record, dict)
-            or set(record) != record_keys
-        ):
-            raise RuntimeError("hot-state value catalog record is invalid")
-        for key in integer_keys:
-            value = record[key]
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
-                or value > (1 << 63) - 1
-            ):
-                raise RuntimeError("hot-state value catalog record is invalid")
-        if (
-            record["last_successful_use_sequence"] == 0
-            or record["last_successful_use_sequence"] > sequence
-            or record["successful_use_count"] == 0
-        ):
-            raise RuntimeError("hot-state value catalog sequence is invalid")
-        value_identity = record["value_identity"]
-        if value_identity is not None and (
-            not isinstance(value_identity, str)
-            or not state_identity_name(value_identity)
-        ):
-            raise RuntimeError("hot-state value catalog value identity is invalid")
-        for key in ("reconstruction_elapsed_ns", "reuse_elapsed_ns"):
-            value = record[key]
-            if value is not None and (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value <= 0
-                or value > (1 << 63) - 1
-            ):
-                raise RuntimeError("hot-state value catalog timing is invalid")
-        if value_identity is None and (
-            record["reconstruction_elapsed_ns"] is not None
-            or record["reuse_elapsed_ns"] is not None
-        ):
-            raise RuntimeError("hot-state value catalog timing is unbound")
+    if set(document) != expected_keys:
+        raise RuntimeError("hot-state value record has an unsupported shape")
+    if (
+        document["schema_version"] != HOT_STATE_VALUE_RECORD_SCHEMA_VERSION
+        or document["producer"] != HOT_STATE_VALUE_RECORD_PRODUCER
+    ):
+        raise RuntimeError("hot-state value record identity is not accepted")
+    state_identity = document["state_identity"]
+    record = {key: value for key, value in document.items() if key not in {
+        "schema_version", "producer", "state_identity"
+    }}
+    validate_hot_state_value_record_fields(state_identity, record)
     return document
 
 
@@ -1640,8 +1712,168 @@ def canonical_hot_state_value_catalog_bytes(document: dict[str, object]) -> byte
         json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
     if len(encoded) > MAX_HOT_STATE_VALUE_CATALOG_BYTES:
-        raise RuntimeError("hot-state value catalog exceeds its size bound")
+        raise RuntimeError("hot-state value catalog exceeds its byte budget")
     return encoded
+
+
+def canonical_hot_state_value_record_bytes(document: dict[str, object]) -> bytes:
+    validate_hot_state_value_record(document)
+    encoded = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_HOT_STATE_VALUE_RECORD_BYTES:
+        raise RuntimeError("hot-state value record exceeds its byte budget")
+    return encoded
+
+
+def hot_state_value_records_root(namespace_root: Path) -> Path:
+    return namespace_root / HOT_STATE_VALUE_RECORDS
+
+
+def ensure_hot_state_value_records_root(namespace_root: Path) -> Path:
+    root = hot_state_value_records_root(namespace_root)
+    try:
+        root.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    details = root.stat(follow_symlinks=False)
+    namespace_details = namespace_root.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != os.getuid()
+        or stat.S_IMODE(details.st_mode) != 0o700
+        or details.st_dev != namespace_details.st_dev
+    ):
+        raise RuntimeError("hot-state value-record root is not owner-private")
+    return root
+
+
+def hot_state_value_record_path(
+    namespace_root: Path, state_identity: str
+) -> Path:
+    if not state_identity_name(state_identity):
+        raise RuntimeError("hot-state value record state identity is invalid")
+    return hot_state_value_records_root(namespace_root) / (
+        state_identity + HOT_STATE_VALUE_RECORD_SUFFIX
+    )
+
+
+def read_hot_state_value_record(
+    namespace_root: Path, state_identity: str
+) -> dict[str, object] | None:
+    path = hot_state_value_record_path(namespace_root, state_identity)
+    try:
+        document, encoded = read_private_json(
+            path, "hot-state value record", MAX_HOT_STATE_VALUE_RECORD_BYTES
+        )
+    except FileNotFoundError:
+        return None
+    record = validate_hot_state_value_record(document)
+    if record["state_identity"] != state_identity:
+        raise RuntimeError("hot-state value record filename conflicts with identity")
+    if canonical_hot_state_value_record_bytes(record) != encoded:
+        raise RuntimeError("hot-state value record is not canonical")
+    return record
+
+
+def write_hot_state_value_record(
+    namespace_root: Path,
+    state_identity: str,
+    record_fields: dict[str, object],
+) -> None:
+    root = ensure_hot_state_value_records_root(namespace_root)
+    document = hot_state_value_record_document(state_identity, record_fields)
+    encoded = canonical_hot_state_value_record_bytes(document)
+    final = root / (state_identity + HOT_STATE_VALUE_RECORD_SUFFIX)
+    staging = root / (
+        "." + state_identity + HOT_STATE_VALUE_RECORD_SUFFIX
+        + HOT_STATE_VALUE_RECORD_STAGING_SUFFIX
+    )
+    try:
+        details = staging.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_nlink != 1
+            or stat.S_IMODE(details.st_mode) != 0o600
+            or details.st_size > MAX_HOT_STATE_VALUE_RECORD_BYTES
+        ):
+            raise RuntimeError("hot-state value record stage is not recoverable")
+        staging.unlink()
+        fsync_directory(root)
+    descriptor = os.open(
+        staging,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        written = 0
+        while written < len(encoded):
+            count = os.write(descriptor, encoded[written:])
+            if count <= 0:
+                raise OSError("hot-state value record write made no progress")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(staging, final)
+    fsync_directory(root)
+
+
+def remove_hot_state_value_record(
+    namespace_root: Path, state_identity: str
+) -> bool:
+    path = hot_state_value_record_path(namespace_root, state_identity)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    fsync_directory(path.parent)
+    return True
+
+
+def read_all_hot_state_value_records(
+    namespace_root: Path, maximum_sequence: int
+) -> list[dict[str, object]]:
+    root = hot_state_value_records_root(namespace_root)
+    try:
+        details = root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return []
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != os.getuid()
+        or stat.S_IMODE(details.st_mode) != 0o700
+    ):
+        raise RuntimeError("hot-state value-record root is not owner-private")
+    records: list[dict[str, object]] = []
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if not entry.name.endswith(HOT_STATE_VALUE_RECORD_SUFFIX):
+                continue
+            state_identity = entry.name.removesuffix(HOT_STATE_VALUE_RECORD_SUFFIX)
+            if not state_identity_name(state_identity):
+                continue
+            try:
+                record = read_hot_state_value_record(namespace_root, state_identity)
+                if record is None:
+                    continue
+                fields = {
+                    key: value for key, value in record.items()
+                    if key not in {"schema_version", "producer", "state_identity"}
+                }
+                validate_hot_state_value_record_fields(
+                    state_identity, fields, maximum_sequence
+                )
+                records.append(record)
+            except (OSError, RuntimeError):
+                continue
+    return records
 
 
 def remove_stale_hot_state_value_catalog_stage(namespace_root: Path) -> bool:
@@ -1655,28 +1887,12 @@ def remove_stale_hot_state_value_catalog_stage(namespace_root: Path) -> bool:
         or details.st_uid != os.getuid()
         or details.st_nlink != 1
         or stat.S_IMODE(details.st_mode) != 0o600
-        or details.st_size > MAX_HOT_STATE_VALUE_CATALOG_BYTES
+        or details.st_size > MAX_HOT_STATE_VALUE_CATALOG_V1_BYTES
     ):
         raise RuntimeError("hot-state value catalog stage is not recoverable")
     staging.unlink()
     fsync_directory(namespace_root)
     return True
-
-
-def read_hot_state_value_catalog(namespace_root: Path) -> dict[str, object]:
-    path = namespace_root / HOT_STATE_VALUE_CATALOG
-    try:
-        document, encoded = read_private_json(
-            path,
-            "hot-state value catalog",
-            MAX_HOT_STATE_VALUE_CATALOG_BYTES,
-        )
-    except FileNotFoundError:
-        return empty_hot_state_value_catalog()
-    catalog = validate_hot_state_value_catalog(document)
-    if canonical_hot_state_value_catalog_bytes(catalog) != encoded:
-        raise RuntimeError("hot-state value catalog is not canonical")
-    return catalog
 
 
 def write_hot_state_value_catalog(
@@ -1704,6 +1920,61 @@ def write_hot_state_value_catalog(
     fsync_directory(namespace_root)
 
 
+def migrate_hot_state_value_catalog_v1(
+    namespace_root: Path, catalog: dict[str, object]
+) -> dict[str, object]:
+    validated = validate_hot_state_value_catalog_v1(catalog)
+    sequence = validated["next_use_sequence"]
+    states = validated["states"]
+    assert isinstance(sequence, int)
+    assert isinstance(states, dict)
+    ensure_hot_state_value_records_root(namespace_root)
+    for state_identity, fields in states.items():
+        assert isinstance(state_identity, str)
+        assert isinstance(fields, dict)
+        existing = read_hot_state_value_record(namespace_root, state_identity)
+        expected = hot_state_value_record_document(state_identity, fields)
+        if existing is None:
+            write_hot_state_value_record(namespace_root, state_identity, fields)
+        elif canonical_hot_state_value_record_bytes(existing) != (
+            canonical_hot_state_value_record_bytes(expected)
+        ):
+            raise RuntimeError("hot-state v1 migration conflicts with value record")
+    migrated = {
+        "schema_version": HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION,
+        "producer": HOT_STATE_VALUE_CATALOG_PRODUCER,
+        "pressure_active": validated["pressure_active"],
+        "retire_start_used_percent": HOT_STATE_RETIRE_START_USED_PERCENT,
+        "retire_stop_used_percent": HOT_STATE_RETIRE_STOP_USED_PERCENT,
+        "next_use_sequence": sequence,
+    }
+    write_hot_state_value_catalog(namespace_root, migrated)
+    return migrated
+
+
+def read_hot_state_value_catalog(namespace_root: Path) -> dict[str, object]:
+    path = namespace_root / HOT_STATE_VALUE_CATALOG
+    try:
+        document, encoded = read_private_json(
+            path,
+            "hot-state value catalog",
+            MAX_HOT_STATE_VALUE_CATALOG_V1_BYTES,
+        )
+    except FileNotFoundError:
+        return empty_hot_state_value_catalog()
+    if document.get("schema_version") == HOT_STATE_VALUE_CATALOG_V1_SCHEMA_VERSION:
+        legacy = validate_hot_state_value_catalog_v1(document)
+        legacy_encoded = (
+            json.dumps(legacy, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        if legacy_encoded != encoded:
+            raise RuntimeError("hot-state v1 value catalog is not canonical")
+        return migrate_hot_state_value_catalog_v1(namespace_root, legacy)
+    catalog = validate_hot_state_value_catalog(document)
+    if canonical_hot_state_value_catalog_bytes(catalog) != encoded:
+        raise RuntimeError("hot-state value catalog is not canonical")
+    return catalog
+
 def hot_state_value_identity(
     comparison_key: str,
     runtime_contract: RuntimeContract | None,
@@ -1730,7 +2001,7 @@ def hot_state_value_identity(
 def elapsed_nanoseconds(seconds: float) -> int:
     if not math.isfinite(seconds) or seconds < 0:
         raise RuntimeError("hot-state successful-use duration is invalid")
-    return max(1, min(round(seconds * 1_000_000_000), (1 << 63) - 1))
+    return max(1, round(seconds * 1_000_000_000))
 
 
 def record_successful_hot_state_use(
@@ -1770,28 +2041,16 @@ def record_successful_hot_state_use(
         remove_stale_hot_state_value_catalog_stage(namespace_root)
         catalog = read_hot_state_value_catalog(namespace_root)
         sequence = catalog["next_use_sequence"]
-        states = catalog["states"]
         assert isinstance(sequence, int)
-        assert isinstance(states, dict)
-        if sequence >= (1 << 63) - 1:
-            return "sequence_exhausted"
-        if (
-            state_base.name not in states
-            and len(states) >= MAX_HOT_STATE_NAMESPACE_ENTRIES
-        ):
-            retained_states: dict[str, object] = {}
-            for state_identity, record in states.items():
-                try:
-                    (namespace_root / state_identity).lstat()
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    pass
-                retained_states[state_identity] = record
-            states = retained_states
-            if len(states) >= MAX_HOT_STATE_NAMESPACE_ENTRIES:
-                return "catalog_bound_exceeded"
-        prior = states.get(state_base.name)
+        prior_document = read_hot_state_value_record(
+            namespace_root, state_base.name
+        )
+        prior = None
+        if prior_document is not None:
+            prior = {
+                key: value for key, value in prior_document.items()
+                if key not in {"schema_version", "producer", "state_identity"}
+            }
         same_manifest = isinstance(prior, dict) and (
             prior["manifest_device"] == manifest_identity.device
             and prior["manifest_inode"] == manifest_identity.inode
@@ -1800,7 +2059,7 @@ def record_successful_hot_state_use(
         )
         next_sequence = sequence + 1
         successful_use_count = (
-            min(prior["successful_use_count"] + 1, (1 << 63) - 1)
+            prior["successful_use_count"] + 1
             if same_manifest
             else 1
         )
@@ -1829,27 +2088,31 @@ def record_successful_hot_state_use(
                 value_identity = observed_value_identity
                 reconstruction_elapsed_ns = None
                 reuse_elapsed_ns = total_elapsed_ns
-        updated_states = dict(states)
-        updated_states[state_base.name] = {
-            "manifest_device": manifest_identity.device,
-            "manifest_inode": manifest_identity.inode,
-            "manifest_creation_witness_ns": manifest_identity.creation_witness_ns,
-            "last_successful_use_sequence": next_sequence,
-            "successful_use_count": successful_use_count,
-            "value_identity": value_identity,
-            "reconstruction_elapsed_ns": reconstruction_elapsed_ns,
-            "reuse_elapsed_ns": reuse_elapsed_ns,
-        }
-        updated_catalog = {
-            **catalog,
-            "next_use_sequence": next_sequence,
-            "states": updated_states,
-        }
-        write_hot_state_value_catalog(namespace_root, updated_catalog)
+
+        # Advance the global sequence first. A crash before the per-generation
+        # record update leaves only a harmless sequence gap, never a record
+        # that claims a future sequence.
+        write_hot_state_value_catalog(
+            namespace_root,
+            {**catalog, "next_use_sequence": next_sequence},
+        )
+        write_hot_state_value_record(
+            namespace_root,
+            state_base.name,
+            {
+                "manifest_device": manifest_identity.device,
+                "manifest_inode": manifest_identity.inode,
+                "manifest_creation_witness_ns": manifest_identity.creation_witness_ns,
+                "last_successful_use_sequence": next_sequence,
+                "successful_use_count": successful_use_count,
+                "value_identity": value_identity,
+                "reconstruction_elapsed_ns": reconstruction_elapsed_ns,
+                "reuse_elapsed_ns": reuse_elapsed_ns,
+            },
+        )
         return "recorded"
     finally:
         os.close(namespace_lock)
-
 
 def hot_state_filesystem_used_percent(namespace_root: Path) -> tuple[int, int]:
     details = os.statvfs(namespace_root)
@@ -1886,17 +2149,32 @@ def retire_one_low_value_state(
             else "ordinary_free_space"
         )
 
-    states = catalog["states"]
-    assert isinstance(states, dict)
+    sequence = catalog["next_use_sequence"]
+    assert isinstance(sequence, int)
     candidates: list[tuple[int, str, dict[str, object]]] = []
-    for state_identity, untyped_record in states.items():
+    for record in read_all_hot_state_value_records(namespace_root, sequence):
+        state_identity = record["state_identity"]
         assert isinstance(state_identity, str)
-        assert isinstance(untyped_record, dict)
         if state_identity == current_state_identity:
             continue
-        sequence = untyped_record["last_successful_use_sequence"]
-        assert isinstance(sequence, int)
-        candidates.append((sequence, state_identity, untyped_record))
+        state = namespace_root / state_identity
+        try:
+            state.lstat()
+        except FileNotFoundError:
+            try:
+                remove_hot_state_value_record(namespace_root, state_identity)
+            except OSError:
+                pass
+            continue
+        except OSError:
+            continue
+        candidates.append(
+            (
+                int(record["last_successful_use_sequence"]),
+                state_identity,
+                record,
+            )
+        )
     candidates.sort(key=lambda item: (item[0], item[1]))
 
     namespace_details = namespace_root.stat(follow_symlinks=False)
@@ -1960,13 +2238,8 @@ def retire_one_low_value_state(
             fsync_directory(namespace_root)
             close_retirement_locks(locks)
             locks = None
-            updated_states = dict(states)
-            del updated_states[state_identity]
             try:
-                write_hot_state_value_catalog(
-                    namespace_root,
-                    {**catalog, "states": updated_states},
-                )
+                remove_hot_state_value_record(namespace_root, state_identity)
             except (OSError, RuntimeError):
                 return "retired_low_value_catalog_deferred"
             delete_retired_state_bounded(
@@ -1982,7 +2255,6 @@ def retire_one_low_value_state(
             if state_descriptor is not None:
                 os.close(state_descriptor)
     return "pressure_no_eligible_state"
-
 
 def ensure_retirement_record(
     namespace_root: Path, retired_name: str, state_identity: str
@@ -2190,139 +2462,180 @@ def collect_one_unreachable_state(
             or stat.S_IMODE(namespace_details.st_mode) != 0o700
         ):
             return "unavailable"
-        entries = scan_directory_bounded(
-            namespace_root, MAX_HOT_STATE_NAMESPACE_ENTRIES
-        )
     except OSError:
         return "unavailable"
-    if entries is None:
-        return "namespace_bound_exceeded"
 
-    for entry in entries:
-        if not (
-            entry.name.startswith(HOT_STATE_RETIREMENT_RECORD_PREFIX)
-            and entry.name.endswith(HOT_STATE_RETIREMENT_RECORD_SUFFIX)
-        ):
-            continue
-        try:
-            record, _ = read_private_json(
-                namespace_root / entry.name,
-                "hot-state retirement record",
-            )
-            validate_retirement_record(record)
-            state_identity = record["state_identity"]
-            retired_name = record["retired_name"]
-            assert isinstance(state_identity, str)
-            assert isinstance(retired_name, str)
-            if entry.name != retirement_record_name(
-                retired_name, state_identity
-            ):
-                continue
-            delete_retired_state_bounded(
-                namespace_root, retired_name, state_identity
-            )
-            return "retirement_record_recovery"
-        except (OSError, RuntimeError):
-            continue
-
-    for entry in entries:
-        if not entry.name.startswith(HOT_STATE_CREATING_PREFIX):
-            continue
-        suffix = entry.name.removeprefix(HOT_STATE_CREATING_PREFIX)
-        state_identity, separator, _ = suffix.partition("-")
-        if separator and state_identity_name(state_identity):
-            if delete_unpublished_stage_bounded(
-                namespace_root, entry.name, state_identity
-            ):
-                return "creating_recovery"
-            return "creating_recovery_deferred"
-
-    for entry in entries:
-        if not entry.name.startswith(HOT_STATE_RETIRED_PREFIX):
-            continue
-        state_identity = entry.name.removeprefix(HOT_STATE_RETIRED_PREFIX)
-        if state_identity_name(state_identity):
-            try:
-                delete_retired_state_bounded(
-                    namespace_root, entry.name, state_identity
-                )
-            except RuntimeError:
-                return "retired_recovery_deferred"
-            return "retired_recovery"
-
-    for entry in entries:
-        if entry.name == current_state_identity or not state_identity_name(entry.name):
-            continue
-        state = namespace_root / entry.name
-        state_descriptor: int | None = None
-        try:
-            details = entry.stat(follow_symlinks=False)
-            if (
-                not stat.S_ISDIR(details.st_mode)
-                or stat.S_ISLNK(details.st_mode)
-                or details.st_uid != os.getuid()
-                or stat.S_IMODE(details.st_mode) != 0o700
-                or details.st_dev != namespace_details.st_dev
-            ):
-                continue
-            state_descriptor = os.open(
-                state,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            )
-            pinned_state = os.fstat(state_descriptor)
-            if (
-                pinned_state.st_dev != details.st_dev
-                or pinned_state.st_ino != details.st_ino
-                or pinned_state.st_uid != os.getuid()
-                or stat.S_IMODE(pinned_state.st_mode) != 0o700
-            ):
-                continue
-            manifest, encoded_before = read_producer_manifest(
-                state_descriptor, entry.name
-            )
-            if manifest_generation_reachable(manifest) is not False:
-                continue
-            locks = acquire_retirement_locks(state)
-            if locks is None:
-                continue
-            try:
-                try:
-                    manifest_after, encoded_after = read_producer_manifest(
-                        state_descriptor, entry.name
-                    )
-                except (OSError, RuntimeError):
-                    continue
-                try:
-                    named_state = state.stat(follow_symlinks=False)
-                except OSError:
-                    continue
-                if (
-                    encoded_after != encoded_before
-                    or manifest_generation_reachable(manifest_after) is not False
-                    or not retirement_locks_unchanged(locks)
-                    or named_state.st_dev != pinned_state.st_dev
-                    or named_state.st_ino != pinned_state.st_ino
+    try:
+        with os.scandir(namespace_root) as entries:
+            for entry in entries:
+                if not (
+                    entry.name.startswith(HOT_STATE_RETIREMENT_RECORD_PREFIX)
+                    and entry.name.endswith(HOT_STATE_RETIREMENT_RECORD_SUFFIX)
                 ):
                     continue
-                retired_name = f"{HOT_STATE_RETIRED_PREFIX}{entry.name}"
                 try:
-                    rename_noreplace(state, namespace_root / retired_name)
-                except FileExistsError:
+                    record, _ = read_private_json(
+                        namespace_root / entry.name,
+                        "hot-state retirement record",
+                    )
+                    validate_retirement_record(record)
+                    state_identity = record["state_identity"]
+                    retired_name = record["retired_name"]
+                    assert isinstance(state_identity, str)
+                    assert isinstance(retired_name, str)
+                    if entry.name != retirement_record_name(
+                        retired_name, state_identity
+                    ):
+                        continue
+                    delete_retired_state_bounded(
+                        namespace_root, retired_name, state_identity
+                    )
+                    try:
+                        remove_hot_state_value_record(
+                            namespace_root, state_identity
+                        )
+                    except (OSError, RuntimeError):
+                        pass
+                    return "retirement_record_recovery"
+                except (OSError, RuntimeError):
                     continue
-                except OSError:
-                    continue
-                fsync_directory(namespace_root)
-            finally:
-                close_retirement_locks(locks)
-            delete_retired_state_bounded(namespace_root, retired_name, entry.name)
-            return "retired_unreachable"
-        except (OSError, RuntimeError):
-            continue
-        finally:
-            if state_descriptor is not None:
-                os.close(state_descriptor)
-    return "nothing_eligible"
+    except OSError:
+        return "unavailable"
 
+    try:
+        with os.scandir(namespace_root) as entries:
+            for entry in entries:
+                if not entry.name.startswith(HOT_STATE_CREATING_PREFIX):
+                    continue
+                suffix = entry.name.removeprefix(HOT_STATE_CREATING_PREFIX)
+                state_identity, separator, _ = suffix.partition("-")
+                if separator and state_identity_name(state_identity):
+                    if delete_unpublished_stage_bounded(
+                        namespace_root, entry.name, state_identity
+                    ):
+                        return "creating_recovery"
+                    return "creating_recovery_deferred"
+    except OSError:
+        return "unavailable"
+
+    try:
+        with os.scandir(namespace_root) as entries:
+            for entry in entries:
+                if not entry.name.startswith(HOT_STATE_RETIRED_PREFIX):
+                    continue
+                state_identity = entry.name.removeprefix(HOT_STATE_RETIRED_PREFIX)
+                if state_identity_name(state_identity):
+                    try:
+                        delete_retired_state_bounded(
+                            namespace_root, entry.name, state_identity
+                        )
+                        try:
+                            remove_hot_state_value_record(
+                                namespace_root, state_identity
+                            )
+                        except (OSError, RuntimeError):
+                            pass
+                    except RuntimeError:
+                        return "retired_recovery_deferred"
+                    return "retired_recovery"
+    except OSError:
+        return "unavailable"
+
+    try:
+        with os.scandir(namespace_root) as entries:
+            for entry in entries:
+                if (
+                    entry.name == current_state_identity
+                    or not state_identity_name(entry.name)
+                ):
+                    continue
+                state = namespace_root / entry.name
+                state_descriptor: int | None = None
+                try:
+                    details = entry.stat(follow_symlinks=False)
+                    if (
+                        not stat.S_ISDIR(details.st_mode)
+                        or stat.S_ISLNK(details.st_mode)
+                        or details.st_uid != os.getuid()
+                        or stat.S_IMODE(details.st_mode) != 0o700
+                        or details.st_dev != namespace_details.st_dev
+                    ):
+                        continue
+                    state_descriptor = os.open(
+                        state,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_CLOEXEC
+                        | os.O_NOFOLLOW,
+                    )
+                    pinned_state = os.fstat(state_descriptor)
+                    if (
+                        pinned_state.st_dev != details.st_dev
+                        or pinned_state.st_ino != details.st_ino
+                        or pinned_state.st_uid != os.getuid()
+                        or stat.S_IMODE(pinned_state.st_mode) != 0o700
+                    ):
+                        continue
+                    manifest, encoded_before = read_producer_manifest(
+                        state_descriptor, entry.name
+                    )
+                    if manifest_generation_reachable(manifest) is not False:
+                        continue
+                    locks = acquire_retirement_locks(state)
+                    if locks is None:
+                        continue
+                    try:
+                        try:
+                            manifest_after, encoded_after = read_producer_manifest(
+                                state_descriptor, entry.name
+                            )
+                        except (OSError, RuntimeError):
+                            continue
+                        try:
+                            named_state = state.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if (
+                            encoded_after != encoded_before
+                            or manifest_generation_reachable(manifest_after)
+                            is not False
+                            or not retirement_locks_unchanged(locks)
+                            or named_state.st_dev != pinned_state.st_dev
+                            or named_state.st_ino != pinned_state.st_ino
+                        ):
+                            continue
+                        retired_name = (
+                            f"{HOT_STATE_RETIRED_PREFIX}{entry.name}"
+                        )
+                        try:
+                            rename_noreplace(
+                                state, namespace_root / retired_name
+                            )
+                        except FileExistsError:
+                            continue
+                        except OSError:
+                            continue
+                        fsync_directory(namespace_root)
+                    finally:
+                        close_retirement_locks(locks)
+                    try:
+                        remove_hot_state_value_record(
+                            namespace_root, entry.name
+                        )
+                    except (OSError, RuntimeError):
+                        pass
+                    delete_retired_state_bounded(
+                        namespace_root, retired_name, entry.name
+                    )
+                    return "retired_unreachable"
+                except (OSError, RuntimeError):
+                    continue
+                finally:
+                    if state_descriptor is not None:
+                        os.close(state_descriptor)
+    except OSError:
+        return "unavailable"
+    return "nothing_eligible"
 
 def prepare_private_copy(
     spec: CacheSpec, resident_cache: Path, destination: Path
