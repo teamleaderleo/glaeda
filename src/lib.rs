@@ -45,6 +45,9 @@ pub mod disposable_prepared_template;
 /// Private, secret-safe command binding for one durably registered disposable guest runner.
 #[cfg(unix)]
 pub(crate) mod disposable_runner_runtime;
+/// Native owned-Linux task backend for one trusted GitHub Actions JIT runner.
+#[cfg(unix)]
+pub(crate) mod owned_linux_jit_runtime;
 /// Pure bounded diagnostic document for one controller-service failure.
 pub mod disposable_service_failure_receipt;
 pub mod disposable_template_generation;
