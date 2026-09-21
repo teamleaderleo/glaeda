@@ -79,6 +79,38 @@ Rules in this first slice:
 
 Performance evidence never substitutes for semantic validation.
 
+### Composition with #21 reusable-state lifecycle
+
+The lifecycle above is the **optimizer-plan lifecycle**. It decides whether Glaeda has enough
+evidence to recommend a bounded execution change. It carries advisory authority only.
+
+Reusable candidates map into the shared `reusable_state_lifecycle` classes:
+
+| optimizer candidate | #21 reusable-state class |
+| --- | --- |
+| reuse exact compiled product | `immutable_compiled_product` |
+| retain local immutable artifact | `immutable_compiled_product` |
+| split consumer artifact | `immutable_compiled_product` |
+| run test without rebuild | `immutable_compiled_product` |
+| reuse dependency generation | `prepared_dependency_generation` |
+| bake prepared tool | `prepared_dependency_generation` |
+
+A `preferred` optimizer candidate therefore means **hand this exact candidate to the owning
+reusable-state family**. It does not publish bytes or grant consumption authority. A real generation
+still begins under #21's reviewed publisher boundary and must progress through:
+
+`candidate -> validated -> observed_consumers -> preferred -> demoted -> retired`
+
+using `ReusableStateIdentityContract`, `ReusableStateMetrics`, semantic mismatch accounting,
+reset/invalidation limits, and the shared retention/eviction policy.
+
+The optimizer's utility is an experiment/candidate estimate. Once a generation exists, #21's
+cumulative generation utility is authoritative for retain/demote/stop-publishing decisions. This
+keeps discovery history separate from generation validity/retention history.
+
+Repository-side classes such as guard parallelization, suite isolation, moving a static guard, and
+platform-lane skipping remain recommendations. The reducer never edits workflow YAML.
+
 ## cmux proving case
 
 The production reducer contains no cmux names or rules. The unit fixture feeds cmux-like observations through the same generic paths.
