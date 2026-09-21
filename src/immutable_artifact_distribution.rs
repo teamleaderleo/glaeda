@@ -708,14 +708,19 @@ mod tests {
         successor.producer.source_revision =
             CommitId::parse(&"cd".repeat(20)).expect("successor revision");
 
-        let edge =
-            immutable_artifact_supersession(&predecessor, &successor).expect("supersession");
-        assert_eq!(edge.cache_class, ReusableStateClass::ImmutableCompiledProduct);
+        let edge = immutable_artifact_supersession(&predecessor, &successor).expect("supersession");
+        assert_eq!(
+            edge.cache_class,
+            ReusableStateClass::ImmutableCompiledProduct
+        );
         assert_eq!(
             edge.predecessor.0,
             predecessor.digest().expect("predecessor digest")
         );
-        assert_eq!(edge.successor.0, successor.digest().expect("successor digest"));
+        assert_eq!(
+            edge.successor.0,
+            successor.digest().expect("successor digest")
+        );
     }
 
     #[test]
