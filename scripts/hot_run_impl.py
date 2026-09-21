@@ -209,14 +209,6 @@ class DeleteBudget:
     remaining_entries: int
 
 
-@dataclass(frozen=True)
-class RetirementLock:
-    path: Path
-    descriptor: int
-    device: int
-    inode: int
-
-
 def nonnegative_finite(raw: str) -> float:
     value = float(raw)
     if not math.isfinite(value) or value < 0:
@@ -1331,112 +1323,6 @@ def manifest_generation_reachable(document: dict[str, object]) -> bool | None:
     return True
 
 
-def acquire_retirement_locks(state: Path) -> list[RetirementLock] | None:
-    locks: list[RetirementLock] = []
-    pending_descriptor: int | None = None
-    acquired_all = False
-
-    def acquire(path: Path) -> bool:
-        nonlocal pending_descriptor
-        try:
-            pending_descriptor = os.open(
-                path, os.O_CLOEXEC | os.O_NOFOLLOW | os.O_RDWR
-            )
-            details = os.fstat(pending_descriptor)
-            if (
-                not stat.S_ISREG(details.st_mode)
-                or details.st_uid != os.getuid()
-                or details.st_nlink != 1
-                or stat.S_IMODE(details.st_mode) != 0o600
-            ):
-                return False
-            fcntl.flock(pending_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return False
-        locks.append(
-            RetirementLock(
-                path,
-                pending_descriptor,
-                details.st_dev,
-                details.st_ino,
-            )
-        )
-        pending_descriptor = None
-        return True
-
-    try:
-        direct_lock = state / "lock"
-        try:
-            direct_lock.lstat()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            return None
-        else:
-            if not acquire(direct_lock):
-                return None
-
-        try:
-            with os.scandir(state) as entries:
-                for entry in entries:
-                    if not entry.name.startswith("runtime-"):
-                        continue
-                    identity = entry.name.removeprefix("runtime-")
-                    try:
-                        details = entry.stat(follow_symlinks=False)
-                    except OSError:
-                        return None
-                    if (
-                        not state_identity_name(identity)
-                        or not stat.S_ISDIR(details.st_mode)
-                        or stat.S_ISLNK(details.st_mode)
-                        or details.st_uid != os.getuid()
-                        or stat.S_IMODE(details.st_mode) != 0o700
-                    ):
-                        return None
-                    runtime_lock = state / entry.name / "lock"
-                    try:
-                        runtime_lock.lstat()
-                    except OSError:
-                        return None
-                    if not acquire(runtime_lock):
-                        return None
-        except OSError:
-            return None
-
-        acquired_all = True
-        return locks
-    finally:
-        if pending_descriptor is not None:
-            os.close(pending_descriptor)
-        if not acquired_all:
-            for lock in reversed(locks):
-                os.close(lock.descriptor)
-
-def retirement_locks_unchanged(locks: list[RetirementLock]) -> bool:
-    for lock in locks:
-        try:
-            details = lock.path.stat(follow_symlinks=False)
-        except OSError:
-            return False
-        if (
-            details.st_dev != lock.device
-            or details.st_ino != lock.inode
-            or not stat.S_ISREG(details.st_mode)
-            or details.st_uid != os.getuid()
-            or details.st_nlink != 1
-            or stat.S_IMODE(details.st_mode) != 0o600
-        ):
-            return False
-    return True
-
-
-def close_retirement_locks(locks: list[RetirementLock] | None) -> None:
-    if locks is not None:
-        for lock in reversed(locks):
-            os.close(lock.descriptor)
-
-
 def delete_directory_contents_bounded(
     descriptor: int,
     expected_device: int,
@@ -2137,39 +2023,6 @@ def remove_hot_state_value_ticket(
         return False
     fsync_directory(root)
     return True
-
-
-def read_all_hot_state_value_records(
-    namespace_root: Path, maximum_sequence: int
-) -> list[dict[str, object]]:
-    root = validate_hot_state_value_records_root(
-        namespace_root, create=False
-    )
-    if root is None:
-        return []
-    records: list[dict[str, object]] = []
-    with os.scandir(root) as entries:
-        for entry in entries:
-            if not entry.name.endswith(HOT_STATE_VALUE_RECORD_SUFFIX):
-                continue
-            state_identity = entry.name.removesuffix(HOT_STATE_VALUE_RECORD_SUFFIX)
-            if not state_identity_name(state_identity):
-                continue
-            try:
-                record = read_hot_state_value_record(namespace_root, state_identity)
-                if record is None:
-                    continue
-                fields = {
-                    key: value for key, value in record.items()
-                    if key not in {"schema_version", "producer", "state_identity"}
-                }
-                validate_hot_state_value_record_fields(
-                    state_identity, fields, maximum_sequence
-                )
-                records.append(record)
-            except (OSError, RuntimeError):
-                continue
-    return records
 
 
 def remove_stale_hot_state_value_catalog_stage(namespace_root: Path) -> bool:
