@@ -193,6 +193,21 @@ class OwnerLocalDispatchTests(unittest.TestCase):
         with self.assertRaisesRegex(local.LocalRefusal, "installation file"):
             local.load_installation(self.installation.path)
 
+    def test_installation_rejects_writable_checkout_and_query_program(self) -> None:
+        self.installation.checkout.chmod(0o777)
+        with self.assertRaisesRegex(local.LocalRefusal, "owner-controlled directory"):
+            local.load_installation(self.installation.path)
+        self.installation.checkout.chmod(0o755)
+
+        self.installation.query_program.chmod(0o722)
+        with mock.patch.object(
+            local,
+            "REPO_QUERY_PROGRAM",
+            self.installation.query_program,
+        ):
+            with self.assertRaisesRegex(local.LocalRefusal, "owned executable"):
+                local.installed_repo_query_program()
+
     def test_repo_query_uses_only_installed_checkout_and_fixed_argv(self) -> None:
         semantic_request = repo_query_request()
         compiled = semantic.compile_request(semantic_request)
