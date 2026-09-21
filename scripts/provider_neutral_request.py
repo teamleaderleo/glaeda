@@ -454,9 +454,9 @@ def capabilities_receipt(compiled: CompiledRequest) -> dict[str, object]:
     )
 
 
-def status_receipt(compiled: CompiledRequest, observation: dict[str, object]) -> dict[str, object]:
-    if compiled.request.operation != OP_STATUS:
-        raise ContractRefusal("internal_contract_error", "request is not status")
+def validate_status_observation(
+    observation: dict[str, object],
+) -> dict[str, object]:
     expected = {
         "document_type",
         "schema_version",
@@ -480,12 +480,18 @@ def status_receipt(compiled: CompiledRequest, observation: dict[str, object]) ->
         or observation.get("authorizes_redispatch") is not False
     ):
         raise ContractRefusal("invalid_status_observation", "status observation is outside the reviewed contract")
+    return observation
+
+
+def status_receipt(compiled: CompiledRequest, observation: dict[str, object]) -> dict[str, object]:
+    if compiled.request.operation != OP_STATUS:
+        raise ContractRefusal("internal_contract_error", "request is not status")
     return _receipt(
         compiled.request,
         compiled.request_sha256,
         state="succeeded",
         resolved_operation=compiled.resolved_operation,
-        result=observation,
+        result=validate_status_observation(observation),
     )
 
 
