@@ -10,10 +10,11 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::artifact::{CommitId, RepositoryRef, Sha256Digest};
+use crate::reusable_state_lifecycle::{
+    ReusableStateClass, ReusableStateGenerationId, ReusableStateSupersession,
+};
 
 pub const IMMUTABLE_ARTIFACT_DISTRIBUTION_SCHEMA_VERSION: u8 = 1;
-pub const MAX_IMMUTABLE_ARTIFACT_BYTES: u64 = 1 << 50;
-pub const MAX_IMMUTABLE_ARTIFACT_DURATION_MILLIS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -306,6 +307,39 @@ impl ImmutableArtifactObjectIdentity {
     }
 }
 
+/// Build one explicit reusable-state supersession edge for the same immutable product lineage.
+///
+/// Source/build/content/provenance generations may change. Artifact schema, product contract,
+/// repository, and compatibility must stay equal so transport code cannot infer replacement across
+/// unrelated products.
+///
+/// # Errors
+///
+/// Returns an error when the two objects are identical, their product lineages differ, or either
+/// canonical identity digest cannot be encoded.
+pub fn immutable_artifact_supersession(
+    predecessor: &ImmutableArtifactObjectIdentity,
+    successor: &ImmutableArtifactObjectIdentity,
+) -> Result<ReusableStateSupersession, ImmutableArtifactDistributionError> {
+    let predecessor_digest = predecessor.digest()?;
+    let successor_digest = successor.digest()?;
+    if predecessor_digest == successor_digest {
+        return Err(ImmutableArtifactDistributionError::IdenticalSupersession);
+    }
+    if predecessor.artifact_schema != successor.artifact_schema
+        || predecessor.product_contract != successor.product_contract
+        || predecessor.producer.repository != successor.producer.repository
+        || predecessor.compatibility != successor.compatibility
+    {
+        return Err(ImmutableArtifactDistributionError::SupersessionLineageMismatch);
+    }
+    Ok(ReusableStateSupersession {
+        cache_class: ReusableStateClass::ImmutableCompiledProduct,
+        predecessor: ReusableStateGenerationId(predecessor_digest),
+        successor: ReusableStateGenerationId(successor_digest),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImmutableArtifactSourceClass {
@@ -345,12 +379,12 @@ impl ImmutableArtifactAvailability {
     ///
     /// # Errors
     ///
-    /// Returns an error when the object size is zero or exceeds the reviewed bound.
+    /// Returns an error when the exact object size is zero.
     pub fn available(
         object_identity: Sha256Digest,
         size_bytes: u64,
     ) -> Result<Self, ImmutableArtifactDistributionError> {
-        if size_bytes == 0 || size_bytes > MAX_IMMUTABLE_ARTIFACT_BYTES {
+        if size_bytes == 0 {
             return Err(ImmutableArtifactDistributionError::InvalidObjectSize);
         }
         Ok(Self::Available {
@@ -386,7 +420,7 @@ pub struct ImmutableArtifactLookupObservation {
 impl ImmutableArtifactLookupObservation {
     /// # Errors
     ///
-    /// Returns an error for unbounded sizes, byte counts, or durations.
+    /// Returns an error when byte accounting is internally inconsistent.
     pub fn new(
         source: ImmutableArtifactSourceClass,
         outcome: ImmutableArtifactLookupOutcome,
@@ -396,20 +430,10 @@ impl ImmutableArtifactLookupObservation {
         bytes_transferred: u64,
         restore_duration_millis: u64,
     ) -> Result<Self, ImmutableArtifactDistributionError> {
-        if object_size_bytes > MAX_IMMUTABLE_ARTIFACT_BYTES
-            || bytes_transferred > MAX_IMMUTABLE_ARTIFACT_BYTES
+        if bytes_transferred > object_size_bytes
+            || (outcome == ImmutableArtifactLookupOutcome::Hit && object_size_bytes == 0)
         {
-            return Err(ImmutableArtifactDistributionError::InvalidObjectSize);
-        }
-        if [
-            lookup_duration_millis,
-            transfer_duration_millis,
-            restore_duration_millis,
-        ]
-        .into_iter()
-        .any(|value| value > MAX_IMMUTABLE_ARTIFACT_DURATION_MILLIS)
-        {
-            return Err(ImmutableArtifactDistributionError::InvalidDuration);
+            return Err(ImmutableArtifactDistributionError::InvalidObservationBytes);
         }
         Ok(Self {
             source,
@@ -428,7 +452,9 @@ impl ImmutableArtifactLookupObservation {
 pub enum ImmutableArtifactDistributionError {
     InvalidProducerProvenance,
     InvalidObjectSize,
-    InvalidDuration,
+    InvalidObservationBytes,
+    IdenticalSupersession,
+    SupersessionLineageMismatch,
     DigestEncoding,
 }
 
@@ -436,10 +462,16 @@ impl fmt::Display for ImmutableArtifactDistributionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InvalidProducerProvenance => "immutable artifact producer provenance is invalid",
-            Self::InvalidObjectSize => {
-                "immutable artifact object size is outside the reviewed bound"
+            Self::InvalidObjectSize => "immutable artifact object size must be nonzero",
+            Self::InvalidObservationBytes => {
+                "immutable artifact byte accounting is internally inconsistent"
             }
-            Self::InvalidDuration => "immutable artifact duration is outside the reviewed bound",
+            Self::IdenticalSupersession => {
+                "immutable artifact supersession requires two distinct exact objects"
+            }
+            Self::SupersessionLineageMismatch => {
+                "immutable artifact supersession crosses product lineage"
+            }
             Self::DigestEncoding => "immutable artifact identity digest could not be encoded",
         })
     }
@@ -642,14 +674,83 @@ mod tests {
             ImmutableArtifactLookupObservation::new(
                 ImmutableArtifactSourceClass::PrivateR2,
                 ImmutableArtifactLookupOutcome::Miss,
-                0,
-                MAX_IMMUTABLE_ARTIFACT_DURATION_MILLIS + 1,
-                0,
-                0,
-                0,
+                10,
+                u64::MAX,
+                u64::MAX,
+                11,
+                u64::MAX,
             )
             .is_err()
         );
+
+        let huge = ImmutableArtifactLookupObservation::new(
+            ImmutableArtifactSourceClass::PrivateR2,
+            ImmutableArtifactLookupOutcome::Hit,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+        )
+        .expect("u64-bounded metadata has no arbitrary protocol ceiling");
+        assert_eq!(huge.object_size_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn exact_product_lineage_emits_reusable_state_supersession_edge() {
+        let predecessor = object();
+        let mut successor = object();
+        successor.source_identity = digest("b");
+        successor.build_identity = digest("c");
+        successor.content_digest = digest("d");
+        successor.producer.artifact_id += 1;
+        successor.producer.producer_run_id += 1;
+        successor.producer.source_revision =
+            CommitId::parse(&"cd".repeat(20)).expect("successor revision");
+
+        let edge = immutable_artifact_supersession(&predecessor, &successor).expect("supersession");
+        assert_eq!(
+            edge.cache_class,
+            ReusableStateClass::ImmutableCompiledProduct
+        );
+        assert_eq!(
+            edge.predecessor.0,
+            predecessor.digest().expect("predecessor digest")
+        );
+        assert_eq!(
+            edge.successor.0,
+            successor.digest().expect("successor digest")
+        );
+    }
+
+    #[test]
+    fn supersession_refuses_identical_or_cross_product_objects() {
+        let predecessor = object();
+        assert_eq!(
+            immutable_artifact_supersession(&predecessor, &predecessor).unwrap_err(),
+            ImmutableArtifactDistributionError::IdenticalSupersession
+        );
+
+        let mut unrelated = object();
+        unrelated.product_contract = digest("f");
+        assert_eq!(
+            immutable_artifact_supersession(&predecessor, &unrelated).unwrap_err(),
+            ImmutableArtifactDistributionError::SupersessionLineageMismatch
+        );
+    }
+
+    #[test]
+    fn artifact_metadata_has_no_arbitrary_size_ceiling() {
+        let identity = object().digest().expect("identity");
+        let availability =
+            ImmutableArtifactAvailability::available(identity, u64::MAX).expect("large object");
+        assert!(matches!(
+            availability,
+            ImmutableArtifactAvailability::Available {
+                size_bytes: u64::MAX,
+                ..
+            }
+        ));
     }
 
     #[test]
