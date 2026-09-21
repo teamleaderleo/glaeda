@@ -1,5 +1,7 @@
 /// Read-only observation of one configured official Actions runner.
 pub mod actions_runner_readiness;
+/// Pure recommendation-only adaptive CI pool routing from bounded evidence.
+pub mod adaptive_ci_routing;
 pub mod artifact;
 /// Pure, path-free classification of explicit hot-state inventory observations.
 pub mod cache_inventory;
