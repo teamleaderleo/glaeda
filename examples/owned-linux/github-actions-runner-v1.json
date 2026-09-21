@@ -4,7 +4,7 @@
     "version": "2.336.0",
     "architecture": "x64",
     "location": "https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-x64-2.336.0.tar.gz",
-    "archive_sha256": "sha256:466a920e38e74ff5e7d23c28143a66450cd3868da58609d11af98c64aa179a79"
+    "archive_sha256": "sha256:04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d"
   },
   "task": {
     "profile": "github-actions-trusted-v1",
