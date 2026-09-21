@@ -468,15 +468,24 @@ def validate_status_observation(
         "authorizes_execution",
         "authorizes_redispatch",
     }
+    pairs = {
+        ("ready", "compatible"),
+        ("refused", "observation_unavailable"),
+        ("wait", "node_held"),
+        ("wait", "node_draining"),
+        ("wait", "pressure_high"),
+        ("wait", "capacity_unavailable"),
+        ("wait", "reserved"),
+    }
     if (
         not isinstance(observation, dict)
         or set(observation) != expected
         or observation.get("document_type") != "glaeda-owned-admission-observation"
         or type(observation.get("schema_version")) is not int
         or observation.get("schema_version") != 1
-        or observation.get("outcome") not in {"ready", "wait", "refused"}
+        or not isinstance(observation.get("outcome"), str)
         or not isinstance(observation.get("reason"), str)
-        or not REASON_PATTERN.fullmatch(observation["reason"])
+        or (observation["outcome"], observation["reason"]) not in pairs
         or observation.get("grants_authority") is not False
         or observation.get("authorizes_execution") is not False
         or observation.get("authorizes_redispatch") is not False
