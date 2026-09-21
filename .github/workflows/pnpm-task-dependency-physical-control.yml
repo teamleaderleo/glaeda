@@ -215,7 +215,7 @@ jobs:
           sudo -u "$BENCH_USER" env -i             HOME="$BENCH_HOME"             PATH="$NODE_BIN:/usr/bin:/bin"             NPM_CONFIG_USERCONFIG=/dev/null             PNPM_CONFIG_VIRTUAL_STORE_TYPE=project             bash -c 'cd "$1" && exec "$2" install --frozen-lockfile --ignore-scripts --virtual-store-dir=node_modules/.pnpm'             bash "$SOURCE" "$PNPM_BIN"
 
           STORE="$(sudo -u "$BENCH_USER" env -i             HOME="$BENCH_HOME"             PATH="$NODE_BIN:/usr/bin:/bin"             NPM_CONFIG_USERCONFIG=/dev/null             PNPM_CONFIG_VIRTUAL_STORE_TYPE=project             bash -c 'cd "$1" && exec "$2" store path --silent'             bash "$SOURCE" "$PNPM_BIN")"
-          test -d "$STORE"
+          sudo test -d "$STORE"
 
           if test "$STORE_POLICY" = readonly; then
             sudo chown -R root:root "$STORE"
