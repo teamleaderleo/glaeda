@@ -80,7 +80,7 @@ cargo build --locked --release --bin glaeda
 GLAEDA_INSTALL_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/glaeda/cmux-fleet"
 GLAEDA_BIN="$GLAEDA_INSTALL_ROOT/glaeda"
 install -d -m 700 "$GLAEDA_INSTALL_ROOT"
-if test -f "$GLAEDA_BIN"; then
+if test -f "$GLAEDA_BIN" && ! test -e "$GLAEDA_INSTALL_ROOT/glaeda.rollback"; then
   cp -p "$GLAEDA_BIN" "$GLAEDA_INSTALL_ROOT/glaeda.rollback"
 fi
 install -m 755 target/release/glaeda "$GLAEDA_INSTALL_ROOT/.glaeda.next"
@@ -157,7 +157,7 @@ cargo build --locked --release --bin glaeda
 GLAEDA_INSTALL_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/glaeda/cmux-fleet"
 GLAEDA_BIN="$GLAEDA_INSTALL_ROOT/glaeda"
 install -d -m 700 "$GLAEDA_INSTALL_ROOT"
-if test -f "$GLAEDA_BIN"; then
+if test -f "$GLAEDA_BIN" && ! test -e "$GLAEDA_INSTALL_ROOT/glaeda.rollback"; then
   cp -p "$GLAEDA_BIN" "$GLAEDA_INSTALL_ROOT/glaeda.rollback"
 fi
 install -m 755 target/release/glaeda "$GLAEDA_INSTALL_ROOT/.glaeda.next"
@@ -278,7 +278,7 @@ sudo pmset -c sleep 0
 sudo pmset -c sleep "$OLD_AC_SLEEP"
 ```
 
-For Glaeda distribution, the bootstrap consumes an exact executable path and records its SHA-256 generation. The examples above install the reviewed repository build into a stable per-user CMUX-fleet location with an atomic rename. A release package, MDM payload, or configuration manager may supply the same exact file instead.
+For Glaeda distribution, the bootstrap consumes an exact executable path and records its SHA-256 generation. The examples above install the reviewed repository build into a stable per-user CMUX-fleet location with an atomic rename. The first update attempt preserves the previously installed binary as `glaeda.rollback`; later retries leave that copy untouched until the candidate enrollment generation is accepted. A release package, MDM payload, or configuration manager may supply the same exact file instead.
 
 Rollback a just-installed repository build before re-enrollment with:
 
@@ -299,3 +299,6 @@ Hosted CI needs no physical CMUX machine. Glaeda CI runs the enrollment and boot
 
 Related Glaeda work: #743, #546, #365, #492, #970, #1048, #1008, #1010.
 Related CMUX work: manaflow-ai/cmux#13091, #13095, #13198, #13325.
+
+
+Role eligibility also binds the current CMUX acceptance-workload generation. Bootstrap hashes the reviewed `scripts/fleet_acceptance.py` for every enrolled role, and status rejects an acceptance receipt when that generation no longer matches.
