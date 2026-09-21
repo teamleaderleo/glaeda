@@ -354,7 +354,6 @@ pub struct VerificationObservation {
     sample_count: u16,
     stage: VerificationStage,
     duration_millis: u64,
-    sample_count: u16,
     reuse_class: VerificationReuseClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     bytes_read: Option<u64>,
@@ -785,6 +784,7 @@ pub struct CandidateEvidence {
     run_id: String,
     stage: VerificationStage,
     duration_millis: u64,
+    sample_count: u16,
     reuse_class: VerificationReuseClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     bytes_read: Option<u64>,
