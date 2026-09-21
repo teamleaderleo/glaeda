@@ -503,7 +503,8 @@ def validate_cmux_semantic_result(
 ACCEPTANCE_RECEIPT_KEYS = {
     "schema", "nodeId", "enrollmentGeneration", "role", "source", "profile",
     "toolchainGeneration", "glaedaGeneration", "cmuxSemanticResultSha256",
-    "cmuxSemanticResultState", "processSettlement", "result",
+    "cmuxSemanticResultState", "cmuxEnvironmentClass", "cmuxToolchainIdentity",
+    "postBootstrapSha256", "processSettlement", "result",
 }
 
 
@@ -539,6 +540,9 @@ def validate_acceptance_receipt(value: object) -> dict[str, Any]:
     sha256(doc["toolchainGeneration"], "acceptance receipt toolchain generation")
     sha256(doc["glaedaGeneration"], "acceptance receipt Glaeda generation")
     sha256(doc["cmuxSemanticResultSha256"], "CMUX semantic result digest")
+    sha256(doc["cmuxToolchainIdentity"], "CMUX semantic toolchain identity")
+    sha256(doc["postBootstrapSha256"], "post-acceptance bootstrap digest")
+    token(doc["cmuxEnvironmentClass"], "CMUX environment class")
     if doc["cmuxSemanticResultState"] not in CMUX_RESULT_STATES:
         raise FleetError("CMUX semantic result state is invalid")
     if doc["processSettlement"] not in {"complete", "incomplete"}:
@@ -570,11 +574,37 @@ def acceptance_matches_enrollment(enrollment: dict[str, Any], receipt: dict[str,
     return True, "accepted"
 
 
+def validate_post_acceptance_bootstrap(
+    enrollment: dict[str, Any],
+    bootstrap_value: object,
+    toolchain_generation: str,
+) -> str:
+    observed = enrollment_from_bootstrap(
+        bootstrap_value,
+        node_id=enrollment["nodeId"],
+        operator_fleet_scope=enrollment["operatorFleetScope"],
+        enrollment_generation=enrollment["enrollmentGeneration"],
+    )
+    stable_fields = ENROLLMENT_KEYS - {"state", "quarantineReason"}
+    expected_stable = {name: enrollment[name] for name in stable_fields}
+    observed_stable = {name: observed[name] for name in stable_fields}
+    if observed_stable != expected_stable:
+        raise FleetError(
+            "post-acceptance bootstrap differs from enrolled machine capability"
+        )
+    if toolchain_generation not in observed["supportedToolchainGenerations"]:
+        raise FleetError(
+            "post-acceptance bootstrap toolchain differs from acceptance"
+        )
+    return digest(bootstrap_value)
+
+
 def finalize_acceptance(
     enrollment_value: object,
     role: str,
     toolchain_generation: str,
     cmux_result_value: object,
+    post_bootstrap_value: object,
     cmux_result_sha256: str | None = None,
 ) -> dict[str, Any]:
     enrollment = validate_enrollment(enrollment_value)
@@ -582,6 +612,11 @@ def finalize_acceptance(
         raise FleetError("acceptance role is outside the enrollment allowlist")
     if toolchain_generation not in enrollment["supportedToolchainGenerations"]:
         raise FleetError("acceptance toolchain generation is outside the enrollment allowlist")
+    post_bootstrap_sha256 = validate_post_acceptance_bootstrap(
+        enrollment,
+        post_bootstrap_value,
+        toolchain_generation,
+    )
     expected_profile = enrollment["roleProfiles"][role]
     semantic = validate_cmux_semantic_result(cmux_result_value, expected_profile)
     actual_cmux_result_sha256 = digest(semantic)
@@ -612,6 +647,9 @@ def finalize_acceptance(
         "glaedaGeneration": enrollment["glaedaGeneration"],
         "cmuxSemanticResultSha256": cmux_result_sha256,
         "cmuxSemanticResultState": semantic["result"],
+        "cmuxEnvironmentClass": semantic["environment_class"],
+        "cmuxToolchainIdentity": semantic["toolchain"]["identity"],
+        "postBootstrapSha256": post_bootstrap_sha256,
         "processSettlement": settlement,
         "result": result,
     }
@@ -1028,6 +1066,7 @@ def parser() -> argparse.ArgumentParser:
     a = sub.add_parser("finalize-acceptance")
     a.add_argument("enrollment", type=Path)
     a.add_argument("cmux_result", type=Path)
+    a.add_argument("post_bootstrap", type=Path)
     a.add_argument("--role", required=True, choices=sorted(ENROLLABLE_ROLES))
     a.add_argument("--toolchain-generation", required=True)
     return p
@@ -1073,12 +1112,14 @@ def main() -> int:
             )
         elif args.command == "finalize-acceptance":
             cmux_result, cmux_result_sha256 = load_cmux_semantic_result(args.cmux_result)
+            post_bootstrap = load(args.post_bootstrap)
             emit(
                 finalize_acceptance(
                     enrollment,
                     args.role,
                     args.toolchain_generation,
                     cmux_result,
+                    post_bootstrap,
                     cmux_result_sha256,
                 )
             )
