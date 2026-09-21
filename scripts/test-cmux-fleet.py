@@ -78,11 +78,12 @@ class FleetTests(unittest.TestCase):
         by_role = {v["role"]: v for v in status["roles"]}
         self.assertTrue(by_role["cmux_macos_native_build"]["eligible"])
         self.assertEqual(set(by_role), {"cmux_macos_native_build"})
-        self.assertTrue(status["automaticRoutingEligible"])
+        self.assertTrue(status["routingCandidateEligible"])
+        self.assertFalse(status["automaticDispatchAuthorized"])
 
     def test_enrollment_presence_does_not_grant_role(self):
         status = f.node_status(enrollment(), [])
-        self.assertFalse(status["automaticRoutingEligible"])
+        self.assertFalse(status["routingCandidateEligible"])
         self.assertTrue(all(not r["eligible"] for r in status["roles"]))
 
     def test_non_routable_states_exclude_every_role(self):
@@ -96,10 +97,28 @@ class FleetTests(unittest.TestCase):
                     evidence(),
                 )
                 status = f.node_status(e, [receipt])
-                self.assertFalse(status["automaticRoutingEligible"])
+                self.assertFalse(status["routingCandidateEligible"])
                 self.assertTrue(
                     all(r["reason"] == f"node_{state}" for r in status["roles"])
                 )
+
+    def test_null_glaeda_generation_is_rejected(self):
+        e = enrollment()
+        e["glaedaGeneration"] = None
+        with self.assertRaisesRegex(f.FleetError, "Glaeda generation is invalid"):
+            f.validate_enrollment(e)
+
+        bad_evidence = evidence()
+        bad_evidence["glaedaGeneration"] = None
+        with self.assertRaisesRegex(f.FleetError, "acceptance Glaeda generation is invalid"):
+            f.validate_acceptance_evidence(bad_evidence)
+
+        receipt = f.finalize_acceptance(enrollment(), evidence())
+        receipt["glaedaGeneration"] = None
+        with self.assertRaisesRegex(
+            f.FleetError, "acceptance receipt Glaeda generation is invalid"
+        ):
+            f.validate_acceptance_receipt(receipt)
 
     def test_stale_acceptance_generation_is_ineligible(self):
         e = enrollment()
