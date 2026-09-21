@@ -557,6 +557,11 @@ fn operation_for(
         DisposableAttemptPhase::CloneAuthorized => Ok(CoordinatorOperation::ExecuteClone),
         DisposableAttemptPhase::CloneStarted => Ok(CoordinatorOperation::CheckpointRegistration),
         DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
+            if !attempt.runner_start_started() && attempt.runner_id().is_some() =>
+        {
+            Ok(CoordinatorOperation::Cleanup)
+        }
+        DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
             if !attempt.runner_start_started() =>
         {
             Ok(CoordinatorOperation::RunRunner)
