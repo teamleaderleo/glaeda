@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 
 import github_actions_owned_linux_runner as runner
+import owned_linux_admission as owned_admission
 import owned_linux_task as owned_task
 from owned_linux_task import Refusal
 
@@ -47,7 +48,6 @@ class FakeAdmission:
 def arguments(root: Path, **overrides) -> argparse.Namespace:
     values = {
         "state_root": str(root / "state"),
-        "admission_root": str(root / "admission"),
         "attempt_id": "attempt-1010",
         "assignment_id": "assignment-41",
         "repository": runner.TRUSTED_REPOSITORY,
@@ -63,6 +63,28 @@ def arguments(root: Path, **overrides) -> argparse.Namespace:
     }
     values.update(overrides)
     return argparse.Namespace(**values)
+
+
+def install_admission_fixture(root: Path) -> None:
+    root.mkdir(mode=0o700)
+    policy = {
+        "schema_version": 1,
+        "generation": "a" * 64,
+        "revision": 1,
+        "node_control": "available",
+        "host_executable": {
+            "path": "/bin/true",
+            "sha256": "sha256:" + "1" * 64,
+        },
+        "policy_executable": {
+            "path": "/bin/true",
+            "sha256": "sha256:" + "2" * 64,
+        },
+        "memory_reserve_bytes": 4 * 1024**3,
+    }
+    path = root / "policy.json"
+    path.write_bytes(owned_admission.canonical(policy))
+    path.chmod(0o600)
 
 
 class OwnedLinuxJitRunnerTests(unittest.TestCase):
@@ -84,6 +106,10 @@ class OwnedLinuxJitRunnerTests(unittest.TestCase):
         self.assertEqual(runner.ISOLATION["ssh_agent"], "absent")
         self.assertEqual(runner.ISOLATION["sudo_admin"], "absent")
         self.assertEqual(runner.ISOLATION["docker_podman_host_socket"], "absent")
+        self.assertEqual(
+            owned_admission.CANONICAL_ROOT,
+            Path("/var/lib/glaeda/owned-linux-admission-v1"),
+        )
 
     def test_wrong_repository_or_runner_label_refuses(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -198,6 +224,47 @@ class OwnedLinuxJitRunnerTests(unittest.TestCase):
                         runner.run_once(args)
             reservation.assert_not_called()
             execute.assert_not_called()
+
+    def test_direct_owner_collision_uses_same_canonical_slot_and_creates_no_runner_state(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            shared = root / "shared-admission"
+            install_admission_fixture(shared)
+            case_root = root / "jit"
+            case_root.mkdir()
+            args = arguments(case_root)
+            request = runner.normalize(args)
+            direct = owned_admission.Reservation(
+                shared,
+                "sha256:" + "3" * 64,
+                "direct-owner.service",
+                "sha256:" + "4" * 64,
+            )
+            with (
+                mock.patch.object(owned_admission, "CANONICAL_ROOT", shared),
+                mock.patch.object(
+                    owned_admission,
+                    "check",
+                    side_effect=lambda _: time.monotonic() + 3,
+                ),
+            ):
+                with direct:
+                    with (
+                        mock.patch.object(
+                            runner.owned_task, "execute_secret_stdin"
+                        ) as execute,
+                        mock.patch.object(runner, "read_jit_secret") as read_secret,
+                    ):
+                        with self.assertRaisesRegex(Refusal, "busy"):
+                            runner.run_once(args)
+                    execute.assert_not_called()
+                    read_secret.assert_not_called()
+                    assignment = (
+                        Path(args.state_root)
+                        / request.assignment_fingerprint()[7:]
+                    )
+                    self.assertFalse(assignment.exists())
+                    direct.release()
 
     def test_hold_drain_pressure_and_capacity_refusals_launch_nothing(self):
         with tempfile.TemporaryDirectory() as raw:
