@@ -1,8 +1,6 @@
 /// Read-only observation of one configured official Actions runner.
 pub mod actions_runner_readiness;
 pub mod artifact;
-/// Pure transport-independent identity and source observations for immutable build products.
-pub mod immutable_artifact_distribution;
 /// Pure, path-free classification of explicit hot-state inventory observations.
 pub mod cache_inventory;
 /// Positive-only Linux process and mount reference observation for one Cargo target.
@@ -133,6 +131,8 @@ pub mod hot_fleet_window;
 pub mod hot_run_cache_observation;
 /// Pure path-class policy for selecting reviewed hot-state sharing mechanisms.
 pub mod hot_state_path_policy;
+/// Pure transport-independent identity and source observations for immutable build products.
+pub mod immutable_artifact_distribution;
 /// Pure immutable resident Git object-pool generation and consumer-lease core.
 pub mod immutable_git_object_pool;
 /// Pure sealed non-task Git producer planning for immutable pool publication.
