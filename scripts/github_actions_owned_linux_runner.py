@@ -40,6 +40,7 @@ RUNNER_VERSION = "2.336.0"
 RUNNER_ARCHIVE = Path(
     "/opt/glaeda/payloads/actions-runner-linux-x64-2.336.0.tar.gz"
 )
+RUNNER_ARCHIVE_BYTES = 226_035_903
 RUNNER_ARCHIVE_SHA256 = (
     "sha256:04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d"
 )
@@ -75,6 +76,7 @@ PROFILE_SPEC = {
     "repository": TRUSTED_REPOSITORY,
     "runner_label": TRUSTED_RUNNER_LABEL,
     "runner_version": RUNNER_VERSION,
+    "runner_archive_bytes": RUNNER_ARCHIVE_BYTES,
     "runner_archive_sha256": RUNNER_ARCHIVE_SHA256,
     "resource_class": RESOURCE_CLASS,
     "deadline_seconds": DEADLINE_SECONDS,
@@ -418,6 +420,8 @@ def file_sha256(path: Path) -> str:
 def extract_reviewed_runner(task_root: Path) -> Path:
     if not RUNNER_ARCHIVE.is_file() or RUNNER_ARCHIVE.is_symlink():
         raise Refusal("reviewed Actions runner archive is unavailable")
+    if RUNNER_ARCHIVE.stat().st_size != RUNNER_ARCHIVE_BYTES:
+        raise Refusal("reviewed Actions runner archive size changed")
     if file_sha256(RUNNER_ARCHIVE) != RUNNER_ARCHIVE_SHA256:
         raise Refusal("reviewed Actions runner archive digest changed")
     runner_root = task_root / "runner"
