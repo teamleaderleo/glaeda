@@ -107,7 +107,15 @@ impl DisposableCloneAdmissionObservation {
         Ok(())
     }
 
-    fn validate_identity_and_freshness_for(
+    pub(crate) const fn capacity_reserved(&self) -> bool {
+        self.capacity_reserved
+    }
+
+    pub(crate) const fn cancellation_requested(&self) -> bool {
+        self.cancellation_requested
+    }
+
+    pub(crate) fn validate_identity_and_freshness_for(
         &self,
         catalog: &DisposableAttemptCatalogDocument,
         reservation: &DisposableAttemptReservation,
