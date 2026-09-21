@@ -15,6 +15,7 @@ import re
 import sys
 from typing import NoReturn
 
+import provider_neutral_request as semantic
 import verify_focused_impl as focused
 
 REQUEST_DOCUMENT_TYPE = "glaeda-external-execution-request"
@@ -24,7 +25,6 @@ RECEIPT_SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 4 * 1024
 MAX_RECEIPT_BYTES = 4 * 1024
 MAX_REFERENCE_BYTES = 128
-INTERNAL_BINDING_DOMAIN = "glaeda-external-verify-focused-binding-v1"
 OPERATION_VERIFY_FOCUSED = "verify_focused"
 REUSE_HINTS = {"no_preference", "prefer_valid_reuse"}
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
@@ -35,6 +35,7 @@ REQUEST_KEYS = {
     "document_type",
     "schema_version",
     "external_request_ref",
+    "semantic_request_id",
     "source",
     "operation",
     "requested_capability_class",
@@ -45,6 +46,7 @@ REQUIRED_REQUEST_KEYS = {
     "document_type",
     "schema_version",
     "external_request_ref",
+    "semantic_request_id",
     "source",
     "operation",
     "requested_capability_class",
@@ -56,6 +58,7 @@ RECEIPT_KEYS = {
     "schema_version",
     "external_request_ref",
     "request_sha256",
+    "semantic_request_id",
     "correlation",
     "operation",
     "source",
@@ -82,6 +85,7 @@ class ContractRefusal(ValueError):
 @dataclass(frozen=True)
 class ExternalRequest:
     external_request_ref: str
+    semantic_request_id: str
     repository: str
     commit: str
     tree: str
@@ -95,6 +99,7 @@ class ExternalRequest:
 class CompiledRequest:
     external: ExternalRequest
     request_sha256: str
+    semantic: semantic.CompiledRequest
     internal: focused.Request
 
 
@@ -125,6 +130,7 @@ def request_document(request: ExternalRequest) -> dict[str, object]:
         "document_type": REQUEST_DOCUMENT_TYPE,
         "schema_version": REQUEST_SCHEMA_VERSION,
         "external_request_ref": request.external_request_ref,
+        "semantic_request_id": request.semantic_request_id,
         "source": {
             "repository": request.repository,
             "commit": request.commit,
@@ -171,6 +177,10 @@ def decode_request(raw: bytes) -> ExternalRequest:
     ):
         raise ContractRefusal("invalid_request", "source commit/tree identity is invalid")
     external_request_ref = _token(value["external_request_ref"], "external request reference")
+    try:
+        semantic_request_id = semantic.parse_request_id(value["semantic_request_id"])
+    except semantic.ContractRefusal as error:
+        raise ContractRefusal(error.code, str(error)) from error
     operation = _token(value["operation"], "operation")
     capability = _token(value["requested_capability_class"], "requested capability class")
     reuse_hint = value.get("reuse_hint")
@@ -186,6 +196,7 @@ def decode_request(raw: bytes) -> ExternalRequest:
         work_ref = _token(correlation["work_ref"], "caller work reference")
     return ExternalRequest(
         external_request_ref,
+        semantic_request_id,
         repository,
         commit,
         tree,
@@ -200,26 +211,6 @@ def request_sha256(request: ExternalRequest) -> str:
     return sha256(canonical_bytes(request_document(request)))
 
 
-def _internal_fingerprint(request: ExternalRequest, profile_generation: str) -> str:
-    # Caller refs, correlation, and reuse hints are deliberately absent: they cannot mint
-    # physical execution identity.
-    binding = {
-        "domain": INTERNAL_BINDING_DOMAIN,
-        "source": {
-            "repository": request.repository,
-            "commit": request.commit,
-            "tree": request.tree,
-        },
-        "operation": OPERATION_VERIFY_FOCUSED,
-        "requested_capability_class": focused.EXECUTION_IDENTITY_CLASS,
-        "resolved_workload": {
-            "id": focused.FOCUSED_PROFILE.profile_id,
-            "generation": profile_generation,
-        },
-    }
-    return sha256(canonical_bytes(binding))
-
-
 def compile_request(request: ExternalRequest) -> CompiledRequest:
     if request.operation != OPERATION_VERIFY_FOCUSED:
         raise ContractRefusal(
@@ -229,21 +220,27 @@ def compile_request(request: ExternalRequest) -> CompiledRequest:
         raise ContractRefusal(
             "unsupported_capability", "requested capability is not admitted by this adapter"
         )
-    profile = focused.FOCUSED_PROFILE
-    generation = focused.profile_generation(profile)
-    if not SHA256_PATTERN.fullmatch(generation):
-        raise ContractRefusal(
-            "internal_contract_error", "resolved workload generation is invalid"
+    try:
+        semantic_request = semantic.make_verify_named_request(
+            request.semantic_request_id,
+            request.repository,
+            request.commit,
+            request.tree,
+            focused.FOCUSED_PROFILE.profile_id,
         )
-    internal = focused.Request(
-        repository=request.repository,
-        commit=request.commit,
-        tree=request.tree,
-        profile_generation=generation,
-        command_fingerprint=_internal_fingerprint(request, generation),
-        profile=profile,
+        compiled_semantic = semantic.compile_request(semantic_request)
+    except semantic.ContractRefusal as error:
+        raise ContractRefusal(error.code, str(error)) from error
+    if compiled_semantic.internal is None:
+        raise ContractRefusal(
+            "internal_contract_error", "semantic request did not resolve a verifier"
+        )
+    return CompiledRequest(
+        request,
+        request_sha256(request),
+        compiled_semantic,
+        compiled_semantic.internal,
     )
-    return CompiledRequest(request, request_sha256(request), internal)
 
 
 def _resolved_workload(compiled: CompiledRequest) -> dict[str, object]:
@@ -268,6 +265,7 @@ def _receipt(
         "schema_version": RECEIPT_SCHEMA_VERSION,
         "external_request_ref": request.external_request_ref,
         "request_sha256": digest,
+        "semantic_request_id": request.semantic_request_id,
         "correlation": {"work_ref": request.work_ref}
         if request.work_ref is not None
         else None,
@@ -366,6 +364,10 @@ def validate_replay(
         raise ContractRefusal(
             "external_request_mismatch",
             "existing receipt belongs to another external request",
+        )
+    if existing_receipt.get("semantic_request_id") != request.semantic_request_id:
+        raise ContractRefusal(
+            "invalid_existing_receipt", "existing external receipt is invalid"
         )
     if existing_receipt.get("request_sha256") != request_sha256(request):
         raise ContractRefusal(
