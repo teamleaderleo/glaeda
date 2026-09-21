@@ -58,6 +58,69 @@ def _validated_digest(value: str, label: str) -> str:
     return value
 
 
+def _read_stable_regular(
+    path: Path,
+    *,
+    max_bytes: int,
+    allowed_uids: set[int],
+    exact_modes: set[int] | None = None,
+    forbidden_mode_bits: int = 0,
+    require_nonempty: bool = False,
+    problem: str,
+) -> bytes:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except OSError as error:
+        raise task.Refusal(problem) from error
+    try:
+        before = os.fstat(descriptor)
+        mode = stat.S_IMODE(before.st_mode)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid not in allowed_uids
+            or before.st_nlink != 1
+            or (exact_modes is not None and mode not in exact_modes)
+            or mode & forbidden_mode_bits
+            or before.st_size < 0
+            or before.st_size > max_bytes
+            or (require_nonempty and before.st_size == 0)
+        ):
+            raise task.Refusal(problem)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            remaining = max_bytes + 1 - total
+            if remaining <= 0:
+                raise task.Refusal(problem)
+            chunk = os.read(descriptor, min(8192, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise task.Refusal(problem)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_uid != after.st_uid
+            or before.st_gid != after.st_gid
+            or before.st_mode != after.st_mode
+            or before.st_nlink != after.st_nlink
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+            or total != after.st_size
+        ):
+            raise task.Refusal(problem)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
 def _exact_path(value: str, *, directory: bool, private_parent: bool = False) -> Path:
     path = Path(value)
     if not path.is_absolute() or path.resolve() != path or path.is_symlink():
@@ -77,16 +140,14 @@ def _exact_path(value: str, *, directory: bool, private_parent: bool = False) ->
 
 
 def _verify_launcher(path: Path) -> None:
-    info = path.stat(follow_symlinks=False)
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid not in (0, os.getuid())
-        or info.st_nlink != 1
-        or info.st_mode & 0o022
-        or info.st_size > 64 * 1024
-    ):
-        raise task.Refusal("owned runner launcher is unsafe")
-    if _digest(path.read_bytes()) != LAUNCHER_SHA256:
+    raw = _read_stable_regular(
+        path,
+        max_bytes=64 * 1024,
+        allowed_uids={0, os.getuid()},
+        forbidden_mode_bits=0o022,
+        problem="owned runner launcher is unsafe",
+    )
+    if _digest(raw) != LAUNCHER_SHA256:
         raise task.Refusal("owned runner launcher changed")
 
 
@@ -107,33 +168,17 @@ def _validate_egress_guard_document(raw: bytes) -> dict[str, object]:
 
 
 def _verify_egress_guard(path: Path, expected_digest: str) -> None:
-    info = path.stat(follow_symlinks=False)
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != 0
-        or info.st_nlink != 1
-        or stat.S_IMODE(info.st_mode) not in (0o400, 0o444)
-        or info.st_size <= 0
-        or info.st_size > MAX_EGRESS_GUARD_BYTES
-    ):
-        raise task.Refusal("owned runner egress authority is unsafe")
-    raw = path.read_bytes()
+    raw = _read_stable_regular(
+        path,
+        max_bytes=MAX_EGRESS_GUARD_BYTES,
+        allowed_uids={0},
+        exact_modes={0o400, 0o444},
+        require_nonempty=True,
+        problem="owned runner egress authority is unsafe",
+    )
     if _digest(raw) != expected_digest:
         raise task.Refusal("owned runner egress authority changed")
     _validate_egress_guard_document(raw)
-    after = path.stat(follow_symlinks=False)
-    if (
-        after.st_dev != info.st_dev
-        or after.st_ino != info.st_ino
-        or after.st_uid != info.st_uid
-        or after.st_gid != info.st_gid
-        or after.st_mode != info.st_mode
-        or after.st_nlink != info.st_nlink
-        or after.st_size != info.st_size
-        or after.st_mtime_ns != info.st_mtime_ns
-        or after.st_ctime_ns != info.st_ctime_ns
-    ):
-        raise task.Refusal("owned runner egress authority changed")
 
 
 def payload_tree_digest(root: Path) -> str:
@@ -243,17 +288,14 @@ def _task_root(arguments: argparse.Namespace) -> Path:
 
 
 def _task_document(root: Path) -> dict[str, object]:
-    path = root / TASK_DOCUMENT
-    info = path.stat(follow_symlinks=False)
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.getuid()
-        or info.st_nlink != 1
-        or stat.S_IMODE(info.st_mode) != 0o600
-        or info.st_size > admission.MAX_DOCUMENT
-    ):
-        raise task.Refusal("owned runner task document is unsafe")
-    raw = path.read_bytes()
+    raw = _read_stable_regular(
+        root / TASK_DOCUMENT,
+        max_bytes=admission.MAX_DOCUMENT,
+        allowed_uids={os.getuid()},
+        exact_modes={0o600},
+        require_nonempty=True,
+        problem="owned runner task document is unsafe",
+    )
     value = admission.decode(raw)
     if not isinstance(value, dict) or canonical(value) != raw:
         raise task.Refusal("owned runner task document is invalid")
