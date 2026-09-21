@@ -148,13 +148,7 @@ impl OwnedLinuxJitRuntime {
         executor: &impl TimedCommandExecutor,
     ) -> Result<DisposableVmIdentity, DisposableCloneRuntimeError> {
         self.validate_reservation_generation(reservation)?;
-        let record = self.execute(
-            "prepare",
-            reservation,
-            None,
-            executor,
-            MUTATION_TIMEOUT,
-        )?;
+        let record = self.execute("prepare", reservation, None, executor, MUTATION_TIMEOUT)?;
         let receipt: PrepareReceipt =
             parse_receipt(&record, "glaeda-owned-linux-jit-prepare-receipt")?;
         if receipt.reservation_phase != "preparing"
@@ -181,7 +175,10 @@ impl OwnedLinuxJitRuntime {
         let receipt: ObservationReceipt =
             parse_receipt(&record, "glaeda-owned-linux-jit-observation")?;
         if !receipt.settled
-            || !matches!(receipt.reservation_phase.as_str(), "preparing" | "launching")
+            || !matches!(
+                receipt.reservation_phase.as_str(),
+                "preparing" | "launching"
+            )
         {
             return Err(DisposableCloneRuntimeError::recovery(
                 "owned_linux_observation_invalid",
@@ -197,13 +194,7 @@ impl OwnedLinuxJitRuntime {
         executor: &impl TimedCommandExecutor,
     ) -> Result<(), DisposableCloneRuntimeError> {
         self.validate_reservation_generation(reservation)?;
-        let record = self.execute(
-            "cleanup",
-            reservation,
-            None,
-            executor,
-            MUTATION_TIMEOUT,
-        )?;
+        let record = self.execute("cleanup", reservation, None, executor, MUTATION_TIMEOUT)?;
         let receipt: CleanupReceipt =
             parse_receipt(&record, "glaeda-owned-linux-jit-cleanup-receipt")?;
         if !receipt.settled || !receipt.task_state_absent || !receipt.capacity_released {
@@ -226,14 +217,17 @@ impl OwnedLinuxJitRuntime {
         now: EpochMillis,
         jit: Zeroizing<String>,
     ) -> Result<CommandSpec, crate::disposable_runner_runtime::DisposableRunnerRuntimeError> {
-        self.verify_helper()
-            .map_err(|_| crate::disposable_runner_runtime::DisposableRunnerRuntimeError::observation(
+        self.verify_helper().map_err(|_| {
+            crate::disposable_runner_runtime::DisposableRunnerRuntimeError::observation(
                 "owned_linux_runner_helper_drift",
-            ))?;
+            )
+        })?;
         self.validate_reservation_generation(reservation)
-            .map_err(|_| crate::disposable_runner_runtime::DisposableRunnerRuntimeError::recovery(
-                "owned_linux_runner_generation_drift",
-            ))?;
+            .map_err(|_| {
+                crate::disposable_runner_runtime::DisposableRunnerRuntimeError::recovery(
+                    "owned_linux_runner_generation_drift",
+                )
+            })?;
         let remaining_millis = reservation
             .attempt()
             .not_after()
@@ -261,7 +255,8 @@ impl OwnedLinuxJitRuntime {
         Ok(command)
     }
 
-    pub(crate) fn fixed_resources() -> Result<DisposableWorkerResources, DisposableCloneRuntimeError> {
+    pub(crate) fn fixed_resources() -> Result<DisposableWorkerResources, DisposableCloneRuntimeError>
+    {
         DisposableWorkerResources::new(4_000, 8 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024)
             .map_err(|_| config("owned_linux_resource_profile_invalid"))
     }
@@ -283,7 +278,9 @@ impl OwnedLinuxJitRuntime {
         }
         let record = executor
             .execute_with_timeout(&command, timeout)
-            .map_err(|_| DisposableCloneRuntimeError::command("owned_linux_helper_command_failed"))?;
+            .map_err(|_| {
+                DisposableCloneRuntimeError::command("owned_linux_helper_command_failed")
+            })?;
         validate_record(&command, &record)?;
         Ok(record)
     }
@@ -423,10 +420,8 @@ impl crate::disposable_runner_runtime::DisposableRunnerTargetRuntime for OwnedLi
         reservation: &DisposableAttemptReservation,
         executor: &impl TimedCommandExecutor,
         _clock: &impl CloneRuntimeClock,
-    ) -> Result<
-        Self::Confirmation,
-        crate::disposable_runner_runtime::DisposableRunnerRuntimeError,
-    > {
+    ) -> Result<Self::Confirmation, crate::disposable_runner_runtime::DisposableRunnerRuntimeError>
+    {
         self.confirm(reservation, executor).map_err(|_| {
             crate::disposable_runner_runtime::DisposableRunnerRuntimeError::observation(
                 "runner_target_not_ready",
@@ -510,20 +505,36 @@ trait Receipt {
 }
 
 impl Receipt for ProbeReceipt {
-    fn document_type(&self) -> &str { &self.document_type }
-    fn schema_version(&self) -> u8 { self.schema_version }
+    fn document_type(&self) -> &str {
+        &self.document_type
+    }
+    fn schema_version(&self) -> u8 {
+        self.schema_version
+    }
 }
 impl Receipt for PrepareReceipt {
-    fn document_type(&self) -> &str { &self.document_type }
-    fn schema_version(&self) -> u8 { self.schema_version }
+    fn document_type(&self) -> &str {
+        &self.document_type
+    }
+    fn schema_version(&self) -> u8 {
+        self.schema_version
+    }
 }
 impl Receipt for ObservationReceipt {
-    fn document_type(&self) -> &str { &self.document_type }
-    fn schema_version(&self) -> u8 { self.schema_version }
+    fn document_type(&self) -> &str {
+        &self.document_type
+    }
+    fn schema_version(&self) -> u8 {
+        self.schema_version
+    }
 }
 impl Receipt for CleanupReceipt {
-    fn document_type(&self) -> &str { &self.document_type }
-    fn schema_version(&self) -> u8 { self.schema_version }
+    fn document_type(&self) -> &str {
+        &self.document_type
+    }
+    fn schema_version(&self) -> u8 {
+        self.schema_version
+    }
 }
 
 fn parse_receipt<T: for<'de> Deserialize<'de> + Receipt>(
@@ -568,16 +579,18 @@ fn digest_parts(domain: &[u8], values: &[&str]) -> String {
 }
 
 fn validate_path(path: PathBuf) -> Result<PathBuf, DisposableCloneRuntimeError> {
-    let raw = path.to_str().ok_or_else(|| config("owned_linux_path_invalid"))?;
+    let raw = path
+        .to_str()
+        .ok_or_else(|| config("owned_linux_path_invalid"))?;
     if !path.is_absolute()
         || path == Path::new("/")
         || raw.len() > 2_048
         || raw.bytes().any(|byte| byte.is_ascii_control())
         || raw.contains("//")
         || raw.ends_with('/')
-        || path.components().any(|component| {
-            !matches!(component, Component::RootDir | Component::Normal(_))
-        })
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
     {
         return Err(config("owned_linux_path_invalid"));
     }
