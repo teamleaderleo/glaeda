@@ -544,6 +544,8 @@ def validate_capacity(value: object) -> dict[str, Any]:
     if doc["result"] == "accepted":
         if measurement["validatedCompletions"] == 0:
             raise RoleModelError("accepted capacity requires validated completions")
+        if measurement["unfinishedWork"] != 0:
+            raise RoleModelError("accepted capacity requires all offered work settled")
         if measurement["cpuPressure"] in {"critical", "unknown"}:
             raise RoleModelError("accepted capacity requires bounded CPU pressure")
         if measurement["memoryPressure"] in {"critical", "unknown"}:
