@@ -21,6 +21,14 @@ ENROLLABLE_ROLES = {
     "cmux_macos_native_build",
     "cmux_linux_ci",
 }
+CMUX_REPOSITORY = "manaflow-ai/cmux"
+CMUX_RESULT_CONTRACT = "cmux-workload-result/v1"
+CMUX_PROFILE_REGISTRY = "scripts/ci/cmux-workload-profiles.json"
+MAX_PROFILE_REGISTRY_BYTES = 64 * 1024
+ROLE_PROFILES = {
+    "cmux_linux_ci": {"id": "cmux.ci.guard", "generation": 1},
+    "cmux_macos_native_build": {"id": "cmux.macos.dev-check", "generation": 1},
+}
 ROLE_OS = {
     "cmux_macos_native_build": "macos",
     "cmux_macos_test": "macos",
@@ -104,13 +112,58 @@ def disk_free_gib(path: Path) -> int:
     return shutil.disk_usage(path).free // (1024**3)
 
 
-def role_workload_generations(cmux_root: Path, roles: list[str]) -> dict[str, str]:
-    workload = cmux_root / "scripts/fleet_acceptance.py"
-    if not workload.is_file():
-        raise BootstrapError("CMUX fleet acceptance workload is unavailable")
-    generation = digest_file(workload)
-    return {role: generation for role in sorted(set(roles))}
+def role_profiles(
+    cmux_root: Path,
+    roles: list[str],
+    platform_name: str,
+    architecture: str,
+) -> dict[str, dict[str, object]]:
+    registry_path = cmux_root / CMUX_PROFILE_REGISTRY
+    try:
+        raw = registry_path.read_bytes()
+    except OSError as error:
+        raise BootstrapError("CMUX workload profile registry is unavailable") from error
+    if len(raw) > MAX_PROFILE_REGISTRY_BYTES:
+        raise BootstrapError("CMUX workload profile registry exceeds its ceiling")
+    try:
+        registry = json.loads(raw)
+    except (UnicodeError, ValueError) as error:
+        raise BootstrapError("CMUX workload profile registry is invalid JSON") from error
+    if (
+        not isinstance(registry, dict)
+        or registry.get("schema_version") != 1
+        or registry.get("repository") != CMUX_REPOSITORY
+        or registry.get("result_contract") != CMUX_RESULT_CONTRACT
+        or not isinstance(registry.get("profiles"), list)
+    ):
+        raise BootstrapError("CMUX workload profile registry contract is unsupported")
 
+    profiles_by_id: dict[str, list[dict[str, Any]]] = {}
+    for item in registry["profiles"]:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            raise BootstrapError("CMUX workload profile registry contains an invalid profile")
+        profiles_by_id.setdefault(item["id"], []).append(item)
+
+    selected: dict[str, dict[str, object]] = {}
+    for role in sorted(set(roles)):
+        expected = ROLE_PROFILES.get(role)
+        if expected is None:
+            raise BootstrapError("bootstrap role lacks a reviewed v1 CMUX profile")
+        matches = profiles_by_id.get(expected["id"], [])
+        if len(matches) != 1:
+            raise BootstrapError(f"CMUX profile for role {role} is unavailable")
+        profile = matches[0]
+        platform_doc = profile.get("platform")
+        if (
+            profile.get("generation") != expected["generation"]
+            or not isinstance(platform_doc, dict)
+            or platform_doc.get("os") != platform_name
+            or not isinstance(platform_doc.get("architectures"), list)
+            or architecture not in platform_doc["architectures"]
+        ):
+            raise BootstrapError(f"CMUX profile for role {role} is incompatible")
+        selected[role] = dict(expected)
+    return selected
 
 def mac_sleep_disabled_on_ac(raw: str) -> bool:
     in_ac = False
@@ -477,17 +530,17 @@ def evaluate(
         or any(type(value) is not bool for value in checks.values())
     ):
         raise BootstrapError("bootstrap checks are invalid")
-    workload_generations = observation.get("roleWorkloadGenerations")
-    if (
-        not isinstance(workload_generations, dict)
-        or set(workload_generations) != set(roles)
-        or any(
-            not isinstance(value, str)
-            or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
-            for value in workload_generations.values()
-        )
-    ):
-        raise BootstrapError("role workload generations are invalid")
+    profiles = observation.get("roleProfiles")
+    if not isinstance(profiles, dict) or set(profiles) != set(roles):
+        raise BootstrapError("role profiles are invalid")
+    for role in roles:
+        profile = profiles.get(role)
+        if (
+            not isinstance(profile, dict)
+            or set(profile) != {"id", "generation"}
+            or profile != ROLE_PROFILES.get(role)
+        ):
+            raise BootstrapError("role profiles are invalid")
     failures = sorted(key for key, passed in checks.items() if not passed)
     result = {
         "schema": SCHEMA,
@@ -498,7 +551,7 @@ def evaluate(
         "roles": roles,
         "glaedaGeneration": observation["glaedaGeneration"],
         "toolchainGeneration": observation["toolchainGeneration"],
-        "roleWorkloadGenerations": workload_generations,
+        "roleProfiles": profiles,
         "checks": checks,
         "observed": observation.get("observed", {}),
         "eligibleForEnrollment": not failures,
@@ -567,9 +620,11 @@ def main() -> int:
                 args.hardware_class,
             )
         )
-        observation["roleWorkloadGenerations"] = role_workload_generations(
+        observation["roleProfiles"] = role_profiles(
             cmux_root,
             args.role,
+            observation["platform"],
+            observation["architecture"],
         )
         sys.stdout.buffer.write(
             canonical(evaluate(observation, args.role, args.hardware_class))
