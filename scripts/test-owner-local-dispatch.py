@@ -202,7 +202,7 @@ class OwnerLocalDispatchTests(unittest.TestCase):
             "profile_id": "repo-query/v1",
             "profile_generation": "sha256:" + "b" * 64,
             "authority": "observation_only",
-            "repository": SOURCE["repository"],
+            "repository": "github.com/" + SOURCE["repository"],
             "requested_base": "3" * 40,
             "head": SOURCE["commit"],
             "head_tree": SOURCE["tree"],
