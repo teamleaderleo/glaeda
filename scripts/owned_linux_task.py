@@ -20,7 +20,11 @@ import time
 
 class TaskNetwork(Enum):
     NONE = "none"
-    # Trusted first-party GitHub Actions only. This deliberately shares the host\n    # network namespace while retaining user/PID/IPC/UTS/cgroup/mount isolation.\n    # Hostile-LAN/domain filtering is a separate reviewed boundary.\n    GITHUB_ACTIONS_TRUSTED_EGRESS = "github_actions_trusted_egress"\n
+    # Trusted first-party GitHub Actions only. This deliberately shares the host
+    # network namespace while retaining user/PID/IPC/UTS/cgroup/mount isolation.
+    # Hostile-LAN/domain filtering is a separate reviewed boundary.
+    GITHUB_ACTIONS_TRUSTED_EGRESS = "github_actions_trusted_egress"
+
 
 MAX_CONTROL_OUTPUT_BYTES = 64 * 1024
 MAX_SOURCE_OUTPUT_BYTES = 1024 * 1024
@@ -102,7 +106,8 @@ def materialize(repository_root: Path, task_root: Path, commit: str, tree: str) 
             command,
             cwd=cwd,
             env=environment,
-            stdin=None if inherit_stdin else subprocess.DEVNULL,\n            stdout=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=60,
             check=False,
@@ -164,7 +169,31 @@ def sandbox_command(
     mount_arguments: list[str], recipe_arguments: list[str],
     network: TaskNetwork, source_read_only: bool = True,
 ) -> list[str]:
-    if network is TaskNetwork.NONE:\n        namespace_arguments = ["--unshare-all", "--unshare-user"]\n        network_arguments: list[str] = []\n    elif network is TaskNetwork.GITHUB_ACTIONS_TRUSTED_EGRESS:\n        namespace_arguments = [\n            "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup"\n        ]\n        network_arguments = [\n            "--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",\n            "--ro-bind-try", "/etc/hosts", "/etc/hosts",\n            "--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",\n            "--ro-bind-try", "/etc/ssl", "/etc/ssl",\n            "--ro-bind-try", "/etc/ca-certificates", "/etc/ca-certificates",\n        ]\n    else:\n        raise Refusal("owned task network class is unsupported")\n    source_bind = "--ro-bind" if source_read_only else "--bind"\n    bubblewrap = [\n        "/usr/bin/bwrap",\n        *namespace_arguments,\n        "--die-with-parent",
+    if network is TaskNetwork.NONE:
+        namespace_arguments = ["--unshare-all", "--unshare-user"]
+        network_arguments: list[str] = []
+    elif network is TaskNetwork.GITHUB_ACTIONS_TRUSTED_EGRESS:
+        namespace_arguments = [
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup",
+        ]
+        network_arguments = [
+            "--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
+            "--ro-bind-try", "/etc/hosts", "/etc/hosts",
+            "--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
+            "--ro-bind-try", "/etc/ssl", "/etc/ssl",
+            "--ro-bind-try", "/etc/ca-certificates", "/etc/ca-certificates",
+        ]
+    else:
+        raise Refusal("owned task network class is unsupported")
+    source_bind = "--ro-bind" if source_read_only else "--bind"
+    bubblewrap = [
+        "/usr/bin/bwrap",
+        *namespace_arguments,
+        "--die-with-parent",
         "--new-session",
         "--cap-drop",
         "ALL",
@@ -192,7 +221,11 @@ def sandbox_command(
         "--ro-bind-try",
         "/etc/ld.so.cache",
         "/etc/ld.so.cache",
-        "--ro-bind-try",\n        "/etc/alternatives",\n        "/etc/alternatives",\n        *network_arguments,\n        "--proc",
+        "--ro-bind-try",
+        "/etc/alternatives",
+        "/etc/alternatives",
+        *network_arguments,
+        "--proc",
         "/proc",
         "--dev",
         "/dev",
@@ -267,8 +300,15 @@ def stop_unit(unit_name: str) -> None:
     )
 
 
-def execute(\n    command: list[str], *, unit: str, deadline_seconds: int, label: str,\n    launch_guard=None, inherit_stdin: bool = False, emit_failure_tail: bool = True,\n) -> tuple[str, int, float, bool, int, str]:\n    observation = _run_bounded(
-        command, unit=unit, deadline_seconds=deadline_seconds, label=label,\n        launch_guard=launch_guard, retain_limit=0, separate_stderr=False,\n        inherit_stdin=inherit_stdin, emit_failure_tail=emit_failure_tail,\n    )
+def execute(
+    command: list[str], *, unit: str, deadline_seconds: int, label: str,
+    launch_guard=None, inherit_stdin: bool = False, emit_failure_tail: bool = True,
+) -> tuple[str, int, float, bool, int, str]:
+    observation = _run_bounded(
+        command, unit=unit, deadline_seconds=deadline_seconds, label=label,
+        launch_guard=launch_guard, retain_limit=0, separate_stderr=False,
+        inherit_stdin=inherit_stdin, emit_failure_tail=emit_failure_tail,
+    )
     return observation[:6]
 
 
@@ -289,7 +329,10 @@ def execute_capturing(
     if type(max_bytes) is not int or max_bytes <= 0:
         raise Refusal("capture ceiling must be a positive byte count")
     return _run_bounded(
-        command, unit=unit, deadline_seconds=deadline_seconds, label=label,\n        launch_guard=launch_guard, retain_limit=max_bytes, separate_stderr=False,\n        inherit_stdin=False, emit_failure_tail=True,\n    )[:8]
+        command, unit=unit, deadline_seconds=deadline_seconds, label=label,
+        launch_guard=launch_guard, retain_limit=max_bytes, separate_stderr=False,
+        inherit_stdin=False, emit_failure_tail=True,
+    )[:8]
 
 
 def execute_capturing_split(
@@ -307,17 +350,24 @@ def execute_capturing_split(
     if type(max_bytes) is not int or max_bytes <= 0:
         raise Refusal("capture ceiling must be a positive byte count")
     observation = _run_bounded(
-        command, unit=unit, deadline_seconds=deadline_seconds, label=label,\n        launch_guard=launch_guard, retain_limit=max_bytes, separate_stderr=True,\n        inherit_stdin=False, emit_failure_tail=True,\n    )
+        command, unit=unit, deadline_seconds=deadline_seconds, label=label,
+        launch_guard=launch_guard, retain_limit=max_bytes, separate_stderr=True,
+        inherit_stdin=False, emit_failure_tail=True,
+    )
     return observation[:8] + observation[8:10]
 
 
-def _run_bounded(\n    command: list[str], *, unit: str, deadline_seconds: int, label: str,\n    launch_guard=None, retain_limit: int, separate_stderr: bool,\n    inherit_stdin: bool, emit_failure_tail: bool,\n) -> tuple[str, int, float, bool, int, str, bytes, bool, int, str]:
+def _run_bounded(
+    command: list[str], *, unit: str, deadline_seconds: int, label: str,
+    launch_guard=None, retain_limit: int, separate_stderr: bool,
+    inherit_stdin: bool, emit_failure_tail: bool,
+) -> tuple[str, int, float, bool, int, str, bytes, bool, int, str]:
     started = time.monotonic()
     with launch_guard() if launch_guard is not None else nullcontext():
         process = subprocess.Popen(
             command,
             env=closed_environment({"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}),
-            stdin=subprocess.DEVNULL,
+            stdin=None if inherit_stdin else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
             start_new_session=True,
