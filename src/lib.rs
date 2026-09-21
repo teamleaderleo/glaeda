@@ -1,5 +1,7 @@
 /// Read-only observation of one configured official Actions runner.
 pub mod actions_runner_readiness;
+/// Pure deterministic optimization discovery from bounded verification observations.
+pub mod adaptive_verification_compiler;
 pub mod artifact;
 /// Pure, path-free classification of explicit hot-state inventory observations.
 pub mod cache_inventory;
