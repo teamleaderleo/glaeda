@@ -180,6 +180,57 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
         with self.assertRaises(task.Refusal):
             jit._validate_egress_guard_document(json.dumps(expected).encode() + b"\n")
 
+    def test_egress_authority_requires_root_owned_exact_file(self):
+        raw = jit.canonical({
+            "class": jit.NETWORK.value,
+            "document_type": jit.EGRESS_GUARD_DOCUMENT_TYPE,
+            "enforcement": jit.EGRESS_GUARD_ENFORCEMENT,
+            "private_or_link_local_egress": False,
+            "schema_version": jit.SCHEMA_VERSION,
+        })
+        fields = dict(
+            st_mode=stat.S_IFREG | 0o444,
+            st_uid=0,
+            st_gid=0,
+            st_nlink=1,
+            st_size=len(raw),
+            st_dev=1,
+            st_ino=2,
+            st_mtime_ns=3,
+            st_ctime_ns=4,
+        )
+        root_info = type("Info", (), fields)()
+        foreign_info = type("Info", (), {**fields, "st_uid": 1000})()
+        with (
+            mock.patch.object(Path, "stat", return_value=root_info),
+            mock.patch.object(Path, "read_bytes", return_value=raw),
+        ):
+            jit._verify_egress_guard(self.egress_guard, jit._digest(raw))
+        with mock.patch.object(Path, "stat", return_value=foreign_info):
+            with self.assertRaisesRegex(task.Refusal, "unsafe"):
+                jit._verify_egress_guard(self.egress_guard, jit._digest(raw))
+
+    def test_egress_revocation_blocks_launch_but_cleanup_remains_available(self):
+        self.prepare()
+        with (
+            mock.patch.object(
+                jit,
+                "_verify_egress_guard",
+                side_effect=task.Refusal("egress authority revoked"),
+            ),
+            mock.patch.object(task, "execute") as execute,
+        ):
+            with self.assertRaisesRegex(task.Refusal, "revoked"):
+                jit.launch(self.args("launch"))
+            execute.assert_not_called()
+            with (
+                mock.patch.object(task, "unit_absent", return_value=True),
+                mock.patch.object(jit, "emit"),
+            ):
+                self.assertEqual(jit.cleanup(self.args("cleanup")), 0)
+        self.assertFalse(self.task_root.exists())
+        self.assertFalse((self.admission / "reservation.json").exists())
+
     def test_prepare_is_private_and_exact_restart_is_idempotent(self):
         receipt = self.prepare()
         self.assertRegex(receipt["task_identity_sha256"], r"^sha256:[0-9a-f]{64}$")
