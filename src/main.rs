@@ -35,9 +35,7 @@ use glaeda::disposable_launchd_service_status::{
     DisposableLaunchdServiceStatusErrorKind, inspect_disposable_launchd_service_status,
 };
 #[cfg(target_os = "macos")]
-use glaeda::disposable_worker_enrollment::{
-    MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES, decode_disposable_worker_enrollment,
-};
+use glaeda::disposable_worker_enrollment::decode_disposable_worker_enrollment;
 #[cfg(target_os = "macos")]
 use glaeda::disposable_worker_service::serve_disposable_worker;
 #[cfg(target_os = "linux")]
