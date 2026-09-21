@@ -1264,11 +1264,7 @@ fn predict_pool(
             )
         })
         .collect::<Vec<_>>();
-    evidence_ids.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.cmp(&right.1))
-    });
+    evidence_ids.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     let evidence_ids = evidence_ids
         .into_iter()
         .map(|(_, identity)| identity)
