@@ -28,6 +28,7 @@ INTERNAL_BINDING_DOMAIN = "glaeda-external-verify-focused-binding-v1"
 OPERATION_VERIFY_FOCUSED = "verify_focused"
 REUSE_HINTS = {"no_preference", "prefer_valid_reuse"}
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
+SEMANTIC_REQUEST_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{7,63}$")
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 OID_PATTERN = re.compile(r"^[a-f0-9]{40}$")
 SHA256_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -35,6 +36,7 @@ REQUEST_KEYS = {
     "document_type",
     "schema_version",
     "external_request_ref",
+    "semantic_request_id",
     "source",
     "operation",
     "requested_capability_class",
@@ -87,6 +89,7 @@ class ExternalRequest:
     tree: str
     operation: str
     requested_capability_class: str
+    semantic_request_id: str | None = None
     reuse_hint: str | None = None
     work_ref: str | None = None
 
@@ -133,6 +136,8 @@ def request_document(request: ExternalRequest) -> dict[str, object]:
         "operation": request.operation,
         "requested_capability_class": request.requested_capability_class,
     }
+    if request.semantic_request_id is not None:
+        document["semantic_request_id"] = request.semantic_request_id
     if request.reuse_hint is not None:
         document["reuse_hint"] = request.reuse_hint
     if request.work_ref is not None:
@@ -173,6 +178,12 @@ def decode_request(raw: bytes) -> ExternalRequest:
     external_request_ref = _token(value["external_request_ref"], "external request reference")
     operation = _token(value["operation"], "operation")
     capability = _token(value["requested_capability_class"], "requested capability class")
+    semantic_request_id = value.get("semantic_request_id")
+    if semantic_request_id is not None and (
+        not isinstance(semantic_request_id, str)
+        or SEMANTIC_REQUEST_ID_PATTERN.fullmatch(semantic_request_id) is None
+    ):
+        raise ContractRefusal("invalid_request", "semantic request identity is invalid")
     reuse_hint = value.get("reuse_hint")
     if reuse_hint is not None and (
         not isinstance(reuse_hint, str) or reuse_hint not in REUSE_HINTS
@@ -191,6 +202,7 @@ def decode_request(raw: bytes) -> ExternalRequest:
         tree,
         operation,
         capability,
+        semantic_request_id,
         reuse_hint,
         work_ref,
     )
@@ -217,6 +229,8 @@ def _internal_fingerprint(request: ExternalRequest, profile_generation: str) -> 
             "generation": profile_generation,
         },
     }
+    if request.semantic_request_id is not None:
+        binding["semantic_request_id"] = request.semantic_request_id
     return sha256(canonical_bytes(binding))
 
 
