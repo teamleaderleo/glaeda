@@ -73,6 +73,7 @@ ACCEPTED_KEYS = {
     "created_at",
     "expires_at",
     "supersession",
+    "semantic_request_id",
     "external_request_sha256",
     "resolved_workload",
     "authority",
@@ -95,6 +96,7 @@ RESULT_KEYS = {
     "source",
     "operation",
     "caller_principal",
+    "semantic_request_id",
     "state",
     "terminal_class",
     "external_receipt_sha256",
@@ -362,11 +364,22 @@ def request_document(request: DispatchRequest) -> dict[str, object]:
     return value
 
 
+def semantic_request_id(request: DispatchRequest) -> str:
+    digest = request.request_fingerprint.removeprefix("sha256:")
+    if len(digest) != 64:
+        raise DispatchRefusal(
+            "internal_contract_error",
+            "accepted dispatch fingerprint is invalid",
+        )
+    return "accepted-" + digest[:55]
+
+
 def external_document(request: DispatchRequest) -> dict[str, object]:
     return {
         "document_type": external.REQUEST_DOCUMENT_TYPE,
         "schema_version": external.REQUEST_SCHEMA_VERSION,
         "external_request_ref": request.request_id,
+        "semantic_request_id": semantic_request_id(request),
         "source": {
             "repository": request.repository,
             "commit": request.commit,
@@ -432,6 +445,7 @@ def accept_request(
             "created_at": request.created_at,
             "expires_at": request.expires_at,
             "supersession": {"policy": request.supersession_policy},
+            "semantic_request_id": semantic_request_id(request),
             "external_request_sha256": compiled.request_sha256,
             "resolved_workload": resolved,
             "authority": dict(AUTHORITY),
@@ -654,6 +668,7 @@ def result_document(
                 "profile": accepted.request.profile,
             },
             "caller_principal": accepted.request.caller_principal,
+            "semantic_request_id": accepted.accepted_document["semantic_request_id"],
             "state": lifecycle["state"],
             "terminal_class": lifecycle["terminal_class"],
             "external_receipt_sha256": lifecycle["external_receipt_sha256"],
