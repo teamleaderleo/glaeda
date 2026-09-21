@@ -132,6 +132,46 @@ class TrustedDispatchTests(unittest.TestCase):
             other_compiled.internal.command_fingerprint,
         )
 
+    def test_same_external_id_is_partitioned_by_caller_namespace(self) -> None:
+        first = accepted()
+        replay = accepted()
+        self.assertEqual(
+            first.accepted_document["semantic_request_id"],
+            replay.accepted_document["semantic_request_id"],
+        )
+        self.assertEqual(
+            first.accepted_document["workload_command_fingerprint"],
+            replay.accepted_document["workload_command_fingerprint"],
+        )
+
+        changed = base_document()
+        changed["caller"] = {
+            "principal": "cmux-ci:teamleaderleo/glaeda",
+            "provenance_binding": "cmux-controller:reviewed-local",
+        }
+        changed["request_fingerprint"] = dispatch.fingerprint_document(changed)
+        request = dispatch.decode_request(raw(changed), now=NOW)
+        other = dispatch.accept_request(
+            request,
+            dispatch.ProvenanceEvidence(
+                "cmux-ci:teamleaderleo/glaeda",
+                "cmux-controller:reviewed-local",
+            ),
+        )
+
+        self.assertEqual(
+            first.request.request_id,
+            other.request.request_id,
+        )
+        self.assertNotEqual(
+            first.accepted_document["semantic_request_id"],
+            other.accepted_document["semantic_request_id"],
+        )
+        self.assertNotEqual(
+            first.accepted_document["workload_command_fingerprint"],
+            other.accepted_document["workload_command_fingerprint"],
+        )
+
     def test_caller_request_schema_does_not_gain_physical_identity_fields(self) -> None:
         document = base_document()
         self.assertNotIn("semantic_request_id", document)
