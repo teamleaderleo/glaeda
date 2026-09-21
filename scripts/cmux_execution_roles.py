@@ -55,6 +55,7 @@ KNOWN_STATES = {
 ROLE_REQUIREMENTS = {
     "cmux_macos_native_build": {
         "platform": "macos",
+        "allowedOsVersionClasses": {"macos-15", "macos-26"},
         "architectures": {"arm64"},
         "minimumCpuClass": "medium",
         "minimumMemoryClass": "medium",
@@ -68,6 +69,7 @@ ROLE_REQUIREMENTS = {
     },
     "cmux_macos_test": {
         "platform": "macos",
+        "allowedOsVersionClasses": {"macos-15", "macos-26"},
         "architectures": {"arm64"},
         "minimumCpuClass": "medium",
         "minimumMemoryClass": "medium",
@@ -77,6 +79,7 @@ ROLE_REQUIREMENTS = {
     },
     "cmux_linux_ci": {
         "platform": "linux",
+        "allowedOsVersionClasses": {"ubuntu-24.04", "debian-12"},
         "architectures": {"x86_64", "arm64"},
         "minimumCpuClass": "medium",
         "minimumMemoryClass": "medium",
@@ -84,6 +87,7 @@ ROLE_REQUIREMENTS = {
         "requiredCapabilities": {
             "cgroup_v2",
             "linux_ci_toolchain",
+            "linux_kernel_6_plus",
             "systemd_execution",
             "task_isolation",
         },
@@ -91,11 +95,17 @@ ROLE_REQUIREMENTS = {
     },
     "cmux_linux_agent": {
         "platform": "linux",
+        "allowedOsVersionClasses": {"ubuntu-24.04", "debian-12"},
         "architectures": {"x86_64", "arm64"},
         "minimumCpuClass": "medium",
         "minimumMemoryClass": "medium",
         "minimumDiskClass": "medium",
-        "requiredCapabilities": {"cgroup_v2", "systemd_execution", "task_isolation"},
+        "requiredCapabilities": {
+            "cgroup_v2",
+            "linux_kernel_6_plus",
+            "systemd_execution",
+            "task_isolation",
+        },
         "requiresToolchainProfile": True,
     },
     "artifact_cache": {
@@ -584,6 +594,13 @@ def role_eligibility(
             results[role] = {
                 "eligible": False,
                 "reason": "platform_mismatch",
+            }
+            continue
+        allowed_os = requirement.get("allowedOsVersionClasses")
+        if allowed_os is not None and node["osVersionClass"] not in allowed_os:
+            results[role] = {
+                "eligible": False,
+                "reason": "unsupported_os_version_class",
             }
             continue
         if node["architecture"] not in requirement["architectures"]:
