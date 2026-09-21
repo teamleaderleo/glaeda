@@ -6,7 +6,6 @@ import json
 import importlib.util
 from pathlib import Path
 import unittest
-from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,9 +24,9 @@ COMMIT = "1" * 40
 def enrollment(os_family="macos", state="eligible", roles=None):
     if roles is None:
         roles = (
-            ["artifact_cache", "cmux_macos_native_build"]
+            ["cmux_macos_native_build"]
             if os_family == "macos"
-            else ["artifact_cache", "cmux_linux_ci"]
+            else ["cmux_linux_ci"]
         )
     return {
         "schema": f.ENROLLMENT_SCHEMA,
@@ -76,7 +75,7 @@ class FleetTests(unittest.TestCase):
         status = f.node_status(e, [r])
         by_role = {v["role"]: v for v in status["roles"]}
         self.assertTrue(by_role["cmux_macos_native_build"]["eligible"])
-        self.assertEqual(by_role["artifact_cache"]["reason"], "acceptance_missing_or_rejected")
+        self.assertEqual(set(by_role), {"cmux_macos_native_build"})
         self.assertTrue(status["automaticRoutingEligible"])
 
     def test_enrollment_presence_does_not_grant_role(self):
@@ -117,6 +116,12 @@ class FleetTests(unittest.TestCase):
                 e[field] = "secret-ish"
                 with self.assertRaisesRegex(f.FleetError, "unknown or missing"):
                     f.validate_enrollment(e)
+
+    def test_role_without_reviewed_workload_is_rejected(self):
+        with self.assertRaisesRegex(f.FleetError, "reviewed v1 acceptance workload"):
+            f.validate_enrollment(
+                enrollment(roles=["artifact_cache"])
+            )
 
     def test_os_role_mismatch_is_rejected(self):
         with self.assertRaisesRegex(f.FleetError, "incompatible"):
