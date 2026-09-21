@@ -11,10 +11,7 @@
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   ],
   "allowedExecutionRoles": [
-    "artifact_cache",
-    "benchmark",
-    "cmux_macos_native_build",
-    "cmux_macos_test"
+    "cmux_macos_native_build"
   ],
   "operatorFleetScope": "cmux-founders",
   "enrollmentGeneration": 1,
