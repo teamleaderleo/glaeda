@@ -89,15 +89,8 @@
       "maximum": 2147483647
     },
     "glaedaGeneration": {
-      "oneOf": [
-        {
-          "type": "null"
-        },
-        {
-          "type": "string",
-          "pattern": "^sha256:[0-9a-f]{64}$"
-        }
-      ]
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
     },
     "state": {
       "enum": [
