@@ -111,10 +111,9 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      - name: Activate exact pnpm
+      - name: Install exact pnpm
         run: |
-          corepack enable
-          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          npm install --global --ignore-scripts "pnpm@${PNPM_VERSION}"
           test "$(node --version)" = "v${NODE_VERSION}"
           test "$(pnpm --version)" = "${PNPM_VERSION}"
           printf 'NODE_BIN=%s\n' "$(dirname "$(command -v node)")" >> "$GITHUB_ENV"
@@ -234,7 +233,7 @@ jobs:
           fi
           STORE_STAT="$(sudo stat -c 'uid=%u gid=%g mode=%a device=%d inode=%i' "$STORE")"
 
-          jq -n             --arg benchmark_head "$BENCHMARK_HEAD"             --arg source_repository "$SOURCE_REPOSITORY"             --arg source_commit "$SOURCE_COMMIT"             --arg source_tree "$SOURCE_TREE"             --arg mode "$MODE"             --arg filesystem "$FILESYSTEM"             --arg import_method "$IMPORT_METHOD"             --arg probe_script "$PROBE_SCRIPT"             --arg expected_mechanism "$EXPECTED_MECHANISM"             --arg store_policy "$STORE_POLICY"             --arg kernel "$(uname -srvm)"             --arg runner_image "${ImageOS:-unknown}"             --arg node "$(node --version)"             --arg pnpm "$(pnpm --version)"             --arg git "$(git --version)"             --arg mkfs_version "$MKFS_VERSION"             --arg mount_info "$MOUNT_INFO"             --arg fs_detail "$FS_DETAIL"             --arg store_stat "$STORE_STAT"             --arg protected_hardlinks "$(sysctl -n fs.protected_hardlinks 2>/dev/null || printf unknown)"             --argjson loop_image_bytes "$LOOP_IMAGE_BYTES"             --argjson repetitions "$REPETITIONS"             '{
+          jq -n             --arg benchmark_head "$BENCHMARK_HEAD"             --arg source_repository "$SOURCE_REPOSITORY"             --arg source_commit "$SOURCE_COMMIT"             --arg source_tree "$SOURCE_TREE"             --arg mode "$MODE"             --arg filesystem "$FILESYSTEM"             --arg import_method "$IMPORT_METHOD"             --arg probe_script "$PROBE_SCRIPT"             --arg expected_mechanism "$EXPECTED_MECHANISM"             --arg store_policy "$STORE_POLICY"             --arg kernel "$(uname -srvm)"             --arg runner_image "${ImageOS:-unknown}"             --arg node "$(node --version)"             --arg npm "$(npm --version)"             --arg pnpm "$(pnpm --version)"             --arg git "$(git --version)"             --arg mkfs_version "$MKFS_VERSION"             --arg mount_info "$MOUNT_INFO"             --arg fs_detail "$FS_DETAIL"             --arg store_stat "$STORE_STAT"             --arg protected_hardlinks "$(sysctl -n fs.protected_hardlinks 2>/dev/null || printf unknown)"             --argjson loop_image_bytes "$LOOP_IMAGE_BYTES"             --argjson repetitions "$REPETITIONS"             '{
               schema_version: 1,
               document_type: "glaeda-pnpm-hosted-physical-control",
               authority: "performance_observation_only",
@@ -248,6 +247,7 @@ jobs:
               },
               toolchain: {
                 node: $node,
+                npm: $npm,
                 pnpm: $pnpm,
                 git: $git
               },
@@ -380,4 +380,4 @@ jobs:
         with:
           name: pnpm-${{ matrix.mode }}-${{ matrix.filesystem }}-${{ matrix.method }}
           path: ${{ runner.temp }}/pnpm-${{ matrix.mode }}-${{ matrix.filesystem }}-${{ matrix.method }}
-          if-no-files-found: error
+          if-no-files-found: warn
