@@ -36,7 +36,6 @@ REQUEST_KEYS = {
     "document_type",
     "schema_version",
     "external_request_ref",
-    "semantic_request_id",
     "source",
     "operation",
     "requested_capability_class",
@@ -89,7 +88,6 @@ class ExternalRequest:
     tree: str
     operation: str
     requested_capability_class: str
-    semantic_request_id: str | None = None
     reuse_hint: str | None = None
     work_ref: str | None = None
 
@@ -136,8 +134,6 @@ def request_document(request: ExternalRequest) -> dict[str, object]:
         "operation": request.operation,
         "requested_capability_class": request.requested_capability_class,
     }
-    if request.semantic_request_id is not None:
-        document["semantic_request_id"] = request.semantic_request_id
     if request.reuse_hint is not None:
         document["reuse_hint"] = request.reuse_hint
     if request.work_ref is not None:
@@ -178,12 +174,6 @@ def decode_request(raw: bytes) -> ExternalRequest:
     external_request_ref = _token(value["external_request_ref"], "external request reference")
     operation = _token(value["operation"], "operation")
     capability = _token(value["requested_capability_class"], "requested capability class")
-    semantic_request_id = value.get("semantic_request_id")
-    if semantic_request_id is not None and (
-        not isinstance(semantic_request_id, str)
-        or SEMANTIC_REQUEST_ID_PATTERN.fullmatch(semantic_request_id) is None
-    ):
-        raise ContractRefusal("invalid_request", "semantic request identity is invalid")
     reuse_hint = value.get("reuse_hint")
     if reuse_hint is not None and (
         not isinstance(reuse_hint, str) or reuse_hint not in REUSE_HINTS
@@ -202,7 +192,6 @@ def decode_request(raw: bytes) -> ExternalRequest:
         tree,
         operation,
         capability,
-        semantic_request_id,
         reuse_hint,
         work_ref,
     )
@@ -212,7 +201,11 @@ def request_sha256(request: ExternalRequest) -> str:
     return sha256(canonical_bytes(request_document(request)))
 
 
-def _internal_fingerprint(request: ExternalRequest, profile_generation: str) -> str:
+def _internal_fingerprint(
+    request: ExternalRequest,
+    profile_generation: str,
+    semantic_request_id: str | None = None,
+) -> str:
     # Caller refs, correlation, and reuse hints are deliberately absent: they cannot mint
     # physical execution identity.
     binding = {
@@ -229,12 +222,16 @@ def _internal_fingerprint(request: ExternalRequest, profile_generation: str) -> 
             "generation": profile_generation,
         },
     }
-    if request.semantic_request_id is not None:
-        binding["semantic_request_id"] = request.semantic_request_id
+    if semantic_request_id is not None:
+        binding["semantic_request_id"] = semantic_request_id
     return sha256(canonical_bytes(binding))
 
 
-def compile_request(request: ExternalRequest) -> CompiledRequest:
+def compile_request(
+    request: ExternalRequest,
+    *,
+    semantic_request_id: str | None = None,
+) -> CompiledRequest:
     if request.operation != OPERATION_VERIFY_FOCUSED:
         raise ContractRefusal(
             "unsupported_operation", "operation is not admitted by this adapter"
@@ -242,6 +239,14 @@ def compile_request(request: ExternalRequest) -> CompiledRequest:
     if request.requested_capability_class != focused.EXECUTION_IDENTITY_CLASS:
         raise ContractRefusal(
             "unsupported_capability", "requested capability is not admitted by this adapter"
+        )
+    if semantic_request_id is not None and (
+        not isinstance(semantic_request_id, str)
+        or SEMANTIC_REQUEST_ID_PATTERN.fullmatch(semantic_request_id) is None
+    ):
+        raise ContractRefusal(
+            "invalid_semantic_identity",
+            "accepted semantic request identity is invalid",
         )
     profile = focused.FOCUSED_PROFILE
     generation = focused.profile_generation(profile)
@@ -254,7 +259,11 @@ def compile_request(request: ExternalRequest) -> CompiledRequest:
         commit=request.commit,
         tree=request.tree,
         profile_generation=generation,
-        command_fingerprint=_internal_fingerprint(request, generation),
+        command_fingerprint=_internal_fingerprint(
+            request,
+            generation,
+            semantic_request_id,
+        ),
         profile=profile,
     )
     return CompiledRequest(request, request_sha256(request), internal)
