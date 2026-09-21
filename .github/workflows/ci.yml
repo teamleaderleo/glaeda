@@ -74,8 +74,10 @@ jobs:
               Path("scripts/verify_focused_impl.py"),
               Path("scripts/owned_linux_task.py"),
               Path("scripts/owned_linux_admission.py"),
+              Path("scripts/external_execution_request.py"),
               Path("scripts/owned-admission-control"),
               Path("scripts/test-owned-linux-admission.py"),
+              Path("scripts/test-external-execution-request.py"),
               Path("scripts/cmux_fleet.py"),
               Path("scripts/cmux_fleet_bootstrap.py"),
               Path("scripts/cmux_execution_roles.py"),
@@ -123,6 +125,7 @@ jobs:
           python3 scripts/test-hot-run.py
           python3 scripts/test-verify-focused.py
           python3 scripts/test-owned-linux-admission.py
+          python3 scripts/test-external-execution-request.py
           python3 scripts/test-cmux-fleet.py
           python3 scripts/test-cmux-fleet-bootstrap.py
           python3 scripts/test-cmux-execution-roles.py
