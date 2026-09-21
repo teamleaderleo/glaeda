@@ -20,6 +20,10 @@ import time
 
 class TaskNetwork(Enum):
     NONE = "none"
+    # Owner-trusted GitHub Actions only. This shares the host network namespace:
+    # GitHub/public internet egress works, while hostile-LAN containment remains a
+    # later policy layer. Callers and receipts must name this exact class.
+    GITHUB_ACTIONS_TRUSTED_EGRESS = "github_actions_trusted_host_egress_v1"
 
 
 MAX_CONTROL_OUTPUT_BYTES = 64 * 1024
@@ -165,12 +169,32 @@ def sandbox_command(
     mount_arguments: list[str], recipe_arguments: list[str],
     network: TaskNetwork, source_read_only: bool = True,
 ) -> list[str]:
-    if network is not TaskNetwork.NONE:
+    if network not in {
+        TaskNetwork.NONE,
+        TaskNetwork.GITHUB_ACTIONS_TRUSTED_EGRESS,
+    }:
         raise Refusal("owned task network class is unsupported")
     source_bind = "--ro-bind" if source_read_only else "--bind"
+    network_arguments = (
+        []
+        if network is TaskNetwork.NONE
+        else ["--share-net"]
+    )
+    resolver_arguments = (
+        []
+        if network is TaskNetwork.NONE
+        else [
+            "--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
+            "--ro-bind-try", "/etc/hosts", "/etc/hosts",
+            "--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
+            "--ro-bind-try", "/etc/ssl/certs", "/etc/ssl/certs",
+            "--ro-bind-try", "/etc/ca-certificates.conf", "/etc/ca-certificates.conf",
+        ]
+    )
     bubblewrap = [
         "/usr/bin/bwrap",
         "--unshare-all",
+        *network_arguments,
         "--unshare-user",
         "--die-with-parent",
         "--new-session",
@@ -203,6 +227,7 @@ def sandbox_command(
         "--ro-bind-try",
         "/etc/alternatives",
         "/etc/alternatives",
+        *resolver_arguments,
         "--proc",
         "/proc",
         "--dev",
@@ -289,6 +314,32 @@ def execute(
     return observation[:6]
 
 
+def execute_secret_stdin(
+    command: list[str], *, unit: str, deadline_seconds: int, label: str,
+    secret_stdin: bytearray, launch_guard=None,
+) -> tuple[str, int, float, bool, int, str]:
+    """Run one fixed command with a bounded mutable secret on stdin.
+
+    The buffer is written without placing secret bytes in argv/environment or a
+    durable file, failure tails are suppressed, and the caller-owned bytearray is
+    overwritten before return or exception. Only byte count/digest observations
+    leave this boundary.
+    """
+    if not isinstance(secret_stdin, bytearray) or not secret_stdin:
+        raise Refusal("secret stdin must be one non-empty mutable byte buffer")
+    if len(secret_stdin) > 64 * 1024 + 1:
+        raise Refusal("secret stdin exceeds its fixed ceiling")
+    try:
+        observation = _run_bounded(
+            command, unit=unit, deadline_seconds=deadline_seconds, label=label,
+            launch_guard=launch_guard, retain_limit=0, separate_stderr=False,
+            secret_stdin=secret_stdin, emit_failure_tail=False,
+        )
+        return observation[:6]
+    finally:
+        secret_stdin[:] = b"\x00" * len(secret_stdin)
+
+
 def execute_capturing(
     command: list[str], *, unit: str, deadline_seconds: int, label: str,
     max_bytes: int, launch_guard=None,
@@ -335,13 +386,14 @@ def execute_capturing_split(
 def _run_bounded(
     command: list[str], *, unit: str, deadline_seconds: int, label: str,
     launch_guard=None, retain_limit: int, separate_stderr: bool,
+    secret_stdin: bytearray | None = None, emit_failure_tail: bool = True,
 ) -> tuple[str, int, float, bool, int, str, bytes, bool, int, str]:
     started = time.monotonic()
     with launch_guard() if launch_guard is not None else nullcontext():
         process = subprocess.Popen(
             command,
             env=closed_environment({"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}),
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if secret_stdin is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
             start_new_session=True,
@@ -349,6 +401,12 @@ def _run_bounded(
     assert process.stdout is not None
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
+    secret_offset = 0
+    secret_write_failed = False
+    if secret_stdin is not None:
+        assert process.stdin is not None
+        os.set_blocking(process.stdin.fileno(), False)
+        selector.register(process.stdin, selectors.EVENT_WRITE)
     if separate_stderr:
         assert process.stderr is not None
         selector.register(process.stderr, selectors.EVENT_READ)
@@ -365,6 +423,7 @@ def _run_bounded(
     forced_timeout = False
     deadline = started + deadline_seconds + 30
     stdout_fd = process.stdout.fileno()
+    stdin_fd = process.stdin.fileno() if process.stdin is not None else None
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -377,6 +436,24 @@ def _run_bounded(
             break
         events = selector.select(min(0.1, remaining))
         for key, _ in events:
+            if stdin_fd is not None and key.fd == stdin_fd:
+                try:
+                    written = os.write(
+                        stdin_fd, memoryview(secret_stdin)[secret_offset:]
+                    )
+                except (BrokenPipeError, OSError):
+                    secret_write_failed = True
+                    selector.unregister(key.fileobj)
+                    process.stdin.close()
+                    stdin_fd = None
+                    stop_unit(unit)
+                    continue
+                secret_offset += written
+                if secret_offset == len(secret_stdin):
+                    selector.unregister(key.fileobj)
+                    process.stdin.close()
+                    stdin_fd = None
+                continue
             chunk = os.read(key.fd, 64 * 1024)
             if not chunk:
                 selector.unregister(key.fileobj)
@@ -416,6 +493,8 @@ def _run_bounded(
         returncode = process.wait()
     selector.close()
     process.stdout.close()
+    if process.stdin is not None and not process.stdin.closed:
+        process.stdin.close()
     if separate_stderr and process.stderr is not None:
         process.stderr.close()
     elapsed = time.monotonic() - started
@@ -426,11 +505,11 @@ def _run_bounded(
     terminal = "succeeded" if returncode == 0 else "failed"
     if forced_timeout or elapsed >= deadline_seconds:
         terminal = "timed_out"
-    if output_exceeded or err_exceeded:
+    if output_exceeded or err_exceeded or secret_write_failed:
         terminal = "failed"
     if not settled:
         terminal = "cleanup_incomplete"
-    if terminal != "succeeded" and (tail or err_tail):
+    if emit_failure_tail and terminal != "succeeded" and (tail or err_tail):
         if tail:
             omitted = output_bytes - len(tail)
             print(
