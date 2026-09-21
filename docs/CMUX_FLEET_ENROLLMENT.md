@@ -8,8 +8,8 @@ This path turns a CMUX-controlled Mac or Linux host into a reviewed fleet node w
 
 The repository-owned bootstrap commands are read-only. They inspect an exact CMUX checkout and exact Glaeda executable, produce a bounded receipt, and leave package installation, MDM, SSH, networking, and machine account policy with their existing owners.
 
-- macOS: Apple Silicon or x86_64; macOS major 15 or 26; CMUX `.xcode-version` must be `26.0`; the selected Xcode and macOS SDK must be generation 26; Git present; at least 120 GiB free by default; AC system sleep disabled for unattended work.
-- Linux: x86_64 or arm64; Ubuntu 24.04 or Debian 12; kernel major 6 or newer; Git, Python, systemd, bubblewrap, cgroup v2, pressure signals; at least 40 GiB free and 8 GiB available memory by default. `cmux_linux_ci` also checks `curl`, `tar`, `gzip`, and `ldd`.
+- macOS: Apple Silicon or x86_64; macOS major 15 or 26; CMUX `.xcode-version` must be `26.0`; the selected Xcode and macOS SDK must be generation 26; Git present; at least 120 GiB free by default; AC system sleep disabled for unattended work. `cmux-mac-build-large` and `cmux-mac-test-large` require at least 8 logical CPUs and 16 GiB total memory.
+- Linux: x86_64 or arm64; Ubuntu 24.04 or Debian 12; kernel major 6 or newer; Git, Python, systemd, bubblewrap, cgroup v2, pressure signals; at least 40 GiB free and 8 GiB available memory by default. `cmux-linux-ci-medium` and `cmux-linux-agent-medium` require at least 4 logical CPUs and 8 GiB total memory. `cmux_linux_ci` also checks `curl`, `tar`, `gzip`, and `ldd`.
 
 A different machine class starts as a bootstrap refusal until the reviewed policy changes.
 
@@ -52,7 +52,7 @@ States are:
 
 `discovered -> enrolling -> eligible -> draining/quarantined -> retired`
 
-Supported recovery paths also include `draining -> eligible` and `quarantined -> enrolling`.
+Supported recovery paths also include `draining -> eligible` and `quarantined -> enrolling`. Leaving quarantine advances the enrollment generation, so every pre-quarantine acceptance receipt becomes stale immediately.
 
 Automatic routing reads `scripts/cmux-fleet status`. A node in `draining`, `quarantined`, or `retired` produces zero eligible roles even when an older acceptance receipt exists. An `eligible` node still produces zero eligible roles when its acceptance evidence is absent, rejected, or stale.
 
