@@ -31,7 +31,7 @@ impl RoutingId {
     ///
     /// # Errors
     ///
-    /// Returns an error for empty, oversized, path-shaped, command-shaped, or non-canonical text.
+    /// Returns an error for empty, oversized, or non-canonical text.
     pub fn parse(value: &str) -> Result<Self, RoutingError> {
         let Some(first) = value.bytes().next() else {
             return Err(error(
@@ -351,6 +351,7 @@ impl AllowanceBudgetV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContentionEvidenceV1 {
+    pub comparison_class: RoutingId,
     pub window_count: u16,
     pub offered_tasks: u32,
     pub validated_completions: u32,
@@ -371,11 +372,23 @@ impl ContentionEvidenceV1 {
     ///
     /// Returns an error for impossible counts or zero elapsed time.
     pub fn validate(&self) -> Result<(), RoutingError> {
-        if self.window_count == 0 || self.elapsed_millis == 0 {
+        if self.window_count == 0 || self.offered_tasks == 0 || self.elapsed_millis == 0 {
             return Err(error(
                 "contention",
                 "routing_contention_empty",
-                "contention evidence requires at least one window and positive elapsed time",
+                "contention evidence requires offered work, at least one window, and positive elapsed time",
+            ));
+        }
+        let offered = u64::from(self.offered_tasks);
+        if u64::from(self.semantic_mismatches) > offered
+            || u64::from(self.failures) > offered
+            || u64::from(self.fallbacks) > offered
+            || u64::from(self.unfinished) > offered
+        {
+            return Err(error(
+                "contention",
+                "routing_contention_count_exceeds_offered",
+                "contention outcome counts cannot exceed offered work",
             ));
         }
         if self.validated_completions > self.offered_tasks {
@@ -1325,19 +1338,22 @@ fn pressure_cmp(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Orderi
 
 fn contention_cmp(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Ordering {
     match (&left.prediction.contention, &right.prediction.contention) {
-        (Some(left), Some(right)) => {
+        (Some(left), Some(right)) if left.comparison_class == right.comparison_class => {
             let left_rate =
                 u128::from(left.validated_completions) * u128::from(right.elapsed_millis);
             let right_rate =
                 u128::from(right.validated_completions) * u128::from(left.elapsed_millis);
-            right_rate.cmp(&left_rate).then_with(|| {
-                left.final_result_p90_millis
-                    .cmp(&right.final_result_p90_millis)
-            })
+            right_rate
+                .cmp(&left_rate)
+                .then_with(|| {
+                    left.final_result_p90_millis
+                        .cmp(&right.final_result_p90_millis)
+                })
+                .then_with(|| left.failures.cmp(&right.failures))
+                .then_with(|| left.fallbacks.cmp(&right.fallbacks))
+                .then_with(|| left.unfinished.cmp(&right.unfinished))
         }
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
+        _ => Ordering::Equal,
     }
 }
 
@@ -1720,6 +1736,7 @@ mod tests {
         let workload = workload();
         let mut bad = pool("bad", PoolAccountingClass::Owned, HotStateClass::HotExact);
         bad.contention = Some(ContentionEvidenceV1 {
+            comparison_class: id("cmux-macos-contention"),
             window_count: 4,
             offered_tasks: 16,
             validated_completions: 14,
@@ -1814,6 +1831,7 @@ mod tests {
             pressure_after_admission: HostPressureClass::Moderate,
             allowance: None,
             contention: Some(ContentionEvidenceV1 {
+                comparison_class: id("glaeda-linux-contention"),
                 window_count: 4,
                 offered_tasks: 16,
                 validated_completions: 16,
@@ -2022,6 +2040,7 @@ mod tests {
         let workload = workload();
         let mut candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Warm);
         candidate.contention = Some(ContentionEvidenceV1 {
+            comparison_class: id("cmux-macos-contention"),
             window_count: 4,
             offered_tasks: 16,
             validated_completions: 16,
