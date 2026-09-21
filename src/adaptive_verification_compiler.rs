@@ -2543,6 +2543,18 @@ mod tests {
                 .count()
                 >= 2
         );
+        assert!(
+            receipt
+                .candidates()
+                .iter()
+                .filter(
+                    |candidate| candidate.class() == OptimizationClass::ReuseExactCompiledProduct
+                )
+                .all(|candidate| {
+                    candidate.reusable_state_class()
+                        == Some(ReusableStateClass::ImmutableCompiledProduct)
+                })
+        );
 
         let transfer_backends = receipt
             .observations()
