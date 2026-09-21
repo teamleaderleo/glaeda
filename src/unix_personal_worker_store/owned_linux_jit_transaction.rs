@@ -324,6 +324,19 @@ impl UnixPersonalWorkerStore {
             );
         }
 
+        if matches!(
+            phase,
+            DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
+        ) && reservation.attempt().runner_id().is_some()
+            && !reservation.attempt().runner_start_started()
+        {
+            return self.publish_owned_linux_cleanup_action(
+                &current,
+                attempt_id,
+                DisposableAttemptCatalogAction::BeginCleanup,
+            );
+        }
+
         match phase {
             DisposableAttemptPhase::Destroying => {
                 match runner_source.observe_runner(reservation.attempt().runner_name())? {
