@@ -37,6 +37,7 @@ ROLE_OS = {
     "artifact_cache": None,
     "background_replay": None,
     "benchmark": None,
+    "diagnostic": None,
 }
 
 
