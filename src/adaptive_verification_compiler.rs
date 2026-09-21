@@ -2757,7 +2757,7 @@ mod tests {
             compile_observation("compile-3", "run-3", 119_000),
         ];
         let proposal =
-            compile_verification_optimizations("cmux-ci", "macos-full", &observations, &[]).unwrap();
+            compile_verification_optimizations("cmux-ci", "macos-full", &observations, &[])\n                .unwrap();
         let candidate_id = proposal
             .candidates()
             .iter()
@@ -2867,7 +2867,7 @@ mod tests {
     fn cmux_controlled_restore_is_experimenting_and_measured_resource_reuse_is_rejected() {
         let observations = cmux_case_observations();
         let proposal =
-            compile_verification_optimizations("cmux-ci", "macos-full", &observations, &[]).unwrap();
+            compile_verification_optimizations("cmux-ci", "macos-full", &observations, &[])\n                .unwrap();
         let app_host_candidate_id = proposal
             .candidates()
             .iter()
@@ -3008,7 +3008,7 @@ mod tests {
             receipt
                 .candidates()
                 .iter()
-                .filter(|candidate| candidate.class() == OptimizationClass::ReuseExactCompiledProduct)
+                .filter(\n                    |candidate| candidate.class() == OptimizationClass::ReuseExactCompiledProduct\n                )
                 .all(|candidate| candidate.lifecycle() == OptimizationLifecycle::Candidate)
         );
     }
