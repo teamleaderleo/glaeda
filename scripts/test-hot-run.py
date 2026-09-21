@@ -1257,6 +1257,53 @@ class HotRunTests(unittest.TestCase):
                 301,
             )
 
+    def test_corrupt_value_record_does_not_block_other_reclamation(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            states = []
+            for label in ("a", "b"):
+                state, _, document = self.make_hot_state_manifest_fixture(
+                    namespace, fixture, label * 64
+                )
+                namespace["publish_implicit_state_base"](state, document)
+                (state / "lock").touch(mode=0o600)
+                namespace["record_successful_hot_state_use"](
+                    namespace_root,
+                    state,
+                    "created",
+                    None,
+                    None,
+                    None,
+                    namespace["ExecutionObservation"](0.1, 0.0),
+                )
+                states.append(state)
+
+            corrupt = (
+                namespace_root
+                / ".value-records-v2"
+                / f"{states[0].name}.json"
+            )
+            corrupt.write_text('{"corrupt":true}\n', encoding="utf-8")
+            corrupt.chmod(0o600)
+
+            retire = namespace["retire_one_low_value_state"]
+            filesystem = retire.__globals__["os"]
+            pressure = os.statvfs_result(
+                (4096, 4096, 100, 10, 10, 0, 0, 0, 0, 255)
+            )
+            with mock.patch.object(
+                filesystem, "statvfs", return_value=pressure
+            ):
+                self.assertEqual(
+                    retire(namespace_root, "f" * 64),
+                    "retired_low_value",
+                )
+            self.assertTrue(states[0].exists())
+            self.assertFalse(states[1].exists())
+
     def test_value_retirement_uses_deterministic_lru_and_hysteresis(self) -> None:
         namespace = load_hot_run()
         with tempfile.TemporaryDirectory() as directory:
