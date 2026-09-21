@@ -49,7 +49,7 @@ The versioned schema carries the full role vocabulary in `$defs.knownRole` while
 
 The schema has no hostname, serial number, username, private address, SSH identity, MDM identifier, or raw hardware inventory fields. Unknown top-level fields are rejected.
 
-Role eligibility binds repository-owned CMUX semantic profiles rather than a duplicate acceptance recipe. Finalization emits `glaeda-cmux-fleet-acceptance/v2`, which binds the exact CMUX result digest, CMUX environment class/toolchain identity, and a fresh post-run bootstrap digest in addition to enrollment/Glaeda/toolchain/process-settlement identity. The CMUX semantic result also carries a bounded repository-owned environment class; Glaeda does not interpret that class, but it requires the class to participate in CMUX's recomputed semantic comparison identity before accepting the result. Bootstrap reads `scripts/ci/cmux-workload-profiles.json`, requires `cmux_linux_ci -> cmux.ci.guard@1` or `cmux_macos_native_build -> cmux.macos.dev-check@1`, and checks that the selected profile admits the observed OS/architecture. Finalization consumes the canonical `cmux-workload-result/v1` emitted by that profile, records only its exact digest/state plus Glaeda-owned enrollment/toolchain/process-settlement identity, and never reconstructs CMUX argv, artifacts, or pass/fail semantics.
+Role eligibility binds repository-owned CMUX semantic profiles rather than a duplicate acceptance recipe. The low-level `finalize-acceptance` command can validate externally supplied semantic evidence for diagnostics, but v2 marks that evidence as externally supplied and it cannot mint an accepted receipt. Candidate-eligible receipts come from `accept-local`, which owns the local CMUX process invocation. Finalization emits `glaeda-cmux-fleet-acceptance/v2`, which binds the exact CMUX result digest, CMUX environment class/toolchain identity, and a fresh post-run bootstrap digest in addition to enrollment/Glaeda/toolchain/process-settlement identity. The CMUX semantic result also carries a bounded repository-owned environment class; Glaeda does not interpret that class, but it requires the class to participate in CMUX's recomputed semantic comparison identity before accepting the result. Bootstrap reads `scripts/ci/cmux-workload-profiles.json`, requires `cmux_linux_ci -> cmux.ci.guard@1` or `cmux_macos_native_build -> cmux.macos.dev-check@1`, and checks that the selected profile admits the observed OS/architecture. Finalization consumes the canonical `cmux-workload-result/v1` emitted by that profile, records only its exact digest/state plus Glaeda-owned enrollment/toolchain/process-settlement identity, and never reconstructs CMUX argv, artifacts, or pass/fail semantics.
 
 Canonical enrollment and acceptance documents used for lifecycle or routing-candidate decisions are read through a no-follow private-file gate: current-user owned, regular, single-link, mode `0600`, bounded size, and unchanged inode/metadata across the read. A loose, symlinked, or swapped file cannot supply eligibility. `transition` remains a side-effect-free planner. `transition-apply` holds one private mutation lock, re-reads the current enrollment under that lock, writes a mode-0600 same-directory stage, fsyncs the staged bytes, atomically replaces `enrollment.json`, fsyncs the fleet directory, and revalidates the published bytes before returning.
 
@@ -103,8 +103,7 @@ FLEET_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet"
 umask 077
 install -d -m 700 "$FLEET_ROOT" "$FLEET_ROOT/acceptance"
 BOOTSTRAP="$(mktemp "$FLEET_ROOT/.bootstrap.XXXXXX")"
-POST_BOOTSTRAP="$(mktemp "$FLEET_ROOT/.post-bootstrap.XXXXXX")"
-chmod 600 "$BOOTSTRAP" "$POST_BOOTSTRAP"
+chmod 600 "$BOOTSTRAP"
 ENROLLMENT="$FLEET_ROOT/enrollment.json"
 ACCEPTANCE="$FLEET_ROOT/acceptance/cmux_macos_native_build.json"
 NODE_ID=cmux-mac-001
@@ -126,33 +125,12 @@ python3 scripts/cmux_fleet.py enroll "$BOOTSTRAP" \
 chmod 600 "$ENROLLMENT_NEXT"
 mv "$ENROLLMENT_NEXT" "$ENROLLMENT"
 
-CMUX_COMMIT="$(git -C "$CMUX_ROOT" rev-parse HEAD)"
-CMUX_TREE="$(git -C "$CMUX_ROOT" rev-parse 'HEAD^{tree}')"
-CMUX_STATE="$(mktemp -d)"
-chmod 700 "$CMUX_STATE"
-CMUX_RESULT="$CMUX_STATE/result.json"
-python3 "$CMUX_ROOT/scripts/ci/cmux_workload_profile.py" run cmux.macos.dev-check \
-  --generation 1 \
-  --commit "$CMUX_COMMIT" \
-  --tree "$CMUX_TREE" \
-  --state-class cold \
-  --state-root "$CMUX_STATE" \
-  --result "$CMUX_RESULT"
-
-bash scripts/cmux-fleet-bootstrap-macos \
+ACCEPTANCE_NEXT="$(mktemp "$FLEET_ROOT/acceptance/.cmux_macos_native_build.XXXXXX")"
+python3 scripts/cmux_fleet.py accept-local "$ENROLLMENT" \
   --cmux-root "$CMUX_ROOT" \
   --glaeda "$GLAEDA_BIN" \
   --cache-root "$CMUX_CACHE_ROOT" \
-  --hardware-class cmux-mac-build-large \
   --role cmux_macos_native_build \
-  > "$POST_BOOTSTRAP"
-
-TOOLCHAIN_GENERATION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["supportedToolchainGenerations"][0])' "$ENROLLMENT")"
-ACCEPTANCE_NEXT="$(mktemp "$FLEET_ROOT/acceptance/.cmux_macos_native_build.XXXXXX")"
-python3 scripts/cmux_fleet.py finalize-acceptance \
-  "$ENROLLMENT" "$CMUX_RESULT" "$POST_BOOTSTRAP" \
-  --role cmux_macos_native_build \
-  --toolchain-generation "$TOOLCHAIN_GENERATION" \
   > "$ACCEPTANCE_NEXT"
 chmod 600 "$ACCEPTANCE_NEXT"
 mv "$ACCEPTANCE_NEXT" "$ACCEPTANCE"
@@ -164,7 +142,7 @@ bash scripts/cmux-fleet status "$ENROLLMENT" \
   --acceptance "$ACCEPTANCE"
 ```
 
-The macOS preparation reuses CMUX's reviewed `scripts/setup.sh` for prerequisites. Bootstrap re-observes those prerequisites read-only and verifies the exact checkout exposes `cmux.macos.dev-check@1` for the observed Apple-Silicon node. CMUX's own profile runner owns the developer-build commands, semantic validator, artifact checks, timeout, and cleanup result. Glaeda accepts only the matching profile/result digest, requires complete process settlement, and requires the fresh post-run bootstrap to reconstruct the enrolled machine capability and selected toolchain generation. It does not maintain a second definition of the CMUX build.
+The macOS preparation reuses CMUX's reviewed `scripts/setup.sh` for prerequisites. Bootstrap re-observes those prerequisites read-only and verifies the exact checkout exposes `cmux.macos.dev-check@1` for the observed Apple-Silicon node. `accept-local` launches CMUX's checked-in profile runner on this node inside a private attempt directory, captures the canonical semantic result, reruns the read-only bootstrap on this same node, and emits `glaeda-cmux-fleet-acceptance/v2`. CMUX still owns the developer-build commands, validator, artifacts, timeout, and pass/fail semantics. Glaeda owns the local-attempt binding, fresh capability check, and durable receipt.
 
 ## Onboard Linux
 
@@ -186,8 +164,7 @@ FLEET_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet"
 umask 077
 install -d -m 700 "$FLEET_ROOT" "$FLEET_ROOT/acceptance"
 BOOTSTRAP="$(mktemp "$FLEET_ROOT/.bootstrap.XXXXXX")"
-POST_BOOTSTRAP="$(mktemp "$FLEET_ROOT/.post-bootstrap.XXXXXX")"
-chmod 600 "$BOOTSTRAP" "$POST_BOOTSTRAP"
+chmod 600 "$BOOTSTRAP"
 ENROLLMENT="$FLEET_ROOT/enrollment.json"
 ACCEPTANCE="$FLEET_ROOT/acceptance/cmux_linux_ci.json"
 NODE_ID=cmux-linux-001
@@ -208,32 +185,11 @@ python3 scripts/cmux_fleet.py enroll "$BOOTSTRAP" \
 chmod 600 "$ENROLLMENT_NEXT"
 mv "$ENROLLMENT_NEXT" "$ENROLLMENT"
 
-CMUX_COMMIT="$(git -C "$CMUX_ROOT" rev-parse HEAD)"
-CMUX_TREE="$(git -C "$CMUX_ROOT" rev-parse 'HEAD^{tree}')"
-CMUX_STATE="$(mktemp -d)"
-chmod 700 "$CMUX_STATE"
-CMUX_RESULT="$CMUX_STATE/result.json"
-python3 "$CMUX_ROOT/scripts/ci/cmux_workload_profile.py" run cmux.ci.guard \
-  --generation 1 \
-  --commit "$CMUX_COMMIT" \
-  --tree "$CMUX_TREE" \
-  --state-class cold \
-  --state-root "$CMUX_STATE" \
-  --result "$CMUX_RESULT"
-
-bash scripts/cmux-fleet-bootstrap-linux \
+ACCEPTANCE_NEXT="$(mktemp "$FLEET_ROOT/acceptance/.cmux_linux_ci.XXXXXX")"
+python3 scripts/cmux_fleet.py accept-local "$ENROLLMENT" \
   --cmux-root "$CMUX_ROOT" \
   --glaeda "$GLAEDA_BIN" \
-  --hardware-class cmux-linux-ci-medium \
   --role cmux_linux_ci \
-  > "$POST_BOOTSTRAP"
-
-TOOLCHAIN_GENERATION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["supportedToolchainGenerations"][0])' "$ENROLLMENT")"
-ACCEPTANCE_NEXT="$(mktemp "$FLEET_ROOT/acceptance/.cmux_linux_ci.XXXXXX")"
-python3 scripts/cmux_fleet.py finalize-acceptance \
-  "$ENROLLMENT" "$CMUX_RESULT" "$POST_BOOTSTRAP" \
-  --role cmux_linux_ci \
-  --toolchain-generation "$TOOLCHAIN_GENERATION" \
   > "$ACCEPTANCE_NEXT"
 chmod 600 "$ACCEPTANCE_NEXT"
 mv "$ACCEPTANCE_NEXT" "$ACCEPTANCE"
@@ -245,13 +201,12 @@ bash scripts/cmux-fleet status "$ENROLLMENT" \
   --acceptance "$ACCEPTANCE"
 ```
 
-The Linux acceptance runs CMUX's canonical `cmux.ci.guard@1` profile against the exact commit/tree in cold state. CMUX owns the guard list and pass/fail semantics. Glaeda binds the canonical semantic-result digest and then re-observes the host through bootstrap; the role becomes candidate-eligible only when the post-run capability, Glaeda generation, role profile, and selected toolchain generation still match enrollment.
+The Linux `accept-local` path runs CMUX's canonical `cmux.ci.guard@1` profile against the exact local commit/tree in cold state, then re-observes this same host. A v2 receipt becomes accepted only when CMUX reports `passed`, process settlement is complete, and the post-run capability, Glaeda generation, role profile, and selected toolchain generation still match enrollment.
 
 After either onboarding path, remove only the transient evidence files:
 
 ```bash
-rm -f "$BOOTSTRAP" "$POST_BOOTSTRAP"
-rm -rf "$CMUX_STATE"
+rm -f "$BOOTSTRAP"
 ```
 
 The canonical enrollment and finalized role receipts stay under `$FLEET_ROOT` across reboot. They contain no credentials or project secrets.
