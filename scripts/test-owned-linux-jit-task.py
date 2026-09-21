@@ -317,14 +317,11 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
         self.assertTrue((self.task_root / "unexpected").exists())
 
     def test_controller_restart_resumes_exact_preparation_and_keeps_capacity(self):
-        prepared = self.prepare()
-        emitted = []
+        self.prepare()
         with (mock.patch.object(task, "execute", side_effect=self.fake_execute),
-              mock.patch.object(jit, "emit", side_effect=emitted.append)):
+              mock.patch.object(jit, "emit") as emit):
             self.assertEqual(jit.launch(self.args("launch")), 0)
-        self.assertEqual(emitted[0]["task_identity_sha256"], prepared["task_identity_sha256"])
-        self.assertEqual(emitted[0]["jit_transport"], "inherited_stdin_only")
-        self.assertFalse(emitted[0]["failure_tail_emitted"])
+        emit.assert_not_called()
         reservation = json.loads((self.admission / "reservation.json").read_bytes())
         self.assertEqual(reservation["phase"], "launching")
         self.assertTrue(self.task_root.exists())
@@ -359,14 +356,13 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
             with kwargs["launch_guard"]():
                 pass
             return ("failed", 3, 0.1, True, len(secret), "sha256:" + "2" * 64)
-        emitted = []
         with (mock.patch.object(task, "execute", side_effect=execute),
-              mock.patch.object(jit, "emit", side_effect=emitted.append)):
+              mock.patch.object(jit, "emit") as emit):
             self.assertEqual(jit.launch(self.args("launch")), 70)
         serialized = task.closed_environment().copy()
         self.assertNotIn(secret, "\0".join(seen["command"]))
         self.assertNotIn(secret, json.dumps(serialized))
-        self.assertNotIn(secret, json.dumps(emitted))
+        emit.assert_not_called()
         self.assertTrue(seen["kwargs"]["inherit_stdin"])
         self.assertFalse(seen["kwargs"]["emit_failure_tail"])
 
