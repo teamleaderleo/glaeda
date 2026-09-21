@@ -163,7 +163,7 @@ def validate_enrollment(value: object) -> dict[str, Any]:
         if required_os is not None and required_os != os_doc["family"]:
             raise FleetError(f"role {role} is incompatible with OS family {os_doc['family']}")
     positive_int(doc["enrollmentGeneration"], "enrollment generation")
-    sha256(doc["glaedaGeneration"], "Glaeda generation", optional=True)
+    sha256(doc["glaedaGeneration"], "Glaeda generation")
     if doc["state"] not in STATES:
         raise FleetError("node state is unsupported")
     reason = doc["quarantineReason"]
@@ -229,7 +229,7 @@ def validate_acceptance_evidence(value: object) -> dict[str, Any]:
     if not isinstance(source["commit"], str) or COMMIT_RE.fullmatch(source["commit"]) is None:
         raise FleetError("source commit is invalid")
     sha256(doc["toolchainGeneration"], "acceptance toolchain generation")
-    sha256(doc["glaedaGeneration"], "acceptance Glaeda generation", optional=True)
+    sha256(doc["glaedaGeneration"], "acceptance Glaeda generation")
     sha256(doc["workloadGeneration"], "acceptance workload generation")
     checks = exact_keys(doc["checks"], CHECK_KEYS, "acceptance checks")
     if any(v not in {"pass", "fail"} for v in checks.values()):
@@ -278,7 +278,6 @@ def validate_acceptance_receipt(value: object) -> dict[str, Any]:
     sha256(
         doc["glaedaGeneration"],
         "acceptance receipt Glaeda generation",
-        optional=True,
     )
     sha256(
         doc["workloadGeneration"],
@@ -375,7 +374,8 @@ def node_status(enrollment_value: object, acceptance_values: list[object]) -> di
         "nodeId": enrollment["nodeId"],
         "enrollmentGeneration": enrollment["enrollmentGeneration"],
         "state": enrollment["state"],
-        "automaticRoutingEligible": any(r["eligible"] for r in role_status),
+        "routingCandidateEligible": any(r["eligible"] for r in role_status),
+        "automaticDispatchAuthorized": False,
         "capability": {
             "architecture": enrollment["architecture"],
             "osFamily": enrollment["os"]["family"],
@@ -426,7 +426,7 @@ def transition(
     enrollment = validate_enrollment(enrollment)
     if target == "eligible":
         status = node_status(enrollment, acceptance_values or [])
-        if not status["automaticRoutingEligible"]:
+        if not status["routingCandidateEligible"]:
             raise FleetError(
                 "eligible transition requires a current accepted role receipt"
             )
