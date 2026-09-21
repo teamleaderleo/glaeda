@@ -182,8 +182,10 @@ executable, host path, environment, credential, mount, cgroup, sudo or shell fie
 
 The fixed local installation file is
 `~/.config/glaeda/owner-local-v1.json`, mode `0600`, owned by the local account. It binds reviewed
-repository identities to resident checkout paths and names the installed `glaeda-repo-query`
-binary. Those bindings are machine-owner configuration and never appear in the remote request.
+repository identities to resident checkout paths. The query executable is resolved by Glaeda at
+the fixed owner install path `~/.local/bin/glaeda-repo-query`; the installation file cannot select
+an executable. Repository bindings are machine-owner configuration and never appear in the remote
+request.
 
 Example local installation shape:
 
@@ -191,7 +193,6 @@ Example local installation shape:
 {
   "document_type": "glaeda-owner-local-installation",
   "schema_version": 1,
-  "repo_query_program": "/operator/installed/glaeda-repo-query",
   "repositories": [
     {
       "repository": "teamleaderleo/glaeda",
