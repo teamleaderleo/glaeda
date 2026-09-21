@@ -580,9 +580,12 @@ def finalize_acceptance(
         raise FleetError("acceptance toolchain generation is outside the enrollment allowlist")
     expected_profile = enrollment["roleProfiles"][role]
     semantic = validate_cmux_semantic_result(cmux_result_value, expected_profile)
+    actual_cmux_result_sha256 = digest(semantic)
     if cmux_result_sha256 is None:
-        cmux_result_sha256 = digest(semantic)
+        cmux_result_sha256 = actual_cmux_result_sha256
     sha256(cmux_result_sha256, "CMUX semantic result digest")
+    if cmux_result_sha256 != actual_cmux_result_sha256:
+        raise FleetError("CMUX semantic result digest does not match validated result")
     cleanup = semantic["cleanup"]
     settlement = (
         "complete"
