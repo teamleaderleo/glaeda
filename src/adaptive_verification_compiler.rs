@@ -1551,11 +1551,13 @@ fn discover_late_static_guards(
             if wasted < MIN_SERIAL_GUARD_MILLIS {
                 continue;
             }
-            let subject = guard
+            let Some(subject) = guard
                 .suite_identity
                 .as_deref()
                 .or(guard.independence_group.as_deref())
-                .unwrap_or("static-guard");
+            else {
+                continue;
+            };
             let entry = groups.entry(subject.to_owned()).or_default();
             entry.extend(preceding);
             entry.push(guard);
@@ -1608,7 +1610,8 @@ fn discover_hanging_suites(
             .filter(|observation| {
                 observation.semantic_validation == SemanticValidationResult::TimedOut
             })
-            .count();
+            .map(|observation| usize::from(observation.sample_count))
+            .sum::<usize>();
         if observation_sample_count(&evidence) >= MIN_REPETITIONS && timeout_count >= 2 {
             candidates.push(build_candidate(
                 OptimizationClass::IsolateFlakyOrHangingSuite,
@@ -1677,6 +1680,10 @@ fn build_candidate(
         .filter(|experiment| {
             experiment.class == class
                 && experiment.bound_candidate_id.as_deref() == Some(candidate_id.as_str())
+                && experiment
+                    .subject_identity
+                    .as_deref()
+                    .is_none_or(|subject| subject_identity.as_deref() == Some(subject))
         })
         .collect::<Vec<_>>();
     let experiment_summary = summarize_experiments(&matched_experiments);
@@ -2251,6 +2258,16 @@ fn candidate_id(
     hasher.update(b"\n");
     if let Some(fingerprint) = validity_fingerprint {
         hasher.update(fingerprint.as_bytes());
+    } else if !class.requires_exact_validity() {
+        if let Some(subject) = subject {
+            hasher.update(b"subject=");
+            hasher.update(subject.as_bytes());
+        } else {
+            for observation in evidence {
+                hasher.update(observation.observation_id.as_bytes());
+                hasher.update(b"\n");
+            }
+        }
     } else {
         for observation in evidence {
             hasher.update(observation.observation_id.as_bytes());
@@ -3015,6 +3032,211 @@ mod tests {
                 )
                 .all(|candidate| candidate.lifecycle() == OptimizationLifecycle::Candidate)
         );
+    }
+
+    #[test]
+    fn repository_candidate_identity_survives_additional_evidence() {
+        let observations = cmux_case_observations();
+        let first = compile_verification_optimizations("cmux-ci", "macos-full", &observations, &[])
+            .unwrap();
+        let candidate = first
+            .candidates()
+            .iter()
+            .find(|candidate| {
+                candidate.class() == OptimizationClass::ParallelizeIndependentChecks
+                    && candidate.subject_identity() == Some("workflow-guards")
+            })
+            .unwrap();
+        let candidate_id = candidate.candidate_id().to_owned();
+
+        let experiment = OptimizationExperiment::new(
+            "parallel-guards-controlled",
+            "cmux-ci",
+            "macos-full",
+            OptimizationClass::ParallelizeIndependentChecks,
+            Some("workflow-guards"),
+            150_000,
+            60_000,
+            0,
+            0,
+            0,
+            0,
+            true,
+            true,
+            false,
+            10_000,
+            true,
+            "parallel-guards-receipt",
+        )
+        .unwrap()
+        .bind_candidate(&candidate_id)
+        .unwrap();
+
+        let mut extended = observations;
+        extended.push(
+            VerificationObservation::new(
+                "run-4-guard-extra",
+                "run-4",
+                "cmux-ci",
+                "macos-full",
+                20,
+                VerificationStage::StaticGuard,
+                45_000,
+                VerificationReuseClass::Warm,
+                SemanticValidationResult::Passed,
+                "linux-guard",
+            )
+            .unwrap()
+            .with_independence("workflow-guards")
+            .unwrap(),
+        );
+
+        let second =
+            compile_verification_optimizations("cmux-ci", "macos-full", &extended, &[experiment])
+                .unwrap();
+        let candidate = second
+            .candidates()
+            .iter()
+            .find(|candidate| {
+                candidate.class() == OptimizationClass::ParallelizeIndependentChecks
+                    && candidate.subject_identity() == Some("workflow-guards")
+            })
+            .unwrap();
+
+        assert_eq!(candidate.candidate_id(), candidate_id);
+        assert_eq!(candidate.lifecycle(), OptimizationLifecycle::Experimenting);
+    }
+
+    #[test]
+    fn contradictory_experiment_subject_has_zero_promotion_authority() {
+        let observations = cmux_case_observations();
+        let first = compile_verification_optimizations("cmux-ci", "macos-full", &observations, &[])
+            .unwrap();
+        let candidate = first
+            .candidates()
+            .iter()
+            .find(|candidate| {
+                candidate.class() == OptimizationClass::ParallelizeIndependentChecks
+                    && candidate.subject_identity() == Some("workflow-guards")
+            })
+            .unwrap();
+
+        let experiment = OptimizationExperiment::new(
+            "wrong-subject",
+            "cmux-ci",
+            "macos-full",
+            OptimizationClass::ParallelizeIndependentChecks,
+            Some("other-guards"),
+            150_000,
+            60_000,
+            0,
+            0,
+            0,
+            0,
+            true,
+            true,
+            false,
+            10_000,
+            true,
+            "wrong-subject-receipt",
+        )
+        .unwrap()
+        .bind_candidate(candidate.candidate_id())
+        .unwrap();
+
+        let receipt = compile_verification_optimizations(
+            "cmux-ci",
+            "macos-full",
+            &observations,
+            &[experiment],
+        )
+        .unwrap();
+        let candidate = receipt
+            .candidates()
+            .iter()
+            .find(|candidate| {
+                candidate.class() == OptimizationClass::ParallelizeIndependentChecks
+                    && candidate.subject_identity() == Some("workflow-guards")
+            })
+            .unwrap();
+
+        assert_eq!(candidate.lifecycle(), OptimizationLifecycle::Candidate);
+    }
+
+    #[test]
+    fn anonymous_late_guards_do_not_coalesce() {
+        let mut observations = Vec::new();
+        for run in ["guard-a", "guard-b"] {
+            observations.push(
+                VerificationObservation::new(
+                    &format!("{run}-compile"),
+                    run,
+                    "project",
+                    "profile",
+                    1,
+                    VerificationStage::Compile,
+                    60_000,
+                    VerificationReuseClass::Cold,
+                    SemanticValidationResult::Passed,
+                    "linux",
+                )
+                .unwrap(),
+            );
+            observations.push(
+                VerificationObservation::new(
+                    &format!("{run}-guard"),
+                    run,
+                    "project",
+                    "profile",
+                    2,
+                    VerificationStage::StaticGuard,
+                    1_000,
+                    VerificationReuseClass::Warm,
+                    SemanticValidationResult::Failed,
+                    "linux",
+                )
+                .unwrap(),
+            );
+        }
+
+        let receipt =
+            compile_verification_optimizations("project", "profile", &observations, &[]).unwrap();
+
+        assert!(
+            receipt
+                .candidates()
+                .iter()
+                .all(|candidate| candidate.class() != OptimizationClass::MoveStaticGuardEarlier)
+        );
+    }
+
+    #[test]
+    fn aggregated_timeout_samples_count_toward_hanging_suite_evidence() {
+        let timeout = VerificationObservation::new(
+            "timeouts",
+            "aggregate-timeouts",
+            "project",
+            "profile",
+            1,
+            VerificationStage::TestExecution,
+            60_000,
+            VerificationReuseClass::Warm,
+            SemanticValidationResult::TimedOut,
+            "linux",
+        )
+        .unwrap()
+        .with_sample_count(3)
+        .unwrap()
+        .with_test(VerificationTestScope::Full, "flaky-suite", false)
+        .unwrap();
+
+        let receipt =
+            compile_verification_optimizations("project", "profile", &[timeout], &[]).unwrap();
+
+        assert!(receipt.candidates().iter().any(|candidate| {
+            candidate.class() == OptimizationClass::IsolateFlakyOrHangingSuite
+                && candidate.subject_identity() == Some("flaky-suite")
+        }));
     }
 
     #[test]
