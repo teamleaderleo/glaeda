@@ -322,6 +322,49 @@ class FleetTests(unittest.TestCase):
                 D,
             )
 
+    def test_acceptance_requires_fresh_matching_post_bootstrap(self):
+        e = enrollment()
+
+        changed_toolchain = bootstrap_for(e, B)
+        with self.assertRaisesRegex(
+            f.FleetError,
+            "post-acceptance bootstrap toolchain differs",
+        ):
+            finalized(e, post_bootstrap=changed_toolchain)
+
+        changed_glaeda = bootstrap_for(e)
+        changed_glaeda["glaedaGeneration"] = D
+        with self.assertRaisesRegex(
+            f.FleetError,
+            "post-acceptance bootstrap differs",
+        ):
+            finalized(e, post_bootstrap=changed_glaeda)
+
+        changed_hardware = bootstrap_for(e)
+        changed_hardware["hardwareCapabilityClass"] = "cmux-mac-other"
+        with self.assertRaisesRegex(
+            f.FleetError,
+            "post-acceptance bootstrap differs",
+        ):
+            finalized(e, post_bootstrap=changed_hardware)
+
+    def test_acceptance_receipt_binds_post_bootstrap_and_cmux_context(self):
+        e = enrollment()
+        result = cmux_result()
+        receipt = finalized(e, result=result)
+        self.assertEqual(
+            receipt["postBootstrapSha256"],
+            f.digest(bootstrap_for(e)),
+        )
+        self.assertEqual(
+            receipt["cmuxToolchainIdentity"],
+            result["toolchain"]["identity"],
+        )
+        self.assertEqual(
+            receipt["cmuxEnvironmentClass"],
+            result["environment_class"],
+        )
+
     def test_failed_settlement_rejects_role(self):
         e = enrollment()
         receipt = finalized(
@@ -619,11 +662,13 @@ class FleetTests(unittest.TestCase):
                 exact_digest,
                 "sha256:" + __import__("hashlib").sha256(raw).hexdigest(),
             )
+            e = enrollment()
             receipt = f.finalize_acceptance(
-                enrollment(),
+                e,
                 "cmux_macos_native_build",
                 A,
                 loaded,
+                bootstrap_for(e),
                 exact_digest,
             )
             self.assertEqual(receipt["cmuxSemanticResultSha256"], exact_digest)
