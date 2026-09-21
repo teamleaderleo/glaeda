@@ -311,6 +311,47 @@ def prepare(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def probe(arguments: argparse.Namespace) -> int:
+    task_identity, identity = _identity(arguments)
+    root = _task_root(arguments)
+    store = admission.Store(arguments.admission_root)
+    try:
+        with store.lock("policy.lock"):
+            current = admission.policy(store)
+            reservation = store.read("reservation.json")
+        expected = {
+            "schema_version": 1,
+            "command_fingerprint": arguments.command_fingerprint,
+            "unit": arguments.unit,
+            "generation": current["generation"],
+            "binding_sha256": arguments.binding_sha256,
+        }
+        if not root.exists() and reservation is None:
+            state = "absent"
+            phase = None
+        elif root.is_dir() and reservation in (
+            {**expected, "phase": "preparing"},
+            {**expected, "phase": "launching"},
+        ):
+            _validate_task_state(arguments, task_identity, identity)
+            state = "present"
+            phase = reservation["phase"]
+        else:
+            raise task.Refusal("owned runner task ownership is ambiguous")
+    finally:
+        store.close()
+    emit(
+        {
+            "document_type": "glaeda-owned-linux-jit-probe",
+            "schema_version": SCHEMA_VERSION,
+            "task_identity_sha256": task_identity,
+            "state": state,
+            "reservation_phase": phase,
+        }
+    )
+    return 0
+
+
 def observe(arguments: argparse.Namespace) -> int:
     task_identity, identity = _identity(arguments)
     _validate_task_state(arguments, task_identity, identity)
@@ -462,7 +503,7 @@ def emit(value: object) -> None:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     subparsers = result.add_subparsers(dest="command", required=True)
-    for name in ("prepare", "observe", "launch", "cleanup"):
+    for name in ("probe", "prepare", "observe", "launch", "cleanup"):
         command = subparsers.add_parser(name)
         command.add_argument("--admission-root", required=True)
         command.add_argument("--task-root", required=True)
@@ -481,6 +522,7 @@ def main() -> int:
     arguments = parser().parse_args()
     try:
         return {
+            "probe": probe,
             "prepare": prepare,
             "observe": observe,
             "launch": launch,
