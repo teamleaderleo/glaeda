@@ -360,28 +360,11 @@ def run_verify(
     assert compiled.internal is not None
     observation = observe_admission()
     try:
-        status = semantic.status_receipt(
-            semantic.compile_request(
-                semantic.decode_request(
-                    semantic.canonical_bytes(
-                        {
-                            "document_type": semantic.REQUEST_DOCUMENT_TYPE,
-                            "schema_version": semantic.REQUEST_SCHEMA_VERSION,
-                            "request_id": request.request_id,
-                            "operation": semantic.OP_STATUS,
-                            "source": None,
-                            "parameters": {},
-                        }
-                    )
-                    + b"\n"
-                )
-            ),
-            observation,
-        )
+        semantic.validate_status_observation(observation)
     except semantic.ContractRefusal:
         return _semantic_refusal(request, "admission_unavailable")
-    outcome = status["result"]["outcome"]
-    reason = status["result"]["reason"]
+    outcome = observation["outcome"]
+    reason = observation["reason"]
     if outcome == "wait":
         return semantic.waiting_receipt(compiled, reason)
     if outcome != "ready":
@@ -446,18 +429,22 @@ def execute(
     if request.operation == semantic.OP_CAPABILITIES:
         return semantic.capabilities_receipt(compiled)
 
-    try:
-        installation = load_installation(installation_path)
-    except LocalRefusal as error:
-        return _semantic_refusal(request, error.code)
-
     if request.operation == semantic.OP_STATUS:
         try:
             return semantic.status_receipt(compiled, observe_admission())
         except (LocalRefusal, semantic.ContractRefusal):
             return _semantic_refusal(request, "admission_unavailable")
+
+    try:
+        installation = load_installation(installation_path)
+    except LocalRefusal as error:
+        return _semantic_refusal(request, error.code)
+
     if request.operation == semantic.OP_REPO_QUERY:
-        return run_repo_query(compiled, installation)
+        try:
+            return run_repo_query(compiled, installation)
+        except LocalRefusal as error:
+            return _semantic_refusal(request, error.code)
     if request.operation == semantic.OP_VERIFY_NAMED:
         try:
             return run_verify(compiled, installation)
