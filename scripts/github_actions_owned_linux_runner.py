@@ -307,18 +307,55 @@ def open_lock(directory: Path) -> IO[bytes]:
 
 def read_document(path: Path) -> dict[str, object] | None:
     try:
-        metadata = path.lstat()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
     except FileNotFoundError:
         return None
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
-        or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or metadata.st_size > MAX_STATE_BYTES
-    ):
-        raise Refusal("runner state contains an unsafe document")
-    raw = path.read_bytes()
+    except OSError as error:
+        raise Refusal("runner state contains an unsafe document") from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_size < 0
+            or before.st_size > MAX_STATE_BYTES
+        ):
+            raise Refusal("runner state contains an unsafe document")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(8192, MAX_STATE_BYTES + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_STATE_BYTES:
+                raise Refusal("runner state document exceeds its ceiling")
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_uid != after.st_uid
+            or before.st_gid != after.st_gid
+            or before.st_mode != after.st_mode
+            or before.st_nlink != after.st_nlink
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+            or total != after.st_size
+        ):
+            raise Refusal("runner state changed while reading")
+        raw = b"".join(chunks)
+    finally:
+        os.close(descriptor)
     try:
         value = json.loads(raw)
     except (UnicodeError, ValueError) as error:
@@ -728,33 +765,37 @@ def run_once(arguments: argparse.Namespace) -> int:
                 owned_task.prepare_task(task_root)
                 runner_root = extract_reviewed_runner(task_root)
                 launcher = reviewed_launcher(task_root)
+                command = sandbox_command(task_root, runner_root, launcher, request)
                 secret = read_jit_secret()
-                publish(intent_path, intent_document(request), replace=False)
-                started = time.monotonic()
+                try:
+                    publish(intent_path, intent_document(request), replace=False)
+                    started = time.monotonic()
 
-                @contextmanager
-                def guarded_launch():
-                    with launch_fence(command_root):
-                        cancellation = read_document(cancellation_path)
-                        if cancellation is not None:
-                            if not matches_request(cancellation, request):
-                                raise Refusal(
-                                    "runner cancellation conflicts with exact attempt"
-                                )
-                            raise Refusal("assignment was cancelled before runner start")
-                        with admission.launch():
-                            yield
+                    @contextmanager
+                    def guarded_launch():
+                        with launch_fence(command_root):
+                            cancellation = read_document(cancellation_path)
+                            if cancellation is not None:
+                                if not matches_request(cancellation, request):
+                                    raise Refusal(
+                                        "runner cancellation conflicts with exact attempt"
+                                    )
+                                raise Refusal("assignment was cancelled before runner start")
+                            with admission.launch():
+                                yield
 
-                terminal, code, elapsed, settled, output_bytes, output_digest = (
-                    owned_task.execute_secret_stdin(
-                        sandbox_command(task_root, runner_root, launcher, request),
-                        unit=unit,
-                        deadline_seconds=DEADLINE_SECONDS,
-                        label="github-actions-jit-runner",
-                        secret_stdin=secret,
-                        launch_guard=guarded_launch,
+                    terminal, code, elapsed, settled, output_bytes, output_digest = (
+                        owned_task.execute_secret_stdin(
+                            command,
+                            unit=unit,
+                            deadline_seconds=DEADLINE_SECONDS,
+                            label="github-actions-jit-runner",
+                            secret_stdin=secret,
+                            launch_guard=guarded_launch,
+                        )
                     )
-                )
+                finally:
+                    secret[:] = b"\x00" * len(secret)
                 if not settled:
                     raise Refusal(
                         "runner process tree remains unsettled; capacity stays reserved"
