@@ -75,8 +75,17 @@ Use an exact reviewed Glaeda checkout and the CMUX checkout that will run accept
 
 ```bash
 ./scripts/bootstrap
-cargo build --locked --release
-GLAEDA_BIN="$PWD/target/release/glaeda"
+cargo build --locked --release --bin glaeda
+
+GLAEDA_INSTALL_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/glaeda/cmux-fleet"
+GLAEDA_BIN="$GLAEDA_INSTALL_ROOT/glaeda"
+install -d -m 700 "$GLAEDA_INSTALL_ROOT"
+if test -f "$GLAEDA_BIN"; then
+  cp -p "$GLAEDA_BIN" "$GLAEDA_INSTALL_ROOT/glaeda.rollback"
+fi
+install -m 755 target/release/glaeda "$GLAEDA_INSTALL_ROOT/.glaeda.next"
+mv "$GLAEDA_INSTALL_ROOT/.glaeda.next" "$GLAEDA_BIN"
+
 CMUX_ROOT=/absolute/path/to/cmux
 CMUX_CACHE_ROOT=/absolute/path/to/cmux-native-cache
 FLEET_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet"
@@ -137,8 +146,17 @@ The macOS bootstrap verifies the operator-owned native cache root is writable an
 
 ```bash
 ./scripts/bootstrap
-cargo build --locked --release
-GLAEDA_BIN="$PWD/target/release/glaeda"
+cargo build --locked --release --bin glaeda
+
+GLAEDA_INSTALL_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/glaeda/cmux-fleet"
+GLAEDA_BIN="$GLAEDA_INSTALL_ROOT/glaeda"
+install -d -m 700 "$GLAEDA_INSTALL_ROOT"
+if test -f "$GLAEDA_BIN"; then
+  cp -p "$GLAEDA_BIN" "$GLAEDA_INSTALL_ROOT/glaeda.rollback"
+fi
+install -m 755 target/release/glaeda "$GLAEDA_INSTALL_ROOT/.glaeda.next"
+mv "$GLAEDA_INSTALL_ROOT/.glaeda.next" "$GLAEDA_BIN"
+
 CMUX_ROOT=/absolute/path/to/cmux
 FLEET_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet"
 umask 077
@@ -254,7 +272,20 @@ sudo pmset -c sleep 0
 sudo pmset -c sleep "$OLD_AC_SLEEP"
 ```
 
-For Glaeda distribution, the bootstrap consumes an exact executable path and records its SHA-256 generation. A release package, MDM payload, configuration manager, or a reviewed repository build can supply that file. Updating the executable always requires a fresh bootstrap and enrollment generation before automatic routing resumes.
+For Glaeda distribution, the bootstrap consumes an exact executable path and records its SHA-256 generation. The examples above install the reviewed repository build into a stable per-user CMUX-fleet location with an atomic rename. A release package, MDM payload, or configuration manager may supply the same exact file instead.
+
+Rollback a just-installed repository build before re-enrollment with:
+
+```bash
+test -f "$GLAEDA_INSTALL_ROOT/glaeda.rollback"
+mv "$GLAEDA_INSTALL_ROOT/glaeda.rollback" "$GLAEDA_BIN"
+```
+
+After any install, update, or rollback, rerun bootstrap and advance the enrollment generation before automatic routing resumes. Once the new generation is accepted, remove the one-step rollback copy:
+
+```bash
+rm -f "$GLAEDA_INSTALL_ROOT/glaeda.rollback"
+```
 
 ## CI and synthetic evidence
 
