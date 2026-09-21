@@ -64,17 +64,15 @@ The status branch is replaceable convenience state. Glaeda execution truth remai
 
 The committed v1 file intentionally enrolls zero physical nodes. Enrolling a node requires a reviewed opaque node ID plus its dedicated public signing key. The private key stays on the producer and is never stored in the repository, snapshot, receipt, logs, request input, or consumer view.
 
-Bounds:
+Resource safety is byte-bounded, not cardinality-bounded. The schema has no fixed maximum node, repository, profile, request, project, or reusable-state count; collections may grow while the containing canonical document remains inside its reviewed byte budget.
 
-- at most 8 nodes;
-- at most 8 repository identities;
 - public node IDs are opaque `node-` plus 16 lowercase hex characters;
 - key IDs are opaque `key-` plus 16 lowercase hex characters;
 - only Ed25519 OpenSSH public keys are accepted.
 
 ## Signed node schema
 
-Canonical JSON uses sorted keys, compact separators, UTF-8, and one trailing newline. One signed node entry is capped at 16 KiB. The aggregate fleet file is capped at 128 KiB and 8 nodes.
+Canonical JSON uses sorted keys, compact separators, UTF-8, and one trailing newline. V1 applies byte budgets to signed node and aggregate fleet documents so malformed or accidentally enormous inputs stay bounded; those budgets do not encode a fleet-size policy. A 14-node fleet is an ordinary accepted case when its canonical bytes fit the aggregate budget.
 
 ```json
 {
@@ -205,7 +203,7 @@ revalidation_required
 unknown
 ```
 
-Each project can also publish up to 16 exact `ReusableStateStatusSummary` values from the accepted #21 lifecycle. The snapshot keeps only the lifecycle's agent-facing fields:
+Each project can publish exact `ReusableStateStatusSummary` values from the accepted #21 lifecycle for as many generations as fit the signed document's byte budget. The snapshot keeps only the lifecycle's agent-facing fields:
 
 ```text
 cache_class
@@ -383,7 +381,7 @@ Canonical repository identity (including its GitHub owner component), exact Git 
 
 ## Measurements and experiment counters
 
-Hosted contract run 35595612668 on exact head `52add98eca2e0fdcfe02a4a3cc97072f2b9213fd` measured a representative signed node carrying one reusable-state summary at **2,516 bytes** and the corresponding one-node fleet file at **2,594 bytes**. The contract suite passed **16/16** tests. The fixed ceilings remain 16 KiB/node and 128 KiB/fleet.
+Hosted contract run 35595612668 on exact head `52add98eca2e0fdcfe02a4a3cc97072f2b9213fd` measured a representative signed node carrying one reusable-state summary at **2,516 bytes** and the corresponding one-node fleet file at **2,594 bytes**. The current contract additionally exercises 14 nodes and 24 reusable generations without a cardinality rule; only serialized byte budgets bound those documents.
 
 Transport/accounting properties are deterministic from the protocol:
 
