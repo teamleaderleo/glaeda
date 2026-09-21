@@ -54,7 +54,7 @@ class Tests(unittest.TestCase):
     def test_mac_ready(self):
         result = b.evaluate(
             observation(),
-            ["cmux_macos_native_build", "artifact_cache"],
+            ["cmux_macos_native_build"],
             "cmux-mac-build-large",
         )
         self.assertTrue(result["eligibleForEnrollment"])
