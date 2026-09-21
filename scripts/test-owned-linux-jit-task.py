@@ -203,11 +203,11 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
         root_info = type("Info", (), fields)()
         foreign_info = type("Info", (), {**fields, "st_uid": 1000})()
         with (
-            mock.patch.object(Path, "stat", return_value=root_info),
+            mock.patch.object(type(self.egress_guard), "stat", return_value=root_info),
             mock.patch.object(Path, "read_bytes", return_value=raw),
         ):
             jit._verify_egress_guard(self.egress_guard, jit._digest(raw))
-        with mock.patch.object(Path, "stat", return_value=foreign_info):
+        with mock.patch.object(type(self.egress_guard), "stat", return_value=foreign_info):
             with self.assertRaisesRegex(task.Refusal, "unsafe"):
                 jit._verify_egress_guard(self.egress_guard, jit._digest(raw))
 
