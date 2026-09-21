@@ -190,10 +190,20 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
             "private_or_link_local_egress": False,
             "schema_version": jit.SCHEMA_VERSION,
         })
+        with mock.patch.object(
+            jit,
+            "_read_stable_regular",
+            return_value=raw,
+        ) as read:
+            jit._verify_egress_guard(self.egress_guard, jit._digest(raw))
+        self.assertEqual(read.call_args.kwargs["allowed_uids"], {0})
+        self.assertEqual(read.call_args.kwargs["exact_modes"], {0o400, 0o444})
+        self.assertTrue(read.call_args.kwargs["require_nonempty"])
+
         fields = dict(
             st_mode=stat.S_IFREG | 0o444,
-            st_uid=0,
-            st_gid=0,
+            st_uid=1000,
+            st_gid=1000,
             st_nlink=1,
             st_size=len(raw),
             st_dev=1,
@@ -201,16 +211,62 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
             st_mtime_ns=3,
             st_ctime_ns=4,
         )
-        root_info = type("Info", (), fields)()
-        foreign_info = type("Info", (), {**fields, "st_uid": 1000})()
-        with (
-            mock.patch.object(type(self.egress_guard), "stat", return_value=root_info),
-            mock.patch.object(Path, "read_bytes", return_value=raw),
-        ):
-            jit._verify_egress_guard(self.egress_guard, jit._digest(raw))
-        with mock.patch.object(type(self.egress_guard), "stat", return_value=foreign_info):
+        foreign_info = type("Info", (), fields)()
+        with mock.patch.object(jit.os, "fstat", return_value=foreign_info):
             with self.assertRaisesRegex(task.Refusal, "unsafe"):
-                jit._verify_egress_guard(self.egress_guard, jit._digest(raw))
+                jit._read_stable_regular(
+                    self.egress_guard,
+                    max_bytes=jit.MAX_EGRESS_GUARD_BYTES,
+                    allowed_uids={0},
+                    exact_modes={0o400, 0o444},
+                    require_nonempty=True,
+                    problem="owned runner egress authority is unsafe",
+                )
+
+    def test_stable_regular_read_refuses_symlink(self):
+        target = self.root / "stable-target"
+        target.write_bytes(b"stable\n")
+        target.chmod(0o600)
+        alias = self.root / "stable-alias"
+        alias.symlink_to(target)
+        with self.assertRaisesRegex(task.Refusal, "unsafe"):
+            jit._read_stable_regular(
+                alias,
+                max_bytes=64,
+                allowed_uids={os.getuid()},
+                exact_modes={0o600},
+                require_nonempty=True,
+                problem="stable file is unsafe",
+            )
+
+    def test_stable_regular_read_detects_path_replacement_during_read(self):
+        path = self.root / "stable-file"
+        replacement = self.root / "replacement-file"
+        path.write_bytes(b"original\n")
+        replacement.write_bytes(b"replacement\n")
+        path.chmod(0o600)
+        replacement.chmod(0o600)
+        real_fstat = jit.os.fstat
+        calls = 0
+
+        def swapping_fstat(descriptor):
+            nonlocal calls
+            calls += 1
+            observed = real_fstat(descriptor)
+            if calls == 1:
+                os.replace(replacement, path)
+            return observed
+
+        with mock.patch.object(jit.os, "fstat", side_effect=swapping_fstat):
+            with self.assertRaisesRegex(task.Refusal, "unsafe"):
+                jit._read_stable_regular(
+                    path,
+                    max_bytes=64,
+                    allowed_uids={os.getuid()},
+                    exact_modes={0o600},
+                    require_nonempty=True,
+                    problem="stable file is unsafe",
+                )
 
     def test_egress_revocation_blocks_launch_but_cleanup_remains_available(self):
         self.prepare()
