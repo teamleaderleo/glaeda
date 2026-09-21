@@ -183,6 +183,65 @@ class VerifyFocusedTests(unittest.TestCase):
         self.assertIn("--commit", help_text)
         self.assertIn("--tree", help_text)
 
+    def test_semantic_request_binding_replays_exactly_and_rejects_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = MODULE.private_state_directory(
+                os.fspath(Path(temporary) / "state")
+            )
+            first = MODULE.Request(
+                "teamleaderleo/glaeda",
+                "1" * 40,
+                "2" * 40,
+                MODULE.profile_generation(),
+                "sha256:" + "a" * 64,
+            )
+            MODULE.bind_semantic_request(
+                state_root,
+                "accepted-request-0001",
+                first,
+            )
+            MODULE.bind_semantic_request(
+                state_root,
+                "accepted-request-0001",
+                first,
+            )
+            binding = (
+                state_root
+                / "semantic-requests"
+                / "accepted-request-0001"
+                / "binding.json"
+            )
+            self.assertTrue(binding.is_file())
+
+            drifted = MODULE.Request(
+                "teamleaderleo/glaeda",
+                "3" * 40,
+                "4" * 40,
+                MODULE.profile_generation(),
+                "sha256:" + "b" * 64,
+            )
+            with self.assertRaises(MODULE.SemanticRequestConflict):
+                MODULE.bind_semantic_request(
+                    state_root,
+                    "accepted-request-0001",
+                    drifted,
+                )
+
+    def test_semantic_request_binding_rejects_unbounded_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = MODULE.private_state_directory(
+                os.fspath(Path(temporary) / "state")
+            )
+            request = MODULE.Request(
+                "teamleaderleo/glaeda",
+                "1" * 40,
+                "2" * 40,
+                MODULE.profile_generation(),
+                "sha256:" + "a" * 64,
+            )
+            with self.assertRaisesRegex(MODULE.Refusal, "identity"):
+                MODULE.bind_semantic_request(state_root, "../escape", request)
+
     def test_sandbox_clears_authority_and_owns_recipe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
