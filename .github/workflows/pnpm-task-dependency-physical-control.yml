@@ -25,6 +25,7 @@ env:
 
 jobs:
   physical:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
     name: ${{ matrix.mode }} / ${{ matrix.filesystem }} / ${{ matrix.method }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
