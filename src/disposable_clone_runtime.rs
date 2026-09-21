@@ -1078,9 +1078,7 @@ impl ConfirmedDisposableWorker {
     }
 }
 
-impl crate::disposable_runner_runtime::DisposableRunnerTargetRuntime
-    for DisposableCloneRuntime
-{
+impl crate::disposable_runner_runtime::DisposableRunnerTargetRuntime for DisposableCloneRuntime {
     type Confirmation = ConfirmedDisposableWorker;
 
     fn confirm_runner_target(
@@ -1088,10 +1086,8 @@ impl crate::disposable_runner_runtime::DisposableRunnerTargetRuntime
         reservation: &DisposableAttemptReservation,
         executor: &impl TimedCommandExecutor,
         clock: &impl CloneRuntimeClock,
-    ) -> Result<
-        Self::Confirmation,
-        crate::disposable_runner_runtime::DisposableRunnerRuntimeError,
-    > {
+    ) -> Result<Self::Confirmation, crate::disposable_runner_runtime::DisposableRunnerRuntimeError>
+    {
         self.confirm_ready_worker(reservation, executor, clock)
             .map_err(|_| {
                 crate::disposable_runner_runtime::DisposableRunnerRuntimeError::observation(
