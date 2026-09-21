@@ -39,6 +39,14 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
             path.chmod(0o555)
         self.launcher = Path(__file__).with_name("owned_linux_jit_launcher").resolve()
         self.egress_guard = self.root / "egress-authority.json"
+        self.egress_guard.write_bytes(jit.canonical({
+            "class": jit.NETWORK.value,
+            "document_type": jit.EGRESS_GUARD_DOCUMENT_TYPE,
+            "enforcement": jit.EGRESS_GUARD_ENFORCEMENT,
+            "private_or_link_local_egress": False,
+            "schema_version": jit.SCHEMA_VERSION,
+        }))
+        self.egress_guard.chmod(0o400)
         self.egress_guard_digest = "sha256:" + "7" * 64
         self.egress_patch = mock.patch.object(jit, "_verify_egress_guard", return_value=None)
         self.egress_patch.start()
