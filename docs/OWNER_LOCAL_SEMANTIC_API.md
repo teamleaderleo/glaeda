@@ -130,15 +130,22 @@ A host adapter invokes the existing fixed `glaeda-repo-query` / `repo-query/v1` 
 against its operator-owned resident checkout mapping.
 
 The local adapter maps semantic `owner/repo` identity into repo-query's canonical
-`github.com/owner/repo` project identity. The semantic layer accepts only a matching typed report:
+`github.com/owner/repo` project identity. The semantic layer resolves the reviewed
+`repo-query/v1` generation and independently derives the producer request digest from the exact
+project/base/head/tree/patch ceiling plus the fixed no-auxiliary-query defaults. It accepts only a
+matching typed report:
 
 - `document_type=glaeda-resident-repo-query`;
-- `profile_id=repo-query/v1`;
+- exact current `repo-query/v1` profile generation;
+- exact producer request digest;
 - `authority=observation_only`;
 - exact canonical project plus requested base/head/tree;
-- bounded result bytes.
+- the closed no-grep/no-blob/no-history/no-object request family;
+- bounded typed diff/patch/metrics evidence.
 
-No Git argv, ref, fetch, remote URL or checkout path enters the semantic request.
+The remote receipt contains a closed semantic projection of that report. Producer-only fields and
+unexpected additions cannot flow through the API. No Git argv, ref, fetch, remote URL or checkout
+path enters the semantic request.
 
 ### verify_named
 
