@@ -664,22 +664,30 @@ class HotRunTests(unittest.TestCase):
                 (state / "payload").read_text(encoding="utf-8"), "preserve\n"
             )
 
-    def test_discovery_bounds_refuse_large_namespace_and_runtime_inventory(
+    def test_discovery_streams_large_namespace_and_runtime_inventory(
         self,
     ) -> None:
         namespace = load_hot_run()
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
-            namespace_root = fixture / "bounded-namespace"
+            namespace_root = fixture / "large-namespace"
             namespace_root.mkdir(mode=0o700)
-            for index in range(namespace["MAX_HOT_STATE_NAMESPACE_ENTRIES"] + 1):
+            for index in range(320):
                 (namespace_root / f"foreign-{index:04d}").touch(mode=0o600)
+            state, task, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "n" * 64
+            )
+            target = namespace_root / document["state_identity"]
+            namespace["publish_implicit_state_base"](target, document)
+            (target / "lock").touch(mode=0o600)
+            (task / ".git").unlink()
             self.assertEqual(
                 namespace["collect_one_unreachable_state"](
                     namespace_root, "0" * 64
                 ),
-                "namespace_bound_exceeded",
+                "retired_unreachable",
             )
+            self.assertFalse(target.exists())
 
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
@@ -689,19 +697,21 @@ class HotRunTests(unittest.TestCase):
                 namespace, fixture, "r" * 64
             )
             namespace["publish_implicit_state_base"](state, document)
-            for index in range(namespace["MAX_HOT_STATE_RUNTIME_ENTRIES"] + 1):
+            for index in range(96):
                 runtime = state / f"runtime-{index:064x}"
                 runtime.mkdir(mode=0o700)
                 (runtime / "lock").touch(mode=0o600)
             (task / ".git").unlink()
-            self.assertIsNone(namespace["acquire_retirement_locks"](state))
+            locks = namespace["acquire_retirement_locks"](state)
+            self.assertIsNotNone(locks)
+            namespace["close_retirement_locks"](locks)
             self.assertEqual(
                 namespace["collect_one_unreachable_state"](
                     namespace_root, "0" * 64
                 ),
-                "nothing_eligible",
+                "retired_unreachable",
             )
-            self.assertTrue(state.exists())
+            self.assertFalse(state.exists())
 
     def test_collector_requires_unreachable_generation_and_idle_exact_lock(
         self,
@@ -1003,7 +1013,12 @@ class HotRunTests(unittest.TestCase):
                 "recorded",
             )
             catalog = namespace["read_hot_state_value_catalog"](namespace_root)
-            record = catalog["states"][state.name]
+            record = namespace["read_hot_state_value_record"](
+                namespace_root, state.name
+            )
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(catalog["schema_version"], 2)
             self.assertEqual(catalog["next_use_sequence"], 2)
             self.assertEqual(record["last_successful_use_sequence"], 2)
             self.assertEqual(record["successful_use_count"], 2)
@@ -1012,6 +1027,14 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(
                 stat.S_IMODE(
                     (namespace_root / ".value-catalog-v1.json").stat().st_mode
+                ),
+                0o600,
+            )
+            records_root = namespace_root / ".value-records-v2"
+            self.assertEqual(stat.S_IMODE(records_root.stat().st_mode), 0o700)
+            self.assertEqual(
+                stat.S_IMODE(
+                    (records_root / f"{state.name}.json").stat().st_mode
                 ),
                 0o600,
             )
@@ -1028,6 +1051,132 @@ class HotRunTests(unittest.TestCase):
                 )
             )
             self.assertFalse(stale.exists())
+
+    def test_value_catalog_migrates_v1_records_atomically(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, _, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "m" * 64
+            )
+            namespace["publish_implicit_state_base"](state, document)
+            _, _, manifest_identity = namespace[
+                "read_producer_manifest_with_identity"
+            ](state, state.name)
+            fields = {
+                "manifest_device": manifest_identity.device,
+                "manifest_inode": manifest_identity.inode,
+                "manifest_creation_witness_ns":
+                    manifest_identity.creation_witness_ns,
+                "last_successful_use_sequence": 7,
+                "successful_use_count": 3,
+                "value_identity": None,
+                "reconstruction_elapsed_ns": None,
+                "reuse_elapsed_ns": None,
+            }
+            legacy = {
+                "schema_version": 1,
+                "producer": "glaeda-hot-run-value-catalog-v1",
+                "pressure_active": True,
+                "retire_start_used_percent": 90,
+                "retire_stop_used_percent": 85,
+                "next_use_sequence": 7,
+                "states": {state.name: fields},
+            }
+            encoded = (
+                json.dumps(legacy, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            )
+            catalog_path = namespace_root / ".value-catalog-v1.json"
+            catalog_path.write_text(encoded, encoding="utf-8")
+            catalog_path.chmod(0o600)
+
+            migrated = namespace["read_hot_state_value_catalog"](
+                namespace_root
+            )
+            self.assertEqual(migrated["schema_version"], 2)
+            self.assertTrue(migrated["pressure_active"])
+            self.assertEqual(migrated["next_use_sequence"], 7)
+            record = namespace["read_hot_state_value_record"](
+                namespace_root, state.name
+            )
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record["successful_use_count"], 3)
+            self.assertNotIn("states", migrated)
+
+            # Re-reading a completed migration is idempotent.
+            self.assertEqual(
+                namespace["read_hot_state_value_catalog"](namespace_root),
+                migrated,
+            )
+
+    def test_value_records_have_no_total_generation_ceiling(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, _, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "v" * 64
+            )
+            namespace["publish_implicit_state_base"](state, document)
+            (state / "lock").touch(mode=0o600)
+
+            catalog = namespace["empty_hot_state_value_catalog"]()
+            namespace["write_hot_state_value_catalog"](
+                namespace_root, {**catalog, "next_use_sequence": 300}
+            )
+            for index in range(1, 301):
+                state_identity = f"{index:064x}"
+                namespace["write_hot_state_value_record"](
+                    namespace_root,
+                    state_identity,
+                    {
+                        "manifest_device": 1,
+                        "manifest_inode": index,
+                        "manifest_creation_witness_ns": index,
+                        "last_successful_use_sequence": index,
+                        "successful_use_count": 1,
+                        "value_identity": None,
+                        "reconstruction_elapsed_ns": None,
+                        "reuse_elapsed_ns": None,
+                    },
+                )
+
+            self.assertEqual(
+                namespace["record_successful_hot_state_use"](
+                    namespace_root,
+                    state,
+                    "created",
+                    None,
+                    None,
+                    None,
+                    namespace["ExecutionObservation"](0.1, 0.0),
+                ),
+                "recorded",
+            )
+            updated = namespace["read_hot_state_value_catalog"](
+                namespace_root
+            )
+            self.assertEqual(updated["next_use_sequence"], 301)
+            record = namespace["read_hot_state_value_record"](
+                namespace_root, state.name
+            )
+            self.assertIsNotNone(record)
+            records_root = namespace_root / ".value-records-v2"
+            self.assertEqual(
+                len(
+                    [
+                        path
+                        for path in records_root.iterdir()
+                        if path.name.endswith(".json")
+                    ]
+                ),
+                301,
+            )
 
     def test_value_retirement_uses_deterministic_lru_and_hysteresis(self) -> None:
         namespace = load_hot_run()
@@ -1150,12 +1299,15 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(len(retired), 1)
             self.assertFalse(states[0].exists())
             self.assertTrue(states[1].exists())
-            retained_catalog = namespace["read_hot_state_value_catalog"](
-                namespace_root
-            )
-            self.assertEqual(
-                set(retained_catalog["states"]),
-                {state.name for state in states},
+            namespace["read_hot_state_value_catalog"](namespace_root)
+            self.assertTrue(
+                all(
+                    namespace["read_hot_state_value_record"](
+                        namespace_root, state.name
+                    )
+                    is not None
+                    for state in states
+                )
             )
 
             self.assertEqual(
