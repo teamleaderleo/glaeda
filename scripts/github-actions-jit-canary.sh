@@ -40,8 +40,9 @@ for resource in cpu memory io; do
   fi
 done
 
+printf 'workload=owned-linux-jit-contract-tests\n' >>"$receipt"
 set +e
-/usr/bin/time -v -o "$timing" ./scripts/verify fast
+/usr/bin/time -v -o "$timing" python3 scripts/test-owned-linux-jit-task.py
 status=$?
 set -e
 
