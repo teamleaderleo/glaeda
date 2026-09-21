@@ -870,10 +870,7 @@ pub fn recommend_ci_pool(
         if let Some(reason) = policy_exclusion {
             exclusions.push(PoolExclusionV1 { pool_id, reason });
         } else {
-            evaluated.push(EvaluatedCandidate {
-                candidate,
-                prediction,
-            });
+            evaluated.push(EvaluatedCandidate { prediction });
         }
     }
 
@@ -908,8 +905,7 @@ enum EvidenceRefusal {
     Insufficient,
 }
 
-struct EvaluatedCandidate<'a> {
-    candidate: &'a PoolCandidateV1,
+struct EvaluatedCandidate {
     prediction: PoolPredictionV1,
 }
 
@@ -1129,9 +1125,9 @@ fn policy_exclusion(
 }
 
 fn select_candidate<'a>(
-    candidates: &'a [EvaluatedCandidate<'a>],
+    candidates: &'a [EvaluatedCandidate],
     policy: RoutingPolicyV1,
-) -> Option<&'a EvaluatedCandidate<'a>> {
+) -> Option<&'a EvaluatedCandidate> {
     match policy.mode {
         RoutingPolicyMode::Economy => select_economy(candidates, policy),
         RoutingPolicyMode::Balanced => {
@@ -1159,9 +1155,9 @@ fn select_candidate<'a>(
 }
 
 fn select_economy<'a>(
-    candidates: &'a [EvaluatedCandidate<'a>],
+    candidates: &'a [EvaluatedCandidate],
     policy: RoutingPolicyV1,
-) -> Option<&'a EvaluatedCandidate<'a>> {
+) -> Option<&'a EvaluatedCandidate> {
     let fastest_p90 = candidates
         .iter()
         .map(|entry| entry.prediction.completion.total.p90)
@@ -1173,7 +1169,7 @@ fn select_economy<'a>(
         .min_by(|left, right| economy_cmp(left, right))
 }
 
-fn economy_cmp(left: &EvaluatedCandidate<'_>, right: &EvaluatedCandidate<'_>) -> Ordering {
+fn economy_cmp(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Ordering {
     left.prediction
         .accounting_class
         .economy_rank()
@@ -1221,7 +1217,7 @@ fn economy_cmp(left: &EvaluatedCandidate<'_>, right: &EvaluatedCandidate<'_>) ->
         .then_with(|| left.prediction.pool_id.cmp(&right.prediction.pool_id))
 }
 
-fn latency_cmp(left: &EvaluatedCandidate<'_>, right: &EvaluatedCandidate<'_>) -> Ordering {
+fn latency_cmp(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Ordering {
     left.prediction
         .completion
         .total
@@ -1249,14 +1245,14 @@ fn latency_cmp(left: &EvaluatedCandidate<'_>, right: &EvaluatedCandidate<'_>) ->
         .then_with(|| left.prediction.pool_id.cmp(&right.prediction.pool_id))
 }
 
-fn pressure_cmp(left: &EvaluatedCandidate<'_>, right: &EvaluatedCandidate<'_>) -> Ordering {
+fn pressure_cmp(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Ordering {
     left.prediction
         .pressure_after_admission
         .policy_rank()
         .cmp(&right.prediction.pressure_after_admission.policy_rank())
 }
 
-fn contention_cmp(left: &EvaluatedCandidate<'_>, right: &EvaluatedCandidate<'_>) -> Ordering {
+fn contention_cmp(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Ordering {
     match (&left.prediction.contention, &right.prediction.contention) {
         (Some(left), Some(right)) => {
             let left_rate =
