@@ -1933,6 +1933,175 @@ def remove_hot_state_value_record(
     return True
 
 
+def hot_state_value_tickets_root(namespace_root: Path) -> Path:
+    return namespace_root / HOT_STATE_VALUE_TICKETS
+
+
+def validate_hot_state_value_tickets_root(
+    namespace_root: Path, *, create: bool
+) -> Path | None:
+    root = hot_state_value_tickets_root(namespace_root)
+    if create:
+        try:
+            root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    try:
+        details = root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        if create:
+            raise
+        return None
+    namespace_details = namespace_root.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != os.getuid()
+        or stat.S_IMODE(details.st_mode) != 0o700
+        or details.st_dev != namespace_details.st_dev
+    ):
+        raise RuntimeError("hot-state value-ticket root is not owner-private")
+    return root
+
+
+def value_ticket_name(ticket_sequence: int) -> str:
+    if ticket_sequence <= 0:
+        raise RuntimeError("hot-state value ticket sequence is invalid")
+    return f"{ticket_sequence:020d}{HOT_STATE_VALUE_TICKET_SUFFIX}"
+
+
+def value_ticket_document(
+    ticket_sequence: int,
+    state_identity: str,
+    last_successful_use_sequence: int,
+) -> dict[str, object]:
+    if (
+        ticket_sequence <= 0
+        or last_successful_use_sequence <= 0
+        or not state_identity_name(state_identity)
+    ):
+        raise RuntimeError("hot-state value ticket is invalid")
+    return {
+        "schema_version": HOT_STATE_VALUE_TICKET_SCHEMA_VERSION,
+        "producer": HOT_STATE_VALUE_TICKET_PRODUCER,
+        "ticket_sequence": ticket_sequence,
+        "state_identity": state_identity,
+        "last_successful_use_sequence": last_successful_use_sequence,
+    }
+
+
+def validate_hot_state_value_ticket(document: object) -> dict[str, object]:
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "producer",
+        "ticket_sequence",
+        "state_identity",
+        "last_successful_use_sequence",
+    }:
+        raise RuntimeError("hot-state value ticket has an unsupported shape")
+    if (
+        document["schema_version"] != HOT_STATE_VALUE_TICKET_SCHEMA_VERSION
+        or document["producer"] != HOT_STATE_VALUE_TICKET_PRODUCER
+        or isinstance(document["ticket_sequence"], bool)
+        or not isinstance(document["ticket_sequence"], int)
+        or document["ticket_sequence"] <= 0
+        or not isinstance(document["state_identity"], str)
+        or not state_identity_name(document["state_identity"])
+        or isinstance(document["last_successful_use_sequence"], bool)
+        or not isinstance(document["last_successful_use_sequence"], int)
+        or document["last_successful_use_sequence"] <= 0
+    ):
+        raise RuntimeError("hot-state value ticket identity is invalid")
+    return document
+
+
+def canonical_hot_state_value_ticket_bytes(
+    document: dict[str, object],
+) -> bytes:
+    validate_hot_state_value_ticket(document)
+    encoded = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_HOT_STATE_VALUE_TICKET_BYTES:
+        raise RuntimeError("hot-state value ticket exceeds its byte budget")
+    return encoded
+
+
+def read_hot_state_value_ticket(
+    namespace_root: Path, ticket_sequence: int
+) -> dict[str, object] | None:
+    root = validate_hot_state_value_tickets_root(
+        namespace_root, create=False
+    )
+    if root is None:
+        return None
+    path = root / value_ticket_name(ticket_sequence)
+    try:
+        document, encoded = read_private_json(
+            path, "hot-state value ticket", MAX_HOT_STATE_VALUE_TICKET_BYTES
+        )
+    except FileNotFoundError:
+        return None
+    ticket = validate_hot_state_value_ticket(document)
+    if ticket["ticket_sequence"] != ticket_sequence:
+        raise RuntimeError("hot-state value ticket filename conflicts with identity")
+    if canonical_hot_state_value_ticket_bytes(ticket) != encoded:
+        raise RuntimeError("hot-state value ticket is not canonical")
+    return ticket
+
+
+def write_hot_state_value_ticket(
+    namespace_root: Path,
+    ticket_sequence: int,
+    state_identity: str,
+    last_successful_use_sequence: int,
+) -> None:
+    root = validate_hot_state_value_tickets_root(
+        namespace_root, create=True
+    )
+    assert root is not None
+    document = value_ticket_document(
+        ticket_sequence,
+        state_identity,
+        last_successful_use_sequence,
+    )
+    encoded = canonical_hot_state_value_ticket_bytes(document)
+    path = root / value_ticket_name(ticket_sequence)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        written = 0
+        while written < len(encoded):
+            count = os.write(descriptor, encoded[written:])
+            if count <= 0:
+                raise OSError("hot-state value ticket write made no progress")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    fsync_directory(root)
+
+
+def remove_hot_state_value_ticket(
+    namespace_root: Path, ticket_sequence: int
+) -> bool:
+    root = validate_hot_state_value_tickets_root(
+        namespace_root, create=False
+    )
+    if root is None:
+        return False
+    path = root / value_ticket_name(ticket_sequence)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    fsync_directory(root)
+    return True
+
+
 def read_all_hot_state_value_records(
     namespace_root: Path, maximum_sequence: int
 ) -> list[dict[str, object]]:
