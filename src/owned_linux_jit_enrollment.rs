@@ -165,6 +165,8 @@ fn build_enrollment(
         .map_err(|_| invalid_configuration())?;
     let payload_tree_digest = Sha256Digest::parse(&wire.owned_linux.payload_tree_sha256)
         .map_err(|_| invalid_configuration())?;
+    let egress_guard_digest = Sha256Digest::parse(&wire.owned_linux.egress_guard_sha256)
+        .map_err(|_| invalid_configuration())?;
     let private_key_digest = Sha256Digest::parse(&wire.github.private_key_sha256)
         .map_err(|_| invalid_configuration())?;
     let github_app = GitHubAppKeychainConfig::new_without_keychain(
@@ -194,6 +196,8 @@ fn build_enrollment(
         PathBuf::from(&wire.owned_linux.payload_root),
         payload_tree_digest,
         PathBuf::from(&wire.owned_linux.launcher),
+        PathBuf::from(&wire.owned_linux.egress_guard),
+        egress_guard_digest,
     )
     .map_err(|_| invalid_configuration())?;
     let resources = OwnedLinuxJitRuntime::fixed_resources().map_err(|_| invalid_configuration())?;
@@ -315,4 +319,6 @@ struct OwnedLinuxWire {
     payload_root: String,
     payload_tree_sha256: String,
     launcher: String,
+    egress_guard: String,
+    egress_guard_sha256: String,
 }
