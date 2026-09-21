@@ -28,11 +28,6 @@ STATUS_BRANCH = "glaeda-status/v1"
 STATUS_FILE = "resident-nodes.json"
 MAX_NODE_BYTES = 16 * 1024
 MAX_FLEET_BYTES = 128 * 1024
-MAX_NODES = 8
-MAX_PROJECTS = 8
-MAX_REQUESTS = 16
-MAX_PROFILES = 8
-MAX_REUSABLE_STATES = 16
 MIN_USEFUL_AGE_SECONDS = 60
 MAX_USEFUL_AGE_SECONDS = 600
 DEFAULT_USEFUL_AGE_SECONDS = 300
@@ -98,9 +93,9 @@ def exact_object(value: object, label: str) -> dict[str, Any]:
     return value
 
 
-def exact_list(value: object, label: str, maximum: int) -> list[Any]:
-    if not isinstance(value, list) or len(value) > maximum:
-        raise SnapshotError(f"{label} must be a bounded array")
+def exact_list(value: object, label: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise SnapshotError(f"{label} must be an array")
     return value
 
 
@@ -154,15 +149,17 @@ def load_json(path: Path, maximum_bytes: int = MAX_FLEET_BYTES) -> object:
 
 def validate_trust(value: object) -> dict[str, Any]:
     trust = exact_object(value, "trust document")
+    if len(canonical_json(trust)) > MAX_FLEET_BYTES:
+        raise SnapshotError("trust document exceeds the byte budget")
     exact_keys(trust, {"document_type", "schema_version", "repositories", "nodes"}, "trust document")
     if trust["document_type"] != TRUST_DOCUMENT or trust["schema_version"] != SCHEMA_VERSION:
         raise SnapshotError("trust document version is unsupported")
-    repositories = exact_list(trust["repositories"], "trusted repositories", MAX_PROJECTS)
+    repositories = exact_list(trust["repositories"], "trusted repositories")
     if not repositories or any(not isinstance(item, str) or REPOSITORY_RE.fullmatch(item) is None for item in repositories):
         raise SnapshotError("trusted repositories are invalid")
     if len(set(repositories)) != len(repositories):
         raise SnapshotError("trusted repositories contain duplicates")
-    nodes = exact_list(trust["nodes"], "trusted nodes", MAX_NODES)
+    nodes = exact_list(trust["nodes"], "trusted nodes")
     seen_nodes: set[str] = set()
     seen_keys: set[str] = set()
     for entry_raw in nodes:
@@ -254,7 +251,7 @@ def capability_projection(
         "glaeda_node_generation": node["generation"],
     }
 
-    profiles_raw = exact_list(capability.get("profiles"), "capability profiles", MAX_PROFILES)
+    profiles_raw = exact_list(capability.get("profiles"), "capability profiles")
     profiles: list[dict[str, object]] = []
     profile_ids: set[str] = set()
     for item_raw in profiles_raw:
@@ -271,7 +268,7 @@ def capability_projection(
         profiles.append({"id": profile_id, "class": profile_class, "generation": generation})
 
     repositories = set(trust["repositories"])
-    projects_raw = exact_list(capability.get("projects"), "capability projects", MAX_PROJECTS)
+    projects_raw = exact_list(capability.get("projects"), "capability projects")
     projects: list[dict[str, object]] = []
     for item_raw in projects_raw:
         item = exact_object(item_raw, "capability project")
@@ -285,7 +282,7 @@ def capability_projection(
         heat_map = {"resident_hot": "resident_hot", "resident_cold": "cold"}
         if heat not in heat_map:
             raise SnapshotError("project heat class is unsupported")
-        verification_profiles = exact_list(item.get("verificationProfiles"), "project verification profiles", MAX_PROFILES)
+        verification_profiles = exact_list(item.get("verificationProfiles"), "project verification profiles")
         if any(not isinstance(profile, str) or len(profile) > 80 for profile in verification_profiles):
             raise SnapshotError("project verification profiles are invalid")
         projects.append({
@@ -307,7 +304,7 @@ def capability_projection(
 def validate_reusable_states(value: object) -> list[dict[str, object]]:
     summaries: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
-    for raw in exact_list(value, "project reusable states", MAX_REUSABLE_STATES):
+    for raw in exact_list(value, "project reusable states"):
         item = exact_object(raw, "project reusable state")
         exact_keys(
             item,
@@ -364,7 +361,7 @@ def validate_project_state(value: object, trust: dict[str, Any], profile_ids: se
     repositories = set(trust["repositories"])
     projects: list[dict[str, object]] = []
     seen: set[str] = set()
-    for raw in exact_list(doc["projects"], "project state", MAX_PROJECTS):
+    for raw in exact_list(doc["projects"], "project state"):
         item = exact_object(raw, "project state")
         exact_keys(
             item,
@@ -382,7 +379,7 @@ def validate_project_state(value: object, trust: dict[str, Any], profile_ids: se
         if item["heat_class"] not in HEAT_CLASSES or item["dependency_build_state_class"] not in BUILD_STATE_CLASSES:
             raise SnapshotError("project state class is invalid")
         active = integer(item["active_task_count"], "project active task count", 0, 32)
-        verification_profiles = exact_list(item["verification_profiles"], "project verification profiles", MAX_PROFILES)
+        verification_profiles = exact_list(item["verification_profiles"], "project verification profiles")
         if any(not isinstance(profile, str) or VERIFICATION_PROFILE_RE.fullmatch(profile) is None for profile in verification_profiles):
             raise SnapshotError("project verification profile is invalid")
         receipt = item["recent_compatible_receipt_ref"]
@@ -409,7 +406,7 @@ def validate_request_state(value: object, trust: dict[str, Any], profile_ids: se
     repositories = set(trust["repositories"])
     requests: list[dict[str, object]] = []
     seen: set[str] = set()
-    for raw in exact_list(doc["requests"], "request state", MAX_REQUESTS):
+    for raw in exact_list(doc["requests"], "request state"):
         item = exact_object(raw, "request state")
         exact_keys(
             item,
@@ -536,6 +533,8 @@ def validate_unsigned_snapshot(
 ) -> dict[str, Any]:
     trust = validate_trust(trust_value)
     value = exact_object(value, "node snapshot")
+    if len(canonical_json(value)) > MAX_NODE_BYTES:
+        raise SnapshotError("node snapshot exceeds the byte budget")
     exact_keys(value, {"document_type", "schema_version", "payload"}, "node snapshot")
     if value["document_type"] != NODE_DOCUMENT or value["schema_version"] != SCHEMA_VERSION:
         raise SnapshotError("node snapshot version is unsupported")
@@ -587,7 +586,7 @@ def validate_unsigned_snapshot(
         raise SnapshotError("snapshot node state class is invalid")
     integer(node["active_work_count"], "active work count", 0, 32)
 
-    profiles = exact_list(payload["profiles"], "snapshot profiles", MAX_PROFILES)
+    profiles = exact_list(payload["profiles"], "snapshot profiles")
     profile_ids: set[str] = set()
     for raw in profiles:
         item = exact_object(raw, "snapshot profile")
@@ -601,7 +600,7 @@ def validate_unsigned_snapshot(
         bounded_string(item["generation"], SHA256_RE, "snapshot profile generation")
 
     repositories = set(trust["repositories"])
-    projects = exact_list(payload["projects"], "snapshot projects", MAX_PROJECTS)
+    projects = exact_list(payload["projects"], "snapshot projects")
     seen_projects: set[str] = set()
     for raw in projects:
         item = exact_object(raw, "snapshot project")
@@ -617,14 +616,14 @@ def validate_unsigned_snapshot(
         if item["heat_class"] not in HEAT_CLASSES or item["dependency_build_state_class"] not in BUILD_STATE_CLASSES:
             raise SnapshotError("snapshot project state class is invalid")
         validate_reusable_states(item["reusable_states"])
-        verification_profiles = exact_list(item["verification_profiles"], "snapshot project profiles", MAX_PROFILES)
+        verification_profiles = exact_list(item["verification_profiles"], "snapshot project profiles")
         if any(not isinstance(profile, str) or VERIFICATION_PROFILE_RE.fullmatch(profile) is None for profile in verification_profiles):
             raise SnapshotError("snapshot project verification profile is invalid")
         integer(item["active_task_count"], "snapshot project active task count", 0, 32)
         if item["recent_compatible_receipt_ref"] is not None:
             bounded_string(item["recent_compatible_receipt_ref"], SHA256_RE, "snapshot recent receipt")
 
-    requests = exact_list(payload["requests"], "snapshot requests", MAX_REQUESTS)
+    requests = exact_list(payload["requests"], "snapshot requests")
     seen_requests: set[str] = set()
     for raw in requests:
         item = exact_object(raw, "snapshot request")
@@ -648,8 +647,6 @@ def validate_unsigned_snapshot(
         elif item["terminal_receipt_ref"] is not None:
             raise SnapshotError("non-terminal snapshot request claims a terminal receipt")
 
-    if len(canonical_json(value)) > MAX_NODE_BYTES:
-        raise SnapshotError("node snapshot exceeds the byte ceiling")
     return value
 
 
@@ -834,12 +831,12 @@ def raw_snapshot_node_id(value: object) -> str | None:
 
 def validate_fleet(value: object) -> dict[str, Any]:
     fleet = exact_object(value, "fleet snapshot")
+    if len(canonical_json(fleet)) > MAX_FLEET_BYTES:
+        raise SnapshotError("fleet snapshot exceeds the byte budget")
     exact_keys(fleet, {"document_type", "schema_version", "nodes"}, "fleet snapshot")
     if fleet["document_type"] != FLEET_DOCUMENT or fleet["schema_version"] != SCHEMA_VERSION:
         raise SnapshotError("fleet snapshot version is unsupported")
-    exact_list(fleet["nodes"], "fleet node snapshots", MAX_NODES)
-    if len(canonical_json(fleet)) > MAX_FLEET_BYTES:
-        raise SnapshotError("fleet snapshot exceeds the byte ceiling")
+    exact_list(fleet["nodes"], "fleet node snapshots")
     return fleet
 
 
