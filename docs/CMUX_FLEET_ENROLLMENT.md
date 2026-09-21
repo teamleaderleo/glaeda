@@ -146,7 +146,7 @@ bash scripts/cmux-fleet status "$ENROLLMENT" \
   --acceptance "$ACCEPTANCE"
 ```
 
-The macOS preparation reuses CMUX's reviewed `scripts/setup.sh` for prerequisites. Bootstrap re-observes those prerequisites read-only and verifies the exact checkout exposes `cmux.macos.dev-check@1` for the observed Apple-Silicon node. `accept-local` launches CMUX's checked-in profile runner on this node inside a private attempt directory, captures the canonical semantic result, reruns the read-only bootstrap on this same node, and emits `glaeda-cmux-fleet-acceptance/v2`. CMUX still owns the developer-build commands, validator, artifacts, timeout, and pass/fail semantics. Glaeda owns the local-attempt binding, fresh capability check, and durable receipt.
+The macOS preparation reuses CMUX's reviewed `scripts/setup.sh` for prerequisites. Bootstrap re-observes those prerequisites read-only and verifies the exact checkout exposes `cmux.macos.dev-check@1` for the observed Apple-Silicon node. `accept-local` launches CMUX's checked-in profile runner on this node inside a private attempt directory, captures the canonical semantic result, reruns the read-only bootstrap on this same node, and emits `glaeda-cmux-fleet-acceptance/v2`. Both Python front doors execute in isolated interpreter mode (`-I`) with a closed allowlist containing only reviewed toolchain/home path inputs plus a private attempt-local `TMPDIR`; Python import controls, Git redirection variables, SSH agents, credentials, and unrelated operator environment never flow into either child. CMUX still owns the developer-build commands, validator, artifacts, timeout, and pass/fail semantics. Glaeda owns the local-attempt binding, fresh capability check, and durable receipt.
 
 ## Onboard Linux
 
