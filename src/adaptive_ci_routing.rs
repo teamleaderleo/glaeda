@@ -1802,6 +1802,244 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_candidate_pool_ids_are_rejected() {
+        let workload = workload();
+        let candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::HotExact);
+        let observations =
+            three_successes(&workload, "owned", HotStateClass::HotExact, 60_000, 0, 0);
+
+        let error = recommend_ci_pool(
+            &workload,
+            &[candidate.clone(), candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "routing_duplicate_pool_id");
+    }
+
+    #[test]
+    fn changed_execution_class_does_not_reuse_old_pool_history() {
+        let workload = workload();
+        let mut candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::HotExact);
+        candidate.pool.execution_class = id("macos-arm64-next");
+        let observations =
+            three_successes(&workload, "owned", HotStateClass::HotExact, 60_000, 0, 0);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, RecommendationStatus::Abstained);
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("owned") && entry.reason == PoolExclusionReason::MissingEvidence
+        }));
+    }
+
+    #[test]
+    fn total_percentiles_preserve_observed_phase_correlation() {
+        let workload = workload();
+        let candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::HotExact);
+        let mut observations =
+            three_successes(&workload, "owned", HotStateClass::HotExact, 0, 0, 0);
+        observations[0].timing = ObservationTimingV1 {
+            queue_millis: 100,
+            start_millis: 0,
+            preparation_millis: 0,
+            execution_millis: 0,
+            settlement_millis: 0,
+        };
+        observations[1].timing = ObservationTimingV1 {
+            queue_millis: 0,
+            start_millis: 0,
+            preparation_millis: 0,
+            execution_millis: 100,
+            settlement_millis: 0,
+        };
+        observations[2].timing = ObservationTimingV1 {
+            queue_millis: 0,
+            start_millis: 0,
+            preparation_millis: 0,
+            execution_millis: 0,
+            settlement_millis: 0,
+        };
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        let prediction = &report.predictions[0];
+        assert_eq!(prediction.completion.queue.p90, 100);
+        assert_eq!(prediction.completion.execution.p90, 100);
+        assert_eq!(prediction.completion.total.p90, 100);
+    }
+
+    #[test]
+    fn failed_attempt_cost_counts_toward_spend_ceiling() {
+        let workload = workload();
+        let candidate = pool(
+            "burst",
+            PoolAccountingClass::PaidBurst,
+            HotStateClass::Cold,
+        );
+        let mut observations =
+            three_successes(&workload, "burst", HotStateClass::Cold, 40_000, 0, 0);
+        observations.push(observation(
+            &workload,
+            "burst",
+            HotStateClass::Cold,
+            4_000,
+            20_000,
+            1_000,
+            0,
+            ObservationOutcome::Failure,
+        ));
+        let mut policy = RoutingPolicyV1::latency(500);
+        policy.max_failure_permille = 1_000;
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            policy,
+        )
+        .unwrap();
+
+        assert_eq!(report.predictions[0].marginal_cost_microusd.p90, 1_000);
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("burst") && entry.reason == PoolExclusionReason::SpendCeiling
+        }));
+    }
+
+    #[test]
+    fn expired_allowance_period_is_refused() {
+        let workload = workload();
+        let mut candidate = pool(
+            "included",
+            PoolAccountingClass::MeteredIncluded,
+            HotStateClass::Cold,
+        );
+        candidate.allowance = Some(AllowanceBudgetV1 {
+            period_id: id("expired-period"),
+            included_budget_units: 1_000,
+            remaining_estimate_units: 900,
+            reset_at_millis: NOW,
+            observed_consumption_units: 100,
+        });
+        let observations =
+            three_successes(&workload, "included", HotStateClass::Cold, 40_000, 0, 20);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, RecommendationStatus::Abstained);
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("included") && entry.reason == PoolExclusionReason::AllowanceExpired
+        }));
+    }
+
+    #[test]
+    fn contention_pressure_respects_policy_ceiling() {
+        let workload = workload();
+        let mut candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Warm);
+        candidate.contention = Some(ContentionEvidenceV1 {
+            window_count: 4,
+            offered_tasks: 16,
+            validated_completions: 16,
+            elapsed_millis: 120_000,
+            final_result_p50_millis: 30_000,
+            final_result_p90_millis: 45_000,
+            semantic_mismatches: 0,
+            failures: 0,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::High,
+        });
+        let observations =
+            three_successes(&workload, "owned", HotStateClass::Warm, 40_000, 0, 0);
+        let mut policy = RoutingPolicyV1::economy(60_000);
+        policy.max_pressure = HostPressureClass::Moderate;
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            policy,
+        )
+        .unwrap();
+
+        assert_eq!(report.status, RecommendationStatus::Abstained);
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("owned") && entry.reason == PoolExclusionReason::PressureAbovePolicy
+        }));
+    }
+
+    #[test]
+    fn fallback_rate_breaks_otherwise_equal_choices() {
+        let workload = workload();
+        let stable = pool("stable", PoolAccountingClass::Owned, HotStateClass::Warm);
+        let flaky = pool("flaky", PoolAccountingClass::Owned, HotStateClass::Warm);
+        let mut observations =
+            three_successes(&workload, "stable", HotStateClass::Warm, 40_000, 0, 0);
+        observations.extend(three_successes(
+            &workload,
+            "flaky",
+            HotStateClass::Warm,
+            40_000,
+            0,
+            0,
+        ));
+        observations.push(observation(
+            &workload,
+            "flaky",
+            HotStateClass::Warm,
+            4_000,
+            40_000,
+            0,
+            0,
+            ObservationOutcome::Fallback,
+        ));
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[stable, flaky],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert_eq!(report.choice, Some(id("stable")));
+    }
+
+    #[test]
     fn human_and_json_explain_the_same_recommendation() {
         let workload = workload();
         let candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::HotExact);
@@ -1821,6 +2059,8 @@ mod tests {
         let json = report.render_json().unwrap();
         assert!(human.contains("choice: owned"));
         assert!(human.contains("automatic routing: disabled"));
+        assert!(human.lines().count() > 8);
+        assert!(!human.contains("\\n"));
         assert!(json.contains("\"choice\": \"owned\""));
         assert!(json.contains("\"automatic_routing_eligible\": false"));
         assert!(json.contains("\"authority\": \"recommendation_only\""));
