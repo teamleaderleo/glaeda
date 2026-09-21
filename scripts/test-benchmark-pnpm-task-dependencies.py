@@ -309,6 +309,7 @@ class PnpmTaskDependencyBenchmarkTests(unittest.TestCase):
     def test_explicit_import_methods_require_per_task_physical_proof(self) -> None:
         validate = NAMESPACE['validate_mechanisms']
         BenchmarkError = NAMESPACE['BenchmarkError']
+
         def evidence(
             mechanism: str,
             hardlinks: int = 0,
