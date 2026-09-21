@@ -358,9 +358,6 @@ def validate_replay(
         or type(existing_receipt.get("schema_version")) is not int
         or existing_receipt.get("schema_version") != RECEIPT_SCHEMA_VERSION
         or existing_receipt.get("authority") != AUTHORITY
-        or existing_receipt.get("operation") != request.operation
-        or existing_receipt.get("source") != expected_source
-        or existing_receipt.get("correlation") != expected_correlation
     ):
         raise ContractRefusal(
             "invalid_existing_receipt", "existing external receipt is invalid"
@@ -374,6 +371,14 @@ def validate_replay(
         raise ContractRefusal(
             "external_request_conflict",
             "external request reference was reused with different semantics",
+        )
+    if (
+        existing_receipt.get("operation") != request.operation
+        or existing_receipt.get("source") != expected_source
+        or existing_receipt.get("correlation") != expected_correlation
+    ):
+        raise ContractRefusal(
+            "invalid_existing_receipt", "existing external receipt is invalid"
         )
     return existing_receipt
 
