@@ -870,6 +870,39 @@ def _slot_claims(workload: dict[str, Any]) -> tuple[str, ...]:
     return contract["slotClaims"]
 
 
+def _capacity_sets_for_workload(
+    node: dict[str, Any],
+    workload: dict[str, Any],
+    capacity_values: Iterable[object],
+) -> list[dict[str, int]]:
+    claims = set(_slot_claims(workload))
+    by_generation: dict[str, dict[str, int]] = {}
+    for value in capacity_values:
+        receipt = validate_capacity(value)
+        if (
+            receipt["nodeId"] != node["nodeId"]
+            or receipt["enrollmentGeneration"] != node["enrollmentGeneration"]
+            or receipt["capabilityGeneration"] != node["capabilityGeneration"]
+            or receipt["role"] != workload["role"]
+            or receipt["resourceProfile"] != workload["resourceProfile"]
+            or receipt["result"] != "accepted"
+        ):
+            continue
+        generation = receipt["contentionEvidenceGeneration"]
+        slots = by_generation.setdefault(generation, {})
+        slot = receipt["slotClass"]
+        if slot in slots and slots[slot] != receipt["maxConcurrent"]:
+            raise RoleModelError(
+                "one contention evidence generation disagrees on slot capacity"
+            )
+        slots[slot] = receipt["maxConcurrent"]
+    return [
+        slots
+        for _, slots in sorted(by_generation.items())
+        if claims.issubset(slots)
+    ]
+
+
 def _profile_has_capacity(
     node: dict[str, Any],
     workload: dict[str, Any],
@@ -882,28 +915,7 @@ def _profile_has_capacity(
         not in eligibility[role].get("acceptedResourceProfiles", [])
     ):
         return False
-    claims = set(_slot_claims(workload))
-    matched = set()
-    measured_profile = False
-    for value in capacity_values:
-        receipt = validate_capacity(value)
-        if (
-            receipt["nodeId"] != node["nodeId"]
-            or receipt["enrollmentGeneration"] != node["enrollmentGeneration"]
-            or receipt["capabilityGeneration"]
-            != node["capabilityGeneration"]
-            or receipt["role"] != role
-            or receipt["resourceProfile"]
-            != workload["resourceProfile"]
-            or receipt["result"] != "accepted"
-        ):
-            continue
-        measured_profile = True
-        if receipt["slotClass"] in claims:
-            matched.add(receipt["slotClass"])
-    if not measured_profile:
-        return False
-    return matched == claims
+    return bool(_capacity_sets_for_workload(node, workload, capacity_values))
 
 
 def select_eligible(
@@ -962,25 +974,14 @@ def _workload_slot_capacities(
     workload: dict[str, Any],
     capacity_values: Iterable[object],
 ) -> dict[str, int]:
-    capacities: dict[str, int] = {}
-    for value in capacity_values:
-        receipt = validate_capacity(value)
-        if (
-            receipt["nodeId"] != node["nodeId"]
-            or receipt["enrollmentGeneration"] != node["enrollmentGeneration"]
-            or receipt["capabilityGeneration"]
-            != node["capabilityGeneration"]
-            or receipt["role"] != workload["role"]
-            or receipt["resourceProfile"]
-            != workload["resourceProfile"]
-            or receipt["result"] != "accepted"
-        ):
-            continue
-        capacities[receipt["slotClass"]] = max(
-            capacities.get(receipt["slotClass"], 0),
-            receipt["maxConcurrent"],
-        )
-    return capacities
+    complete = _capacity_sets_for_workload(node, workload, capacity_values)
+    if not complete:
+        return {}
+    claims = _slot_claims(workload)
+    return {
+        slot: min(capacities[slot] for capacities in complete)
+        for slot in claims
+    }
 
 
 def validate_physical_lease(value: object) -> dict[str, Any]:
