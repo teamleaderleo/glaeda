@@ -26,7 +26,7 @@ const NETWORK: &str = "github_actions_trusted_egress";
 const RUNNER_VERSION: &str = "2.336.0";
 const RUNNER_ARCHITECTURE: &str = "x64";
 const RUNNER_ARCHIVE_SHA256: &str =
-    "sha256:466a920e38e74ff5e7d23c28143a66450cd3868da58609d11af98c64aa179a79";
+    "sha256:04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d";
 const MAX_HELPER_BYTES: u64 = 512 * 1024;
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
 const MUTATION_TIMEOUT: Duration = Duration::from_secs(120);
