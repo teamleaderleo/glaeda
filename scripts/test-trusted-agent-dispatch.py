@@ -93,6 +93,33 @@ class TrustedDispatchTests(unittest.TestCase):
             4096,
         )
 
+    def test_acceptance_mints_transport_scoped_semantic_identity(self) -> None:
+        item = accepted()
+        semantic_id = item.accepted_document["semantic_request_id"]
+        self.assertRegex(semantic_id, r"^accepted-[a-f0-9]{55}$")
+        self.assertEqual(item.external_request.semantic_request_id, semantic_id)
+
+        changed = base_document()
+        changed["request_id"] = "dispatch-967-proof-two"
+        changed["request_fingerprint"] = dispatch.fingerprint_document(changed)
+        other = accepted(changed)
+        self.assertNotEqual(
+            semantic_id,
+            other.accepted_document["semantic_request_id"],
+        )
+        first_compiled = external.compile_request(item.external_request)
+        other_compiled = external.compile_request(other.external_request)
+        self.assertNotEqual(
+            first_compiled.internal.command_fingerprint,
+            other_compiled.internal.command_fingerprint,
+        )
+
+    def test_caller_request_schema_does_not_gain_physical_identity_fields(self) -> None:
+        document = base_document()
+        self.assertNotIn("semantic_request_id", document)
+        self.assertNotIn("backend", document)
+        self.assertNotIn("argv", document)
+
     def test_transport_projection_gets_the_same_deterministic_identity(self) -> None:
         document = base_document()
         expected = dispatch.decode_request(raw(document), now=NOW)
