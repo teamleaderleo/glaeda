@@ -195,7 +195,11 @@ class RepositoryAgentWorkTests(unittest.TestCase):
             w.decode_receipt(raw(value), request)
 
     def test_repair_receipt_requires_patch_bounds_scope_and_all_profiles_passed(self) -> None:
-        request = w.decode_request(raw(repair_request()))
+        request_value = repair_request()
+        request_value['verification'].append(
+            {'id': 'cmux.macos.dev-check', 'generation': 1}
+        )
+        request = w.decode_request(raw(request_value))
         result = {
             'kind': 'repair',
             'result_source': {'commit': '5' * 40, 'tree': '6' * 40},
@@ -205,12 +209,20 @@ class RepositoryAgentWorkTests(unittest.TestCase):
             }],
             'patch_sha256': A,
             'patch_bytes': 1024,
-            'verification_results': [{
-                'profile': {'id': 'cmux.ci.guard', 'generation': 1},
-                'source': {'commit': '5' * 40, 'tree': '6' * 40},
-                'semantic_result': 'passed',
-                'result_sha256': D,
-            }],
+            'verification_results': [
+                {
+                    'profile': {'id': 'cmux.ci.guard', 'generation': 1},
+                    'source': {'commit': '5' * 40, 'tree': '6' * 40},
+                    'semantic_result': 'passed',
+                    'result_sha256': D,
+                },
+                {
+                    'profile': {'id': 'cmux.macos.dev-check', 'generation': 1},
+                    'source': {'commit': '5' * 40, 'tree': '6' * 40},
+                    'semantic_result': 'passed',
+                    'result_sha256': C,
+                },
+            ],
             'working_copy': 'clean',
         }
         normalized = w.decode_receipt(raw(receipt(request, result)), request)
@@ -238,10 +250,15 @@ class RepositoryAgentWorkTests(unittest.TestCase):
             w.decode_receipt(raw(receipt(request, bad)), request)
 
         bad = copy.deepcopy(result)
-        bad['verification_results'][0]['source'] = copy.deepcopy(
+        bad['verification_results'][1]['source'] = copy.deepcopy(
             request['source']['head']
         )
         with self.assertRaisesRegex(w.ContractRefusal, 'exact resulting source'):
+            w.decode_receipt(raw(receipt(request, bad)), request)
+
+        bad = copy.deepcopy(result)
+        bad['result_source']['commit'] = request['source']['head']['commit']
+        with self.assertRaisesRegex(w.ContractRefusal, 'different exact source'):
             w.decode_receipt(raw(receipt(request, bad)), request)
 
         bad = copy.deepcopy(result)
