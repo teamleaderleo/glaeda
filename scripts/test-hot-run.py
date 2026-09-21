@@ -1017,7 +1017,10 @@ class HotRunTests(unittest.TestCase):
             assert record is not None
             self.assertEqual(catalog["schema_version"], 2)
             self.assertEqual(catalog["next_use_sequence"], 2)
+            self.assertEqual(catalog["next_value_ticket_sequence"], 2)
+            self.assertEqual(catalog["value_cursor_ticket_sequence"], 0)
             self.assertEqual(record["last_successful_use_sequence"], 2)
+            self.assertEqual(record["value_ticket_sequence"], 2)
             self.assertEqual(record["successful_use_count"], 2)
             self.assertEqual(record["reconstruction_elapsed_ns"], 500_000_000)
             self.assertEqual(record["reuse_elapsed_ns"], 50_000_000)
@@ -1175,12 +1178,21 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(migrated["schema_version"], 2)
             self.assertTrue(migrated["pressure_active"])
             self.assertEqual(migrated["next_use_sequence"], 7)
+            self.assertEqual(migrated["next_value_ticket_sequence"], 1)
+            self.assertEqual(migrated["value_cursor_ticket_sequence"], 0)
             record = namespace["read_hot_state_value_record"](
                 namespace_root, state.name
             )
             self.assertIsNotNone(record)
             assert record is not None
             self.assertEqual(record["successful_use_count"], 3)
+            self.assertEqual(record["value_ticket_sequence"], 1)
+            ticket = namespace["read_hot_state_value_ticket"](
+                namespace_root, 1
+            )
+            self.assertIsNotNone(ticket)
+            assert ticket is not None
+            self.assertEqual(ticket["state_identity"], state.name)
             self.assertNotIn("states", migrated)
 
             # Re-reading a completed migration is idempotent.
