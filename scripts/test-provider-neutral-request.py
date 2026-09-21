@@ -161,6 +161,11 @@ class ProviderNeutralRequestTests(unittest.TestCase):
         self.assertEqual(receipt["state"], "succeeded")
         self.assertEqual(receipt["result"]["reason"], "node_draining")
 
+        unknown = dict(observation)
+        unknown["reason"] = "scheduler_says_yes"
+        with self.assertRaisesRegex(module.ContractRefusal, "outside the reviewed"):
+            module.status_receipt(compiled, unknown)
+
         bad = dict(observation)
         bad["authorizes_execution"] = True
         with self.assertRaisesRegex(module.ContractRefusal, "outside the reviewed"):
