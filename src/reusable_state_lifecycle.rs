@@ -139,8 +139,16 @@ impl ReusableStateIdentityContract {
         let mut hasher = Sha256::new();
         hash_field(&mut hasher, b"schema", &[self.schema_version]);
         hash_field(&mut hasher, b"class", self.state_class.as_str().as_bytes());
-        hash_field(&mut hasher, b"repository", self.repository.as_str().as_bytes());
-        hash_field(&mut hasher, b"architecture", self.architecture.as_str().as_bytes());
+        hash_field(
+            &mut hasher,
+            b"repository",
+            self.repository.as_str().as_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"architecture",
+            self.architecture.as_str().as_bytes(),
+        );
         hash_digest(&mut hasher, b"toolchain", &self.toolchain_generation);
         hash_digest(&mut hasher, b"runtime", &self.os_runtime_generation);
         hash_optional(&mut hasher, b"lock", self.dependency_lock_digest.as_ref());
@@ -149,7 +157,11 @@ impl ReusableStateIdentityContract {
             b"build_configuration",
             self.build_configuration_digest.as_ref(),
         );
-        hash_optional(&mut hasher, b"compiler_flags", self.compiler_flags_digest.as_ref());
+        hash_optional(
+            &mut hasher,
+            b"compiler_flags",
+            self.compiler_flags_digest.as_ref(),
+        );
         hash_optional(
             &mut hasher,
             b"prepared_environment",
@@ -179,7 +191,10 @@ impl ReusableStateIdentityContract {
         mismatch!(dependency_lock_digest, DependencyLockDigest);
         mismatch!(build_configuration_digest, BuildConfigurationDigest);
         mismatch!(compiler_flags_digest, CompilerFlagsDigest);
-        mismatch!(prepared_environment_generation, PreparedEnvironmentGeneration);
+        mismatch!(
+            prepared_environment_generation,
+            PreparedEnvironmentGeneration
+        );
         mismatch!(cache_schema_generation, CacheSchemaGeneration);
         mismatch!(family_inputs_digest, FamilyInputsDigest);
         None
@@ -522,17 +537,22 @@ impl ReusableStateGeneration {
     ) -> Result<Self, ReusableStatePolicyError> {
         let allowed = matches!(
             (self.lifecycle, target),
-            (ReusableStateLifecycle::Candidate, ReusableStateLifecycle::Validated)
-                | (
-                    ReusableStateLifecycle::Validated,
-                    ReusableStateLifecycle::ObservedConsumers
-                )
-                | (
-                    ReusableStateLifecycle::ObservedConsumers,
-                    ReusableStateLifecycle::Preferred
-                )
-                | (ReusableStateLifecycle::Preferred, ReusableStateLifecycle::Demoted)
-                | (ReusableStateLifecycle::Demoted, ReusableStateLifecycle::Retired)
+            (
+                ReusableStateLifecycle::Candidate,
+                ReusableStateLifecycle::Validated
+            ) | (
+                ReusableStateLifecycle::Validated,
+                ReusableStateLifecycle::ObservedConsumers
+            ) | (
+                ReusableStateLifecycle::ObservedConsumers,
+                ReusableStateLifecycle::Preferred
+            ) | (
+                ReusableStateLifecycle::Preferred,
+                ReusableStateLifecycle::Demoted
+            ) | (
+                ReusableStateLifecycle::Demoted,
+                ReusableStateLifecycle::Retired
+            )
         );
         if !allowed {
             return Err(ReusableStatePolicyError::InvalidTransition);
@@ -638,7 +658,8 @@ impl ReusableStateGeneration {
         now_epoch_millis: u64,
     ) -> Result<ReusableStateStatusSummary, ReusableStatePolicyError> {
         let utility = self.metrics.utility()?;
-        let recent_hit = classify_recent_hit(self.metrics.last_useful_hit_epoch_millis, now_epoch_millis);
+        let recent_hit =
+            classify_recent_hit(self.metrics.last_useful_hit_epoch_millis, now_epoch_millis);
         let heat = if self.revalidation_required
             || matches!(
                 self.lifecycle,
@@ -708,16 +729,18 @@ impl ReusableStatePromotionPolicy {
         } else {
             metrics.reset_invalidation_count.saturating_mul(1_000) / metrics.lookups
         };
-        Ok(generation.publication == ReusableStatePublicationState::Complete
-            && generation.integrity == ReusableStateIntegrityState::Verified
-            && !generation.revalidation_required
-            && metrics.producer_successes >= self.min_producer_successes
-            && metrics.successful_consumers >= self.min_successful_consumers
-            && metrics.lookups >= self.min_lookups_for_value
-            && metrics.semantic_mismatches == 0
-            && metrics.validation_failures <= self.max_validation_failures
-            && reset_rate <= self.max_resets_per_thousand_lookups
-            && metrics.utility()?.net_time_saved_millis >= self.min_net_time_saved_millis)
+        Ok(
+            generation.publication == ReusableStatePublicationState::Complete
+                && generation.integrity == ReusableStateIntegrityState::Verified
+                && !generation.revalidation_required
+                && metrics.producer_successes >= self.min_producer_successes
+                && metrics.successful_consumers >= self.min_successful_consumers
+                && metrics.lookups >= self.min_lookups_for_value
+                && metrics.semantic_mismatches == 0
+                && metrics.validation_failures <= self.max_validation_failures
+                && reset_rate <= self.max_resets_per_thousand_lookups
+                && metrics.utility()?.net_time_saved_millis >= self.min_net_time_saved_millis,
+        )
     }
 }
 
@@ -791,8 +814,12 @@ pub fn evaluate_reusable_state_consumption(
     let publication_failure = match generation.publication {
         ReusableStatePublicationState::Complete => None,
         ReusableStatePublicationState::Partial => Some(ReusableStateMissReason::PartialPublish),
-        ReusableStatePublicationState::DiskFull => Some(ReusableStateMissReason::DiskFullPublication),
-        ReusableStatePublicationState::ProducerCrashed => Some(ReusableStateMissReason::ProducerCrash),
+        ReusableStatePublicationState::DiskFull => {
+            Some(ReusableStateMissReason::DiskFullPublication)
+        }
+        ReusableStatePublicationState::ProducerCrashed => {
+            Some(ReusableStateMissReason::ProducerCrash)
+        }
         ReusableStatePublicationState::ConcurrentPublisherConflict => {
             Some(ReusableStateMissReason::ConcurrentPublisherConflict)
         }
@@ -1229,7 +1256,10 @@ mod tests {
         }
     }
 
-    fn candidate(class: ReusableStateClass, metrics: ReusableStateMetrics) -> ReusableStateGeneration {
+    fn candidate(
+        class: ReusableStateClass,
+        metrics: ReusableStateMetrics,
+    ) -> ReusableStateGeneration {
         ReusableStateGeneration::candidate(
             ReusableStatePublisherAuthority::ReviewedTrustedPublisher,
             identity(class),
@@ -1285,7 +1315,11 @@ mod tests {
         variant!(prepared_environment_generation = Some(digest('9')));
         variant!(cache_schema_generation = digest('9'));
         variant!(family_inputs_digest = digest('9'));
-        assert!(variants.into_iter().all(|value| value.digest().unwrap() != expected));
+        assert!(
+            variants
+                .into_iter()
+                .all(|value| value.digest().unwrap() != expected)
+        );
     }
 
     #[test]
@@ -1379,7 +1413,10 @@ mod tests {
         let mut evidence = metrics(6, 6, 43_985, 3_355, 1_895_000_000, 2, 6);
         evidence.restore_duration_millis = 0;
         evidence.publication_duration_millis = 43_985;
-        let cargo = preferred(candidate(ReusableStateClass::IncrementalBuildState, evidence));
+        let cargo = preferred(candidate(
+            ReusableStateClass::IncrementalBuildState,
+            evidence,
+        ));
         assert_eq!(
             cargo
                 .recommendation(ReusableStatePromotionPolicy::conservative())
@@ -1494,9 +1531,18 @@ mod tests {
         );
 
         for (publication, reason) in [
-            (ReusableStatePublicationState::Partial, ReusableStateMissReason::PartialPublish),
-            (ReusableStatePublicationState::DiskFull, ReusableStateMissReason::DiskFullPublication),
-            (ReusableStatePublicationState::ProducerCrashed, ReusableStateMissReason::ProducerCrash),
+            (
+                ReusableStatePublicationState::Partial,
+                ReusableStateMissReason::PartialPublish,
+            ),
+            (
+                ReusableStatePublicationState::DiskFull,
+                ReusableStateMissReason::DiskFullPublication,
+            ),
+            (
+                ReusableStatePublicationState::ProducerCrashed,
+                ReusableStateMissReason::ProducerCrash,
+            ),
             (
                 ReusableStatePublicationState::ConcurrentPublisherConflict,
                 ReusableStateMissReason::ConcurrentPublisherConflict,
@@ -1510,8 +1556,14 @@ mod tests {
             );
         }
         for (integrity, reason) in [
-            (ReusableStateIntegrityState::Truncated, ReusableStateMissReason::TruncatedGeneration),
-            (ReusableStateIntegrityState::Corrupt, ReusableStateMissReason::CorruptGeneration),
+            (
+                ReusableStateIntegrityState::Truncated,
+                ReusableStateMissReason::TruncatedGeneration,
+            ),
+            (
+                ReusableStateIntegrityState::Corrupt,
+                ReusableStateMissReason::CorruptGeneration,
+            ),
         ] {
             let mut broken = base.clone();
             broken.integrity = integrity;
@@ -1629,7 +1681,14 @@ mod tests {
         let encoded = serde_json::to_string(&status).unwrap();
         assert_eq!(status.heat, ReusableStateHeatClass::Hot);
         assert_eq!(status.size, ReusableStateSizeClass::Medium);
-        for forbidden in ["/Users/", "/home/", "credential", "source_content", "argv", "log"] {
+        for forbidden in [
+            "/Users/",
+            "/home/",
+            "credential",
+            "source_content",
+            "argv",
+            "log",
+        ] {
             assert!(!encoded.contains(forbidden));
         }
         assert_eq!(
