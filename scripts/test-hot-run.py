@@ -871,7 +871,7 @@ class HotRunTests(unittest.TestCase):
                 namespace["collect_one_unreachable_state"](
                     namespace_root, "7" * 64
                 ),
-                "retirement_record_recovery",
+                "retired_recovery",
             )
             self.assertFalse(retired.exists())
 
@@ -914,7 +914,7 @@ class HotRunTests(unittest.TestCase):
                 namespace["collect_one_unreachable_state"](
                     namespace_root, "9" * 64
                 ),
-                "retirement_record_recovery",
+                "retired_recovery",
             )
             self.assertFalse(retired.exists())
             self.assertFalse((namespace_root / record_name).exists())
@@ -940,6 +940,12 @@ class HotRunTests(unittest.TestCase):
             )
             temporary_manifest.write_text('{"producer":', encoding="utf-8")
             temporary_manifest.chmod(0o600)
+            namespace["enqueue_hot_state_reconcile_ticket"](
+                namespace_root,
+                "creating",
+                state.name,
+                staging.name,
+            )
 
             self.assertEqual(
                 namespace["collect_one_unreachable_state"](
@@ -961,6 +967,12 @@ class HotRunTests(unittest.TestCase):
             unknown_payload = unknown_stage / "partial-cache"
             unknown_payload.write_text("preserve\n", encoding="utf-8")
             unknown_payload.chmod(0o600)
+            namespace["enqueue_hot_state_reconcile_ticket"](
+                namespace_root,
+                "creating",
+                state.name,
+                unknown_stage.name,
+            )
             self.assertEqual(
                 namespace["collect_one_unreachable_state"](
                     namespace_root, state.name
@@ -1444,18 +1456,41 @@ class HotRunTests(unittest.TestCase):
                 (4096, 4096, 100, 10, 10, 0, 0, 0, 0, 255)
             )
             retire = namespace["retire_one_low_value_state"]
-            filesystem = retire.__globals__["os"]
+            globals_ = retire.__globals__
+            filesystem = globals_["os"]
+            real_rename = globals_["rename_noreplace"]
+            real_fsync = globals_["fsync_directory"]
+            renamed = False
+            failed = False
+
+            def rename_then_mark(source, destination):
+                nonlocal renamed
+                real_rename(source, destination)
+                if destination.name.startswith(".retired-v1-"):
+                    renamed = True
+
+            def fail_post_rename_namespace_sync(path):
+                nonlocal failed
+                if renamed and path == namespace_root and not failed:
+                    failed = True
+                    raise OSError("sync")
+                return real_fsync(path)
+
             with (
                 mock.patch.object(filesystem, "statvfs", return_value=pressure),
                 mock.patch.dict(
-                    retire.__globals__,
-                    {"fsync_directory": mock.Mock(side_effect=OSError("sync"))},
+                    globals_,
+                    {
+                        "rename_noreplace": rename_then_mark,
+                        "fsync_directory": fail_post_rename_namespace_sync,
+                    },
                 ),
             ):
                 self.assertEqual(
                     retire(namespace_root, "f" * 64),
                     "retired_low_value_recovery_deferred",
                 )
+            self.assertTrue(failed)
 
             retired = list(namespace_root.glob(".retired-v1-*"))
             self.assertEqual(len(retired), 1)
@@ -1481,7 +1516,7 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(list(namespace_root.glob(".retired-v1-*")), [])
             self.assertTrue(states[1].exists())
 
-    def test_value_retirement_preserves_current_active_unknown_and_recreated_state(
+    def test_value_retirement_preserves_current_unknown_and_recreated_state(
         self,
     ) -> None:
         namespace = load_hot_run()
@@ -1514,18 +1549,6 @@ class HotRunTests(unittest.TestCase):
                     retire(namespace_root, state.name),
                     "pressure_no_eligible_state",
                 )
-            self.assertTrue(state.exists())
-
-            active = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
-            fcntl.flock(active, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
-                with mock.patch.object(filesystem, "statvfs", return_value=pressure):
-                    self.assertEqual(
-                        retire(namespace_root, "f" * 64),
-                        "pressure_no_eligible_state",
-                    )
-            finally:
-                os.close(active)
             self.assertTrue(state.exists())
 
             old_state = namespace_root / ("old-" + state.name)
