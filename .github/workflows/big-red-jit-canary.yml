@@ -31,7 +31,7 @@ jobs:
         run: |
           mkdir -p canary-receipt
           cp /tmp/glaeda-job-entry.txt canary-receipt/job-entry.txt
-          ./scripts/github-actions-jit-canary.sh hosted canary-receipt
+          bash scripts/github-actions-jit-canary.sh hosted canary-receipt
       - name: Publish hosted receipt
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -61,7 +61,7 @@ jobs:
         run: |
           mkdir -p canary-receipt
           cp /tmp/glaeda-job-entry.txt canary-receipt/job-entry.txt
-          ./scripts/github-actions-jit-canary.sh big-red canary-receipt
+          bash scripts/github-actions-jit-canary.sh big-red canary-receipt
       - name: Publish Big Red receipt
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
