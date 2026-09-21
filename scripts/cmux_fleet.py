@@ -17,11 +17,11 @@ STATUS_SCHEMA = "glaeda-cmux-fleet-node-status/v1"
 BOOTSTRAP_SCHEMA = "glaeda-cmux-fleet-bootstrap/v1"
 MAX_DOCUMENT_BYTES = 64 * 1024
 MAX_STATUS_BYTES = 16 * 1024
-SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\\Z")
-COMMIT_RE = re.compile(r"[0-9a-f]{40}\\Z")
-TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,79}\\Z")
-NODE_RE = re.compile(r"cmux-[a-z0-9][a-z0-9-]{2,59}\\Z")
-REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}/[A-Za-z0-9_.-]{1,100}\\Z")
+SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
+TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,79}\Z")
+NODE_RE = re.compile(r"cmux-[a-z0-9][a-z0-9-]{2,59}\Z")
+REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}/[A-Za-z0-9_.-]{1,100}\Z")
 
 ROLES = (
     "artifact_cache",
