@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 ENROLLMENT_SCHEMA = "glaeda-cmux-fleet-enrollment/v1"
-ACCEPTANCE_SCHEMA = "glaeda-cmux-fleet-acceptance/v1"
+ACCEPTANCE_SCHEMA = "glaeda-cmux-fleet-acceptance/v2"
 STATUS_SCHEMA = "glaeda-cmux-fleet-node-status/v1"
 BOOTSTRAP_SCHEMA = "glaeda-cmux-fleet-bootstrap/v1"
 MAX_DOCUMENT_BYTES = 64 * 1024
