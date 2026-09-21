@@ -32,6 +32,10 @@ ROLES = (
     "cmux_macos_native_build",
     "cmux_macos_test",
 )
+ENROLLABLE_ROLES = {
+    "cmux_linux_ci",
+    "cmux_macos_native_build",
+}
 STATES = ("discovered", "enrolling", "eligible", "draining", "quarantined", "retired")
 QUARANTINE_REASONS = (
     "dirty_canonical_checkout",
@@ -137,6 +141,12 @@ def validate_enrollment(value: object) -> dict[str, Any]:
     roles = sorted_unique_strings(doc["allowedExecutionRoles"], "allowed execution roles", allowed=set(ROLES))
     if not roles:
         raise FleetError("at least one execution role is required")
+    unreviewed = [role for role in roles if role not in ENROLLABLE_ROLES]
+    if unreviewed:
+        raise FleetError(
+            "execution role lacks a reviewed v1 acceptance workload: "
+            + ",".join(unreviewed)
+        )
     for role in roles:
         required_os = ROLE_OS.get(role)
         if required_os is not None and required_os != os_doc["family"]:
@@ -199,8 +209,8 @@ def validate_acceptance_evidence(value: object) -> dict[str, Any]:
     if not isinstance(doc["nodeId"], str) or NODE_RE.fullmatch(doc["nodeId"]) is None:
         raise FleetError("acceptance nodeId is invalid")
     positive_int(doc["enrollmentGeneration"], "acceptance enrollment generation")
-    if doc["role"] not in ROLES:
-        raise FleetError("acceptance role is unsupported")
+    if doc["role"] not in ENROLLABLE_ROLES:
+        raise FleetError("acceptance role lacks a reviewed v1 workload")
     source = exact_keys(doc["source"], {"repository", "commit"}, "source")
     if not isinstance(source["repository"], str) or REPOSITORY_RE.fullmatch(source["repository"]) is None:
         raise FleetError("source repository is invalid")
@@ -232,8 +242,8 @@ def validate_acceptance_receipt(value: object) -> dict[str, Any]:
         doc["enrollmentGeneration"],
         "acceptance receipt enrollment generation",
     )
-    if doc["role"] not in ROLES:
-        raise FleetError("acceptance receipt role is unsupported")
+    if doc["role"] not in ENROLLABLE_ROLES:
+        raise FleetError("acceptance receipt role lacks a reviewed v1 workload")
     source = exact_keys(
         doc["source"],
         {"repository", "commit"},
