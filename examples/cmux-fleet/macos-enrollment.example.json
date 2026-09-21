@@ -10,6 +10,9 @@
   "supportedToolchainGenerations": [
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   ],
+  "roleWorkloadGenerations": {
+    "cmux_macos_native_build": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
   "allowedExecutionRoles": [
     "cmux_macos_native_build"
   ],
