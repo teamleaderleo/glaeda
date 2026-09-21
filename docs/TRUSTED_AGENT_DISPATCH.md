@@ -97,7 +97,10 @@ passes it through the caller-neutral #1050 adapter:
 ```text
 trusted transport request + observed provenance
   -> accepted semantic request id
-  -> glaeda-external-execution-request/v1
+  -> glaeda-semantic-request/v1
+       operation=verify_named
+       request_id=<accepted id>
+  -> #1050 glaeda-external-execution-request/v1
        semantic_request_id=<accepted id>
   -> operation=verify_focused
   -> requested_capability_class=credentialless_project
@@ -114,8 +117,9 @@ deliberately converge on one accepted provider-neutral request identity. The fir
 adapter always mints a transport-scoped accepted identity; a later reviewed adapter can explicitly
 import/share one provider-neutral identity when that is intended.
 
-The accepted document records the semantic request ID and Glaeda-resolved workload ID/generation for
-correlation. The caller never supplies the workload generation.
+The accepted document records the semantic request ID, the exact semantic request digest, and the
+Glaeda-resolved workload ID/generation for correlation. The caller never supplies the workload
+generation.
 
 ## Lifecycle and replay
 
