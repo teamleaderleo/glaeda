@@ -273,6 +273,45 @@ jobs:
 
           sudo install -D -o root -g root -m 0755 scripts/benchmark-pnpm-task-dependencies "$MOUNT/bin/benchmark-pnpm-task-dependencies"
 
+          sudo -u "$BENCH_USER" env -i \
+            HOME="$BENCH_HOME" \
+            PATH="$NODE_BIN:/usr/bin:/bin" \
+            LANG=C.UTF-8 \
+            LC_ALL=C.UTF-8 \
+            CI=1 \
+            python3 - "$MOUNT/bin/benchmark-pnpm-task-dependencies" "$SOURCE" "$SCRATCH" "$PNPM_BIN" <<'PY'
+          import pathlib
+          import runpy
+          import sys
+
+          script = pathlib.Path(sys.argv[1])
+          source = pathlib.Path(sys.argv[2])
+          scratch = pathlib.Path(sys.argv[3])
+          pnpm = pathlib.Path(sys.argv[4])
+          namespace = runpy.run_path(str(script), run_name="pnpm_physical_preflight")
+
+          observations = [
+              ("git_program", lambda: namespace["program_identity"](
+                  namespace["GIT"],
+                  ["--version"],
+                  source,
+                  {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+              )),
+              ("git_identity", lambda: namespace["git_identity"](source)),
+              ("package_identity", lambda: namespace["package_identity"](source)),
+              ("pnpm_identity", lambda: namespace["pnpm_identity"](pnpm, source)),
+              ("filesystem_observation", lambda: namespace["filesystem_observation"](scratch)),
+          ]
+          for label, observe in observations:
+              try:
+                  observe()
+              except Exception as error:
+                  print(f"physical-preflight:{label}:failed:{type(error).__name__}:{error}", file=sys.stderr)
+                  raise
+              else:
+                  print(f"physical-preflight:{label}:ok")
+          PY
+
           for width in 1 8 32; do
             output="$RESULTS/${IMPORT_METHOD}-width-${width}.json"
             receipt="$RECEIPTS/${IMPORT_METHOD}-width-${width}.json"
