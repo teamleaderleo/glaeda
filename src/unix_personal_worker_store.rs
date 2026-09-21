@@ -27,6 +27,8 @@ pub(crate) mod disposable_cleanup_transaction;
 mod disposable_clone_transaction;
 /// Same-lock JIT generation, runner registration, and guest start transaction.
 pub(crate) mod disposable_runner_transaction;
+/// Same-lock native-Linux task preparation, recovery, and teardown.
+pub(crate) mod owned_linux_jit_transaction;
 /// Same-lock durable persistence for prepared-template generation state.
 pub(crate) mod disposable_template_generation;
 /// Same-lock durable persistence for the personal-worker Lima lifecycle authority.
