@@ -392,8 +392,7 @@ impl DisposableWorkerCoordinator {
                         ),
                 }
                 .map_err(map_runner_error)?;
-                match outcome
-                {
+                match outcome {
                     DisposableRunnerTransactionOutcome::RegistrationRecovered { attempt_id } => Ok(
                         DisposableWorkerCoordinatorDisposition::RunnerRegistrationRecovered {
                             attempt_id,
