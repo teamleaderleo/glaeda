@@ -16,6 +16,10 @@ from typing import Any
 
 SCHEMA = "glaeda-cmux-fleet-bootstrap/v1"
 MAX_OUTPUT_BYTES = 16 * 1024
+ENROLLABLE_ROLES = {
+    "cmux_macos_native_build",
+    "cmux_linux_ci",
+}
 ROLE_OS = {
     "cmux_macos_native_build": "macos",
     "cmux_macos_test": "macos",
@@ -325,6 +329,12 @@ def evaluate(
     roles = sorted(set(roles))
     if not roles or any(role not in ROLE_OS for role in roles):
         raise BootstrapError("bootstrap roles are invalid")
+    unreviewed = [role for role in roles if role not in ENROLLABLE_ROLES]
+    if unreviewed:
+        raise BootstrapError(
+            "bootstrap role lacks a reviewed v1 acceptance workload: "
+            + ",".join(unreviewed)
+        )
     for role in roles:
         required = ROLE_OS[role]
         if required is not None and required != platform_name:
