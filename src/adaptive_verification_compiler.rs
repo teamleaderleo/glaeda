@@ -817,6 +817,18 @@ pub enum UtilityInputKind {
     StorageCost,
 }
 
+impl UtilityInputKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RestoreTransferOverhead => "restore_transfer_overhead",
+            Self::PublicationOverhead => "publication_overhead",
+            Self::InvalidationResetCost => "invalidation_reset_cost",
+            Self::StorageCost => "storage_cost",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OptimizationUtility {
     avoided_work_millis: u64,
@@ -1024,6 +1036,12 @@ impl AdaptiveVerificationCompilerReceipt {
                     output.push_str("validity: no reusable-artifact contract required\n");
                 }
             }
+            if let Some(state_class) = candidate.reusable_state_class {
+                output.push_str(&format!(
+                    "reusable state class: {}\n",
+                    state_class.as_str()
+                ));
+            }
             output.push_str(&format!(
                 "evidence: {} observations\navoided work: {} ms\nrestore/transfer overhead: {} ms\npublication overhead: {} ms\ninvalidation/reset cost: {} ms\nestimated net: {} ms\nstorage: {} bytes\nhit frequency: {} bp\ntrials: {} ({} controlled, {} compatible successes)\nnext action: {}\n",
                 candidate.evidence.len(),
@@ -1039,6 +1057,16 @@ impl AdaptiveVerificationCompilerReceipt {
                 candidate.experiments.compatible_successes,
                 candidate.next_action.human(),
             ));
+            if !candidate.utility.missing_cost_inputs.is_empty() {
+                let missing = candidate
+                    .utility
+                    .missing_cost_inputs
+                    .iter()
+                    .map(|input| input.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                output.push_str(&format!("missing utility inputs: {missing}\n"));
+            }
             for evidence in &candidate.evidence {
                 let transfer = evidence.artifact_transfer_backend.as_deref().unwrap_or("-");
                 output.push_str(&format!(
@@ -2803,6 +2831,8 @@ mod tests {
 
         assert!(human.contains("candidate: reuse_exact_compiled_product"));
         assert!(human.contains("restore/transfer overhead:"));
+        assert!(human.contains("missing utility inputs:"));
+        assert!(human.contains("reusable state class: immutable_compiled_product"));
         assert!(json.contains("\"document_type\": \"adaptive_verification_compiler_receipt\""));
         assert!(json.contains("\"validity\""));
         assert!(json.contains("\"reusable_state_class\": \"immutable_compiled_product\""));
