@@ -3287,6 +3287,29 @@ def requeue_hot_state_reconcile_ticket(
         pass
 
 
+def remove_generation_value_metadata(
+    namespace_root: Path, state_identity: str
+) -> None:
+    try:
+        record = read_hot_state_value_record(
+            namespace_root, state_identity
+        )
+    except (OSError, RuntimeError):
+        record = None
+    if record is not None:
+        try:
+            remove_hot_state_value_ticket(
+                namespace_root,
+                int(record["value_ticket_sequence"]),
+            )
+        except (OSError, RuntimeError):
+            pass
+    try:
+        remove_hot_state_value_record(namespace_root, state_identity)
+    except (OSError, RuntimeError):
+        pass
+
+
 def collect_one_unreachable_state(
     namespace_root: Path, current_state_identity: str
 ) -> str:
@@ -3298,180 +3321,236 @@ def collect_one_unreachable_state(
             or stat.S_IMODE(namespace_details.st_mode) != 0o700
         ):
             return "unavailable"
-    except OSError:
+        catalog = read_hot_state_reconcile_catalog(namespace_root)
+    except (OSError, RuntimeError):
         return "unavailable"
 
-    try:
-        with os.scandir(namespace_root) as entries:
-            for entry in entries:
-                if not (
-                    entry.name.startswith(HOT_STATE_RETIREMENT_RECORD_PREFIX)
-                    and entry.name.endswith(HOT_STATE_RETIREMENT_RECORD_SUFFIX)
-                ):
-                    continue
+    cursor = int(catalog["cursor_ticket_sequence"])
+    initial_next_ticket = int(catalog["next_ticket_sequence"])
+    processed = 0
+    outcome = "nothing_eligible"
+
+    while (
+        processed < HOT_STATE_RECONCILE_TICKETS_PER_PASS
+        and cursor < initial_next_ticket
+    ):
+        ticket_sequence = cursor + 1
+        cursor = ticket_sequence
+        processed += 1
+        try:
+            ticket = read_hot_state_reconcile_ticket(
+                namespace_root, ticket_sequence
+            )
+        except (OSError, RuntimeError):
+            ticket = None
+        if ticket is None:
+            continue
+
+        kind = ticket["kind"]
+        state_identity = ticket["state_identity"]
+        name = ticket["name"]
+        assert isinstance(kind, str)
+        assert isinstance(state_identity, str)
+        assert isinstance(name, str)
+
+        if kind == "creating":
+            stage = namespace_root / name
+            if not stage.exists():
                 try:
-                    record, _ = read_private_json(
-                        namespace_root / entry.name,
-                        "hot-state retirement record",
+                    remove_hot_state_reconcile_ticket(
+                        namespace_root, ticket_sequence
                     )
-                    validate_retirement_record(record)
-                    state_identity = record["state_identity"]
-                    retired_name = record["retired_name"]
-                    assert isinstance(state_identity, str)
-                    assert isinstance(retired_name, str)
-                    if entry.name != retirement_record_name(
-                        retired_name, state_identity
-                    ):
-                        continue
-                    delete_retired_state_bounded(
-                        namespace_root, retired_name, state_identity
-                    )
-                    try:
-                        remove_hot_state_value_record(
-                            namespace_root, state_identity
-                        )
-                    except (OSError, RuntimeError):
-                        pass
-                    return "retirement_record_recovery"
                 except (OSError, RuntimeError):
-                    continue
-    except OSError:
-        return "unavailable"
-
-    try:
-        with os.scandir(namespace_root) as entries:
-            for entry in entries:
-                if not entry.name.startswith(HOT_STATE_CREATING_PREFIX):
-                    continue
-                suffix = entry.name.removeprefix(HOT_STATE_CREATING_PREFIX)
-                state_identity, separator, _ = suffix.partition("-")
-                if separator and state_identity_name(state_identity):
-                    if delete_unpublished_stage_bounded(
-                        namespace_root, entry.name, state_identity
-                    ):
-                        return "creating_recovery"
-                    return "creating_recovery_deferred"
-    except OSError:
-        return "unavailable"
-
-    try:
-        with os.scandir(namespace_root) as entries:
-            for entry in entries:
-                if not entry.name.startswith(HOT_STATE_RETIRED_PREFIX):
-                    continue
-                state_identity = entry.name.removeprefix(HOT_STATE_RETIRED_PREFIX)
-                if state_identity_name(state_identity):
-                    try:
-                        delete_retired_state_bounded(
-                            namespace_root, entry.name, state_identity
-                        )
-                        try:
-                            remove_hot_state_value_record(
-                                namespace_root, state_identity
-                            )
-                        except (OSError, RuntimeError):
-                            pass
-                    except RuntimeError:
-                        return "retired_recovery_deferred"
-                    return "retired_recovery"
-    except OSError:
-        return "unavailable"
-
-    try:
-        with os.scandir(namespace_root) as entries:
-            for entry in entries:
-                if (
-                    entry.name == current_state_identity
-                    or not state_identity_name(entry.name)
-                ):
-                    continue
-                state = namespace_root / entry.name
-                state_descriptor: int | None = None
+                    pass
+                continue
+            if delete_unpublished_stage_bounded(
+                namespace_root, name, state_identity
+            ):
                 try:
-                    details = entry.stat(follow_symlinks=False)
-                    if (
-                        not stat.S_ISDIR(details.st_mode)
-                        or stat.S_ISLNK(details.st_mode)
-                        or details.st_uid != os.getuid()
-                        or stat.S_IMODE(details.st_mode) != 0o700
-                        or details.st_dev != namespace_details.st_dev
-                    ):
-                        continue
-                    state_descriptor = os.open(
-                        state,
-                        os.O_RDONLY
-                        | os.O_DIRECTORY
-                        | os.O_CLOEXEC
-                        | os.O_NOFOLLOW,
+                    remove_hot_state_reconcile_ticket(
+                        namespace_root, ticket_sequence
                     )
-                    pinned_state = os.fstat(state_descriptor)
-                    if (
-                        pinned_state.st_dev != details.st_dev
-                        or pinned_state.st_ino != details.st_ino
-                        or pinned_state.st_uid != os.getuid()
-                        or stat.S_IMODE(pinned_state.st_mode) != 0o700
-                    ):
-                        continue
-                    manifest, encoded_before = read_producer_manifest(
-                        state_descriptor, entry.name
-                    )
-                    if manifest_generation_reachable(manifest) is not False:
-                        continue
-                    locks = acquire_retirement_locks(state)
-                    if locks is None:
-                        continue
-                    try:
-                        try:
-                            manifest_after, encoded_after = read_producer_manifest(
-                                state_descriptor, entry.name
-                            )
-                        except (OSError, RuntimeError):
-                            continue
-                        try:
-                            named_state = state.stat(follow_symlinks=False)
-                        except OSError:
-                            continue
-                        if (
-                            encoded_after != encoded_before
-                            or manifest_generation_reachable(manifest_after)
-                            is not False
-                            or not retirement_locks_unchanged(locks)
-                            or named_state.st_dev != pinned_state.st_dev
-                            or named_state.st_ino != pinned_state.st_ino
-                        ):
-                            continue
-                        retired_name = (
-                            f"{HOT_STATE_RETIRED_PREFIX}{entry.name}"
-                        )
-                        try:
-                            rename_noreplace(
-                                state, namespace_root / retired_name
-                            )
-                        except FileExistsError:
-                            continue
-                        except OSError:
-                            continue
-                        fsync_directory(namespace_root)
-                    finally:
-                        close_retirement_locks(locks)
-                    try:
-                        remove_hot_state_value_record(
-                            namespace_root, entry.name
-                        )
-                    except (OSError, RuntimeError):
-                        pass
-                    delete_retired_state_bounded(
-                        namespace_root, retired_name, entry.name
-                    )
-                    return "retired_unreachable"
                 except (OSError, RuntimeError):
-                    continue
-                finally:
-                    if state_descriptor is not None:
-                        os.close(state_descriptor)
-    except OSError:
+                    pass
+                outcome = "creating_recovery"
+                break
+            requeue_hot_state_reconcile_ticket(namespace_root, ticket)
+            outcome = "creating_recovery_deferred"
+            break
+
+        if kind == "retired":
+            complete = delete_retired_state_bounded(
+                namespace_root, name, state_identity
+            )
+            if complete:
+                remove_generation_value_metadata(
+                    namespace_root, state_identity
+                )
+                try:
+                    remove_hot_state_reconcile_ticket(
+                        namespace_root, ticket_sequence
+                    )
+                except (OSError, RuntimeError):
+                    pass
+                outcome = "retired_recovery"
+            else:
+                requeue_hot_state_reconcile_ticket(
+                    namespace_root, ticket
+                )
+                outcome = "retired_recovery_deferred"
+            break
+
+        if state_identity == current_state_identity:
+            requeue_hot_state_reconcile_ticket(namespace_root, ticket)
+            continue
+
+        state = namespace_root / state_identity
+        state_descriptor: int | None = None
+        try:
+            details = state.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            remove_generation_value_metadata(
+                namespace_root, state_identity
+            )
+            try:
+                remove_hot_state_reconcile_ticket(
+                    namespace_root, ticket_sequence
+                )
+            except (OSError, RuntimeError):
+                pass
+            continue
+        except OSError:
+            requeue_hot_state_reconcile_ticket(namespace_root, ticket)
+            continue
+
+        try:
+            if (
+                not stat.S_ISDIR(details.st_mode)
+                or stat.S_ISLNK(details.st_mode)
+                or details.st_uid != os.getuid()
+                or stat.S_IMODE(details.st_mode) != 0o700
+                or details.st_dev != namespace_details.st_dev
+            ):
+                remove_hot_state_reconcile_ticket(
+                    namespace_root, ticket_sequence
+                )
+                continue
+            state_descriptor = os.open(
+                state,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+            )
+            pinned_state = os.fstat(state_descriptor)
+            if (
+                pinned_state.st_dev != details.st_dev
+                or pinned_state.st_ino != details.st_ino
+                or pinned_state.st_uid != os.getuid()
+                or stat.S_IMODE(pinned_state.st_mode) != 0o700
+            ):
+                requeue_hot_state_reconcile_ticket(
+                    namespace_root, ticket
+                )
+                continue
+            manifest, encoded_before = read_producer_manifest(
+                state_descriptor, state_identity
+            )
+            if not manifest_has_full_execution_namespace_lease(manifest):
+                # Legacy state remains usable but never receives deletion
+                # authority from the new namespace-lease protocol.
+                remove_hot_state_reconcile_ticket(
+                    namespace_root, ticket_sequence
+                )
+                continue
+            reachable = manifest_generation_reachable(manifest)
+            if reachable is not False:
+                requeue_hot_state_reconcile_ticket(
+                    namespace_root, ticket
+                )
+                continue
+
+            try:
+                manifest_after, encoded_after = read_producer_manifest(
+                    state_descriptor, state_identity
+                )
+                named_state = state.stat(follow_symlinks=False)
+            except (OSError, RuntimeError):
+                requeue_hot_state_reconcile_ticket(
+                    namespace_root, ticket
+                )
+                continue
+            if (
+                encoded_after != encoded_before
+                or not manifest_has_full_execution_namespace_lease(
+                    manifest_after
+                )
+                or manifest_generation_reachable(manifest_after) is not False
+                or named_state.st_dev != pinned_state.st_dev
+                or named_state.st_ino != pinned_state.st_ino
+            ):
+                requeue_hot_state_reconcile_ticket(
+                    namespace_root, ticket
+                )
+                continue
+
+            retired_name = f"{HOT_STATE_RETIRED_PREFIX}{state_identity}"
+            enqueue_hot_state_reconcile_ticket(
+                namespace_root,
+                "retired",
+                state_identity,
+                retired_name,
+            )
+            try:
+                rename_noreplace(
+                    state, namespace_root / retired_name
+                )
+            except (FileExistsError, OSError):
+                requeue_hot_state_reconcile_ticket(
+                    namespace_root, ticket
+                )
+                continue
+            fsync_directory(namespace_root)
+            try:
+                remove_hot_state_reconcile_ticket(
+                    namespace_root, ticket_sequence
+                )
+            except (OSError, RuntimeError):
+                pass
+            remove_generation_value_metadata(
+                namespace_root, state_identity
+            )
+            delete_retired_state_bounded(
+                namespace_root, retired_name, state_identity
+            )
+            outcome = "retired_unreachable"
+            break
+        except (OSError, RuntimeError):
+            try:
+                requeue_hot_state_reconcile_ticket(
+                    namespace_root, ticket
+                )
+            except (OSError, RuntimeError):
+                pass
+        finally:
+            if state_descriptor is not None:
+                os.close(state_descriptor)
+
+    try:
+        latest = read_hot_state_reconcile_catalog(namespace_root)
+        write_hot_state_reconcile_catalog(
+            namespace_root,
+            {**latest, "cursor_ticket_sequence": cursor},
+        )
+    except (OSError, RuntimeError):
         return "unavailable"
+
+    if outcome != "nothing_eligible":
+        return outcome
+    if cursor < initial_next_ticket:
+        return "reconcile_scan_deferred"
     return "nothing_eligible"
+
 
 def prepare_private_copy(
     spec: CacheSpec, resident_cache: Path, destination: Path
