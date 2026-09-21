@@ -182,6 +182,7 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
             jit._validate_egress_guard_document(json.dumps(expected).encode() + b"\n")
 
     def test_egress_authority_requires_root_owned_exact_file(self):
+        self.egress_patch.stop()
         raw = jit.canonical({
             "class": jit.NETWORK.value,
             "document_type": jit.EGRESS_GUARD_DOCUMENT_TYPE,
@@ -258,6 +259,25 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
                     jit.prepare(arguments)
         self.assertTrue((self.admission / "reservation.json").exists())
         self.assertTrue(self.task_root.exists())
+
+    def test_direct_local_reservation_blocks_jit_prepare(self):
+        direct = admission.Reservation(
+            self.admission,
+            "sha256:" + "6" * 64,
+            "glaeda-verify-" + "6" * 32 + ".service",
+            "sha256:" + "5" * 64,
+        )
+        with direct:
+            with self.assertRaisesRegex(task.Refusal, "busy|recovery"):
+                jit.prepare(self.args("prepare"))
+            self.assertFalse(self.task_root.exists())
+            reservation = json.loads(
+                (self.admission / "reservation.json").read_bytes()
+            )
+            self.assertEqual(
+                reservation["command_fingerprint"],
+                "sha256:" + "6" * 64,
+            )
 
     def test_controller_restart_repairs_bounded_partial_preparation(self):
         arguments = self.args("prepare")
