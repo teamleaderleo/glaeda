@@ -148,7 +148,8 @@ Documentation-only changes follow the repository's docs-only verification policy
 
 ## Project documents
 
-- [`docs/COMPUTE_RUNTIME.md`](docs/COMPUTE_RUNTIME.md) — general compute-runtime boundary and typed workload seam.\n- [`docs/MULTI_ORCHESTRATOR_INTEROP.md`](docs/MULTI_ORCHESTRATOR_INTEROP.md) — caller/request/physical-lease interoperability for shared CMUX-owned hardware.
+- [`docs/COMPUTE_RUNTIME.md`](docs/COMPUTE_RUNTIME.md) — general compute-runtime boundary and typed workload seam.
+- [`docs/MULTI_ORCHESTRATOR_INTEROP.md`](docs/MULTI_ORCHESTRATOR_INTEROP.md) — caller/request/physical-lease interoperability for shared CMUX-owned hardware.
 - [`docs/BLAZINGLY_HOT.md`](docs/BLAZINGLY_HOT.md) — trusted residency and hot execution.
 - [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) — hostile/unknown execution boundary.
 - [`docs/AGENT_EXECUTION_SAFETY.md`](docs/AGENT_EXECUTION_SAFETY.md) — ownership, durable state, mutation, subprocess, and experiment safety.
