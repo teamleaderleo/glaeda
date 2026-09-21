@@ -1069,10 +1069,7 @@ impl AdaptiveVerificationCompilerReceipt {
                 }
             }
             if let Some(state_class) = candidate.reusable_state_class {
-                output.push_str(&format!(
-                    "reusable state class: {}\n",
-                    state_class.as_str()
-                ));
+                output.push_str(&format!("reusable state class: {}\n", state_class.as_str()));
             }
             output.push_str(&format!(
                 "evidence: {} observations\navoided work: {} ms\nrestore/transfer overhead: {} ms\npublication overhead: {} ms\ninvalidation/reset cost: {} ms\nestimated net: {} ms\nstorage: {} bytes\nhit frequency: {} bp\ntrials: {} ({} controlled, {} compatible successes)\nnext action: {}\n",
