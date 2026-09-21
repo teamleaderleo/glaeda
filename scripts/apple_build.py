@@ -521,9 +521,28 @@ def source_snapshot(plan):
     git = ["/usr/bin/git", "-C", str(plan["project"])]
     environment = base_environment()
     commit = probe([*git, "rev-parse", "HEAD"], environment)
-    if not re.fullmatch(r"[a-f0-9]{40,64}", commit):
-        raise Refusal("project HEAD identity is invalid")
-    return {"commit": commit, "clean": not bool(probe([*git, "status", "--porcelain"], environment))}
+    tree = probe([*git, "rev-parse", "HEAD^{tree}"], environment)
+    if (not re.fullmatch(r"[a-f0-9]{40,64}", commit)
+            or not re.fullmatch(r"[a-f0-9]{40,64}", tree)):
+        raise Refusal("project source identity is invalid")
+    return {"commit": commit, "tree": tree,
+            "clean": not bool(probe([*git, "status", "--porcelain"], environment))}
+
+
+def validate_source(plan, expected_commit=None, expected_tree=None, require_clean=False):
+    for value, subject in ((expected_commit, "commit"), (expected_tree, "tree")):
+        if value is not None and (not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{40,64}", value)):
+            raise Refusal("expected source " + subject + " is invalid")
+    if type(require_clean) is not bool:
+        raise Refusal("clean-source requirement must be boolean")
+    snapshot = source_snapshot(plan)
+    if expected_commit is not None and snapshot["commit"] != expected_commit:
+        raise Refusal("project HEAD does not match the expected source commit")
+    if expected_tree is not None and snapshot["tree"] != expected_tree:
+        raise Refusal("project HEAD does not match the expected source tree")
+    if require_clean and not snapshot["clean"]:
+        raise Refusal("project working tree does not satisfy the clean-source requirement")
+    return snapshot
 
 
 def native_work_summary(state, run_id):
@@ -566,10 +585,12 @@ def native_work_summary(state, run_id):
         return result
 
 
-def execute(plan, prepare_again=prepare, reuse_dependencies=False, wait_seconds=0):
+def execute(plan, prepare_again=prepare, reuse_dependencies=False, wait_seconds=0,
+            expected_commit=None, expected_tree=None, require_clean_source=False):
     if type(wait_seconds) is not int or not 0 <= wait_seconds <= 3600:
         raise Refusal("wait seconds must be an integer from 0 to 3600")
     entered = time.monotonic()
+    validate_source(plan, expected_commit, expected_tree, require_clean_source)
     inspect(plan)
     waiting = time.monotonic()
     with store(plan, create=True) as state, (lock(state, wait_seconds) if wait_seconds else lock(state)):
@@ -589,6 +610,10 @@ def execute(plan, prepare_again=prepare, reuse_dependencies=False, wait_seconds=
                 or fresh.get("invocation_identity") != plan.get("invocation_identity")
                 or fresh.get("lineage") != plan.get("lineage")):
             raise Refusal("build configuration or toolchain changed during admission")
+        source_before = validate_source(fresh, expected_commit, expected_tree, require_clean_source)
+        source_validation = ("exact_commit_tree_clean" if expected_commit is not None and expected_tree is not None
+                             and require_clean_source else "bounded_expectation" if expected_commit is not None
+                             or expected_tree is not None or require_clean_source else "observed_only")
         dependency_state = fresh.get("dependency_state")
         if reuse_dependencies and plan.get("operation") == "dependencies" and dependency_state and dependency_state["outputs"]:
             try:
@@ -602,9 +627,11 @@ def execute(plan, prepare_again=prepare, reuse_dependencies=False, wait_seconds=
                     and previous.get("dependency_state") == dependency_state):
                 if plan.get("lineage"):
                     write_json(state, "lineage-" + plan["lineage"]["lineage"] + ".json", plan["lineage"])
+                source_after = validate_source(fresh, expected_commit, expected_tree, require_clean_source)
                 return {**inspect(plan), "state": "preparation_reused", "exit_code": 0,
                         "validation": "declared_inputs_and_files_match", "native_build_validation_required": True,
-                        "elapsed_seconds": round(time.monotonic() - entered, 6)}
+                        "source_validation": source_validation, "source_before": source_before,
+                        "source_after": source_after, "elapsed_seconds": round(time.monotonic() - entered, 6)}
         caches, _ = directory(state, "cache", True)
         try:
             cache, made = directory(caches, plan["key"], True)
@@ -624,7 +651,6 @@ def execute(plan, prepare_again=prepare, reuse_dependencies=False, wait_seconds=
         if plan.get("lineage"):
             write_json(state, "lineage-" + plan["lineage"]["lineage"] + ".json", plan["lineage"])
         run_id = uuid.uuid4().hex
-        source_before = source_snapshot(plan)
         active = {"schema_version": 1, "run_id": run_id, "cache_key": plan["key"], "pgid": None,
                   "operation": plan.get("operation", "build")}
         write_json(state, "inflight.json", active)
@@ -654,10 +680,12 @@ def execute(plan, prepare_again=prepare, reuse_dependencies=False, wait_seconds=
                 raise Refusal("build descendants remain; state kept unfinished")
             if interrupted:
                 code = -interrupted[0]
+            source_after = validate_source(fresh, expected_commit, expected_tree, require_clean_source)
             receipt = {**inspect(plan), "state": "completed", "active_run": None, "run_id": run_id,
                        "exit_code": code if code >= 0 else 128 - code, "signal": -code if code < 0 else None,
                        "elapsed_seconds": round(time.monotonic() - started, 6), "validation": "native_command_ran",
-                       "source_before": source_before, "source_after": source_snapshot(plan)}
+                       "source_validation": source_validation,
+                       "source_before": source_before, "source_after": source_after}
             receipt["timings_seconds"] = {
                 "initial_observation": round(waiting - entered, 6),
                 "store_and_lock": round(admitted - waiting, 6),
@@ -776,6 +804,10 @@ def main():
     parser.add_argument("--wait-seconds", type=int, default=0, help="wait up to 3600 seconds for native execution admission; default refuses contention")
     parser.add_argument("--operation", choices=("check", "build", "dependencies"), help="operation for submit; default check")
     parser.add_argument("--request-id", help="exact id for request-status or forget-request")
+    parser.add_argument("--expected-commit", help="exact Git commit required immediately before and after native execution")
+    parser.add_argument("--expected-tree", help="exact Git tree required immediately before and after native execution")
+    parser.add_argument("--require-clean-source", action="store_true",
+                        help="require a clean Git worktree immediately before and after native execution")
     args = parser.parse_args()
     try:
         if (args.action == "recover") != bool(args.run_id):
@@ -788,6 +820,9 @@ def main():
             raise Refusal("--request-id is required only for request-status, forget-request or wait-request")
         if args.operation is not None and args.action != "submit":
             raise Refusal("--operation applies only to submit")
+        source_contract = args.expected_commit is not None or args.expected_tree is not None or args.require_clean_source
+        if source_contract and args.action not in ("check", "dependencies", "ensure-dependencies", "run", "warm"):
+            raise Refusal("exact source options apply only to direct native execution")
         if args.action in ("submit", "request-status", "forget-request", "requests", "wake", "wait-request", "plan-refresh", "refresh"):
             import apple_queue
             if args.action in ("plan-refresh", "refresh"):
@@ -814,7 +849,10 @@ def main():
         operation = "dependencies" if args.action in ("dependencies", "ensure-dependencies", "plan-dependencies") else "check" if args.action in ("check", "plan-check") else "build"
         plan = prepare(args.project, args.profile, args.generation, operation=operation)
         preparation_seconds = round(time.monotonic() - preparing, 6)
-        result = explain(plan) if args.action == "explain" else inspect(plan) if args.action in ("plan", "plan-dependencies", "plan-check") else recover(plan, args.run_id) if args.action == "recover" else execute(plan, reuse_dependencies=args.action == "ensure-dependencies", wait_seconds=args.wait_seconds)
+        result = explain(plan) if args.action == "explain" else inspect(plan) if args.action in ("plan", "plan-dependencies", "plan-check") else recover(plan, args.run_id) if args.action == "recover" else execute(
+            plan, reuse_dependencies=args.action == "ensure-dependencies", wait_seconds=args.wait_seconds,
+            expected_commit=args.expected_commit, expected_tree=args.expected_tree,
+            require_clean_source=args.require_clean_source)
         result["toolchain_and_profile_probe_seconds"] = preparation_seconds
         print(json.dumps(result, sort_keys=True))
         return result.get("exit_code", 0)
