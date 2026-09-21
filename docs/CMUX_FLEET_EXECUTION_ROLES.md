@@ -87,10 +87,11 @@ CPU / memory / disk capability classes
 capability generation
 current toolchain profiles
 declared capabilities
+current #1056 role acceptance identities (profile + receipt digest)
 fresh pressure classes
 ```
 
-The CPU, memory, and disk values are reviewed symbolic classes. They are node evidence, not caller-selected raw resource values.
+The CPU, memory, and disk values are reviewed symbolic classes. They are node evidence, not caller-selected raw resource values. The compact role-acceptance identities are projected with `fleet_acceptance_binding()` from a receipt that first passes #1056's closed `validate_acceptance_receipt()`; callers do not supply acceptance digests or role profiles.
 
 A role becomes eligible only when:
 
@@ -118,7 +119,7 @@ linux-rust-ci-2026-09
 
 The token represents the exact observed generation accepted by the canary. Mac compile/test work names the required profile explicitly.
 
-A toolchain/OS/Glaeda-relevant upgrade advances the node capability generation and replaces the current toolchain profile. Old role canaries then become stale automatically and routing reports `role_canary_pending` or `toolchain_canary_pending` until fresh acceptance exists.
+A toolchain/OS/Glaeda-relevant upgrade advances the node capability generation and replaces the current toolchain profile. A new #1056 role acceptance also changes the bound receipt digest/profile identity. Old role canaries then become stale automatically and routing reports the corresponding canary/acceptance reason until fresh acceptance exists.
 
 This allows one profile generation to be accepted while another generation remains ineligible.
 
@@ -303,6 +304,8 @@ Operators do not need task IDs, cgroup values, host paths, cache directories, pr
 - insufficient memory class;
 - insufficient CPU class;
 - failed role canary;
+- stale canary profile or acceptance-receipt digest;
+- fabricated current acceptance for a role that #1056 has not reviewed;
 - draining node;
 - role removed after upgrade/capability-generation change;
 - multiple roles sharing one scarce slot;
