@@ -466,4 +466,182 @@ def validate_unsigned_snapshot(
     if value["document_type"] != NODE_DOCUMENT or value["schema_version"] != SCHEMA_VERSION:
         raise SnapshotError("node snapshot version is unsupported")
     payload = exact_object(value["payload"], "node payload")
-    exact_keys(payload, {"authority", "freshness", "pr
+    exact_keys(payload, {"authority", "freshness", "producer", "node", "profiles", "projects", "requests"}, "node payload")
+    authority = exact_object(payload["authority"], "snapshot authority")
+    exact_keys(authority, {"advisory_only", "authorizes_dispatch", "authorizes_execution", "authorizes_host_selection", "authorizes_cleanup"}, "snapshot authority")
+    if authority != {
+        "advisory_only": True,
+        "authorizes_dispatch": False,
+        "authorizes_execution": False,
+        "authorizes_host_selection": False,
+        "authorizes_cleanup": False,
+    }:
+        raise SnapshotError("node snapshot carries authority")
+    freshness = exact_object(payload["freshness"], "snapshot freshness")
+    exact_keys(freshness, {"snapshot_sequence", "observed_at", "published_at", "producer_generation", "maximum_useful_age_seconds"}, "snapshot freshness")
+    integer(freshness["snapshot_sequence"], "snapshot sequence", 1, 2**63 - 1)
+    integer(freshness["producer_generation"], "producer generation", 1, 2**31 - 1)
+    max_age = integer(freshness["maximum_useful_age_seconds"], "maximum useful age", MIN_USEFUL_AGE_SECONDS, MAX_USEFUL_AGE_SECONDS)
+    observed = parse_time(freshness["observed_at"], "snapshot observed_at")
+    published = parse_time(freshness["published_at"], "snapshot published_at")
+    if published < observed:
+        raise SnapshotError("snapshot publication time is invalid")
+    if check_freshness:
+        now = now or dt.datetime.now(dt.UTC)
+        if now.tzinfo is None or now.utcoffset() != dt.timedelta(0):
+            raise SnapshotError("freshness clock must be UTC")
+        if observed > now + dt.timedelta(seconds=MAX_CLOCK_SKEW_SECONDS) or published > now + dt.timedelta(seconds=MAX_CLOCK_SKEW_SECONDS):
+            raise SnapshotError("snapshot timestamp is in the future")
+        if now - observed > dt.timedelta(seconds=max_age):
+            raise SnapshotError("snapshot is stale")
+
+    producer = exact_object(payload["producer"], "snapshot producer")
+    exact_keys(producer, {"glaeda_generation", "key_id"}, "snapshot producer")
+    bounded_string(producer["glaeda_generation"], SHA256_RE, "Glaeda generation")
+    key_id = bounded_string(producer["key_id"], KEY_RE, "producer key id")
+
+    node = exact_object(payload["node"], "snapshot node")
+    exact_keys(node, {"id", "os_class", "architecture_class", "glaeda_node_generation", "availability_class", "pressure_class", "capacity_class", "active_work_count"}, "snapshot node")
+    node_id = bounded_string(node["id"], NODE_RE, "snapshot node id")
+    reviewed = trust_node(trust, node_id)
+    if key_id != reviewed["key_id"]:
+        raise SnapshotError("snapshot key id disagrees with reviewed trust")
+    if node["os_class"] != reviewed["os_class"] or node["architecture_class"] != reviewed["architecture_class"]:
+        raise SnapshotError("snapshot node class disagrees with reviewed trust")
+    integer(node["glaeda_node_generation"], "Glaeda node generation", 1, 2**31 - 1)
+    if node["availability_class"] not in AVAILABILITY_CLASSES or node["pressure_class"] not in PRESSURE_CLASSES or node["capacity_class"] not in CAPACITY_CLASSES:
+        raise SnapshotError("snapshot node state class is invalid")
+    integer(node["active_work_count"], "active work count", 0, 32)
+
+    profiles = exact_list(payload["profiles"], "snapshot profiles", MAX_PROFILES)
+    profile_ids: set[str] = set()
+    for raw in profiles:
+        item = exact_object(raw, "snapshot profile")
+        exact_keys(item, {"id", "class", "generation"}, "snapshot profile")
+        profile_id = bounded_string(item["id"], PROFILE_RE, "snapshot profile id")
+        if profile_id in profile_ids:
+            raise SnapshotError("snapshot profile ids must be unique")
+        profile_ids.add(profile_id)
+        if not isinstance(item["class"], str) or len(item["class"]) > 48 or re.fullmatch(r"[a-z0-9_]+", item["class"]) is None:
+            raise SnapshotError("snapshot profile class is invalid")
+        bounded_string(item["generation"], SHA256_RE, "snapshot profile generation")
+
+    repositories = set(trust["repositories"])
+    projects = exact_list(payload["projects"], "snapshot projects", MAX_PROJECTS)
+    seen_projects: set[str] = set()
+    for raw in projects:
+        item = exact_object(raw, "snapshot project")
+        exact_keys(item, {"repository", "source", "heat_class", "verification_profiles", "dependency_build_state_class", "active_task_count", "recent_compatible_receipt_ref"}, "snapshot project")
+        repository = item["repository"]
+        if repository not in repositories or repository in seen_projects:
+            raise SnapshotError("snapshot project repository is invalid")
+        seen_projects.add(repository)
+        source = exact_object(item["source"], "snapshot project source")
+        exact_keys(source, {"commit_oid", "tree_oid"}, "snapshot project source")
+        bounded_string(source["commit_oid"], OID_RE, "snapshot project commit")
+        bounded_string(source["tree_oid"], OID_RE, "snapshot project tree")
+        if item["heat_class"] not in HEAT_CLASSES or item["dependency_build_state_class"] not in BUILD_STATE_CLASSES:
+            raise SnapshotError("snapshot project state class is invalid")
+        verification_profiles = exact_list(item["verification_profiles"], "snapshot project profiles", MAX_PROFILES)
+        if any(not isinstance(profile, str) or VERIFICATION_PROFILE_RE.fullmatch(profile) is None for profile in verification_profiles):
+            raise SnapshotError("snapshot project verification profile is invalid")
+        integer(item["active_task_count"], "snapshot project active task count", 0, 32)
+        if item["recent_compatible_receipt_ref"] is not None:
+            bounded_string(item["recent_compatible_receipt_ref"], SHA256_RE, "snapshot recent receipt")
+
+    requests = exact_list(payload["requests"], "snapshot requests", MAX_REQUESTS)
+    seen_requests: set[str] = set()
+    for raw in requests:
+        item = exact_object(raw, "snapshot request")
+        exact_keys(item, {"request_id", "source", "profile", "state", "terminal_receipt_ref", "elapsed_class", "estimate_class"}, "snapshot request")
+        request_id = bounded_string(item["request_id"], REQUEST_RE, "snapshot request id")
+        if request_id in seen_requests:
+            raise SnapshotError("snapshot request ids must be unique")
+        seen_requests.add(request_id)
+        source = exact_object(item["source"], "snapshot request source")
+        exact_keys(source, {"repository", "commit_oid", "tree_oid"}, "snapshot request source")
+        if source["repository"] not in repositories:
+            raise SnapshotError("snapshot request repository is invalid")
+        bounded_string(source["commit_oid"], OID_RE, "snapshot request commit")
+        bounded_string(source["tree_oid"], OID_RE, "snapshot request tree")
+        if item["profile"] not in profile_ids or item["state"] not in REQUEST_STATES:
+            raise SnapshotError("snapshot request state is invalid")
+        if item["elapsed_class"] not in DURATION_CLASSES or item["estimate_class"] not in DURATION_CLASSES:
+            raise SnapshotError("snapshot request duration class is invalid")
+        if item["state"] == "terminal":
+            bounded_string(item["terminal_receipt_ref"], SHA256_RE, "snapshot terminal receipt")
+        elif item["terminal_receipt_ref"] is not None:
+            raise SnapshotError("non-terminal snapshot request claims a terminal receipt")
+
+    if len(canonical_json(value)) > MAX_NODE_BYTES:
+        raise SnapshotError("node snapshot exceeds the byte ceiling")
+    return value
+
+
+def signing_environment() -> dict[str, str]:
+    return {"LC_ALL": "C"}
+
+
+def require_executable(path: Path, label: str) -> Path:
+    if not path.is_absolute():
+        raise SnapshotError(f"{label} must be an absolute path")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise SnapshotError(f"{label} is unavailable") from error
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise SnapshotError(f"{label} is unavailable")
+    return resolved
+
+
+def run_bounded(
+    argv: list[str],
+    *,
+    cwd: Path | None = None,
+    input_bytes: bytes | None = None,
+    env: dict[str, str] | None = None,
+    timeout: int = 10,
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        options: dict[str, object] = {
+            "cwd": cwd,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "check": False,
+            "timeout": timeout,
+            "env": env or {"LC_ALL": "C"},
+        }
+        if input_bytes is None:
+            options["stdin"] = subprocess.DEVNULL
+        else:
+            options["input"] = input_bytes
+        completed = subprocess.run(argv, **options)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SnapshotError("bounded subprocess failed") from error
+    if len(completed.stdout) > MAX_GIT_OUTPUT_BYTES or len(completed.stderr) > MAX_GIT_OUTPUT_BYTES:
+        raise SnapshotError("bounded subprocess output exceeded its ceiling")
+    return completed
+
+
+def sign_snapshot(
+    unsigned_value: object,
+    trust_value: object,
+    *,
+    private_key: Path,
+    ssh_keygen: Path = Path("/usr/bin/ssh-keygen"),
+) -> dict[str, object]:
+    trust = validate_trust(trust_value)
+    unsigned = validate_unsigned_snapshot(unsigned_value, trust, check_freshness=False)
+    node_id = unsigned["payload"]["node"]["id"]
+    reviewed = trust_node(trust, node_id)
+    key_id = reviewed["key_id"]
+    ssh_keygen = require_executable(ssh_keygen, "ssh-keygen")
+    private_key = private_key.resolve(strict=True)
+    if not private_key.is_file():
+        raise SnapshotError("snapshot signing key is unavailable")
+    if stat.S_IMODE(private_key.stat().st_mode) & 0o077:
+        raise SnapshotError("snapshot signing key permissions are too broad")
+    public = run_bounded(
+        [str(ssh_keygen), "-y", "-f", str(private_key)],
+        env=signing_environment(),
+ 
