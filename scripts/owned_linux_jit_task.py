@@ -253,6 +253,65 @@ def _validate_task_state(
     return root
 
 
+def _reservation(arguments: argparse.Namespace) -> admission.Reservation:
+    store = admission.Store(arguments.admission_root)
+    try:
+        with store.lock("policy.lock"):
+            current = admission.policy(store)
+            existing = store.read("reservation.json")
+        expected = {
+            "schema_version": 1,
+            "command_fingerprint": arguments.command_fingerprint,
+            "unit": arguments.unit,
+            "generation": current["generation"],
+            "binding_sha256": arguments.binding_sha256,
+        }
+        if existing is None:
+            return admission.Reservation(
+                arguments.admission_root,
+                arguments.command_fingerprint,
+                arguments.unit,
+                arguments.binding_sha256,
+            )
+        if existing == {**expected, "phase": "preparing"}:
+            return admission.Reservation.resume(
+                arguments.admission_root,
+                arguments.command_fingerprint,
+                arguments.unit,
+                arguments.binding_sha256,
+            )
+        raise task.Refusal("owned runner reservation requires recovery")
+    finally:
+        store.close()
+
+
+def _repairable_preparing_root(
+    root: Path, task_identity: str, identity: dict[str, object]
+) -> None:
+    info = root.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise task.Refusal("owned runner partial task root is unsafe")
+    allowed = {"work", "diag", "home", TASK_DOCUMENT}
+    for child in root.iterdir():
+        if child.name not in allowed or child.is_symlink():
+            raise task.Refusal("owned runner partial task contains unknown state")
+        child_info = child.stat(follow_symlinks=False)
+        if child_info.st_uid != os.getuid():
+            raise task.Refusal("owned runner partial task ownership changed")
+        if child.name == TASK_DOCUMENT:
+            if _task_document(root) != _expected_document(task_identity, identity):
+                raise task.Refusal("owned runner partial task identity changed")
+        elif (
+            not stat.S_ISDIR(child_info.st_mode)
+            or stat.S_IMODE(child_info.st_mode) != 0o700
+        ):
+            raise task.Refusal("owned runner partial task state is unsafe")
+
+
 def _reservation_phase(arguments: argparse.Namespace) -> str:
     store = admission.Store(arguments.admission_root)
     try:
@@ -278,22 +337,26 @@ def _reservation_phase(arguments: argparse.Namespace) -> str:
 def prepare(arguments: argparse.Namespace) -> int:
     task_identity, identity = _identity(arguments)
     root = _task_root(arguments)
-    reservation = admission.Reservation(
-        arguments.admission_root,
-        arguments.command_fingerprint,
-        arguments.unit,
-        arguments.binding_sha256,
-    )
+    reservation = _reservation(arguments)
     with reservation:
         try:
-            task.prepare_task(root)
-            for name in ("work", "diag", "home"):
-                (root / name).mkdir(mode=0o700)
-            _write_private(root / TASK_DOCUMENT, _expected_document(task_identity, identity))
+            if root.exists():
+                try:
+                    _validate_task_state(arguments, task_identity, identity)
+                except (task.Refusal, OSError, ValueError, json.JSONDecodeError):
+                    _repairable_preparing_root(root, task_identity, identity)
+                    task.remove_task(root)
+            if not root.exists():
+                task.prepare_task(root)
+                for name in ("work", "diag", "home"):
+                    (root / name).mkdir(mode=0o700)
+                _write_private(root / TASK_DOCUMENT, _expected_document(task_identity, identity))
             _validate_task_state(arguments, task_identity, identity)
         except BaseException:
             try:
-                task.remove_task(root)
+                if root.exists():
+                    _repairable_preparing_root(root, task_identity, identity)
+                    task.remove_task(root)
             finally:
                 reservation.release()
             raise
