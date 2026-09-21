@@ -456,6 +456,42 @@ class FleetTests(unittest.TestCase):
                 "eligible",
             )
 
+    def test_cmux_semantic_result_loader_requires_canonical_exact_bytes(self):
+        result = cmux_result()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "cmux-result.json"
+            raw = f.canonical(result)
+            path.write_bytes(raw)
+            loaded, exact_digest = f.load_cmux_semantic_result(path)
+            self.assertEqual(loaded, result)
+            self.assertEqual(
+                exact_digest,
+                "sha256:" + __import__("hashlib").sha256(raw).hexdigest(),
+            )
+            receipt = f.finalize_acceptance(
+                enrollment(),
+                "cmux_macos_native_build",
+                A,
+                loaded,
+                exact_digest,
+            )
+            self.assertEqual(receipt["cmuxSemanticResultSha256"], exact_digest)
+
+            path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(f.FleetError, "not canonical"):
+                f.load_cmux_semantic_result(path)
+
+    def test_cmux_semantic_result_loader_refuses_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "result.json"
+            target.write_bytes(f.canonical(cmux_result()))
+            alias = root / "alias.json"
+            alias.symlink_to(target)
+            with self.assertRaisesRegex(f.FleetError, "unavailable"):
+                f.load_cmux_semantic_result(alias)
+
     def test_fingerprint_is_canonical(self):
         e = enrollment()
         self.assertEqual(f.digest(copy.deepcopy(e)), f.digest(e))
