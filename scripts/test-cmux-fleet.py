@@ -67,12 +67,23 @@ def cmux_result(
     role="cmux_macos_native_build",
     *,
     state="passed",
-    cleanup_state="complete",
-    process_group_settled=True,
+    cleanup_state=None,
+    process_group_settled=None,
     profile=None,
 ):
     chosen_profile = dict(profile or f.ROLE_PROFILES[role])
-    return {
+    if cleanup_state is None:
+        cleanup_state = "forced" if state == "ambiguous" else "complete"
+    if process_group_settled is None:
+        process_group_settled = state != "ambiguous"
+    exit_code = {
+        "passed": 0,
+        "failed": 1,
+        "timed_out": 124,
+        "ambiguous": 0,
+    }[state]
+    observations = {"fixture": "cmux-test"}
+    result = {
         "document_type": f.CMUX_RESULT_DOCUMENT_TYPE,
         "schema_version": f.CMUX_RESULT_SCHEMA_VERSION,
         "source": {
@@ -85,17 +96,45 @@ def cmux_result(
         "expected_result_class": "cmux.fixture-result/v1",
         "result": state,
         "parameters": {},
+        "runtime_input_identities": [],
         "artifact_identities": [],
+        "validation": {
+            "missing_required_artifact_classes": [],
+        },
+        "stage_timings": [{"stage": "test", "seconds": 1.25}],
+        "resource_summary": {
+            "resource_class": "cmux-fixture",
+            "cpu_count": 4,
+            "memory_bytes": 16 * 1024**3,
+            "architecture": "arm64" if role == "cmux_macos_native_build" else "x86_64",
+        },
+        "toolchain": {
+            "identity": f.cmux_digest(observations),
+            "observations": observations,
+        },
         "benchmark": {
             "state_class": "cold",
             "semantic_comparison_key": A,
             "comparison_context_key": B,
         },
+        "network_class": "none",
+        "timeout_class": "fixture",
         "cleanup": {
             "state": cleanup_state,
             "process_group_settled": process_group_settled,
         },
+        "exit_code": exit_code,
+        "started_at_unix_millis": 1000,
+        "ended_at_unix_millis": 2250,
     }
+    semantic = f._cmux_semantic_key(result)
+    result["benchmark"]["semantic_comparison_key"] = semantic
+    result["benchmark"]["comparison_context_key"] = f._cmux_context_key(
+        semantic,
+        "cold",
+        result["toolchain"]["identity"],
+    )
+    return result
 
 
 def finalized(enrollment_value, role=None, *, result=None, toolchain=A):
@@ -235,10 +274,7 @@ class FleetTests(unittest.TestCase):
         e = enrollment()
         receipt = finalized(
             e,
-            result=cmux_result(
-                cleanup_state="forced",
-                process_group_settled=False,
-            ),
+            result=cmux_result(state="ambiguous"),
         )
         self.assertEqual(receipt["result"], "rejected")
         self.assertEqual(receipt["processSettlement"], "incomplete")
@@ -256,6 +292,40 @@ class FleetTests(unittest.TestCase):
                 self.assertEqual(receipt["result"], "rejected")
                 self.assertEqual(receipt["cmuxSemanticResultState"], state)
                 self.assertFalse(f.node_status(e, [receipt])["routingCandidateEligible"])
+
+    def test_cmux_semantic_result_rejects_inconsistent_evidence(self):
+        e = enrollment()
+        cases = []
+
+        extra = cmux_result()
+        extra["unexpected"] = True
+        cases.append(("unknown or missing", extra))
+
+        toolchain = cmux_result()
+        toolchain["toolchain"]["observations"]["fixture"] = "changed"
+        cases.append(("toolchain identity", toolchain))
+
+        semantic = cmux_result()
+        semantic["benchmark"]["semantic_comparison_key"] = D
+        cases.append(("semantic comparison", semantic))
+
+        passed_forced = cmux_result()
+        passed_forced["cleanup"] = {
+            "state": "forced",
+            "process_group_settled": False,
+        }
+        cases.append(("terminal CMUX result", passed_forced))
+
+        missing = cmux_result()
+        missing["validation"]["missing_required_artifact_classes"] = [
+            "cmux.required/v1"
+        ]
+        cases.append(("passed CMUX result", missing))
+
+        for message, result in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(f.FleetError, message):
+                    finalized(e, result=result)
 
     def test_linux_fixture_can_be_eligible(self):
         e = enrollment("linux")
@@ -471,6 +541,7 @@ class FleetTests(unittest.TestCase):
             path = root / "cmux-result.json"
             raw = f.canonical(result)
             path.write_bytes(raw)
+            path.chmod(0o600)
             loaded, exact_digest = f.load_cmux_semantic_result(path)
             self.assertEqual(loaded, result)
             self.assertEqual(
@@ -490,11 +561,20 @@ class FleetTests(unittest.TestCase):
             with self.assertRaisesRegex(f.FleetError, "not canonical"):
                 f.load_cmux_semantic_result(path)
 
+    def test_cmux_semantic_result_loader_requires_private_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "result.json"
+            path.write_bytes(f.canonical(cmux_result()))
+            path.chmod(0o644)
+            with self.assertRaisesRegex(f.FleetError, "unsafe"):
+                f.load_cmux_semantic_result(path)
+
     def test_cmux_semantic_result_loader_refuses_symlink(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             target = root / "result.json"
             target.write_bytes(f.canonical(cmux_result()))
+            target.chmod(0o600)
             alias = root / "alias.json"
             alias.symlink_to(target)
             with self.assertRaisesRegex(f.FleetError, "unavailable"):
