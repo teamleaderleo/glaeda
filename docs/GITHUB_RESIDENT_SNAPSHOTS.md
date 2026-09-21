@@ -354,7 +354,7 @@ Canonical repository identity (including its GitHub owner component), exact Git 
 
 ## Measurements and experiment counters
 
-The contract test prints exact serialized bytes for a representative signed node and one-node fleet on the hosted runner. The fixed ceilings are 16 KiB/node and 128 KiB/fleet.
+Hosted contract run 35588972518 on exact head `5a8db07fe6d70fc42dc384ad0261a71c9a19dfe7` measured a representative signed node at **2,262 bytes** and the corresponding one-node fleet file at **2,340 bytes**. The fixed ceilings remain 16 KiB/node and 128 KiB/fleet.
 
 Transport/accounting properties are deterministic from the protocol:
 
