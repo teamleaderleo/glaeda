@@ -80,7 +80,9 @@ jobs:
               Path("scripts/test-owned-linux-jit-task.py"),
               Path("scripts/cmux_fleet.py"),
               Path("scripts/cmux_fleet_bootstrap.py"),
+              Path("scripts/cmux_execution_roles.py"),
               Path("scripts/test-cmux-fleet.py"),
+              Path("scripts/test-cmux-execution-roles.py"),
               Path("scripts/test-cmux-fleet-bootstrap.py"),
               Path("scripts/cmux_workload_request.py"),
               Path("scripts/test-cmux-workload-request.py"),
@@ -126,6 +128,7 @@ jobs:
           python3 scripts/test-owned-linux-jit-task.py
           python3 scripts/test-cmux-fleet.py
           python3 scripts/test-cmux-fleet-bootstrap.py
+          python3 scripts/test-cmux-execution-roles.py
           python3 scripts/test-cmux-workload-request.py
           python3 scripts/test-verify.py
           python3 scripts/test-verify-changed-rustfmt.py
