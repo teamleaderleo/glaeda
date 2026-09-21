@@ -73,7 +73,7 @@ It then projects the CMUX terminal vocabulary without redefining profile semanti
 - `timed_out` -> `timed_out`;
 - `ambiguous` -> `ambiguous`.
 
-The outer observation stores the exact CMUX result digest. Glaeda-specific machine and execution evidence belongs beside that digest in the physical receipt.
+The outer observation stores the exact CMUX result digest. Fleet acceptance uses `glaeda-cmux-fleet-acceptance/v2`: after the CMUX workload finishes, Glaeda requires a fresh read-only bootstrap observation matching the enrolled capability/toolchain and durably records that bootstrap digest together with the CMUX environment class/toolchain identity.
 
 ## Fleet roles and routing
 
