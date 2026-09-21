@@ -17,8 +17,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SOURCE_REPOSITORY: APIDevTools/swagger-parser
-  SOURCE_COMMIT: b86714364809f4806728d80c24771859e3224a4e
+  SOURCE_REPOSITORY: teamleaderleo/scrawlix
+  SOURCE_COMMIT: 4babfd97df26089186538479b02c994fcad73635
   NODE_VERSION: 22.19.0
   PNPM_VERSION: 12.5.1
   LOOP_IMAGE_BYTES: "34359738368"
@@ -86,7 +86,7 @@ jobs:
             method: auto
             repetitions: 10
             store_policy: readonly
-            probe_script: test:node
+            probe_script: validate:corpora
             expected_mechanism: copy_observed
             must_succeed: "true"
           - mode: composed
@@ -94,7 +94,7 @@ jobs:
             method: clone
             repetitions: 10
             store_policy: readonly
-            probe_script: test:node
+            probe_script: validate:corpora
             expected_mechanism: reflink_observed
             must_succeed: "true"
 
@@ -113,11 +113,24 @@ jobs:
 
       - name: Install exact pnpm
         run: |
-          npm install --global "pnpm@${PNPM_VERSION}"
+          set -euo pipefail
+          archive="$RUNNER_TEMP/pnpm-linux-x64.tar.gz"
+          tool_root="$RUNNER_TEMP/pnpm-${PNPM_VERSION}"
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            "https://github.com/pnpm/pnpm/releases/download/v${PNPM_VERSION}/pnpm-linux-x64.tar.gz"
+          echo "5a397dfb6b3d4b07d3d7769586aeb471048faf04299a492e2808b95a9a1c701f  $archive" |
+            sha256sum -c -
+          mkdir -p "$tool_root"
+          tar -xzf "$archive" -C "$tool_root"
+          PNPM_BIN="$(find "$tool_root" -type f -name pnpm -print -quit)"
+          test -n "$PNPM_BIN"
+          chmod u+x "$PNPM_BIN"
           test "$(node --version)" = "v${NODE_VERSION}"
-          test "$(pnpm --version)" = "${PNPM_VERSION}"
+          test "$("$PNPM_BIN" --version)" = "${PNPM_VERSION}"
           printf 'NODE_BIN=%s\n' "$(dirname "$(command -v node)")" >> "$GITHUB_ENV"
-          printf 'PNPM_BIN=%s\n' "$(command -v pnpm)" >> "$GITHUB_ENV"
+          printf 'PNPM_BIN=%s\n' "$PNPM_BIN" >> "$GITHUB_ENV"
+          printf 'PNPM_ARCHIVE_SHA256=%s\n' "sha256:5a397dfb6b3d4b07d3d7769586aeb471048faf04299a492e2808b95a9a1c701f" >> "$GITHUB_ENV"
 
       - name: Validate benchmark contract
         run: python3 scripts/test-benchmark-pnpm-task-dependencies.py
@@ -136,7 +149,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          for command in git jq losetup mount umount mountpoint findmnt truncate mkfs.ext4 sync sha256sum; do
+          for command in git jq losetup mount umount mountpoint findmnt truncate mkfs.ext4 sync sha256sum curl tar; do
             command -v "$command" >/dev/null
           done
           if test "$FILESYSTEM" = xfs; then
@@ -212,6 +225,39 @@ jobs:
           sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" checkout -q --detach FETCH_HEAD
           test "$(sudo -u "$BENCH_USER" git -C "$SOURCE" rev-parse HEAD)" = "$SOURCE_COMMIT"
 
+          SOURCE_BASE_COMMIT="$SOURCE_COMMIT"
+          sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" \
+            python3 - "$SOURCE/package.json" "$PNPM_VERSION" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          version = sys.argv[2]
+          document = json.loads(path.read_text(encoding="utf-8"))
+          document["packageManager"] = f"pnpm@{version}"
+          path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+          PY
+          sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" diff --check
+          test "$(sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" diff --name-only)" = "package.json"
+          sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" add package.json
+          SOURCE_TOOLCHAIN_PATCH_SHA256="sha256:$(sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" diff --cached --binary | sha256sum | awk '{print $1}')"
+          sudo -u "$BENCH_USER" env -i \
+            HOME="$BENCH_HOME" \
+            PATH="$NODE_BIN:/usr/bin:/bin" \
+            GIT_AUTHOR_NAME="Glaeda physical benchmark" \
+            GIT_AUTHOR_EMAIL="benchmark@invalid" \
+            GIT_AUTHOR_DATE="2000-01-01T00:00:00Z" \
+            GIT_COMMITTER_NAME="Glaeda physical benchmark" \
+            GIT_COMMITTER_EMAIL="benchmark@invalid" \
+            GIT_COMMITTER_DATE="2000-01-01T00:00:00Z" \
+            git -C "$SOURCE" commit -q --no-gpg-sign -m "benchmark: pin pnpm $PNPM_VERSION"
+          SOURCE_COMMIT="$(sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" rev-parse HEAD)"
+          test "$(sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" rev-parse HEAD^)" = "$SOURCE_BASE_COMMIT"
+          test -z "$(sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" status --porcelain=v1 --untracked-files=all)"
+          SOURCE_MANIFEST_PACKAGE_MANAGER="$(sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" jq -r .packageManager "$SOURCE/package.json")"
+          test "$SOURCE_MANIFEST_PACKAGE_MANAGER" = "pnpm@$PNPM_VERSION"
+
           sudo -u "$BENCH_USER" env -i             HOME="$BENCH_HOME"             PATH="$NODE_BIN:/usr/bin:/bin"             NPM_CONFIG_USERCONFIG=/dev/null             PNPM_CONFIG_VIRTUAL_STORE_TYPE=project             bash -c 'cd "$1" && exec "$2" install --frozen-lockfile --ignore-scripts --virtual-store-dir=node_modules/.pnpm'             bash "$SOURCE" "$PNPM_BIN"
 
           STORE="$(sudo -u "$BENCH_USER" env -i             HOME="$BENCH_HOME"             PATH="$NODE_BIN:/usr/bin:/bin"             NPM_CONFIG_USERCONFIG=/dev/null             PNPM_CONFIG_VIRTUAL_STORE_TYPE=project             bash -c 'cd "$1" && exec "$2" store path --silent'             bash "$SOURCE" "$PNPM_BIN")"
@@ -233,7 +279,7 @@ jobs:
           fi
           STORE_STAT="$(sudo stat -c 'uid=%u gid=%g mode=%a device=%d inode=%i' "$STORE")"
 
-          jq -n             --arg benchmark_head "$BENCHMARK_HEAD"             --arg source_repository "$SOURCE_REPOSITORY"             --arg source_commit "$SOURCE_COMMIT"             --arg source_tree "$SOURCE_TREE"             --arg mode "$MODE"             --arg filesystem "$FILESYSTEM"             --arg import_method "$IMPORT_METHOD"             --arg probe_script "$PROBE_SCRIPT"             --arg expected_mechanism "$EXPECTED_MECHANISM"             --arg store_policy "$STORE_POLICY"             --arg kernel "$(uname -srvm)"             --arg runner_image "${ImageOS:-unknown}"             --arg node "$(node --version)"             --arg npm "$(npm --version)"             --arg pnpm "$(pnpm --version)"             --arg git "$(git --version)"             --arg mkfs_version "$MKFS_VERSION"             --arg mount_info "$MOUNT_INFO"             --arg fs_detail "$FS_DETAIL"             --arg store_stat "$STORE_STAT"             --arg protected_hardlinks "$(sysctl -n fs.protected_hardlinks 2>/dev/null || printf unknown)"             --argjson loop_image_bytes "$LOOP_IMAGE_BYTES"             --argjson repetitions "$REPETITIONS"             '{
+          jq -n             --arg benchmark_head "$BENCHMARK_HEAD"             --arg source_repository "$SOURCE_REPOSITORY"             --arg source_base_commit "$SOURCE_BASE_COMMIT"             --arg source_commit "$SOURCE_COMMIT"             --arg source_tree "$SOURCE_TREE"             --arg source_toolchain_patch_sha256 "$SOURCE_TOOLCHAIN_PATCH_SHA256"             --arg source_manifest_package_manager "$SOURCE_MANIFEST_PACKAGE_MANAGER"             --arg mode "$MODE"             --arg filesystem "$FILESYSTEM"             --arg import_method "$IMPORT_METHOD"             --arg probe_script "$PROBE_SCRIPT"             --arg expected_mechanism "$EXPECTED_MECHANISM"             --arg store_policy "$STORE_POLICY"             --arg kernel "$(uname -srvm)"             --arg runner_image "${ImageOS:-unknown}"             --arg node "$(node --version)"             --arg npm "$(npm --version)"             --arg pnpm "$("$PNPM_BIN" --version)"             --arg pnpm_archive_sha256 "$PNPM_ARCHIVE_SHA256"             --arg git "$(git --version)"             --arg mkfs_version "$MKFS_VERSION"             --arg mount_info "$MOUNT_INFO"             --arg fs_detail "$FS_DETAIL"             --arg store_stat "$STORE_STAT"             --arg protected_hardlinks "$(sysctl -n fs.protected_hardlinks 2>/dev/null || printf unknown)"             --argjson loop_image_bytes "$LOOP_IMAGE_BYTES"             --argjson repetitions "$REPETITIONS"             '{
               schema_version: 1,
               document_type: "glaeda-pnpm-hosted-physical-control",
               authority: "performance_observation_only",
@@ -241,14 +287,18 @@ jobs:
               mode: $mode,
               source: {
                 repository: $source_repository,
+                base_commit: $source_base_commit,
                 commit: $source_commit,
                 tree: $source_tree,
+                toolchain_patch_sha256: $source_toolchain_patch_sha256,
+                manifest_package_manager: $source_manifest_package_manager,
                 probe_script: $probe_script
               },
               toolchain: {
                 node: $node,
                 npm: $npm,
                 pnpm: $pnpm,
+                pnpm_archive_sha256: $pnpm_archive_sha256,
                 git: $git
               },
               filesystem: {
@@ -343,7 +393,7 @@ jobs:
             jq -e               --arg fs "$FILESYSTEM"               --arg commit "$SOURCE_COMMIT"               --arg pnpm "$PNPM_VERSION"               --argjson repetitions "$REPETITIONS"               '.source.commit == $commit and
                .pnpm.version == $pnpm and
                .pnpm.virtual_store_type == "project" and
-               .samples[0].filesystem_before.filesystem_type == $fs and
+               all(.samples[]; .filesystem_before.filesystem_type == $fs) and
                (.samples | length) == $repetitions'               "$receipt" >/dev/null
 
             if test "$MUST_SUCCEED" = true; then

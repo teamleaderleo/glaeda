@@ -95,22 +95,24 @@ Summary distributions publish p50/p90/p99 over successful samples. Explicit `clo
 
 ## Hosted Linux physical control
 
-`.github/workflows/pnpm-task-dependency-physical-control.yml` supplies a disposable GitHub-hosted Linux control for this benchmark. It is a control plane for physical evidence, not the resident-project promotion environment.
+`.github/workflows/pnpm-task-dependency-physical-control.yml` supplies a disposable GitHub-hosted Linux control for this benchmark. It is a control plane for physical evidence, outside the resident-project promotion environment.
 
 The workflow pins:
 
 - benchmark code to the pull-request head or dispatched commit;
 - Node 22.19.0 and pnpm 12.5.1;
-- the real `APIDevTools/swagger-parser` repository at commit `b86714364809f4806728d80c24771859e3224a4e`;
+- pnpm's official immutable `pnpm-linux-x64.tar.gz` release asset at SHA-256 `5a397dfb6b3d4b07d3d7769586aeb471048faf04299a492e2808b95a9a1c701f`;
+- the trusted `teamleaderleo/scrawlix` repository at upstream commit `4babfd97df26089186538479b02c994fcad73635`;
+- one deterministic local metadata-only commit that changes Scrawlix's `packageManager` pin from pnpm 10.34.5 to pnpm 12.5.1, with the upstream parent, derived commit/tree, patch digest, and resulting manifest value recorded in every host receipt;
 - 32 GiB sparse loop images with either ext4 or XFS `reflink=1`;
 - one benchmark user whose home, resident pnpm store, source, scratch, and results live on the selected filesystem;
-- no package-manager network access during measured installs.
+- package-manager network access only during source/store preparation; measured installs remain offline and frozen-store.
 
 The full matrix runs `auto`, `hardlink`, and `clone` at widths 1/8/32 with 20 repetitions. The explicit XFS clone arm must prove reflink in every successful task; hardlink controls must prove shared inodes. The ext4 clone arm may produce a failed treatment receipt when the filesystem cannot satisfy explicit clone semantics.
 
-A second real-repository composition makes the prehydrated resident store root-owned and read-only. With Linux protected-hardlink policy recorded, it compares ext4 `auto` expected to fall through to private copies against XFS explicit `clone`, then runs the same `test:node` repository probe at widths 1/8/32 for 10 repetitions. This supplies task-ready, first-command, first-test, FIEMAP/nlink, filesystem free-space, visible `st_blocks`, backing-allocation, and cleanup receipts in one bounded path.
+A second real-repository composition makes the prehydrated resident store root-owned and read-only. With Linux protected-hardlink policy recorded, it compares ext4 `auto` expected to fall through to private copies against XFS explicit `clone`, then runs Scrawlix `validate:corpora` at widths 1/8/32 for 10 repetitions. Repository code starts only after the benchmark's task-private/CoW dependency proof. The receipts therefore combine task-ready, first-command, first-relevant-script, FIEMAP/nlink, filesystem free-space, visible `st_blocks`, backing-allocation, and cleanup observations in one bounded path.
 
-Every job records kernel/tool/filesystem/source identities, syncs the mounted filesystem before backing-file allocation measurement, unmounts the loop filesystem, detaches the loop device, deletes the sparse image, and removes the benchmark user. The workflow installs no filesystem packages; missing ext4/XFS tooling is an explicit control failure.
+Every job records kernel/tool/filesystem/source identities, validates every sample against the selected filesystem, syncs the mounted filesystem before backing-file allocation measurement, unmounts the loop filesystem, detaches the loop device, deletes the sparse image, and removes the benchmark user. The workflow installs no filesystem packages; missing ext4/XFS tooling is an explicit control failure.
 
 GitHub-hosted results remain a platform control. Product promotion still requires the reviewed resident-Linux project-disk path, including the existing project ownership/recovery gates.
 
