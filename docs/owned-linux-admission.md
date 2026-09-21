@@ -1,14 +1,21 @@
-# Focused owned-Linux admission
+# Shared fixed-envelope owned-Linux admission
 
-The local `verify-focused run --admission-root <installed-private-root>` path adds a physical
-launch gate to the existing verifier. An installed adapter supplies this root; a connected request
-must never select, override, or omit it. The dispatch v2 focused capability forwards this fixed local
-option. Ordinary local verification without the option retains its existing behavior.
+The machine-wide slot owner is the checked-in canonical root
+`/var/lib/glaeda/owned-linux-admission-v1`. Installation creates that exact
+current-user 0700 directory and its policy document. Production semantic adapters
+share this one root; a request never selects another coordination namespace.
 
-The gate admits only `verify-focused/v1`: four CPUs, 8 GiB MemoryMax, and the existing fixed
-TasksMax and deadline. It reserves one job in the installed root before source preparation and
-retains that slot through physical settlement, task cleanup, and terminal receipt publication.
-The slot is compute capacity state, not another work queue or execution/result identity.
+The local `verify-focused run --admission-root ...` argument remains an installed-adapter
+wiring mechanism for the existing verifier and production installation supplies the canonical
+root. The GitHub Actions JIT adapter has no admission-root argument and imports the canonical
+root directly. Ordinary local verification without admission retains its existing behavior.
+
+The gate owns one fixed coexist envelope: four CPUs and 8 GiB MemoryMax, with the existing
+TasksMax policy and an adapter-owned bounded deadline. `verify-focused/v1` and the initial
+owner-trusted GitHub Actions profile both fit this exact grant. It reserves one job in the
+canonical root before task-private runner/source preparation and retains that slot through
+physical settlement, cleanup, and terminal publication. The slot is compute capacity state,
+not another work queue or execution/result identity.
 
 Immediately around the existing `Popen`, the gate locks local operator policy, observes the host
 through the pinned `glaeda-host-observe` binary, and calls the pinned `glaeda-local-admission`
@@ -29,7 +36,8 @@ No preemption, VM controls, network widening, or arbitrary commands are added.
 ## Operator control and installation boundary
 
 Installation is a separate protected action; this change does not install a policy or service.
-The installation must provide a private 0700 exact directory containing canonical UTF-8 JSON
+The installation must provide the exact canonical root
+`/var/lib/glaeda/owned-linux-admission-v1` as a private current-user 0700 directory containing canonical UTF-8 JSON
 `policy.json` (sorted keys, compact separators, newline; regular 0600 single-link file):
 
 - `schema_version`: integer 1.
@@ -44,9 +52,9 @@ The installation must provide a private 0700 exact directory containing canonica
 Use the serialized control path, never edit policy behind an active launch transaction:
 
 ```bash
-python3 scripts/owned-admission-control --root <installed-private-root> held
-python3 scripts/owned-admission-control --root <installed-private-root> draining
-python3 scripts/owned-admission-control --root <installed-private-root> available
+python3 scripts/owned-admission-control --root /var/lib/glaeda/owned-linux-admission-v1 held
+python3 scripts/owned-admission-control --root /var/lib/glaeda/owned-linux-admission-v1 draining
+python3 scripts/owned-admission-control --root /var/lib/glaeda/owned-linux-admission-v1 available
 ```
 
 Control refuses busy while the short check/spawn transaction is active. Retry after observing the
@@ -80,13 +88,18 @@ pre-launch cleanup, real disposable child settlement, immutable replay, filesyst
 protocol binding, and bounded helper output. These are local child tests with fixture host facts;
 they do not prove systemd/bubblewrap verification or a regular ChatGPT journey.
 
-The next consumer change must pin this reviewed gate in the dispatch capability and resident
-adapter, then prove named physical verification, capability revocation, restart recovery, two
-requests, and timing. Service/capability installation requires its own concrete reviewed action.
+Every production consumer of this fixed envelope must use the canonical root or import an
+already-held reservation from the future shared lease owner. Separate roots are forbidden because
+they can double-admit the same physical capacity. The JIT regression suite includes a collision
+fixture in which a direct/local reservation already holds the canonical slot and the Actions path
+refuses before assignment-private runner state or JIT launch exists.
+
+Service/capability installation and migration of older installed roots remain concrete protected
+operator actions.
 
 ## Pending-before-launch observation
 
-`python3 scripts/owned-admission-observe --root <installed-private-root>` returns a bounded
+`python3 scripts/owned-admission-observe --root /var/lib/glaeda/owned-linux-admission-v1` returns a bounded
 `glaeda-owned-admission-observation` v1 JSON snapshot. It creates no lock, reservation, journal
 or directory. All authority fields are false. A consumer may leave a request pending when
 `outcome` is `wait`: `node_held`, `node_draining`, `pressure_high`, `capacity_unavailable`, or
