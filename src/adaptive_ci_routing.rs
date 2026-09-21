@@ -1024,7 +1024,7 @@ fn predict_pool(
     let projected_allowance_remaining_ppm = candidate
         .allowance
         .as_ref()
-        .map(|allowance| allowance.projected_remaining_ppm(allowance_units.p50));
+        .map(|allowance| allowance.projected_remaining_ppm(allowance_units.p90));
 
     Ok(PoolPredictionV1 {
         pool_id: candidate.pool.pool_id.clone(),
@@ -1083,7 +1083,7 @@ fn policy_exclusion(
     }
     if policy
         .spend_ceiling_microusd
-        .is_some_and(|ceiling| prediction.marginal_cost_microusd.p50 > ceiling)
+        .is_some_and(|ceiling| prediction.marginal_cost_microusd.p90 > ceiling)
     {
         return Some(PoolExclusionReason::SpendCeiling);
     }
