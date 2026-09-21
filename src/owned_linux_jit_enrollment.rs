@@ -161,8 +161,8 @@ fn build_enrollment(
     let state_root = PathBuf::from(&wire.state_root);
     let bridge_digest =
         Sha256Digest::parse(&wire.bridge.program_digest).map_err(|_| invalid_configuration())?;
-    let helper_digest =
-        Sha256Digest::parse(&wire.owned_linux.helper_sha256).map_err(|_| invalid_configuration())?;
+    let helper_digest = Sha256Digest::parse(&wire.owned_linux.helper_sha256)
+        .map_err(|_| invalid_configuration())?;
     let payload_tree_digest = Sha256Digest::parse(&wire.owned_linux.payload_tree_sha256)
         .map_err(|_| invalid_configuration())?;
     let private_key_digest = Sha256Digest::parse(&wire.github.private_key_sha256)
@@ -209,9 +209,11 @@ fn build_enrollment(
         generation,
     )
     .map_err(|_| invalid_configuration())?;
-    let host_storage =
-        DisposableHostStorage::new(PathBuf::from(&wire.owned_linux.task_root), resources.disk_bytes())
-            .map_err(|_| invalid_configuration())?;
+    let host_storage = DisposableHostStorage::new(
+        PathBuf::from(&wire.owned_linux.task_root),
+        resources.disk_bytes(),
+    )
+    .map_err(|_| invalid_configuration())?;
     let runner_runtime = DisposableRunnerRuntime::new_owned_linux(runtime.clone());
 
     Ok(OwnedLinuxJitEnrollment {
