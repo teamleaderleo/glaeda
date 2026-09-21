@@ -53,6 +53,7 @@ HOT_STATE_NAMESPACE_LEASE_PROTOCOL = "full_execution_shared_namespace_v1"
 HOT_STATE_MANIFEST = "producer-manifest.json"
 HOT_STATE_MANIFEST_STAGING_PREFIX = ".producer-manifest.json.creating-"
 HOT_STATE_NAMESPACE_LOCK = ".namespace-lock"
+HOT_STATE_VALUE_LOCK = ".value-lock-v2"
 HOT_STATE_CREATING_PREFIX = ".creating-v1-"
 HOT_STATE_RETIRED_PREFIX = ".retired-v1-"
 HOT_STATE_RETIREMENT_RECORD_PREFIX = ".retirement-v1-"
@@ -2193,13 +2194,22 @@ def record_successful_hot_state_use(
     runtime_contract: RuntimeContract | None,
     resource_profile: str | None,
     observation: ExecutionObservation,
+    namespace_lease_fd: int | None = None,
 ) -> str:
-    namespace_lock = open_private_lock(
-        namespace_root / HOT_STATE_NAMESPACE_LOCK,
-        "hot-state namespace lock",
-    )
+    owned_namespace_lease: int | None = None
+    value_lock: int | None = None
     try:
-        fcntl.flock(namespace_lock, fcntl.LOCK_EX)
+        if namespace_lease_fd is None:
+            owned_namespace_lease = open_private_lock(
+                namespace_root / HOT_STATE_NAMESPACE_LOCK,
+                "hot-state namespace lock",
+            )
+            fcntl.flock(owned_namespace_lease, fcntl.LOCK_SH)
+        value_lock = open_private_lock(
+            namespace_root / HOT_STATE_VALUE_LOCK,
+            "hot-state value writer lock",
+        )
+        fcntl.flock(value_lock, fcntl.LOCK_EX)
         namespace_details = namespace_root.stat(follow_symlinks=False)
         state_details = state_base.stat(follow_symlinks=False)
         if (
@@ -2328,7 +2338,10 @@ def record_successful_hot_state_use(
                 pass
         return "recorded"
     finally:
-        os.close(namespace_lock)
+        if value_lock is not None:
+            os.close(value_lock)
+        if owned_namespace_lease is not None:
+            os.close(owned_namespace_lease)
 
 def hot_state_filesystem_used_percent(namespace_root: Path) -> tuple[int, int]:
     details = os.statvfs(namespace_root)
@@ -4634,10 +4647,6 @@ def run(
             ),
             observation_consumer=execution_observations.append,
         )
-        if namespace_lock_fd is not None:
-            fcntl.flock(namespace_lock_fd, fcntl.LOCK_UN)
-            os.close(namespace_lock_fd)
-            namespace_lock_fd = None
         if (
             exit_code == 0
             and implicit_worktree_identity is not None
@@ -4654,6 +4663,7 @@ def run(
                     runtime_contract,
                     resource_profile,
                     execution_observations[0],
+                    namespace_lock_fd,
                 )
             except (OSError, RuntimeError):
                 use_disposition = "record_unavailable"
@@ -4662,6 +4672,10 @@ def run(
                     f"hot-run: lifecycle-success={use_disposition}",
                     file=sys.stderr,
                 )
+        if namespace_lock_fd is not None:
+            fcntl.flock(namespace_lock_fd, fcntl.LOCK_UN)
+            os.close(namespace_lock_fd)
+            namespace_lock_fd = None
         return exit_code
     finally:
         for descriptor in reversed(cache_source_fds):
