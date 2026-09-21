@@ -1281,6 +1281,12 @@ def inspect_receipt(raw: bytes) -> dict[str, object]:
         reconstructed = _request_from_receipt(value)
         if request_sha256(reconstructed) != digest:
             raise ContractRefusal("invalid_receipt", "semantic receipt request digest does not match its request")
+        expected_resolution = compile_request(reconstructed).resolved_operation
+        if value["resolved_operation"] != expected_resolution:
+            raise ContractRefusal(
+                "invalid_receipt",
+                "semantic receipt resolution does not match its request",
+            )
     result = value.get("result")
     expected_result_digest = _result_digest(result)
     if value.get("result_sha256") != expected_result_digest:
