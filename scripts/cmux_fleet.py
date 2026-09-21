@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 ENROLLMENT_SCHEMA = "glaeda-cmux-fleet-enrollment/v1"
-ACCEPTANCE_EVIDENCE_SCHEMA = "glaeda-cmux-fleet-acceptance-evidence/v1"
 ACCEPTANCE_SCHEMA = "glaeda-cmux-fleet-acceptance/v1"
 STATUS_SCHEMA = "glaeda-cmux-fleet-node-status/v1"
 BOOTSTRAP_SCHEMA = "glaeda-cmux-fleet-bootstrap/v1"
@@ -38,6 +37,14 @@ ROLES = (
 ENROLLABLE_ROLES = {
     "cmux_linux_ci",
     "cmux_macos_native_build",
+}
+CMUX_REPOSITORY = "manaflow-ai/cmux"
+CMUX_RESULT_DOCUMENT_TYPE = "cmux-workload-result"
+CMUX_RESULT_SCHEMA_VERSION = 1
+CMUX_RESULT_STATES = {"passed", "failed", "timed_out", "ambiguous"}
+ROLE_PROFILES = {
+    "cmux_linux_ci": {"id": "cmux.ci.guard", "generation": 1},
+    "cmux_macos_native_build": {"id": "cmux.macos.dev-check", "generation": 1},
 }
 STATES = ("discovered", "enrolling", "eligible", "draining", "quarantined", "retired")
 QUARANTINE_REASONS = (
@@ -66,16 +73,10 @@ TRANSITIONS = {
 }
 ENROLLMENT_KEYS = {
     "schema", "nodeId", "architecture", "os", "hardwareCapabilityClass",
-    "supportedToolchainGenerations", "roleWorkloadGenerations",
+    "supportedToolchainGenerations", "roleProfiles",
     "allowedExecutionRoles", "operatorFleetScope",
     "enrollmentGeneration", "glaedaGeneration", "state", "quarantineReason",
 }
-ACCEPTANCE_EVIDENCE_KEYS = {
-    "schema", "nodeId", "enrollmentGeneration", "role", "source",
-    "toolchainGeneration", "glaedaGeneration", "workloadGeneration", "checks",
-}
-CHECK_KEYS = {"workload", "semanticVerifier", "artifact", "processSettlement"}
-
 
 class FleetError(RuntimeError):
     """A closed fleet enrollment/status refusal."""
@@ -145,16 +146,15 @@ def validate_enrollment(value: object) -> dict[str, Any]:
     roles = sorted_unique_strings(doc["allowedExecutionRoles"], "allowed execution roles", allowed=set(ROLES))
     if not roles:
         raise FleetError("at least one execution role is required")
-    workload_generations = doc["roleWorkloadGenerations"]
-    if (
-        not isinstance(workload_generations, dict)
-        or set(workload_generations) != set(roles)
-        or any(
-            not isinstance(value, str) or SHA256_RE.fullmatch(value) is None
-            for value in workload_generations.values()
-        )
-    ):
-        raise FleetError("role workload generations must exactly cover allowed roles")
+    role_profiles = doc["roleProfiles"]
+    if not isinstance(role_profiles, dict) or set(role_profiles) != set(roles):
+        raise FleetError("role profiles must exactly cover allowed roles")
+    for role in roles:
+        profile = exact_keys(role_profiles[role], {"id", "generation"}, "role profile")
+        token(profile["id"], "role profile id")
+        positive_int(profile["generation"], "role profile generation")
+        if profile != ROLE_PROFILES.get(role):
+            raise FleetError(f"role {role} profile is not the reviewed v1 profile")
     unreviewed = [role for role in roles if role not in ENROLLABLE_ROLES]
     if unreviewed:
         raise FleetError(
@@ -206,7 +206,7 @@ def enrollment_from_bootstrap(
         "supportedToolchainGenerations": [
             bootstrap_value.get("toolchainGeneration")
         ],
-        "roleWorkloadGenerations": bootstrap_value.get("roleWorkloadGenerations"),
+        "roleProfiles": bootstrap_value.get("roleProfiles"),
         "allowedExecutionRoles": bootstrap_value.get("roles"),
         "operatorFleetScope": operator_fleet_scope,
         "enrollmentGeneration": enrollment_generation,
@@ -217,33 +217,53 @@ def enrollment_from_bootstrap(
     return validate_enrollment(enrollment)
 
 
-def validate_acceptance_evidence(value: object) -> dict[str, Any]:
-    doc = exact_keys(value, ACCEPTANCE_EVIDENCE_KEYS, "acceptance evidence")
-    if doc["schema"] != ACCEPTANCE_EVIDENCE_SCHEMA:
-        raise FleetError("acceptance evidence schema is unsupported")
-    if not isinstance(doc["nodeId"], str) or NODE_RE.fullmatch(doc["nodeId"]) is None:
-        raise FleetError("acceptance nodeId is invalid")
-    positive_int(doc["enrollmentGeneration"], "acceptance enrollment generation")
-    if doc["role"] not in ENROLLABLE_ROLES:
-        raise FleetError("acceptance role lacks a reviewed v1 workload")
-    source = exact_keys(doc["source"], {"repository", "commit"}, "source")
-    if not isinstance(source["repository"], str) or REPOSITORY_RE.fullmatch(source["repository"]) is None:
-        raise FleetError("source repository is invalid")
-    if not isinstance(source["commit"], str) or COMMIT_RE.fullmatch(source["commit"]) is None:
-        raise FleetError("source commit is invalid")
-    sha256(doc["toolchainGeneration"], "acceptance toolchain generation")
-    sha256(doc["glaedaGeneration"], "acceptance Glaeda generation")
-    sha256(doc["workloadGeneration"], "acceptance workload generation")
-    checks = exact_keys(doc["checks"], CHECK_KEYS, "acceptance checks")
-    if any(v not in {"pass", "fail"} for v in checks.values()):
-        raise FleetError("acceptance checks must be pass or fail")
-    return doc
+def validate_cmux_semantic_result(
+    value: object,
+    expected_profile: dict[str, object],
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise FleetError("CMUX semantic result is not an object")
+    if (
+        value.get("document_type") != CMUX_RESULT_DOCUMENT_TYPE
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != CMUX_RESULT_SCHEMA_VERSION
+        or value.get("result") not in CMUX_RESULT_STATES
+    ):
+        raise FleetError("CMUX semantic result contract is unsupported")
+    source = exact_keys(value.get("source"), {"repository", "commit", "tree"}, "CMUX semantic source")
+    if source["repository"] != CMUX_REPOSITORY:
+        raise FleetError("CMUX semantic source repository is invalid")
+    if (
+        not isinstance(source["commit"], str)
+        or COMMIT_RE.fullmatch(source["commit"]) is None
+        or not isinstance(source["tree"], str)
+        or COMMIT_RE.fullmatch(source["tree"]) is None
+    ):
+        raise FleetError("CMUX semantic source commit/tree is invalid")
+    profile = exact_keys(value.get("profile"), {"id", "generation"}, "CMUX semantic profile")
+    token(profile["id"], "CMUX semantic profile id")
+    positive_int(profile["generation"], "CMUX semantic profile generation")
+    if profile != expected_profile:
+        raise FleetError("CMUX semantic profile differs from enrolled role profile")
+    if value.get("parameters") != {}:
+        raise FleetError("CMUX fleet acceptance profile parameters must be empty")
+    benchmark = value.get("benchmark")
+    if not isinstance(benchmark, dict) or benchmark.get("state_class") != "cold":
+        raise FleetError("CMUX fleet acceptance must use cold benchmark state")
+    cleanup = value.get("cleanup")
+    if (
+        not isinstance(cleanup, dict)
+        or cleanup.get("state") not in {"complete", "forced"}
+        or type(cleanup.get("process_group_settled")) is not bool
+    ):
+        raise FleetError("CMUX semantic cleanup evidence is invalid")
+    return value
 
 
 ACCEPTANCE_RECEIPT_KEYS = {
-    "schema", "nodeId", "enrollmentGeneration", "role", "source",
-    "toolchainGeneration", "glaedaGeneration", "workloadGeneration", "checks",
-    "result", "evidenceSha256",
+    "schema", "nodeId", "enrollmentGeneration", "role", "source", "profile",
+    "toolchainGeneration", "glaedaGeneration", "cmuxSemanticResultSha256",
+    "cmuxSemanticResultState", "processSettlement", "result",
 }
 
 
@@ -253,52 +273,44 @@ def validate_acceptance_receipt(value: object) -> dict[str, Any]:
         raise FleetError("acceptance receipt schema is unsupported")
     if not isinstance(doc["nodeId"], str) or NODE_RE.fullmatch(doc["nodeId"]) is None:
         raise FleetError("acceptance receipt nodeId is invalid")
-    positive_int(
-        doc["enrollmentGeneration"],
-        "acceptance receipt enrollment generation",
-    )
-    if doc["role"] not in ENROLLABLE_ROLES:
-        raise FleetError("acceptance receipt role lacks a reviewed v1 workload")
+    positive_int(doc["enrollmentGeneration"], "acceptance receipt enrollment generation")
+    role = doc["role"]
+    if role not in ENROLLABLE_ROLES:
+        raise FleetError("acceptance receipt role lacks a reviewed v1 profile")
     source = exact_keys(
         doc["source"],
-        {"repository", "commit"},
+        {"repository", "commit", "tree"},
         "acceptance receipt source",
     )
-    if (
-        not isinstance(source["repository"], str)
-        or REPOSITORY_RE.fullmatch(source["repository"]) is None
-    ):
+    if source["repository"] != CMUX_REPOSITORY:
         raise FleetError("acceptance receipt source repository is invalid")
     if (
         not isinstance(source["commit"], str)
         or COMMIT_RE.fullmatch(source["commit"]) is None
+        or not isinstance(source["tree"], str)
+        or COMMIT_RE.fullmatch(source["tree"]) is None
     ):
-        raise FleetError("acceptance receipt source commit is invalid")
-    sha256(
-        doc["toolchainGeneration"],
-        "acceptance receipt toolchain generation",
-    )
-    sha256(
-        doc["glaedaGeneration"],
-        "acceptance receipt Glaeda generation",
-    )
-    sha256(
-        doc["workloadGeneration"],
-        "acceptance receipt workload generation",
-    )
-    sha256(doc["evidenceSha256"], "acceptance evidence digest")
-    checks = exact_keys(
-        doc["checks"],
-        CHECK_KEYS,
-        "acceptance receipt checks",
-    )
-    if any(value not in {"pass", "fail"} for value in checks.values()):
-        raise FleetError("acceptance receipt checks must be pass or fail")
+        raise FleetError("acceptance receipt source commit/tree is invalid")
+    profile = exact_keys(doc["profile"], {"id", "generation"}, "acceptance receipt profile")
+    token(profile["id"], "acceptance receipt profile id")
+    positive_int(profile["generation"], "acceptance receipt profile generation")
+    if profile != ROLE_PROFILES.get(role):
+        raise FleetError("acceptance receipt profile is not the reviewed role profile")
+    sha256(doc["toolchainGeneration"], "acceptance receipt toolchain generation")
+    sha256(doc["glaedaGeneration"], "acceptance receipt Glaeda generation")
+    sha256(doc["cmuxSemanticResultSha256"], "CMUX semantic result digest")
+    if doc["cmuxSemanticResultState"] not in CMUX_RESULT_STATES:
+        raise FleetError("CMUX semantic result state is invalid")
+    if doc["processSettlement"] not in {"complete", "incomplete"}:
+        raise FleetError("acceptance process settlement is invalid")
     if doc["result"] not in {"accepted", "rejected"}:
         raise FleetError("acceptance receipt result is invalid")
-    all_pass = all(value == "pass" for value in checks.values())
-    if (doc["result"] == "accepted") != all_pass:
-        raise FleetError("acceptance receipt result disagrees with checks")
+    accepted = (
+        doc["cmuxSemanticResultState"] == "passed"
+        and doc["processSettlement"] == "complete"
+    )
+    if (doc["result"] == "accepted") != accepted:
+        raise FleetError("acceptance receipt result disagrees with semantic result")
     return doc
 
 
@@ -313,40 +325,50 @@ def acceptance_matches_enrollment(enrollment: dict[str, Any], receipt: dict[str,
         return False, "acceptance_glaeda_stale"
     if receipt.get("toolchainGeneration") not in enrollment["supportedToolchainGenerations"]:
         return False, "acceptance_toolchain_stale"
-    if receipt.get("workloadGeneration") != enrollment["roleWorkloadGenerations"].get(role):
-        return False, "acceptance_workload_stale"
+    if receipt.get("profile") != enrollment["roleProfiles"].get(role):
+        return False, "acceptance_profile_stale"
     return True, "accepted"
 
 
-def finalize_acceptance(enrollment_value: object, evidence_value: object) -> dict[str, Any]:
+def finalize_acceptance(
+    enrollment_value: object,
+    role: str,
+    toolchain_generation: str,
+    cmux_result_value: object,
+) -> dict[str, Any]:
     enrollment = validate_enrollment(enrollment_value)
-    evidence = validate_acceptance_evidence(evidence_value)
-    if evidence["nodeId"] != enrollment["nodeId"]:
-        raise FleetError("acceptance node identity differs from enrollment")
-    if evidence["enrollmentGeneration"] != enrollment["enrollmentGeneration"]:
-        raise FleetError("acceptance enrollment generation differs from current enrollment")
-    if evidence["role"] not in enrollment["allowedExecutionRoles"]:
+    if role not in enrollment["allowedExecutionRoles"]:
         raise FleetError("acceptance role is outside the enrollment allowlist")
-    if evidence["toolchainGeneration"] not in enrollment["supportedToolchainGenerations"]:
+    if toolchain_generation not in enrollment["supportedToolchainGenerations"]:
         raise FleetError("acceptance toolchain generation is outside the enrollment allowlist")
-    if evidence["glaedaGeneration"] != enrollment["glaedaGeneration"]:
-        raise FleetError("acceptance Glaeda generation differs from current enrollment")
-    if evidence["workloadGeneration"] != enrollment["roleWorkloadGenerations"].get(evidence["role"]):
-        raise FleetError("acceptance workload generation differs from current enrollment")
-    result = "accepted" if all(v == "pass" for v in evidence["checks"].values()) else "rejected"
+    expected_profile = enrollment["roleProfiles"][role]
+    semantic = validate_cmux_semantic_result(cmux_result_value, expected_profile)
+    cleanup = semantic["cleanup"]
+    settlement = (
+        "complete"
+        if cleanup["state"] == "complete" and cleanup["process_group_settled"] is True
+        else "incomplete"
+    )
+    result = (
+        "accepted"
+        if semantic["result"] == "passed" and settlement == "complete"
+        else "rejected"
+    )
     receipt = {
         "schema": ACCEPTANCE_SCHEMA,
-        "nodeId": evidence["nodeId"],
-        "enrollmentGeneration": evidence["enrollmentGeneration"],
-        "role": evidence["role"],
-        "source": evidence["source"],
-        "toolchainGeneration": evidence["toolchainGeneration"],
-        "glaedaGeneration": evidence["glaedaGeneration"],
-        "workloadGeneration": evidence["workloadGeneration"],
-        "checks": evidence["checks"],
+        "nodeId": enrollment["nodeId"],
+        "enrollmentGeneration": enrollment["enrollmentGeneration"],
+        "role": role,
+        "source": semantic["source"],
+        "profile": semantic["profile"],
+        "toolchainGeneration": toolchain_generation,
+        "glaedaGeneration": enrollment["glaedaGeneration"],
+        "cmuxSemanticResultSha256": digest(semantic),
+        "cmuxSemanticResultState": semantic["result"],
+        "processSettlement": settlement,
         "result": result,
-        "evidenceSha256": digest(evidence),
     }
+    validate_acceptance_receipt(receipt)
     if len(canonical(receipt)) > MAX_STATUS_BYTES:
         raise FleetError("acceptance receipt exceeds size ceiling")
     return receipt
@@ -387,7 +409,7 @@ def node_status(enrollment_value: object, acceptance_values: list[object]) -> di
             "supportedToolchainGenerations": enrollment[
                 "supportedToolchainGenerations"
             ],
-            "roleWorkloadGenerations": enrollment["roleWorkloadGenerations"],
+            "roleProfiles": enrollment["roleProfiles"],
             "glaedaGeneration": enrollment["glaedaGeneration"],
             "operatorFleetScope": enrollment["operatorFleetScope"],
         },
@@ -703,7 +725,9 @@ def parser() -> argparse.ArgumentParser:
     ta.add_argument("--acceptance", action="append", type=Path, default=[])
     a = sub.add_parser("finalize-acceptance")
     a.add_argument("enrollment", type=Path)
-    a.add_argument("evidence", type=Path)
+    a.add_argument("cmux_result", type=Path)
+    a.add_argument("--role", required=True, choices=sorted(ENROLLABLE_ROLES))
+    a.add_argument("--toolchain-generation", required=True)
     return p
 
 
@@ -746,7 +770,14 @@ def main() -> int:
                 )
             )
         elif args.command == "finalize-acceptance":
-            emit(finalize_acceptance(enrollment, load(args.evidence)))
+            emit(
+                finalize_acceptance(
+                    enrollment,
+                    args.role,
+                    args.toolchain_generation,
+                    load(args.cmux_result),
+                )
+            )
         else:
             raise FleetError("unsupported command")
         return 0
