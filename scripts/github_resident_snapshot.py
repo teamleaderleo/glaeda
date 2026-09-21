@@ -853,4 +853,253 @@ def unknown_node(entry: dict[str, Any], reason: str) -> dict[str, object]:
         "active_work_count": None,
         "glaeda_generation": None,
         "profiles": [],
-    
+        "projects": [],
+        "requests": [],
+    }
+
+
+def bounded_reason(error: Exception) -> str:
+    message = str(error)
+    if "stale" in message:
+        return "stale"
+    if "signature" in message or "key" in message:
+        return "untrusted"
+    if "future" in message:
+        return "future_timestamp"
+    return "invalid"
+
+
+def consume_fleet(
+    fleet_value: object,
+    trust_value: object,
+    *,
+    now: dt.datetime,
+    ssh_keygen: Path = Path("/usr/bin/ssh-keygen"),
+) -> dict[str, object]:
+    trust = validate_trust(trust_value)
+    try:
+        fleet = validate_fleet(fleet_value)
+        raw_nodes = fleet["nodes"]
+    except SnapshotError:
+        raw_nodes = []
+    result_nodes: list[dict[str, object]] = []
+    for trusted in trust["nodes"]:
+        candidates = [item for item in raw_nodes if raw_snapshot_node_id(item) == trusted["id"]]
+        if len(candidates) != 1:
+            result_nodes.append(unknown_node(trusted, "missing" if len(candidates) == 0 else "duplicate"))
+            continue
+        try:
+            snapshot = validate_signed_snapshot(candidates[0], trust, now=now, ssh_keygen=ssh_keygen)
+        except SnapshotError as error:
+            result_nodes.append(unknown_node(trusted, bounded_reason(error)))
+            continue
+        payload = snapshot["payload"]
+        node = payload["node"]
+        result_nodes.append({
+            "id": node["id"],
+            "os_class": node["os_class"],
+            "architecture_class": node["architecture_class"],
+            "freshness_class": "fresh",
+            "reason": "verified",
+            "availability_class": node["availability_class"],
+            "pressure_class": node["pressure_class"],
+            "capacity_class": node["capacity_class"],
+            "active_work_count": node["active_work_count"],
+            "glaeda_generation": payload["producer"]["glaeda_generation"],
+            "profiles": payload["profiles"],
+            "projects": payload["projects"],
+            "requests": payload["requests"],
+        })
+    return {
+        "document_type": VIEW_DOCUMENT,
+        "schema_version": SCHEMA_VERSION,
+        "observed_at": format_time(now),
+        "authority": {"advisory_only": True, "authorizes_dispatch": False, "authorizes_execution": False},
+        "nodes": result_nodes,
+    }
+
+
+def git_environment() -> dict[str, str]:
+    env = {"LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0", "PATH": "/usr/bin:/bin"}
+    for key in ("HOME", "SSH_AUTH_SOCK"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    return env
+
+
+def git_call(
+    git: Path,
+    repository_root: Path,
+    arguments: list[str],
+    *,
+    input_bytes: bytes | None = None,
+    extra_env: dict[str, str] | None = None,
+    timeout: int = 20,
+) -> subprocess.CompletedProcess[bytes]:
+    env = git_environment()
+    if extra_env:
+        env.update(extra_env)
+    return run_bounded(
+        [str(git), "-c", "core.hooksPath=/dev/null", *arguments],
+        cwd=repository_root,
+        input_bytes=input_bytes,
+        env=env,
+        timeout=timeout,
+    )
+
+
+def remote_fleet(
+    git: Path,
+    repository_root: Path,
+    remote: str,
+    branch: str,
+) -> tuple[str | None, dict[str, object]]:
+    fetch = git_call(git, repository_root, ["fetch", "--quiet", "--no-tags", remote, f"refs/heads/{branch}"])
+    if fetch.returncode != 0:
+        text = fetch.stderr.decode("utf-8", errors="replace")
+        if "couldn't find remote ref" in text or "could not find remote ref" in text:
+            return None, empty_fleet()
+        raise SnapshotError("GitHub status fetch failed")
+    head = git_call(git, repository_root, ["rev-parse", "FETCH_HEAD"])
+    if head.returncode != 0:
+        raise SnapshotError("GitHub status head is unavailable")
+    sha = head.stdout.decode("ascii", errors="strict").strip()
+    if OID_RE.fullmatch(sha) is None:
+        raise SnapshotError("GitHub status head is invalid")
+    content = git_call(git, repository_root, ["show", f"{sha}:{STATUS_FILE}"])
+    if content.returncode != 0 or len(content.stdout) > MAX_FLEET_BYTES:
+        raise SnapshotError("GitHub status file is unavailable")
+    try:
+        fleet = json.loads(content.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SnapshotError("GitHub status file is invalid") from error
+    return sha, validate_fleet(fleet)
+
+
+def create_status_commit(
+    git: Path,
+    repository_root: Path,
+    fleet: dict[str, object],
+    parent: str | None,
+    node_id: str,
+) -> str:
+    fleet_bytes = canonical_json(fleet)
+    blob = git_call(git, repository_root, ["hash-object", "-w", "--stdin"], input_bytes=fleet_bytes)
+    if blob.returncode != 0:
+        raise SnapshotError("Git object creation failed")
+    blob_sha = blob.stdout.decode("ascii", errors="strict").strip()
+    if OID_RE.fullmatch(blob_sha) is None:
+        raise SnapshotError("Git blob identity is invalid")
+    tree_line = f"100644 blob {blob_sha}\t{STATUS_FILE}\n".encode("ascii")
+    tree = git_call(git, repository_root, ["mktree"], input_bytes=tree_line)
+    if tree.returncode != 0:
+        raise SnapshotError("Git tree creation failed")
+    tree_sha = tree.stdout.decode("ascii", errors="strict").strip()
+    if OID_RE.fullmatch(tree_sha) is None:
+        raise SnapshotError("Git tree identity is invalid")
+    args = ["commit-tree", tree_sha]
+    if parent is not None:
+        args.extend(["-p", parent])
+    args.extend(["-m", f"Update advisory resident snapshot {node_id}"])
+    commit = git_call(
+        git,
+        repository_root,
+        args,
+        extra_env={
+            "GIT_AUTHOR_NAME": "Glaeda resident snapshot",
+            "GIT_AUTHOR_EMAIL": "glaeda-resident-snapshot@invalid",
+            "GIT_COMMITTER_NAME": "Glaeda resident snapshot",
+            "GIT_COMMITTER_EMAIL": "glaeda-resident-snapshot@invalid",
+        },
+    )
+    if commit.returncode != 0:
+        raise SnapshotError("Git status commit creation failed")
+    commit_sha = commit.stdout.decode("ascii", errors="strict").strip()
+    if OID_RE.fullmatch(commit_sha) is None:
+        raise SnapshotError("Git status commit identity is invalid")
+    return commit_sha
+
+
+def publish_snapshot(
+    candidate_value: object,
+    trust_value: object,
+    *,
+    repository_root: Path,
+    remote: str = "origin",
+    branch: str = STATUS_BRANCH,
+    refresh_interval_seconds: int = DEFAULT_REFRESH_INTERVAL_SECONDS,
+    now: dt.datetime | None = None,
+    git: Path = Path("/usr/bin/git"),
+    ssh_keygen: Path = Path("/usr/bin/ssh-keygen"),
+    retries: int = 2,
+) -> dict[str, object]:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", remote):
+        raise SnapshotError("Git remote name is invalid")
+    if branch != STATUS_BRANCH:
+        raise SnapshotError("GitHub status branch is fixed by the v1 contract")
+    retries = integer(retries, "publish retries", 0, 3)
+    now = now or dt.datetime.now(dt.UTC)
+    git = require_executable(git, "git")
+    repository_root = repository_root.resolve(strict=True)
+    candidate = validate_signed_snapshot(candidate_value, trust_value, now=now, ssh_keygen=ssh_keygen)
+    node_id = candidate["payload"]["node"]["id"]
+    candidate_digest = digest(canonical_json(candidate))
+    for attempt in range(retries + 1):
+        parent, fleet = remote_fleet(git, repository_root, remote, branch)
+        try:
+            updated, reason = upsert_fleet(
+                fleet,
+                candidate,
+                trust_value,
+                now=now,
+                refresh_interval_seconds=refresh_interval_seconds,
+                ssh_keygen=ssh_keygen,
+            )
+        except PublicationSuppressed as suppressed:
+            return {
+                "document_type": PUBLICATION_DOCUMENT,
+                "schema_version": SCHEMA_VERSION,
+                "state": "unchanged",
+                "reason": "already_published" if "already" in str(suppressed) else "refresh_interval",
+                "branch": branch,
+                "snapshot_sha256": candidate_digest,
+                "network_round_trips": 1,
+            }
+        commit_sha = create_status_commit(git, repository_root, updated, parent, node_id)
+        push = git_call(git, repository_root, ["push", "--quiet", remote, f"{commit_sha}:refs/heads/{branch}"])
+        if push.returncode == 0:
+            return {
+                "document_type": PUBLICATION_DOCUMENT,
+                "schema_version": SCHEMA_VERSION,
+                "state": "published",
+                "reason": reason,
+                "branch": branch,
+                "snapshot_sha256": candidate_digest,
+                "network_round_trips": 2 + attempt * 2,
+            }
+    raise SnapshotError("GitHub status publication lost a bounded compare-and-swap race")
+
+
+def current_time(value: str | None) -> dt.datetime:
+    return dt.datetime.now(dt.UTC) if value is None else parse_time(value, "requested time")
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description=__doc__)
+    subparsers = root.add_subparsers(dest="command", required=True)
+
+    compose = subparsers.add_parser("compose", help="compose and sign one advisory node snapshot")
+    compose.add_argument("--capability", required=True, type=Path)
+    compose.add_argument("--admission", required=True, type=Path)
+    compose.add_argument("--trust", required=True, type=Path)
+    compose.add_argument("--private-key", required=True, type=Path)
+    compose.add_argument("--public-node-id", required=True)
+    compose.add_argument("--producer-generation", required=True, type=int)
+    compose.add_argument("--snapshot-sequence", required=True, type=int)
+    compose.add_argument("--project-state", type=Path)
+    compose.add_argument("--request-state", type=Path)
+    compose.add_argument("--observed-at")
+    compose.add_argument("--published-at")
+    compose.add_argument("--maximum-useful-age-seconds", type=int, default=DEFAULT_USEFUL_AGE_SECONDS)
+    compose.add_argument("--ssh-keyge
