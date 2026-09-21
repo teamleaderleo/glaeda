@@ -829,6 +829,28 @@ def raw_snapshot_node_id(value: object) -> str | None:
     return node_id
 
 
+def raw_snapshot_key_id(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    payload = value.get("payload")
+    signature = value.get("signature")
+    if not isinstance(payload, dict) or not isinstance(signature, dict):
+        return None
+    producer = payload.get("producer")
+    if not isinstance(producer, dict):
+        return None
+    signature_key = signature.get("key_id")
+    producer_key = producer.get("key_id")
+    if (
+        not isinstance(signature_key, str)
+        or not isinstance(producer_key, str)
+        or signature_key != producer_key
+        or KEY_RE.fullmatch(signature_key) is None
+    ):
+        return None
+    return signature_key
+
+
 def validate_fleet(value: object) -> dict[str, Any]:
     fleet = exact_object(value, "fleet snapshot")
     if len(canonical_json(fleet)) > MAX_FLEET_BYTES:
@@ -867,53 +889,123 @@ def upsert_fleet(
     refresh_interval_seconds = integer(
         refresh_interval_seconds, "refresh interval", 30, MAX_USEFUL_AGE_SECONDS
     )
+    trust = validate_trust(trust_value)
     fleet = validate_fleet(fleet_value)
-    candidate = validate_signed_snapshot(candidate_value, trust_value, now=now, ssh_keygen=ssh_keygen)
-    candidate_max_age = int(candidate["payload"]["freshness"]["maximum_useful_age_seconds"])
+    candidate = validate_signed_snapshot(
+        candidate_value, trust, now=now, ssh_keygen=ssh_keygen
+    )
+    candidate_max_age = int(
+        candidate["payload"]["freshness"]["maximum_useful_age_seconds"]
+    )
     if refresh_interval_seconds > candidate_max_age - MAX_CLOCK_SKEW_SECONDS:
         raise SnapshotError("refresh interval leaves no bounded stale margin")
     node_id = candidate["payload"]["node"]["id"]
-    nodes = list(fleet["nodes"])
-    raw_ids = [raw_snapshot_node_id(item) for item in nodes]
-    if any(raw_id is None for raw_id in raw_ids):
+
+    reviewed_by_id = {entry["id"]: entry for entry in trust["nodes"]}
+    original_nodes = list(fleet["nodes"])
+    original_ids = [raw_snapshot_node_id(item) for item in original_nodes]
+    if any(raw_id is None for raw_id in original_ids):
         raise SnapshotError("fleet contains a malformed node entry")
-    if len(set(raw_ids)) != len(raw_ids):
-        raise SnapshotError("fleet contains duplicate node entries")
-    for item in nodes:
-        validate_signed_snapshot(item, trust_value, check_freshness=False, ssh_keygen=ssh_keygen)
+
+    retained = [
+        (item, raw_id)
+        for item, raw_id in zip(original_nodes, original_ids)
+        if raw_id in reviewed_by_id
+    ]
+    retained_ids = [raw_id for _, raw_id in retained]
+    if len(set(retained_ids)) != len(retained_ids):
+        raise SnapshotError("fleet contains duplicate reviewed node entries")
+
+    nodes: list[dict[str, Any]] = []
+    trust_state_by_id: dict[str, str] = {}
+    for item, raw_id in retained:
+        reviewed = reviewed_by_id[raw_id]
+        try:
+            current = validate_signed_snapshot(
+                item, trust, check_freshness=False, ssh_keygen=ssh_keygen
+            )
+        except SnapshotError:
+            historical_key_id = raw_snapshot_key_id(item)
+            if (
+                historical_key_id is None
+                or historical_key_id == reviewed["key_id"]
+            ):
+                raise
+            trust_state_by_id[raw_id] = "superseded_key"
+            nodes.append(item)
+        else:
+            trust_state_by_id[raw_id] = "current_key"
+            nodes.append(current)
+
+    raw_ids = [raw_snapshot_node_id(item) for item in nodes]
     matches = [index for index, raw_id in enumerate(raw_ids) if raw_id == node_id]
     if len(matches) > 1:
         raise SnapshotError("fleet contains duplicate entries for the node")
     if not matches:
         nodes.append(candidate)
-        result = {"document_type": FLEET_DOCUMENT, "schema_version": SCHEMA_VERSION, "nodes": sorted(nodes, key=lambda item: item["payload"]["node"]["id"])}
+        result = {
+            "document_type": FLEET_DOCUMENT,
+            "schema_version": SCHEMA_VERSION,
+            "nodes": sorted(nodes, key=lambda item: item["payload"]["node"]["id"]),
+        }
         validate_fleet(result)
         return result, "transition"
 
     index = matches[0]
-    current = validate_signed_snapshot(nodes[index], trust_value, check_freshness=False, ssh_keygen=ssh_keygen)
-    current_version = snapshot_version(current)
     candidate_version = snapshot_version(candidate)
+    if trust_state_by_id[node_id] == "superseded_key":
+        if candidate_version[1] != 1:
+            raise SnapshotError(
+                "first snapshot under a new reviewed key must restart snapshot sequence at one"
+            )
+        nodes[index] = candidate
+        result = {
+            "document_type": FLEET_DOCUMENT,
+            "schema_version": SCHEMA_VERSION,
+            "nodes": sorted(nodes, key=lambda item: item["payload"]["node"]["id"]),
+        }
+        validate_fleet(result)
+        return result, "transition"
+
+    current = nodes[index]
+    current_version = snapshot_version(current)
     if candidate_version == current_version:
         if canonical_json(candidate) == canonical_json(current):
             raise PublicationSuppressed("snapshot is already published")
         raise SnapshotError("same snapshot version carries different content")
     if candidate_version < current_version:
         raise SnapshotError("older producer or snapshot sequence cannot overwrite newer state")
-    if candidate_version[0] == current_version[0] and candidate_version[1] != current_version[1] + 1:
-        raise SnapshotError("snapshot sequence must advance by exactly one within a producer generation")
+    if (
+        candidate_version[0] == current_version[0]
+        and candidate_version[1] != current_version[1] + 1
+    ):
+        raise SnapshotError(
+            "snapshot sequence must advance by exactly one within a producer generation"
+        )
     if candidate_version[0] > current_version[0] and candidate_version[1] != 1:
         raise SnapshotError("a new producer generation must restart snapshot sequence at one")
 
-    current_published = parse_time(current["payload"]["freshness"]["published_at"], "current published_at")
-    if snapshot_semantics(candidate) == snapshot_semantics(current) and now - current_published < dt.timedelta(seconds=refresh_interval_seconds):
+    current_published = parse_time(
+        current["payload"]["freshness"]["published_at"], "current published_at"
+    )
+    if (
+        snapshot_semantics(candidate) == snapshot_semantics(current)
+        and now - current_published < dt.timedelta(seconds=refresh_interval_seconds)
+    ):
         raise PublicationSuppressed("unchanged snapshot is inside the refresh interval")
     nodes[index] = candidate
-    result = {"document_type": FLEET_DOCUMENT, "schema_version": SCHEMA_VERSION, "nodes": sorted(nodes, key=lambda item: item["payload"]["node"]["id"])}
+    result = {
+        "document_type": FLEET_DOCUMENT,
+        "schema_version": SCHEMA_VERSION,
+        "nodes": sorted(nodes, key=lambda item: item["payload"]["node"]["id"]),
+    }
     validate_fleet(result)
-    reason = "refresh" if snapshot_semantics(candidate) == snapshot_semantics(current) else "transition"
+    reason = (
+        "refresh"
+        if snapshot_semantics(candidate) == snapshot_semantics(current)
+        else "transition"
+    )
     return result, reason
-
 
 def unknown_node(entry: dict[str, Any], reason: str) -> dict[str, object]:
     return {
