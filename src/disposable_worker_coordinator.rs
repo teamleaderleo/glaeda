@@ -317,10 +317,12 @@ impl DisposableWorkerCoordinator {
                 .ok_or_else(|| coordinator_error("disposable_attempt_missing_after_deadline"))?
                 .attempt()
                 .phase();
-            return Ok(DisposableWorkerCoordinatorDisposition::CleanupCheckpointed {
-                attempt_id: attempt_id.as_str().to_owned(),
-                phase,
-            });
+            return Ok(
+                DisposableWorkerCoordinatorDisposition::CleanupCheckpointed {
+                    attempt_id: attempt_id.as_str().to_owned(),
+                    phase,
+                },
+            );
         }
         match operation_for(reservation)? {
             CoordinatorOperation::AuthorizeClone => {
@@ -990,7 +992,6 @@ mod tests {
         )
         .unwrap()
     }
-
 
     fn unavailable_storage_error() -> crate::disposable_host_storage::DisposableHostStorageError {
         crate::disposable_host_storage::DisposableHostStorage::new(
