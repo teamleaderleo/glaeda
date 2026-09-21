@@ -789,23 +789,23 @@ pub fn recommend_ci_pool(
             continue;
         }
 
-        if let Some(allowance) = &candidate.allowance {
-            if allowance.validate().is_err() {
-                exclusions.push(PoolExclusionV1 {
-                    pool_id,
-                    reason: PoolExclusionReason::InvalidAllowance,
-                });
-                continue;
-            }
+        if let Some(allowance) = &candidate.allowance
+            && allowance.validate().is_err()
+        {
+            exclusions.push(PoolExclusionV1 {
+                pool_id,
+                reason: PoolExclusionReason::InvalidAllowance,
+            });
+            continue;
         }
-        if let Some(contention) = &candidate.contention {
-            if contention.validate().is_err() {
-                exclusions.push(PoolExclusionV1 {
-                    pool_id,
-                    reason: PoolExclusionReason::InvalidContentionEvidence,
-                });
-                continue;
-            }
+        if let Some(contention) = &candidate.contention
+            && contention.validate().is_err()
+        {
+            exclusions.push(PoolExclusionV1 {
+                pool_id,
+                reason: PoolExclusionReason::InvalidContentionEvidence,
+            });
+            continue;
         }
 
         let prediction = match predict_pool(
@@ -1097,10 +1097,10 @@ fn policy_exclusion(
     None
 }
 
-fn select_candidate<'a>(
-    candidates: &'a [EvaluatedCandidate],
+fn select_candidate(
+    candidates: &[EvaluatedCandidate],
     policy: RoutingPolicyV1,
-) -> Option<&'a EvaluatedCandidate> {
+) -> Option<&EvaluatedCandidate> {
     match policy.mode {
         RoutingPolicyMode::Economy => select_economy(candidates, policy),
         RoutingPolicyMode::Balanced => {
@@ -1127,10 +1127,10 @@ fn select_candidate<'a>(
     }
 }
 
-fn select_economy<'a>(
-    candidates: &'a [EvaluatedCandidate],
+fn select_economy(
+    candidates: &[EvaluatedCandidate],
     policy: RoutingPolicyV1,
-) -> Option<&'a EvaluatedCandidate> {
+) -> Option<&EvaluatedCandidate> {
     let fastest_p90 = candidates
         .iter()
         .map(|entry| entry.prediction.completion.total.p90)
@@ -1334,6 +1334,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn observation(
         workload: &WorkloadClassV1,
         pool_id: &str,
