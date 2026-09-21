@@ -415,6 +415,48 @@ impl OwnedLinuxJitRuntime {
     }
 }
 
+impl crate::disposable_runner_runtime::DisposableRunnerTargetRuntime for OwnedLinuxJitRuntime {
+    type Confirmation = String;
+
+    fn confirm_runner_target(
+        &self,
+        reservation: &DisposableAttemptReservation,
+        executor: &impl TimedCommandExecutor,
+        _clock: &impl CloneRuntimeClock,
+    ) -> Result<
+        Self::Confirmation,
+        crate::disposable_runner_runtime::DisposableRunnerRuntimeError,
+    > {
+        self.confirm(reservation, executor).map_err(|_| {
+            crate::disposable_runner_runtime::DisposableRunnerRuntimeError::observation(
+                "runner_target_not_ready",
+            )
+        })
+    }
+
+    fn reconfirm_runner_target(
+        &self,
+        confirmation: &Self::Confirmation,
+        reservation: &DisposableAttemptReservation,
+        executor: &impl TimedCommandExecutor,
+        _clock: &impl CloneRuntimeClock,
+    ) -> Result<(), crate::disposable_runner_runtime::DisposableRunnerRuntimeError> {
+        let observed = self.confirm(reservation, executor).map_err(|_| {
+            crate::disposable_runner_runtime::DisposableRunnerRuntimeError::observation(
+                "runner_target_not_ready",
+            )
+        })?;
+        if &observed != confirmation {
+            return Err(
+                crate::disposable_runner_runtime::DisposableRunnerRuntimeError::recovery(
+                    "runner_target_identity_drift",
+                ),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct TaskIdentity {
     task_root: PathBuf,
