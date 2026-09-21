@@ -199,7 +199,9 @@ def payload_tree_digest(root: Path) -> str:
     return "sha256:" + h.hexdigest()
 
 
-def _identity(arguments: argparse.Namespace) -> tuple[str, dict[str, object]]:
+def _identity(
+    arguments: argparse.Namespace, *, require_egress_authority: bool = True
+) -> tuple[str, dict[str, object]]:
     _validated_digest(arguments.command_fingerprint, "command fingerprint")
     _validated_digest(arguments.binding_sha256, "task binding")
     _validated_digest(arguments.payload_tree_sha256, "payload tree identity")
@@ -208,9 +210,10 @@ def _identity(arguments: argparse.Namespace) -> tuple[str, dict[str, object]]:
         raise task.Refusal("owned runner unit is invalid")
     payload = _exact_path(arguments.payload_root, directory=True)
     launcher = _exact_path(arguments.launcher, directory=False)
-    egress_guard = _exact_path(arguments.egress_guard, directory=False)
     _verify_launcher(launcher)
-    _verify_egress_guard(egress_guard, arguments.egress_guard_sha256)
+    if require_egress_authority:
+        egress_guard = _exact_path(arguments.egress_guard, directory=False)
+        _verify_egress_guard(egress_guard, arguments.egress_guard_sha256)
     observed_tree = payload_tree_digest(payload)
     if observed_tree != arguments.payload_tree_sha256:
         raise task.Refusal("owned runner payload generation changed")
@@ -426,7 +429,7 @@ def prepare(arguments: argparse.Namespace) -> int:
 
 
 def probe(arguments: argparse.Namespace) -> int:
-    task_identity, identity = _identity(arguments)
+    task_identity, identity = _identity(arguments, require_egress_authority=False)
     root = _task_root(arguments)
     store = admission.Store(arguments.admission_root)
     try:
@@ -571,7 +574,7 @@ def launch(arguments: argparse.Namespace) -> int:
 
 
 def cleanup(arguments: argparse.Namespace) -> int:
-    task_identity, identity = _identity(arguments)
+    task_identity, identity = _identity(arguments, require_egress_authority=False)
     root = _task_root(arguments)
 
     def settle() -> None:
