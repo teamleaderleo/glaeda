@@ -2698,6 +2698,12 @@ def retire_one_low_value_state(
                 continue
 
             retired_name = f"{HOT_STATE_RETIRED_PREFIX}{state_identity}"
+            enqueue_hot_state_reconcile_ticket(
+                namespace_root,
+                "retired",
+                state_identity,
+                retired_name,
+            )
             try:
                 rename_noreplace(state, namespace_root / retired_name)
             except (FileExistsError, OSError):
@@ -2716,10 +2722,7 @@ def retire_one_low_value_state(
             renamed = True
             fsync_directory(namespace_root)
             try:
-                remove_hot_state_value_ticket(
-                    namespace_root, ticket_sequence
-                )
-                remove_hot_state_value_record(
+                remove_generation_value_metadata(
                     namespace_root, state_identity
                 )
             except (OSError, RuntimeError):
