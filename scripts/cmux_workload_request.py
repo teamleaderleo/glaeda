@@ -291,6 +291,7 @@ def _cmux_semantic_key(result: dict[str, object]) -> str:
                     "generation": profile["generation"],
                 },
                 "semantic_validator": result["semantic_validator"],
+                "environment_class": result["environment_class"],
                 "parameters": result["parameters"],
                 "runtime_inputs": [
                     {
@@ -328,6 +329,7 @@ def validate_cmux_result(value: dict[str, object]) -> dict[str, object]:
             "source",
             "profile",
             "semantic_validator",
+            "environment_class",
             "expected_result_class",
             "result",
             "parameters",
@@ -399,6 +401,8 @@ def validate_cmux_result(value: dict[str, object]) -> dict[str, object]:
         value.get("result") not in SEMANTIC_RESULTS
         or not isinstance(value.get("semantic_validator"), str)
         or not value["semantic_validator"]
+        or not isinstance(value.get("environment_class"), str)
+        or TOKEN_RE.fullmatch(value["environment_class"]) is None
         or not isinstance(value.get("expected_result_class"), str)
         or not value["expected_result_class"]
         or not isinstance(value.get("network_class"), str)
