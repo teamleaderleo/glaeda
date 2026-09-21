@@ -329,14 +329,21 @@ class RoleModelTests(unittest.TestCase):
         eligibility = m.role_eligibility(node, canaries)
         self.assertEqual(eligibility['cmux_linux_ci']['reason'], 'insufficient_cpu_class')
 
-    def test_reenrollment_invalidates_old_role_canary(self):
+    def test_reenrollment_invalidates_old_role_acceptance_and_canary(self):
         node = mac_node()
         receipt = canary(node, 'cmux_macos_native_build')
         node['enrollmentGeneration'] += 1
+        with self.assertRaisesRegex(
+            m.RoleModelError,
+            'role acceptance enrollment generation is stale',
+        ):
+            m.role_eligibility(node, [receipt])
+
+        node['roleAcceptances'] = {}
         eligibility = m.role_eligibility(node, [receipt])
         self.assertEqual(
             eligibility['cmux_macos_native_build']['reason'],
-            'role_canary_enrollment_stale',
+            'fleet_acceptance_pending',
         )
 
     def test_role_canary_binds_exact_current_fleet_acceptance(self):
@@ -422,6 +429,8 @@ class RoleModelTests(unittest.TestCase):
     def test_reserved_role_cannot_install_fake_current_acceptance(self):
         node = mac_node()
         node['roleAcceptances']['cmux_macos_test'] = {
+            'nodeId': node['nodeId'],
+            'enrollmentGeneration': node['enrollmentGeneration'],
             'profile': {'id': 'cmux.macos.app-host-test-shard', 'generation': 1},
             'receiptSha256': GEN,
         }
