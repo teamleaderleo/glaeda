@@ -576,6 +576,234 @@ def _inspect_source(operation: str, value: object) -> None:
         raise ContractRefusal("invalid_receipt", "semantic receipt source is invalid") from error
 
 
+def _inspect_resolved(operation: str, resolved: object) -> dict[str, object]:
+    if not isinstance(resolved, dict) or resolved.get("kind") != operation:
+        raise ContractRefusal("invalid_receipt", "semantic receipt resolution is inconsistent")
+    if operation == OP_CAPABILITIES:
+        if (
+            set(resolved) != {"kind", "contract_generation"}
+            or not isinstance(resolved.get("contract_generation"), str)
+            or not SHA256_PATTERN.fullmatch(resolved["contract_generation"])
+        ):
+            raise ContractRefusal("invalid_receipt", "capabilities resolution is invalid")
+    elif operation == OP_STATUS:
+        if resolved != {
+            "kind": OP_STATUS,
+            "observation_contract": "glaeda-owned-admission-observation/v1",
+            "authority": "observation_only",
+        }:
+            raise ContractRefusal("invalid_receipt", "status resolution is invalid")
+    elif operation == OP_REPO_QUERY:
+        if (
+            set(resolved)
+            != {
+                "kind",
+                "profile_id",
+                "source_class",
+                "base_commit",
+                "max_patch_bytes",
+                "result_ceiling_bytes",
+                "authority",
+            }
+            or resolved.get("profile_id") != "repo-query/v1"
+            or resolved.get("source_class") != "resident_exact"
+            or resolved.get("authority") != "observation_only"
+            or not isinstance(resolved.get("base_commit"), str)
+            or not OID_PATTERN.fullmatch(resolved["base_commit"])
+            or isinstance(resolved.get("max_patch_bytes"), bool)
+            or not isinstance(resolved.get("max_patch_bytes"), int)
+            or not 0 <= resolved["max_patch_bytes"] <= MAX_REPO_QUERY_PATCH_BYTES
+            or resolved.get("result_ceiling_bytes") != MAX_REPO_QUERY_RESULT_BYTES
+        ):
+            raise ContractRefusal("invalid_receipt", "repo query resolution is invalid")
+    elif operation == OP_VERIFY_NAMED:
+        if (
+            set(resolved)
+            != {
+                "kind",
+                "profile_id",
+                "profile_generation",
+                "capability_class",
+                "resource_class",
+                "network_class",
+                "environment_class",
+                "deadline_seconds",
+                "output_ceiling_bytes",
+                "workload_request_sha256",
+            }
+            or resolved.get("profile_id") != focused.FOCUSED_PROFILE.profile_id
+            or not isinstance(resolved.get("profile_generation"), str)
+            or not SHA256_PATTERN.fullmatch(resolved["profile_generation"])
+            or resolved.get("capability_class") != focused.EXECUTION_IDENTITY_CLASS
+            or resolved.get("resource_class") != focused.FOCUSED_PROFILE.resource_class
+            or resolved.get("network_class") != "none"
+            or resolved.get("environment_class") != "minimal"
+            or resolved.get("deadline_seconds") != focused.FOCUSED_PROFILE.deadline_seconds
+            or resolved.get("output_ceiling_bytes") != focused.MAX_SOURCE_OUTPUT_BYTES
+            or not isinstance(resolved.get("workload_request_sha256"), str)
+            or not SHA256_PATTERN.fullmatch(resolved["workload_request_sha256"])
+        ):
+            raise ContractRefusal("invalid_receipt", "verification resolution is invalid")
+    return resolved
+
+
+def _inspect_capabilities_result(result: object, resolved: dict[str, object]) -> None:
+    if not isinstance(result, dict) or set(result) != {
+        "document_type",
+        "schema_version",
+        "contract_generation",
+        "operations",
+        "command_argv",
+        "authority",
+    }:
+        raise ContractRefusal("invalid_receipt", "capabilities result is invalid")
+    operations = result.get("operations")
+    command = result.get("command_argv")
+    if (
+        result.get("document_type") != CAPABILITIES_DOCUMENT_TYPE
+        or type(result.get("schema_version")) is not int
+        or result.get("schema_version") != CAPABILITIES_SCHEMA_VERSION
+        or result.get("authority") != "observation_only"
+        or not isinstance(result.get("contract_generation"), str)
+        or not SHA256_PATTERN.fullmatch(result["contract_generation"])
+        or result["contract_generation"] != resolved["contract_generation"]
+        or not isinstance(operations, list)
+        or len(operations) != 4
+        or command
+        != {
+            "available": False,
+            "reason": "no_reviewed_glaeda_command_profile",
+        }
+    ):
+        raise ContractRefusal("invalid_receipt", "capabilities result is invalid")
+    by_kind = {
+        item.get("kind"): item
+        for item in operations
+        if isinstance(item, dict) and isinstance(item.get("kind"), str)
+    }
+    if set(by_kind) != OPERATIONS or len(by_kind) != len(operations):
+        raise ContractRefusal("invalid_receipt", "capabilities operation set is invalid")
+    if by_kind[OP_CAPABILITIES] != {
+        "kind": OP_CAPABILITIES,
+        "authority": "observation_only",
+    }:
+        raise ContractRefusal("invalid_receipt", "capabilities operation entry is invalid")
+    if by_kind[OP_STATUS] != {
+        "kind": OP_STATUS,
+        "authority": "observation_only",
+        "observation_contract": "glaeda-owned-admission-observation/v1",
+    }:
+        raise ContractRefusal("invalid_receipt", "status capability entry is invalid")
+    repo = by_kind[OP_REPO_QUERY]
+    if repo != {
+        "kind": OP_REPO_QUERY,
+        "authority": "observation_only",
+        "profile_id": "repo-query/v1",
+        "source_class": "resident_exact",
+        "max_patch_bytes": MAX_REPO_QUERY_PATCH_BYTES,
+    }:
+        raise ContractRefusal("invalid_receipt", "repo query capability entry is invalid")
+    verify = by_kind[OP_VERIFY_NAMED]
+    profiles = verify.get("profiles") if isinstance(verify, dict) else None
+    if (
+        not isinstance(verify, dict)
+        or set(verify) != {"kind", "authority", "profiles"}
+        or verify.get("authority") != "bounded_execution_request"
+        or not isinstance(profiles, list)
+        or len(profiles) != 1
+        or not isinstance(profiles[0], dict)
+        or set(profiles[0]) != {"id", "generation", "capability_class"}
+        or profiles[0].get("id") != focused.FOCUSED_PROFILE.profile_id
+        or profiles[0].get("capability_class") != focused.EXECUTION_IDENTITY_CLASS
+        or not isinstance(profiles[0].get("generation"), str)
+        or not SHA256_PATTERN.fullmatch(profiles[0]["generation"])
+    ):
+        raise ContractRefusal("invalid_receipt", "verification capability entry is invalid")
+    contract = {
+        "document_type": "glaeda-semantic-contract",
+        "schema_version": 1,
+        "operations": operations,
+        "command_argv": command,
+    }
+    if sha256(canonical_bytes(contract)) != result["contract_generation"]:
+        raise ContractRefusal("invalid_receipt", "capabilities contract generation is invalid")
+
+
+def _inspect_repo_query_result(
+    result: object,
+    source: SourceIdentity,
+    resolved: dict[str, object],
+) -> None:
+    if not isinstance(result, dict):
+        raise ContractRefusal("invalid_receipt", "repo query result is invalid")
+    raw = canonical_bytes(result) + b"\n"
+    if (
+        len(raw) > MAX_REPO_QUERY_RESULT_BYTES
+        or result.get("document_type") != "glaeda-resident-repo-query"
+        or type(result.get("schema_version")) is not int
+        or result.get("schema_version") != 1
+        or result.get("profile_id") != "repo-query/v1"
+        or result.get("authority") != "observation_only"
+        or not isinstance(result.get("profile_generation"), str)
+        or not SHA256_PATTERN.fullmatch(result["profile_generation"])
+        or result.get("repository") != source.repository
+        or result.get("requested_base") != resolved["base_commit"]
+        or result.get("head") != source.commit
+        or result.get("head_tree") != source.tree
+    ):
+        raise ContractRefusal("invalid_receipt", "repo query result is invalid")
+
+
+def _inspect_verify_result(result: object, state: str) -> None:
+    if (
+        not isinstance(result, dict)
+        or set(result)
+        != {
+            "workload_receipt_sha256",
+            "terminal_class",
+            "started_at_unix_millis",
+            "settled_at_unix_millis",
+            "output_bytes",
+            "output_sha256",
+            "process_tree_settled",
+            "task_cleanup_complete",
+        }
+        or result.get("terminal_class") != state
+        or not isinstance(result.get("workload_receipt_sha256"), str)
+        or not SHA256_PATTERN.fullmatch(result["workload_receipt_sha256"])
+        or type(result.get("started_at_unix_millis")) is not int
+        or type(result.get("settled_at_unix_millis")) is not int
+        or not 0
+        <= result["started_at_unix_millis"]
+        <= result["settled_at_unix_millis"]
+        < 253402300800000
+        or type(result.get("output_bytes")) is not int
+        or result["output_bytes"] < 0
+        or not isinstance(result.get("output_sha256"), str)
+        or not SHA256_PATTERN.fullmatch(result["output_sha256"])
+        or result.get("process_tree_settled") is not True
+        or type(result.get("task_cleanup_complete")) is not bool
+        or (state == "cleanup_incomplete") != (result["task_cleanup_complete"] is False)
+    ):
+        raise ContractRefusal("invalid_receipt", "verification result is invalid")
+
+
+def _request_from_receipt(value: dict[str, object]) -> SemanticRequest:
+    operation = value["operation"]
+    resolved = _inspect_resolved(operation, value["resolved_operation"])
+    source = None if value["source"] is None else _source(value["source"])
+    if operation in {OP_CAPABILITIES, OP_STATUS}:
+        parameters: dict[str, object] = {}
+    elif operation == OP_REPO_QUERY:
+        parameters = {
+            "base_commit": resolved["base_commit"],
+            "max_patch_bytes": resolved["max_patch_bytes"],
+        }
+    else:
+        parameters = {"profile_id": resolved["profile_id"]}
+    return SemanticRequest(value["request_id"], operation, source, parameters)
+
+
 def _inspect_state(value: dict[str, object]) -> None:
     operation = value["operation"]
     state = value["state"]
@@ -588,15 +816,15 @@ def _inspect_state(value: dict[str, object]) -> None:
             raise ContractRefusal("invalid_receipt", "refused semantic receipt is inconsistent")
         return
 
-    if not isinstance(resolved, dict) or resolved.get("kind") != operation:
-        raise ContractRefusal("invalid_receipt", "semantic receipt resolution is inconsistent")
+    resolved = _inspect_resolved(operation, resolved)
     if state == "planned":
         if result is not None or refusal is not None:
             raise ContractRefusal("invalid_receipt", "planned semantic receipt is inconsistent")
         return
     if state == "waiting":
         if (
-            not isinstance(result, dict)
+            operation != OP_VERIFY_NAMED
+            or not isinstance(result, dict)
             or set(result) != {"reason"}
             or not isinstance(result.get("reason"), str)
             or not REASON_PATTERN.fullmatch(result["reason"])
@@ -605,7 +833,7 @@ def _inspect_state(value: dict[str, object]) -> None:
             raise ContractRefusal("invalid_receipt", "waiting semantic receipt is inconsistent")
         return
     if state == "ambiguous":
-        if result is not None or refusal != "ambiguous_execution":
+        if operation != OP_VERIFY_NAMED or result is not None or refusal != "ambiguous_execution":
             raise ContractRefusal("invalid_receipt", "ambiguous semantic receipt is inconsistent")
         return
 
@@ -620,6 +848,20 @@ def _inspect_state(value: dict[str, object]) -> None:
         "cleanup_incomplete",
     }:
         raise ContractRefusal("invalid_receipt", "verification semantic receipt has an invalid terminal state")
+
+    if operation == OP_CAPABILITIES:
+        _inspect_capabilities_result(result, resolved)
+    elif operation == OP_STATUS:
+        try:
+            validate_status_observation(result)
+        except ContractRefusal as error:
+            raise ContractRefusal("invalid_receipt", "status result is invalid") from error
+    elif operation == OP_REPO_QUERY:
+        if value["source"] is None:
+            raise ContractRefusal("invalid_receipt", "repo query source is invalid")
+        _inspect_repo_query_result(result, _source(value["source"]), resolved)
+    else:
+        _inspect_verify_result(result, state)
 
 
 def inspect_receipt(raw: bytes) -> dict[str, object]:
@@ -647,6 +889,10 @@ def inspect_receipt(raw: bytes) -> dict[str, object]:
     digest = value.get("request_sha256")
     if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
         raise ContractRefusal("invalid_receipt", "semantic receipt request digest is invalid")
+    if value["state"] != "refused":
+        reconstructed = _request_from_receipt(value)
+        if request_sha256(reconstructed) != digest:
+            raise ContractRefusal("invalid_receipt", "semantic receipt request digest does not match its request")
     result = value.get("result")
     expected_result_digest = _result_digest(result)
     if value.get("result_sha256") != expected_result_digest:
