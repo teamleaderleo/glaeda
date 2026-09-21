@@ -298,6 +298,21 @@ impl DisposableCleanupRunnerSource for ScaleSetBridgeClient {
 }
 
 impl DisposableCloneRuntimeReceipt {
+    pub(crate) fn from_owned_linux(
+        attempt_id: &DisposableAttemptId,
+        catalog_revision: u64,
+        attempt_revision: u64,
+        command_identity: Sha256Digest,
+    ) -> Self {
+        Self {
+            schema_version: DISPOSABLE_CLONE_RUNTIME_SCHEMA_VERSION,
+            attempt_id: attempt_id.as_str().to_owned(),
+            catalog_revision,
+            attempt_revision,
+            command_identity,
+        }
+    }
+
     #[must_use]
     pub const fn schema_version(&self) -> u8 {
         self.schema_version
