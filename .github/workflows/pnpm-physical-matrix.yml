@@ -164,7 +164,7 @@ jobs:
             set -e
             printf '%s\n' "$rc" > "$rc_file"
 
-            python3 - "$output" "$fs" "$mode" "$width" "$REPS" "$rc" <<'PY'
+            python3 - "$output" "$fs" "$mode" "$width" "$REPS" "$rc" "$SOURCE_COMMIT" <<'PY'
           import json
           import sys
           from pathlib import Path
@@ -175,6 +175,7 @@ jobs:
           width = int(sys.argv[4])
           repetitions = int(sys.argv[5])
           rc = int(sys.argv[6])
+          expected_commit = sys.argv[7]
           
           if not path.is_file():
               raise SystemExit(f"missing report for {filesystem}/{mode}/w{width}, rc={rc}")
@@ -184,7 +185,7 @@ jobs:
               raise SystemExit("report treatment identity mismatch")
           if report["repetitions"] != repetitions:
               raise SystemExit("report repetition identity mismatch")
-          if report["source"]["commit"] != "4babfd97df26089186538479b02c994fcad73635":
+          if report["source"]["commit"] != expected_commit:
               raise SystemExit("source commit mismatch")
           if not report["pnpm"]["store_device_matches_task_scratch"]:
               raise SystemExit("resident store is not on task scratch device")
@@ -253,8 +254,11 @@ jobs:
 
             {
               echo "filesystem=$fs"
+              echo "source_base_commit=$SOURCE_BASE_COMMIT"
               echo "source_commit=$SOURCE_COMMIT"
-              echo "source_tree=$(git -C "$SOURCE" rev-parse HEAD^{tree})"
+              echo "source_tree=$SOURCE_TREE"
+              echo "source_toolchain_patch_sha256=$SOURCE_TOOLCHAIN_PATCH_SHA256"
+              echo "pnpm_archive_sha256=$PNPM_ARCHIVE_SHA256"
               echo "source_manifest_package_manager=$(cd "$SOURCE" && node -p 'require("./package.json").packageManager || ""')"
               echo "glaeda_commit=$(git rev-parse HEAD)"
               echo "kernel=$(uname -srvm)"
