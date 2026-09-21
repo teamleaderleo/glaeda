@@ -117,9 +117,10 @@ deliberately converge on one accepted provider-neutral request identity. The fir
 adapter always mints a transport-scoped accepted identity; a later reviewed adapter can explicitly
 import/share one provider-neutral identity when that is intended.
 
-The accepted document records the semantic request ID, the exact semantic request digest, and the
-Glaeda-resolved workload ID/generation for correlation. The caller never supplies the workload
-generation.
+The accepted document records the semantic request ID, the exact semantic request digest, the
+Glaeda-resolved workload ID/generation, and the resolved workload command fingerprint. The trusted
+transport must carry that fingerprint unchanged into the verifier launch and recovery path. The
+caller never supplies the workload generation or command fingerprint.
 
 ## Lifecycle and replay
 
