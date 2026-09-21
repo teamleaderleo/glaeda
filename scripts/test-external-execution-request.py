@@ -151,6 +151,48 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(module.ContractRefusal, "different semantics"):
             module.validate_replay(existing, module.decode_request(raw(drift)))
 
+    def test_replay_rejects_state_semantic_corruption(self) -> None:
+        request = module.decode_request(raw())
+        compiled = module.compile_request(request)
+
+        planned = module.planned_receipt(compiled)
+        corrupted = copy.deepcopy(planned)
+        corrupted["state"] = "succeeded"
+        with self.assertRaisesRegex(module.ContractRefusal, "state fields"):
+            module.validate_replay(corrupted, request)
+
+        terminal = module.terminal_receipt(compiled, internal_receipt(compiled))
+        corrupted = copy.deepcopy(terminal)
+        corrupted["workload_receipt_sha256"] = None
+        with self.assertRaisesRegex(module.ContractRefusal, "state fields"):
+            module.validate_replay(corrupted, request)
+
+        refused = module.refused_receipt(
+            request,
+            module.ContractRefusal("unsupported_capability", "refused"),
+        )
+        corrupted = copy.deepcopy(refused)
+        corrupted["resolved_workload"] = {
+            "id": "verify-focused/v1",
+            "generation": focused.profile_generation(),
+            "capability_class": focused.EXECUTION_IDENTITY_CLASS,
+        }
+        with self.assertRaisesRegex(module.ContractRefusal, "state fields"):
+            module.validate_replay(corrupted, request)
+
+    def test_replay_rejects_wrong_resolved_generation_and_oversized_receipt(self) -> None:
+        request = module.decode_request(raw())
+        receipt = module.planned_receipt(module.compile_request(request))
+        drift = copy.deepcopy(receipt)
+        drift["resolved_workload"]["generation"] = "sha256:" + "f" * 64
+        with self.assertRaisesRegex(module.ContractRefusal, "state fields"):
+            module.validate_replay(drift, request)
+
+        oversized = copy.deepcopy(receipt)
+        oversized["refusal_code"] = "x" * module.MAX_RECEIPT_BYTES
+        with self.assertRaisesRegex(module.ContractRefusal, "fixed ceiling"):
+            module.validate_receipt(oversized)
+
     def test_repository_fixture_round_trip(self) -> None:
         root = Path(__file__).resolve().parents[1]
         request_path = (
