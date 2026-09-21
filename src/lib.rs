@@ -344,6 +344,8 @@ pub mod resident_repo_query;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod resident_sandbox_catalog;
 pub mod resource;
+/// Pure evidence-driven lifecycle and retention policy for expensive reusable state.
+pub mod reusable_state_lifecycle;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;
 /// Strict, bounded, nonblocking, descriptor-relative, identity-bound observation of reviewed Podman sources.
