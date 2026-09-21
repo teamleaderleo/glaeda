@@ -2024,7 +2024,7 @@ mod tests {
         HostPreparePhaseKind, Invocation, classify_host_prepare_actions, try_parse_invocation_from,
     };
     #[cfg(target_os = "macos")]
-    use super::{approved_enrollment_bytes, read_private_disposable_worker_enrollment};
+    use super::{approved_enrollment_bytes, read_private_worker_enrollment};
 
     #[cfg(target_os = "macos")]
     static NEXT_ENROLLMENT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -2539,7 +2539,7 @@ mod tests {
         fs::write(&enrollment, b"exact-enrollment\n").unwrap();
         fs::set_permissions(&enrollment, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
-            read_private_disposable_worker_enrollment(&enrollment).unwrap(),
+            read_private_worker_enrollment(&enrollment).unwrap(),
             b"exact-enrollment\n"
         );
         let approved_digest = format!("sha256:{:x}", Sha256::digest(b"exact-enrollment\n"));
@@ -2558,7 +2558,7 @@ mod tests {
 
         let alias = root.join("alias.json");
         symlink(&enrollment, &alias).unwrap();
-        assert!(read_private_disposable_worker_enrollment(&alias).is_err());
+        assert!(read_private_worker_enrollment(&alias).is_err());
         fs::remove_file(alias).unwrap();
         fs::remove_file(enrollment).unwrap();
         fs::remove_dir(root).unwrap();
