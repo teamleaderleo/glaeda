@@ -121,7 +121,6 @@ class InstallationFixture:
         document = {
             "document_type": local.INSTALLATION_DOCUMENT_TYPE,
             "schema_version": 1,
-            "repo_query_program": os.fspath(self.query_program),
             "repositories": [
                 {
                     "repository": repository,
@@ -207,7 +206,10 @@ class OwnerLocalDispatchTests(unittest.TestCase):
             b"",
         )
         installation = local.load_installation(self.installation.path)
-        with mock.patch.object(local, "_run", return_value=completed) as run:
+        with (
+            mock.patch.object(local, "REPO_QUERY_PROGRAM", self.installation.query_program),
+            mock.patch.object(local, "_run", return_value=completed) as run,
+        ):
             receipt = local.run_repo_query(compiled, installation)
         argv = run.call_args.args[0]
         self.assertEqual(argv[0], os.fspath(self.installation.query_program))
