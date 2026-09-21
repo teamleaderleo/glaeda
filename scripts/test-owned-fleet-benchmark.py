@@ -483,6 +483,8 @@ class FleetHarnessTests(unittest.TestCase):
 
     def test_role_stability_rejects_swap_growth_and_p90_collapse(self) -> None:
         values = self._reduced_windows()
+        for value in values:
+            value["concurrency"]["underfilled"] = False
         self.assertIn(
             ("glaeda-rust-focused-v1", "native-linux"),
             _stable_profile_sets(values),
