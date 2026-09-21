@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "actions_runner": {
+    "version": "2.336.0",
+    "architecture": "x64",
+    "location": "https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-x64-2.336.0.tar.gz",
+    "archive_sha256": "sha256:466a920e38e74ff5e7d23c28143a66450cd3868da58609d11af98c64aa179a79"
+  },
+  "task": {
+    "profile": "github-actions-trusted-v1",
+    "network": "github_actions_trusted_egress",
+    "cpu_quota_percent": 400,
+    "memory_max_bytes": 8589934592,
+    "memory_swap_max_bytes": 0,
+    "tasks_max": 1024,
+    "max_deadline_seconds": 21600
+  },
+  "trust": {
+    "repository_jobs": "owner_trusted_internal_only",
+    "fork_pull_requests": false,
+    "host_container_socket": false,
+    "sudo_or_admin": false,
+    "control_credentials": false,
+    "publisher_credentials": false,
+    "ssh_agent": false
+  }
+}
