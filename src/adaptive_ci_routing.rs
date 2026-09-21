@@ -1755,6 +1755,68 @@ mod tests {
     }
 
     #[test]
+    fn owned_native_linux_pilot_is_generic_and_recommendable() {
+        let workload = WorkloadClassV1::new(
+            id("project:glaeda"),
+            id("required-verify"),
+            ComputeTrustClass::Trusted,
+            id("ordinary-change"),
+            id("rust-workspace"),
+            id("verify-medium"),
+            vec![id("arch:x86_64"), id("os:linux")],
+        )
+        .unwrap();
+        let candidate = PoolCandidateV1 {
+            pool: ExecutionPoolV1::new(
+                id("owned-native-linux"),
+                id("native-linux-x86_64"),
+                PoolAccountingClass::Owned,
+                vec![id("arch:x86_64"), id("os:linux")],
+            )
+            .unwrap(),
+            eligibility: PoolEligibility::Eligible,
+            hot_state: HotStateEvidenceV1 {
+                class: HotStateClass::Warm,
+                state_identity: Some(id("state:rust-main")),
+                source: LocalityEvidenceSource::LocalAccepted,
+            },
+            pressure_after_admission: HostPressureClass::Moderate,
+            allowance: None,
+            contention: Some(ContentionEvidenceV1 {
+                window_count: 4,
+                offered_tasks: 16,
+                validated_completions: 16,
+                elapsed_millis: 120_000,
+                final_result_p50_millis: 28_000,
+                final_result_p90_millis: 41_000,
+                semantic_mismatches: 0,
+                failures: 0,
+                fallbacks: 0,
+                unfinished: 0,
+                peak_pressure: HostPressureClass::Moderate,
+            }),
+        };
+        let observations =
+            three_successes(&workload, "owned-native-linux", HotStateClass::Warm, 55_000, 0, 0);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert_eq!(report.choice, Some(id("owned-native-linux")));
+        assert_eq!(
+            report.predictions[0].execution_class,
+            id("native-linux-x86_64")
+        );
+    }
+
+    #[test]
     fn human_and_json_explain_the_same_recommendation() {
         let workload = workload();
         let candidate = pool(
