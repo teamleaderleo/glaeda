@@ -16,6 +16,7 @@ Canonical JSON is bounded to 4096 bytes. Unknown fields fail closed.
   "document_type": "glaeda-external-execution-request",
   "schema_version": 1,
   "external_request_ref": "cmux:exec:1050:fixture-1",
+  "semantic_request_id": "cmux-1050-fixture-0001",
   "source": {
     "repository": "teamleaderleo/glaeda",
     "commit": "0409c2f4e82385d0770bb2b34f34fd3e6e2dbc36",
@@ -33,6 +34,7 @@ Canonical JSON is bounded to 4096 bytes. Unknown fields fail closed.
 Required fields are:
 
 - `external_request_ref`: bounded caller correlation text. It grants zero Glaeda authority.
+- `semantic_request_id`: explicit Glaeda request identity shared only when two transports intentionally refer to the same physical work.
 - `source.repository`: canonical `owner/repository` identity.
 - `source.commit` and `source.tree`: exact 40-hex Git object identities.
 - `operation`: v1 admits only `verify_focused`.
@@ -44,9 +46,11 @@ Optional fields are:
 - `correlation.work_ref`: bounded caller-owned work identity used only in the external receipt.
 
 The external request reference, caller work reference and reuse hint are deliberately absent from
-the physical execution fingerprint. Changing those fields cannot mint another execution identity.
-The complete canonical external document is separately hashed as `request_sha256` so reuse of one
-external request reference with drifted semantics is detectable.
+the physical execution fingerprint. `semantic_request_id` enters the provider-neutral Glaeda
+verification identity. Two transports therefore share physical work only when they explicitly carry
+the same accepted semantic request identity and semantics. The complete canonical external document
+is separately hashed as `request_sha256` so reuse of one external request reference with drifted
+semantics is detectable.
 
 ## Exact receipt schema
 
@@ -58,6 +62,7 @@ Canonical JSON is bounded to 4096 bytes.
   "schema_version": 1,
   "external_request_ref": "cmux:exec:1050:fixture-1",
   "request_sha256": "sha256:...",
+  "semantic_request_id": "cmux-1050-fixture-0001",
   "correlation": {
     "work_ref": "cmux:work:1050"
   },
@@ -101,6 +106,7 @@ copy private command output, host state or internal attempt data.
 
 | External semantic field | Glaeda mapping |
 | --- | --- |
+| `semantic_request_id` | provider-neutral Glaeda request identity; included in physical verification fingerprint |
 | `source.repository` | existing `verify_focused_impl.Request.repository` |
 | `source.commit` | existing exact commit identity |
 | `source.tree` | existing exact tree identity |
@@ -114,9 +120,10 @@ source, network-none credentialless execution, fixed `scripts/verify focused` re
 deadline and bounded terminal receipt. None of those implementation fields enter the external
 request.
 
-The adapter derives an internal `command_fingerprint` from exact source, semantic operation,
-capability class and the Glaeda-resolved workload id/generation under the domain
-`glaeda-external-verify-focused-binding-v1`.
+The adapter now compiles through `scripts/provider_neutral_request.py`. That Glaeda-owned semantic
+contract derives the verification `command_fingerprint` from the explicit semantic request identity,
+exact source and Glaeda-resolved workload id/generation. External caller correlation stays outside
+physical identity.
 
 Immediately before physical work, the existing verifier re-resolves the exact commit/tree and
 canonical repository origin. The installed admission adapter independently observes current local
@@ -130,11 +137,12 @@ run.
 
 ## Replay, ambiguity and recovery
 
-Three identities stay separate:
+Four identities stay separate:
 
 1. caller correlation: `external_request_ref` and optional `correlation.work_ref`;
-2. external semantic request: `request_sha256` over the canonical external document;
-3. Glaeda physical execution: the derived workload request/fingerprint plus Glaeda durable state.
+2. external adapter document: `request_sha256` over the canonical external document;
+3. provider-neutral Glaeda request: explicit `semantic_request_id` plus its canonical semantics;
+4. Glaeda physical execution: the derived workload request/fingerprint plus Glaeda durable state.
 
 Exact replay of an existing external receipt requires the same external request reference and the
 same canonical request digest. Reusing the reference with drifted semantics is a conflict.
