@@ -1289,8 +1289,15 @@ fn select_candidate(
         RoutingPolicyMode::Economy => select_economy(candidates, policy),
         RoutingPolicyMode::Balanced => {
             let economy = select_economy(candidates, policy)?;
+            let fastest_p90 = candidates
+                .iter()
+                .map(|entry| entry.prediction.completion.total.p90)
+                .min()?;
+            let tail_deadline =
+                fastest_p90.saturating_add(policy.acceptable_completion_slack_millis);
             let fastest = candidates
                 .iter()
+                .filter(|entry| entry.prediction.completion.total.p90 <= tail_deadline)
                 .min_by(|left, right| latency_cmp(left, right))?;
             if fastest
                 .prediction
@@ -1709,6 +1716,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.choice, Some(id("burst")));
+    }
+
+    #[test]
+    fn balanced_rejects_median_win_outside_tail_slack() {
+        let workload = workload();
+        let candidates = vec![
+            pool("owned", PoolAccountingClass::Owned, HotStateClass::Cold),
+            pool("burst", PoolAccountingClass::PaidBurst, HotStateClass::Cold),
+        ];
+        let mut observations =
+            three_successes(&workload, "owned", HotStateClass::Cold, 75_000, 0, 0);
+        let mut burst =
+            three_successes(&workload, "burst", HotStateClass::Cold, 20_000, 90_000, 0);
+        burst[0].timing.execution_millis = 20_000;
+        burst[1].timing.execution_millis = 20_000;
+        burst[2].timing.execution_millis = 400_000;
+        observations.extend(burst);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &candidates,
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::balanced(60_000, 30_000),
+        )
+        .unwrap();
+
+        assert_eq!(report.choice, Some(id("owned")));
     }
 
     #[test]
