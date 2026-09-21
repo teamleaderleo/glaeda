@@ -2756,6 +2756,16 @@ mod tests {
             compile_observation("compile-2", "run-2", 121_000),
             compile_observation("compile-3", "run-3", 119_000),
         ];
+        let proposal =
+            compile_verification_optimizations("cmux-ci", "macos-full", &observations, &[]).unwrap();
+        let candidate_id = proposal
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.class() == OptimizationClass::ReuseExactCompiledProduct)
+            .unwrap()
+            .candidate_id()
+            .to_owned();
+
         let accepted_trials = [
             OptimizationExperiment::new(
                 "trial-1",
@@ -2776,6 +2786,8 @@ mod tests {
                 true,
                 "receipt-a",
             )
+            .unwrap()
+            .bind_candidate(&candidate_id)
             .unwrap(),
             OptimizationExperiment::new(
                 "trial-2",
@@ -2796,6 +2808,8 @@ mod tests {
                 true,
                 "receipt-b",
             )
+            .unwrap()
+            .bind_candidate(&candidate_id)
             .unwrap(),
         ];
         let accepted = compile_verification_optimizations(
@@ -2831,6 +2845,8 @@ mod tests {
             true,
             "receipt-c",
         )
+        .unwrap()
+        .bind_candidate(&candidate_id)
         .unwrap();
         let demoted = compile_verification_optimizations(
             "cmux-ci",
@@ -2850,6 +2866,29 @@ mod tests {
     #[test]
     fn cmux_controlled_restore_is_experimenting_and_measured_resource_reuse_is_rejected() {
         let observations = cmux_case_observations();
+        let proposal =
+            compile_verification_optimizations("cmux-ci", "macos-full", &observations, &[]).unwrap();
+        let app_host_candidate_id = proposal
+            .candidates()
+            .iter()
+            .find(|candidate| {
+                candidate.class() == OptimizationClass::ReuseExactCompiledProduct
+                    && candidate.subject_identity() == Some("app-host-v2")
+            })
+            .unwrap()
+            .candidate_id()
+            .to_owned();
+        let resource_candidate_id = proposal
+            .candidates()
+            .iter()
+            .find(|candidate| {
+                candidate.class() == OptimizationClass::ReuseExactCompiledProduct
+                    && candidate.subject_identity() == Some("bundled-resources-v1")
+            })
+            .unwrap()
+            .candidate_id()
+            .to_owned();
+
         let experiments = [
             OptimizationExperiment::new(
                 "cmux-13091-exact-restore",
@@ -2870,6 +2909,8 @@ mod tests {
                 true,
                 "cmux-13091-35481043093",
             )
+            .unwrap()
+            .bind_candidate(&app_host_candidate_id)
             .unwrap(),
             OptimizationExperiment::new(
                 "cmux-12985-resource-skip-regression",
@@ -2890,6 +2931,8 @@ mod tests {
                 true,
                 "cmux-12985-5746554064",
             )
+            .unwrap()
+            .bind_candidate(&resource_candidate_id)
             .unwrap(),
         ];
         let receipt = compile_verification_optimizations(
@@ -2929,6 +2972,45 @@ mod tests {
             .find(|candidate| candidate.class() == OptimizationClass::SplitConsumerArtifact)
             .unwrap();
         assert_eq!(split.lifecycle(), OptimizationLifecycle::Candidate);
+    }
+
+    #[test]
+    fn unbound_experiment_has_zero_promotion_authority() {
+        let observations = cmux_case_observations();
+        let unbound = OptimizationExperiment::new(
+            "unbound-trial",
+            "cmux-ci",
+            "macos-full",
+            OptimizationClass::ReuseExactCompiledProduct,
+            None,
+            2_000_000,
+            1,
+            0,
+            0,
+            0,
+            0,
+            true,
+            true,
+            false,
+            1,
+            true,
+            "unbound-receipt",
+        )
+        .unwrap();
+
+        let receipt =
+            compile_verification_optimizations("cmux-ci", "macos-full", &observations, &[unbound])
+                .unwrap();
+
+        assert_eq!(receipt.experiments().len(), 1);
+        assert!(receipt.experiments()[0].bound_candidate_id().is_none());
+        assert!(
+            receipt
+                .candidates()
+                .iter()
+                .filter(|candidate| candidate.class() == OptimizationClass::ReuseExactCompiledProduct)
+                .all(|candidate| candidate.lifecycle() == OptimizationLifecycle::Candidate)
+        );
     }
 
     #[test]
