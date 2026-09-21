@@ -76,6 +76,7 @@ ACCEPTED_KEYS = {
     "semantic_request_id",
     "semantic_request_sha256",
     "external_request_sha256",
+    "workload_command_fingerprint",
     "resolved_workload",
     "authority",
 }
@@ -450,6 +451,7 @@ def accept_request(
             "semantic_request_id": semantic_request_id(request),
             "semantic_request_sha256": compiled_semantic.request_sha256,
             "external_request_sha256": compiled.request_sha256,
+            "workload_command_fingerprint": compiled.internal.command_fingerprint,
             "resolved_workload": resolved,
             "authority": dict(AUTHORITY),
         },
