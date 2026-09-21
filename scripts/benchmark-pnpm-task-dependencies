@@ -272,6 +272,21 @@ def program_identity(program: Path, arguments: list[str], cwd: Path, env: dict[s
     }
 
 
+def pnpm_virtual_store_type(
+    pnpm: Path,
+    source: Path,
+    environment: dict[str, str],
+) -> str:
+    value = run_text(
+        [os.fspath(pnpm), "config", "get", "virtualStoreType"],
+        cwd=source,
+        env=environment,
+    )
+    if value != "project":
+        raise BenchmarkError("pnpm must report project virtual store type")
+    return value
+
+
 def pnpm_identity(pnpm: Path, source: Path) -> dict[str, Any]:
     if not pnpm.is_absolute() or not pnpm.exists():
         raise BenchmarkError("pnpm must be an absolute executable")
@@ -288,6 +303,7 @@ def pnpm_identity(pnpm: Path, source: Path) -> dict[str, Any]:
         env=environment,
     )
     config_digest = f"sha256:{hashlib.sha256(config_text.encode('utf-8')).hexdigest()}"
+    virtual_store_type = pnpm_virtual_store_type(pnpm, source, environment)
     store_text = run_text(
         [os.fspath(pnpm), "store", "path", "--silent"],
         cwd=source,
@@ -301,6 +317,7 @@ def pnpm_identity(pnpm: Path, source: Path) -> dict[str, Any]:
         **pnpm_program,
         "node": node_program,
         "config_digest": config_digest,
+        "virtual_store_type": virtual_store_type,
         "node_path": node,
         "environment": environment,
         "store": store,
@@ -1147,6 +1164,7 @@ def main(arguments: list[str] | None = None) -> int:
                 "program_sha256": pnpm["program_sha256"],
                 "node": pnpm["node"],
                 "config_digest": pnpm["config_digest"],
+                "virtual_store_type": pnpm["virtual_store_type"],
                 "store_device": pnpm["store_device"],
                 "store_inode": pnpm["store_inode"],
                 "store_device_matches_task_scratch": pnpm["store_device"] == scratch_device,
