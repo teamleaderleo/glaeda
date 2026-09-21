@@ -20,6 +20,11 @@ import time
 
 class TaskNetwork(Enum):
     NONE = "none"
+    # Trusted first-party GitHub Actions only. The task shares host routing only
+    # after the caller has verified the exact root-owned external egress-authority
+    # marker. That marker binds a separately reviewed host firewall/gateway which
+    # denies private/link-local egress; this helper does not create that authority.
+    GITHUB_ACTIONS_TRUSTED_EGRESS = "github_actions_trusted_egress"
 
 
 MAX_CONTROL_OUTPUT_BYTES = 64 * 1024
@@ -165,13 +170,30 @@ def sandbox_command(
     mount_arguments: list[str], recipe_arguments: list[str],
     network: TaskNetwork, source_read_only: bool = True,
 ) -> list[str]:
-    if network is not TaskNetwork.NONE:
+    if network is TaskNetwork.NONE:
+        namespace_arguments = ["--unshare-all", "--unshare-user"]
+        network_arguments: list[str] = []
+    elif network is TaskNetwork.GITHUB_ACTIONS_TRUSTED_EGRESS:
+        namespace_arguments = [
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup",
+        ]
+        network_arguments = [
+            "--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
+            "--ro-bind-try", "/etc/hosts", "/etc/hosts",
+            "--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
+            "--ro-bind-try", "/etc/ssl", "/etc/ssl",
+            "--ro-bind-try", "/etc/ca-certificates", "/etc/ca-certificates",
+        ]
+    else:
         raise Refusal("owned task network class is unsupported")
     source_bind = "--ro-bind" if source_read_only else "--bind"
     bubblewrap = [
         "/usr/bin/bwrap",
-        "--unshare-all",
-        "--unshare-user",
+        *namespace_arguments,
         "--die-with-parent",
         "--new-session",
         "--cap-drop",
@@ -203,6 +225,7 @@ def sandbox_command(
         "--ro-bind-try",
         "/etc/alternatives",
         "/etc/alternatives",
+        *network_arguments,
         "--proc",
         "/proc",
         "--dev",
@@ -280,11 +303,12 @@ def stop_unit(unit_name: str) -> None:
 
 def execute(
     command: list[str], *, unit: str, deadline_seconds: int, label: str,
-    launch_guard=None,
+    launch_guard=None, inherit_stdin: bool = False, emit_failure_tail: bool = True,
 ) -> tuple[str, int, float, bool, int, str]:
     observation = _run_bounded(
         command, unit=unit, deadline_seconds=deadline_seconds, label=label,
         launch_guard=launch_guard, retain_limit=0, separate_stderr=False,
+        inherit_stdin=inherit_stdin, emit_failure_tail=emit_failure_tail,
     )
     return observation[:6]
 
@@ -308,6 +332,7 @@ def execute_capturing(
     return _run_bounded(
         command, unit=unit, deadline_seconds=deadline_seconds, label=label,
         launch_guard=launch_guard, retain_limit=max_bytes, separate_stderr=False,
+        inherit_stdin=False, emit_failure_tail=True,
     )[:8]
 
 
@@ -328,6 +353,7 @@ def execute_capturing_split(
     observation = _run_bounded(
         command, unit=unit, deadline_seconds=deadline_seconds, label=label,
         launch_guard=launch_guard, retain_limit=max_bytes, separate_stderr=True,
+        inherit_stdin=False, emit_failure_tail=True,
     )
     return observation[:8] + observation[8:10]
 
@@ -335,13 +361,14 @@ def execute_capturing_split(
 def _run_bounded(
     command: list[str], *, unit: str, deadline_seconds: int, label: str,
     launch_guard=None, retain_limit: int, separate_stderr: bool,
+    inherit_stdin: bool, emit_failure_tail: bool,
 ) -> tuple[str, int, float, bool, int, str, bytes, bool, int, str]:
     started = time.monotonic()
     with launch_guard() if launch_guard is not None else nullcontext():
         process = subprocess.Popen(
             command,
             env=closed_environment({"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}),
-            stdin=subprocess.DEVNULL,
+            stdin=None if inherit_stdin else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
             start_new_session=True,
@@ -430,7 +457,7 @@ def _run_bounded(
         terminal = "failed"
     if not settled:
         terminal = "cleanup_incomplete"
-    if terminal != "succeeded" and (tail or err_tail):
+    if emit_failure_tail and terminal != "succeeded" and (tail or err_tail):
         if tail:
             omitted = output_bytes - len(tail)
             print(
