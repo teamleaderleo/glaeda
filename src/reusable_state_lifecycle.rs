@@ -401,14 +401,14 @@ impl ReusableStateRetentionFacts {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReusableStateGeneration {
-    pub identity: ReusableStateIdentityContract,
-    pub generation: ReusableStateGenerationId,
-    pub lifecycle: ReusableStateLifecycle,
-    pub publication: ReusableStatePublicationState,
-    pub integrity: ReusableStateIntegrityState,
-    pub revalidation_required: bool,
-    pub metrics: ReusableStateMetrics,
-    pub retention: ReusableStateRetentionFacts,
+    identity: ReusableStateIdentityContract,
+    generation: ReusableStateGenerationId,
+    lifecycle: ReusableStateLifecycle,
+    publication: ReusableStatePublicationState,
+    integrity: ReusableStateIntegrityState,
+    revalidation_required: bool,
+    metrics: ReusableStateMetrics,
+    retention: ReusableStateRetentionFacts,
 }
 
 impl ReusableStateGeneration {
@@ -445,6 +445,69 @@ impl ReusableStateGeneration {
             metrics,
             retention,
         })
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> &ReusableStateIdentityContract {
+        &self.identity
+    }
+
+    #[must_use]
+    pub const fn generation_id(&self) -> &ReusableStateGenerationId {
+        &self.generation
+    }
+
+    #[must_use]
+    pub const fn lifecycle(&self) -> ReusableStateLifecycle {
+        self.lifecycle
+    }
+
+    #[must_use]
+    pub const fn publication(&self) -> ReusableStatePublicationState {
+        self.publication
+    }
+
+    #[must_use]
+    pub const fn integrity(&self) -> ReusableStateIntegrityState {
+        self.integrity
+    }
+
+    #[must_use]
+    pub const fn revalidation_required(&self) -> bool {
+        self.revalidation_required
+    }
+
+    #[must_use]
+    pub const fn metrics(&self) -> &ReusableStateMetrics {
+        &self.metrics
+    }
+
+    #[must_use]
+    pub const fn retention(&self) -> ReusableStateRetentionFacts {
+        self.retention
+    }
+
+    /// Replace bounded observation evidence without changing generation identity or lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for inconsistent metrics or contradictory retention facts.
+    pub fn replace_observation(
+        &mut self,
+        publication: ReusableStatePublicationState,
+        integrity: ReusableStateIntegrityState,
+        revalidation_required: bool,
+        metrics: ReusableStateMetrics,
+        retention: ReusableStateRetentionFacts,
+    ) -> Result<(), ReusableStatePolicyError> {
+        metrics.validate()?;
+        retention.validate()?;
+        self.publication = publication;
+        self.integrity = integrity;
+        self.revalidation_required = revalidation_required;
+        self.metrics = metrics;
+        self.retention = retention;
+        Ok(())
     }
 
     /// Advance exactly one lifecycle edge using the generation's current evidence.
