@@ -197,7 +197,13 @@ class OwnedLinuxJitRunnerTests(unittest.TestCase):
                         runner.run_once(args)
             execute.assert_not_called()
 
-    def _run_injected_exit(self, root: Path, secret_value: bytes = b"JITSECRET123\n"):
+    def _run_injected_exit(
+        self,
+        root: Path,
+        secret_value: bytes = b"JITSECRET123\n",
+        terminal: str = "succeeded",
+        exit_code: int = 0,
+    ):
         args = arguments(root)
         admission = FakeAdmission()
 
@@ -217,8 +223,8 @@ class OwnedLinuxJitRunnerTests(unittest.TestCase):
                 pass
             secret_stdin[:] = b"\x00" * len(secret_stdin)
             return (
-                "succeeded",
-                0,
+                terminal,
+                exit_code,
                 1.25,
                 True,
                 0,
@@ -281,6 +287,59 @@ class OwnedLinuxJitRunnerTests(unittest.TestCase):
             ) as execute:
                 with self.assertRaisesRegex(Refusal, "conflicts with exact attempt"):
                     runner.run_once(duplicate)
+            execute.assert_not_called()
+
+    def test_deadline_expiry_is_durable_and_keeps_capacity_reserved(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            args, admission = self._run_injected_exit(
+                root, terminal="timed_out", exit_code=-15
+            )
+            self.assertTrue(admission.launch_attempted)
+            self.assertFalse(admission.released)
+            command_root = (
+                Path(args.state_root)
+                / runner.normalize(args).assignment_fingerprint()[7:]
+            )
+            receipt = runner.read_document(command_root / "runner-exit.json")
+            self.assertEqual(receipt["result"]["terminal_class"], "timed_out")
+            self.assertFalse(receipt["result"]["capacity_released"])
+            self.assertFalse(receipt["result"]["github_terminal_observed"])
+
+    def test_cancellation_stops_only_checkpointed_exact_unit_and_blocks_replay(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            args = arguments(root)
+            request = runner.normalize(args)
+            state_root = runner.private_directory(args.state_root)
+            command_root = runner.ensure_private_child(
+                state_root, request.assignment_fingerprint()[7:]
+            )
+            runner.publish(
+                command_root / "intent.json",
+                runner.intent_document(request),
+                replace=False,
+            )
+            stopped = []
+
+            def stop(unit):
+                stopped.append(unit)
+
+            with mock.patch.object(runner.owned_task, "stop_unit", side_effect=stop):
+                with mock.patch.object(
+                    runner.owned_task, "unit_absent", return_value=True
+                ):
+                    self.assertEqual(runner.cancel(args), 0)
+            self.assertEqual(stopped, [runner.unit_name(request)])
+            cancellation = runner.read_document(command_root / "cancellation.json")
+            self.assertTrue(runner.matches_request(cancellation, request))
+            with mock.patch.object(
+                runner.owned_task, "execute_secret_stdin"
+            ) as execute:
+                with self.assertRaisesRegex(
+                    Refusal, "ambiguous|cancelled assignment"
+                ):
+                    runner.run_once(args)
             execute.assert_not_called()
 
     def test_wrong_runner_generation_cannot_settle_existing_attempt(self):
