@@ -215,6 +215,69 @@ def validate_acceptance_evidence(value: object) -> dict[str, Any]:
     return doc
 
 
+ACCEPTANCE_RECEIPT_KEYS = {
+    "schema", "nodeId", "enrollmentGeneration", "role", "source",
+    "toolchainGeneration", "glaedaGeneration", "workloadGeneration", "checks",
+    "result", "evidenceSha256",
+}
+
+
+def validate_acceptance_receipt(value: object) -> dict[str, Any]:
+    doc = exact_keys(value, ACCEPTANCE_RECEIPT_KEYS, "acceptance receipt")
+    if doc["schema"] != ACCEPTANCE_SCHEMA:
+        raise FleetError("acceptance receipt schema is unsupported")
+    if not isinstance(doc["nodeId"], str) or NODE_RE.fullmatch(doc["nodeId"]) is None:
+        raise FleetError("acceptance receipt nodeId is invalid")
+    positive_int(
+        doc["enrollmentGeneration"],
+        "acceptance receipt enrollment generation",
+    )
+    if doc["role"] not in ROLES:
+        raise FleetError("acceptance receipt role is unsupported")
+    source = exact_keys(
+        doc["source"],
+        {"repository", "commit"},
+        "acceptance receipt source",
+    )
+    if (
+        not isinstance(source["repository"], str)
+        or REPOSITORY_RE.fullmatch(source["repository"]) is None
+    ):
+        raise FleetError("acceptance receipt source repository is invalid")
+    if (
+        not isinstance(source["commit"], str)
+        or COMMIT_RE.fullmatch(source["commit"]) is None
+    ):
+        raise FleetError("acceptance receipt source commit is invalid")
+    sha256(
+        doc["toolchainGeneration"],
+        "acceptance receipt toolchain generation",
+    )
+    sha256(
+        doc["glaedaGeneration"],
+        "acceptance receipt Glaeda generation",
+        optional=True,
+    )
+    sha256(
+        doc["workloadGeneration"],
+        "acceptance receipt workload generation",
+    )
+    sha256(doc["evidenceSha256"], "acceptance evidence digest")
+    checks = exact_keys(
+        doc["checks"],
+        CHECK_KEYS,
+        "acceptance receipt checks",
+    )
+    if any(value not in {"pass", "fail"} for value in checks.values()):
+        raise FleetError("acceptance receipt checks must be pass or fail")
+    if doc["result"] not in {"accepted", "rejected"}:
+        raise FleetError("acceptance receipt result is invalid")
+    all_pass = all(value == "pass" for value in checks.values())
+    if (doc["result"] == "accepted") != all_pass:
+        raise FleetError("acceptance receipt result disagrees with checks")
+    return doc
+
+
 def acceptance_matches_enrollment(enrollment: dict[str, Any], receipt: dict[str, Any], role: str) -> tuple[bool, str]:
     if receipt.get("schema") != ACCEPTANCE_SCHEMA or receipt.get("result") != "accepted":
         return False, "acceptance_missing_or_rejected"
@@ -265,13 +328,11 @@ def node_status(enrollment_value: object, acceptance_values: list[object]) -> di
     enrollment = validate_enrollment(enrollment_value)
     receipts: dict[str, dict[str, Any]] = {}
     for value in acceptance_values:
-        if not isinstance(value, dict):
-            raise FleetError("acceptance receipt must be an object")
-        role = value.get("role")
+        receipt = validate_acceptance_receipt(value)
+        role = receipt["role"]
         if role in receipts:
             raise FleetError("duplicate acceptance receipt for role")
-        if role in ROLES:
-            receipts[role] = value
+        receipts[role] = receipt
     role_status = []
     for role in enrollment["allowedExecutionRoles"]:
         if enrollment["state"] != "eligible":
@@ -314,6 +375,10 @@ def transition(enrollment_value: object, target: str, reason: str | None) -> dic
         if reason is not None:
             raise FleetError("transition reason is only accepted for quarantine")
         enrollment["quarantineReason"] = None
+    if current == "quarantined" and target == "enrolling":
+        if enrollment["enrollmentGeneration"] == 2**31 - 1:
+            raise FleetError("enrollment generation is exhausted")
+        enrollment["enrollmentGeneration"] += 1
     enrollment["state"] = target
     return validate_enrollment(enrollment)
 
