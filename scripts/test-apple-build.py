@@ -50,7 +50,10 @@ class AppleBuildTests(unittest.TestCase):
 
     def test_plan_is_read_only_and_source_edits_preserve_incremental_paths(self):
         plan = self.plan()
-        self.assertEqual(apple.inspect(plan)["state"], "cold")
+        observation = apple.inspect(plan)
+        self.assertEqual(observation["state"], "cold")
+        self.assertEqual(observation["cache_root"], ".glaeda/apple-build/cache/" + plan["key"])
+        self.assertNotIn(str(self.root), json.dumps(observation))
         self.assertFalse((self.root / ".glaeda").exists())
         (self.root / "Feature.swift").write_text("// changed source\n")
         self.assertEqual(plan["key"], self.plan()["key"])
