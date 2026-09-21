@@ -47,6 +47,13 @@ CMUX_RESULT_STATES = {"passed", "failed", "timed_out", "ambiguous"}
 CMUX_PROFILE_RUNNER = "scripts/ci/cmux_workload_profile.py"
 LOCAL_EXECUTION_CLASS = "glaeda-local-profile/v1"
 EXTERNAL_EVIDENCE_CLASS = "external-evidence/v1"
+ACCEPTANCE_CHILD_ENV_KEYS = (
+    "PATH",
+    "HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "DEVELOPER_DIR",
+)
 ROLE_PROFILES = {
     "cmux_linux_ci": {"id": "cmux.ci.guard", "generation": 1},
     "cmux_macos_native_build": {"id": "cmux.macos.dev-check", "generation": 1},
@@ -1085,6 +1092,27 @@ def durable_replace_enrollment(
         raise FleetError("published fleet enrollment did not revalidate")
 
 
+def acceptance_child_environment(temporary_root: Path) -> dict[str, str]:
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    temporary_root.chmod(0o700)
+    environment = {
+        "LC_ALL": "C",
+        "LANG": "C",
+        "TMPDIR": str(temporary_root),
+        "PATH": os.environ.get(
+            "PATH",
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        ),
+    }
+    for name in ACCEPTANCE_CHILD_ENV_KEYS:
+        if name == "PATH":
+            continue
+        value = os.environ.get(name)
+        if value:
+            environment[name] = value
+    return environment
+
+
 def _bounded_tail(path: Path, ceiling: int = 4096) -> str:
     try:
         with path.open("rb") as stream:
@@ -1193,6 +1221,7 @@ def accept_local(
         state_root.chmod(0o700)
         result_path = state_root / "result.json"
         log_path = state_root / "cmux-runner.log"
+        child_environment = acceptance_child_environment(state_root / "tmp")
         log_fd = os.open(
             log_path,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -1204,6 +1233,7 @@ def accept_local(
                 completed = subprocess.run(
                     [
                         sys.executable,
+                        "-I",
                         str(runner),
                         "run",
                         profile["id"],
@@ -1222,6 +1252,7 @@ def accept_local(
                     stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
+                    env=child_environment,
                     check=False,
                 )
         finally:
@@ -1238,6 +1269,7 @@ def accept_local(
 
         bootstrap_argv = [
             sys.executable,
+            "-I",
             str(bootstrap_script),
             "--platform",
             family,
@@ -1261,6 +1293,7 @@ def accept_local(
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=child_environment,
                 check=False,
                 timeout=180,
             )
