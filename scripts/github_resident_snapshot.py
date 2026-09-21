@@ -912,6 +912,7 @@ def upsert_fleet(
         for item, raw_id in zip(original_nodes, original_ids)
         if raw_id in reviewed_by_id
     ]
+    fleet_pruned = len(retained) != len(original_nodes)
     retained_ids = [raw_id for _, raw_id in retained]
     if len(set(retained_ids)) != len(retained_ids):
         raise SnapshotError("fleet contains duplicate reviewed node entries")
@@ -989,7 +990,8 @@ def upsert_fleet(
         current["payload"]["freshness"]["published_at"], "current published_at"
     )
     if (
-        snapshot_semantics(candidate) == snapshot_semantics(current)
+        not fleet_pruned
+        and snapshot_semantics(candidate) == snapshot_semantics(current)
         and now - current_published < dt.timedelta(seconds=refresh_interval_seconds)
     ):
         raise PublicationSuppressed("unchanged snapshot is inside the refresh interval")
@@ -1002,7 +1004,8 @@ def upsert_fleet(
     validate_fleet(result)
     reason = (
         "refresh"
-        if snapshot_semantics(candidate) == snapshot_semantics(current)
+        if not fleet_pruned
+        and snapshot_semantics(candidate) == snapshot_semantics(current)
         else "transition"
     )
     return result, reason
