@@ -192,10 +192,10 @@ The connector owns authentication and transport only. It contains no SSH client,
 raw filesystem API, resource scheduler or cache authority.
 
 The trusted Git lifecycle in #1054 validates transport-specific lifetime/provenance first, then
-mints one accepted semantic request identity and supplies that identity to #1050 before physical
-admission. Existing Git request IDs remain caller correlation; they do not become physical identity.
-GitHub Actions, CLI, direct connectors and Stensibly can compile into the same provider-neutral
-request family.
+mints one accepted semantic request identity and compiles a `glaeda-semantic-request/v1` through
+this module. Source execution then flows through #1050 before physical admission. Existing Git
+request IDs remain caller correlation; they do not become physical identity. GitHub Actions, CLI,
+direct connectors and Stensibly can compile into the same provider-neutral request family.
 A transport-specific request/result journal stays transport evidence; physical attempt truth remains
 with Glaeda.
 
