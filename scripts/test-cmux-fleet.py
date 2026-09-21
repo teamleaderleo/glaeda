@@ -45,7 +45,15 @@ def enrollment(os_family="macos", state="eligible", roles=None):
             "cmux-mac-build-large" if os_family == "macos" else "cmux-linux-ci-medium"
         ),
         "supportedToolchainGenerations": [A, B],
-        "roleProfiles": {role: dict(f.ROLE_PROFILES[role]) for role in sorted(roles)},
+        "roleProfiles": {
+            role: dict(
+                f.ROLE_PROFILES.get(
+                    role,
+                    {"id": "reserved.placeholder", "generation": 1},
+                )
+            )
+            for role in sorted(roles)
+        },
         "allowedExecutionRoles": sorted(roles),
         "operatorFleetScope": "cmux-founders",
         "enrollmentGeneration": 3,
@@ -180,7 +188,7 @@ class FleetTests(unittest.TestCase):
                     f.validate_enrollment(e)
 
     def test_role_without_reviewed_workload_is_rejected(self):
-        with self.assertRaisesRegex(f.FleetError, "reviewed v1 acceptance workload"):
+        with self.assertRaisesRegex(f.FleetError, "reviewed v1 profile"):
             f.validate_enrollment(
                 enrollment(roles=["artifact_cache"])
             )
