@@ -257,6 +257,18 @@ class ProviderNeutralRequestTests(unittest.TestCase):
         with self.assertRaisesRegex(module.ContractRefusal, "result digest"):
             module.inspect_receipt(module.canonical_bytes(tampered) + b"\n")
 
+        drifted_resolution = copy.deepcopy(receipt)
+        drifted_resolution["resolved_operation"]["kind"] = "status"
+        with self.assertRaisesRegex(module.ContractRefusal, "resolution"):
+            module.inspect_receipt(
+                module.canonical_bytes(drifted_resolution) + b"\n"
+            )
+
+        drifted_source = copy.deepcopy(receipt)
+        drifted_source["source"] = SOURCE
+        with self.assertRaisesRegex(module.ContractRefusal, "unexpected source"):
+            module.inspect_receipt(module.canonical_bytes(drifted_source) + b"\n")
+
     def test_noncanonical_request_is_refused(self) -> None:
         value = document()
         pretty = (json.dumps(value, indent=2) + "\n").encode()
