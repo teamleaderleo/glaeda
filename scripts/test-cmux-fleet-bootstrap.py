@@ -11,6 +11,7 @@ SPEC.loader.exec_module(b)
 
 A = "sha256:" + "a" * 64
 B = "sha256:" + "b" * 64
+W = "sha256:" + "e" * 64
 
 
 def observation(platform="macos", failed=()):
@@ -45,6 +46,9 @@ def observation(platform="macos", failed=()):
         "osVersionClass": "macos-26" if platform == "macos" else "ubuntu-24.04",
         "glaedaGeneration": A,
         "toolchainGeneration": B,
+        "roleWorkloadGenerations": {
+            "cmux_macos_native_build" if platform == "macos" else "cmux_linux_ci": W
+        },
         "checks": checks,
         "observed": {},
     }
@@ -59,6 +63,10 @@ class Tests(unittest.TestCase):
         )
         self.assertTrue(result["eligibleForEnrollment"])
         self.assertEqual(result["authority"], "observation_only")
+        self.assertEqual(
+            result["roleWorkloadGenerations"],
+            {"cmux_macos_native_build": W},
+        )
 
     def test_linux_ready(self):
         result = b.evaluate(
@@ -133,6 +141,16 @@ class Tests(unittest.TestCase):
         self.assertFalse(b.zig_version_compatible("0.15.9", "0.16.0"))
         self.assertFalse(b.zig_version_compatible("0.17.0", "0.16.0"))
         self.assertFalse(b.zig_version_compatible("nightly", "0.16.0"))
+
+    def test_workload_generation_must_cover_exact_roles(self):
+        observed = observation()
+        observed["roleWorkloadGenerations"] = {}
+        with self.assertRaisesRegex(b.BootstrapError, "workload generations"):
+            b.evaluate(
+                observed,
+                ["cmux_macos_native_build"],
+                "cmux-mac-build-large",
+            )
 
     def test_power_posture_parser(self):
         raw = (
