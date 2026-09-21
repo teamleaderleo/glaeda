@@ -592,6 +592,7 @@ class VerifyFocusedTests(unittest.TestCase):
             for name in ("repository", "cargo", "rustup"):
                 (root / name).mkdir()
             arguments = mock.Mock(
+                semantic_request_id=None,
                 admission_root=None,
                 repository_root=str(root / "repository"),
                 state_root=str(root / "state"),
