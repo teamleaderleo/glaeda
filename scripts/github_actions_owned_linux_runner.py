@@ -111,6 +111,25 @@ class Request:
     runner_generation: str
     expires_at_unix_ms: int
 
+    def assignment_fingerprint(self) -> str:
+        """Stable durable owner for one exact GitHub assignment.
+
+        Local retry/attempt identities deliberately do not change this key, so
+        the same GitHub assignment cannot acquire a second physical runner root.
+        """
+        return sha256(
+            canonical_bytes(
+                {
+                    "assignment_id": self.assignment_id,
+                    "repository": self.repository,
+                    "runner_label": self.runner_label,
+                    "workflow_run_id": self.workflow_run_id,
+                    "job_id": self.job_id,
+                    "profile_id": PROFILE_ID,
+                }
+            )
+        )
+
     def fingerprint(self) -> str:
         return sha256(
             canonical_bytes(
@@ -326,13 +345,16 @@ def read_jit_secret() -> bytearray:
         allowed_set = set(allowed)
         if any(buffer[index] not in allowed_set for index in range(offset - 1)):
             raise Refusal("JIT input contains invalid characters")
+        view.release()
+        view = None
         del buffer[offset:]
         return buffer
     except BaseException:
         buffer[:] = b"\x00" * len(buffer)
         raise
     finally:
-        view.release()
+        if view is not None:
+            view.release()
 
 
 def file_sha256(path: Path) -> str:
@@ -390,7 +412,7 @@ def reviewed_launcher(task_root: Path) -> Path:
 
 
 def unit_name(request: Request) -> str:
-    return f"glaeda-gha-{request.fingerprint()[7:39]}.service"
+    return f"glaeda-gha-{request.assignment_fingerprint()[7:39]}.service"
 
 
 def admission_binding(request: Request, command_root: Path) -> str:
@@ -422,12 +444,25 @@ def sandbox_command(
     (cargo / "bin").mkdir(parents=True, mode=0o700)
     rustup = task_root / "rustup"
     rustup.mkdir(mode=0o700)
+    identity = task_root / "identity"
+    identity.mkdir(mode=0o700)
+    passwd = identity / "passwd"
+    group = identity / "group"
+    passwd.write_text(
+        "glaeda-runner:x:65534:65534:Glaeda runner:/home/project:/usr/sbin/nologin\n",
+        encoding="utf-8",
+    )
+    group.write_text("glaeda-runner:x:65534:\n", encoding="utf-8")
+    passwd.chmod(0o444)
+    group.chmod(0o444)
     mounts = [
         "--dir", "/opt",
         "--dir", "/opt/smolrunner",
         "--dir", "/opt/smolrunner/bin",
         "--bind", os.fspath(runner_root), "/opt/smolrunner/actions-runner",
         "--ro-bind", os.fspath(launcher), "/opt/smolrunner/bin/smolrunner-jit-launcher",
+        "--ro-bind", os.fspath(passwd), "/etc/passwd",
+        "--ro-bind", os.fspath(group), "/etc/group",
         "--ro-bind-try", "/etc/os-release", "/etc/os-release",
         "--ro-bind-try", "/etc/debian_version", "/etc/debian_version",
     ]
@@ -554,7 +589,7 @@ def emit(document: dict[str, object]) -> None:
 def run_once(arguments: argparse.Namespace) -> int:
     request = normalize(arguments)
     state_root = private_directory(arguments.state_root)
-    command_root = ensure_private_child(state_root, request.fingerprint()[7:])
+    command_root = ensure_private_child(state_root, request.assignment_fingerprint()[7:])
     with open_lock(command_root):
         final_path = command_root / "receipt.json"
         exit_path = command_root / "runner-exit.json"
@@ -581,7 +616,7 @@ def run_once(arguments: argparse.Namespace) -> int:
         unit = unit_name(request)
         binding = admission_binding(request, command_root)
         gate = owned_admission.Reservation(
-            arguments.admission_root, request.fingerprint(), unit, binding
+            arguments.admission_root, request.assignment_fingerprint(), unit, binding
         )
         with gate as admission:
             task_root = command_root / "task"
@@ -636,7 +671,7 @@ def settle(arguments: argparse.Namespace) -> int:
     if arguments.retired_runner_id != request.runner_id:
         raise Refusal("retired runner identity does not match exact bound runner")
     state_root = private_directory(arguments.state_root)
-    command_root = ensure_private_child(state_root, request.fingerprint()[7:])
+    command_root = ensure_private_child(state_root, request.assignment_fingerprint()[7:])
     with open_lock(command_root):
         final_path = command_root / "receipt.json"
         exit_path = command_root / "runner-exit.json"
@@ -669,7 +704,7 @@ def settle(arguments: argparse.Namespace) -> int:
 
         owned_admission.recover(
             arguments.admission_root,
-            request.fingerprint(),
+            request.assignment_fingerprint(),
             unit,
             admission_binding(request, command_root),
             observe_settled,
