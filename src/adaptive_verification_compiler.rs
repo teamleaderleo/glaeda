@@ -19,6 +19,7 @@ pub const MAX_VERIFICATION_DURATION_MILLIS: u64 = 7 * 24 * 60 * 60 * 1_000;
 pub const MAX_VERIFICATION_BYTES: u64 = 1 << 50;
 
 const MAX_LABEL_BYTES: usize = 128;
+const MAX_OBSERVATION_SAMPLE_COUNT: u16 = 1_000;
 const MIN_REPETITIONS: usize = 3;
 const MIN_COMPILE_MILLIS: u64 = 10_000;
 const MIN_DEPENDENCY_MILLIS: u64 = 2_000;
@@ -350,8 +351,10 @@ pub struct VerificationObservation {
     workload: String,
     profile: String,
     sequence: u16,
+    sample_count: u16,
     stage: VerificationStage,
     duration_millis: u64,
+    sample_count: u16,
     reuse_class: VerificationReuseClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     bytes_read: Option<u64>,
@@ -419,6 +422,7 @@ impl VerificationObservation {
             workload: workload.to_owned(),
             profile: profile.to_owned(),
             sequence,
+            sample_count: 1,
             stage,
             duration_millis,
             reuse_class,
@@ -443,6 +447,28 @@ impl VerificationObservation {
             platform_lane: None,
             platform_relevant: None,
         })
+    }
+
+    /// Mark this record as a bounded aggregate over comparable samples.
+    ///
+    /// A count larger than one means `duration_millis` and byte fields are representative
+    /// summaries supplied by the observation owner; it never manufactures per-run samples.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded public error for zero or excessive sample count.
+    pub fn with_sample_count(
+        mut self,
+        sample_count: u16,
+    ) -> Result<Self, AdaptiveVerificationCompilerError> {
+        if sample_count == 0 || sample_count > MAX_OBSERVATION_SAMPLE_COUNT {
+            return Err(error(
+                "verification_sample_count_out_of_range",
+                "verification sample count exceeds the bounded observation range",
+            ));
+        }
+        self.sample_count = sample_count;
+        Ok(self)
     }
 
     /// Attach bounded byte counters.
@@ -791,6 +817,7 @@ impl CandidateEvidence {
             run_id: observation.run_id.clone(),
             stage: observation.stage,
             duration_millis: observation.duration_millis,
+            sample_count: observation.sample_count,
             reuse_class: observation.reuse_class,
             bytes_read: observation.bytes_read,
             bytes_written: observation.bytes_written,
@@ -897,6 +924,11 @@ impl OptimizationCandidate {
     #[must_use]
     pub fn candidate_id(&self) -> &str {
         &self.candidate_id
+    }
+
+    #[must_use]
+    pub fn subject_identity(&self) -> Option<&str> {
+        self.subject_identity.as_deref()
     }
 
     #[must_use]
@@ -1070,11 +1102,12 @@ impl AdaptiveVerificationCompilerReceipt {
             for evidence in &candidate.evidence {
                 let transfer = evidence.artifact_transfer_backend.as_deref().unwrap_or("-");
                 output.push_str(&format!(
-                    "  - {} / {} / {} / {} ms / {:?} / transfer {}\n",
+                    "  - {} / {} / {} / {} ms / {} samples / {:?} / transfer {}\n",
                     evidence.run_id,
                     evidence.observation_id,
                     evidence.stage.as_str(),
                     evidence.duration_millis,
+                    evidence.sample_count,
                     evidence.reuse_class,
                     transfer
                 ));
@@ -1208,9 +1241,8 @@ fn discover_repeated_compile(
             )
         },
     ) {
-        if group.len() >= MIN_REPETITIONS {
-            let subject =
-                common_subject(&group, |observation| observation.source_identity.as_deref());
+        if observation_sample_count(&group) >= MIN_REPETITIONS {
+            let subject = validity_subject(&group, ValidityInputKind::ProductSchema);
             candidates.push(build_candidate(
                 OptimizationClass::ReuseExactCompiledProduct,
                 subject,
@@ -1235,7 +1267,7 @@ fn discover_dependency_reuse(
         }),
         |observation| grouping_key(observation, required, None),
     ) {
-        if group.len() >= MIN_REPETITIONS {
+        if observation_sample_count(&group) >= MIN_REPETITIONS {
             candidates.push(build_candidate(
                 OptimizationClass::ReuseDependencyGeneration,
                 validity_subject(&group, ValidityInputKind::Lockfile),
@@ -1261,7 +1293,7 @@ fn discover_prepared_tools(
         }),
         |observation| grouping_key(observation, required, observation.tool_identity.as_deref()),
     ) {
-        if group.len() >= MIN_REPETITIONS {
+        if observation_sample_count(&group) >= MIN_REPETITIONS {
             let subject =
                 common_subject(&group, |observation| observation.tool_identity.as_deref());
             candidates.push(build_candidate(
@@ -1290,7 +1322,7 @@ fn discover_artifact_transport(
     );
 
     for group in groups {
-        if group.len() < MIN_REPETITIONS {
+        if observation_sample_count(&group) < MIN_REPETITIONS {
             continue;
         }
         let subject = common_subject(&group, |observation| {
@@ -1550,7 +1582,7 @@ fn discover_hanging_suites(
                 observation.semantic_validation == SemanticValidationResult::TimedOut
             })
             .count();
-        if evidence.len() >= MIN_REPETITIONS && timeout_count >= 2 {
+        if observation_sample_count(&evidence) >= MIN_REPETITIONS && timeout_count >= 2 {
             candidates.push(build_candidate(
                 OptimizationClass::IsolateFlakyOrHangingSuite,
                 Some(suite),
@@ -1579,7 +1611,7 @@ fn discover_irrelevant_platform_lanes(
             .push(observation);
     }
     for (lane, evidence) in by_lane {
-        if evidence.len() >= MIN_REPETITIONS {
+        if observation_sample_count(&evidence) >= MIN_REPETITIONS {
             candidates.push(build_candidate(
                 OptimizationClass::SkipIrrelevantPlatformLane,
                 Some(lane),
@@ -2079,6 +2111,13 @@ fn estimated_late_guard_savings(evidence: &[&VerificationObservation]) -> Vec<u6
         .collect()
 }
 
+fn observation_sample_count(evidence: &[&VerificationObservation]) -> usize {
+    evidence
+        .iter()
+        .map(|observation| usize::from(observation.sample_count))
+        .sum()
+}
+
 fn observation_matches_subject(observation: &VerificationObservation, subject: &str) -> bool {
     observation.artifact_identity.as_deref() == Some(subject)
         || observation.tool_identity.as_deref() == Some(subject)
@@ -2309,6 +2348,36 @@ mod tests {
         )
     }
 
+    fn rejected_resource_reuse_observation() -> VerificationObservation {
+        VerificationObservation::new(
+            "cmux-12985-resource-skip",
+            "cmux-12985-matched-noop",
+            "cmux-ci",
+            "macos-full",
+            1,
+            VerificationStage::Compile,
+            66_200,
+            VerificationReuseClass::Reuse,
+            SemanticValidationResult::Passed,
+            "macos-arm64-local",
+        )
+        .unwrap()
+        .with_sample_count(4)
+        .unwrap()
+        .with_source_toolchain(Some("resource-tree-a"), Some("xcode-27"))
+        .unwrap()
+        .with_validity_inputs(
+            &validity(&[
+                (ValidityInputKind::Sdk, "macos-26.5"),
+                (ValidityInputKind::Architecture, "arm64"),
+                (ValidityInputKind::BuildConfiguration, "debug"),
+                (ValidityInputKind::CompilerFlags, "resource-flags-a"),
+                (ValidityInputKind::ProductSchema, "bundled-resources-v1"),
+            ])
+            .unwrap(),
+        )
+    }
+
     fn release_compile_observation(
         id: &str,
         run: &str,
@@ -2373,7 +2442,7 @@ mod tests {
     }
 
     fn cmux_case_observations() -> Vec<VerificationObservation> {
-        let mut observations = Vec::new();
+        let mut observations = vec![rejected_resource_reuse_observation()];
 
         for (run, duration) in [
             ("run-1", 1_208_000),
@@ -2750,7 +2819,7 @@ mod tests {
     }
 
     #[test]
-    fn cmux_controlled_restore_is_experimenting_and_split_only_measurement_is_rejected() {
+    fn cmux_controlled_restore_is_experimenting_and_measured_resource_reuse_is_rejected() {
         let observations = cmux_case_observations();
         let experiments = [
             OptimizationExperiment::new(
@@ -2758,7 +2827,7 @@ mod tests {
                 "cmux-ci",
                 "macos-full",
                 OptimizationClass::ReuseExactCompiledProduct,
-                Some("tree-a"),
+                Some("app-host-v2"),
                 2_481_000,
                 392_000,
                 0,
@@ -2774,23 +2843,23 @@ mod tests {
             )
             .unwrap(),
             OptimizationExperiment::new(
-                "cmux-13201-split-only",
+                "cmux-12985-resource-skip-regression",
                 "cmux-ci",
                 "macos-full",
-                OptimizationClass::SplitConsumerArtifact,
-                Some("app-host-product-a"),
-                2_762,
-                2_762,
+                OptimizationClass::ReuseExactCompiledProduct,
+                Some("bundled-resources-v1"),
+                11_200,
+                66_200,
                 0,
-                4_252,
                 0,
-                432_926_479,
+                0,
+                0,
                 true,
                 true,
                 false,
-                250,
+                1_000,
                 true,
-                "cmux-13095-5752292743",
+                "cmux-12985-5746554064",
             )
             .unwrap(),
         ];
@@ -2804,17 +2873,33 @@ mod tests {
         let reuse = receipt
             .candidates()
             .iter()
-            .find(|candidate| candidate.class() == OptimizationClass::ReuseExactCompiledProduct)
+            .find(|candidate| {
+                candidate.class() == OptimizationClass::ReuseExactCompiledProduct
+                    && candidate.subject_identity() == Some("app-host-v2")
+            })
             .unwrap();
         assert_eq!(reuse.lifecycle(), OptimizationLifecycle::Experimenting);
+
+        let rejected = receipt
+            .candidates()
+            .iter()
+            .find(|candidate| {
+                candidate.class() == OptimizationClass::ReuseExactCompiledProduct
+                    && candidate.subject_identity() == Some("bundled-resources-v1")
+            })
+            .unwrap();
+        assert_eq!(rejected.lifecycle(), OptimizationLifecycle::Demoted);
+        assert_eq!(
+            rejected.confidence(),
+            OptimizationConfidence::RejectedEvidence
+        );
 
         let split = receipt
             .candidates()
             .iter()
             .find(|candidate| candidate.class() == OptimizationClass::SplitConsumerArtifact)
             .unwrap();
-        assert_eq!(split.lifecycle(), OptimizationLifecycle::Demoted);
-        assert_eq!(split.confidence(), OptimizationConfidence::RejectedEvidence);
+        assert_eq!(split.lifecycle(), OptimizationLifecycle::Candidate);
     }
 
     #[test]
