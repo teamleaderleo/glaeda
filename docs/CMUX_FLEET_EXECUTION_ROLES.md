@@ -178,7 +178,7 @@ thermal behavior
 unfinished work
 ```
 
-Only current accepted receipts contribute capacity. Missing, stale, rejected, or wrong-profile evidence produces `resource_profile_unmeasured`. Accepted capacity requires validated completions plus bounded CPU/memory pressure; unknown or critical CPU/memory evidence grants zero slots.
+Only current accepted receipts contribute capacity. Missing, stale, rejected, or wrong-profile evidence produces `resource_profile_unmeasured`. Accepted capacity requires validated completions, zero unfinished work, and bounded CPU/memory pressure; unknown or critical CPU/memory evidence grants zero slots. Rejected measurements may retain unfinished-work counts for diagnosis but grant no capacity.
 
 This can express measurements such as:
 
