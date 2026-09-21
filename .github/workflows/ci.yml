@@ -71,6 +71,8 @@ jobs:
               Path("scripts/verify-focused"),
               Path("scripts/verify-required"),
               Path("scripts/verify_focused_impl.py"),
+              Path("scripts/provider_neutral_request.py"),
+              Path("scripts/test-provider-neutral-request.py"),
               Path("scripts/external_execution_request.py"),
               Path("scripts/test-external-execution-request.py"),
               Path("scripts/trusted_agent_dispatch.py"),
@@ -112,6 +114,7 @@ jobs:
           python3 scripts/test-hot-pressure-shadow.py
           python3 scripts/test-hot-run.py
           python3 scripts/test-verify-focused.py
+          python3 scripts/test-provider-neutral-request.py
           python3 scripts/test-external-execution-request.py
           python3 scripts/test-trusted-agent-dispatch.py
           python3 scripts/test-owned-linux-admission.py
