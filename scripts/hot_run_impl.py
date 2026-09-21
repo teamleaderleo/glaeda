@@ -1799,13 +1799,21 @@ def hot_state_value_records_root(namespace_root: Path) -> Path:
     return namespace_root / HOT_STATE_VALUE_RECORDS
 
 
-def ensure_hot_state_value_records_root(namespace_root: Path) -> Path:
+def validate_hot_state_value_records_root(
+    namespace_root: Path, *, create: bool
+) -> Path | None:
     root = hot_state_value_records_root(namespace_root)
+    if create:
+        try:
+            root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
     try:
-        root.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    details = root.stat(follow_symlinks=False)
+        details = root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        if create:
+            raise
+        return None
     namespace_details = namespace_root.stat(follow_symlinks=False)
     if (
         not stat.S_ISDIR(details.st_mode)
@@ -1818,20 +1826,23 @@ def ensure_hot_state_value_records_root(namespace_root: Path) -> Path:
     return root
 
 
-def hot_state_value_record_path(
-    namespace_root: Path, state_identity: str
-) -> Path:
-    if not state_identity_name(state_identity):
-        raise RuntimeError("hot-state value record state identity is invalid")
-    return hot_state_value_records_root(namespace_root) / (
-        state_identity + HOT_STATE_VALUE_RECORD_SUFFIX
-    )
+def ensure_hot_state_value_records_root(namespace_root: Path) -> Path:
+    root = validate_hot_state_value_records_root(namespace_root, create=True)
+    assert root is not None
+    return root
 
 
 def read_hot_state_value_record(
     namespace_root: Path, state_identity: str
 ) -> dict[str, object] | None:
-    path = hot_state_value_record_path(namespace_root, state_identity)
+    root = validate_hot_state_value_records_root(
+        namespace_root, create=False
+    )
+    if root is None:
+        return None
+    if not state_identity_name(state_identity):
+        raise RuntimeError("hot-state value record state identity is invalid")
+    path = root / (state_identity + HOT_STATE_VALUE_RECORD_SUFFIX)
     try:
         document, encoded = read_private_json(
             path, "hot-state value record", MAX_HOT_STATE_VALUE_RECORD_BYTES
@@ -1896,30 +1907,30 @@ def write_hot_state_value_record(
 def remove_hot_state_value_record(
     namespace_root: Path, state_identity: str
 ) -> bool:
-    path = hot_state_value_record_path(namespace_root, state_identity)
+    root = validate_hot_state_value_records_root(
+        namespace_root, create=False
+    )
+    if root is None:
+        return False
+    if not state_identity_name(state_identity):
+        raise RuntimeError("hot-state value record state identity is invalid")
+    path = root / (state_identity + HOT_STATE_VALUE_RECORD_SUFFIX)
     try:
         path.unlink()
     except FileNotFoundError:
         return False
-    fsync_directory(path.parent)
+    fsync_directory(root)
     return True
 
 
 def read_all_hot_state_value_records(
     namespace_root: Path, maximum_sequence: int
 ) -> list[dict[str, object]]:
-    root = hot_state_value_records_root(namespace_root)
-    try:
-        details = root.stat(follow_symlinks=False)
-    except FileNotFoundError:
+    root = validate_hot_state_value_records_root(
+        namespace_root, create=False
+    )
+    if root is None:
         return []
-    if (
-        not stat.S_ISDIR(details.st_mode)
-        or stat.S_ISLNK(details.st_mode)
-        or details.st_uid != os.getuid()
-        or stat.S_IMODE(details.st_mode) != 0o700
-    ):
-        raise RuntimeError("hot-state value-record root is not owner-private")
     records: list[dict[str, object]] = []
     with os.scandir(root) as entries:
         for entry in entries:
