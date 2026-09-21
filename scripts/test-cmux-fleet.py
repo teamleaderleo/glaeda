@@ -63,6 +63,25 @@ def enrollment(os_family="macos", state="eligible", roles=None):
     }
 
 
+def bootstrap_for(enrollment_value, toolchain=A):
+    return {
+        "schema": f.BOOTSTRAP_SCHEMA,
+        "platform": enrollment_value["os"]["family"],
+        "architecture": enrollment_value["architecture"],
+        "osVersionClass": enrollment_value["os"]["versionClass"],
+        "hardwareCapabilityClass": enrollment_value["hardwareCapabilityClass"],
+        "roles": list(enrollment_value["allowedExecutionRoles"]),
+        "glaedaGeneration": enrollment_value["glaedaGeneration"],
+        "toolchainGeneration": toolchain,
+        "roleProfiles": copy.deepcopy(enrollment_value["roleProfiles"]),
+        "checks": {"ready": True},
+        "observed": {},
+        "eligibleForEnrollment": True,
+        "blockingChecks": [],
+        "authority": "observation_only",
+    }
+
+
 def cmux_result(
     role="cmux_macos_native_build",
     *,
@@ -142,13 +161,21 @@ def cmux_result(
     return result
 
 
-def finalized(enrollment_value, role=None, *, result=None, toolchain=A):
+def finalized(
+    enrollment_value,
+    role=None,
+    *,
+    result=None,
+    toolchain=A,
+    post_bootstrap=None,
+):
     role = role or enrollment_value["allowedExecutionRoles"][0]
     return f.finalize_acceptance(
         enrollment_value,
         role,
         toolchain,
         result or cmux_result(role),
+        post_bootstrap or bootstrap_for(enrollment_value, toolchain),
     )
 
 
@@ -266,7 +293,13 @@ class FleetTests(unittest.TestCase):
     def test_acceptance_binds_current_identity(self):
         e = enrollment()
         with self.assertRaisesRegex(f.FleetError, "toolchain generation"):
-            f.finalize_acceptance(e, "cmux_macos_native_build", D, cmux_result())
+            f.finalize_acceptance(
+                e,
+                "cmux_macos_native_build",
+                D,
+                cmux_result(),
+                bootstrap_for(e, D),
+            )
 
         wrong_profile = {
             "id": "cmux.macos.dev-check",
@@ -285,6 +318,7 @@ class FleetTests(unittest.TestCase):
                 "cmux_macos_native_build",
                 A,
                 cmux_result(),
+                bootstrap_for(e),
                 D,
             )
 
