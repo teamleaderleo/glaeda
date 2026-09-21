@@ -240,6 +240,10 @@ class ProviderNeutralRequestTests(unittest.TestCase):
             compiled.resolved_operation["profile_generation"],
             "sha256:f575e0e3cd40e54ca4f868f99777e40386a2fe909cb91362f777e8881302ef65",
         )
+        self.assertEqual(
+            compiled.resolved_operation["request_digest"],
+            "sha256:8b8f146edc28989d4d1d1f986a40f986c951d60f57c6af19b0e7ccdcbf692cd8",
+        )
         report = repo_query_report(compiled)
         receipt = module.repo_query_receipt(compiled, report)
         self.assertEqual(receipt["state"], "succeeded")
