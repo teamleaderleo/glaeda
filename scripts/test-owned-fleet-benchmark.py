@@ -17,6 +17,7 @@ import owned_fleet_benchmark as fleet
 from owned_fleet_benchmark.observe import validate_semantic
 from owned_fleet_benchmark.report import _stable_profile_sets
 from owned_fleet_benchmark.run import _validate_direct_runtime
+from owned_fleet_benchmark.model import env_for
 
 NS = {name: getattr(fleet, name) for name in fleet.__all__}
 FleetError = fleet.FleetError
@@ -188,6 +189,49 @@ def window_manifest(profile_id: str, items: list[dict], *, start_ns: int = 1_000
         "offered_work": items,
     }
 
+
+    def test_benchmark_environment_is_closed(self) -> None:
+        workload = {
+            "environment": {
+                "CARGO_TARGET_DIR": "{state_dir}/target",
+            }
+        }
+        ambient = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/fixture",
+            "CARGO_HOME": "/home/fixture/.cargo",
+            "RUSTUP_HOME": "/home/fixture/.rustup",
+            "DEVELOPER_DIR": "/Applications/Xcode.app",
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "SSH_AUTH_SOCK": "/tmp/agent.sock",
+            "GITHUB_TOKEN": "secret",
+            "PYTHONPATH": "/tmp/injected",
+            "GIT_CONFIG_COUNT": "1",
+            "TMPDIR": "/tmp/caller",
+        }
+        with patch.dict("os.environ", ambient, clear=True):
+            environment = env_for(workload, Path("/private/benchmark-state"))
+
+        self.assertEqual(environment["PATH"], ambient["PATH"])
+        self.assertEqual(environment["HOME"], ambient["HOME"])
+        self.assertEqual(environment["DEVELOPER_DIR"], ambient["DEVELOPER_DIR"])
+        self.assertEqual(environment["XDG_RUNTIME_DIR"], ambient["XDG_RUNTIME_DIR"])
+        self.assertEqual(
+            environment["CARGO_TARGET_DIR"],
+            "/private/benchmark-state/target",
+        )
+        self.assertEqual(environment["LANG"], "C")
+        self.assertEqual(environment["LC_ALL"], "C")
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+        for forbidden in (
+            "SSH_AUTH_SOCK",
+            "GITHUB_TOKEN",
+            "PYTHONPATH",
+            "GIT_CONFIG_COUNT",
+            "TMPDIR",
+        ):
+            self.assertNotIn(forbidden, environment)
 
 class FleetHarnessTests(unittest.TestCase):
     def test_catalog_keeps_only_contention_shape(self) -> None:
