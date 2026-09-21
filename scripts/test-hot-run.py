@@ -1189,24 +1189,30 @@ class HotRunTests(unittest.TestCase):
                 migrated,
             )
 
-    def test_value_records_have_no_total_generation_ceiling(self) -> None:
+    def test_value_reclamation_cursor_bounds_work_and_makes_progress(self) -> None:
         namespace = load_hot_run()
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
             namespace_root = fixture / "hot-run"
             namespace_root.mkdir(mode=0o700)
-            state, _, document = self.make_hot_state_manifest_fixture(
-                namespace, fixture, "v" * 64
-            )
-            namespace["publish_implicit_state_base"](state, document)
-            (state / "lock").touch(mode=0o600)
 
             catalog = namespace["empty_hot_state_value_catalog"]()
             namespace["write_hot_state_value_catalog"](
-                namespace_root, {**catalog, "next_use_sequence": 300}
+                namespace_root,
+                {
+                    **catalog,
+                    "next_use_sequence": 64,
+                    "next_value_ticket_sequence": 64,
+                },
             )
-            for index in range(1, 301):
+            for index in range(1, 65):
                 state_identity = f"{index:064x}"
+                namespace["write_hot_state_value_ticket"](
+                    namespace_root,
+                    index,
+                    state_identity,
+                    index,
+                )
                 namespace["write_hot_state_value_record"](
                     namespace_root,
                     state_identity,
@@ -1219,40 +1225,61 @@ class HotRunTests(unittest.TestCase):
                         "value_identity": None,
                         "reconstruction_elapsed_ns": None,
                         "reuse_elapsed_ns": None,
+                        "value_ticket_sequence": index,
                     },
                 )
 
-            self.assertEqual(
-                namespace["record_successful_hot_state_use"](
-                    namespace_root,
-                    state,
-                    "created",
-                    None,
-                    None,
-                    None,
-                    namespace["ExecutionObservation"](0.1, 0.0),
-                ),
-                "recorded",
+            state, _, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "v" * 64
             )
-            updated = namespace["read_hot_state_value_catalog"](
-                namespace_root
+            namespace["publish_implicit_state_base"](state, document)
+            namespace["record_successful_hot_state_use"](
+                namespace_root,
+                state,
+                "created",
+                None,
+                None,
+                None,
+                namespace["ExecutionObservation"](0.1, 0.0),
             )
-            self.assertEqual(updated["next_use_sequence"], 301)
-            record = namespace["read_hot_state_value_record"](
-                namespace_root, state.name
+
+            retire = namespace["retire_one_low_value_state"]
+            filesystem = retire.__globals__["os"]
+            pressure = os.statvfs_result(
+                (4096, 4096, 100, 10, 10, 0, 0, 0, 0, 255)
             )
-            self.assertIsNotNone(record)
-            records_root = namespace_root / ".value-records-v2"
-            self.assertEqual(
-                len(
-                    [
-                        path
-                        for path in records_root.iterdir()
-                        if path.name.endswith(".json")
-                    ]
-                ),
-                301,
-            )
+            with mock.patch.object(
+                filesystem, "statvfs", return_value=pressure
+            ):
+                self.assertEqual(
+                    retire(namespace_root, "f" * 64),
+                    "pressure_scan_deferred",
+                )
+                first = namespace["read_hot_state_value_catalog"](
+                    namespace_root
+                )
+                self.assertEqual(
+                    first["value_cursor_ticket_sequence"], 32
+                )
+                self.assertTrue(state.exists())
+
+                self.assertEqual(
+                    retire(namespace_root, "f" * 64),
+                    "pressure_scan_deferred",
+                )
+                second = namespace["read_hot_state_value_catalog"](
+                    namespace_root
+                )
+                self.assertEqual(
+                    second["value_cursor_ticket_sequence"], 64
+                )
+                self.assertTrue(state.exists())
+
+                self.assertEqual(
+                    retire(namespace_root, "f" * 64),
+                    "retired_low_value",
+                )
+            self.assertFalse(state.exists())
 
     def test_corrupt_value_record_does_not_block_other_reclamation(self) -> None:
         namespace = load_hot_run()
