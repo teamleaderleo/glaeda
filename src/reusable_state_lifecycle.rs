@@ -4,7 +4,11 @@
 //! semantic validation, execution truth, publication mechanics, locking, and deletion authority.
 //! This layer answers whether an exact generation has earned reuse and retention.
 
-use std::{cmp::Ordering, collections::{BTreeMap, BTreeSet}, fmt};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -1008,8 +1012,7 @@ impl ReusableStateDiskBudget {
     ///
     /// Returns an error for reversed watermarks or a zero-sized reconciliation pass.
     pub fn validate(self) -> Result<(), ReusableStatePolicyError> {
-        if self.low_watermark_bytes >= self.high_watermark_bytes
-            || self.max_evictions_per_pass == 0
+        if self.low_watermark_bytes >= self.high_watermark_bytes || self.max_evictions_per_pass == 0
         {
             Err(ReusableStatePolicyError::InvalidDiskBudget)
         } else {
