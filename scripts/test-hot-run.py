@@ -664,172 +664,45 @@ class HotRunTests(unittest.TestCase):
                 (state / "payload").read_text(encoding="utf-8"), "preserve\n"
             )
 
-    def test_discovery_streams_large_namespace_and_runtime_inventory(
+    def test_reconcile_queue_bounds_work_and_eventually_reaches_state(
         self,
     ) -> None:
         namespace = load_hot_run()
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
-            namespace_root = fixture / "large-namespace"
+            namespace_root = fixture / "hot-run"
             namespace_root.mkdir(mode=0o700)
             for index in range(320):
                 (namespace_root / f"foreign-{index:04d}").touch(mode=0o600)
+            for index in range(1, 97):
+                state_identity = f"{index:064x}"
+                namespace["enqueue_hot_state_reconcile_ticket"](
+                    namespace_root,
+                    "state",
+                    state_identity,
+                    state_identity,
+                )
+
             state, task, document = self.make_hot_state_manifest_fixture(
                 namespace, fixture, "n" * 64
             )
-            target = namespace_root / document["state_identity"]
-            namespace["publish_implicit_state_base"](target, document)
-            (target / "lock").touch(mode=0o600)
-            (task / ".git").unlink()
-            self.assertEqual(
-                namespace["collect_one_unreachable_state"](
-                    namespace_root, "0" * 64
-                ),
-                "retired_unreachable",
-            )
-            self.assertFalse(target.exists())
-
-        with tempfile.TemporaryDirectory() as directory:
-            fixture = Path(directory)
-            namespace_root = fixture / "hot-run"
-            namespace_root.mkdir(mode=0o700)
-            state, task, document = self.make_hot_state_manifest_fixture(
-                namespace, fixture, "r" * 64
-            )
             namespace["publish_implicit_state_base"](state, document)
-            for index in range(96):
-                runtime = state / f"runtime-{index:064x}"
-                runtime.mkdir(mode=0o700)
-                (runtime / "lock").touch(mode=0o600)
-            (task / ".git").unlink()
-            locks = namespace["acquire_retirement_locks"](state)
-            self.assertIsNotNone(locks)
-            namespace["close_retirement_locks"](locks)
-            self.assertEqual(
-                namespace["collect_one_unreachable_state"](
-                    namespace_root, "0" * 64
-                ),
-                "retired_unreachable",
-            )
-            self.assertFalse(state.exists())
-
-    def test_collector_requires_unreachable_generation_and_idle_exact_lock(
-        self,
-    ) -> None:
-        namespace = load_hot_run()
-        with tempfile.TemporaryDirectory() as directory:
-            fixture = Path(directory)
-            namespace_root = fixture / "hot-run"
-            namespace_root.mkdir(mode=0o700)
-            state, task, document = self.make_hot_state_manifest_fixture(
-                namespace, fixture, "3" * 64
-            )
-            namespace["publish_implicit_state_base"](state, document)
-            lock = state / "lock"
-            lock.touch(mode=0o600)
-            payload = state / "cache" / "nested"
-            payload.mkdir(parents=True)
-            (payload / "artifact").write_text("reconstructible\n", encoding="utf-8")
-            outside = fixture / "outside"
-            outside.write_text("preserve\n", encoding="utf-8")
-            (payload / "outside-link").symlink_to(outside)
-
-            self.assertEqual(
-                namespace["collect_one_unreachable_state"](
-                    namespace_root, "4" * 64
-                ),
-                "nothing_eligible",
-            )
-            self.assertTrue(state.exists())
-
-            (task / ".git").write_text("replacement\n", encoding="utf-8")
-            lock_descriptor = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
-            fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
-                self.assertEqual(
-                    namespace["collect_one_unreachable_state"](
-                        namespace_root, "4" * 64
-                    ),
-                    "nothing_eligible",
-                )
-                self.assertTrue(state.exists())
-            finally:
-                os.close(lock_descriptor)
-
-            self.assertEqual(
-                namespace["collect_one_unreachable_state"](
-                    namespace_root, "4" * 64
-                ),
-                "retired_unreachable",
-            )
-            self.assertFalse(state.exists())
-            self.assertEqual(outside.read_text(encoding="utf-8"), "preserve\n")
-
-            legacy = namespace_root / ("5" * 64)
-            legacy.mkdir()
-            (legacy / "lock").touch(mode=0o600)
-            self.assertEqual(
-                namespace["collect_one_unreachable_state"](
-                    namespace_root, "4" * 64
-                ),
-                "nothing_eligible",
-            )
-            self.assertTrue(legacy.exists())
-
-    def test_collector_requires_private_manifest_and_all_runtime_locks(self) -> None:
-        namespace = load_hot_run()
-        with tempfile.TemporaryDirectory() as directory:
-            fixture = Path(directory)
-            namespace_root = fixture / "hot-run"
-            namespace_root.mkdir(mode=0o700)
-            state, task, document = self.make_hot_state_manifest_fixture(
-                namespace, fixture, "c" * 64
-            )
-            namespace["publish_implicit_state_base"](state, document)
-            runtimes = []
-            for identity in ("d" * 64, "e" * 64):
-                runtime = state / f"runtime-{identity}"
-                runtime.mkdir(mode=0o700)
-                (runtime / "lock").touch(mode=0o600)
-                runtimes.append(runtime)
             (task / ".git").unlink()
 
-            manifest = state / "producer-manifest.json"
-            manifest.chmod(0o640)
-            self.assertEqual(
-                namespace["collect_one_unreachable_state"](
-                    namespace_root, "f" * 64
-                ),
-                "nothing_eligible",
-            )
-            manifest.chmod(0o600)
-
-            active = os.open(runtimes[1] / "lock", os.O_RDWR | os.O_NOFOLLOW)
-            fcntl.flock(active, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
+            for expected_cursor in (32, 64, 96):
                 self.assertEqual(
                     namespace["collect_one_unreachable_state"](
                         namespace_root, "f" * 64
                     ),
-                    "nothing_eligible",
+                    "reconcile_scan_deferred",
                 )
-            finally:
-                os.close(active)
-            self.assertTrue(state.exists())
-
-            locks = namespace["acquire_retirement_locks"](state)
-            self.assertIsNotNone(locks)
-            assert locks is not None
-            original_lock = runtimes[0] / "lock"
-            moved_lock = runtimes[0] / "old-lock"
-            original_lock.rename(moved_lock)
-            original_lock.touch(mode=0o600)
-            try:
-                self.assertFalse(namespace["retirement_locks_unchanged"](locks))
-            finally:
-                namespace["close_retirement_locks"](locks)
-                original_lock.unlink()
-                moved_lock.rename(original_lock)
+                catalog = namespace["read_hot_state_reconcile_catalog"](
+                    namespace_root
+                )
+                self.assertEqual(
+                    catalog["cursor_ticket_sequence"], expected_cursor
+                )
+                self.assertTrue(state.exists())
 
             self.assertEqual(
                 namespace["collect_one_unreachable_state"](
@@ -838,6 +711,130 @@ class HotRunTests(unittest.TestCase):
                 "retired_unreachable",
             )
             self.assertFalse(state.exists())
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_cross_worktree_execution_holds_shared_namespace_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            resident = fixture / "resident"
+            task = fixture / "task"
+            cache_home = fixture / "cache"
+            resident.mkdir()
+            subprocess.run(["git", "init", "--quiet"], cwd=resident, check=True)
+            (resident / "payload").write_text("tracked\n", encoding="utf-8")
+            subprocess.run(["git", "add", "payload"], cwd=resident, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Glaeda test",
+                    "-c",
+                    "user.email=glaeda-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ],
+                cwd=resident,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    os.fspath(task),
+                ],
+                cwd=resident,
+                check=True,
+            )
+            script = (
+                "import fcntl, os, pathlib, sys\n"
+                "lock = pathlib.Path(os.environ['XDG_CACHE_HOME']) / "
+                "'glaeda/hot-run/.namespace-lock'\n"
+                "fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)\n"
+                "try:\n"
+                "    try:\n"
+                "        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                "    except BlockingIOError:\n"
+                "        raise SystemExit(0)\n"
+                "    raise SystemExit(9)\n"
+                "finally:\n"
+                "    os.close(fd)\n"
+            )
+            result = subprocess.run(
+                [
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(resident),
+                    "--task",
+                    os.fspath(task),
+                    "--",
+                    "/usr/bin/python3",
+                    "-c",
+                    script,
+                ],
+                env={**os.environ, "XDG_CACHE_HOME": os.fspath(cache_home)},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            state_root = cache_home / "glaeda" / "hot-run"
+            states = [
+                entry for entry in state_root.iterdir()
+                if len(entry.name) == 64
+            ]
+            self.assertEqual(len(states), 1)
+            manifest, _ = load_hot_run()["read_producer_manifest"](
+                states[0], states[0].name
+            )
+            self.assertTrue(
+                load_hot_run()["manifest_has_full_execution_namespace_lease"](
+                    manifest
+                )
+            )
+
+    def test_legacy_manifest_is_usable_but_not_retirable(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, task, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "l" * 64
+            )
+            legacy = dict(document)
+            legacy["schema_version"] = 1
+            legacy["producer"] = "glaeda-hot-run-python-state-v1"
+            legacy.pop("namespace_lease_protocol")
+            state.mkdir(mode=0o700)
+            namespace["write_producer_manifest"](
+                state, namespace["canonical_manifest_bytes"](legacy)
+            )
+            self.assertEqual(
+                namespace["publish_implicit_state_base"](state, document),
+                "reused",
+            )
+            observed, _ = namespace["read_producer_manifest"](
+                state, state.name
+            )
+            self.assertFalse(
+                namespace["manifest_has_full_execution_namespace_lease"](
+                    observed
+                )
+            )
+            (task / ".git").unlink()
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "f" * 64
+                ),
+                "nothing_eligible",
+            )
+            self.assertTrue(state.exists())
 
     def test_retired_deletion_is_bounded_and_resumes_on_later_activity(self) -> None:
         namespace = load_hot_run()
@@ -874,7 +871,7 @@ class HotRunTests(unittest.TestCase):
                 namespace["collect_one_unreachable_state"](
                     namespace_root, "7" * 64
                 ),
-                "retirement_record_recovery",
+                "retired_recovery",
             )
             self.assertFalse(retired.exists())
 
@@ -1014,7 +1011,7 @@ class HotRunTests(unittest.TestCase):
                 namespace["collect_one_unreachable_state"](
                     namespace_root, "9" * 64
                 ),
-                "retirement_record_recovery",
+                "retired_recovery",
             )
             self.assertFalse(retired.exists())
             self.assertFalse((namespace_root / record_name).exists())
@@ -1040,6 +1037,12 @@ class HotRunTests(unittest.TestCase):
             )
             temporary_manifest.write_text('{"producer":', encoding="utf-8")
             temporary_manifest.chmod(0o600)
+            namespace["enqueue_hot_state_reconcile_ticket"](
+                namespace_root,
+                "creating",
+                state.name,
+                staging.name,
+            )
 
             self.assertEqual(
                 namespace["collect_one_unreachable_state"](
@@ -1061,6 +1064,12 @@ class HotRunTests(unittest.TestCase):
             unknown_payload = unknown_stage / "partial-cache"
             unknown_payload.write_text("preserve\n", encoding="utf-8")
             unknown_payload.chmod(0o600)
+            namespace["enqueue_hot_state_reconcile_ticket"](
+                namespace_root,
+                "creating",
+                state.name,
+                unknown_stage.name,
+            )
             self.assertEqual(
                 namespace["collect_one_unreachable_state"](
                     namespace_root, state.name
@@ -1117,7 +1126,10 @@ class HotRunTests(unittest.TestCase):
             assert record is not None
             self.assertEqual(catalog["schema_version"], 2)
             self.assertEqual(catalog["next_use_sequence"], 2)
+            self.assertEqual(catalog["next_value_ticket_sequence"], 2)
+            self.assertEqual(catalog["value_cursor_ticket_sequence"], 0)
             self.assertEqual(record["last_successful_use_sequence"], 2)
+            self.assertEqual(record["value_ticket_sequence"], 2)
             self.assertEqual(record["successful_use_count"], 2)
             self.assertEqual(record["reconstruction_elapsed_ns"], 500_000_000)
             self.assertEqual(record["reuse_elapsed_ns"], 50_000_000)
@@ -1148,6 +1160,60 @@ class HotRunTests(unittest.TestCase):
                 )
             )
             self.assertFalse(stale.exists())
+
+    def test_success_record_keeps_caller_namespace_lease_held(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, _, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "u" * 64
+            )
+            namespace["publish_implicit_state_base"](state, document)
+            (state / "lock").touch(mode=0o600)
+            lease = namespace["open_private_lock"](
+                namespace_root / namespace["HOT_STATE_NAMESPACE_LOCK"],
+                "hot-state namespace lock",
+            )
+            contender = None
+            try:
+                fcntl.flock(lease, fcntl.LOCK_SH)
+                self.assertEqual(
+                    namespace["record_successful_hot_state_use"](
+                        namespace_root,
+                        state,
+                        "created",
+                        "sha256:" + "2" * 64,
+                        None,
+                        None,
+                        namespace["ExecutionObservation"](0.1, 0.0),
+                        lease,
+                    ),
+                    "recorded",
+                )
+                contender = namespace["open_private_lock"](
+                    namespace_root / namespace["HOT_STATE_NAMESPACE_LOCK"],
+                    "hot-state namespace lock",
+                )
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(
+                        contender,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                value_lock = (
+                    namespace_root / namespace["HOT_STATE_VALUE_LOCK"]
+                )
+                self.assertTrue(value_lock.is_file())
+                self.assertEqual(
+                    stat.S_IMODE(value_lock.stat().st_mode),
+                    0o600,
+                )
+            finally:
+                if contender is not None:
+                    os.close(contender)
+                fcntl.flock(lease, fcntl.LOCK_UN)
+                os.close(lease)
 
     def test_value_record_parent_symlink_is_never_followed(self) -> None:
         namespace = load_hot_run()
@@ -1275,12 +1341,21 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(migrated["schema_version"], 2)
             self.assertTrue(migrated["pressure_active"])
             self.assertEqual(migrated["next_use_sequence"], 7)
+            self.assertEqual(migrated["next_value_ticket_sequence"], 1)
+            self.assertEqual(migrated["value_cursor_ticket_sequence"], 0)
             record = namespace["read_hot_state_value_record"](
                 namespace_root, state.name
             )
             self.assertIsNotNone(record)
             assert record is not None
             self.assertEqual(record["successful_use_count"], 3)
+            self.assertEqual(record["value_ticket_sequence"], 1)
+            ticket = namespace["read_hot_state_value_ticket"](
+                namespace_root, 1
+            )
+            self.assertIsNotNone(ticket)
+            assert ticket is not None
+            self.assertEqual(ticket["state_identity"], state.name)
             self.assertNotIn("states", migrated)
 
             # Re-reading a completed migration is idempotent.
@@ -1289,24 +1364,30 @@ class HotRunTests(unittest.TestCase):
                 migrated,
             )
 
-    def test_value_records_have_no_total_generation_ceiling(self) -> None:
+    def test_value_reclamation_cursor_bounds_work_and_makes_progress(self) -> None:
         namespace = load_hot_run()
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
             namespace_root = fixture / "hot-run"
             namespace_root.mkdir(mode=0o700)
-            state, _, document = self.make_hot_state_manifest_fixture(
-                namespace, fixture, "v" * 64
-            )
-            namespace["publish_implicit_state_base"](state, document)
-            (state / "lock").touch(mode=0o600)
 
             catalog = namespace["empty_hot_state_value_catalog"]()
             namespace["write_hot_state_value_catalog"](
-                namespace_root, {**catalog, "next_use_sequence": 300}
+                namespace_root,
+                {
+                    **catalog,
+                    "next_use_sequence": 64,
+                    "next_value_ticket_sequence": 64,
+                },
             )
-            for index in range(1, 301):
+            for index in range(1, 65):
                 state_identity = f"{index:064x}"
+                namespace["write_hot_state_value_ticket"](
+                    namespace_root,
+                    index,
+                    state_identity,
+                    index,
+                )
                 namespace["write_hot_state_value_record"](
                     namespace_root,
                     state_identity,
@@ -1319,40 +1400,61 @@ class HotRunTests(unittest.TestCase):
                         "value_identity": None,
                         "reconstruction_elapsed_ns": None,
                         "reuse_elapsed_ns": None,
+                        "value_ticket_sequence": index,
                     },
                 )
 
-            self.assertEqual(
-                namespace["record_successful_hot_state_use"](
-                    namespace_root,
-                    state,
-                    "created",
-                    None,
-                    None,
-                    None,
-                    namespace["ExecutionObservation"](0.1, 0.0),
-                ),
-                "recorded",
+            state, _, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "v" * 64
             )
-            updated = namespace["read_hot_state_value_catalog"](
-                namespace_root
+            namespace["publish_implicit_state_base"](state, document)
+            namespace["record_successful_hot_state_use"](
+                namespace_root,
+                state,
+                "created",
+                None,
+                None,
+                None,
+                namespace["ExecutionObservation"](0.1, 0.0),
             )
-            self.assertEqual(updated["next_use_sequence"], 301)
-            record = namespace["read_hot_state_value_record"](
-                namespace_root, state.name
+
+            retire = namespace["retire_one_low_value_state"]
+            filesystem = retire.__globals__["os"]
+            pressure = os.statvfs_result(
+                (4096, 4096, 100, 10, 10, 0, 0, 0, 0, 255)
             )
-            self.assertIsNotNone(record)
-            records_root = namespace_root / ".value-records-v2"
-            self.assertEqual(
-                len(
-                    [
-                        path
-                        for path in records_root.iterdir()
-                        if path.name.endswith(".json")
-                    ]
-                ),
-                301,
-            )
+            with mock.patch.object(
+                filesystem, "statvfs", return_value=pressure
+            ):
+                self.assertEqual(
+                    retire(namespace_root, "f" * 64),
+                    "pressure_scan_deferred",
+                )
+                first = namespace["read_hot_state_value_catalog"](
+                    namespace_root
+                )
+                self.assertEqual(
+                    first["value_cursor_ticket_sequence"], 32
+                )
+                self.assertTrue(state.exists())
+
+                self.assertEqual(
+                    retire(namespace_root, "f" * 64),
+                    "pressure_scan_deferred",
+                )
+                second = namespace["read_hot_state_value_catalog"](
+                    namespace_root
+                )
+                self.assertEqual(
+                    second["value_cursor_ticket_sequence"], 64
+                )
+                self.assertTrue(state.exists())
+
+                self.assertEqual(
+                    retire(namespace_root, "f" * 64),
+                    "retired_low_value",
+                )
+            self.assertFalse(state.exists())
 
     def test_corrupt_value_record_does_not_block_other_reclamation(self) -> None:
         namespace = load_hot_run()
@@ -1505,18 +1607,41 @@ class HotRunTests(unittest.TestCase):
                 (4096, 4096, 100, 10, 10, 0, 0, 0, 0, 255)
             )
             retire = namespace["retire_one_low_value_state"]
-            filesystem = retire.__globals__["os"]
+            globals_ = retire.__globals__
+            filesystem = globals_["os"]
+            real_rename = globals_["rename_noreplace"]
+            real_fsync = globals_["fsync_directory"]
+            renamed = False
+            failed = False
+
+            def rename_then_mark(source, destination):
+                nonlocal renamed
+                real_rename(source, destination)
+                if destination.name.startswith(".retired-v1-"):
+                    renamed = True
+
+            def fail_post_rename_namespace_sync(path):
+                nonlocal failed
+                if renamed and path == namespace_root and not failed:
+                    failed = True
+                    raise OSError("sync")
+                return real_fsync(path)
+
             with (
                 mock.patch.object(filesystem, "statvfs", return_value=pressure),
                 mock.patch.dict(
-                    retire.__globals__,
-                    {"fsync_directory": mock.Mock(side_effect=OSError("sync"))},
+                    globals_,
+                    {
+                        "rename_noreplace": rename_then_mark,
+                        "fsync_directory": fail_post_rename_namespace_sync,
+                    },
                 ),
             ):
                 self.assertEqual(
                     retire(namespace_root, "f" * 64),
                     "retired_low_value_recovery_deferred",
                 )
+            self.assertTrue(failed)
 
             retired = list(namespace_root.glob(".retired-v1-*"))
             self.assertEqual(len(retired), 1)
@@ -1542,7 +1667,7 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(list(namespace_root.glob(".retired-v1-*")), [])
             self.assertTrue(states[1].exists())
 
-    def test_value_retirement_preserves_current_active_unknown_and_recreated_state(
+    def test_value_retirement_preserves_current_unknown_and_recreated_state(
         self,
     ) -> None:
         namespace = load_hot_run()
@@ -1575,18 +1700,6 @@ class HotRunTests(unittest.TestCase):
                     retire(namespace_root, state.name),
                     "pressure_no_eligible_state",
                 )
-            self.assertTrue(state.exists())
-
-            active = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
-            fcntl.flock(active, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
-                with mock.patch.object(filesystem, "statvfs", return_value=pressure):
-                    self.assertEqual(
-                        retire(namespace_root, "f" * 64),
-                        "pressure_no_eligible_state",
-                    )
-            finally:
-                os.close(active)
             self.assertTrue(state.exists())
 
             old_state = namespace_root / ("old-" + state.name)
