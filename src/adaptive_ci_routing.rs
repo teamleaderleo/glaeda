@@ -65,13 +65,13 @@ impl RoutingId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkloadClassV1 {
-    pub project: RoutingId,
-    pub profile: RoutingId,
-    pub trust_class: ComputeTrustClass,
-    pub source_class: RoutingId,
-    pub input_class: RoutingId,
-    pub resource_profile: RoutingId,
-    pub requirements: Vec<RoutingId>,
+    project: RoutingId,
+    profile: RoutingId,
+    trust_class: ComputeTrustClass,
+    source_class: RoutingId,
+    input_class: RoutingId,
+    resource_profile: RoutingId,
+    requirements: Vec<RoutingId>,
 }
 
 impl WorkloadClassV1 {
@@ -115,6 +115,41 @@ impl WorkloadClassV1 {
             requirements,
         })
     }
+
+    #[must_use]
+    pub const fn project(&self) -> &RoutingId {
+        &self.project
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> &RoutingId {
+        &self.profile
+    }
+
+    #[must_use]
+    pub const fn trust_class(&self) -> ComputeTrustClass {
+        self.trust_class
+    }
+
+    #[must_use]
+    pub const fn source_class(&self) -> &RoutingId {
+        &self.source_class
+    }
+
+    #[must_use]
+    pub const fn input_class(&self) -> &RoutingId {
+        &self.input_class
+    }
+
+    #[must_use]
+    pub const fn resource_profile(&self) -> &RoutingId {
+        &self.resource_profile
+    }
+
+    #[must_use]
+    pub fn requirements(&self) -> &[RoutingId] {
+        &self.requirements
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -138,10 +173,10 @@ impl PoolAccountingClass {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionPoolV1 {
-    pub pool_id: RoutingId,
-    pub execution_class: RoutingId,
-    pub accounting_class: PoolAccountingClass,
-    pub capabilities: Vec<RoutingId>,
+    pool_id: RoutingId,
+    execution_class: RoutingId,
+    accounting_class: PoolAccountingClass,
+    capabilities: Vec<RoutingId>,
 }
 
 impl ExecutionPoolV1 {
@@ -177,6 +212,26 @@ impl ExecutionPoolV1 {
             accounting_class,
             capabilities,
         })
+    }
+
+    #[must_use]
+    pub const fn pool_id(&self) -> &RoutingId {
+        &self.pool_id
+    }
+
+    #[must_use]
+    pub const fn execution_class(&self) -> &RoutingId {
+        &self.execution_class
+    }
+
+    #[must_use]
+    pub const fn accounting_class(&self) -> PoolAccountingClass {
+        self.accounting_class
+    }
+
+    #[must_use]
+    pub fn capabilities(&self) -> &[RoutingId] {
+        &self.capabilities
     }
 
     fn satisfies(&self, workload: &WorkloadClassV1) -> bool {
