@@ -38,16 +38,17 @@ A new specialization becomes a capability or operation first. A new role require
 A node is eligible for a role only when all of these agree:
 
 1. the node is in a routable lifecycle state;
-2. the platform and architecture match the role;
-3. reviewed CPU, memory, and disk classes meet the role minimums;
-4. required node capabilities are present;
-5. a current accepted role canary exists;
-6. the canary matches the current #1056 enrollment generation;
-7. the canary matches the current Glaeda generation;
-8. the canary matches the current #1056 per-role acceptance-workload generation;
-9. the canary matches the current execution capability generation;
-10. the canary accepted every capability needed by the role;
-11. toolchain-bound roles bind a semantic profile to the exact accepted #1056 toolchain generation.
+2. the platform, reviewed OS version class, and architecture match the role;
+3. Linux execution roles carry the reviewed kernel-6-or-newer capability from bootstrap/acceptance;
+4. reviewed CPU, memory, and disk classes meet the role minimums;
+5. required node capabilities are present;
+6. a current accepted role canary exists;
+7. the canary matches the current #1056 enrollment generation;
+8. the canary matches the current Glaeda generation;
+9. the canary matches the current #1056 per-role acceptance-workload generation;
+10. the canary matches the current execution capability generation;
+11. the canary accepted every capability needed by the role;
+12. toolchain-bound roles bind a semantic profile to the exact accepted #1056 toolchain generation.
 
 Enrollment alone yields zero role eligibility.
 
@@ -56,6 +57,8 @@ The node capability projection carries `enrollmentGeneration`, exact `glaedaGene
 `toolchainProfiles` maps an immutable semantic name such as `apple-xcode-26-sdk-26` to the exact accepted #1056 toolchain-generation digest. A toolchain update changes that digest or publishes a new profile; the previous canary cannot authorize the changed toolchain.
 
 ## Machine capability classes
+
+The initial reviewed OS classes follow #1056: macOS 15/26 for macOS roles, Ubuntu 24.04 or Debian 12 plus kernel-major-6-or-newer capability for Linux execution roles.
 
 Remote placement consumes reviewed classes instead of arbitrary host controls:
 
@@ -192,6 +195,7 @@ Internal enrollment/capability/workload generation objects stay out of the human
 
 - exact role requirements;
 - wrong Xcode/toolchain profile;
+- unsupported OS version class and missing Linux kernel class;
 - insufficient CPU and memory classes;
 - failed role canary;
 - stale role canary after re-enrollment;
