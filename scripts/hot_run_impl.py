@@ -1588,6 +1588,8 @@ def empty_hot_state_value_catalog() -> dict[str, object]:
         "retire_start_used_percent": HOT_STATE_RETIRE_START_USED_PERCENT,
         "retire_stop_used_percent": HOT_STATE_RETIRE_STOP_USED_PERCENT,
         "next_use_sequence": 0,
+        "next_value_ticket_sequence": 0,
+        "value_cursor_ticket_sequence": 0,
     }
 
 
@@ -1629,9 +1631,13 @@ def validate_hot_state_value_catalog(document: object) -> dict[str, object]:
         "retire_start_used_percent",
         "retire_stop_used_percent",
         "next_use_sequence",
+        "next_value_ticket_sequence",
+        "value_cursor_ticket_sequence",
     }:
         raise RuntimeError("hot-state value catalog has an unsupported shape")
     sequence = document["next_use_sequence"]
+    next_ticket = document["next_value_ticket_sequence"]
+    cursor = document["value_cursor_ticket_sequence"]
     if (
         document["schema_version"] != HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION
         or document["producer"] != HOT_STATE_VALUE_CATALOG_PRODUCER
@@ -1641,6 +1647,13 @@ def validate_hot_state_value_catalog(document: object) -> dict[str, object]:
         or isinstance(sequence, bool)
         or not isinstance(sequence, int)
         or sequence < 0
+        or isinstance(next_ticket, bool)
+        or not isinstance(next_ticket, int)
+        or next_ticket < 0
+        or isinstance(cursor, bool)
+        or not isinstance(cursor, int)
+        or cursor < 0
+        or cursor > next_ticket
     ):
         raise RuntimeError("hot-state value catalog identity is not accepted")
     return document
@@ -1660,6 +1673,7 @@ def validate_hot_state_value_record_fields(
         "value_identity",
         "reconstruction_elapsed_ns",
         "reuse_elapsed_ns",
+        "value_ticket_sequence",
     }
     if (
         not isinstance(state_identity, str)
@@ -1674,6 +1688,7 @@ def validate_hot_state_value_record_fields(
         "manifest_creation_witness_ns",
         "last_successful_use_sequence",
         "successful_use_count",
+        "value_ticket_sequence",
     ):
         value = record[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1681,6 +1696,7 @@ def validate_hot_state_value_record_fields(
     if (
         record["last_successful_use_sequence"] == 0
         or record["successful_use_count"] == 0
+        or record["value_ticket_sequence"] == 0
         or (
             maximum_sequence is not None
             and record["last_successful_use_sequence"] > maximum_sequence
@@ -1736,6 +1752,7 @@ def validate_hot_state_value_record(document: object) -> dict[str, object]:
         "value_identity",
         "reconstruction_elapsed_ns",
         "reuse_elapsed_ns",
+        "value_ticket_sequence",
     }
     if set(document) != expected_keys:
         raise RuntimeError("hot-state value record has an unsupported shape")
