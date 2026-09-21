@@ -360,6 +360,28 @@ class ProviderNeutralRequestTests(unittest.TestCase):
         with self.assertRaisesRegex(module.ContractRefusal, "unexpected source"):
             module.inspect_receipt(module.canonical_bytes(drifted_source) + b"\n")
 
+    def test_receipt_inspection_recompiles_repo_query_resolution(self) -> None:
+        request = module.decode_request(
+            raw(
+                document(
+                    operation="repo_query",
+                    source=SOURCE,
+                    parameters={"base_commit": "3" * 40, "max_patch_bytes": 4096},
+                )
+            )
+        )
+        compiled = module.compile_request(request)
+        receipt = module.repo_query_receipt(compiled, repo_query_report(compiled))
+        tampered = copy.deepcopy(receipt)
+        fake = "sha256:" + "d" * 64
+        tampered["resolved_operation"]["request_digest"] = fake
+        tampered["result"]["request_digest"] = fake
+        tampered["result_sha256"] = module.sha256(
+            module.canonical_bytes(tampered["result"]) + b"\n"
+        )
+        with self.assertRaisesRegex(module.ContractRefusal, "resolution does not match"):
+            module.inspect_receipt(module.canonical_bytes(tampered) + b"\n")
+
     def test_receipt_inspection_rejects_rehashed_invalid_verify_projection(self) -> None:
         receipt = module.terminal_verify_receipt(
             compiled_verify(),
