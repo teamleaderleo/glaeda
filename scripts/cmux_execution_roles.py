@@ -501,6 +501,10 @@ def validate_capacity(value: object) -> dict[str, Any]:
     measurement = _exact(
         doc["measurement"],
         {
+            "offeredTasks",
+            "maximumSimultaneous",
+            "startedTasks",
+            "settledTasks",
             "validatedCompletions",
             "p50Millis",
             "p90Millis",
@@ -514,11 +518,35 @@ def validate_capacity(value: object) -> dict[str, Any]:
         },
         "capacity measurement",
     )
-    _nonnegative_int(
+    offered = _nonnegative_int(
+        measurement["offeredTasks"],
+        "offered tasks",
+        maximum=16,
+    )
+    maximum_simultaneous = _nonnegative_int(
+        measurement["maximumSimultaneous"],
+        "maximum simultaneous tasks",
+        maximum=16,
+    )
+    started = _nonnegative_int(
+        measurement["startedTasks"],
+        "started tasks",
+        maximum=16,
+    )
+    settled = _nonnegative_int(
+        measurement["settledTasks"],
+        "settled tasks",
+        maximum=16,
+    )
+    validated = _nonnegative_int(
         measurement["validatedCompletions"],
         "validated completions",
-        maximum=65535,
+        maximum=16,
     )
+    if not 0 <= maximum_simultaneous <= started <= offered:
+        raise RoleModelError("capacity cohort counts are inconsistent")
+    if settled > started or validated > settled:
+        raise RoleModelError("capacity settled/completion counts are inconsistent")
     _positive_int(measurement["p50Millis"], "p50 millis")
     _positive_int(measurement["p90Millis"], "p90 millis")
     if measurement["p90Millis"] < measurement["p50Millis"]:
@@ -536,16 +564,26 @@ def validate_capacity(value: object) -> dict[str, Any]:
         raise RoleModelError("swap peak bytes cannot be below start or end")
     if measurement["thermalBehavior"] not in THERMAL_CLASSES:
         raise RoleModelError("capacity thermal class is unsupported")
-    _nonnegative_int(
-        measurement["unfinishedWork"], "unfinished work", maximum=65535
+    unfinished = _nonnegative_int(
+        measurement["unfinishedWork"], "unfinished work", maximum=16
     )
+    if unfinished != offered - settled:
+        raise RoleModelError("capacity unfinished work disagrees with cohort counts")
     if doc["result"] not in {"accepted", "rejected"}:
         raise RoleModelError("capacity result is invalid")
     if doc["result"] == "accepted":
-        if measurement["validatedCompletions"] == 0:
+        if validated == 0:
             raise RoleModelError("accepted capacity requires validated completions")
-        if measurement["unfinishedWork"] != 0:
+        if unfinished != 0 or settled != offered:
             raise RoleModelError("accepted capacity requires all offered work settled")
+        if maximum_simultaneous < doc["maxConcurrent"]:
+            raise RoleModelError(
+                "accepted capacity concurrency exceeds measured simultaneous work"
+            )
+        if validated < doc["maxConcurrent"]:
+            raise RoleModelError(
+                "accepted capacity concurrency exceeds validated completions"
+            )
         if measurement["cpuPressure"] in {"critical", "unknown"}:
             raise RoleModelError("accepted capacity requires bounded CPU pressure")
         if measurement["memoryPressure"] in {"critical", "unknown"}:
