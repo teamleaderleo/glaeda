@@ -194,6 +194,21 @@ revalidation_required
 unknown
 ```
 
+Each project can also publish up to 16 exact `ReusableStateStatusSummary` values from the accepted #21 lifecycle. The snapshot keeps only the lifecycle's agent-facing fields:
+
+```text
+cache_class
+generation
+heat
+size
+recent_hit
+revalidation_required
+```
+
+The closed cache-class vocabulary keeps package-manager state, compiler caches, incremental build state, immutable compiled products, container layers, prepared dependency generations, and approved project-local hot state distinct. `generation` is one canonical SHA-256 identity. Heat is `cold | warm | hot`; size and recent-hit values use the bounded #1066 classes. A revalidation-required summary must report cold heat.
+
+These summaries are advisory routing evidence for #546/#970. They grant no reuse, publication, validation, retention, cleanup, or execution authority.
+
 No dependency names, cache contents, cache paths, dirty filenames, package inventory, or local-only source bytes enter the projection.
 
 ### Request classes
@@ -282,7 +297,7 @@ glaeda-owned-workstation-capability/v1
 -> signed glaeda-github-resident-node-snapshot/v1
 ```
 
-The optional project input carries only the project fields present in the public schema. The optional request input carries only request ID, exact source, advertised profile, state, optional terminal receipt, and bounded duration classes. Unknown fields refuse.
+The optional project input carries only the project fields present in the public schema, including optional bounded reusable-state summaries that exactly match #1066's `ReusableStateStatusSummary` JSON contract. The optional request input carries only request ID, exact source, advertised profile, state, optional terminal receipt, and bounded duration classes. Unknown fields refuse.
 
 If request state claims `preparing` or `running`, the local admission evidence must show at least as much active work. Published project active-task counts also cannot exceed the local bounded active-work count.
 
