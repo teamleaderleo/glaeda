@@ -433,6 +433,38 @@ class ResidentSnapshotSigningAndTransportTests(unittest.TestCase):
         )
         return MODULE.sign_snapshot(unsigned, trust_value, private_key=key, ssh_keygen=SSH_KEYGEN), trust_value, key
 
+    def signed_for(
+        self,
+        trust_value,
+        key,
+        node_id,
+        *,
+        sequence,
+        generation=1,
+        now=BASE_TIME,
+        os_class="linux",
+        architecture="x86_64",
+    ):
+        return MODULE.sign_snapshot(
+            MODULE.build_unsigned_snapshot(
+                capability(
+                    observed=now,
+                    os_class=os_class,
+                    architecture=architecture,
+                ),
+                admission(),
+                trust_value,
+                public_node_id=node_id,
+                producer_generation=generation,
+                snapshot_sequence=sequence,
+                observed_at=now,
+                published_at=now,
+            ),
+            trust_value,
+            private_key=key,
+            ssh_keygen=SSH_KEYGEN,
+        )
+
     def test_signature_round_trip_and_manual_forgery_degrades_to_unknown(self):
         signed, trust_value, _ = self.one_signed()
         fleet = {"document_type": MODULE.FLEET_DOCUMENT, "schema_version": 1, "nodes": [signed]}
@@ -505,6 +537,248 @@ class ResidentSnapshotSigningAndTransportTests(unittest.TestCase):
         self.assertLessEqual(node_bytes, MODULE.MAX_NODE_BYTES)
         self.assertLessEqual(fleet_bytes, MODULE.MAX_FLEET_BYTES)
         print(f"MEASURE github_resident_snapshot node_bytes={node_bytes} fleet_bytes={fleet_bytes} reusable_state_count=1 agent_reads=2 successful_write_remote_round_trips=2 idle_refresh_seconds={MODULE.DEFAULT_REFRESH_INTERVAL_SECONDS}")
+
+    def test_removed_trust_node_does_not_block_other_node_publication(self):
+        node_a = "node-1111111111111111"
+        node_b = "node-2222222222222222"
+        key_a, pub_a = self.key("removed-node-a")
+        key_b, pub_b = self.key("removed-node-b")
+        old_trust = trust(nodes=[
+            {
+                "id": node_a,
+                "key_id": "key-aaaaaaaaaaaaaaaa",
+                "ssh_public_key": pub_a,
+                "os_class": "linux",
+                "architecture_class": "x86_64",
+            },
+            {
+                "id": node_b,
+                "key_id": "key-bbbbbbbbbbbbbbbb",
+                "ssh_public_key": pub_b,
+                "os_class": "macos",
+                "architecture_class": "arm64",
+            },
+        ])
+        current_trust = trust(nodes=[old_trust["nodes"][1]])
+        old_a = self.signed_for(
+            old_trust, key_a, node_a, sequence=1
+        )
+        old_b = self.signed_for(
+            old_trust,
+            key_b,
+            node_b,
+            sequence=1,
+            os_class="macos",
+            architecture="arm64",
+        )
+        update_time = BASE_TIME + dt.timedelta(seconds=30)
+        new_b = self.signed_for(
+            current_trust,
+            key_b,
+            node_b,
+            sequence=2,
+            now=update_time,
+            os_class="macos",
+            architecture="arm64",
+        )
+        fleet = {
+            "document_type": MODULE.FLEET_DOCUMENT,
+            "schema_version": 1,
+            "nodes": [old_a, old_b],
+        }
+
+        updated, reason = MODULE.upsert_fleet(
+            fleet,
+            new_b,
+            current_trust,
+            now=update_time,
+            ssh_keygen=SSH_KEYGEN,
+        )
+
+        self.assertEqual(reason, "transition")
+        self.assertEqual(
+            [item["payload"]["node"]["id"] for item in updated["nodes"]],
+            [node_b],
+        )
+        view = MODULE.consume_fleet(
+            updated,
+            current_trust,
+            now=update_time + dt.timedelta(seconds=5),
+            ssh_keygen=SSH_KEYGEN,
+        )
+        self.assertEqual(view["nodes"][0]["freshness_class"], "fresh")
+
+    def test_rotated_key_allows_other_publish_then_current_key_replacement(self):
+        node_a = "node-1111111111111111"
+        node_b = "node-2222222222222222"
+        old_key_a, old_pub_a = self.key("rotated-node-a-old")
+        new_key_a, new_pub_a = self.key("rotated-node-a-new")
+        key_b, pub_b = self.key("rotated-node-b")
+        old_trust = trust(nodes=[
+            {
+                "id": node_a,
+                "key_id": "key-aaaaaaaaaaaaaaaa",
+                "ssh_public_key": old_pub_a,
+                "os_class": "linux",
+                "architecture_class": "x86_64",
+            },
+            {
+                "id": node_b,
+                "key_id": "key-bbbbbbbbbbbbbbbb",
+                "ssh_public_key": pub_b,
+                "os_class": "macos",
+                "architecture_class": "arm64",
+            },
+        ])
+        current_trust = trust(nodes=[
+            {
+                "id": node_a,
+                "key_id": "key-cccccccccccccccc",
+                "ssh_public_key": new_pub_a,
+                "os_class": "linux",
+                "architecture_class": "x86_64",
+            },
+            old_trust["nodes"][1],
+        ])
+        old_a = self.signed_for(
+            old_trust, old_key_a, node_a, sequence=7, generation=9
+        )
+        old_b = self.signed_for(
+            old_trust,
+            key_b,
+            node_b,
+            sequence=1,
+            os_class="macos",
+            architecture="arm64",
+        )
+        fleet = {
+            "document_type": MODULE.FLEET_DOCUMENT,
+            "schema_version": 1,
+            "nodes": [old_a, old_b],
+        }
+
+        update_time = BASE_TIME + dt.timedelta(seconds=30)
+        new_b = self.signed_for(
+            current_trust,
+            key_b,
+            node_b,
+            sequence=2,
+            now=update_time,
+            os_class="macos",
+            architecture="arm64",
+        )
+        after_b, _ = MODULE.upsert_fleet(
+            fleet,
+            new_b,
+            current_trust,
+            now=update_time,
+            ssh_keygen=SSH_KEYGEN,
+        )
+        interim = MODULE.consume_fleet(
+            after_b,
+            current_trust,
+            now=update_time + dt.timedelta(seconds=5),
+            ssh_keygen=SSH_KEYGEN,
+        )
+        by_id = {item["id"]: item for item in interim["nodes"]}
+        self.assertEqual(by_id[node_a]["freshness_class"], "unknown")
+        self.assertEqual(by_id[node_a]["reason"], "untrusted")
+        self.assertEqual(by_id[node_b]["freshness_class"], "fresh")
+
+        bad_a = self.signed_for(
+            current_trust,
+            new_key_a,
+            node_a,
+            sequence=2,
+            generation=10,
+            now=update_time,
+        )
+        with self.assertRaisesRegex(MODULE.SnapshotError, "restart snapshot sequence at one"):
+            MODULE.upsert_fleet(
+                after_b,
+                bad_a,
+                current_trust,
+                now=update_time,
+                ssh_keygen=SSH_KEYGEN,
+            )
+
+        replacement_time = BASE_TIME + dt.timedelta(seconds=60)
+        new_a = self.signed_for(
+            current_trust,
+            new_key_a,
+            node_a,
+            sequence=1,
+            generation=10,
+            now=replacement_time,
+        )
+        updated, reason = MODULE.upsert_fleet(
+            after_b,
+            new_a,
+            current_trust,
+            now=replacement_time,
+            ssh_keygen=SSH_KEYGEN,
+        )
+        self.assertEqual(reason, "transition")
+        final = MODULE.consume_fleet(
+            updated,
+            current_trust,
+            now=replacement_time + dt.timedelta(seconds=5),
+            ssh_keygen=SSH_KEYGEN,
+        )
+        self.assertTrue(
+            all(item["freshness_class"] == "fresh" for item in final["nodes"])
+        )
+
+    def test_trust_transition_does_not_allow_cross_node_forgery(self):
+        node_a = "node-1111111111111111"
+        node_b = "node-2222222222222222"
+        key_a, pub_a = self.key("forgery-node-a")
+        key_b, pub_b = self.key("forgery-node-b")
+        trust_value = trust(nodes=[
+            {
+                "id": node_a,
+                "key_id": "key-aaaaaaaaaaaaaaaa",
+                "ssh_public_key": pub_a,
+                "os_class": "linux",
+                "architecture_class": "x86_64",
+            },
+            {
+                "id": node_b,
+                "key_id": "key-bbbbbbbbbbbbbbbb",
+                "ssh_public_key": pub_b,
+                "os_class": "macos",
+                "architecture_class": "arm64",
+            },
+        ])
+        snap_a = self.signed_for(trust_value, key_a, node_a, sequence=1)
+        snap_b = self.signed_for(
+            trust_value,
+            key_b,
+            node_b,
+            sequence=1,
+            os_class="macos",
+            architecture="arm64",
+        )
+        forged = json.loads(json.dumps(snap_b))
+        forged["payload"]["node"]["id"] = node_a
+        forged["payload"]["node"]["os_class"] = "linux"
+        forged["payload"]["node"]["architecture_class"] = "x86_64"
+        forged["payload"]["producer"]["key_id"] = "key-aaaaaaaaaaaaaaaa"
+        forged["signature"]["key_id"] = "key-aaaaaaaaaaaaaaaa"
+        fleet = {
+            "document_type": MODULE.FLEET_DOCUMENT,
+            "schema_version": 1,
+            "nodes": [snap_a, snap_b],
+        }
+
+        with self.assertRaisesRegex(MODULE.SnapshotError, "signature verification failed"):
+            MODULE.upsert_fleet(
+                fleet,
+                forged,
+                trust_value,
+                now=BASE_TIME + dt.timedelta(seconds=10),
+                ssh_keygen=SSH_KEYGEN,
+            )
 
     def test_two_nodes_can_publish_concurrently_and_converge(self):
         remote = self.root / "remote.git"
