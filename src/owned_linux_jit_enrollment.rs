@@ -21,6 +21,7 @@ use crate::owned_linux_jit_runtime::OwnedLinuxJitRuntime;
 pub const OWNED_LINUX_JIT_ENROLLMENT_SCHEMA_VERSION: u8 = 1;
 pub const MAX_OWNED_LINUX_JIT_ENROLLMENT_BYTES: usize = 16 * 1024;
 const BRIDGE_PROGRAM: &str = "/opt/smolrunner/bin/scaleset-bridge";
+const SHARED_ADMISSION_RELATIVE: &str = ".local/state/glaeda/direct-owned-admission-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -191,7 +192,7 @@ fn build_enrollment(
     let runtime = OwnedLinuxJitRuntime::new(
         PathBuf::from(&wire.owned_linux.helper),
         helper_digest,
-        PathBuf::from(&wire.owned_linux.admission_root),
+        shared_owned_linux_admission_root()?,
         PathBuf::from(&wire.owned_linux.task_root),
         PathBuf::from(&wire.owned_linux.payload_root),
         payload_tree_digest,
@@ -230,6 +231,15 @@ fn build_enrollment(
         runtime,
         runner_runtime,
     })
+}
+
+fn shared_owned_linux_admission_root() -> Result<PathBuf, OwnedLinuxJitEnrollmentError> {
+    let home = std::env::var_os("HOME").ok_or_else(invalid_configuration)?;
+    let root = PathBuf::from(home).join(SHARED_ADMISSION_RELATIVE);
+    if !root.is_absolute() || root == Path::new("/") {
+        return Err(invalid_configuration());
+    }
+    Ok(root)
 }
 
 fn canonical_bytes(wire: &EnrollmentWire) -> Result<Vec<u8>, OwnedLinuxJitEnrollmentError> {
@@ -314,7 +324,6 @@ struct ScaleSetWire {
 struct OwnedLinuxWire {
     helper: String,
     helper_sha256: String,
-    admission_root: String,
     task_root: String,
     payload_root: String,
     payload_tree_sha256: String,
