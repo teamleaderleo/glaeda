@@ -1,0 +1,24 @@
+{
+  "schema": "glaeda-cmux-fleet-enrollment/v1",
+  "nodeId": "cmux-example-linux-001",
+  "architecture": "x86_64",
+  "os": {
+    "family": "linux",
+    "versionClass": "ubuntu-24.04"
+  },
+  "hardwareCapabilityClass": "cmux-linux-ci-medium",
+  "supportedToolchainGenerations": [
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  ],
+  "allowedExecutionRoles": [
+    "artifact_cache",
+    "background_replay",
+    "cmux_linux_agent",
+    "cmux_linux_ci"
+  ],
+  "operatorFleetScope": "cmux-founders",
+  "enrollmentGeneration": 1,
+  "glaedaGeneration": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "state": "enrolling",
+  "quarantineReason": null
+}
