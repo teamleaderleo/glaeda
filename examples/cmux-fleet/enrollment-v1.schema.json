@@ -131,9 +131,6 @@
     "roleWorkloadGenerations": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "cmux_macos_native_build"
-      ],
       "properties": {
         "cmux_macos_native_build": {
           "type": "string",
