@@ -878,37 +878,102 @@ class HotRunTests(unittest.TestCase):
             )
             self.assertFalse(retired.exists())
 
-    def test_retired_deletion_has_no_protocol_depth_ceiling(self) -> None:
+    def test_retired_deletion_depth_exceeds_budget_and_resumes(self) -> None:
         namespace = load_hot_run()
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
             namespace_root = fixture / "hot-run"
             namespace_root.mkdir(mode=0o700)
-            state, task, document = self.make_hot_state_manifest_fixture(
+            state, _, document = self.make_hot_state_manifest_fixture(
                 namespace, fixture, "z" * 64
             )
             namespace["publish_implicit_state_base"](state, document)
-            (state / "lock").touch(mode=0o600)
             deepest = state
-            for index in range(180):
+            for index in range(24):
                 deepest = deepest / f"d{index:03d}"
                 deepest.mkdir()
             (deepest / "artifact").write_text(
                 "reconstructible\n", encoding="utf-8"
             )
-            (task / ".git").unlink()
+            retired_name = ".retired-v1-" + state.name
+            retired = namespace_root / retired_name
+            namespace["rename_noreplace"](state, retired)
+            namespace["fsync_directory"](namespace_root)
 
-            self.assertEqual(
-                namespace["collect_one_unreachable_state"](
-                    namespace_root, "0" * 64
-                ),
-                "retired_unreachable",
+            delete = namespace["delete_retired_state_bounded"]
+            globals_ = delete.__globals__
+            passes = 0
+            with mock.patch.dict(
+                globals_, {"MAX_HOT_STATE_DELETE_ENTRIES": 5}
+            ):
+                while True:
+                    passes += 1
+                    complete = delete(
+                        namespace_root, retired_name, state.name
+                    )
+                    if complete:
+                        break
+                    self.assertTrue(retired.exists())
+                    self.assertTrue(
+                        (retired / "producer-manifest.json").exists()
+                    )
+                    self.assertLess(passes, 32)
+
+            self.assertGreater(passes, 1)
+            self.assertFalse(retired.exists())
+
+    def test_retired_deletion_descriptor_exhaustion_fails_closed_then_recovers(
+        self,
+    ) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, _, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "y" * 64
             )
-            self.assertFalse(state.exists())
-            self.assertEqual(
-                list(namespace_root.glob(".retired-v1-*")),
-                [],
+            namespace["publish_implicit_state_base"](state, document)
+            nested = state / "nested"
+            nested.mkdir()
+            (nested / "artifact").write_text("data\n", encoding="utf-8")
+            retired_name = ".retired-v1-" + state.name
+            retired = namespace_root / retired_name
+            namespace["rename_noreplace"](state, retired)
+            namespace["fsync_directory"](namespace_root)
+
+            delete = namespace["delete_retired_state_bounded"]
+            filesystem = delete.__globals__["os"]
+            real_open = filesystem.open
+            failed = False
+
+            def fail_nested_open(path, flags, *args, **kwargs):
+                nonlocal failed
+                if (
+                    path == "nested"
+                    and kwargs.get("dir_fd") is not None
+                    and not failed
+                ):
+                    failed = True
+                    raise OSError(24, "Too many open files")
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                filesystem, "open", side_effect=fail_nested_open
+            ):
+                self.assertFalse(
+                    delete(namespace_root, retired_name, state.name)
+                )
+            self.assertTrue(failed)
+            self.assertTrue(retired.exists())
+            self.assertTrue(
+                (retired / "producer-manifest.json").exists()
             )
+
+            self.assertTrue(
+                delete(namespace_root, retired_name, state.name)
+            )
+            self.assertFalse(retired.exists())
 
     def test_retirement_record_closes_the_final_delete_crash_window(self) -> None:
         namespace = load_hot_run()
