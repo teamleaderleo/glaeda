@@ -209,7 +209,9 @@ class OwnedLinuxJitRunnerTests(unittest.TestCase):
                 "capacity_unavailable",
             ):
                 with self.subTest(reason=reason):
-                    args = arguments(root / reason)
+                    case_root = root / reason
+                    case_root.mkdir()
+                    args = arguments(case_root)
 
                     class Refusing:
                         def __enter__(self):
