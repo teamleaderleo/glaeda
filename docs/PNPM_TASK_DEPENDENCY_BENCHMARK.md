@@ -83,7 +83,7 @@ Storage evidence includes:
 - signed filesystem available-space (`statvfs.f_bavail`) and available-inode deltas at workspace-ready time;
 - exact `node_modules` logical bytes, summed `st_blocks * 512` bytes, and inode counts;
 - exhaustive regular-file and multiply-linked regular-file counts;
-- sampled FIEMAP shared-extent observations over non-empty imported package payload files;
+- deterministic lexicographic sampled FIEMAP (with a sample-set digest and bounded hashed private-copy diagnostics) shared-extent observations over non-empty imported package payload files;
 - signed filesystem available-space/inode deltas during cleanup;
 - signed residual filesystem available-space/inode deltas after cleanup.
 
