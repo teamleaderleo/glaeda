@@ -162,6 +162,13 @@ request/fingerprint state, and then feeds the accepted semantic request into thi
 private request journals remain the durable transport bridge; the physical verifier remains the only
 source-executing owner.
 
+The deployed direct-v1 envelope carries older transport-policy boilerplate. The compatibility bridge
+projects that envelope down to the fields above and calls `accept-projection`; the semantic
+fingerprint is derived by this module, so those legacy execution-policy fields never enter the
+accepted Glaeda identity. New direct terminal results publish that accepted semantic fingerprint in
+`glaeda-github-direct-result/v2` while retaining the immutable transport request fingerprint.
+
+
 The first provenance class is the deliberately tiny private repository writer set. The local
 focused capability remains an independent action-time authorization boundary. The Git object carries
 zero authority by itself.
