@@ -175,7 +175,7 @@ FLEET_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet"
 umask 077
 install -d -m 700 "$FLEET_ROOT" "$FLEET_ROOT/acceptance"
 BOOTSTRAP="$(mktemp)"
-ACCEPTANCE_EVIDENCE="$(mktemp)"
+CMUX_RESULT="$(mktemp)"
 ENROLLMENT="$FLEET_ROOT/enrollment.json"
 ACCEPTANCE="$FLEET_ROOT/acceptance/cmux_linux_ci.json"
 NODE_ID=cmux-linux-001
