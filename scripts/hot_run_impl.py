@@ -2922,6 +2922,336 @@ def delete_unpublished_stage_bounded(
         os.close(root_descriptor)
 
 
+def empty_hot_state_reconcile_catalog() -> dict[str, object]:
+    return {
+        "schema_version": HOT_STATE_RECONCILE_SCHEMA_VERSION,
+        "producer": HOT_STATE_RECONCILE_PRODUCER,
+        "next_ticket_sequence": 0,
+        "cursor_ticket_sequence": 0,
+    }
+
+
+def validate_hot_state_reconcile_catalog(
+    document: object,
+) -> dict[str, object]:
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "producer",
+        "next_ticket_sequence",
+        "cursor_ticket_sequence",
+    }:
+        raise RuntimeError("hot-state reconcile catalog has an unsupported shape")
+    next_ticket = document["next_ticket_sequence"]
+    cursor = document["cursor_ticket_sequence"]
+    if (
+        document["schema_version"] != HOT_STATE_RECONCILE_SCHEMA_VERSION
+        or document["producer"] != HOT_STATE_RECONCILE_PRODUCER
+        or isinstance(next_ticket, bool)
+        or not isinstance(next_ticket, int)
+        or next_ticket < 0
+        or isinstance(cursor, bool)
+        or not isinstance(cursor, int)
+        or cursor < 0
+        or cursor > next_ticket
+    ):
+        raise RuntimeError("hot-state reconcile catalog identity is invalid")
+    return document
+
+
+def canonical_hot_state_reconcile_catalog_bytes(
+    document: dict[str, object],
+) -> bytes:
+    validate_hot_state_reconcile_catalog(document)
+    encoded = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_HOT_STATE_RECONCILE_CATALOG_BYTES:
+        raise RuntimeError("hot-state reconcile catalog exceeds its byte budget")
+    return encoded
+
+
+def read_hot_state_reconcile_catalog(
+    namespace_root: Path,
+) -> dict[str, object]:
+    path = namespace_root / HOT_STATE_RECONCILE_CATALOG
+    try:
+        document, encoded = read_private_json(
+            path,
+            "hot-state reconcile catalog",
+            MAX_HOT_STATE_RECONCILE_CATALOG_BYTES,
+        )
+    except FileNotFoundError:
+        return empty_hot_state_reconcile_catalog()
+    catalog = validate_hot_state_reconcile_catalog(document)
+    if canonical_hot_state_reconcile_catalog_bytes(catalog) != encoded:
+        raise RuntimeError("hot-state reconcile catalog is not canonical")
+    return catalog
+
+
+def write_hot_state_reconcile_catalog(
+    namespace_root: Path, document: dict[str, object]
+) -> None:
+    encoded = canonical_hot_state_reconcile_catalog_bytes(document)
+    staging = namespace_root / HOT_STATE_RECONCILE_CATALOG_STAGING
+    try:
+        details = staging.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_nlink != 1
+            or stat.S_IMODE(details.st_mode) != 0o600
+            or details.st_size > MAX_HOT_STATE_RECONCILE_CATALOG_BYTES
+        ):
+            raise RuntimeError("hot-state reconcile catalog stage is not recoverable")
+        staging.unlink()
+        fsync_directory(namespace_root)
+    descriptor = os.open(
+        staging,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        written = 0
+        while written < len(encoded):
+            count = os.write(descriptor, encoded[written:])
+            if count <= 0:
+                raise OSError("hot-state reconcile catalog write made no progress")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(staging, namespace_root / HOT_STATE_RECONCILE_CATALOG)
+    fsync_directory(namespace_root)
+
+
+def validate_hot_state_reconcile_tickets_root(
+    namespace_root: Path, *, create: bool
+) -> Path | None:
+    root = namespace_root / HOT_STATE_RECONCILE_TICKETS
+    if create:
+        try:
+            root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    try:
+        details = root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        if create:
+            raise
+        return None
+    namespace_details = namespace_root.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != os.getuid()
+        or stat.S_IMODE(details.st_mode) != 0o700
+        or details.st_dev != namespace_details.st_dev
+    ):
+        raise RuntimeError("hot-state reconcile-ticket root is not owner-private")
+    return root
+
+
+def reconcile_ticket_name(ticket_sequence: int) -> str:
+    if ticket_sequence <= 0:
+        raise RuntimeError("hot-state reconcile ticket sequence is invalid")
+    return f"{ticket_sequence:020d}{HOT_STATE_RECONCILE_TICKET_SUFFIX}"
+
+
+def reconcile_ticket_document(
+    ticket_sequence: int,
+    kind: str,
+    state_identity: str,
+    name: str,
+) -> dict[str, object]:
+    if (
+        ticket_sequence <= 0
+        or kind not in {"state", "creating", "retired"}
+        or not state_identity_name(state_identity)
+        or not isinstance(name, str)
+        or "/" in name
+        or name in {"", ".", ".."}
+    ):
+        raise RuntimeError("hot-state reconcile ticket is invalid")
+    if kind == "state" and name != state_identity:
+        raise RuntimeError("hot-state state ticket name is invalid")
+    if kind == "creating" and not name.startswith(
+        f"{HOT_STATE_CREATING_PREFIX}{state_identity}-"
+    ):
+        raise RuntimeError("hot-state creating ticket name is invalid")
+    if kind == "retired" and name != f"{HOT_STATE_RETIRED_PREFIX}{state_identity}":
+        raise RuntimeError("hot-state retired ticket name is invalid")
+    return {
+        "schema_version": HOT_STATE_RECONCILE_TICKET_SCHEMA_VERSION,
+        "producer": HOT_STATE_RECONCILE_TICKET_PRODUCER,
+        "ticket_sequence": ticket_sequence,
+        "kind": kind,
+        "state_identity": state_identity,
+        "name": name,
+    }
+
+
+def validate_hot_state_reconcile_ticket(
+    document: object,
+) -> dict[str, object]:
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "producer",
+        "ticket_sequence",
+        "kind",
+        "state_identity",
+        "name",
+    }:
+        raise RuntimeError("hot-state reconcile ticket has an unsupported shape")
+    if (
+        document["schema_version"] != HOT_STATE_RECONCILE_TICKET_SCHEMA_VERSION
+        or document["producer"] != HOT_STATE_RECONCILE_TICKET_PRODUCER
+        or isinstance(document["ticket_sequence"], bool)
+        or not isinstance(document["ticket_sequence"], int)
+    ):
+        raise RuntimeError("hot-state reconcile ticket identity is invalid")
+    expected = reconcile_ticket_document(
+        document["ticket_sequence"],
+        document["kind"],
+        document["state_identity"],
+        document["name"],
+    )
+    if document != expected:
+        raise RuntimeError("hot-state reconcile ticket is not canonical")
+    return document
+
+
+def canonical_hot_state_reconcile_ticket_bytes(
+    document: dict[str, object],
+) -> bytes:
+    validate_hot_state_reconcile_ticket(document)
+    encoded = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_HOT_STATE_RECONCILE_TICKET_BYTES:
+        raise RuntimeError("hot-state reconcile ticket exceeds its byte budget")
+    return encoded
+
+
+def read_hot_state_reconcile_ticket(
+    namespace_root: Path, ticket_sequence: int
+) -> dict[str, object] | None:
+    root = validate_hot_state_reconcile_tickets_root(
+        namespace_root, create=False
+    )
+    if root is None:
+        return None
+    path = root / reconcile_ticket_name(ticket_sequence)
+    try:
+        document, encoded = read_private_json(
+            path,
+            "hot-state reconcile ticket",
+            MAX_HOT_STATE_RECONCILE_TICKET_BYTES,
+        )
+    except FileNotFoundError:
+        return None
+    ticket = validate_hot_state_reconcile_ticket(document)
+    if ticket["ticket_sequence"] != ticket_sequence:
+        raise RuntimeError("hot-state reconcile ticket filename conflicts with identity")
+    if canonical_hot_state_reconcile_ticket_bytes(ticket) != encoded:
+        raise RuntimeError("hot-state reconcile ticket is not canonical")
+    return ticket
+
+
+def write_hot_state_reconcile_ticket(
+    namespace_root: Path,
+    ticket_sequence: int,
+    kind: str,
+    state_identity: str,
+    name: str,
+) -> None:
+    root = validate_hot_state_reconcile_tickets_root(
+        namespace_root, create=True
+    )
+    assert root is not None
+    document = reconcile_ticket_document(
+        ticket_sequence, kind, state_identity, name
+    )
+    encoded = canonical_hot_state_reconcile_ticket_bytes(document)
+    path = root / reconcile_ticket_name(ticket_sequence)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        written = 0
+        while written < len(encoded):
+            count = os.write(descriptor, encoded[written:])
+            if count <= 0:
+                raise OSError("hot-state reconcile ticket write made no progress")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    fsync_directory(root)
+
+
+def remove_hot_state_reconcile_ticket(
+    namespace_root: Path, ticket_sequence: int
+) -> bool:
+    root = validate_hot_state_reconcile_tickets_root(
+        namespace_root, create=False
+    )
+    if root is None:
+        return False
+    path = root / reconcile_ticket_name(ticket_sequence)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    fsync_directory(root)
+    return True
+
+
+def enqueue_hot_state_reconcile_ticket(
+    namespace_root: Path,
+    kind: str,
+    state_identity: str,
+    name: str,
+) -> int:
+    catalog = read_hot_state_reconcile_catalog(namespace_root)
+    ticket_sequence = int(catalog["next_ticket_sequence"]) + 1
+    updated = {
+        **catalog,
+        "next_ticket_sequence": ticket_sequence,
+    }
+    write_hot_state_reconcile_catalog(namespace_root, updated)
+    write_hot_state_reconcile_ticket(
+        namespace_root,
+        ticket_sequence,
+        kind,
+        state_identity,
+        name,
+    )
+    return ticket_sequence
+
+
+def requeue_hot_state_reconcile_ticket(
+    namespace_root: Path,
+    ticket: dict[str, object],
+) -> None:
+    enqueue_hot_state_reconcile_ticket(
+        namespace_root,
+        str(ticket["kind"]),
+        str(ticket["state_identity"]),
+        str(ticket["name"]),
+    )
+    try:
+        remove_hot_state_reconcile_ticket(
+            namespace_root, int(ticket["ticket_sequence"])
+        )
+    except (OSError, RuntimeError):
+        pass
+
+
 def collect_one_unreachable_state(
     namespace_root: Path, current_state_identity: str
 ) -> str:
