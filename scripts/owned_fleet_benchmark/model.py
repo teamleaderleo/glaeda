@@ -389,8 +389,30 @@ def platform_allowed(kind: str) -> bool:
     )
 
 
+BENCHMARK_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "DEVELOPER_DIR",
+    "XDG_RUNTIME_DIR",
+)
+
+
 def env_for(workload: dict[str, Any], state_dir: Path):
-    environment = os.environ.copy()
+    environment = {
+        key: os.environ[key]
+        for key in BENCHMARK_ENV_ALLOWLIST
+        if key in os.environ
+    }
+    environment.update(
+        {
+            "LANG": "C",
+            "LC_ALL": "C",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+        }
+    )
     for key, value in (workload.get("environment") or {}).items():
         environment[key] = value.format(state_dir=os.fspath(state_dir))
     return environment
