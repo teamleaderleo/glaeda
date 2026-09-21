@@ -205,6 +205,14 @@ impl DisposableCloneRuntimeError {
     pub(crate) const fn observation(code: &'static str) -> Self {
         observation(code)
     }
+
+    pub(crate) const fn configuration(code: &'static str) -> Self {
+        invalid_configuration(code)
+    }
+
+    pub(crate) const fn command(code: &'static str) -> Self {
+        command(code)
+    }
 }
 
 impl fmt::Display for DisposableCloneRuntimeError {
