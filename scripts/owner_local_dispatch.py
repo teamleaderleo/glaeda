@@ -20,6 +20,7 @@ from typing import NoReturn
 
 import owned_linux_task as owned_task
 import provider_neutral_request as semantic
+import verify_focused_impl as focused
 
 
 INSTALLATION_DOCUMENT_TYPE = "glaeda-owner-local-installation"
@@ -351,6 +352,21 @@ def _verifier_problem(stderr: bytes) -> str | None:
     return value["problem"]
 
 
+def bind_verify_request(compiled: semantic.CompiledRequest) -> dict[str, object] | None:
+    """Persist the accepted semantic identity before any admission wait or physical launch."""
+    request = compiled.request
+    if request.operation != semantic.OP_VERIFY_NAMED or compiled.internal is None:
+        return _semantic_refusal(request, "internal_contract_error")
+    try:
+        state_root = focused.private_state_directory(os.fspath(SHARED_VERIFY_STATE_ROOT))
+        focused.bind_semantic_request(state_root, request.request_id, compiled.internal)
+    except focused.SemanticRequestConflict:
+        return _semantic_refusal(request, "request_conflict")
+    except (owned_task.Refusal, OSError):
+        return _semantic_refusal(request, "semantic_state_unavailable")
+    return None
+
+
 def run_verify(
     compiled: semantic.CompiledRequest,
     installation: Installation,
@@ -395,6 +411,8 @@ def run_verify(
             internal.profile_generation,
             "--command-fingerprint",
             internal.command_fingerprint,
+            "--semantic-request-id",
+            request.request_id,
             "--admission-root",
             os.fspath(ADMISSION_ROOT),
         ],
@@ -434,6 +452,11 @@ def execute(
             return semantic.status_receipt(compiled, observe_admission())
         except (LocalRefusal, semantic.ContractRefusal):
             return _semantic_refusal(request, "admission_unavailable")
+
+    if request.operation == semantic.OP_VERIFY_NAMED:
+        refusal = bind_verify_request(compiled)
+        if refusal is not None:
+            return refusal
 
     try:
         installation = load_installation(installation_path)
