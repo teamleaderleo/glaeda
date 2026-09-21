@@ -191,7 +191,11 @@ def capacity(node, role, profile, slot, concurrent, *, result='accepted', pressu
         'maxConcurrent': concurrent,
         'contentionEvidenceGeneration': GEN,
         'measurement': {
-            'validatedCompletions': 8,
+            'offeredTasks': 8,
+            'maximumSimultaneous': concurrent,
+            'startedTasks': 8,
+            'settledTasks': 8 - unfinished,
+            'validatedCompletions': 8 - unfinished,
             'p50Millis': 1000,
             'p90Millis': 1400,
             'cpuPressure': pressure,
@@ -623,6 +627,38 @@ class RoleModelTests(unittest.TestCase):
             1,
         )
 
+    def test_accepted_capacity_cannot_exceed_measured_simultaneous_work(self):
+        node = linux_node()
+        receipt = capacity(
+            node,
+            'cmux_linux_ci',
+            'medium',
+            'linux_medium_slot',
+            4,
+        )
+        receipt['measurement']['maximumSimultaneous'] = 3
+        with self.assertRaisesRegex(
+            m.RoleModelError,
+            'exceeds measured simultaneous work',
+        ):
+            m.validate_capacity(receipt)
+
+    def test_capacity_cohort_counts_must_reconcile(self):
+        node = linux_node()
+        receipt = capacity(
+            node,
+            'cmux_linux_ci',
+            'medium',
+            'linux_medium_slot',
+            4,
+        )
+        receipt['measurement']['settledTasks'] = 7
+        with self.assertRaisesRegex(
+            m.RoleModelError,
+            'unfinished work disagrees',
+        ):
+            m.validate_capacity(receipt)
+
     def test_capacity_receipt_records_contention_window_fields_without_remote_raw_cpu_ram(self):
         node = linux_node()
         receipt = capacity(node, 'cmux_linux_ci', 'medium', 'linux_medium_slot', 4)
@@ -632,9 +668,10 @@ class RoleModelTests(unittest.TestCase):
         self.assertEqual(
             set(measurement),
             {
-                'validatedCompletions', 'p50Millis', 'p90Millis', 'cpuPressure',
-                'memoryPressure', 'swapStartBytes', 'swapPeakBytes', 'swapEndBytes',
-                'thermalBehavior', 'unfinishedWork'
+                'offeredTasks', 'maximumSimultaneous', 'startedTasks',
+                'settledTasks', 'validatedCompletions', 'p50Millis', 'p90Millis',
+                'cpuPressure', 'memoryPressure', 'swapStartBytes', 'swapPeakBytes',
+                'swapEndBytes', 'thermalBehavior', 'unfinishedWork'
             },
         )
         self.assertNotIn('cpu', validated)
