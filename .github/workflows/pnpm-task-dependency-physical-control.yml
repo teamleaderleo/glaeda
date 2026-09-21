@@ -113,7 +113,7 @@ jobs:
 
       - name: Install exact pnpm
         run: |
-          npm install --global --ignore-scripts "pnpm@${PNPM_VERSION}"
+          npm install --global "pnpm@${PNPM_VERSION}"
           test "$(node --version)" = "v${NODE_VERSION}"
           test "$(pnpm --version)" = "${PNPM_VERSION}"
           printf 'NODE_BIN=%s\n' "$(dirname "$(command -v node)")" >> "$GITHUB_ENV"
