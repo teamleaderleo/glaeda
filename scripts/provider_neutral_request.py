@@ -28,6 +28,26 @@ MAX_RECEIPT_BYTES = 192 * 1024
 MAX_REPO_QUERY_RESULT_BYTES = 128 * 1024
 MAX_REFERENCE_BYTES = 128
 MAX_REPO_QUERY_PATCH_BYTES = 8 * 1024
+REPO_QUERY_MAX_PATCH_BYTES = 64 * 1024
+REPO_QUERY_MAX_CHANGED_FILES = 64
+REPO_QUERY_MAX_GIT_OUTPUT_BYTES = 1024 * 1024
+REPO_QUERY_MAX_AUXILIARY_QUERIES = 8
+REPO_QUERY_MAX_GREP_MATCHES = 64
+REPO_QUERY_MAX_BLOB_BYTES = 16 * 1024
+REPO_QUERY_MAX_HISTORY_COMMITS = 32
+REPO_QUERY_MAX_PATH_BYTES = 1024
+REPO_QUERY_MAX_LITERAL_BYTES = 512
+REPO_QUERY_MAX_MATCH_TEXT_BYTES = 1024
+REPO_QUERY_MAX_SUBJECT_BYTES = 512
+REPO_QUERY_COMMAND_TIMEOUT_MILLIS = 10_000
+REPO_QUERY_PROFILE_CONTRACT = (
+    b"glaeda-repo-query-profile-v1\0"
+    b"exact-commit-objects\0merge-base\0ancestry\0commit-count\0"
+    b"numstat-no-renames\0bounded-complete-patch\0literal-tree-grep\0"
+    b"bounded-tree-blobs\0path-history\0object-info\0object-format\0network-disabled\0"
+    b"checkout-and-git-directory-identity-stable\0origin-reobserved\0"
+)
+REPO_QUERY_RESULT_DOCUMENT_TYPE = "glaeda-semantic-repo-query-result"
 
 OP_CAPABILITIES = "capabilities"
 OP_STATUS = "status"
@@ -112,6 +132,55 @@ def canonical_bytes(value: object) -> bytes:
 
 def sha256(value: bytes) -> str:
     return f"sha256:{hashlib.sha256(value).hexdigest()}"
+
+
+def _append_repo_query_field(buffer: bytearray, value: str) -> None:
+    raw = value.encode("utf-8")
+    buffer.extend(len(raw).to_bytes(8, "big"))
+    buffer.extend(raw)
+
+
+def repo_query_profile_generation() -> str:
+    contract = bytearray(REPO_QUERY_PROFILE_CONTRACT)
+    for value in (
+        REPO_QUERY_MAX_PATCH_BYTES,
+        REPO_QUERY_MAX_CHANGED_FILES,
+        REPO_QUERY_MAX_GIT_OUTPUT_BYTES,
+        MAX_REPO_QUERY_RESULT_BYTES,
+        REPO_QUERY_MAX_AUXILIARY_QUERIES,
+        REPO_QUERY_MAX_GREP_MATCHES,
+        REPO_QUERY_MAX_BLOB_BYTES,
+        REPO_QUERY_MAX_HISTORY_COMMITS,
+        REPO_QUERY_MAX_PATH_BYTES,
+        REPO_QUERY_MAX_LITERAL_BYTES,
+        REPO_QUERY_MAX_MATCH_TEXT_BYTES,
+        REPO_QUERY_MAX_SUBJECT_BYTES,
+        REPO_QUERY_COMMAND_TIMEOUT_MILLIS,
+    ):
+        _append_repo_query_field(contract, str(value))
+    return sha256(bytes(contract))
+
+
+def repo_query_request_digest(request: SemanticRequest) -> str:
+    if request.operation != OP_REPO_QUERY or request.source is None:
+        raise ContractRefusal("internal_contract_error", "request is not repo_query")
+    buffer = bytearray()
+    for value in (
+        f"github.com/{request.source.repository}",
+        str(request.parameters["base_commit"]),
+        request.source.commit,
+        request.source.tree,
+        str(request.parameters["max_patch_bytes"]),
+        "grep",
+        "blobs",
+        str(REPO_QUERY_MAX_BLOB_BYTES),
+        "history",
+        str(REPO_QUERY_MAX_HISTORY_COMMITS),
+        "objects",
+        repo_query_profile_generation(),
+    ):
+        _append_repo_query_field(buffer, value)
+    return sha256(bytes(buffer))
 
 
 def reject_json_constant(value: str) -> NoReturn:
@@ -266,6 +335,7 @@ def _contract_spec() -> dict[str, object]:
                 "kind": OP_REPO_QUERY,
                 "authority": "observation_only",
                 "profile_id": "repo-query/v1",
+                "profile_generation": repo_query_profile_generation(),
                 "source_class": "resident_exact",
                 "max_patch_bytes": MAX_REPO_QUERY_PATCH_BYTES,
             },
@@ -328,9 +398,11 @@ def compile_request(request: SemanticRequest) -> CompiledRequest:
             {
                 "kind": OP_REPO_QUERY,
                 "profile_id": "repo-query/v1",
+                "profile_generation": repo_query_profile_generation(),
                 "source_class": "resident_exact",
                 "base_commit": request.parameters["base_commit"],
                 "max_patch_bytes": request.parameters["max_patch_bytes"],
+                "request_digest": repo_query_request_digest(request),
                 "result_ceiling_bytes": MAX_REPO_QUERY_RESULT_BYTES,
                 "authority": "observation_only",
             },
@@ -506,33 +578,227 @@ def status_receipt(compiled: CompiledRequest, observation: dict[str, object]) ->
     )
 
 
-def repo_query_receipt(compiled: CompiledRequest, report: dict[str, object]) -> dict[str, object]:
+def _bounded_nonnegative_integer(value: object) -> bool:
+    return type(value) is int and 0 <= value <= 2**63 - 1
+
+
+def _repo_relative_path(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > REPO_QUERY_MAX_PATH_BYTES
+        or value.startswith("/")
+        or "\\" in value
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ContractRefusal("invalid_repo_query_result", "repo query path is invalid")
+    return value
+
+
+def _project_repo_query_result(
+    compiled: CompiledRequest,
+    report: dict[str, object],
+) -> dict[str, object]:
     if compiled.request.operation != OP_REPO_QUERY or compiled.request.source is None:
         raise ContractRefusal("internal_contract_error", "request is not repo_query")
     raw = canonical_bytes(report) + b"\n"
     source = compiled.request.source
+    resolved = compiled.resolved_operation
+    expected_keys = {
+        "document_type",
+        "schema_version",
+        "profile_id",
+        "profile_generation",
+        "authority",
+        "request_digest",
+        "repository",
+        "object_format",
+        "requested_base",
+        "head",
+        "head_tree",
+        "merge_base",
+        "base_is_ancestor",
+        "commits_since_merge_base",
+        "changed_files",
+        "changed_files_status",
+        "changed_files_observed",
+        "changed_files_omitted",
+        "diff_summary",
+        "patch",
+        "blobs",
+        "path_history",
+        "objects",
+        "metrics",
+    }
     if (
         len(raw) > MAX_REPO_QUERY_RESULT_BYTES
         or not isinstance(report, dict)
+        or set(report) != expected_keys
         or report.get("document_type") != "glaeda-resident-repo-query"
         or type(report.get("schema_version")) is not int
         or report.get("schema_version") != 1
         or report.get("profile_id") != "repo-query/v1"
+        or report.get("profile_generation") != resolved["profile_generation"]
         or report.get("authority") != "observation_only"
-        or not isinstance(report.get("profile_generation"), str)
-        or not SHA256_PATTERN.fullmatch(report["profile_generation"])
+        or report.get("request_digest") != resolved["request_digest"]
         or report.get("repository") != f"github.com/{source.repository}"
-        or report.get("requested_base") != compiled.request.parameters["base_commit"]
+        or report.get("object_format") != "sha1"
+        or report.get("requested_base") != resolved["base_commit"]
         or report.get("head") != source.commit
         or report.get("head_tree") != source.tree
+        or not isinstance(report.get("merge_base"), str)
+        or OID_PATTERN.fullmatch(report["merge_base"]) is None
+        or type(report.get("base_is_ancestor")) is not bool
+        or not _bounded_nonnegative_integer(report.get("commits_since_merge_base"))
+        or report.get("changed_files_status") not in {"complete", "truncated", "unknown"}
+        or not _bounded_nonnegative_integer(report.get("changed_files_observed"))
+        or not _bounded_nonnegative_integer(report.get("changed_files_omitted"))
+        or report.get("blobs") != []
+        or report.get("path_history") != []
+        or report.get("objects") != []
     ):
         raise ContractRefusal("invalid_repo_query_result", "repo query result does not match the semantic request")
+
+    changed = report["changed_files"]
+    if not isinstance(changed, list) or len(changed) > REPO_QUERY_MAX_CHANGED_FILES:
+        raise ContractRefusal("invalid_repo_query_result", "repo query changed-file evidence is invalid")
+    projected_changed: list[dict[str, object]] = []
+    for item in changed:
+        if not isinstance(item, dict) or set(item) not in (
+            {"path", "binary"},
+            {"path", "insertions", "deletions", "binary"},
+        ):
+            raise ContractRefusal("invalid_repo_query_result", "repo query changed-file evidence is invalid")
+        binary = item.get("binary")
+        if type(binary) is not bool:
+            raise ContractRefusal("invalid_repo_query_result", "repo query changed-file evidence is invalid")
+        projected: dict[str, object] = {
+            "path": _repo_relative_path(item.get("path")),
+            "binary": binary,
+        }
+        if binary:
+            if set(item) != {"path", "binary"}:
+                raise ContractRefusal("invalid_repo_query_result", "binary changed-file evidence is invalid")
+        else:
+            if (
+                set(item) != {"path", "insertions", "deletions", "binary"}
+                or not _bounded_nonnegative_integer(item.get("insertions"))
+                or not _bounded_nonnegative_integer(item.get("deletions"))
+            ):
+                raise ContractRefusal("invalid_repo_query_result", "text changed-file evidence is invalid")
+            projected["insertions"] = item["insertions"]
+            projected["deletions"] = item["deletions"]
+        projected_changed.append(projected)
+    if (
+        report["changed_files_observed"]
+        != len(projected_changed) + report["changed_files_omitted"]
+    ):
+        raise ContractRefusal("invalid_repo_query_result", "repo query changed-file counts are inconsistent")
+
+    summary = report["diff_summary"]
+    if (
+        not isinstance(summary, dict)
+        or set(summary)
+        != {"files_changed", "text_files", "binary_files", "insertions", "deletions"}
+        or any(not _bounded_nonnegative_integer(summary.get(key)) for key in summary)
+        or summary["files_changed"] != report["changed_files_observed"]
+        or summary["text_files"] + summary["binary_files"] != summary["files_changed"]
+    ):
+        raise ContractRefusal("invalid_repo_query_result", "repo query diff summary is invalid")
+    projected_summary = dict(summary)
+
+    patch = report["patch"]
+    if not isinstance(patch, dict):
+        raise ContractRefusal("invalid_repo_query_result", "repo query patch evidence is invalid")
+    allowed_patch = {"bytes", "sha256", "included", "omitted_bytes", "reason", "text"}
+    if not {"bytes", "sha256", "included", "omitted_bytes"} <= set(patch) <= allowed_patch:
+        raise ContractRefusal("invalid_repo_query_result", "repo query patch evidence is invalid")
+    patch_bytes = patch.get("bytes")
+    included = patch.get("included")
+    omitted_bytes = patch.get("omitted_bytes")
+    if (
+        not _bounded_nonnegative_integer(patch_bytes)
+        or patch_bytes > REPO_QUERY_MAX_GIT_OUTPUT_BYTES
+        or not isinstance(patch.get("sha256"), str)
+        or SHA256_PATTERN.fullmatch(patch["sha256"]) is None
+        or type(included) is not bool
+        or not _bounded_nonnegative_integer(omitted_bytes)
+    ):
+        raise ContractRefusal("invalid_repo_query_result", "repo query patch evidence is invalid")
+    projected_patch: dict[str, object] = {
+        "bytes": patch_bytes,
+        "sha256": patch["sha256"],
+        "included": included,
+        "omitted_bytes": omitted_bytes,
+    }
+    if included:
+        text = patch.get("text")
+        if (
+            set(patch) != {"bytes", "sha256", "included", "omitted_bytes", "text"}
+            or not isinstance(text, str)
+            or len(text.encode("utf-8")) != patch_bytes
+            or patch_bytes > resolved["max_patch_bytes"]
+            or omitted_bytes != 0
+            or sha256(text.encode("utf-8")) != patch["sha256"]
+        ):
+            raise ContractRefusal("invalid_repo_query_result", "included repo query patch is invalid")
+        projected_patch["text"] = text
+    else:
+        if (
+            set(patch) != {"bytes", "sha256", "included", "omitted_bytes", "reason"}
+            or patch.get("reason") not in {"patch_byte_limit", "aggregate_response_limit"}
+            or omitted_bytes != patch_bytes
+        ):
+            raise ContractRefusal("invalid_repo_query_result", "omitted repo query patch is invalid")
+        projected_patch["reason"] = patch["reason"]
+
+    metrics = report["metrics"]
+    if (
+        not isinstance(metrics, dict)
+        or set(metrics)
+        != {
+            "git_processes",
+            "git_stdout_bytes",
+            "git_wall_microseconds",
+            "complete_wall_microseconds",
+        }
+        or any(not _bounded_nonnegative_integer(metrics.get(key)) for key in metrics)
+    ):
+        raise ContractRefusal("invalid_repo_query_result", "repo query metrics are invalid")
+
+    return {
+        "document_type": REPO_QUERY_RESULT_DOCUMENT_TYPE,
+        "schema_version": 1,
+        "profile_id": "repo-query/v1",
+        "profile_generation": resolved["profile_generation"],
+        "request_digest": resolved["request_digest"],
+        "repository": source.repository,
+        "object_format": "sha1",
+        "requested_base": resolved["base_commit"],
+        "head": source.commit,
+        "head_tree": source.tree,
+        "merge_base": report["merge_base"],
+        "base_is_ancestor": report["base_is_ancestor"],
+        "commits_since_merge_base": report["commits_since_merge_base"],
+        "changed_files": projected_changed,
+        "changed_files_status": report["changed_files_status"],
+        "changed_files_observed": report["changed_files_observed"],
+        "changed_files_omitted": report["changed_files_omitted"],
+        "diff_summary": projected_summary,
+        "patch": projected_patch,
+        "metrics": dict(metrics),
+    }
+
+
+def repo_query_receipt(compiled: CompiledRequest, report: dict[str, object]) -> dict[str, object]:
+    projection = _project_repo_query_result(compiled, report)
     return _receipt(
         compiled.request,
         compiled.request_sha256,
         state="succeeded",
         resolved_operation=compiled.resolved_operation,
-        result=report,
+        result=projection,
     )
 
 
@@ -608,13 +874,16 @@ def _inspect_resolved(operation: str, resolved: object) -> dict[str, object]:
             != {
                 "kind",
                 "profile_id",
+                "profile_generation",
                 "source_class",
                 "base_commit",
                 "max_patch_bytes",
+                "request_digest",
                 "result_ceiling_bytes",
                 "authority",
             }
             or resolved.get("profile_id") != "repo-query/v1"
+            or resolved.get("profile_generation") != repo_query_profile_generation()
             or resolved.get("source_class") != "resident_exact"
             or resolved.get("authority") != "observation_only"
             or not isinstance(resolved.get("base_commit"), str)
@@ -622,6 +891,8 @@ def _inspect_resolved(operation: str, resolved: object) -> dict[str, object]:
             or isinstance(resolved.get("max_patch_bytes"), bool)
             or not isinstance(resolved.get("max_patch_bytes"), int)
             or not 0 <= resolved["max_patch_bytes"] <= MAX_REPO_QUERY_PATCH_BYTES
+            or not isinstance(resolved.get("request_digest"), str)
+            or not SHA256_PATTERN.fullmatch(resolved["request_digest"])
             or resolved.get("result_ceiling_bytes") != MAX_REPO_QUERY_RESULT_BYTES
         ):
             raise ContractRefusal("invalid_receipt", "repo query resolution is invalid")
@@ -708,6 +979,7 @@ def _inspect_capabilities_result(result: object, resolved: dict[str, object]) ->
         "kind": OP_REPO_QUERY,
         "authority": "observation_only",
         "profile_id": "repo-query/v1",
+        "profile_generation": repo_query_profile_generation(),
         "source_class": "resident_exact",
         "max_patch_bytes": MAX_REPO_QUERY_PATCH_BYTES,
     }:
@@ -743,24 +1015,132 @@ def _inspect_repo_query_result(
     source: SourceIdentity,
     resolved: dict[str, object],
 ) -> None:
-    if not isinstance(result, dict):
-        raise ContractRefusal("invalid_receipt", "repo query result is invalid")
-    raw = canonical_bytes(result) + b"\n"
+    expected_keys = {
+        "document_type",
+        "schema_version",
+        "profile_id",
+        "profile_generation",
+        "request_digest",
+        "repository",
+        "object_format",
+        "requested_base",
+        "head",
+        "head_tree",
+        "merge_base",
+        "base_is_ancestor",
+        "commits_since_merge_base",
+        "changed_files",
+        "changed_files_status",
+        "changed_files_observed",
+        "changed_files_omitted",
+        "diff_summary",
+        "patch",
+        "metrics",
+    }
     if (
-        len(raw) > MAX_REPO_QUERY_RESULT_BYTES
-        or result.get("document_type") != "glaeda-resident-repo-query"
+        not isinstance(result, dict)
+        or set(result) != expected_keys
+        or result.get("document_type") != REPO_QUERY_RESULT_DOCUMENT_TYPE
         or type(result.get("schema_version")) is not int
         or result.get("schema_version") != 1
         or result.get("profile_id") != "repo-query/v1"
-        or result.get("authority") != "observation_only"
-        or not isinstance(result.get("profile_generation"), str)
-        or not SHA256_PATTERN.fullmatch(result["profile_generation"])
-        or result.get("repository") != f"github.com/{source.repository}"
+        or result.get("profile_generation") != resolved["profile_generation"]
+        or result.get("request_digest") != resolved["request_digest"]
+        or result.get("repository") != source.repository
+        or result.get("object_format") != "sha1"
         or result.get("requested_base") != resolved["base_commit"]
         or result.get("head") != source.commit
         or result.get("head_tree") != source.tree
+        or not isinstance(result.get("merge_base"), str)
+        or OID_PATTERN.fullmatch(result["merge_base"]) is None
+        or type(result.get("base_is_ancestor")) is not bool
+        or not _bounded_nonnegative_integer(result.get("commits_since_merge_base"))
+        or result.get("changed_files_status") not in {"complete", "truncated", "unknown"}
+        or not _bounded_nonnegative_integer(result.get("changed_files_observed"))
+        or not _bounded_nonnegative_integer(result.get("changed_files_omitted"))
     ):
         raise ContractRefusal("invalid_receipt", "repo query result is invalid")
+    changed = result["changed_files"]
+    if not isinstance(changed, list) or len(changed) > REPO_QUERY_MAX_CHANGED_FILES:
+        raise ContractRefusal("invalid_receipt", "repo query changed-file result is invalid")
+    for item in changed:
+        if not isinstance(item, dict) or set(item) not in (
+            {"path", "binary"},
+            {"path", "insertions", "deletions", "binary"},
+        ):
+            raise ContractRefusal("invalid_receipt", "repo query changed-file result is invalid")
+        _repo_relative_path(item.get("path"))
+        binary = item.get("binary")
+        if type(binary) is not bool:
+            raise ContractRefusal("invalid_receipt", "repo query changed-file result is invalid")
+        if binary:
+            if set(item) != {"path", "binary"}:
+                raise ContractRefusal("invalid_receipt", "repo query changed-file result is invalid")
+        elif (
+            set(item) != {"path", "insertions", "deletions", "binary"}
+            or not _bounded_nonnegative_integer(item.get("insertions"))
+            or not _bounded_nonnegative_integer(item.get("deletions"))
+        ):
+            raise ContractRefusal("invalid_receipt", "repo query changed-file result is invalid")
+    if result["changed_files_observed"] != len(changed) + result["changed_files_omitted"]:
+        raise ContractRefusal("invalid_receipt", "repo query changed-file counts are inconsistent")
+    summary = result["diff_summary"]
+    if (
+        not isinstance(summary, dict)
+        or set(summary)
+        != {"files_changed", "text_files", "binary_files", "insertions", "deletions"}
+        or any(not _bounded_nonnegative_integer(summary.get(key)) for key in summary)
+        or summary["files_changed"] != result["changed_files_observed"]
+        or summary["text_files"] + summary["binary_files"] != summary["files_changed"]
+    ):
+        raise ContractRefusal("invalid_receipt", "repo query diff summary is invalid")
+    patch = result["patch"]
+    if not isinstance(patch, dict):
+        raise ContractRefusal("invalid_receipt", "repo query patch result is invalid")
+    patch_bytes = patch.get("bytes")
+    included = patch.get("included")
+    omitted_bytes = patch.get("omitted_bytes")
+    if (
+        not {"bytes", "sha256", "included", "omitted_bytes"} <= set(patch)
+        or not set(patch) <= {"bytes", "sha256", "included", "omitted_bytes", "reason", "text"}
+        or not _bounded_nonnegative_integer(patch_bytes)
+        or patch_bytes > REPO_QUERY_MAX_GIT_OUTPUT_BYTES
+        or not isinstance(patch.get("sha256"), str)
+        or SHA256_PATTERN.fullmatch(patch["sha256"]) is None
+        or type(included) is not bool
+        or not _bounded_nonnegative_integer(omitted_bytes)
+    ):
+        raise ContractRefusal("invalid_receipt", "repo query patch result is invalid")
+    if included:
+        text = patch.get("text")
+        if (
+            set(patch) != {"bytes", "sha256", "included", "omitted_bytes", "text"}
+            or not isinstance(text, str)
+            or len(text.encode("utf-8")) != patch_bytes
+            or patch_bytes > resolved["max_patch_bytes"]
+            or omitted_bytes != 0
+            or sha256(text.encode("utf-8")) != patch["sha256"]
+        ):
+            raise ContractRefusal("invalid_receipt", "repo query included patch result is invalid")
+    elif (
+        set(patch) != {"bytes", "sha256", "included", "omitted_bytes", "reason"}
+        or patch.get("reason") not in {"patch_byte_limit", "aggregate_response_limit"}
+        or omitted_bytes != patch_bytes
+    ):
+        raise ContractRefusal("invalid_receipt", "repo query omitted patch result is invalid")
+    metrics = result["metrics"]
+    if (
+        not isinstance(metrics, dict)
+        or set(metrics)
+        != {
+            "git_processes",
+            "git_stdout_bytes",
+            "git_wall_microseconds",
+            "complete_wall_microseconds",
+        }
+        or any(not _bounded_nonnegative_integer(metrics.get(key)) for key in metrics)
+    ):
+        raise ContractRefusal("invalid_receipt", "repo query metrics result is invalid")
 
 
 def _inspect_verify_result(result: object, state: str) -> None:
