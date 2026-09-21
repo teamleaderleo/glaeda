@@ -320,6 +320,22 @@ def _class_at_least(current: str, required: str, classes: tuple[str, ...]) -> bo
     return classes.index(current) >= classes.index(required)
 
 
+def fleet_acceptance_binding(value: object) -> dict[str, object]:
+    try:
+        receipt = fleet.validate_acceptance_receipt(value)
+    except fleet.FleetError as error:
+        raise RoleModelError("fleet acceptance receipt is invalid") from error
+    if receipt["result"] != "accepted":
+        raise RoleModelError("fleet acceptance receipt is not accepted")
+    return {
+        "role": receipt["role"],
+        "nodeId": receipt["nodeId"],
+        "enrollmentGeneration": receipt["enrollmentGeneration"],
+        "profile": dict(receipt["profile"]),
+        "receiptSha256": fleet.digest(receipt),
+    }
+
+
 def validate_node(value: object) -> dict[str, Any]:
     doc = _exact(
         value,
