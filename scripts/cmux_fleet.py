@@ -1170,6 +1170,7 @@ def accept_local(
     source_commit = _git_oid(cmux_root, "HEAD^{commit}")
     source_tree = _git_oid(cmux_root, "HEAD^{tree}")
     profile = enrollment["roleProfiles"][role]
+    fleet_contract_before = fleet_contract_generation()
 
     fleet_root = enrollment_path.resolve(strict=True).parent
     root_info = fleet_root.stat(follow_symlinks=False)
@@ -1281,6 +1282,10 @@ def accept_local(
                 "post-acceptance toolchain is outside enrollment allowlist"
             )
 
+        if fleet_contract_generation() != fleet_contract_before:
+            raise FleetError(
+                "Glaeda fleet contract changed during local acceptance"
+            )
         local_attempt = "sha256:" + hashlib.sha256(os.urandom(32)).hexdigest()
         receipt = finalize_acceptance(
             enrollment,
