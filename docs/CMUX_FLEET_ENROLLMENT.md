@@ -157,6 +157,7 @@ python3 scripts/cmux_fleet.py finalize-acceptance \
   "$ENROLLMENT" "$ACCEPTANCE_EVIDENCE" > "$ACCEPTANCE"
 
 python3 scripts/cmux_fleet.py transition "$ENROLLMENT" --to eligible \
+  --acceptance "$ACCEPTANCE" \
   > "$ENROLLMENT.next"
 mv "$ENROLLMENT.next" "$ENROLLMENT"
 
