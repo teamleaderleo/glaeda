@@ -259,13 +259,22 @@ class PnpmTaskDependencyBenchmarkTests(unittest.TestCase):
         self.assertEqual(evidence['sampled_regular_files'], 1)
         self.assertEqual(evidence['fiemap_observed_files'], 1)
         self.assertEqual(evidence['shared_extent_files'], 1)
+        self.assertEqual(evidence['private_copy_files'], 0)
+        self.assertEqual(evidence['shared_extent_percent'], 100.0)
         self.assertEqual(evidence['mechanism'], 'reflink_observed')
 
     def test_explicit_import_methods_require_per_task_physical_proof(self) -> None:
         validate = NAMESPACE['validate_mechanisms']
         BenchmarkError = NAMESPACE['BenchmarkError']
 
-        def evidence(mechanism: str, hardlinks: int = 0) -> dict[str, object]:
+        def evidence(
+            mechanism: str,
+            hardlinks: int = 0,
+            *,
+            sampled: int = 100,
+            fiemap_observed: int = 100,
+            shared: int = 100,
+        ) -> dict[str, object]:
             return {
                 'usage': {
                     'regular_file_count': 10,
@@ -273,15 +282,45 @@ class PnpmTaskDependencyBenchmarkTests(unittest.TestCase):
                 },
                 'sample': {
                     'mechanism': mechanism,
+                    'sampled_regular_files': sampled,
+                    'fiemap_observed_files': fiemap_observed,
+                    'shared_extent_files': shared,
                 },
             }
 
         reflink = [evidence('reflink_observed') for _ in range(8)]
-        hardlink = [evidence('hardlink_observed', hardlinks=10) for _ in range(8)]
-        copy = [evidence('copy_observed') for _ in range(8)]
+        mixed = [
+            evidence('mixed_private_copy_and_reflink_observed', shared=95)
+            for _ in range(8)
+        ]
+        weak_mixed = [
+            evidence('mixed_private_copy_and_reflink_observed', shared=94)
+            for _ in range(8)
+        ]
+        unproven = [
+            evidence(
+                'physical_mechanism_unproven',
+                fiemap_observed=99,
+                shared=99,
+            )
+            for _ in range(8)
+        ]
+        hardlink = [
+            evidence('hardlink_observed', hardlinks=10, shared=0)
+            for _ in range(8)
+        ]
+        copy = [evidence('copy_observed', shared=0) for _ in range(8)]
         self.assertEqual(validate('clone', reflink), {'reflink_observed'})
+        self.assertEqual(
+            validate('clone', mixed),
+            {'mixed_private_copy_and_reflink_observed'},
+        )
         self.assertEqual(validate('hardlink', hardlink), {'hardlink_observed'})
         self.assertEqual(validate('auto', copy), {'copy_observed'})
+        with self.assertRaises(BenchmarkError):
+            validate('clone', weak_mixed)
+        with self.assertRaises(BenchmarkError):
+            validate('clone', unproven)
         with self.assertRaises(BenchmarkError):
             validate('clone', reflink[:-1] + hardlink[:1])
         with self.assertRaises(BenchmarkError):

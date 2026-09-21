@@ -38,6 +38,7 @@ FANOUTS = (1, 8, 32)
 IMPORT_METHODS = ("auto", "hardlink", "clone")
 MAX_REPETITIONS = 100
 MAX_SAMPLE_FILES = 256
+CLONE_SHARED_EXTENT_MIN_PERCENT = 95
 MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 MAX_PACKAGE_JSON_BYTES = 4 * 1024 * 1024
 DEFAULT_DEADLINE_SECONDS = 600
@@ -709,6 +710,8 @@ def sample_physical_mechanism(node_modules: Path) -> dict[str, Any]:
         "hardlinked_files": hardlinked,
         "fiemap_observed_files": fiemap_observed,
         "shared_extent_files": shared,
+        "private_copy_files": sampled - shared,
+        "shared_extent_percent": round(shared * 100.0 / sampled, 6),
         "mechanism": mechanism,
     }
 
@@ -726,10 +729,22 @@ def validate_mechanisms(import_method: str, physical: list[dict[str, Any]]) -> s
             continue
         if sample["mechanism"] == "hardlink_observed":
             raise BenchmarkError("dependency link evidence changed during observation")
+        if import_method == "clone":
+            sampled = sample["sampled_regular_files"]
+            fiemap_observed = sample["fiemap_observed_files"]
+            shared = sample["shared_extent_files"]
+            if sampled < 1 or fiemap_observed != sampled:
+                raise BenchmarkError("clone mode lacks complete FIEMAP observation")
+            if shared * 100 < sampled * CLONE_SHARED_EXTENT_MIN_PERCENT:
+                raise BenchmarkError(
+                    "clone mode lacks CoW-dominant per-task shared-extent evidence"
+                )
         mechanisms.add(sample["mechanism"])
 
-    if import_method == "clone" and mechanisms != {"reflink_observed"}:
-        raise BenchmarkError("clone mode lacks per-task shared-extent evidence")
+    if import_method == "clone":
+        allowed = {"reflink_observed", "mixed_private_copy_and_reflink_observed"}
+        if not mechanisms or not mechanisms.issubset(allowed):
+            raise BenchmarkError("clone mode physical mechanism is unsafe or unproven")
     if import_method == "hardlink" and mechanisms != {"hardlink_observed"}:
         raise BenchmarkError("hardlink mode lacks per-task shared-inode evidence")
     return mechanisms

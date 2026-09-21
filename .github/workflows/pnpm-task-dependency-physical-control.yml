@@ -80,7 +80,8 @@ jobs:
             repetitions: 20
             store_policy: user
             probe_script: ""
-            expected_mechanism: reflink_observed
+            expected_mechanism: ""
+            min_shared_percent: 95
             must_succeed: "true"
           - mode: composed
             filesystem: ext4
@@ -96,7 +97,8 @@ jobs:
             repetitions: 10
             store_policy: readonly
             probe_script: test
-            expected_mechanism: reflink_observed
+            expected_mechanism: ""
+            min_shared_percent: 95
             must_succeed: "true"
 
     steps:
@@ -145,6 +147,7 @@ jobs:
           STORE_POLICY: ${{ matrix.store_policy }}
           PROBE_SCRIPT: ${{ matrix.probe_script }}
           EXPECTED_MECHANISM: ${{ matrix.expected_mechanism }}
+          MIN_SHARED_PERCENT: ${{ matrix.min_shared_percent || 0 }}
           MUST_SUCCEED: ${{ matrix.must_succeed }}
           BENCHMARK_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
@@ -376,6 +379,18 @@ jobs:
                  all(.samples[];
                    .result == "succeeded" and
                    (.observed_import_mechanisms == [$mechanism]))
+                ' "$receipt" >/dev/null
+            fi
+            if test "$MIN_SHARED_PERCENT" -gt 0; then
+              jq -e                 --argjson minimum "$MIN_SHARED_PERCENT"                 '.result == "succeeded" and
+                 all(.samples[];
+                   .result == "succeeded" and
+                   all(.task_dependency_evidence[];
+                     (.usage.multiply_linked_regular_file_count == 0) and
+                     (.sample.sampled_regular_files > 0) and
+                     (.sample.fiemap_observed_files == .sample.sampled_regular_files) and
+                     ((.sample.shared_extent_files * 100) >=
+                       (.sample.sampled_regular_files * $minimum))))
                 ' "$receipt" >/dev/null
             fi
             if test -n "$PROBE_SCRIPT"; then
