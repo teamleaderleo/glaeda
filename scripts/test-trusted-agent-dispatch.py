@@ -67,9 +67,13 @@ def external_terminal(
         if state not in {"refused", "ambiguous"}
         else None
     )
-    receipt["refusal_code"] = (
-        "ambiguous_execution" if state == "ambiguous" else None
-    )
+    if state == "refused":
+        receipt["resolved_workload"] = None
+        receipt["refusal_code"] = "fixture_refused"
+    elif state == "ambiguous":
+        receipt["refusal_code"] = "ambiguous_execution"
+    else:
+        receipt["refusal_code"] = None
     return receipt
 
 
