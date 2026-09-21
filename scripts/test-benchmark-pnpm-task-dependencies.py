@@ -53,6 +53,10 @@ class PnpmTaskDependencyBenchmarkTests(unittest.TestCase):
                 document['workspace_policy']['task_local_pnpm_virtual_store'],
                 'node_modules/.pnpm',
             )
+            self.assertEqual(
+                document['workspace_policy']['virtual_store_type'],
+                'project_forced_by_closed_environment',
+            )
             self.assertTrue(
                 document['workspace_policy']['repository_execution_requires_task_private_dependency_bytes']
             )
@@ -174,10 +178,37 @@ class PnpmTaskDependencyBenchmarkTests(unittest.TestCase):
         self.assertIn('--offline', command)
         self.assertIn('--frozen-lockfile', command)
         self.assertIn('--ignore-scripts', command)
-        self.assertIn('--virtual-store-type=project', command)
+        self.assertNotIn('--virtual-store-type=project', command)
         self.assertIn('--virtual-store-dir=node_modules/.pnpm', command)
         self.assertIn('--store-dir=/store', command)
         self.assertIn('--package-import-method=clone', command)
+
+    def test_closed_environment_forces_project_virtual_store_type(self) -> None:
+        environment = NAMESPACE['closed_environment'](Path('/opt/node/bin/node'))
+        self.assertEqual(
+            environment['PNPM_CONFIG_VIRTUAL_STORE_TYPE'],
+            'project',
+        )
+        self.assertEqual(environment['NPM_CONFIG_USERCONFIG'], '/dev/null')
+
+    def test_pnpm_virtual_store_type_preflight_requires_project(self) -> None:
+        helper = NAMESPACE['pnpm_virtual_store_type']
+        BenchmarkError = NAMESPACE['BenchmarkError']
+        environment = {'PNPM_CONFIG_VIRTUAL_STORE_TYPE': 'project'}
+        with mock.patch.dict(
+            helper.__globals__,
+            {'run_text': mock.Mock(return_value='project')},
+        ):
+            self.assertEqual(
+                helper(Path('/pnpm'), Path('/source'), environment),
+                'project',
+            )
+        with mock.patch.dict(
+            helper.__globals__,
+            {'run_text': mock.Mock(return_value='global')},
+        ):
+            with self.assertRaises(BenchmarkError):
+                helper(Path('/pnpm'), Path('/source'), environment)
 
     def test_first_read_only_command_uses_local_dependency_state(self) -> None:
         command = NAMESPACE['first_read_only_command'](Path('/pnpm'))
