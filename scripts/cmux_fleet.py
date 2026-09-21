@@ -14,6 +14,7 @@ ENROLLMENT_SCHEMA = "glaeda-cmux-fleet-enrollment/v1"
 ACCEPTANCE_EVIDENCE_SCHEMA = "glaeda-cmux-fleet-acceptance-evidence/v1"
 ACCEPTANCE_SCHEMA = "glaeda-cmux-fleet-acceptance/v1"
 STATUS_SCHEMA = "glaeda-cmux-fleet-node-status/v1"
+BOOTSTRAP_SCHEMA = "glaeda-cmux-fleet-bootstrap/v1"
 MAX_DOCUMENT_BYTES = 64 * 1024
 MAX_STATUS_BYTES = 16 * 1024
 SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\\Z")
@@ -151,6 +152,44 @@ def validate_enrollment(value: object) -> dict[str, Any]:
     elif reason is not None:
         raise FleetError("quarantine reason is only valid for quarantined nodes")
     return doc
+
+
+def enrollment_from_bootstrap(
+    bootstrap_value: object,
+    *,
+    node_id: str,
+    operator_fleet_scope: str,
+    enrollment_generation: int,
+) -> dict[str, Any]:
+    if (
+        not isinstance(bootstrap_value, dict)
+        or bootstrap_value.get("schema") != BOOTSTRAP_SCHEMA
+    ):
+        raise FleetError("bootstrap receipt schema is unsupported")
+    if bootstrap_value.get("authority") != "observation_only":
+        raise FleetError("bootstrap receipt authority is invalid")
+    if bootstrap_value.get("eligibleForEnrollment") is not True:
+        raise FleetError("bootstrap receipt has blocking checks")
+    enrollment = {
+        "schema": ENROLLMENT_SCHEMA,
+        "nodeId": node_id,
+        "architecture": bootstrap_value.get("architecture"),
+        "os": {
+            "family": bootstrap_value.get("platform"),
+            "versionClass": bootstrap_value.get("osVersionClass"),
+        },
+        "hardwareCapabilityClass": bootstrap_value.get("hardwareCapabilityClass"),
+        "supportedToolchainGenerations": [
+            bootstrap_value.get("toolchainGeneration")
+        ],
+        "allowedExecutionRoles": bootstrap_value.get("roles"),
+        "operatorFleetScope": operator_fleet_scope,
+        "enrollmentGeneration": enrollment_generation,
+        "glaedaGeneration": bootstrap_value.get("glaedaGeneration"),
+        "state": "enrolling",
+        "quarantineReason": None,
+    }
+    return validate_enrollment(enrollment)
 
 
 def validate_acceptance_evidence(value: object) -> dict[str, Any]:
@@ -297,6 +336,11 @@ def emit(value: object) -> None:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
+    e = sub.add_parser("enroll")
+    e.add_argument("bootstrap", type=Path)
+    e.add_argument("--node-id", required=True)
+    e.add_argument("--scope", required=True)
+    e.add_argument("--generation", required=True, type=int)
     v = sub.add_parser("validate")
     v.add_argument("enrollment", type=Path)
     f = sub.add_parser("fingerprint")
@@ -317,6 +361,16 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     try:
         args = parser().parse_args()
+        if args.command == "enroll":
+            emit(
+                enrollment_from_bootstrap(
+                    load(args.bootstrap),
+                    node_id=args.node_id,
+                    operator_fleet_scope=args.scope,
+                    enrollment_generation=args.generation,
+                )
+            )
+            return 0
         enrollment = load(args.enrollment)
         if args.command == "validate":
             emit(validate_enrollment(enrollment))
