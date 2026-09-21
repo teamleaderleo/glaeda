@@ -139,6 +139,14 @@ class OwnerLocalDispatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.installation = InstallationFixture()
         self.addCleanup(self.installation.close)
+        self.semantic_state = self.installation.root / "provider-neutral-verify-v1"
+        state_patch = mock.patch.object(
+            local,
+            "SHARED_VERIFY_STATE_ROOT",
+            self.semantic_state,
+        )
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
 
     def test_capabilities_need_no_installation_and_advertise_no_argv(self) -> None:
         semantic_request = request(semantic.OP_CAPABILITIES)
@@ -282,6 +290,10 @@ class OwnerLocalDispatchTests(unittest.TestCase):
             compiled.internal.command_fingerprint,
         )
         self.assertEqual(
+            argv[argv.index("--semantic-request-id") + 1],
+            semantic_request.request_id,
+        )
+        self.assertEqual(
             argv[argv.index("--admission-root") + 1],
             os.fspath(local.ADMISSION_ROOT),
         )
@@ -318,6 +330,60 @@ class OwnerLocalDispatchTests(unittest.TestCase):
         self.assertEqual(receipt["state"], "refused")
         self.assertEqual(receipt["refusal_code"], "source_unavailable")
         run.assert_not_called()
+
+    def test_waiting_request_binds_identity_and_drift_refuses_before_launch(self) -> None:
+        first = verify_request("owner-local-request-0001")
+        with (
+            mock.patch.object(
+                local,
+                "observe_admission",
+                return_value=admission("wait", "node_held"),
+            ),
+            mock.patch.object(local, "_run") as run,
+        ):
+            waiting = local.execute(first, self.installation.path)
+        self.assertEqual(waiting["state"], "waiting")
+        run.assert_not_called()
+
+        drifted_source = dict(SOURCE)
+        drifted_source["commit"] = "4" * 40
+        drifted = request(
+            semantic.OP_VERIFY_NAMED,
+            request_id="owner-local-request-0001",
+            source=drifted_source,
+            parameters={"profile_id": "verify-focused/v1"},
+        )
+        with (
+            mock.patch.object(
+                local,
+                "observe_admission",
+                side_effect=AssertionError("conflict must refuse before admission"),
+            ),
+            mock.patch.object(local, "_run") as run,
+        ):
+            refused = local.execute(drifted, self.installation.path)
+        self.assertEqual(refused["state"], "refused")
+        self.assertEqual(refused["refusal_code"], "request_conflict")
+        run.assert_not_called()
+
+    def test_exact_waiting_replay_keeps_one_semantic_binding(self) -> None:
+        semantic_request = verify_request("owner-local-request-0001")
+        with mock.patch.object(
+            local,
+            "observe_admission",
+            return_value=admission("wait", "pressure_high"),
+        ):
+            first = local.execute(semantic_request, self.installation.path)
+            second = local.execute(semantic_request, self.installation.path)
+        self.assertEqual(first["state"], "waiting")
+        self.assertEqual(second["state"], "waiting")
+        binding = (
+            self.semantic_state
+            / "semantic-requests"
+            / semantic_request.request_id
+            / "binding.json"
+        )
+        self.assertTrue(binding.is_file())
 
     def test_duplicate_identity_is_shared_by_local_and_semantic_workload(self) -> None:
         first = semantic.compile_request(verify_request("owner-local-request-0001"))
