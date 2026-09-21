@@ -1052,6 +1052,56 @@ class HotRunTests(unittest.TestCase):
             )
             self.assertFalse(stale.exists())
 
+    def test_successful_use_rebuilds_corrupt_generation_value_record(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, _, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "q" * 64
+            )
+            namespace["publish_implicit_state_base"](state, document)
+            (state / "lock").touch(mode=0o600)
+            observation = namespace["ExecutionObservation"](0.1, 0.0)
+            self.assertEqual(
+                namespace["record_successful_hot_state_use"](
+                    namespace_root,
+                    state,
+                    "created",
+                    None,
+                    None,
+                    None,
+                    observation,
+                ),
+                "recorded",
+            )
+            record_path = (
+                namespace_root / ".value-records-v2" / f"{state.name}.json"
+            )
+            record_path.write_text('{"corrupt":true}\n', encoding="utf-8")
+            record_path.chmod(0o600)
+
+            self.assertEqual(
+                namespace["record_successful_hot_state_use"](
+                    namespace_root,
+                    state,
+                    "reused",
+                    None,
+                    None,
+                    None,
+                    observation,
+                ),
+                "recorded",
+            )
+            repaired = namespace["read_hot_state_value_record"](
+                namespace_root, state.name
+            )
+            self.assertIsNotNone(repaired)
+            assert repaired is not None
+            self.assertEqual(repaired["successful_use_count"], 1)
+            self.assertEqual(repaired["last_successful_use_sequence"], 2)
+
     def test_value_catalog_migrates_v1_records_atomically(self) -> None:
         namespace = load_hot_run()
         with tempfile.TemporaryDirectory() as directory:
