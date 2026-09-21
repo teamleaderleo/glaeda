@@ -336,6 +336,31 @@ def fleet_acceptance_binding(value: object) -> dict[str, object]:
     }
 
 
+def fleet_role_acceptances(
+    node_id: str,
+    enrollment_generation: int,
+    values: Iterable[object],
+) -> dict[str, dict[str, object]]:
+    if not isinstance(node_id, str) or NODE_RE.fullmatch(node_id) is None:
+        raise RoleModelError("nodeId is invalid")
+    _positive_int(enrollment_generation, "enrollment generation")
+    projected: dict[str, dict[str, object]] = {}
+    for value in values:
+        binding = fleet_acceptance_binding(value)
+        if binding["nodeId"] != node_id:
+            raise RoleModelError("fleet acceptance belongs to a different node")
+        if binding["enrollmentGeneration"] != enrollment_generation:
+            raise RoleModelError("fleet acceptance enrollment generation is stale")
+        role = binding["role"]
+        if role in projected:
+            raise RoleModelError("duplicate fleet acceptance role")
+        projected[role] = {
+            "profile": binding["profile"],
+            "receiptSha256": binding["receiptSha256"],
+        }
+    return projected
+
+
 def validate_node(value: object) -> dict[str, Any]:
     doc = _exact(
         value,
