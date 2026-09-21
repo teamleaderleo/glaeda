@@ -535,6 +535,7 @@ pub struct ResourceEnvelopeV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RoutingObservationV1 {
+    pub observation_id: RoutingId,
     pub workload: WorkloadClassV1,
     pub pool_id: RoutingId,
     pub execution_class: RoutingId,
@@ -572,12 +573,13 @@ pub struct ResourcePredictionV1 {
     pub disk_bytes_p90: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EvidenceBasisV1 {
     pub fresh_observations: u16,
     pub validated_successes: u16,
     pub first_observed_at_millis: u64,
     pub last_observed_at_millis: u64,
+    pub evidence_ids: Vec<RoutingId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -952,7 +954,15 @@ pub fn recommend_ci_pool(
             "routing observation input exceeds the bounded maximum",
         ));
     }
+    let mut observation_ids = BTreeSet::new();
     for observation in observations {
+        if !observation_ids.insert(observation.observation_id.as_str()) {
+            return Err(error(
+                "observations.observation_id",
+                "routing_duplicate_observation_id",
+                "routing observation identifiers must be unique",
+            ));
+        }
         observation.timing.validate()?;
         if observation.hot_state == HotStateClass::HotExact
             && observation.hot_state_identity.is_none()
@@ -1245,6 +1255,24 @@ fn predict_pool(
         .allowance
         .as_ref()
         .map(|allowance| allowance.projected_remaining_ppm(allowance_units.p90));
+    let mut evidence_ids = fresh
+        .iter()
+        .map(|observation| {
+            (
+                observation.observed_at_millis,
+                observation.observation_id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    evidence_ids.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    let evidence_ids = evidence_ids
+        .into_iter()
+        .map(|(_, identity)| identity)
+        .collect();
 
     Ok(PoolPredictionV1 {
         pool_id: candidate.pool.pool_id.clone(),
@@ -1256,6 +1284,7 @@ fn predict_pool(
             validated_successes: u16::try_from(successes.len()).unwrap_or(u16::MAX),
             first_observed_at_millis,
             last_observed_at_millis,
+            evidence_ids,
         },
         completion: CompletionPredictionV1 {
             queue,
@@ -1595,6 +1624,7 @@ mod tests {
         outcome: ObservationOutcome,
     ) -> RoutingObservationV1 {
         RoutingObservationV1 {
+            observation_id: id(&format!("obs:{pool_id}:{age_millis}")),
             workload: workload.clone(),
             pool_id: id(pool_id),
             execution_class: id("macos-arm64"),
@@ -2109,6 +2139,35 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_observation_receipt_cannot_inflate_sample_count() {
+        let workload = workload();
+        let candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::HotExact);
+        let one = observation(
+            &workload,
+            "owned",
+            HotStateClass::HotExact,
+            1_000,
+            60_000,
+            0,
+            0,
+            ObservationOutcome::ValidatedSuccess,
+        );
+        let observations = vec![one.clone(), one];
+
+        let error = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "routing_duplicate_observation_id");
+    }
+
+    #[test]
     fn changed_execution_class_does_not_reuse_old_pool_history() {
         let workload = workload();
         let mut candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::HotExact);
@@ -2458,5 +2517,6 @@ mod tests {
         assert!(json.contains("\"choice\": \"owned\""));
         assert!(json.contains("\"automatic_routing_eligible\": false"));
         assert!(json.contains("\"authority\": \"recommendation_only\""));
+        assert!(json.contains("\"evidence_ids\""));
     }
 }
