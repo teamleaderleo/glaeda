@@ -232,6 +232,20 @@ class TrustedDispatchTests(unittest.TestCase):
             ambiguous["authority"]["authorizes_redispatch"]
         )
 
+    def test_terminal_receipt_requires_state_specific_evidence(self) -> None:
+        item = accepted()
+        launching = dispatch.mark_launching(
+            dispatch.initial_lifecycle(item),
+            item,
+        )
+        forged = external_terminal(item)
+        forged["workload_receipt_sha256"] = None
+        with self.assertRaisesRegex(
+            dispatch.DispatchRefusal,
+            "fields are inconsistent",
+        ):
+            dispatch.settle_from_external(launching, item, forged)
+
     def test_exact_settlement_replay_is_idempotent_and_drift_conflicts(
         self,
     ) -> None:
