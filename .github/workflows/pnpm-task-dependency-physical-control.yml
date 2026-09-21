@@ -343,7 +343,7 @@ jobs:
             jq -e               --arg fs "$FILESYSTEM"               --arg commit "$SOURCE_COMMIT"               --arg pnpm "$PNPM_VERSION"               --argjson repetitions "$REPETITIONS"               '.source.commit == $commit and
                .pnpm.version == $pnpm and
                .pnpm.virtual_store_type == "project" and
-               .filesystem_before.filesystem_type == $fs and
+               .samples[0].filesystem_before.filesystem_type == $fs and
                (.samples | length) == $repetitions'               "$receipt" >/dev/null
 
             if test "$MUST_SUCCEED" = true; then
