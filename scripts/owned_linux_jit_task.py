@@ -35,6 +35,9 @@ MAX_DEADLINE_SECONDS = 6 * 60 * 60
 MAX_PAYLOAD_BYTES = 1024 * 1024 * 1024
 MAX_PAYLOAD_ENTRIES = 50_000
 TASK_DOCUMENT = "task.json"
+EGRESS_GUARD_DOCUMENT_TYPE = "glaeda-owned-linux-egress-authority"
+EGRESS_GUARD_ENFORCEMENT = "external_reviewed_host_firewall_or_gateway"
+MAX_EGRESS_GUARD_BYTES = 4096
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 UNIT_RE = re.compile(r"^glaeda-gha-[0-9a-f]{32}\.service$")
 
@@ -85,6 +88,52 @@ def _verify_launcher(path: Path) -> None:
         raise task.Refusal("owned runner launcher is unsafe")
     if _digest(path.read_bytes()) != LAUNCHER_SHA256:
         raise task.Refusal("owned runner launcher changed")
+
+
+def _validate_egress_guard_document(raw: bytes) -> dict[str, object]:
+    if len(raw) > MAX_EGRESS_GUARD_BYTES:
+        raise task.Refusal("owned runner egress authority is too large")
+    value = admission.decode(raw)
+    expected = {
+        "class": NETWORK.value,
+        "document_type": EGRESS_GUARD_DOCUMENT_TYPE,
+        "enforcement": EGRESS_GUARD_ENFORCEMENT,
+        "private_or_link_local_egress": False,
+        "schema_version": SCHEMA_VERSION,
+    }
+    if value != expected or canonical(value) != raw:
+        raise task.Refusal("owned runner egress authority is invalid")
+    return value
+
+
+def _verify_egress_guard(path: Path, expected_digest: str) -> None:
+    info = path.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) not in (0o400, 0o444)
+        or info.st_size <= 0
+        or info.st_size > MAX_EGRESS_GUARD_BYTES
+    ):
+        raise task.Refusal("owned runner egress authority is unsafe")
+    raw = path.read_bytes()
+    if _digest(raw) != expected_digest:
+        raise task.Refusal("owned runner egress authority changed")
+    _validate_egress_guard_document(raw)
+    after = path.stat(follow_symlinks=False)
+    if (
+        after.st_dev != info.st_dev
+        or after.st_ino != info.st_ino
+        or after.st_uid != info.st_uid
+        or after.st_gid != info.st_gid
+        or after.st_mode != info.st_mode
+        or after.st_nlink != info.st_nlink
+        or after.st_size != info.st_size
+        or after.st_mtime_ns != info.st_mtime_ns
+        or after.st_ctime_ns != info.st_ctime_ns
+    ):
+        raise task.Refusal("owned runner egress authority changed")
 
 
 def payload_tree_digest(root: Path) -> str:
@@ -154,11 +203,14 @@ def _identity(arguments: argparse.Namespace) -> tuple[str, dict[str, object]]:
     _validated_digest(arguments.command_fingerprint, "command fingerprint")
     _validated_digest(arguments.binding_sha256, "task binding")
     _validated_digest(arguments.payload_tree_sha256, "payload tree identity")
+    _validated_digest(arguments.egress_guard_sha256, "egress authority identity")
     if not UNIT_RE.fullmatch(arguments.unit):
         raise task.Refusal("owned runner unit is invalid")
     payload = _exact_path(arguments.payload_root, directory=True)
     launcher = _exact_path(arguments.launcher, directory=False)
+    egress_guard = _exact_path(arguments.egress_guard, directory=False)
     _verify_launcher(launcher)
+    _verify_egress_guard(egress_guard, arguments.egress_guard_sha256)
     observed_tree = payload_tree_digest(payload)
     if observed_tree != arguments.payload_tree_sha256:
         raise task.Refusal("owned runner payload generation changed")
@@ -171,6 +223,7 @@ def _identity(arguments: argparse.Namespace) -> tuple[str, dict[str, object]]:
         "runner_archive_sha256": RUNNER_ARCHIVE_SHA256,
         "payload_tree_sha256": observed_tree,
         "launcher_sha256": LAUNCHER_SHA256,
+        "egress_guard_sha256": arguments.egress_guard_sha256,
         "command_fingerprint": arguments.command_fingerprint,
         "unit": arguments.unit,
         "binding_sha256": arguments.binding_sha256,
@@ -571,6 +624,8 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--payload-root", required=True)
         command.add_argument("--payload-tree-sha256", required=True)
         command.add_argument("--launcher", required=True)
+        command.add_argument("--egress-guard", required=True)
+        command.add_argument("--egress-guard-sha256", required=True)
         command.add_argument("--command-fingerprint", required=True)
         command.add_argument("--unit", required=True)
         command.add_argument("--binding-sha256", required=True)
