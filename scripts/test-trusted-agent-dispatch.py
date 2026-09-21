@@ -172,6 +172,47 @@ class TrustedDispatchTests(unittest.TestCase):
             other.accepted_document["workload_command_fingerprint"],
         )
 
+    def test_same_external_id_partitions_callers_but_exact_replay_is_stable(self) -> None:
+        original_document = base_document()
+        first = accepted(original_document)
+        replay = accepted(copy.deepcopy(original_document))
+        self.assertEqual(
+            first.accepted_document["semantic_request_id"],
+            replay.accepted_document["semantic_request_id"],
+        )
+        self.assertEqual(
+            first.accepted_document["workload_command_fingerprint"],
+            replay.accepted_document["workload_command_fingerprint"],
+        )
+
+        other_principal = "github-mailbox-writers:teamleaderleo/other-dispatch"
+        other_binding = "github-private-repo-write-policy:teamleaderleo/other-dispatch"
+        other_document = copy.deepcopy(original_document)
+        other_document["caller"] = {
+            "principal": other_principal,
+            "provenance_binding": other_binding,
+        }
+        other_document["request_fingerprint"] = dispatch.fingerprint_document(
+            other_document
+        )
+        other_request = dispatch.decode_request(raw(other_document), now=NOW)
+        other = dispatch.accept_request(
+            other_request,
+            dispatch.ProvenanceEvidence(other_principal, other_binding),
+        )
+        self.assertEqual(first.request.request_id, other.request.request_id)
+        self.assertEqual(first.request.repository, other.request.repository)
+        self.assertEqual(first.request.commit, other.request.commit)
+        self.assertEqual(first.request.tree, other.request.tree)
+        self.assertNotEqual(
+            first.accepted_document["semantic_request_id"],
+            other.accepted_document["semantic_request_id"],
+        )
+        self.assertNotEqual(
+            first.accepted_document["workload_command_fingerprint"],
+            other.accepted_document["workload_command_fingerprint"],
+        )
+
     def test_caller_request_schema_does_not_gain_physical_identity_fields(self) -> None:
         document = base_document()
         self.assertNotIn("semantic_request_id", document)
