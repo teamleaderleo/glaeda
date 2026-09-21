@@ -31,6 +31,7 @@ ROLES = (
     "cmux_linux_ci",
     "cmux_macos_native_build",
     "cmux_macos_test",
+    "diagnostic",
 )
 ENROLLABLE_ROLES = {
     "cmux_linux_ci",
