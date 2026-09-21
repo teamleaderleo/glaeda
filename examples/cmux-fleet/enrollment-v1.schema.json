@@ -19,20 +19,33 @@
     "quarantineReason"
   ],
   "properties": {
-    "schema": {"const": "glaeda-cmux-fleet-enrollment/v1"},
+    "schema": {
+      "const": "glaeda-cmux-fleet-enrollment/v1"
+    },
     "nodeId": {
       "type": "string",
       "pattern": "^cmux-[a-z0-9][a-z0-9-]{2,59}$"
     },
     "architecture": {
-      "enum": ["arm64", "x86_64"]
+      "enum": [
+        "arm64",
+        "x86_64"
+      ]
     },
     "os": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["family", "versionClass"],
+      "required": [
+        "family",
+        "versionClass"
+      ],
       "properties": {
-        "family": {"enum": ["macos", "linux"]},
+        "family": {
+          "enum": [
+            "macos",
+            "linux"
+          ]
+        },
         "versionClass": {
           "type": "string",
           "pattern": "^[a-z0-9][a-z0-9._-]{0,79}$"
@@ -60,13 +73,8 @@
       "uniqueItems": true,
       "items": {
         "enum": [
-          "artifact_cache",
-          "background_replay",
-          "benchmark",
-          "cmux_linux_agent",
           "cmux_linux_ci",
-          "cmux_macos_native_build",
-          "cmux_macos_test"
+          "cmux_macos_native_build"
         ]
       }
     },
@@ -81,7 +89,9 @@
     },
     "glaedaGeneration": {
       "oneOf": [
-        {"type": "null"},
+        {
+          "type": "null"
+        },
         {
           "type": "string",
           "pattern": "^sha256:[0-9a-f]{64}$"
@@ -100,7 +110,9 @@
     },
     "quarantineReason": {
       "oneOf": [
-        {"type": "null"},
+        {
+          "type": "null"
+        },
         {
           "enum": [
             "dirty_canonical_checkout",
@@ -119,16 +131,24 @@
   "allOf": [
     {
       "if": {
-        "properties": {"state": {"const": "quarantined"}}
+        "properties": {
+          "state": {
+            "const": "quarantined"
+          }
+        }
       },
       "then": {
         "properties": {
-          "quarantineReason": {"type": "string"}
+          "quarantineReason": {
+            "type": "string"
+          }
         }
       },
       "else": {
         "properties": {
-          "quarantineReason": {"type": "null"}
+          "quarantineReason": {
+            "type": "null"
+          }
         }
       }
     },
@@ -136,7 +156,11 @@
       "if": {
         "properties": {
           "os": {
-            "properties": {"family": {"const": "macos"}}
+            "properties": {
+              "family": {
+                "const": "macos"
+              }
+            }
           }
         }
       },
@@ -145,7 +169,10 @@
           "allowedExecutionRoles": {
             "items": {
               "not": {
-                "enum": ["cmux_linux_agent", "cmux_linux_ci"]
+                "enum": [
+                  "cmux_linux_agent",
+                  "cmux_linux_ci"
+                ]
               }
             }
           }
@@ -156,7 +183,11 @@
       "if": {
         "properties": {
           "os": {
-            "properties": {"family": {"const": "linux"}}
+            "properties": {
+              "family": {
+                "const": "linux"
+              }
+            }
           }
         }
       },
@@ -165,12 +196,29 @@
           "allowedExecutionRoles": {
             "items": {
               "not": {
-                "enum": ["cmux_macos_native_build", "cmux_macos_test"]
+                "enum": [
+                  "cmux_macos_native_build",
+                  "cmux_macos_test"
+                ]
               }
             }
           }
         }
       }
     }
-  ]
+  ],
+  "$defs": {
+    "knownRole": {
+      "description": "CMUX fleet role vocabulary. Roles become enrolable only after an exact reviewed acceptance workload lands.",
+      "enum": [
+        "artifact_cache",
+        "background_replay",
+        "benchmark",
+        "cmux_linux_agent",
+        "cmux_linux_ci",
+        "cmux_macos_native_build",
+        "cmux_macos_test"
+      ]
+    }
+  }
 }
