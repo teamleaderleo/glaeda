@@ -259,7 +259,7 @@ class FleetTests(unittest.TestCase):
     def test_status_rejects_forged_acceptance_receipt(self):
         e = enrollment()
         forged = finalized(e)
-        forged["checks"]["processSettlement"] = "fail"
+        forged["cmuxSemanticResultState"] = "failed"
         with self.assertRaisesRegex(f.FleetError, "disagrees"):
             f.node_status(e, [forged])
 
