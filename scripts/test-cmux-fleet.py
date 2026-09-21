@@ -236,6 +236,30 @@ class FleetTests(unittest.TestCase):
         )
         self.assertEqual(native["reason"], "acceptance_enrollment_stale")
 
+    def test_fleet_contract_change_stales_acceptance(self):
+        e = enrollment()
+        receipt = finalized(e)
+        self.assertEqual(
+            receipt["glaedaFleetContractGeneration"],
+            f.fleet_contract_generation(),
+        )
+        with mock.patch.object(
+            f,
+            "fleet_contract_generation",
+            return_value=D,
+        ):
+            status = f.node_status(e, [receipt])
+        native = next(
+            value
+            for value in status["roles"]
+            if value["role"] == "cmux_macos_native_build"
+        )
+        self.assertFalse(native["eligible"])
+        self.assertEqual(
+            native["reason"],
+            "acceptance_glaeda_contract_stale",
+        )
+
     def test_profile_policy_change_requires_fresh_enrollment(self):
         e = enrollment()
         receipt = finalized(e)
@@ -368,6 +392,10 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(
             receipt["cmuxEnvironmentClass"],
             result["environment_class"],
+        )
+        self.assertEqual(
+            receipt["glaedaFleetContractGeneration"],
+            f.fleet_contract_generation(),
         )
 
     def test_acceptance_receipt_execution_binding_is_closed(self):
