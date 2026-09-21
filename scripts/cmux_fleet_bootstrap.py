@@ -398,13 +398,13 @@ def main() -> int:
         if (
             args.platform == "macos"
             and any(
-                role in {"cmux_macos_native_build", "artifact_cache"}
+                role == "cmux_macos_native_build"
                 for role in args.role
             )
             and cache_root is None
         ):
             raise BootstrapError(
-                "macOS native-build/cache roles require --cache-root"
+                "macOS native-build role requires --cache-root"
             )
         minimum = args.min_free_gib or (120 if args.platform == "macos" else 40)
         if minimum <= 0:
