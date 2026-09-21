@@ -644,4 +644,213 @@ def sign_snapshot(
     public = run_bounded(
         [str(ssh_keygen), "-y", "-f", str(private_key)],
         env=signing_environment(),
- 
+        timeout=5,
+    )
+    if public.returncode != 0:
+        raise SnapshotError("snapshot signing key could not be read")
+    observed_public = public.stdout.decode("ascii", errors="strict").strip()
+    expected_public = reviewed["ssh_public_key"].split(" ", 2)
+    expected_public = " ".join(expected_public[:2])
+    if observed_public != expected_public:
+        raise SnapshotError("snapshot signing key disagrees with reviewed trust")
+
+    message = canonical_json(unsigned)
+    with tempfile.TemporaryDirectory(prefix="glaeda-status-sign-") as directory:
+        message_path = Path(directory) / "snapshot"
+        message_path.write_bytes(message)
+        completed = run_bounded(
+            [str(ssh_keygen), "-Y", "sign", "-f", str(private_key), "-n", SIGNING_NAMESPACE, str(message_path)],
+            env=signing_environment(),
+            timeout=5,
+        )
+        if completed.returncode != 0:
+            raise SnapshotError("snapshot signature could not be created")
+        signature_path = Path(str(message_path) + ".sig")
+        try:
+            signature = signature_path.read_text(encoding="ascii")
+        except (OSError, UnicodeDecodeError) as error:
+            raise SnapshotError("snapshot signature output is unavailable") from error
+    if len(signature.encode("ascii")) > 4096 or "BEGIN SSH SIGNATURE" not in signature:
+        raise SnapshotError("snapshot signature output is invalid")
+    signed = {
+        **unsigned,
+        "signature": {
+            "algorithm": "sshsig-ed25519",
+            "key_id": key_id,
+            "namespace": SIGNING_NAMESPACE,
+            "value": signature,
+        },
+    }
+    if len(canonical_json(signed)) > MAX_NODE_BYTES:
+        raise SnapshotError("signed node snapshot exceeds the byte ceiling")
+    return signed
+
+
+def verify_snapshot_signature(
+    value: object,
+    trust_value: object,
+    *,
+    ssh_keygen: Path = Path("/usr/bin/ssh-keygen"),
+) -> dict[str, Any]:
+    trust = validate_trust(trust_value)
+    signed = exact_object(value, "signed node snapshot")
+    exact_keys(signed, {"document_type", "schema_version", "payload", "signature"}, "signed node snapshot")
+    signature = exact_object(signed["signature"], "snapshot signature")
+    exact_keys(signature, {"algorithm", "key_id", "namespace", "value"}, "snapshot signature")
+    if signature["algorithm"] != "sshsig-ed25519" or signature["namespace"] != SIGNING_NAMESPACE:
+        raise SnapshotError("snapshot signature algorithm is unsupported")
+    key_id = bounded_string(signature["key_id"], KEY_RE, "snapshot signature key id")
+    if not isinstance(signature["value"], str) or len(signature["value"].encode("utf-8")) > 4096:
+        raise SnapshotError("snapshot signature is invalid")
+    unsigned = {key: signed[key] for key in ("document_type", "schema_version", "payload")}
+    validate_unsigned_snapshot(unsigned, trust, check_freshness=False)
+    node_id = unsigned["payload"]["node"]["id"]
+    reviewed = trust_node(trust, node_id)
+    if key_id != reviewed["key_id"] or unsigned["payload"]["producer"]["key_id"] != key_id:
+        raise SnapshotError("snapshot signature key disagrees with reviewed trust")
+    ssh_keygen = require_executable(ssh_keygen, "ssh-keygen")
+    with tempfile.TemporaryDirectory(prefix="glaeda-status-verify-") as directory:
+        signature_path = Path(directory) / "snapshot.sig"
+        allowed_path = Path(directory) / "allowed_signers"
+        signature_path.write_text(signature["value"], encoding="ascii")
+        allowed_path.write_text(f"{key_id} {reviewed['ssh_public_key']}\n", encoding="ascii")
+        completed = run_bounded(
+            [str(ssh_keygen), "-Y", "verify", "-f", str(allowed_path), "-I", key_id, "-n", SIGNING_NAMESPACE, "-s", str(signature_path)],
+            input_bytes=canonical_json(unsigned),
+            env=signing_environment(),
+            timeout=5,
+        )
+        if completed.returncode != 0:
+            raise SnapshotError("snapshot signature verification failed")
+    return signed
+
+
+def validate_signed_snapshot(
+    value: object,
+    trust_value: object,
+    *,
+    now: dt.datetime | None = None,
+    check_freshness: bool = True,
+    ssh_keygen: Path = Path("/usr/bin/ssh-keygen"),
+) -> dict[str, Any]:
+    signed = verify_snapshot_signature(value, trust_value, ssh_keygen=ssh_keygen)
+    unsigned = {key: signed[key] for key in ("document_type", "schema_version", "payload")}
+    validate_unsigned_snapshot(unsigned, trust_value, now=now, check_freshness=check_freshness)
+    return signed
+
+
+def raw_snapshot_node_id(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    payload = value.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    node = payload.get("node")
+    if not isinstance(node, dict):
+        return None
+    node_id = node.get("id")
+    if not isinstance(node_id, str) or NODE_RE.fullmatch(node_id) is None:
+        return None
+    return node_id
+
+
+def validate_fleet(value: object) -> dict[str, Any]:
+    fleet = exact_object(value, "fleet snapshot")
+    exact_keys(fleet, {"document_type", "schema_version", "nodes"}, "fleet snapshot")
+    if fleet["document_type"] != FLEET_DOCUMENT or fleet["schema_version"] != SCHEMA_VERSION:
+        raise SnapshotError("fleet snapshot version is unsupported")
+    exact_list(fleet["nodes"], "fleet node snapshots", MAX_NODES)
+    if len(canonical_json(fleet)) > MAX_FLEET_BYTES:
+        raise SnapshotError("fleet snapshot exceeds the byte ceiling")
+    return fleet
+
+
+def empty_fleet() -> dict[str, object]:
+    return {"document_type": FLEET_DOCUMENT, "schema_version": SCHEMA_VERSION, "nodes": []}
+
+
+def snapshot_version(snapshot: dict[str, Any]) -> tuple[int, int]:
+    freshness = snapshot["payload"]["freshness"]
+    return int(freshness["producer_generation"]), int(freshness["snapshot_sequence"])
+
+
+def snapshot_semantics(snapshot: dict[str, Any]) -> bytes:
+    payload = dict(snapshot["payload"])
+    payload.pop("freshness", None)
+    return canonical_json(payload)
+
+
+def upsert_fleet(
+    fleet_value: object,
+    candidate_value: object,
+    trust_value: object,
+    *,
+    now: dt.datetime,
+    refresh_interval_seconds: int = DEFAULT_REFRESH_INTERVAL_SECONDS,
+    ssh_keygen: Path = Path("/usr/bin/ssh-keygen"),
+) -> tuple[dict[str, object], str]:
+    refresh_interval_seconds = integer(
+        refresh_interval_seconds, "refresh interval", 30, MAX_USEFUL_AGE_SECONDS
+    )
+    fleet = validate_fleet(fleet_value)
+    candidate = validate_signed_snapshot(candidate_value, trust_value, now=now, ssh_keygen=ssh_keygen)
+    candidate_max_age = int(candidate["payload"]["freshness"]["maximum_useful_age_seconds"])
+    if refresh_interval_seconds > candidate_max_age - MAX_CLOCK_SKEW_SECONDS:
+        raise SnapshotError("refresh interval leaves no bounded stale margin")
+    node_id = candidate["payload"]["node"]["id"]
+    nodes = list(fleet["nodes"])
+    raw_ids = [raw_snapshot_node_id(item) for item in nodes]
+    if any(raw_id is None for raw_id in raw_ids):
+        raise SnapshotError("fleet contains a malformed node entry")
+    if len(set(raw_ids)) != len(raw_ids):
+        raise SnapshotError("fleet contains duplicate node entries")
+    for item in nodes:
+        validate_signed_snapshot(item, trust_value, check_freshness=False, ssh_keygen=ssh_keygen)
+    matches = [index for index, raw_id in enumerate(raw_ids) if raw_id == node_id]
+    if len(matches) > 1:
+        raise SnapshotError("fleet contains duplicate entries for the node")
+    if not matches:
+        nodes.append(candidate)
+        result = {"document_type": FLEET_DOCUMENT, "schema_version": SCHEMA_VERSION, "nodes": sorted(nodes, key=lambda item: item["payload"]["node"]["id"])}
+        validate_fleet(result)
+        return result, "transition"
+
+    index = matches[0]
+    current = validate_signed_snapshot(nodes[index], trust_value, check_freshness=False, ssh_keygen=ssh_keygen)
+    current_version = snapshot_version(current)
+    candidate_version = snapshot_version(candidate)
+    if candidate_version == current_version:
+        if canonical_json(candidate) == canonical_json(current):
+            raise PublicationSuppressed("snapshot is already published")
+        raise SnapshotError("same snapshot version carries different content")
+    if candidate_version < current_version:
+        raise SnapshotError("older producer or snapshot sequence cannot overwrite newer state")
+    if candidate_version[0] == current_version[0] and candidate_version[1] != current_version[1] + 1:
+        raise SnapshotError("snapshot sequence must advance by exactly one within a producer generation")
+    if candidate_version[0] > current_version[0] and candidate_version[1] != 1:
+        raise SnapshotError("a new producer generation must restart snapshot sequence at one")
+
+    current_published = parse_time(current["payload"]["freshness"]["published_at"], "current published_at")
+    if snapshot_semantics(candidate) == snapshot_semantics(current) and now - current_published < dt.timedelta(seconds=refresh_interval_seconds):
+        raise PublicationSuppressed("unchanged snapshot is inside the refresh interval")
+    nodes[index] = candidate
+    result = {"document_type": FLEET_DOCUMENT, "schema_version": SCHEMA_VERSION, "nodes": sorted(nodes, key=lambda item: item["payload"]["node"]["id"])}
+    validate_fleet(result)
+    reason = "refresh" if snapshot_semantics(candidate) == snapshot_semantics(current) else "transition"
+    return result, reason
+
+
+def unknown_node(entry: dict[str, Any], reason: str) -> dict[str, object]:
+    return {
+        "id": entry["id"],
+        "os_class": entry["os_class"],
+        "architecture_class": entry["architecture_class"],
+        "freshness_class": "unknown",
+        "reason": reason,
+        "availability_class": "unknown",
+        "pressure_class": "unknown",
+        "capacity_class": "unknown",
+        "active_work_count": None,
+        "glaeda_generation": None,
+        "profiles": [],
+    
