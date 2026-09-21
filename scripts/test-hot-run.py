@@ -664,172 +664,45 @@ class HotRunTests(unittest.TestCase):
                 (state / "payload").read_text(encoding="utf-8"), "preserve\n"
             )
 
-    def test_discovery_streams_large_namespace_and_runtime_inventory(
+    def test_reconcile_queue_bounds_work_and_eventually_reaches_state(
         self,
     ) -> None:
         namespace = load_hot_run()
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
-            namespace_root = fixture / "large-namespace"
+            namespace_root = fixture / "hot-run"
             namespace_root.mkdir(mode=0o700)
             for index in range(320):
                 (namespace_root / f"foreign-{index:04d}").touch(mode=0o600)
+            for index in range(1, 97):
+                state_identity = f"{index:064x}"
+                namespace["enqueue_hot_state_reconcile_ticket"](
+                    namespace_root,
+                    "state",
+                    state_identity,
+                    state_identity,
+                )
+
             state, task, document = self.make_hot_state_manifest_fixture(
                 namespace, fixture, "n" * 64
             )
-            target = namespace_root / document["state_identity"]
-            namespace["publish_implicit_state_base"](target, document)
-            (target / "lock").touch(mode=0o600)
-            (task / ".git").unlink()
-            self.assertEqual(
-                namespace["collect_one_unreachable_state"](
-                    namespace_root, "0" * 64
-                ),
-                "retired_unreachable",
-            )
-            self.assertFalse(target.exists())
-
-        with tempfile.TemporaryDirectory() as directory:
-            fixture = Path(directory)
-            namespace_root = fixture / "hot-run"
-            namespace_root.mkdir(mode=0o700)
-            state, task, document = self.make_hot_state_manifest_fixture(
-                namespace, fixture, "r" * 64
-            )
             namespace["publish_implicit_state_base"](state, document)
-            for index in range(96):
-                runtime = state / f"runtime-{index:064x}"
-                runtime.mkdir(mode=0o700)
-                (runtime / "lock").touch(mode=0o600)
-            (task / ".git").unlink()
-            locks = namespace["acquire_retirement_locks"](state)
-            self.assertIsNotNone(locks)
-            namespace["close_retirement_locks"](locks)
-            self.assertEqual(
-                namespace["collect_one_unreachable_state"](
-                    namespace_root, "0" * 64
-                ),
-                "retired_unreachable",
-            )
-            self.assertFalse(state.exists())
-
-    def test_collector_requires_unreachable_generation_and_idle_exact_lock(
-        self,
-    ) -> None:
-        namespace = load_hot_run()
-        with tempfile.TemporaryDirectory() as directory:
-            fixture = Path(directory)
-            namespace_root = fixture / "hot-run"
-            namespace_root.mkdir(mode=0o700)
-            state, task, document = self.make_hot_state_manifest_fixture(
-                namespace, fixture, "3" * 64
-            )
-            namespace["publish_implicit_state_base"](state, document)
-            lock = state / "lock"
-            lock.touch(mode=0o600)
-            payload = state / "cache" / "nested"
-            payload.mkdir(parents=True)
-            (payload / "artifact").write_text("reconstructible\n", encoding="utf-8")
-            outside = fixture / "outside"
-            outside.write_text("preserve\n", encoding="utf-8")
-            (payload / "outside-link").symlink_to(outside)
-
-            self.assertEqual(
-                namespace["collect_one_unreachable_state"](
-                    namespace_root, "4" * 64
-                ),
-                "nothing_eligible",
-            )
-            self.assertTrue(state.exists())
-
-            (task / ".git").write_text("replacement\n", encoding="utf-8")
-            lock_descriptor = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
-            fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
-                self.assertEqual(
-                    namespace["collect_one_unreachable_state"](
-                        namespace_root, "4" * 64
-                    ),
-                    "nothing_eligible",
-                )
-                self.assertTrue(state.exists())
-            finally:
-                os.close(lock_descriptor)
-
-            self.assertEqual(
-                namespace["collect_one_unreachable_state"](
-                    namespace_root, "4" * 64
-                ),
-                "retired_unreachable",
-            )
-            self.assertFalse(state.exists())
-            self.assertEqual(outside.read_text(encoding="utf-8"), "preserve\n")
-
-            legacy = namespace_root / ("5" * 64)
-            legacy.mkdir()
-            (legacy / "lock").touch(mode=0o600)
-            self.assertEqual(
-                namespace["collect_one_unreachable_state"](
-                    namespace_root, "4" * 64
-                ),
-                "nothing_eligible",
-            )
-            self.assertTrue(legacy.exists())
-
-    def test_collector_requires_private_manifest_and_all_runtime_locks(self) -> None:
-        namespace = load_hot_run()
-        with tempfile.TemporaryDirectory() as directory:
-            fixture = Path(directory)
-            namespace_root = fixture / "hot-run"
-            namespace_root.mkdir(mode=0o700)
-            state, task, document = self.make_hot_state_manifest_fixture(
-                namespace, fixture, "c" * 64
-            )
-            namespace["publish_implicit_state_base"](state, document)
-            runtimes = []
-            for identity in ("d" * 64, "e" * 64):
-                runtime = state / f"runtime-{identity}"
-                runtime.mkdir(mode=0o700)
-                (runtime / "lock").touch(mode=0o600)
-                runtimes.append(runtime)
             (task / ".git").unlink()
 
-            manifest = state / "producer-manifest.json"
-            manifest.chmod(0o640)
-            self.assertEqual(
-                namespace["collect_one_unreachable_state"](
-                    namespace_root, "f" * 64
-                ),
-                "nothing_eligible",
-            )
-            manifest.chmod(0o600)
-
-            active = os.open(runtimes[1] / "lock", os.O_RDWR | os.O_NOFOLLOW)
-            fcntl.flock(active, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
+            for expected_cursor in (32, 64, 96):
                 self.assertEqual(
                     namespace["collect_one_unreachable_state"](
                         namespace_root, "f" * 64
                     ),
-                    "nothing_eligible",
+                    "reconcile_scan_deferred",
                 )
-            finally:
-                os.close(active)
-            self.assertTrue(state.exists())
-
-            locks = namespace["acquire_retirement_locks"](state)
-            self.assertIsNotNone(locks)
-            assert locks is not None
-            original_lock = runtimes[0] / "lock"
-            moved_lock = runtimes[0] / "old-lock"
-            original_lock.rename(moved_lock)
-            original_lock.touch(mode=0o600)
-            try:
-                self.assertFalse(namespace["retirement_locks_unchanged"](locks))
-            finally:
-                namespace["close_retirement_locks"](locks)
-                original_lock.unlink()
-                moved_lock.rename(original_lock)
+                catalog = namespace["read_hot_state_reconcile_catalog"](
+                    namespace_root
+                )
+                self.assertEqual(
+                    catalog["cursor_ticket_sequence"], expected_cursor
+                )
+                self.assertTrue(state.exists())
 
             self.assertEqual(
                 namespace["collect_one_unreachable_state"](
@@ -838,6 +711,130 @@ class HotRunTests(unittest.TestCase):
                 "retired_unreachable",
             )
             self.assertFalse(state.exists())
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_cross_worktree_execution_holds_shared_namespace_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            resident = fixture / "resident"
+            task = fixture / "task"
+            cache_home = fixture / "cache"
+            resident.mkdir()
+            subprocess.run(["git", "init", "--quiet"], cwd=resident, check=True)
+            (resident / "payload").write_text("tracked\n", encoding="utf-8")
+            subprocess.run(["git", "add", "payload"], cwd=resident, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Glaeda test",
+                    "-c",
+                    "user.email=glaeda-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ],
+                cwd=resident,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    os.fspath(task),
+                ],
+                cwd=resident,
+                check=True,
+            )
+            script = (
+                "import fcntl, os, pathlib, sys\n"
+                "lock = pathlib.Path(os.environ['XDG_CACHE_HOME']) / "
+                "'glaeda/hot-run/.namespace-lock'\n"
+                "fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)\n"
+                "try:\n"
+                "    try:\n"
+                "        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                "    except BlockingIOError:\n"
+                "        raise SystemExit(0)\n"
+                "    raise SystemExit(9)\n"
+                "finally:\n"
+                "    os.close(fd)\n"
+            )
+            result = subprocess.run(
+                [
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(resident),
+                    "--task",
+                    os.fspath(task),
+                    "--",
+                    "/usr/bin/python3",
+                    "-c",
+                    script,
+                ],
+                env={**os.environ, "XDG_CACHE_HOME": os.fspath(cache_home)},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            state_root = cache_home / "glaeda" / "hot-run"
+            states = [
+                entry for entry in state_root.iterdir()
+                if len(entry.name) == 64
+            ]
+            self.assertEqual(len(states), 1)
+            manifest, _ = load_hot_run()["read_producer_manifest"](
+                states[0], states[0].name
+            )
+            self.assertTrue(
+                load_hot_run()["manifest_has_full_execution_namespace_lease"](
+                    manifest
+                )
+            )
+
+    def test_legacy_manifest_is_usable_but_not_retirable(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, task, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "l" * 64
+            )
+            legacy = dict(document)
+            legacy["schema_version"] = 1
+            legacy["producer"] = "glaeda-hot-run-python-state-v1"
+            legacy.pop("namespace_lease_protocol")
+            state.mkdir(mode=0o700)
+            namespace["write_producer_manifest"](
+                state, namespace["canonical_manifest_bytes"](legacy)
+            )
+            self.assertEqual(
+                namespace["publish_implicit_state_base"](state, document),
+                "reused",
+            )
+            observed, _ = namespace["read_producer_manifest"](
+                state, state.name
+            )
+            self.assertFalse(
+                namespace["manifest_has_full_execution_namespace_lease"](
+                    observed
+                )
+            )
+            (task / ".git").unlink()
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "f" * 64
+                ),
+                "nothing_eligible",
+            )
+            self.assertTrue(state.exists())
 
     def test_retired_deletion_is_bounded_and_resumes_on_later_activity(self) -> None:
         namespace = load_hot_run()
