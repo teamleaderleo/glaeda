@@ -462,17 +462,19 @@ def unit_name(request: Request) -> str:
     return f"glaeda-gha-{request.assignment_fingerprint()[7:39]}.service"
 
 
-def admission_binding(request: Request, command_root: Path) -> str:
-    info = command_root.stat()
+def admission_binding(request: Request, state_root: Path) -> str:
+    """Bind the shared physical reservation before assignment-private state exists."""
+    info = state_root.stat()
     return sha256(
         canonical_bytes(
             {
                 "attempt_id": request.attempt_id,
                 "assignment_id": request.assignment_id,
+                "assignment_fingerprint": request.assignment_fingerprint(),
                 "runner_id": request.runner_id,
                 "runner_name": request.runner_name,
                 "runner_generation": request.runner_generation,
-                "command_root": os.fspath(command_root),
+                "state_root": os.fspath(state_root),
                 "device": info.st_dev,
                 "inode": info.st_ino,
                 "profile_generation": profile_generation(),
@@ -644,45 +646,83 @@ def emit(document: dict[str, object]) -> None:
     sys.stdout.buffer.write(canonical_bytes(document) + b"\n")
 
 
-def run_once(arguments: argparse.Namespace) -> int:
-    request = normalize(arguments)
-    state_root = private_directory(arguments.state_root)
-    command_root = ensure_private_child(state_root, request.assignment_fingerprint()[7:])
+def inspect_existing_assignment(
+    command_root: Path, request: Request
+) -> bool:
+    """Replay a terminal receipt or refuse any ambiguous prior physical state.
+
+    An empty assignment directory is safe pre-launch bookkeeping from a prior
+    refusal whose physical reservation was released. It grants no replay.
+    """
     with open_lock(command_root):
-        final_path = command_root / "receipt.json"
-        exit_path = command_root / "runner-exit.json"
-        intent_path = command_root / "intent.json"
-        cancellation_path = command_root / "cancellation.json"
-        final = read_document(final_path)
+        final = read_document(command_root / "receipt.json")
         if final is not None:
             if not matches_request(final, request):
                 raise Refusal("terminal receipt conflicts with exact runner attempt")
             emit(final)
-            return 0
-        existing_exit = read_document(exit_path)
+            return True
+        existing_exit = read_document(command_root / "runner-exit.json")
         if existing_exit is not None:
             if not matches_request(existing_exit, request):
                 raise Refusal("runner exit receipt conflicts with exact attempt")
-            raise Refusal("runner exited without settled GitHub evidence; redispatch refused")
-        intent = read_document(intent_path)
+            raise Refusal(
+                "runner exited without settled GitHub evidence; redispatch refused"
+            )
+        intent = read_document(command_root / "intent.json")
         if intent is not None:
             if not matches_request(intent, request):
                 raise Refusal("runner intent conflicts with exact attempt")
             raise Refusal("previous runner start is ambiguous; redispatch refused")
-        cancellation = read_document(cancellation_path)
+        cancellation = read_document(command_root / "cancellation.json")
         if cancellation is not None:
             if not matches_request(cancellation, request):
                 raise Refusal("runner cancellation conflicts with exact attempt")
             raise Refusal("cancelled assignment cannot be redispatched")
-        if time.time_ns() // 1_000_000 >= request.expires_at_unix_ms:
-            raise Refusal("runner attempt is expired")
+    return False
 
-        unit = unit_name(request)
-        binding = admission_binding(request, command_root)
-        gate = owned_admission.Reservation(
-            owned_admission.CANONICAL_ROOT, request.assignment_fingerprint(), unit, binding
-        )
-        with gate as admission:
+
+def run_once(arguments: argparse.Namespace) -> int:
+    request = normalize(arguments)
+    state_root = private_directory(arguments.state_root)
+    assignment_name = request.assignment_fingerprint()[7:]
+    candidate = state_root / assignment_name
+    try:
+        candidate.lstat()
+    except FileNotFoundError:
+        command_root = None
+    else:
+        command_root = existing_private_child(state_root, assignment_name)
+        if inspect_existing_assignment(command_root, request):
+            return 0
+
+    if time.time_ns() // 1_000_000 >= request.expires_at_unix_ms:
+        raise Refusal("runner attempt is expired")
+
+    unit = unit_name(request)
+    binding = admission_binding(request, state_root)
+    gate = owned_admission.Reservation(
+        owned_admission.CANONICAL_ROOT,
+        request.assignment_fingerprint(),
+        unit,
+        binding,
+    )
+    with gate as admission:
+        if command_root is None:
+            command_root = ensure_private_child(state_root, assignment_name)
+        with open_lock(command_root):
+            final_path = command_root / "receipt.json"
+            exit_path = command_root / "runner-exit.json"
+            intent_path = command_root / "intent.json"
+            cancellation_path = command_root / "cancellation.json"
+            # A concurrent controller may have populated an already-empty assignment
+            # while this process waited for the shared physical slot. Refuse and
+            # release pre-launch capacity; the next invocation reconciles that state.
+            if any(
+                read_document(path) is not None
+                for path in (final_path, exit_path, intent_path, cancellation_path)
+            ):
+                raise Refusal("runner assignment changed while acquiring physical capacity")
+
             task_root = command_root / "task"
             try:
                 owned_task.prepare_task(task_root)
@@ -691,6 +731,7 @@ def run_once(arguments: argparse.Namespace) -> int:
                 secret = read_jit_secret()
                 publish(intent_path, intent_document(request), replace=False)
                 started = time.monotonic()
+
                 @contextmanager
                 def guarded_launch():
                     with launch_fence(command_root):
@@ -823,7 +864,7 @@ def settle(arguments: argparse.Namespace) -> int:
             owned_admission.CANONICAL_ROOT,
             request.assignment_fingerprint(),
             unit,
-            admission_binding(request, command_root),
+            admission_binding(request, state_root),
             observe_settled,
         )
         document = terminal_document(exit_receipt, arguments.github_terminal)
