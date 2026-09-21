@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import copy
+import json
+import itertools
+import re
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+import owned_fleet_benchmark as fleet
+from owned_fleet_benchmark.observe import validate_semantic
+from owned_fleet_benchmark.report import _stable_profile_sets
+from owned_fleet_benchmark.run import _validate_direct_runtime
+
+NS = {name: getattr(fleet, name) for name in fleet.__all__}
+FleetError = fleet.FleetError
+GIB = 1024**3
+SAMPLE_IDS = itertools.count()
+
+
+def complete_machine() -> dict:
+    return {
+        "schema_version": 1,
+        "document_type": "glaeda-owned-fleet-machine-receipt",
+        "status": "complete",
+        "machine_id": "fixture-node",
+        "machine_config": "fixture linux node",
+        "purchase": {
+            "date": "2026-09-01",
+            "currency": "USD",
+            "all_in_price": 2400,
+        },
+        "cpu": {
+            "vendor": "Fixture",
+            "model": "CPU",
+            "topology": {
+                "physical_cores": 8,
+                "logical_cpus": 8,
+                "classes": [],
+            },
+        },
+        "ram_bytes": 32 * GIB,
+        "internal_storage": {
+            "capacity_bytes": 10**12,
+            "public_model": "fixture nvme",
+            "bus": "nvme",
+            "filesystem": "ext4",
+        },
+        "platform": {
+            "os": "linux",
+            "os_version": "fixture",
+            "kernel": "fixture",
+            "xcode": None,
+            "rust_toolchain": "rustc 1.97.1",
+            "python": "3.14",
+        },
+        "power_policy": "AC/performance",
+        "filesystem": "ext4",
+        "network_class": "1gbe",
+        "power": {
+            "measurement_status": "measured",
+            "idle_watts": 10.0,
+            "load_watts": 50.0,
+            "measurement_method": "fixture meter",
+        },
+        "thermal": {
+            "observation_status": "measured",
+            "sustained_minutes": 30,
+            "max_temperature_c": 80.0,
+            "throttling_observed": False,
+            "notes": "fixture",
+        },
+        "privacy": {
+            "serial_numbers_omitted": True,
+            "hostname_omitted": True,
+            "unrelated_host_details_omitted": True,
+        },
+    }
+
+
+def benchmark_receipt(
+    *,
+    machine: dict,
+    start_ns: int,
+    request_ns: int,
+    latency_ms: float,
+    cpu_millis: int,
+    memory_bytes: int,
+    validated: bool = True,
+    fallback: int = 0,
+    backend_id: str = "native-linux",
+    state_class: str = "project_resident",
+) -> dict:
+    command_start = max(start_ns, request_ns)
+    command_exit = command_start + 200_000_000
+    final_result = request_ns + int(latency_ms * 1_000_000)
+    if final_result < command_exit:
+        final_result = command_exit
+        latency_ms = (final_result - request_ns) / 1_000_000
+    return {
+        "schema_version": 1,
+        "document_type": "glaeda-owned-fleet-benchmark-receipt",
+        "sample_id": f"sample-{next(SAMPLE_IDS)}",
+        "machine_id": machine["machine_id"],
+        "machine_comparison_digest": NS["machine_comparison_digest"](machine),
+        "machine_receipt_digest": "sha256:fixture-full-machine",
+        "workload": {
+            "id": "glaeda-rust-focused-v1",
+            "variant": None,
+            "commit": "a" * 40,
+            "tree": "b" * 40,
+            "operation_digest": "sha256:operation",
+        },
+        "state": {
+            "class": state_class,
+            "preparation_id": "fixture-preparation-v1",
+        },
+        "storage": {
+            "source_tier": "internal",
+            "source_id": "machine-internal",
+            "state_tier": "internal",
+            "state_id": "machine-internal",
+            "source_filesystem": "ext4",
+            "state_filesystem": "ext4",
+        },
+        "toolchain": {"digest": "sha256:toolchain"},
+        "execution": {
+            "backend_id": backend_id,
+            "runtime": {"digest": "sha256:runtime"},
+            "resource_policy_id": "fixture-cgroup",
+            "resource_policy_status": "enforced",
+            "resource_policy_evidence_id": "fixture-policy-evidence-v1",
+            "declared_cpu_millis": cpu_millis,
+            "declared_memory_limit_bytes": memory_bytes,
+            "timeout_seconds": 7200.0,
+        },
+        "timing": {
+            "request_known_monotonic_ns": request_ns,
+            "command_start_monotonic_ns": command_start,
+            "command_exit_monotonic_ns": command_exit,
+            "final_result_monotonic_ns": final_result,
+        },
+        "milestones": {
+            "request_known_to_final_result_ms": latency_ms,
+        },
+        "result": {
+            "validated": validated,
+            "failure_count": 0 if validated else 1,
+        },
+        "resources": {
+            "peak_aggregate_rss_kib": 1000,
+            "swap_used_start_bytes": 0,
+            "swap_used_max_observed_bytes": 0,
+            "swap_used_end_bytes": 0,
+            "memory_psi_some_avg10_max_observed": 0.2,
+            "max_temperature_c_observed": 70.0,
+        },
+        "queue_delay_ms": 0,
+        "events": {"fallback_count": fallback, "reset_count": 0},
+    }
+
+
+def window_manifest(profile_id: str, items: list[dict], *, start_ns: int = 1_000_000_000) -> dict:
+    return {
+        "schema_version": 1,
+        "document_type": "glaeda-owned-fleet-window-manifest",
+        "experiment_id": "fixture-window",
+        "machine_id": "fixture-node",
+        "workload_id": "glaeda-rust-focused-v1",
+        "variant": None,
+        "state_class": "project_resident",
+        "profile_id": profile_id,
+        "window_start_monotonic_ns": start_ns,
+        "window_elapsed_seconds": 10,
+        "arrival_pattern_id": "simultaneous-burst-v1",
+        "arrival_tolerance_ms": 1,
+        "resource_policy_id": "fixture-cgroup",
+        "resource_policy_status": "enforced",
+        "resource_policy_evidence_id": "fixture-policy-evidence-v1",
+        "aggregate_cpu_millis": 8000,
+        "aggregate_memory_limit_bytes": 16 * GIB,
+        "offered_work": items,
+    }
+
+
+class FleetHarnessTests(unittest.TestCase):
+    def test_catalog_keeps_only_contention_shape(self) -> None:
+        value = NS["catalog"]()
+        self.assertEqual(len(value["workloads"]), 6)
+        self.assertEqual(
+            value["contention_profiles"],
+            {"large": {"jobs": 1}, "medium": {"jobs": 2}, "small": {"jobs": 4}},
+        )
+        incremental = next(
+            item
+            for item in value["workloads"]
+            if item["id"] == "cmux-native-apple-incremental-v1"
+        )
+        self.assertIn("touch Sources/RestorableAgentSession.swift", incremental["operation"]["command"])
+        self.assertIsNotNone(
+            re.search(
+                incremental["toolchain"]["required_output_regex"],
+                "26.3",
+                re.MULTILINE,
+            )
+        )
+
+    def test_direct_backend_is_bound_to_native_runtime_identity(self) -> None:
+        machine = complete_machine()
+        machine["platform"]["os"] = "linux"
+        machine["platform"]["kernel"] = "6.8.0-fixture"
+        machine["cpu"]["topology"]["logical_cpus"] = 8
+        with (
+            patch("owned_fleet_benchmark.run.platform.system", return_value="Linux"),
+            patch("owned_fleet_benchmark.run.platform.release", return_value="6.8.0-fixture"),
+            patch("owned_fleet_benchmark.run.os.cpu_count", return_value=8),
+        ):
+            _validate_direct_runtime(machine, "native-linux")
+            with self.assertRaises(FleetError):
+                _validate_direct_runtime(machine, "lima-vz")
+            machine["platform"]["kernel"] = "different"
+            with self.assertRaises(FleetError):
+                _validate_direct_runtime(machine, "native-linux")
+
+    def test_partial_machine_is_planning_only(self) -> None:
+        partial = json.loads(
+            (
+                ROOT
+                / "benchmarks"
+                / "fleet"
+                / "machine-receipt.v1.template.json"
+            ).read_text()
+        )
+        NS["validate_machine"](partial, require_complete=False)
+        with self.assertRaises(FleetError):
+            NS["validate_machine"](partial, require_complete=True)
+
+    def test_machine_comparison_digest_ignores_economics_and_observations(self) -> None:
+        machine = complete_machine()
+        first = NS["machine_comparison_digest"](machine)
+        changed = copy.deepcopy(machine)
+        changed["purchase"]["all_in_price"] = 3000
+        changed["power"]["idle_watts"] = 12
+        changed["power"]["load_watts"] = 60
+        changed["thermal"]["max_temperature_c"] = 90
+        self.assertEqual(first, NS["machine_comparison_digest"](changed))
+        changed["power_policy"] = "balanced"
+        self.assertNotEqual(first, NS["machine_comparison_digest"](changed))
+
+    def test_complete_machine_requires_privacy_and_observed_identity(self) -> None:
+        machine = complete_machine()
+        self.assertEqual(
+            NS["validate_machine"](machine, require_complete=True)["machine_id"],
+            "fixture-node",
+        )
+        machine["privacy"]["hostname_omitted"] = False
+        with self.assertRaises(FleetError):
+            NS["validate_machine"](machine, require_complete=True)
+
+    def test_state_classes_have_exact_boolean_contracts(self) -> None:
+        for state in NS["catalog"]()["state_classes"]:
+            value = NS["state_template"](state)
+            value["preparation_id"] = f"fixture-{state}"
+            self.assertEqual(
+                NS["validate_state_evidence"](value)["state_class"], state
+            )
+        bad = NS["state_template"]("project_resident")
+        bad["preparation_id"] = "fixture"
+        bad["observed"]["exact_reusable_product_present"] = True
+        with self.assertRaises(FleetError):
+            NS["validate_state_evidence"](bad)
+
+    def test_window_reducer_uses_validated_numerator_and_unfinished(self) -> None:
+        machine = complete_machine()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            items = []
+            profile_jobs = 2
+            per_cpu = 8000 // profile_jobs
+            per_memory = 16 * GIB // profile_jobs
+            for index, (offset_ms, latency_ms) in enumerate(
+                ((0, 1000.0), (0, 2000.0), (3000, 3000.0))
+            ):
+                request_ns = 1_000_000_000 + offset_ms * 1_000_000
+                value = benchmark_receipt(
+                    machine=machine,
+                    start_ns=request_ns + 10_000_000,
+                    request_ns=request_ns,
+                    latency_ms=latency_ms,
+                    cpu_millis=per_cpu,
+                    memory_bytes=per_memory,
+                )
+                path = root / f"r{index}.json"
+                path.write_text(json.dumps(value))
+                items.append(
+                    {
+                        "work_id": f"w{index}",
+                        "arrival_offset_ms": offset_ms,
+                        "receipt": path.name,
+                    }
+                )
+            items.append(
+                {
+                    "work_id": "w3",
+                    "arrival_offset_ms": 6000,
+                    "receipt": None,
+                }
+            )
+            result = NS["reduce_window"](
+                window_manifest("medium", items), root
+            )
+            self.assertEqual(result["counts"]["validated_completions"], 3)
+            self.assertEqual(result["counts"]["unfinished"], 1)
+            self.assertEqual(result["final_result_latency_ms"]["p50"], 2000.0)
+            self.assertEqual(result["final_result_latency_ms"]["p90"], 3000.0)
+            self.assertEqual(
+                result["concurrency"]["maximum_simultaneous_observed"], 2
+            )
+
+    def test_window_reducer_does_not_blame_preexisting_swap_on_window(self) -> None:
+        machine = complete_machine()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = benchmark_receipt(
+                machine=machine,
+                start_ns=1_010_000_000,
+                request_ns=1_000_000_000,
+                latency_ms=500,
+                cpu_millis=8000,
+                memory_bytes=16 * GIB,
+            )
+            value["resources"]["swap_used_start_bytes"] = 4 * GIB
+            value["resources"]["swap_used_max_observed_bytes"] = 4 * GIB
+            value["resources"]["swap_used_end_bytes"] = 4 * GIB
+            path = root / "r0.json"
+            path.write_text(json.dumps(value))
+            manifest = window_manifest(
+                "large",
+                [
+                    {
+                        "work_id": "w0",
+                        "arrival_offset_ms": 0,
+                        "receipt": path.name,
+                    }
+                ],
+            )
+            reduced = NS["reduce_window"](manifest, root)
+            self.assertEqual(
+                reduced["resources"]["swap_growth_max_observed_bytes"], 0.0
+            )
+
+    def test_window_reducer_refuses_over_concurrency(self) -> None:
+        machine = complete_machine()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            items = []
+            for index in range(2):
+                request_ns = 1_000_000_000
+                value = benchmark_receipt(
+                    machine=machine,
+                    start_ns=1_010_000_000,
+                    request_ns=request_ns,
+                    latency_ms=1000,
+                    cpu_millis=8000,
+                    memory_bytes=16 * GIB,
+                )
+                path = root / f"r{index}.json"
+                path.write_text(json.dumps(value))
+                items.append(
+                    {
+                        "work_id": f"w{index}",
+                        "arrival_offset_ms": 0,
+                        "receipt": path.name,
+                    }
+                )
+            with self.assertRaises(FleetError):
+                NS["reduce_window"](window_manifest("large", items), root)
+
+    def test_window_reducer_refuses_duplicate_sample_receipt(self) -> None:
+        machine = complete_machine()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = benchmark_receipt(
+                machine=machine,
+                start_ns=1_010_000_000,
+                request_ns=1_000_000_000,
+                latency_ms=500,
+                cpu_millis=4000,
+                memory_bytes=8 * GIB,
+            )
+            items = []
+            for index in range(2):
+                path = root / f"r{index}.json"
+                path.write_text(json.dumps(value))
+                items.append(
+                    {
+                        "work_id": f"w{index}",
+                        "arrival_offset_ms": 0,
+                        "receipt": path.name,
+                    }
+                )
+            with self.assertRaises(FleetError):
+                NS["reduce_window"](window_manifest("medium", items), root)
+
+    def test_window_reducer_refuses_mixed_machine_identity(self) -> None:
+        machine = complete_machine()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            items = []
+            for index in range(2):
+                request_ns = 1_000_000_000 + index * 1_000_000_000
+                value = benchmark_receipt(
+                    machine=machine,
+                    start_ns=request_ns + 10_000_000,
+                    request_ns=request_ns,
+                    latency_ms=500,
+                    cpu_millis=4000,
+                    memory_bytes=8 * GIB,
+                )
+                if index:
+                    value["machine_comparison_digest"] = "sha256:different"
+                path = root / f"r{index}.json"
+                path.write_text(json.dumps(value))
+                items.append(
+                    {
+                        "work_id": f"w{index}",
+                        "arrival_offset_ms": index * 1000,
+                        "receipt": path.name,
+                    }
+                )
+            with self.assertRaises(FleetError):
+                NS["reduce_window"](window_manifest("medium", items), root)
+
+    def _reduced_windows(self) -> list[dict]:
+        machine = complete_machine()
+        values = []
+        for profile_id, jobs in (("large", 1), ("medium", 2), ("small", 4)):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                items = []
+                for index in range(4):
+                    offset_ms = index * 2000
+                    request_ns = 1_000_000_000 + offset_ms * 1_000_000
+                    value = benchmark_receipt(
+                        machine=machine,
+                        start_ns=request_ns + 10_000_000,
+                        request_ns=request_ns,
+                        latency_ms=500,
+                        cpu_millis=8000 // jobs,
+                        memory_bytes=16 * GIB // jobs,
+                    )
+                    path = root / f"r{index}.json"
+                    path.write_text(json.dumps(value))
+                    items.append(
+                        {
+                            "work_id": f"w{index}",
+                            "arrival_offset_ms": offset_ms,
+                            "receipt": path.name,
+                        }
+                    )
+                values.append(
+                    NS["reduce_window"](
+                        window_manifest(profile_id, items), root
+                    )
+                )
+        return values
+
+    def test_window_comparison_requires_all_three_profiles(self) -> None:
+        values = self._reduced_windows()
+        with self.assertRaises(FleetError):
+            NS["compare_windows"](values[:2])
+        compared = NS["compare_windows"](values)
+        self.assertEqual(
+            [row["profile_id"] for row in compared["rows"]],
+            ["large", "medium", "small"],
+        )
+
+    def test_role_stability_rejects_swap_growth_and_p90_collapse(self) -> None:
+        values = self._reduced_windows()
+        self.assertIn(
+            ("glaeda-rust-focused-v1", "native-linux"),
+            _stable_profile_sets(values),
+        )
+
+        swapped = copy.deepcopy(values)
+        swapped[1]["resources"]["swap_growth_max_observed_bytes"] = 1024
+        self.assertNotIn(
+            ("glaeda-rust-focused-v1", "native-linux"),
+            _stable_profile_sets(swapped),
+        )
+
+        collapsed = copy.deepcopy(values)
+        collapsed[2]["final_result_latency_ms"]["p90"] = (
+            collapsed[0]["final_result_latency_ms"]["p90"] * 2
+        )
+        self.assertNotIn(
+            ("glaeda-rust-focused-v1", "native-linux"),
+            _stable_profile_sets(collapsed),
+        )
+
+    def test_window_comparison_refuses_changed_budget(self) -> None:
+        values = self._reduced_windows()
+        values[1] = copy.deepcopy(values[1])
+        values[1]["window_elapsed_seconds"] = 11
+        with self.assertRaises(FleetError):
+            NS["compare_windows"](values)
+
+    def test_economics_allows_different_heat_state_and_null_same_currency_fx(self) -> None:
+        machine = complete_machine()
+        owned = benchmark_receipt(
+            machine=machine,
+            start_ns=1_010_000_000,
+            request_ns=1_000_000_000,
+            latency_ms=60_000,
+            cpu_millis=8000,
+            memory_bytes=16 * GIB,
+        )
+        owned["queue_delay_ms"] = 0
+        hosted = {
+            "schema_version": 1,
+            "document_type": "glaeda-hosted-equivalent-job-receipt",
+            "backend": "fixture-hosted",
+            "measurement_date": "2026-09-21",
+            "validated": True,
+            "workload_id": "glaeda-rust-focused-v1",
+            "variant": None,
+            "source_commit": "a" * 40,
+            "source_tree": "b" * 40,
+            "operation_digest": "sha256:operation",
+            "toolchain_digest": "sha256:toolchain",
+            "state_class": "cold",
+            "actual_wall_seconds": 60,
+            "queue_delay_seconds": 20,
+            "rate_per_minute": 2.0,
+            "billing_currency": "USD",
+            "billing_increment_seconds": 1,
+            "minimum_billed_seconds": 0,
+            "fx_to_purchase_currency": None,
+            "fx_observed_at": None,
+        }
+        reference = benchmark_receipt(
+            machine=machine,
+            start_ns=1_010_000_000,
+            request_ns=1_000_000_000,
+            latency_ms=90_000,
+            cpu_millis=8000,
+            memory_bytes=16 * GIB,
+            state_class="cold",
+        )
+        result = NS["economics"](
+            owned, hosted, machine, 1.0, [36], [0.10, 0.50], reference, 0.33
+        )
+        self.assertFalse(result["state_context"]["same_state_class"])
+        self.assertTrue(result["hot_state_benefit"]["available"])
+        self.assertEqual(result["hot_state_benefit"]["reference_state_class"], "cold")
+        self.assertAlmostEqual(result["hot_state_benefit"]["seconds_saved"], 30.0)
+        observed_rows = [
+            row
+            for row in result["sensitivities"]
+            if row["utilization_basis"] == "observed"
+        ]
+        self.assertEqual(len(observed_rows), 1)
+        self.assertAlmostEqual(observed_rows[0]["utilization"], 0.33)
+        sensitivity_rows = [
+            row
+            for row in result["sensitivities"]
+            if row["utilization_basis"] == "sensitivity"
+        ]
+        low, high = sensitivity_rows
+        self.assertGreater(
+            low["accounted_watt_hours_per_validated_completion"],
+            high["accounted_watt_hours_per_validated_completion"],
+        )
+        self.assertIsNotNone(low["break_even_utilization"])
+
+    def test_economics_refuses_different_machine_identity(self) -> None:
+        machine = complete_machine()
+        owned = benchmark_receipt(
+            machine=machine,
+            start_ns=1_010_000_000,
+            request_ns=1_000_000_000,
+            latency_ms=60_000,
+            cpu_millis=8000,
+            memory_bytes=16 * GIB,
+        )
+        owned["machine_comparison_digest"] = "sha256:different"
+        hosted = {
+            "schema_version": 1,
+            "document_type": "glaeda-hosted-equivalent-job-receipt",
+            "backend": "fixture-hosted",
+            "measurement_date": "2026-09-21",
+            "validated": True,
+            "workload_id": "glaeda-rust-focused-v1",
+            "variant": None,
+            "source_commit": "a" * 40,
+            "source_tree": "b" * 40,
+            "operation_digest": "sha256:operation",
+            "toolchain_digest": "sha256:toolchain",
+            "state_class": "project_resident",
+            "actual_wall_seconds": 60,
+            "queue_delay_seconds": 0,
+            "rate_per_minute": 1,
+            "billing_currency": "USD",
+            "billing_increment_seconds": 1,
+            "minimum_billed_seconds": 0,
+            "fx_to_purchase_currency": None,
+            "fx_observed_at": None,
+        }
+        with self.assertRaises(FleetError):
+            NS["economics"](owned, hosted, machine, 1.0, [36], [0.5])
+
+    def test_glaeda_semantic_receipt_requires_exact_profile(self) -> None:
+        workload = {
+            "commit": "a" * 40,
+            "tree": "b" * 40,
+            "toolchain": {},
+        }
+        value = {
+            "document_type": "glaeda-local-verification-receipt",
+            "profile": "full-tests",
+            "source": {
+                "commit": "a" * 40,
+                "tree": "b" * 40,
+                "unchanged": True,
+            },
+            "result": {"exit_code": 0},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "semantic.json"
+            path.write_text(json.dumps(value))
+            valid, _, _ = validate_semantic(
+                "glaeda_verification_receipt",
+                {"expected_profile": "focused"},
+                0,
+                False,
+                path,
+                workload,
+            )
+            self.assertFalse(valid)
+
+    def test_quarry_parallel_receipt_requires_exact_verifier_closure(self) -> None:
+        workload = {
+            "commit": "a" * 40,
+            "tree": "b" * 40,
+            "toolchain": {"known_verifier_toolchain_id": "toolchain:expected"},
+        }
+        value = {
+            "schema_version": 2,
+            "receipt_kind": "quarry-parallel-verification-receipt-v2",
+            "result": {"class": "passed", "termination_reason": "completed"},
+            "cleanup": {"status": "passed"},
+            "evidence_scope": "exact_head",
+            "hosted_ci_evidence": False,
+            "merge_authority": False,
+            "verified_head": "a" * 40,
+            "plan": {
+                "key": {
+                    "source": {"commit": "a" * 40, "tree": "b" * 40},
+                    "toolchain_id": "toolchain:different",
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "semantic.json"
+            path.write_text(json.dumps(value))
+            valid, _, _ = validate_semantic(
+                "quarry_parallel_receipt",
+                {},
+                0,
+                False,
+                path,
+                workload,
+            )
+            self.assertFalse(valid)
+
+    def test_report_refuses_mixed_machine_evidence(self) -> None:
+        machine = complete_machine()
+        value = benchmark_receipt(
+            machine=machine,
+            start_ns=1_010_000_000,
+            request_ns=1_000_000_000,
+            latency_ms=500,
+            cpu_millis=8000,
+            memory_bytes=16 * GIB,
+        )
+        value["machine_id"] = "other-node"
+        with self.assertRaises(FleetError):
+            NS["markdown_report"](machine, [value], [], [])
+
+    def test_report_contains_decision_questions_without_premature_role(self) -> None:
+        machine = complete_machine()
+        value = benchmark_receipt(
+            machine=machine,
+            start_ns=1_010_000_000,
+            request_ns=1_000_000_000,
+            latency_ms=500,
+            cpu_millis=8000,
+            memory_bytes=16 * GIB,
+        )
+        report = NS["markdown_report"](machine, [value], [], [])
+        self.assertIn("What does this machine do well?", report)
+        self.assertIn("How many useful concurrent jobs can it sustain?", report)
+        self.assertIn("What existing bottleneck would buying another one remove?", report)
+        self.assertIn(
+            "At what utilization does ownership beat observed hosted alternatives?",
+            report,
+        )
+        self.assertIn("What workloads should still stay hosted?", report)
+        self.assertIn(
+            "No fleet-planning role is classified before repeated validated samples",
+            report,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
