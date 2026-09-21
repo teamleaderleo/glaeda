@@ -27,6 +27,11 @@ MAX_DOCUMENT = 32768
 MAX_EXECUTABLE = 128 * 1024 * 1024
 FRESH_SECONDS = 3
 
+# One machine-wide owner for the reviewed fixed 4-CPU/8-GiB coexist slot.
+# Installation provisions this exact directory as current-user 0700 state.
+# Semantic adapters never accept a caller-selected alternate root.
+CANONICAL_ROOT = Path("/var/lib/glaeda/owned-linux-admission-v1")
+
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
