@@ -84,6 +84,9 @@ jobs:
               Path("scripts/test-cmux-fleet-bootstrap.py"),
               Path("scripts/cmux_workload_request.py"),
               Path("scripts/test-cmux-workload-request.py"),
+              Path("scripts/owned-fleet-benchmark"),
+              Path("scripts/test-owned-fleet-benchmark.py"),
+              *Path("scripts/owned_fleet_benchmark").glob("*.py"),
               Path("scripts/test-verify-focused.py"),
               Path("scripts/verify-changed-rustfmt"),
               Path("scripts/test-hot-run.py"),
@@ -127,6 +130,7 @@ jobs:
           python3 scripts/test-cmux-fleet-bootstrap.py
           python3 scripts/test-cmux-execution-roles.py
           python3 scripts/test-cmux-workload-request.py
+          python3 scripts/test-owned-fleet-benchmark.py
           python3 scripts/test-verify.py
           python3 scripts/test-verify-changed-rustfmt.py
           python3 scripts/test-front-door.py
