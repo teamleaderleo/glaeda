@@ -48,7 +48,7 @@ Runtime-input paths stay physical. Their content identities are published by the
 Three identities remain separate:
 
 - caller correlation: external request/work references;
-- semantic execution binding: exact source + CMUX profile/generation + state class + semantic parameters + fixed adapter generation;
+- semantic execution binding: exact source + CMUX profile/generation + CMUX-owned environment class + state class + semantic parameters + fixed adapter generation;
 - physical attempt: Glaeda backend, node, leases, cache placement, resources, timing, cleanup, and recovery state.
 
 Caller correlation and reuse hints do not mint another execution binding. A profile generation change does.
@@ -59,6 +59,7 @@ Caller correlation and reuse hints do not mint another execution binding. A prof
 
 - exact repository/commit/tree;
 - exact profile ID/generation;
+- bounded CMUX-owned environment class, bound into the semantic comparison identity;
 - exact semantic parameters;
 - requested benchmark state class;
 - presence of the CMUX semantic validator, artifact collection, and cleanup evidence.
