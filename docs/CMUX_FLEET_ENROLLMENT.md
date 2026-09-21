@@ -75,6 +75,7 @@ Use an exact reviewed Glaeda checkout and the CMUX checkout that will run accept
 cargo build --locked --release
 GLAEDA_BIN="$PWD/target/release/glaeda"
 CMUX_ROOT=/absolute/path/to/cmux
+CMUX_CACHE_ROOT=/absolute/path/to/cmux-native-cache
 BOOTSTRAP=/tmp/cmux-fleet-bootstrap.json
 ENROLLMENT=/tmp/cmux-fleet-enrollment.json
 ACCEPTANCE_EVIDENCE=/tmp/cmux-fleet-acceptance-evidence.json
@@ -84,6 +85,7 @@ NODE_ID=cmux-mac-001
 bash scripts/cmux-fleet-bootstrap-macos \
   --cmux-root "$CMUX_ROOT" \
   --glaeda "$GLAEDA_BIN" \
+  --cache-root "$CMUX_CACHE_ROOT" \
   --hardware-class cmux-mac-build-large \
   --role cmux_macos_native_build \
   > "$BOOTSTRAP"
@@ -114,7 +116,7 @@ bash scripts/cmux-fleet status "$ENROLLMENT" \
   --acceptance "$ACCEPTANCE"
 ```
 
-The macOS acceptance creates a fresh private DerivedData root, runs an exact clean Debug build with code signing disabled, verifies the produced `cmux DEV` executable is Mach-O, rechecks the canonical checkout, and refuses a surviving acceptance process group.
+The macOS bootstrap verifies the operator-owned native cache root is writable and has the same disk headroom threshold without publishing its path. The acceptance creates a fresh private DerivedData root, runs an exact clean Debug build with code signing disabled, verifies the produced `cmux DEV` executable is Mach-O, rechecks the canonical checkout, and refuses a surviving acceptance process group.
 
 ## Onboard Linux
 
