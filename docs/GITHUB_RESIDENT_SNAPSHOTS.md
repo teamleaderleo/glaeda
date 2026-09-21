@@ -64,6 +64,15 @@ The status branch is replaceable convenience state. Glaeda execution truth remai
 
 The committed v1 file intentionally enrolls zero physical nodes. Enrolling a node requires a reviewed opaque node ID plus its dedicated public signing key. The private key stays on the producer and is never stored in the repository, snapshot, receipt, logs, request input, or consumer view.
 
+Trust-set changes are also reviewed lifecycle events:
+
+- removing a node from the trust document makes its old status entry retired convenience state; the next successful publisher prunes that entry;
+- rotating a node key does not block unrelated reviewed nodes from publishing. The old-key entry stays non-authoritative and consumers report that node as `unknown/untrusted` until it republishes;
+- the first snapshot under a newly reviewed key must restart `snapshot_sequence` at 1 before it can replace the old-key entry;
+- malformed or signature-invalid entries that claim the *current* reviewed key still fail closed and block publication rather than being silently laundered through a trust transition.
+
+A trust change never promotes historical bytes to positive evidence. Current-key signature verification remains mandatory before a node can become fresh again.
+
 Resource safety is byte-bounded, not cardinality-bounded. The schema has no fixed maximum node, repository, profile, request, project, or reusable-state count; collections may grow while the containing canonical document remains inside its reviewed byte budget.
 
 - public node IDs are opaque `node-` plus 16 lowercase hex characters;
