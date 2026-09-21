@@ -88,7 +88,10 @@ class TrustedDispatchTests(unittest.TestCase):
             item.accepted_document["caller"]["principal"],
             PRINCIPAL,
         )
-        compiled = external.compile_request(item.external_request)
+        compiled = external.compile_request(
+            item.external_request,
+            semantic_request_id=item.accepted_document["semantic_request_id"],
+        )
         self.assertEqual(
             item.accepted_document["workload_command_fingerprint"],
             compiled.internal.command_fingerprint,
@@ -137,6 +140,15 @@ class TrustedDispatchTests(unittest.TestCase):
             first.accepted_document["workload_command_fingerprint"],
             other.accepted_document["workload_command_fingerprint"],
         )
+
+    def test_external_workload_document_cannot_supply_accepted_identity(self) -> None:
+        item = accepted()
+        document = external.request_document(item.external_request)
+        self.assertNotIn("semantic_request_id", document)
+        widened = copy.deepcopy(document)
+        widened["semantic_request_id"] = item.accepted_document["semantic_request_id"]
+        with self.assertRaisesRegex(external.ContractRefusal, "unsupported fields"):
+            external.decode_request(external.canonical_bytes(widened) + b"\n")
 
     def test_transport_projection_gets_the_same_deterministic_identity(self) -> None:
         document = base_document()
