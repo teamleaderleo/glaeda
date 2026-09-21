@@ -593,6 +593,7 @@ pub struct RoutingPolicyV1 {
     pub spend_ceiling_microusd: Option<u64>,
     pub min_allowance_remaining_ppm: u32,
     pub max_failure_permille: u16,
+    pub max_fallback_permille: u16,
     pub max_pressure: HostPressureClass,
 }
 
@@ -606,6 +607,7 @@ impl RoutingPolicyV1 {
             spend_ceiling_microusd: None,
             min_allowance_remaining_ppm: 100_000,
             max_failure_permille: 100,
+            max_fallback_permille: 100,
             max_pressure: HostPressureClass::High,
         }
     }
@@ -622,6 +624,7 @@ impl RoutingPolicyV1 {
             spend_ceiling_microusd: None,
             min_allowance_remaining_ppm: 50_000,
             max_failure_permille: 100,
+            max_fallback_permille: 100,
             max_pressure: HostPressureClass::High,
         }
     }
@@ -635,12 +638,16 @@ impl RoutingPolicyV1 {
             spend_ceiling_microusd: Some(spend_ceiling_microusd),
             min_allowance_remaining_ppm: 0,
             max_failure_permille: 100,
+            max_fallback_permille: 100,
             max_pressure: HostPressureClass::High,
         }
     }
 
     fn validate(self) -> Result<(), RoutingError> {
-        if self.min_allowance_remaining_ppm > 1_000_000 || self.max_failure_permille > 1_000 {
+        if self.min_allowance_remaining_ppm > 1_000_000
+            || self.max_failure_permille > 1_000
+            || self.max_fallback_permille > 1_000
+        {
             return Err(error(
                 "policy",
                 "routing_policy_ratio_out_of_range",
@@ -682,6 +689,7 @@ pub enum PoolExclusionReason {
     InsufficientEvidence,
     SemanticMismatch,
     ReliabilityAbovePolicy,
+    FallbackAbovePolicy,
     PressureAbovePolicy,
     SpendCeiling,
     AllowanceReserve,
@@ -1174,6 +1182,9 @@ fn policy_exclusion(
     }
     if prediction.failure_permille > policy.max_failure_permille {
         return Some(PoolExclusionReason::ReliabilityAbovePolicy);
+    }
+    if prediction.fallback_permille > policy.max_fallback_permille {
+        return Some(PoolExclusionReason::FallbackAbovePolicy);
     }
     if prediction.pressure_after_admission.policy_rank() > policy.max_pressure.policy_rank()
         || candidate.contention.as_ref().is_some_and(|contention| {
@@ -2100,17 +2111,52 @@ mod tests {
             ObservationOutcome::Fallback,
         ));
 
+        let mut policy = RoutingPolicyV1::economy(60_000);
+        policy.max_fallback_permille = 1_000;
         let report = recommend_ci_pool(
             &workload,
             &[stable, flaky],
             &observations,
             NOW,
             PredictionConfigV1::default(),
-            RoutingPolicyV1::economy(60_000),
+            policy,
         )
         .unwrap();
 
         assert_eq!(report.choice, Some(id("stable")));
+    }
+
+    #[test]
+    fn fallback_rate_above_policy_abstains() {
+        let workload = workload();
+        let candidate = pool("flaky", PoolAccountingClass::Owned, HotStateClass::Warm);
+        let mut observations =
+            three_successes(&workload, "flaky", HotStateClass::Warm, 40_000, 0, 0);
+        observations.push(observation(
+            &workload,
+            "flaky",
+            HotStateClass::Warm,
+            4_000,
+            40_000,
+            0,
+            0,
+            ObservationOutcome::Fallback,
+        ));
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::latency(0),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, RecommendationStatus::Abstained);
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("flaky") && entry.reason == PoolExclusionReason::FallbackAbovePolicy
+        }));
     }
 
     #[test]
