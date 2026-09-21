@@ -95,6 +95,7 @@ def linux_node(state='eligible', generation=4, memory='large'):
             'linux_agent',
             'linux_ci',
             'linux_ci_toolchain',
+            'linux_kernel_6_plus',
             'systemd_execution',
             'task_isolation',
             'web_ci',
@@ -244,6 +245,26 @@ class RoleModelTests(unittest.TestCase):
             toolchain='apple-xcode-27-sdk-27',
         )
         self.assertEqual(m.select_eligible(req, node, canaries, caps), (False, 'toolchain_profile_missing'))
+
+    def test_unsupported_os_version_class_refuses(self):
+        node = mac_node()
+        node['osVersionClass'] = 'macos-27'
+        canaries = [canary(node, 'cmux_macos_native_build')]
+        eligibility = m.role_eligibility(node, canaries)
+        self.assertEqual(
+            eligibility['cmux_macos_native_build']['reason'],
+            'unsupported_os_version_class',
+        )
+
+    def test_linux_kernel_class_is_required(self):
+        node = linux_node()
+        node['capabilities'].remove('linux_kernel_6_plus')
+        canaries = [canary(node, 'cmux_linux_ci')]
+        eligibility = m.role_eligibility(node, canaries)
+        self.assertEqual(
+            eligibility['cmux_linux_ci']['reason'],
+            'node_capability_missing',
+        )
 
     def test_insufficient_memory_class_refuses(self):
         node = mac_node(memory='small')
