@@ -218,6 +218,9 @@ jobs:
           BENCH_UID="$(id -u "$BENCH_USER")"
           BENCH_GID="$(id -g "$BENCH_USER")"
           sudo install -d -o "$BENCH_UID" -g "$BENCH_GID" -m 0700             "$BENCH_HOME" "$SOURCE" "$SCRATCH" "$RESULTS"
+          sudo install -D -o root -g root -m 0755 "$PNPM_BIN" "$MOUNT/bin/pnpm"
+          PNPM_BIN="$MOUNT/bin/pnpm"
+          test "$("$PNPM_BIN" --version)" = "$PNPM_VERSION"
 
           sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" init -q
           sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" remote add origin "https://github.com/${SOURCE_REPOSITORY}.git"
