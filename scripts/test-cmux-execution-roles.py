@@ -17,6 +17,37 @@ GEN = 'sha256:' + 'a' * 64
 PREF = 'sha256:' + 'b' * 64
 
 
+def fleet_acceptance(node_id, enrollment_generation, role):
+    return {
+        'schema': m.fleet.ACCEPTANCE_SCHEMA,
+        'nodeId': node_id,
+        'enrollmentGeneration': enrollment_generation,
+        'role': role,
+        'source': {
+            'repository': m.fleet.CMUX_REPOSITORY,
+            'commit': '1' * 40,
+            'tree': '2' * 40,
+        },
+        'profile': dict(m.fleet.ROLE_PROFILES[role]),
+        'toolchainGeneration': GEN,
+        'glaedaGeneration': PREF,
+        'cmuxSemanticResultSha256': GEN,
+        'cmuxSemanticResultState': 'passed',
+        'processSettlement': 'complete',
+        'result': 'accepted',
+    }
+
+
+def fleet_binding(node_id, enrollment_generation, role):
+    projected = m.fleet_acceptance_binding(
+        fleet_acceptance(node_id, enrollment_generation, role)
+    )
+    return {
+        'profile': projected['profile'],
+        'receiptSha256': projected['receiptSha256'],
+    }
+
+
 def mac_node(state='eligible', generation=7, xcode='apple-xcode-26-sdk-26', memory='large', pressure=None):
     return {
         'schema': m.NODE_SCHEMA,
@@ -41,10 +72,11 @@ def mac_node(state='eligible', generation=7, xcode='apple-xcode-26-sdk-26', memo
             'native_xcode_build',
         }),
         'roleAcceptances': {
-            'cmux_macos_native_build': {
-                'profile': dict(m.fleet.ROLE_PROFILES['cmux_macos_native_build']),
-                'receiptSha256': PREF,
-            },
+            'cmux_macos_native_build': fleet_binding(
+                'cmux-mac-001',
+                3,
+                'cmux_macos_native_build',
+            ),
         },
         'pressure': pressure or {
             'cpu': 'normal',
@@ -85,10 +117,11 @@ def linux_node(state='eligible', generation=4, memory='large'):
             'web_ci',
         }),
         'roleAcceptances': {
-            'cmux_linux_ci': {
-                'profile': dict(m.fleet.ROLE_PROFILES['cmux_linux_ci']),
-                'receiptSha256': PREF,
-            },
+            'cmux_linux_ci': fleet_binding(
+                'cmux-linux-001',
+                2,
+                'cmux_linux_ci',
+            ),
         },
         'pressure': {
             'cpu': 'normal',
@@ -307,7 +340,10 @@ class RoleModelTests(unittest.TestCase):
     def test_role_canary_binds_exact_current_fleet_acceptance(self):
         node = mac_node()
         receipt = canary(node, 'cmux_macos_native_build')
-        self.assertEqual(receipt['acceptanceReceiptSha256'], PREF)
+        self.assertEqual(
+            receipt['acceptanceReceiptSha256'],
+            node['roleAcceptances']['cmux_macos_native_build']['receiptSha256'],
+        )
         self.assertEqual(
             receipt['profile'],
             m.fleet.ROLE_PROFILES['cmux_macos_native_build'],
@@ -328,6 +364,19 @@ class RoleModelTests(unittest.TestCase):
             eligibility['cmux_macos_native_build']['reason'],
             'role_canary_profile_stale',
         )
+
+    def test_fleet_acceptance_projection_rejects_invalid_receipt(self):
+        receipt = fleet_acceptance(
+            'cmux-mac-001',
+            3,
+            'cmux_macos_native_build',
+        )
+        receipt['cmuxSemanticResultState'] = 'failed'
+        with self.assertRaisesRegex(
+            m.RoleModelError,
+            'fleet acceptance receipt is invalid',
+        ):
+            m.fleet_acceptance_binding(receipt)
 
     def test_reserved_role_cannot_install_fake_current_acceptance(self):
         node = mac_node()
