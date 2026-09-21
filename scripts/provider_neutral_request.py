@@ -894,7 +894,6 @@ def inspect_receipt(raw: bytes) -> dict[str, object]:
         raise ContractRefusal("invalid_receipt", "semantic receipt is outside the closed schema")
     parse_request_id(value.get("request_id"))
     _inspect_source(value["operation"], value["source"])
-    _inspect_state(value)
     digest = value.get("request_sha256")
     if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
         raise ContractRefusal("invalid_receipt", "semantic receipt request digest is invalid")
@@ -906,6 +905,7 @@ def inspect_receipt(raw: bytes) -> dict[str, object]:
     expected_result_digest = _result_digest(result)
     if value.get("result_sha256") != expected_result_digest:
         raise ContractRefusal("invalid_receipt", "semantic receipt result digest is invalid")
+    _inspect_state(value)
     refusal = value.get("refusal_code")
     if refusal is not None and (
         not isinstance(refusal, str) or not REASON_PATTERN.fullmatch(refusal)
