@@ -878,6 +878,38 @@ class HotRunTests(unittest.TestCase):
             )
             self.assertFalse(retired.exists())
 
+    def test_retired_deletion_has_no_protocol_depth_ceiling(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, task, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "z" * 64
+            )
+            namespace["publish_implicit_state_base"](state, document)
+            (state / "lock").touch(mode=0o600)
+            deepest = state
+            for index in range(180):
+                deepest = deepest / f"d{index:03d}"
+                deepest.mkdir()
+            (deepest / "artifact").write_text(
+                "reconstructible\n", encoding="utf-8"
+            )
+            (task / ".git").unlink()
+
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "0" * 64
+                ),
+                "retired_unreachable",
+            )
+            self.assertFalse(state.exists())
+            self.assertEqual(
+                list(namespace_root.glob(".retired-v1-*")),
+                [],
+            )
+
     def test_retirement_record_closes_the_final_delete_crash_window(self) -> None:
         namespace = load_hot_run()
         with tempfile.TemporaryDirectory() as directory:
