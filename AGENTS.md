@@ -55,6 +55,24 @@ Product details live in `README.md` and `docs/COMPUTE_RUNTIME.md`.
   raw logs, repository contents, environment dumps, and private paths out of
   public evidence.
 
+## Native Apple agent builds
+
+For initialized native projects, prefer `glaeda-apple submit --operation check`.
+After coordinated pulls or branch changes, use `refresh` to ensure dependency
+readiness and then check incrementally; `plan-refresh` previews both stages.
+Save the returned request id; use `wait-request --request-id <id> --wait-seconds 300`
+in an active runner’s asynchronous process facility for event-based completion,
+or collect it with `request-status --request-id <id>`
+and explicitly `forget-request --request-id <id>` after consuming a terminal result.
+Use operation `dependencies` for preparation and `build` for a complete app build.
+The worker starts on demand and exits when idle; `wake` resumes pending work after
+interruption. Submission targets latest source at execution, not a pinned revision.
+Preserve each project's launch rules and coordinate source/branch edits separately.
+Never run direct and managed builds concurrently. Foreground callers can still use
+`check --wait-seconds 300`; timeout never authorizes killing another builder or
+removing its state. See `docs/APPLE_NATIVE_BUILDS.md` for recovery, receipt scope,
+source-observation limits and the bounded request history.
+
 ## Verify
 
 Use the repository profiles:
