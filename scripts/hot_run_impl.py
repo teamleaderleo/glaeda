@@ -2340,7 +2340,9 @@ def record_successful_hot_state_use(
         remove_stale_hot_state_value_catalog_stage(namespace_root)
         catalog = read_hot_state_value_catalog(namespace_root)
         sequence = catalog["next_use_sequence"]
+        next_ticket_sequence = catalog["next_value_ticket_sequence"]
         assert isinstance(sequence, int)
+        assert isinstance(next_ticket_sequence, int)
         try:
             prior_document = read_hot_state_value_record(
                 namespace_root, state_base.name
@@ -2365,6 +2367,12 @@ def record_successful_hot_state_use(
             == manifest_identity.creation_witness_ns
         )
         next_sequence = sequence + 1
+        new_ticket_sequence = next_ticket_sequence + 1
+        old_ticket_sequence = (
+            int(prior["value_ticket_sequence"])
+            if isinstance(prior, dict)
+            else None
+        )
         successful_use_count = (
             prior["successful_use_count"] + 1
             if same_manifest
@@ -2396,12 +2404,20 @@ def record_successful_hot_state_use(
                 reconstruction_elapsed_ns = None
                 reuse_elapsed_ns = total_elapsed_ns
 
-        # Advance the global sequence first. A crash before the per-generation
-        # record update leaves only a harmless sequence gap, never a record
-        # that claims a future sequence.
-        write_hot_state_value_catalog(
+        # Advance the tiny catalog first. A crash before ticket/record
+        # publication leaves only harmless sequence gaps. A ticket published
+        # before its record is stale until the record points at it.
+        updated_catalog = {
+            **catalog,
+            "next_use_sequence": next_sequence,
+            "next_value_ticket_sequence": new_ticket_sequence,
+        }
+        write_hot_state_value_catalog(namespace_root, updated_catalog)
+        write_hot_state_value_ticket(
             namespace_root,
-            {**catalog, "next_use_sequence": next_sequence},
+            new_ticket_sequence,
+            state_base.name,
+            next_sequence,
         )
         write_hot_state_value_record(
             namespace_root,
@@ -2415,8 +2431,19 @@ def record_successful_hot_state_use(
                 "value_identity": value_identity,
                 "reconstruction_elapsed_ns": reconstruction_elapsed_ns,
                 "reuse_elapsed_ns": reuse_elapsed_ns,
+                "value_ticket_sequence": new_ticket_sequence,
             },
         )
+        if (
+            old_ticket_sequence is not None
+            and old_ticket_sequence != new_ticket_sequence
+        ):
+            try:
+                remove_hot_state_value_ticket(
+                    namespace_root, old_ticket_sequence
+                )
+            except (OSError, RuntimeError):
+                pass
         return "recorded"
     finally:
         os.close(namespace_lock)
