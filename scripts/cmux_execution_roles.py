@@ -607,6 +607,10 @@ def validate_capacity(value: object) -> dict[str, Any]:
             raise RoleModelError("accepted capacity requires validated completions")
         if unfinished != 0 or settled != offered:
             raise RoleModelError("accepted capacity requires all offered work settled")
+        if validated != settled:
+            raise RoleModelError(
+                "accepted capacity requires every settled task validated"
+            )
         if maximum_simultaneous < doc["maxConcurrent"]:
             raise RoleModelError(
                 "accepted capacity concurrency exceeds measured simultaneous work"
