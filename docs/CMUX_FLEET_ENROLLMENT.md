@@ -72,6 +72,7 @@ Reviewed quarantine reasons are:
 Use an exact reviewed Glaeda checkout and the CMUX checkout that will run acceptance.
 
 ```bash
+./scripts/bootstrap
 cargo build --locked --release
 GLAEDA_BIN="$PWD/target/release/glaeda"
 CMUX_ROOT=/absolute/path/to/cmux
@@ -133,6 +134,7 @@ The macOS bootstrap verifies the operator-owned native cache root is writable an
 ## Onboard Linux
 
 ```bash
+./scripts/bootstrap
 cargo build --locked --release
 GLAEDA_BIN="$PWD/target/release/glaeda"
 CMUX_ROOT=/absolute/path/to/cmux
