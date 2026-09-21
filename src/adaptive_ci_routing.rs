@@ -276,6 +276,8 @@ pub struct HotStateEvidenceV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     state_identity: Option<RoutingId>,
     source: LocalityEvidenceSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid_until_millis: Option<u64>,
 }
 
 impl HotStateEvidenceV1 {
@@ -289,6 +291,7 @@ impl HotStateEvidenceV1 {
         class: HotStateClass,
         state_identity: Option<RoutingId>,
         source: LocalityEvidenceSource,
+        valid_until_millis: Option<u64>,
     ) -> Result<Self, RoutingError> {
         if class == HotStateClass::HotExact && state_identity.is_none() {
             return Err(error(
@@ -297,10 +300,25 @@ impl HotStateEvidenceV1 {
                 "exact-hot locality requires an exact state identity",
             ));
         }
+        if source == LocalityEvidenceSource::RemoteAdvisory && valid_until_millis.is_none() {
+            return Err(error(
+                "hot_state.valid_until_millis",
+                "routing_remote_locality_expiry_missing",
+                "remote locality evidence requires an explicit freshness expiry",
+            ));
+        }
+        if valid_until_millis == Some(0) {
+            return Err(error(
+                "hot_state.valid_until_millis",
+                "routing_locality_expiry_invalid",
+                "locality evidence expiry must be a positive epoch timestamp",
+            ));
+        }
         Ok(Self {
             class,
             state_identity,
             source,
+            valid_until_millis,
         })
     }
 
@@ -317,6 +335,11 @@ impl HotStateEvidenceV1 {
     #[must_use]
     pub const fn source(&self) -> LocalityEvidenceSource {
         self.source
+    }
+
+    #[must_use]
+    pub const fn valid_until_millis(&self) -> Option<u64> {
+        self.valid_until_millis
     }
 }
 
@@ -744,6 +767,7 @@ pub enum PoolExclusionReason {
     AllowanceExpired,
     InvalidAllowance,
     InvalidContentionEvidence,
+    StaleLocalityEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -957,6 +981,17 @@ pub fn recommend_ci_pool(
         };
         if let Some(reason) = hard_exclusion {
             exclusions.push(PoolExclusionV1 { pool_id, reason });
+            continue;
+        }
+        if candidate
+            .hot_state
+            .valid_until_millis
+            .is_some_and(|valid_until| valid_until <= now_millis)
+        {
+            exclusions.push(PoolExclusionV1 {
+                pool_id,
+                reason: PoolExclusionReason::StaleLocalityEvidence,
+            });
             continue;
         }
 
@@ -1535,6 +1570,7 @@ mod tests {
                 heat,
                 (heat == HotStateClass::HotExact).then(|| id("state:main-xcode27")),
                 LocalityEvidenceSource::LocalAccepted,
+                None,
             )
             .unwrap(),
             pressure_after_admission: if accounting_class == PoolAccountingClass::Owned {
@@ -1907,7 +1943,13 @@ mod tests {
             HotStateClass::HotExact,
         );
         remote.eligibility = PoolEligibility::Unknown;
-        remote.hot_state.source = LocalityEvidenceSource::RemoteAdvisory;
+        remote.hot_state = HotStateEvidenceV1::new(
+            HotStateClass::HotExact,
+            Some(id("state:main-xcode27")),
+            LocalityEvidenceSource::RemoteAdvisory,
+            Some(NOW + 60_000),
+        )
+        .unwrap();
         let observations =
             three_successes(&workload, "remote", HotStateClass::HotExact, 30_000, 0, 0);
 
@@ -1928,6 +1970,41 @@ mod tests {
                 .iter()
                 .any(|entry| { entry.reason == PoolExclusionReason::EligibilityUnknown })
         );
+    }
+
+    #[test]
+    fn expired_remote_heat_is_advisory_only_and_refused_as_stale() {
+        let workload = workload();
+        let mut remote = pool(
+            "remote",
+            PoolAccountingClass::PaidBurst,
+            HotStateClass::HotExact,
+        );
+        remote.hot_state = HotStateEvidenceV1::new(
+            HotStateClass::HotExact,
+            Some(id("state:main-xcode27")),
+            LocalityEvidenceSource::RemoteAdvisory,
+            Some(NOW),
+        )
+        .unwrap();
+        let observations =
+            three_successes(&workload, "remote", HotStateClass::HotExact, 30_000, 10_000, 0);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[remote],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::latency(20_000),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, RecommendationStatus::Abstained);
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("remote")
+                && entry.reason == PoolExclusionReason::StaleLocalityEvidence
+        }));
     }
 
     #[test]
@@ -1955,6 +2032,7 @@ mod tests {
                 HotStateClass::Warm,
                 Some(id("state:rust-main")),
                 LocalityEvidenceSource::LocalAccepted,
+                None,
             )
             .unwrap(),
             pressure_after_admission: HostPressureClass::Moderate,
@@ -2281,6 +2359,7 @@ mod tests {
             HotStateClass::HotExact,
             Some(id("state:new-xcode-generation")),
             LocalityEvidenceSource::LocalAccepted,
+            None,
         )
         .unwrap();
         let observations =
@@ -2308,6 +2387,7 @@ mod tests {
             HotStateClass::HotExact,
             None,
             LocalityEvidenceSource::LocalAccepted,
+            None,
         )
         .unwrap_err();
 
