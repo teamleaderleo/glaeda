@@ -235,4 +235,196 @@ class ResidentSnapshotPureTests(unittest.TestCase):
             snapshot_sequence=1,
             published_at=BASE_TIME + dt.timedelta(seconds=30),
         ))
-        fleet = {"document_type": MODUL
+        fleet = {"document_type": MODULE.FLEET_DOCUMENT, "schema_version": 1, "nodes": [current]}
+        with mock.patch.object(MODULE, "validate_signed_snapshot", side_effect=lambda value, *_a, **_kw: value):
+            updated, reason = MODULE.upsert_fleet(fleet, reboot, trust(), now=BASE_TIME + dt.timedelta(seconds=30))
+        self.assertEqual(reason, "transition")
+        self.assertEqual(updated["nodes"][0]["payload"]["freshness"]["snapshot_sequence"], 1)
+        self.assertEqual(updated["nodes"][0]["payload"]["producer"]["glaeda_generation"], "sha256:" + "f" * 64)
+
+    def test_unchanged_refresh_is_suppressed_until_interval(self):
+        current = fake_signed(build_unsigned(snapshot_sequence=8))
+        candidate = fake_signed(build_unsigned(
+            snapshot_sequence=9,
+            observed_at=BASE_TIME + dt.timedelta(seconds=20),
+            published_at=BASE_TIME + dt.timedelta(seconds=20),
+            capability=capability(observed=BASE_TIME + dt.timedelta(seconds=20)),
+        ))
+        fleet = {"document_type": MODULE.FLEET_DOCUMENT, "schema_version": 1, "nodes": [current]}
+        with mock.patch.object(MODULE, "validate_signed_snapshot", side_effect=lambda value, *_a, **_kw: value):
+            with self.assertRaises(MODULE.PublicationSuppressed):
+                MODULE.upsert_fleet(fleet, candidate, trust(), now=BASE_TIME + dt.timedelta(seconds=20))
+
+    def test_running_request_requires_matching_local_active_work(self):
+        with self.assertRaisesRegex(MODULE.SnapshotError, "active work"):
+            build_unsigned(request_state=request_state(state="running"), admission=admission())
+        value = build_unsigned(
+            request_state=request_state(state="running"),
+            admission=admission("wait", "reserved"),
+        )
+        self.assertEqual(value["payload"]["node"]["active_work_count"], 1)
+        self.assertEqual(value["payload"]["requests"][0]["state"], "running")
+
+    def test_terminal_state_requires_bounded_receipt(self):
+        with self.assertRaisesRegex(MODULE.SnapshotError, "terminal receipt"):
+            build_unsigned(request_state=request_state(state="terminal", receipt=None))
+        value = build_unsigned(request_state=request_state(state="terminal", receipt="sha256:" + "9" * 64))
+        self.assertEqual(value["payload"]["requests"][0]["state"], "terminal")
+
+
+@unittest.skipUnless(GIT.exists() and SSH_KEYGEN.exists(), "OpenSSH signing integration unavailable")
+class ResidentSnapshotSigningAndTransportTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="glaeda-status-test-")
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def key(self, name):
+        path = self.root / name
+        subprocess.run(
+            [str(SSH_KEYGEN), "-q", "-t", "ed25519", "-N", "", "-f", str(path)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        public = Path(str(path) + ".pub").read_text(encoding="ascii").strip()
+        return path, public
+
+    def one_signed(self, *, now=BASE_TIME, sequence=1, generation=1, hot=True, request=None, admission_value=None):
+        key, public = self.key(f"key-{sequence}-{generation}")
+        trust_value = trust(nodes=[{
+            "id": "node-1111111111111111",
+            "key_id": "key-aaaaaaaaaaaaaaaa",
+            "ssh_public_key": public,
+            "os_class": "linux",
+            "architecture_class": "x86_64",
+        }])
+        unsigned = build_unsigned(
+            capability=capability(observed=now, hot=hot),
+            admission=admission_value or admission(),
+            trust_value=trust_value,
+            producer_generation=generation,
+            snapshot_sequence=sequence,
+            observed_at=now,
+            published_at=now,
+            request_state=request if request is not None else request_state(state="queued"),
+        )
+        return MODULE.sign_snapshot(unsigned, trust_value, private_key=key, ssh_keygen=SSH_KEYGEN), trust_value, key
+
+    def test_signature_round_trip_and_manual_forgery_degrades_to_unknown(self):
+        signed, trust_value, _ = self.one_signed()
+        fleet = {"document_type": MODULE.FLEET_DOCUMENT, "schema_version": 1, "nodes": [signed]}
+        view = MODULE.consume_fleet(fleet, trust_value, now=BASE_TIME + dt.timedelta(seconds=10), ssh_keygen=SSH_KEYGEN)
+        self.assertEqual(view["nodes"][0]["freshness_class"], "fresh")
+        forged = json.loads(json.dumps(signed))
+        forged["payload"]["projects"][0]["heat_class"] = "cold"
+        view = MODULE.consume_fleet(
+            {"document_type": MODULE.FLEET_DOCUMENT, "schema_version": 1, "nodes": [forged]},
+            trust_value,
+            now=BASE_TIME + dt.timedelta(seconds=10),
+            ssh_keygen=SSH_KEYGEN,
+        )
+        self.assertEqual(view["nodes"][0]["freshness_class"], "unknown")
+        self.assertEqual(view["nodes"][0]["reason"], "untrusted")
+        self.assertEqual(view["nodes"][0]["projects"], [])
+
+    def test_node_dies_after_available_and_lost_terminal_update_degrade_to_unknown(self):
+        signed, trust_value, key = self.one_signed(
+            request=request_state(state="running"),
+            admission_value=admission("wait", "reserved"),
+        )
+        terminal_time = BASE_TIME + dt.timedelta(seconds=30)
+        terminal_unsigned = MODULE.build_unsigned_snapshot(
+            capability(observed=terminal_time),
+            admission(),
+            trust_value,
+            public_node_id="node-1111111111111111",
+            producer_generation=1,
+            snapshot_sequence=2,
+            observed_at=terminal_time,
+            published_at=terminal_time,
+            request_state=request_state(state="terminal", receipt="sha256:" + "9" * 64),
+        )
+        terminal = MODULE.sign_snapshot(terminal_unsigned, trust_value, private_key=key, ssh_keygen=SSH_KEYGEN)
+        self.assertEqual(terminal["payload"]["requests"][0]["state"], "terminal")
+        # Simulate the terminal GitHub update being lost: the remote fleet still contains sequence 1.
+        fleet = {"document_type": MODULE.FLEET_DOCUMENT, "schema_version": 1, "nodes": [signed]}
+        stale = MODULE.consume_fleet(fleet, trust_value, now=BASE_TIME + dt.timedelta(seconds=301), ssh_keygen=SSH_KEYGEN)
+        self.assertEqual(stale["nodes"][0]["freshness_class"], "unknown")
+        self.assertEqual(stale["nodes"][0]["reason"], "stale")
+        self.assertEqual(stale["nodes"][0]["requests"], [])
+
+    def test_signed_snapshot_and_fleet_byte_measurements(self):
+        signed, trust_value, _ = self.one_signed()
+        fleet = {"document_type": MODULE.FLEET_DOCUMENT, "schema_version": 1, "nodes": [signed]}
+        node_bytes = len(MODULE.canonical_json(signed))
+        fleet_bytes = len(MODULE.canonical_json(fleet))
+        self.assertLessEqual(node_bytes, MODULE.MAX_NODE_BYTES)
+        self.assertLessEqual(fleet_bytes, MODULE.MAX_FLEET_BYTES)
+        print(f"MEASURE github_resident_snapshot node_bytes={node_bytes} fleet_bytes={fleet_bytes} agent_reads=2 successful_write_remote_round_trips=2 idle_refresh_seconds={MODULE.DEFAULT_REFRESH_INTERVAL_SECONDS}")
+
+    def test_two_nodes_can_publish_concurrently_and_converge(self):
+        remote = self.root / "remote.git"
+        subprocess.run([str(GIT), "init", "--bare", "--quiet", str(remote)], check=True)
+        repos = []
+        for index in (1, 2):
+            repo = self.root / f"repo-{index}"
+            subprocess.run([str(GIT), "init", "--quiet", str(repo)], check=True)
+            subprocess.run([str(GIT), "-C", str(repo), "remote", "add", "origin", str(remote)], check=True)
+            repos.append(repo)
+
+        key1, pub1 = self.key("node1")
+        key2, pub2 = self.key("node2")
+        trust_value = trust(nodes=[
+            {
+                "id": "node-1111111111111111",
+                "key_id": "key-aaaaaaaaaaaaaaaa",
+                "ssh_public_key": pub1,
+                "os_class": "linux",
+                "architecture_class": "x86_64",
+            },
+            {
+                "id": "node-2222222222222222",
+                "key_id": "key-bbbbbbbbbbbbbbbb",
+                "ssh_public_key": pub2,
+                "os_class": "macos",
+                "architecture_class": "arm64",
+            },
+        ])
+        snap1 = MODULE.sign_snapshot(
+            MODULE.build_unsigned_snapshot(
+                capability(observed=BASE_TIME), admission(), trust_value,
+                public_node_id="node-1111111111111111", producer_generation=1, snapshot_sequence=1,
+                observed_at=BASE_TIME, published_at=BASE_TIME,
+            ),
+            trust_value, private_key=key1, ssh_keygen=SSH_KEYGEN,
+        )
+        snap2 = MODULE.sign_snapshot(
+            MODULE.build_unsigned_snapshot(
+                capability(observed=BASE_TIME, os_class="macos", architecture="arm64"), admission(), trust_value,
+                public_node_id="node-2222222222222222", producer_generation=1, snapshot_sequence=1,
+                observed_at=BASE_TIME, published_at=BASE_TIME,
+            ),
+            trust_value, private_key=key2, ssh_keygen=SSH_KEYGEN,
+        )
+        def publish(args):
+            snapshot, repo = args
+            return MODULE.publish_snapshot(
+                snapshot, trust_value, repository_root=repo, now=BASE_TIME,
+                git=GIT, ssh_keygen=SSH_KEYGEN, retries=3,
+            )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            receipts = list(pool.map(publish, [(snap1, repos[0]), (snap2, repos[1])]))
+        self.assertTrue(all(item["state"] == "published" for item in receipts))
+        head = subprocess.check_output([str(GIT), "--git-dir", str(remote), "rev-parse", f"refs/heads/{MODULE.STATUS_BRANCH}"], text=True).strip()
+        raw = subprocess.check_output([str(GIT), "--git-dir", str(remote), "show", f"{head}:{MODULE.STATUS_FILE}"])
+        fleet = json.loads(raw)
+        view = MODULE.consume_fleet(fleet, trust_value, now=BASE_TIME + dt.timedelta(seconds=5), ssh_keygen=SSH_KEYGEN)
+        self.assertEqual([item["id"] for item in view["nodes"]], ["node-1111111111111111", "node-2222222222222222"])
+        self.assertTrue(all(item["freshness_class"] == "fresh" for item in view["nodes"]))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
