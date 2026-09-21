@@ -127,6 +127,13 @@ class Tests(unittest.TestCase):
                 "cmux-mac-build-large",
             )
 
+    def test_zig_version_compatibility_matches_cmux_policy(self):
+        self.assertTrue(b.zig_version_compatible("0.16.0", "0.16.0"))
+        self.assertTrue(b.zig_version_compatible("0.16.4", "0.16.0"))
+        self.assertFalse(b.zig_version_compatible("0.15.9", "0.16.0"))
+        self.assertFalse(b.zig_version_compatible("0.17.0", "0.16.0"))
+        self.assertFalse(b.zig_version_compatible("nightly", "0.16.0"))
+
     def test_power_posture_parser(self):
         raw = (
             "Battery Power:\n"
