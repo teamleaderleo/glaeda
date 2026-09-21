@@ -179,7 +179,7 @@ def canary(
     }
 
 
-def capacity(node, role, profile, slot, concurrent, *, result='accepted', pressure='normal', unfinished=0):
+def capacity(node, role, profile, slot, concurrent, *, result='accepted', pressure='normal', unfinished=0, generation=GEN):
     return {
         'schema': m.CAPACITY_SCHEMA,
         'nodeId': node['nodeId'],
@@ -189,7 +189,7 @@ def capacity(node, role, profile, slot, concurrent, *, result='accepted', pressu
         'resourceProfile': profile,
         'slotClass': slot,
         'maxConcurrent': concurrent,
-        'contentionEvidenceGeneration': GEN,
+        'contentionEvidenceGeneration': generation,
         'measurement': {
             'offeredTasks': 8,
             'maximumSimultaneous': concurrent,
@@ -442,6 +442,79 @@ class RoleModelTests(unittest.TestCase):
         )
         self.assertFalse(decision['accepted'])
         self.assertEqual(decision['reason'], 'fleet_acceptance_pending')
+
+    def test_multi_slot_capacity_requires_one_complete_evidence_generation(self):
+        node = mac_node()
+        canaries = [canary(node, 'cmux_macos_native_build')]
+        req = workload(
+            'cmux_macos_compile_admission',
+            'cmux_macos_native_build',
+            'macos',
+            'arm64',
+            {'native_xcode_build'},
+            toolchain='apple-xcode-26-sdk-26',
+        )
+        split = [
+            capacity(
+                node,
+                'cmux_macos_native_build',
+                'medium',
+                'mac_native_build_lane',
+                1,
+                generation=GEN,
+            ),
+            capacity(
+                node,
+                'cmux_macos_native_build',
+                'medium',
+                'mac_native_heavy_slot',
+                2,
+                generation=PREF,
+            ),
+        ]
+        self.assertEqual(
+            m.select_eligible(req, node, canaries, split),
+            (False, 'resource_profile_unmeasured'),
+        )
+
+        complete = mac_compile_capacities(node)
+        self.assertEqual(
+            m.select_eligible(req, node, canaries, complete),
+            (True, 'eligible'),
+        )
+
+    def test_same_capacity_generation_cannot_disagree_on_one_slot(self):
+        node = linux_node()
+        canaries = [canary(node, 'cmux_linux_ci')]
+        req = workload(
+            'cmux_linux_ci_admission',
+            'cmux_linux_ci',
+            'linux',
+            'x86_64',
+            {'linux_ci'},
+            toolchain='linux-rust-ci-2026-09',
+        )
+        evidence = [
+            capacity(
+                node,
+                'cmux_linux_ci',
+                'medium',
+                'linux_medium_slot',
+                4,
+            ),
+            capacity(
+                node,
+                'cmux_linux_ci',
+                'medium',
+                'linux_medium_slot',
+                3,
+            ),
+        ]
+        with self.assertRaisesRegex(
+            m.RoleModelError,
+            'disagrees on slot capacity',
+        ):
+            m.select_eligible(req, node, canaries, evidence)
 
     def test_four_linux_medium_jobs_are_the_measured_limit(self):
         node = linux_node()
