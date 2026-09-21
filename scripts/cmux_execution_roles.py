@@ -247,7 +247,8 @@ def _sorted_tokens(
     if (
         not isinstance(value, list)
         or len(value) > 64
-        or any(not isinstance(v, str) for v in value)\n    ):
+        or any(not isinstance(v, str) for v in value)
+    ):
         raise RoleModelError(f"{label} is invalid")
     if value != sorted(set(value)):
         raise RoleModelError(f"{label} must be sorted and unique")
@@ -544,7 +545,8 @@ def validate_preference(value: object) -> dict[str, Any]:
         raise RoleModelError("preference nodeId is invalid")
     if doc["role"] not in ROLES:
         raise RoleModelError("preference role is unsupported")
-    _sha(doc["evidenceGeneration"], "preference evidence generation")\n    if doc["preference"] not in {"preferred", "neutral"}:
+    _sha(doc["evidenceGeneration"], "preference evidence generation")
+    if doc["preference"] not in {"preferred", "neutral"}:
         raise RoleModelError("preference value is unsupported")
     if doc["authority"] != "observation_only":
         raise RoleModelError(
@@ -839,7 +841,8 @@ def select_eligible(
         return False, "insufficient_memory_class"
     if not set(workload["requiredCapabilities"]).issubset(
         node["capabilities"]
-    ):\n        return False, "node_capability_missing"
+    ):
+        return False, "node_capability_missing"
     if not set(workload["requiredCapabilities"]).issubset(
         eligibility[role].get("acceptedCapabilities", [])
     ):
