@@ -32,6 +32,7 @@ MAX_NODES = 8
 MAX_PROJECTS = 8
 MAX_REQUESTS = 16
 MAX_PROFILES = 8
+MAX_REUSABLE_STATES = 16
 MIN_USEFUL_AGE_SECONDS = 60
 MAX_USEFUL_AGE_SECONDS = 600
 DEFAULT_USEFUL_AGE_SECONDS = 300
@@ -54,6 +55,25 @@ DURATION_CLASSES = {"under_10s", "10s_to_1m", "1m_to_5m", "over_5m", "unknown"}
 AVAILABILITY_CLASSES = {"available", "held", "draining", "unknown"}
 PRESSURE_CLASSES = {"low", "high", "unknown"}
 CAPACITY_CLASSES = {"available", "reserved", "insufficient", "unknown"}
+REUSABLE_STATE_CLASSES = {
+    "package_manager_state",
+    "compiler_cache",
+    "incremental_build_state",
+    "immutable_compiled_product",
+    "container_layer",
+    "prepared_dependency_generation",
+    "project_local_approved_hot_state",
+}
+REUSABLE_STATE_HEAT_CLASSES = {"cold", "warm", "hot"}
+REUSABLE_STATE_SIZE_CLASSES = {"empty", "tiny", "small", "medium", "large", "huge"}
+REUSABLE_STATE_RECENT_HIT_CLASSES = {
+    "never",
+    "within_hour",
+    "within_day",
+    "within_week",
+    "older",
+    "clock_skew",
+}
 
 
 class SnapshotError(RuntimeError):
@@ -274,6 +294,7 @@ def capability_projection(
             "heat_class": heat_map[heat],
             "verification_profiles": sorted(set(verification_profiles)),
             "dependency_build_state_class": "resident_generation" if heat == "resident_hot" else "cold",
+            "reusable_states": [],
             "active_task_count": 0,
             "recent_compatible_receipt_ref": None,
         })
@@ -281,6 +302,58 @@ def capability_projection(
     producer = exact_object(capability.get("producer"), "capability producer")
     glaeda_generation = bounded_string(producer.get("glaedaRuntimeSha256"), SHA256_RE, "Glaeda generation")
     return public_node, profiles, projects, glaeda_generation, cap_observed
+
+
+def validate_reusable_states(value: object) -> list[dict[str, object]]:
+    summaries: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in exact_list(value, "project reusable states", MAX_REUSABLE_STATES):
+        item = exact_object(raw, "project reusable state")
+        exact_keys(
+            item,
+            {
+                "schema_version",
+                "cache_class",
+                "generation",
+                "heat",
+                "size",
+                "recent_hit",
+                "revalidation_required",
+            },
+            "project reusable state",
+        )
+        if item["schema_version"] != 1:
+            raise SnapshotError("reusable-state summary version is unsupported")
+        cache_class = item["cache_class"]
+        generation = bounded_string(item["generation"], SHA256_RE, "reusable-state generation")
+        if cache_class not in REUSABLE_STATE_CLASSES:
+            raise SnapshotError("reusable-state class is invalid")
+        if item["heat"] not in REUSABLE_STATE_HEAT_CLASSES:
+            raise SnapshotError("reusable-state heat class is invalid")
+        if item["size"] not in REUSABLE_STATE_SIZE_CLASSES:
+            raise SnapshotError("reusable-state size class is invalid")
+        if item["recent_hit"] not in REUSABLE_STATE_RECENT_HIT_CLASSES:
+            raise SnapshotError("reusable-state recent-hit class is invalid")
+        if not isinstance(item["revalidation_required"], bool):
+            raise SnapshotError("reusable-state revalidation flag is invalid")
+        if item["revalidation_required"] and item["heat"] != "cold":
+            raise SnapshotError("reusable-state revalidation requires cold heat")
+        identity = (cache_class, generation)
+        if identity in seen:
+            raise SnapshotError("project reusable-state identities must be unique")
+        seen.add(identity)
+        summaries.append(
+            {
+                "schema_version": 1,
+                "cache_class": cache_class,
+                "generation": generation,
+                "heat": item["heat"],
+                "size": item["size"],
+                "recent_hit": item["recent_hit"],
+                "revalidation_required": item["revalidation_required"],
+            }
+        )
+    return sorted(summaries, key=lambda item: (str(item["cache_class"]), str(item["generation"])))
 
 
 def validate_project_state(value: object, trust: dict[str, Any], profile_ids: set[str]) -> list[dict[str, object]]:
@@ -295,7 +368,7 @@ def validate_project_state(value: object, trust: dict[str, Any], profile_ids: se
         item = exact_object(raw, "project state")
         exact_keys(
             item,
-            {"repository", "source", "heat_class", "verification_profiles", "dependency_build_state_class", "active_task_count", "recent_compatible_receipt_ref"},
+            {"repository", "source", "heat_class", "verification_profiles", "dependency_build_state_class", "reusable_states", "active_task_count", "recent_compatible_receipt_ref"},
             "project state",
         )
         repository = item["repository"]
@@ -321,6 +394,7 @@ def validate_project_state(value: object, trust: dict[str, Any], profile_ids: se
             "heat_class": item["heat_class"],
             "verification_profiles": sorted(set(verification_profiles)),
             "dependency_build_state_class": item["dependency_build_state_class"],
+            "reusable_states": validate_reusable_states(item["reusable_states"]),
             "active_task_count": active,
             "recent_compatible_receipt_ref": receipt,
         })
@@ -531,7 +605,7 @@ def validate_unsigned_snapshot(
     seen_projects: set[str] = set()
     for raw in projects:
         item = exact_object(raw, "snapshot project")
-        exact_keys(item, {"repository", "source", "heat_class", "verification_profiles", "dependency_build_state_class", "active_task_count", "recent_compatible_receipt_ref"}, "snapshot project")
+        exact_keys(item, {"repository", "source", "heat_class", "verification_profiles", "dependency_build_state_class", "reusable_states", "active_task_count", "recent_compatible_receipt_ref"}, "snapshot project")
         repository = item["repository"]
         if repository not in repositories or repository in seen_projects:
             raise SnapshotError("snapshot project repository is invalid")
@@ -542,6 +616,7 @@ def validate_unsigned_snapshot(
         bounded_string(source["tree_oid"], OID_RE, "snapshot project tree")
         if item["heat_class"] not in HEAT_CLASSES or item["dependency_build_state_class"] not in BUILD_STATE_CLASSES:
             raise SnapshotError("snapshot project state class is invalid")
+        validate_reusable_states(item["reusable_states"])
         verification_profiles = exact_list(item["verification_profiles"], "snapshot project profiles", MAX_PROFILES)
         if any(not isinstance(profile, str) or VERIFICATION_PROFILE_RE.fullmatch(profile) is None for profile in verification_profiles):
             raise SnapshotError("snapshot project verification profile is invalid")
