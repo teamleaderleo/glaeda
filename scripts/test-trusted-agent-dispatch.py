@@ -232,6 +232,42 @@ class TrustedDispatchTests(unittest.TestCase):
             ambiguous["authority"]["authorizes_redispatch"]
         )
 
+    def test_restored_lifecycle_refuses_state_terminal_mismatch(self) -> None:
+        item = accepted()
+        launching = dispatch.mark_launching(
+            dispatch.initial_lifecycle(item),
+            item,
+        )
+        cases = [
+            ("refused", "succeeded"),
+            ("ambiguous", "failed"),
+            ("terminal", "refused"),
+            ("terminal", "ambiguous"),
+        ]
+        for state, terminal_class in cases:
+            with self.subTest(state=state, terminal_class=terminal_class):
+                value = dispatch.settle_from_external(
+                    launching,
+                    item,
+                    external_terminal(
+                        item,
+                        "refused" if state == "refused" else (
+                            "ambiguous" if state == "ambiguous" else "succeeded"
+                        ),
+                    ),
+                )
+                value["state"] = state
+                value["terminal_class"] = terminal_class
+                with self.assertRaisesRegex(
+                    dispatch.DispatchRefusal,
+                    "state and terminal class disagree",
+                ):
+                    dispatch.validate_lifecycle(value, item)
+                with self.assertRaises(dispatch.DispatchRefusal):
+                    dispatch.restart_disposition(value, item)
+                with self.assertRaises(dispatch.DispatchRefusal):
+                    dispatch.result_document(value, item)
+
     def test_terminal_receipt_requires_state_specific_evidence(self) -> None:
         item = accepted()
         launching = dispatch.mark_launching(
