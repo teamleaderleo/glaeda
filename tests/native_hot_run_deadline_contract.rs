@@ -45,7 +45,10 @@ impl Drop for RunningFixture {
 
 fn wait_for_file(path: &std::path::Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
-    while fs::read_to_string(path).is_err() {
+    loop {
+        if fs::read_to_string(path).is_ok_and(|contents| !contents.trim().is_empty()) {
+            return;
+        }
         assert!(Instant::now() < deadline, "timed out waiting for {path:?}");
         thread::sleep(Duration::from_millis(20));
     }
