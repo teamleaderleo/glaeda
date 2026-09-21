@@ -1102,4 +1102,77 @@ def parser() -> argparse.ArgumentParser:
     compose.add_argument("--observed-at")
     compose.add_argument("--published-at")
     compose.add_argument("--maximum-useful-age-seconds", type=int, default=DEFAULT_USEFUL_AGE_SECONDS)
-    compose.add_argument("--ssh-keyge
+    compose.add_argument("--ssh-keygen", type=Path, default=Path("/usr/bin/ssh-keygen"))
+
+    consume = subparsers.add_parser("consume", help="validate one fleet file into an agent-readable view")
+    consume.add_argument("--fleet", required=True, type=Path)
+    consume.add_argument("--trust", required=True, type=Path)
+    consume.add_argument("--now")
+    consume.add_argument("--ssh-keygen", type=Path, default=Path("/usr/bin/ssh-keygen"))
+
+    publish = subparsers.add_parser("publish", help="compare-and-swap one signed snapshot into the GitHub status branch")
+    publish.add_argument("--snapshot", required=True, type=Path)
+    publish.add_argument("--trust", required=True, type=Path)
+    publish.add_argument("--repository-root", required=True, type=Path)
+    publish.add_argument("--remote", default="origin")
+    publish.add_argument("--refresh-interval-seconds", type=int, default=DEFAULT_REFRESH_INTERVAL_SECONDS)
+    publish.add_argument("--now")
+    publish.add_argument("--git", type=Path, default=Path("/usr/bin/git"))
+    publish.add_argument("--ssh-keygen", type=Path, default=Path("/usr/bin/ssh-keygen"))
+    return root
+
+
+def main() -> int:
+    try:
+        arguments = parser().parse_args()
+        if arguments.command == "compose":
+            trust = load_json(arguments.trust, 32 * 1024)
+            observed = current_time(arguments.observed_at)
+            published = current_time(arguments.published_at) if arguments.published_at else observed
+            unsigned = build_unsigned_snapshot(
+                load_json(arguments.capability, MAX_NODE_BYTES),
+                load_json(arguments.admission, MAX_NODE_BYTES),
+                trust,
+                public_node_id=arguments.public_node_id,
+                producer_generation=arguments.producer_generation,
+                snapshot_sequence=arguments.snapshot_sequence,
+                observed_at=observed,
+                published_at=published,
+                maximum_useful_age_seconds=arguments.maximum_useful_age_seconds,
+                project_state=load_json(arguments.project_state, MAX_NODE_BYTES) if arguments.project_state else None,
+                request_state=load_json(arguments.request_state, MAX_NODE_BYTES) if arguments.request_state else None,
+            )
+            sys.stdout.buffer.write(canonical_json(sign_snapshot(unsigned, trust, private_key=arguments.private_key, ssh_keygen=arguments.ssh_keygen)))
+            return 0
+        if arguments.command == "consume":
+            now = current_time(arguments.now)
+            view = consume_fleet(
+                load_json(arguments.fleet),
+                load_json(arguments.trust, 32 * 1024),
+                now=now,
+                ssh_keygen=arguments.ssh_keygen,
+            )
+            sys.stdout.buffer.write(canonical_json(view))
+            return 0
+        if arguments.command == "publish":
+            now = current_time(arguments.now)
+            receipt = publish_snapshot(
+                load_json(arguments.snapshot, MAX_NODE_BYTES),
+                load_json(arguments.trust, 32 * 1024),
+                repository_root=arguments.repository_root,
+                remote=arguments.remote,
+                refresh_interval_seconds=arguments.refresh_interval_seconds,
+                now=now,
+                git=arguments.git,
+                ssh_keygen=arguments.ssh_keygen,
+            )
+            sys.stdout.buffer.write(canonical_json(receipt))
+            return 0
+        raise SnapshotError("unsupported command")
+    except (OSError, SnapshotError, subprocess.SubprocessError) as error:
+        sys.stderr.write(json.dumps({"error": str(error)}, sort_keys=True, separators=(",", ":")) + "\n")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
