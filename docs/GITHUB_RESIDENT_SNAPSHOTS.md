@@ -126,6 +126,17 @@ Canonical JSON uses sorted keys, compact separators, UTF-8, and one trailing new
         "heat_class": "resident_hot",
         "verification_profiles": ["glaeda.required", "verify-focused/v1"],
         "dependency_build_state_class": "resident_generation",
+        "reusable_states": [
+          {
+            "schema_version": 1,
+            "cache_class": "incremental_build_state",
+            "generation": "sha256:...",
+            "heat": "hot",
+            "size": "medium",
+            "recent_hit": "within_hour",
+            "revalidation_required": false
+          }
+        ],
         "active_task_count": 0,
         "recent_compatible_receipt_ref": "sha256:..."
       }
@@ -264,6 +275,7 @@ Publish immediately for meaningful semantic transitions:
 - producer/Glaeda/node generation change;
 - profile generation change;
 - project source/heat/build-state/receipt change;
+- reusable-state generation/heat/size/recent-hit/revalidation change;
 - request queued/preparing/running/terminal/superseded transition.
 
 For unchanged semantics, suppress the write until the 240-second default refresh interval. The publisher requires at least a 30-second stale margin between refresh interval and maximum useful age. This keeps CPU-percentage fluctuations and raw host telemetry out of GitHub. With the default, one continuously idle node performs at most 15 successful refresh writes/hour. A suppressed attempt performs a read and zero writes.
@@ -364,6 +376,8 @@ Canonical repository identity (including its GitHub owner component), exact Git 
 - manual/forged payload edits: SSH signature failure yields `unknown`;
 - Glaeda/node generation changes after reboot: producer generation restarts sequence at one and publishes a transition;
 - two nodes publish concurrently: local bare-Git integration test runs concurrent publishers and verifies convergence;
+- malformed reusable-state classes and duplicate class/generation identities refuse;
+- reusable state requiring revalidation cannot claim warm/hot heat;
 - request terminal state requires a bounded receipt reference;
 - `running`/`preparing` request state cannot exceed locally observed active work.
 
@@ -414,6 +428,7 @@ teamleaderleo/glaeda
   exact source: <commit>/<tree>
   heat: resident_hot
   verify-focused/v1: generation sha256:...
+  incremental_build_state: sha256:... hot medium within_hour
 
 req-0123456789abcdef
   same source/profile: running
