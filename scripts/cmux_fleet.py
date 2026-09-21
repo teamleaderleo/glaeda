@@ -90,6 +90,19 @@ def digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
 
 
+def cmux_canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+
+
+def cmux_digest(value: object) -> str:
+    return "sha256:" + hashlib.sha256(cmux_canonical_bytes(value)).hexdigest()
+
+
 def exact_keys(value: object, keys: set[str], label: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != keys:
         raise FleetError(f"{label} has unknown or missing fields")
@@ -217,47 +230,278 @@ def enrollment_from_bootstrap(
     return validate_enrollment(enrollment)
 
 
+def _cmux_semantic_key(value: dict[str, Any]) -> str:
+    source = value["source"]
+    profile = value["profile"]
+    runtime_inputs = value["runtime_input_identities"]
+    return cmux_digest(
+        {
+            "source": {
+                "repository": source["repository"],
+                "tree": source["tree"],
+            },
+            "profile": {
+                "id": profile["id"],
+                "generation": profile["generation"],
+            },
+            "semantic_validator": value["semantic_validator"],
+            "parameters": value["parameters"],
+            "runtime_inputs": [
+                {
+                    "name": item["name"],
+                    "class": item["class"],
+                    "identity": item["identity"],
+                    "sha256": item["sha256"],
+                }
+                for item in runtime_inputs
+            ],
+        }
+    )
+
+
+def _cmux_context_key(
+    semantic_key: str,
+    state_class: str,
+    toolchain_identity: str,
+) -> str:
+    return cmux_digest(
+        {
+            "semantic_key": semantic_key,
+            "state_class": state_class,
+            "toolchain_identity": toolchain_identity,
+        }
+    )
+
+
 def validate_cmux_semantic_result(
     value: object,
     expected_profile: dict[str, object],
 ) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise FleetError("CMUX semantic result is not an object")
+    doc = exact_keys(
+        value,
+        {
+            "document_type",
+            "schema_version",
+            "source",
+            "profile",
+            "semantic_validator",
+            "expected_result_class",
+            "result",
+            "parameters",
+            "runtime_input_identities",
+            "artifact_identities",
+            "validation",
+            "stage_timings",
+            "resource_summary",
+            "toolchain",
+            "benchmark",
+            "network_class",
+            "timeout_class",
+            "cleanup",
+            "exit_code",
+            "started_at_unix_millis",
+            "ended_at_unix_millis",
+        },
+        "CMUX semantic result",
+    )
     if (
-        value.get("document_type") != CMUX_RESULT_DOCUMENT_TYPE
-        or type(value.get("schema_version")) is not int
-        or value.get("schema_version") != CMUX_RESULT_SCHEMA_VERSION
-        or value.get("result") not in CMUX_RESULT_STATES
+        doc["document_type"] != CMUX_RESULT_DOCUMENT_TYPE
+        or type(doc["schema_version"]) is not int
+        or doc["schema_version"] != CMUX_RESULT_SCHEMA_VERSION
+        or doc["result"] not in CMUX_RESULT_STATES
     ):
         raise FleetError("CMUX semantic result contract is unsupported")
-    source = exact_keys(value.get("source"), {"repository", "commit", "tree"}, "CMUX semantic source")
-    if source["repository"] != CMUX_REPOSITORY:
-        raise FleetError("CMUX semantic source repository is invalid")
+
+    source = exact_keys(
+        doc["source"],
+        {"repository", "commit", "tree"},
+        "CMUX semantic source",
+    )
     if (
-        not isinstance(source["commit"], str)
+        source["repository"] != CMUX_REPOSITORY
+        or not isinstance(source["commit"], str)
         or COMMIT_RE.fullmatch(source["commit"]) is None
         or not isinstance(source["tree"], str)
         or COMMIT_RE.fullmatch(source["tree"]) is None
     ):
         raise FleetError("CMUX semantic source commit/tree is invalid")
-    profile = exact_keys(value.get("profile"), {"id", "generation"}, "CMUX semantic profile")
+
+    profile = exact_keys(
+        doc["profile"],
+        {"id", "generation"},
+        "CMUX semantic profile",
+    )
     token(profile["id"], "CMUX semantic profile id")
     positive_int(profile["generation"], "CMUX semantic profile generation")
     if profile != expected_profile:
         raise FleetError("CMUX semantic profile differs from enrolled role profile")
-    if value.get("parameters") != {}:
+    if doc["parameters"] != {}:
         raise FleetError("CMUX fleet acceptance profile parameters must be empty")
-    benchmark = value.get("benchmark")
-    if not isinstance(benchmark, dict) or benchmark.get("state_class") != "cold":
-        raise FleetError("CMUX fleet acceptance must use cold benchmark state")
-    cleanup = value.get("cleanup")
+    if doc["runtime_input_identities"] != []:
+        raise FleetError("CMUX fleet acceptance profile runtime inputs must be empty")
+
     if (
-        not isinstance(cleanup, dict)
-        or cleanup.get("state") not in {"complete", "forced"}
-        or type(cleanup.get("process_group_settled")) is not bool
+        not isinstance(doc["semantic_validator"], str)
+        or not doc["semantic_validator"]
+        or not isinstance(doc["expected_result_class"], str)
+        or not doc["expected_result_class"]
+        or not isinstance(doc["network_class"], str)
+        or not doc["network_class"]
+        or not isinstance(doc["timeout_class"], str)
+        or not doc["timeout_class"]
+        or type(doc["exit_code"]) is not int
+        or type(doc["started_at_unix_millis"]) is not int
+        or type(doc["ended_at_unix_millis"]) is not int
+        or not 0
+        <= doc["started_at_unix_millis"]
+        <= doc["ended_at_unix_millis"]
+        < 253402300800000
+    ):
+        raise FleetError("CMUX semantic result state is invalid")
+
+    validation = exact_keys(
+        doc["validation"],
+        {"missing_required_artifact_classes"},
+        "CMUX semantic validation",
+    )
+    missing = validation["missing_required_artifact_classes"]
+    if (
+        not isinstance(missing, list)
+        or any(not isinstance(item, str) or not item for item in missing)
+    ):
+        raise FleetError("CMUX semantic artifact validation is invalid")
+
+    artifacts = doc["artifact_identities"]
+    if not isinstance(artifacts, list):
+        raise FleetError("CMUX semantic artifact identities are invalid")
+    for item in artifacts:
+        artifact = exact_keys(
+            item,
+            {"class", "path_class", "sha256", "bytes"},
+            "CMUX semantic artifact identity",
+        )
+        if (
+            not isinstance(artifact["class"], str)
+            or not artifact["class"]
+            or artifact["path_class"] != "repository_output"
+            or not isinstance(artifact["sha256"], str)
+            or SHA256_RE.fullmatch(artifact["sha256"]) is None
+            or type(artifact["bytes"]) is not int
+            or artifact["bytes"] < 0
+        ):
+            raise FleetError("CMUX semantic artifact identity is invalid")
+
+    benchmark = exact_keys(
+        doc["benchmark"],
+        {"state_class", "semantic_comparison_key", "comparison_context_key"},
+        "CMUX semantic benchmark",
+    )
+    if (
+        benchmark["state_class"] != "cold"
+        or not isinstance(benchmark["semantic_comparison_key"], str)
+        or SHA256_RE.fullmatch(benchmark["semantic_comparison_key"]) is None
+        or not isinstance(benchmark["comparison_context_key"], str)
+        or SHA256_RE.fullmatch(benchmark["comparison_context_key"]) is None
+    ):
+        raise FleetError("CMUX fleet acceptance benchmark identity is invalid")
+
+    toolchain = exact_keys(
+        doc["toolchain"],
+        {"identity", "observations"},
+        "CMUX semantic toolchain",
+    )
+    observations = toolchain["observations"]
+    if (
+        not isinstance(toolchain["identity"], str)
+        or SHA256_RE.fullmatch(toolchain["identity"]) is None
+        or not isinstance(observations, dict)
+        or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(observation, str)
+            for name, observation in observations.items()
+        )
+        or toolchain["identity"] != cmux_digest(observations)
+    ):
+        raise FleetError("CMUX semantic toolchain identity is inconsistent")
+
+    semantic_key = _cmux_semantic_key(doc)
+    if benchmark["semantic_comparison_key"] != semantic_key:
+        raise FleetError("CMUX semantic comparison identity is inconsistent")
+    if benchmark["comparison_context_key"] != _cmux_context_key(
+        semantic_key,
+        benchmark["state_class"],
+        toolchain["identity"],
+    ):
+        raise FleetError("CMUX comparison context identity is inconsistent")
+
+    cleanup = exact_keys(
+        doc["cleanup"],
+        {"state", "process_group_settled"},
+        "CMUX semantic cleanup",
+    )
+    if (
+        cleanup["state"] not in {"complete", "forced", "incomplete"}
+        or type(cleanup["process_group_settled"]) is not bool
     ):
         raise FleetError("CMUX semantic cleanup evidence is invalid")
-    return value
+    if doc["result"] == "ambiguous":
+        if cleanup != {"state": "forced", "process_group_settled": False}:
+            raise FleetError("ambiguous CMUX result lacks forced cleanup evidence")
+    elif cleanup != {"state": "complete", "process_group_settled": True}:
+        raise FleetError("terminal CMUX result lacks complete cleanup")
+
+    if doc["result"] == "passed" and (doc["exit_code"] != 0 or missing):
+        raise FleetError("passed CMUX result is inconsistent")
+    if doc["result"] == "failed" and doc["exit_code"] == 0 and not missing:
+        raise FleetError("failed CMUX result is inconsistent")
+    if doc["result"] == "timed_out" and doc["exit_code"] != 124:
+        raise FleetError("timed-out CMUX result is inconsistent")
+
+    timings = doc["stage_timings"]
+    if (
+        not isinstance(timings, list)
+        or not timings
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"stage", "seconds"}
+            or not isinstance(item["stage"], str)
+            or not item["stage"]
+            or isinstance(item["seconds"], bool)
+            or not isinstance(item["seconds"], (int, float))
+            or item["seconds"] < 0
+            for item in timings
+        )
+    ):
+        raise FleetError("CMUX semantic stage timings are invalid")
+
+    resource = exact_keys(
+        doc["resource_summary"],
+        {"resource_class", "cpu_count", "memory_bytes", "architecture"},
+        "CMUX semantic resources",
+    )
+    if (
+        not isinstance(resource["resource_class"], str)
+        or not resource["resource_class"]
+        or (
+            resource["cpu_count"] is not None
+            and (
+                type(resource["cpu_count"]) is not int
+                or resource["cpu_count"] <= 0
+            )
+        )
+        or (
+            resource["memory_bytes"] is not None
+            and (
+                type(resource["memory_bytes"]) is not int
+                or resource["memory_bytes"] <= 0
+            )
+        )
+        or not isinstance(resource["architecture"], str)
+        or not resource["architecture"]
+    ):
+        raise FleetError("CMUX semantic resource summary is invalid")
+    return doc
 
 
 ACCEPTANCE_RECEIPT_KEYS = {
@@ -529,7 +773,9 @@ def load_cmux_semantic_result(path: Path) -> tuple[dict[str, Any], str]:
         info = os.fstat(descriptor)
         if (
             not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
             or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
             or info.st_size <= 0
             or info.st_size > MAX_DOCUMENT_BYTES
         ):
@@ -546,6 +792,8 @@ def load_cmux_semantic_result(path: Path) -> tuple[dict[str, Any], str]:
         if (
             info.st_dev != after.st_dev
             or info.st_ino != after.st_ino
+            or info.st_uid != after.st_uid
+            or info.st_gid != after.st_gid
             or info.st_mode != after.st_mode
             or info.st_nlink != after.st_nlink
             or info.st_size != after.st_size
