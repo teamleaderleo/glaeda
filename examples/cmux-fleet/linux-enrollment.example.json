@@ -10,9 +10,6 @@
   "supportedToolchainGenerations": [
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
   ],
-  "roleWorkloadGenerations": {
-    "cmux_linux_ci": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-  },
   "allowedExecutionRoles": [
     "cmux_linux_ci"
   ],
@@ -20,5 +17,11 @@
   "enrollmentGeneration": 1,
   "glaedaGeneration": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
   "state": "enrolling",
-  "quarantineReason": null
+  "quarantineReason": null,
+  "roleProfiles": {
+    "cmux_linux_ci": {
+      "id": "cmux.ci.guard",
+      "generation": 1
+    }
+  }
 }
