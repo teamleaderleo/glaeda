@@ -427,6 +427,9 @@ class FleetTests(unittest.TestCase):
 
             def fake_run(argv, **kwargs):
                 if "cmux_workload_profile.py" in str(argv[1]):
+                    self.assertIn("--state-class", argv)
+                    self.assertEqual(argv[argv.index("--state-class") + 1], "cold")
+                    self.assertNotIn("--state-root", argv)
                     result_path = Path(argv[argv.index("--result") + 1])
                     result_path.write_bytes(f.canonical(result))
                     result_path.chmod(0o600)
