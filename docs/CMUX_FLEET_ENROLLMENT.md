@@ -15,19 +15,21 @@ A different machine class starts as a bootstrap refusal until the reviewed polic
 
 ## Roles
 
-The v1 enrollment schema recognizes:
+The role vocabulary is stable enough to name future work:
 
-- `cmux_macos_native_build`
-- `cmux_macos_test`
-- `cmux_linux_ci`
-- `cmux_linux_agent`
-- `artifact_cache`
-- `background_replay`
-- `benchmark`
+| Role | v1 enrollment | Exact acceptance owner |
+| --- | --- | --- |
+| `cmux_macos_native_build` | supported | `manaflow-ai/cmux/scripts/fleet-accept-macos-native-build` |
+| `cmux_linux_ci` | supported | `manaflow-ai/cmux/scripts/fleet-accept-linux-ci` |
+| `cmux_macos_test` | reserved | acceptance workload must land first |
+| `cmux_linux_agent` | reserved | acceptance workload must land first |
+| `artifact_cache` | reserved | acceptance workload must land first |
+| `background_replay` | reserved | acceptance workload must land first |
+| `benchmark` | reserved | acceptance workload must land first |
 
-Enrollment is an allowlist. A role becomes eligible only when the node state is `eligible` and a current accepted role receipt matches the node ID, enrollment generation, Glaeda generation, and one enrolled toolchain generation.
+The v1 enrollment validator and bootstrap refuse reserved roles. A role becomes enrolable only when an exact reviewed workload exists; this keeps "advertised" equivalent to "can be proven." For supported roles, eligibility then requires node state `eligible` plus a current accepted receipt matching node ID, enrollment generation, Glaeda generation, and an enrolled toolchain generation.
 
-The first executable acceptance recipes live in `manaflow-ai/cmux` for `cmux_macos_native_build` and `cmux_linux_ci`. Every other role stays ineligible until its own reviewed acceptance workload exists.
+The versioned schema carries the full role vocabulary in `$defs.knownRole` while `allowedExecutionRoles` accepts only the v1 supported subset.
 
 ## Enrollment identity and privacy
 
