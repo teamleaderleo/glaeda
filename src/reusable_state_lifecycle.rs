@@ -337,8 +337,7 @@ impl ReusableStateMetrics {
         if self.lookups == 0 {
             return 0;
         }
-        let basis_points =
-            (u128::from(self.hits) * 10_000) / u128::from(self.lookups);
+        let basis_points = (u128::from(self.hits) * 10_000) / u128::from(self.lookups);
         u16::try_from(basis_points).unwrap_or(10_000)
     }
 }
