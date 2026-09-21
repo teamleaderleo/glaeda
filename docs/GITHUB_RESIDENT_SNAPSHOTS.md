@@ -222,4 +222,186 @@ Use `unknown` unless an accepted #21-style observation supports the class. The c
 
 ## Freshness and rollback rules
 
-Freshness uses the oldest observation contributing to a snapshot. Republishin
+Freshness uses the oldest observation contributing to a snapshot. Republishing an old project capability never refreshes its `observed_at`.
+
+Rules:
+
+- `snapshot_sequence` starts at 1 and advances exactly by one inside one producer generation;
+- `producer_generation` increases after producer replacement/reinstallation/reboot policy and a new generation restarts sequence at 1;
+- lower `(producer_generation, snapshot_sequence)` cannot replace a higher one through the publisher;
+- equal version + equal bytes is idempotent;
+- equal version + different bytes refuses;
+- `published_at` cannot precede `observed_at`;
+- timestamps more than 30 seconds in the future refuse;
+- `maximum_useful_age_seconds` is 60–600 seconds, default 300;
+- age is calculated from `observed_at`, so delayed GitHub publication can arrive already stale;
+- signature failure, malformed fields, missing node entry, duplicate node entry, stale data, or future timestamps produce an `unknown` consumer view for that reviewed node.
+
+A dead/sleeping node can therefore remain remotely `available` only until its bounded useful age expires. Dispatch still performs fresh local admission immediately before physical execution.
+
+## Publication triggers and write ceiling
+
+Publish immediately for meaningful semantic transitions:
+
+- node hold/drain/availability class change;
+- pressure/capacity class change;
+- active-work count change;
+- producer/Glaeda/node generation change;
+- profile generation change;
+- project source/heat/build-state/receipt change;
+- request queued/preparing/running/terminal/superseded transition.
+
+For unchanged semantics, suppress the write until the 240-second default refresh interval. The publisher requires at least a 30-second stale margin between refresh interval and maximum useful age. This keeps CPU-percentage fluctuations and raw host telemetry out of GitHub. With the default, one continuously idle node performs at most 15 successful refresh writes/hour. A suppressed attempt performs a read and zero writes.
+
+## Concurrent Git publication
+
+The publisher uses the fixed branch `glaeda-status/v1` and file `resident-nodes.json`.
+
+For each attempt:
+
+1. fetch the current status ref;
+2. validate the bounded fleet and every existing node signature;
+3. merge exactly one candidate node entry;
+4. create a Git blob/tree/commit containing only `resident-nodes.json`;
+5. push the new commit without force;
+6. on a non-fast-forward race, refetch, revalidate, remerge, and retry a bounded number of times.
+
+Separate nodes can therefore publish concurrently without a shared per-node filename race or one node rewriting another node's signed payload. The v1 publisher performs no automatic routing or physical execution.
+
+Normal successful update cost: 2 network round trips (fetch + push). Suppressed unchanged update: 1 fetch. One compare-and-swap retry adds 2 round trips.
+
+## Producer inputs
+
+The script composes from already bounded local evidence:
+
+```text
+glaeda-owned-workstation-capability/v1
++ glaeda-owned-admission-observation/v1
++ optional glaeda-github-project-heat-input/v1
++ optional glaeda-github-request-state-input/v1
+-> signed glaeda-github-resident-node-snapshot/v1
+```
+
+The optional project input carries only the project fields present in the public schema. The optional request input carries only request ID, exact source, advertised profile, state, optional terminal receipt, and bounded duration classes. Unknown fields refuse.
+
+If request state claims `preparing` or `running`, the local admission evidence must show at least as much active work. Published project active-task counts also cannot exceed the local bounded active-work count.
+
+## Commands
+
+Compose and sign one entry:
+
+```text
+python3 scripts/github_resident_snapshot.py compose \
+  --capability <bounded-capability.json> \
+  --admission <bounded-admission.json> \
+  --trust config/github-resident-snapshot-trust.json \
+  --private-key <dedicated-node-signing-key> \
+  --public-node-id node-0123456789abcdef \
+  --producer-generation 1 \
+  --snapshot-sequence 1
+```
+
+Publish it through the current repository remote:
+
+```text
+python3 scripts/github_resident_snapshot.py publish \
+  --snapshot <signed-node.json> \
+  --trust config/github-resident-snapshot-trust.json \
+  --repository-root <glaeda-worktree>
+```
+
+Turn a downloaded fleet file into the small agent view:
+
+```text
+python3 scripts/github_resident_snapshot.py consume \
+  --fleet <resident-nodes.json> \
+  --trust config/github-resident-snapshot-trust.json
+```
+
+The consumer verifies the reviewed node identity/class, exact schema, bounds, SSH signature, timestamps, and freshness before returning positive facts. A GitHub-connected agent needs two repository reads on first use: the trust file from `main` and the fleet file from `glaeda-status/v1`. The trust file changes slowly and can be cached by generation/commit, reducing steady-state target selection to one fleet read.
+
+## Privacy ceiling
+
+Snapshot bytes never contain:
+
+- host/OS account usernames or private hostnames;
+- IP or MAC addresses;
+- filesystem paths;
+- PIDs or process lists;
+- commands/argv;
+- environment values;
+- credentials or signing private keys;
+- dirty filenames or unpushed source contents;
+- arbitrary package inventory;
+- cache contents.
+
+Canonical repository identity (including its GitHub owner component), exact Git object IDs, reviewed profile IDs/generations, opaque IDs, bounded classes/counts, timestamps, and digest references are the intended public vocabulary.
+
+## Failure cases exercised by the contract suite
+
+`python3 scripts/test-github-resident-snapshot.py -v` covers:
+
+- a node dies after publishing `available`: expiry yields `unknown`;
+- resident project heat disappears: next sequence is a semantic transition to `cold`;
+- GitHub publication is delayed: age remains tied to local observation and can be stale on arrival;
+- publication is lost: the previous state expires to `unknown` instead of claiming an unobserved terminal transition;
+- an old producer/sequence attempts overwrite: publisher refuses;
+- manual/forged payload edits: SSH signature failure yields `unknown`;
+- Glaeda/node generation changes after reboot: producer generation restarts sequence at one and publishes a transition;
+- two nodes publish concurrently: local bare-Git integration test runs concurrent publishers and verifies convergence;
+- request terminal state requires a bounded receipt reference;
+- `running`/`preparing` request state cannot exceed locally observed active work.
+
+## Measurements and experiment counters
+
+The contract test prints exact serialized bytes for a representative signed node and one-node fleet on the hosted runner. The fixed ceilings are 16 KiB/node and 128 KiB/fleet.
+
+Transport/accounting properties are deterministic from the protocol:
+
+```text
+agent reads to select a target
+  cold trust cache: 2
+  warm trust cache: 1
+
+successful publication
+  fetch + push: 2 remote round trips
+
+unchanged suppressed publication
+  fetch only: 1 remote round trip, 0 writes
+
+idle default write ceiling
+  refresh every 240s: <= 15 writes/hour/node
+```
+
+Operational measurements that require real resident dispatch remain separate from the read-only implementation:
+
+```text
+stale-selection/refusal rate
+duplicate dispatch avoided
+dispatch-to-result improvement from visible hot state
+```
+
+Record those during an explicit #967/#1050-compatible dogfood loop using exact request/source/profile identity. This lane itself starts no workload and cannot manufacture those physical measurements.
+
+## Consumer interpretation
+
+A consumer can make statements such as:
+
+```text
+node-0123456789abcdef
+  freshness: fresh / signature verified
+  state: available
+  pressure: low
+  capacity: available
+  Glaeda: sha256:...
+
+teamleaderleo/glaeda
+  exact source: <commit>/<tree>
+  heat: resident_hot
+  verify-focused/v1: generation sha256:...
+
+req-0123456789abcdef
+  same source/profile: running
+```
+
+Then it can choose whether to submit an existing reviewed request contract. The node re-observes local truth before admission. If the project disappeared, the node went to sleep, capacity filled, the Glaeda generation changed, or local ownership/reuse became ambiguous, current local policy wins and remote evidence becomes a routing miss.
