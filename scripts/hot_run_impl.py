@@ -2475,7 +2475,13 @@ def retire_one_low_value_state(
         state_descriptor: int | None = None
         renamed = False
         try:
-            details = state.stat(follow_symlinks=False)
+            try:
+                details = state.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                remove_generation_value_metadata(
+                    namespace_root, state_identity
+                )
+                continue
             if (
                 not stat.S_ISDIR(details.st_mode)
                 or stat.S_ISLNK(details.st_mode)
@@ -2483,8 +2489,8 @@ def retire_one_low_value_state(
                 or stat.S_IMODE(details.st_mode) != 0o700
                 or details.st_dev != namespace_details.st_dev
             ):
-                remove_hot_state_value_ticket(
-                    namespace_root, ticket_sequence
+                remove_generation_value_metadata(
+                    namespace_root, state_identity
                 )
                 continue
             state_descriptor = os.open(
