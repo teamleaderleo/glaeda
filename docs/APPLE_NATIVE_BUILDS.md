@@ -25,6 +25,11 @@ glaeda-apple run --profile app \
   --require-clean-source
 ```
 
+Read-only plan/execute receipts also expose `cache_root`, a project-relative
+locator for the admitted cache generation. It contains no absolute checkout path;
+integrations can locate Glaeda-owned outputs without duplicating the cache-key
+layout or mutating cache directories before admission.
+
 These options apply to direct `run`/`warm`/`check`/dependency execution. Glaeda
 validates the requested commit/tree and clean worktree before creating or reusing
 cache state under the build lock, and validates the same source again after the
