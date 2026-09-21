@@ -432,6 +432,49 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(receipt["result"], "rejected")
         self.assertFalse(f.node_status(e, [receipt])["routingCandidateEligible"])
 
+    def test_acceptance_child_environment_is_explicit_allowlist(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with mock.patch.dict(
+                f.os.environ,
+                {
+                    "PATH": "/reviewed/bin:/usr/bin:/bin",
+                    "HOME": str(root / "home"),
+                    "CARGO_HOME": str(root / "cargo"),
+                    "RUSTUP_HOME": str(root / "rustup"),
+                    "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer",
+                    "PYTHONPATH": "/attacker/python",
+                    "PYTHONHOME": "/attacker/home",
+                    "SSH_AUTH_SOCK": "/private/agent.sock",
+                    "SECRET_SENTINEL": "secret",
+                    "GIT_CONFIG_GLOBAL": "/attacker/gitconfig",
+                },
+                clear=True,
+            ):
+                environment = f.acceptance_child_environment(root / "tmp")
+
+        self.assertEqual(
+            set(environment),
+            {
+                "LC_ALL",
+                "LANG",
+                "TMPDIR",
+                "PATH",
+                "HOME",
+                "CARGO_HOME",
+                "RUSTUP_HOME",
+                "DEVELOPER_DIR",
+            },
+        )
+        self.assertEqual(environment["LC_ALL"], "C")
+        self.assertEqual(environment["LANG"], "C")
+        self.assertEqual(environment["PATH"], "/reviewed/bin:/usr/bin:/bin")
+        self.assertNotIn("PYTHONPATH", environment)
+        self.assertNotIn("PYTHONHOME", environment)
+        self.assertNotIn("SSH_AUTH_SOCK", environment)
+        self.assertNotIn("SECRET_SENTINEL", environment)
+        self.assertNotIn("GIT_CONFIG_GLOBAL", environment)
+
     def test_accept_local_binds_profile_run_to_this_node(self):
         e = enrollment("linux", state="enrolling")
         with tempfile.TemporaryDirectory() as temporary:
@@ -452,9 +495,38 @@ class FleetTests(unittest.TestCase):
 
             result = cmux_result("cmux_linux_ci")
             post = bootstrap_for(e)
+            child_environments = []
 
             def fake_run(argv, **kwargs):
-                if "cmux_workload_profile.py" in str(argv[1]):
+                joined = " ".join(str(item) for item in argv)
+                self.assertGreaterEqual(len(argv), 3)
+                self.assertEqual(argv[1], "-I")
+                environment = dict(kwargs["env"])
+                child_environments.append(environment)
+                for forbidden in (
+                    "PYTHONPATH",
+                    "PYTHONHOME",
+                    "SSH_AUTH_SOCK",
+                    "SECRET_SENTINEL",
+                    "GIT_DIR",
+                    "GIT_WORK_TREE",
+                ):
+                    self.assertNotIn(forbidden, environment)
+                self.assertEqual(environment["LC_ALL"], "C")
+                self.assertEqual(environment["LANG"], "C")
+                self.assertEqual(environment["PATH"], "/reviewed/bin:/usr/bin:/bin")
+                self.assertEqual(environment["HOME"], str(root / "home"))
+                self.assertEqual(environment["CARGO_HOME"], str(root / "cargo"))
+                self.assertEqual(environment["RUSTUP_HOME"], str(root / "rustup"))
+                self.assertEqual(
+                    environment["DEVELOPER_DIR"],
+                    "/Applications/Xcode.app/Contents/Developer",
+                )
+                tmpdir = Path(environment["TMPDIR"])
+                self.assertEqual(tmpdir.name, "tmp")
+                self.assertEqual(tmpdir.stat().st_mode & 0o777, 0o700)
+
+                if "cmux_workload_profile.py" in joined:
                     self.assertIn("--state-class", argv)
                     self.assertEqual(argv[argv.index("--state-class") + 1], "cold")
                     self.assertNotIn("--state-root", argv)
@@ -462,7 +534,7 @@ class FleetTests(unittest.TestCase):
                     result_path.write_bytes(f.canonical(result))
                     result_path.chmod(0o600)
                     return __import__("subprocess").CompletedProcess(argv, 0)
-                if "cmux_fleet_bootstrap.py" in str(argv[1]):
+                if "cmux_fleet_bootstrap.py" in joined:
                     return __import__("subprocess").CompletedProcess(
                         argv,
                         0,
@@ -471,7 +543,24 @@ class FleetTests(unittest.TestCase):
                     )
                 raise AssertionError(argv)
 
+            environment = {
+                "PATH": "/reviewed/bin:/usr/bin:/bin",
+                "HOME": str(root / "home"),
+                "CARGO_HOME": str(root / "cargo"),
+                "RUSTUP_HOME": str(root / "rustup"),
+                "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer",
+                "LANG": "en_US.UTF-8",
+                "LC_ALL": "en_US.UTF-8",
+                "TMPDIR": str(root / "ambient-tmp"),
+                "PYTHONPATH": "/attacker/python",
+                "PYTHONHOME": "/attacker/home",
+                "SSH_AUTH_SOCK": "/private/agent.sock",
+                "SECRET_SENTINEL": "do-not-forward",
+                "GIT_DIR": "/attacker/git",
+                "GIT_WORK_TREE": "/attacker/tree",
+            }
             with (
+                mock.patch.dict(f.os.environ, environment, clear=True),
                 mock.patch.object(
                     f,
                     "_git_oid",
@@ -485,6 +574,9 @@ class FleetTests(unittest.TestCase):
                     glaeda,
                     "cmux_linux_ci",
                 )
+
+            self.assertEqual(len(child_environments), 2)
+            self.assertEqual(child_environments[0], child_environments[1])
 
         self.assertEqual(receipt["result"], "accepted")
         self.assertEqual(receipt["executionClass"], f.LOCAL_EXECUTION_CLASS)
@@ -519,12 +611,13 @@ class FleetTests(unittest.TestCase):
             post = bootstrap_for(e)
 
             def fake_run(argv, **kwargs):
-                if "cmux_workload_profile.py" in str(argv[1]):
+                joined = " ".join(str(item) for item in argv)
+                if "cmux_workload_profile.py" in joined:
                     result_path = Path(argv[argv.index("--result") + 1])
                     result_path.write_bytes(f.canonical(result))
                     result_path.chmod(0o600)
                     return __import__("subprocess").CompletedProcess(argv, 0)
-                if "cmux_fleet_bootstrap.py" in str(argv[1]):
+                if "cmux_fleet_bootstrap.py" in joined:
                     return __import__("subprocess").CompletedProcess(
                         argv,
                         0,
