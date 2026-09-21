@@ -528,10 +528,13 @@ def normalize_repair_result(value: object, request: dict[str, object]) -> dict[s
     if value["kind"] != "repair" or value["working_copy"] != "clean":
         raise ContractRefusal("invalid_result", "completed repair must end with a clean task workspace")
     result_source = exact_source(value["result_source"], "result_source")
-    if result_source["tree"] == request["source"]["head"]["tree"]:
+    if (
+        result_source["commit"] == request["source"]["head"]["commit"]
+        or result_source["tree"] == request["source"]["head"]["tree"]
+    ):
         raise ContractRefusal(
             "repair_source_unchanged",
-            "completed repair must produce a different source tree",
+            "completed repair must produce a different exact source",
         )
     changes = value["changes"]
     mutation = request["mutation"]
