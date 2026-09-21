@@ -103,7 +103,6 @@ class TrustedDispatchTests(unittest.TestCase):
         semantic_id = item.accepted_document["semantic_request_id"]
         self.assertRegex(semantic_id, r"^accepted-[a-f0-9]{55}$")
         self.assertEqual(item.semantic_request.request_id, semantic_id)
-        self.assertEqual(item.external_request.semantic_request_id, semantic_id)
         self.assertEqual(
             item.accepted_document["semantic_request_sha256"],
             item.semantic_request_sha256,
@@ -117,8 +116,14 @@ class TrustedDispatchTests(unittest.TestCase):
             semantic_id,
             other.accepted_document["semantic_request_id"],
         )
-        first_compiled = external.compile_request(item.external_request)
-        other_compiled = external.compile_request(other.external_request)
+        first_compiled = external.compile_request(
+            item.external_request,
+            semantic_request_id=semantic_id,
+        )
+        other_compiled = external.compile_request(
+            other.external_request,
+            semantic_request_id=other.accepted_document["semantic_request_id"],
+        )
         self.assertNotEqual(
             first_compiled.internal.command_fingerprint,
             other_compiled.internal.command_fingerprint,
