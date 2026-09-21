@@ -1,7 +1,12 @@
-"""Private, focused-only launch admission. No queue or caller authority.
+"""Private fixed-envelope owned-Linux launch admission. No queue or caller authority.
 
-Only an installed local adapter supplies this root; remote requests never choose it.
-An uncompleted reservation is deliberately not reclaimed from a dead PID or absent lock.
+The gate owns one reviewed 4-CPU/8-GiB coexist resource slot plus fresh
+hold/drain/pressure checks. Checked-in adapters may reuse it only when their
+declared physical envelope fits that exact grant; remote requests never choose
+this root, resource values, or interference class.
+
+An uncompleted reservation is deliberately not reclaimed from a dead PID or
+absent lock.
 """
 from __future__ import annotations
 
@@ -251,8 +256,10 @@ def check(current):
             raise ValueError()
     except (KeyError, TypeError, ValueError) as error:
         raise Refusal("incomplete local admission observation") from error
-    # Fixed verify-focused/v1: 8 GiB MemoryMax, four CPUs. Reserve at least four more
-    # GiB and four CPUs for owner work. Unknown or unavailable facts never become zero.
+    # Fixed shared owned-Linux envelope: 8 GiB MemoryMax, four CPUs. Reserve at
+    # least four more GiB and four CPUs for owner work. Semantic adapters remain
+    # responsible for proving their own profile fits this grant. Unknown or
+    # unavailable facts never become zero.
     if memory < 8 * 1024**3 + current["memory_reserve_bytes"] or cpus < 8:
         raise Deferred("capacity_unavailable", "local admission capacity unavailable")
     high = any(p >= ceiling for p, ceiling in zip(pressure, (50_000_000, 1_000_000, 20_000_000)))
