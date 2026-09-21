@@ -477,6 +477,7 @@ def inspect(plan):
             raise Refusal("existing Apple state is incomplete; refusing implicit adoption")
     return {"schema_version": 1, "authority": "developer_observation_only", "profile": plan["profile"],
             "engine": plan["engine"], "cache_key": plan["key"], "generation": plan["generation"],
+            "cache_root": ".glaeda/apple-build/cache/" + plan["key"],
             "state": status, "active_run": active, "isolation": "trusted_native_host", "result_reuse": False,
             "operation": plan.get("operation", "build"), "invocation_identity": plan.get("invocation_identity")}
 
