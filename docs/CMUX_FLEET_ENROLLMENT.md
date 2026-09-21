@@ -52,7 +52,7 @@ States are:
 
 `discovered -> enrolling -> eligible -> draining/quarantined -> retired`
 
-Supported recovery paths also include `draining -> eligible` and `quarantined -> enrolling`. Leaving quarantine advances the enrollment generation, so every pre-quarantine acceptance receipt becomes stale immediately.
+Supported recovery paths also include `draining -> eligible` and `quarantined -> enrolling`. Every transition into `eligible` requires at least one current accepted role receipt. Leaving quarantine advances the enrollment generation, so every pre-quarantine acceptance receipt becomes stale immediately.
 
 Automatic routing reads `scripts/cmux-fleet status`. A node in `draining`, `quarantined`, or `retired` produces zero eligible roles even when an older acceptance receipt exists. An `eligible` node still produces zero eligible roles when its acceptance evidence is absent, rejected, or stale.
 
@@ -109,6 +109,7 @@ python3 scripts/cmux_fleet.py finalize-acceptance \
   "$ENROLLMENT" "$ACCEPTANCE_EVIDENCE" > "$ACCEPTANCE"
 
 python3 scripts/cmux_fleet.py transition "$ENROLLMENT" --to eligible \
+  --acceptance "$ACCEPTANCE" \
   > "$ENROLLMENT.next"
 mv "$ENROLLMENT.next" "$ENROLLMENT"
 
