@@ -260,8 +260,823 @@ class PnpmTaskDependencyBenchmarkTests(unittest.TestCase):
         self.assertEqual(evidence['fiemap_observed_files'], 1)
         self.assertEqual(evidence['shared_extent_files'], 1)
         self.assertEqual(evidence['private_copy_files'], 0)
+        self.assertEqual(
+            evidence['sample_selection'],
+            'lexicographic_relative_path_first_256',
+        )
+        self.assertRegex(evidence['sample_path_set_sha256'], r'^sha256:[0-9a-f]{64}
+        validate = NAMESPACE['validate_mechanisms']
+        BenchmarkError = NAMESPACE['BenchmarkError']
+
+        def evidence(
+            mechanism: str,
+            hardlinks: int = 0,
+            *,
+            sampled: int = 100,
+            fiemap_observed: int = 100,
+            shared: int = 100,
+        ) -> dict[str, object]:
+            return {
+                'usage': {
+                    'regular_file_count': 10,
+                    'multiply_linked_regular_file_count': hardlinks,
+                },
+                'sample': {
+                    'mechanism': mechanism,
+                    'sampled_regular_files': sampled,
+                    'fiemap_observed_files': fiemap_observed,
+                    'shared_extent_files': shared,
+                },
+            }
+
+        reflink = [evidence('reflink_observed') for _ in range(8)]
+        mixed = [
+            evidence('mixed_private_copy_and_reflink_observed', shared=95)
+            for _ in range(8)
+        ]
+        weak_mixed = [
+            evidence('mixed_private_copy_and_reflink_observed', shared=94)
+            for _ in range(8)
+        ]
+        unproven = [
+            evidence(
+                'physical_mechanism_unproven',
+                fiemap_observed=99,
+                shared=99,
+            )
+            for _ in range(8)
+        ]
+        hardlink = [
+            evidence('hardlink_observed', hardlinks=10, shared=0)
+            for _ in range(8)
+        ]
+        copy = [evidence('copy_observed', shared=0) for _ in range(8)]
+        self.assertEqual(validate('clone', reflink), {'reflink_observed'})
+        self.assertEqual(
+            validate('clone', mixed),
+            {'mixed_private_copy_and_reflink_observed'},
+        )
+        self.assertEqual(validate('hardlink', hardlink), {'hardlink_observed'})
+        self.assertEqual(validate('auto', copy), {'copy_observed'})
+        with self.assertRaises(BenchmarkError):
+            validate('clone', weak_mixed)
+        with self.assertRaises(BenchmarkError):
+            validate('clone', unproven)
+        with self.assertRaises(BenchmarkError):
+            validate('clone', reflink[:-1] + hardlink[:1])
+        with self.assertRaises(BenchmarkError):
+            validate('hardlink', hardlink[:-1] + copy[:1])
+
+        hidden_hardlink = evidence('reflink_observed', hardlinks=1)
+        self.assertEqual(
+            validate('auto', reflink[:-1] + [hidden_hardlink]),
+            {'reflink_observed', 'hardlink_observed'},
+        )
+        with self.assertRaises(BenchmarkError):
+            validate('clone', reflink[:-1] + [hidden_hardlink])
+
+    def test_ready_boundary_proves_git_before_first_command(self) -> None:
+        measure_once = NAMESPACE['measure_once']
+        events: list[str] = []
+        with tempfile.TemporaryDirectory() as source_text, tempfile.TemporaryDirectory() as scratch_text:
+            source = Path(source_text)
+            scratch = Path(scratch_text)
+            store = scratch / 'store'
+            store.mkdir()
+            plan = NAMESPACE['Plan'](
+                source=source,
+                scratch_root=scratch,
+                pnpm=Path('/pnpm'),
+                fanout=1,
+                import_method='clone',
+                repetitions=1,
+                deadline_seconds=60,
+                probe_script=None,
+            )
+            identity = {'commit': '1' * 40, 'tree': '2' * 40}
+            pnpm = {'store': store, 'environment': {}}
+            filesystem = {
+                'mount_id': '1',
+                'device_major': 1,
+                'device_minor': 2,
+                'findmnt_device': '1:2',
+                'filesystem_type': 'xfs',
+                'fragment_size_bytes': 4096,
+                'available_bytes': 1_000_000,
+                'available_inodes': 10_000,
+            }
+
+            def observe(_path: Path) -> dict[str, object]:
+                events.append('filesystem')
+                return dict(filesystem)
+
+            def capacity(_path: Path, _baseline: dict[str, object]) -> dict[str, object]:
+                events.append('capacity')
+                return dict(filesystem)
+
+            def add(_source: Path, target: Path, _commit: str) -> None:
+                events.append('worktree')
+                target.mkdir()
+                (target / 'node_modules').mkdir()
+
+            def cohort(commands: object, **_kwargs: object) -> dict[str, object]:
+                command_list = list(commands)
+                action = command_list[0][1][1]
+                events.append(action)
+                return {
+                    'elapsed_seconds': 0.01,
+                    'process_count': 1,
+                    'maximum_simultaneous_observed': 1,
+                    'failure_count': 0,
+                    'deadline_exceeded': False,
+                    'surviving_process_groups_detected': 0,
+                }
+
+            def prove(_task: Path, _commit: str, _tree: str) -> None:
+                events.append('git-proof')
+
+            def physical(_node_modules: Path) -> dict[str, object]:
+                events.append('physical')
+                return {
+                    'sampled_regular_files': 1,
+                    'hardlinked_files': 0,
+                    'fiemap_observed_files': 1,
+                    'shared_extent_files': 1,
+                    'mechanism': 'reflink_observed',
+                }
+
+            def remove(_source: Path, target: Path) -> None:
+                events.append('remove')
+                (target / 'node_modules').rmdir()
+                target.rmdir()
+
+            with mock.patch.dict(
+                measure_once.__globals__,
+                {
+                    'filesystem_observation': observe,
+                    'filesystem_capacity_observation': capacity,
+                    'add_worktree': add,
+                    'run_cohort': cohort,
+                    'prove_task_git': prove,
+                    'tree_usage': lambda _root: {
+                        'logical_bytes': 1,
+                        'allocated_bytes': 4096,
+                        'inode_count': 1,
+                        'regular_file_count': 1,
+                        'multiply_linked_regular_file_count': 0,
+                    },
+                    'sample_physical_mechanism': physical,
+                    'remove_worktree': remove,
+                    'rusage_snapshot': lambda: (0.0, 0.0),
+                },
+            ):
+                sample = measure_once(plan, identity, pnpm, 1)
+
+        self.assertEqual(sample['result'], 'succeeded')
+        self.assertLess(events.index('git-proof'), events.index('capacity'))
+        self.assertLess(events.index('capacity'), events.index('list'))
+        self.assertLess(events.index('list'), events.index('physical'))
+        self.assertIsNotNone(sample['readiness_verification_seconds'])
+        self.assertIsNotNone(sample['ready_storage_observation_seconds'])
+        self.assertLessEqual(
+            sample['workspace_ready_seconds'],
+            sample['task_known_to_first_command_start_seconds'],
+        )
+        self.assertIn('filesystem_available_space_delta_at_ready_bytes', sample)
+        self.assertIn('filesystem_available_space_delta_during_cleanup_bytes', sample)
+        self.assertEqual(sample['node_modules_st_blocks_bytes'], 4096)
+        self.assertNotIn('physical_byte_delta_at_ready', sample)
+
+    def test_partial_worktree_registration_attempt_is_cleanup_owned(self) -> None:
+        measure_once = NAMESPACE['measure_once']
+        events: list[str] = []
+        with tempfile.TemporaryDirectory() as source_text, tempfile.TemporaryDirectory() as scratch_text:
+            source = Path(source_text)
+            scratch = Path(scratch_text)
+            store = scratch / 'store'
+            store.mkdir()
+            plan = NAMESPACE['Plan'](
+                source=source,
+                scratch_root=scratch,
+                pnpm=Path('/pnpm'),
+                fanout=1,
+                import_method='clone',
+                repetitions=1,
+                deadline_seconds=60,
+                probe_script=None,
+            )
+            identity = {'commit': '1' * 40, 'tree': '2' * 40}
+            pnpm = {'store': store, 'environment': {}}
+            filesystem = {
+                'mount_id': '1',
+                'device_major': 1,
+                'device_minor': 2,
+                'findmnt_device': '1:2',
+                'filesystem_type': 'xfs',
+                'fragment_size_bytes': 4096,
+                'available_bytes': 1_000_000,
+                'available_inodes': 10_000,
+            }
+
+            def add(_source: Path, target: Path, _commit: str) -> None:
+                events.append('add')
+                target.mkdir()
+                raise NAMESPACE['BenchmarkError']('partial_registration')
+
+            def remove(_source: Path, target: Path) -> None:
+                events.append('remove')
+                if target.exists():
+                    target.rmdir()
+
+            with mock.patch.dict(
+                measure_once.__globals__,
+                {
+                    'filesystem_observation': lambda _path: dict(filesystem),
+                    'add_worktree': add,
+                    'remove_worktree': remove,
+                    'rusage_snapshot': lambda: (0.0, 0.0),
+                },
+            ):
+                sample = measure_once(plan, identity, pnpm, 1)
+
+        self.assertEqual(sample['result'], 'failed')
+        self.assertEqual(sample['failure'], 'partial_registration')
+        self.assertEqual(events, ['add', 'remove'])
+
+    def test_summary_publishes_p50_p90_p99_from_successful_samples_only(self) -> None:
+        summarize = NAMESPACE['summarize']
+        samples = []
+        for ordinal, value in enumerate((1.0, 2.0, 3.0, 4.0, 100.0), 1):
+            samples.append(
+                {
+                    'ordinal': ordinal,
+                    'result': 'succeeded' if ordinal < 5 else 'failed',
+                    'workspace_ready_seconds': value,
+                    'observed_import_mechanisms': ['reflink_observed'],
+                }
+            )
+        result = summarize(samples)
+        distribution = result['distributions']['workspace_ready_seconds']
+        self.assertEqual(result['successful_samples'], 4)
+        self.assertEqual(result['failed_samples'], 1)
+        self.assertEqual(distribution['p50'], 2.5)
+        self.assertAlmostEqual(distribution['p90'], 3.7)
+        self.assertAlmostEqual(distribution['p99'], 3.97)
+        self.assertEqual(
+            result['observed_import_mechanism_sample_counts'],
+            {'reflink_observed': 4},
+        )
+
+    def test_worktree_cleanup_accepts_only_exact_unregistered_target(self) -> None:
+        remove = NAMESPACE['remove_worktree']
+        BenchmarkError = NAMESPACE['BenchmarkError']
+        failed_remove = SimpleNamespace(returncode=128, stdout=b'')
+        absent = SimpleNamespace(
+            returncode=0,
+            stdout=b'worktree /different\0HEAD 0000\0\0',
+        )
+        with mock.patch.object(
+            remove.__globals__['subprocess'],
+            'run',
+            side_effect=(failed_remove, absent),
+        ):
+            remove(Path('/repository'), Path('/target'))
+
+        present = SimpleNamespace(
+            returncode=0,
+            stdout=b'worktree /target\0HEAD 0000\0\0',
+        )
+        with mock.patch.object(
+            remove.__globals__['subprocess'],
+            'run',
+            side_effect=(failed_remove, present),
+        ):
+            with self.assertRaises(BenchmarkError):
+                remove(Path('/repository'), Path('/target'))
+
+    def test_cohort_interruption_terminates_process_group_before_reraising(self) -> None:
+        run_cohort = NAMESPACE['run_cohort']
+        process_group_exists = NAMESPACE['process_group_exists']
+        real_sleep = time.sleep
+        interrupted = False
+        process_group_ids: list[int] = []
+        real_terminate = run_cohort.__globals__['terminate_processes']
+
+        def interrupt_once(seconds: float) -> None:
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            real_sleep(seconds)
+
+        def terminate(processes: list[object]) -> None:
+            process_group_ids.extend(process.pid for process in processes)
+            real_terminate(processes)
+
+        with mock.patch.object(
+            run_cohort.__globals__['time'],
+            'sleep',
+            side_effect=interrupt_once,
+        ), mock.patch.dict(
+            run_cohort.__globals__,
+            {'terminate_processes': terminate},
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                run_cohort(
+                    [(Path('/tmp'), ['/usr/bin/python3', '-c', 'import time; time.sleep(60)'])],
+                    env={
+                        'PATH': '/usr/bin:/bin',
+                        'LANG': 'C.UTF-8',
+                        'LC_ALL': 'C.UTF-8',
+                    },
+                    deadline_seconds=60,
+                )
+
+        self.assertTrue(process_group_ids)
+        self.assertTrue(all(not process_group_exists(pid) for pid in process_group_ids))
+
+    def test_cohort_deadline_owns_and_terminates_process_group(self) -> None:
+        run_cohort = NAMESPACE['run_cohort']
+        program = (
+            'import signal,time;'
+            'signal.signal(signal.SIGTERM,signal.SIG_IGN);'
+            'time.sleep(60)'
+        )
+        started = time.monotonic()
+        with mock.patch.dict(
+            run_cohort.__globals__,
+            {
+                'PROCESS_GROUP_TERM_GRACE_SECONDS': 0.05,
+                'PROCESS_GROUP_KILL_GRACE_SECONDS': 1.0,
+                'PROCESS_GROUP_POLL_SECONDS': 0.01,
+            },
+        ):
+            result = run_cohort(
+                [(Path('/tmp'), ['/usr/bin/python3', '-c', program])],
+                env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'},
+                deadline_seconds=0.05,
+            )
+        self.assertTrue(result['deadline_exceeded'])
+        self.assertGreaterEqual(result['failure_count'], 1)
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_leader_first_descendant_is_detected_and_killed(self) -> None:
+        run_cohort = NAMESPACE['run_cohort']
+        descendant = (
+            'import signal,time;'
+            'signal.signal(signal.SIGTERM,signal.SIG_IGN);'
+            'time.sleep(60)'
+        )
+        leader = (
+            'import subprocess;'
+            "subprocess.Popen(['/usr/bin/python3','-c'," + repr(descendant) + ']);'
+        )
+        with mock.patch.dict(
+            run_cohort.__globals__,
+            {
+                'PROCESS_GROUP_TERM_GRACE_SECONDS': 0.05,
+                'PROCESS_GROUP_KILL_GRACE_SECONDS': 1.0,
+                'PROCESS_GROUP_POLL_SECONDS': 0.01,
+            },
+        ):
+            result = run_cohort(
+                [(Path('/tmp'), ['/usr/bin/python3', '-c', leader])],
+                env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'},
+                deadline_seconds=1,
+            )
+        self.assertEqual(result['surviving_process_groups_detected'], 1)
+        self.assertGreaterEqual(result['failure_count'], 1)
+
+
+if __name__ == '__main__':
+    unittest.main()
+)
+        self.assertRegex(
+            evidence['private_copy_path_set_sha256'],
+            r'^sha256:[0-9a-f]{64}
+        validate = NAMESPACE['validate_mechanisms']
+        BenchmarkError = NAMESPACE['BenchmarkError']
+
+        def evidence(
+            mechanism: str,
+            hardlinks: int = 0,
+            *,
+            sampled: int = 100,
+            fiemap_observed: int = 100,
+            shared: int = 100,
+        ) -> dict[str, object]:
+            return {
+                'usage': {
+                    'regular_file_count': 10,
+                    'multiply_linked_regular_file_count': hardlinks,
+                },
+                'sample': {
+                    'mechanism': mechanism,
+                    'sampled_regular_files': sampled,
+                    'fiemap_observed_files': fiemap_observed,
+                    'shared_extent_files': shared,
+                },
+            }
+
+        reflink = [evidence('reflink_observed') for _ in range(8)]
+        mixed = [
+            evidence('mixed_private_copy_and_reflink_observed', shared=95)
+            for _ in range(8)
+        ]
+        weak_mixed = [
+            evidence('mixed_private_copy_and_reflink_observed', shared=94)
+            for _ in range(8)
+        ]
+        unproven = [
+            evidence(
+                'physical_mechanism_unproven',
+                fiemap_observed=99,
+                shared=99,
+            )
+            for _ in range(8)
+        ]
+        hardlink = [
+            evidence('hardlink_observed', hardlinks=10, shared=0)
+            for _ in range(8)
+        ]
+        copy = [evidence('copy_observed', shared=0) for _ in range(8)]
+        self.assertEqual(validate('clone', reflink), {'reflink_observed'})
+        self.assertEqual(
+            validate('clone', mixed),
+            {'mixed_private_copy_and_reflink_observed'},
+        )
+        self.assertEqual(validate('hardlink', hardlink), {'hardlink_observed'})
+        self.assertEqual(validate('auto', copy), {'copy_observed'})
+        with self.assertRaises(BenchmarkError):
+            validate('clone', weak_mixed)
+        with self.assertRaises(BenchmarkError):
+            validate('clone', unproven)
+        with self.assertRaises(BenchmarkError):
+            validate('clone', reflink[:-1] + hardlink[:1])
+        with self.assertRaises(BenchmarkError):
+            validate('hardlink', hardlink[:-1] + copy[:1])
+
+        hidden_hardlink = evidence('reflink_observed', hardlinks=1)
+        self.assertEqual(
+            validate('auto', reflink[:-1] + [hidden_hardlink]),
+            {'reflink_observed', 'hardlink_observed'},
+        )
+        with self.assertRaises(BenchmarkError):
+            validate('clone', reflink[:-1] + [hidden_hardlink])
+
+    def test_ready_boundary_proves_git_before_first_command(self) -> None:
+        measure_once = NAMESPACE['measure_once']
+        events: list[str] = []
+        with tempfile.TemporaryDirectory() as source_text, tempfile.TemporaryDirectory() as scratch_text:
+            source = Path(source_text)
+            scratch = Path(scratch_text)
+            store = scratch / 'store'
+            store.mkdir()
+            plan = NAMESPACE['Plan'](
+                source=source,
+                scratch_root=scratch,
+                pnpm=Path('/pnpm'),
+                fanout=1,
+                import_method='clone',
+                repetitions=1,
+                deadline_seconds=60,
+                probe_script=None,
+            )
+            identity = {'commit': '1' * 40, 'tree': '2' * 40}
+            pnpm = {'store': store, 'environment': {}}
+            filesystem = {
+                'mount_id': '1',
+                'device_major': 1,
+                'device_minor': 2,
+                'findmnt_device': '1:2',
+                'filesystem_type': 'xfs',
+                'fragment_size_bytes': 4096,
+                'available_bytes': 1_000_000,
+                'available_inodes': 10_000,
+            }
+
+            def observe(_path: Path) -> dict[str, object]:
+                events.append('filesystem')
+                return dict(filesystem)
+
+            def capacity(_path: Path, _baseline: dict[str, object]) -> dict[str, object]:
+                events.append('capacity')
+                return dict(filesystem)
+
+            def add(_source: Path, target: Path, _commit: str) -> None:
+                events.append('worktree')
+                target.mkdir()
+                (target / 'node_modules').mkdir()
+
+            def cohort(commands: object, **_kwargs: object) -> dict[str, object]:
+                command_list = list(commands)
+                action = command_list[0][1][1]
+                events.append(action)
+                return {
+                    'elapsed_seconds': 0.01,
+                    'process_count': 1,
+                    'maximum_simultaneous_observed': 1,
+                    'failure_count': 0,
+                    'deadline_exceeded': False,
+                    'surviving_process_groups_detected': 0,
+                }
+
+            def prove(_task: Path, _commit: str, _tree: str) -> None:
+                events.append('git-proof')
+
+            def physical(_node_modules: Path) -> dict[str, object]:
+                events.append('physical')
+                return {
+                    'sampled_regular_files': 1,
+                    'hardlinked_files': 0,
+                    'fiemap_observed_files': 1,
+                    'shared_extent_files': 1,
+                    'mechanism': 'reflink_observed',
+                }
+
+            def remove(_source: Path, target: Path) -> None:
+                events.append('remove')
+                (target / 'node_modules').rmdir()
+                target.rmdir()
+
+            with mock.patch.dict(
+                measure_once.__globals__,
+                {
+                    'filesystem_observation': observe,
+                    'filesystem_capacity_observation': capacity,
+                    'add_worktree': add,
+                    'run_cohort': cohort,
+                    'prove_task_git': prove,
+                    'tree_usage': lambda _root: {
+                        'logical_bytes': 1,
+                        'allocated_bytes': 4096,
+                        'inode_count': 1,
+                        'regular_file_count': 1,
+                        'multiply_linked_regular_file_count': 0,
+                    },
+                    'sample_physical_mechanism': physical,
+                    'remove_worktree': remove,
+                    'rusage_snapshot': lambda: (0.0, 0.0),
+                },
+            ):
+                sample = measure_once(plan, identity, pnpm, 1)
+
+        self.assertEqual(sample['result'], 'succeeded')
+        self.assertLess(events.index('git-proof'), events.index('capacity'))
+        self.assertLess(events.index('capacity'), events.index('list'))
+        self.assertLess(events.index('list'), events.index('physical'))
+        self.assertIsNotNone(sample['readiness_verification_seconds'])
+        self.assertIsNotNone(sample['ready_storage_observation_seconds'])
+        self.assertLessEqual(
+            sample['workspace_ready_seconds'],
+            sample['task_known_to_first_command_start_seconds'],
+        )
+        self.assertIn('filesystem_available_space_delta_at_ready_bytes', sample)
+        self.assertIn('filesystem_available_space_delta_during_cleanup_bytes', sample)
+        self.assertEqual(sample['node_modules_st_blocks_bytes'], 4096)
+        self.assertNotIn('physical_byte_delta_at_ready', sample)
+
+    def test_partial_worktree_registration_attempt_is_cleanup_owned(self) -> None:
+        measure_once = NAMESPACE['measure_once']
+        events: list[str] = []
+        with tempfile.TemporaryDirectory() as source_text, tempfile.TemporaryDirectory() as scratch_text:
+            source = Path(source_text)
+            scratch = Path(scratch_text)
+            store = scratch / 'store'
+            store.mkdir()
+            plan = NAMESPACE['Plan'](
+                source=source,
+                scratch_root=scratch,
+                pnpm=Path('/pnpm'),
+                fanout=1,
+                import_method='clone',
+                repetitions=1,
+                deadline_seconds=60,
+                probe_script=None,
+            )
+            identity = {'commit': '1' * 40, 'tree': '2' * 40}
+            pnpm = {'store': store, 'environment': {}}
+            filesystem = {
+                'mount_id': '1',
+                'device_major': 1,
+                'device_minor': 2,
+                'findmnt_device': '1:2',
+                'filesystem_type': 'xfs',
+                'fragment_size_bytes': 4096,
+                'available_bytes': 1_000_000,
+                'available_inodes': 10_000,
+            }
+
+            def add(_source: Path, target: Path, _commit: str) -> None:
+                events.append('add')
+                target.mkdir()
+                raise NAMESPACE['BenchmarkError']('partial_registration')
+
+            def remove(_source: Path, target: Path) -> None:
+                events.append('remove')
+                if target.exists():
+                    target.rmdir()
+
+            with mock.patch.dict(
+                measure_once.__globals__,
+                {
+                    'filesystem_observation': lambda _path: dict(filesystem),
+                    'add_worktree': add,
+                    'remove_worktree': remove,
+                    'rusage_snapshot': lambda: (0.0, 0.0),
+                },
+            ):
+                sample = measure_once(plan, identity, pnpm, 1)
+
+        self.assertEqual(sample['result'], 'failed')
+        self.assertEqual(sample['failure'], 'partial_registration')
+        self.assertEqual(events, ['add', 'remove'])
+
+    def test_summary_publishes_p50_p90_p99_from_successful_samples_only(self) -> None:
+        summarize = NAMESPACE['summarize']
+        samples = []
+        for ordinal, value in enumerate((1.0, 2.0, 3.0, 4.0, 100.0), 1):
+            samples.append(
+                {
+                    'ordinal': ordinal,
+                    'result': 'succeeded' if ordinal < 5 else 'failed',
+                    'workspace_ready_seconds': value,
+                    'observed_import_mechanisms': ['reflink_observed'],
+                }
+            )
+        result = summarize(samples)
+        distribution = result['distributions']['workspace_ready_seconds']
+        self.assertEqual(result['successful_samples'], 4)
+        self.assertEqual(result['failed_samples'], 1)
+        self.assertEqual(distribution['p50'], 2.5)
+        self.assertAlmostEqual(distribution['p90'], 3.7)
+        self.assertAlmostEqual(distribution['p99'], 3.97)
+        self.assertEqual(
+            result['observed_import_mechanism_sample_counts'],
+            {'reflink_observed': 4},
+        )
+
+    def test_worktree_cleanup_accepts_only_exact_unregistered_target(self) -> None:
+        remove = NAMESPACE['remove_worktree']
+        BenchmarkError = NAMESPACE['BenchmarkError']
+        failed_remove = SimpleNamespace(returncode=128, stdout=b'')
+        absent = SimpleNamespace(
+            returncode=0,
+            stdout=b'worktree /different\0HEAD 0000\0\0',
+        )
+        with mock.patch.object(
+            remove.__globals__['subprocess'],
+            'run',
+            side_effect=(failed_remove, absent),
+        ):
+            remove(Path('/repository'), Path('/target'))
+
+        present = SimpleNamespace(
+            returncode=0,
+            stdout=b'worktree /target\0HEAD 0000\0\0',
+        )
+        with mock.patch.object(
+            remove.__globals__['subprocess'],
+            'run',
+            side_effect=(failed_remove, present),
+        ):
+            with self.assertRaises(BenchmarkError):
+                remove(Path('/repository'), Path('/target'))
+
+    def test_cohort_interruption_terminates_process_group_before_reraising(self) -> None:
+        run_cohort = NAMESPACE['run_cohort']
+        process_group_exists = NAMESPACE['process_group_exists']
+        real_sleep = time.sleep
+        interrupted = False
+        process_group_ids: list[int] = []
+        real_terminate = run_cohort.__globals__['terminate_processes']
+
+        def interrupt_once(seconds: float) -> None:
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            real_sleep(seconds)
+
+        def terminate(processes: list[object]) -> None:
+            process_group_ids.extend(process.pid for process in processes)
+            real_terminate(processes)
+
+        with mock.patch.object(
+            run_cohort.__globals__['time'],
+            'sleep',
+            side_effect=interrupt_once,
+        ), mock.patch.dict(
+            run_cohort.__globals__,
+            {'terminate_processes': terminate},
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                run_cohort(
+                    [(Path('/tmp'), ['/usr/bin/python3', '-c', 'import time; time.sleep(60)'])],
+                    env={
+                        'PATH': '/usr/bin:/bin',
+                        'LANG': 'C.UTF-8',
+                        'LC_ALL': 'C.UTF-8',
+                    },
+                    deadline_seconds=60,
+                )
+
+        self.assertTrue(process_group_ids)
+        self.assertTrue(all(not process_group_exists(pid) for pid in process_group_ids))
+
+    def test_cohort_deadline_owns_and_terminates_process_group(self) -> None:
+        run_cohort = NAMESPACE['run_cohort']
+        program = (
+            'import signal,time;'
+            'signal.signal(signal.SIGTERM,signal.SIG_IGN);'
+            'time.sleep(60)'
+        )
+        started = time.monotonic()
+        with mock.patch.dict(
+            run_cohort.__globals__,
+            {
+                'PROCESS_GROUP_TERM_GRACE_SECONDS': 0.05,
+                'PROCESS_GROUP_KILL_GRACE_SECONDS': 1.0,
+                'PROCESS_GROUP_POLL_SECONDS': 0.01,
+            },
+        ):
+            result = run_cohort(
+                [(Path('/tmp'), ['/usr/bin/python3', '-c', program])],
+                env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'},
+                deadline_seconds=0.05,
+            )
+        self.assertTrue(result['deadline_exceeded'])
+        self.assertGreaterEqual(result['failure_count'], 1)
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_leader_first_descendant_is_detected_and_killed(self) -> None:
+        run_cohort = NAMESPACE['run_cohort']
+        descendant = (
+            'import signal,time;'
+            'signal.signal(signal.SIGTERM,signal.SIG_IGN);'
+            'time.sleep(60)'
+        )
+        leader = (
+            'import subprocess;'
+            "subprocess.Popen(['/usr/bin/python3','-c'," + repr(descendant) + ']);'
+        )
+        with mock.patch.dict(
+            run_cohort.__globals__,
+            {
+                'PROCESS_GROUP_TERM_GRACE_SECONDS': 0.05,
+                'PROCESS_GROUP_KILL_GRACE_SECONDS': 1.0,
+                'PROCESS_GROUP_POLL_SECONDS': 0.01,
+            },
+        ):
+            result = run_cohort(
+                [(Path('/tmp'), ['/usr/bin/python3', '-c', leader])],
+                env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'},
+                deadline_seconds=1,
+            )
+        self.assertEqual(result['surviving_process_groups_detected'], 1)
+        self.assertGreaterEqual(result['failure_count'], 1)
+
+
+if __name__ == '__main__':
+    unittest.main()
+,
+        )
+        self.assertEqual(evidence['private_copy_diagnostics'], [])
         self.assertEqual(evidence['shared_extent_percent'], 100.0)
         self.assertEqual(evidence['mechanism'], 'reflink_observed')
+
+    def test_physical_sample_is_deterministic_and_hashes_private_copy_paths(self) -> None:
+        sample = NAMESPACE['sample_physical_mechanism']
+        with tempfile.TemporaryDirectory() as root_text:
+            node_modules = Path(root_text) / 'node_modules'
+            package = node_modules / '.pnpm' / 'pkg@1.0.0' / 'node_modules' / 'pkg'
+            package.mkdir(parents=True)
+            late = package / 'z.js'
+            early = package / 'a.js'
+            late.write_bytes(b'late')
+            early.write_bytes(b'early')
+            with (
+                mock.patch.dict(
+                    sample.__globals__,
+                    {
+                        'fiemap_has_shared_extent': lambda _path: False,
+                        'MAX_SAMPLE_FILES': 1,
+                    },
+                ),
+            ):
+                evidence = sample(node_modules)
+
+        expected_relative = '.pnpm/pkg@1.0.0/node_modules/pkg/a.js'
+        expected_digest = 'sha256:' + hashlib.sha256(
+            expected_relative.encode('utf-8')
+        ).hexdigest()
+        self.assertEqual(evidence['sampled_regular_files'], 1)
+        self.assertEqual(evidence['private_copy_files'], 1)
+        self.assertEqual(
+            evidence['private_copy_diagnostics'],
+            [{'path_sha256': expected_digest, 'bytes': len(b'early')}],
+        )
+        self.assertNotIn(expected_relative, json.dumps(evidence))
 
     def test_explicit_import_methods_require_per_task_physical_proof(self) -> None:
         validate = NAMESPACE['validate_mechanisms']
