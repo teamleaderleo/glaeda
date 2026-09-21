@@ -63,6 +63,7 @@ HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION = 2
 HOT_STATE_VALUE_CATALOG_PRODUCER = "glaeda-hot-run-value-catalog-v2"
 HOT_STATE_VALUE_CATALOG_V1_SCHEMA_VERSION = 1
 HOT_STATE_VALUE_CATALOG_V1_PRODUCER = "glaeda-hot-run-value-catalog-v1"
+HOT_STATE_VALUE_CATALOG_V1_MAX_STATES = 256
 HOT_STATE_VALUE_RECORDS = ".value-records-v2"
 HOT_STATE_VALUE_RECORD_SCHEMA_VERSION = 1
 HOT_STATE_VALUE_RECORD_PRODUCER = "glaeda-hot-run-value-record-v1"
@@ -1619,6 +1620,7 @@ def validate_hot_state_value_catalog_v1(document: object) -> dict[str, object]:
         or not isinstance(sequence, int)
         or sequence < 0
         or not isinstance(states, dict)
+        or len(states) > HOT_STATE_VALUE_CATALOG_V1_MAX_STATES
     ):
         raise RuntimeError("hot-state v1 value catalog identity is not accepted")
     for state_identity, record in states.items():
@@ -2188,9 +2190,44 @@ def migrate_hot_state_value_catalog_v1(
     assert isinstance(sequence, int)
     assert isinstance(states, dict)
     ensure_hot_state_value_records_root(namespace_root)
-    for state_identity, fields in states.items():
+    validate_hot_state_value_tickets_root(namespace_root, create=True)
+
+    ordered = sorted(
+        states.items(),
+        key=lambda item: (
+            int(item[1]["last_successful_use_sequence"]),
+            item[0],
+        ),
+    )
+    for ticket_sequence, (state_identity, legacy_fields) in enumerate(
+        ordered, start=1
+    ):
         assert isinstance(state_identity, str)
-        assert isinstance(fields, dict)
+        assert isinstance(legacy_fields, dict)
+        fields = {
+            **legacy_fields,
+            "value_ticket_sequence": ticket_sequence,
+        }
+        expected_ticket = value_ticket_document(
+            ticket_sequence,
+            state_identity,
+            int(legacy_fields["last_successful_use_sequence"]),
+        )
+        observed_ticket = read_hot_state_value_ticket(
+            namespace_root, ticket_sequence
+        )
+        if observed_ticket is None:
+            write_hot_state_value_ticket(
+                namespace_root,
+                ticket_sequence,
+                state_identity,
+                int(legacy_fields["last_successful_use_sequence"]),
+            )
+        elif canonical_hot_state_value_ticket_bytes(observed_ticket) != (
+            canonical_hot_state_value_ticket_bytes(expected_ticket)
+        ):
+            raise RuntimeError("hot-state v1 migration conflicts with value ticket")
+
         existing = read_hot_state_value_record(namespace_root, state_identity)
         expected = hot_state_value_record_document(state_identity, fields)
         if existing is None:
@@ -2199,6 +2236,7 @@ def migrate_hot_state_value_catalog_v1(
             canonical_hot_state_value_record_bytes(expected)
         ):
             raise RuntimeError("hot-state v1 migration conflicts with value record")
+
     migrated = {
         "schema_version": HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION,
         "producer": HOT_STATE_VALUE_CATALOG_PRODUCER,
@@ -2206,6 +2244,8 @@ def migrate_hot_state_value_catalog_v1(
         "retire_start_used_percent": HOT_STATE_RETIRE_START_USED_PERCENT,
         "retire_stop_used_percent": HOT_STATE_RETIRE_STOP_USED_PERCENT,
         "next_use_sequence": sequence,
+        "next_value_ticket_sequence": len(ordered),
+        "value_cursor_ticket_sequence": 0,
     }
     write_hot_state_value_catalog(namespace_root, migrated)
     return migrated
