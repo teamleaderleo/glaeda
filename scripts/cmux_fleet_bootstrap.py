@@ -51,10 +51,15 @@ def digest_file(path: Path) -> str:
     return "sha256:" + h.hexdigest()
 
 
-def run(argv: list[str], timeout: int = 10) -> str:
+def run(
+    argv: list[str],
+    timeout: int = 10,
+    cwd: Path | None = None,
+) -> str:
     result = subprocess.run(
         argv,
         check=False,
+        cwd=cwd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -106,6 +111,74 @@ def mac_sleep_disabled_on_ac(raw: str) -> bool:
     return False
 
 
+def cmux_checkout_clean(root: Path) -> bool:
+    return (
+        run(
+            [
+                executable("git"),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            cwd=root,
+        )
+        == ""
+    )
+
+
+def cmux_submodules_ready(root: Path) -> bool:
+    output = run(
+        [executable("git"), "submodule", "status", "--recursive"],
+        cwd=root,
+    )
+    lines = [line for line in output.splitlines() if line]
+    return bool(lines) and all(line[0] == " " for line in lines)
+
+
+def cmux_required_zig_version(root: Path) -> str:
+    manifest = root / "ghostty/build.zig.zon"
+    match = re.search(
+        r'^\s*\.minimum_zig_version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"',
+        manifest.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if match is None:
+        raise BootstrapError("Ghostty minimum Zig version is unavailable")
+    return match.group(1)
+
+
+def zig_version_compatible(actual: str, required: str) -> bool:
+    def parse(value: str) -> tuple[int, int, int] | None:
+        core = re.split(r"[-+]", value, maxsplit=1)[0]
+        match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", core)
+        if match is None:
+            return None
+        return tuple(int(part) for part in match.groups())
+
+    actual_parts = parse(actual)
+    required_parts = parse(required)
+    return bool(
+        actual_parts
+        and required_parts
+        and actual_parts[:2] == required_parts[:2]
+        and actual_parts[2] >= required_parts[2]
+    )
+
+
+def cmux_diff_rust_toolchain(root: Path) -> str:
+    content = (root / "Native/DiffSidecar/rust-toolchain.toml").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(
+        r'^\s*channel\s*=\s*"([^"]+)"',
+        content,
+        re.MULTILINE,
+    )
+    if match is None:
+        raise BootstrapError("CMUX DiffSidecar Rust toolchain is unavailable")
+    return match.group(1)
+
+
 def collect_macos(
     cmux_root: Path,
     glaeda: Path,
@@ -122,8 +195,19 @@ def collect_macos(
     major = int(match.group(1))
     pin = (cmux_root / ".xcode-version").read_text(encoding="utf-8").strip()
     xcode = run([executable("xcodebuild"), "-version"])
-    sdk = run([executable("xcrun"), "--sdk", "macosx", "--show-sdk-version"])
+    xcrun = executable("xcrun")
+    sdk = run([xcrun, "--sdk", "macosx", "--show-sdk-version"])
+    metal = run([xcrun, "metal", "--version"])
     git = run([executable("git"), "--version"])
+    zig = run([executable("zig"), "version"])
+    zig_required = cmux_required_zig_version(cmux_root)
+    rustup = executable("rustup")
+    rustup_version = run([rustup, "--version"])
+    cargo = run([executable("cargo"), "--version"])
+    rustc = run([executable("rustc"), "--version"])
+    diff_rust = cmux_diff_rust_toolchain(cmux_root)
+    diff_cargo = run([rustup, "run", diff_rust, "cargo", "--version"])
+    diff_rustc = run([rustup, "run", diff_rust, "rustc", "--version"])
     pmset = run([executable("pmset"), "-g", "custom"])
     xcode_match = re.search(r"^Xcode\s+(\d+(?:\.\d+)*)$", xcode, re.MULTILINE)
     sdk_match = re.fullmatch(r"(\d+)(?:\.\d+)*", sdk)
@@ -132,6 +216,15 @@ def collect_macos(
         "xcodeVersion": xcode_match.group(1) if xcode_match else "unknown",
         "macosSdkVersion": sdk,
         "gitVersion": git,
+        "metalVersion": metal,
+        "zigVersion": zig,
+        "zigRequired": zig_required,
+        "rustupVersion": rustup_version,
+        "cargoVersion": cargo,
+        "rustcVersion": rustc,
+        "diffRustToolchain": diff_rust,
+        "diffCargoVersion": diff_cargo,
+        "diffRustcVersion": diff_rustc,
     }
     free_gib = disk_free_gib(cmux_root)
     cache_required = cache_root is not None
@@ -159,6 +252,14 @@ def collect_macos(
             ),
             "cmuxCheckout": (cmux_root / ".git").exists()
             and (cmux_root / ".xcode-version").is_file(),
+            "canonicalCheckoutClean": cmux_checkout_clean(cmux_root),
+            "submodulesReady": cmux_submodules_ready(cmux_root),
+            "cmuxSetupArtifacts": (
+                (cmux_root / "ghostty/include/ghostty.h").is_file()
+                and (
+                    cmux_root / "ghostty/macos/GhosttyKit.xcframework"
+                ).is_dir()
+            ),
             "xcodePin": bool(
                 xcode_match
                 and sdk_match
@@ -167,6 +268,15 @@ def collect_macos(
                 and int(sdk_match.group(1)) == 26
             ),
             "git": git.startswith("git version "),
+            "zig": zig_version_compatible(zig, zig_required),
+            "rust": (
+                rustup_version.startswith("rustup ")
+                and cargo.startswith("cargo ")
+                and rustc.startswith("rustc ")
+                and diff_cargo.startswith("cargo ")
+                and diff_rustc.startswith("rustc ")
+            ),
+            "metalToolchain": bool(metal),
             "glaedaExecutable": glaeda.is_file() and os.access(glaeda, os.X_OK),
             "diskAdmission": free_gib >= min_free_gib,
             "nativeCacheRoot": (not cache_required) or cache_ready,
@@ -293,6 +403,7 @@ def collect_linux(
                 total_gib,
             ),
             "cmuxCheckout": (cmux_root / ".git").exists(),
+            "canonicalCheckoutClean": cmux_checkout_clean(cmux_root),
             "git": git.startswith("git version "),
             "glaedaExecutable": glaeda.is_file() and os.access(glaeda, os.X_OK),
             "systemd": systemd.startswith("systemd "),
