@@ -18,7 +18,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use rustix::fs::{Mode, OFlags, fcntl_getfl, fcntl_setfl};
+use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+#[cfg(target_os = "linux")]
+use rustix::fs::Mode;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 #[cfg(unix)]
