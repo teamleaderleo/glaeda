@@ -447,7 +447,8 @@ class VerifyFocusedTests(unittest.TestCase):
             original_mtime = path.stat().st_mtime_ns
             for reconcile_only in (False, True):
                 arguments = mock.Mock(
-                admission_root=None,
+                    semantic_request_id=None,
+                    admission_root=None,
                     repository_root=str(root / "repository"), state_root=str(root / "state"),
                     cargo_root=str(root / "cargo"), rustup_root=str(root / "rustup"),
                     repository=request.repository, commit=request.commit, tree=request.tree,
@@ -553,6 +554,7 @@ class VerifyFocusedTests(unittest.TestCase):
             for name in ("repository", "cargo", "rustup"):
                 (root / name).mkdir()
             arguments = mock.Mock(
+                semantic_request_id=None,
                 admission_root=None,
                 repository_root=str(root / "repository"),
                 state_root=str(root / "state"),
