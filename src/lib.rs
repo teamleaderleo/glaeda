@@ -265,6 +265,12 @@ pub mod operator_remediation;
 pub mod operator_status;
 /// Typed, read-only aggregation of one coherent operator status evidence bundle.
 pub mod operator_status_service;
+/// Canonical controller enrollment for one trusted native-Linux GitHub Actions JIT worker.
+#[cfg(target_os = "linux")]
+pub mod owned_linux_jit_enrollment;
+/// Native owned-Linux task backend for one trusted GitHub Actions JIT runner.
+#[cfg(unix)]
+pub(crate) mod owned_linux_jit_runtime;
 pub mod ownership;
 /// Pure composition of durable queue, Lima lifecycle, and runner-readiness evidence.
 pub mod personal_worker_host_broker;
