@@ -132,59 +132,59 @@ jobs:
             printf '%s\n' "$rc" > "$rc_file"
 
             python3 - "$output" "$fs" "$mode" "$width" "$REPS" "$rc" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-filesystem = sys.argv[2]
-mode = sys.argv[3]
-width = int(sys.argv[4])
-repetitions = int(sys.argv[5])
-rc = int(sys.argv[6])
-
-if not path.is_file():
-    raise SystemExit(f"missing report for {filesystem}/{mode}/w{width}, rc={rc}")
-
-report = json.loads(path.read_text(encoding="utf-8"))
-if report["fanout"] != width or report["import_method"] != mode:
-    raise SystemExit("report treatment identity mismatch")
-if report["repetitions"] != repetitions:
-    raise SystemExit("report repetition identity mismatch")
-if report["source"]["commit"] != "4babfd97df26089186538479b02c994fcad73635":
-    raise SystemExit("source commit mismatch")
-if not report["pnpm"]["store_device_matches_task_scratch"]:
-    raise SystemExit("resident store is not on task scratch device")
-
-for sample in report["samples"]:
-    observed_fs = sample["filesystem_before"]["filesystem_type"]
-    if observed_fs != filesystem:
-        raise SystemExit(f"filesystem mismatch: expected {filesystem}, got {observed_fs}")
-
-if filesystem == "xfs":
-    if report["result"] != "succeeded" or rc != 0:
-        raise SystemExit(f"XFS treatment failed: {mode}/w{width}")
-    if mode == "clone":
-        if report["summary"]["successful_samples"] != repetitions:
-            raise SystemExit("XFS clone lacks complete successful sample set")
-        for sample in report["samples"]:
-            if sample["first_relevant_script_seconds"] is None:
-                raise SystemExit("XFS clone did not execute the reviewed repository probe")
-            for task in sample["task_dependency_evidence"]:
-                if task["usage"]["multiply_linked_regular_file_count"] != 0:
-                    raise SystemExit("XFS clone contains hardlinked dependency files")
-                if task["sample"]["mechanism"] != "reflink_observed":
-                    raise SystemExit("XFS clone lacks per-task reflink evidence")
-else:
-    if mode in {"auto", "hardlink"}:
-        if report["result"] != "succeeded" or rc != 0:
-            raise SystemExit(f"ext4 control failed: {mode}/w{width}")
-    elif mode == "clone":
-        if report["result"] != "failed" or rc != 1:
-            raise SystemExit("ext4 clone control unexpectedly satisfied reflink treatment")
-        if any(sample["first_relevant_script_seconds"] is not None for sample in report["samples"]):
-            raise SystemExit("ext4 clone executed repository code before CoW proof")
-PY
+          import json
+          import sys
+          from pathlib import Path
+          
+          path = Path(sys.argv[1])
+          filesystem = sys.argv[2]
+          mode = sys.argv[3]
+          width = int(sys.argv[4])
+          repetitions = int(sys.argv[5])
+          rc = int(sys.argv[6])
+          
+          if not path.is_file():
+              raise SystemExit(f"missing report for {filesystem}/{mode}/w{width}, rc={rc}")
+          
+          report = json.loads(path.read_text(encoding="utf-8"))
+          if report["fanout"] != width or report["import_method"] != mode:
+              raise SystemExit("report treatment identity mismatch")
+          if report["repetitions"] != repetitions:
+              raise SystemExit("report repetition identity mismatch")
+          if report["source"]["commit"] != "4babfd97df26089186538479b02c994fcad73635":
+              raise SystemExit("source commit mismatch")
+          if not report["pnpm"]["store_device_matches_task_scratch"]:
+              raise SystemExit("resident store is not on task scratch device")
+          
+          for sample in report["samples"]:
+              observed_fs = sample["filesystem_before"]["filesystem_type"]
+              if observed_fs != filesystem:
+                  raise SystemExit(f"filesystem mismatch: expected {filesystem}, got {observed_fs}")
+          
+          if filesystem == "xfs":
+              if report["result"] != "succeeded" or rc != 0:
+                  raise SystemExit(f"XFS treatment failed: {mode}/w{width}")
+              if mode == "clone":
+                  if report["summary"]["successful_samples"] != repetitions:
+                      raise SystemExit("XFS clone lacks complete successful sample set")
+                  for sample in report["samples"]:
+                      if sample["first_relevant_script_seconds"] is None:
+                          raise SystemExit("XFS clone did not execute the reviewed repository probe")
+                      for task in sample["task_dependency_evidence"]:
+                          if task["usage"]["multiply_linked_regular_file_count"] != 0:
+                              raise SystemExit("XFS clone contains hardlinked dependency files")
+                          if task["sample"]["mechanism"] != "reflink_observed":
+                              raise SystemExit("XFS clone lacks per-task reflink evidence")
+          else:
+              if mode in {"auto", "hardlink"}:
+                  if report["result"] != "succeeded" or rc != 0:
+                      raise SystemExit(f"ext4 control failed: {mode}/w{width}")
+              elif mode == "clone":
+                  if report["result"] != "failed" or rc != 1:
+                      raise SystemExit("ext4 clone control unexpectedly satisfied reflink treatment")
+                  if any(sample["first_relevant_script_seconds"] is not None for sample in report["samples"]):
+                      raise SystemExit("ext4 clone executed repository code before CoW proof")
+          PY
           }
 
           for fs in ext4 xfs; do
@@ -266,29 +266,29 @@ PY
           set -euo pipefail
           if compgen -G 'receipts/*.json' > /dev/null; then
             python3 - <<'PY'
-import json
-from pathlib import Path
-
-for path in sorted(Path("receipts").glob("*.json")):
-    report = json.loads(path.read_text(encoding="utf-8"))
-    summary = report["summary"]
-    distributions = summary.get("distributions", {})
-    ready = distributions.get("workspace_ready_seconds", {})
-    first = distributions.get("task_known_to_first_command_complete_seconds", {})
-    probe = distributions.get("task_known_to_first_relevant_script_complete_seconds", {})
-    blocks = distributions.get("node_modules_st_blocks_bytes", {})
-    print(
-        path.name,
-        "result=", report["result"],
-        "successful=", summary.get("successful_samples"),
-        "failed=", summary.get("failed_samples"),
-        "mechanisms=", summary.get("observed_import_mechanism_sample_counts"),
-        "ready_p50/p90/p99=", (ready.get("p50"), ready.get("p90"), ready.get("p99")),
-        "first_p50/p90/p99=", (first.get("p50"), first.get("p90"), first.get("p99")),
-        "probe_p50/p90/p99=", (probe.get("p50"), probe.get("p90"), probe.get("p99")),
-        "st_blocks_p50/p90/p99=", (blocks.get("p50"), blocks.get("p90"), blocks.get("p99")),
-    )
-PY
+          import json
+          from pathlib import Path
+          
+          for path in sorted(Path("receipts").glob("*.json")):
+              report = json.loads(path.read_text(encoding="utf-8"))
+              summary = report["summary"]
+              distributions = summary.get("distributions", {})
+              ready = distributions.get("workspace_ready_seconds", {})
+              first = distributions.get("task_known_to_first_command_complete_seconds", {})
+              probe = distributions.get("task_known_to_first_relevant_script_complete_seconds", {})
+              blocks = distributions.get("node_modules_st_blocks_bytes", {})
+              print(
+                  path.name,
+                  "result=", report["result"],
+                  "successful=", summary.get("successful_samples"),
+                  "failed=", summary.get("failed_samples"),
+                  "mechanisms=", summary.get("observed_import_mechanism_sample_counts"),
+                  "ready_p50/p90/p99=", (ready.get("p50"), ready.get("p90"), ready.get("p99")),
+                  "first_p50/p90/p99=", (first.get("p50"), first.get("p90"), first.get("p99")),
+                  "probe_p50/p90/p99=", (probe.get("p50"), probe.get("p90"), probe.get("p99")),
+                  "st_blocks_p50/p90/p99=", (blocks.get("p50"), blocks.get("p90"), blocks.get("p99")),
+              )
+          PY
           fi
 
       - name: Upload receipts
