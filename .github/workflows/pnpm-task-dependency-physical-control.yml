@@ -206,15 +206,15 @@ jobs:
           BENCH_GID="$(id -g "$BENCH_USER")"
           sudo install -d -o "$BENCH_UID" -g "$BENCH_GID" -m 0700             "$BENCH_HOME" "$SOURCE" "$SCRATCH" "$RESULTS"
 
-          sudo -u "$BENCH_USER" env HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" init -q
-          sudo -u "$BENCH_USER" env HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" remote add origin "https://github.com/${SOURCE_REPOSITORY}.git"
-          sudo -u "$BENCH_USER" env HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" fetch -q --depth=1 origin "$SOURCE_COMMIT"
-          sudo -u "$BENCH_USER" env HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" checkout -q --detach FETCH_HEAD
+          sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" init -q
+          sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" remote add origin "https://github.com/${SOURCE_REPOSITORY}.git"
+          sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" fetch -q --depth=1 origin "$SOURCE_COMMIT"
+          sudo -u "$BENCH_USER" env -i HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" checkout -q --detach FETCH_HEAD
           test "$(sudo -u "$BENCH_USER" git -C "$SOURCE" rev-parse HEAD)" = "$SOURCE_COMMIT"
 
-          sudo -u "$BENCH_USER" env             HOME="$BENCH_HOME"             PATH="$NODE_BIN:/usr/bin:/bin"             NPM_CONFIG_USERCONFIG=/dev/null             PNPM_CONFIG_VIRTUAL_STORE_TYPE=project             bash -c 'cd "$1" && exec "$2" install --frozen-lockfile --ignore-scripts --virtual-store-dir=node_modules/.pnpm'             bash "$SOURCE" "$PNPM_BIN"
+          sudo -u "$BENCH_USER" env -i             HOME="$BENCH_HOME"             PATH="$NODE_BIN:/usr/bin:/bin"             NPM_CONFIG_USERCONFIG=/dev/null             PNPM_CONFIG_VIRTUAL_STORE_TYPE=project             bash -c 'cd "$1" && exec "$2" install --frozen-lockfile --ignore-scripts --virtual-store-dir=node_modules/.pnpm'             bash "$SOURCE" "$PNPM_BIN"
 
-          STORE="$(sudo -u "$BENCH_USER" env             HOME="$BENCH_HOME"             PATH="$NODE_BIN:/usr/bin:/bin"             NPM_CONFIG_USERCONFIG=/dev/null             PNPM_CONFIG_VIRTUAL_STORE_TYPE=project             bash -c 'cd "$1" && exec "$2" store path --silent'             bash "$SOURCE" "$PNPM_BIN")"
+          STORE="$(sudo -u "$BENCH_USER" env -i             HOME="$BENCH_HOME"             PATH="$NODE_BIN:/usr/bin:/bin"             NPM_CONFIG_USERCONFIG=/dev/null             PNPM_CONFIG_VIRTUAL_STORE_TYPE=project             bash -c 'cd "$1" && exec "$2" store path --silent'             bash "$SOURCE" "$PNPM_BIN")"
           test -d "$STORE"
 
           if test "$STORE_POLICY" = readonly; then
@@ -290,7 +290,7 @@ jobs:
             fi
 
             set +e
-            sudo -u "$BENCH_USER" env               HOME="$BENCH_HOME"               PATH="$NODE_BIN:/usr/bin:/bin"               "$RUNNER_TEMP/benchmark-pnpm-task-dependencies" "${args[@]}"
+            sudo -u "$BENCH_USER" env -i               HOME="$BENCH_HOME"               PATH="$NODE_BIN:/usr/bin:/bin"               LANG=C.UTF-8               LC_ALL=C.UTF-8               CI=1               "$RUNNER_TEMP/benchmark-pnpm-task-dependencies" "${args[@]}"
             benchmark_rc=$?
             set -e
 
