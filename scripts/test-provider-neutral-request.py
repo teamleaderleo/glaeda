@@ -46,6 +46,60 @@ def compiled_verify(request_id: str = "owner-1012-request-0001") -> module.Compi
     return module.compile_request(request)
 
 
+def repo_query_report(compiled: module.CompiledRequest) -> dict[str, object]:
+    patch_text = "diff\n"
+    return {
+        "document_type": "glaeda-resident-repo-query",
+        "schema_version": 1,
+        "profile_id": "repo-query/v1",
+        "profile_generation": compiled.resolved_operation["profile_generation"],
+        "authority": "observation_only",
+        "request_digest": compiled.resolved_operation["request_digest"],
+        "repository": "github.com/" + SOURCE["repository"],
+        "object_format": "sha1",
+        "requested_base": compiled.resolved_operation["base_commit"],
+        "head": SOURCE["commit"],
+        "head_tree": SOURCE["tree"],
+        "merge_base": "4" * 40,
+        "base_is_ancestor": True,
+        "commits_since_merge_base": 1,
+        "changed_files": [
+            {
+                "path": "src/lib.rs",
+                "insertions": 2,
+                "deletions": 0,
+                "binary": False,
+            }
+        ],
+        "changed_files_status": "complete",
+        "changed_files_observed": 1,
+        "changed_files_omitted": 0,
+        "diff_summary": {
+            "files_changed": 1,
+            "text_files": 1,
+            "binary_files": 0,
+            "insertions": 2,
+            "deletions": 0,
+        },
+        "patch": {
+            "bytes": len(patch_text.encode("utf-8")),
+            "sha256": module.sha256(patch_text.encode("utf-8")),
+            "included": True,
+            "omitted_bytes": 0,
+            "text": patch_text,
+        },
+        "blobs": [],
+        "path_history": [],
+        "objects": [],
+        "metrics": {
+            "git_processes": 13,
+            "git_stdout_bytes": 100,
+            "git_wall_microseconds": 200,
+            "complete_wall_microseconds": 300,
+        },
+    }
+
+
 def internal_receipt(
     compiled: module.CompiledRequest, terminal: str = "succeeded"
 ) -> dict[str, object]:
@@ -171,7 +225,7 @@ class ProviderNeutralRequestTests(unittest.TestCase):
         with self.assertRaisesRegex(module.ContractRefusal, "outside the reviewed"):
             module.status_receipt(compiled, bad)
 
-    def test_repo_query_wraps_exact_existing_profile_result(self) -> None:
+    def test_repo_query_wraps_exact_reviewed_profile_and_projects_closed_result(self) -> None:
         request = module.decode_request(
             raw(
                 document(
@@ -182,26 +236,41 @@ class ProviderNeutralRequestTests(unittest.TestCase):
             )
         )
         compiled = module.compile_request(request)
-        report = {
-            "document_type": "glaeda-resident-repo-query",
-            "schema_version": 1,
-            "profile_id": "repo-query/v1",
-            "profile_generation": "sha256:" + "b" * 64,
-            "authority": "observation_only",
-            "repository": "github.com/" + SOURCE["repository"],
-            "requested_base": "3" * 40,
-            "head": SOURCE["commit"],
-            "head_tree": SOURCE["tree"],
-            "request_digest": "sha256:" + "c" * 64,
-        }
+        self.assertEqual(
+            compiled.resolved_operation["profile_generation"],
+            "sha256:f575e0e3cd40e54ca4f868f99777e40386a2fe909cb91362f777e8881302ef65",
+        )
+        report = repo_query_report(compiled)
         receipt = module.repo_query_receipt(compiled, report)
         self.assertEqual(receipt["state"], "succeeded")
-        self.assertEqual(receipt["result"]["profile_id"], "repo-query/v1")
+        self.assertEqual(
+            receipt["result"]["document_type"],
+            module.REPO_QUERY_RESULT_DOCUMENT_TYPE,
+        )
+        self.assertEqual(receipt["result"]["repository"], SOURCE["repository"])
+        self.assertEqual(
+            receipt["result"]["request_digest"],
+            compiled.resolved_operation["request_digest"],
+        )
+        self.assertNotIn("blobs", receipt["result"])
+        self.assertNotIn("private_path", receipt["result"])
 
-        drift = copy.deepcopy(report)
-        drift["head"] = "4" * 40
+        for field, value in (
+            ("head", "5" * 40),
+            ("profile_generation", "sha256:" + "b" * 64),
+            ("request_digest", "sha256:" + "c" * 64),
+        ):
+            with self.subTest(field=field):
+                drift = copy.deepcopy(report)
+                drift[field] = value
+                with self.assertRaisesRegex(module.ContractRefusal, "does not match"):
+                    module.repo_query_receipt(compiled, drift)
+
+        unexpected = copy.deepcopy(report)
+        unexpected["private_path"] = "/home/owner/project"
         with self.assertRaisesRegex(module.ContractRefusal, "does not match"):
-            module.repo_query_receipt(compiled, drift)
+            module.repo_query_receipt(compiled, unexpected)
+
 
     def test_verify_terminal_projection_uses_existing_typed_receipt(self) -> None:
         compiled = compiled_verify()
