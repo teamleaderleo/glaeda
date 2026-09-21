@@ -6,6 +6,8 @@ import json
 import re
 from typing import Any, Iterable
 
+import cmux_fleet as fleet
+
 NODE_SCHEMA = "glaeda-cmux-node-capabilities/v1"
 ROLE_CANARY_SCHEMA = "glaeda-cmux-role-canary/v1"
 CAPACITY_SCHEMA = "glaeda-cmux-role-capacity/v1"
@@ -335,6 +337,7 @@ def validate_node(value: object) -> dict[str, Any]:
             "capabilityGeneration",
             "toolchainProfiles",
             "capabilities",
+            "roleAcceptances",
             "pressure",
         },
         "node capability",
@@ -364,6 +367,23 @@ def validate_node(value: object) -> dict[str, Any]:
         "node capabilities",
         allowed=set(CAPABILITY_CLASSES),
     )
+    role_acceptances = doc["roleAcceptances"]
+    if not isinstance(role_acceptances, dict):
+        raise RoleModelError("role acceptances are invalid")
+    for role, acceptance in role_acceptances.items():
+        if role not in fleet.ENROLLABLE_ROLES:
+            raise RoleModelError("role acceptance is not reviewed by fleet enrollment")
+        entry = _exact(
+            acceptance,
+            {"profile", "receiptSha256"},
+            "role acceptance",
+        )
+        profile = _exact(entry["profile"], {"id", "generation"}, "role acceptance profile")
+        _token(profile["id"], "role acceptance profile id")
+        _positive_int(profile["generation"], "role acceptance profile generation")
+        if profile != fleet.ROLE_PROFILES.get(role):
+            raise RoleModelError("role acceptance profile is not current")
+        _sha(entry["receiptSha256"], "role acceptance receipt digest")
     pressure = _exact(
         doc["pressure"], {"cpu", "memory", "swap", "thermal"}, "pressure"
     )
@@ -391,7 +411,7 @@ def validate_role_canary(value: object) -> dict[str, Any]:
             "toolchainProfile",
             "acceptedCapabilities",
             "acceptedResourceProfiles",
-            "workloadGeneration",
+            "profile",
             "acceptanceReceiptSha256",
             "result",
         },
@@ -420,7 +440,9 @@ def validate_role_canary(value: object) -> dict[str, Any]:
         "accepted resource profiles",
         allowed=set(RESOURCE_PROFILES),
     )
-    _sha(doc["workloadGeneration"], "role canary workload generation")
+    profile = _exact(doc["profile"], {"id", "generation"}, "role canary profile")
+    _token(profile["id"], "role canary profile id")
+    _positive_int(profile["generation"], "role canary profile generation")
     _sha(doc["acceptanceReceiptSha256"], "role canary acceptance receipt digest")
     if doc["result"] not in {"accepted", "rejected"}:
         raise RoleModelError("role canary result is invalid")
@@ -671,11 +693,33 @@ def role_eligibility(
                 "reason": "node_capability_missing",
             }
             continue
+        current_acceptance = node["roleAcceptances"].get(role)
+        if current_acceptance is None:
+            results[role] = {
+                "eligible": False,
+                "reason": "fleet_acceptance_pending",
+            }
+            continue
         canary = canaries.get(role)
         if canary is None:
             results[role] = {
                 "eligible": False,
                 "reason": "role_canary_pending",
+            }
+            continue
+        if canary["profile"] != current_acceptance["profile"]:
+            results[role] = {
+                "eligible": False,
+                "reason": "role_canary_profile_stale",
+            }
+            continue
+        if (
+            canary["acceptanceReceiptSha256"]
+            != current_acceptance["receiptSha256"]
+        ):
+            results[role] = {
+                "eligible": False,
+                "reason": "role_canary_acceptance_stale",
             }
             continue
         if canary["result"] != "accepted":
