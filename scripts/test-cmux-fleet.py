@@ -127,6 +127,10 @@ class FleetTests(unittest.TestCase):
         enrolling = f.transition(q, "enrolling", None)
         self.assertIsNone(enrolling["quarantineReason"])
         self.assertEqual(enrolling["state"], "enrolling")
+        self.assertEqual(
+            enrolling["enrollmentGeneration"],
+            e["enrollmentGeneration"] + 1,
+        )
 
     def test_acceptance_binds_current_identity(self):
         e = enrollment()
@@ -164,6 +168,20 @@ class FleetTests(unittest.TestCase):
         status = f.node_status(e, [r])
         linux = next(v for v in status["roles"] if v["role"] == "cmux_linux_ci")
         self.assertTrue(linux["eligible"])
+
+    def test_status_rejects_forged_acceptance_receipt(self):
+        e = enrollment()
+        forged = f.finalize_acceptance(e, evidence())
+        forged["checks"]["processSettlement"] = "fail"
+        with self.assertRaisesRegex(f.FleetError, "disagrees"):
+            f.node_status(e, [forged])
+
+    def test_status_rejects_unknown_acceptance_fields(self):
+        e = enrollment()
+        receipt = f.finalize_acceptance(e, evidence())
+        receipt["hostname"] = "hidden-host"
+        with self.assertRaisesRegex(f.FleetError, "unknown or missing"):
+            f.node_status(e, [receipt])
 
     def test_enrollment_is_derived_from_accepted_bootstrap(self):
         bootstrap = {
