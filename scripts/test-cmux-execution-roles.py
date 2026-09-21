@@ -39,13 +39,11 @@ def fleet_acceptance(node_id, enrollment_generation, role):
 
 
 def fleet_binding(node_id, enrollment_generation, role):
-    projected = m.fleet_acceptance_binding(
-        fleet_acceptance(node_id, enrollment_generation, role)
-    )
-    return {
-        'profile': projected['profile'],
-        'receiptSha256': projected['receiptSha256'],
-    }
+    return m.fleet_role_acceptances(
+        node_id,
+        enrollment_generation,
+        [fleet_acceptance(node_id, enrollment_generation, role)],
+    )[role]
 
 
 def mac_node(state='eligible', generation=7, xcode='apple-xcode-26-sdk-26', memory='large', pressure=None):
@@ -381,6 +379,45 @@ class RoleModelTests(unittest.TestCase):
             'fleet acceptance receipt is invalid',
         ):
             m.fleet_acceptance_binding(receipt)
+
+    def test_fleet_acceptance_projection_rejects_wrong_node_and_generation(self):
+        wrong_node = fleet_acceptance(
+            'cmux-other-001',
+            3,
+            'cmux_macos_native_build',
+        )
+        with self.assertRaisesRegex(
+            m.RoleModelError,
+            'different node',
+        ):
+            m.fleet_role_acceptances('cmux-mac-001', 3, [wrong_node])
+
+        stale = fleet_acceptance(
+            'cmux-mac-001',
+            2,
+            'cmux_macos_native_build',
+        )
+        with self.assertRaisesRegex(
+            m.RoleModelError,
+            'generation is stale',
+        ):
+            m.fleet_role_acceptances('cmux-mac-001', 3, [stale])
+
+    def test_fleet_acceptance_projection_rejects_duplicate_role(self):
+        receipt = fleet_acceptance(
+            'cmux-mac-001',
+            3,
+            'cmux_macos_native_build',
+        )
+        with self.assertRaisesRegex(
+            m.RoleModelError,
+            'duplicate fleet acceptance role',
+        ):
+            m.fleet_role_acceptances(
+                'cmux-mac-001',
+                3,
+                [receipt, copy.deepcopy(receipt)],
+            )
 
     def test_reserved_role_cannot_install_fake_current_acceptance(self):
         node = mac_node()
