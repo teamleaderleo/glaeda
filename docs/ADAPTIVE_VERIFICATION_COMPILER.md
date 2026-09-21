@@ -71,8 +71,10 @@ The typed lifecycle is:
 Rules in this first slice:
 
 - reusable candidates with incomplete validity remain `observed`;
-- an exact candidate with zero trials is `candidate`;
-- one successful controlled trial is `experimenting`;
+- an exact candidate with zero applicable trials is `candidate`;
+- a controlled experiment gains lifecycle authority only after it is bound to the exact deterministic candidate ID emitted by a prior receipt;
+- unbound/class-only/subject-only experiments remain retained advisory evidence and cannot promote or demote any candidate;
+- one successful exactly bound controlled trial is `experimenting`;
 - two compatible successful controlled trials whose gain exceeds stated noise become `accepted`;
 - three become `preferred`;
 - a semantic disagreement, candidate failure/reset, or controlled regression/noise result produces `demoted`;
@@ -168,6 +170,7 @@ experiment-required until selective-consumer transfer savings are measured.
 The tests also cover:
 
 - generic cmux rediscovery without repository-specific production rules, including a separate Release build and both R2/GitHub transfer paths;
+- fail-closed experiment applicability: an unbound trial has zero promotion authority across multiple same-class candidates;
 - deterministic receipt output under reordered equivalent observations;
 - advisory reuse when exact validity is incomplete;
 - promotion after multiple compatible controlled trials;
