@@ -512,7 +512,7 @@ def repo_query_receipt(compiled: CompiledRequest, report: dict[str, object]) -> 
         or report.get("authority") != "observation_only"
         or not isinstance(report.get("profile_generation"), str)
         or not SHA256_PATTERN.fullmatch(report["profile_generation"])
-        or report.get("repository") != source.repository
+        or report.get("repository") != f"github.com/{source.repository}"
         or report.get("requested_base") != compiled.request.parameters["base_commit"]
         or report.get("head") != source.commit
         or report.get("head_tree") != source.tree
@@ -746,7 +746,7 @@ def _inspect_repo_query_result(
         or result.get("authority") != "observation_only"
         or not isinstance(result.get("profile_generation"), str)
         or not SHA256_PATTERN.fullmatch(result["profile_generation"])
-        or result.get("repository") != source.repository
+        or result.get("repository") != f"github.com/{source.repository}"
         or result.get("requested_base") != resolved["base_commit"]
         or result.get("head") != source.commit
         or result.get("head_tree") != source.tree
