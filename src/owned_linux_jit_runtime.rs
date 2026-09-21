@@ -52,6 +52,8 @@ pub(crate) struct OwnedLinuxJitRuntime {
     payload_root: PathBuf,
     payload_tree_digest: Sha256Digest,
     launcher: PathBuf,
+    egress_guard: PathBuf,
+    egress_guard_digest: Sha256Digest,
 }
 
 impl std::fmt::Debug for OwnedLinuxJitRuntime {
@@ -75,6 +77,8 @@ impl OwnedLinuxJitRuntime {
         payload_root: impl Into<PathBuf>,
         payload_tree_digest: Sha256Digest,
         launcher: impl Into<PathBuf>,
+        egress_guard: impl Into<PathBuf>,
+        egress_guard_digest: Sha256Digest,
     ) -> Result<Self, DisposableCloneRuntimeError> {
         let runtime = Self {
             helper: validate_path(helper.into())?,
@@ -84,6 +88,8 @@ impl OwnedLinuxJitRuntime {
             payload_root: validate_path(payload_root.into())?,
             payload_tree_digest,
             launcher: validate_path(launcher.into())?,
+            egress_guard: validate_path(egress_guard.into())?,
+            egress_guard_digest,
         };
         runtime.verify_helper()?;
         Ok(runtime)
@@ -102,6 +108,10 @@ impl OwnedLinuxJitRuntime {
                 RUNNER_ARCHIVE_SHA256,
                 self.helper_digest.as_str(),
                 self.payload_tree_digest.as_str(),
+                self.egress_guard_digest.as_str(),
+                self.egress_guard
+                    .to_str()
+                    .ok_or_else(|| config("owned_linux_egress_guard_path_invalid"))?,
                 self.launcher
                     .to_str()
                     .ok_or_else(|| config("owned_linux_launcher_path_invalid"))?,
@@ -304,6 +314,10 @@ impl OwnedLinuxJitRuntime {
             .argument(self.payload_tree_digest.as_str())
             .argument("--launcher")
             .argument(self.launcher.to_string_lossy())
+            .argument("--egress-guard")
+            .argument(self.egress_guard.to_string_lossy())
+            .argument("--egress-guard-sha256")
+            .argument(self.egress_guard_digest.as_str())
             .argument("--command-fingerprint")
             .argument(identity.command_fingerprint)
             .argument("--unit")
@@ -345,6 +359,7 @@ impl OwnedLinuxJitRuntime {
                 attempt.attempt_id().as_str(),
                 attempt.runner_name().as_str(),
                 self.payload_tree_digest.as_str(),
+                self.egress_guard_digest.as_str(),
             ],
         );
         let binding_sha256 = digest_parts(
