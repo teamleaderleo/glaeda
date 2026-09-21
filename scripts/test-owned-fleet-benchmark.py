@@ -190,6 +190,7 @@ def window_manifest(profile_id: str, items: list[dict], *, start_ns: int = 1_000
     }
 
 
+class FleetHarnessTests(unittest.TestCase):
     def test_benchmark_environment_is_closed(self) -> None:
         workload = {
             "environment": {
@@ -233,7 +234,6 @@ def window_manifest(profile_id: str, items: list[dict], *, start_ns: int = 1_000
         ):
             self.assertNotIn(forbidden, environment)
 
-class FleetHarnessTests(unittest.TestCase):
     def test_catalog_keeps_only_contention_shape(self) -> None:
         value = NS["catalog"]()
         self.assertEqual(len(value["workloads"]), 6)
