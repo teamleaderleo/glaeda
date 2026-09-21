@@ -335,6 +335,7 @@ def finalize_acceptance(
     role: str,
     toolchain_generation: str,
     cmux_result_value: object,
+    cmux_result_sha256: str | None = None,
 ) -> dict[str, Any]:
     enrollment = validate_enrollment(enrollment_value)
     if role not in enrollment["allowedExecutionRoles"]:
@@ -343,6 +344,9 @@ def finalize_acceptance(
         raise FleetError("acceptance toolchain generation is outside the enrollment allowlist")
     expected_profile = enrollment["roleProfiles"][role]
     semantic = validate_cmux_semantic_result(cmux_result_value, expected_profile)
+    if cmux_result_sha256 is None:
+        cmux_result_sha256 = digest(semantic)
+    sha256(cmux_result_sha256, "CMUX semantic result digest")
     cleanup = semantic["cleanup"]
     settlement = (
         "complete"
@@ -363,7 +367,7 @@ def finalize_acceptance(
         "profile": semantic["profile"],
         "toolchainGeneration": toolchain_generation,
         "glaedaGeneration": enrollment["glaedaGeneration"],
-        "cmuxSemanticResultSha256": digest(semantic),
+        "cmuxSemanticResultSha256": cmux_result_sha256,
         "cmuxSemanticResultState": semantic["result"],
         "processSettlement": settlement,
         "result": result,
@@ -511,6 +515,57 @@ def load(path: Path) -> object:
         return _read_private_document(descriptor)
     finally:
         os.close(descriptor)
+
+
+def load_cmux_semantic_result(path: Path) -> tuple[dict[str, Any], str]:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except OSError as error:
+        raise FleetError("CMUX semantic result is unavailable") from error
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size <= 0
+            or info.st_size > MAX_DOCUMENT_BYTES
+        ):
+            raise FleetError("CMUX semantic result file is unsafe")
+        raw = b""
+        while len(raw) <= MAX_DOCUMENT_BYTES:
+            chunk = os.read(descriptor, min(8192, MAX_DOCUMENT_BYTES + 1 - len(raw)))
+            if not chunk:
+                break
+            raw += chunk
+        if len(raw) > MAX_DOCUMENT_BYTES:
+            raise FleetError("CMUX semantic result exceeds size ceiling")
+        after = os.fstat(descriptor)
+        if (
+            info.st_dev != after.st_dev
+            or info.st_ino != after.st_ino
+            or info.st_mode != after.st_mode
+            or info.st_nlink != after.st_nlink
+            or info.st_size != after.st_size
+            or info.st_mtime_ns != after.st_mtime_ns
+            or info.st_ctime_ns != after.st_ctime_ns
+            or len(raw) != after.st_size
+        ):
+            raise FleetError("CMUX semantic result changed while reading")
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise FleetError("CMUX semantic result is invalid JSON") from error
+    canonical_raw = canonical(value)
+    if raw != canonical_raw:
+        raise FleetError("CMUX semantic result is not canonical")
+    if not isinstance(value, dict):
+        raise FleetError("CMUX semantic result is not an object")
+    return value, "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
 def load_at(parent_fd: int, name: str) -> object:
@@ -770,12 +825,14 @@ def main() -> int:
                 )
             )
         elif args.command == "finalize-acceptance":
+            cmux_result, cmux_result_sha256 = load_cmux_semantic_result(args.cmux_result)
             emit(
                 finalize_acceptance(
                     enrollment,
                     args.role,
                     args.toolchain_generation,
-                    load(args.cmux_result),
+                    cmux_result,
+                    cmux_result_sha256,
                 )
             )
         else:
