@@ -18,6 +18,7 @@ SPEC.loader.exec_module(f)
 A = "sha256:" + "a" * 64
 B = "sha256:" + "b" * 64
 C = "sha256:" + "c" * 64
+D = "sha256:" + "d" * 64
 COMMIT = "1" * 40
 
 
@@ -40,6 +41,7 @@ def enrollment(os_family="macos", state="eligible", roles=None):
             "cmux-mac-build-large" if os_family == "macos" else "cmux-linux-ci-medium"
         ),
         "supportedToolchainGenerations": [A, B],
+        "roleWorkloadGenerations": {role: B for role in sorted(roles)},
         "allowedExecutionRoles": sorted(roles),
         "operatorFleetScope": "cmux-founders",
         "enrollmentGeneration": 3,
@@ -109,6 +111,17 @@ class FleetTests(unittest.TestCase):
         )
         self.assertEqual(native["reason"], "acceptance_enrollment_stale")
 
+    def test_stale_acceptance_workload_generation_is_ineligible(self):
+        e = enrollment()
+        r = f.finalize_acceptance(e, evidence())
+        e["roleWorkloadGenerations"]["cmux_macos_native_build"] = D
+        status = f.node_status(e, [r])
+        native = next(
+            v for v in status["roles"] if v["role"] == "cmux_macos_native_build"
+        )
+        self.assertFalse(native["eligible"])
+        self.assertEqual(native["reason"], "acceptance_workload_stale")
+
     def test_private_identity_fields_are_rejected(self):
         for field in ("hostname", "serialNumber", "privateIp", "username"):
             with self.subTest(field=field):
@@ -162,6 +175,10 @@ class FleetTests(unittest.TestCase):
         bad["enrollmentGeneration"] = 4
         with self.assertRaisesRegex(f.FleetError, "enrollment generation"):
             f.finalize_acceptance(e, bad)
+        bad = evidence()
+        bad["workloadGeneration"] = D
+        with self.assertRaisesRegex(f.FleetError, "workload generation"):
+            f.finalize_acceptance(e, bad)
 
     def test_failed_settlement_rejects_role(self):
         checks = {
@@ -210,6 +227,7 @@ class FleetTests(unittest.TestCase):
             "roles": ["cmux_macos_native_build"],
             "glaedaGeneration": C,
             "toolchainGeneration": A,
+            "roleWorkloadGenerations": {"cmux_macos_native_build": B},
             "checks": {"ready": True},
             "observed": {},
             "eligibleForEnrollment": True,
@@ -224,6 +242,10 @@ class FleetTests(unittest.TestCase):
         )
         self.assertEqual(result["state"], "enrolling")
         self.assertEqual(result["supportedToolchainGenerations"], [A])
+        self.assertEqual(
+            result["roleWorkloadGenerations"],
+            {"cmux_macos_native_build": B},
+        )
 
     def test_blocked_bootstrap_cannot_enroll(self):
         bootstrap = {
