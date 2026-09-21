@@ -11,9 +11,6 @@
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
   ],
   "allowedExecutionRoles": [
-    "artifact_cache",
-    "background_replay",
-    "cmux_linux_agent",
     "cmux_linux_ci"
   ],
   "operatorFleetScope": "cmux-founders",
