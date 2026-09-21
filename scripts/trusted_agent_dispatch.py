@@ -378,22 +378,6 @@ def semantic_request_id(request: DispatchRequest) -> str:
     return "accepted-" + digest[:55]
 
 
-def external_document(request: DispatchRequest) -> dict[str, object]:
-    return {
-        "document_type": external.REQUEST_DOCUMENT_TYPE,
-        "schema_version": external.REQUEST_SCHEMA_VERSION,
-        "external_request_ref": request.request_id,
-        "semantic_request_id": semantic_request_id(request),
-        "source": {
-            "repository": request.repository,
-            "commit": request.commit,
-            "tree": request.tree,
-        },
-        "operation": EXTERNAL_OPERATION,
-        "requested_capability_class": CAPABILITY_CLASS,
-    }
-
-
 def _bounded(value: dict[str, object], label: str) -> dict[str, object]:
     if len(canonical_bytes(value) + b"\n") > MAX_DOCUMENT_BYTES:
         raise DispatchRefusal(
