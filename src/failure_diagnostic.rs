@@ -3,6 +3,8 @@ use std::fmt;
 
 use serde::Serialize;
 
+use crate::reusable_state_lifecycle::ReusableStateIntegrityState;
+
 pub const FAILURE_DIAGNOSTIC_SCHEMA_VERSION: u8 = 1;
 pub const MAX_FAILURE_STEP_BYTES: usize = 96;
 pub const MAX_TEST_SELECTOR_BYTES: usize = 160;
@@ -285,6 +287,18 @@ impl FailureEvidence {
     #[must_use]
     pub fn with_artifact_cache(mut self, value: ArtifactCacheReceipt) -> Self {
         self.artifact_cache = value;
+        self
+    }
+
+    /// Consume #21's typed reusable-state integrity result without interpreting cache paths or logs.
+    #[must_use]
+    pub fn with_reusable_state_integrity(mut self, value: ReusableStateIntegrityState) -> Self {
+        self.artifact_cache = match value {
+            ReusableStateIntegrityState::Verified => ArtifactCacheReceipt::Present,
+            ReusableStateIntegrityState::Truncated | ReusableStateIntegrityState::Corrupt => {
+                ArtifactCacheReceipt::CacheCorrupt
+            }
+        };
         self
     }
 
@@ -2016,6 +2030,24 @@ mod tests {
         assert_eq!(
             diagnosis.recommended_remedy(),
             Some(RemedyClass::RetryFreshRunner)
+        );
+    }
+
+    #[test]
+    fn reusable_state_corruption_from_issue_21_maps_to_cache_corruption() {
+        let input = evidence(
+            FailureExitClass::NonZero,
+            FailurePhase::Cache,
+            "Consume reusable state",
+        )
+        .with_repository_command_status(RepositoryCommandStatus::Executed)
+        .with_reusable_state_integrity(ReusableStateIntegrityState::Corrupt);
+
+        let diagnosis = diagnose_failure(&input, None).expect("diagnosis");
+        assert_eq!(diagnosis.failure_class(), FailureClass::CacheCorruption);
+        assert_eq!(
+            diagnosis.recommended_remedy(),
+            Some(RemedyClass::ClearSpecificReconstructibleCache)
         );
     }
 
