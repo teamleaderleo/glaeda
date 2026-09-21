@@ -88,7 +88,10 @@ class TrustedDispatchTests(unittest.TestCase):
             item.accepted_document["caller"]["principal"],
             PRINCIPAL,
         )
-        compiled = external.compile_request(item.external_request)
+        compiled = external.compile_request(
+            item.external_request,
+            semantic_request_id=item.accepted_document["semantic_request_id"],
+        )
         self.assertEqual(
             item.accepted_document["workload_command_fingerprint"],
             compiled.internal.command_fingerprint,
