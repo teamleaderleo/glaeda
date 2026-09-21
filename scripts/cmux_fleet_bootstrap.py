@@ -130,7 +130,7 @@ def collect_macos(
         "gitVersion": git,
     }
     free_gib = disk_free_gib(cmux_root)
-    cache_required = True
+    cache_required = cache_root is not None
     cache_ready = (
         cache_root is not None
         and cache_root.is_dir()
@@ -178,9 +178,13 @@ def collect_macos(
             ),
             "xcodePin": pin,
             "nativeCacheFreeDiskGiBClass": (
-                f"ge-{min_free_gib}"
-                if cache_ready and cache_free_gib >= min_free_gib
-                else f"lt-{min_free_gib}"
+                "unconfigured"
+                if not cache_required
+                else (
+                    f"ge-{min_free_gib}"
+                    if cache_ready and cache_free_gib >= min_free_gib
+                    else f"lt-{min_free_gib}"
+                )
             ),
             "logicalCpuClass": "ge-8" if cpus >= 8 else "lt-8",
             "totalMemoryGiBClass": (
