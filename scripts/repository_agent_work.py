@@ -380,16 +380,55 @@ def compute_workload(request: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _count_class(value: int) -> str:
+    if value <= 1:
+        return "one"
+    if value <= 4:
+        return "small"
+    if value <= 16:
+        return "medium"
+    return "large"
+
+
+def _patch_bytes_class(value: int) -> str:
+    if value <= 16 * 1024:
+        return "tiny"
+    if value <= 64 * 1024:
+        return "small"
+    if value <= 256 * 1024:
+        return "medium"
+    return "large"
+
+
 def routing_classification(request: dict[str, object]) -> dict[str, object]:
     compute = compute_workload(request)
+    scope = request["scope"]
+    mutation = request["mutation"]
+    scope_size_class = (
+        _count_class(len(scope["paths"]))
+        if scope["class"] == "bounded_paths"
+        else scope["class"]
+    )
+    mutation_budget = (
+        {
+            "changed_paths": _count_class(mutation["max_changed_paths"]),
+            "patch_bytes": _patch_bytes_class(mutation["max_patch_bytes"]),
+            "allow_new_files": mutation["allow_new_files"],
+            "allow_deletes": mutation["allow_deletes"],
+        }
+        if mutation["class"] == "task_private_patch"
+        else {"class": "read_only"}
+    )
     return {
         "family": compute["family"],
         "semantic_generation": compute["semantic_generation"],
         "operation": request["operation"],
         "trust_class": compute["trust_class"],
         "network_class": request["network_class"],
-        "scope_class": request["scope"]["class"],
-        "mutation_class": request["mutation"]["class"],
+        "scope_class": scope["class"],
+        "scope_size_class": scope_size_class,
+        "mutation_class": mutation["class"],
+        "mutation_budget_class": mutation_budget,
         "required_capabilities": compute["required_capabilities"],
         "verification_profiles": request["verification"],
         "output_contract_sha256": compute["output_contract_sha256"],
