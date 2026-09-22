@@ -644,9 +644,9 @@ impl OperatorConfigDocument {
     {
         match self {
             Self::SmolrunnerV1(document) => {
-                if document.schema_version == GLAEDA_OPERATOR_CONFIG_SCHEMA_VERSION {
-                    return Err(generation_pair_error());
-                }
+                // An unmarked document carries no identity generation to disagree with, so any
+                // schema version this v1 shape does not own stays the landed unsupported-version
+                // failure class. Generation pairing is only decidable once a marker is present.
                 if document.schema_version != SMOLRUNNER_OPERATOR_CONFIG_SCHEMA_VERSION {
                     return Err(unsupported_schema_version_error());
                 }
@@ -1111,7 +1111,9 @@ mod tests {
             &serde_json::to_vec(&value).expect("v2 without marker"),
         )
         .expect_err("missing v2 marker");
-        assert_eq!(error.code, "generation_schema_mismatch");
+        // Still fails closed; an unmarked document is reported by schema version because no
+        // identity generation is present to pair against.
+        assert_eq!(error.code, "unsupported_schema_version");
 
         let mut value: serde_json::Value = serde_json::from_slice(&v1).expect("v1 document");
         value["schema_version"] = serde_json::json!(3);
