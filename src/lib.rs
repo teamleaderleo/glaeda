@@ -13,6 +13,7 @@ pub mod cargo_target_holder_observation;
 /// Read-only, descriptor-bound observation of one Linux Cargo target tree.
 #[cfg(target_os = "linux")]
 pub mod cargo_target_observation;
+pub mod cargo_target_reclaim;
 /// Pure projection of validated CMUX workload results into adaptive verification observations.
 pub mod cmux_workload_verification_adapter;
 /// Pure workload-neutral pre-admission compute request.
