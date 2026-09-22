@@ -202,7 +202,7 @@ The field names `required_tools`, `optional_tools`, `verification_backends`, `fo
 
 Workspace receipt schema version 2 emits the current Glaeda successor profile identities:
 
-- `glaeda.required` — exactly the eight required checks listed in `AGENTS.md`;
+- `glaeda.required` — exactly the eight checks emitted by `scripts/verify required --plan-json`;
 - `glaeda.doctor` — the machine-readable doctor check;
 - `glaeda.plan` — the reference plan and host-plan smoke checks.
 

@@ -1063,6 +1063,37 @@ const fn io_error() -> TrustedOverlayMountPlanError {
     )
 }
 
+/// Build evidence for descriptor/fake-backend unit tests without requiring the
+/// operator to activate OverlayFS. No actual mount backend may consume this plan.
+/// Production observation and confirmation are unchanged and this constructor is
+/// absent from production builds.
+#[cfg(test)]
+pub(crate) fn descriptor_test_plan(
+    source_anchor: &OverlaySourceAnchorRecord,
+    task_view: &OverlayTaskViewRecord,
+    paths: TrustedOverlayMountPaths,
+) -> Result<TrustedOverlayMountPlan, TrustedOverlayMountPlanError> {
+    require_mount_authority(source_anchor, task_view)?;
+    require_procfs()?;
+    let filesystems = read_bounded(Path::new("/proc/filesystems"), MAX_PROC_FILESYSTEMS_BYTES)?;
+    let mountinfo = read_bounded(Path::new("/proc/self/mountinfo"), MAX_PROC_MOUNTINFO_BYTES)?;
+    let namespace = fs::metadata("/proc/self/ns/mnt").map_err(|_| io_error())?;
+    let mut plan = observe_with_evidence(
+        source_anchor.binding().clone(),
+        task_view.lease().clone(),
+        paths,
+        b"nodev\toverlay\n",
+        &mountinfo,
+        (namespace.dev(), namespace.ino()),
+        || {},
+    )?;
+    // Only the initial OverlayFS capability is synthetic. Subsequent production
+    // confirmation must still detect changes to the real kernel evidence,
+    // namespace, directory identities, workdir, target, and task authority.
+    plan.kernel.filesystems_digest = sha256_digest(&filesystems)?;
+    Ok(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1200,11 +1231,43 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_fixture_preserves_live_production_capability_refusal() {
+        let fixture = Fixture::new();
+        let (anchor, task) = registered_authority();
+        let filesystems = super::read_bounded(
+            std::path::Path::new("/proc/filesystems"),
+            super::MAX_PROC_FILESYSTEMS_BYTES,
+        )
+        .unwrap();
+        let result =
+            super::observe_trusted_overlay_mount_plan(&anchor, &task, fixture.paths.clone());
+        if super::filesystems_expose_overlay(&filesystems).unwrap() {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(
+                result.unwrap_err().code(),
+                "overlay_mount_kernel_unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_fixture_still_detects_kernel_evidence_drift() {
+        let fixture = Fixture::new();
+        let (anchor, task) = registered_authority();
+        let mut plan = super::descriptor_test_plan(&anchor, &task, fixture.paths.clone()).unwrap();
+        plan.kernel.filesystems_digest = super::sha256_digest(b"different evidence").unwrap();
+        assert_eq!(
+            plan.confirm(&anchor, &task).unwrap_err().code(),
+            super::changed_during_observation().code()
+        );
+    }
+
+    #[test]
     fn descriptor_lease_reopens_all_exact_roles_without_exposing_paths() {
         let fixture = Fixture::new();
         let (anchor, task) = registered_authority();
-        let plan = super::observe_trusted_overlay_mount_plan(&anchor, &task, fixture.paths.clone())
-            .unwrap();
+        let plan = super::descriptor_test_plan(&anchor, &task, fixture.paths.clone()).unwrap();
         let lease = plan.open_descriptor_lease(&anchor, &task).unwrap();
         assert_eq!(lease.summary().schema_version(), 1);
         assert_eq!(lease.summary().role_count(), 4);
@@ -1217,8 +1280,7 @@ mod tests {
     fn descriptor_lease_retains_exact_merged_parent_and_private_basename() {
         let fixture = Fixture::new();
         let (anchor, task) = registered_authority();
-        let plan = super::observe_trusted_overlay_mount_plan(&anchor, &task, fixture.paths.clone())
-            .unwrap();
+        let plan = super::descriptor_test_plan(&anchor, &task, fixture.paths.clone()).unwrap();
         let lease = plan.open_descriptor_lease(&anchor, &task).unwrap();
         super::require_merged_parent_binding(
             &lease.merged_parent,
@@ -1235,8 +1297,7 @@ mod tests {
     fn descriptor_lease_retains_old_object_while_path_replacement_fails_confirmation() {
         let fixture = Fixture::new();
         let (anchor, task) = registered_authority();
-        let plan = super::observe_trusted_overlay_mount_plan(&anchor, &task, fixture.paths.clone())
-            .unwrap();
+        let plan = super::descriptor_test_plan(&anchor, &task, fixture.paths.clone()).unwrap();
         let lease = plan.open_descriptor_lease(&anchor, &task).unwrap();
         let held_before = super::snapshot_held_directory(&lease.upper).unwrap();
         fs::rename(fixture.root.join("upper"), fixture.root.join("upper-old")).unwrap();
@@ -1257,8 +1318,7 @@ mod tests {
     fn descriptor_acquisition_refuses_intermediate_alias_after_plan_sealing() {
         let fixture = Fixture::new();
         let (anchor, task) = registered_authority();
-        let plan = super::observe_trusted_overlay_mount_plan(&anchor, &task, fixture.paths.clone())
-            .unwrap();
+        let plan = super::descriptor_test_plan(&anchor, &task, fixture.paths.clone()).unwrap();
         let parent = fixture.root.parent().unwrap().to_path_buf();
         let original_name = fixture.root.file_name().unwrap().to_owned();
         let moved = parent.join(format!("{}-moved", original_name.to_string_lossy()));
@@ -1280,8 +1340,7 @@ mod tests {
     fn sealed_plan_reconfirms_exact_child_lease_across_anchor_revision() {
         let fixture = Fixture::new();
         let (anchor, task) = registered_authority();
-        let plan = super::observe_trusted_overlay_mount_plan(&anchor, &task, fixture.paths.clone())
-            .unwrap();
+        let plan = super::descriptor_test_plan(&anchor, &task, fixture.paths.clone()).unwrap();
         plan.confirm(&anchor, &task).unwrap();
         let draining = anchor.request_draining().unwrap();
         plan.confirm(&draining, &task)
@@ -1297,8 +1356,7 @@ mod tests {
     fn sealed_plan_confirmation_detects_late_workdir_and_directory_drift() {
         let fixture = Fixture::new();
         let (anchor, task) = registered_authority();
-        let plan = super::observe_trusted_overlay_mount_plan(&anchor, &task, fixture.paths.clone())
-            .unwrap();
+        let plan = super::descriptor_test_plan(&anchor, &task, fixture.paths.clone()).unwrap();
         fs::write(fixture.root.join("work/late"), b"x").unwrap();
         assert_eq!(
             plan.confirm(&anchor, &task).unwrap_err().kind(),

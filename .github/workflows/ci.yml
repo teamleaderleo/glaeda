@@ -25,8 +25,9 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          persist-credentials: false
           show-progress: false
 
       - name: Install pinned Go toolchain
@@ -60,18 +61,87 @@ jobs:
           paths = [
               Path("smolrunner"),
               Path("scripts/bootstrap"),
+              Path("scripts/benchmark-hot-state-fanout"),
+              Path("scripts/benchmark-pnpm-task-dependencies"),
+              Path("scripts/benchmark-linker-throughput"),
+              Path("scripts/hot-observe"),
+              Path("scripts/hot-pressure-shadow"),
+              Path("scripts/hot-run-python"),
+              Path("scripts/hot_run_impl.py"),
+              Path("scripts/verify"),
+              Path("scripts/verify-focused"),
+              Path("scripts/verify-required"),
+              Path("scripts/verify_focused_impl.py"),
+              Path("scripts/owned_linux_task.py"),
+              Path("scripts/owned_linux_admission.py"),
+              Path("scripts/owned_linux_jit_task.py"),
+              Path("scripts/external_execution_request.py"),
+              Path("scripts/trusted_agent_dispatch.py"),
+              Path("scripts/owned-admission-control"),
+              Path("scripts/test-owned-linux-admission.py"),
+              Path("scripts/test-owned-linux-jit-task.py"),
+              Path("scripts/test-external-execution-request.py"),
+              Path("scripts/test-trusted-agent-dispatch.py"),
+              Path("scripts/cmux_fleet.py"),
+              Path("scripts/cmux_fleet_bootstrap.py"),
+              Path("scripts/cmux_execution_roles.py"),
+              Path("scripts/test-cmux-fleet.py"),
+              Path("scripts/test-cmux-execution-roles.py"),
+              Path("scripts/test-cmux-fleet-bootstrap.py"),
+              Path("scripts/cmux_workload_request.py"),
+              Path("scripts/test-cmux-workload-request.py"),
+              Path("scripts/test-verify-focused.py"),
+              Path("scripts/verify-changed-rustfmt"),
+              Path("scripts/test-hot-run.py"),
+              Path("scripts/test-hot-pressure-shadow.py"),
+              Path("scripts/test-benchmark-hot-state-fanout.py"),
+              Path("scripts/test-benchmark-pnpm-task-dependencies.py"),
+              Path("scripts/test-benchmark-linker-throughput.py"),
+              Path("scripts/test-hot-observe.py"),
+              Path("scripts/test-verify.py"),
+              Path("scripts/test-verify-changed-rustfmt.py"),
               Path("scripts/test-front-door.py"),
               Path("scripts/project_disk_physical_receipt.py"),
               Path("scripts/test_project_disk_physical_receipt.py"),
+              Path("scripts/quarry_sweep_impl.py"),
+              Path("scripts/test-quarry-sweep.py"),
+              Path("scripts/quarry_parallel_impl.py"),
+              Path("scripts/test-quarry-parallel.py"),
               *Path("scripts/workspace_bootstrap").glob("*.py"),
           ]
           for path in paths:
               compile(path.read_text(encoding="utf-8"), str(path), "exec")
           PY
           test -x ./smolrunner
+          sh -n scripts/hot-run
+          bash -n scripts/benchmark-developer-loop
           bash -n scripts/test-bootstrap.sh
+          bash -n scripts/cmux-fleet
+          bash -n scripts/cmux-fleet-bootstrap-macos
+          bash -n scripts/cmux-fleet-bootstrap-linux
           bash scripts/test-bootstrap.sh
+          python3 scripts/test-benchmark-developer-loop.py
+          python3 scripts/test-benchmark-hot-state-fanout.py
+          python3 scripts/test-benchmark-pnpm-task-dependencies.py
+          python3 scripts/test-benchmark-linker-throughput.py
+          python3 scripts/test-hot-observe.py
+          python3 scripts/test-hot-pressure-shadow.py
+          python3 scripts/test-hot-run.py
+          python3 scripts/test-verify-focused.py
+          python3 scripts/test-owned-linux-admission.py
+          python3 scripts/test-owned-linux-jit-task.py
+          python3 scripts/test-external-execution-request.py
+          python3 scripts/test-trusted-agent-dispatch.py
+          python3 scripts/test-cmux-fleet.py
+          python3 scripts/test-cmux-fleet-operator-summary.py
+          python3 scripts/test-cmux-fleet-bootstrap.py
+          python3 scripts/test-cmux-execution-roles.py
+          python3 scripts/test-cmux-workload-request.py
+          python3 scripts/test-verify.py
+          python3 scripts/test-verify-changed-rustfmt.py
           python3 scripts/test-front-door.py
+          python3 scripts/test-quarry-sweep.py
+          python3 scripts/test-quarry-parallel.py
 
           first_receipt=$(mktemp)
           second_receipt=$(mktemp)

@@ -1,6 +1,20 @@
 /// Read-only observation of one configured official Actions runner.
 pub mod actions_runner_readiness;
+/// Pure recommendation-only adaptive CI pool routing from bounded evidence.
+pub mod adaptive_ci_routing;
+/// Pure deterministic optimization discovery from bounded verification observations.
+pub mod adaptive_verification_compiler;
 pub mod artifact;
+/// Pure, path-free classification of explicit hot-state inventory observations.
+pub mod cache_inventory;
+/// Positive-only Linux process and mount reference observation for one Cargo target.
+#[cfg(target_os = "linux")]
+pub mod cargo_target_holder_observation;
+/// Read-only, descriptor-bound observation of one Linux Cargo target tree.
+#[cfg(target_os = "linux")]
+pub mod cargo_target_observation;
+/// Pure projection of validated CMUX workload results into adaptive verification observations.
+pub mod cmux_workload_verification_adapter;
 /// Pure workload-neutral pre-admission compute request.
 pub mod compute_execution_request;
 /// Pure workload-family-neutral identity for declared compute semantics.
@@ -65,6 +79,8 @@ pub mod execution_admission;
 pub mod execution_capacity;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
+/// Pure bounded failure classification, diagnostic probes, remedies, and preflight learning.
+pub mod failure_diagnostic;
 /// Pure model-derived frontier-inference workload vocabulary and synthetic sensitivity fixtures.
 pub mod frontier_inference_workload;
 /// Pure Git index-v2 stat-cache patching for CoW task materialization.
@@ -118,8 +134,13 @@ pub mod hot_execution_performance;
 pub mod hot_fleet_latency_summary;
 /// Pure bounded contended fleet-window receipts and exact A-B-B-A comparison evidence.
 pub mod hot_fleet_window;
+/// Read-only, descriptor-bound observation of an explicit Linux hot-run cache root.
+#[cfg(target_os = "linux")]
+pub mod hot_run_cache_observation;
 /// Pure path-class policy for selecting reviewed hot-state sharing mechanisms.
 pub mod hot_state_path_policy;
+/// Pure transport-independent identity and source observations for immutable build products.
+pub mod immutable_artifact_distribution;
 /// Pure immutable resident Git object-pool generation and consumer-lease core.
 pub mod immutable_git_object_pool;
 /// Pure sealed non-task Git producer planning for immutable pool publication.
@@ -163,6 +184,9 @@ pub mod linux_dynamic_loader_config;
 /// Pure bounded ELF64 dependency parsing for the Linux runtime closure.
 #[cfg(target_os = "linux")]
 pub mod linux_elf_runtime_dependency;
+/// Bounded path-private observation of one Linux operator machine.
+#[cfg(target_os = "linux")]
+pub mod linux_host_observation;
 /// Read-only, fail-closed lookup of persisted project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_catalog;
@@ -199,6 +223,9 @@ pub mod linux_personal_worker_runtime_loader_state_prerequisite;
 /// Read-only, locked discovery of one protected recorded personal-worker runtime manifest.
 #[cfg(target_os = "linux")]
 pub mod linux_personal_worker_runtime_manifest;
+/// Native Linux research adapter for exact same-HEAD reflink task worktrees.
+#[cfg(target_os = "linux")]
+pub mod linux_reflink_task_materialization;
 #[cfg(target_os = "linux")]
 pub mod linux_state;
 #[cfg(target_os = "linux")]
@@ -207,13 +234,24 @@ pub mod linux_state_prepare;
 pub mod linux_state_recovery;
 /// Pure fixed offline Cargo command policy for exact local self-builds.
 pub mod local_install_build_command;
+/// Bounded exact-source local self-build execution and artifact evidence.
+#[cfg(unix)]
+pub mod local_install_build_execution;
 /// Read-only, path-private proof that the isolated self-build Cargo lookup path is config-free.
 pub mod local_install_cargo_config_preflight;
+/// Crash-safe private per-user publication of verified Glaeda binary generations.
+#[cfg(unix)]
+pub mod local_install_generation_store;
+/// Descriptor-bound observation and publication of the canonical local `glaeda` launcher.
+#[cfg(unix)]
+pub mod local_install_launcher;
 /// Pure exact-source local binary generation and stable launcher planning.
 pub mod local_install_plan;
 /// Read-only exact checkout and Cargo.lock proof for local self-builds.
 #[cfg(unix)]
 pub mod local_install_source_preflight;
+/// Pure interference policy shared by local owned-execution adapters.
+pub mod local_interference_admission;
 pub mod mac_availability;
 pub mod macos_resource_observation;
 pub mod manifest;
@@ -229,6 +267,12 @@ pub mod operator_remediation;
 pub mod operator_status;
 /// Typed, read-only aggregation of one coherent operator status evidence bundle.
 pub mod operator_status_service;
+/// Canonical controller enrollment for one trusted native-Linux GitHub Actions JIT worker.
+#[cfg(target_os = "linux")]
+pub mod owned_linux_jit_enrollment;
+/// Native owned-Linux task backend for one trusted GitHub Actions JIT runner.
+#[cfg(unix)]
+pub(crate) mod owned_linux_jit_runtime;
 pub mod ownership;
 /// Pure composition of durable queue, Lima lifecycle, and runner-readiness evidence.
 pub mod personal_worker_host_broker;
@@ -247,6 +291,8 @@ pub mod personal_worker_operator_store;
 pub mod personal_worker_queue;
 /// Pure bounded projection of durable personal-worker status, queue pages, and job state.
 pub mod personal_worker_read_model;
+/// Pure binding of one repository-owned parallel verifier to one personal-worker attempt/result.
+pub mod personal_worker_repository_result;
 /// Read-only official-runner readiness composed with exact personal-worker evidence.
 pub mod personal_worker_runner_readiness;
 /// Pure sealed authority for the exact personal-worker Linux verification-runtime closure.
@@ -281,6 +327,18 @@ pub mod project_disk_host_observation;
 pub mod project_disk_lease;
 /// Pure bounded validator for the final #628 full project-filesystem correlation receipt.
 pub mod project_filesystem_correlation_receipt;
+pub mod project_workspace_identity;
+/// Pure path-free catalog-wide authority vocabulary for protected cache generations.
+pub mod protected_cache_generation_catalog;
+/// Conservative namespace-wide lease visibility from personal-worker durable state.
+pub mod protected_cache_namespace_lease_visibility;
+/// Strict path-free replacement-equivalence receipt vocabulary for protected cache generations.
+pub mod protected_cache_replacement_equivalence;
+pub mod quarry_parallel_verification_adapter;
+/// Bounded exact-byte capture from one already-open Quarry verification receipt channel.
+pub mod quarry_parallel_verification_capture;
+/// Strict supplied-receipt-only decoder for Quarry parallel verification receipt v2.
+pub mod quarry_parallel_verification_receipt;
 pub mod renderprove_artifact_binding;
 pub mod renderprove_execution;
 #[cfg(target_os = "linux")]
@@ -293,10 +351,17 @@ pub mod renderprove_vision_profile;
 pub mod renderprove_vision_result;
 /// Credentialless, bounded observation of one immutable reviewed repository source.
 pub mod repository_source_observation;
+/// Pure frozen preregistration and sample binding for resident backend comparisons.
+pub mod resident_backend_comparison;
+/// Bounded exact-OID repository evidence for resident trusted-agent work.
+#[cfg(unix)]
+pub mod resident_repo_query;
 /// Pure, authority-free resident-sandbox generation/config/locator catalog and strict codec.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod resident_sandbox_catalog;
 pub mod resource;
+/// Pure evidence-driven lifecycle and retention policy for expensive reusable state.
+pub mod reusable_state_lifecycle;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;
 /// Strict, bounded, nonblocking, descriptor-relative, identity-bound observation of reviewed Podman sources.
@@ -323,6 +388,8 @@ pub mod rust_verification_envelope;
 pub mod rust_verification_envelope_digest;
 pub mod state;
 pub mod state_document;
+/// Closed current/legacy selection for Glaeda's fixed Linux durable-state roots.
+pub mod state_root_generation;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 pub mod subordinate_id;
@@ -365,6 +432,9 @@ pub mod trusted_project_filesystem_guest_protocol;
 pub mod trusted_workspace_receipt;
 #[cfg(unix)]
 pub mod unix_personal_worker_store;
+/// Unix descriptor-retained persistence for the empty protected cache-generation catalog.
+#[cfg(unix)]
+pub mod unix_protected_cache_generation_catalog_store;
 /// Descriptor-bound private persistence for the resident-sandbox catalog.
 #[cfg(unix)]
 pub mod unix_resident_sandbox_store;

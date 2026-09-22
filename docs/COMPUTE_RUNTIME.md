@@ -191,6 +191,12 @@ Current and future candidates can include:
 
 A better backend should improve Glaeda without redefining the workload, trust, ownership, recovery, or hot-state model.
 
+The host operating system is the first backend layer, not an implementation detail to replace.
+Glaeda should lower semantic workload intent into mature scheduler, cgroup, process, filesystem,
+mount, page-cache and service-manager primitives, then observe the effective result. A bespoke
+userspace mechanism belongs only where measured complete-loop evidence shows a remaining gap that
+the native control cannot satisfy.
+
 ## Current coupling audit
 
 The first generic workload seam has now landed, while two composition seams still deserve attention before broader refactoring:
@@ -241,4 +247,3 @@ Work under #770 should:
 6. preserve exact old schema, digest, receipt, runtime, and recovery identities until explicit successor work owns them.
 
 Related direction: #750, #764, #765, #761, #762, #769, #547, #548.
-
