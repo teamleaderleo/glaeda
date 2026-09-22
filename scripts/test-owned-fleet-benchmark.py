@@ -155,6 +155,7 @@ def benchmark_receipt(
         "result": {
             "class": "validated" if validated else "command_failed",
             "validated": validated,
+            "exit_code": 0 if validated else 1,
             "failure_count": 0 if validated else 1,
             "timed_out": False,
             "source_unchanged": True,
@@ -612,6 +613,9 @@ class FleetHarnessTests(unittest.TestCase):
                 value["result"]["failure_count"] = (
                     1 if result_class == "command_failed" else 0
                 )
+                value["result"]["exit_code"] = (
+                    1 if result_class == "command_failed" else 0
+                )
                 value["result"]["source_unchanged"] = result_class != "source_changed"
                 value["result"]["semantic_validation"] = {
                     "validated": "fixture_accepted",
@@ -672,6 +676,14 @@ class FleetHarnessTests(unittest.TestCase):
             bad_authority = copy.deepcopy(base)
             bad_authority["authority"] = "declared_only"
             cases.append(bad_authority)
+
+            bad_exit = copy.deepcopy(base)
+            bad_exit["result"]["class"] = "command_failed"
+            bad_exit["result"]["validated"] = False
+            bad_exit["result"]["failure_count"] = 1
+            bad_exit["result"]["exit_code"] = 0
+            bad_exit["result"]["semantic_validation"] = "command_exit_nonzero"
+            cases.append(bad_exit)
 
             for index, value in enumerate(cases):
                 with self.subTest(index=index):
