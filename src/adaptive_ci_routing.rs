@@ -2228,8 +2228,7 @@ mod tests {
     fn manually_built_latency_policy_requires_spend_ceiling() {
         let workload = workload();
         let candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Cold);
-        let observations =
-            three_successes(&workload, "owned", HotStateClass::Cold, 40_000, 0, 0);
+        let observations = three_successes(&workload, "owned", HotStateClass::Cold, 40_000, 0, 0);
         let mut policy = RoutingPolicyV1::latency(0);
         policy.spend_ceiling_microusd = None;
 
@@ -2924,8 +2923,7 @@ mod tests {
             unfinished: 0,
             peak_pressure: HostPressureClass::NotApplicable,
         });
-        let observations =
-            three_successes(&workload, "owned", HotStateClass::Warm, 40_000, 0, 0);
+        let observations = three_successes(&workload, "owned", HotStateClass::Warm, 40_000, 0, 0);
 
         let report = recommend_ci_pool(
             &workload,
