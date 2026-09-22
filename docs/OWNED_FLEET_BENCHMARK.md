@@ -199,6 +199,12 @@ The receipt records:
 
 Repository semantic receipts begin absent on every sample. A stale semantic receipt from an earlier success cannot validate a later run.
 
+Source commit/tree and cleanliness probes use absolute `/usr/bin/git` with a
+closed C-locale environment, global/system Git config disabled, and
+`--ignore-submodules=none` for cleanliness. Reviewed catalog commands execute
+through absolute `/bin/bash` with the benchmark's explicit environment rather
+than the caller's ambient process environment.
+
 ## Contention: 1 large / 2 medium / 4 small
 
 The catalog defines only the concurrency shape:
