@@ -222,7 +222,7 @@ pub fn project_cmux_workload_result(
             )
         })?;
         let duration_millis = duration_millis(timing.seconds)?;
-        let observation_id = observation_id(run_id, &timing.stage);
+        let observation_id = observation_id(run_id, sequence, &timing.stage);
 
         let mut observation = VerificationObservation::new(
             &observation_id,
@@ -428,11 +428,11 @@ fn runtime_input_set_identity(inputs: &[RawRuntimeInputIdentity]) -> Option<Stri
     ))
 }
 
-fn observation_id(run_id: &str, stage: &str) -> String {
-    let material = format!("{run_id}\n{stage}\n");
+fn observation_id(run_id: &str, sequence: u16, stage: &str) -> String {
+    let material = format!("{run_id}\n{sequence}\n{stage}\n");
     format!(
         "cmux-{}",
-        &domain_digest("cmux-verification-observation-v1", material.as_bytes())[7..23]
+        &domain_digest("cmux-verification-observation-v1", material.as_bytes())[7..]
     )
 }
 
@@ -538,6 +538,14 @@ fn validate_result(
         ));
     }
 
+    if result.ended_at_unix_millis < result.started_at_unix_millis {
+        return Err(error(
+            "cmux_result_interval_invalid",
+            "CMUX result end time precedes its start time",
+        ));
+    }
+    let elapsed_millis = result.ended_at_unix_millis - result.started_at_unix_millis;
+
     let mut runtime_names = BTreeSet::new();
     for input in &result.runtime_input_identities {
         validate_token(&input.name)?;
@@ -574,7 +582,13 @@ fn validate_result(
     }
     for timing in &result.stage_timings {
         validate_stage(&timing.stage)?;
-        duration_millis(timing.seconds)?;
+        let stage_millis = duration_millis(timing.seconds)?;
+        if stage_millis > elapsed_millis {
+            return Err(error(
+                "cmux_stage_duration_outside_result_interval",
+                "CMUX stage duration exceeds the observed result interval",
+            ));
+        }
     }
     validate_text(&result.resource_summary.resource_class)?;
     validate_token(&result.resource_summary.architecture)?;
@@ -1098,6 +1112,54 @@ mod tests {
         );
         assert_eq!(batch.ignored_stages(), &["validation".to_owned()]);
         assert_eq!(batch.observations()[2].duration_millis(), 343_600);
+    }
+
+    #[test]
+    fn result_interval_bounds_projected_stage_durations() {
+        let mut reversed = compile_result("passed", "cold");
+        reversed.ended_at_unix_millis = reversed.started_at_unix_millis - 1;
+        assert_eq!(
+            validate_result(&reversed).unwrap_err().code,
+            "cmux_result_interval_invalid"
+        );
+
+        let mut too_short = compile_result("passed", "cold");
+        too_short.ended_at_unix_millis = too_short.started_at_unix_millis + 1_000;
+        assert_eq!(
+            validate_result(&too_short).unwrap_err().code,
+            "cmux_stage_duration_outside_result_interval"
+        );
+    }
+
+    #[test]
+    fn repeated_stage_names_get_distinct_observation_ids() {
+        let mut result = compile_result("passed", "cold");
+        result.stage_timings.insert(
+            3,
+            RawStageTiming {
+                stage: "compile".to_owned(),
+                seconds: 2.5,
+            },
+        );
+        let bytes = serde_json::to_vec(&result).unwrap();
+        let outer = outer_for(&bytes, &result);
+        let projected = project_cmux_workload_result(
+            "cmux-run-duplicate-stage",
+            &serde_json::to_vec(&outer).unwrap(),
+            &bytes,
+        )
+        .unwrap();
+
+        let compile_ids = projected
+            .observations()
+            .iter()
+            .filter(|observation| observation.stage() == VerificationStage::Compile)
+            .map(VerificationObservation::observation_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(compile_ids.len(), 2);
+        assert_ne!(compile_ids[0], compile_ids[1]);
+        assert!(compile_ids.iter().all(|identity| identity.len() == 69));
     }
 
     #[test]
