@@ -18,6 +18,7 @@ pub const MAX_ROUTING_ID_BYTES: usize = 96;
 pub const MAX_ROUTING_CAPABILITIES: usize = 32;
 pub const MAX_ROUTING_POOLS: usize = 32;
 pub const MAX_ROUTING_OBSERVATIONS: usize = 256;
+pub const MIN_ROUTING_VALIDATED_SAMPLES: u16 = 3;
 pub const MAX_ROUTING_PHASE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 pub const MAX_ROUTING_AGE_MILLIS: u64 = 180 * 24 * 60 * 60 * 1_000;
 const PARTS_PER_MILLION: u64 = 1_000_000;
@@ -721,13 +722,13 @@ impl PredictionConfigV1 {
         }
         if self.max_samples == 0
             || usize::from(self.max_samples) > MAX_ROUTING_OBSERVATIONS
-            || self.min_validated_samples == 0
+            || self.min_validated_samples < MIN_ROUTING_VALIDATED_SAMPLES
             || self.min_validated_samples > self.max_samples
         {
             return Err(error(
                 "prediction.samples",
                 "routing_prediction_sample_bounds",
-                "prediction sample bounds are invalid",
+                "prediction sample bounds are invalid or below the comparable-sample floor",
             ));
         }
         Ok(())
@@ -1877,6 +1878,39 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn prediction_config_cannot_enable_single_run_recommendations() {
+        let workload = workload();
+        let candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Cold);
+        let observations = vec![observation(
+            &workload,
+            "owned",
+            HotStateClass::Cold,
+            1_000,
+            40_000,
+            0,
+            0,
+            ObservationOutcome::ValidatedSuccess,
+        )];
+        let config = PredictionConfigV1 {
+            max_age_millis: 60_000,
+            max_samples: 1,
+            min_validated_samples: 1,
+        };
+
+        let error = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            config,
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "routing_prediction_sample_bounds");
     }
 
     #[test]
