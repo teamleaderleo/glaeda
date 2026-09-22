@@ -301,10 +301,66 @@ def reduce_window(manifest: dict[str, Any], base_dir: Path) -> dict[str, Any]:
         sample_ids.add(sample_id)
         receipts.append(receipt)
 
+    offered_digest = digest_json(
+        sorted(arrival_basis, key=lambda item: item["work_id"])
+    )
+    arrival_pattern_digest = digest_json(
+        {
+            "arrival_pattern_id": manifest["arrival_pattern_id"],
+            "arrival_tolerance_ms": arrival_tolerance_ms,
+            "offered_work": sorted(arrival_basis, key=lambda item: item["work_id"]),
+        }
+    )
+
     if not receipts:
-        raise FleetError(
-            "window needs at least one settled receipt to bind machine/backend/toolchain identity"
-        )
+        return {
+            "schema_version": WINDOW_SCHEMA_VERSION,
+            "document_type": "glaeda-owned-fleet-window-partial-receipt",
+            "authority": "diagnostic_observation_only",
+            "experiment_id": manifest["experiment_id"],
+            "machine_id": manifest["machine_id"],
+            "workload_id": manifest["workload_id"],
+            "variant": manifest.get("variant"),
+            "state_class": manifest["state_class"],
+            "profile_id": profile_id,
+            "profile": value_catalog["contention_profiles"][profile_id],
+            "resource_policy_id": manifest["resource_policy_id"],
+            "resource_policy_status": resource_policy_status,
+            "resource_policy_evidence_id": policy_evidence_id,
+            "evidence_class": "diagnostic_only",
+            "aggregate_cpu_millis": aggregate_cpu,
+            "aggregate_memory_limit_bytes": aggregate_memory,
+            "per_job_cpu_millis": per_job_cpu,
+            "per_job_memory_limit_bytes": per_job_memory,
+            "arrival_pattern_id": manifest["arrival_pattern_id"],
+            "arrival_pattern_digest": arrival_pattern_digest,
+            "offered_work_digest": offered_digest,
+            "window_start_monotonic_ns": start_ns,
+            "window_elapsed_seconds": elapsed_seconds,
+            "counts": {
+                "offered": len(offered),
+                "settled": 0,
+                "validated_completions": 0,
+                "unfinished": len(offered),
+                "failure_count": 0,
+                "fallback_count": 0,
+                "reset_count": 0,
+            },
+            "validated_completions_per_second": 0.0,
+            "final_result_latency_ms": {"p50": None, "p90": None},
+            "concurrency": {
+                "declared_jobs": jobs,
+                "maximum_simultaneous_observed": 0,
+                "underfilled": True,
+            },
+            "resources": {
+                "max_member_peak_rss_kib": None,
+                "swap_used_max_observed_bytes": None,
+                "swap_growth_max_observed_bytes": None,
+                "memory_psi_some_avg10_max_observed": None,
+                "max_temperature_c_observed": None,
+            },
+        }
 
     identities = [_receipt_identity(receipt) for receipt in receipts]
     identity_digests = {digest_json(identity) for identity in identities}
@@ -377,14 +433,7 @@ def reduce_window(manifest: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 )
             )
 
-    offered_digest = digest_json(sorted(arrival_basis, key=lambda item: item["work_id"]))
-    arrival_pattern_digest = digest_json(
-        {
-            "arrival_pattern_id": manifest["arrival_pattern_id"],
-            "arrival_tolerance_ms": arrival_tolerance_ms,
-            "offered_work": sorted(arrival_basis, key=lambda item: item["work_id"]),
-        }
-    )
+
     return {
         "schema_version": WINDOW_SCHEMA_VERSION,
         "document_type": "glaeda-owned-fleet-window-receipt",
@@ -531,6 +580,8 @@ def compare_windows(windows: list[dict[str, Any]]) -> dict[str, Any]:
         flags = []
         if window["counts"]["unfinished"]:
             flags.append("unfinished_work")
+        if window["counts"]["failure_count"]:
+            flags.append("failed_work")
         if window["counts"]["fallback_count"] or window["counts"]["reset_count"]:
             flags.append("fallback_or_reset")
         if window["counts"]["validated_completions"] < max_validated:
@@ -553,6 +604,7 @@ def compare_windows(windows: list[dict[str, Any]]) -> dict[str, Any]:
                 "p50_ms": window["final_result_latency_ms"]["p50"],
                 "p90_ms": p90,
                 "unfinished": window["counts"]["unfinished"],
+                "failure_count": window["counts"]["failure_count"],
                 "swap_max_bytes": window["resources"][
                     "swap_used_max_observed_bytes"
                 ],
