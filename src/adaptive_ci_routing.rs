@@ -1128,7 +1128,18 @@ pub fn recommend_ci_pool(
                 candidate.pressure_after_admission == HostPressureClass::NotApplicable
             }
         };
-        if !pressure_semantics_valid {
+        if !pressure_semantics_valid
+            || candidate.contention.as_ref().is_some_and(|contention| {
+                match candidate.pool.pressure_applicability {
+                    HostPressureApplicability::LocalObserved => {
+                        contention.peak_pressure == HostPressureClass::NotApplicable
+                    }
+                    HostPressureApplicability::NotApplicable => {
+                        contention.peak_pressure != HostPressureClass::NotApplicable
+                    }
+                }
+            })
+        {
             exclusions.push(PoolExclusionV1 {
                 pool_id,
                 reason: PoolExclusionReason::InvalidPressureSemantics,
@@ -2821,6 +2832,92 @@ mod tests {
             HotStateClass::Cold,
         );
         candidate.pressure_after_admission = HostPressureClass::Low;
+        let observations =
+            three_successes(&workload, "hosted", HotStateClass::Cold, 40_000, 10_000, 0);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::latency(20_000),
+        )
+        .unwrap();
+
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("hosted")
+                && entry.reason == PoolExclusionReason::InvalidPressureSemantics
+        }));
+    }
+
+    #[test]
+    fn local_contention_cannot_hide_pressure_as_not_applicable() {
+        let workload = workload();
+        let mut candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Warm);
+        candidate.contention = Some(ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 4,
+            maximum_simultaneous: 4,
+            validated_completions: 4,
+            elapsed_millis: 60_000,
+            final_result_p50_millis: Some(20_000),
+            final_result_p90_millis: Some(30_000),
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 0,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::NotApplicable,
+        });
+        let observations =
+            three_successes(&workload, "owned", HotStateClass::Warm, 40_000, 0, 0);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("owned")
+                && entry.reason == PoolExclusionReason::InvalidPressureSemantics
+        }));
+    }
+
+    #[test]
+    fn nonlocal_contention_cannot_claim_local_pressure() {
+        let workload = workload();
+        let mut candidate = pool(
+            "hosted",
+            PoolAccountingClass::PaidBurst,
+            HotStateClass::Cold,
+        );
+        candidate.contention = Some(ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 4,
+            maximum_simultaneous: 4,
+            validated_completions: 4,
+            elapsed_millis: 60_000,
+            final_result_p50_millis: Some(20_000),
+            final_result_p90_millis: Some(30_000),
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 0,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::Low,
+        });
         let observations =
             three_successes(&workload, "hosted", HotStateClass::Cold, 40_000, 10_000, 0);
 
