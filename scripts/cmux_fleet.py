@@ -9,12 +9,14 @@ import json
 import os
 import re
 import stat
+import subprocess
+import tempfile
 import sys
 from pathlib import Path
 from typing import Any
 
 ENROLLMENT_SCHEMA = "glaeda-cmux-fleet-enrollment/v1"
-ACCEPTANCE_SCHEMA = "glaeda-cmux-fleet-acceptance/v1"
+ACCEPTANCE_SCHEMA = "glaeda-cmux-fleet-acceptance/v2"
 STATUS_SCHEMA = "glaeda-cmux-fleet-node-status/v1"
 BOOTSTRAP_SCHEMA = "glaeda-cmux-fleet-bootstrap/v1"
 MAX_DOCUMENT_BYTES = 64 * 1024
@@ -33,6 +35,7 @@ ROLES = (
     "cmux_linux_ci",
     "cmux_macos_native_build",
     "cmux_macos_test",
+    "diagnostic",
 )
 ENROLLABLE_ROLES = {
     "cmux_linux_ci",
@@ -42,6 +45,16 @@ CMUX_REPOSITORY = "manaflow-ai/cmux"
 CMUX_RESULT_DOCUMENT_TYPE = "cmux-workload-result"
 CMUX_RESULT_SCHEMA_VERSION = 1
 CMUX_RESULT_STATES = {"passed", "failed", "timed_out", "ambiguous"}
+CMUX_PROFILE_RUNNER = "scripts/ci/cmux_workload_profile.py"
+LOCAL_EXECUTION_CLASS = "glaeda-local-profile/v1"
+EXTERNAL_EVIDENCE_CLASS = "external-evidence/v1"
+ACCEPTANCE_CHILD_ENV_KEYS = (
+    "PATH",
+    "HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "DEVELOPER_DIR",
+)
 ROLE_PROFILES = {
     "cmux_linux_ci": {"id": "cmux.ci.guard", "generation": 1},
     "cmux_macos_native_build": {"id": "cmux.macos.dev-check", "generation": 1},
@@ -101,6 +114,26 @@ def cmux_canonical_bytes(value: object) -> bytes:
 
 def cmux_digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(cmux_canonical_bytes(value)).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest_value = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest_value.update(chunk)
+    except OSError as error:
+        raise FleetError("Glaeda fleet contract file is unavailable") from error
+    return "sha256:" + digest_value.hexdigest()
+
+
+def fleet_contract_generation() -> str:
+    root = Path(__file__).resolve().parent
+    files = {
+        "cmux_fleet.py": _file_sha256(root / "cmux_fleet.py"),
+        "cmux_fleet_bootstrap.py": _file_sha256(root / "cmux_fleet_bootstrap.py"),
+    }
+    return digest(files)
 
 
 def exact_keys(value: object, keys: set[str], label: str) -> dict[str, Any]:
@@ -245,6 +278,7 @@ def _cmux_semantic_key(value: dict[str, Any]) -> str:
                 "generation": profile["generation"],
             },
             "semantic_validator": value["semantic_validator"],
+            "environment_class": value["environment_class"],
             "parameters": value["parameters"],
             "runtime_inputs": [
                 {
@@ -285,6 +319,7 @@ def validate_cmux_semantic_result(
             "source",
             "profile",
             "semantic_validator",
+            "environment_class",
             "expected_result_class",
             "result",
             "parameters",
@@ -343,6 +378,8 @@ def validate_cmux_semantic_result(
     if (
         not isinstance(doc["semantic_validator"], str)
         or not doc["semantic_validator"]
+        or not isinstance(doc["environment_class"], str)
+        or TOKEN_RE.fullmatch(doc["environment_class"]) is None
         or not isinstance(doc["expected_result_class"], str)
         or not doc["expected_result_class"]
         or not isinstance(doc["network_class"], str)
@@ -498,8 +535,11 @@ def validate_cmux_semantic_result(
 
 ACCEPTANCE_RECEIPT_KEYS = {
     "schema", "nodeId", "enrollmentGeneration", "role", "source", "profile",
-    "toolchainGeneration", "glaedaGeneration", "cmuxSemanticResultSha256",
-    "cmuxSemanticResultState", "processSettlement", "result",
+    "toolchainGeneration", "glaedaGeneration", "glaedaFleetContractGeneration",
+    "cmuxSemanticResultSha256",
+    "cmuxSemanticResultState", "cmuxEnvironmentClass", "cmuxToolchainIdentity",
+    "postBootstrapSha256", "executionClass", "localExecutionAttemptSha256",
+    "processSettlement", "result",
 }
 
 
@@ -534,9 +574,31 @@ def validate_acceptance_receipt(value: object) -> dict[str, Any]:
         raise FleetError("acceptance receipt profile is not the reviewed role profile")
     sha256(doc["toolchainGeneration"], "acceptance receipt toolchain generation")
     sha256(doc["glaedaGeneration"], "acceptance receipt Glaeda generation")
+    sha256(
+        doc["glaedaFleetContractGeneration"],
+        "acceptance receipt Glaeda fleet contract generation",
+    )
     sha256(doc["cmuxSemanticResultSha256"], "CMUX semantic result digest")
+    sha256(doc["cmuxToolchainIdentity"], "CMUX semantic toolchain identity")
+    sha256(doc["postBootstrapSha256"], "post-acceptance bootstrap digest")
+    token(doc["cmuxEnvironmentClass"], "CMUX environment class")
     if doc["cmuxSemanticResultState"] not in CMUX_RESULT_STATES:
         raise FleetError("CMUX semantic result state is invalid")
+    if doc["executionClass"] not in {
+        LOCAL_EXECUTION_CLASS,
+        EXTERNAL_EVIDENCE_CLASS,
+    }:
+        raise FleetError("acceptance execution class is invalid")
+    local_attempt = sha256(
+        doc["localExecutionAttemptSha256"],
+        "local execution attempt",
+        optional=True,
+    )
+    if (
+        (doc["executionClass"] == LOCAL_EXECUTION_CLASS)
+        != (local_attempt is not None)
+    ):
+        raise FleetError("acceptance local execution evidence is inconsistent")
     if doc["processSettlement"] not in {"complete", "incomplete"}:
         raise FleetError("acceptance process settlement is invalid")
     if doc["result"] not in {"accepted", "rejected"}:
@@ -544,6 +606,8 @@ def validate_acceptance_receipt(value: object) -> dict[str, Any]:
     accepted = (
         doc["cmuxSemanticResultState"] == "passed"
         and doc["processSettlement"] == "complete"
+        and doc["executionClass"] == LOCAL_EXECUTION_CLASS
+        and local_attempt is not None
     )
     if (doc["result"] == "accepted") != accepted:
         raise FleetError("acceptance receipt result disagrees with semantic result")
@@ -559,6 +623,8 @@ def acceptance_matches_enrollment(enrollment: dict[str, Any], receipt: dict[str,
         return False, "acceptance_enrollment_stale"
     if receipt.get("glaedaGeneration") != enrollment["glaedaGeneration"]:
         return False, "acceptance_glaeda_stale"
+    if receipt.get("glaedaFleetContractGeneration") != fleet_contract_generation():
+        return False, "acceptance_glaeda_contract_stale"
     if receipt.get("toolchainGeneration") not in enrollment["supportedToolchainGenerations"]:
         return False, "acceptance_toolchain_stale"
     if receipt.get("profile") != enrollment["roleProfiles"].get(role):
@@ -566,18 +632,56 @@ def acceptance_matches_enrollment(enrollment: dict[str, Any], receipt: dict[str,
     return True, "accepted"
 
 
+def validate_post_acceptance_bootstrap(
+    enrollment: dict[str, Any],
+    bootstrap_value: object,
+    toolchain_generation: str,
+) -> str:
+    observed = enrollment_from_bootstrap(
+        bootstrap_value,
+        node_id=enrollment["nodeId"],
+        operator_fleet_scope=enrollment["operatorFleetScope"],
+        enrollment_generation=enrollment["enrollmentGeneration"],
+    )
+    stable_fields = ENROLLMENT_KEYS - {
+        "state",
+        "quarantineReason",
+        "supportedToolchainGenerations",
+    }
+    expected_stable = {name: enrollment[name] for name in stable_fields}
+    observed_stable = {name: observed[name] for name in stable_fields}
+    if observed_stable != expected_stable:
+        raise FleetError(
+            "post-acceptance bootstrap differs from enrolled machine capability"
+        )
+    if observed["supportedToolchainGenerations"] != [toolchain_generation]:
+        raise FleetError(
+            "post-acceptance bootstrap toolchain differs from acceptance"
+        )
+    return digest(bootstrap_value)
+
+
 def finalize_acceptance(
     enrollment_value: object,
     role: str,
     toolchain_generation: str,
     cmux_result_value: object,
+    post_bootstrap_value: object,
     cmux_result_sha256: str | None = None,
+    *,
+    execution_class: str = EXTERNAL_EVIDENCE_CLASS,
+    local_execution_attempt_sha256: str | None = None,
 ) -> dict[str, Any]:
     enrollment = validate_enrollment(enrollment_value)
     if role not in enrollment["allowedExecutionRoles"]:
         raise FleetError("acceptance role is outside the enrollment allowlist")
     if toolchain_generation not in enrollment["supportedToolchainGenerations"]:
         raise FleetError("acceptance toolchain generation is outside the enrollment allowlist")
+    post_bootstrap_sha256 = validate_post_acceptance_bootstrap(
+        enrollment,
+        post_bootstrap_value,
+        toolchain_generation,
+    )
     expected_profile = enrollment["roleProfiles"][role]
     semantic = validate_cmux_semantic_result(cmux_result_value, expected_profile)
     actual_cmux_result_sha256 = digest(semantic)
@@ -592,9 +696,17 @@ def finalize_acceptance(
         if cleanup["state"] == "complete" and cleanup["process_group_settled"] is True
         else "incomplete"
     )
+    locally_bound = (
+        execution_class == LOCAL_EXECUTION_CLASS
+        and local_execution_attempt_sha256 is not None
+    )
+    if local_execution_attempt_sha256 is not None:
+        sha256(local_execution_attempt_sha256, "local execution attempt")
     result = (
         "accepted"
-        if semantic["result"] == "passed" and settlement == "complete"
+        if semantic["result"] == "passed"
+        and settlement == "complete"
+        and locally_bound
         else "rejected"
     )
     receipt = {
@@ -606,8 +718,14 @@ def finalize_acceptance(
         "profile": semantic["profile"],
         "toolchainGeneration": toolchain_generation,
         "glaedaGeneration": enrollment["glaedaGeneration"],
+        "glaedaFleetContractGeneration": fleet_contract_generation(),
         "cmuxSemanticResultSha256": cmux_result_sha256,
         "cmuxSemanticResultState": semantic["result"],
+        "cmuxEnvironmentClass": semantic["environment_class"],
+        "cmuxToolchainIdentity": semantic["toolchain"]["identity"],
+        "postBootstrapSha256": post_bootstrap_sha256,
+        "executionClass": execution_class,
+        "localExecutionAttemptSha256": local_execution_attempt_sha256,
         "processSettlement": settlement,
         "result": result,
     }
@@ -975,6 +1093,251 @@ def durable_replace_enrollment(
         raise FleetError("published fleet enrollment did not revalidate")
 
 
+def acceptance_child_environment(temporary_root: Path) -> dict[str, str]:
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    temporary_root.chmod(0o700)
+    environment = {
+        "LC_ALL": "C",
+        "LANG": "C",
+        "TMPDIR": str(temporary_root),
+        "PATH": os.environ.get(
+            "PATH",
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        ),
+    }
+    for name in ACCEPTANCE_CHILD_ENV_KEYS:
+        if name == "PATH":
+            continue
+        value = os.environ.get(name)
+        if value:
+            environment[name] = value
+    return environment
+
+
+def _bounded_tail(path: Path, ceiling: int = 4096) -> str:
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - ceiling))
+            return stream.read(ceiling).decode("utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def _git_oid(cmux_root: Path, expression: str) -> str:
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith("GIT_")
+    }
+    environment["LC_ALL"] = "C"
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/git", "-C", str(cmux_root), "rev-parse", expression],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise FleetError("CMUX source identity probe timed out") from error
+    value = completed.stdout.strip()
+    if completed.returncode != 0 or COMMIT_RE.fullmatch(value) is None:
+        raise FleetError("CMUX source identity is unavailable")
+    return value
+
+
+def _decode_bootstrap_output(raw: bytes) -> object:
+    if len(raw) > MAX_DOCUMENT_BYTES:
+        raise FleetError("post-acceptance bootstrap exceeds size ceiling")
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise FleetError("post-acceptance bootstrap is invalid JSON") from error
+    if raw != canonical(value):
+        raise FleetError("post-acceptance bootstrap is not canonical")
+    return value
+
+
+def accept_local(
+    enrollment_path: Path,
+    cmux_root_value: Path,
+    glaeda: Path,
+    role: str,
+    cache_root_value: Path | None = None,
+    min_free_gib: int | None = None,
+) -> dict[str, Any]:
+    enrollment = validate_enrollment(load(enrollment_path))
+    if enrollment["state"] != "enrolling":
+        raise FleetError("local acceptance requires an enrolling node")
+    if role not in enrollment["allowedExecutionRoles"]:
+        raise FleetError("local acceptance role is outside the enrollment allowlist")
+
+    cmux_root = cmux_root_value.resolve(strict=True)
+    runner = cmux_root / CMUX_PROFILE_RUNNER
+    if not runner.is_file() or runner.is_symlink():
+        raise FleetError("CMUX workload profile runner is unavailable")
+    glaeda = glaeda.resolve(strict=True)
+    if not glaeda.is_file() or not os.access(glaeda, os.X_OK):
+        raise FleetError("Glaeda executable is unavailable")
+
+    family = enrollment["os"]["family"]
+    cache_root = (
+        cache_root_value.resolve(strict=True)
+        if cache_root_value is not None
+        else None
+    )
+    if family == "macos" and cache_root is None:
+        raise FleetError("macOS local acceptance requires --cache-root")
+    if min_free_gib is not None and min_free_gib <= 0:
+        raise FleetError("minimum free disk must be positive")
+
+    source_commit = _git_oid(cmux_root, "HEAD^{commit}")
+    source_tree = _git_oid(cmux_root, "HEAD^{tree}")
+    profile = enrollment["roleProfiles"][role]
+    fleet_contract_before = fleet_contract_generation()
+
+    fleet_root = enrollment_path.resolve(strict=True).parent
+    root_info = fleet_root.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != os.geteuid()
+        or stat.S_IMODE(root_info.st_mode) & 0o077
+    ):
+        raise FleetError("fleet state directory ownership or mode is unsafe")
+
+    bootstrap_script = Path(__file__).with_name("cmux_fleet_bootstrap.py")
+    if not bootstrap_script.is_file() or bootstrap_script.is_symlink():
+        raise FleetError("fleet bootstrap implementation is unavailable")
+
+    with tempfile.TemporaryDirectory(
+        prefix=".acceptance-run.",
+        dir=fleet_root,
+    ) as raw_state:
+        state_root = Path(raw_state).resolve(strict=True)
+        state_root.chmod(0o700)
+        result_path = state_root / "result.json"
+        log_path = state_root / "cmux-runner.log"
+        child_environment = acceptance_child_environment(state_root / "tmp")
+        log_fd = os.open(
+            log_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            with os.fdopen(log_fd, "wb", closefd=True) as log:
+                log_fd = -1
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        str(runner),
+                        "run",
+                        profile["id"],
+                        "--generation",
+                        str(profile["generation"]),
+                        "--commit",
+                        source_commit,
+                        "--tree",
+                        source_tree,
+                        "--state-class",
+                        "cold",
+                        "--result",
+                        str(result_path),
+                    ],
+                    cwd=cmux_root,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    env=child_environment,
+                    check=False,
+                )
+        finally:
+            if log_fd >= 0:
+                os.close(log_fd)
+
+        if not result_path.is_file():
+            detail = _bounded_tail(log_path)
+            suffix = f": {detail}" if detail else ""
+            raise FleetError(
+                f"CMUX local acceptance produced no semantic result{suffix}"
+            )
+        cmux_result, cmux_result_sha256 = load_cmux_semantic_result(result_path)
+
+        bootstrap_argv = [
+            sys.executable,
+            "-I",
+            str(bootstrap_script),
+            "--platform",
+            family,
+            "--cmux-root",
+            str(cmux_root),
+            "--glaeda",
+            str(glaeda),
+            "--hardware-class",
+            enrollment["hardwareCapabilityClass"],
+            "--role",
+            role,
+        ]
+        if cache_root is not None:
+            bootstrap_argv.extend(["--cache-root", str(cache_root)])
+        if min_free_gib is not None:
+            bootstrap_argv.extend(["--min-free-gib", str(min_free_gib)])
+        try:
+            bootstrap = subprocess.run(
+                bootstrap_argv,
+                cwd=Path(__file__).resolve().parents[1],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=child_environment,
+                check=False,
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise FleetError("post-acceptance bootstrap timed out") from error
+        if bootstrap.returncode != 0:
+            detail = bootstrap.stderr.decode("utf-8", errors="replace").strip()
+            raise FleetError(
+                "post-acceptance bootstrap refused"
+                + (f": {detail[:1024]}" if detail else "")
+            )
+        post_bootstrap = _decode_bootstrap_output(bootstrap.stdout)
+        if not isinstance(post_bootstrap, dict):
+            raise FleetError("post-acceptance bootstrap is not an object")
+        toolchain_generation = post_bootstrap.get("toolchainGeneration")
+        sha256(toolchain_generation, "post-acceptance toolchain generation")
+        if toolchain_generation not in enrollment["supportedToolchainGenerations"]:
+            raise FleetError(
+                "post-acceptance toolchain is outside enrollment allowlist"
+            )
+
+        if fleet_contract_generation() != fleet_contract_before:
+            raise FleetError(
+                "Glaeda fleet contract changed during local acceptance"
+            )
+        local_attempt = "sha256:" + hashlib.sha256(os.urandom(32)).hexdigest()
+        receipt = finalize_acceptance(
+            enrollment,
+            role,
+            toolchain_generation,
+            cmux_result,
+            post_bootstrap,
+            cmux_result_sha256,
+            execution_class=LOCAL_EXECUTION_CLASS,
+            local_execution_attempt_sha256=local_attempt,
+        )
+        if completed.returncode == 0 and receipt["result"] != "accepted":
+            raise FleetError("successful CMUX local run did not produce acceptance")
+        if completed.returncode != 0 and receipt["result"] == "accepted":
+            raise FleetError("failed CMUX local run produced acceptance")
+        return receipt
+
+
 def apply_transition(
     enrollment_path: Path,
     target: str,
@@ -1021,9 +1384,17 @@ def parser() -> argparse.ArgumentParser:
     ta.add_argument("--to", required=True, choices=STATES)
     ta.add_argument("--reason", choices=QUARANTINE_REASONS)
     ta.add_argument("--acceptance", action="append", type=Path, default=[])
+    al = sub.add_parser("accept-local")
+    al.add_argument("enrollment", type=Path)
+    al.add_argument("--cmux-root", type=Path, required=True)
+    al.add_argument("--glaeda", type=Path, required=True)
+    al.add_argument("--role", required=True, choices=sorted(ENROLLABLE_ROLES))
+    al.add_argument("--cache-root", type=Path)
+    al.add_argument("--min-free-gib", type=int)
     a = sub.add_parser("finalize-acceptance")
     a.add_argument("enrollment", type=Path)
     a.add_argument("cmux_result", type=Path)
+    a.add_argument("post_bootstrap", type=Path)
     a.add_argument("--role", required=True, choices=sorted(ENROLLABLE_ROLES))
     a.add_argument("--toolchain-generation", required=True)
     return p
@@ -1067,14 +1438,27 @@ def main() -> int:
                     args.acceptance,
                 )
             )
+        elif args.command == "accept-local":
+            receipt = accept_local(
+                args.enrollment,
+                args.cmux_root,
+                args.glaeda,
+                args.role,
+                args.cache_root,
+                args.min_free_gib,
+            )
+            emit(receipt)
+            return 0 if receipt["result"] == "accepted" else 1
         elif args.command == "finalize-acceptance":
             cmux_result, cmux_result_sha256 = load_cmux_semantic_result(args.cmux_result)
+            post_bootstrap = load(args.post_bootstrap)
             emit(
                 finalize_acceptance(
                     enrollment,
                     args.role,
                     args.toolchain_generation,
                     cmux_result,
+                    post_bootstrap,
                     cmux_result_sha256,
                 )
             )
