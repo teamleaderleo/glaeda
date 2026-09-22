@@ -214,6 +214,7 @@ def markdown_report(
                 f"`{window.get('backend_id') or 'unobserved'}` / "
                 f"`{window['profile_id']}`: "
                 f"{counts['validated_completions']}/{counts['offered']} validated, "
+                f"failures={counts.get('failure_count', 0)}, "
                 f"unfinished={counts['unfinished']}, p50={latency['p50']} ms, "
                 f"p90={latency['p90']} ms, declared jobs="
                 f"{concurrency.get('declared_jobs')}, max simultaneous observed="
@@ -248,6 +249,11 @@ def markdown_report(
         if window["counts"]["unfinished"] > 0:
             bottlenecks.append(
                 f"{label} leaves {window['counts']['unfinished']} offered jobs unfinished"
+            )
+        if window["counts"].get("failure_count", 0):
+            bottlenecks.append(
+                f"{label} records {window['counts']['failure_count']} failed jobs "
+                "under fixed offered work"
             )
         if (
             window["counts"]["fallback_count"]
