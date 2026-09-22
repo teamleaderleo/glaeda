@@ -70,6 +70,7 @@ pub struct CmuxProductTransportObservationBatch {
     profile: String,
     semantic_result_sha256: String,
     restore_receipt_sha256: String,
+    archive_identity: String,
     lookup_source: CmuxProductLookupSource,
     archive_bytes: u64,
     consumer_unpacked_bytes: u64,
@@ -115,10 +116,11 @@ impl CmuxProductTransportObservationBatch {
     #[must_use]
     pub fn render_human(&self) -> String {
         format!(
-            "cmux product transport observation\nattempt: {}\nprofile: {}\nsource: {}\narchive bytes: {}\nconsumer unpacked bytes: {}\npeer lookup: {} ms\npeer transfer: {} ms\npeer bytes transferred: {}\nrestore: {} ms\nsplit-comparable bytes: {}\nobservations: {}\n",
+            "cmux product transport observation\nattempt: {}\nprofile: {}\nsource: {}\narchive identity: {}\narchive bytes: {}\nconsumer unpacked bytes: {}\npeer lookup: {} ms\npeer transfer: {} ms\npeer bytes transferred: {}\nrestore: {} ms\nsplit-comparable bytes: {}\nobservations: {}\n",
             self.attempt_id,
             self.profile,
             self.lookup_source.as_str(),
+            self.archive_identity,
             self.archive_bytes,
             self.consumer_unpacked_bytes,
             self.peer_lookup_millis,
@@ -178,8 +180,10 @@ pub fn project_cmux_product_transport(
             )
         })?;
     validate_restore_receipt(&receipt)?;
+    validate_semantic_binding(&receipt, semantic_batch)?;
 
     let context = semantic_transport_context(semantic_batch)?;
+    let archive_identity = archive_identity(&receipt);
     let lookup_source = CmuxProductLookupSource::parse(&receipt.lookup_source)?;
     let peer_lookup_millis = seconds_to_millis(receipt.peer_lookup_seconds)?;
     let peer_transfer_millis = seconds_to_millis(receipt.peer_transfer_seconds)?;
@@ -208,7 +212,7 @@ pub fn project_cmux_product_transport(
         .map_err(compiler_projection_error)?
         .with_validity_inputs(context.validity_inputs)
         .with_artifact(
-            &context.artifact_identity,
+            &archive_identity,
             context.consumer_identity.as_deref(),
             None,
         )
@@ -234,7 +238,7 @@ pub fn project_cmux_product_transport(
     .map_err(compiler_projection_error)?
     .with_validity_inputs(context.validity_inputs)
     .with_artifact(
-        &context.artifact_identity,
+        &archive_identity,
         context.consumer_identity.as_deref(),
         None,
     )
@@ -249,6 +253,7 @@ pub fn project_cmux_product_transport(
         profile: semantic_batch.profile().to_owned(),
         semantic_result_sha256: semantic_batch.cmux_semantic_result_sha256().to_owned(),
         restore_receipt_sha256: sha256(restore_receipt_bytes),
+        archive_identity,
         lookup_source,
         archive_bytes: receipt.archive_bytes,
         consumer_unpacked_bytes: context.consumer_unpacked_bytes,
@@ -265,7 +270,6 @@ struct SemanticTransportContext<'a> {
     reuse_class: VerificationReuseClass,
     semantic_validation: SemanticValidationResult,
     resource_profile: String,
-    artifact_identity: String,
     consumer_identity: Option<String>,
     consumer_unpacked_bytes: u64,
     validity_inputs: &'a [crate::adaptive_verification_compiler::ValidityInput],
@@ -291,7 +295,7 @@ fn semantic_transport_context(
         )
     })?;
 
-    let artifact_identity = string_field(&value, "artifact_identity")?;
+    let _runtime_artifact_identity = string_field(&value, "artifact_identity")?;
     let consumer_identity = optional_string_field(&value, "consumer_identity")?;
     let consumer_unpacked_bytes = value
         .get("required_consumer_bytes")
@@ -331,7 +335,6 @@ fn semantic_transport_context(
         reuse_class,
         semantic_validation,
         resource_profile,
-        artifact_identity,
         consumer_identity,
         consumer_unpacked_bytes,
         validity_inputs: test.validity_inputs(),
@@ -365,10 +368,96 @@ fn optional_string_field(
     }
 }
 
+fn validate_semantic_binding(
+    receipt: &RawCmuxProductRestoreReceipt,
+    semantic_batch: &CmuxWorkloadVerificationObservationBatch,
+) -> Result<(), CmuxProductTransportAdapterError> {
+    if receipt.source_revision != semantic_batch.source_commit() {
+        return Err(error(
+            "cmux_product_restore_source_mismatch",
+            "CMUX product restore source revision differs from the semantic workload",
+        ));
+    }
+    let expected_shard = semantic_batch.semantic_parameter("shard").ok_or_else(|| {
+        error(
+            "cmux_product_restore_shard_missing",
+            "CMUX app-host semantic workload lacks its shard parameter",
+        )
+    })?;
+    let actual_shard = receipt
+        .shard
+        .as_deref()
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or_else(|| {
+            error(
+                "cmux_product_restore_shard_invalid",
+                "CMUX product restore receipt lacks a numeric shard identity",
+            )
+        })?;
+    if actual_shard != expected_shard {
+        return Err(error(
+            "cmux_product_restore_shard_mismatch",
+            "CMUX product restore shard differs from the semantic workload",
+        ));
+    }
+    Ok(())
+}
+
+fn archive_identity(receipt: &RawCmuxProductRestoreReceipt) -> String {
+    let material = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        receipt.repository,
+        receipt.artifact_id,
+        normalized_digest(&receipt.provider_digest),
+        normalized_digest(&receipt.archive_sha256),
+        normalized_digest(&receipt.product_contract),
+        receipt.source_revision,
+        receipt.producer_run_id,
+        receipt.producer_run_attempt,
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(b"cmux-immutable-product-archive-v1\0");
+    hasher.update(material.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn normalized_digest(value: &str) -> &str {
+    value.strip_prefix("sha256:").unwrap_or(value)
+}
+
+fn validate_digest_token(value: &str) -> Result<(), CmuxProductTransportAdapterError> {
+    let digest = normalized_digest(value);
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(error(
+            "cmux_product_restore_digest_invalid",
+            "CMUX product restore identity contains an invalid SHA-256 digest",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_restore_receipt(
     receipt: &RawCmuxProductRestoreReceipt,
 ) -> Result<(), CmuxProductTransportAdapterError> {
     let source = CmuxProductLookupSource::parse(&receipt.lookup_source)?;
+    if receipt.repository != "manaflow-ai/cmux"
+        || receipt.artifact_id == 0
+        || receipt.producer_run_id == 0
+        || receipt.producer_run_attempt == 0
+        || receipt.source_revision.len() != 40
+        || !receipt
+            .source_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(error(
+            "cmux_product_restore_identity_invalid",
+            "CMUX product restore immutable identity is invalid",
+        ));
+    }
+    validate_digest_token(&receipt.provider_digest)?;
+    validate_digest_token(&receipt.archive_sha256)?;
+    validate_digest_token(&receipt.product_contract)?;
     if receipt.archive_bytes == 0 {
         return Err(error(
             "cmux_product_restore_bytes_invalid",
@@ -410,7 +499,7 @@ fn validate_restore_receipt(
             if receipt.local_hit
                 || !receipt.peer_hit
                 || receipt.peer_bytes_transferred == 0
-                || receipt.peer_bytes_transferred > receipt.archive_bytes
+                || receipt.peer_bytes_transferred != receipt.archive_bytes
             {
                 return Err(error(
                     "cmux_product_restore_source_inconsistent",
@@ -520,6 +609,14 @@ const fn error(code: &'static str, problem: &'static str) -> CmuxProductTranspor
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawCmuxProductRestoreReceipt {
+    repository: String,
+    artifact_id: u64,
+    provider_digest: String,
+    archive_sha256: String,
+    product_contract: String,
+    source_revision: String,
+    producer_run_id: u64,
+    producer_run_attempt: u64,
     archive_bytes: u64,
     elapsed_seconds: f64,
     lookup_source: String,
