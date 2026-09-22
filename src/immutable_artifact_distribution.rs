@@ -149,7 +149,7 @@ impl ArtifactProducerProvider {
     }
 }
 
-/// Accepted origin provenance. A local, peer, or R2 copy preserves this exact producer record.
+/// Accepted origin provenance. A local, peer, or optional remote-broker copy preserves this exact producer record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ArtifactProducerProvenance {
     pub provider: ArtifactProducerProvider,
@@ -188,7 +188,7 @@ impl ArtifactProducerProvenance {
     }
 }
 
-/// One immutable object identity shared unchanged by local, peer, R2, and provider copies.
+/// One immutable object identity shared unchanged by local, peer, optional remote-broker, and provider copies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ImmutableArtifactObjectIdentity {
     pub schema_version: u8,
@@ -351,8 +351,24 @@ pub enum ImmutableArtifactSourceClass {
 }
 
 impl ImmutableArtifactSourceClass {
+    /// Source order for a co-located persistent fleet that does not need a remote broker.
+    ///
+    /// GitHub Actions remains the canonical provider fallback. Skipping R2 changes only
+    /// acceleration topology; it does not change object identity or validity.
     #[must_use]
-    pub const fn lookup_order() -> [Self; 5] {
+    pub const fn same_site_first_lookup_order() -> [Self; 4] {
+        [
+            Self::NodeLocal,
+            Self::TrustedPeer,
+            Self::GitHubActions,
+            Self::Rebuild,
+        ]
+    }
+
+    /// Source order when an optional private R2 broker is configured for remote distribution,
+    /// off-site resilience, or retention.
+    #[must_use]
+    pub const fn with_private_r2_lookup_order() -> [Self; 5] {
         [
             Self::NodeLocal,
             Self::TrustedPeer,
@@ -543,9 +559,18 @@ mod tests {
     }
 
     #[test]
-    fn source_order_keeps_every_transport_advisory() {
+    fn source_order_keeps_remote_broker_optional() {
         assert_eq!(
-            ImmutableArtifactSourceClass::lookup_order(),
+            ImmutableArtifactSourceClass::same_site_first_lookup_order(),
+            [
+                ImmutableArtifactSourceClass::NodeLocal,
+                ImmutableArtifactSourceClass::TrustedPeer,
+                ImmutableArtifactSourceClass::GitHubActions,
+                ImmutableArtifactSourceClass::Rebuild,
+            ]
+        );
+        assert_eq!(
+            ImmutableArtifactSourceClass::with_private_r2_lookup_order(),
             [
                 ImmutableArtifactSourceClass::NodeLocal,
                 ImmutableArtifactSourceClass::TrustedPeer,

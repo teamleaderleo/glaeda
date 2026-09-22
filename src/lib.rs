@@ -13,6 +13,8 @@ pub mod cargo_target_holder_observation;
 /// Read-only, descriptor-bound observation of one Linux Cargo target tree.
 #[cfg(target_os = "linux")]
 pub mod cargo_target_observation;
+/// Pure projection of validated CMUX workload results into adaptive verification observations.
+pub mod cmux_workload_verification_adapter;
 /// Pure workload-neutral pre-admission compute request.
 pub mod compute_execution_request;
 /// Pure workload-family-neutral identity for declared compute semantics.
@@ -265,6 +267,12 @@ pub mod operator_remediation;
 pub mod operator_status;
 /// Typed, read-only aggregation of one coherent operator status evidence bundle.
 pub mod operator_status_service;
+/// Canonical controller enrollment for one trusted native-Linux GitHub Actions JIT worker.
+#[cfg(target_os = "linux")]
+pub mod owned_linux_jit_enrollment;
+/// Native owned-Linux task backend for one trusted GitHub Actions JIT runner.
+#[cfg(unix)]
+pub(crate) mod owned_linux_jit_runtime;
 pub mod ownership;
 /// Pure composition of durable queue, Lima lifecycle, and runner-readiness evidence.
 pub mod personal_worker_host_broker;
