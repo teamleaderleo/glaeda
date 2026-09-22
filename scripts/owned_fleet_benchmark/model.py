@@ -343,10 +343,19 @@ def render(text: str, state_dir: Path, semantic: Path) -> str:
     )
 
 
+GIT_PROBE_ENV = {
+    "LC_ALL": "C",
+    "LANG": "C",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+}
+
+
 def git_identity(root: Path):
     result = subprocess.run(
-        ["git", "rev-parse", "HEAD", "HEAD^{tree}"],
+        ["/usr/bin/git", "rev-parse", "HEAD", "HEAD^{tree}"],
         cwd=root,
+        env=GIT_PROBE_ENV,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -366,8 +375,16 @@ def verify_source(root: Path, workload: dict[str, Any]) -> None:
             f"{workload['tree']}, got {head} / {tree}"
         )
     status = subprocess.run(
-        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        [
+            "/usr/bin/git",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
         cwd=root,
+        env=GIT_PROBE_ENV,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=30,
