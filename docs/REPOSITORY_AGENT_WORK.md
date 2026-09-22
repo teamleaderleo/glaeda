@@ -137,6 +137,7 @@ placement evidence. It contains only:
 
 ```text
 family + semantic generation
+canonical repository
 operation
 trust class
 network class
@@ -153,7 +154,8 @@ The same canonical object is emitted with
 `routing_classification_sha256 = sha256(canonical_json(routing_classification))`
 so #546 consumers have one stable equality key.
 
-It deliberately excludes exact source commit/tree, exact bounded path names,
+It keeps the canonical repository/project identity while deliberately excluding
+exact source commit/tree, exact bounded path names,
 task-contract digest, and `compute_workload.input_identity`. Two review
 requests against different commits therefore retain distinct exact compute
 identities while sharing one routing population when their semantic work class
