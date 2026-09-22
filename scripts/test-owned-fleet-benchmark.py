@@ -153,9 +153,14 @@ def benchmark_receipt(
             "request_known_to_final_result_ms": latency_ms,
         },
         "result": {
+            "class": "validated" if validated else "command_failed",
             "validated": validated,
             "failure_count": 0 if validated else 1,
             "timed_out": False,
+            "source_unchanged": True,
+            "semantic_validation": (
+                "fixture_accepted" if validated else "command_exit_nonzero"
+            ),
         },
         "resources": {
             "peak_aggregate_rss_kib": 1000,
@@ -578,6 +583,61 @@ class FleetHarnessTests(unittest.TestCase):
                 )
             with self.assertRaises(FleetError):
                 NS["reduce_window"](window_manifest("large", items), root)
+
+    def test_window_reducer_preserves_distinct_terminal_classes(self) -> None:
+        machine = complete_machine()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            items = []
+            classes = (
+                "validated",
+                "semantic_mismatch",
+                "source_changed",
+                "command_failed",
+            )
+            for index, result_class in enumerate(classes):
+                request_ns = 1_000_000_000 + index * 1_000_000_000
+                value = benchmark_receipt(
+                    machine=machine,
+                    start_ns=request_ns + 10_000_000,
+                    request_ns=request_ns,
+                    latency_ms=500,
+                    cpu_millis=2000,
+                    memory_bytes=4 * GIB,
+                    validated=result_class == "validated",
+                )
+                value["result"]["class"] = result_class
+                value["result"]["validated"] = result_class == "validated"
+                value["result"]["timed_out"] = False
+                value["result"]["failure_count"] = (
+                    1 if result_class == "command_failed" else 0
+                )
+                value["result"]["source_unchanged"] = result_class != "source_changed"
+                value["result"]["semantic_validation"] = {
+                    "validated": "fixture_accepted",
+                    "semantic_mismatch": "semantic_receipt_rejected",
+                    "source_changed": "source_changed_after_execution",
+                    "command_failed": "command_exit_nonzero",
+                }[result_class]
+                path = root / f"r{index}.json"
+                path.write_text(json.dumps(value))
+                items.append(
+                    {
+                        "work_id": f"w{index}",
+                        "arrival_offset_ms": index * 1000,
+                        "receipt": path.name,
+                    }
+                )
+
+            reduced = NS["reduce_window"](
+                window_manifest("small", items), root
+            )
+
+        self.assertEqual(reduced["counts"]["validated_completions"], 1)
+        self.assertEqual(reduced["counts"]["semantic_mismatch_count"], 1)
+        self.assertEqual(reduced["counts"]["unvalidated_completion_count"], 1)
+        self.assertEqual(reduced["counts"]["failure_count"], 1)
+        self.assertEqual(reduced["counts"]["unknown_result_count"], 0)
 
     def test_window_reducer_refuses_inconsistent_member_reliability(self) -> None:
         machine = complete_machine()
