@@ -127,6 +127,27 @@ def _runtime_observation(backend_id: str, repo_root: Path, state_dir: Path) -> d
     }
 
 
+def _result_class(
+    *,
+    validated: bool,
+    semantic_valid: bool,
+    source_unchanged: bool,
+    exit_code: int,
+    timed_out: bool,
+) -> str:
+    if validated:
+        return "validated"
+    if timed_out:
+        return "timed_out"
+    if exit_code != 0:
+        return "command_failed"
+    if not source_unchanged:
+        return "source_changed"
+    if not semantic_valid:
+        return "semantic_mismatch"
+    return "unknown"
+
+
 def run_benchmark(args: argparse.Namespace) -> int:
     workload, operation, variant = find_workload(args.workload, args.variant)
     machine = validate_machine(load_json(args.machine), require_complete=True)
@@ -300,6 +321,15 @@ def run_benchmark(args: argparse.Namespace) -> int:
         workload,
     )
     validated = semantic_valid and source_unchanged
+    result_class = _result_class(
+        validated=validated,
+        semantic_valid=semantic_valid,
+        source_unchanged=source_unchanged,
+        exit_code=exit_code,
+        timed_out=timed_out.is_set(),
+    )
+    if result_class == "source_changed":
+        validation_reason = "source_changed_after_execution"
     final_result_ns = time.monotonic_ns()
     final_result_unix_ms = time.time_ns() // 1_000_000
     if first_useful_ns is None and validated:
@@ -401,11 +431,14 @@ def run_benchmark(args: argparse.Namespace) -> int:
             ),
         },
         "result": {
+            "class": result_class,
             "validated": validated,
             "exit_code": exit_code,
             "semantic_validation": validation_reason,
             "source_unchanged": source_unchanged,
-            "failure_count": 0 if validated else 1,
+            "failure_count": (
+                1 if result_class in {"command_failed", "timed_out"} else 0
+            ),
             "timed_out": timed_out.is_set(),
         },
         "resources": {
