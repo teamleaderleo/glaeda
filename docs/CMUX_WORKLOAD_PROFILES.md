@@ -128,7 +128,8 @@ The projection deliberately consumes only facts CMUX publishes:
 - benchmark state class;
 - toolchain identity and observed macOS SDK where present;
 - architecture/resource class;
-- runtime-input and output-artifact content identities;
+- exact runtime-input content identity and aggregate output-artifact bytes;
+- the exact CMUX result digest, which retains the repository-owned artifact identities;
 - named stage timings;
 - semantic result and cleanup state.
 
