@@ -113,3 +113,44 @@ python3 scripts/test-cmux-workload-request.py
 ```
 
 Physical Mac acceptance remains a separate approved fleet experiment.
+
+## Adaptive verification projection
+
+`src/cmux_workload_verification_adapter.rs` is the narrow bridge from the landed
+`cmux-workload-result/v1` corpus into #547. It accepts the exact CMUX result bytes together with
+the already-correlated `glaeda-cmux-workload-observation/v1`, rechecks their source/profile/
+validator/result-digest binding, and emits observation-only `VerificationObservation` values.
+
+The projection deliberately consumes only facts CMUX publishes:
+
+- exact source tree;
+- profile ID/generation and semantic validator;
+- benchmark state class;
+- toolchain identity and observed macOS SDK where present;
+- architecture/resource class;
+- runtime-input and output-artifact content identities;
+- named stage timings;
+- semantic result and cleanup state.
+
+Known CMUX stages map as follows: `setup` to setup/tool installation,
+`dependency_preparation` to dependency resolution, `compile` to compile, and `test` to test
+execution. The adapter also accepts the generic #547 stage names if later CMUX generations emit
+them. Repository-specific `validation` remains visible as an ignored stage because moving or
+reinterpreting that validator is CMUX policy, not Glaeda policy.
+
+For compiled-product reuse, this first bridge can state source tree, toolchain, SDK, architecture,
+and a digest-bound product schema. The current CMUX v1 result does not publish build configuration
+or compiler flags as independent validity parents, so the adaptive compiler leaves those candidates
+`observed` / advisory. The adapter does not infer `Debug`, `Release`, or flags from profile names,
+artifact paths, or command knowledge. A future CMUX result generation can export those parents
+explicitly if exact product reuse needs promotion authority.
+
+For `cmux.macos.app-host-test-shard@1`, exact runtime-input content identity is retained and the
+test observation is marked `reuse` under the `exact-product-reuse` benchmark state. The adapter
+does not mark it as a rebuild and does not treat a successful shard as proof that another source
+tree may consume the same product.
+
+This gives #547 live repository-owned input without teaching Glaeda CMUX command lines. #13365's
+selective-layer work remains a separate evidence question: the current v1 result has no
+consumer-transfer byte/timing fields, so the optimizer cannot claim selective transport savings
+until CMUX measures and exports them.
