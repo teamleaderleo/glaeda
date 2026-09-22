@@ -237,7 +237,11 @@ def main() -> int:
                 args.receipts, "glaeda-owned-fleet-benchmark-receipt"
             )
             windows = collect_json_files(
-                args.windows, "glaeda-owned-fleet-window-receipt"
+                args.windows,
+                (
+                    "glaeda-owned-fleet-window-receipt",
+                    "glaeda-owned-fleet-window-partial-receipt",
+                ),
             )
             econ = collect_json_files(
                 args.economics, "glaeda-owned-vs-hosted-economics"
