@@ -214,7 +214,10 @@ def markdown_report(
                 f"`{window.get('backend_id') or 'unobserved'}` / "
                 f"`{window['profile_id']}`: "
                 f"{counts['validated_completions']}/{counts['offered']} validated, "
+                f"semantic_mismatches={counts.get('semantic_mismatch_count', 0)}, "
+                f"unvalidated={counts.get('unvalidated_completion_count', 0)}, "
                 f"failures={counts.get('failure_count', 0)}, "
+                f"unknown={counts.get('unknown_result_count', 0)}, "
                 f"unfinished={counts['unfinished']}, p50={latency['p50']} ms, "
                 f"p90={latency['p90']} ms, declared jobs="
                 f"{concurrency.get('declared_jobs')}, max simultaneous observed="
@@ -243,6 +246,19 @@ def markdown_report(
         if window["counts"]["unfinished"] > 0:
             bottlenecks.append(
                 f"{label} leaves {window['counts']['unfinished']} offered jobs unfinished"
+            )
+        if window["counts"].get("semantic_mismatch_count", 0):
+            bottlenecks.append(
+                f"{label} records semantic-result mismatches under fixed offered work"
+            )
+        if window["counts"].get("unvalidated_completion_count", 0):
+            bottlenecks.append(
+                f"{label} records source/currentness-invalid completions "
+                "under fixed offered work"
+            )
+        if window["counts"].get("unknown_result_count", 0):
+            bottlenecks.append(
+                f"{label} records unknown terminal results under fixed offered work"
             )
         if window["counts"].get("failure_count", 0):
             bottlenecks.append(
