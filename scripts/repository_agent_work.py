@@ -396,6 +396,10 @@ def routing_classification(request: dict[str, object]) -> dict[str, object]:
     }
 
 
+def routing_classification_sha256(request: dict[str, object]) -> str:
+    return sha256(canonical_bytes(routing_classification(request)))
+
+
 def plan(request: dict[str, object]) -> dict[str, object]:
     return {
         "document_type": PLAN_TYPE,
@@ -405,6 +409,7 @@ def plan(request: dict[str, object]) -> dict[str, object]:
         "source": request["source"],
         "compute_workload": compute_workload(request),
         "routing_classification": routing_classification(request),
+        "routing_classification_sha256": routing_classification_sha256(request),
         "execution_boundary": {
             "task_contract": "caller_owned_digest_bound",
             "agent_harness": "reviewed_adapter_required",
