@@ -133,6 +133,7 @@ jobs:
           python3 scripts/test-external-execution-request.py
           python3 scripts/test-trusted-agent-dispatch.py
           python3 scripts/test-cmux-fleet.py
+          python3 scripts/test-cmux-fleet-operator-summary.py
           python3 scripts/test-cmux-fleet-bootstrap.py
           python3 scripts/test-cmux-execution-roles.py
           python3 scripts/test-cmux-workload-request.py
