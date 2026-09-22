@@ -4,6 +4,8 @@ pub mod actions_runner_readiness;
 pub mod adaptive_ci_routing;
 /// Pure deterministic optimization discovery from bounded verification observations.
 pub mod adaptive_verification_compiler;
+/// Pure projection of validated CMUX workload results into adaptive verification observations.
+pub mod cmux_workload_verification_adapter;
 pub mod artifact;
 /// Pure, path-free classification of explicit hot-state inventory observations.
 pub mod cache_inventory;
