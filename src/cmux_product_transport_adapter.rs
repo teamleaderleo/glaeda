@@ -278,7 +278,6 @@ pub fn project_cmux_product_transport(
 }
 
 struct SemanticTransportContext<'a> {
-    reuse_class: VerificationReuseClass,
     semantic_validation: SemanticValidationResult,
     resource_profile: String,
     consumer_identity: Option<String>,
@@ -318,17 +317,6 @@ fn semantic_transport_context(
             )
         })?;
     let resource_profile = string_field(&value, "resource_profile")?;
-    let reuse_class = match string_field(&value, "reuse_class")?.as_str() {
-        "cold" => VerificationReuseClass::Cold,
-        "warm" => VerificationReuseClass::Warm,
-        "reuse" => VerificationReuseClass::Reuse,
-        _ => {
-            return Err(error(
-                "cmux_product_transport_context_invalid",
-                "CMUX semantic observation has an invalid reuse class",
-            ));
-        }
-    };
     let semantic_validation = match string_field(&value, "semantic_validation")?.as_str() {
         "passed" => SemanticValidationResult::Passed,
         "failed" => SemanticValidationResult::Failed,
@@ -343,7 +331,6 @@ fn semantic_transport_context(
     };
 
     Ok(SemanticTransportContext {
-        reuse_class,
         semantic_validation,
         resource_profile,
         consumer_identity,
