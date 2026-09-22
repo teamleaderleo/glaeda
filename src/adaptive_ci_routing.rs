@@ -2916,14 +2916,7 @@ mod tests {
             unfinished: 4,
             peak_pressure: HostPressureClass::Moderate,
         });
-        let observations = three_successes(
-            &workload,
-            "owned",
-            HotStateClass::Warm,
-            40_000,
-            0,
-            0,
-        );
+        let observations = three_successes(&workload, "owned", HotStateClass::Warm, 40_000, 0, 0);
 
         candidate.contention.as_ref().unwrap().validate().unwrap();
         let report = recommend_ci_pool(
