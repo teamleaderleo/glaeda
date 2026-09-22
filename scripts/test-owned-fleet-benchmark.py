@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import owned_fleet_benchmark as fleet
 from owned_fleet_benchmark.observe import validate_semantic
+from owned_fleet_benchmark.cli import parser as fleet_parser
 from owned_fleet_benchmark.report import _stable_profile_sets
 from owned_fleet_benchmark.run import _validate_direct_runtime
 from owned_fleet_benchmark.model import env_for
@@ -320,6 +321,67 @@ class FleetHarnessTests(unittest.TestCase):
         with self.assertRaises(FleetError):
             NS["validate_state_evidence"](bad)
 
+    def test_direct_runner_cli_refuses_unowned_routing_event_inputs(self) -> None:
+        base = [
+            "run",
+            "--workload",
+            "glaeda-rust-focused-v1",
+            "--repo-root",
+            "/tmp/repo",
+            "--machine",
+            "/tmp/machine.json",
+            "--state-evidence",
+            "/tmp/state.json",
+            "--state-dir",
+            "/tmp/state",
+            "--backend-id",
+            "native-linux",
+            "--output",
+            "/tmp/out.json",
+        ]
+        for unowned in (
+            ["--queue-delay-ms", "9000"],
+            ["--fallback-count", "4"],
+            ["--reset-count", "3"],
+        ):
+            with self.subTest(unowned=unowned):
+                with self.assertRaises(SystemExit):
+                    fleet_parser().parse_args(base + unowned)
+
+    def test_zero_settled_window_preserves_bounded_negative_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            items = [
+                {
+                    "work_id": f"w{index}",
+                    "arrival_offset_ms": index * 1000,
+                    "receipt": None,
+                }
+                for index in range(4)
+            ]
+            partial = NS["reduce_window"](
+                window_manifest("small", items), root
+            )
+
+        self.assertEqual(
+            partial["document_type"],
+            "glaeda-owned-fleet-window-partial-receipt",
+        )
+        self.assertEqual(partial["authority"], "diagnostic_observation_only")
+        self.assertEqual(partial["counts"]["offered"], 4)
+        self.assertEqual(partial["counts"]["settled"], 0)
+        self.assertEqual(partial["counts"]["validated_completions"], 0)
+        self.assertEqual(partial["counts"]["unfinished"], 4)
+        self.assertIsNone(partial["final_result_latency_ms"]["p50"])
+        self.assertIsNone(partial["final_result_latency_ms"]["p90"])
+        self.assertEqual(
+            partial["concurrency"]["maximum_simultaneous_observed"], 0
+        )
+        with self.assertRaisesRegex(
+            FleetError, "unsupported window receipt"
+        ):
+            NS["compare_windows"]([partial, partial, partial])
+
     def test_window_reducer_uses_validated_numerator_and_unfinished(self) -> None:
         machine = complete_machine()
         with tempfile.TemporaryDirectory() as tmp:
@@ -525,6 +587,17 @@ class FleetHarnessTests(unittest.TestCase):
             ["large", "medium", "small"],
         )
 
+    def test_window_comparison_surfaces_failures(self) -> None:
+        values = self._reduced_windows()
+        values[1] = copy.deepcopy(values[1])
+        values[1]["counts"]["failure_count"] = 1
+        compared = NS["compare_windows"](values)
+        medium = next(
+            row for row in compared["rows"] if row["profile_id"] == "medium"
+        )
+        self.assertEqual(medium["failure_count"], 1)
+        self.assertIn("failed_work", medium["collapse_flags"])
+
     def test_role_stability_rejects_swap_growth_and_p90_collapse(self) -> None:
         values = self._reduced_windows()
         for value in values:
@@ -557,6 +630,50 @@ class FleetHarnessTests(unittest.TestCase):
         with self.assertRaises(FleetError):
             NS["compare_windows"](values)
 
+    def test_hosted_economics_requires_measurement_and_rate_provenance(self) -> None:
+        machine = complete_machine()
+        owned = benchmark_receipt(
+            machine=machine,
+            start_ns=1_010_000_000,
+            request_ns=1_000_000_000,
+            latency_ms=60_000,
+            cpu_millis=8000,
+            memory_bytes=16 * GIB,
+        )
+        hosted = {
+            "schema_version": 1,
+            "document_type": "glaeda-hosted-equivalent-job-receipt",
+            "backend": "fixture-hosted",
+            "measurement_date": "2026-09-21",
+            "validated": True,
+            "workload_id": "glaeda-rust-focused-v1",
+            "variant": None,
+            "source_commit": "a" * 40,
+            "source_tree": "b" * 40,
+            "operation_digest": "sha256:operation",
+            "toolchain_digest": "sha256:toolchain",
+            "state_class": "project_resident",
+            "actual_wall_seconds": 60,
+            "queue_delay_seconds": 20,
+            "rate_per_minute": 2.0,
+            "billing_currency": "USD",
+            "billing_increment_seconds": 1,
+            "minimum_billed_seconds": 0,
+            "fx_to_purchase_currency": None,
+            "fx_observed_at": None,
+        }
+
+        with self.assertRaisesRegex(FleetError, "measurement_evidence"):
+            NS["economics"](
+                owned, hosted, machine, 1.0, [36], [0.5]
+            )
+
+        hosted["measurement_evidence_sha256"] = "sha256:" + "e" * 64
+        with self.assertRaisesRegex(FleetError, "rate_source"):
+            NS["economics"](
+                owned, hosted, machine, 1.0, [36], [0.5]
+            )
+
     def test_economics_allows_different_heat_state_and_null_same_currency_fx(self) -> None:
         machine = complete_machine()
         owned = benchmark_receipt(
@@ -583,7 +700,9 @@ class FleetHarnessTests(unittest.TestCase):
             "state_class": "cold",
             "actual_wall_seconds": 60,
             "queue_delay_seconds": 20,
+            "measurement_evidence_sha256": "sha256:" + "e" * 64,
             "rate_per_minute": 2.0,
+            "rate_source": "fixture-provider-rate-card",
             "billing_currency": "USD",
             "billing_increment_seconds": 1,
             "minimum_billed_seconds": 0,
