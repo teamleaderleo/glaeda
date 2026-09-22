@@ -3240,11 +3240,17 @@ mod tests {
         .unwrap()
         .with_bytes(None, None, Some(850_000_000))
         .unwrap()
-        .with_artifact("app-host-product", Some("app-host-shards"), Some(300_000_000))
+        .with_artifact(
+            "app-host-product",
+            Some("app-host-shards"),
+            Some(300_000_000),
+        )
         .unwrap()
-        .with_validity_inputs(&[
-            ValidityInput::new(ValidityInputKind::ProductSchema, "app-host-v2").unwrap(),
-        ]);
+        .with_validity_inputs(&[ValidityInput::new(
+            ValidityInputKind::ProductSchema,
+            "app-host-v2",
+        )
+        .unwrap()]);
 
         let receipt =
             compile_verification_optimizations("project", "profile", &[transfer], &[]).unwrap();
