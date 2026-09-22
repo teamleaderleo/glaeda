@@ -18,6 +18,7 @@ Use **Glaeda** for the project and **`glaeda`** for the binary/crate. Use
 | Ownership, persistence, mutation, recovery, subprocesses, physical experiments | `docs/AGENT_EXECUTION_SAFETY.md` |
 | Delegation and multi-agent work | `docs/AGENT_COORDINATION.md` |
 | Lease transitions | `docs/adr/0004-lease-lifecycle-core.md` |
+| Adding, exporting, or retiring a public module | `docs/MODULE_INVENTORY.md` (generated; do not hand-edit) |
 
 Changing coordination belongs in current issues and PRs. Keep broad document
 preloading out of the normal startup path.
