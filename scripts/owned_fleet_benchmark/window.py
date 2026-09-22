@@ -62,9 +62,32 @@ def _positive_integer(value: Any, field: str) -> int:
 
 
 def _receipt_identity(receipt: dict[str, Any]) -> dict[str, Any]:
+    if receipt.get("authority") != "performance_observation_only":
+        raise FleetError("window member authority is unsupported")
     sample_id = receipt.get("sample_id")
     if not isinstance(sample_id, str) or not sample_id:
         raise FleetError("window member is missing sample_id")
+
+    result = receipt.get("result")
+    if not isinstance(result, dict) or type(result.get("validated")) is not bool:
+        raise FleetError("window member validated result is invalid")
+    failure_count = result.get("failure_count")
+    if (
+        type(failure_count) is not int
+        or failure_count not in {0, 1}
+        or failure_count != (0 if result["validated"] else 1)
+    ):
+        raise FleetError("window member failure count is inconsistent")
+    if type(result.get("timed_out")) is not bool:
+        raise FleetError("window member timeout evidence is invalid")
+
+    events = receipt.get("events")
+    if not isinstance(events, dict):
+        raise FleetError("window member event evidence is invalid")
+    for name in ("fallback_count", "reset_count"):
+        value = events.get(name)
+        if type(value) is not int or value not in {0, 1}:
+            raise FleetError(f"window member {name} is invalid")
 
     execution = receipt.get("execution") or {}
     runtime = execution.get("runtime") or {}
@@ -172,6 +195,11 @@ def _validate_member_receipt(
         or latency < 0
     ):
         raise FleetError("window member final-result latency is invalid")
+    expected_latency = (final_ns - request_ns) / 1_000_000
+    if abs(float(latency) - expected_latency) > 0.001:
+        raise FleetError(
+            "window member final-result latency disagrees with monotonic timing"
+        )
 
 
 def reduce_window(manifest: dict[str, Any], base_dir: Path) -> dict[str, Any]:
