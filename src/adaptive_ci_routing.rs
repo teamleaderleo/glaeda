@@ -442,8 +442,10 @@ pub struct ContentionEvidenceV1 {
     pub maximum_simultaneous: u16,
     pub validated_completions: u32,
     pub elapsed_millis: u64,
-    pub final_result_p50_millis: u64,
-    pub final_result_p90_millis: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_result_p50_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_result_p90_millis: Option<u64>,
     pub semantic_mismatches: u32,
     pub unvalidated_completions: u32,
     pub failures: u32,
@@ -469,13 +471,11 @@ impl ContentionEvidenceV1 {
             ));
         }
         let offered = u64::from(self.offered_tasks);
-        if self.maximum_simultaneous == 0
-            || u32::from(self.maximum_simultaneous) > self.offered_tasks
-        {
+        if u32::from(self.maximum_simultaneous) > self.offered_tasks {
             return Err(error(
                 "contention.maximum_simultaneous",
                 "routing_contention_concurrency_out_of_range",
-                "contention maximum simultaneous work must be positive and no greater than offered work",
+                "contention maximum simultaneous work cannot exceed offered work",
             ));
         }
         if u64::from(self.semantic_mismatches) > offered
@@ -490,13 +490,6 @@ impl ContentionEvidenceV1 {
                 "contention",
                 "routing_contention_count_exceeds_offered",
                 "contention outcome counts cannot exceed offered work",
-            ));
-        }
-        if self.validated_completions == 0 {
-            return Err(error(
-                "contention.validated_completions",
-                "routing_contention_no_validated_completion",
-                "contention evidence requires at least one validated completion",
             ));
         }
         if self.validated_completions > self.offered_tasks {
@@ -520,12 +513,42 @@ impl ContentionEvidenceV1 {
                 "contention terminal counts must exactly cover offered work",
             ));
         }
-        if self.final_result_p90_millis < self.final_result_p50_millis {
-            return Err(error(
-                "contention.final_result_p90_millis",
-                "routing_contention_percentile_order",
-                "contention p90 cannot be below p50",
-            ));
+        match (
+            self.validated_completions,
+            self.final_result_p50_millis,
+            self.final_result_p90_millis,
+        ) {
+            (0, None, None) => {}
+            (0, _, _) => {
+                return Err(error(
+                    "contention.final_result_p50_millis",
+                    "routing_contention_latency_without_validated_completion",
+                    "contention latency must be absent when there are no validated completions",
+                ));
+            }
+            (_, Some(p50), Some(p90)) => {
+                if p90 < p50 {
+                    return Err(error(
+                        "contention.final_result_p90_millis",
+                        "routing_contention_percentile_order",
+                        "contention p90 cannot be below p50",
+                    ));
+                }
+                if p90 > self.elapsed_millis {
+                    return Err(error(
+                        "contention.final_result_p90_millis",
+                        "routing_contention_latency_outside_window",
+                        "contention p90 cannot exceed the observed window",
+                    ));
+                }
+            }
+            _ => {
+                return Err(error(
+                    "contention.final_result_p50_millis",
+                    "routing_contention_validated_latency_missing",
+                    "validated contention completions require p50 and p90 latency",
+                ));
+            }
         }
         Ok(())
     }
@@ -924,7 +947,7 @@ impl RoutingRecommendationV1 {
                             contention.offered_tasks,
                             contention.elapsed_millis,
                             contention.maximum_simultaneous,
-                            contention.final_result_p90_millis,
+                            render_optional_millis(contention.final_result_p90_millis),
                             contention.unvalidated_completions,
                             contention.failures,
                             contention.resets,
@@ -1636,7 +1659,8 @@ fn contention_cmp(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Orde
                 .cmp(&left_rate)
                 .then_with(|| {
                     left.final_result_p90_millis
-                        .cmp(&right.final_result_p90_millis)
+                        .unwrap_or(u64::MAX)
+                        .cmp(&right.final_result_p90_millis.unwrap_or(u64::MAX))
                 })
                 .then_with(|| {
                     left.unvalidated_completions
@@ -1650,6 +1674,10 @@ fn contention_cmp(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Orde
         }
         _ => Ordering::Equal,
     }
+}
+
+fn render_optional_millis(value: Option<u64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |millis| millis.to_string())
 }
 
 fn quantiles(values: impl Iterator<Item = u64>) -> QuantilesU64 {
@@ -2086,8 +2114,8 @@ mod tests {
             maximum_simultaneous: 4,
             validated_completions: 14,
             elapsed_millis: 60_000,
-            final_result_p50_millis: 20_000,
-            final_result_p90_millis: 50_000,
+            final_result_p50_millis: Some(20_000),
+            final_result_p90_millis: Some(50_000),
             semantic_mismatches: 1,
             unvalidated_completions: 0,
             failures: 0,
@@ -2235,8 +2263,8 @@ mod tests {
                 maximum_simultaneous: 4,
                 validated_completions: 16,
                 elapsed_millis: 120_000,
-                final_result_p50_millis: 28_000,
-                final_result_p90_millis: 41_000,
+                final_result_p50_millis: Some(28_000),
+                final_result_p90_millis: Some(41_000),
                 semantic_mismatches: 0,
                 unvalidated_completions: 0,
                 failures: 0,
@@ -2474,8 +2502,8 @@ mod tests {
             maximum_simultaneous: 4,
             validated_completions: 16,
             elapsed_millis: 120_000,
-            final_result_p50_millis: 30_000,
-            final_result_p90_millis: 45_000,
+            final_result_p50_millis: Some(30_000),
+            final_result_p90_millis: Some(45_000),
             semantic_mismatches: 0,
             unvalidated_completions: 0,
             failures: 0,
@@ -2821,8 +2849,8 @@ mod tests {
             maximum_simultaneous: 2,
             validated_completions: 3,
             elapsed_millis: 60_000,
-            final_result_p50_millis: 20_000,
-            final_result_p90_millis: 30_000,
+            final_result_p50_millis: Some(20_000),
+            final_result_p90_millis: Some(30_000),
             semantic_mismatches: 1,
             unvalidated_completions: 0,
             failures: 1,
@@ -2848,8 +2876,8 @@ mod tests {
             maximum_simultaneous: 2,
             validated_completions: 2,
             elapsed_millis: 60_000,
-            final_result_p50_millis: 20_000,
-            final_result_p90_millis: 30_000,
+            final_result_p50_millis: Some(20_000),
+            final_result_p90_millis: Some(30_000),
             semantic_mismatches: 0,
             unvalidated_completions: 0,
             failures: 1,
@@ -2867,6 +2895,103 @@ mod tests {
     }
 
     #[test]
+    fn zero_completion_contention_window_is_valid_negative_evidence() {
+        let workload = workload();
+        let mut candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Warm);
+        candidate.contention = Some(ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 4,
+            maximum_simultaneous: 0,
+            validated_completions: 0,
+            elapsed_millis: 120_000,
+            final_result_p50_millis: None,
+            final_result_p90_millis: None,
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 0,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 4,
+            peak_pressure: HostPressureClass::Moderate,
+        });
+        let observations = three_successes(
+            &workload,
+            "owned",
+            HotStateClass::Warm,
+            40_000,
+            0,
+            0,
+        );
+
+        candidate.contention.as_ref().unwrap().validate().unwrap();
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("owned")
+                && entry.reason == PoolExclusionReason::ReliabilityAbovePolicy
+        }));
+    }
+
+    #[test]
+    fn contention_latency_presence_tracks_validated_completions() {
+        let no_completion = ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 1,
+            maximum_simultaneous: 0,
+            validated_completions: 0,
+            elapsed_millis: 60_000,
+            final_result_p50_millis: Some(1),
+            final_result_p90_millis: Some(1),
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 0,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 1,
+            peak_pressure: HostPressureClass::Low,
+        };
+        assert_eq!(
+            no_completion.validate().unwrap_err().code,
+            "routing_contention_latency_without_validated_completion"
+        );
+
+        let missing_latency = ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 1,
+            maximum_simultaneous: 1,
+            validated_completions: 1,
+            elapsed_millis: 60_000,
+            final_result_p50_millis: None,
+            final_result_p90_millis: None,
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 0,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::Low,
+        };
+        assert_eq!(
+            missing_latency.validate().unwrap_err().code,
+            "routing_contention_validated_latency_missing"
+        );
+    }
+
+    #[test]
     fn contention_failure_rate_obeys_policy_ceiling() {
         let workload = workload();
         let mut candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Warm);
@@ -2877,8 +3002,8 @@ mod tests {
             maximum_simultaneous: 4,
             validated_completions: 14,
             elapsed_millis: 120_000,
-            final_result_p50_millis: 30_000,
-            final_result_p90_millis: 45_000,
+            final_result_p50_millis: Some(30_000),
+            final_result_p90_millis: Some(45_000),
             semantic_mismatches: 0,
             unvalidated_completions: 0,
             failures: 2,
@@ -2917,8 +3042,8 @@ mod tests {
             maximum_simultaneous: 4,
             validated_completions: 14,
             elapsed_millis: 120_000,
-            final_result_p50_millis: 30_000,
-            final_result_p90_millis: 45_000,
+            final_result_p50_millis: Some(30_000),
+            final_result_p90_millis: Some(45_000),
             semantic_mismatches: 0,
             unvalidated_completions: 1,
             failures: 0,
@@ -2955,8 +3080,8 @@ mod tests {
             maximum_simultaneous: 5,
             validated_completions: 4,
             elapsed_millis: 60_000,
-            final_result_p50_millis: 20_000,
-            final_result_p90_millis: 30_000,
+            final_result_p50_millis: Some(20_000),
+            final_result_p90_millis: Some(30_000),
             semantic_mismatches: 0,
             unvalidated_completions: 0,
             failures: 0,
