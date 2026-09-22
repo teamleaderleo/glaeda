@@ -432,7 +432,7 @@ fn observation_id(run_id: &str, sequence: u16, stage: &str) -> String {
     let material = format!("{run_id}\n{sequence}\n{stage}\n");
     format!(
         "cmux-{}",
-        &domain_digest("cmux-verification-observation-v1", material.as_bytes())[7..23]
+        &domain_digest("cmux-verification-observation-v1", material.as_bytes())[7..]
     )
 }
 
@@ -1159,6 +1159,7 @@ mod tests {
 
         assert_eq!(compile_ids.len(), 2);
         assert_ne!(compile_ids[0], compile_ids[1]);
+        assert!(compile_ids.iter().all(|identity| identity.len() == 69));
     }
 
     #[test]
