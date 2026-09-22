@@ -4,8 +4,6 @@ pub mod actions_runner_readiness;
 pub mod adaptive_ci_routing;
 /// Pure deterministic optimization discovery from bounded verification observations.
 pub mod adaptive_verification_compiler;
-/// Pure projection of validated CMUX workload results into adaptive verification observations.
-pub mod cmux_workload_verification_adapter;
 pub mod artifact;
 /// Pure, path-free classification of explicit hot-state inventory observations.
 pub mod cache_inventory;
@@ -15,6 +13,8 @@ pub mod cargo_target_holder_observation;
 /// Read-only, descriptor-bound observation of one Linux Cargo target tree.
 #[cfg(target_os = "linux")]
 pub mod cargo_target_observation;
+/// Pure projection of validated CMUX workload results into adaptive verification observations.
+pub mod cmux_workload_verification_adapter;
 /// Pure workload-neutral pre-admission compute request.
 pub mod compute_execution_request;
 /// Pure workload-family-neutral identity for declared compute semantics.
