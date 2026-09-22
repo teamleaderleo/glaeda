@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import owned_fleet_benchmark as fleet
 from owned_fleet_benchmark.observe import validate_semantic
 from owned_fleet_benchmark.cli import parser as fleet_parser
-from owned_fleet_benchmark.report import _stable_profile_sets
+from owned_fleet_benchmark.report import _stable_profile_sets, markdown_report
 from owned_fleet_benchmark.run import _validate_direct_runtime
 from owned_fleet_benchmark.model import env_for
 
@@ -381,6 +381,29 @@ class FleetHarnessTests(unittest.TestCase):
             FleetError, "unsupported window receipt"
         ):
             NS["compare_windows"]([partial, partial, partial])
+
+    def test_partial_window_remains_visible_in_machine_report(self) -> None:
+        machine = complete_machine()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            partial = NS["reduce_window"](
+                window_manifest(
+                    "small",
+                    [
+                        {
+                            "work_id": f"w{index}",
+                            "arrival_offset_ms": index * 1000,
+                            "receipt": None,
+                        }
+                        for index in range(4)
+                    ],
+                ),
+                root,
+            )
+
+        report = markdown_report(machine, [], [partial], [])
+        self.assertIn("unobserved", report)
+        self.assertIn("settled no offered work", report)
 
     def test_window_reducer_uses_validated_numerator_and_unfinished(self) -> None:
         machine = complete_machine()
