@@ -192,7 +192,8 @@ The receipt records:
 - Linux memory PSI when available;
 - state growth;
 - sampled temperature;
-- fallback/reset counts;
+- direct-run queue delay fixed to zero at the runner-owned request-known boundary;
+- fallback/reset counts fixed to zero because the direct runner does not own an upstream scheduler/controller lifecycle;
 - source and state storage tiers/filesystems;
 - execution Wh when load power is available.
 
@@ -286,12 +287,19 @@ scripts/owned-fleet-benchmark compare-windows --window /tmp/windows/large.window
 
 `compare-windows` requires exactly one large, medium, and small arm. It also requires identical machine comparison identity, backend/runtime, workload/source/toolchain/state/storage identity, offered arrival pattern, resource policy, aggregate CPU/RAM, and window duration.
 
+A fixed-offer window with zero settled members is retained as
+`glaeda-owned-fleet-window-partial-receipt`: it records offered/unfinished work,
+the frozen manifest/arrival/resource-policy request, zero observed concurrency, and
+absent final-result percentiles. It is diagnostic negative evidence only and
+`compare-windows` refuses it because no member receipt established
+machine/backend/toolchain comparison identity.
+
 The reducer derives:
 
 - validated completions/window;
 - nearest-rank p50/p90 final-result latency over validated members;
 - unfinished work;
-- failure/fallback/reset counts;
+- failure/fallback/reset counts, with failures surfaced as an explicit collapse flag;
 - declared vs observed concurrency;
 - max member peak RSS;
 - host swap/pressure/temperature maxima, plus swap growth relative to each member's start observation so preexisting swapped pages are not attributed to the benchmark.
@@ -312,14 +320,20 @@ Retain:
 ```text
 backend
 measurement date
+measurement-evidence SHA-256 binding the hosted wall/queue observation
 actual hosted wall time
 queue delay
 rate/currency/billing increment/minimum
+rate source
 workload/variant/source/operation/toolchain identity
 hosted state class
 dated FX when currencies differ
 semantic validation
 ```
+
+The hosted measurement evidence digest and rate source are required. A manually
+entered queue delay or rate with no provenance is rejected by the economics
+reducer.
 
 The hosted state class may differ from owned state. A persistent owned `project_resident` sample can legitimately be compared with a hosted `cold` sample when the semantic job/toolchain/source are exact. The economics receipt records both conditions instead of pretending they are the same heat state.
 
