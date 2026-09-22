@@ -1,6 +1,17 @@
-# Implementation capability map
+# Implementation capability map (retired)
 
-> **Product-direction note:** the critical path is now [Disposable autoscaling CI](DISPOSABLE_AUTOSCALING_CI.md). Existing R01 modules remain reviewed optional hardening/future Linux-container work; their listed "missing integration proof" cells are not an instruction to add more R01 slices before the disposable Lima/JIT path is complete.
+> **Retired 2026-09-22.** This map was hand-written against exact base
+> `3aa7c8f0341c6dd9138f7b0b5f2e2470140430ae` (2026-07-28) and was never updated. `main` is 1015
+> commits ahead of that base, the crate was renamed from `smolrunner` to `glaeda`, and `src/lib.rs`
+> now exports 200 modules rather than the 91 recorded below — 96 of them appear nowhere in this
+> document, and the "mechanical completeness check" at the end asserts `count=93` against 104 module
+> rows. Nothing in the repository links here. Read it as the W01-base design record it is; do not
+> read a classification, a product track, or a module count from it.
+>
+> The current inventory is generated: [`../MODULE_INVENTORY.md`](../MODULE_INVENTORY.md), produced
+> and gated by `tests/module_inventory.rs`.
+
+> **Product-direction note:** the critical path is now [Disposable autoscaling CI](../DISPOSABLE_AUTOSCALING_CI.md). Existing R01 modules remain reviewed optional hardening/future Linux-container work; their listed "missing integration proof" cells are not an instruction to add more R01 slices before the disposable Lima/JIT path is complete.
 
 This document maps every public library module exported by `src/lib.rs` on exact W01 activation base
 `3aa7c8f0341c6dd9138f7b0b5f2e2470140430ae`. It distinguishes what the installed binary already
@@ -10,8 +21,8 @@ integration guide, not authority to refactor, delete, rename, expose, or call a 
 Evidence reviewed:
 
 - exact-base `src/lib.rs` and `src/main.rs`;
-- the current [README](../README.md), [roadmap](ROADMAP.md), and
-  [MacBook runner quickstart](MACBOOK-RUNNER-QUICKSTART.md);
+- the current [README](../../README.md), [roadmap](../ROADMAP.md), and
+  [MacBook runner quickstart](../MACBOOK-RUNNER-QUICKSTART.md);
 - merged W00 results in PRs #226, #230, and #231;
 - programme waves #233–#239 and P02 preflight comment `5104870676`.
 
@@ -230,7 +241,7 @@ These are findings for later owners, not changes authorised by P02:
   adapter, and exact worker snapshot mutation.
 - The unused exact-commit handoff and Git-bundle export experiment was retired from the compiled
   product path. Its recovery coordinates and rationale are recorded in
-  [`history/RETIRED_FEATURE_ISLANDS.md`](history/RETIRED_FEATURE_ISLANDS.md).
+  [`history/RETIRED_FEATURE_ISLANDS.md`](RETIRED_FEATURE_ISLANDS.md).
 - `github_workflow_job_mapper` and `github_workflow_job_reconciliation` belong to W06. Coupling them
   to the run-once alpha would prematurely import GitHub observation and credential concerns.
 - Renderprove modules are mature within their own track. They should remain separate from the
