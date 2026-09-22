@@ -326,6 +326,15 @@ impl HotStateEvidenceV1 {
                 "remote locality evidence requires an explicit freshness expiry",
             ));
         }
+        if source == LocalityEvidenceSource::DeclaredUnknown
+            && (class != HotStateClass::Unknown || state_identity.is_some())
+        {
+            return Err(error(
+                "hot_state.source",
+                "routing_unknown_locality_claim",
+                "unknown locality evidence cannot claim warm or exact reusable state",
+            ));
+        }
         if valid_until_millis == Some(0) {
             return Err(error(
                 "hot_state.valid_until_millis",
@@ -801,6 +810,13 @@ impl RoutingPolicyV1 {
                 "policy",
                 "routing_policy_ratio_out_of_range",
                 "policy ratios exceed their bounded range",
+            ));
+        }
+        if self.mode == RoutingPolicyMode::Latency && self.spend_ceiling_microusd.is_none() {
+            return Err(error(
+                "policy.spend_ceiling_microusd",
+                "routing_latency_spend_ceiling_required",
+                "latency policy requires an explicit spend ceiling",
             ));
         }
         if matches!(
@@ -2193,6 +2209,41 @@ mod tests {
                 .iter()
                 .any(|entry| { entry.reason == PoolExclusionReason::EligibilityUnknown })
         );
+    }
+
+    #[test]
+    fn unknown_locality_source_cannot_claim_exact_hot_state() {
+        let error = HotStateEvidenceV1::new(
+            HotStateClass::HotExact,
+            Some(id("state:claimed")),
+            LocalityEvidenceSource::DeclaredUnknown,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "routing_unknown_locality_claim");
+    }
+
+    #[test]
+    fn manually_built_latency_policy_requires_spend_ceiling() {
+        let workload = workload();
+        let candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Cold);
+        let observations =
+            three_successes(&workload, "owned", HotStateClass::Cold, 40_000, 0, 0);
+        let mut policy = RoutingPolicyV1::latency(0);
+        policy.spend_ceiling_microusd = None;
+
+        let error = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            policy,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "routing_latency_spend_ceiling_required");
     }
 
     #[test]
