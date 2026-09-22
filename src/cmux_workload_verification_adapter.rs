@@ -1111,7 +1111,7 @@ mod tests {
             },
         );
         let bytes = serde_json::to_vec(&result).unwrap();
-        let outer = outer_observation(&result, &bytes);
+        let outer = outer_for(&bytes, &result);
         let projected = project_cmux_workload_result(
             "cmux-run-duplicate-stage",
             &serde_json::to_vec(&outer).unwrap(),
