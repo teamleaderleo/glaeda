@@ -316,7 +316,7 @@ def reduce_window(manifest: dict[str, Any], base_dir: Path) -> dict[str, Any]:
         return {
             "schema_version": WINDOW_SCHEMA_VERSION,
             "document_type": "glaeda-owned-fleet-window-partial-receipt",
-            "authority": "diagnostic_observation_only",
+            "authority": "declared_offer_only",
             "experiment_id": manifest["experiment_id"],
             "machine_id": manifest["machine_id"],
             "workload_id": manifest["workload_id"],
@@ -327,7 +327,7 @@ def reduce_window(manifest: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             "resource_policy_id": manifest["resource_policy_id"],
             "resource_policy_status": resource_policy_status,
             "resource_policy_evidence_id": policy_evidence_id,
-            "evidence_class": "diagnostic_only",
+            "evidence_class": "manifest_only",
             "aggregate_cpu_millis": aggregate_cpu,
             "aggregate_memory_limit_bytes": aggregate_memory,
             "per_job_cpu_millis": per_job_cpu,
