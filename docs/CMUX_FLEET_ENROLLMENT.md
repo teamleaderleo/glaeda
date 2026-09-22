@@ -66,6 +66,22 @@ Supported recovery paths also include `draining -> eligible` and `quarantined ->
 
 `scripts/cmux-fleet status` reports role/candidate eligibility only. Its `routingCandidateEligible` field means the enrollment and current acceptance receipt satisfy this contract; `automaticDispatchAuthorized` stays `false`. #546 or another separately approved routing-promotion gate owns queue selection and dispatch, including queue/start prediction, hot locality, pressure, allowance scarcity, workload-class evidence, and operator policy. The status projection includes only bounded architecture, OS class, hardware class, accepted toolchain generations, role profiles, Glaeda generation, fleet scope, lifecycle state, and per-role eligibility. A node in `draining`, `quarantined`, or `retired` produces zero eligible roles even when an older acceptance receipt exists. An `eligible` node still produces zero eligible roles when its acceptance evidence is absent, rejected, or stale. Live pressure/heat remains a fresh local admission veto: #970 may publish advisory bounded snapshots, while #546/local execution admission re-observes the machine before dispatch.
 
+For the quiet operator/agent view, use the separate read-only projection:
+
+```bash
+python3 scripts/cmux_fleet_operator_summary.py "$ENROLLMENT" \
+  --acceptance "$ACCEPTANCE"
+```
+
+This emits `glaeda-cmux-fleet-operator-summary/v1`. A healthy accepted node reports
+`attentionRequired: false`, `action: "none"`, and only the eligible role names.
+Missing or stale acceptance reports one concrete `run_role_acceptance` action;
+draining reports `observe_drain`; quarantine exposes only its reviewed bounded
+reason and `inspect_quarantine`; retired nodes are quiet/inactive. The projection
+carries no mutation or dispatch authority and intentionally lives outside the
+Glaeda fleet-contract generation, so changing operator presentation does not
+invalidate otherwise-current physical acceptance receipts.
+
 Reviewed quarantine reasons are:
 
 - `toolchain_mismatch`
