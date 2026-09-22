@@ -233,12 +233,6 @@ def markdown_report(
             window.get("document_type")
             == "glaeda-owned-fleet-window-partial-receipt"
         ):
-            if window["counts"]["unfinished"] > 0:
-                bottlenecks.append(
-                    f"`{window['workload_id']}` / unobserved / "
-                    f"`{window['profile_id']}` settled no offered work; "
-                    "backend/toolchain comparison identity remains unobserved"
-                )
             continue
         if window.get("resource_policy_status") != "enforced":
             continue
