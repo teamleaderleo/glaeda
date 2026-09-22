@@ -38,9 +38,7 @@ enum PreparedTemplateGeneration {
 }
 
 impl PreparedTemplateGeneration {
-    fn from_schema_version(
-        schema_version: u8,
-    ) -> Result<Self, DisposablePreparedTemplateError> {
+    fn from_schema_version(schema_version: u8) -> Result<Self, DisposablePreparedTemplateError> {
         match schema_version {
             LEGACY_SMOLRUNNER_PREPARED_TEMPLATE_SCHEMA_VERSION => Ok(Self::LegacySmolRunnerV3),
             DISPOSABLE_PREPARED_TEMPLATE_SCHEMA_VERSION => Ok(Self::GlaedaV4),
@@ -676,7 +674,10 @@ mod tests {
             manifest.lima_template_digest().as_str(),
             "sha256:1d1b74e9d17d2dcb6fdc5b85b0d14e5cc2cb99c9bb0f182124655fa6661da5b3"
         );
-        assert_eq!(manifest.ready_marker_path(), "/etc/glaeda/prepared-template.json");
+        assert_eq!(
+            manifest.ready_marker_path(),
+            "/etc/glaeda/prepared-template.json"
+        );
         manifest
             .validate_lima_template(current_disposable_lima_template_bytes())
             .unwrap();

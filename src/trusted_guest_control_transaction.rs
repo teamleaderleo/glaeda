@@ -436,8 +436,10 @@ pub fn decode_trusted_guest_control_transaction_receipt(
 pub fn decode_legacy_smolrunner_trusted_guest_control_transaction_receipt_v2(
     bytes: &[u8],
     expected_transaction: &LegacySmolRunnerTrustedGuestControlTransactionV2,
-) -> Result<LegacySmolRunnerTrustedGuestControlTransactionReceiptV2, TrustedGuestControlTransactionError>
-{
+) -> Result<
+    LegacySmolRunnerTrustedGuestControlTransactionReceiptV2,
+    TrustedGuestControlTransactionError,
+> {
     require_frame_size(bytes, MAX_TRUSTED_GUEST_CONTROL_TRANSACTION_RECEIPT_BYTES)?;
     let wire: TransactionReceiptDecodeWire =
         serde_json::from_slice(bytes).map_err(|_| malformed())?;
@@ -460,10 +462,7 @@ pub fn decode_legacy_smolrunner_trusted_guest_control_transaction_receipt_v2(
         result_body.as_deref(),
     )?;
     let receipt_value = raw_json_object(receipt_raw)?;
-    let result_value = result_body
-        .as_deref()
-        .map(raw_json_object)
-        .transpose()?;
+    let result_value = result_body.as_deref().map(raw_json_object).transpose()?;
     let canonical = canonical_frame(
         &TransactionReceiptEncodeWire {
             schema_version: LEGACY_SMOLRUNNER_TRUSTED_GUEST_CONTROL_TRANSACTION_SCHEMA_VERSION,
@@ -529,11 +528,7 @@ pub fn legacy_smolrunner_trusted_guest_control_result_body_v2_digest(
     operation: TrustedGuestControlOperation,
     body: &[u8],
 ) -> Result<Sha256Digest, TrustedGuestControlTransactionError> {
-    operation_body_digest(
-        LEGACY_SMOLRUNNER_RESULT_BODY_DIGEST_DOMAIN,
-        operation,
-        body,
-    )
+    operation_body_digest(LEGACY_SMOLRUNNER_RESULT_BODY_DIGEST_DOMAIN, operation, body)
 }
 
 fn validate_outcome_result(
@@ -1083,7 +1078,7 @@ mod tests {
                 Some(result_body.clone()),
             )
             .unwrap_err()
-                .kind(),
+            .kind(),
             TrustedGuestControlTransactionErrorKind::OutcomeMismatch
         );
 

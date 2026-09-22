@@ -1742,15 +1742,8 @@ mod tests {
                 "example-project",
             )
             .unwrap(),
-            ScaleSetBridgeTarget::new(
-                23,
-                "glaeda",
-                1,
-                &["glaeda".to_owned()],
-                "glaeda-host",
-                1,
-            )
-            .unwrap(),
+            ScaleSetBridgeTarget::new(23, "glaeda", 1, &["glaeda".to_owned()], "glaeda-host", 1)
+                .unwrap(),
         )
         .unwrap()
     }
@@ -1781,26 +1774,12 @@ mod tests {
             .is_err()
         );
         assert!(
-            ScaleSetBridgeTarget::new(
-                23,
-                "glaeda",
-                1,
-                &["glaeda".to_owned()],
-                "glaeda-host",
-                0,
-            )
-            .is_err()
+            ScaleSetBridgeTarget::new(23, "glaeda", 1, &["glaeda".to_owned()], "glaeda-host", 0,)
+                .is_err()
         );
         assert!(
-            ScaleSetBridgeTarget::new(
-                23,
-                "glaeda",
-                1,
-                &["glaeda".to_owned()],
-                "glaeda-host",
-                2,
-            )
-            .is_err()
+            ScaleSetBridgeTarget::new(23, "glaeda", 1, &["glaeda".to_owned()], "glaeda-host", 2,)
+                .is_err()
         );
         let key = GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap();
         assert_eq!(format!("{key:?}"), "[REDACTED]");

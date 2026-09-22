@@ -380,9 +380,9 @@ impl TrustedGuestControlAuthority {
             TrustedGuestControlAuthorityVariant::ResidentSandbox { .. } => {
                 TrustedGuestControlAuthorityKind::ResidentSandbox
             }
-            TrustedGuestControlAuthorityVariant::ResidentPendingProjectDiskAttachment { .. } => {
-                TrustedGuestControlAuthorityKind::ResidentPendingProjectDiskAttachment
-            }
+            TrustedGuestControlAuthorityVariant::ResidentPendingProjectDiskAttachment {
+                ..
+            } => TrustedGuestControlAuthorityKind::ResidentPendingProjectDiskAttachment,
             TrustedGuestControlAuthorityVariant::ResidentAttachedProjectDisk(_) => {
                 TrustedGuestControlAuthorityKind::ResidentAttachedProjectDisk
             }
@@ -916,7 +916,8 @@ pub fn decode_trusted_guest_control_receipt_body(
     require_size(bytes, MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES - 1)?;
     require_version(bytes, TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION)?;
     let wire: ReceiptWire = serde_json::from_slice(bytes).map_err(|_| malformed())?;
-    let receipt = receipt_from_wire_for_schema(wire, TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION)?;
+    let receipt =
+        receipt_from_wire_for_schema(wire, TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION)?;
     if receipt.request_id != expected_request.request_id
         || receipt.binary != expected_request.binary
         || receipt.operation != expected_request.operation
@@ -970,10 +971,7 @@ fn require_size(bytes: &[u8], limit: usize) -> Result<(), TrustedGuestControlPro
     Ok(())
 }
 
-fn require_version(
-    bytes: &[u8],
-    expected: u8,
-) -> Result<(), TrustedGuestControlProtocolError> {
+fn require_version(bytes: &[u8], expected: u8) -> Result<(), TrustedGuestControlProtocolError> {
     let version: VersionWire = serde_json::from_slice(bytes).map_err(|_| malformed())?;
     if version.schema_version != expected {
         return Err(version_incompatible());
@@ -1346,9 +1344,15 @@ fn request_from_wire_for_schema(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum OutcomeWire {
-    Succeeded { result_digest: String },
-    Refused { reason: TrustedGuestControlRefusal },
-    RecoveryRequired { debt: TrustedGuestControlRecoveryDebt },
+    Succeeded {
+        result_digest: String,
+    },
+    Refused {
+        reason: TrustedGuestControlRefusal,
+    },
+    RecoveryRequired {
+        debt: TrustedGuestControlRecoveryDebt,
+    },
 }
 
 impl From<&TrustedGuestControlOutcome> for OutcomeWire {
@@ -1728,8 +1732,8 @@ mod tests {
                 .kind(),
             TrustedGuestControlProtocolErrorKind::VersionIncompatible
         );
-        let decoded = decode_legacy_smolrunner_trusted_guest_control_request_v2(legacy.as_bytes())
-            .unwrap();
+        let decoded =
+            decode_legacy_smolrunner_trusted_guest_control_request_v2(legacy.as_bytes()).unwrap();
         assert_eq!(decoded.request(), &request());
         assert_eq!(decoded.canonical_bytes(), legacy.as_bytes());
         assert_ne!(
@@ -1927,9 +1931,10 @@ mod tests {
         let legacy_request_bytes = std::str::from_utf8(&current_request_bytes)
             .unwrap()
             .replacen("\"schema_version\":3", "\"schema_version\":2", 1);
-        let legacy_request =
-            decode_legacy_smolrunner_trusted_guest_control_request_v2(legacy_request_bytes.as_bytes())
-                .unwrap();
+        let legacy_request = decode_legacy_smolrunner_trusted_guest_control_request_v2(
+            legacy_request_bytes.as_bytes(),
+        )
+        .unwrap();
         let outcome = TrustedGuestControlOutcome::Succeeded {
             result_digest: digest('d'),
         };
