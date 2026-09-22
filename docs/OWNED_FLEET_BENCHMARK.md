@@ -341,7 +341,10 @@ semantic validation
 
 The hosted measurement evidence digest and rate source are required. A manually
 entered queue delay or rate with no provenance is rejected by the economics
-reducer.
+reducer. The reduced economics receipt preserves both
+`hosted.measurement_evidence_sha256` and `hosted.rate_source` so downstream
+routing/accounting consumers can inspect the evidence behind the hosted queue
+and price inputs.
 
 The hosted state class may differ from owned state. A persistent owned `project_resident` sample can legitimately be compared with a hosted `cold` sample when the semantic job/toolchain/source are exact. The economics receipt records both conditions instead of pretending they are the same heat state.
 
