@@ -509,6 +509,13 @@ impl ContentionEvidenceV1 {
                 "validated completions cannot exceed offered tasks",
             ));
         }
+        if self.validated_completions > 0 && self.maximum_simultaneous == 0 {
+            return Err(error(
+                "contention.maximum_simultaneous",
+                "routing_contention_zero_concurrency_with_completion",
+                "validated contention completions require observed simultaneous work",
+            ));
+        }
         let terminal_partition = u64::from(self.validated_completions)
             + u64::from(self.semantic_mismatches)
             + u64::from(self.unvalidated_completions)
@@ -3018,6 +3025,33 @@ mod tests {
             entry.pool_id == id("hosted")
                 && entry.reason == PoolExclusionReason::InvalidPressureSemantics
         }));
+    }
+
+    #[test]
+    fn validated_contention_requires_observed_concurrency() {
+        let evidence = ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 1,
+            maximum_simultaneous: 0,
+            validated_completions: 1,
+            elapsed_millis: 60_000,
+            final_result_p50_millis: Some(20_000),
+            final_result_p90_millis: Some(20_000),
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 0,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::Low,
+        };
+
+        assert_eq!(
+            evidence.validate().unwrap_err().code,
+            "routing_contention_zero_concurrency_with_completion"
+        );
     }
 
     #[test]
