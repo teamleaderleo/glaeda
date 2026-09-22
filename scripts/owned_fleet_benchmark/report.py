@@ -32,7 +32,11 @@ def _validate_report_evidence(
     for item in evidence:
         if item.get("machine_id") != machine["machine_id"]:
             raise FleetError("report evidence belongs to a different machine_id")
-        if item.get("machine_comparison_digest") != comparison_digest:
+        if (
+            item.get("document_type")
+            != "glaeda-owned-fleet-window-partial-receipt"
+            and item.get("machine_comparison_digest") != comparison_digest
+        ):
             raise FleetError(
                 "report evidence belongs to a different machine comparison identity"
             )
@@ -206,7 +210,8 @@ def markdown_report(
             latency = window["final_result_latency_ms"]
             concurrency = window.get("concurrency") or {}
             lines.append(
-                f"- `{window['workload_id']}` / `{window.get('backend_id')}` / "
+                f"- `{window['workload_id']}` / "
+                f"`{window.get('backend_id') or 'unobserved'}` / "
                 f"`{window['profile_id']}`: "
                 f"{counts['validated_completions']}/{counts['offered']} validated, "
                 f"unfinished={counts['unfinished']}, p50={latency['p50']} ms, "
@@ -223,6 +228,17 @@ def markdown_report(
     ]
     bottlenecks: list[str] = []
     for window in windows:
+        if (
+            window.get("document_type")
+            == "glaeda-owned-fleet-window-partial-receipt"
+        ):
+            if window["counts"]["unfinished"] > 0:
+                bottlenecks.append(
+                    f"`{window['workload_id']}` / unobserved / "
+                    f"`{window['profile_id']}` settled no offered work; "
+                    "backend/toolchain comparison identity remains unobserved"
+                )
+            continue
         if window.get("resource_policy_status") != "enforced":
             continue
         label = (
@@ -596,17 +612,22 @@ def markdown_report(
 
 
 def collect_json_files(
-    directory: Path | None, document_type: str
+    directory: Path | None, document_type: str | tuple[str, ...]
 ) -> list[dict[str, Any]]:
     if directory is None or not directory.exists():
         return []
+    allowed = (
+        {document_type}
+        if isinstance(document_type, str)
+        else set(document_type)
+    )
     values = []
     for path in sorted(directory.glob("*.json")):
         try:
             value = load_json(path)
         except FleetError:
             continue
-        if value.get("document_type") == document_type:
+        if value.get("document_type") in allowed:
             values.append(value)
     return values
 
