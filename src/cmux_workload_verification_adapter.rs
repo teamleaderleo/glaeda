@@ -406,26 +406,6 @@ fn consumer_contract_identity(result: &RawCmuxWorkloadResult) -> String {
     domain_digest("cmux-consumer-contract-v1", material.as_bytes())
 }
 
-fn artifact_set_identity(artifacts: &[RawArtifactIdentity]) -> Option<String> {
-    if artifacts.is_empty() {
-        return None;
-    }
-    let mut rows = artifacts
-        .iter()
-        .map(|artifact| {
-            format!(
-                "{}\t{}\t{}\n",
-                artifact.class, artifact.sha256, artifact.bytes
-            )
-        })
-        .collect::<Vec<_>>();
-    rows.sort();
-    Some(domain_digest(
-        "cmux-artifact-set-v1",
-        rows.concat().as_bytes(),
-    ))
-}
-
 fn runtime_input_set_identity(inputs: &[RawRuntimeInputIdentity]) -> Option<String> {
     if inputs.is_empty() {
         return None;
