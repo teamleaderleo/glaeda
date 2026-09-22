@@ -920,8 +920,7 @@ mod tests {
             "runner_name": "cmux-mac-1"
         }))
         .unwrap();
-        let batch =
-            project_cmux_product_transport("local-attempt", &semantic, &local).unwrap();
+        let batch = project_cmux_product_transport("local-attempt", &semantic, &local).unwrap();
         observations.extend_from_slice(batch.observations());
 
         let receipt = compile_verification_optimizations(
