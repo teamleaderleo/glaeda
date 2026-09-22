@@ -6,12 +6,15 @@ import sys
 import threading
 from pathlib import Path
 
+OBSERVATION_ENV = {"LC_ALL": "C", "LANG": "C"}
+
 
 def du_bytes(path: Path) -> int:
     if not path.exists():
         return 0
     result = subprocess.run(
-        ["du", "-sk", str(path)],
+        ["/usr/bin/du", "-sk", str(path)],
+        env=OBSERVATION_ENV,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -33,13 +36,14 @@ def du_bytes(path: Path) -> int:
 
 def filesystem_type(path: Path) -> str | None:
     commands = (
-        ["stat", "-f", "-c", "%T", str(path)],
-        ["stat", "-f", "%T", str(path)],
+        ["/usr/bin/stat", "-f", "-c", "%T", str(path)],
+        ["/usr/bin/stat", "-f", "%T", str(path)],
     )
     for command in commands:
         try:
             result = subprocess.run(
                 command,
+                env=OBSERVATION_ENV,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -67,7 +71,8 @@ def swap_used_bytes():
     if sys.platform == "darwin":
         try:
             output = subprocess.check_output(
-                ["sysctl", "-n", "vm.swapusage"],
+                ["/usr/sbin/sysctl", "-n", "vm.swapusage"],
+                env=OBSERVATION_ENV,
                 text=True,
                 stderr=subprocess.DEVNULL,
             )
@@ -111,7 +116,8 @@ def temperature():
 
 def aggregate_rss(root_pid: int):
     result = subprocess.run(
-        ["ps", "-axo", "pid=,ppid=,rss="],
+        ["/bin/ps", "-axo", "pid=,ppid=,rss="],
+        env=OBSERVATION_ENV,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
