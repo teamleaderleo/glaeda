@@ -77,9 +77,6 @@ def parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--state-storage-id", default="machine-internal")
     run.add_argument("--output", type=Path, required=True)
-    run.add_argument("--queue-delay-ms", type=float, default=0.0)
-    run.add_argument("--fallback-count", type=int, default=0)
-    run.add_argument("--reset-count", type=int, default=0)
     run.add_argument("--load-watts", type=float)
     run.add_argument("--timeout-seconds", type=float, default=7200.0)
 
@@ -219,7 +216,9 @@ def main() -> int:
                     "state_class": "cold",
                     "actual_wall_seconds": None,
                     "queue_delay_seconds": None,
+                    "measurement_evidence_sha256": "sha256:" + "0" * 64,
                     "rate_per_minute": None,
+                    "rate_source": "replace-with-rate-source",
                     "billing_currency": "USD",
                     "billing_increment_seconds": 1,
                     "minimum_billed_seconds": 0,
