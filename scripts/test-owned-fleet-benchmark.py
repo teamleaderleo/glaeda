@@ -108,6 +108,7 @@ def benchmark_receipt(
     return {
         "schema_version": 1,
         "document_type": "glaeda-owned-fleet-benchmark-receipt",
+        "authority": "performance_observation_only",
         "sample_id": f"sample-{next(SAMPLE_IDS)}",
         "machine_id": machine["machine_id"],
         "machine_comparison_digest": NS["machine_comparison_digest"](machine),
@@ -154,6 +155,7 @@ def benchmark_receipt(
         "result": {
             "validated": validated,
             "failure_count": 0 if validated else 1,
+            "timed_out": False,
         },
         "resources": {
             "peak_aggregate_rss_kib": 1000,
@@ -576,6 +578,57 @@ class FleetHarnessTests(unittest.TestCase):
                 )
             with self.assertRaises(FleetError):
                 NS["reduce_window"](window_manifest("large", items), root)
+
+    def test_window_reducer_refuses_inconsistent_member_reliability(self) -> None:
+        machine = complete_machine()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = benchmark_receipt(
+                machine=machine,
+                start_ns=1_010_000_000,
+                request_ns=1_000_000_000,
+                latency_ms=500,
+                cpu_millis=8000,
+                memory_bytes=16 * GIB,
+            )
+
+            cases = []
+            bad_failure = copy.deepcopy(base)
+            bad_failure["result"]["failure_count"] = 1
+            cases.append(bad_failure)
+
+            bad_fallback = copy.deepcopy(base)
+            bad_fallback["events"]["fallback_count"] = 2
+            cases.append(bad_fallback)
+
+            bad_reset = copy.deepcopy(base)
+            bad_reset["events"]["reset_count"] = -1
+            cases.append(bad_reset)
+
+            bad_latency = copy.deepcopy(base)
+            bad_latency["milestones"]["request_known_to_final_result_ms"] += 10
+            cases.append(bad_latency)
+
+            bad_authority = copy.deepcopy(base)
+            bad_authority["authority"] = "declared_only"
+            cases.append(bad_authority)
+
+            for index, value in enumerate(cases):
+                with self.subTest(index=index):
+                    path = root / f"bad-{index}.json"
+                    path.write_text(json.dumps(value))
+                    manifest = window_manifest(
+                        "large",
+                        [
+                            {
+                                "work_id": "w0",
+                                "arrival_offset_ms": 0,
+                                "receipt": path.name,
+                            }
+                        ],
+                    )
+                    with self.assertRaises(FleetError):
+                        NS["reduce_window"](manifest, root)
 
     def test_window_reducer_refuses_duplicate_sample_receipt(self) -> None:
         machine = complete_machine()
