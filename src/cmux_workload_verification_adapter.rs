@@ -222,7 +222,7 @@ pub fn project_cmux_workload_result(
             )
         })?;
         let duration_millis = duration_millis(timing.seconds)?;
-        let observation_id = observation_id(run_id, &timing.stage);
+        let observation_id = observation_id(run_id, sequence, &timing.stage);
 
         let mut observation = VerificationObservation::new(
             &observation_id,
@@ -428,8 +428,8 @@ fn runtime_input_set_identity(inputs: &[RawRuntimeInputIdentity]) -> Option<Stri
     ))
 }
 
-fn observation_id(run_id: &str, stage: &str) -> String {
-    let material = format!("{run_id}\n{stage}\n");
+fn observation_id(run_id: &str, sequence: u16, stage: &str) -> String {
+    let material = format!("{run_id}\n{sequence}\n{stage}\n");
     format!(
         "cmux-{}",
         &domain_digest("cmux-verification-observation-v1", material.as_bytes())[7..23]
@@ -1098,6 +1098,36 @@ mod tests {
         );
         assert_eq!(batch.ignored_stages(), &["validation".to_owned()]);
         assert_eq!(batch.observations()[2].duration_millis(), 343_600);
+    }
+
+    #[test]
+    fn repeated_stage_names_get_distinct_observation_ids() {
+        let mut result = compile_result("passed", "cold");
+        result.stage_timings.insert(
+            3,
+            RawStageTiming {
+                stage: "compile".to_owned(),
+                seconds: 2.5,
+            },
+        );
+        let bytes = serde_json::to_vec(&result).unwrap();
+        let outer = outer_observation(&result, &bytes);
+        let projected = project_cmux_workload_result(
+            "cmux-run-duplicate-stage",
+            &serde_json::to_vec(&outer).unwrap(),
+            &bytes,
+        )
+        .unwrap();
+
+        let compile_ids = projected
+            .observations()
+            .iter()
+            .filter(|observation| observation.stage() == VerificationStage::Compile)
+            .map(VerificationObservation::observation_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(compile_ids.len(), 2);
+        assert_ne!(compile_ids[0], compile_ids[1]);
     }
 
     #[test]
