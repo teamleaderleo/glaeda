@@ -53,6 +53,23 @@ jobs:
           --component clippy,rustfmt
           --no-self-update
 
+      # Verify spends most of its wall time compiling the same dependency
+      # graph from scratch on every run. Restore the registry and target
+      # directory so only changed crates are rebuilt. Pull requests read the
+      # generation published by the last main push; only main writes, which
+      # keeps this workflow from multiplying per-branch cache entries.
+      - name: Restore cargo build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            verify-cargo-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
+
       - name: Validate workspace bootstrap
         run: |
           python3 - <<'PY'
@@ -295,3 +312,17 @@ jobs:
         run: |
           cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
             | jq -e '.schema_version == 1 and .disposition and (.findings | type == "array") and (.report.executables | length == 3) and .report.package_plan and .report.runner_account'
+
+      # Only main publishes a generation. Pull requests restore from it and
+      # never write, so cache storage stays proportional to main rather than
+      # to the number of open branches.
+      - name: Save cargo build cache
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
