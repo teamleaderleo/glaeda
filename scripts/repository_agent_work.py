@@ -380,6 +380,22 @@ def compute_workload(request: dict[str, object]) -> dict[str, object]:
     }
 
 
+def routing_classification(request: dict[str, object]) -> dict[str, object]:
+    compute = compute_workload(request)
+    return {
+        "family": compute["family"],
+        "semantic_generation": compute["semantic_generation"],
+        "operation": request["operation"],
+        "trust_class": compute["trust_class"],
+        "network_class": request["network_class"],
+        "scope_class": request["scope"]["class"],
+        "mutation_class": request["mutation"]["class"],
+        "required_capabilities": compute["required_capabilities"],
+        "verification_profiles": request["verification"],
+        "output_contract_sha256": compute["output_contract_sha256"],
+    }
+
+
 def plan(request: dict[str, object]) -> dict[str, object]:
     return {
         "document_type": PLAN_TYPE,
@@ -388,6 +404,7 @@ def plan(request: dict[str, object]) -> dict[str, object]:
         "operation": request["operation"],
         "source": request["source"],
         "compute_workload": compute_workload(request),
+        "routing_classification": routing_classification(request),
         "execution_boundary": {
             "task_contract": "caller_owned_digest_bound",
             "agent_harness": "reviewed_adapter_required",
