@@ -865,6 +865,14 @@ class FleetHarnessTests(unittest.TestCase):
         result = NS["economics"](
             owned, hosted, machine, 1.0, [36], [0.10, 0.50], reference, 0.33
         )
+        self.assertEqual(
+            result["hosted"]["measurement_evidence_sha256"],
+            "sha256:" + "e" * 64,
+        )
+        self.assertEqual(
+            result["hosted"]["rate_source"],
+            "fixture-provider-rate-card",
+        )
         self.assertFalse(result["state_context"]["same_state_class"])
         self.assertTrue(result["hot_state_benefit"]["available"])
         self.assertEqual(result["hot_state_benefit"]["reference_state_class"], "cold")
