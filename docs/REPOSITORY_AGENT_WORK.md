@@ -147,6 +147,10 @@ exact repository-owned verification profile set
 output-contract identity
 ```
 
+The same canonical object is emitted with
+`routing_classification_sha256 = sha256(canonical_json(routing_classification))`
+so #546 consumers have one stable equality key.
+
 It deliberately excludes exact source commit/tree, task-contract digest, and
 `compute_workload.input_identity`. Two review requests against different commits
 therefore retain distinct exact compute identities while sharing one routing
