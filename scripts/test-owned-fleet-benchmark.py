@@ -431,7 +431,8 @@ class FleetHarnessTests(unittest.TestCase):
             partial["document_type"],
             "glaeda-owned-fleet-window-partial-receipt",
         )
-        self.assertEqual(partial["authority"], "diagnostic_observation_only")
+        self.assertEqual(partial["authority"], "declared_offer_only")
+        self.assertEqual(partial["evidence_class"], "manifest_only")
         self.assertEqual(partial["counts"]["offered"], 4)
         self.assertEqual(partial["counts"]["settled"], 0)
         self.assertEqual(partial["counts"]["validated_completions"], 0)
@@ -467,7 +468,8 @@ class FleetHarnessTests(unittest.TestCase):
 
         report = markdown_report(machine, [], [partial], [])
         self.assertIn("unobserved", report)
-        self.assertIn("settled no offered work", report)
+        self.assertIn("evidence=manifest_only", report)
+        self.assertNotIn("settled no offered work", report)
 
     def test_window_reducer_uses_validated_numerator_and_unfinished(self) -> None:
         machine = complete_machine()
