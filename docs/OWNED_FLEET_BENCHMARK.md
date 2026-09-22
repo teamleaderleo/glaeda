@@ -307,7 +307,8 @@ The reducer derives:
 - validated completions/window;
 - nearest-rank p50/p90 final-result latency over validated members;
 - unfinished work;
-- failure/fallback/reset counts, with failures surfaced as an explicit collapse flag;
+- semantic-mismatch, source/currentness-unvalidated, process/timeout-failure,
+  fallback, and reset counts as separate terminal evidence classes;
 - declared vs observed concurrency;
 - max member peak RSS;
 - host swap/pressure/temperature maxima, plus swap growth relative to each member's start observation so preexisting swapped pages are not attributed to the benchmark.
