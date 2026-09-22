@@ -348,23 +348,41 @@ def observe(root, demand=VERIFY_FOCUSED_DEMAND):
 
 
 class Reservation:
-    def __init__(self, root, fingerprint, unit, binding, demand=VERIFY_FOCUSED_DEMAND):
+    def __init__(self, root, fingerprint, unit, binding, demand=VERIFY_FOCUSED_DEMAND,
+                 *, resume_existing=False):
         self.demand = validated_demand(demand)
         self.store = Store(root)
         self.identity = {"schema_version": 1, "command_fingerprint": fingerprint, "unit": unit,
                          "binding_sha256": binding}
+        self.resume_existing = resume_existing
         self.launch_attempted = False
         self.owned = False
         self.phase = "preparing"
+
+    @classmethod
+    def resume(cls, root, fingerprint, unit, binding):
+        """Reacquire one exact pre-launch reservation after a controller boundary.
+
+        Only the preparing phase is resumable. A launching record is an ambiguous
+        physical side effect and therefore remains recovery-only.
+        """
+        return cls(root, fingerprint, unit, binding, resume_existing=True)
 
     def __enter__(self):
         self.lock = self.store.lock("slot.lock")
         try:
             self.lock.__enter__()
-            if self.store.read("reservation.json") is not None:
-                raise Refusal("previous local reservation requires exact recovery")
             with self.store.lock("policy.lock"):
                 current = policy(self.store)
+                existing = self.store.read("reservation.json")
+                if self.resume_existing:
+                    self.identity["generation"] = current["generation"]
+                    if existing != {**self.identity, "phase": "preparing"}:
+                        raise Refusal("local admission reservation is not exact resumable preparation")
+                    self.owned = True
+                    return self
+                if existing is not None:
+                    raise Refusal("previous local reservation requires exact recovery")
                 check(current, self.demand)
                 self.identity["generation"] = current["generation"]
                 self.store.write("reservation.json", {**self.identity, "phase": "preparing"})

@@ -1,5 +1,9 @@
 /// Read-only observation of one configured official Actions runner.
 pub mod actions_runner_readiness;
+/// Pure recommendation-only adaptive CI pool routing from bounded evidence.
+pub mod adaptive_ci_routing;
+/// Pure deterministic optimization discovery from bounded verification observations.
+pub mod adaptive_verification_compiler;
 pub mod artifact;
 /// Pure, path-free classification of explicit hot-state inventory observations.
 pub mod cache_inventory;
@@ -9,6 +13,8 @@ pub mod cargo_target_holder_observation;
 /// Read-only, descriptor-bound observation of one Linux Cargo target tree.
 #[cfg(target_os = "linux")]
 pub mod cargo_target_observation;
+/// Pure projection of validated CMUX workload results into adaptive verification observations.
+pub mod cmux_workload_verification_adapter;
 /// Pure workload-neutral pre-admission compute request.
 pub mod compute_execution_request;
 /// Pure workload-family-neutral identity for declared compute semantics.
@@ -73,6 +79,8 @@ pub mod execution_admission;
 pub mod execution_capacity;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
+/// Pure bounded failure classification, diagnostic probes, remedies, and preflight learning.
+pub mod failure_diagnostic;
 /// Pure model-derived frontier-inference workload vocabulary and synthetic sensitivity fixtures.
 pub mod frontier_inference_workload;
 /// Pure Git index-v2 stat-cache patching for CoW task materialization.
@@ -131,6 +139,8 @@ pub mod hot_fleet_window;
 pub mod hot_run_cache_observation;
 /// Pure path-class policy for selecting reviewed hot-state sharing mechanisms.
 pub mod hot_state_path_policy;
+/// Pure transport-independent identity and source observations for immutable build products.
+pub mod immutable_artifact_distribution;
 /// Pure immutable resident Git object-pool generation and consumer-lease core.
 pub mod immutable_git_object_pool;
 /// Pure sealed non-task Git producer planning for immutable pool publication.
@@ -257,6 +267,12 @@ pub mod operator_remediation;
 pub mod operator_status;
 /// Typed, read-only aggregation of one coherent operator status evidence bundle.
 pub mod operator_status_service;
+/// Canonical controller enrollment for one trusted native-Linux GitHub Actions JIT worker.
+#[cfg(target_os = "linux")]
+pub mod owned_linux_jit_enrollment;
+/// Native owned-Linux task backend for one trusted GitHub Actions JIT runner.
+#[cfg(unix)]
+pub(crate) mod owned_linux_jit_runtime;
 pub mod ownership;
 /// Pure composition of durable queue, Lima lifecycle, and runner-readiness evidence.
 pub mod personal_worker_host_broker;
@@ -344,6 +360,8 @@ pub mod resident_repo_query;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod resident_sandbox_catalog;
 pub mod resource;
+/// Pure evidence-driven lifecycle and retention policy for expensive reusable state.
+pub mod reusable_state_lifecycle;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;
 /// Strict, bounded, nonblocking, descriptor-relative, identity-bound observation of reviewed Podman sources.

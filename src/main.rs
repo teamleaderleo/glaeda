@@ -6,18 +6,18 @@ mod personal_worker_submit_command;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io::Read as _;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::{
     fs::File,
     io::{Seek as _, SeekFrom},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use glaeda::artifact::Sha256Digest;
 use glaeda::cache_inventory::{
     CacheReportRequest, CacheStateId, MAX_CACHE_INVENTORY_DOCUMENT_BYTES,
@@ -35,11 +35,11 @@ use glaeda::disposable_launchd_service_status::{
     DisposableLaunchdServiceStatusErrorKind, inspect_disposable_launchd_service_status,
 };
 #[cfg(target_os = "macos")]
-use glaeda::disposable_worker_enrollment::{
-    MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES, decode_disposable_worker_enrollment,
-};
+use glaeda::disposable_worker_enrollment::decode_disposable_worker_enrollment;
 #[cfg(target_os = "macos")]
 use glaeda::disposable_worker_service::serve_disposable_worker;
+#[cfg(target_os = "linux")]
+use glaeda::disposable_worker_service::serve_owned_linux_jit_worker;
 use glaeda::doctor::{inspect_host, render_human as render_doctor};
 #[cfg(target_os = "linux")]
 use glaeda::durable_journal::StateStoreJournalCheckpoint;
@@ -76,6 +76,8 @@ use glaeda::linux_installation_catalog::{InstallationLookup, find_default_instal
 use glaeda::linux_state::LinuxStateRoot;
 use glaeda::manifest::{ManifestError, load};
 #[cfg(target_os = "linux")]
+use glaeda::owned_linux_jit_enrollment::decode_owned_linux_jit_enrollment;
+#[cfg(target_os = "linux")]
 use glaeda::ownership::ProjectIdentity;
 use glaeda::plan::{build, render_human as render_plan};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -99,13 +101,13 @@ use personal_worker_submit_command::{
 };
 #[cfg(target_os = "linux")]
 use rustix::rand::{GetRandomFlags, getrandom};
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use rustix::{
     fs::{self as rustix_fs, AtFlags, FileType, Mode, OFlags},
     process::{getegid, geteuid},
 };
 use serde::Serialize;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use sha2::{Digest as _, Sha256};
 
 #[derive(Debug, Parser)]
@@ -329,6 +331,16 @@ enum WorkerCommand {
         #[arg(long)]
         program_digest: String,
         /// Explicit absolute normalized canonical enrollment document.
+        #[arg(long)]
+        enrollment: PathBuf,
+        /// Exact approved canonical enrollment-document content digest.
+        #[arg(long)]
+        enrollment_digest: String,
+    },
+    /// Run the native owned-Linux JIT controller for one reviewed repository/Scale Set.
+    #[cfg(target_os = "linux")]
+    ServeOwnedLinux {
+        /// Explicit absolute normalized canonical owned-Linux enrollment document.
         #[arg(long)]
         enrollment: PathBuf,
         /// Exact approved canonical enrollment-document content digest.
@@ -591,6 +603,11 @@ fn main() -> ExitCode {
                 enrollment,
                 enrollment_digest,
             } => run_worker_serve(cli.output, &program_digest, &enrollment, &enrollment_digest),
+            #[cfg(target_os = "linux")]
+            WorkerCommand::ServeOwnedLinux {
+                enrollment,
+                enrollment_digest,
+            } => run_owned_linux_worker_serve(cli.output, &enrollment, &enrollment_digest),
         },
         Command::Queue { command } => match command {
             QueueCommand::List {
@@ -1162,7 +1179,7 @@ fn run_worker_status(output: OutputFormat, store_root: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn explicit_normalized_absolute_path(path: &Path) -> bool {
     let normalized = path.components().collect::<PathBuf>();
     path.is_absolute()
@@ -1194,7 +1211,7 @@ fn run_worker_serve(
                 .to_owned(),
         );
     }
-    let bytes = match read_private_disposable_worker_enrollment(enrollment_path) {
+    let bytes = match read_private_worker_enrollment(enrollment_path) {
         Ok(bytes) => bytes,
         Err(()) => {
             return emit_runtime_error(
@@ -1231,7 +1248,7 @@ fn run_worker_serve(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn approved_enrollment_bytes(bytes: &[u8], expected: &str) -> bool {
     let Ok(expected) = Sha256Digest::parse(expected) else {
         return false;
@@ -1241,20 +1258,23 @@ fn approved_enrollment_bytes(bytes: &[u8], expected: &str) -> bool {
     observed == expected
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const ENROLLMENT_DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const ENROLLMENT_FILE_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::NONBLOCK)
     .union(OFlags::CLOEXEC);
 
-#[cfg(target_os = "macos")]
-fn read_private_disposable_worker_enrollment(path: &Path) -> Result<Vec<u8>, ()> {
+#[cfg(unix)]
+const MAX_PRIVATE_WORKER_ENROLLMENT_BYTES: usize = 16 * 1024;
+
+#[cfg(unix)]
+fn read_private_worker_enrollment(path: &Path) -> Result<Vec<u8>, ()> {
     if !explicit_normalized_absolute_path(path) {
         return Err(());
     }
@@ -1279,18 +1299,18 @@ fn read_private_disposable_worker_enrollment(path: &Path) -> Result<Vec<u8>, ()>
         return Err(());
     }
 
-    let mut bytes = Vec::with_capacity(MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES);
+    let mut bytes = Vec::with_capacity(MAX_PRIVATE_WORKER_ENROLLMENT_BYTES);
     file.by_ref()
-        .take((MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES + 1) as u64)
+        .take((MAX_PRIVATE_WORKER_ENROLLMENT_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| ())?;
-    if bytes.len() > MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES {
+    if bytes.len() > MAX_PRIVATE_WORKER_ENROLLMENT_BYTES {
         return Err(());
     }
     file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
     let mut confirmation = Vec::with_capacity(bytes.len());
     file.by_ref()
-        .take((MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES + 1) as u64)
+        .take((MAX_PRIVATE_WORKER_ENROLLMENT_BYTES + 1) as u64)
         .read_to_end(&mut confirmation)
         .map_err(|_| ())?;
     if confirmation != bytes {
@@ -1312,7 +1332,7 @@ fn read_private_disposable_worker_enrollment(path: &Path) -> Result<Vec<u8>, ()>
     Ok(bytes)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn open_enrollment_directory_chain(path: &Path) -> Result<std::os::fd::OwnedFd, ()> {
     let mut directory =
         rustix_fs::open("/", ENROLLMENT_DIRECTORY_FLAGS, Mode::empty()).map_err(|_| ())?;
@@ -1330,7 +1350,7 @@ fn open_enrollment_directory_chain(path: &Path) -> Result<std::os::fd::OwnedFd, 
     Ok(directory)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn inspect_enrollment_parent(stat: &rustix_fs::Stat) -> Result<(), ()> {
     if !FileType::from_raw_mode(stat.st_mode).is_dir()
         || stat.st_uid != geteuid().as_raw()
@@ -1342,7 +1362,7 @@ fn inspect_enrollment_parent(stat: &rustix_fs::Stat) -> Result<(), ()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn inspect_enrollment_file(stat: &rustix_fs::Stat) -> Result<(), ()> {
     if !FileType::from_raw_mode(stat.st_mode).is_file()
         || stat.st_nlink != 1
@@ -1352,14 +1372,14 @@ fn inspect_enrollment_file(stat: &rustix_fs::Stat) -> Result<(), ()> {
         || stat.st_size < 0
         || usize::try_from(stat.st_size)
             .ok()
-            .is_none_or(|size| size > MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES)
+            .is_none_or(|size| size > MAX_PRIVATE_WORKER_ENROLLMENT_BYTES)
     {
         return Err(());
     }
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn same_enrollment_snapshot(left: &rustix_fs::Stat, right: &rustix_fs::Stat) -> bool {
     left.st_dev == right.st_dev
         && left.st_ino == right.st_ino
@@ -1374,13 +1394,63 @@ fn same_enrollment_snapshot(left: &rustix_fs::Stat, right: &rustix_fs::Stat) -> 
         && left.st_ctime_nsec == right.st_ctime_nsec
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn same_enrollment_directory(left: &rustix_fs::Stat, right: &rustix_fs::Stat) -> bool {
     left.st_dev == right.st_dev
         && left.st_ino == right.st_ino
         && left.st_mode == right.st_mode
         && left.st_uid == right.st_uid
         && left.st_gid == right.st_gid
+}
+
+#[cfg(target_os = "linux")]
+fn run_owned_linux_worker_serve(
+    output: OutputFormat,
+    enrollment_path: &Path,
+    enrollment_digest: &str,
+) -> ExitCode {
+    if !explicit_normalized_absolute_path(enrollment_path) {
+        return emit_runtime_error(
+            output,
+            "owned_linux_jit_service",
+            "owned-Linux JIT enrollment path must be explicit, absolute, and normalized".to_owned(),
+        );
+    }
+    let bytes = match read_private_worker_enrollment(enrollment_path) {
+        Ok(bytes) => bytes,
+        Err(()) => {
+            return emit_runtime_error(
+                output,
+                "owned_linux_jit_service",
+                "owned-Linux JIT enrollment is unavailable".to_owned(),
+            );
+        }
+    };
+    if !approved_enrollment_bytes(&bytes, enrollment_digest) {
+        return emit_runtime_error(
+            output,
+            "owned_linux_jit_enrollment_digest_mismatch",
+            "owned-Linux JIT enrollment does not match the approved digest".to_owned(),
+        );
+    }
+    let enrollment = match decode_owned_linux_jit_enrollment(&bytes) {
+        Ok(enrollment) => enrollment,
+        Err(error) => {
+            return emit_runtime_error(
+                output,
+                error.code(),
+                "owned-Linux JIT enrollment was refused".to_owned(),
+            );
+        }
+    };
+    match serve_owned_linux_jit_worker(enrollment) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => emit_runtime_error(
+            output,
+            error.code(),
+            "owned-Linux JIT service stopped with a durable blocker".to_owned(),
+        ),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1954,7 +2024,7 @@ mod tests {
         HostPreparePhaseKind, Invocation, classify_host_prepare_actions, try_parse_invocation_from,
     };
     #[cfg(target_os = "macos")]
-    use super::{approved_enrollment_bytes, read_private_disposable_worker_enrollment};
+    use super::{approved_enrollment_bytes, read_private_worker_enrollment};
 
     #[cfg(target_os = "macos")]
     static NEXT_ENROLLMENT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -2469,7 +2539,7 @@ mod tests {
         fs::write(&enrollment, b"exact-enrollment\n").unwrap();
         fs::set_permissions(&enrollment, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
-            read_private_disposable_worker_enrollment(&enrollment).unwrap(),
+            read_private_worker_enrollment(&enrollment).unwrap(),
             b"exact-enrollment\n"
         );
         let approved_digest = format!("sha256:{:x}", Sha256::digest(b"exact-enrollment\n"));
@@ -2488,7 +2558,7 @@ mod tests {
 
         let alias = root.join("alias.json");
         symlink(&enrollment, &alias).unwrap();
-        assert!(read_private_disposable_worker_enrollment(&alias).is_err());
+        assert!(read_private_worker_enrollment(&alias).is_err());
         fs::remove_file(alias).unwrap();
         fs::remove_file(enrollment).unwrap();
         fs::remove_dir(root).unwrap();
