@@ -14,11 +14,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import owned_fleet_benchmark as fleet
-from owned_fleet_benchmark.observe import validate_semantic
+from owned_fleet_benchmark.observe import run_shell, validate_semantic
 from owned_fleet_benchmark.cli import parser as fleet_parser
 from owned_fleet_benchmark.report import _stable_profile_sets, markdown_report
 from owned_fleet_benchmark.run import _validate_direct_runtime
-from owned_fleet_benchmark.model import env_for
+from owned_fleet_benchmark.model import GIT_PROBE_ENV, env_for, git_identity, verify_source
 
 NS = {name: getattr(fleet, name) for name in fleet.__all__}
 FleetError = fleet.FleetError
@@ -234,6 +234,69 @@ class FleetHarnessTests(unittest.TestCase):
             "TMPDIR",
         ):
             self.assertNotIn(forbidden, environment)
+
+    def test_git_source_identity_uses_closed_environment(self) -> None:
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if "rev-parse" in argv:
+                return __import__("subprocess").CompletedProcess(
+                    argv,
+                    0,
+                    stdout="a" * 40 + "\n" + "b" * 40 + "\n",
+                    stderr="",
+                )
+            return __import__("subprocess").CompletedProcess(
+                argv,
+                0,
+                stdout=b"",
+                stderr=b"",
+            )
+
+        workload = {"commit": "a" * 40, "tree": "b" * 40}
+        with patch("owned_fleet_benchmark.model.subprocess.run", side_effect=fake_run):
+            self.assertEqual(
+                git_identity(Path("/fixture")),
+                ("a" * 40, "b" * 40),
+            )
+            verify_source(Path("/fixture"), workload)
+
+        self.assertEqual(calls[0][0][0], "/usr/bin/git")
+        self.assertEqual(calls[0][1]["env"], GIT_PROBE_ENV)
+        self.assertEqual(calls[1][0][0], "/usr/bin/git")
+        self.assertIn("--ignore-submodules=none", calls[1][0])
+        self.assertEqual(calls[1][1]["env"], GIT_PROBE_ENV)
+        for _, kwargs in calls:
+            for forbidden in (
+                "HOME",
+                "PATH",
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "SSH_AUTH_SOCK",
+            ):
+                self.assertNotIn(forbidden, kwargs["env"])
+
+    def test_reviewed_shell_runner_uses_absolute_bash(self) -> None:
+        observed = {}
+
+        def fake_run(argv, **kwargs):
+            observed["argv"] = argv
+            observed["kwargs"] = kwargs
+            return __import__("subprocess").CompletedProcess(
+                argv,
+                0,
+                stdout="ok",
+                stderr=None,
+            )
+
+        environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
+        with patch("owned_fleet_benchmark.observe.subprocess.run", side_effect=fake_run):
+            result = run_shell("printf ok", Path("/fixture"), environment)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(observed["argv"], ["/bin/bash", "-c", "printf ok"])
+        self.assertEqual(observed["kwargs"]["env"], environment)
 
     def test_catalog_keeps_only_contention_shape(self) -> None:
         value = NS["catalog"]()
