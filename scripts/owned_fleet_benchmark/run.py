@@ -223,7 +223,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
     command_start_ns = time.monotonic_ns()
     command_started_unix_ms = time.time_ns() // 1_000_000
     proc = subprocess.Popen(
-        ["bash", "-c", command],
+        ["/bin/bash", "-c", command],
         cwd=repo_root,
         env=environment,
         stdin=subprocess.DEVNULL,
