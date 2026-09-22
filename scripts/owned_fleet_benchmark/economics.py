@@ -392,10 +392,12 @@ def economics(
         "hosted": {
             "backend": hosted["backend"],
             "measurement_date": hosted["measurement_date"],
+            "measurement_evidence_sha256": hosted["measurement_evidence_sha256"],
             "actual_wall_seconds": hosted_wall,
             "queue_delay_seconds": hosted_queue,
             "billed_seconds": hosted_billed_seconds,
             "rate_per_minute": hosted["rate_per_minute"],
+            "rate_source": hosted["rate_source"],
             "billing_currency": hosted["billing_currency"],
             "fx_to_purchase_currency": fx,
             "cost_per_validated_completion_purchase_currency": (
