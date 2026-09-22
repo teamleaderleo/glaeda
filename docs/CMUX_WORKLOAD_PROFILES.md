@@ -163,12 +163,18 @@ to CMUX's `CMUX_TEST_PRODUCT_RESTORE` JSON payload. That second receipt is physi
 lookup source, lookup time, peer-transfer time, transferred bytes, archive bytes, and canonical
 restore time.
 
-The adapter currently emits:
+The adapter first requires the physical receipt to carry the same immutable product identity used
+by CMUX's node cache: repository, artifact/provider identity, archive SHA-256, product-contract
+digest, source revision, producer run, and producer attempt. Source revision and shard must match the
+semantic workload batch before transport evidence is accepted. Glaeda derives the candidate's
+physical archive identity from that complete tuple; the unpacked runtime-input tree remains
+additional validity evidence.
+
+The adapter then emits:
 
 - one `artifact_transfer` observation when the receipt proves a peer hit;
 - one `restore` observation for every accepted receipt;
-- the exact runtime-input artifact and consumer identities already established by the semantic
-  workload projection;
+- the exact physical archive identity plus the semantic consumer/runtime-input validity evidence;
 - the observed peer backend on the transfer observation;
 - separate compressed archive/transfer bytes and unpacked consumer bytes.
 
