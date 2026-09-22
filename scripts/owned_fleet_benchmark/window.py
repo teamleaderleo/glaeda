@@ -80,6 +80,9 @@ def _receipt_identity(receipt: dict[str, Any]) -> dict[str, Any]:
         "source_changed",
     }:
         raise FleetError("window member result class is invalid")
+    exit_code = result.get("exit_code")
+    if type(exit_code) is not int:
+        raise FleetError("window member exit code is invalid")
     failure_count = result.get("failure_count")
     if type(failure_count) is not int or failure_count not in {0, 1}:
         raise FleetError("window member failure count is invalid")
@@ -98,8 +101,13 @@ def _receipt_identity(receipt: dict[str, Any]) -> dict[str, Any]:
         "semantic_mismatch": (False, 0, False),
         "source_changed": (False, 0, False),
     }[result_class]
+    exit_consistent = (
+        (result_class in {"validated", "semantic_mismatch", "source_changed"} and exit_code == 0)
+        or (result_class in {"command_failed", "timed_out"} and exit_code != 0)
+    )
     if (
         (result["validated"], failure_count, result["timed_out"]) != expected
+        or not exit_consistent
         or (result_class == "source_changed" and result["source_unchanged"])
         or (
             result_class in {"validated", "semantic_mismatch"}
