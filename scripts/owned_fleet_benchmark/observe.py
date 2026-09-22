@@ -10,7 +10,7 @@ MAX_SEMANTIC_RECEIPT_BYTES = 4 * 1024 * 1024
 
 def run_shell(command: str, root: Path, environment: dict[str, str], timeout: int = 900) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", "-c", command], cwd=root, env=environment, text=True,
+        ["/bin/bash", "-c", command], cwd=root, env=environment, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, check=False,
     )
 
