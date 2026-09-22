@@ -71,15 +71,42 @@ def _receipt_identity(receipt: dict[str, Any]) -> dict[str, Any]:
     result = receipt.get("result")
     if not isinstance(result, dict) or type(result.get("validated")) is not bool:
         raise FleetError("window member validated result is invalid")
+    result_class = result.get("class")
+    if result_class not in {
+        "validated",
+        "command_failed",
+        "timed_out",
+        "semantic_mismatch",
+        "source_changed",
+    }:
+        raise FleetError("window member result class is invalid")
     failure_count = result.get("failure_count")
-    if (
-        type(failure_count) is not int
-        or failure_count not in {0, 1}
-        or failure_count != (0 if result["validated"] else 1)
-    ):
-        raise FleetError("window member failure count is inconsistent")
+    if type(failure_count) is not int or failure_count not in {0, 1}:
+        raise FleetError("window member failure count is invalid")
     if type(result.get("timed_out")) is not bool:
         raise FleetError("window member timeout evidence is invalid")
+    if type(result.get("source_unchanged")) is not bool:
+        raise FleetError("window member source-currentness evidence is invalid")
+    semantic_validation = result.get("semantic_validation")
+    if not isinstance(semantic_validation, str) or not semantic_validation:
+        raise FleetError("window member semantic validation evidence is invalid")
+
+    expected = {
+        "validated": (True, 0, False),
+        "command_failed": (False, 1, False),
+        "timed_out": (False, 1, True),
+        "semantic_mismatch": (False, 0, False),
+        "source_changed": (False, 0, False),
+    }[result_class]
+    if (
+        (result["validated"], failure_count, result["timed_out"]) != expected
+        or (result_class == "source_changed" and result["source_unchanged"])
+        or (
+            result_class in {"validated", "semantic_mismatch"}
+            and not result["source_unchanged"]
+        )
+    ):
+        raise FleetError("window member result class is inconsistent")
 
     events = receipt.get("events")
     if not isinstance(events, dict):
@@ -370,7 +397,10 @@ def reduce_window(manifest: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 "settled": 0,
                 "validated_completions": 0,
                 "unfinished": len(offered),
+                "semantic_mismatch_count": 0,
+                "unvalidated_completion_count": 0,
                 "failure_count": 0,
+                "unknown_result_count": 0,
                 "fallback_count": 0,
                 "reset_count": 0,
             },
@@ -499,10 +529,21 @@ def reduce_window(manifest: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             "settled": len(receipts),
             "validated_completions": len(validated),
             "unfinished": unfinished,
+            "semantic_mismatch_count": sum(
+                1
+                for receipt in receipts
+                if receipt.get("result", {}).get("class") == "semantic_mismatch"
+            ),
+            "unvalidated_completion_count": sum(
+                1
+                for receipt in receipts
+                if receipt.get("result", {}).get("class") == "source_changed"
+            ),
             "failure_count": sum(
                 int(receipt.get("result", {}).get("failure_count", 0))
                 for receipt in receipts
             ),
+            "unknown_result_count": 0,
             "fallback_count": sum(
                 int(receipt.get("events", {}).get("fallback_count", 0))
                 for receipt in receipts
@@ -608,8 +649,14 @@ def compare_windows(windows: list[dict[str, Any]]) -> dict[str, Any]:
         flags = []
         if window["counts"]["unfinished"]:
             flags.append("unfinished_work")
+        if window["counts"].get("semantic_mismatch_count", 0):
+            flags.append("semantic_mismatch")
+        if window["counts"].get("unvalidated_completion_count", 0):
+            flags.append("unvalidated_completion")
         if window["counts"]["failure_count"]:
             flags.append("failed_work")
+        if window["counts"].get("unknown_result_count", 0):
+            flags.append("unknown_result")
         if window["counts"]["fallback_count"] or window["counts"]["reset_count"]:
             flags.append("fallback_or_reset")
         if window["counts"]["validated_completions"] < max_validated:
@@ -632,7 +679,16 @@ def compare_windows(windows: list[dict[str, Any]]) -> dict[str, Any]:
                 "p50_ms": window["final_result_latency_ms"]["p50"],
                 "p90_ms": p90,
                 "unfinished": window["counts"]["unfinished"],
+                "semantic_mismatch_count": window["counts"].get(
+                    "semantic_mismatch_count", 0
+                ),
+                "unvalidated_completion_count": window["counts"].get(
+                    "unvalidated_completion_count", 0
+                ),
                 "failure_count": window["counts"]["failure_count"],
+                "unknown_result_count": window["counts"].get(
+                    "unknown_result_count", 0
+                ),
                 "swap_max_bytes": window["resources"][
                     "swap_used_max_observed_bytes"
                 ],
