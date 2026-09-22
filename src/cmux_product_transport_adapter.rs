@@ -729,6 +729,14 @@ mod tests {
 
     fn peer_receipt() -> Vec<u8> {
         serde_json::to_vec(&json!({
+            "repository": "manaflow-ai/cmux",
+            "artifact_id": 10_610_975_375_u64,
+            "provider_digest": digest('c'),
+            "archive_sha256": digest('d'),
+            "product_contract": digest('e'),
+            "source_revision": "1".repeat(40),
+            "producer_run_id": 35_645_388_943_u64,
+            "producer_run_attempt": 1_u64,
             "archive_bytes": 606_055_356_u64,
             "elapsed_seconds": 13.0,
             "lookup_source": "peer",
@@ -805,6 +813,14 @@ mod tests {
     fn local_hit_emits_restore_without_manufacturing_transfer_bytes() {
         let semantic = semantic_batch("attempt-local");
         let raw = serde_json::to_vec(&json!({
+            "repository": "manaflow-ai/cmux",
+            "artifact_id": 10_610_975_375_u64,
+            "provider_digest": digest('c'),
+            "archive_sha256": digest('d'),
+            "product_contract": digest('e'),
+            "source_revision": "1".repeat(40),
+            "producer_run_id": 35_645_388_943_u64,
+            "producer_run_attempt": 1_u64,
             "archive_bytes": 606_055_356_u64,
             "elapsed_seconds": 8.0,
             "lookup_source": "local",
@@ -827,9 +843,41 @@ mod tests {
     }
 
     #[test]
+    fn source_revision_and_shard_must_match_semantic_workload() {
+        let semantic = semantic_batch("attempt-mismatch");
+        let mut source: serde_json::Value = serde_json::from_slice(&peer_receipt()).unwrap();
+        source["source_revision"] = serde_json::Value::String("f".repeat(40));
+        let err = project_cmux_product_transport(
+            "attempt-mismatch",
+            &semantic,
+            &serde_json::to_vec(&source).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "cmux_product_restore_source_mismatch");
+
+        let mut shard: serde_json::Value = serde_json::from_slice(&peer_receipt()).unwrap();
+        shard["shard"] = serde_json::Value::String("4".to_owned());
+        let err = project_cmux_product_transport(
+            "attempt-mismatch",
+            &semantic,
+            &serde_json::to_vec(&shard).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "cmux_product_restore_shard_mismatch");
+    }
+
+    #[test]
     fn inconsistent_peer_source_evidence_is_rejected() {
         let semantic = semantic_batch("attempt-bad");
         let raw = serde_json::to_vec(&json!({
+            "repository": "manaflow-ai/cmux",
+            "artifact_id": 10_610_975_375_u64,
+            "provider_digest": digest('c'),
+            "archive_sha256": digest('d'),
+            "product_contract": digest('e'),
+            "source_revision": "1".repeat(40),
+            "producer_run_id": 35_645_388_943_u64,
+            "producer_run_attempt": 1_u64,
             "archive_bytes": 606_055_356_u64,
             "elapsed_seconds": 8.0,
             "lookup_source": "peer",
