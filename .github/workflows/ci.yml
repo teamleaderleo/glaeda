@@ -89,6 +89,11 @@ jobs:
               Path("scripts/verify-focused"),
               Path("scripts/verify-required"),
               Path("scripts/verify_focused_impl.py"),
+              Path("scripts/provider_neutral_request.py"),
+              Path("scripts/owner_local_dispatch.py"),
+              Path("scripts/owner-local-dispatch"),
+              Path("scripts/test-provider-neutral-request.py"),
+              Path("scripts/test-owner-local-dispatch.py"),
               Path("scripts/owned_linux_task.py"),
               Path("scripts/owned_linux_admission.py"),
               Path("scripts/owned_linux_jit_task.py"),
@@ -152,6 +157,8 @@ jobs:
           python3 scripts/test-owned-linux-jit-task.py
           python3 scripts/test-external-execution-request.py
           python3 scripts/test-trusted-agent-dispatch.py
+          python3 scripts/test-provider-neutral-request.py
+          python3 scripts/test-owner-local-dispatch.py
           python3 scripts/test-cmux-fleet.py
           python3 scripts/test-cmux-fleet-operator-summary.py
           python3 scripts/test-cmux-fleet-bootstrap.py
