@@ -422,6 +422,7 @@ def routing_classification(request: dict[str, object]) -> dict[str, object]:
     return {
         "family": compute["family"],
         "semantic_generation": compute["semantic_generation"],
+        "repository": request["source"]["repository"],
         "operation": request["operation"],
         "trust_class": compute["trust_class"],
         "network_class": request["network_class"],
