@@ -150,11 +150,8 @@ def run_benchmark(args: argparse.Namespace) -> int:
         raise FleetError(
             "the direct runner is diagnostic-only and cannot claim a resource-policy evidence ID"
         )
-    _nonnegative(args.queue_delay_ms, "queue_delay_ms")
     if args.timeout_seconds <= 0:
         raise FleetError("timeout_seconds must be positive")
-    if args.fallback_count < 0 or args.reset_count < 0:
-        raise FleetError("fallback/reset counts must be non-negative")
     if args.cpu_millis is not None and args.cpu_millis <= 0:
         raise FleetError("cpu_millis must be positive when supplied")
     if args.memory_limit_bytes is not None and args.memory_limit_bytes <= 0:
@@ -433,10 +430,13 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 round(execution_wh, 6) if execution_wh is not None else None
             ),
         },
-        "queue_delay_ms": float(args.queue_delay_ms),
+        # The direct runner owns no upstream scheduler/controller lifecycle.
+        # Queue begins at its own request-known boundary and it cannot observe
+        # fallback or reset events outside this process.
+        "queue_delay_ms": 0.0,
         "events": {
-            "fallback_count": args.fallback_count,
-            "reset_count": args.reset_count,
+            "fallback_count": 0,
+            "reset_count": 0,
         },
         "artifacts": {
             "log_sha256": "sha256:" + hasher.hexdigest(),
