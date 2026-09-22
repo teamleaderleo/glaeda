@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from datetime import date
 from typing import Any
 
@@ -12,6 +13,7 @@ from .model import (
 )
 
 ECONOMICS_SCHEMA_VERSION = 1
+SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def _finite_number(value: Any, field: str, *, minimum: float | None = None) -> float:
@@ -45,9 +47,14 @@ def hosted_cost(
         raise FleetError("unsupported hosted-equivalent receipt")
     if hosted.get("validated") is not True:
         raise FleetError("hosted comparator must be semantically validated")
-    for key in ("backend", "billing_currency"):
+    for key in ("backend", "billing_currency", "rate_source"):
         if not isinstance(hosted.get(key), str) or not hosted[key]:
             raise FleetError(f"hosted comparator requires {key}")
+    evidence = hosted.get("measurement_evidence_sha256")
+    if not isinstance(evidence, str) or SHA256_RE.fullmatch(evidence) is None:
+        raise FleetError(
+            "hosted comparator requires measurement_evidence_sha256"
+        )
     _iso_date(hosted.get("measurement_date"), "measurement_date")
 
     wall = _finite_number(
