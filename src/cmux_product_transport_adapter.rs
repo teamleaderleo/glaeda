@@ -170,8 +170,8 @@ pub fn project_cmux_product_transport(
         ));
     }
 
-    let receipt: RawCmuxProductRestoreReceipt =
-        serde_json::from_slice(restore_receipt_bytes).map_err(|_| {
+    let receipt: RawCmuxProductRestoreReceipt = serde_json::from_slice(restore_receipt_bytes)
+        .map_err(|_| {
             error(
                 "cmux_product_restore_receipt_invalid",
                 "CMUX product restore receipt is invalid closed-schema JSON",
@@ -513,10 +513,7 @@ impl fmt::Display for CmuxProductTransportAdapterError {
 
 impl std::error::Error for CmuxProductTransportAdapterError {}
 
-const fn error(
-    code: &'static str,
-    problem: &'static str,
-) -> CmuxProductTransportAdapterError {
+const fn error(code: &'static str, problem: &'static str) -> CmuxProductTransportAdapterError {
     CmuxProductTransportAdapterError { code, problem }
 }
 
