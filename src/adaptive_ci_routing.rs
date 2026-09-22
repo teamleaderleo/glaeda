@@ -2928,8 +2928,7 @@ mod tests {
             unfinished: 0,
             peak_pressure: HostPressureClass::Moderate,
         });
-        let observations =
-            three_successes(&workload, "owned", HotStateClass::Warm, 40_000, 0, 0);
+        let observations = three_successes(&workload, "owned", HotStateClass::Warm, 40_000, 0, 0);
 
         let report = recommend_ci_pool(
             &workload,
