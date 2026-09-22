@@ -191,6 +191,7 @@ pub fn project_cmux_product_transport(
     let peer_lookup_millis = seconds_to_millis(receipt.peer_lookup_seconds)?;
     let peer_transfer_millis = seconds_to_millis(receipt.peer_transfer_seconds)?;
     let restore_millis = seconds_to_millis(receipt.elapsed_seconds)?;
+    let restore_observation_millis = local_lookup_millis.saturating_add(restore_millis);
     let restore_reuse_class = match lookup_source {
         CmuxProductLookupSource::Local => VerificationReuseClass::Reuse,
         CmuxProductLookupSource::Peer
@@ -237,7 +238,7 @@ pub fn project_cmux_product_transport(
         semantic_batch.profile(),
         2,
         VerificationStage::Restore,
-        restore_millis,
+        restore_observation_millis,
         restore_reuse_class,
         context.semantic_validation,
         &context.resource_profile,
@@ -854,7 +855,7 @@ mod tests {
 
         assert_eq!(batch.observations().len(), 1);
         assert_eq!(batch.observations()[0].stage(), VerificationStage::Restore);
-        assert_eq!(batch.observations()[0].duration_millis(), 8_000);
+        assert_eq!(batch.observations()[0].duration_millis(), 8_025);
         let json = batch.render_json().unwrap();
         assert!(json.contains("\"reuse_class\": \"reuse\""));
     }
