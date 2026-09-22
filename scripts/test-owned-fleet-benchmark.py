@@ -801,6 +801,30 @@ class FleetHarnessTests(unittest.TestCase):
             ["large", "medium", "small"],
         )
 
+    def test_report_does_not_turn_reliability_failures_into_buy_signals(self) -> None:
+        machine = complete_machine()
+        values = self._reduced_windows()
+        values[1] = copy.deepcopy(values[1])
+        values[1]["counts"]["validated_completions"] -= 1
+        values[1]["counts"]["failure_count"] = 1
+        report = markdown_report(machine, [], values, [])
+
+        bottleneck = report.split(
+            "## What existing bottleneck would buying another one remove?",
+            1,
+        )[1].split("## Correctness and reliability caveats", 1)[0]
+        caveats = report.split(
+            "## Correctness and reliability caveats",
+            1,
+        )[1].split(
+            "## At what utilization does ownership beat observed hosted alternatives?",
+            1,
+        )[0]
+
+        self.assertNotIn("failed jobs", bottleneck)
+        self.assertIn("failed jobs", caveats)
+        self.assertIn("zero evidence that another node would remove the problem", caveats)
+
     def test_window_comparison_surfaces_failures(self) -> None:
         values = self._reduced_windows()
         values[1] = copy.deepcopy(values[1])
