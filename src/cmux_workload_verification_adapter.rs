@@ -200,7 +200,9 @@ pub fn project_cmux_workload_result(
     let artifact_bytes = result
         .artifact_identities
         .iter()
-        .fold(0_u64, |total, artifact| total.saturating_add(artifact.bytes));
+        .fold(0_u64, |total, artifact| {
+            total.saturating_add(artifact.bytes)
+        });
     let runtime_input_bytes = result
         .runtime_input_identities
         .iter()
@@ -540,7 +542,10 @@ fn validate_result(
     for input in &result.runtime_input_identities {
         validate_token(&input.name)?;
         validate_text(&input.class)?;
-        if !matches!(input.identity.as_str(), "file-sha256" | "parent-tree-sha256") {
+        if !matches!(
+            input.identity.as_str(),
+            "file-sha256" | "parent-tree-sha256"
+        ) {
             return Err(error(
                 "cmux_runtime_input_identity_invalid",
                 "CMUX runtime input identity kind is unsupported",
@@ -589,7 +594,10 @@ fn validate_result(
     map_reuse_class(&result.benchmark.state_class)?;
     map_semantic_result(&result.result)?;
 
-    if !matches!(result.cleanup.state.as_str(), "complete" | "forced" | "incomplete") {
+    if !matches!(
+        result.cleanup.state.as_str(),
+        "complete" | "forced" | "incomplete"
+    ) {
         return Err(error(
             "cmux_cleanup_state_invalid",
             "CMUX cleanup state is invalid",
@@ -598,7 +606,10 @@ fn validate_result(
     match result.result.as_str() {
         "passed" => {
             if result.exit_code != 0
-                || !result.validation.missing_required_artifact_classes.is_empty()
+                || !result
+                    .validation
+                    .missing_required_artifact_classes
+                    .is_empty()
                 || result.cleanup.state != "complete"
                 || !result.cleanup.process_group_settled
             {
@@ -624,10 +635,7 @@ fn validate_result(
 }
 
 fn validate_source(source: &RawSource) -> Result<(), CmuxWorkloadVerificationAdapterError> {
-    if source.repository != CMUX_REPOSITORY
-        || !is_oid(&source.commit)
-        || !is_oid(&source.tree)
-    {
+    if source.repository != CMUX_REPOSITORY || !is_oid(&source.commit) || !is_oid(&source.tree) {
         return Err(error(
             "cmux_source_identity_invalid",
             "CMUX source identity is invalid",
@@ -641,9 +649,7 @@ fn validate_profile(profile: &RawProfile) -> Result<(), CmuxWorkloadVerification
         || !profile.id.starts_with("cmux.")
         || profile.id.len() > 96
         || !profile.id.bytes().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || matches!(byte, b'.' | b'-')
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
         })
     {
         return Err(error(
@@ -734,10 +740,7 @@ impl fmt::Display for CmuxWorkloadVerificationAdapterError {
 
 impl std::error::Error for CmuxWorkloadVerificationAdapterError {}
 
-const fn error(
-    code: &'static str,
-    problem: &'static str,
-) -> CmuxWorkloadVerificationAdapterError {
+const fn error(code: &'static str, problem: &'static str) -> CmuxWorkloadVerificationAdapterError {
     CmuxWorkloadVerificationAdapterError { code, problem }
 }
 
@@ -1066,7 +1069,10 @@ mod tests {
         }
     }
 
-    fn project(result: &RawCmuxWorkloadResult, run_id: &str) -> CmuxWorkloadVerificationObservationBatch {
+    fn project(
+        result: &RawCmuxWorkloadResult,
+        run_id: &str,
+    ) -> CmuxWorkloadVerificationObservationBatch {
         let result_bytes = serde_json::to_vec(result).unwrap();
         let outer = outer_for(&result_bytes, result);
         let outer_bytes = serde_json::to_vec(&outer).unwrap();
@@ -1105,9 +1111,13 @@ mod tests {
             observations.extend_from_slice(batch.observations());
         }
 
-        let receipt =
-            compile_verification_optimizations("cmux", "cmux.macos.compile-admission@1", &observations, &[])
-                .unwrap();
+        let receipt = compile_verification_optimizations(
+            "cmux",
+            "cmux.macos.compile-admission@1",
+            &observations,
+            &[],
+        )
+        .unwrap();
         let candidate = receipt
             .candidates()
             .iter()
@@ -1147,7 +1157,12 @@ mod tests {
         assert_eq!(test["reuse_class"], "reuse");
         assert_eq!(test["bytes_read"], 850_000_000_u64);
         assert_eq!(test["rebuilt_before_test"], false);
-        assert!(test["artifact_identity"].as_str().unwrap().starts_with("sha256:"));
+        assert!(
+            test["artifact_identity"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
     }
 
     #[test]
