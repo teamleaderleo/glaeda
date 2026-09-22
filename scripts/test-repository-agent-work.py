@@ -165,6 +165,68 @@ class RepositoryAgentWorkTests(unittest.TestCase):
             first["routing_classification"],
         )
 
+    def test_routing_classification_keeps_coarse_repair_size_classes(self) -> None:
+        small_raw = repair_request()
+        small_raw["scope"] = {
+            "class": "bounded_paths",
+            "paths": ["src/a.rs"],
+        }
+        small_raw["mutation"] = {
+            "class": "task_private_patch",
+            "max_changed_paths": 1,
+            "max_patch_bytes": 16 * 1024,
+            "allow_new_files": False,
+            "allow_deletes": False,
+        }
+        small = w.plan(w.decode_request(raw(small_raw)))
+
+        same_class_raw = repair_request()
+        same_class_raw["scope"] = {
+            "class": "bounded_paths",
+            "paths": ["src/other.rs"],
+        }
+        same_class_raw["mutation"] = copy.deepcopy(small_raw["mutation"])
+        same_class = w.plan(w.decode_request(raw(same_class_raw)))
+
+        large_raw = repair_request()
+        large_raw["scope"] = {
+            "class": "bounded_paths",
+            "paths": [f"src/file-{index}.rs" for index in range(20)],
+        }
+        large_raw["mutation"] = {
+            "class": "task_private_patch",
+            "max_changed_paths": 32,
+            "max_patch_bytes": 1024 * 1024,
+            "allow_new_files": True,
+            "allow_deletes": True,
+        }
+        large = w.plan(w.decode_request(raw(large_raw)))
+
+        self.assertEqual(
+            small["routing_classification"],
+            same_class["routing_classification"],
+        )
+        self.assertEqual(
+            small["routing_classification"]["scope_size_class"],
+            "one",
+        )
+        self.assertEqual(
+            small["routing_classification"]["mutation_budget_class"]["patch_bytes"],
+            "tiny",
+        )
+        self.assertNotEqual(
+            small["routing_classification"],
+            large["routing_classification"],
+        )
+        self.assertEqual(
+            large["routing_classification"]["scope_size_class"],
+            "large",
+        )
+        self.assertEqual(
+            large["routing_classification"]["mutation_budget_class"]["patch_bytes"],
+            "large",
+        )
+
     def test_routing_classification_keeps_semantic_work_axes(self) -> None:
         review = w.plan(w.decode_request(raw(review_request())))
         repair_raw = repair_request()
