@@ -142,6 +142,7 @@ pub fn project_cmux_workload_result(
     glaeda_observation_bytes: &[u8],
     cmux_result_bytes: &[u8],
 ) -> Result<CmuxWorkloadVerificationObservationBatch, CmuxWorkloadVerificationAdapterError> {
+    validate_token(run_id)?;
     if glaeda_observation_bytes.is_empty()
         || glaeda_observation_bytes.len() > MAX_GLAEDA_CMUX_OBSERVATION_BYTES
     {
@@ -190,7 +191,6 @@ pub fn project_cmux_workload_result(
     let profile = format!("{}@{}", result.profile.id, result.profile.generation);
     let reuse_class = map_reuse_class(&result.benchmark.state_class)?;
     let product_schema = product_schema_identity(&result);
-    let output_artifact_identity = artifact_set_identity(&result.artifact_identities);
     let runtime_input_identity = runtime_input_set_identity(&result.runtime_input_identities);
     let sdk_identity = result
         .toolchain
@@ -260,11 +260,6 @@ pub fn project_cmux_workload_result(
                 observation = observation
                     .with_bytes(None, Some(artifact_bytes), None)
                     .map_err(compiler_projection_error)?;
-                if let Some(identity) = output_artifact_identity.as_deref() {
-                    observation = observation
-                        .with_artifact(identity, None, None)
-                        .map_err(compiler_projection_error)?;
-                }
             }
             VerificationStage::TestExecution => {
                 observation = observation
