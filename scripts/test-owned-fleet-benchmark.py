@@ -679,6 +679,7 @@ class FleetHarnessTests(unittest.TestCase):
             "actual_wall_seconds": 60,
             "queue_delay_seconds": 20,
             "rate_per_minute": 2.0,
+            "rate_source": "fixture-provider-rate-card",
             "billing_currency": "USD",
             "billing_increment_seconds": 1,
             "minimum_billed_seconds": 0,
@@ -692,6 +693,7 @@ class FleetHarnessTests(unittest.TestCase):
             )
 
         hosted["measurement_evidence_sha256"] = "sha256:" + "e" * 64
+        del hosted["rate_source"]
         with self.assertRaisesRegex(FleetError, "rate_source"):
             NS["economics"](
                 owned, hosted, machine, 1.0, [36], [0.5]
