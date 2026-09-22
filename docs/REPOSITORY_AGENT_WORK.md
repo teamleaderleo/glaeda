@@ -141,7 +141,9 @@ operation
 trust class
 network class
 scope class
+coarse scope-size class
 mutation class
+coarse mutation-budget class
 required capabilities
 exact repository-owned verification profile set
 output-contract identity
@@ -151,11 +153,14 @@ The same canonical object is emitted with
 `routing_classification_sha256 = sha256(canonical_json(routing_classification))`
 so #546 consumers have one stable equality key.
 
-It deliberately excludes exact source commit/tree, task-contract digest, and
-`compute_workload.input_identity`. Two review requests against different commits
-therefore retain distinct exact compute identities while sharing one routing
-population when their semantic work class is otherwise the same. Repair requests
-with different verification profiles or mutation semantics remain separate
+It deliberately excludes exact source commit/tree, exact bounded path names,
+task-contract digest, and `compute_workload.input_identity`. Two review
+requests against different commits therefore retain distinct exact compute
+identities while sharing one routing population when their semantic work class
+is otherwise the same. Repair requests use coarse path-count and patch-budget
+classes, so a one-path/tiny repair can remain comparable across different files
+while a 32-path/large-patch repair stays in a different routing population.
+Different verification profiles or mutation semantics also remain separate
 populations. A later placement adapter may add its reviewed symbolic resource
 profile; this contract does not invent one.
 
