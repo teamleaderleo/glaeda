@@ -205,7 +205,7 @@ pub fn project_cmux_product_transport(
             1,
             VerificationStage::ArtifactTransfer,
             transfer_millis,
-            context.reuse_class,
+            VerificationReuseClass::Cold,
             context.semantic_validation,
             &context.resource_profile,
         )
@@ -772,6 +772,9 @@ mod tests {
             VerificationStage::ArtifactTransfer
         );
         assert_eq!(batch.observations()[0].duration_millis(), 1_044);
+        let json = batch.render_json().unwrap();
+        assert!(json.contains("\"stage\": \"artifact_transfer\""));
+        assert!(json.contains("\"reuse_class\": \"cold\""));
         assert_eq!(batch.observations()[1].stage(), VerificationStage::Restore);
         assert_eq!(batch.observations()[1].duration_millis(), 13_000);
         assert!(!batch.split_comparable_bytes_available());
@@ -812,6 +815,7 @@ mod tests {
             retention.validity().status(),
             ValidityFingerprintStatus::Exact
         );
+        assert_eq!(retention.utility().hit_frequency_basis_points(), 0);
     }
 
     #[test]
