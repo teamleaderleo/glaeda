@@ -132,6 +132,32 @@ Trust/capabilities are derived locally:
 | repair | ultra-trusted | review capabilities + task-private write + repository-owned verification |
 | research | trusted | agent harness, repository read/query; `network.public` only when declared |
 
+The plan also emits a stable `routing_classification` for #546-style historical
+placement evidence. It contains only:
+
+```text
+family + semantic generation
+operation
+trust class
+network class
+scope class
+mutation class
+required capabilities
+exact repository-owned verification profile set
+output-contract identity
+```
+
+It deliberately excludes exact source commit/tree, task-contract digest, and
+`compute_workload.input_identity`. Two review requests against different commits
+therefore retain distinct exact compute identities while sharing one routing
+population when their semantic work class is otherwise the same. Repair requests
+with different verification profiles or mutation semantics remain separate
+populations. A later placement adapter may add its reviewed symbolic resource
+profile; this contract does not invent one.
+
+`compute_workload.input_identity` remains the exact per-request semantic
+currentness/replay key. It carries zero historical workload-class authority.
+
 The plan grants zero host selection, publication, merge, release, deploy, redispatch, or canonical-source mutation authority.
 
 ## Receipt contract
