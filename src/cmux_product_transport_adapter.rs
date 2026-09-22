@@ -74,6 +74,7 @@ pub struct CmuxProductTransportObservationBatch {
     lookup_source: CmuxProductLookupSource,
     archive_bytes: u64,
     consumer_unpacked_bytes: u64,
+    local_lookup_millis: u64,
     peer_lookup_millis: u64,
     peer_transfer_millis: u64,
     peer_bytes_transferred: u64,
@@ -116,13 +117,14 @@ impl CmuxProductTransportObservationBatch {
     #[must_use]
     pub fn render_human(&self) -> String {
         format!(
-            "cmux product transport observation\nattempt: {}\nprofile: {}\nsource: {}\narchive identity: {}\narchive bytes: {}\nconsumer unpacked bytes: {}\npeer lookup: {} ms\npeer transfer: {} ms\npeer bytes transferred: {}\nrestore: {} ms\nsplit-comparable bytes: {}\nobservations: {}\n",
+            "cmux product transport observation\nattempt: {}\nprofile: {}\nsource: {}\narchive identity: {}\narchive bytes: {}\nconsumer unpacked bytes: {}\nlocal lookup: {} ms\npeer lookup: {} ms\npeer transfer: {} ms\npeer bytes transferred: {}\nrestore: {} ms\nsplit-comparable bytes: {}\nobservations: {}\n",
             self.attempt_id,
             self.profile,
             self.lookup_source.as_str(),
             self.archive_identity,
             self.archive_bytes,
             self.consumer_unpacked_bytes,
+            self.local_lookup_millis,
             self.peer_lookup_millis,
             self.peer_transfer_millis,
             self.peer_bytes_transferred,
@@ -185,9 +187,11 @@ pub fn project_cmux_product_transport(
     let context = semantic_transport_context(semantic_batch)?;
     let archive_identity = archive_identity(&receipt);
     let lookup_source = CmuxProductLookupSource::parse(&receipt.lookup_source)?;
+    let local_lookup_millis = seconds_to_millis(receipt.lookup_seconds)?;
     let peer_lookup_millis = seconds_to_millis(receipt.peer_lookup_seconds)?;
     let peer_transfer_millis = seconds_to_millis(receipt.peer_transfer_seconds)?;
     let restore_millis = seconds_to_millis(receipt.elapsed_seconds)?;
+    let restore_observation_millis = local_lookup_millis.saturating_add(restore_millis);
 
     let mut observations = Vec::new();
     if lookup_source == CmuxProductLookupSource::Peer {
@@ -228,7 +232,7 @@ pub fn project_cmux_product_transport(
         semantic_batch.profile(),
         2,
         VerificationStage::Restore,
-        restore_millis,
+        restore_observation_millis,
         context.reuse_class,
         context.semantic_validation,
         &context.resource_profile,
@@ -257,6 +261,7 @@ pub fn project_cmux_product_transport(
         lookup_source,
         archive_bytes: receipt.archive_bytes,
         consumer_unpacked_bytes: context.consumer_unpacked_bytes,
+        local_lookup_millis,
         peer_lookup_millis,
         peer_transfer_millis,
         peer_bytes_transferred: receipt.peer_bytes_transferred,
@@ -840,6 +845,7 @@ mod tests {
 
         assert_eq!(batch.observations().len(), 1);
         assert_eq!(batch.observations()[0].stage(), VerificationStage::Restore);
+        assert_eq!(batch.observations()[0].duration_millis(), 8_025);
     }
 
     #[test]
