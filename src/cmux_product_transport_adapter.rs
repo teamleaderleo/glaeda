@@ -191,7 +191,12 @@ pub fn project_cmux_product_transport(
     let peer_lookup_millis = seconds_to_millis(receipt.peer_lookup_seconds)?;
     let peer_transfer_millis = seconds_to_millis(receipt.peer_transfer_seconds)?;
     let restore_millis = seconds_to_millis(receipt.elapsed_seconds)?;
-    let restore_observation_millis = local_lookup_millis.saturating_add(restore_millis);
+    let restore_reuse_class = match lookup_source {
+        CmuxProductLookupSource::Local => VerificationReuseClass::Reuse,
+        CmuxProductLookupSource::Peer
+        | CmuxProductLookupSource::R2
+        | CmuxProductLookupSource::Github => VerificationReuseClass::Cold,
+    };
 
     let mut observations = Vec::new();
     if lookup_source == CmuxProductLookupSource::Peer {
@@ -232,8 +237,8 @@ pub fn project_cmux_product_transport(
         semantic_batch.profile(),
         2,
         VerificationStage::Restore,
-        restore_observation_millis,
-        context.reuse_class,
+        restore_millis,
+        restore_reuse_class,
         context.semantic_validation,
         &context.resource_profile,
     )
@@ -849,7 +854,9 @@ mod tests {
 
         assert_eq!(batch.observations().len(), 1);
         assert_eq!(batch.observations()[0].stage(), VerificationStage::Restore);
-        assert_eq!(batch.observations()[0].duration_millis(), 8_025);
+        assert_eq!(batch.observations()[0].duration_millis(), 8_000);
+        let json = batch.render_json().unwrap();
+        assert!(json.contains("\"reuse_class\": \"reuse\""));
     }
 
     #[test]
@@ -874,6 +881,62 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, "cmux_product_restore_shard_mismatch");
+    }
+
+    #[test]
+    fn retention_hit_frequency_uses_restore_source_classes() {
+        let mut observations = Vec::new();
+        for index in 0..3 {
+            let attempt = format!("peer-attempt-{index}");
+            let semantic = semantic_batch(&attempt);
+            let batch =
+                project_cmux_product_transport(&attempt, &semantic, &peer_receipt()).unwrap();
+            observations.extend_from_slice(batch.observations());
+        }
+
+        let semantic = semantic_batch("local-attempt");
+        let local = serde_json::to_vec(&json!({
+            "repository": "manaflow-ai/cmux",
+            "artifact_id": 10_610_975_375_u64,
+            "provider_digest": digest('c'),
+            "archive_sha256": digest('d'),
+            "product_contract": digest('e'),
+            "source_revision": "1".repeat(40),
+            "producer_run_id": 35_645_388_943_u64,
+            "producer_run_attempt": 1_u64,
+            "archive_bytes": 606_055_356_u64,
+            "elapsed_seconds": 8.0,
+            "lookup_source": "local",
+            "local_hit": true,
+            "lookup_seconds": 0.025,
+            "peer_hit": false,
+            "peer_lookup_seconds": 0.0,
+            "peer_transfer_seconds": 0.0,
+            "peer_bytes_transferred": 0,
+            "run_id": "35676384019",
+            "job": "app-host-unit-tests",
+            "shard": "3",
+            "runner_name": "cmux-mac-1"
+        }))
+        .unwrap();
+        let batch =
+            project_cmux_product_transport("local-attempt", &semantic, &local).unwrap();
+        observations.extend_from_slice(batch.observations());
+
+        let receipt = compile_verification_optimizations(
+            "cmux",
+            "cmux.macos.app-host-test-shard@1",
+            &observations,
+            &[],
+        )
+        .unwrap();
+        let retention = receipt
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.class() == OptimizationClass::RetainLocalImmutableArtifact)
+            .unwrap();
+
+        assert_eq!(retention.utility().hit_frequency_basis_points(), 2_500);
     }
 
     #[test]
