@@ -46,6 +46,10 @@ pub struct CmuxWorkloadVerificationObservationBatch {
     workload: String,
     profile: String,
     source_tree: String,
+    #[serde(skip_serializing)]
+    source_commit: String,
+    #[serde(skip_serializing)]
+    semantic_parameters: BTreeMap<String, i64>,
     cmux_semantic_result_sha256: String,
     glaeda_cmux_observation_sha256: String,
     semantic_comparison_key: String,
@@ -69,6 +73,16 @@ impl CmuxWorkloadVerificationObservationBatch {
     #[must_use]
     pub fn source_tree(&self) -> &str {
         &self.source_tree
+    }
+
+    #[must_use]
+    pub fn source_commit(&self) -> &str {
+        &self.source_commit
+    }
+
+    #[must_use]
+    pub fn semantic_parameter(&self, name: &str) -> Option<i64> {
+        self.semantic_parameters.get(name).copied()
     }
 
     #[must_use]
@@ -304,6 +318,8 @@ pub fn project_cmux_workload_result(
         workload: "cmux".to_owned(),
         profile,
         source_tree: result.source.tree,
+        source_commit: result.source.commit,
+        semantic_parameters: result.parameters,
         cmux_semantic_result_sha256: result_digest,
         glaeda_cmux_observation_sha256: sha256(glaeda_observation_bytes),
         semantic_comparison_key: result.benchmark.semantic_comparison_key,
