@@ -231,6 +231,7 @@ def markdown_report(
         "",
     ]
     bottlenecks: list[str] = []
+    quality_caveats: list[str] = []
     for window in windows:
         if (
             window.get("document_type")
@@ -248,29 +249,27 @@ def markdown_report(
                 f"{label} leaves {window['counts']['unfinished']} offered jobs unfinished"
             )
         if window["counts"].get("semantic_mismatch_count", 0):
-            bottlenecks.append(
-                f"{label} records semantic-result mismatches under fixed offered work"
+            quality_caveats.append(
+                f"{label} records semantic-result mismatches"
             )
         if window["counts"].get("unvalidated_completion_count", 0):
-            bottlenecks.append(
-                f"{label} records source/currentness-invalid completions "
-                "under fixed offered work"
+            quality_caveats.append(
+                f"{label} records source/currentness-invalid completions"
             )
         if window["counts"].get("unknown_result_count", 0):
-            bottlenecks.append(
-                f"{label} records unknown terminal results under fixed offered work"
+            quality_caveats.append(
+                f"{label} records unknown terminal results"
             )
         if window["counts"].get("failure_count", 0):
-            bottlenecks.append(
-                f"{label} records {window['counts']['failure_count']} failed jobs "
-                "under fixed offered work"
+            quality_caveats.append(
+                f"{label} records {window['counts']['failure_count']} failed jobs"
             )
         if (
             window["counts"]["fallback_count"]
             or window["counts"]["reset_count"]
         ):
-            bottlenecks.append(
-                f"{label} records fallback/reset activity under fixed offered work"
+            quality_caveats.append(
+                f"{label} records fallback/reset activity"
             )
         swap_growth = window.get("resources", {}).get(
             "swap_growth_max_observed_bytes"
@@ -303,9 +302,19 @@ def markdown_report(
     else:
         lines.append(
             "No measured capacity bottleneck yet justifies another node. "
-            "Queue, pressure, fallback, or unfinished-work evidence must identify "
+            "Queue, pressure, or unfinished-work evidence must identify "
             "the removed reservoir."
         )
+
+    lines += ["", "## Correctness and reliability caveats", ""]
+    if quality_caveats:
+        lines.append(
+            "These observations block capacity/acquisition conclusions; they carry "
+            "zero evidence that another node would remove the problem."
+        )
+        lines.extend(f"- {item}." for item in dict.fromkeys(quality_caveats))
+    else:
+        lines.append("No correctness/reliability caveat is present in the supplied windows.")
 
     lines += [
         "",
