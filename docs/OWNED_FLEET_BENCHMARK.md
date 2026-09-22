@@ -293,12 +293,14 @@ scripts/owned-fleet-benchmark compare-windows --window /tmp/windows/large.window
 
 `compare-windows` requires exactly one large, medium, and small arm. It also requires identical machine comparison identity, backend/runtime, workload/source/toolchain/state/storage identity, offered arrival pattern, resource policy, aggregate CPU/RAM, and window duration.
 
-A fixed-offer window with zero settled members is retained as
-`glaeda-owned-fleet-window-partial-receipt`: it records offered/unfinished work,
-the frozen manifest/arrival/resource-policy request, zero observed concurrency, and
-absent final-result percentiles. It is diagnostic negative evidence only and
-`compare-windows` refuses it because no member receipt established
-machine/backend/toolchain comparison identity.
+A fixed-offer manifest with zero settled member receipts is retained as
+`glaeda-owned-fleet-window-partial-receipt`: it records the declared
+offered/unfinished work, frozen manifest/arrival/resource-policy request, zero
+observed concurrency, and absent final-result percentiles. Its authority is
+`declared_offer_only` / `manifest_only`. It stays visible for experiment
+diagnosis, while `compare-windows`, fleet-capacity classification, bottleneck
+claims, and #546 routing evidence refuse it because no member receipt established
+that the offer reached the declared machine/backend/toolchain.
 
 The reducer derives:
 
