@@ -127,6 +127,54 @@ class RepositoryAgentWorkTests(unittest.TestCase):
         self.assertNotIn('repository.task_private_write', plan['compute_workload']['required_capabilities'])
         self.assertEqual(plan['authority'], w.AUTHORITY)
 
+    def test_routing_classification_is_stable_across_exact_review_inputs(self) -> None:
+        first_request = w.decode_request(raw(review_request()))
+        second_raw = review_request()
+        second_raw["source"]["head"] = {
+            "commit": "5" * 40,
+            "tree": "6" * 40,
+        }
+        second_raw["source"]["base"] = {
+            "commit": "7" * 40,
+            "tree": "8" * 40,
+        }
+        second_raw["task_contract_sha256"] = "sha256:" + "e" * 64
+        second_request = w.decode_request(raw(second_raw))
+
+        first = w.plan(first_request)
+        second = w.plan(second_request)
+
+        self.assertNotEqual(
+            first["compute_workload"]["input_identity"],
+            second["compute_workload"]["input_identity"],
+        )
+        self.assertEqual(
+            first["routing_classification"],
+            second["routing_classification"],
+        )
+        self.assertNotIn(
+            "input_identity",
+            first["routing_classification"],
+        )
+
+    def test_routing_classification_keeps_semantic_work_axes(self) -> None:
+        review = w.plan(w.decode_request(raw(review_request())))
+        repair_raw = repair_request()
+        repair = w.plan(w.decode_request(raw(repair_raw)))
+
+        self.assertNotEqual(
+            review["routing_classification"],
+            repair["routing_classification"],
+        )
+        self.assertEqual(
+            repair["routing_classification"]["verification_profiles"],
+            [{"id": "cmux.ci.guard", "generation": 1}],
+        )
+        self.assertEqual(
+            repair["routing_classification"]["mutation_class"],
+            "task_private_patch",
+        )
+
     def test_review_requires_base_and_rejects_public_web_and_mutation(self) -> None:
         request = review_request()
         del request['source']['base']
