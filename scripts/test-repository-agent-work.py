@@ -152,6 +152,14 @@ class RepositoryAgentWorkTests(unittest.TestCase):
             first["routing_classification"],
             second["routing_classification"],
         )
+        self.assertEqual(
+            first["routing_classification_sha256"],
+            second["routing_classification_sha256"],
+        )
+        self.assertEqual(
+            first["routing_classification_sha256"],
+            w.sha256(w.canonical_bytes(first["routing_classification"])),
+        )
         self.assertNotIn(
             "input_identity",
             first["routing_classification"],
@@ -165,6 +173,10 @@ class RepositoryAgentWorkTests(unittest.TestCase):
         self.assertNotEqual(
             review["routing_classification"],
             repair["routing_classification"],
+        )
+        self.assertNotEqual(
+            review["routing_classification_sha256"],
+            repair["routing_classification_sha256"],
         )
         self.assertEqual(
             repair["routing_classification"]["verification_profiles"],
