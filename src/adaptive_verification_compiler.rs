@@ -1363,7 +1363,7 @@ fn discover_artifact_transport(
             experiments,
         ));
 
-        let mut ratios = group
+        let ratio_evidence = group
             .iter()
             .filter_map(|observation| {
                 let transferred = observation.bytes_transferred?;
@@ -1371,10 +1371,21 @@ fn discover_artifact_transport(
                 if transferred == 0 {
                     return None;
                 }
-                Some(required.saturating_mul(10_000) / transferred)
+                Some((
+                    required.saturating_mul(10_000) / transferred,
+                    usize::from(observation.sample_count),
+                ))
             })
             .collect::<Vec<_>>();
-        if ratios.len() >= MIN_REPETITIONS {
+        let ratio_sample_count = ratio_evidence
+            .iter()
+            .map(|(_, sample_count)| *sample_count)
+            .sum::<usize>();
+        if ratio_sample_count >= MIN_REPETITIONS {
+            let mut ratios = ratio_evidence
+                .iter()
+                .map(|(ratio, _)| *ratio)
+                .collect::<Vec<_>>();
             ratios.sort_unstable();
             if median_u64(&ratios) <= MAX_SPLIT_REQUIRED_BASIS_POINTS {
                 candidates.push(build_candidate(
@@ -3208,6 +3219,43 @@ mod tests {
                 .iter()
                 .all(|candidate| candidate.class() != OptimizationClass::MoveStaticGuardEarlier)
         );
+    }
+
+    #[test]
+    fn aggregated_transfer_samples_count_toward_split_candidate_evidence() {
+        let transfer = VerificationObservation::new(
+            "aggregate-transfer",
+            "aggregate-run",
+            "project",
+            "profile",
+            1,
+            VerificationStage::ArtifactTransfer,
+            60_000,
+            VerificationReuseClass::Cold,
+            SemanticValidationResult::Passed,
+            "macos-arm64",
+        )
+        .unwrap()
+        .with_sample_count(6)
+        .unwrap()
+        .with_bytes(None, None, Some(850_000_000))
+        .unwrap()
+        .with_artifact("app-host-product", Some("app-host-shards"), Some(300_000_000))
+        .unwrap()
+        .with_validity_inputs(&[
+            ValidityInput::new(ValidityInputKind::ProductSchema, "app-host-v2").unwrap(),
+        ]);
+
+        let receipt =
+            compile_verification_optimizations("project", "profile", &[transfer], &[]).unwrap();
+
+        let split = receipt
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.class() == OptimizationClass::SplitConsumerArtifact)
+            .unwrap();
+        assert_eq!(split.lifecycle(), OptimizationLifecycle::Candidate);
+        assert_eq!(split.evidence()[0].sample_count, 6);
     }
 
     #[test]
