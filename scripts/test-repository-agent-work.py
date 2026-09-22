@@ -165,6 +165,25 @@ class RepositoryAgentWorkTests(unittest.TestCase):
             first["routing_classification"],
         )
 
+    def test_routing_classification_separates_repositories(self) -> None:
+        first = w.plan(w.decode_request(raw(review_request())))
+        other_raw = review_request()
+        other_raw["source"]["repository"] = "teamleaderleo/glaeda"
+        other = w.plan(w.decode_request(raw(other_raw)))
+
+        self.assertEqual(
+            first["routing_classification"]["repository"],
+            "manaflow-ai/cmux",
+        )
+        self.assertEqual(
+            other["routing_classification"]["repository"],
+            "teamleaderleo/glaeda",
+        )
+        self.assertNotEqual(
+            first["routing_classification_sha256"],
+            other["routing_classification_sha256"],
+        )
+
     def test_routing_classification_keeps_coarse_repair_size_classes(self) -> None:
         small_raw = repair_request()
         small_raw["scope"] = {
