@@ -264,9 +264,10 @@ class FleetHarnessTests(unittest.TestCase):
 
         self.assertEqual(calls[0][0][0], "/usr/bin/git")
         self.assertEqual(calls[0][1]["env"], GIT_PROBE_ENV)
-        self.assertEqual(calls[1][0][0], "/usr/bin/git")
-        self.assertIn("--ignore-submodules=none", calls[1][0])
-        self.assertEqual(calls[1][1]["env"], GIT_PROBE_ENV)
+        status_call = next(call for call in calls if "status" in call[0])
+        self.assertEqual(status_call[0][0], "/usr/bin/git")
+        self.assertIn("--ignore-submodules=none", status_call[0])
+        self.assertEqual(status_call[1]["env"], GIT_PROBE_ENV)
         for _, kwargs in calls:
             for forbidden in (
                 "HOME",
