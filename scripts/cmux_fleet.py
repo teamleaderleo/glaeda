@@ -1267,6 +1267,13 @@ def accept_local(
                 f"CMUX local acceptance produced no semantic result{suffix}"
             )
         cmux_result, cmux_result_sha256 = load_cmux_semantic_result(result_path)
+        expected_source = {
+            "repository": CMUX_REPOSITORY,
+            "commit": source_commit,
+            "tree": source_tree,
+        }
+        if cmux_result.get("source") != expected_source:
+            raise FleetError("CMUX acceptance result does not match requested source")
 
         bootstrap_argv = [
             sys.executable,
@@ -1320,6 +1327,11 @@ def accept_local(
             raise FleetError(
                 "Glaeda fleet contract changed during local acceptance"
             )
+        if (
+            _git_oid(cmux_root, "HEAD^{commit}") != source_commit
+            or _git_oid(cmux_root, "HEAD^{tree}") != source_tree
+        ):
+            raise FleetError("CMUX source changed during local acceptance")
         local_attempt = "sha256:" + hashlib.sha256(os.urandom(32)).hexdigest()
         receipt = finalize_acceptance(
             enrollment,

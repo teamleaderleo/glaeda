@@ -298,6 +298,12 @@ rm -f "$GLAEDA_INSTALL_ROOT/glaeda.rollback"
 
 ## CI and synthetic evidence
 
+`accept-local` compares the returned CMUX source identity with the exact
+repository/commit/tree passed to the workload, then re-observes HEAD commit/tree
+after post-run bootstrap before issuing acceptance. A self-consistent result for
+another source or checkout movement refuses acceptance. These boundary checks
+do not freeze the checkout; callers must still coordinate exclusive source use.
+
 Hosted CI needs no physical CMUX machine. Glaeda CI runs the enrollment/bootstrap contract suites and synthetic CMUX semantic-result fixtures. CMUX CI owns the workload-profile contract and executes `cmux.ci.guard@1` through its canonical runner. Physical Mac/Linux acceptance receipts are attached only after the corresponding CMUX-controlled hosts exist and have been explicitly approved for the profile.
 
 Related Glaeda work: #743, #546, #365, #492, #970, #1048, #1008, #1010, #1071.

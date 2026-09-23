@@ -616,7 +616,7 @@ class FleetTests(unittest.TestCase):
                 mock.patch.object(
                     f,
                     "_git_oid",
-                    side_effect=[COMMIT, "2" * 40],
+                    side_effect=[COMMIT, "2" * 40, COMMIT, "2" * 40],
                 ),
                 mock.patch.object(f.subprocess, "run", side_effect=fake_run),
             ):
@@ -640,6 +640,49 @@ class FleetTests(unittest.TestCase):
             receipt["cmuxSemanticResultSha256"],
             f.digest(result),
         )
+
+    def test_local_acceptance_rejects_different_result_or_changed_checkout_source(self):
+        for change in ("result_commit", "result_tree", "checkout_commit", "checkout_tree"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                root.chmod(0o700)
+                e = enrollment("linux", state="enrolling")
+                enrollment_path = root / "enrollment.json"
+                enrollment_path.write_bytes(f.canonical(e))
+                enrollment_path.chmod(0o600)
+                cmux_root = root / "cmux"
+                runner = cmux_root / "scripts/ci/cmux_workload_profile.py"
+                runner.parent.mkdir(parents=True)
+                runner.write_text("# fixture\n")
+                glaeda = root / "glaeda"
+                glaeda.write_text("#!/bin/sh\nexit 0\n")
+                glaeda.chmod(0o755)
+                result = cmux_result("cmux_linux_ci")
+                if change.startswith("result_"):
+                    result["source"][change.removeprefix("result_")] = "3" * 40
+                    semantic = f._cmux_semantic_key(result)
+                    result["benchmark"]["semantic_comparison_key"] = semantic
+                    result["benchmark"]["comparison_context_key"] = f._cmux_context_key(
+                        semantic, "cold", result["toolchain"]["identity"])
+                observations = [COMMIT, "2" * 40, COMMIT, "2" * 40]
+                if change == "checkout_commit":
+                    observations[2] = "3" * 40
+                if change == "checkout_tree":
+                    observations[3] = "3" * 40
+
+                def run(argv, **kwargs):
+                    if str(runner) in argv:
+                        path = Path(argv[argv.index("--result") + 1])
+                        path.write_bytes(f.canonical(result))
+                        path.chmod(0o600)
+                        return f.subprocess.CompletedProcess(argv, 0)
+                    return f.subprocess.CompletedProcess(
+                        argv, 0, stdout=f.canonical(bootstrap_for(e)), stderr=b"")
+
+                with mock.patch.object(f, "_git_oid", side_effect=observations), \
+                        mock.patch.object(f.subprocess, "run", side_effect=run):
+                    with self.assertRaisesRegex(f.FleetError, "source"):
+                        f.accept_local(enrollment_path, cmux_root, glaeda, "cmux_linux_ci")
 
     def test_accept_local_refuses_fleet_contract_replacement(self):
         e = enrollment("linux", state="enrolling")
@@ -682,7 +725,7 @@ class FleetTests(unittest.TestCase):
                 mock.patch.object(
                     f,
                     "_git_oid",
-                    side_effect=[COMMIT, "2" * 40],
+                    side_effect=[COMMIT, "2" * 40, COMMIT, "2" * 40],
                 ),
                 mock.patch.object(f.subprocess, "run", side_effect=fake_run),
                 mock.patch.object(
