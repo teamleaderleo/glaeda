@@ -183,7 +183,7 @@ class VerifyFocusedTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.Refusal, "no reviewed local admission demand"):
             MODULE.admission_demand(unknown)
 
-    def test_required_run_supplies_required_demand_to_reservation(self) -> None:
+    def test_required_run_supplies_required_demand_to_reservation_and_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve(strict=True)
             os.chmod(root, 0o700)
@@ -222,6 +222,21 @@ class VerifyFocusedTests(unittest.TestCase):
             self.assertEqual(reserve.call_count, 1)
             self.assertEqual(reserve.call_args.args[4], MODULE.REQUIRED_ADMISSION_DEMAND)
             admission.release.assert_called_once_with()
+
+            arguments.reconcile_only = True
+            with (
+                mock.patch.object(MODULE, "verify_resident_source"),
+                mock.patch.object(MODULE, "unit_absent", return_value=True),
+                mock.patch.object(MODULE, "emit"),
+                mock.patch.object(
+                    MODULE.owned_admission,
+                    "recover",
+                    side_effect=lambda *args: args[4](),
+                ) as recover,
+            ):
+                self.assertEqual(MODULE.run(arguments, MODULE.REQUIRED_PROFILE), 0)
+            recover.assert_called_once()
+            self.assertEqual(recover.call_args.args[5], MODULE.REQUIRED_ADMISSION_DEMAND)
 
     def test_cli_has_no_remote_command_environment_or_url(self) -> None:
         help_text = subprocess.run(
