@@ -2,8 +2,10 @@
 import importlib.util
 from pathlib import Path
 import json
+import os
 import tempfile
 import unittest
+from unittest import mock
 
 MODULE_PATH = Path(__file__).with_name("cmux_fleet_bootstrap.py")
 SPEC = importlib.util.spec_from_file_location("cmux_fleet_bootstrap", MODULE_PATH)
@@ -22,6 +24,7 @@ def observation(platform="macos", failed=()):
         "git": True,
         "glaedaExecutable": True,
         "diskAdmission": True,
+        "profileRunnerInterpreter": True,
     }
     if platform == "macos":
         checks.update(
@@ -203,6 +206,61 @@ class Tests(unittest.TestCase):
                     "macos",
                     "x86_64",
                 )
+
+    def test_command_output_keeps_column_zero(self):
+        # `git submodule status` marks a checked-out submodule with a leading
+        # space, so trimming it made every clean checkout look unready.
+        output = b.run(["/bin/sh", "-c", "printf ' clean sub\\n-absent sub\\n'"])
+        self.assertEqual(output.splitlines(), [" clean sub", "-absent sub"])
+
+    def test_submodules_ready_reads_the_first_line(self):
+        with mock.patch.object(b, "executable", return_value="/usr/bin/git"):
+            for status, ready in (
+                (" a1 ghostty (v1)\n b2 other (v2)", True),
+                ("-a1 ghostty (v1)\n b2 other (v2)", False),
+                ("", False),
+            ):
+                with self.subTest(status=status):
+                    with mock.patch.object(b, "run", return_value=status):
+                        self.assertEqual(
+                            b.cmux_submodules_ready(Path("/nonexistent")), ready
+                        )
+
+    def test_setup_artifacts_accept_either_ghosttykit_location(self):
+        for location in b.CMUX_GHOSTTYKIT_LOCATIONS:
+            with self.subTest(location=location), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                header = root / "ghostty/include/ghostty.h"
+                header.parent.mkdir(parents=True)
+                header.write_text("/* fixture */\n", encoding="utf-8")
+                self.assertFalse(b.cmux_setup_artifacts_present(root))
+                (root / location).mkdir(parents=True)
+                self.assertTrue(b.cmux_setup_artifacts_present(root))
+
+    def test_tools_are_resolved_through_the_workload_path(self):
+        # A tool the operator can reach from their shell is invisible to the
+        # build, which rebuilds PATH from a fixed list of system directories.
+        with tempfile.TemporaryDirectory() as temporary:
+            operator_only = Path(temporary)
+            tool = operator_only / "cmux-fixture-tool"
+            tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            tool.chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": str(operator_only)}):
+                with self.assertRaises(b.BootstrapError):
+                    b.executable("cmux-fixture-tool")
+                self.assertTrue(b.executable("sh").startswith("/"))
+
+    def test_interpreter_without_waitid_blocks_enrollment(self):
+        # CPython exposes os.waitid on macOS only from 3.13, and the CMUX
+        # profile runner cannot wait on its child without it.
+        self.assertEqual(b.profile_runner_interpreter_ready(), hasattr(os, "waitid"))
+        result = b.evaluate(
+            observation(failed=("profileRunnerInterpreter",)),
+            ["cmux_macos_native_build"],
+            "cmux-mac-build-large",
+        )
+        self.assertFalse(result["eligibleForEnrollment"])
+        self.assertIn("profileRunnerInterpreter", result["blockingChecks"])
 
     def test_power_posture_parser(self):
         raw = (

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -46,6 +47,12 @@ CMUX_RESULT_DOCUMENT_TYPE = "cmux-workload-result"
 CMUX_RESULT_SCHEMA_VERSION = 1
 CMUX_RESULT_STATES = {"passed", "failed", "timed_out", "ambiguous"}
 CMUX_PROFILE_RUNNER = "scripts/ci/cmux_workload_profile.py"
+# Mirrors the PATH the CMUX runner hands its workload; scripts/cmux_fleet_bootstrap.py
+# observes through the same list so readiness means the build can find the tool.
+CMUX_WORKLOAD_TOOL_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+ATTEMPT_PREFIX = ".acceptance-run."
+RETAINED_ATTEMPT_PREFIX = "rejected-attempt."
+RETAINED_ATTEMPT_LIMIT = 3
 LOCAL_EXECUTION_CLASS = "glaeda-local-profile/v1"
 EXTERNAL_EVIDENCE_CLASS = "external-evidence/v1"
 ACCEPTANCE_CHILD_ENV_KEYS = (
@@ -1142,10 +1149,7 @@ def acceptance_child_environment(temporary_root: Path) -> dict[str, str]:
         "LC_ALL": "C",
         "LANG": "C",
         "TMPDIR": str(temporary_root),
-        "PATH": os.environ.get(
-            "PATH",
-            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        ),
+        "PATH": CMUX_WORKLOAD_TOOL_PATH,
     }
     for name in ACCEPTANCE_CHILD_ENV_KEYS:
         if name == "PATH":
@@ -1154,6 +1158,49 @@ def acceptance_child_environment(temporary_root: Path) -> dict[str, str]:
         if value:
             environment[name] = value
     return environment
+
+
+def _notice(message: str) -> None:
+    """Tell the operator something stdout cannot carry: stdout is the receipt."""
+    print(message, file=sys.stderr)
+
+
+def profile_runner_interpreter_ready() -> bool:
+    """Report whether this interpreter can run CMUX's profile runner.
+
+    The runner waits on its child with `os.waitid` to hold the child's PID and
+    process group unreleased, and CPython exposes that call on macOS only from
+    3.13. Without it the child dies of an AttributeError a fraction of a second
+    into acceptance, so refuse before the attempt rather than after.
+    """
+    return hasattr(os, "waitid")
+
+
+def _retain_attempt(state_root: Path, fleet_root: Path) -> None:
+    """Keep a failed attempt's evidence, and bound how much of it accumulates.
+
+    A rejected receipt carries a verdict and no cause, so deleting the runner
+    log along with the attempt leaves the operator nothing to read. Drop the
+    child's scratch tree, which is the large part and reconstructible, and keep
+    the runner log and semantic result next to the enrollment that refused.
+    """
+    shutil.rmtree(state_root / "tmp", ignore_errors=True)
+    retained = fleet_root / (
+        RETAINED_ATTEMPT_PREFIX + state_root.name[len(ATTEMPT_PREFIX):]
+    )
+    try:
+        os.replace(state_root, retained)
+    except OSError:
+        shutil.rmtree(state_root, ignore_errors=True)
+        return
+    stale = sorted(
+        fleet_root.glob(RETAINED_ATTEMPT_PREFIX + "*"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[RETAINED_ATTEMPT_LIMIT:]
+    for path in stale:
+        shutil.rmtree(path, ignore_errors=True)
+    _notice(f"retained rejected acceptance attempt: {retained}")
 
 
 def _bounded_tail(path: Path, ceiling: int = 4096) -> str:
@@ -1223,6 +1270,11 @@ def accept_local(
     runner = cmux_root / CMUX_PROFILE_RUNNER
     if not runner.is_file() or runner.is_symlink():
         raise FleetError("CMUX workload profile runner is unavailable")
+    if not profile_runner_interpreter_ready():
+        raise FleetError(
+            "this interpreter lacks os.waitid, which the CMUX profile runner "
+            "requires; use CPython 3.13 or newer on macOS"
+        )
     glaeda = glaeda.resolve(strict=True)
     if not glaeda.is_file() or not os.access(glaeda, os.X_OK):
         raise FleetError("Glaeda executable is unavailable")
@@ -1256,12 +1308,12 @@ def accept_local(
     if not bootstrap_script.is_file() or bootstrap_script.is_symlink():
         raise FleetError("fleet bootstrap implementation is unavailable")
 
-    with tempfile.TemporaryDirectory(
-        prefix=".acceptance-run.",
-        dir=fleet_root,
-    ) as raw_state:
-        state_root = Path(raw_state).resolve(strict=True)
-        state_root.chmod(0o700)
+    state_root = Path(
+        tempfile.mkdtemp(prefix=ATTEMPT_PREFIX, dir=fleet_root)
+    ).resolve(strict=True)
+    state_root.chmod(0o700)
+    accepted = False
+    try:
         result_path = state_root / "result.json"
         log_path = state_root / "cmux-runner.log"
         child_environment = acceptance_child_environment(state_root / "tmp")
@@ -1389,7 +1441,13 @@ def accept_local(
             raise FleetError("successful CMUX local run did not produce acceptance")
         if completed.returncode != 0 and receipt["result"] == "accepted":
             raise FleetError("failed CMUX local run produced acceptance")
+        accepted = receipt["result"] == "accepted"
         return receipt
+    finally:
+        if accepted:
+            shutil.rmtree(state_root, ignore_errors=True)
+        else:
+            _retain_attempt(state_root, fleet_root)
 
 
 def apply_transition(

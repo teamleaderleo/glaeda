@@ -164,6 +164,8 @@ bash scripts/cmux-fleet status "$ENROLLMENT" \
 
 The macOS preparation reuses CMUX's reviewed `scripts/setup.sh` for prerequisites. Bootstrap re-observes those prerequisites read-only and verifies the exact checkout exposes `cmux.macos.dev-check@1` for the observed Apple-Silicon node. `accept-local` launches CMUX's checked-in profile runner on this node inside a private attempt directory, captures the canonical semantic result, reruns the read-only bootstrap on this same node, and emits `glaeda-cmux-fleet-acceptance/v2`. Both Python front doors execute in isolated interpreter mode (`-I`) with a closed allowlist containing only reviewed toolchain/home path inputs plus a private attempt-local `TMPDIR`; Python import controls, Git redirection variables, SSH agents, credentials, and unrelated operator environment never flow into either child. CMUX still owns the developer-build commands, validator, artifacts, timeout, and pass/fail semantics. Glaeda owns the local-attempt binding, fresh capability check, and durable receipt.
 
+Bootstrap resolves the toolchain through the fixed PATH the CMUX runner hands its workload (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`), not the operator's shell. A tool installed only under `$HOME` is reported missing in seconds instead of passing bootstrap and failing the build minutes later, so fleet nodes need their build tools in those directories. An attempt that does not accept keeps its runner log and semantic result as `rejected-attempt.*` beside the enrollment, minus the child's scratch tree; the three most recent are kept and the retained path is named on stderr.
+
 ## Onboard Linux
 
 ```bash

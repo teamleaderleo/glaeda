@@ -6,7 +6,10 @@ Owner: #525. Host promotion/rollback: #149. Enrollment: #1056/#1058.
 on hosted machines. Each archive contains `bin/glaeda`, its matching fleet Python
 tools, the enrollment runbook, license notices, and a manifest with exact source
 commit/tree, target, Rust toolchain and per-file hashes. No Rust compiler is needed
-on the receiving node. Fleet tools require Python 3.11 or newer.
+on the receiving node. Fleet tools require Python 3.11 or newer on Linux and 3.13
+or newer on macOS: CMUX's profile runner waits on its child with `os.waitid`, which
+CPython exposes on macOS only from 3.13. Bootstrap and `accept-local` both refuse an
+interpreter without it rather than fail once the build is already under way.
 
 The [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
 defines `macos-15` as ARM64; the builder also checks the actual native Rust target.

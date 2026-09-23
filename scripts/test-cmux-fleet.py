@@ -19,6 +19,14 @@ assert SPEC and SPEC.loader
 f = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(f)
 
+BOOTSTRAP_PATH = Path(__file__).with_name("cmux_fleet_bootstrap.py")
+BOOTSTRAP_SPEC = importlib.util.spec_from_file_location(
+    "cmux_fleet_bootstrap", BOOTSTRAP_PATH
+)
+assert BOOTSTRAP_SPEC and BOOTSTRAP_SPEC.loader
+bootstrap = importlib.util.module_from_spec(BOOTSTRAP_SPEC)
+BOOTSTRAP_SPEC.loader.exec_module(bootstrap)
+
 A = "sha256:" + "a" * 64
 B = "sha256:" + "b" * 64
 C = "sha256:" + "c" * 64
@@ -183,6 +191,11 @@ def finalized(
 
 
 class FleetTests(unittest.TestCase):
+    def setUp(self):
+        notices = mock.patch.object(f, "_notice")
+        self.notices = notices.start()
+        self.addCleanup(notices.stop)
+
     def test_current_accepted_role_is_eligible(self):
         e = enrollment()
         r = finalized(e)
@@ -520,7 +533,9 @@ class FleetTests(unittest.TestCase):
         )
         self.assertEqual(environment["LC_ALL"], "C")
         self.assertEqual(environment["LANG"], "C")
-        self.assertEqual(environment["PATH"], "/reviewed/bin:/usr/bin:/bin")
+        # The operator's PATH is an input the build never sees, so forwarding it
+        # would let bootstrap and acceptance disagree about which tools exist.
+        self.assertEqual(environment["PATH"], f.CMUX_WORKLOAD_TOOL_PATH)
         self.assertNotIn("PYTHONPATH", environment)
         self.assertNotIn("PYTHONHOME", environment)
         self.assertNotIn("SSH_AUTH_SOCK", environment)
@@ -566,7 +581,7 @@ class FleetTests(unittest.TestCase):
                     self.assertNotIn(forbidden, environment)
                 self.assertEqual(environment["LC_ALL"], "C")
                 self.assertEqual(environment["LANG"], "C")
-                self.assertEqual(environment["PATH"], "/reviewed/bin:/usr/bin:/bin")
+                self.assertEqual(environment["PATH"], f.CMUX_WORKLOAD_TOOL_PATH)
                 self.assertEqual(environment["HOME"], str(root / "home"))
                 self.assertEqual(environment["CARGO_HOME"], str(root / "cargo"))
                 self.assertEqual(environment["RUSTUP_HOME"], str(root / "rustup"))
@@ -683,6 +698,108 @@ class FleetTests(unittest.TestCase):
                         mock.patch.object(f.subprocess, "run", side_effect=run):
                     with self.assertRaisesRegex(f.FleetError, "source"):
                         f.accept_local(enrollment_path, cmux_root, glaeda, "cmux_linux_ci")
+
+    def _local_acceptance_fixture(self, root):
+        e = enrollment("linux", state="enrolling")
+        enrollment_path = root / "enrollment.json"
+        enrollment_path.write_bytes(f.canonical(e))
+        enrollment_path.chmod(0o600)
+        cmux_root = root / "cmux"
+        runner = cmux_root / "scripts/ci/cmux_workload_profile.py"
+        runner.parent.mkdir(parents=True)
+        runner.write_text("# fixture\n")
+        glaeda = root / "glaeda"
+        glaeda.write_text("#!/bin/sh\nexit 0\n")
+        glaeda.chmod(0o755)
+        return e, enrollment_path, cmux_root, runner, glaeda
+
+    def test_workload_tool_path_matches_bootstrap_observation(self):
+        # Bootstrap's readiness verdict means something only if it searched the
+        # directories acceptance will hand the build.
+        self.assertEqual(
+            f.CMUX_WORKLOAD_TOOL_PATH, bootstrap.CMUX_WORKLOAD_TOOL_PATH
+        )
+
+    def test_rejected_attempt_keeps_the_evidence_an_acceptance_discards(self):
+        # A rejected receipt carries a verdict and no cause, so deleting the
+        # runner log with the attempt leaves the operator nothing to read.
+        for state, retained in (("failed", True), ("passed", False)):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                root.chmod(0o700)
+                e, enrollment_path, cmux_root, runner, glaeda = (
+                    self._local_acceptance_fixture(root)
+                )
+                result = cmux_result("cmux_linux_ci", state=state)
+
+                def run(argv, **kwargs):
+                    if str(runner) in argv:
+                        path = Path(argv[argv.index("--result") + 1])
+                        (path.parent / "tmp/scratch").mkdir(parents=True, exist_ok=True)
+                        kwargs["stdout"].write(b"zig 0.16.0 is required\n")
+                        path.write_bytes(f.canonical(result))
+                        path.chmod(0o600)
+                        return f.subprocess.CompletedProcess(
+                            argv, 0 if state == "passed" else 1
+                        )
+                    return f.subprocess.CompletedProcess(
+                        argv, 0, stdout=f.canonical(bootstrap_for(e)), stderr=b"")
+
+                with (
+                    mock.patch.object(
+                        f, "_git_oid", side_effect=[COMMIT, "2" * 40, COMMIT, "2" * 40]
+                    ),
+                    mock.patch.object(f.subprocess, "run", side_effect=run),
+                ):
+                    receipt = f.accept_local(
+                        enrollment_path, cmux_root, glaeda, "cmux_linux_ci"
+                    )
+
+                self.assertEqual(receipt["result"] == "accepted", not retained)
+                self.assertEqual(list(root.glob(f.ATTEMPT_PREFIX + "*")), [])
+                kept = list(root.glob(f.RETAINED_ATTEMPT_PREFIX + "*"))
+                self.assertEqual(len(kept), 1 if retained else 0)
+                if retained:
+                    self.notices.assert_called_once()
+                    self.assertIn(
+                        str(kept[0]), self.notices.call_args.args[0]
+                    )
+                    self.assertIn(
+                        "zig 0.16.0 is required",
+                        (kept[0] / "cmux-runner.log").read_text(encoding="utf-8"),
+                    )
+                    self.assertTrue((kept[0] / "result.json").is_file())
+                    # The child's scratch tree is the large part and rebuilds.
+                    self.assertFalse((kept[0] / "tmp").exists())
+
+    def test_retained_attempts_stay_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for index in range(f.RETAINED_ATTEMPT_LIMIT + 2):
+                attempt = root / f"{f.ATTEMPT_PREFIX}{index:04d}"
+                (attempt / "tmp").mkdir(parents=True)
+                (attempt / "cmux-runner.log").write_text(str(index), encoding="utf-8")
+                os.utime(attempt, (index + 1, index + 1))
+                f._retain_attempt(attempt, root)
+            kept = sorted(path.name for path in root.glob(f.RETAINED_ATTEMPT_PREFIX + "*"))
+            self.assertEqual(len(kept), f.RETAINED_ATTEMPT_LIMIT)
+            self.assertEqual(kept[-1], f"{f.RETAINED_ATTEMPT_PREFIX}0004")
+
+    def test_interpreter_without_waitid_refuses_before_the_attempt(self):
+        # CPython exposes os.waitid on macOS only from 3.13; the CMUX profile
+        # runner cannot wait on its child without it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            root.chmod(0o700)
+            _, enrollment_path, cmux_root, _, glaeda = (
+                self._local_acceptance_fixture(root)
+            )
+            with mock.patch.object(
+                f, "profile_runner_interpreter_ready", return_value=False
+            ):
+                with self.assertRaisesRegex(f.FleetError, "os.waitid"):
+                    f.accept_local(enrollment_path, cmux_root, glaeda, "cmux_linux_ci")
+            self.assertEqual(list(root.glob(f.ATTEMPT_PREFIX + "*")), [])
 
     def test_accept_local_refuses_fleet_contract_replacement(self):
         e = enrollment("linux", state="enrolling")
