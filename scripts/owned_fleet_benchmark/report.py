@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import shlex
 from pathlib import Path
@@ -43,7 +44,7 @@ def _validate_report_evidence(
     return comparison_digest
 
 
-def _measured_number(value: Any) -> float | None:
+def _measured_number(value: Any) -> int | float | None:
     """One actually observed number, or None when the fact was never measured.
 
     `resource.swap_used_bytes()` returns None when its probe fails or the platform
@@ -52,7 +53,9 @@ def _measured_number(value: Any) -> float | None:
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def _window_label(window: dict[str, Any]) -> str:
@@ -254,6 +257,7 @@ def markdown_report(
             counts = window["counts"]
             latency = window["final_result_latency_ms"]
             concurrency = window.get("concurrency") or {}
+            failure_count = _measured_number(counts.get("failure_count"))
             lines.append(
                 f"- `{window['workload_id']}` / "
                 f"`{window.get('backend_id') or 'unobserved'}` / "
@@ -261,7 +265,7 @@ def markdown_report(
                 f"{counts['validated_completions']}/{counts['offered']} validated, "
                 f"semantic_mismatches={counts.get('semantic_mismatch_count', 0)}, "
                 f"unvalidated={counts.get('unvalidated_completion_count', 0)}, "
-                f"failures={counts.get('failure_count', 0)}, "
+                f"failures={failure_count if failure_count is not None else 'unobserved'}, "
                 f"unknown={counts.get('unknown_result_count', 0)}, "
                 f"unfinished={counts['unfinished']}, p50={latency['p50']} ms, "
                 f"p90={latency['p90']} ms, declared jobs="

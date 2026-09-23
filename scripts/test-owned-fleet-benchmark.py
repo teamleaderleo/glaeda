@@ -908,6 +908,25 @@ class FleetHarnessTests(unittest.TestCase):
         self.assertIn("swap", role_section)
         self.assertIn("glaeda-rust-focused-v1", role_section)
 
+    def test_report_preserves_unknown_failure_count(self) -> None:
+        values = self._reduced_windows()
+        del values[1]["counts"]["failure_count"]
+        report = markdown_report(complete_machine(), [], values, [])
+        window_line = next(
+            line for line in report.splitlines()
+            if "`medium`:" in line
+        )
+        self.assertIn("failures=unobserved", window_line)
+
+    def test_stability_reports_nonfinite_measurements_as_unproven(self) -> None:
+        for invalid in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(invalid=invalid):
+                values = self._reduced_windows()
+                values[0]["resources"]["swap_growth_max_observed_bytes"] = invalid
+                stable, reasons = _stable_profile_sets(values)
+                self.assertEqual(stable, set())
+                self.assertTrue(any("swap" in reason for reason in reasons))
+
     def test_collect_json_files_refuses_a_corrupt_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
