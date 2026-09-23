@@ -40,7 +40,7 @@ python3 scripts/fleet_bundle.py stage /private/candidate-download/ARCHIVE.tar.gz
 ```
 
 This previews the operation. Repeat with `--apply` to verify and unpack into that
-new private directory. The parent must already exist, be owned by you with mode
+new private directory, retaining the archive for later checks. The parent must already exist, be owned by you with mode
 0700, and use a canonical absolute path. Each update uses a new generation name.
 The verifier checks bounded decompression, the closed file inventory, hashes,
 source and target before writing. It rejects links and existing destinations.
@@ -56,6 +56,27 @@ when retrying; an incomplete generation is never adopted. Staging runs no bundle
 code and changes no services or active pointers. The receiving host still provides
 Python, the CMUX checkout, Xcode and GitHub runner registration. For verification
 alone, use `verify ARCHIVE --sha256 HASH --source COMMIT --target TARGET`.
+
+## Check a saved version
+
+Before using a staged candidate or returning to a previous version, recheck it:
+
+```bash
+python3 scripts/fleet_bundle.py inspect \
+  --directory "$HOME/Projects/glaeda-generations/GENERATION" \
+  --sha256 SHA256_FROM_TRUSTED_RUN \
+  --source EXACT_40_CHARACTER_COMMIT --target aarch64-apple-darwin
+```
+
+`state: verified` confirms the saved archive, receipt and complete installed file
+inventory match the pinned candidate. Use the original trusted checksum, not one
+read from that generation. The command is read-only and runs no candidate code.
+Role acceptance and scheduler drain remain separate checks before activation.
+
+Keep logs/state outside generation directories and run Python tools with
+`python3 -B` to avoid creating bytecode there. Unexpected files are refused. If an
+older or interrupted stage lacks its archive/receipt, stage the trusted download
+into a fresh directory; keep the working version until acceptance succeeds.
 
 ## Local production
 
