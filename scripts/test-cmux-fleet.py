@@ -948,6 +948,10 @@ class FleetTests(unittest.TestCase):
             attempt.chmod(0o600)
             try:
                 f._retain_attempt(attempt, root)
+                # The scratch tree could not be reached, so it survived; the
+                # operator must be told rather than shown a clean retention.
+                self.assertIn("could not be removed",
+                              self.notices.call_args.args[0])
             finally:
                 for candidate in (attempt, root / f"{f.RETAINED_ATTEMPT_PREFIX}abcd1234"):
                     if candidate.exists():

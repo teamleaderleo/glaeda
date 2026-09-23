@@ -1215,7 +1215,7 @@ def _remove_tree(path: Path) -> bool:
         except OSError:
             return False
         return True
-    if not os.path.lexists(path):
+    if _absent(path):
         return True
     # The top entry is chmod'ed first: os.walk cannot list an unreadable
     # directory, so nothing below it would be repaired otherwise.
@@ -1233,7 +1233,22 @@ def _remove_tree(path: Path) -> bool:
             except OSError:
                 pass
     shutil.rmtree(path, ignore_errors=True)
-    return not os.path.lexists(path)
+    return _absent(path)
+
+
+def _absent(path: Path) -> bool:
+    """Whether `path` is known to be gone.
+
+    `os.path.lexists` answers False on any error, so an entry behind a
+    directory we cannot search would read as removed while it survives.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def _retain_attempt(state_root: Path, fleet_root: Path) -> None:
