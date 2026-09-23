@@ -49,6 +49,15 @@ REQUIRED_TARGET_TMPFS_BYTES = 8 * 1024 * 1024 * 1024
 SHA256_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
 OID_PATTERN = re.compile(r"^[a-f0-9]{40}$")
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+SEMANTIC_REQUEST_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{7,63}$")
+SEMANTIC_BINDING_DOCUMENT_TYPE = "glaeda-semantic-execution-binding"
+SEMANTIC_BINDING_SCHEMA_VERSION = 1
+
+
+class SemanticRequestConflict(Refusal):
+    """One accepted semantic request identity was rebound to different physical work."""
+
+
 @dataclass(frozen=True)
 class Profile:
     profile_id: str
@@ -414,6 +423,45 @@ def publish_document(path: Path, value: dict[str, object], *, replace: bool) -> 
             pass
 
 
+def bind_semantic_request(state_root: Path, request_id: str, request: Request) -> None:
+    """Durably bind one accepted provider-neutral request identity before physical launch.
+
+    The binding is private Glaeda decision state, separate from transport correlation. Exact replay
+    is accepted; reusing one semantic identity for different physical work fails closed. The same
+    state root is shared by direct Git and owner-local callers that intentionally carry the same
+    accepted semantic request identity.
+    """
+    if not isinstance(request_id, str) or SEMANTIC_REQUEST_ID_PATTERN.fullmatch(request_id) is None:
+        raise Refusal("semantic request identity is invalid")
+    namespace = ensure_private_child(state_root, "semantic-requests")
+    request_root = ensure_private_child(namespace, request_id)
+    expected = {
+        "document_type": SEMANTIC_BINDING_DOCUMENT_TYPE,
+        "schema_version": SEMANTIC_BINDING_SCHEMA_VERSION,
+        "request_id": request_id,
+        "command_fingerprint": request.command_fingerprint,
+        "source": {
+            "repository": request.repository,
+            "commit": request.commit,
+            "tree": request.tree,
+        },
+        "profile": {
+            "id": request.profile.profile_id,
+            "generation": request.profile_generation,
+        },
+    }
+    with open_lock(request_root):
+        path = request_root / "binding.json"
+        existing = read_document(path)
+        if existing is None:
+            publish_document(path, expected, replace=False)
+            return
+        if existing != expected:
+            raise SemanticRequestConflict(
+                "semantic request identity conflicts with existing physical binding"
+            )
+
+
 def matches_request(document: dict[str, object], request: Request) -> bool:
     source = document.get("source")
     profile = document.get("profile")
@@ -713,6 +761,9 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
     cargo_root = exact_directory(arguments.cargo_root, "Cargo root")
     rustup_root = exact_directory(arguments.rustup_root, "rustup root")
     state_root = private_state_directory(arguments.state_root)
+    semantic_request_id = vars(arguments).get("semantic_request_id")
+    if semantic_request_id is not None:
+        bind_semantic_request(state_root, semantic_request_id, request)
     verify_resident_source(repository_root, request)
     command_root = ensure_private_child(state_root, request.command_fingerprint[7:])
     with open_lock(command_root):
@@ -738,7 +789,7 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
                         sync_directory(command_root)
                 owned_admission.recover(admission_root, request.command_fingerprint,
                                         unit_name(request), admission_binding(request, command_root),
-                                        observe_settled)
+                                        observe_settled, owned_admission.VERIFY_FOCUSED_DEMAND)
             emit(existing)
             return 0
         intent = read_document(intent_path)
@@ -833,6 +884,10 @@ def parser() -> argparse.ArgumentParser:
     execute.add_argument("--tree", required=True)
     execute.add_argument("--profile-generation", required=True)
     execute.add_argument("--command-fingerprint", required=True)
+    execute.add_argument(
+        "--semantic-request-id",
+        help="accepted provider-neutral request identity; binds exact physical work across transports",
+    )
     execute.add_argument("--reconcile-only", action="store_true")
     execute.add_argument("--admission-root", help="operator-installed reviewed launch gate; never caller-selected")
     return root

@@ -18,6 +18,7 @@ Use **Glaeda** for the project and **`glaeda`** for the binary/crate. Use
 | Ownership, persistence, mutation, recovery, subprocesses, physical experiments | `docs/AGENT_EXECUTION_SAFETY.md` |
 | Delegation and multi-agent work | `docs/AGENT_COORDINATION.md` |
 | Lease transitions | `docs/adr/0004-lease-lifecycle-core.md` |
+| Adding, exporting, or retiring a public module | `docs/MODULE_INVENTORY.md` (generated; do not hand-edit) |
 
 Changing coordination belongs in current issues and PRs. Keep broad document
 preloading out of the normal startup path.
@@ -54,6 +55,24 @@ Product details live in `README.md` and `docs/COMPUTE_RUNTIME.md`.
 - Human and JSON output must stay bounded and typed. Keep secrets, credentials,
   raw logs, repository contents, environment dumps, and private paths out of
   public evidence.
+
+## Native Apple agent builds
+
+For initialized native projects, prefer `glaeda-apple submit --operation check`.
+After coordinated pulls or branch changes, use `refresh` to ensure dependency
+readiness and then check incrementally; `plan-refresh` previews both stages.
+Save the returned request id; use `wait-request --request-id <id> --wait-seconds 300`
+in an active runner’s asynchronous process facility for event-based completion,
+or collect it with `request-status --request-id <id>`
+and explicitly `forget-request --request-id <id>` after consuming a terminal result.
+Use operation `dependencies` for preparation and `build` for a complete app build.
+The worker starts on demand and exits when idle; `wake` resumes pending work after
+interruption. Submission targets latest source at execution, not a pinned revision.
+Preserve each project's launch rules and coordinate source/branch edits separately.
+Never run direct and managed builds concurrently. Foreground callers can still use
+`check --wait-seconds 300`; timeout never authorizes killing another builder or
+removing its state. See `docs/APPLE_NATIVE_BUILDS.md` for recovery, receipt scope,
+source-observation limits and the bounded request history.
 
 ## Verify
 

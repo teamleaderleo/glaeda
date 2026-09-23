@@ -53,6 +53,23 @@ jobs:
           --component clippy,rustfmt
           --no-self-update
 
+      # Verify spends most of its wall time compiling the same dependency
+      # graph from scratch on every run. Restore the registry and target
+      # directory so only changed crates are rebuilt. Pull requests read the
+      # generation published by the last main push; only main writes, which
+      # keeps this workflow from multiplying per-branch cache entries.
+      - name: Restore cargo build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            verify-cargo-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
+
       - name: Validate workspace bootstrap
         run: |
           python3 - <<'PY'
@@ -62,6 +79,7 @@ jobs:
               Path("smolrunner"),
               Path("scripts/bootstrap"),
               Path("scripts/benchmark-hot-state-fanout"),
+              Path("scripts/benchmark-pnpm-task-dependencies"),
               Path("scripts/benchmark-linker-throughput"),
               Path("scripts/hot-observe"),
               Path("scripts/hot-pressure-shadow"),
@@ -71,15 +89,38 @@ jobs:
               Path("scripts/verify-focused"),
               Path("scripts/verify-required"),
               Path("scripts/verify_focused_impl.py"),
+              Path("scripts/provider_neutral_request.py"),
+              Path("scripts/owner_local_dispatch.py"),
+              Path("scripts/owner-local-dispatch"),
+              Path("scripts/test-provider-neutral-request.py"),
+              Path("scripts/test-owner-local-dispatch.py"),
               Path("scripts/owned_linux_task.py"),
               Path("scripts/owned_linux_admission.py"),
+              Path("scripts/owned_linux_jit_task.py"),
+              Path("scripts/external_execution_request.py"),
+              Path("scripts/trusted_agent_dispatch.py"),
               Path("scripts/owned-admission-control"),
               Path("scripts/test-owned-linux-admission.py"),
+              Path("scripts/test-owned-linux-jit-task.py"),
+              Path("scripts/test-external-execution-request.py"),
+              Path("scripts/test-trusted-agent-dispatch.py"),
+              Path("scripts/cmux_fleet.py"),
+              Path("scripts/cmux_fleet_bootstrap.py"),
+              Path("scripts/cmux_execution_roles.py"),
+              Path("scripts/test-cmux-fleet.py"),
+              Path("scripts/test-cmux-execution-roles.py"),
+              Path("scripts/test-cmux-fleet-bootstrap.py"),
+              Path("scripts/cmux_workload_request.py"),
+              Path("scripts/test-cmux-workload-request.py"),
+              Path("scripts/owned-fleet-benchmark"),
+              Path("scripts/test-owned-fleet-benchmark.py"),
+              *Path("scripts/owned_fleet_benchmark").glob("*.py"),
               Path("scripts/test-verify-focused.py"),
               Path("scripts/verify-changed-rustfmt"),
               Path("scripts/test-hot-run.py"),
               Path("scripts/test-hot-pressure-shadow.py"),
               Path("scripts/test-benchmark-hot-state-fanout.py"),
+              Path("scripts/test-benchmark-pnpm-task-dependencies.py"),
               Path("scripts/test-benchmark-linker-throughput.py"),
               Path("scripts/test-hot-observe.py"),
               Path("scripts/test-verify.py"),
@@ -87,6 +128,10 @@ jobs:
               Path("scripts/test-front-door.py"),
               Path("scripts/project_disk_physical_receipt.py"),
               Path("scripts/test_project_disk_physical_receipt.py"),
+              Path("scripts/quarry_sweep_impl.py"),
+              Path("scripts/test-quarry-sweep.py"),
+              Path("scripts/quarry_parallel_impl.py"),
+              Path("scripts/test-quarry-parallel.py"),
               *Path("scripts/workspace_bootstrap").glob("*.py"),
           ]
           for path in paths:
@@ -96,18 +141,35 @@ jobs:
           sh -n scripts/hot-run
           bash -n scripts/benchmark-developer-loop
           bash -n scripts/test-bootstrap.sh
+          bash -n scripts/cmux-fleet
+          bash -n scripts/cmux-fleet-bootstrap-macos
+          bash -n scripts/cmux-fleet-bootstrap-linux
           bash scripts/test-bootstrap.sh
           python3 scripts/test-benchmark-developer-loop.py
           python3 scripts/test-benchmark-hot-state-fanout.py
+          python3 scripts/test-benchmark-pnpm-task-dependencies.py
           python3 scripts/test-benchmark-linker-throughput.py
           python3 scripts/test-hot-observe.py
           python3 scripts/test-hot-pressure-shadow.py
           python3 scripts/test-hot-run.py
           python3 scripts/test-verify-focused.py
           python3 scripts/test-owned-linux-admission.py
+          python3 scripts/test-owned-linux-jit-task.py
+          python3 scripts/test-external-execution-request.py
+          python3 scripts/test-trusted-agent-dispatch.py
+          python3 scripts/test-provider-neutral-request.py
+          python3 scripts/test-owner-local-dispatch.py
+          python3 scripts/test-cmux-fleet.py
+          python3 scripts/test-cmux-fleet-operator-summary.py
+          python3 scripts/test-cmux-fleet-bootstrap.py
+          python3 scripts/test-cmux-execution-roles.py
+          python3 scripts/test-cmux-workload-request.py
+          python3 scripts/test-owned-fleet-benchmark.py
           python3 scripts/test-verify.py
           python3 scripts/test-verify-changed-rustfmt.py
           python3 scripts/test-front-door.py
+          python3 scripts/test-quarry-sweep.py
+          python3 scripts/test-quarry-parallel.py
 
           first_receipt=$(mktemp)
           second_receipt=$(mktemp)
@@ -225,8 +287,17 @@ jobs:
       - name: Install Apple Silicon target
         run: rustup target add aarch64-apple-darwin
 
-      - name: Check Apple Silicon build
-        run: cargo check --locked --all-targets --all-features --target aarch64-apple-darwin
+      # Glaeda is developed on Apple Silicon, so the repository's own `required` profile has to
+      # pass in the macOS `cfg` configuration, not only the Linux one this job runs natively.
+      # `cargo check` already compiled that configuration and already printed the `cfg` drift it
+      # sees -- code whose only consumers are `target_os = "linux"` -- but nothing promoted those
+      # warnings to errors, so `./scripts/verify required` could be broken on the author's machine
+      # while this job stayed green. Clippy with `-D warnings` subsumes the previous check and
+      # closes that gap without needing a macOS runner.
+      - name: Lint Apple Silicon build
+        run: >-
+          cargo clippy --locked --all-targets --all-features
+          --target aarch64-apple-darwin -- -D warnings
 
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -261,3 +332,17 @@ jobs:
         run: |
           cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
             | jq -e '.schema_version == 1 and .disposition and (.findings | type == "array") and (.report.executables | length == 3) and .report.package_plan and .report.runner_account'
+
+      # Only main publishes a generation. Pull requests restore from it and
+      # never write, so cache storage stays proportional to main rather than
+      # to the number of open branches.
+      - name: Save cargo build cache
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}

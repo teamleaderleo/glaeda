@@ -20,6 +20,11 @@ import time
 
 class TaskNetwork(Enum):
     NONE = "none"
+    # Trusted first-party GitHub Actions only. The task shares host routing only
+    # after the caller has verified the exact root-owned external egress-authority
+    # marker. That marker binds a separately reviewed host firewall/gateway which
+    # denies private/link-local egress; this helper does not create that authority.
+    GITHUB_ACTIONS_TRUSTED_EGRESS = "github_actions_trusted_egress"
 
 
 MAX_CONTROL_OUTPUT_BYTES = 64 * 1024
@@ -163,14 +168,32 @@ def sandbox_command(
     source: Path, cargo_root: Path, rustup_root: Path, unit_name: str, *,
     systemd_properties: list[str], build_tmpfs_bytes: int,
     mount_arguments: list[str], recipe_arguments: list[str],
-    network: TaskNetwork,
+    network: TaskNetwork, source_read_only: bool = True,
 ) -> list[str]:
-    if network is not TaskNetwork.NONE:
+    if network is TaskNetwork.NONE:
+        namespace_arguments = ["--unshare-all", "--unshare-user"]
+        network_arguments: list[str] = []
+    elif network is TaskNetwork.GITHUB_ACTIONS_TRUSTED_EGRESS:
+        namespace_arguments = [
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup",
+        ]
+        network_arguments = [
+            "--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
+            "--ro-bind-try", "/etc/hosts", "/etc/hosts",
+            "--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
+            "--ro-bind-try", "/etc/ssl", "/etc/ssl",
+            "--ro-bind-try", "/etc/ca-certificates", "/etc/ca-certificates",
+        ]
+    else:
         raise Refusal("owned task network class is unsupported")
+    source_bind = "--ro-bind" if source_read_only else "--bind"
     bubblewrap = [
         "/usr/bin/bwrap",
-        "--unshare-all",
-        "--unshare-user",
+        *namespace_arguments,
         "--die-with-parent",
         "--new-session",
         "--cap-drop",
@@ -202,6 +225,7 @@ def sandbox_command(
         "--ro-bind-try",
         "/etc/alternatives",
         "/etc/alternatives",
+        *network_arguments,
         "--proc",
         "/proc",
         "--dev",
@@ -212,7 +236,7 @@ def sandbox_command(
         "/tmp",
         "--dir",
         "/workspace",
-        "--ro-bind",
+        source_bind,
         os.fspath(source),
         "/workspace/source",
         "--size",
@@ -279,27 +303,95 @@ def stop_unit(unit_name: str) -> None:
 
 def execute(
     command: list[str], *, unit: str, deadline_seconds: int, label: str,
-    launch_guard=None,
+    launch_guard=None, inherit_stdin: bool = False, emit_failure_tail: bool = True,
 ) -> tuple[str, int, float, bool, int, str]:
+    observation = _run_bounded(
+        command, unit=unit, deadline_seconds=deadline_seconds, label=label,
+        launch_guard=launch_guard, retain_limit=0, separate_stderr=False,
+        inherit_stdin=inherit_stdin, emit_failure_tail=emit_failure_tail,
+    )
+    return observation[:6]
+
+
+def execute_capturing(
+    command: list[str], *, unit: str, deadline_seconds: int, label: str,
+    max_bytes: int, launch_guard=None,
+) -> tuple[str, int, float, bool, int, str, bytes, bool]:
+    """Bounded execution that retains up to max_bytes of stdout.
+
+    Returns the exact execute() observation plus the retained prefix and
+    an overflow flag. Retention is evidence transport only: bytes beyond
+    max_bytes still feed the digest and the byte count, and overflow is
+    reported rather than truncated silently. A non-positive max_bytes
+    refuses; retention never widens the output ceiling. Stderr stays
+    merged into the observed stream, so this suits human-output commands,
+    not machine receipt channels (see execute_capturing_split).
+    """
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise Refusal("capture ceiling must be a positive byte count")
+    return _run_bounded(
+        command, unit=unit, deadline_seconds=deadline_seconds, label=label,
+        launch_guard=launch_guard, retain_limit=max_bytes, separate_stderr=False,
+        inherit_stdin=False, emit_failure_tail=True,
+    )[:8]
+
+
+def execute_capturing_split(
+    command: list[str], *, unit: str, deadline_seconds: int, label: str,
+    max_bytes: int, launch_guard=None,
+) -> tuple[str, int, float, bool, int, str, bytes, bool, int, str]:
+    """Bounded execution with a pure-stdout receipt channel.
+
+    Stdout is retained (up to max_bytes), digested, and counted exactly
+    like execute_capturing. Stderr travels on its own pipe into a private
+    digest and byte count; it never enters the retained channel. Failure
+    tails report both streams distinctly. Returns the capturing tuple
+    plus (stderr_bytes, stderr_digest).
+    """
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise Refusal("capture ceiling must be a positive byte count")
+    observation = _run_bounded(
+        command, unit=unit, deadline_seconds=deadline_seconds, label=label,
+        launch_guard=launch_guard, retain_limit=max_bytes, separate_stderr=True,
+        inherit_stdin=False, emit_failure_tail=True,
+    )
+    return observation[:8] + observation[8:10]
+
+
+def _run_bounded(
+    command: list[str], *, unit: str, deadline_seconds: int, label: str,
+    launch_guard=None, retain_limit: int, separate_stderr: bool,
+    inherit_stdin: bool, emit_failure_tail: bool,
+) -> tuple[str, int, float, bool, int, str, bytes, bool, int, str]:
     started = time.monotonic()
     with launch_guard() if launch_guard is not None else nullcontext():
         process = subprocess.Popen(
             command,
             env=closed_environment({"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}),
-            stdin=subprocess.DEVNULL,
+            stdin=None if inherit_stdin else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
             start_new_session=True,
         )
     assert process.stdout is not None
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
+    if separate_stderr:
+        assert process.stderr is not None
+        selector.register(process.stderr, selectors.EVENT_READ)
     digest = hashlib.sha256()
     output_bytes = 0
+    retained = bytearray()
+    overflow = False
     tail = bytearray()
     output_exceeded = False
+    err_digest = hashlib.sha256()
+    err_bytes = 0
+    err_tail = bytearray()
+    err_exceeded = False
     forced_timeout = False
     deadline = started + deadline_seconds + 30
+    stdout_fd = process.stdout.fileno()
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -314,10 +406,24 @@ def execute(
         for key, _ in events:
             chunk = os.read(key.fd, 64 * 1024)
             if not chunk:
-                selector.unregister(process.stdout)
+                selector.unregister(key.fileobj)
+                continue
+            if separate_stderr and key.fd != stdout_fd:
+                err_digest.update(chunk)
+                err_bytes += len(chunk)
+                err_tail.extend(chunk)
+                if len(err_tail) > FAILURE_TAIL_BYTES:
+                    del err_tail[:-FAILURE_TAIL_BYTES]
+                if err_bytes > MAX_SOURCE_OUTPUT_BYTES and not err_exceeded:
+                    err_exceeded = True
+                    stop_unit(unit)
                 continue
             digest.update(chunk)
             output_bytes += len(chunk)
+            if len(retained) < retain_limit:
+                retained.extend(chunk[: retain_limit - len(retained)])
+            if output_bytes > retain_limit:
+                overflow = True
             tail.extend(chunk)
             if len(tail) > FAILURE_TAIL_BYTES:
                 del tail[:-FAILURE_TAIL_BYTES]
@@ -337,6 +443,8 @@ def execute(
         returncode = process.wait()
     selector.close()
     process.stdout.close()
+    if separate_stderr and process.stderr is not None:
+        process.stderr.close()
     elapsed = time.monotonic() - started
     settled = unit_absent(unit)
     if not settled:
@@ -345,22 +453,39 @@ def execute(
     terminal = "succeeded" if returncode == 0 else "failed"
     if forced_timeout or elapsed >= deadline_seconds:
         terminal = "timed_out"
-    if output_exceeded:
+    if output_exceeded or err_exceeded:
         terminal = "failed"
     if not settled:
         terminal = "cleanup_incomplete"
-    if terminal != "succeeded" and tail:
-        omitted = output_bytes - len(tail)
-        print(
-            f"{label} failure output: tail_bytes={len(tail)} omitted_bytes={omitted}",
-            file=sys.stderr,
-        )
-        sys.stderr.flush()
-        sys.stderr.buffer.write(bytes(tail))
-        if not tail.endswith(b"\n"):
-            sys.stderr.buffer.write(b"\n")
-        sys.stderr.buffer.flush()
-    return terminal, returncode, elapsed, settled, output_bytes, f"sha256:{digest.hexdigest()}"
+    if emit_failure_tail and terminal != "succeeded" and (tail or err_tail):
+        if tail:
+            omitted = output_bytes - len(tail)
+            print(
+                f"{label} failure output: tail_bytes={len(tail)} omitted_bytes={omitted}",
+                file=sys.stderr,
+            )
+            sys.stderr.flush()
+            sys.stderr.buffer.write(bytes(tail))
+            if not tail.endswith(b"\n"):
+                sys.stderr.buffer.write(b"\n")
+            sys.stderr.buffer.flush()
+        if err_tail:
+            omitted = err_bytes - len(err_tail)
+            print(
+                f"{label} failure stderr: tail_bytes={len(err_tail)}"
+                f" omitted_bytes={omitted}",
+                file=sys.stderr,
+            )
+            sys.stderr.flush()
+            sys.stderr.buffer.write(bytes(err_tail))
+            if not err_tail.endswith(b"\n"):
+                sys.stderr.buffer.write(b"\n")
+            sys.stderr.buffer.flush()
+    return (
+        terminal, returncode, elapsed, settled, output_bytes,
+        f"sha256:{digest.hexdigest()}", bytes(retained), overflow,
+        err_bytes, f"sha256:{err_digest.hexdigest()}",
+    )
 
 
 def prepare_task(task_root: Path) -> None:

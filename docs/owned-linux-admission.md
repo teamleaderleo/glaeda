@@ -41,14 +41,21 @@ network widening, or arbitrary commands are added.
 
 `AdmissionDemand` is intentionally an in-process type instead of a request/CLI document. Both
 fields must be positive bounded integers; booleans, zeroes, foreign objects, and oversized integers
-refuse before host observation or workload launch. `observe(root, demand)` and
-`Reservation(..., demand)` consume the same reviewed value.
+refuse before host observation or workload launch. `observe(root, demand)`,
+`Reservation(..., demand)`, `Reservation.resume(..., demand)` and `recover(..., demand)` consume
+the same reviewed value.
 
 The demand does not grant execution, resource ownership, preemption, routing, queue, persistence,
 or result authority. A remote caller cannot lower its apparent memory/CPU need to bypass admission.
 The local adapter that already owns semantic profile authorization owns the mapping from that
-reviewed identity to one demand. The existing command/profile fingerprint remains the semantic
-binding used for durable reservation and recovery.
+reviewed identity to one demand. The command/profile fingerprint and the reviewed demand together
+are the semantic binding used for durable reservation and recovery: the `reservation.json` record
+(`schema_version` 2) carries the demand, so a resume or recovery that names a different demand
+refuses instead of rechecking the launch boundary against the wrong capacity. The record is
+evidence to match, never authority: the caller still supplies the reviewed demand. A pre-v2 record
+omits part of its own binding, so every reservation, launch, release and recovery path refuses it
+as an explicit operator recovery. The advisory `observe()` snapshot still reports it as `reserved`
+rather than refusing, because it adopts nothing and takes no action.
 
 For verification, the adapter mapping is deliberately closed: `verify-focused/v1` selects the
 existing 8 GiB demand, `verify-required/v1` selects 12 GiB, and any other profile refuses until a
@@ -117,14 +124,15 @@ they share the same installed admission root.
 ## Evidence and next integration
 
 `python3 scripts/test-owned-linux-admission.py` covers reviewed demand validation, different memory
-and CPU requirements against fresh host headroom, final launch-boundary demand recheck, durable
-contention, crash refusal, exact recovery, serialized control, hold/drain/pressure changes at the
-real child-launch boundary, pre-launch cleanup, real disposable child settlement, immutable replay,
-filesystem substitution, protocol binding, and bounded helper output. `python3
-scripts/test-verify-focused.py` additionally keeps both verification profile generations and command
-bytes pinned, proves the closed profile-to-demand mapping, and proves the required demand reaches
-the shared reservation. These are local child tests with fixture host facts; they do not prove
-systemd/bubblewrap required verification or a regular ChatGPT journey.
+and CPU requirements against fresh host headroom, final launch-boundary demand recheck, a resumed
+reservation rechecked against its admitted demand rather than the default, resume and recovery
+refusal of another demand, durable contention, crash refusal, exact recovery, serialized control,
+hold/drain/pressure changes at the real child-launch boundary, pre-launch cleanup, real disposable
+child settlement, immutable replay, filesystem substitution, protocol binding, and bounded helper
+output. `python3 scripts/test-verify-focused.py` additionally pins both verification profile
+generations and command bytes, checks the closed profile-to-demand mapping, and checks that the
+required demand reaches the shared reservation. These tests use local children and fixture host
+facts; they do not prove systemd/bubblewrap required verification or a regular ChatGPT journey.
 
 The next consumer may map another reviewed semantic action/profile to an `AdmissionDemand`, then
 prove that exact profile through the same physical admission/receipt path. A generic project-worker

@@ -247,6 +247,58 @@ class BlenderSnapshotExportTests(unittest.TestCase):
             finally:
                 outside.unlink(missing_ok=True)
 
+    def test_symlinked_project_root_spelling_does_not_change_the_result(self) -> None:
+        """The declared root and the Blender path may spell one directory differently.
+
+        macOS produces this on every run, because `$TMPDIR` lives under `/var`, itself a symlink to
+        `/private/var`. Exercising it through an explicit symlink keeps the regression observable on
+        Linux, where no such system symlink exists.
+        """
+        temporary, root, main_scene = self.fixture()
+        with temporary:
+            asset = root / "asset.exr"
+            asset.write_bytes(b"asset")
+            link = root.parent / f"{root.name}-link"
+            link.symlink_to(root, target_is_directory=True)
+            try:
+                through_link = build_snapshot_document(
+                    link,
+                    "blender-5.2.0",
+                    main_scene,
+                    [asset],
+                )
+                self.assertEqual(
+                    {entry["relative_path"] for entry in through_link["files"]},
+                    {"scenes/main.blend", "asset.exr"},
+                )
+
+                through_root = build_snapshot_document(
+                    root,
+                    "blender-5.2.0",
+                    link / "scenes" / "main.blend",
+                    [link / "asset.exr"],
+                )
+                self.assertEqual(
+                    {entry["relative_path"] for entry in through_root["files"]},
+                    {"scenes/main.blend", "asset.exr"},
+                )
+            finally:
+                link.unlink()
+
+    def test_symlink_escaping_the_project_root_still_fails_closed(self) -> None:
+        temporary, root, main_scene = self.fixture()
+        with temporary:
+            outside = root.parent / f"{root.name}-outside.exr"
+            outside.write_bytes(b"outside")
+            escape = root / "escape.exr"
+            escape.symlink_to(outside)
+            try:
+                with self.assertRaises(SnapshotExportError) as escaped:
+                    build_snapshot_document(root, "blender-5.2.0", main_scene, [escape])
+                self.assertEqual(escaped.exception.code, "dependency_outside_project_root")
+            finally:
+                outside.unlink(missing_ok=True)
+
     def test_unicode_relative_path_is_preserved(self) -> None:
         temporary, root, main_scene = self.fixture()
         with temporary:

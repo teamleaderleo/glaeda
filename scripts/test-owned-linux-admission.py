@@ -152,6 +152,57 @@ class AdmissionTests(unittest.TestCase):
             reservation.release()
         self.assertFalse((self.admission / "reservation.json").exists())
 
+    def test_resume_launches_under_the_admitted_demand_not_the_default(self):
+        available = {"bytes": 40 * 1024**3}
+
+        def changing_headroom(entry, arguments, raw=b""):
+            result = self.query(entry, arguments, raw)
+            if entry["path"] == "/host":
+                result["memory"]["available_bytes"] = available["bytes"]
+            return result
+
+        self.query_mock.side_effect = changing_headroom
+        demand = gate.AdmissionDemand(memory_bytes=32 * 1024**3, minimum_logical_cpus=8)
+        with gate.Reservation(self.admission, self.fingerprint, self.unit, self.binding(), demand):
+            pass  # Controller boundary before launch; the preparing record survives.
+        record = json.loads((self.admission / "reservation.json").read_bytes())
+        self.assertEqual(record["demand"],
+                         {"memory_bytes": 32 * 1024**3, "minimum_logical_cpus": 8})
+
+        # Headroom now covers the default demand plus the owner reserve, not the admitted one.
+        available["bytes"] = 13 * 1024**3
+        resumed = gate.Reservation.resume(self.admission, self.fingerprint, self.unit,
+                                          self.binding(), demand)
+        with resumed:
+            self.assertEqual(resumed.demand, demand)
+            with self.assertRaisesRegex(gate.Deferred, "capacity unavailable"):
+                with resumed.launch():
+                    self.fail("resumed reservation launched under the default demand")
+            self.assertFalse(resumed.launch_attempted)
+        self.assertTrue((self.admission / "reservation.json").exists())
+
+    def test_resume_and_recovery_refuse_another_demand(self):
+        demand = gate.AdmissionDemand(memory_bytes=12 * 1024**3, minimum_logical_cpus=8)
+        other = gate.AdmissionDemand(memory_bytes=8 * 1024**3, minimum_logical_cpus=8)
+        with gate.Reservation(self.admission, self.fingerprint, self.unit, self.binding(), demand):
+            pass
+        with self.assertRaisesRegex(task.Refusal, "exact resumable preparation"):
+            with gate.Reservation.resume(self.admission, self.fingerprint, self.unit,
+                                         self.binding(), other):
+                self.fail("another demand resumed the reservation")
+        with self.assertRaisesRegex(task.Refusal, "invalid local admission demand"):
+            gate.Reservation.resume(self.admission, self.fingerprint, self.unit,
+                                    self.binding(), object())
+        settled = mock.Mock()
+        with self.assertRaisesRegex(task.Refusal, "exact terminal"):
+            gate.recover(self.admission, self.fingerprint, self.unit, self.binding(),
+                         settled, other)
+        settled.assert_not_called()
+        gate.recover(self.admission, self.fingerprint, self.unit, self.binding(),
+                     settled, demand)
+        settled.assert_called_once_with()
+        self.assertFalse((self.admission / "reservation.json").exists())
+
     def test_observation_refuses_malformed_reducer_and_policy_change(self):
         self.query_mock.side_effect = lambda *args: {}
         self.assertEqual(gate.observe(self.admission)["outcome"], "refused")

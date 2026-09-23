@@ -92,7 +92,7 @@ Glaeda owns the compute-side layer shared across workload families:
 - hot-state validity, reuse, reset, retention, and teardown policy;
 - bounded human/JSON evidence for results, recovery debt, and performance decisions.
 
-Workload adapters own domain semantics and result authority. GitHub Actions remains the ordinary workflow scheduler, check/status surface, and hosted log owner for GitHub jobs. Backends such as Lima/VZ, native Linux, operator-owned fleet nodes, and future VM/container or burst providers remain mechanisms selected through capability and complete-loop evidence.
+Workload adapters own domain semantics and result authority. GitHub Actions remains the ordinary workflow scheduler, check/status surface, and hosted log owner for GitHub jobs. Backends such as Lima/VZ, native Linux, operator-owned fleet nodes, and future VM/container or burst providers remain mechanisms selected through capability and complete-loop evidence. When several orchestrators share one physical node, caller identity, semantic workload identity, and the physical execution lease remain independent; every participating adapter converges on one local collision boundary before consuming scarce resources. See [`docs/MULTI_ORCHESTRATOR_INTEROP.md`](docs/MULTI_ORCHESTRATOR_INTEROP.md).
 
 The first production host/backend is an operator-owned Apple-silicon Mac with Linux execution through Lima/VZ. macOS is the trusted control plane; filesystem-heavy workload execution happens inside Linux. See [`docs/LINUX-ACCEPTANCE.md`](docs/LINUX-ACCEPTANCE.md) and the threat model for the exact boundary.
 
@@ -149,12 +149,14 @@ Documentation-only changes follow the repository's docs-only verification policy
 ## Project documents
 
 - [`docs/COMPUTE_RUNTIME.md`](docs/COMPUTE_RUNTIME.md) — general compute-runtime boundary and typed workload seam.
+- [`docs/MULTI_ORCHESTRATOR_INTEROP.md`](docs/MULTI_ORCHESTRATOR_INTEROP.md) — caller/request/physical-lease interoperability for shared CMUX-owned hardware.
 - [`docs/BLAZINGLY_HOT.md`](docs/BLAZINGLY_HOT.md) — trusted residency and hot execution.
 - [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) — hostile/unknown execution boundary.
 - [`docs/AGENT_EXECUTION_SAFETY.md`](docs/AGENT_EXECUTION_SAFETY.md) — ownership, durable state, mutation, subprocess, and experiment safety.
 - [`docs/WORKSPACE_BOOTSTRAP.md`](docs/WORKSPACE_BOOTSTRAP.md) — repository bootstrap contract.
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — current sequencing and detailed programme state.
 - [`docs/MANIFEST.md`](docs/MANIFEST.md) — project manifest model.
+- [`docs/MODULE_INVENTORY.md`](docs/MODULE_INVENTORY.md) — generated: every exported module and what reaches it.
 - [`AGENTS.md`](AGENTS.md) — repository instructions and task routing for agents.
 
 ## License
