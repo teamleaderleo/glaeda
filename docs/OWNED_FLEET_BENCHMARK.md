@@ -408,6 +408,8 @@ It answers:
 
 Fleet-planning roles require repeated validated samples plus a complete stable large/medium/small contention set. A single successful command does not classify a node.
 
+A stability gate is satisfied only by facts that were actually observed. Swap growth is reported as `null` when the host swap probe failed or the platform is unsupported, and that unmeasured value does not count as an observed zero; a window that reports no `failure_count` at all does not count as a window without failures. Such a set is not classified stable, and the report names each unproven window and the fact it never measured. A corrupt or non-object evidence document refuses the report naming the exact path, instead of being skipped into a report that silently omits it.
+
 These are acquisition/redeployment labels only. CMUX execution-role eligibility and routing authority remain with the CMUX fleet enrollment/acceptance contract on current main.
 
 Recognized evidence-driven planning roles include:
@@ -430,4 +432,4 @@ python3 -m py_compile scripts/owned_fleet_benchmark/*.py scripts/owned-fleet-ben
 python3 scripts/test-owned-fleet-benchmark.py
 ```
 
-The suite covers generic catalog closure, partial-machine execution refusal, machine comparison identity, exact state contracts, validated-only window reduction, over-concurrency refusal, mixed-machine refusal, complete 1/2/4 comparison requirements, fixed-window comparability, cold-hosted/hot-owned economics, machine/economics identity fences, mixed-report evidence, and conservative role classification.
+The suite covers generic catalog closure, partial-machine execution refusal, machine comparison identity, exact state contracts, validated-only window reduction, over-concurrency refusal, mixed-machine refusal, complete 1/2/4 comparison requirements, fixed-window comparability, cold-hosted/hot-owned economics, machine/economics identity fences, mixed-report evidence, conservative role classification, refusal of unmeasured swap and missing failure counts as stability evidence, and refusal of corrupt evidence documents.

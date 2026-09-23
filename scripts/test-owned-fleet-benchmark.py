@@ -16,7 +16,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import owned_fleet_benchmark as fleet
 from owned_fleet_benchmark.observe import run_shell, validate_semantic
 from owned_fleet_benchmark.cli import parser as fleet_parser
-from owned_fleet_benchmark.report import _stable_profile_sets, markdown_report
+from owned_fleet_benchmark.report import (
+    _stable_profile_sets,
+    collect_json_files,
+    markdown_report,
+)
 from owned_fleet_benchmark.run import _validate_direct_runtime
 from owned_fleet_benchmark.model import GIT_PROBE_ENV, env_for, git_identity, verify_source
 
@@ -840,16 +844,15 @@ class FleetHarnessTests(unittest.TestCase):
         values = self._reduced_windows()
         for value in values:
             value["concurrency"]["underfilled"] = False
-        self.assertIn(
-            ("glaeda-rust-focused-v1", "native-linux"),
-            _stable_profile_sets(values),
-        )
+        stable, unproven = _stable_profile_sets(values)
+        self.assertIn(("glaeda-rust-focused-v1", "native-linux"), stable)
+        self.assertEqual(unproven, [])
 
         swapped = copy.deepcopy(values)
         swapped[1]["resources"]["swap_growth_max_observed_bytes"] = 1024
         self.assertNotIn(
             ("glaeda-rust-focused-v1", "native-linux"),
-            _stable_profile_sets(swapped),
+            _stable_profile_sets(swapped)[0],
         )
 
         collapsed = copy.deepcopy(values)
@@ -858,8 +861,79 @@ class FleetHarnessTests(unittest.TestCase):
         )
         self.assertNotIn(
             ("glaeda-rust-focused-v1", "native-linux"),
-            _stable_profile_sets(collapsed),
+            _stable_profile_sets(collapsed)[0],
         )
+
+    def test_role_stability_refuses_unmeasured_swap_and_missing_failure_count(
+        self,
+    ) -> None:
+        values = self._reduced_windows()
+        for value in values:
+            value["concurrency"]["underfilled"] = False
+        self.assertEqual(
+            values[0]["resources"]["swap_growth_max_observed_bytes"], 0.0
+        )
+
+        # swap_used_bytes() returns None when the probe fails or the platform is
+        # unsupported, so None means never observed, not observed to be zero.
+        unobserved = copy.deepcopy(values)
+        unobserved[1]["resources"]["swap_growth_max_observed_bytes"] = None
+        stable, unproven = _stable_profile_sets(unobserved)
+        self.assertNotIn(("glaeda-rust-focused-v1", "native-linux"), stable)
+        self.assertTrue(any("swap" in reason for reason in unproven))
+
+        missing = copy.deepcopy(values)
+        del missing[2]["counts"]["failure_count"]
+        stable, unproven = _stable_profile_sets(missing)
+        self.assertNotIn(("glaeda-rust-focused-v1", "native-linux"), stable)
+        self.assertTrue(any("failure_count" in reason for reason in unproven))
+
+        # A boolean is not a measured byte count.
+        boolean = copy.deepcopy(values)
+        boolean[0]["resources"]["swap_growth_max_observed_bytes"] = False
+        self.assertNotIn(
+            ("glaeda-rust-focused-v1", "native-linux"),
+            _stable_profile_sets(boolean)[0],
+        )
+
+    def test_report_names_the_unproven_stability_input(self) -> None:
+        machine = complete_machine()
+        values = self._reduced_windows()
+        for value in values:
+            value["concurrency"]["underfilled"] = False
+        values[1] = copy.deepcopy(values[1])
+        values[1]["resources"]["swap_growth_max_observed_bytes"] = None
+        report = markdown_report(machine, [], values, [])
+        role_section = report.split("## Fleet-planning role evidence", 1)[1]
+        self.assertIn("swap", role_section)
+        self.assertIn("glaeda-rust-focused-v1", role_section)
+
+    def test_collect_json_files_refuses_a_corrupt_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "good.json").write_text(
+                json.dumps(
+                    {"document_type": "glaeda-owned-vs-hosted-economics"}
+                )
+            )
+            self.assertEqual(
+                len(
+                    collect_json_files(
+                        root, "glaeda-owned-vs-hosted-economics"
+                    )
+                ),
+                1,
+            )
+            (root / "corrupt.json").write_text("{not json")
+            with self.assertRaisesRegex(FleetError, "corrupt.json"):
+                collect_json_files(root, "glaeda-owned-vs-hosted-economics")
+
+    def test_collect_json_files_refuses_a_non_object_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "list.json").write_text("[]")
+            with self.assertRaisesRegex(FleetError, "list.json"):
+                collect_json_files(root, "glaeda-owned-vs-hosted-economics")
 
     def test_window_comparison_refuses_changed_budget(self) -> None:
         values = self._reduced_windows()

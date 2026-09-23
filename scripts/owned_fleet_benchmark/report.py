@@ -43,9 +43,34 @@ def _validate_report_evidence(
     return comparison_digest
 
 
+def _measured_number(value: Any) -> float | None:
+    """One actually observed number, or None when the fact was never measured.
+
+    `resource.swap_used_bytes()` returns None when its probe fails or the platform
+    is unsupported, and that None reaches the window receipt. Unmeasured is not
+    measured-zero, so it must not satisfy a gate that exists to prove a zero.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _window_label(window: dict[str, Any]) -> str:
+    return (
+        f"`{window.get('workload_id')}` / `{window.get('backend_id')}` / "
+        f"`{window.get('profile_id')}`"
+    )
+
+
 def _stable_profile_sets(
     windows: list[dict[str, Any]],
-) -> set[tuple[str, str | None]]:
+) -> tuple[set[tuple[str, str | None]], list[str]]:
+    """Profile sets proven stable, plus an explicit reason for each unproven one.
+
+    A stability gate may only be satisfied by evidence that was observed. A window
+    that never measured swap, or that reports no failure count at all, is reported
+    as unproven rather than counted as clean.
+    """
     grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for window in windows:
         key = (
@@ -69,6 +94,7 @@ def _stable_profile_sets(
         grouped.setdefault(key, []).append(window)
 
     stable: set[tuple[str, str | None]] = set()
+    unproven: list[str] = []
     for group in grouped.values():
         if len(group) != 3:
             continue
@@ -90,23 +116,42 @@ def _stable_profile_sets(
         ):
             continue
         best_p90 = min(float(value) for value in p90_values)
+
+        unmeasured: list[str] = []
+        for item in group:
+            label = _window_label(item)
+            counts = item.get("counts") or {}
+            if _measured_number(counts.get("failure_count")) is None:
+                unmeasured.append(
+                    f"{label} reports no failure_count, so a clean run is unproven"
+                )
+            resources = item.get("resources") or {}
+            swap_growth = resources.get("swap_growth_max_observed_bytes")
+            if _measured_number(swap_growth) is None:
+                unmeasured.append(
+                    f"{label} never observed swap, so swap growth is unproven"
+                )
+        if unmeasured:
+            unproven.extend(unmeasured)
+            continue
+
         if all(
             item["counts"]["validated_completions"] == item["counts"]["offered"]
             and item["counts"]["unfinished"] == 0
-            and item["counts"].get("failure_count", 0) == 0
+            and _measured_number(item["counts"]["failure_count"]) == 0
             and item["counts"]["fallback_count"] == 0
             and item["counts"]["reset_count"] == 0
             and not item.get("concurrency", {}).get("underfilled", True)
-            and (
-                item.get("resources", {}).get("swap_growth_max_observed_bytes")
-                in (None, 0, 0.0)
+            and _measured_number(
+                item["resources"]["swap_growth_max_observed_bytes"]
             )
+            == 0
             and float(item["final_result_latency_ms"]["p90"]) <= best_p90 * 1.5
             for item in group
         ):
             first = group[0]
             stable.add((first.get("workload_id"), first.get("backend_id")))
-    return stable
+    return stable, unproven
 
 def markdown_report(
     machine: dict[str, Any],
@@ -491,7 +536,7 @@ def markdown_report(
         ),
         "",
     ]
-    stable_sets = _stable_profile_sets(windows)
+    stable_sets, unproven_stability = _stable_profile_sets(windows)
     sample_counts: dict[tuple[str, str], int] = {}
     for receipt in validated:
         key = (
@@ -632,6 +677,18 @@ def markdown_report(
             "No fleet-planning role is classified before repeated validated samples and "
             "stable contention evidence exist."
         )
+    if unproven_stability:
+        lines += [
+            "",
+            (
+                "Stability is unproven for the following windows; an unmeasured "
+                "fact is not a clean measurement and does not satisfy the gate:"
+            ),
+            "",
+        ]
+        lines.extend(
+            f"- {reason}" for reason in dict.fromkeys(unproven_stability)
+        )
     lines.append("")
     return "\n".join(lines)
 
@@ -648,10 +705,13 @@ def collect_json_files(
     )
     values = []
     for path in sorted(directory.glob("*.json")):
-        try:
-            value = load_json(path)
-        except FleetError:
-            continue
+        # A corrupt receipt is missing evidence, not absent evidence. Refuse the
+        # report instead of quietly producing one that omits it.
+        value = load_json(path)
+        if not isinstance(value, dict):
+            raise FleetError(
+                f"benchmark evidence {path} is not a JSON object"
+            )
         if value.get("document_type") in allowed:
             values.append(value)
     return values
