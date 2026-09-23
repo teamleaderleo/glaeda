@@ -872,6 +872,85 @@ class FleetTests(unittest.TestCase):
             {"cmux_macos_native_build": dict(f.ROLE_PROFILES["cmux_macos_native_build"])},
         )
 
+    def test_renewal_refreshes_capabilities_and_requires_new_acceptance(self):
+        for family in ("macos", "linux"):
+            with self.subTest(family=family):
+                original = enrollment(family)
+                old_receipt = finalized(original)
+                current = f.transition(original, "quarantined", "toolchain_mismatch")
+                bootstrap = bootstrap_for(current, D)
+                bootstrap["glaedaGeneration"] = E
+                bootstrap["osVersionClass"] = "updated-os"
+                before = copy.deepcopy(current)
+                plan = f.renewal_plan(current, bootstrap)
+                self.assertEqual(current, before)
+                renewed = plan["replacement"]
+                self.assertEqual(renewed["nodeId"], current["nodeId"])
+                self.assertEqual(renewed["operatorFleetScope"], current["operatorFleetScope"])
+                self.assertEqual(renewed["enrollmentGeneration"], current["enrollmentGeneration"] + 1)
+                self.assertEqual(renewed["supportedToolchainGenerations"], [D])
+                self.assertEqual(renewed["glaedaGeneration"], E)
+                self.assertEqual(renewed["os"]["versionClass"], "updated-os")
+                self.assertEqual(renewed["state"], "enrolling")
+                self.assertIsNone(renewed["quarantineReason"])
+                with self.assertRaisesRegex(f.FleetError, "current accepted role"):
+                    f.transition(renewed, "eligible", None, [old_receipt])
+                fresh_receipt = finalized(renewed, toolchain=D)
+                eligible = f.transition(renewed, "eligible", None, [fresh_receipt])
+                self.assertTrue(f.node_status(eligible, [fresh_receipt])["routingCandidateEligible"])
+                self.assertFalse(f.node_status(eligible, [fresh_receipt])["automaticDispatchAuthorized"])
+
+    def test_renewal_refuses_live_terminal_blocked_and_exhausted_inputs(self):
+        for state in f.STATES:
+            if state == "quarantined":
+                continue
+            with self.subTest(state=state):
+                current = enrollment(state=state)
+                with self.assertRaisesRegex(f.FleetError, "quarantined"):
+                    f.renewal_plan(current, bootstrap_for(current))
+        current = f.transition(enrollment(), "quarantined", "service_mismatch")
+        bootstrap = bootstrap_for(current)
+        bootstrap["eligibleForEnrollment"] = False
+        with self.assertRaisesRegex(f.FleetError, "blocking checks"):
+            f.renewal_plan(current, bootstrap)
+        current["enrollmentGeneration"] = 2**31 - 1
+        with self.assertRaisesRegex(f.FleetError, "exhausted"):
+            f.renewal_plan(current, bootstrap_for(current))
+
+    def test_apply_renewal_binds_plan_and_publishes_once(self):
+        for changed in (None, "enrollment", "bootstrap", "digest"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                root.chmod(0o700)
+                path = root / "enrollment.json"
+                bootstrap_path = root / "bootstrap.json"
+                current = f.transition(enrollment(), "quarantined", "toolchain_mismatch")
+                bootstrap = bootstrap_for(current, D)
+                plan = f.renewal_plan(current, bootstrap)
+                if changed == "enrollment":
+                    current["quarantineReason"] = "hardware_failure"
+                if changed == "bootstrap":
+                    bootstrap["toolchainGeneration"] = E
+                for target, value in ((path, current), (bootstrap_path, bootstrap)):
+                    target.write_bytes(f.canonical(value))
+                    target.chmod(0o600)
+                before = path.read_bytes()
+                self.assertEqual(f.renewal_plan(current, bootstrap)["replacement"]["state"], "enrolling")
+                self.assertFalse((root / ".mutation.lock").exists())
+                if changed:
+                    with self.assertRaisesRegex(f.FleetError, "plan changed"):
+                        f.apply_renewal(path, bootstrap_path, A if changed == "digest" else plan["planSha256"])
+                    self.assertEqual(path.read_bytes(), before)
+                else:
+                    result = f.apply_renewal(path, bootstrap_path, plan["planSha256"])
+                    self.assertEqual(result, plan["replacement"])
+                    self.assertEqual(f.load(path), result)
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                    with self.assertRaisesRegex(f.FleetError, "quarantined"):
+                        f.apply_renewal(path, bootstrap_path, plan["planSha256"])
+                    self.assertEqual(f.load(path), result)
+                self.assertFalse(list(root.glob(".enrollment.next.*")))
+
     def test_blocked_bootstrap_cannot_enroll(self):
         bootstrap = {
             "schema": f.BOOTSTRAP_SCHEMA,

@@ -256,7 +256,34 @@ python3 scripts/cmux_fleet.py transition-apply "$ENROLLMENT" \
   --to quarantined --reason toolchain_mismatch
 ```
 
-After a toolchain, OS, hardware class, or Glaeda update, rerun bootstrap and create a fresh enrollment with generation N+1. Old acceptance receipts then become stale by construction.
+After a toolchain, OS, hardware class, or Glaeda update, quarantine the enrollment
+and rerun the platform bootstrap above into a private mode-0600 `$BOOTSTRAP`
+report. Renew from that report instead of hand-editing the enrollment or choosing
+a generation number:
+
+```bash
+python3 scripts/cmux_fleet.py renew-enrollment "$ENROLLMENT" "$BOOTSTRAP"
+# Inspect replacement capabilities and copy planSha256 from the preview.
+python3 scripts/cmux_fleet.py renew-enrollment-apply "$ENROLLMENT" "$BOOTSTRAP" \
+  --expected-plan-sha256 sha256:REPLACE_WITH_PREVIEW_DIGEST
+```
+
+The preview has no side effects. Apply re-reads both private documents under the
+existing enrollment mutation lock and refuses if either differs from the preview.
+It preserves node ID and fleet scope, refreshes capabilities from bootstrap,
+advances the enrollment generation once, and atomically publishes `enrolling`.
+Old receipts cannot promote this generation; rerun `accept-local` and then
+`transition-apply --to eligible` using the new receipt. A repeated apply refuses
+without advancing the generation again. Active, draining, and retired enrollments
+cannot use renewal.
+
+Bootstrap is observation-only: renewal does not certify report freshness or grant
+execution ownership. Fresh local acceptance still re-observes the machine. The
+caller must first stop new work through its actual scheduler and settle existing
+work before changing software; quarantine alone does not drain that scheduler.
+If the candidate fails, quarantine its enrollment, restore the reviewed previous software,
+rerun bootstrap and renew again before acceptance. The old receipt is never a
+rollback shortcut.
 
 Rollback an onboarding before candidate promotion, or retire an active node, by preserving the record in the terminal `retired` state:
 
