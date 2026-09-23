@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import importlib.util
 import io
+import json
+import os
+import stat
 from pathlib import Path
 import subprocess
 import tarfile
@@ -102,6 +105,101 @@ class BundleTests(unittest.TestCase):
         with mock.patch.object(b, "MAX_TOTAL", 16384):
             with self.assertRaisesRegex(b.BundleError, "expands beyond"):
                 b.verify(raw, b.sha256(raw), SOURCE, TARGET)
+
+    def test_stage_preview_and_apply_preserve_previous_generation(self):
+        payload, manifest = fixture()
+        raw = b.archive_bytes(payload, manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            old = root / "previous"
+            old.mkdir()
+            (old / "binary").write_bytes(b"previous")
+            destination = root / "candidate"
+            preview = b.stage(raw, b.sha256(raw), SOURCE, TARGET, destination)
+            self.assertEqual(preview["state"], "planned")
+            self.assertFalse(destination.exists())
+            result = b.stage(raw, b.sha256(raw), SOURCE, TARGET, destination, apply=True)
+            self.assertEqual(result["state"], "staged")
+            self.assertEqual(json.loads((destination / "stage-receipt.json").read_bytes()), result)
+            self.assertFalse(result["automaticUpdateAuthorized"])
+            for name, data in payload.items():
+                self.assertEqual((destination / name).read_bytes(), data)
+            self.assertEqual(stat.S_IMODE((destination / "bin/glaeda").stat().st_mode), 0o700)
+            self.assertEqual((old / "binary").read_bytes(), b"previous")
+            with self.assertRaisesRegex(b.BundleError, "already exists"):
+                b.stage(raw, b.sha256(raw), SOURCE, TARGET, destination, apply=True)
+
+    def test_stage_refuses_bad_digest_before_any_write(self):
+        payload, manifest = fixture()
+        raw = b.archive_bytes(payload, manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with self.assertRaises(b.BundleError):
+                b.stage(raw, "0" * 64, SOURCE, TARGET, root / "candidate", apply=True)
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_stage_requires_private_canonical_parent_and_fresh_destination(self):
+        payload, manifest = fixture()
+        raw = b.archive_bytes(payload, manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            private = root / "private"
+            private.mkdir(mode=0o700)
+            alias = root / "alias"
+            alias.symlink_to(private, target_is_directory=True)
+            occupied = private / "candidate"
+            occupied.symlink_to(root / "missing")
+            for destination in (alias / "new", occupied, Path("relative/new")):
+                with self.subTest(destination=destination), self.assertRaises((b.BundleError, OSError)):
+                    b.stage(raw, b.sha256(raw), SOURCE, TARGET, destination, apply=True)
+            private.chmod(0o755)
+            with self.assertRaisesRegex(b.BundleError, "0700"):
+                b.stage(raw, b.sha256(raw), SOURCE, TARGET, private / "new", apply=True)
+            self.assertFalse((private / "new").exists())
+
+    def test_stage_failure_retains_incomplete_directory_without_adopting_it(self):
+        payload, manifest = fixture()
+        raw = b.archive_bytes(payload, manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            destination = root / "candidate"
+            real_fsync = os.fsync
+            count = 0
+            def fail_during_files(fd):
+                nonlocal count
+                count += 1
+                if count == 3:
+                    raise OSError("injected I/O failure")
+                return real_fsync(fd)
+            with mock.patch.object(b.os, "fsync", side_effect=fail_during_files):
+                with self.assertRaises(OSError):
+                    b.stage(raw, b.sha256(raw), SOURCE, TARGET, destination, apply=True)
+            self.assertTrue(destination.is_dir())
+            self.assertFalse((destination / "stage-receipt.json").exists())
+            with self.assertRaisesRegex(b.BundleError, "already exists"):
+                b.stage(raw, b.sha256(raw), SOURCE, TARGET, destination, apply=True)
+
+    def test_stage_rejects_parent_replacement_before_completion(self):
+        payload, manifest = fixture()
+        raw = b.archive_bytes(payload, manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            parent = root / "private"
+            parent.mkdir(mode=0o700)
+            original_open = b.private_parent
+            calls = 0
+            def replace_parent(path):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    parent.rename(root / "moved")
+                    parent.mkdir(mode=0o700)
+                return original_open(path)
+            with mock.patch.object(b, "private_parent", side_effect=replace_parent):
+                with self.assertRaisesRegex(b.BundleError, "parent moved"):
+                    b.stage(raw, b.sha256(raw), SOURCE, TARGET, parent / "candidate", apply=True)
+            self.assertEqual(list(parent.iterdir()), [])
+            self.assertFalse((root / "moved/candidate/stage-receipt.json").exists())
 
     def test_source_requires_exact_clean_checkout(self):
         with tempfile.TemporaryDirectory() as temporary:

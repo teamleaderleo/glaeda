@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and verify exact-source fleet candidate bundles; never install or execute them."""
+"""Build, verify and stage exact-source fleet candidates."""
 from __future__ import annotations
 
 import argparse
@@ -129,7 +129,7 @@ def archive_bytes(payload: dict[str, bytes], manifest: dict) -> bytes:
     return output.getvalue()
 
 
-def verify(raw: bytes, expected_sha256: str, source: str, target: str) -> dict:
+def verified_contents(raw: bytes, expected_sha256: str, source: str, target: str) -> tuple[dict, dict[str, bytes]]:
     if len(raw) > MAX_ARCHIVE or sha256(raw) != expected_sha256:
         raise BundleError("candidate archive digest or size mismatch")
     contents = {}
@@ -181,9 +181,117 @@ def verify(raw: bytes, expected_sha256: str, source: str, target: str) -> dict:
                           for name, data in contents.items()}
         if manifest["files"] != expected_files:
             raise BundleError("candidate file inventory mismatch")
-        return manifest
+        return manifest, contents
     except (tarfile.TarError, EOFError, ValueError, TypeError, KeyError) as error:
         raise BundleError("candidate archive or manifest is malformed") from error
+
+
+def verify(raw: bytes, expected_sha256: str, source: str, target: str) -> dict:
+    return verified_contents(raw, expected_sha256, source, target)[0]
+
+
+def private_parent(path: Path) -> int:
+    """Hold a canonical, non-symlink directory chain, ending in a private root."""
+    if not path.is_absolute() or ".." in path.parts or path.resolve(strict=True) != path:
+        raise BundleError("generation parent must be an existing canonical absolute directory")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            info = os.fstat(fd)
+            # Root-owned sticky temporary directories are safe ancestors of a
+            # private user-owned directory. Other writable ancestors are refused.
+            sticky_root = info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
+            if info.st_uid not in (0, os.geteuid()) or (info.st_mode & 0o022 and not sticky_root):
+                raise BundleError("generation parent has an untrusted ancestor")
+        info = os.fstat(fd)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise BundleError("generation parent must be owned by the current user with mode 0700")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def stage(raw: bytes, digest: str, source: str, target: str, destination: Path, *, apply: bool = False) -> dict:
+    manifest, contents = verified_contents(raw, digest, source, target)
+    if destination.name in ("", ".", ".."):
+        raise BundleError("generation directory must have a new name")
+    parent = private_parent(destination.parent)
+    generation = None
+    directories = {}
+    try:
+        try:
+            os.stat(destination.name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise BundleError("generation directory already exists; choose a new directory")
+        result = {
+            "schema": "glaeda-fleet-stage/v1", "state": "planned",
+            "archiveSha256": digest, "source": manifest["source"], "target": target,
+            "generationDirectory": str(destination),
+            "binary": str(destination / "bin/glaeda"),
+            "fleetTool": str(destination / "scripts/cmux_fleet.py"),
+            "automaticUpdateAuthorized": False,
+        }
+        if not apply:
+            return result
+        # mkdir is the exclusive claim: no existing or interrupted directory is
+        # adopted. There is no active pointer and no write to a prior generation.
+        os.mkdir(destination.name, 0o700, dir_fd=parent)
+        generation = os.open(destination.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        os.fchmod(generation, 0o700)
+        os.fsync(parent)
+        for name in ("bin", "scripts", "docs"):
+            os.mkdir(name, 0o700, dir_fd=generation)
+            directories[name] = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=generation)
+            os.fchmod(directories[name], 0o700)
+        for name, data in sorted({**contents, "manifest.json": canonical(manifest)}.items()):
+            parts = name.split("/")
+            directory = directories[parts[0]] if len(parts) == 2 else generation
+            fd = os.open(parts[-1], os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            with os.fdopen(fd, "w+b") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fchmod(stream.fileno(), 0o700 if name == "bin/glaeda" else 0o600)
+                os.fsync(stream.fileno())
+                stream.seek(0)
+                if stream.read(len(data) + 1) != data:
+                    raise BundleError("staged file readback mismatch")
+        for fd in directories.values():
+            os.fsync(fd)
+        # Re-observe the named parent and generation before issuing completion.
+        observed = private_parent(destination.parent)
+        try:
+            fresh, original = os.fstat(observed), os.fstat(parent)
+            if (fresh.st_dev, fresh.st_ino) != (original.st_dev, original.st_ino):
+                raise BundleError("generation parent moved during staging")
+        finally:
+            os.close(observed)
+        named = os.stat(destination.name, dir_fd=parent, follow_symlinks=False)
+        held = os.fstat(generation)
+        if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):
+            raise BundleError("generation directory moved during staging")
+        result["state"] = "staged"
+        fd = os.open("stage-receipt.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=generation)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(canonical(result))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.fsync(generation)
+        return result
+    finally:
+        # Interrupted writes are retained; only a complete receipt reports staging.
+        # Never
+        # recursively clean paths that another process could have replaced.
+        for fd in directories.values():
+            os.close(fd)
+        if generation is not None:
+            os.close(generation)
+        os.close(parent)
 
 
 def build(root: Path, expected_source: str, target: str, output: Path) -> dict:
@@ -225,13 +333,20 @@ def main() -> int:
     v = sub.add_parser("verify")
     v.add_argument("archive", type=Path)
     v.add_argument("--sha256", required=True)
-    for p in (b, v):
+    st = sub.add_parser("stage", help="preview or prepare a fresh private generation")
+    st.add_argument("archive", type=Path)
+    st.add_argument("--sha256", required=True)
+    st.add_argument("--directory", type=Path, required=True)
+    st.add_argument("--apply", action="store_true", help="write the previewed generation")
+    for p in (b, v, st):
         p.add_argument("--source", required=True)
         p.add_argument("--target", required=True, choices=sorted(TARGETS))
     args = parser.parse_args()
     try:
         if args.command == "build":
             result = build(Path(__file__).resolve().parents[1], args.source, args.target, args.output)
+        elif args.command == "stage":
+            result = stage(file_bytes(args.archive), args.sha256, args.source, args.target, args.directory, apply=args.apply)
         else:
             result = verify(file_bytes(args.archive), args.sha256, args.source, args.target)
         print(canonical(result).decode(), end="")
