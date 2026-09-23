@@ -63,7 +63,7 @@ first-writer-wins index entries, and an optional read-only index.
 | fresh 1 | service only | **33.3 s** | 189 / 1 | 3.6x faster than cold |
 | fresh 2 | service only | **30.1 s** | 190 / 0 | 3.9x |
 
-`SWIFT_SUPPRESS_WARNINGS=YES` was set for these four runs (see blocker 1).
+`SWIFT_SUPPRESS_WARNINGS=YES` was set for these four runs, before the replay crash was traced to symlinked build paths (see finding 1).
 Store after the fill: 177 MB, 1,674 objects, 716 index entries. The remaining ~30 s is
 work the cache does not cover: package resolution, dependency scanning, build planning,
 linking, and bundle steps.

@@ -32,9 +32,9 @@ Sources: [Blacksmith pricing](https://www.blacksmith.sh/pricing), [Blacksmith in
 
 Observations:
 
-- **Price floor is $0.06 to $0.08/min** for a 6 to 8 core Mac VM. Nobody competes on price below that; the differentiators are queue depth, cache, and hardware generation.
+- **Price floor is $0.06 to $0.08/min** for a 6 to 8 core Mac VM. Unit-priced offers below that exist (Namespace from about $0.04, Buildkite per vCPU-minute), but the differentiators are queue depth, cache, and hardware generation.
 - **Hot state is a Linux feature everywhere except Namespace and Buildkite.** WarpBuild says so outright. Blacksmith documents sticky disks only with Ubuntu examples.
-- **The cache winners on macOS are colocated.** Tuist's own benchmarks show remote cache gains shrink versus local (Wikipedia 24% local vs 18% remote; Pocket Casts 36% vs 20%). That matches the #1134 finding that a store 100 ms away broke uploads and the node daemon is required.
+- **The cache winners on macOS are colocated.** Tuist's own benchmarks show remote cache gains shrink versus local (Wikipedia 24% local vs 18% remote; Pocket Casts 36% vs 20%). Separately, #1134 found that the client sends large blobs as file paths on its own disk, so a store on another host cannot receive them; that, not distance, is why the node daemon is required.
 - **Queue depth is the real product for cmux.** The 1 to 3 hour wait is capacity, not speed. Every provider above sells burst capacity from a shared pool; the minis are dedicated capacity.
 
 ## 2. macOS virtualization constraints
@@ -88,7 +88,7 @@ Decision rule: if restore plus checkout plus incremental build is under ~90 s p5
 - *Locality:* because save files are bound to one Mac and user, each mini builds its own generation (cost: one incremental build per merge per mini, cheap when warm). The fleet shares only the compilation cache and base OCI image, not memory state. Treat this as a hard constraint, not an optimisation to remove later.
 - *Ultra-trusted tier:* a resident VM or bare-metal slot that never resets (the current warm slot), for maintainers and main. The fastest path, and the only tier allowed to keep state across jobs.
 
-**4. Ship #1134 as a component, not the pitch.** It is necessary (fresh or new machines near warm; 30 s vs 118 s) and makes generation builds cheap, but Tuist, Bitrise and Namespace sell the same protocol. Keep the node daemon mandatory and the store on the LAN; Tuist's own numbers show remote-only halves the gain.
+**4. Ship #1134 as a component, not the pitch.** It is necessary (fresh or new machines near warm; 30 s vs 118 s) and makes generation builds cheap, but Tuist, Bitrise and Namespace sell the same protocol. Keep the node daemon mandatory and the store on the LAN; Tuist's own numbers show remote-only keeps less of the gain (24% local vs 18% remote on one project, 36% vs 20% on another).
 
 **5. Differentiate on "hot at main, per PR, on hardware you own", not per-minute price.** The pitch that no one else can make today: a PR build starts from a memory-hot VM that is already at the latest `main` with warm DerivedData, isolated, discarded afterwards, with an auditable trust receipt for every generation. For cmux the immediate win is simply removing the 1 to 3 hour Blacksmith queue by moving macOS jobs to the minis.
 
