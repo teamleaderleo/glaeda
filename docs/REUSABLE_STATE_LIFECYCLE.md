@@ -79,9 +79,35 @@ on, the same way `docs/THREAT_MODEL.md` does.
   `AdmittedHotStateCandidate` through
   `src/hot_state_path_policy/admission.rs::admit_family_evidence` and then asks
   `src/hot_state_path_policy.rs::HotStatePathPolicy::select` for the mode. Any refusal, any
-  unsupported mode, and any capability-generation drift become
-  `ReusableStateMissReason::HotStateReuseUnproven`. Proven by
+  unsupported mode, and any capability-generation drift refuse reuse. Proven by
   `tests/reusable_state_hot_state_admission.rs`.
+- **enforced** — a ladder refusal is attributed, not counted. Each one carries its own
+  `src/reusable_state_lifecycle.rs::ReusableStateHotStateRefusal` inside
+  `ReusableStateMissReason::HotStateReuseRefused`, mapped by
+  `src/reusable_state_lifecycle.rs::hot_state_reuse_refusal` from
+  `src/reusable_state_hot_state_policy.rs::ReusableStateHotStateDecision::refusal`. A path that
+  refuses 100% of the time therefore reports *what* refused. This is the cmux "0 hits in 112
+  attempts" shape (#1106, #1107) applied to this gate: a refusal you can count but not attribute
+  teaches nothing. Proven by
+  `tests/reusable_state_hot_state_admission.rs::different_hot_state_refusal_causes_produce_distinguishable_miss_reasons`
+  and
+  `tests/reusable_state_hot_state_admission.rs::every_reachable_refusal_cause_reaches_the_serialized_disposition`.
+- **enforced** — the causes this entry point can reach are `sharing_mode_unavailable` (the host
+  offers no reviewed mode that reuses bytes), `unique_local_work`, and `context_underivable` (the
+  contract is not expressible as a hot-state admission context — an error, not a disagreement).
+  `ladder_mismatch` carries the exact refusing rung but is subsumed here:
+  `src/reusable_state_lifecycle.rs::ReusableStateIdentityContract::first_mismatch` runs first and
+  covers every contract field, and
+  `src/reusable_state_hot_state_policy.rs::admission_context` is a pure function of that contract,
+  so contracts that agree on every field derive equal contexts. The rung mismatch is reported one
+  term earlier, by name, as `ReusableStateMissReason::IdentityMismatch`. Pinned by
+  `tests/reusable_state_hot_state_admission.rs::a_ladder_rung_mismatch_is_attributed_by_the_identity_check_that_runs_first`.
+- **required** — `family_standing_refused`, `resource_refused`, and `admission_stale` are named
+  causes for refusals this call site cannot currently produce: standing is derived only from
+  publication, integrity, and revalidation, all of which return a more specific miss reason first;
+  this layer always offers `HotStateResourceDisposition::Accepted`; and the admission is minted and
+  spent inside one `select_reusable_state_hot_state` call. They exist so a future standing source,
+  a real resource check, or a cached admission cannot land in an undifferentiated bucket.
 - **enforced** — the reviewed sharing modes for every reusable-state path class are
   `immutable_overlay` then `private_empty`
   (`src/reusable_state_hot_state_policy.rs::REVIEWED_MODES`), because consumption here is
