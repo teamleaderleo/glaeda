@@ -169,12 +169,20 @@ def swift_driver(toolchain):
     return str(binary)
 
 
+def build_helper(project, profile):
+    try:
+        executable = project_file(project, profile.get("executable"))
+    except FileNotFoundError as error:
+        raise Refusal("configured build helper is missing; check the profile executable") from error
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise Refusal("build helper must be an executable project file")
+    return executable
+
+
 def command_for(project, profile, toolchain, paths):
     kind = profile["engine"]
     if kind == "script":
-        executable = project_file(project, profile.get("executable"))
-        if not executable.is_file() or not os.access(executable, os.X_OK):
-            raise Refusal("build helper must be an executable project file")
+        executable = build_helper(project, profile)
         arguments = profile.get("arguments", [])
         if not isinstance(arguments, list) or len(arguments) > 64:
             raise Refusal("invalid helper arguments")
@@ -339,7 +347,7 @@ def prepare(project, name, generation="default", toolchain_probe=apple_toolchain
     owner = {"schema_version": 1, "project": digest([str(project), info.st_dev, info.st_ino])}
     recipe = None
     if profile["engine"] == "script":
-        recipe_path = project_file(project, profile.get("executable"))
+        recipe_path = build_helper(project, profile)
         recipe = hashlib.sha256(recipe_path.read_bytes()).hexdigest()
     key = digest([owner, profile, tools, generation, recipe])
     invocation_identity = key
