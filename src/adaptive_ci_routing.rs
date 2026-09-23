@@ -18,6 +18,7 @@ pub const MAX_ROUTING_ID_BYTES: usize = 96;
 pub const MAX_ROUTING_CAPABILITIES: usize = 32;
 pub const MAX_ROUTING_POOLS: usize = 32;
 pub const MAX_ROUTING_OBSERVATIONS: usize = 256;
+pub const MIN_ROUTING_VALIDATED_SAMPLES: u16 = 3;
 pub const MAX_ROUTING_PHASE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 pub const MAX_ROUTING_AGE_MILLIS: u64 = 180 * 24 * 60 * 60 * 1_000;
 const PARTS_PER_MILLION: u64 = 1_000_000;
@@ -171,11 +172,23 @@ impl PoolAccountingClass {
     }
 }
 
+/// Declares whether host-pressure evidence is meaningful for this execution pool.
+///
+/// This is deliberately independent of accounting: an owned/on-prem pool can have included-cost
+/// accounting, while a provider-backed pool can use any commercial model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostPressureApplicability {
+    LocalObserved,
+    NotApplicable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionPoolV1 {
     pool_id: RoutingId,
     execution_class: RoutingId,
     accounting_class: PoolAccountingClass,
+    pressure_applicability: HostPressureApplicability,
     capabilities: Vec<RoutingId>,
 }
 
@@ -189,6 +202,7 @@ impl ExecutionPoolV1 {
         pool_id: RoutingId,
         execution_class: RoutingId,
         accounting_class: PoolAccountingClass,
+        pressure_applicability: HostPressureApplicability,
         mut capabilities: Vec<RoutingId>,
     ) -> Result<Self, RoutingError> {
         if capabilities.len() > MAX_ROUTING_CAPABILITIES {
@@ -210,6 +224,7 @@ impl ExecutionPoolV1 {
             pool_id,
             execution_class,
             accounting_class,
+            pressure_applicability,
             capabilities,
         })
     }
@@ -227,6 +242,11 @@ impl ExecutionPoolV1 {
     #[must_use]
     pub const fn accounting_class(&self) -> PoolAccountingClass {
         self.accounting_class
+    }
+
+    #[must_use]
+    pub const fn pressure_applicability(&self) -> HostPressureApplicability {
+        self.pressure_applicability
     }
 
     #[must_use]
@@ -305,6 +325,15 @@ impl HotStateEvidenceV1 {
                 "hot_state.valid_until_millis",
                 "routing_remote_locality_expiry_missing",
                 "remote locality evidence requires an explicit freshness expiry",
+            ));
+        }
+        if source == LocalityEvidenceSource::DeclaredUnknown
+            && (class != HotStateClass::Unknown || state_identity.is_some())
+        {
+            return Err(error(
+                "hot_state.source",
+                "routing_unknown_locality_claim",
+                "unknown locality evidence cannot claim warm or exact reusable state",
             ));
         }
         if valid_until_millis == Some(0) {
@@ -420,14 +449,20 @@ pub struct ContentionEvidenceV1 {
     pub comparison_class: RoutingId,
     pub window_count: u16,
     pub offered_tasks: u32,
+    pub maximum_simultaneous: u16,
     pub validated_completions: u32,
     pub elapsed_millis: u64,
-    pub final_result_p50_millis: u64,
-    pub final_result_p90_millis: u64,
-    pub semantic_mismatches: u16,
-    pub failures: u16,
-    pub fallbacks: u16,
-    pub unfinished: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_result_p50_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_result_p90_millis: Option<u64>,
+    pub semantic_mismatches: u32,
+    pub unvalidated_completions: u32,
+    pub failures: u32,
+    pub resets: u32,
+    pub unknown_results: u32,
+    pub fallbacks: u32,
+    pub unfinished: u32,
     pub peak_pressure: HostPressureClass,
 }
 
@@ -446,8 +481,18 @@ impl ContentionEvidenceV1 {
             ));
         }
         let offered = u64::from(self.offered_tasks);
+        if u32::from(self.maximum_simultaneous) > self.offered_tasks {
+            return Err(error(
+                "contention.maximum_simultaneous",
+                "routing_contention_concurrency_out_of_range",
+                "contention maximum simultaneous work cannot exceed offered work",
+            ));
+        }
         if u64::from(self.semantic_mismatches) > offered
+            || u64::from(self.unvalidated_completions) > offered
             || u64::from(self.failures) > offered
+            || u64::from(self.resets) > offered
+            || u64::from(self.unknown_results) > offered
             || u64::from(self.fallbacks) > offered
             || u64::from(self.unfinished) > offered
         {
@@ -464,12 +509,63 @@ impl ContentionEvidenceV1 {
                 "validated completions cannot exceed offered tasks",
             ));
         }
-        if self.final_result_p90_millis < self.final_result_p50_millis {
+        if self.validated_completions > 0 && self.maximum_simultaneous == 0 {
             return Err(error(
-                "contention.final_result_p90_millis",
-                "routing_contention_percentile_order",
-                "contention p90 cannot be below p50",
+                "contention.maximum_simultaneous",
+                "routing_contention_zero_concurrency_with_completion",
+                "validated contention completions require observed simultaneous work",
             ));
+        }
+        let terminal_partition = u64::from(self.validated_completions)
+            + u64::from(self.semantic_mismatches)
+            + u64::from(self.unvalidated_completions)
+            + u64::from(self.failures)
+            + u64::from(self.resets)
+            + u64::from(self.unknown_results)
+            + u64::from(self.unfinished);
+        if terminal_partition != u64::from(self.offered_tasks) {
+            return Err(error(
+                "contention",
+                "routing_contention_terminal_partition_invalid",
+                "contention terminal counts must exactly cover offered work",
+            ));
+        }
+        match (
+            self.validated_completions,
+            self.final_result_p50_millis,
+            self.final_result_p90_millis,
+        ) {
+            (0, None, None) => {}
+            (0, _, _) => {
+                return Err(error(
+                    "contention.final_result_p50_millis",
+                    "routing_contention_latency_without_validated_completion",
+                    "contention latency must be absent when there are no validated completions",
+                ));
+            }
+            (_, Some(p50), Some(p90)) => {
+                if p90 < p50 {
+                    return Err(error(
+                        "contention.final_result_p90_millis",
+                        "routing_contention_percentile_order",
+                        "contention p90 cannot be below p50",
+                    ));
+                }
+                if p90 > self.elapsed_millis {
+                    return Err(error(
+                        "contention.final_result_p90_millis",
+                        "routing_contention_latency_outside_window",
+                        "contention p90 cannot exceed the observed window",
+                    ));
+                }
+            }
+            _ => {
+                return Err(error(
+                    "contention.final_result_p50_millis",
+                    "routing_contention_validated_latency_missing",
+                    "validated contention completions require p50 and p90 latency",
+                ));
+            }
         }
         Ok(())
     }
@@ -633,13 +729,13 @@ impl PredictionConfigV1 {
         }
         if self.max_samples == 0
             || usize::from(self.max_samples) > MAX_ROUTING_OBSERVATIONS
-            || self.min_validated_samples == 0
+            || self.min_validated_samples < MIN_ROUTING_VALIDATED_SAMPLES
             || self.min_validated_samples > self.max_samples
         {
             return Err(error(
                 "prediction.samples",
                 "routing_prediction_sample_bounds",
-                "prediction sample bounds are invalid",
+                "prediction sample bounds are invalid or below the comparable-sample floor",
             ));
         }
         Ok(())
@@ -724,6 +820,13 @@ impl RoutingPolicyV1 {
                 "policy ratios exceed their bounded range",
             ));
         }
+        if self.mode == RoutingPolicyMode::Latency && self.spend_ceiling_microusd.is_none() {
+            return Err(error(
+                "policy.spend_ceiling_microusd",
+                "routing_latency_spend_ceiling_required",
+                "latency policy requires an explicit spend ceiling",
+            ));
+        }
         if matches!(
             self.max_pressure,
             HostPressureClass::Unknown | HostPressureClass::NotApplicable
@@ -767,7 +870,10 @@ pub enum PoolExclusionReason {
     SpendCeiling,
     AllowanceReserve,
     AllowanceExpired,
+    AllowanceRequired,
+    UnexpectedAllowance,
     InvalidAllowance,
+    InvalidPressureSemantics,
     InvalidContentionEvidence,
     StaleLocalityEvidence,
 }
@@ -860,11 +966,18 @@ impl RoutingRecommendationV1 {
                     }
                     if let Some(contention) = &prediction.contention {
                         out.push_str(&format!(
-                            "  contention: {}/{} validated in {} ms; p90 {} ms; pressure {:?}\n",
+                            "  contention: {}/{} validated in {} ms; max simultaneous {}; p90 {} ms; unvalidated {}; failures {}; resets {}; unknown {}; unfinished {}; fallbacks {}; pressure {:?}\n",
                             contention.validated_completions,
                             contention.offered_tasks,
                             contention.elapsed_millis,
-                            contention.final_result_p90_millis,
+                            contention.maximum_simultaneous,
+                            render_optional_millis(contention.final_result_p90_millis),
+                            contention.unvalidated_completions,
+                            contention.failures,
+                            contention.resets,
+                            contention.unknown_results,
+                            contention.unfinished,
+                            contention.fallbacks,
                             contention.peak_pressure
                         ));
                     }
@@ -872,12 +985,20 @@ impl RoutingRecommendationV1 {
             }
             None => out.push_str("choice: abstained\n"),
         }
-        if self.predictions.len() > 1 {
+        let eligible_alternatives = self
+            .predictions
+            .iter()
+            .filter(|prediction| self.choice.as_ref() != Some(&prediction.pool_id))
+            .filter(|prediction| {
+                !self
+                    .exclusions
+                    .iter()
+                    .any(|exclusion| exclusion.pool_id == prediction.pool_id)
+            })
+            .collect::<Vec<_>>();
+        if !eligible_alternatives.is_empty() {
             out.push_str("alternatives:\n");
-            for prediction in &self.predictions {
-                if self.choice.as_ref() == Some(&prediction.pool_id) {
-                    continue;
-                }
+            for prediction in eligible_alternatives {
                 out.push_str(&format!(
                     "  {}: {}-{} ms, {}-{} microUSD, {:?}\n",
                     prediction.pool_id.as_str(),
@@ -1005,6 +1126,50 @@ pub fn recommend_ci_pool(
             continue;
         }
 
+        match candidate.pool.accounting_class {
+            PoolAccountingClass::MeteredIncluded if candidate.allowance.is_none() => {
+                exclusions.push(PoolExclusionV1 {
+                    pool_id,
+                    reason: PoolExclusionReason::AllowanceRequired,
+                });
+                continue;
+            }
+            PoolAccountingClass::MeteredIncluded => {}
+            _ if candidate.allowance.is_some() => {
+                exclusions.push(PoolExclusionV1 {
+                    pool_id,
+                    reason: PoolExclusionReason::UnexpectedAllowance,
+                });
+                continue;
+            }
+            _ => {}
+        }
+        let pressure_semantics_valid = match candidate.pool.pressure_applicability {
+            HostPressureApplicability::LocalObserved => {
+                candidate.pressure_after_admission != HostPressureClass::NotApplicable
+            }
+            HostPressureApplicability::NotApplicable => {
+                candidate.pressure_after_admission == HostPressureClass::NotApplicable
+            }
+        };
+        if !pressure_semantics_valid
+            || candidate.contention.as_ref().is_some_and(|contention| {
+                match candidate.pool.pressure_applicability {
+                    HostPressureApplicability::LocalObserved => {
+                        contention.peak_pressure == HostPressureClass::NotApplicable
+                    }
+                    HostPressureApplicability::NotApplicable => {
+                        contention.peak_pressure != HostPressureClass::NotApplicable
+                    }
+                }
+            })
+        {
+            exclusions.push(PoolExclusionV1 {
+                pool_id,
+                reason: PoolExclusionReason::InvalidPressureSemantics,
+            });
+            continue;
+        }
         if let Some(allowance) = &candidate.allowance {
             if allowance.validate().is_err() {
                 exclusions.push(PoolExclusionV1 {
@@ -1151,7 +1316,12 @@ fn predict_pool(
     if fresh.is_empty() {
         return Err(EvidenceRefusal::Stale);
     }
-    fresh.sort_by_key(|observation| std::cmp::Reverse(observation.observed_at_millis));
+    fresh.sort_by(|left, right| {
+        right
+            .observed_at_millis
+            .cmp(&left.observed_at_millis)
+            .then_with(|| left.observation_id.cmp(&right.observation_id))
+    });
     fresh.truncate(usize::from(config.max_samples));
 
     let successes: Vec<&RoutingObservationV1> = fresh
@@ -1321,6 +1491,26 @@ fn policy_exclusion(
     }
     if prediction.fallback_permille > policy.max_fallback_permille {
         return Some(PoolExclusionReason::FallbackAbovePolicy);
+    }
+    if let Some(contention) = &candidate.contention {
+        let contention_failure_permille = rate_permille_u64(
+            u64::from(contention.unvalidated_completions)
+                + u64::from(contention.failures)
+                + u64::from(contention.resets)
+                + u64::from(contention.unknown_results)
+                + u64::from(contention.unfinished),
+            u64::from(contention.offered_tasks),
+        );
+        if contention_failure_permille > policy.max_failure_permille {
+            return Some(PoolExclusionReason::ReliabilityAbovePolicy);
+        }
+        let contention_fallback_permille = rate_permille_u64(
+            u64::from(contention.fallbacks),
+            u64::from(contention.offered_tasks),
+        );
+        if contention_fallback_permille > policy.max_fallback_permille {
+            return Some(PoolExclusionReason::FallbackAbovePolicy);
+        }
     }
     if prediction.pressure_after_admission.policy_rank() > policy.max_pressure.policy_rank()
         || candidate.contention.as_ref().is_some_and(|contention| {
@@ -1492,7 +1682,10 @@ fn pressure_cmp(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Orderi
 
 fn contention_cmp(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Ordering {
     match (&left.prediction.contention, &right.prediction.contention) {
-        (Some(left), Some(right)) if left.comparison_class == right.comparison_class => {
+        (Some(left), Some(right))
+            if left.comparison_class == right.comparison_class
+                && left.offered_tasks == right.offered_tasks =>
+        {
             let left_rate =
                 u128::from(left.validated_completions) * u128::from(right.elapsed_millis);
             let right_rate =
@@ -1501,14 +1694,25 @@ fn contention_cmp(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Orde
                 .cmp(&left_rate)
                 .then_with(|| {
                     left.final_result_p90_millis
-                        .cmp(&right.final_result_p90_millis)
+                        .unwrap_or(u64::MAX)
+                        .cmp(&right.final_result_p90_millis.unwrap_or(u64::MAX))
+                })
+                .then_with(|| {
+                    left.unvalidated_completions
+                        .cmp(&right.unvalidated_completions)
                 })
                 .then_with(|| left.failures.cmp(&right.failures))
+                .then_with(|| left.resets.cmp(&right.resets))
+                .then_with(|| left.unknown_results.cmp(&right.unknown_results))
                 .then_with(|| left.fallbacks.cmp(&right.fallbacks))
                 .then_with(|| left.unfinished.cmp(&right.unfinished))
         }
         _ => Ordering::Equal,
     }
+}
+
+fn render_optional_millis(value: Option<u64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |millis| millis.to_string())
 }
 
 fn quantiles(values: impl Iterator<Item = u64>) -> QuantilesU64 {
@@ -1528,6 +1732,14 @@ fn sum_components(values: [u64; 5]) -> u64 {
 
 fn rate_permille(numerator: usize, denominator: usize) -> u16 {
     let value = numerator.saturating_mul(1_000) / denominator.max(1);
+    u16::try_from(value).unwrap_or(1_000)
+}
+
+fn rate_permille_u64(numerator: u64, denominator: u64) -> u16 {
+    if denominator == 0 {
+        return 1_000;
+    }
+    let value = (u128::from(numerator) * 1_000) / u128::from(denominator);
     u16::try_from(value).unwrap_or(1_000)
 }
 
@@ -1587,6 +1799,11 @@ mod tests {
                 id(pool_id),
                 id("macos-arm64"),
                 accounting_class,
+                if accounting_class == PoolAccountingClass::Owned {
+                    HostPressureApplicability::LocalObserved
+                } else {
+                    HostPressureApplicability::NotApplicable
+                },
                 vec![id("arch:arm64"), id("os:macos")],
             )
             .unwrap(),
@@ -1668,6 +1885,39 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn prediction_config_cannot_enable_single_run_recommendations() {
+        let workload = workload();
+        let candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Cold);
+        let observations = vec![observation(
+            &workload,
+            "owned",
+            HotStateClass::Cold,
+            1_000,
+            40_000,
+            0,
+            0,
+            ObservationOutcome::ValidatedSuccess,
+        )];
+        let config = PredictionConfigV1 {
+            max_age_millis: 60_000,
+            max_samples: 1,
+            min_validated_samples: 1,
+        };
+
+        let error = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            config,
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "routing_prediction_sample_bounds");
     }
 
     #[test]
@@ -1929,12 +2179,16 @@ mod tests {
             comparison_class: id("cmux-macos-contention"),
             window_count: 4,
             offered_tasks: 16,
+            maximum_simultaneous: 4,
             validated_completions: 14,
             elapsed_millis: 60_000,
-            final_result_p50_millis: 20_000,
-            final_result_p90_millis: 50_000,
+            final_result_p50_millis: Some(20_000),
+            final_result_p90_millis: Some(50_000),
             semantic_mismatches: 1,
+            unvalidated_completions: 0,
             failures: 0,
+            resets: 0,
+            unknown_results: 0,
             fallbacks: 0,
             unfinished: 1,
             peak_pressure: HostPressureClass::Critical,
@@ -1999,6 +2253,40 @@ mod tests {
     }
 
     #[test]
+    fn unknown_locality_source_cannot_claim_exact_hot_state() {
+        let error = HotStateEvidenceV1::new(
+            HotStateClass::HotExact,
+            Some(id("state:claimed")),
+            LocalityEvidenceSource::DeclaredUnknown,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "routing_unknown_locality_claim");
+    }
+
+    #[test]
+    fn manually_built_latency_policy_requires_spend_ceiling() {
+        let workload = workload();
+        let candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Cold);
+        let observations = three_successes(&workload, "owned", HotStateClass::Cold, 40_000, 0, 0);
+        let mut policy = RoutingPolicyV1::latency(0);
+        policy.spend_ceiling_microusd = None;
+
+        let error = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            policy,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "routing_latency_spend_ceiling_required");
+    }
+
+    #[test]
     fn expired_remote_heat_is_advisory_only_and_refused_as_stale() {
         let workload = workload();
         let mut remote = pool(
@@ -2056,6 +2344,7 @@ mod tests {
                 id("owned-native-linux"),
                 id("native-linux-x86_64"),
                 PoolAccountingClass::Owned,
+                HostPressureApplicability::LocalObserved,
                 vec![id("arch:x86_64"), id("os:linux")],
             )
             .unwrap(),
@@ -2073,12 +2362,16 @@ mod tests {
                 comparison_class: id("glaeda-linux-contention"),
                 window_count: 4,
                 offered_tasks: 16,
+                maximum_simultaneous: 4,
                 validated_completions: 16,
                 elapsed_millis: 120_000,
-                final_result_p50_millis: 28_000,
-                final_result_p90_millis: 41_000,
+                final_result_p50_millis: Some(28_000),
+                final_result_p90_millis: Some(41_000),
                 semantic_mismatches: 0,
+                unvalidated_completions: 0,
                 failures: 0,
+                resets: 0,
+                unknown_results: 0,
                 fallbacks: 0,
                 unfinished: 0,
                 peak_pressure: HostPressureClass::Moderate,
@@ -2308,12 +2601,16 @@ mod tests {
             comparison_class: id("cmux-macos-contention"),
             window_count: 4,
             offered_tasks: 16,
+            maximum_simultaneous: 4,
             validated_completions: 16,
             elapsed_millis: 120_000,
-            final_result_p50_millis: 30_000,
-            final_result_p90_millis: 45_000,
+            final_result_p50_millis: Some(30_000),
+            final_result_p90_millis: Some(45_000),
             semantic_mismatches: 0,
+            unvalidated_completions: 0,
             failures: 0,
+            resets: 0,
+            unknown_results: 0,
             fallbacks: 0,
             unfinished: 0,
             peak_pressure: HostPressureClass::High,
@@ -2486,6 +2783,624 @@ mod tests {
         assert_eq!(report.choice, Some(id("hot")));
         assert_eq!(report.fallback, Some(id("cold")));
         assert!(report.render_human().contains("fallback: cold"));
+    }
+
+    #[test]
+    fn metered_included_pool_requires_allowance_accounting() {
+        let workload = workload();
+        let candidate = pool(
+            "included",
+            PoolAccountingClass::MeteredIncluded,
+            HotStateClass::Cold,
+        );
+        let observations =
+            three_successes(&workload, "included", HotStateClass::Cold, 40_000, 0, 10);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, RecommendationStatus::Abstained);
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("included")
+                && entry.reason == PoolExclusionReason::AllowanceRequired
+        }));
+    }
+
+    #[test]
+    fn non_metered_pool_rejects_allowance_accounting() {
+        let workload = workload();
+        let mut candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Cold);
+        candidate.allowance = Some(AllowanceBudgetV1 {
+            period_id: id("unexpected"),
+            included_budget_units: 100,
+            remaining_estimate_units: 90,
+            reset_at_millis: NOW + 60_000,
+            observed_consumption_units: 10,
+        });
+        let observations = three_successes(&workload, "owned", HotStateClass::Cold, 40_000, 0, 0);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("owned") && entry.reason == PoolExclusionReason::UnexpectedAllowance
+        }));
+    }
+
+    #[test]
+    fn included_accounting_can_still_use_local_pressure_evidence() {
+        let workload = workload();
+        let candidate = PoolCandidateV1 {
+            pool: ExecutionPoolV1::new(
+                id("internal-included"),
+                id("macos-arm64"),
+                PoolAccountingClass::UnmeteredIncluded,
+                HostPressureApplicability::LocalObserved,
+                vec![id("arch:arm64"), id("os:macos")],
+            )
+            .unwrap(),
+            eligibility: PoolEligibility::Eligible,
+            hot_state: HotStateEvidenceV1::new(
+                HotStateClass::Cold,
+                None,
+                LocalityEvidenceSource::LocalAccepted,
+                None,
+            )
+            .unwrap(),
+            pressure_after_admission: HostPressureClass::Low,
+            allowance: None,
+            contention: None,
+        };
+        let observations = three_successes(
+            &workload,
+            "internal-included",
+            HotStateClass::Cold,
+            40_000,
+            0,
+            0,
+        );
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert_eq!(report.choice, Some(id("internal-included")));
+        assert!(!report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("internal-included")
+                && entry.reason == PoolExclusionReason::InvalidPressureSemantics
+        }));
+    }
+
+    #[test]
+    fn owned_pool_cannot_bypass_pressure_with_not_applicable() {
+        let workload = workload();
+        let mut candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Cold);
+        candidate.pressure_after_admission = HostPressureClass::NotApplicable;
+        let observations = three_successes(&workload, "owned", HotStateClass::Cold, 40_000, 0, 0);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("owned")
+                && entry.reason == PoolExclusionReason::InvalidPressureSemantics
+        }));
+    }
+
+    #[test]
+    fn hosted_pool_cannot_invent_local_pressure() {
+        let workload = workload();
+        let mut candidate = pool(
+            "hosted",
+            PoolAccountingClass::PaidBurst,
+            HotStateClass::Cold,
+        );
+        candidate.pressure_after_admission = HostPressureClass::Low;
+        let observations =
+            three_successes(&workload, "hosted", HotStateClass::Cold, 40_000, 10_000, 0);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::latency(20_000),
+        )
+        .unwrap();
+
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("hosted")
+                && entry.reason == PoolExclusionReason::InvalidPressureSemantics
+        }));
+    }
+
+    #[test]
+    fn local_contention_cannot_hide_pressure_as_not_applicable() {
+        let workload = workload();
+        let mut candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Warm);
+        candidate.contention = Some(ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 4,
+            maximum_simultaneous: 4,
+            validated_completions: 4,
+            elapsed_millis: 60_000,
+            final_result_p50_millis: Some(20_000),
+            final_result_p90_millis: Some(30_000),
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 0,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::NotApplicable,
+        });
+        let observations = three_successes(&workload, "owned", HotStateClass::Warm, 40_000, 0, 0);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("owned")
+                && entry.reason == PoolExclusionReason::InvalidPressureSemantics
+        }));
+    }
+
+    #[test]
+    fn nonlocal_contention_cannot_claim_local_pressure() {
+        let workload = workload();
+        let mut candidate = pool(
+            "hosted",
+            PoolAccountingClass::PaidBurst,
+            HotStateClass::Cold,
+        );
+        candidate.contention = Some(ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 4,
+            maximum_simultaneous: 4,
+            validated_completions: 4,
+            elapsed_millis: 60_000,
+            final_result_p50_millis: Some(20_000),
+            final_result_p90_millis: Some(30_000),
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 0,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::Low,
+        });
+        let observations =
+            three_successes(&workload, "hosted", HotStateClass::Cold, 40_000, 10_000, 0);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::latency(20_000),
+        )
+        .unwrap();
+
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("hosted")
+                && entry.reason == PoolExclusionReason::InvalidPressureSemantics
+        }));
+    }
+
+    #[test]
+    fn validated_contention_requires_observed_concurrency() {
+        let evidence = ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 1,
+            maximum_simultaneous: 0,
+            validated_completions: 1,
+            elapsed_millis: 60_000,
+            final_result_p50_millis: Some(20_000),
+            final_result_p90_millis: Some(20_000),
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 0,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::Low,
+        };
+
+        assert_eq!(
+            evidence.validate().unwrap_err().code,
+            "routing_contention_zero_concurrency_with_completion"
+        );
+    }
+
+    #[test]
+    fn impossible_contention_terminal_partition_is_rejected() {
+        let evidence = ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 4,
+            maximum_simultaneous: 2,
+            validated_completions: 3,
+            elapsed_millis: 60_000,
+            final_result_p50_millis: Some(20_000),
+            final_result_p90_millis: Some(30_000),
+            semantic_mismatches: 1,
+            unvalidated_completions: 0,
+            failures: 1,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::Low,
+        };
+
+        assert_eq!(
+            evidence.validate().unwrap_err().code,
+            "routing_contention_terminal_partition_invalid"
+        );
+    }
+
+    #[test]
+    fn missing_contention_outcomes_are_rejected() {
+        let evidence = ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 4,
+            maximum_simultaneous: 2,
+            validated_completions: 2,
+            elapsed_millis: 60_000,
+            final_result_p50_millis: Some(20_000),
+            final_result_p90_millis: Some(30_000),
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 1,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::Low,
+        };
+
+        assert_eq!(
+            evidence.validate().unwrap_err().code,
+            "routing_contention_terminal_partition_invalid"
+        );
+    }
+
+    #[test]
+    fn zero_completion_contention_window_is_valid_negative_evidence() {
+        let workload = workload();
+        let mut candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Warm);
+        candidate.contention = Some(ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 4,
+            maximum_simultaneous: 0,
+            validated_completions: 0,
+            elapsed_millis: 120_000,
+            final_result_p50_millis: None,
+            final_result_p90_millis: None,
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 0,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 4,
+            peak_pressure: HostPressureClass::Moderate,
+        });
+        let observations = three_successes(&workload, "owned", HotStateClass::Warm, 40_000, 0, 0);
+
+        candidate.contention.as_ref().unwrap().validate().unwrap();
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("owned")
+                && entry.reason == PoolExclusionReason::ReliabilityAbovePolicy
+        }));
+    }
+
+    #[test]
+    fn contention_latency_presence_tracks_validated_completions() {
+        let no_completion = ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 1,
+            maximum_simultaneous: 0,
+            validated_completions: 0,
+            elapsed_millis: 60_000,
+            final_result_p50_millis: Some(1),
+            final_result_p90_millis: Some(1),
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 0,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 1,
+            peak_pressure: HostPressureClass::Low,
+        };
+        assert_eq!(
+            no_completion.validate().unwrap_err().code,
+            "routing_contention_latency_without_validated_completion"
+        );
+
+        let missing_latency = ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 1,
+            maximum_simultaneous: 1,
+            validated_completions: 1,
+            elapsed_millis: 60_000,
+            final_result_p50_millis: None,
+            final_result_p90_millis: None,
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 0,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::Low,
+        };
+        assert_eq!(
+            missing_latency.validate().unwrap_err().code,
+            "routing_contention_validated_latency_missing"
+        );
+    }
+
+    #[test]
+    fn contention_failure_rate_obeys_policy_ceiling() {
+        let workload = workload();
+        let mut candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Warm);
+        candidate.contention = Some(ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 4,
+            offered_tasks: 16,
+            maximum_simultaneous: 4,
+            validated_completions: 14,
+            elapsed_millis: 120_000,
+            final_result_p50_millis: Some(30_000),
+            final_result_p90_millis: Some(45_000),
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 2,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::Moderate,
+        });
+        let observations = three_successes(&workload, "owned", HotStateClass::Warm, 40_000, 0, 0);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("owned")
+                && entry.reason == PoolExclusionReason::ReliabilityAbovePolicy
+        }));
+    }
+
+    #[test]
+    fn contention_unvalidated_and_reset_outcomes_count_as_unreliable() {
+        let workload = workload();
+        let mut candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Warm);
+        candidate.contention = Some(ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 4,
+            offered_tasks: 16,
+            maximum_simultaneous: 4,
+            validated_completions: 14,
+            elapsed_millis: 120_000,
+            final_result_p50_millis: Some(30_000),
+            final_result_p90_millis: Some(45_000),
+            semantic_mismatches: 0,
+            unvalidated_completions: 1,
+            failures: 0,
+            resets: 1,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::Moderate,
+        });
+        let observations = three_successes(&workload, "owned", HotStateClass::Warm, 40_000, 0, 0);
+
+        let report = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert!(report.exclusions.iter().any(|entry| {
+            entry.pool_id == id("owned")
+                && entry.reason == PoolExclusionReason::ReliabilityAbovePolicy
+        }));
+    }
+
+    #[test]
+    fn contention_concurrency_must_fit_offered_work() {
+        let evidence = ContentionEvidenceV1 {
+            comparison_class: id("contention"),
+            window_count: 1,
+            offered_tasks: 4,
+            maximum_simultaneous: 5,
+            validated_completions: 4,
+            elapsed_millis: 60_000,
+            final_result_p50_millis: Some(20_000),
+            final_result_p90_millis: Some(30_000),
+            semantic_mismatches: 0,
+            unvalidated_completions: 0,
+            failures: 0,
+            resets: 0,
+            unknown_results: 0,
+            fallbacks: 0,
+            unfinished: 0,
+            peak_pressure: HostPressureClass::Low,
+        };
+
+        assert_eq!(
+            evidence.validate().unwrap_err().code,
+            "routing_contention_concurrency_out_of_range"
+        );
+    }
+
+    #[test]
+    fn equal_timestamp_sample_truncation_is_deterministic() {
+        let workload = workload();
+        let candidate = pool("owned", PoolAccountingClass::Owned, HotStateClass::Cold);
+        let mut observations = Vec::new();
+        for (identity, execution) in [
+            ("obs:a", 10_000),
+            ("obs:b", 20_000),
+            ("obs:c", 30_000),
+            ("obs:d", 400_000),
+        ] {
+            let mut value = observation(
+                &workload,
+                "owned",
+                HotStateClass::Cold,
+                1_000,
+                execution,
+                0,
+                0,
+                ObservationOutcome::ValidatedSuccess,
+            );
+            value.observation_id = id(identity);
+            value.observed_at_millis = NOW - 1_000;
+            observations.push(value);
+        }
+        let config = PredictionConfigV1 {
+            max_age_millis: PredictionConfigV1::default().max_age_millis,
+            max_samples: 3,
+            min_validated_samples: 3,
+        };
+        let first = recommend_ci_pool(
+            &workload,
+            std::slice::from_ref(&candidate),
+            &observations,
+            NOW,
+            config,
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+        observations.reverse();
+        let second = recommend_ci_pool(
+            &workload,
+            &[candidate],
+            &observations,
+            NOW,
+            config,
+            RoutingPolicyV1::economy(60_000),
+        )
+        .unwrap();
+
+        assert_eq!(
+            first.predictions[0].basis.evidence_ids,
+            second.predictions[0].basis.evidence_ids
+        );
+        assert_eq!(
+            first.predictions[0].completion.total,
+            second.predictions[0].completion.total
+        );
+        assert_eq!(
+            first.predictions[0].basis.evidence_ids,
+            vec![id("obs:a"), id("obs:b"), id("obs:c")]
+        );
+    }
+
+    #[test]
+    fn human_alternatives_omit_policy_excluded_pools() {
+        let workload = workload();
+        let candidates = vec![
+            pool("owned", PoolAccountingClass::Owned, HotStateClass::Cold),
+            pool("burst", PoolAccountingClass::PaidBurst, HotStateClass::Cold),
+        ];
+        let mut observations =
+            three_successes(&workload, "owned", HotStateClass::Cold, 60_000, 0, 0);
+        observations.extend(three_successes(
+            &workload,
+            "burst",
+            HotStateClass::Cold,
+            30_000,
+            100_000,
+            0,
+        ));
+
+        let report = recommend_ci_pool(
+            &workload,
+            &candidates,
+            &observations,
+            NOW,
+            PredictionConfigV1::default(),
+            RoutingPolicyV1::latency(50_000),
+        )
+        .unwrap();
+        let human = report.render_human();
+
+        assert_eq!(report.choice, Some(id("owned")));
+        assert!(human.contains("excluded:\n  burst: SpendCeiling"));
+        assert!(!human.contains("alternatives:\n  burst:"));
     }
 
     #[test]

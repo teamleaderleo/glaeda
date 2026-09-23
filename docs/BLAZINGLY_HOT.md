@@ -432,11 +432,12 @@ scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
   -- node ./node_modules/.bin/next build
 ```
 
-`--runtime-bin` requires a runtime ID, accepts only one absolute canonical plain directory, resolves
-the launched executable from that directory, and places the directory first in the inherited
-descendant `PATH`. The receipt records only `runtime_bin_first` plus an opaque binding digest; the
-private-state namespace also includes that digest, so bound and unbound executions or replaced
-directories cannot share mutable lineage. No private path is recorded.
+`--runtime-bin` requires a runtime ID, accepts only one absolute canonical plain directory owned by
+root or the current user and not group- or world-writable, resolves the launched executable from
+that directory, and places the directory first in the inherited descendant `PATH`. The receipt
+records only `runtime_bin_first` plus an opaque binding digest; the private-state namespace also
+includes that digest, so bound and unbound executions or replaced directories cannot share mutable
+lineage. No private path is recorded.
 
 This closes the common `/usr/bin/env node` and package-script shebang path for an explicitly
 selected ultra-trusted toolchain. It does not hash the whole toolchain tree, intercept absolute

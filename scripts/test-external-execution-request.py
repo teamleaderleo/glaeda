@@ -70,6 +70,35 @@ class ContractTests(unittest.TestCase):
         )
         self.assertNotEqual(left.request_sha256, right.request_sha256)
 
+    def test_internal_semantic_identity_partitions_physical_execution(self) -> None:
+        request = module.decode_request(raw())
+        legacy = module.compile_request(request)
+        compiled_first = module.compile_request(
+            request,
+            semantic_request_id="accepted-1054-request-0001",
+        )
+        compiled_second = module.compile_request(
+            request,
+            semantic_request_id="accepted-1054-request-0002",
+        )
+        self.assertNotEqual(
+            legacy.internal.command_fingerprint,
+            compiled_first.internal.command_fingerprint,
+        )
+        self.assertNotEqual(
+            compiled_first.internal.command_fingerprint,
+            compiled_second.internal.command_fingerprint,
+        )
+        self.assertEqual(compiled_first.request_sha256, compiled_second.request_sha256)
+
+    def test_external_request_cannot_supply_semantic_execution_identity(self) -> None:
+        request = module.decode_request(raw())
+        self.assertEqual(module.request_document(request), BASE)
+        widened = copy.deepcopy(BASE)
+        widened["semantic_request_id"] = "accepted-1054-request-0001"
+        with self.assertRaisesRegex(module.ContractRefusal, "unsupported fields"):
+            module.decode_request(raw(widened))
+
     def test_rejects_caller_workspace_and_execution_controls(self) -> None:
         forbidden = {
             "cwd": "/tmp/x",
@@ -180,6 +209,7 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(module.ContractRefusal, "state fields"):
             module.validate_replay(corrupted, request)
 
+
     def test_replay_rejects_wrong_resolved_generation_and_oversized_receipt(self) -> None:
         request = module.decode_request(raw())
         receipt = module.planned_receipt(module.compile_request(request))
@@ -192,6 +222,7 @@ class ContractTests(unittest.TestCase):
         oversized["refusal_code"] = "x" * module.MAX_RECEIPT_BYTES
         with self.assertRaisesRegex(module.ContractRefusal, "fixed ceiling"):
             module.validate_receipt(oversized)
+
 
     def test_repository_fixture_round_trip(self) -> None:
         root = Path(__file__).resolve().parents[1]

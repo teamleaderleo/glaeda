@@ -60,16 +60,20 @@ def external_terminal(
     state: str = "succeeded",
 ) -> dict[str, object]:
     compiled = external.compile_request(item.external_request)
-    if state == "refused":
-        return external.refused_receipt(
-            item.external_request,
-            external.ContractRefusal("fixture_refusal", "fixture refusal"),
-        )
-    if state == "ambiguous":
-        return external.ambiguous_receipt(compiled)
     receipt = external.planned_receipt(compiled)
     receipt["state"] = state
-    receipt["workload_receipt_sha256"] = "sha256:" + "a" * 64
+    receipt["workload_receipt_sha256"] = (
+        "sha256:" + "a" * 64
+        if state not in {"refused", "ambiguous"}
+        else None
+    )
+    if state == "refused":
+        receipt["resolved_workload"] = None
+        receipt["refusal_code"] = "fixture_refused"
+    elif state == "ambiguous":
+        receipt["refusal_code"] = "ambiguous_execution"
+    else:
+        receipt["refusal_code"] = None
     return receipt
 
 
@@ -96,13 +100,40 @@ class TrustedDispatchTests(unittest.TestCase):
             item.accepted_document["workload_command_fingerprint"],
             compiled.internal.command_fingerprint,
         )
-        self.assertEqual(
-            item.accepted_document["semantic_request_id"],
-            dispatch.semantic_request_id(item.request),
-        )
         self.assertLessEqual(
             len(dispatch.canonical_bytes(item.accepted_document) + b"\n"),
             4096,
+        )
+
+    def test_acceptance_mints_transport_scoped_semantic_identity(self) -> None:
+        item = accepted()
+        semantic_id = item.accepted_document["semantic_request_id"]
+        self.assertRegex(semantic_id, r"^accepted-[a-f0-9]{55}$")
+        self.assertEqual(item.semantic_request.request_id, semantic_id)
+        self.assertEqual(
+            item.accepted_document["semantic_request_sha256"],
+            item.semantic_request_sha256,
+        )
+
+        changed = base_document()
+        changed["request_id"] = "dispatch-967-proof-two"
+        changed["request_fingerprint"] = dispatch.fingerprint_document(changed)
+        other = accepted(changed)
+        self.assertNotEqual(
+            semantic_id,
+            other.accepted_document["semantic_request_id"],
+        )
+        first_compiled = external.compile_request(
+            item.external_request,
+            semantic_request_id=semantic_id,
+        )
+        other_compiled = external.compile_request(
+            other.external_request,
+            semantic_request_id=other.accepted_document["semantic_request_id"],
+        )
+        self.assertNotEqual(
+            first_compiled.internal.command_fingerprint,
+            other_compiled.internal.command_fingerprint,
         )
 
     def test_same_external_id_is_partitioned_by_caller_namespace(self) -> None:
@@ -131,7 +162,11 @@ class TrustedDispatchTests(unittest.TestCase):
                 "cmux-controller:reviewed-local",
             ),
         )
-        self.assertEqual(first.request.request_id, other.request.request_id)
+
+        self.assertEqual(
+            first.request.request_id,
+            other.request.request_id,
+        )
         self.assertNotEqual(
             first.accepted_document["semantic_request_id"],
             other.accepted_document["semantic_request_id"],
@@ -141,14 +176,52 @@ class TrustedDispatchTests(unittest.TestCase):
             other.accepted_document["workload_command_fingerprint"],
         )
 
-    def test_external_workload_document_cannot_supply_accepted_identity(self) -> None:
-        item = accepted()
-        document = external.request_document(item.external_request)
+    def test_same_external_id_partitions_callers_but_exact_replay_is_stable(self) -> None:
+        original_document = base_document()
+        first = accepted(original_document)
+        replay = accepted(copy.deepcopy(original_document))
+        self.assertEqual(
+            first.accepted_document["semantic_request_id"],
+            replay.accepted_document["semantic_request_id"],
+        )
+        self.assertEqual(
+            first.accepted_document["workload_command_fingerprint"],
+            replay.accepted_document["workload_command_fingerprint"],
+        )
+
+        other_principal = "github-mailbox-writers:teamleaderleo/other-dispatch"
+        other_binding = "github-private-repo-write-policy:teamleaderleo/other-dispatch"
+        other_document = copy.deepcopy(original_document)
+        other_document["caller"] = {
+            "principal": other_principal,
+            "provenance_binding": other_binding,
+        }
+        other_document["request_fingerprint"] = dispatch.fingerprint_document(
+            other_document
+        )
+        other_request = dispatch.decode_request(raw(other_document), now=NOW)
+        other = dispatch.accept_request(
+            other_request,
+            dispatch.ProvenanceEvidence(other_principal, other_binding),
+        )
+        self.assertEqual(first.request.request_id, other.request.request_id)
+        self.assertEqual(first.request.repository, other.request.repository)
+        self.assertEqual(first.request.commit, other.request.commit)
+        self.assertEqual(first.request.tree, other.request.tree)
+        self.assertNotEqual(
+            first.accepted_document["semantic_request_id"],
+            other.accepted_document["semantic_request_id"],
+        )
+        self.assertNotEqual(
+            first.accepted_document["workload_command_fingerprint"],
+            other.accepted_document["workload_command_fingerprint"],
+        )
+
+    def test_caller_request_schema_does_not_gain_physical_identity_fields(self) -> None:
+        document = base_document()
         self.assertNotIn("semantic_request_id", document)
-        widened = copy.deepcopy(document)
-        widened["semantic_request_id"] = item.accepted_document["semantic_request_id"]
-        with self.assertRaisesRegex(external.ContractRefusal, "unsupported fields"):
-            external.decode_request(external.canonical_bytes(widened) + b"\n")
+        self.assertNotIn("backend", document)
+        self.assertNotIn("argv", document)
 
     def test_transport_projection_gets_the_same_deterministic_identity(self) -> None:
         document = base_document()

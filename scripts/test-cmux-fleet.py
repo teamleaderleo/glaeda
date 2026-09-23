@@ -432,6 +432,58 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(receipt["result"], "rejected")
         self.assertFalse(f.node_status(e, [receipt])["routingCandidateEligible"])
 
+    def test_git_oid_uses_closed_environment(self):
+        observed = {}
+
+        def fake_run(argv, **kwargs):
+            observed.update(kwargs)
+            return __import__("subprocess").CompletedProcess(
+                argv,
+                0,
+                stdout=COMMIT + "\n",
+                stderr="",
+            )
+
+        with (
+            mock.patch.dict(
+                f.os.environ,
+                {
+                    "PATH": "/attacker/bin",
+                    "HOME": "/attacker/home",
+                    "PYTHONPATH": "/attacker/python",
+                    "SSH_AUTH_SOCK": "/private/agent.sock",
+                    "SECRET_SENTINEL": "do-not-forward",
+                    "LD_PRELOAD": "/attacker/lib.so",
+                    "GIT_DIR": "/attacker/git",
+                    "GIT_CONFIG_GLOBAL": "/attacker/config",
+                },
+                clear=True,
+            ),
+            mock.patch.object(f.subprocess, "run", side_effect=fake_run),
+        ):
+            value = f._git_oid(Path("/cmux"), "HEAD^{commit}")
+
+        self.assertEqual(value, COMMIT)
+        self.assertEqual(
+            observed["env"],
+            {
+                "LC_ALL": "C",
+                "LANG": "C",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+            },
+        )
+        for forbidden in (
+            "PATH",
+            "HOME",
+            "PYTHONPATH",
+            "SSH_AUTH_SOCK",
+            "SECRET_SENTINEL",
+            "LD_PRELOAD",
+            "GIT_DIR",
+        ):
+            self.assertNotIn(forbidden, observed["env"])
+
     def test_acceptance_child_environment_is_explicit_allowlist(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
