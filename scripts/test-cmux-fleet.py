@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import json
 import fcntl
 import importlib.util
@@ -186,6 +188,7 @@ class FleetTests(unittest.TestCase):
     def setUp(self):
         # create=True so this suite can also be run against a revision that
         # predates the operator notice, which is how its binding is measured.
+        self.real_notice = getattr(f, "_notice", None)
         notices = mock.patch.object(f, "_notice", create=True)
         self.notices = notices.start()
         self.addCleanup(notices.stop)
@@ -771,6 +774,94 @@ class FleetTests(unittest.TestCase):
             self.addCleanup(f._remove_tree, root / "attempt")
             self.assertTrue(f._remove_tree(root / "attempt"))
             self.assertFalse((root / "attempt").exists())
+
+    def test_removal_never_reaches_outside_the_tree(self):
+        # os.walk does not traverse a symlink but os.chmod follows one, so a
+        # build that links its TMPDIR at a toolchain or a Cargo registry would
+        # have that directory's bits relaxed by a cleanup that does not own it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            outside = root / "outside"
+            (outside / "keep").mkdir(parents=True)
+            outside.chmod(0o500)
+            attempt = root / "attempt/tmp"
+            attempt.mkdir(parents=True)
+            (attempt / "registry").symlink_to(outside)
+            self.assertTrue(f._remove_tree(root / "attempt"))
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o500)
+            self.assertTrue((outside / "keep").is_dir())
+            # Restore before the temporary directory tries to remove it.
+            outside.chmod(0o700)
+
+    def test_removal_answers_honestly_for_links_and_unreadable_roots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            dangling = root / "dangling"
+            dangling.symlink_to(root / "never")
+            self.assertTrue(f._remove_tree(dangling))
+            self.assertFalse(dangling.is_symlink())
+
+            # os.walk cannot list an unreadable directory, so repairing only
+            # what it yields would leave the top entry behind.
+            sealed = root / "sealed"
+            (sealed / "inner").mkdir(parents=True)
+            sealed.chmod(0o000)
+            self.assertTrue(f._remove_tree(sealed))
+            self.assertFalse(sealed.exists())
+
+    def test_pruning_ranks_only_the_directories_it_created(self):
+        # The doc tells operators this evidence is theirs to keep, so they will
+        # archive it under the same name. An archive must not consume the
+        # retention budget and push real evidence out of it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for index in range(f.RETAINED_ATTEMPT_LIMIT):
+                kept = root / f"{f.RETAINED_ATTEMPT_PREFIX}dir{index}"
+                kept.mkdir()
+                (kept / "cmux-runner.log").write_text(str(index), encoding="utf-8")
+                os.utime(kept, (index + 1, index + 1))
+            for name in ("archive.tar.gz", "elsewhere"):
+                path = root / f"{f.RETAINED_ATTEMPT_PREFIX}{name}"
+                if name.endswith(".tar.gz"):
+                    path.write_text("archived", encoding="utf-8")
+                else:
+                    path.symlink_to(root)
+                os.utime(path, (99, 99), follow_symlinks=False)
+
+            f._prune_retained_attempts(root)
+
+            for index in range(f.RETAINED_ATTEMPT_LIMIT):
+                self.assertTrue(
+                    (root / f"{f.RETAINED_ATTEMPT_PREFIX}dir{index}"
+                     / "cmux-runner.log").is_file()
+                )
+            self.assertTrue((root / f"{f.RETAINED_ATTEMPT_PREFIX}archive.tar.gz").is_file())
+            self.assertTrue((root / f"{f.RETAINED_ATTEMPT_PREFIX}elsewhere").is_symlink())
+
+    def test_notice_never_raises_and_never_writes_to_stdout(self):
+        # _notice runs from a finally. A closed fd 2 leaves sys.stderr as None,
+        # and print(file=None) would put a private path in front of the receipt.
+        captured = io.StringIO()
+        with (
+            mock.patch.object(f.sys, "stderr", None),
+            contextlib.redirect_stdout(captured),
+        ):
+            self.real_notice("attempt retained")
+        self.assertEqual(captured.getvalue(), "")
+
+        class Broken:
+            def write(self, _value):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        with (
+            mock.patch.object(f.sys, "stderr", Broken()),
+            contextlib.redirect_stdout(captured),
+        ):
+            self.real_notice("attempt retained")
+        self.assertEqual(captured.getvalue(), "")
 
     def test_retention_keeps_evidence_when_the_name_is_taken(self):
         # The whole point of retaining is that the operator has something to

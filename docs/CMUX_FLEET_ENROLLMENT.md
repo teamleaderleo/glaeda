@@ -169,7 +169,9 @@ The macOS preparation reuses CMUX's reviewed `scripts/setup.sh` for prerequisite
 
 Bootstrap still probes the toolchain through the operator's shell, so a node with a misplaced tool produces a complete receipt rather than a bare error. It separately reports whether the CMUX workload will be able to find those tools: the runner rebuilds PATH as `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` plus a per-attempt Cargo home that starts empty, so a build tool reachable only from `$HOME` is one the build cannot spend. `workloadToolPath` fails and `observed.toolsMissingFromWorkloadPath` names them, which blocks enrollment in seconds instead of passing bootstrap and failing the build minutes later. **`rustup`, `cargo` and `rustc` therefore have to be reachable from those six directories, not only from `$CARGO_HOME/bin`** — the `export PATH` above lets bootstrap describe the toolchain, it does not make it visible to the build.
 
-An attempt that does not accept keeps its runner log and semantic result as `rejected-attempt.*` beside the enrollment, and drops the child's scratch tree; the three most recent are kept and the retained path is named on stderr. The retained `cmux-runner.log` is the build's raw merged output, kept at mode `0600` inside the `0700` fleet root — operator-private evidence with an indefinite lifetime, not something to attach to an issue unread. Removing a retained attempt by hand is safe at any time.
+An attempt that does not accept keeps its runner log and semantic result beside the enrollment, renamed to `rejected-attempt.*`, and drops the child's scratch tree. Both steps are best-effort and say so: if the name is already taken the attempt stays under its hidden `.acceptance-run.*` name, and if the scratch tree survives a second line names it. Either way the retained path is printed on stderr, and the receipt is never sacrificed to report it.
+
+Retention is bounded to the three most recent directories Glaeda itself created. Anything else you leave under that prefix — an archive, a symlink onto another volume — is neither counted against the budget nor removed, so archiving old evidence in place is safe. Removing a retained attempt by hand is safe at any time. The retained `cmux-runner.log` is the build's raw merged output at mode `0600` inside the `0700` fleet root: operator-private evidence with an indefinite lifetime, not something to attach to an issue unread.
 
 ## Onboard Linux
 
@@ -229,7 +231,7 @@ bash scripts/cmux-fleet status "$ENROLLMENT" \
   --acceptance "$ACCEPTANCE"
 ```
 
-The Linux `accept-local` path runs CMUX's canonical `cmux.ci.guard@1` profile against the exact local commit/tree in cold state, then re-observes this same host. A v2 receipt becomes accepted only when CMUX reports `passed`, process settlement is complete, and the post-run capability, Glaeda generation, role profile, and selected toolchain generation still match enrollment.
+The Linux `accept-local` path runs CMUX's canonical `cmux.ci.guard@1` profile against the exact local commit/tree in cold state, then re-observes this same host. Workload tool visibility and rejected-attempt retention work exactly as described for macOS above; on Linux the tools checked are `git` and `python3`. A v2 receipt becomes accepted only when CMUX reports `passed`, process settlement is complete, and the post-run capability, Glaeda generation, role profile, and selected toolchain generation still match enrollment.
 
 After either onboarding path, remove only the transient evidence files:
 

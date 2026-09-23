@@ -277,6 +277,100 @@ class Tests(unittest.TestCase):
                 )
             self.assertEqual(b.missing_workload_tools(("sh", "cat")), [])
 
+    def _macos_checkout(self, root):
+        """A checkout shaped enough for collect_macos to read it."""
+        (root / ".xcode-version").write_text("26.0\n", encoding="utf-8")
+        ghostty = root / "ghostty"
+        (ghostty / "include").mkdir(parents=True)
+        (ghostty / "include/ghostty.h").write_text("/* fixture */\n", encoding="utf-8")
+        (root / "GhosttyKit.xcframework").mkdir()
+        (ghostty / "build.zig.zon").write_text(
+            '.{\n    .minimum_zig_version = "0.16.0",\n}\n', encoding="utf-8"
+        )
+        sidecar = root / "Native/DiffSidecar"
+        sidecar.mkdir(parents=True)
+        (sidecar / "rust-toolchain.toml").write_text(
+            '[toolchain]\nchannel = "1.90.0"\n', encoding="utf-8"
+        )
+
+    @staticmethod
+    def _macos_command(argv, **_kwargs):
+        name = Path(argv[0]).name
+        rest = argv[1:]
+        if name == "git":
+            if rest[:1] == ["status"]:
+                return ""
+            if rest[:1] == ["submodule"]:
+                return " a1 ghostty (heads/main)"
+            return "git version 2.51.0"
+        if name == "xcodebuild":
+            return "Xcode 26.0\nBuild version 26A123"
+        if name == "xcrun":
+            return "metal version 32023" if "metal" in rest else "26.0"
+        if name == "zig":
+            return "0.16.0"
+        if name == "rustup":
+            if rest[:1] == ["run"]:
+                return f"{rest[2]} 1.90.0 (abc 2026-01-01)"
+            return "rustup 1.28.0"
+        if name in ("cargo", "rustc"):
+            return f"{name} 1.90.0 (abc 2026-01-01)"
+        if name == "pmset":
+            return "AC Power:\n sleep 0\nBattery Power:\n sleep 10"
+        if name == "sysctl":
+            return str(64 * 1024**3)
+        raise AssertionError(argv)
+
+    def _collect_macos(self, root, cache_root, visible):
+        with (
+            mock.patch.object(b.platform, "system", return_value="Darwin"),
+            mock.patch.object(b.platform, "mac_ver", return_value=("26.5", ("", "", ""), "arm64")),
+            mock.patch.object(b.platform, "machine", return_value="arm64"),
+            mock.patch.object(b, "executable", side_effect=lambda n: f"/usr/bin/{n}"),
+            mock.patch.object(b, "run", side_effect=self._macos_command),
+            mock.patch.object(
+                b.shutil, "which",
+                side_effect=lambda name, path=None: f"/usr/bin/{name}" if visible else None,
+            ),
+        ):
+            return b.collect_macos(root, root / "glaeda", 1, "cmux-mac-build-large", cache_root)
+
+    def test_macos_observation_reports_workload_tool_visibility(self):
+        # collect_macos cannot run on the host that runs this suite, so its
+        # wiring is the half most likely to be left behind by a later edit.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._macos_checkout(root)
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+            cache_root = root / "cache"
+            cache_root.mkdir()
+
+            visible = self._collect_macos(root, cache_root, visible=True)
+            self.assertTrue(visible["checks"]["workloadToolPath"])
+            self.assertEqual(visible["observed"]["toolsMissingFromWorkloadPath"], [])
+            self.assertEqual(
+                visible["checks"]["profileRunnerInterpreter"], hasattr(os, "waitid")
+            )
+
+            invisible = self._collect_macos(root, cache_root, visible=False)
+            self.assertFalse(invisible["checks"]["workloadToolPath"])
+            self.assertEqual(
+                invisible["observed"]["toolsMissingFromWorkloadPath"],
+                sorted(b.MACOS_WORKLOAD_TOOLS),
+            )
+            invisible["roleProfiles"] = {
+                "cmux_macos_native_build": dict(
+                    b.ROLE_PROFILES["cmux_macos_native_build"]
+                )
+            }
+            result = b.evaluate(
+                invisible, ["cmux_macos_native_build"], "cmux-mac-build-large"
+            )
+            self.assertFalse(result["eligibleForEnrollment"])
+            self.assertIn("workloadToolPath", result["blockingChecks"])
+
     def test_linux_observation_reports_the_new_checks(self):
         # evaluate() is key-agnostic, so asserting on a hand-built fixture
         # proves nothing about what the collectors actually emit.
@@ -310,10 +404,8 @@ class Tests(unittest.TestCase):
         self.assertEqual(
             observed["checks"]["profileRunnerInterpreter"], hasattr(os, "waitid")
         )
-        self.assertEqual(
-            observed["checks"]["workloadToolPath"],
-            not observed["observed"]["toolsMissingFromWorkloadPath"],
-        )
+        self.assertTrue(observed["checks"]["workloadToolPath"])
+        self.assertEqual(observed["observed"]["toolsMissingFromWorkloadPath"], [])
 
     def test_power_posture_parser(self):
         raw = (

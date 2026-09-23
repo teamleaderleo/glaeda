@@ -1161,8 +1161,22 @@ def acceptance_child_environment(temporary_root: Path) -> dict[str, str]:
 
 
 def _notice(message: str) -> None:
-    """Tell the operator something stdout cannot carry: stdout is the receipt."""
-    print(message, file=sys.stderr)
+    """Tell the operator something stdout cannot carry: stdout is the receipt.
+
+    This runs from a `finally`, so it may not raise and it may not write to
+    stdout. Both are reachable: a closed fd 2 leaves `sys.stderr` as None and
+    `print(file=None)` then writes to stdout, putting a private path in front
+    of the JSON and making the receipt unparseable; piping stderr into a
+    short-lived reader raises BrokenPipeError. A lost notice is worse only
+    than a lost receipt.
+    """
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        print(message, file=stream)
+    except (OSError, ValueError):
+        pass
 
 
 def profile_runner_interpreter_ready() -> bool:
@@ -1184,17 +1198,37 @@ def _remove_tree(path: Path) -> bool:
     remove those. `ignore_errors` would swallow the failure and leave the tree,
     so restore the owner's bits on the way down and then answer plainly. A
     caller that has promised the operator a bound needs to know when it missed.
+
+    Links are unlinked, never followed. `os.walk` does not traverse a symlink
+    but `os.chmod` does, so chmod'ing one would reach out of the tree and
+    relax the permissions of a directory this function does not own — a build
+    that links its TMPDIR at a toolchain or a Cargo registry is enough.
     """
-    if not path.exists():
+    if path.is_symlink():
+        try:
+            path.unlink()
+        except OSError:
+            return False
         return True
+    if not os.path.lexists(path):
+        return True
+    # The top entry is chmod'ed first: os.walk cannot list an unreadable
+    # directory, so nothing below it would be repaired otherwise.
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
     for parent, directories, _files in os.walk(path):
-        for name in (parent, *(os.path.join(parent, d) for d in directories)):
+        for name in directories:
+            child = os.path.join(parent, name)
+            if os.path.islink(child):
+                continue
             try:
-                os.chmod(name, 0o700)
+                os.chmod(child, 0o700)
             except OSError:
                 pass
     shutil.rmtree(path, ignore_errors=True)
-    return not path.exists()
+    return not os.path.lexists(path)
 
 
 def _retain_attempt(state_root: Path, fleet_root: Path) -> None:
@@ -1228,7 +1262,14 @@ def _retain_attempt(state_root: Path, fleet_root: Path) -> None:
 
 
 def _prune_retained_attempts(fleet_root: Path) -> None:
-    """Keep the newest retained attempts and drop the rest, quietly."""
+    """Keep the newest retained attempts and drop the rest, quietly.
+
+    Only directories this function could itself have created are ranked. The
+    name is a namespace an operator also writes in — the enrollment doc tells
+    them this evidence is theirs to keep — so an archive left as
+    `rejected-attempt.2026-09-23.tar.gz`, or a symlink onto another volume,
+    must not occupy the budget and push real evidence out of it.
+    """
     dated: list[tuple[float, Path]] = []
     try:
         candidates = sorted(fleet_root.glob(RETAINED_ATTEMPT_PREFIX + "*"))
@@ -1236,10 +1277,13 @@ def _prune_retained_attempts(fleet_root: Path) -> None:
         return
     for path in candidates:
         try:
-            dated.append((path.stat().st_mtime, path))
+            info = path.lstat()
         except OSError:
-            # A dangling symlink or an entry a concurrent run just removed.
+            # An entry a concurrent run just removed.
             continue
+        if not stat.S_ISDIR(info.st_mode):
+            continue
+        dated.append((info.st_mtime, path))
     dated.sort(reverse=True)
     for _mtime, path in dated[RETAINED_ATTEMPT_LIMIT:]:
         _remove_tree(path)
