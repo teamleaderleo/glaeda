@@ -902,14 +902,56 @@ class FleetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             for index in range(f.RETAINED_ATTEMPT_LIMIT + 2):
-                attempt = root / f"{f.ATTEMPT_PREFIX}{index:04d}"
+                attempt = root / f"{f.ATTEMPT_PREFIX}{index:08d}"
                 (attempt / "tmp").mkdir(parents=True)
                 (attempt / "cmux-runner.log").write_text(str(index), encoding="utf-8")
                 os.utime(attempt, (index + 1, index + 1))
                 f._retain_attempt(attempt, root)
             kept = sorted(path.name for path in root.glob(f.RETAINED_ATTEMPT_PREFIX + "*"))
             self.assertEqual(len(kept), f.RETAINED_ATTEMPT_LIMIT)
-            self.assertEqual(kept[-1], f"{f.RETAINED_ATTEMPT_PREFIX}0004")
+            self.assertEqual(kept[-1], f"{f.RETAINED_ATTEMPT_PREFIX}00000004")
+
+    def test_pruning_leaves_operator_directories_alone(self):
+        # The doc promises that evidence an operator renames, copies or keeps
+        # under the prefix is theirs: never ranked, never removed.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            kept_by_operator = [
+                root / f"{f.RETAINED_ATTEMPT_PREFIX}abcd1234.investigating",
+                root / f"{f.RETAINED_ATTEMPT_PREFIX}old-investigation",
+            ]
+            for index, directory in enumerate(kept_by_operator):
+                directory.mkdir()
+                (directory / "notes.txt").write_text("mine", encoding="utf-8")
+                # Oldest and newest: either would decide a naive ranking.
+                os.utime(directory, (1, 1) if index else (10**10, 10**10))
+            for index in range(f.RETAINED_ATTEMPT_LIMIT):
+                attempt = root / f"{f.ATTEMPT_PREFIX}{index:08d}"
+                (attempt / "tmp").mkdir(parents=True)
+                f._retain_attempt(attempt, root)
+            for directory in kept_by_operator:
+                self.assertTrue((directory / "notes.txt").is_file())
+            for index in range(f.RETAINED_ATTEMPT_LIMIT):
+                self.assertTrue(
+                    (root / f"{f.RETAINED_ATTEMPT_PREFIX}{index:08d}").is_dir()
+                )
+
+    def test_retention_never_raises_from_an_unsearchable_attempt(self):
+        # Path.is_symlink re-raises EACCES before Python 3.14. The child holds
+        # the attempt path, so it can revoke search on it before the finally.
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory search permission")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            attempt = root / f"{f.ATTEMPT_PREFIX}abcd1234"
+            (attempt / "tmp").mkdir(parents=True)
+            attempt.chmod(0o600)
+            try:
+                f._retain_attempt(attempt, root)
+            finally:
+                for candidate in (attempt, root / f"{f.RETAINED_ATTEMPT_PREFIX}abcd1234"):
+                    if candidate.exists():
+                        candidate.chmod(0o700)
 
     def test_interpreter_without_waitid_refuses_before_the_attempt(self):
         # CPython exposes os.waitid on macOS only from 3.13; the CMUX profile

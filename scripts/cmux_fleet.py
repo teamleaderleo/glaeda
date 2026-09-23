@@ -50,6 +50,9 @@ CMUX_PROFILE_RUNNER = "scripts/ci/cmux_workload_profile.py"
 ATTEMPT_PREFIX = ".acceptance-run."
 RETAINED_ATTEMPT_PREFIX = "rejected-attempt."
 RETAINED_ATTEMPT_LIMIT = 3
+# What tempfile.mkdtemp appends to ATTEMPT_PREFIX. Retention renames keep it,
+# so this is also exactly the set of names Glaeda can have retained.
+ATTEMPT_SUFFIX = re.compile(r"[a-z0-9_]{8}")
 LOCAL_EXECUTION_CLASS = "glaeda-local-profile/v1"
 EXTERNAL_EVIDENCE_CLASS = "external-evidence/v1"
 ACCEPTANCE_CHILD_ENV_KEYS = (
@@ -1204,7 +1207,9 @@ def _remove_tree(path: Path) -> bool:
     relax the permissions of a directory this function does not own — a build
     that links its TMPDIR at a toolchain or a Cargo registry is enough.
     """
-    if path.is_symlink():
+    # os.path, not Path: Path.is_symlink re-raises EACCES before 3.14, and this
+    # runs from a finally.
+    if os.path.islink(path):
         try:
             path.unlink()
         except OSError:
@@ -1267,8 +1272,9 @@ def _prune_retained_attempts(fleet_root: Path) -> None:
     Only directories this function could itself have created are ranked. The
     name is a namespace an operator also writes in — the enrollment doc tells
     them this evidence is theirs to keep — so an archive left as
-    `rejected-attempt.2026-09-23.tar.gz`, or a symlink onto another volume,
-    must not occupy the budget and push real evidence out of it.
+    `rejected-attempt.2026-09-23.tar.gz`, a symlink onto another volume, or an
+    attempt renamed `rejected-attempt.x.investigating` must neither occupy the
+    budget nor be removed by it.
     """
     dated: list[tuple[float, Path]] = []
     try:
@@ -1276,6 +1282,8 @@ def _prune_retained_attempts(fleet_root: Path) -> None:
     except OSError:
         return
     for path in candidates:
+        if not ATTEMPT_SUFFIX.fullmatch(path.name[len(RETAINED_ATTEMPT_PREFIX):]):
+            continue
         try:
             info = path.lstat()
         except OSError:
