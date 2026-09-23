@@ -648,16 +648,12 @@ impl TrustedOverlayRole {
 /// Refuse any overlay role directory an untrusted identity owns or can write.
 ///
 /// Every role must be owned by root or the observing identity and carry no group or world write
-/// bit. That is the predicate the rest of this repository applies to trusted filesystem objects
-/// (`src/bin/glaeda-hot-run.rs::observe_runtime_bin`,
-/// `src/local_install_launcher.rs::safe_directory_ancestor`,
-/// `src/trusted_workspace_receipt.rs::validate_observed_directory`). Group ownership needs no
+/// bit. Group ownership needs no
 /// separate rule here, because a foreign group only gains authority through the group write bit
 /// this already refuses.
 ///
 /// `Upper` and `Work` are runtime-private scratch roles the mount must write through, so they
-/// additionally require full owner access, matching
-/// `src/renderprove_protected_mount.rs::require_evidence_directory_policy`. `Lower` deliberately
+/// additionally require full owner access. `Lower` deliberately
 /// carries no owner-write requirement: a read-only source anchor is a valid immutable base, and
 /// this observer never writes to it.
 fn require_role_trust(
