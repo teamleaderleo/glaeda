@@ -10,6 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{self as rustix_fs, FileType, Mode, OFlags};
 use rustix::io::Errno;
+use rustix::process::geteuid;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
@@ -468,15 +469,17 @@ impl std::error::Error for TrustedOverlayMountPlanError {}
 /// Observe and seal one task-specific OverlayFS mount plan without mutating host state.
 ///
 /// The observer requires exact real-directory identities for the immutable lower source, upper,
-/// work, and merged target. All four roles must live on one exact filesystem device in v1, work must
-/// be empty, the merged target must be absent from the current mount table, and the current kernel
-/// filesystem list must expose OverlayFS. Every directory and capability input is revalidated before
-/// the plan is returned.
+/// work, and merged target. Every role must be owned by root or the observing identity and carry no
+/// group or world write bit; `upperdir` and `workdir` must additionally grant full owner access. All
+/// four roles must live on one exact filesystem device in v1, work must be empty, the merged target
+/// must be absent from the current mount table, and the current kernel filesystem list must expose
+/// OverlayFS. Every directory and capability input is revalidated before the plan is returned.
 ///
 /// # Errors
 ///
-/// Returns a bounded path-private error for aliasing, identity drift, filesystem mismatch, a dirty
-/// workdir, unavailable OverlayFS, an already-mounted target, malformed proc evidence, or I/O failure.
+/// Returns a bounded path-private error for aliasing, an untrusted-writable or foreign-owned role,
+/// identity drift, filesystem mismatch, a dirty workdir, unavailable OverlayFS, an already-mounted
+/// target, malformed proc evidence, or I/O failure.
 pub fn observe_trusted_overlay_mount_plan(
     source_anchor: &OverlaySourceAnchorRecord,
     task_view: &OverlayTaskViewRecord,
@@ -496,6 +499,7 @@ pub fn observe_trusted_overlay_mount_plan(
         &filesystems,
         &mountinfo,
         mount_namespace_identity,
+        geteuid().as_raw(),
         || {},
     )?;
 
@@ -537,6 +541,7 @@ fn observe_with_evidence<F>(
     filesystems: &[u8],
     mountinfo: &[u8],
     mount_namespace: (u64, u64),
+    observer_euid: u32,
     before_revalidation: F,
 ) -> Result<TrustedOverlayMountPlan, TrustedOverlayMountPlanError>
 where
@@ -552,10 +557,22 @@ where
         return Err(invalid_proc_evidence());
     }
 
-    let lower = observe_directory(paths.lower.clone())?;
-    let upper = observe_directory(paths.upper.clone())?;
-    let work = observe_directory(paths.work.clone())?;
-    let merged = observe_directory(paths.merged.clone())?;
+    let lower = observe_directory(
+        paths.lower.clone(),
+        TrustedOverlayRole::Lower,
+        observer_euid,
+    )?;
+    let upper = observe_directory(
+        paths.upper.clone(),
+        TrustedOverlayRole::Upper,
+        observer_euid,
+    )?;
+    let work = observe_directory(paths.work.clone(), TrustedOverlayRole::Work, observer_euid)?;
+    let merged = observe_directory(
+        paths.merged.clone(),
+        TrustedOverlayRole::Merged,
+        observer_euid,
+    )?;
     validate_directory_roles([&lower, &upper, &work, &merged])?;
     require_empty_directory(&work.path)?;
 
@@ -608,10 +625,66 @@ struct DirectorySnapshot {
     ctime_nsec: i64,
 }
 
+/// The trust question one OverlayFS role answers.
+///
+/// `Lower` is the read-only base every task read and execution resolves against, `Upper` receives
+/// the task's writes and shadows `Lower` entry by entry, `Work` is OverlayFS's private staging area
+/// on the upper filesystem, and `Merged` is the visible mount target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustedOverlayRole {
+    Lower,
+    Upper,
+    Work,
+    Merged,
+}
+
+impl TrustedOverlayRole {
+    /// Roles OverlayFS must itself read, write, and traverse as the mounting identity.
+    const fn requires_owner_access(self) -> bool {
+        matches!(self, Self::Upper | Self::Work)
+    }
+}
+
+/// Refuse any overlay role directory an untrusted identity owns or can write.
+///
+/// Every role must be owned by root or the observing identity and carry no group or world write
+/// bit. That is the predicate the rest of this repository applies to trusted filesystem objects
+/// (`src/bin/glaeda-hot-run.rs::observe_runtime_bin`,
+/// `src/local_install_launcher.rs::safe_directory_ancestor`,
+/// `src/trusted_workspace_receipt.rs::validate_observed_directory`). Group ownership needs no
+/// separate rule here, because a foreign group only gains authority through the group write bit
+/// this already refuses.
+///
+/// `Upper` and `Work` are runtime-private scratch roles the mount must write through, so they
+/// additionally require full owner access, matching
+/// `src/renderprove_protected_mount.rs::require_evidence_directory_policy`. `Lower` deliberately
+/// carries no owner-write requirement: a read-only source anchor is a valid immutable base, and
+/// this observer never writes to it.
+fn require_role_trust(
+    role: TrustedOverlayRole,
+    snapshot: &DirectorySnapshot,
+    observer_euid: u32,
+) -> Result<(), TrustedOverlayMountPlanError> {
+    if snapshot.uid != 0 && snapshot.uid != observer_euid {
+        return Err(role_owner_foreign());
+    }
+    let permissions = snapshot.mode & 0o7777;
+    if permissions & 0o022 != 0 {
+        return Err(role_untrusted_writable());
+    }
+    if role.requires_owner_access() && permissions & 0o700 != 0o700 {
+        return Err(role_owner_access_missing());
+    }
+    Ok(())
+}
+
 fn observe_directory(
     path: PathBuf,
+    role: TrustedOverlayRole,
+    observer_euid: u32,
 ) -> Result<TrustedOverlayDirectory, TrustedOverlayMountPlanError> {
     let snapshot = snapshot_directory(&path)?;
+    require_role_trust(role, &snapshot, observer_euid)?;
     let identity = ReviewedFilesystemIdentity::new(
         snapshot.device,
         snapshot.inode,
@@ -760,6 +833,12 @@ fn validate_held_roles(descriptors: [&OwnedFd; 4]) -> Result<(), TrustedOverlayM
     Ok(())
 }
 
+/// Confirm one already-admitted role directory is still the exact same object.
+///
+/// This needs no second `require_role_trust` call: the recorded snapshot only exists because it
+/// passed that gate in `observe_directory`, and any later ownership or mode change fails the exact
+/// snapshot comparison below as observation drift. The same holds for the descriptor-lease checks
+/// in `require_held_directory`.
 fn revalidate_directory(
     directory: &TrustedOverlayDirectory,
 ) -> Result<(), TrustedOverlayMountPlanError> {
@@ -975,6 +1054,30 @@ const fn unsafe_filesystem() -> TrustedOverlayMountPlanError {
     )
 }
 
+const fn role_owner_foreign() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::UnsafeFilesystem,
+        "overlay_mount_role_owner_foreign",
+        "trusted overlay mount role is not owned by root or the observing identity",
+    )
+}
+
+const fn role_untrusted_writable() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::UnsafeFilesystem,
+        "overlay_mount_role_untrusted_writable",
+        "trusted overlay mount role is writable by an untrusted identity",
+    )
+}
+
+const fn role_owner_access_missing() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::UnsafeFilesystem,
+        "overlay_mount_role_owner_access_missing",
+        "trusted overlay writable role must grant full owner access",
+    )
+}
+
 const fn role_conflict() -> TrustedOverlayMountPlanError {
     error(
         TrustedOverlayMountPlanErrorKind::IdentityConflict,
@@ -1085,6 +1188,7 @@ pub(crate) fn descriptor_test_plan(
         b"nodev\toverlay\n",
         &mountinfo,
         (namespace.dev(), namespace.ino()),
+        geteuid().as_raw(),
         || {},
     )?;
     // Only the initial OverlayFS capability is synthetic. Subsequent production
@@ -1097,14 +1201,17 @@ pub(crate) fn descriptor_test_plan(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use rustix::process::geteuid;
+
     use super::{
         DirectorySnapshot, TrustedOverlayMountOptionPolicy, TrustedOverlayMountPaths,
-        TrustedOverlayMountPlanErrorKind, filesystems_expose_overlay, mountinfo_has_mountpoint,
-        observe_with_evidence, validate_directory_roles,
+        TrustedOverlayMountPlanErrorKind, TrustedOverlayRole, filesystems_expose_overlay,
+        mountinfo_has_mountpoint, observe_with_evidence, require_role_trust,
+        validate_directory_roles,
     };
     use crate::artifact::{CommitId, GitTreeId, Sha256Digest};
     use crate::descriptor_bound_launcher::ReviewedFilesystemIdentity;
@@ -1137,7 +1244,11 @@ mod tests {
             ));
             fs::create_dir_all(&root).unwrap();
             for name in ["lower", "upper", "work", "merged"] {
-                fs::create_dir(root.join(name)).unwrap();
+                let role = root.join(name);
+                fs::create_dir(&role).unwrap();
+                // Pin the fixture modes instead of inheriting the ambient umask, so a role-trust
+                // refusal in a test is the test's own doing.
+                fs::set_permissions(&role, fs::Permissions::from_mode(0o755)).unwrap();
             }
             let paths = TrustedOverlayMountPaths::new(
                 root.join("lower"),
@@ -1198,6 +1309,11 @@ mod tests {
             ))
             .unwrap();
         (anchor, task)
+    }
+
+    /// The identity production observation passes to `observe_with_evidence`.
+    fn observer_euid() -> u32 {
+        geteuid().as_raw()
     }
 
     fn filesystems() -> &'static [u8] {
@@ -1382,6 +1498,7 @@ mod tests {
             filesystems(),
             mountinfo(),
             (4, 9),
+            observer_euid(),
             || {},
         )
         .unwrap();
@@ -1408,6 +1525,7 @@ mod tests {
             filesystems(),
             mountinfo(),
             (4, 9),
+            observer_euid(),
             || {},
         )
         .unwrap_err();
@@ -1432,6 +1550,7 @@ mod tests {
             filesystems(),
             mountinfo(),
             (4, 9),
+            observer_euid(),
             || {},
         )
         .unwrap_err();
@@ -1451,6 +1570,7 @@ mod tests {
             b"nodev\tproc\n\text4\n",
             mountinfo(),
             (4, 9),
+            observer_euid(),
             || {},
         )
         .unwrap_err();
@@ -1471,6 +1591,7 @@ mod tests {
             filesystems(),
             mounted.as_bytes(),
             (4, 9),
+            observer_euid(),
             || {},
         )
         .unwrap_err();
@@ -1491,6 +1612,7 @@ mod tests {
             filesystems(),
             mountinfo(),
             (4, 9),
+            observer_euid(),
             move || {
                 fs::rename(root.join("lower"), root.join("lower-old")).unwrap();
                 fs::create_dir(root.join("lower")).unwrap();
@@ -1502,6 +1624,32 @@ mod tests {
             TrustedOverlayMountPlanErrorKind::ChangedDuringObservation
                 | TrustedOverlayMountPlanErrorKind::Io
         ));
+    }
+
+    #[test]
+    fn refuses_mode_drift_after_role_trust_was_observed() {
+        for role in ["lower", "upper", "work", "merged"] {
+            let fixture = Fixture::new();
+            let directory = fixture.root.join(role);
+            let error = observe_with_evidence(
+                binding(),
+                lease(),
+                fixture.paths.clone(),
+                filesystems(),
+                mountinfo(),
+                (4, 9),
+                observer_euid(),
+                || {
+                    fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                TrustedOverlayMountPlanErrorKind::ChangedDuringObservation,
+                "{role} mode drift must invalidate the admitted snapshot"
+            );
+        }
     }
 
     #[test]
@@ -1558,6 +1706,168 @@ mod tests {
                 .kind(),
             TrustedOverlayMountPlanErrorKind::IdentityConflict
         );
+    }
+
+    #[test]
+    fn refuses_group_or_world_writable_role_directories() {
+        for role in ["lower", "upper", "work", "merged"] {
+            for mode in [0o775, 0o757, 0o777] {
+                let fixture = Fixture::new();
+                let directory = fixture.root.join(role);
+                fs::set_permissions(&directory, fs::Permissions::from_mode(mode)).unwrap();
+                let error = observe_with_evidence(
+                    binding(),
+                    lease(),
+                    fixture.paths.clone(),
+                    filesystems(),
+                    mountinfo(),
+                    (4, 9),
+                    observer_euid(),
+                    || {},
+                )
+                .unwrap_err();
+                assert_eq!(error.code(), "overlay_mount_role_untrusted_writable");
+                assert_eq!(
+                    error.kind(),
+                    TrustedOverlayMountPlanErrorKind::UnsafeFilesystem
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_a_foreign_owned_role_directory() {
+        let fixture = Fixture::new();
+        let owner = fs::metadata(fixture.root.join("lower")).unwrap().uid();
+        // The fixture roles belong to whoever runs the tests. Observing them as a different
+        // identity is exactly what a foreign-owned lower base looks like to production.
+        let foreign_euid = owner.checked_add(1).expect("uid has headroom");
+        let result = observe_with_evidence(
+            binding(),
+            lease(),
+            fixture.paths.clone(),
+            filesystems(),
+            mountinfo(),
+            (4, 9),
+            foreign_euid,
+            || {},
+        );
+        if owner == 0 {
+            // Running as root: a root-owned role stays trusted under any observing identity.
+            assert!(result.is_ok());
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.code(), "overlay_mount_role_owner_foreign");
+            assert_eq!(
+                error.kind(),
+                TrustedOverlayMountPlanErrorKind::UnsafeFilesystem
+            );
+        }
+
+        // The same roles are admitted for the identity that actually owns them.
+        observe_with_evidence(
+            binding(),
+            lease(),
+            fixture.paths.clone(),
+            filesystems(),
+            mountinfo(),
+            (4, 9),
+            observer_euid(),
+            || {},
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn writable_roles_require_owner_access_but_a_read_only_lower_base_does_not() {
+        let fixture = Fixture::new();
+        let upper = fixture.root.join("upper");
+        fs::set_permissions(&upper, fs::Permissions::from_mode(0o355)).unwrap();
+        let error = observe_with_evidence(
+            binding(),
+            lease(),
+            fixture.paths.clone(),
+            filesystems(),
+            mountinfo(),
+            (4, 9),
+            observer_euid(),
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "overlay_mount_role_owner_access_missing");
+        fs::set_permissions(&upper, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // An immutable read-only source anchor is a valid lower base.
+        fs::set_permissions(
+            fixture.root.join("lower"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        observe_with_evidence(
+            binding(),
+            lease(),
+            fixture.paths.clone(),
+            filesystems(),
+            mountinfo(),
+            (4, 9),
+            observer_euid(),
+            || {},
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pure_role_trust_separates_the_read_only_base_from_the_writable_roles() {
+        fn snapshot(uid: u32, mode: u32) -> DirectorySnapshot {
+            DirectorySnapshot {
+                device: 1,
+                inode: 2,
+                uid,
+                gid: 1000,
+                mode: 0o40000 | mode,
+                mtime: 1,
+                mtime_nsec: 0,
+                ctime: 1,
+                ctime_nsec: 0,
+            }
+        }
+
+        let roles = [
+            TrustedOverlayRole::Lower,
+            TrustedOverlayRole::Upper,
+            TrustedOverlayRole::Work,
+            TrustedOverlayRole::Merged,
+        ];
+        for role in roles {
+            require_role_trust(role, &snapshot(1000, 0o755), 1000).unwrap();
+            require_role_trust(role, &snapshot(0, 0o755), 1000).unwrap();
+            assert_eq!(
+                require_role_trust(role, &snapshot(1001, 0o755), 1000)
+                    .unwrap_err()
+                    .code(),
+                "overlay_mount_role_owner_foreign"
+            );
+            for mode in [0o775, 0o757, 0o777] {
+                assert_eq!(
+                    require_role_trust(role, &snapshot(1000, mode), 1000)
+                        .unwrap_err()
+                        .code(),
+                    "overlay_mount_role_untrusted_writable"
+                );
+            }
+        }
+
+        // Only the writable roles demand full owner access.
+        require_role_trust(TrustedOverlayRole::Lower, &snapshot(1000, 0o555), 1000).unwrap();
+        require_role_trust(TrustedOverlayRole::Merged, &snapshot(1000, 0o555), 1000).unwrap();
+        for role in [TrustedOverlayRole::Upper, TrustedOverlayRole::Work] {
+            assert_eq!(
+                require_role_trust(role, &snapshot(1000, 0o555), 1000)
+                    .unwrap_err()
+                    .code(),
+                "overlay_mount_role_owner_access_missing"
+            );
+        }
     }
 
     #[test]
