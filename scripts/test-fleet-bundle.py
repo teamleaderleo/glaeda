@@ -201,6 +201,42 @@ class BundleTests(unittest.TestCase):
             self.assertEqual(list(parent.iterdir()), [])
             self.assertFalse((root / "moved/candidate/stage-receipt.json").exists())
 
+    def test_stage_rejects_payload_changes_before_completion(self):
+        payload, manifest = fixture()
+        raw = b.archive_bytes(payload, manifest)
+        for attack in ("directory", "replace", "contents", "mode", "hardlink", "symlink"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                destination = root / "candidate"
+                original_open = b.private_parent
+                calls = 0
+                def change_payload(path):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        binary = destination / "bin/glaeda"
+                        if attack == "directory":
+                            binary.parent.rename(destination / "moved-bin")
+                            binary.parent.mkdir(mode=0o700)
+                            binary.write_bytes(b"foreign")
+                        elif attack == "replace":
+                            binary.unlink()
+                            binary.write_bytes(b"foreign")
+                        elif attack == "contents":
+                            binary.write_bytes(b"changed")
+                        elif attack == "mode":
+                            binary.chmod(0o777)
+                        elif attack == "hardlink":
+                            os.link(binary, root / "alias")
+                        elif attack == "symlink":
+                            binary.unlink()
+                            binary.symlink_to(root / "missing")
+                    return original_open(path)
+                with mock.patch.object(b, "private_parent", side_effect=change_payload):
+                    with self.assertRaises((b.BundleError, OSError)):
+                        b.stage(raw, b.sha256(raw), SOURCE, TARGET, destination, apply=True)
+                self.assertFalse((destination / "stage-receipt.json").exists())
+
     def test_source_requires_exact_clean_checkout(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

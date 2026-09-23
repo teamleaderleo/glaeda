@@ -222,6 +222,7 @@ def stage(raw: bytes, digest: str, source: str, target: str, destination: Path, 
     parent = private_parent(destination.parent)
     generation = None
     directories = {}
+    written = {}
     try:
         try:
             os.stat(destination.name, dir_fd=parent, follow_symlinks=False)
@@ -258,6 +259,7 @@ def stage(raw: bytes, digest: str, source: str, target: str, destination: Path, 
                 stream.flush()
                 os.fchmod(stream.fileno(), 0o700 if name == "bin/glaeda" else 0o600)
                 os.fsync(stream.fileno())
+                written[name] = os.fstat(stream.fileno())
                 stream.seek(0)
                 if stream.read(len(data) + 1) != data:
                     raise BundleError("staged file readback mismatch")
@@ -275,6 +277,26 @@ def stage(raw: bytes, digest: str, source: str, target: str, destination: Path, 
         held = os.fstat(generation)
         if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):
             raise BundleError("generation directory moved during staging")
+        for name, fd in directories.items():
+            named_dir = os.stat(name, dir_fd=generation, follow_symlinks=False)
+            held_dir = os.fstat(fd)
+            if ((named_dir.st_dev, named_dir.st_ino) != (held_dir.st_dev, held_dir.st_ino)
+                    or not stat.S_ISDIR(named_dir.st_mode)
+                    or stat.S_IMODE(named_dir.st_mode) != 0o700
+                    or named_dir.st_uid != os.geteuid()):
+                raise BundleError("staged directory identity changed")
+        for name, data in {**contents, "manifest.json": canonical(manifest)}.items():
+            parts = name.split("/")
+            directory = directories[parts[0]] if len(parts) == 2 else generation
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            with os.fdopen(fd, "rb") as stream:
+                fresh, original = os.fstat(stream.fileno()), written[name]
+                if ((fresh.st_dev, fresh.st_ino) != (original.st_dev, original.st_ino)
+                        or not stat.S_ISREG(fresh.st_mode) or fresh.st_nlink != 1
+                        or fresh.st_uid != os.geteuid() or fresh.st_size != len(data)
+                        or stat.S_IMODE(fresh.st_mode) != (0o700 if name == "bin/glaeda" else 0o600)
+                        or stream.read(len(data) + 1) != data):
+                    raise BundleError("staged file identity or contents changed")
         result["state"] = "staged"
         fd = os.open("stage-receipt.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=generation)
         with os.fdopen(fd, "wb") as stream:
