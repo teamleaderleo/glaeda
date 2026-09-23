@@ -16,6 +16,12 @@ use serde::Serialize;
 pub const PROJECT_CHECKOUT_OBSERVATION_SCHEMA_VERSION: u8 = 2;
 pub const PROJECT_CHECKOUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_PROJECT_CHECKOUT_OUTPUT_BYTES: usize = 65_536;
+/// Bound for the one read that scales with index size: one mode line per tracked file.
+///
+/// At seven bytes per entry the general bound stops at roughly 9,000 tracked files, which refuses
+/// ordinary large repositories outright. Each line is still validated strictly, so a larger bound
+/// buys coverage without loosening what is accepted.
+pub const MAX_PROJECT_INDEX_MODE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_PROJECT_REMOTES: usize = 16;
 pub const MAX_REMOTE_NAME_BYTES: usize = 100;
 pub const MAX_BRANCH_NAME_BYTES: usize = 512;
@@ -374,7 +380,12 @@ impl ProjectCheckoutObserver {
         let (primary_project, source_ambiguous) = select_primary_project(&remotes);
         let raw_status = self.read_status(checkout, executor)?;
         let status = parse_status(&raw_status)?;
-        let modes = self.git(checkout, &["ls-files", "--format=%(objectmode)"], executor)?;
+        let modes = self.git_bounded(
+            checkout,
+            &["ls-files", "--format=%(objectmode)"],
+            MAX_PROJECT_INDEX_MODE_OUTPUT_BYTES,
+            executor,
+        )?;
         require_success(&modes)?;
         let submodules_present = parse_submodule_presence(&modes.stdout)?;
         let worktrees = self.git(
@@ -465,10 +476,29 @@ impl ProjectCheckoutObserver {
         Ok(record.stdout)
     }
 
-    fn git(
+    /// Run one hardened, credentialless, lock-free Git command beneath `checkout`.
+    ///
+    /// Shared with sibling read-only observers so every Git read uses the same environment and
+    /// output bounds.
+    pub(crate) fn git(
         &self,
         checkout: &Path,
         arguments: &[&str],
+        executor: &impl TimedCommandExecutor,
+    ) -> Result<ExecutionRecord, ProjectCheckoutObservationError> {
+        self.git_bounded(
+            checkout,
+            arguments,
+            MAX_PROJECT_CHECKOUT_OUTPUT_BYTES,
+            executor,
+        )
+    }
+
+    fn git_bounded(
+        &self,
+        checkout: &Path,
+        arguments: &[&str],
+        max_stdout_bytes: usize,
         executor: &impl TimedCommandExecutor,
     ) -> Result<ExecutionRecord, ProjectCheckoutObservationError> {
         let checkout = checkout.to_str().ok_or_else(unsafe_path)?;
@@ -504,7 +534,7 @@ impl ProjectCheckoutObserver {
             .map_err(|_| unavailable())?;
         if record.argv != expected_argv
             || record.environment_keys != expected_environment_keys
-            || record.stdout.len() > MAX_PROJECT_CHECKOUT_OUTPUT_BYTES
+            || record.stdout.len() > max_stdout_bytes
             || record.stderr.len() > MAX_PROJECT_CHECKOUT_OUTPUT_BYTES
             || record.stdout.contains('\u{fffd}')
             || record.stderr.contains('\u{fffd}')

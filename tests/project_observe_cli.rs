@@ -184,3 +184,35 @@ fn git_executable_is_fixed_instead_of_a_caller_selected_command_surface() {
     let stdout = String::from_utf8(help.stdout).expect("UTF-8 help");
     assert!(!stdout.contains("git-program"));
 }
+
+#[test]
+fn observation_accepts_an_index_larger_than_the_general_output_bound() {
+    // Seven bytes of mode output per tracked file: 12,000 files is about 84 KB, which the general
+    // 64 KiB bound used to refuse outright for every ordinary large repository.
+    let fixture = Fixture::new();
+    let bulk = fixture.checkout.join("bulk");
+    fs::create_dir(&bulk).expect("create bulk directory");
+    for index in 0..12_000 {
+        fs::write(bulk.join(format!("{index}.txt")), "x\n").expect("write bulk file");
+    }
+    git(&fixture.checkout, &["add", "bulk"]);
+    git(
+        &fixture.checkout,
+        &[
+            "-c",
+            "user.name=Glaeda Test",
+            "-c",
+            "user.email=glaeda-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "bulk",
+        ],
+    );
+
+    let output = fixture.observe("json");
+    assert_child_success("large-index project observation", &output);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert_eq!(report["observation"]["tracked_changes_present"], false);
+    assert_eq!(report["observation"]["submodules_present"], false);
+}
