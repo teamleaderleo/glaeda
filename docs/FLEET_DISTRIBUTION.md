@@ -29,27 +29,33 @@ gh run download RUN_ID --repo teamleaderleo/glaeda \
 
 Use the receipt from the trusted run's summary for the archive SHA-256. A checksum
 downloaded beside an unknown archive is not an independent source of trust.
-From an independently reviewed Glaeda checkout, verify without executing anything
-in the bundle:
+From an independently reviewed Glaeda checkout, stage the exact archive:
 
 ```bash
-python3 scripts/fleet_bundle.py verify /private/candidate-download/ARCHIVE.tar.gz \
+mkdir -m 700 "$HOME/Projects/glaeda-generations" # first install only
+python3 scripts/fleet_bundle.py stage /private/candidate-download/ARCHIVE.tar.gz \
   --sha256 SHA256_FROM_TRUSTED_RUN \
-  --source EXACT_40_CHARACTER_COMMIT --target aarch64-apple-darwin
+  --source EXACT_40_CHARACTER_COMMIT --target aarch64-apple-darwin \
+  --directory "$HOME/Projects/glaeda-generations/GENERATION"
 ```
 
-The verifier checks the exact closed file inventory, sizes, hashes, source and
-target, and rejects links, foreign paths, duplicates and incomplete bundles. It
-does not extract, install, run the binary, touch services or grant update authority.
-The download contains the named archive and `receipt.json`; select that exact
-archive, never an arbitrary newest file.
+This previews the operation. Repeat with `--apply` to verify and unpack into that
+new private directory. The parent must already exist, be owned by you with mode
+0700, and use a canonical absolute path. Each update uses a new generation name.
+The verifier checks bounded decompression, the closed file inventory, hashes,
+source and target before writing. It rejects links and existing destinations.
 
-After verification, unpack into a new private generation directory. Keep the
-previous installed generation intact. Set `GLAEDA_BIN` to that directory's
-`bin/glaeda` and run the included fleet tools from its root; continue with
+A successful command returns `state: staged`, the binary/tool paths, and writes
+`stage-receipt.json` after file readback and sync. Set `GLAEDA_BIN` to the returned
+binary and run the included fleet tools from that generation; continue with
 [bootstrap and local acceptance](CMUX_FLEET_ENROLLMENT.md), skipping the source-build
-and binary-copy step. The bundle does not include a CMUX checkout, Python, Xcode,
-GitHub runner registration or operator credentials.
+and binary-copy step. Keep the previous generation for rollback.
+
+Interrupted staging leaves its directory for inspection. Choose a fresh directory
+when retrying; an incomplete generation is never adopted. Staging runs no bundle
+code and changes no services or active pointers. The receiving host still provides
+Python, the CMUX checkout, Xcode and GitHub runner registration. For verification
+alone, use `verify ARCHIVE --sha256 HASH --source COMMIT --target TARGET`.
 
 ## Local production
 
