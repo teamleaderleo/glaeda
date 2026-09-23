@@ -22,12 +22,15 @@ ENROLLABLE_ROLES = {
     "cmux_linux_ci",
 }
 CMUX_REPOSITORY = "manaflow-ai/cmux"
-# The CMUX profile runner rebuilds PATH for the workload from a fixed list of
-# system directories plus a per-attempt Cargo home that starts empty. A tool
-# reachable only from the operator's shell is therefore invisible to the build,
-# so observing through the operator's PATH reports a readiness the build cannot
-# spend. Search the directories the build will search.
+# The fixed part of the PATH the CMUX profile runner hands its workload, from
+# `workload_environment` in the repository's scripts/ci/cmux_workload_profile.py.
+# The runner prepends a per-attempt Cargo home that it creates empty, so these
+# six directories are everything a build can actually reach.
 CMUX_WORKLOAD_TOOL_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# Tools the CMUX developer build itself invokes, as opposed to the ones this
+# script runs to describe the machine.
+MACOS_WORKLOAD_TOOLS = ("cargo", "git", "rustc", "rustup", "xcodebuild", "xcrun", "zig")
+LINUX_WORKLOAD_TOOLS = ("git", "python3")
 # CMUX publishes GhosttyKit at the repository root when setup takes the
 # prebuilt archive, and under the Ghostty submodule when it builds from source.
 CMUX_GHOSTTYKIT_LOCATIONS = (
@@ -80,7 +83,7 @@ def run(
 ) -> str:
     environment = {
         "LC_ALL": "C",
-        "PATH": CMUX_WORKLOAD_TOOL_PATH,
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
     }
     for name in ("HOME", "CARGO_HOME", "RUSTUP_HOME", "DEVELOPER_DIR"):
         value = os.environ.get(name)
@@ -105,17 +108,34 @@ def run(
         raise BootstrapError(f"required command failed: {Path(argv[0]).name}")
     # Column zero carries meaning for callers such as `git submodule status`,
     # whose leading space marks a checked-out submodule. Trim the trailing
-    # newline only, so no caller has to defend its own first line.
+    # newline and nothing else: callers that fullmatch this output are matching
+    # a command's exact bytes, not a normalised form.
     return result.stdout.rstrip("\n")
 
 
 def executable(name: str) -> str:
-    value = shutil.which(name, path=CMUX_WORKLOAD_TOOL_PATH)
+    value = shutil.which(name)
     if value is None:
-        raise BootstrapError(
-            f"required command is missing from the CMUX workload PATH: {name}"
-        )
+        raise BootstrapError(f"required command is missing: {name}")
     return os.path.abspath(value)
+
+
+def missing_workload_tools(names: tuple[str, ...]) -> list[str]:
+    """Name the build tools the CMUX workload will not be able to find.
+
+    Resolving a tool from the operator's shell says nothing about the build:
+    the runner rebuilds PATH from ``CMUX_WORKLOAD_TOOL_PATH`` plus a Cargo home
+    that starts empty. A tool installed under the operator's home therefore
+    passes every probe here and fails the build minutes later, which is how the
+    first fleet canary lost 670 seconds to a Zig it could see. Report the
+    difference as an observation so the receipt still lists everything else
+    wrong with the node.
+    """
+    return sorted(
+        name
+        for name in names
+        if shutil.which(name, path=CMUX_WORKLOAD_TOOL_PATH) is None
+    )
 
 
 def profile_runner_interpreter_ready() -> bool:
@@ -349,6 +369,7 @@ def collect_macos(
     cache_free_gib = disk_free_gib(cache_root) if cache_ready and cache_root else 0
     cpus = os.cpu_count() or 0
     memory_gib = mac_total_memory_gib()
+    invisible = missing_workload_tools(MACOS_WORKLOAD_TOOLS)
     return {
         "platform": "macos",
         "architecture": normalize_arch(platform.machine()),
@@ -377,6 +398,7 @@ def collect_macos(
             ),
             "git": git.startswith("git version "),
             "profileRunnerInterpreter": profile_runner_interpreter_ready(),
+            "workloadToolPath": not invisible,
             "zig": zig_version_compatible(zig, zig_required),
             "rust": (
                 rustup_version.startswith("rustup ")
@@ -409,6 +431,7 @@ def collect_macos(
                     else f"lt-{min_free_gib}"
                 )
             ),
+            "toolsMissingFromWorkloadPath": invisible,
             "logicalCpuClass": "ge-8" if cpus >= 8 else "lt-8",
             "totalMemoryGiBClass": (
                 "ge-16" if memory_gib >= 16 else "lt-16"
@@ -477,9 +500,7 @@ def collect_linux(
     actions_ok = True
     if "cmux_linux_ci" in roles:
         for name in ("curl", "tar", "gzip", "ldd"):
-            actions_ok = actions_ok and (
-                shutil.which(name, path=CMUX_WORKLOAD_TOOL_PATH) is not None
-            )
+            actions_ok = actions_ok and shutil.which(name) is not None
     toolchain = {
         "distribution": f"{distro}-{version}",
         "kernelMajor": kernel_major,
@@ -499,6 +520,7 @@ def collect_linux(
     total_gib = linux_memory_gib("MemTotal")
     cpus = os.cpu_count() or 0
     free_gib = disk_free_gib(cmux_root)
+    invisible = missing_workload_tools(LINUX_WORKLOAD_TOOLS)
     return {
         "platform": "linux",
         "architecture": normalize_arch(platform.machine()),
@@ -517,6 +539,7 @@ def collect_linux(
             "canonicalCheckoutClean": cmux_checkout_clean(cmux_root),
             "git": git.startswith("git version "),
             "profileRunnerInterpreter": profile_runner_interpreter_ready(),
+            "workloadToolPath": not invisible,
             "glaedaExecutable": glaeda.is_file() and os.access(glaeda, os.X_OK),
             "systemd": systemd.startswith("systemd "),
             "bubblewrap": bwrap.startswith("bubblewrap "),
@@ -533,6 +556,7 @@ def collect_linux(
             "availableMemoryGiBClass": (
                 "ge-8" if available_gib >= 8 else "lt-8"
             ),
+            "toolsMissingFromWorkloadPath": invisible,
             "logicalCpuClass": "ge-4" if cpus >= 4 else "lt-4",
             "totalMemoryGiBClass": (
                 "ge-8" if total_gib >= 8 else "lt-8"

@@ -2,7 +2,9 @@
 import importlib.util
 from pathlib import Path
 import json
+import platform
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -25,6 +27,7 @@ def observation(platform="macos", failed=()):
         "glaedaExecutable": True,
         "diskAdmission": True,
         "profileRunnerInterpreter": True,
+        "workloadToolPath": True,
     }
     if platform == "macos":
         checks.update(
@@ -213,18 +216,36 @@ class Tests(unittest.TestCase):
         output = b.run(["/bin/sh", "-c", "printf ' clean sub\\n-absent sub\\n'"])
         self.assertEqual(output.splitlines(), [" clean sub", "-absent sub"])
 
-    def test_submodules_ready_reads_the_first_line(self):
-        with mock.patch.object(b, "executable", return_value="/usr/bin/git"):
-            for status, ready in (
-                (" a1 ghostty (v1)\n b2 other (v2)", True),
-                ("-a1 ghostty (v1)\n b2 other (v2)", False),
-                ("", False),
-            ):
-                with self.subTest(status=status):
-                    with mock.patch.object(b, "run", return_value=status):
-                        self.assertEqual(
-                            b.cmux_submodules_ready(Path("/nonexistent")), ready
-                        )
+    def test_submodules_ready_on_a_real_checked_out_submodule(self):
+        # Mocking `run` here would step over the bug: the leading space that
+        # marks a checked-out submodule only survives if `run` leaves it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            inner, outer = root / "inner", root / "outer"
+
+            def git(*args, cwd):
+                subprocess.run(
+                    ["git", "-c", "protocol.file.allow=always",
+                     "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                     *args],
+                    cwd=cwd, check=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                         "HOME": str(root), "GIT_CONFIG_GLOBAL": "/dev/null",
+                         "GIT_CONFIG_NOSYSTEM": "1"},
+                )
+
+            for path in (inner, outer):
+                path.mkdir()
+                git("init", "-q", "-b", "main", cwd=path)
+                (path / "file").write_text("x", encoding="utf-8")
+                git("add", "-A", cwd=path)
+                git("commit", "-qm", "seed", cwd=path)
+            git("submodule", "add", "-q", str(inner), "vendor", cwd=outer)
+            git("commit", "-qm", "vendor", cwd=outer)
+
+            self.assertTrue(b.cmux_submodules_ready(outer))
+            self.assertTrue(b.cmux_checkout_clean(outer))
 
     def test_setup_artifacts_accept_either_ghosttykit_location(self):
         for location in b.CMUX_GHOSTTYKIT_LOCATIONS:
@@ -237,30 +258,62 @@ class Tests(unittest.TestCase):
                 (root / location).mkdir(parents=True)
                 self.assertTrue(b.cmux_setup_artifacts_present(root))
 
-    def test_tools_are_resolved_through_the_workload_path(self):
-        # A tool the operator can reach from their shell is invisible to the
-        # build, which rebuilds PATH from a fixed list of system directories.
+    def test_tools_only_on_the_operator_path_are_reported_invisible(self):
+        # The build rebuilds PATH from a fixed list of system directories plus
+        # an empty Cargo home, so a tool under the operator's home is one the
+        # build cannot spend, however well the operator's shell resolves it.
         with tempfile.TemporaryDirectory() as temporary:
             operator_only = Path(temporary)
             tool = operator_only / "cmux-fixture-tool"
             tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             tool.chmod(0o755)
             with mock.patch.dict(os.environ, {"PATH": str(operator_only)}):
-                with self.assertRaises(b.BootstrapError):
-                    b.executable("cmux-fixture-tool")
-                self.assertTrue(b.executable("sh").startswith("/"))
+                # Still resolvable for probing: a node with a misplaced tool
+                # must still produce a receipt naming everything else wrong.
+                self.assertTrue(b.executable("cmux-fixture-tool").startswith("/"))
+                self.assertEqual(
+                    b.missing_workload_tools(("cmux-fixture-tool", "sh")),
+                    ["cmux-fixture-tool"],
+                )
+            self.assertEqual(b.missing_workload_tools(("sh", "cat")), [])
 
-    def test_interpreter_without_waitid_blocks_enrollment(self):
-        # CPython exposes os.waitid on macOS only from 3.13, and the CMUX
-        # profile runner cannot wait on its child without it.
-        self.assertEqual(b.profile_runner_interpreter_ready(), hasattr(os, "waitid"))
-        result = b.evaluate(
-            observation(failed=("profileRunnerInterpreter",)),
-            ["cmux_macos_native_build"],
-            "cmux-mac-build-large",
+    def test_linux_observation_reports_the_new_checks(self):
+        # evaluate() is key-agnostic, so asserting on a hand-built fixture
+        # proves nothing about what the collectors actually emit.
+        if platform.system() != "Linux":
+            self.skipTest("collect_linux observes a Linux host")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / ".git").mkdir()
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+            outputs = {
+                "git": "git version 2.51.0",
+                "python3": "Python 3.14.0",
+                "systemctl": "systemd 257 (257)\n+PAM",
+                "bwrap": "bubblewrap 0.11.0",
+            }
+            with (
+                mock.patch.object(b, "executable", side_effect=lambda name: f"/usr/bin/{name}"),
+                mock.patch.object(
+                    b, "run", side_effect=lambda argv, **kw: outputs[Path(argv[0]).name]
+                ),
+                mock.patch.object(b, "read_os_release", return_value=("ubuntu", "24.04")),
+                mock.patch.object(b, "linux_memory_gib", return_value=64),
+            ):
+                observed = b.collect_linux(
+                    root, glaeda, 1, ["cmux_linux_ci"], "cmux-linux-ci-medium"
+                )
+        self.assertIn("profileRunnerInterpreter", observed["checks"])
+        self.assertIn("workloadToolPath", observed["checks"])
+        self.assertEqual(
+            observed["checks"]["profileRunnerInterpreter"], hasattr(os, "waitid")
         )
-        self.assertFalse(result["eligibleForEnrollment"])
-        self.assertIn("profileRunnerInterpreter", result["blockingChecks"])
+        self.assertEqual(
+            observed["checks"]["workloadToolPath"],
+            not observed["observed"]["toolsMissingFromWorkloadPath"],
+        )
 
     def test_power_posture_parser(self):
         raw = (

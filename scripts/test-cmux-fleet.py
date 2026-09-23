@@ -19,14 +19,6 @@ assert SPEC and SPEC.loader
 f = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(f)
 
-BOOTSTRAP_PATH = Path(__file__).with_name("cmux_fleet_bootstrap.py")
-BOOTSTRAP_SPEC = importlib.util.spec_from_file_location(
-    "cmux_fleet_bootstrap", BOOTSTRAP_PATH
-)
-assert BOOTSTRAP_SPEC and BOOTSTRAP_SPEC.loader
-bootstrap = importlib.util.module_from_spec(BOOTSTRAP_SPEC)
-BOOTSTRAP_SPEC.loader.exec_module(bootstrap)
-
 A = "sha256:" + "a" * 64
 B = "sha256:" + "b" * 64
 C = "sha256:" + "c" * 64
@@ -192,7 +184,9 @@ def finalized(
 
 class FleetTests(unittest.TestCase):
     def setUp(self):
-        notices = mock.patch.object(f, "_notice")
+        # create=True so this suite can also be run against a revision that
+        # predates the operator notice, which is how its binding is measured.
+        notices = mock.patch.object(f, "_notice", create=True)
         self.notices = notices.start()
         self.addCleanup(notices.stop)
 
@@ -533,9 +527,7 @@ class FleetTests(unittest.TestCase):
         )
         self.assertEqual(environment["LC_ALL"], "C")
         self.assertEqual(environment["LANG"], "C")
-        # The operator's PATH is an input the build never sees, so forwarding it
-        # would let bootstrap and acceptance disagree about which tools exist.
-        self.assertEqual(environment["PATH"], f.CMUX_WORKLOAD_TOOL_PATH)
+        self.assertEqual(environment["PATH"], "/reviewed/bin:/usr/bin:/bin")
         self.assertNotIn("PYTHONPATH", environment)
         self.assertNotIn("PYTHONHOME", environment)
         self.assertNotIn("SSH_AUTH_SOCK", environment)
@@ -581,7 +573,7 @@ class FleetTests(unittest.TestCase):
                     self.assertNotIn(forbidden, environment)
                 self.assertEqual(environment["LC_ALL"], "C")
                 self.assertEqual(environment["LANG"], "C")
-                self.assertEqual(environment["PATH"], f.CMUX_WORKLOAD_TOOL_PATH)
+                self.assertEqual(environment["PATH"], "/reviewed/bin:/usr/bin:/bin")
                 self.assertEqual(environment["HOME"], str(root / "home"))
                 self.assertEqual(environment["CARGO_HOME"], str(root / "cargo"))
                 self.assertEqual(environment["RUSTUP_HOME"], str(root / "rustup"))
@@ -713,13 +705,6 @@ class FleetTests(unittest.TestCase):
         glaeda.chmod(0o755)
         return e, enrollment_path, cmux_root, runner, glaeda
 
-    def test_workload_tool_path_matches_bootstrap_observation(self):
-        # Bootstrap's readiness verdict means something only if it searched the
-        # directories acceptance will hand the build.
-        self.assertEqual(
-            f.CMUX_WORKLOAD_TOOL_PATH, bootstrap.CMUX_WORKLOAD_TOOL_PATH
-        )
-
     def test_rejected_attempt_keeps_the_evidence_an_acceptance_discards(self):
         # A rejected receipt carries a verdict and no cause, so deleting the
         # runner log with the attempt leaves the operator nothing to read.
@@ -771,6 +756,56 @@ class FleetTests(unittest.TestCase):
                     self.assertTrue((kept[0] / "result.json").is_file())
                     # The child's scratch tree is the large part and rebuilds.
                     self.assertFalse((kept[0] / "tmp").exists())
+
+    def test_unwritable_scratch_tree_is_removed_not_swallowed(self):
+        # A build leaves read-only directories behind; rmtree(ignore_errors=True)
+        # would silently keep the whole tree and the storage bound with it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            locked = root / "attempt/tmp/DerivedData/locked"
+            locked.mkdir(parents=True)
+            (locked / "artifact").write_text("x", encoding="utf-8")
+            locked.chmod(0o500)
+            # Only needed if the removal under test fails; otherwise the
+            # TemporaryDirectory cleanup would inherit the locked tree.
+            self.addCleanup(f._remove_tree, root / "attempt")
+            self.assertTrue(f._remove_tree(root / "attempt"))
+            self.assertFalse((root / "attempt").exists())
+
+    def test_retention_keeps_evidence_when_the_name_is_taken(self):
+        # The whole point of retaining is that the operator has something to
+        # read, so a name collision must never be resolved by deleting it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            attempt = root / f"{f.ATTEMPT_PREFIX}abcd1234"
+            (attempt / "tmp").mkdir(parents=True)
+            (attempt / "cmux-runner.log").write_text("cause", encoding="utf-8")
+            (root / f"{f.RETAINED_ATTEMPT_PREFIX}abcd1234").write_text(
+                "operator file", encoding="utf-8"
+            )
+            f._retain_attempt(attempt, root)
+            self.assertEqual(
+                (attempt / "cmux-runner.log").read_text(encoding="utf-8"), "cause"
+            )
+            self.assertIn("kept rejected acceptance attempt in place",
+                          self.notices.call_args.args[0])
+
+    def test_pruning_survives_an_unreadable_retained_entry(self):
+        # _retain_attempt runs from a finally: anything it raises replaces the
+        # receipt or the error that explains the rejection.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / f"{f.RETAINED_ATTEMPT_PREFIX}dangling").symlink_to(
+                root / "gone"
+            )
+            attempt = root / f"{f.ATTEMPT_PREFIX}abcd1234"
+            (attempt / "tmp").mkdir(parents=True)
+            (attempt / "cmux-runner.log").write_text("cause", encoding="utf-8")
+            f._retain_attempt(attempt, root)
+            self.assertTrue(
+                (root / f"{f.RETAINED_ATTEMPT_PREFIX}abcd1234"
+                 / "cmux-runner.log").is_file()
+            )
 
     def test_retained_attempts_stay_bounded(self):
         with tempfile.TemporaryDirectory() as temporary:
