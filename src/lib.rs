@@ -177,6 +177,9 @@ pub mod lima_lifecycle;
 pub mod lima_lifecycle_executor;
 /// Read-only, bounded exact observation of one Lima instance and running guest.
 pub mod lima_observation;
+/// Read-only observation and pure reclaim planning for linked Git worktrees.
+#[cfg(unix)]
+pub mod linked_worktree_reclaim;
 /// Pure bounded parsing of the admitted glibc dynamic-loader cache.
 #[cfg(target_os = "linux")]
 pub mod linux_dynamic_loader_cache;
