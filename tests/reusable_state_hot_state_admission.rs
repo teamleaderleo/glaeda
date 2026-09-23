@@ -59,6 +59,7 @@ fn metrics() -> ReusableStateMetrics {
         lookups: 8,
         hits: 6,
         misses: 2,
+        unresolved_identity_attempts: 0,
         restore_duration_millis: 100,
         publication_duration_millis: 200,
         bytes_read: 1_024,

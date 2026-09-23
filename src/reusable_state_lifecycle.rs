@@ -345,9 +345,8 @@ impl ReusableStateMetrics {
 
     /// Every consumer attempt that addressed this identity, resolved or not.
     #[must_use]
-    pub const fn resolution_attempts(&self) -> u64 {
-        self.lookups
-            .saturating_add(self.unresolved_identity_attempts)
+    pub fn resolution_attempts(&self) -> u128 {
+        u128::from(self.lookups) + u128::from(self.unresolved_identity_attempts)
     }
 
     /// Observed hit rate, or `None` when no consumer has addressed this identity at all.
@@ -361,7 +360,7 @@ impl ReusableStateMetrics {
         if attempts == 0 {
             return None;
         }
-        let basis_points = (u128::from(self.hits) * 10_000) / u128::from(attempts);
+        let basis_points = (u128::from(self.hits) * 10_000) / attempts;
         Some(u16::try_from(basis_points).unwrap_or(10_000))
     }
 }
@@ -621,6 +620,7 @@ impl ReusableStateGeneration {
         // never accumulates, so without this a permanently unreachable generation would
         // stay on `Observe` for its whole life.
         if self.metrics.hits == 0
+            && self.metrics.unresolved_identity_attempts > 0
             && self.metrics.unresolved_identity_attempts >= policy.min_unresolved_attempts_for_alarm
         {
             return Ok(ReusableStateRecommendation::InvestigateUnreachableIdentity);
@@ -1712,8 +1712,8 @@ mod tests {
             semantic_mismatches: u64::MAX,
         };
         metrics.validate().expect("full u64 metric range is valid");
-        assert_eq!(metrics.resolution_attempts(), u64::MAX);
-        assert_eq!(metrics.hit_rate_basis_points(), Some(10_000));
+        assert_eq!(metrics.resolution_attempts(), u128::from(u64::MAX) * 2);
+        assert_eq!(metrics.hit_rate_basis_points(), Some(5_000));
         assert_eq!(
             metrics.utility().unwrap_err(),
             ReusableStatePolicyError::UtilityOverflow
@@ -2325,6 +2325,20 @@ mod tests {
         assert_eq!(generation.metrics().hit_rate_basis_points(), Some(2_307));
     }
 
+    #[test]
+    fn zero_alarm_threshold_still_requires_an_observed_unresolved_attempt() {
+        let mut policy = ReusableStatePromotionPolicy::conservative();
+        policy.min_unresolved_attempts_for_alarm = 0;
+        let generation = candidate(
+            ReusableStateClass::ImmutableCompiledProduct,
+            metrics(0, 0, 1_300_000, 40_000, 890_000_000, 2, 0),
+        );
+        assert_eq!(
+            generation.recommendation(policy).unwrap(),
+            ReusableStateRecommendation::Observe
+        );
+    }
+
     /// Resolution failure carries its own vocabulary because no identity comparison
     /// happened: there is no mismatching field to name.
     #[test]
@@ -2351,6 +2365,7 @@ mod tests {
             ReusableStateConsumptionPolicy {
                 low_trust_read_only_allowed: false,
             },
+            &overlay_capabilities(),
         );
         assert!(!matches!(
             resolved,

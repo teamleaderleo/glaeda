@@ -169,6 +169,7 @@ Each generation record carries only low-cardinality public accounting:
 lookups
 hits
 misses
+unresolved_identity_attempts
 restore_duration_millis
 publication_duration_millis
 bytes_read
@@ -187,6 +188,17 @@ semantic_mismatches
 
 The reusable-state record has no field for paths, source contents, credentials, environment values,
 command output, or arbitrary logs.
+
+Attempts that resolve no generation are counted separately from resolved lookups, preserving
+`hits + misses == lookups`. The hit rate includes both kinds of attempt: `null` means unmeasured,
+while zero means attempts were observed but none hit. The denominator uses widened arithmetic
+so adding two valid counters cannot silently inflate the rate.
+
+A hitless run of unresolved attempts at the policy threshold recommends
+`InvestigateUnreachableIdentity`; no observation means no alarm, even with a zero threshold.
+This is advisory accounting. A resolver must supply the observations; this model neither resolves
+generations nor proves producer provenance. Resolved consumption keeps its existing trust and
+sharing-mode checks.
 
 ## Metric range
 
@@ -401,4 +413,3 @@ platform identity and record complete validation before preferred consumption.
   producer contract.
 - **cmux #13363/#13364/#13384:** preserve compiled-product eligibility, transport, and node-local
   immutable residency as three separate responsibilities.
-
