@@ -160,9 +160,15 @@ def has_git(path: Path) -> bool:
     return False
 
 
+UNREADABLE: set[str] = set()
+
+
 def _children(path: Path) -> list[Path]:
     try:
         return list(path.iterdir())
+    except PermissionError:
+        UNREADABLE.add(str(path))
+        return []
     except OSError:
         return []
 
@@ -270,6 +276,9 @@ def report(items: list[Item], free: int, total: int, limit: int, idle_hours: flo
         why = f" ({', '.join(i.reasons)})" if i.reasons else ""
         path = i.path.replace(str(HOME), "~")
         print(f"  {gib(i.bytes)}  {i.verdict:12s} {i.idle_hours:6.1f}h  {path}{why}")
+    for u in sorted(UNREADABLE):
+        print(f"\ncannot read {u}: permission denied (background jobs need Full Disk Access for "
+              f"{os.path.realpath(sys.executable)})", file=sys.stderr)
     total_r = sum(i.bytes for i in items if i.verdict == "reclaimable")
     print(f"\nreclaimable now: {gib(total_r).strip()}  ->  glaeda-disk --apply")
 
