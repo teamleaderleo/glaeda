@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import json
 import fcntl
 import importlib.util
@@ -183,6 +185,14 @@ def finalized(
 
 
 class FleetTests(unittest.TestCase):
+    def setUp(self):
+        # create=True so this suite can also be run against a revision that
+        # predates the operator notice, which is how its binding is measured.
+        self.real_notice = getattr(f, "_notice", None)
+        notices = mock.patch.object(f, "_notice", create=True)
+        self.notices = notices.start()
+        self.addCleanup(notices.stop)
+
     def test_current_accepted_role_is_eligible(self):
         e = enrollment()
         r = finalized(e)
@@ -683,6 +693,285 @@ class FleetTests(unittest.TestCase):
                         mock.patch.object(f.subprocess, "run", side_effect=run):
                     with self.assertRaisesRegex(f.FleetError, "source"):
                         f.accept_local(enrollment_path, cmux_root, glaeda, "cmux_linux_ci")
+
+    def _local_acceptance_fixture(self, root):
+        e = enrollment("linux", state="enrolling")
+        enrollment_path = root / "enrollment.json"
+        enrollment_path.write_bytes(f.canonical(e))
+        enrollment_path.chmod(0o600)
+        cmux_root = root / "cmux"
+        runner = cmux_root / "scripts/ci/cmux_workload_profile.py"
+        runner.parent.mkdir(parents=True)
+        runner.write_text("# fixture\n")
+        glaeda = root / "glaeda"
+        glaeda.write_text("#!/bin/sh\nexit 0\n")
+        glaeda.chmod(0o755)
+        return e, enrollment_path, cmux_root, runner, glaeda
+
+    def test_rejected_attempt_keeps_the_evidence_an_acceptance_discards(self):
+        # A rejected receipt carries a verdict and no cause, so deleting the
+        # runner log with the attempt leaves the operator nothing to read.
+        for state, retained in (("failed", True), ("passed", False)):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                root.chmod(0o700)
+                e, enrollment_path, cmux_root, runner, glaeda = (
+                    self._local_acceptance_fixture(root)
+                )
+                result = cmux_result("cmux_linux_ci", state=state)
+
+                def run(argv, **kwargs):
+                    if str(runner) in argv:
+                        path = Path(argv[argv.index("--result") + 1])
+                        (path.parent / "tmp/scratch").mkdir(parents=True, exist_ok=True)
+                        kwargs["stdout"].write(b"zig 0.16.0 is required\n")
+                        path.write_bytes(f.canonical(result))
+                        path.chmod(0o600)
+                        return f.subprocess.CompletedProcess(
+                            argv, 0 if state == "passed" else 1
+                        )
+                    return f.subprocess.CompletedProcess(
+                        argv, 0, stdout=f.canonical(bootstrap_for(e)), stderr=b"")
+
+                with (
+                    mock.patch.object(
+                        f, "_git_oid", side_effect=[COMMIT, "2" * 40, COMMIT, "2" * 40]
+                    ),
+                    mock.patch.object(f.subprocess, "run", side_effect=run),
+                ):
+                    receipt = f.accept_local(
+                        enrollment_path, cmux_root, glaeda, "cmux_linux_ci"
+                    )
+
+                self.assertEqual(receipt["result"] == "accepted", not retained)
+                self.assertEqual(list(root.glob(f.ATTEMPT_PREFIX + "*")), [])
+                kept = list(root.glob(f.RETAINED_ATTEMPT_PREFIX + "*"))
+                self.assertEqual(len(kept), 1 if retained else 0)
+                if retained:
+                    self.notices.assert_called_once()
+                    self.assertIn(
+                        str(kept[0]), self.notices.call_args.args[0]
+                    )
+                    self.assertIn(
+                        "zig 0.16.0 is required",
+                        (kept[0] / "cmux-runner.log").read_text(encoding="utf-8"),
+                    )
+                    self.assertTrue((kept[0] / "result.json").is_file())
+                    # The child's scratch tree is the large part and rebuilds.
+                    self.assertFalse((kept[0] / "tmp").exists())
+
+    def test_unwritable_scratch_tree_is_removed_not_swallowed(self):
+        # A build leaves read-only directories behind; rmtree(ignore_errors=True)
+        # would silently keep the whole tree and the storage bound with it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            locked = root / "attempt/tmp/DerivedData/locked"
+            locked.mkdir(parents=True)
+            (locked / "artifact").write_text("x", encoding="utf-8")
+            locked.chmod(0o500)
+            # Only needed if the removal under test fails; otherwise the
+            # TemporaryDirectory cleanup would inherit the locked tree.
+            self.addCleanup(f._remove_tree, root / "attempt")
+            self.assertTrue(f._remove_tree(root / "attempt"))
+            self.assertFalse((root / "attempt").exists())
+
+    def test_removal_never_reaches_outside_the_tree(self):
+        # os.walk does not traverse a symlink but os.chmod follows one, so a
+        # build that links its TMPDIR at a toolchain or a Cargo registry would
+        # have that directory's bits relaxed by a cleanup that does not own it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            outside = root / "outside"
+            (outside / "keep").mkdir(parents=True)
+            outside.chmod(0o500)
+            attempt = root / "attempt/tmp"
+            attempt.mkdir(parents=True)
+            (attempt / "registry").symlink_to(outside)
+            self.assertTrue(f._remove_tree(root / "attempt"))
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o500)
+            self.assertTrue((outside / "keep").is_dir())
+            # Restore before the temporary directory tries to remove it.
+            outside.chmod(0o700)
+
+    def test_removal_answers_honestly_for_links_and_unreadable_roots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            dangling = root / "dangling"
+            dangling.symlink_to(root / "never")
+            self.assertTrue(f._remove_tree(dangling))
+            self.assertFalse(dangling.is_symlink())
+
+            # os.walk cannot list an unreadable directory, so repairing only
+            # what it yields would leave the top entry behind.
+            sealed = root / "sealed"
+            (sealed / "inner").mkdir(parents=True)
+            sealed.chmod(0o000)
+            self.assertTrue(f._remove_tree(sealed))
+            self.assertFalse(sealed.exists())
+
+    def test_pruning_ranks_only_the_directories_it_created(self):
+        # The doc tells operators this evidence is theirs to keep, so they will
+        # archive it under the same name. An archive must not consume the
+        # retention budget and push real evidence out of it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for index in range(f.RETAINED_ATTEMPT_LIMIT):
+                kept = root / f"{f.RETAINED_ATTEMPT_PREFIX}dir{index}"
+                kept.mkdir()
+                (kept / "cmux-runner.log").write_text(str(index), encoding="utf-8")
+                os.utime(kept, (index + 1, index + 1))
+            for name in ("archive.tar.gz", "elsewhere"):
+                path = root / f"{f.RETAINED_ATTEMPT_PREFIX}{name}"
+                if name.endswith(".tar.gz"):
+                    path.write_text("archived", encoding="utf-8")
+                else:
+                    path.symlink_to(root)
+                os.utime(path, (99, 99), follow_symlinks=False)
+
+            f._prune_retained_attempts(root)
+
+            for index in range(f.RETAINED_ATTEMPT_LIMIT):
+                self.assertTrue(
+                    (root / f"{f.RETAINED_ATTEMPT_PREFIX}dir{index}"
+                     / "cmux-runner.log").is_file()
+                )
+            self.assertTrue((root / f"{f.RETAINED_ATTEMPT_PREFIX}archive.tar.gz").is_file())
+            self.assertTrue((root / f"{f.RETAINED_ATTEMPT_PREFIX}elsewhere").is_symlink())
+
+    def test_notice_never_raises_and_never_writes_to_stdout(self):
+        # _notice runs from a finally. A closed fd 2 leaves sys.stderr as None,
+        # and print(file=None) would put a private path in front of the receipt.
+        captured = io.StringIO()
+        with (
+            mock.patch.object(f.sys, "stderr", None),
+            contextlib.redirect_stdout(captured),
+        ):
+            self.real_notice("attempt retained")
+        self.assertEqual(captured.getvalue(), "")
+
+        class Broken:
+            def write(self, _value):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        with (
+            mock.patch.object(f.sys, "stderr", Broken()),
+            contextlib.redirect_stdout(captured),
+        ):
+            self.real_notice("attempt retained")
+        self.assertEqual(captured.getvalue(), "")
+
+    def test_retention_keeps_evidence_when_the_name_is_taken(self):
+        # The whole point of retaining is that the operator has something to
+        # read, so a name collision must never be resolved by deleting it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            attempt = root / f"{f.ATTEMPT_PREFIX}abcd1234"
+            (attempt / "tmp").mkdir(parents=True)
+            (attempt / "cmux-runner.log").write_text("cause", encoding="utf-8")
+            (root / f"{f.RETAINED_ATTEMPT_PREFIX}abcd1234").write_text(
+                "operator file", encoding="utf-8"
+            )
+            f._retain_attempt(attempt, root)
+            self.assertEqual(
+                (attempt / "cmux-runner.log").read_text(encoding="utf-8"), "cause"
+            )
+            self.assertIn("kept rejected acceptance attempt in place",
+                          self.notices.call_args.args[0])
+
+    def test_pruning_survives_an_unreadable_retained_entry(self):
+        # _retain_attempt runs from a finally: anything it raises replaces the
+        # receipt or the error that explains the rejection.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / f"{f.RETAINED_ATTEMPT_PREFIX}dangling").symlink_to(
+                root / "gone"
+            )
+            attempt = root / f"{f.ATTEMPT_PREFIX}abcd1234"
+            (attempt / "tmp").mkdir(parents=True)
+            (attempt / "cmux-runner.log").write_text("cause", encoding="utf-8")
+            f._retain_attempt(attempt, root)
+            self.assertTrue(
+                (root / f"{f.RETAINED_ATTEMPT_PREFIX}abcd1234"
+                 / "cmux-runner.log").is_file()
+            )
+
+    def test_retained_attempts_stay_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for index in range(f.RETAINED_ATTEMPT_LIMIT + 2):
+                attempt = root / f"{f.ATTEMPT_PREFIX}{index:08d}"
+                (attempt / "tmp").mkdir(parents=True)
+                (attempt / "cmux-runner.log").write_text(str(index), encoding="utf-8")
+                os.utime(attempt, (index + 1, index + 1))
+                f._retain_attempt(attempt, root)
+            kept = sorted(path.name for path in root.glob(f.RETAINED_ATTEMPT_PREFIX + "*"))
+            self.assertEqual(len(kept), f.RETAINED_ATTEMPT_LIMIT)
+            self.assertEqual(kept[-1], f"{f.RETAINED_ATTEMPT_PREFIX}00000004")
+
+    def test_pruning_leaves_operator_directories_alone(self):
+        # The doc promises that evidence an operator renames, copies or keeps
+        # under the prefix is theirs: never ranked, never removed.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            kept_by_operator = [
+                root / f"{f.RETAINED_ATTEMPT_PREFIX}abcd1234.investigating",
+                root / f"{f.RETAINED_ATTEMPT_PREFIX}old-investigation",
+            ]
+            for index, directory in enumerate(kept_by_operator):
+                directory.mkdir()
+                (directory / "notes.txt").write_text("mine", encoding="utf-8")
+                # Oldest and newest: either would decide a naive ranking.
+                os.utime(directory, (1, 1) if index else (10**10, 10**10))
+            for index in range(f.RETAINED_ATTEMPT_LIMIT):
+                attempt = root / f"{f.ATTEMPT_PREFIX}{index:08d}"
+                (attempt / "tmp").mkdir(parents=True)
+                f._retain_attempt(attempt, root)
+            for directory in kept_by_operator:
+                self.assertTrue((directory / "notes.txt").is_file())
+            for index in range(f.RETAINED_ATTEMPT_LIMIT):
+                self.assertTrue(
+                    (root / f"{f.RETAINED_ATTEMPT_PREFIX}{index:08d}").is_dir()
+                )
+
+    def test_retention_never_raises_from_an_unsearchable_attempt(self):
+        # Path.is_symlink re-raises EACCES before Python 3.14. The child holds
+        # the attempt path, so it can revoke search on it before the finally.
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory search permission")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            attempt = root / f"{f.ATTEMPT_PREFIX}abcd1234"
+            (attempt / "tmp").mkdir(parents=True)
+            attempt.chmod(0o600)
+            try:
+                f._retain_attempt(attempt, root)
+                # The scratch tree could not be reached, so it survived; the
+                # operator must be told rather than shown a clean retention.
+                self.assertIn("could not be removed",
+                              self.notices.call_args.args[0])
+            finally:
+                for candidate in (attempt, root / f"{f.RETAINED_ATTEMPT_PREFIX}abcd1234"):
+                    if candidate.exists():
+                        candidate.chmod(0o700)
+
+    def test_interpreter_without_waitid_refuses_before_the_attempt(self):
+        # CPython exposes os.waitid on macOS only from 3.13; the CMUX profile
+        # runner cannot wait on its child without it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            root.chmod(0o700)
+            _, enrollment_path, cmux_root, _, glaeda = (
+                self._local_acceptance_fixture(root)
+            )
+            with mock.patch.object(
+                f, "profile_runner_interpreter_ready", return_value=False
+            ):
+                with self.assertRaisesRegex(f.FleetError, "os.waitid"):
+                    f.accept_local(enrollment_path, cmux_root, glaeda, "cmux_linux_ci")
+            self.assertEqual(list(root.glob(f.ATTEMPT_PREFIX + "*")), [])
 
     def test_accept_local_refuses_fleet_contract_replacement(self):
         e = enrollment("linux", state="enrolling")

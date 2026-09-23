@@ -117,6 +117,9 @@ CMUX_CACHE_ROOT=/absolute/path/to/cmux-native-cache
   cd "$CMUX_ROOT"
   ./scripts/setup.sh
 )
+# Lets bootstrap describe the toolchain. It does not make it visible to the
+# CMUX build, which searches a fixed list of system directories — see the
+# workloadToolPath note below before installing rustup only under $HOME.
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 FLEET_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet"
@@ -163,6 +166,12 @@ bash scripts/cmux-fleet status "$ENROLLMENT" \
 ```
 
 The macOS preparation reuses CMUX's reviewed `scripts/setup.sh` for prerequisites. Bootstrap re-observes those prerequisites read-only and verifies the exact checkout exposes `cmux.macos.dev-check@1` for the observed Apple-Silicon node. `accept-local` launches CMUX's checked-in profile runner on this node inside a private attempt directory, captures the canonical semantic result, reruns the read-only bootstrap on this same node, and emits `glaeda-cmux-fleet-acceptance/v2`. Both Python front doors execute in isolated interpreter mode (`-I`) with a closed allowlist containing only reviewed toolchain/home path inputs plus a private attempt-local `TMPDIR`; Python import controls, Git redirection variables, SSH agents, credentials, and unrelated operator environment never flow into either child. CMUX still owns the developer-build commands, validator, artifacts, timeout, and pass/fail semantics. Glaeda owns the local-attempt binding, fresh capability check, and durable receipt.
+
+Bootstrap still probes the toolchain through the operator's shell, so a node with a misplaced tool produces a complete receipt rather than a bare error. It separately reports whether the CMUX workload will be able to find those tools: the runner rebuilds PATH as `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` plus a per-attempt Cargo home that starts empty, so a build tool reachable only from `$HOME` is one the build cannot spend. `workloadToolPath` fails and `observed.toolsMissingFromWorkloadPath` names them, which blocks enrollment in seconds instead of passing bootstrap and failing the build minutes later. **`rustup`, `cargo` and `rustc` therefore have to be reachable from those six directories, not only from `$CARGO_HOME/bin`** — the `export PATH` above lets bootstrap describe the toolchain, it does not make it visible to the build.
+
+An attempt that does not accept keeps its runner log and semantic result beside the enrollment, renamed to `rejected-attempt.*`, and drops the child's scratch tree. Both steps are best-effort and say so: if the name is already taken the attempt stays under its hidden `.acceptance-run.*` name, and if the scratch tree survives a second line names it. Either way the retained path is printed on stderr, and the receipt is never sacrificed to report it.
+
+Retention is bounded to the three most recent directories Glaeda itself created. Glaeda recognises those by name: exactly eight characters from `a-z`, `0-9` and `_` after the prefix. Anything else you leave under that prefix — an archive, a symlink onto another volume, a directory renamed `rejected-attempt.x9k2mq4p.keep` — is neither counted against the budget nor removed. Avoid a bare eight-character suffix such as a date (`rejected-attempt.20260923`) for evidence you mean to keep: it is indistinguishable from one Glaeda made. Removing a retained attempt by hand is safe at any time. The retained `cmux-runner.log` is the build's raw merged output at mode `0600` inside the `0700` fleet root: operator-private evidence with an indefinite lifetime, not something to attach to an issue unread.
 
 ## Onboard Linux
 
@@ -222,7 +231,7 @@ bash scripts/cmux-fleet status "$ENROLLMENT" \
   --acceptance "$ACCEPTANCE"
 ```
 
-The Linux `accept-local` path runs CMUX's canonical `cmux.ci.guard@1` profile against the exact local commit/tree in cold state, then re-observes this same host. A v2 receipt becomes accepted only when CMUX reports `passed`, process settlement is complete, and the post-run capability, Glaeda generation, role profile, and selected toolchain generation still match enrollment.
+The Linux `accept-local` path runs CMUX's canonical `cmux.ci.guard@1` profile against the exact local commit/tree in cold state, then re-observes this same host. Workload tool visibility and rejected-attempt retention work exactly as described for macOS above; on Linux the tools checked are `git` and `python3`. A v2 receipt becomes accepted only when CMUX reports `passed`, process settlement is complete, and the post-run capability, Glaeda generation, role profile, and selected toolchain generation still match enrollment.
 
 After either onboarding path, remove only the transient evidence files:
 

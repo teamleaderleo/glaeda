@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -46,6 +47,12 @@ CMUX_RESULT_DOCUMENT_TYPE = "cmux-workload-result"
 CMUX_RESULT_SCHEMA_VERSION = 1
 CMUX_RESULT_STATES = {"passed", "failed", "timed_out", "ambiguous"}
 CMUX_PROFILE_RUNNER = "scripts/ci/cmux_workload_profile.py"
+ATTEMPT_PREFIX = ".acceptance-run."
+RETAINED_ATTEMPT_PREFIX = "rejected-attempt."
+RETAINED_ATTEMPT_LIMIT = 3
+# What tempfile.mkdtemp appends to ATTEMPT_PREFIX. Retention renames keep it,
+# so this is also exactly the set of names Glaeda can have retained.
+ATTEMPT_SUFFIX = re.compile(r"[a-z0-9_]{8}")
 LOCAL_EXECUTION_CLASS = "glaeda-local-profile/v1"
 EXTERNAL_EVIDENCE_CLASS = "external-evidence/v1"
 ACCEPTANCE_CHILD_ENV_KEYS = (
@@ -1156,6 +1163,155 @@ def acceptance_child_environment(temporary_root: Path) -> dict[str, str]:
     return environment
 
 
+def _notice(message: str) -> None:
+    """Tell the operator something stdout cannot carry: stdout is the receipt.
+
+    This runs from a `finally`, so it may not raise and it may not write to
+    stdout. Both are reachable: a closed fd 2 leaves `sys.stderr` as None and
+    `print(file=None)` then writes to stdout, putting a private path in front
+    of the JSON and making the receipt unparseable; piping stderr into a
+    short-lived reader raises BrokenPipeError. A lost notice is worse only
+    than a lost receipt.
+    """
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        print(message, file=stream)
+    except (OSError, ValueError):
+        pass
+
+
+def profile_runner_interpreter_ready() -> bool:
+    """Report whether this interpreter can run CMUX's profile runner.
+
+    The runner waits on its child with `os.waitid` to hold the child's PID and
+    process group unreleased, and CPython exposes that call on macOS only from
+    3.13. Without it the child dies of an AttributeError a fraction of a second
+    into acceptance, so refuse before the attempt rather than after.
+    """
+    return hasattr(os, "waitid")
+
+
+def _remove_tree(path: Path) -> bool:
+    """Remove `path` and report whether it is actually gone.
+
+    A build leaves directories behind that the owner cannot descend into —
+    Xcode's DerivedData and Cargo's source cache both do — and `rmtree` cannot
+    remove those. `ignore_errors` would swallow the failure and leave the tree,
+    so restore the owner's bits on the way down and then answer plainly. A
+    caller that has promised the operator a bound needs to know when it missed.
+
+    Links are unlinked, never followed. `os.walk` does not traverse a symlink
+    but `os.chmod` does, so chmod'ing one would reach out of the tree and
+    relax the permissions of a directory this function does not own — a build
+    that links its TMPDIR at a toolchain or a Cargo registry is enough.
+    """
+    # os.path, not Path: Path.is_symlink re-raises EACCES before 3.14, and this
+    # runs from a finally.
+    if os.path.islink(path):
+        try:
+            path.unlink()
+        except OSError:
+            return False
+        return True
+    if _absent(path):
+        return True
+    # The top entry is chmod'ed first: os.walk cannot list an unreadable
+    # directory, so nothing below it would be repaired otherwise.
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    for parent, directories, _files in os.walk(path):
+        for name in directories:
+            child = os.path.join(parent, name)
+            if os.path.islink(child):
+                continue
+            try:
+                os.chmod(child, 0o700)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+    return _absent(path)
+
+
+def _absent(path: Path) -> bool:
+    """Whether `path` is known to be gone.
+
+    `os.path.lexists` answers False on any error, so an entry behind a
+    directory we cannot search would read as removed while it survives.
+    """
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def _retain_attempt(state_root: Path, fleet_root: Path) -> None:
+    """Keep a failed attempt's evidence, and bound how much of it accumulates.
+
+    A rejected receipt carries a verdict and no cause, so deleting the runner
+    log along with the attempt leaves the operator nothing to read. Drop the
+    child's scratch tree, which is the large part and reconstructible, and keep
+    the runner log and semantic result next to the enrollment that refused.
+
+    Nothing here may raise: the caller runs it from a `finally`, where an
+    exception would replace either the receipt or the error that explains the
+    rejection. Every failure becomes a notice instead, and no failure deletes
+    evidence — a retained attempt that could not be moved stays where it is.
+    """
+    scratch_dropped = _remove_tree(state_root / "tmp")
+    retained = fleet_root / (
+        RETAINED_ATTEMPT_PREFIX + state_root.name[len(ATTEMPT_PREFIX):]
+    )
+    try:
+        os.replace(state_root, retained)
+    except OSError as error:
+        # Something already owns that name. Keeping the attempt where it is
+        # beats deleting the only record of why acceptance refused.
+        _notice(f"kept rejected acceptance attempt in place ({error}): {state_root}")
+        return
+    _notice(f"retained rejected acceptance attempt: {retained}")
+    if not scratch_dropped:
+        _notice(f"attempt scratch tree could not be removed: {retained / 'tmp'}")
+    _prune_retained_attempts(fleet_root)
+
+
+def _prune_retained_attempts(fleet_root: Path) -> None:
+    """Keep the newest retained attempts and drop the rest, quietly.
+
+    Only directories this function could itself have created are ranked. The
+    name is a namespace an operator also writes in — the enrollment doc tells
+    them this evidence is theirs to keep — so an archive left as
+    `rejected-attempt.2026-09-23.tar.gz`, a symlink onto another volume, or an
+    attempt renamed `rejected-attempt.x.investigating` must neither occupy the
+    budget nor be removed by it.
+    """
+    dated: list[tuple[float, Path]] = []
+    try:
+        candidates = sorted(fleet_root.glob(RETAINED_ATTEMPT_PREFIX + "*"))
+    except OSError:
+        return
+    for path in candidates:
+        if not ATTEMPT_SUFFIX.fullmatch(path.name[len(RETAINED_ATTEMPT_PREFIX):]):
+            continue
+        try:
+            info = path.lstat()
+        except OSError:
+            # An entry a concurrent run just removed.
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            continue
+        dated.append((info.st_mtime, path))
+    dated.sort(reverse=True)
+    for _mtime, path in dated[RETAINED_ATTEMPT_LIMIT:]:
+        _remove_tree(path)
+
+
 def _bounded_tail(path: Path, ceiling: int = 4096) -> str:
     try:
         with path.open("rb") as stream:
@@ -1223,6 +1379,11 @@ def accept_local(
     runner = cmux_root / CMUX_PROFILE_RUNNER
     if not runner.is_file() or runner.is_symlink():
         raise FleetError("CMUX workload profile runner is unavailable")
+    if not profile_runner_interpreter_ready():
+        raise FleetError(
+            "this interpreter lacks os.waitid, which the CMUX profile runner "
+            "requires; use CPython 3.13 or newer on macOS"
+        )
     glaeda = glaeda.resolve(strict=True)
     if not glaeda.is_file() or not os.access(glaeda, os.X_OK):
         raise FleetError("Glaeda executable is unavailable")
@@ -1256,12 +1417,12 @@ def accept_local(
     if not bootstrap_script.is_file() or bootstrap_script.is_symlink():
         raise FleetError("fleet bootstrap implementation is unavailable")
 
-    with tempfile.TemporaryDirectory(
-        prefix=".acceptance-run.",
-        dir=fleet_root,
-    ) as raw_state:
-        state_root = Path(raw_state).resolve(strict=True)
-        state_root.chmod(0o700)
+    state_root = Path(
+        tempfile.mkdtemp(prefix=ATTEMPT_PREFIX, dir=fleet_root)
+    ).resolve(strict=True)
+    state_root.chmod(0o700)
+    accepted = False
+    try:
         result_path = state_root / "result.json"
         log_path = state_root / "cmux-runner.log"
         child_environment = acceptance_child_environment(state_root / "tmp")
@@ -1389,7 +1550,14 @@ def accept_local(
             raise FleetError("successful CMUX local run did not produce acceptance")
         if completed.returncode != 0 and receipt["result"] == "accepted":
             raise FleetError("failed CMUX local run produced acceptance")
+        accepted = receipt["result"] == "accepted"
         return receipt
+    finally:
+        if accepted:
+            if not _remove_tree(state_root):
+                _notice(f"acceptance attempt directory remains: {state_root}")
+        else:
+            _retain_attempt(state_root, fleet_root)
 
 
 def apply_transition(

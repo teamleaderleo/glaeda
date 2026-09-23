@@ -2,8 +2,12 @@
 import importlib.util
 from pathlib import Path
 import json
+import platform
+import os
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 MODULE_PATH = Path(__file__).with_name("cmux_fleet_bootstrap.py")
 SPEC = importlib.util.spec_from_file_location("cmux_fleet_bootstrap", MODULE_PATH)
@@ -22,6 +26,8 @@ def observation(platform="macos", failed=()):
         "git": True,
         "glaedaExecutable": True,
         "diskAdmission": True,
+        "profileRunnerInterpreter": True,
+        "workloadToolPath": True,
     }
     if platform == "macos":
         checks.update(
@@ -203,6 +209,203 @@ class Tests(unittest.TestCase):
                     "macos",
                     "x86_64",
                 )
+
+    def test_command_output_keeps_column_zero(self):
+        # `git submodule status` marks a checked-out submodule with a leading
+        # space, so trimming it made every clean checkout look unready.
+        output = b.run(["/bin/sh", "-c", "printf ' clean sub\\n-absent sub\\n'"])
+        self.assertEqual(output.splitlines(), [" clean sub", "-absent sub"])
+
+    def test_submodules_ready_on_a_real_checked_out_submodule(self):
+        # Mocking `run` here would step over the bug: the leading space that
+        # marks a checked-out submodule only survives if `run` leaves it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            inner, outer = root / "inner", root / "outer"
+
+            def git(*args, cwd):
+                subprocess.run(
+                    ["git", "-c", "protocol.file.allow=always",
+                     "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                     *args],
+                    cwd=cwd, check=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                         "HOME": str(root), "GIT_CONFIG_GLOBAL": "/dev/null",
+                         "GIT_CONFIG_NOSYSTEM": "1"},
+                )
+
+            for path in (inner, outer):
+                path.mkdir()
+                git("init", "-q", "-b", "main", cwd=path)
+                (path / "file").write_text("x", encoding="utf-8")
+                git("add", "-A", cwd=path)
+                git("commit", "-qm", "seed", cwd=path)
+            git("submodule", "add", "-q", str(inner), "vendor", cwd=outer)
+            git("commit", "-qm", "vendor", cwd=outer)
+
+            self.assertTrue(b.cmux_submodules_ready(outer))
+            self.assertTrue(b.cmux_checkout_clean(outer))
+
+    def test_setup_artifacts_accept_either_ghosttykit_location(self):
+        for location in b.CMUX_GHOSTTYKIT_LOCATIONS:
+            with self.subTest(location=location), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                header = root / "ghostty/include/ghostty.h"
+                header.parent.mkdir(parents=True)
+                header.write_text("/* fixture */\n", encoding="utf-8")
+                self.assertFalse(b.cmux_setup_artifacts_present(root))
+                (root / location).mkdir(parents=True)
+                self.assertTrue(b.cmux_setup_artifacts_present(root))
+
+    def test_tools_only_on_the_operator_path_are_reported_invisible(self):
+        # The build rebuilds PATH from a fixed list of system directories plus
+        # an empty Cargo home, so a tool under the operator's home is one the
+        # build cannot spend, however well the operator's shell resolves it.
+        with tempfile.TemporaryDirectory() as temporary:
+            operator_only = Path(temporary)
+            tool = operator_only / "cmux-fixture-tool"
+            tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            tool.chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": str(operator_only)}):
+                # Still resolvable for probing: a node with a misplaced tool
+                # must still produce a receipt naming everything else wrong.
+                self.assertTrue(b.executable("cmux-fixture-tool").startswith("/"))
+                self.assertEqual(
+                    b.missing_workload_tools(("cmux-fixture-tool", "sh")),
+                    ["cmux-fixture-tool"],
+                )
+            self.assertEqual(b.missing_workload_tools(("sh", "cat")), [])
+
+    def _macos_checkout(self, root):
+        """A checkout shaped enough for collect_macos to read it."""
+        (root / ".xcode-version").write_text("26.0\n", encoding="utf-8")
+        ghostty = root / "ghostty"
+        (ghostty / "include").mkdir(parents=True)
+        (ghostty / "include/ghostty.h").write_text("/* fixture */\n", encoding="utf-8")
+        (root / "GhosttyKit.xcframework").mkdir()
+        (ghostty / "build.zig.zon").write_text(
+            '.{\n    .minimum_zig_version = "0.16.0",\n}\n', encoding="utf-8"
+        )
+        sidecar = root / "Native/DiffSidecar"
+        sidecar.mkdir(parents=True)
+        (sidecar / "rust-toolchain.toml").write_text(
+            '[toolchain]\nchannel = "1.90.0"\n', encoding="utf-8"
+        )
+
+    @staticmethod
+    def _macos_command(argv, **_kwargs):
+        name = Path(argv[0]).name
+        rest = argv[1:]
+        if name == "git":
+            if rest[:1] == ["status"]:
+                return ""
+            if rest[:1] == ["submodule"]:
+                return " a1 ghostty (heads/main)"
+            return "git version 2.51.0"
+        if name == "xcodebuild":
+            return "Xcode 26.0\nBuild version 26A123"
+        if name == "xcrun":
+            return "metal version 32023" if "metal" in rest else "26.0"
+        if name == "zig":
+            return "0.16.0"
+        if name == "rustup":
+            if rest[:1] == ["run"]:
+                return f"{rest[2]} 1.90.0 (abc 2026-01-01)"
+            return "rustup 1.28.0"
+        if name in ("cargo", "rustc"):
+            return f"{name} 1.90.0 (abc 2026-01-01)"
+        if name == "pmset":
+            return "AC Power:\n sleep 0\nBattery Power:\n sleep 10"
+        if name == "sysctl":
+            return str(64 * 1024**3)
+        raise AssertionError(argv)
+
+    def _collect_macos(self, root, cache_root, visible):
+        with (
+            mock.patch.object(b.platform, "system", return_value="Darwin"),
+            mock.patch.object(b.platform, "mac_ver", return_value=("26.5", ("", "", ""), "arm64")),
+            mock.patch.object(b.platform, "machine", return_value="arm64"),
+            mock.patch.object(b, "executable", side_effect=lambda n: f"/usr/bin/{n}"),
+            mock.patch.object(b, "run", side_effect=self._macos_command),
+            mock.patch.object(
+                b.shutil, "which",
+                side_effect=lambda name, path=None: f"/usr/bin/{name}" if visible else None,
+            ),
+        ):
+            return b.collect_macos(root, root / "glaeda", 1, "cmux-mac-build-large", cache_root)
+
+    def test_macos_observation_reports_workload_tool_visibility(self):
+        # collect_macos cannot run on the host that runs this suite, so its
+        # wiring is the half most likely to be left behind by a later edit.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._macos_checkout(root)
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+            cache_root = root / "cache"
+            cache_root.mkdir()
+
+            visible = self._collect_macos(root, cache_root, visible=True)
+            self.assertTrue(visible["checks"]["workloadToolPath"])
+            self.assertEqual(visible["observed"]["toolsMissingFromWorkloadPath"], [])
+            self.assertEqual(
+                visible["checks"]["profileRunnerInterpreter"], hasattr(os, "waitid")
+            )
+
+            invisible = self._collect_macos(root, cache_root, visible=False)
+            self.assertFalse(invisible["checks"]["workloadToolPath"])
+            self.assertEqual(
+                invisible["observed"]["toolsMissingFromWorkloadPath"],
+                sorted(b.MACOS_WORKLOAD_TOOLS),
+            )
+            invisible["roleProfiles"] = {
+                "cmux_macos_native_build": dict(
+                    b.ROLE_PROFILES["cmux_macos_native_build"]
+                )
+            }
+            result = b.evaluate(
+                invisible, ["cmux_macos_native_build"], "cmux-mac-build-large"
+            )
+            self.assertFalse(result["eligibleForEnrollment"])
+            self.assertIn("workloadToolPath", result["blockingChecks"])
+
+    def test_linux_observation_reports_the_new_checks(self):
+        # evaluate() is key-agnostic, so asserting on a hand-built fixture
+        # proves nothing about what the collectors actually emit.
+        if platform.system() != "Linux":
+            self.skipTest("collect_linux observes a Linux host")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / ".git").mkdir()
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+            outputs = {
+                "git": "git version 2.51.0",
+                "python3": "Python 3.14.0",
+                "systemctl": "systemd 257 (257)\n+PAM",
+                "bwrap": "bubblewrap 0.11.0",
+            }
+            with (
+                mock.patch.object(b, "executable", side_effect=lambda name: f"/usr/bin/{name}"),
+                mock.patch.object(
+                    b, "run", side_effect=lambda argv, **kw: outputs[Path(argv[0]).name]
+                ),
+                mock.patch.object(b, "read_os_release", return_value=("ubuntu", "24.04")),
+                mock.patch.object(b, "linux_memory_gib", return_value=64),
+            ):
+                observed = b.collect_linux(
+                    root, glaeda, 1, ["cmux_linux_ci"], "cmux-linux-ci-medium"
+                )
+        self.assertIn("profileRunnerInterpreter", observed["checks"])
+        self.assertIn("workloadToolPath", observed["checks"])
+        self.assertEqual(
+            observed["checks"]["profileRunnerInterpreter"], hasattr(os, "waitid")
+        )
+        self.assertTrue(observed["checks"]["workloadToolPath"])
+        self.assertEqual(observed["observed"]["toolsMissingFromWorkloadPath"], [])
 
     def test_power_posture_parser(self):
         raw = (
