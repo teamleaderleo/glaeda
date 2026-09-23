@@ -1,10 +1,11 @@
 # Fleet-shared Xcode compilation cache: first measurements
 
-Status: **feasible, with three blockers**. A fresh machine building a real cmux package chain
-went from 118 s cold to 30–33 s when its only warm source was a shared cache
-service, with byte-identical compiler outputs. The blockers are an Xcode 27 crash when replaying
-some cached warnings, the protocol assuming a same-host service, and index entries that can
-point at missing objects. Design and plan: #1134.
+Status: **feasible**. A fresh machine building a real cmux package chain went from 118 s cold to
+30 to 33 s when its only warm source was a shared cache service, with byte-identical compiler
+outputs. One apparent blocker turned out to be an Xcode bug limited to symlinked build paths
+(swiftlang/swift#92545). Two design requirements remain: the protocol assumes a same-host service,
+and index entries can point at missing objects. Design and plan: #1134. Prior art:
+[`docs/research/fleet-cache-prior-art.md`](../research/fleet-cache-prior-art.md).
 
 ## Question
 
@@ -81,21 +82,25 @@ linking, and bundle steps.
   `failed to update cache: cache poisoned` for mismatched results and did not use them.
   Before the fix, a re-upload did not replace a damaged object. Now it does.
 
-## Blockers found
+## Blockers and requirements found
 
-1. **Xcode 27 build-service crash replaying some cached warnings.** A fresh DerivedData
-   replaying `CmuxFoundation` from a warm cache crashes `SWBBuildService` (`SIGABRT`,
-   `std::bad_optional_access` in
-   `swift::FileSpecificDiagnosticConsumer::subconsumerForLocation`, reached from
-   `swift::CachingDiagnosticsProcessor::replayCachedDiagnostics`). It is not caused by the
-   service: the same crash happens with a shared *local* CAS and no remote, and with an
-   identical DerivedData path. It goes away when the package emits no warnings (fixing its
-   warnings: 90 hits, 0 misses, 7.1 s vs 18–37 s for the filling builds), and with
-   `SWIFT_SUPPRESS_WARNINGS=YES`. Synthetic packages with the same warning kinds did not
-   reproduce it, so the exact trigger is not yet isolated. Repro: fill and replay
-   `Packages/macOS/CmuxFoundation` at the revision above into two DerivedData paths sharing one
-   `COMPILATION_CACHE_CAS_PATH`. To do: report it upstream, and check whether cmux CI's
-   existing tarball cache hits it.
+1. **Xcode 27 build-service crash replaying some cached warnings (not a fleet blocker).**
+   A fresh DerivedData replaying `CmuxFoundation` from a warm cache crashed `SWBBuildService`
+   (`SIGABRT`, `std::bad_optional_access` in
+   `swift::FileSpecificDiagnosticConsumer::subconsumerForLocation`, from
+   `swift::CachingDiagnosticsProcessor::replayCachedDiagnostics`). Follow-up isolated it: it
+   needs a build under a symlinked path (`/tmp`, `/private/tmp`, or `$TMPDIR` under
+   `/var/folders`), project prefix mapping, a resource bundle, and a warning in a multi-file
+   batch. Xcode maps SRCROOT as `/tmp/...` while SwiftPM passes sources as `/private/tmp/...`,
+   so only the generated `resource_bundle_accessor.swift` is prefix-mapped, it is left out of the
+   cached diagnostics, and replay dereferences its missing buffer. All measurements above ran in
+   a `/private/tmp` scratch directory, which is why they hit it. From a path under `$HOME`, the
+   same `CmuxSettingsUI` chain with warnings on replayed all 179 hits in 31.9 s with no crash,
+   and the minimal reproducer does not crash. Reported as swiftlang/swift#92545 with a
+   three-file reproducer. Rule for fleet builds: never build under a symlinked path.
+   (`SWIFT_SUPPRESS_WARNINGS=YES` in the results table was only needed because of the scratch
+   location.) cmux CI runs Xcode 26.3/26.5, replays cached jobs alongside about 2,000 warnings
+   without crashing, and is not affected.
 2. **The protocol assumes a same-host service.** For large blobs the client sends
    `CASBytes.file_path`, a path on its own disk, not the bytes. With the service on Big Red over
    an SSH-forwarded socket, those uploads failed (`invalid argument … localcas-…/plugin/temp-…`),
