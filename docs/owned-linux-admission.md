@@ -50,7 +50,9 @@ are the semantic binding used for durable reservation and recovery: the `reserva
 (`schema_version` 2) carries the demand, so a resume or recovery that names a different demand
 refuses instead of rechecking the launch boundary against the wrong capacity. The record is
 evidence to match, never authority: the caller still supplies the reviewed demand. A pre-v2 record
-omits part of its own binding and therefore refuses as an explicit operator recovery.
+omits part of its own binding, so every reservation, launch, release and recovery path refuses it
+as an explicit operator recovery. The advisory `observe()` snapshot still reports it as `reserved`
+rather than refusing, because it adopts nothing and takes no action.
 
 Fresh host availability remains decisive at the final launch boundary. For example, owner-local
 coding-agent work that consumes memory after an advisory readiness check reduces the next fresh
@@ -116,9 +118,8 @@ reservation rechecked against its admitted demand rather than the default, resum
 refusal of another demand, durable contention, crash refusal, exact recovery, serialized control,
 hold/drain/pressure changes at the real child-launch boundary, pre-launch cleanup, real disposable
 child settlement, immutable replay, filesystem substitution, protocol binding, and bounded helper
-output. These are local child tests
-with fixture host facts; they do not prove systemd/bubblewrap verification or a regular ChatGPT
-journey.
+output. These are local child tests with fixture host facts; they do not prove systemd/bubblewrap
+verification or a regular ChatGPT journey.
 
 The next consumer may map another reviewed semantic action/profile to an `AdmissionDemand`, then
 prove that exact profile through the same physical admission/receipt path. Service/capability
