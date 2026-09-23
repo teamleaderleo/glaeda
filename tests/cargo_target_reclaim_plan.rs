@@ -11,10 +11,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use glaeda::cargo_target_holder_observation::observe_cargo_target_holders;
-use glaeda::cargo_target_observation::{observe_cargo_target, CargoTargetState};
+use glaeda::cargo_target_observation::{CargoTargetState, observe_cargo_target};
 use glaeda::cargo_target_reclaim::{
-    plan_cargo_target_reclaim, CargoTargetReclaimDecision, CargoTargetReclaimError,
-    CargoTargetReclaimPolicy, CargoTargetReclaimVeto, MIN_CARGO_TARGET_RECLAIM_IDLE_SECONDS,
+    CargoTargetReclaimDecision, CargoTargetReclaimError, CargoTargetReclaimPolicy,
+    CargoTargetReclaimVeto, MIN_CARGO_TARGET_RECLAIM_IDLE_SECONDS, plan_cargo_target_reclaim,
 };
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
@@ -45,8 +45,8 @@ impl Fixture {
         let mut info = File::create(target.join(".rustc_info.json")).expect("create rustc info");
         info.write_all(br#"{"rustc_fingerprint":1}"#)
             .expect("write rustc info");
-        let mut artifact = File::create(target.join("debug").join("libfixture.rlib"))
-            .expect("create artifact");
+        let mut artifact =
+            File::create(target.join("debug").join("libfixture.rlib")).expect("create artifact");
         artifact.write_all(&[0_u8; 4096]).expect("write artifact");
         self
     }
@@ -127,7 +127,10 @@ fn incomplete_holder_coverage_does_not_refuse() {
         holder_evidence, ..
     } = plan.decision()
     else {
-        panic!("incomplete holder coverage must not refuse: {:?}", plan.decision());
+        panic!(
+            "incomplete holder coverage must not refuse: {:?}",
+            plan.decision()
+        );
     };
     assert!(
         holder_evidence.process_entries_incomplete() > 0,
@@ -204,4 +207,138 @@ fn a_target_newer_than_the_clock_is_disagreeing_evidence() {
         .expect_err("a future target must not produce a decision");
 
     assert_eq!(error.code(), "future_timestamp");
+}
+
+// --- Execution -------------------------------------------------------------
+
+use glaeda::cargo_target_reclaim::{CargoTargetReclaimOutcome, reclaim_cargo_target};
+
+fn reviewed_policy() -> CargoTargetReclaimPolicy {
+    CargoTargetReclaimPolicy::new(MIN_CARGO_TARGET_RECLAIM_IDLE_SECONDS).expect("reviewed policy")
+}
+
+#[test]
+fn an_eligible_target_is_actually_removed() {
+    let fixture = Fixture::new().with_cargo_target();
+    let now = fixture.newest_entry_seconds() + ONE_DAY;
+    let target = fixture.checkout.join("target");
+    assert!(target.exists(), "fixture precondition");
+
+    let receipt = reclaim_cargo_target(&fixture.checkout, reviewed_policy(), now).expect("reclaim");
+
+    match receipt.outcome() {
+        CargoTargetReclaimOutcome::Reclaimed {
+            entries_removed,
+            released_bytes,
+            ..
+        } => {
+            assert!(*entries_removed > 0, "the fixture had entries to remove");
+            assert!(*released_bytes > 0, "the fixture allocated real blocks");
+        }
+        other => panic!("expected Reclaimed, got {other:?}"),
+    }
+    assert!(receipt.mutation_performed());
+    assert!(!target.exists(), "the target must be gone");
+    assert!(
+        fixture.checkout.exists(),
+        "the checkout itself must survive"
+    );
+}
+
+#[test]
+fn a_refused_target_is_left_untouched() {
+    let fixture = Fixture::new().with_cargo_target();
+    // Inside the idle window, so the decision must refuse.
+    let now = fixture.newest_entry_seconds() + 60;
+    let artifact = fixture
+        .checkout
+        .join("target")
+        .join("debug")
+        .join("libfixture.rlib");
+
+    let receipt = reclaim_cargo_target(&fixture.checkout, reviewed_policy(), now).expect("reclaim");
+
+    assert!(
+        matches!(receipt.outcome(), CargoTargetReclaimOutcome::Refused { .. }),
+        "expected Refused, got {:?}",
+        receipt.outcome()
+    );
+    assert!(!receipt.mutation_performed(), "a refusal mutates nothing");
+    assert!(artifact.exists(), "the artifact must survive a refusal");
+}
+
+#[test]
+fn an_interrupted_pass_is_finished_by_the_next_one() {
+    // Simulate the crash window: a retiring directory left behind after the rename but before the
+    // delete finished. A later pass must clean it up without being asked.
+    let fixture = Fixture::new().with_cargo_target();
+    let leftover = fixture.checkout.join(".glaeda-reclaiming-999999");
+    fs::create_dir_all(leftover.join("deep").join("deeper")).expect("create leftover");
+    File::create(leftover.join("deep").join("stale.rlib")).expect("create stale artifact");
+    let now = fixture.newest_entry_seconds() + ONE_DAY;
+
+    let receipt = reclaim_cargo_target(&fixture.checkout, reviewed_policy(), now).expect("reclaim");
+
+    assert!(
+        !leftover.exists(),
+        "an interrupted pass must be finished by the next one"
+    );
+    assert!(
+        receipt.resumed_entries_removed() > 0,
+        "the resumed entries must be reported, got {receipt:?}"
+    );
+}
+
+#[test]
+fn a_retiring_tree_deeper_than_any_fixed_ceiling_is_fully_removed() {
+    // #1083: a depth limit is the wrong kind of bound, because a valid tree past it can never be
+    // reclaimed on any later pass. The resume path never observes, so it is the one that must hold
+    // at arbitrary depth -- 300 levels is past every ceiling this codebase has used.
+    let fixture = Fixture::new().with_cargo_target();
+    let mut deep = fixture.checkout.join(".glaeda-reclaiming-424242");
+    let leftover = deep.clone();
+    for level in 0..300 {
+        deep = deep.join(format!("l{level}"));
+    }
+    fs::create_dir_all(&deep).expect("create deep retiring tree");
+    File::create(deep.join("leaf.bin")).expect("create leaf");
+    let now = fixture.newest_entry_seconds() + ONE_DAY;
+
+    let receipt = reclaim_cargo_target(&fixture.checkout, reviewed_policy(), now).expect("reclaim");
+
+    assert!(
+        !leftover.exists(),
+        "a retiring tree must be removed at any depth"
+    );
+    assert!(receipt.resumed_entries_removed() > 300, "{receipt:?}");
+}
+
+#[test]
+fn a_target_past_the_observation_bound_says_so() {
+    // The delete has no depth ceiling, but planning needs an observation and the observer does.
+    // The operator should learn which bound stopped them, not a generic read failure.
+    let fixture = Fixture::new().with_cargo_target();
+    // Read the clock while the tree is still observable; the deep tree below is not.
+    let now = fixture.newest_entry_seconds() + ONE_DAY;
+    let mut deep = fixture.checkout.join("target");
+    for level in 0..300 {
+        deep = deep.join(format!("l{level}"));
+    }
+    fs::create_dir_all(&deep).expect("create deep target");
+
+    let error = reclaim_cargo_target(&fixture.checkout, reviewed_policy(), now)
+        .expect_err("a target past the observation bound must not be reclaimed silently");
+
+    assert_eq!(error.code(), "target_exceeds_observation_bound");
+}
+
+#[test]
+fn a_relative_checkout_is_refused() {
+    let error = reclaim_cargo_target(
+        std::path::Path::new("relative/checkout"),
+        reviewed_policy(),
+        0,
+    )
+    .expect_err("a relative checkout must not be reclaimed");
+    assert_eq!(error.code(), "checkout_unavailable");
 }

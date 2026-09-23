@@ -10,16 +10,28 @@
 //! returns one decision with every veto that applied, so a refusal explains itself completely
 //! instead of surfacing only the first reason.
 
+use std::ffi::{CStr, CString};
 use std::fmt;
+use std::os::fd::{AsFd as _, OwnedFd};
+use std::path::Path;
 
+use rustix::fs::{self as rustix_fs, AtFlags, Dir, FileType, Mode, OFlags};
+use rustix::io::Errno;
 use serde::Serialize;
 
+use crate::cargo_target_holder_observation::observe_cargo_target_holders;
 use crate::cargo_target_holder_observation::{
     CargoTargetHolderDisposition, CargoTargetHolderObservation, CargoTargetHolderState,
 };
 use crate::cargo_target_observation::{
-    CargoTargetHardlinkCoverage, CargoTargetObservation, CargoTargetState, RustcInfoObservation,
+    CargoTargetHardlinkCoverage, CargoTargetObservation, CargoTargetObservationErrorKind,
+    CargoTargetState, RustcInfoObservation, observe_cargo_target,
 };
+
+const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
 
 pub const CARGO_TARGET_RECLAIM_SCHEMA_VERSION: u8 = 1;
 
@@ -76,9 +88,6 @@ pub enum CargoTargetReclaimVeto {
     TargetOwnerDiffersFromCheckout,
     /// At least one entry inside the target belongs to another user.
     ForeignEntriesPresent,
-    /// Hardlinks reach outside the observed tree, so unlinking here need not free the bytes and
-    /// can affect state this observation never examined.
-    ExternalHardlinksPresent,
     /// No usable `.rustc_info.json`, so nothing establishes that Cargo produced this directory.
     NotCargoProduced,
     /// The newest entry is inside the policy's idle window.
@@ -96,7 +105,6 @@ impl CargoTargetReclaimVeto {
             Self::TargetAbsent => "target_absent",
             Self::TargetOwnerDiffersFromCheckout => "target_owner_differs_from_checkout",
             Self::ForeignEntriesPresent => "foreign_entries_present",
-            Self::ExternalHardlinksPresent => "external_hardlinks_present",
             Self::NotCargoProduced => "not_cargo_produced",
             Self::RecentlyModified => "recently_modified",
             Self::HoldersObserved => "holders_observed",
@@ -150,6 +158,11 @@ pub enum CargoTargetReclaimDecision {
         entry_count: u64,
         idle_seconds: i64,
         holder_evidence: CargoTargetHolderEvidence,
+        /// Hardlinks reach outside the tree, so unlinking frees fewer bytes than observed.
+        /// Cargo hardlinks its own binaries, so links are ordinary here; an external one costs
+        /// accuracy in the reported figure and nothing else, because unlinking one link never
+        /// destroys the other.
+        released_bytes_are_lower_bound: bool,
     },
 }
 
@@ -234,9 +247,6 @@ pub fn plan_cargo_target_reclaim(
     if !all_entries_match_target_owner {
         vetoes.push(CargoTargetReclaimVeto::ForeignEntriesPresent);
     }
-    if *hardlink_coverage == CargoTargetHardlinkCoverage::ExternalLinksPresent {
-        vetoes.push(CargoTargetReclaimVeto::ExternalHardlinksPresent);
-    }
     if !matches!(rustc_info, RustcInfoObservation::Observed { .. }) {
         vetoes.push(CargoTargetReclaimVeto::NotCargoProduced);
     }
@@ -288,6 +298,8 @@ pub fn plan_cargo_target_reclaim(
             entry_count: *entry_count,
             idle_seconds,
             holder_evidence: evidence.ok_or_else(missing_holder_evidence)?,
+            released_bytes_are_lower_bound: *hardlink_coverage
+                == CargoTargetHardlinkCoverage::ExternalLinksPresent,
         }
     } else {
         CargoTargetReclaimDecision::Refused { vetoes }
@@ -306,6 +318,7 @@ pub enum CargoTargetReclaimErrorKind {
     InvalidPolicy,
     DisagreeingEvidence,
     Overflow,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -381,5 +394,404 @@ const fn idle_overflow() -> CargoTargetReclaimError {
         CargoTargetReclaimErrorKind::Overflow,
         "idle_overflow",
         "the idle window could not be computed without overflow",
+    )
+}
+
+// --- Execution -------------------------------------------------------------
+//
+// Retire by rename, then delete descriptor-relative. The rename makes the target vanish from its
+// name in one atomic step, so a build that starts mid-delete creates a fresh `target` instead of
+// racing a half-deleted one. Everything after the rename is bounded and resumable: an interrupted
+// pass leaves a retiring directory that the next pass finishes, which is why no recovery journal
+// is needed to avoid leaking bytes.
+//
+// Deletion is irreversible. Its accurate compensation is cold reconstruction -- Cargo rebuilds the
+// tree from the checkout and its lockfile -- not rollback, and nothing here pretends otherwise.
+
+/// Entries one pass may unlink. Bounds work per invocation; leftovers resume on the next pass.
+pub const MAX_CARGO_TARGET_RECLAIM_ENTRIES: u64 = 4_000_000;
+
+const RECLAIMING_PREFIX: &[u8] = b".glaeda-reclaiming-";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum CargoTargetReclaimOutcome {
+    Refused {
+        vetoes: Vec<CargoTargetReclaimVeto>,
+    },
+    Reclaimed {
+        entries_removed: u64,
+        released_bytes: u64,
+        released_bytes_are_lower_bound: bool,
+    },
+    /// The entry budget ran out. The retiring directory remains and the next pass resumes it.
+    Incomplete {
+        entries_removed: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CargoTargetReclaimReceipt {
+    schema_version: u8,
+    mutation_performed: bool,
+    resumed_entries_removed: u64,
+    outcome: CargoTargetReclaimOutcome,
+}
+
+impl CargoTargetReclaimReceipt {
+    #[must_use]
+    pub const fn outcome(&self) -> &CargoTargetReclaimOutcome {
+        &self.outcome
+    }
+
+    #[must_use]
+    pub const fn mutation_performed(&self) -> bool {
+        self.mutation_performed
+    }
+
+    #[must_use]
+    pub const fn resumed_entries_removed(&self) -> u64 {
+        self.resumed_entries_removed
+    }
+}
+
+struct DeleteBudget {
+    remaining: u64,
+    removed: u64,
+}
+
+impl DeleteBudget {
+    const fn new(limit: u64) -> Self {
+        Self {
+            remaining: limit,
+            removed: 0,
+        }
+    }
+
+    fn spend(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        self.removed += 1;
+        true
+    }
+}
+
+/// Reclaim one checkout-local Cargo target, resuming any interrupted earlier pass first.
+///
+/// # Errors
+///
+/// Refuses a relative checkout path, an unreadable or replaced target, a cross-device or
+/// non-directory target, and any entry whose owner or device changes mid-delete. Errors never
+/// contain the supplied path or a child name.
+pub fn reclaim_cargo_target(
+    checkout: &Path,
+    policy: CargoTargetReclaimPolicy,
+    now_seconds: i64,
+) -> Result<CargoTargetReclaimReceipt, CargoTargetReclaimError> {
+    if !checkout.is_absolute() {
+        return Err(checkout_unavailable());
+    }
+    let checkout_fd = open_directory(checkout)?;
+    let mut budget = DeleteBudget::new(MAX_CARGO_TARGET_RECLAIM_ENTRIES);
+
+    // Finish anything a previous pass left behind before measuring, so a resumed tree is not
+    // observed as if it were a live target.
+    resume_retiring_directories(&checkout_fd, &mut budget)?;
+    let resumed = budget.removed;
+
+    let observation = observe_cargo_target(checkout).map_err(|error| {
+        // A tree past the observer's bound cannot be planned, even though the delete below has no
+        // depth ceiling of its own. Name that distinctly: "unreadable" would send someone looking
+        // for a permissions fault that is not there.
+        if error.kind() == CargoTargetObservationErrorKind::TooLarge {
+            target_exceeds_observation_bound()
+        } else {
+            target_unreadable()
+        }
+    })?;
+    let holders = observe_cargo_target_holders(checkout).map_err(|_| target_unreadable())?;
+    let plan = plan_cargo_target_reclaim(&observation, &holders, policy, now_seconds)?;
+
+    let CargoTargetReclaimDecision::Eligible {
+        allocated_bytes,
+        released_bytes_are_lower_bound,
+        ..
+    } = plan.decision()
+    else {
+        return Ok(CargoTargetReclaimReceipt {
+            schema_version: CARGO_TARGET_RECLAIM_SCHEMA_VERSION,
+            mutation_performed: resumed > 0,
+            resumed_entries_removed: resumed,
+            outcome: CargoTargetReclaimOutcome::Refused {
+                vetoes: plan.decision().vetoes().to_vec(),
+            },
+        });
+    };
+    let released_bytes = *allocated_bytes;
+    let lower_bound = *released_bytes_are_lower_bound;
+
+    let target_name = c"target";
+    let before = rustix_fs::statat(checkout_fd.as_fd(), target_name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| target_unreadable())?;
+    if !FileType::from_raw_mode(before.st_mode).is_dir() {
+        return Err(target_unsafe_shape());
+    }
+
+    let retiring = retiring_name(before.st_ino);
+    let retiring_name = CString::new(retiring).map_err(|_| target_unsafe_shape())?;
+    rustix_fs::renameat(
+        checkout_fd.as_fd(),
+        target_name,
+        checkout_fd.as_fd(),
+        retiring_name.as_c_str(),
+    )
+    .map_err(|_| retire_failed())?;
+
+    // The rename moved an inode, not a name. Prove the directory now under the retiring name is
+    // the one that was measured, so a concurrent replacement cannot redirect the delete.
+    let retiring_fd = open_child_directory(&checkout_fd, retiring_name.as_c_str())?;
+    let pinned = rustix_fs::fstat(retiring_fd.as_fd()).map_err(|_| target_unreadable())?;
+    if pinned.st_ino != before.st_ino || pinned.st_dev != before.st_dev {
+        return Err(target_changed());
+    }
+
+    let complete = delete_directory_contents(&retiring_fd, pinned.st_dev, &mut budget)?;
+    drop(retiring_fd);
+
+    if !complete {
+        return Ok(CargoTargetReclaimReceipt {
+            schema_version: CARGO_TARGET_RECLAIM_SCHEMA_VERSION,
+            mutation_performed: true,
+            resumed_entries_removed: resumed,
+            outcome: CargoTargetReclaimOutcome::Incomplete {
+                entries_removed: budget.removed - resumed,
+            },
+        });
+    }
+    rustix_fs::unlinkat(
+        checkout_fd.as_fd(),
+        retiring_name.as_c_str(),
+        AtFlags::REMOVEDIR,
+    )
+    .map_err(|_| retire_failed())?;
+
+    Ok(CargoTargetReclaimReceipt {
+        schema_version: CARGO_TARGET_RECLAIM_SCHEMA_VERSION,
+        mutation_performed: true,
+        resumed_entries_removed: resumed,
+        outcome: CargoTargetReclaimOutcome::Reclaimed {
+            entries_removed: budget.removed - resumed,
+            released_bytes,
+            released_bytes_are_lower_bound: lower_bound,
+        },
+    })
+}
+
+fn retiring_name(inode: u64) -> Vec<u8> {
+    let mut name = RECLAIMING_PREFIX.to_vec();
+    name.extend_from_slice(inode.to_string().as_bytes());
+    name
+}
+
+fn resume_retiring_directories(
+    checkout_fd: &OwnedFd,
+    budget: &mut DeleteBudget,
+) -> Result<(), CargoTargetReclaimError> {
+    let mut pending: Vec<CString> = Vec::new();
+    {
+        let mut entries = Dir::read_from(checkout_fd).map_err(|_| target_unreadable())?;
+        for entry in &mut entries {
+            let entry = entry.map_err(|_| target_unreadable())?;
+            let name = entry.file_name();
+            if !name.to_bytes().starts_with(RECLAIMING_PREFIX) {
+                continue;
+            }
+            pending.push(name.to_owned());
+        }
+    }
+    for name in pending {
+        let stat = match rustix_fs::statat(
+            checkout_fd.as_fd(),
+            name.as_c_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) => continue,
+            Err(_) => return Err(target_unreadable()),
+        };
+        if !FileType::from_raw_mode(stat.st_mode).is_dir() {
+            continue;
+        }
+        let fd = open_child_directory(checkout_fd, name.as_c_str())?;
+        let complete = delete_directory_contents(&fd, stat.st_dev, budget)?;
+        drop(fd);
+        if !complete {
+            return Ok(());
+        }
+        rustix_fs::unlinkat(checkout_fd.as_fd(), name.as_c_str(), AtFlags::REMOVEDIR)
+            .map_err(|_| retire_failed())?;
+    }
+    Ok(())
+}
+
+/// Delete one directory's contents depth-first, holding a descriptor per level.
+///
+/// There is no depth ceiling: a valid tree deeper than an arbitrary limit would otherwise be
+/// unreclaimable on every future pass. Work is bounded by the entry budget instead, which always
+/// makes progress.
+fn delete_directory_contents(
+    root: &OwnedFd,
+    expected_device: u64,
+    budget: &mut DeleteBudget,
+) -> Result<bool, CargoTargetReclaimError> {
+    let uid = rustix::process::getuid().as_raw();
+    let mut stack: Vec<(OwnedFd, Option<CString>)> = vec![(
+        rustix_fs::openat(root.as_fd(), c".", DIRECTORY_FLAGS, Mode::empty())
+            .map_err(|_| target_unreadable())?,
+        None,
+    )];
+
+    while let Some((fd, _)) = stack.last() {
+        let mut descend: Option<(OwnedFd, CString)> = None;
+        let mut emptied = true;
+        {
+            let mut entries = Dir::read_from(fd).map_err(|_| target_unreadable())?;
+            for entry in &mut entries {
+                let entry = entry.map_err(|_| target_unreadable())?;
+                let name = entry.file_name();
+                let bytes = name.to_bytes();
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                let stat = match rustix_fs::statat(fd.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(stat) => stat,
+                    Err(Errno::NOENT) => continue,
+                    Err(_) => return Err(target_unreadable()),
+                };
+                if stat.st_uid != uid || stat.st_dev != expected_device {
+                    return Err(foreign_entry());
+                }
+                let kind = FileType::from_raw_mode(stat.st_mode);
+                if kind.is_dir() {
+                    let child = rustix_fs::openat(fd.as_fd(), name, DIRECTORY_FLAGS, Mode::empty())
+                        .map_err(|_| target_unreadable())?;
+                    let pinned =
+                        rustix_fs::fstat(child.as_fd()).map_err(|_| target_unreadable())?;
+                    if pinned.st_ino != stat.st_ino
+                        || pinned.st_dev != expected_device
+                        || pinned.st_uid != uid
+                    {
+                        return Err(target_changed());
+                    }
+                    descend = Some((child, name.to_owned()));
+                    emptied = false;
+                    break;
+                }
+                if !budget.spend() {
+                    return Ok(false);
+                }
+                match rustix_fs::unlinkat(fd.as_fd(), name, AtFlags::empty()) {
+                    Ok(()) | Err(Errno::NOENT) => {}
+                    Err(_) => return Err(delete_failed()),
+                }
+            }
+        }
+        if let Some((child, name)) = descend {
+            stack.push((child, Some(name)));
+            continue;
+        }
+        if !emptied {
+            continue;
+        }
+        let (_, name) = stack.pop().expect("stack is non-empty inside the loop");
+        let Some(name) = name else {
+            return Ok(true);
+        };
+        let Some((parent, _)) = stack.last() else {
+            return Err(target_changed());
+        };
+        if !budget.spend() {
+            return Ok(false);
+        }
+        match rustix_fs::unlinkat(parent.as_fd(), name.as_c_str(), AtFlags::REMOVEDIR) {
+            Ok(()) | Err(Errno::NOENT) => {}
+            Err(_) => return Err(delete_failed()),
+        }
+    }
+    Ok(true)
+}
+
+fn open_directory(path: &Path) -> Result<OwnedFd, CargoTargetReclaimError> {
+    rustix_fs::open(path, DIRECTORY_FLAGS, Mode::empty()).map_err(|_| checkout_unavailable())
+}
+
+fn open_child_directory(parent: &OwnedFd, name: &CStr) -> Result<OwnedFd, CargoTargetReclaimError> {
+    rustix_fs::openat(parent.as_fd(), name, DIRECTORY_FLAGS, Mode::empty())
+        .map_err(|_| target_unreadable())
+}
+
+const fn checkout_unavailable() -> CargoTargetReclaimError {
+    error(
+        CargoTargetReclaimErrorKind::Unavailable,
+        "checkout_unavailable",
+        "the checkout root could not be opened as a directory",
+    )
+}
+
+const fn target_unreadable() -> CargoTargetReclaimError {
+    error(
+        CargoTargetReclaimErrorKind::Unavailable,
+        "target_unreadable",
+        "the target could not be read",
+    )
+}
+
+const fn target_exceeds_observation_bound() -> CargoTargetReclaimError {
+    error(
+        CargoTargetReclaimErrorKind::Unavailable,
+        "target_exceeds_observation_bound",
+        "the target is larger or deeper than the observer's reviewed bound",
+    )
+}
+
+const fn target_unsafe_shape() -> CargoTargetReclaimError {
+    error(
+        CargoTargetReclaimErrorKind::DisagreeingEvidence,
+        "target_unsafe_shape",
+        "the target is not a plain directory",
+    )
+}
+
+const fn target_changed() -> CargoTargetReclaimError {
+    error(
+        CargoTargetReclaimErrorKind::DisagreeingEvidence,
+        "target_changed",
+        "the target changed identity while it was being reclaimed",
+    )
+}
+
+const fn foreign_entry() -> CargoTargetReclaimError {
+    error(
+        CargoTargetReclaimErrorKind::DisagreeingEvidence,
+        "foreign_entry",
+        "an entry inside the target is owned by another user or filesystem",
+    )
+}
+
+const fn retire_failed() -> CargoTargetReclaimError {
+    error(
+        CargoTargetReclaimErrorKind::Unavailable,
+        "retire_failed",
+        "the target could not be retired",
+    )
+}
+
+const fn delete_failed() -> CargoTargetReclaimError {
+    error(
+        CargoTargetReclaimErrorKind::Unavailable,
+        "delete_failed",
+        "an entry inside the retired target could not be removed",
     )
 }

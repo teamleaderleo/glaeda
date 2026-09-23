@@ -563,6 +563,11 @@ pub struct CargoTargetObservationError {
 
 impl CargoTargetObservationError {
     #[must_use]
+    pub const fn kind(&self) -> CargoTargetObservationErrorKind {
+        self.kind
+    }
+
+    #[must_use]
     pub const fn code(&self) -> &'static str {
         self.code
     }
