@@ -287,8 +287,17 @@ jobs:
       - name: Install Apple Silicon target
         run: rustup target add aarch64-apple-darwin
 
-      - name: Check Apple Silicon build
-        run: cargo check --locked --all-targets --all-features --target aarch64-apple-darwin
+      # Glaeda is developed on Apple Silicon, so the repository's own `required` profile has to
+      # pass in the macOS `cfg` configuration, not only the Linux one this job runs natively.
+      # `cargo check` already compiled that configuration and already printed the `cfg` drift it
+      # sees -- code whose only consumers are `target_os = "linux"` -- but nothing promoted those
+      # warnings to errors, so `./scripts/verify required` could be broken on the author's machine
+      # while this job stayed green. Clippy with `-D warnings` subsumes the previous check and
+      # closes that gap without needing a macOS runner.
+      - name: Lint Apple Silicon build
+        run: >-
+          cargo clippy --locked --all-targets --all-features
+          --target aarch64-apple-darwin -- -D warnings
 
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
