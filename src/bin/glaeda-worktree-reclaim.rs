@@ -39,7 +39,12 @@ const COMPENSATION: &str = "git_worktree_add_at_preserved_commit";
 #[derive(Debug, Parser)]
 #[command(
     name = "glaeda-worktree-reclaim",
-    about = "Find linked Git worktrees whose removal loses nothing, and optionally remove them"
+    about = "Find linked Git worktrees whose removal loses nothing, and optionally remove them",
+    long_about = "Find linked Git worktrees whose removal loses nothing, and optionally remove them.\n\n\
+Without --apply nothing is changed. With --apply the JSON or human report is the receipt: it names \
+the commit and branch of every removed worktree, which `git worktree add` needs to recreate it. \
+Persist it if you need that record; refs/glaeda/worktree-pins/ refs are the only state this tool \
+keeps on its own."
 )]
 struct Cli {
     /// Canonical absolute path of a repository's main worktree. Repeat for several repositories.
@@ -50,7 +55,7 @@ struct Cli {
     #[arg(long)]
     apply: bool,
 
-    /// Most worktrees one run may remove across all repositories.
+    /// Most removal attempts one run may make across all repositories.
     #[arg(long, default_value_t = DEFAULT_MAX_RECLAIMS)]
     max_reclaims: usize,
 
@@ -125,6 +130,11 @@ enum RepositoryResult {
 struct RepositoryReport {
     /// Position of the repository among the `--repository` arguments, starting at 1.
     ordinal: usize,
+    /// Free bytes on the repository's filesystem around this repository's removals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    available_bytes_before: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    available_bytes_after: Option<u64>,
     #[serde(flatten)]
     result: RepositoryResult,
 }
@@ -139,10 +149,6 @@ struct Report {
     max_reclaims: usize,
     budget_exhausted: bool,
     circuit_breaker_tripped: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    available_bytes_before: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    available_bytes_after: Option<u64>,
     repositories: Vec<RepositoryReport>,
 }
 
@@ -176,10 +182,6 @@ fn main() -> ExitCode {
     };
     let executor = ProcessExecutor;
 
-    let available_bytes_before = cli
-        .apply
-        .then(|| available_bytes(&cli.repositories[0]))
-        .flatten();
     let mut remaining_budget = cli.max_reclaims;
     let mut budget_exhausted = false;
     let mut circuit_breaker_tripped = false;
@@ -192,11 +194,14 @@ fn main() -> ExitCode {
             Err(error) => {
                 repositories.push(RepositoryReport {
                     ordinal: index + 1,
+                    available_bytes_before: None,
+                    available_bytes_after: None,
                     result: RepositoryResult::Unlisted { code: error.code() },
                 });
                 continue;
             }
         };
+        let available_bytes_before = cli.apply.then(|| available_bytes(repository)).flatten();
         let observations = observe_linked_worktrees(&observer, &inventory, &executor);
         let mut summary = Summary {
             linked: inventory.linked().len(),
@@ -228,7 +233,6 @@ fn main() -> ExitCode {
                                         budget_exhausted = true;
                                     } else {
                                         remaining_budget -= 1;
-                                        mutation_performed = true;
                                         let outcome = reclaim_linked_worktree(
                                             &observer,
                                             &inventory,
@@ -243,6 +247,7 @@ fn main() -> ExitCode {
                                         ) {
                                             summary.reclaimed += 1;
                                         }
+                                        mutation_performed |= outcome.mutated();
                                         circuit_breaker_tripped |= !outcome.batch_may_continue();
                                         reclaim = Some(outcome);
                                     }
@@ -269,6 +274,8 @@ fn main() -> ExitCode {
         }
         repositories.push(RepositoryReport {
             ordinal: index + 1,
+            available_bytes_before,
+            available_bytes_after: cli.apply.then(|| available_bytes(repository)).flatten(),
             result: RepositoryResult::Listed { summary, worktrees },
         });
     }
@@ -286,11 +293,6 @@ fn main() -> ExitCode {
         max_reclaims: cli.max_reclaims,
         budget_exhausted,
         circuit_breaker_tripped,
-        available_bytes_before,
-        available_bytes_after: cli
-            .apply
-            .then(|| available_bytes(&cli.repositories[0]))
-            .flatten(),
         repositories,
     };
     match cli.output {
@@ -306,8 +308,15 @@ fn main() -> ExitCode {
         },
         OutputFormat::Human => render_human(&report, cli.apply, cli.all),
     }
+    let any_unlisted = report
+        .repositories
+        .iter()
+        .any(|repository| matches!(repository.result, RepositoryResult::Unlisted { .. }));
     if circuit_breaker_tripped {
         ExitCode::from(3)
+    } else if any_unlisted {
+        // A mistyped or invalid repository must not pass silently in an unattended run.
+        ExitCode::from(2)
     } else {
         ExitCode::SUCCESS
     }
@@ -347,19 +356,20 @@ fn render_human(report: &Report, apply: bool, all: bool) {
                         println!("  #{}: {line}", worktree.ordinal);
                     }
                 }
+                if let (Some(before), Some(after)) = (
+                    repository.available_bytes_before,
+                    repository.available_bytes_after,
+                ) {
+                    println!(
+                        "  free space: {:.1} GiB -> {:.1} GiB",
+                        gib(before),
+                        gib(after)
+                    );
+                }
             }
         }
     }
     if apply {
-        if let (Some(before), Some(after)) =
-            (report.available_bytes_before, report.available_bytes_after)
-        {
-            println!(
-                "free space: {:.1} GiB -> {:.1} GiB",
-                gib(before),
-                gib(after)
-            );
-        }
         if report.budget_exhausted {
             println!(
                 "stopped at the --max-reclaims budget of {}; run again to continue",
@@ -387,20 +397,32 @@ fn worktree_line(result: &WorktreeResult, all: bool) -> Option<String> {
             reclaim: Some(outcome),
             ..
         } => Some(match outcome {
-            LinkedWorktreeReclaimOutcome::Reclaimed { pinned, .. } => format!(
-                "reclaimed{}",
-                if *pinned { " (HEAD pinned first)" } else { "" }
+            LinkedWorktreeReclaimOutcome::Reclaimed { target, .. } => format!(
+                "reclaimed {}{}{}",
+                short(&target.commit),
+                target
+                    .branch
+                    .as_deref()
+                    .map_or_else(String::new, |branch| format!(" ({branch})")),
+                if target.pinned {
+                    ", HEAD pinned first"
+                } else {
+                    ""
+                }
             ),
+            LinkedWorktreeReclaimOutcome::Changed { .. } => {
+                "kept: changed since it was checked".to_owned()
+            }
             LinkedWorktreeReclaimOutcome::Refused { vetoes } => {
                 format!("kept: fresh check refused: {}", join_vetoes(vetoes))
             }
             LinkedWorktreeReclaimOutcome::Unobservable { code } => {
                 format!("kept: fresh check failed: {code}")
             }
-            LinkedWorktreeReclaimOutcome::GitRefused => {
+            LinkedWorktreeReclaimOutcome::GitRefused { .. } => {
                 "kept: git worktree remove refused".to_owned()
             }
-            LinkedWorktreeReclaimOutcome::Incomplete { code } => format!("INCOMPLETE: {code}"),
+            LinkedWorktreeReclaimOutcome::Incomplete { code, .. } => format!("INCOMPLETE: {code}"),
         }),
         WorktreeResult::Planned {
             decision:
@@ -426,6 +448,10 @@ fn worktree_line(result: &WorktreeResult, all: bool) -> Option<String> {
             .then(|| "prunable: registration is stale (directory or .git file missing)".to_owned()),
         WorktreeResult::Unobservable { code } => Some(format!("unobservable: {code}")),
     }
+}
+
+fn short(commit: &str) -> &str {
+    commit.get(..12).unwrap_or(commit)
 }
 
 #[allow(clippy::cast_precision_loss)]

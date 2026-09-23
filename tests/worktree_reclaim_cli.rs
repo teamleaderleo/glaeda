@@ -287,7 +287,12 @@ fn a_linked_worktree_is_not_accepted_as_the_repository() {
     let fixture = Fixture::new();
     let linked = fixture.add("linked");
     let output = fixture.plan(&linked);
-    let document = document(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an unlisted repository must not pass silently"
+    );
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
     assert_eq!(document["repositories"][0]["result"], "unlisted");
     assert_eq!(document["repositories"][0]["code"], "not_main_worktree");
 }
@@ -639,6 +644,24 @@ fn apply_reclaims_only_eligible_worktrees_and_pins_orphan_heads() {
     assert_eq!(receipt["mutation_performed"], true);
     assert_eq!(receipt["circuit_breaker_tripped"], false);
     assert_eq!(receipt["repositories"][0]["summary"]["reclaimed"], 2);
+    let outcomes = receipt["repositories"][0]["worktrees"]
+        .as_array()
+        .expect("worktrees")
+        .iter()
+        .filter_map(|worktree| worktree.get("reclaim"))
+        .collect::<Vec<_>>();
+    assert!(outcomes.iter().any(|outcome| {
+        outcome["target"]["branch"] == "clean"
+            && outcome["target"]["commit"]
+                .as_str()
+                .is_some_and(|commit| commit.len() == 40)
+    }));
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| outcome["target"]["commit"] == orphan.as_str()
+                && outcome["target"]["pinned"] == true)
+    );
 
     assert!(!clean.exists(), "clean worktree removed");
     assert!(!detached.exists(), "detached worktree removed");
@@ -680,5 +703,47 @@ fn apply_stops_at_the_reclaim_budget() {
         usize::from(first.exists()) + usize::from(second.exists()),
         1,
         "exactly one worktree removed"
+    );
+}
+
+/// A removal Git starts but cannot finish trips the circuit breaker and stops the batch.
+#[test]
+fn a_partial_removal_trips_the_circuit_breaker() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::new();
+    fs::write(fixture.main.join(".git/info/exclude"), "build/\n").expect("ignore build output");
+    let first = fixture.add("first");
+    fixture.age("first");
+    let second = fixture.add("second");
+    fixture.age("second");
+    let order = fixture.linked_order();
+    let (stuck, untouched) = if order[0] == "first" {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let build = stuck.join("build");
+    fs::create_dir(&build).expect("create ignored build directory");
+    fs::write(build.join("output.o"), "binary\n").expect("write ignored output");
+    fs::set_permissions(&build, fs::Permissions::from_mode(0o555)).expect("make build read-only");
+    // Re-age after creating the directory changed the checkout root mtime.
+    fixture.age(
+        stuck
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("name"),
+    );
+
+    let output = fixture.run(&fixture.main, &["--apply"]);
+    fs::set_permissions(&build, fs::Permissions::from_mode(0o755)).expect("restore permissions");
+    assert_eq!(output.status.code(), Some(3), "circuit breaker exit status");
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON receipt");
+    assert_eq!(receipt["circuit_breaker_tripped"], true);
+    assert_eq!(receipt["mutation_performed"], true);
+    assert_eq!(receipt["repositories"][0]["summary"]["reclaimed"], 0);
+    assert!(
+        untouched.exists(),
+        "the batch stopped before the next worktree"
     );
 }

@@ -487,6 +487,52 @@ pub fn observe_linked_worktree(
     entry: &LinkedWorktreeEntry,
     executor: &impl TimedCommandExecutor,
 ) -> Result<LinkedWorktreeFacts, LinkedWorktreeReclaimError> {
+    observe_detailed(observer, inventory, entry, executor).map(|observed| observed.facts)
+}
+
+/// Facts plus the exact identities an executor must bind its action to.
+struct ObservedWorktree {
+    facts: LinkedWorktreeFacts,
+    head: String,
+    branch: Option<String>,
+    git_dir: PathBuf,
+    fingerprint: AdministrativeFingerprint,
+}
+
+/// Modification time and size of the per-worktree entries any Git activity rewrites.
+///
+/// Compared again immediately before removal: a commit, checkout, reset, `update-index` flag change,
+/// or staging in the meantime changes at least one of them. The index is included here, unlike in
+/// the idle signal, because a spurious change only makes the executor keep a worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdministrativeFingerprint(Vec<Option<(i64, i64, u64)>>);
+
+const FINGERPRINT_ENTRIES: [&str; 3] = ["HEAD", "logs/HEAD", "index"];
+
+fn administrative_fingerprint(
+    git_dir: &Path,
+) -> Result<AdministrativeFingerprint, LinkedWorktreeReclaimError> {
+    FINGERPRINT_ENTRIES
+        .iter()
+        .map(|name| match std::fs::symlink_metadata(git_dir.join(name)) {
+            Ok(metadata) => Ok(Some((
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.size(),
+            ))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(unavailable()),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(AdministrativeFingerprint)
+}
+
+fn observe_detailed(
+    observer: &ProjectCheckoutObserver,
+    inventory: &LinkedWorktreeInventory,
+    entry: &LinkedWorktreeEntry,
+    executor: &impl TimedCommandExecutor,
+) -> Result<ObservedWorktree, LinkedWorktreeReclaimError> {
     if entry.prunable {
         return Err(registration_stale());
     }
@@ -560,8 +606,14 @@ pub fn observe_linked_worktree(
         .any(|present| present);
     let locked = entry.locked || entry_present(&git_dir.join("locked"))?;
     let last_activity_seconds = last_activity_seconds(&git_dir, &checkout)?;
+    let fingerprint = administrative_fingerprint(&git_dir)?;
+    let branch = match observation.branch() {
+        ProjectBranchState::Attached { name } => Some(name.clone()),
+        ProjectBranchState::Detached => None,
+    };
+    let head = observation.commit().as_str().to_owned();
 
-    Ok(LinkedWorktreeFacts {
+    let facts = LinkedWorktreeFacts {
         linked,
         locked,
         operation_in_progress,
@@ -579,6 +631,13 @@ pub fn observe_linked_worktree(
             == rustix::process::geteuid().as_raw(),
         head_reachability,
         last_activity_seconds,
+    };
+    Ok(ObservedWorktree {
+        facts,
+        head,
+        branch,
+        git_dir,
+        fingerprint,
     })
 }
 
@@ -1040,22 +1099,43 @@ pub const LINKED_WORKTREE_REMOVE_TIMEOUT: Duration = Duration::from_secs(600);
 
 const ZERO_OBJECT_ID: &str = "0000000000000000000000000000000000000000";
 
+/// The exact commit and branch a reclaim acted on: what `git worktree add` needs to recreate it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LinkedWorktreeReclaimTarget {
+    pub commit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// A `refs/glaeda/worktree-pins/<commit>` ref was written or already present for this commit.
+    pub pinned: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum LinkedWorktreeReclaimOutcome {
-    /// The worktree is gone and its registration removed; a pin was written first when required.
-    Reclaimed { pinned: bool, idle_seconds: i64 },
-    /// Fresh observation no longer supports removal.
+    /// The worktree is gone and its registration removed.
+    Reclaimed {
+        target: LinkedWorktreeReclaimTarget,
+        idle_seconds: i64,
+    },
+    /// Fresh observation no longer supports removal; nothing was changed.
     Refused {
         vetoes: Vec<LinkedWorktreeReclaimVeto>,
     },
     /// Fresh observation failed; nothing was changed.
     Unobservable { code: &'static str },
-    /// `git worktree remove` refused on its own checks; nothing was removed.
-    GitRefused,
-    /// A pin or removal ran but post-effect observation disagrees with the intended state.
-    /// Callers must stop the batch: this is the circuit breaker.
-    Incomplete { code: &'static str },
+    /// HEAD or per-worktree Git state changed between observation and removal; the worktree was
+    /// kept. A pin written before the change is reported in `target`.
+    Changed { target: LinkedWorktreeReclaimTarget },
+    /// `git worktree remove` exited non-zero on its own checks, and fresh observation confirms the
+    /// worktree is still registered and intact.
+    GitRefused { target: LinkedWorktreeReclaimTarget },
+    /// A pin or removal ran and fresh observation does not confirm a clean end state. Callers must
+    /// stop the batch: this is the circuit breaker.
+    Incomplete {
+        code: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target: Option<LinkedWorktreeReclaimTarget>,
+    },
 }
 
 impl LinkedWorktreeReclaimOutcome {
@@ -1064,11 +1144,60 @@ impl LinkedWorktreeReclaimOutcome {
     pub const fn batch_may_continue(&self) -> bool {
         !matches!(self, Self::Incomplete { .. })
     }
+
+    /// Whether this attempt changed repository or filesystem state.
+    #[must_use]
+    pub fn mutated(&self) -> bool {
+        match self {
+            Self::Reclaimed { .. } => true,
+            Self::Refused { .. } | Self::Unobservable { .. } => false,
+            Self::Changed { target } | Self::GitRefused { target } => target.pinned,
+            // Unknown end state: treat as mutated so receipts never understate what happened.
+            Self::Incomplete { .. } => true,
+        }
+    }
+}
+
+/// How the removal command ended, as far as the executor could tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalExit {
+    Succeeded,
+    /// Exited normally with a non-zero status: Git's own refusal path.
+    ExitedNonZero,
+    /// Killed by a signal, timed out, or never reported: state is unknown.
+    Interrupted,
+}
+
+/// Classify one removal from its exit and fresh post-effect observation.
+///
+/// Only a normal non-zero exit with the checkout still present, still registered, and observed
+/// intact counts as Git refusing. A signal can kill Git after it has started deleting the tree, and
+/// that partial state must trip the circuit breaker rather than read as "nothing happened".
+const fn classify_removal(
+    exit: RemovalExit,
+    directory_gone: bool,
+    still_registered: bool,
+    observed_intact: bool,
+) -> RemovalClass {
+    match (exit, directory_gone, still_registered, observed_intact) {
+        (RemovalExit::Succeeded, true, false, _) => RemovalClass::Reclaimed,
+        (RemovalExit::ExitedNonZero, false, true, true) => RemovalClass::GitRefused,
+        _ => RemovalClass::Incomplete,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalClass {
+    Reclaimed,
+    GitRefused,
+    Incomplete,
 }
 
 /// Re-observe one worktree and remove it only if a fresh plan still makes it eligible.
 ///
-/// Never returns an error: every failure becomes a typed outcome so a batch can record it.
+/// Never returns an error: every failure becomes a typed outcome so a batch can record it. The
+/// returned outcome is the receipt; persisting it is the caller's responsibility (pin refs are the
+/// only state this function makes durable on its own).
 pub fn reclaim_linked_worktree(
     observer: &ProjectCheckoutObserver,
     inventory: &LinkedWorktreeInventory,
@@ -1077,12 +1206,14 @@ pub fn reclaim_linked_worktree(
     now_seconds: i64,
     executor: &impl TimedCommandExecutor,
 ) -> LinkedWorktreeReclaimOutcome {
-    let facts = match observe_linked_worktree(observer, inventory, entry, executor) {
-        Ok(facts) => facts,
+    let observed = match observe_detailed(observer, inventory, entry, executor) {
+        Ok(observed) => observed,
         Err(error) => return LinkedWorktreeReclaimOutcome::Unobservable { code: error.code() },
     };
     let (compensation, idle_seconds) =
-        match plan_linked_worktree_reclaim(&facts, policy, now_seconds).map(|plan| plan.decision) {
+        match plan_linked_worktree_reclaim(&observed.facts, policy, now_seconds)
+            .map(|plan| plan.decision)
+        {
             Ok(LinkedWorktreeReclaimDecision::Eligible {
                 compensation,
                 idle_seconds,
@@ -1094,9 +1225,37 @@ pub fn reclaim_linked_worktree(
             Err(error) => return LinkedWorktreeReclaimOutcome::Unobservable { code: error.code() },
         };
 
-    let pinned = compensation == LinkedWorktreeReclaimCompensation::PinHeadCommit;
-    if pinned && let Err(error) = pin_head_commit(observer, inventory, &entry.path, executor) {
-        return LinkedWorktreeReclaimOutcome::Incomplete { code: error.code() };
+    let mut target = LinkedWorktreeReclaimTarget {
+        commit: observed.head.clone(),
+        branch: observed.branch.clone(),
+        pinned: false,
+    };
+    if compensation == LinkedWorktreeReclaimCompensation::PinHeadCommit {
+        // Pin the commit that was observed and planned, never a re-read HEAD.
+        if let Err(error) = pin_commit(observer, inventory, &observed.head, executor) {
+            return LinkedWorktreeReclaimOutcome::Incomplete {
+                code: error.code(),
+                target: Some(target),
+            };
+        }
+        target.pinned = true;
+    }
+
+    // Final guard, as close to removal as possible. Git's own check covers new untracked files,
+    // staging, locks, and path swaps, but not hidden-flag edits or a new detached commit, so any
+    // movement of HEAD or per-worktree Git state since observation keeps the worktree. The window
+    // that remains is the time between these reads and Git's own status check.
+    let head_unchanged = git(
+        observer,
+        &entry.path,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        executor,
+    )
+    .is_ok_and(|record| record.stdout.strip_suffix('\n') == Some(observed.head.as_str()));
+    let fingerprint_unchanged = administrative_fingerprint(&observed.git_dir)
+        .is_ok_and(|fingerprint| fingerprint == observed.fingerprint);
+    if !head_unchanged || !fingerprint_unchanged {
+        return LinkedWorktreeReclaimOutcome::Changed { target };
     }
 
     let Some(checkout) = entry.path.to_str() else {
@@ -1106,13 +1265,26 @@ pub fn reclaim_linked_worktree(
     };
     let removal = observer.git_with_limits(
         &inventory.repository,
-        &["worktree", "remove", checkout],
+        &[
+            // Repository config could hide untracked files from Git's own cleanliness check.
+            "-c",
+            "status.showUntrackedFiles=normal",
+            "worktree",
+            "remove",
+            "--",
+            checkout,
+        ],
         MAX_CAPTURED_STREAM_BYTES,
         LINKED_WORKTREE_REMOVE_TIMEOUT,
         executor,
     );
-    let removal_succeeded =
-        matches!(&removal, Ok(record) if record.success && record.status == Some(0));
+    let exit = match &removal {
+        Ok(record) if record.success && record.status == Some(0) => RemovalExit::Succeeded,
+        Ok(record) if matches!(record.status, Some(status) if status != 0) => {
+            RemovalExit::ExitedNonZero
+        }
+        _ => RemovalExit::Interrupted,
+    };
 
     // Fresh post-effect observation decides the outcome, whatever the command reported.
     let directory_gone = matches!(entry_present(&entry.path), Ok(false));
@@ -1126,35 +1298,38 @@ pub fn reclaim_linked_worktree(
     .and_then(|record| parse_worktree_list(&record.stdout))
     {
         Ok(entries) => entries.iter().any(|listed| listed.path == entry.path),
-        Err(error) => return LinkedWorktreeReclaimOutcome::Incomplete { code: error.code() },
+        Err(error) => {
+            return LinkedWorktreeReclaimOutcome::Incomplete {
+                code: error.code(),
+                target: Some(target),
+            };
+        }
     };
-    match (removal_succeeded, directory_gone, still_registered) {
-        (true, true, false) => LinkedWorktreeReclaimOutcome::Reclaimed {
-            pinned,
+    let observed_intact = exit == RemovalExit::ExitedNonZero
+        && !directory_gone
+        && still_registered
+        && observe_detailed(observer, inventory, entry, executor)
+            .is_ok_and(|after| !after.facts.tracked_changes_present && after.head == observed.head);
+    match classify_removal(exit, directory_gone, still_registered, observed_intact) {
+        RemovalClass::Reclaimed => LinkedWorktreeReclaimOutcome::Reclaimed {
+            target,
             idle_seconds,
         },
-        // Git's own guard refused and left everything in place.
-        (false, false, true) if removal.is_ok() => LinkedWorktreeReclaimOutcome::GitRefused,
-        _ => LinkedWorktreeReclaimOutcome::Incomplete {
+        RemovalClass::GitRefused => LinkedWorktreeReclaimOutcome::GitRefused { target },
+        RemovalClass::Incomplete => LinkedWorktreeReclaimOutcome::Incomplete {
             code: removal_postcondition_failed().code(),
+            target: Some(target),
         },
     }
 }
 
-/// Pin the worktree's current HEAD under a create-only ref and confirm it resolves.
-fn pin_head_commit(
+/// Pin one exact commit under a create-only ref and confirm it resolves.
+fn pin_commit(
     observer: &ProjectCheckoutObserver,
     inventory: &LinkedWorktreeInventory,
-    checkout: &Path,
+    commit: &str,
     executor: &impl TimedCommandExecutor,
 ) -> Result<(), LinkedWorktreeReclaimError> {
-    let head = git(
-        observer,
-        checkout,
-        &["rev-parse", "--verify", "HEAD^{commit}"],
-        executor,
-    )?;
-    let commit = head.stdout.strip_suffix('\n').ok_or_else(invalid_output)?;
     crate::artifact::CommitId::parse(commit).map_err(|_| invalid_output())?;
     let reference = format!("{LINKED_WORKTREE_PIN_REF_PREFIX}{commit}");
     let existing = observer
@@ -1691,6 +1866,36 @@ worktree /wt/b\0HEAD 3333333333333333333333333333333333333333\0branch refs/heads
             (128, 2)
         );
         assert!(read_index_varint(&[0xff; 11], 0).is_err());
+    }
+
+    #[test]
+    fn only_a_clean_nonzero_exit_with_everything_intact_counts_as_git_refusing() {
+        use RemovalClass::{GitRefused, Incomplete, Reclaimed};
+        use RemovalExit::{ExitedNonZero, Interrupted, Succeeded};
+        assert_eq!(classify_removal(Succeeded, true, false, false), Reclaimed);
+        assert_eq!(
+            classify_removal(ExitedNonZero, false, true, true),
+            GitRefused
+        );
+        // A signal after deletion started: tree partly gone but still present and registered.
+        assert_eq!(classify_removal(Interrupted, false, true, true), Incomplete);
+        // Non-zero exit but fresh observation no longer shows an intact tree.
+        assert_eq!(
+            classify_removal(ExitedNonZero, false, true, false),
+            Incomplete
+        );
+        // Git deleted the tree, then failed on its administrative directory.
+        assert_eq!(
+            classify_removal(ExitedNonZero, false, false, false),
+            Incomplete
+        );
+        assert_eq!(
+            classify_removal(ExitedNonZero, true, true, false),
+            Incomplete
+        );
+        // Success reported but the postcondition does not hold.
+        assert_eq!(classify_removal(Succeeded, false, false, false), Incomplete);
+        assert_eq!(classify_removal(Succeeded, true, true, false), Incomplete);
     }
 
     #[test]
