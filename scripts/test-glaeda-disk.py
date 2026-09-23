@@ -110,6 +110,16 @@ class GlaedaDiskTest(unittest.TestCase):
             os.utime(p, (time.time() - 48 * 3600,) * 2)
         self.assertEqual(gd.survey([self.fam], 24, 0)[0].verdict, "git-checkout")
 
+    def test_deep_tree_is_unchecked_not_git_and_build_dirs_are_skipped(self) -> None:
+        deep = self.root / "deep"
+        (deep / "a/b/c/d/e/f/g").mkdir(parents=True)
+        self.assertEqual(gd.git_state(deep), "unchecked")
+        mods = self.root / "mods"
+        (mods / "node_modules/x/y/z/w/v/u").mkdir(parents=True)
+        self.assertEqual(gd.git_state(mods), "none")
+        (self.root / "repo/sub/.git").mkdir(parents=True)
+        self.assertEqual(gd.git_state(self.root / "repo"), "git")
+
     def test_tmp_alias_and_comma_lists_count_as_named(self) -> None:
         self.assertTrue(gd.named_by("/private/tmp/foo", "tool --out /tmp/foo/dist\n"))
         self.assertTrue(gd.named_by("/private/tmp/foo", "tool --dirs=/private/tmp/foo,/x\n"))

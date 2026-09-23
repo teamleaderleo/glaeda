@@ -90,7 +90,7 @@ class Item:
     path: str
     bytes: int
     idle_hours: float
-    verdict: str  # reclaimable | recent | in-use | git-checkout | report-only
+    verdict: str  # reclaimable | recent | in-use | git-checkout | unchecked | report-only
     reasons: list[str] = field(default_factory=list)
 
 
@@ -150,7 +150,11 @@ def process_evidence() -> tuple[list[str], str]:
         for pid in proc.iterdir():
             if not pid.name.isdigit():
                 continue
-            for link in [pid / "cwd", *(_children(pid / "fd"))]:
+            try:  # other users' processes are unreadable; that is expected, not a finding
+                fds = [pid / "fd" / fd for fd in os.listdir(pid / "fd")]
+            except OSError:
+                fds = []
+            for link in [pid / "cwd", *fds]:
                 try:
                     opened.append(os.readlink(link))
                 except OSError:
@@ -202,11 +206,16 @@ def claude_session_active(session_id: str, idle_s: float) -> bool:
     return False
 
 
-def has_git(path: Path, depth: int = 5, budget: int = 20000) -> bool:
-    """True when a .git entry exists up to `depth` levels down, or the tree is too big to tell.
+REPRODUCIBLE_DIRS = frozenset({"node_modules", ".build", "DerivedData", "target", ".venv",
+                               "__pycache__", ".gradle", "Pods"})
 
-    A clone inside a scratch directory can hold unpushed commits, so an unfinished search
-    counts as a checkout (fail closed).
+
+def git_state(path: Path, depth: int = 5, budget: int = 20000) -> str:
+    """"git" when a .git entry exists up to `depth` levels down, "none" when the whole tree was
+    searched without finding one, "unchecked" when the search could not finish.
+
+    A clone inside a scratch directory can hold unpushed commits, so callers treat "unchecked"
+    like "git" (fail closed). Package and build-output directories are not searched.
     """
     frontier = [str(path)]
     for _ in range(depth + 1):
@@ -217,17 +226,21 @@ def has_git(path: Path, depth: int = 5, budget: int = 20000) -> bool:
                     for e in it:
                         budget -= 1
                         if budget < 0:
-                            return True
+                            return "unchecked"
                         if e.name == ".git":
-                            return True
-                        if e.is_dir(follow_symlinks=False):
+                            return "git"
+                        if e.is_dir(follow_symlinks=False) and e.name not in REPRODUCIBLE_DIRS:
                             nxt.append(e.path)
             except PermissionError:
-                return True
+                return "unchecked"
             except OSError:
                 pass
         frontier = nxt
-    return bool(frontier)  # deeper levels left unsearched
+    return "unchecked" if frontier else "none"
+
+
+def has_git(path: Path) -> bool:
+    return git_state(path) != "none"
 
 
 UNREADABLE: set[str] = set()
@@ -324,8 +337,10 @@ def _survey(families, idle_hours, min_bytes, known, evidence) -> list[Item]:
             verdict = "report-only"
         elif reasons:
             verdict = "in-use"
-        elif fam.id != "xcode-derived-data" and has_git(path):
-            verdict = "git-checkout"
+        elif fam.id != "xcode-derived-data" and (g := git_state(path)) != "none":
+            verdict = "git-checkout" if g == "git" else "unchecked"
+            if g == "unchecked":
+                reasons.append("too deep or large to rule out a git checkout")
         elif idle < idle_hours:
             verdict = "recent"
         else:
@@ -608,8 +623,13 @@ def main(argv: list[str] | None = None) -> int:
     at, known = (0.0, {}) if a.refresh or a.no_snapshot else load_snapshot()
     if a.apply:
         # sizes decide what gets deleted under pressure, so never trust stale ones there
-        reclaim_roots = tuple(str(f.root) + "/" for f in fams if f.reclaimable)
-        known = {k: v for k, v in known.items() if not k.startswith(reclaim_roots)}
+        def candidate_of_selected(k: str) -> bool:
+            for f in fams:
+                root = str(f.root) + "/"
+                if f.reclaimable and k.startswith(root) and k[len(root):].split("/")[0] not in f.skip:
+                    return True
+            return False
+        known = {k: v for k, v in known.items() if not candidate_of_selected(k)}
     known = {k: v for k, v in known.items() if os.path.lexists(k)}
     before = len(known)
     items = survey(fams, idle, a.min_mib * 1024**2, known)
