@@ -505,6 +505,25 @@ impl ProjectCheckoutObserver {
         max_stdout_bytes: usize,
         executor: &impl TimedCommandExecutor,
     ) -> Result<ExecutionRecord, ProjectCheckoutObservationError> {
+        self.git_with_limits(
+            checkout,
+            arguments,
+            max_stdout_bytes,
+            PROJECT_CHECKOUT_COMMAND_TIMEOUT,
+            executor,
+        )
+    }
+
+    /// Like [`Self::git_bounded`] with an explicit deadline, for reviewed commands whose runtime
+    /// scales with the size of the tree they act on.
+    pub(crate) fn git_with_limits(
+        &self,
+        checkout: &Path,
+        arguments: &[&str],
+        max_stdout_bytes: usize,
+        timeout: Duration,
+        executor: &impl TimedCommandExecutor,
+    ) -> Result<ExecutionRecord, ProjectCheckoutObservationError> {
         let checkout = checkout.to_str().ok_or_else(unsafe_path)?;
         let mut spec = CommandSpec::new(&self.git_program)
             .argument("--no-optional-locks")
@@ -534,7 +553,7 @@ impl ProjectCheckoutObserver {
         let expected_argv = spec.displayed_argv();
         let expected_environment_keys = spec.environment.keys().cloned().collect::<Vec<_>>();
         let record = executor
-            .execute_with_timeout(&spec, PROJECT_CHECKOUT_COMMAND_TIMEOUT)
+            .execute_with_timeout(&spec, timeout)
             .map_err(|_| unavailable())?;
         if record.argv != expected_argv
             || record.environment_keys != expected_environment_keys

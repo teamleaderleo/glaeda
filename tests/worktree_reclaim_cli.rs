@@ -6,7 +6,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const BINARY: &str = env!("CARGO_BIN_EXE_glaeda-worktree-reclaim-plan");
+const BINARY: &str = env!("CARGO_BIN_EXE_glaeda-worktree-reclaim");
 const GIT: &str = "/usr/bin/git";
 const TOUCH: &str = "/usr/bin/touch";
 /// Older than any idle window the tests use.
@@ -74,6 +74,10 @@ impl Fixture {
     }
 
     fn plan(&self, repository: &Path) -> Output {
+        self.run(repository, &[])
+    }
+
+    fn run(&self, repository: &Path, extra: &[&str]) -> Output {
         Command::new(BINARY)
             .args([
                 "--repository",
@@ -81,8 +85,9 @@ impl Fixture {
                 "--output",
                 "json",
             ])
+            .args(extra)
             .output()
-            .expect("run worktree reclaim planner")
+            .expect("run worktree reclaim")
     }
 
     /// Linked worktree basenames in `git worktree list` order, which the report's ordinals follow.
@@ -160,9 +165,16 @@ fn assert_child_success(operation: &str, output: &Output) {
     );
 }
 
-fn report(output: &Output) -> serde_json::Value {
-    assert_child_success("worktree reclaim plan", output);
+fn document(output: &Output) -> serde_json::Value {
+    assert_child_success("worktree reclaim", output);
     serde_json::from_slice(&output.stdout).expect("JSON report")
+}
+
+/// The single repository section of a one-repository report.
+fn report(output: &Output) -> serde_json::Value {
+    let document = document(output);
+    assert_eq!(document["repositories"][0]["result"], "listed");
+    document["repositories"][0].clone()
 }
 
 /// Every worktree state the planner distinguishes, observed through the real binary and real Git.
@@ -200,9 +212,10 @@ fn plan_classifies_real_worktrees_and_changes_nothing() {
     let listing_before = git_output(&fixture.main, &["worktree", "list", "--porcelain"]).stdout;
     let refs_before = git_output(&fixture.main, &["for-each-ref"]).stdout;
 
-    let report = report(&fixture.plan(&fixture.main));
-    assert_eq!(report["document_type"], "glaeda-worktree-reclaim-plan");
-    assert_eq!(report["mutation_performed"], false);
+    let document = document(&fixture.plan(&fixture.main));
+    assert_eq!(document["document_type"], "glaeda-worktree-reclaim-plan");
+    assert_eq!(document["mutation_performed"], false);
+    let report = document["repositories"][0].clone();
     assert_eq!(report["summary"]["linked"], 6);
     assert_eq!(report["summary"]["eligible"], 2);
     assert_eq!(report["summary"]["eligible_requiring_head_pin"], 1);
@@ -252,7 +265,7 @@ fn plan_classifies_real_worktrees_and_changes_nothing() {
     );
     assert_eq!(by_name("missing")["result"], "prunable");
 
-    let text = String::from_utf8(serde_json::to_vec(&report).expect("serialize")).expect("UTF-8");
+    let text = String::from_utf8(serde_json::to_vec(&document).expect("serialize")).expect("UTF-8");
     assert!(
         !text.contains(fixture.root.to_str().expect("UTF-8")),
         "report must not publish checkout paths"
@@ -274,9 +287,14 @@ fn a_linked_worktree_is_not_accepted_as_the_repository() {
     let fixture = Fixture::new();
     let linked = fixture.add("linked");
     let output = fixture.plan(&linked);
-    assert_eq!(output.status.code(), Some(2));
-    let error: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON error");
-    assert_eq!(error["code"], "not_main_worktree");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an unlisted repository must not pass silently"
+    );
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert_eq!(document["repositories"][0]["result"], "unlisted");
+    assert_eq!(document["repositories"][0]["code"], "not_main_worktree");
 }
 
 fn git_as_user(checkout: &Path, arguments: &[&str]) {
@@ -582,5 +600,150 @@ fn relative_path_worktrees_are_observable() {
     assert_eq!(
         entry_by_name(&fixture, &report, "relative")["decision"]["decision"],
         "eligible"
+    );
+}
+
+fn ref_exists(repository: &Path, reference: &str) -> bool {
+    Command::new(GIT)
+        .arg("-C")
+        .arg(repository)
+        .args(["rev-parse", "--quiet", "--verify", reference])
+        .output()
+        .expect("run rev-parse")
+        .status
+        .success()
+}
+
+/// `--apply` removes exactly the eligible worktrees, pins an unreachable HEAD first, and keeps
+/// everything a fresh check refuses.
+#[test]
+fn apply_reclaims_only_eligible_worktrees_and_pins_orphan_heads() {
+    let fixture = Fixture::new();
+
+    let clean = fixture.add("clean");
+    fixture.age("clean");
+
+    let detached = fixture.add("detached");
+    git(&detached, &["checkout", "--detach"]);
+    commit(&detached, "only this worktree reaches it");
+    let orphan = String::from_utf8(git_output(&detached, &["rev-parse", "HEAD"]).stdout)
+        .expect("UTF-8")
+        .trim()
+        .to_owned();
+    git(&fixture.main, &["branch", "-D", "detached"]);
+    fixture.age("detached");
+
+    let dirty = fixture.add("dirty");
+    fs::write(dirty.join("scratch.txt"), "local\n").expect("write untracked file");
+    fixture.age("dirty");
+
+    let recent = fixture.add("recent");
+
+    let receipt = document(&fixture.run(&fixture.main, &["--apply"]));
+    assert_eq!(receipt["document_type"], "glaeda-worktree-reclaim-receipt");
+    assert_eq!(receipt["mutation_performed"], true);
+    assert_eq!(receipt["circuit_breaker_tripped"], false);
+    assert_eq!(receipt["repositories"][0]["summary"]["reclaimed"], 2);
+    let outcomes = receipt["repositories"][0]["worktrees"]
+        .as_array()
+        .expect("worktrees")
+        .iter()
+        .filter_map(|worktree| worktree.get("reclaim"))
+        .collect::<Vec<_>>();
+    assert!(outcomes.iter().any(|outcome| {
+        outcome["target"]["branch"] == "clean"
+            && outcome["target"]["commit"]
+                .as_str()
+                .is_some_and(|commit| commit.len() == 40)
+    }));
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| outcome["target"]["commit"] == orphan.as_str()
+                && outcome["target"]["pinned"] == true)
+    );
+
+    assert!(!clean.exists(), "clean worktree removed");
+    assert!(!detached.exists(), "detached worktree removed");
+    assert!(
+        ref_exists(&fixture.main, "refs/heads/clean"),
+        "branch survives removal"
+    );
+    assert!(
+        ref_exists(
+            &fixture.main,
+            &format!("refs/glaeda/worktree-pins/{orphan}")
+        ),
+        "orphan HEAD pinned before removal"
+    );
+    assert!(dirty.join("scratch.txt").exists(), "dirty worktree kept");
+    assert!(recent.exists(), "recent worktree kept");
+
+    let listed = fixture.linked_order();
+    assert_eq!(listed, ["dirty", "recent"]);
+
+    // A second run finds nothing left to do and changes nothing.
+    let again = document(&fixture.run(&fixture.main, &["--apply"]));
+    assert_eq!(again["mutation_performed"], false);
+    assert_eq!(again["repositories"][0]["summary"]["eligible"], 0);
+}
+
+#[test]
+fn apply_stops_at_the_reclaim_budget() {
+    let fixture = Fixture::new();
+    let first = fixture.add("first");
+    fixture.age("first");
+    let second = fixture.add("second");
+    fixture.age("second");
+
+    let document = document(&fixture.run(&fixture.main, &["--apply", "--max-reclaims", "1"]));
+    assert_eq!(document["budget_exhausted"], true);
+    assert_eq!(document["repositories"][0]["summary"]["reclaimed"], 1);
+    assert_eq!(
+        usize::from(first.exists()) + usize::from(second.exists()),
+        1,
+        "exactly one worktree removed"
+    );
+}
+
+/// A removal Git starts but cannot finish trips the circuit breaker and stops the batch.
+#[test]
+fn a_partial_removal_trips_the_circuit_breaker() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::new();
+    fs::write(fixture.main.join(".git/info/exclude"), "build/\n").expect("ignore build output");
+    let first = fixture.add("first");
+    fixture.age("first");
+    let second = fixture.add("second");
+    fixture.age("second");
+    let order = fixture.linked_order();
+    let (stuck, untouched) = if order[0] == "first" {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let build = stuck.join("build");
+    fs::create_dir(&build).expect("create ignored build directory");
+    fs::write(build.join("output.o"), "binary\n").expect("write ignored output");
+    fs::set_permissions(&build, fs::Permissions::from_mode(0o555)).expect("make build read-only");
+    // Re-age after creating the directory changed the checkout root mtime.
+    fixture.age(
+        stuck
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("name"),
+    );
+
+    let output = fixture.run(&fixture.main, &["--apply"]);
+    fs::set_permissions(&build, fs::Permissions::from_mode(0o755)).expect("restore permissions");
+    assert_eq!(output.status.code(), Some(3), "circuit breaker exit status");
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON receipt");
+    assert_eq!(receipt["circuit_breaker_tripped"], true);
+    assert_eq!(receipt["mutation_performed"], true);
+    assert_eq!(receipt["repositories"][0]["summary"]["reclaimed"], 0);
+    assert!(
+        untouched.exists(),
+        "the batch stopped before the next worktree"
     );
 }
