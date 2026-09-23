@@ -132,6 +132,8 @@ jobs:
               Path("scripts/test-quarry-sweep.py"),
               Path("scripts/quarry_parallel_impl.py"),
               Path("scripts/test-quarry-parallel.py"),
+              Path("scripts/status_page.py"),
+              Path("scripts/test-status-page.py"),
               *Path("scripts/workspace_bootstrap").glob("*.py"),
           ]
           for path in paths:
@@ -170,6 +172,7 @@ jobs:
           python3 scripts/test-front-door.py
           python3 scripts/test-quarry-sweep.py
           python3 scripts/test-quarry-parallel.py
+          python3 scripts/test-status-page.py
 
           first_receipt=$(mktemp)
           second_receipt=$(mktemp)
