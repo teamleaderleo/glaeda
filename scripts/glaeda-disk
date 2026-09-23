@@ -135,24 +135,64 @@ def newest_mtime(path: Path, levels: int = 2, budget: int = 3000) -> float:
     return newest
 
 
+class NoEvidence(Exception):
+    """Process evidence could not be collected; nothing may be deleted."""
+
+
 def process_evidence() -> tuple[list[str], str]:
-    cwds: list[str] = []
-    lsof = shutil.which("lsof")
-    if lsof:
-        out = subprocess.run([lsof, "-n", "-P", "-d", "cwd", "-Fn"], capture_output=True, text=True)
-        cwds = [line[1:] for line in out.stdout.splitlines() if line.startswith("n/")]
-    cmds = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True).stdout
-    return cwds, cmds
+    """Every path a process has open (cwd and files) plus all command lines.
+
+    Raises NoEvidence when either source is unavailable, so callers fail closed.
+    """
+    opened: list[str] = []
+    proc = Path("/proc")
+    if not DARWIN and proc.is_dir():
+        for pid in proc.iterdir():
+            if not pid.name.isdigit():
+                continue
+            for link in [pid / "cwd", *(_children(pid / "fd"))]:
+                try:
+                    opened.append(os.readlink(link))
+                except OSError:
+                    pass
+    else:
+        lsof = shutil.which("lsof") or "/usr/sbin/lsof"
+        try:
+            out = subprocess.run([lsof, "-n", "-P", "-Fn"], capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise NoEvidence(f"lsof: {e}") from e
+        opened = [line[1:] for line in out.stdout.splitlines() if line.startswith("n/")]
+        if not opened:
+            raise NoEvidence(f"lsof returned nothing (exit {out.returncode})")
+    try:
+        ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise NoEvidence(f"ps: {e}") from e
+    if ps.returncode != 0 or not ps.stdout.strip():
+        raise NoEvidence(f"ps failed (exit {ps.returncode})")
+    return opened, ps.stdout
+
+
+def spellings(path: str) -> list[str]:
+    """The same location as processes may name it (macOS /tmp and /var are symlinks into /private)."""
+    out = [path]
+    for real, alias in (("/private/tmp", "/tmp"), ("/private/var", "/var"), ("/private/etc", "/etc")):
+        if path == real or path.startswith(real + "/"):
+            out.append(alias + path[len(real):])
+    return out
 
 
 def named_by(path: str, cmds: str) -> bool:
-    if path not in cmds:
-        return False
-    return re.search(re.escape(path) + r"(?=$|[/\s'\"=:])", cmds, re.M) is not None
+    for spelling in spellings(path):
+        if spelling in cmds and re.search(
+                re.escape(spelling) + r"(?=$|[/\s'\"=:,;)\]])", cmds, re.M):
+            return True
+    return False
 
 
-def in_cwd(path: str, cwds: list[str]) -> bool:
-    return any(c == path or c.startswith(path + "/") for c in cwds)
+def in_cwd(path: str, opened: list[str]) -> bool:
+    """True when any process has its cwd or an open file inside path."""
+    return any(o == sp or o.startswith(sp + "/") for sp in spellings(path) for o in opened)
 
 
 def claude_session_active(session_id: str, idle_s: float) -> bool:
@@ -162,11 +202,32 @@ def claude_session_active(session_id: str, idle_s: float) -> bool:
     return False
 
 
-def has_git(path: Path) -> bool:
-    for probe in [path, *(p for p in _children(path) if p.is_dir())]:
-        if (probe / ".git").exists():
-            return True
-    return False
+def has_git(path: Path, depth: int = 5, budget: int = 20000) -> bool:
+    """True when a .git entry exists up to `depth` levels down, or the tree is too big to tell.
+
+    A clone inside a scratch directory can hold unpushed commits, so an unfinished search
+    counts as a checkout (fail closed).
+    """
+    frontier = [str(path)]
+    for _ in range(depth + 1):
+        nxt: list[str] = []
+        for d in frontier:
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        budget -= 1
+                        if budget < 0:
+                            return True
+                        if e.name == ".git":
+                            return True
+                        if e.is_dir(follow_symlinks=False):
+                            nxt.append(e.path)
+            except PermissionError:
+                return True
+            except OSError:
+                pass
+        frontier = nxt
+    return bool(frontier)  # deeper levels left unsearched
 
 
 UNREADABLE: set[str] = set()
@@ -188,7 +249,14 @@ def candidates(fam: Family) -> list[Path]:
         level = [c for p in level for c in _children(p)
                  if c.name not in fam.skip and c.is_dir() and not c.is_symlink()]
     uid = os.getuid()
-    return [p for p in level if p.lstat().st_uid == uid]
+    owned = []
+    for p in level:
+        try:
+            if p.lstat().st_uid == uid:
+                owned.append(p)
+        except OSError:
+            pass  # vanished mid-scan
+    return owned
 
 
 def load_snapshot(path: Path = SNAPSHOT) -> tuple[float, dict[str, int]]:
@@ -234,14 +302,20 @@ def _survey(families, idle_hours, min_bytes, known, evidence) -> list[Item]:
     idles = [(now - newest_mtime(path, 2 if fam.reclaimable else 1,
                                  3000 if fam.reclaimable else 300)) / 3600
              if size >= min_bytes else 0.0 for (fam, path), size in zip(work, sizes)]
-    cwds, cmds = evidence.result()
+    try:
+        cwds, cmds = evidence.result()
+        blind = ""
+    except NoEvidence as e:
+        cwds, cmds, blind = [], "", f"no process evidence ({e})"
     for (fam, path), size, idle in zip(work, sizes, idles):
         if size < min_bytes:
             continue
         sp = str(path)
         reasons = []
+        if blind:
+            reasons.append(blind)
         if in_cwd(sp, cwds):
-            reasons.append("process cwd inside")
+            reasons.append("open by a process")
         if named_by(sp, cmds):
             reasons.append("named by a running command")
         if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_hours * 3600):
@@ -299,9 +373,12 @@ def remove(path: Path) -> None:
 
 
 def _chmod_retry(func, p, _exc):  # read-only files in SwiftPM/Xcode checkouts
-    os.chmod(p, stat.S_IWUSR | stat.S_IRUSR | stat.S_IXUSR)
+    rwx = stat.S_IWUSR | stat.S_IRUSR | stat.S_IXUSR
     parent = os.path.dirname(p)
-    os.chmod(parent, stat.S_IWUSR | stat.S_IRUSR | stat.S_IXUSR)
+    if not os.path.islink(parent):
+        os.chmod(parent, rwx)
+    if not os.path.islink(p):  # never chmod through a symlink to something outside the tree
+        os.chmod(p, rwx)
     func(p)
 
 
@@ -309,7 +386,11 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
           stop_free: int | None, fs: Path, idle_hours: float) -> int:
     receipt.parent.mkdir(parents=True, exist_ok=True)
     released = 0
-    cwds, cmds = process_evidence()
+    try:
+        cwds, cmds = process_evidence()
+    except NoEvidence as e:
+        print(f"refusing to delete anything: {e}", file=sys.stderr)
+        return 0
     for i in items:
         if i.verdict != "reclaimable":
             continue
@@ -341,7 +422,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
 def dedupe_roots(derived_data: Path) -> list[Path]:
     roots = [derived_data / sub for sub in DEDUPE_SUBDIRS]
     for d in _children(derived_data):
-        roots += [d / sub for sub in DEDUPE_SUBDIRS]
+        if not d.is_symlink():
+            roots += [d / sub for sub in DEDUPE_SUBDIRS]
     return [r for r in roots if r.is_dir() and not r.is_symlink()]
 
 
@@ -358,14 +440,18 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def clone_over(canonical: str, target: str, expect: list[int]) -> bool:
+def clone_over(canonical: str, target: str, expect: list[int],
+               canonical_expect: list[int] | None = None) -> bool:
     """Replace target with an APFS clone of canonical, keeping target's mode and times.
 
-    Refuses when target changed since it was hashed. A process that has target open keeps
+    Refuses when target or canonical changed since they were hashed, checked before and
+    after the copy, so a file rewritten mid-run can never be cloned over a verified one. A process that has target open keeps
     reading the old inode; the rename only swaps the directory entry.
     """
     st = os.lstat(target)
     if _file_key(st) != expect or not stat.S_ISREG(st.st_mode):
+        return False
+    if canonical_expect is not None and _file_key(os.lstat(canonical)) != canonical_expect:
         return False
     tmp = os.path.join(os.path.dirname(target), f".{os.path.basename(target)}.glaeda-clone-{os.getpid()}")
     try:
@@ -373,6 +459,8 @@ def clone_over(canonical: str, target: str, expect: list[int]) -> bool:
         os.chmod(tmp, stat.S_IMODE(st.st_mode))
         os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
         if _file_key(os.lstat(target)) != expect:
+            return False
+        if canonical_expect is not None and _file_key(os.lstat(canonical)) != canonical_expect:
             return False
         os.rename(tmp, target)
         return True
@@ -438,12 +526,15 @@ def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
             if new_state[target]["cloned"]:
                 continue
             try:
-                ok = clone_over(canonical, target, files[target])
+                ok = clone_over(canonical, target, files[target], files[canonical])
+                if ok:
+                    new_state[target] = {"key": _file_key(os.lstat(target)), "sha": sha,
+                                         "cloned": True}
             except (OSError, subprocess.CalledProcessError):
                 ok = False
+                new_state.pop(target, None)  # vanished or unreadable; rehash next run
             if ok:
                 cloned_bytes += files[target][0]
-                new_state[target] = {"key": _file_key(os.lstat(target)), "sha": sha, "cloned": True}
             else:
                 refused += 1
         new_state[canonical]["cloned"] = True
@@ -515,6 +606,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     idle = a.idle_hours if a.idle_hours is not None else (6 if under else 24)
     at, known = (0.0, {}) if a.refresh or a.no_snapshot else load_snapshot()
+    if a.apply:
+        # sizes decide what gets deleted under pressure, so never trust stale ones there
+        reclaim_roots = tuple(str(f.root) + "/" for f in fams if f.reclaimable)
+        known = {k: v for k, v in known.items() if not k.startswith(reclaim_roots)}
+    known = {k: v for k, v in known.items() if os.path.lexists(k)}
     before = len(known)
     items = survey(fams, idle, a.min_mib * 1024**2, known)
     age_min = (time.time() - at) / 60 if at else 0.0
@@ -524,7 +620,7 @@ def main(argv: list[str] | None = None) -> int:
             # merge, so a --family refresh keeps the other families' sizes
             save_snapshot({**load_snapshot()[1], **known})
             lock.unlink(missing_ok=True)
-        elif not at or len(known) > before:
+        elif not at or len(known) != before or a.apply:
             save_snapshot(known)
         if at and age_min > a.max_age and not a.apply and not _fresh(lock, 600):
             lock.touch()

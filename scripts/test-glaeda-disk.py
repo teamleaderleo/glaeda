@@ -101,6 +101,50 @@ class GlaedaDiskTest(unittest.TestCase):
         finally:
             receipt.unlink(missing_ok=True)
 
+    def test_git_clone_two_levels_down_is_a_checkout(self) -> None:
+        self.fam = gd.Family("claude-scratchpad", self.root, True, "scratch")
+        session = make(self.root / "session")
+        (session / "scratchpad" / "repo" / ".git").mkdir(parents=True)
+        for p in (session / "scratchpad" / "repo" / ".git", session / "scratchpad" / "repo",
+                  session / "scratchpad", session):
+            os.utime(p, (time.time() - 48 * 3600,) * 2)
+        self.assertEqual(gd.survey([self.fam], 24, 0)[0].verdict, "git-checkout")
+
+    def test_tmp_alias_and_comma_lists_count_as_named(self) -> None:
+        self.assertTrue(gd.named_by("/private/tmp/foo", "tool --out /tmp/foo/dist\n"))
+        self.assertTrue(gd.named_by("/private/tmp/foo", "tool --dirs=/private/tmp/foo,/x\n"))
+        self.assertFalse(gd.named_by("/private/tmp/foo", "tool /tmp/foobar\n"))
+        self.assertTrue(gd.in_cwd("/private/tmp/foo", ["/tmp/foo/a.log"]))
+
+    def test_missing_process_evidence_fails_closed(self) -> None:
+        make(self.root / "old")
+
+        def blind():
+            raise gd.NoEvidence("lsof missing")
+        gd.process_evidence = blind
+        items = gd.survey([self.fam], 24, 0)
+        self.assertEqual(items[0].verdict, "in-use")
+        forced = [gd.Item(i.family, i.path, i.bytes, i.idle_hours, "reclaimable") for i in items]
+        receipt = self.root.parent / f"{self.root.name}-receipt.jsonl"
+        gd.apply(forced, {self.fam.id: self.fam}, receipt, None, self.root, 24)
+        self.assertTrue((self.root / "old").exists())
+
+    def test_remove_never_chmods_through_symlinks(self) -> None:
+        outside = self.root.parent / f"{self.root.name}-outside"
+        outside.write_text("x")
+        os.chmod(outside, 0o400)
+        try:
+            tree = self.root / "tree"
+            (tree / "ro").mkdir(parents=True)
+            os.symlink(outside, tree / "ro" / "link")
+            os.chmod(tree / "ro", 0o500)
+            gd.remove(tree)
+            self.assertFalse(tree.exists())
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o400)
+        finally:
+            os.chmod(outside, 0o600)
+            outside.unlink()
+
     def test_known_sizes_are_reused_and_new_items_measured(self) -> None:
         old, new = make(self.root / "old"), make(self.root / "new")
         known = {str(old): 7 * 1024**3}
@@ -161,6 +205,15 @@ class DedupeTest(unittest.TestCase):
         os.utime(b, (3_000_000, 3_000_000))
         self.assertFalse(gd.clone_over(str(a), str(b), key))
         self.assertEqual(int(b.stat().st_mtime), 3_000_000)
+
+    def test_canonical_changed_after_hash_is_refused(self) -> None:
+        data = os.urandom(2 * 1024 * 1024)
+        a = self.blob("a/x.bin", data)
+        b = self.blob("b/x.bin", data)
+        akey, bkey = gd._file_key(os.lstat(a)), gd._file_key(os.lstat(b))
+        a.write_bytes(os.urandom(len(data)))
+        self.assertFalse(gd.clone_over(str(a), str(b), bkey, akey))
+        self.assertEqual(b.read_bytes(), data)
 
     def test_recently_written_files_wait_for_a_later_pass(self) -> None:
         data = os.urandom(2 * 1024 * 1024)
