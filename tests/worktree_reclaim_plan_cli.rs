@@ -480,3 +480,107 @@ fn aliased_registration_is_unobservable() {
         "eligible"
     );
 }
+
+/// Layouts the index scanner must either read correctly or refuse, never misread.
+#[test]
+fn index_layouts_are_read_or_refused_never_misread() {
+    let fixture = Fixture::new();
+
+    // Index v4 prefix-compresses paths; skip-worktree must still be found through it.
+    let compressed = fixture.add("compressed");
+    git(&compressed, &["update-index", "--index-version", "4"]);
+    git(
+        &compressed,
+        &["update-index", "--skip-worktree", "tracked.txt"],
+    );
+    fs::write(compressed.join("tracked.txt"), "hidden edit\n").expect("edit v4 file");
+    fixture.age("compressed");
+
+    // A split index keeps entries and flags in a shared file this observer does not read.
+    let split = fixture.add("split");
+    git(
+        &split,
+        &["update-index", "--assume-unchanged", "tracked.txt"],
+    );
+    git(&split, &["update-index", "--split-index"]);
+    fs::write(split.join("tracked.txt"), "hidden edit\n").expect("edit split file");
+    git(
+        &split,
+        &[
+            "-c",
+            "splitIndex.maxPercentChange=0",
+            "update-index",
+            "--split-index",
+        ],
+    );
+    fixture.age("split");
+
+    // A submodule path whose repository was deleted but whose files remain.
+    let source = fixture.root.join("submodule-source");
+    fs::create_dir(&source).expect("create submodule source");
+    git(&source, &["init", "-b", "main"]);
+    commit(&source, "source commit");
+    let orphaned = fixture.add("orphaned");
+    git_as_user(
+        &orphaned,
+        &["submodule", "add", source.to_str().expect("UTF-8"), "sub"],
+    );
+    git_as_user(&orphaned, &["commit", "-m", "add submodule"]);
+    fs::remove_file(orphaned.join("sub/.git")).expect("remove submodule gitfile");
+    fs::remove_dir_all(fixture.main.join(".git/worktrees/orphaned/modules"))
+        .expect("remove absorbed submodule repository");
+    fs::write(orphaned.join("sub/work.txt"), "local only\n").expect("write orphaned file");
+    fixture.age("orphaned");
+
+    let report = report(&fixture.plan(&fixture.main));
+    assert_eq!(
+        vetoes_of(&entry_by_name(&fixture, &report, "compressed")),
+        ["hidden_index_entries_present"]
+    );
+    let split = entry_by_name(&fixture, &report, "split");
+    assert_eq!(split["result"], "unobservable");
+    assert_eq!(split["code"], "split_index_unsupported");
+    assert_eq!(
+        vetoes_of(&entry_by_name(&fixture, &report, "orphaned")),
+        ["populated_submodules_present"]
+    );
+}
+
+/// `worktree add --relative-paths` (Git 2.48+) records a relative backlink that must still bind.
+#[test]
+fn relative_path_worktrees_are_observable() {
+    let fixture = Fixture::new();
+    let path = fixture.root.join("relative");
+    let added = Command::new(GIT)
+        .arg("-C")
+        .arg(&fixture.main)
+        .args([
+            "worktree",
+            "add",
+            "--relative-paths",
+            "-b",
+            "relative",
+            path.to_str().expect("UTF-8"),
+        ])
+        .env_clear()
+        .env("HOME", &fixture.main)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .expect("run git worktree add");
+    if !added.status.success() {
+        // Older Git has no relative worktree links, so there is nothing to bind.
+        assert!(
+            String::from_utf8_lossy(&added.stderr).contains("relative-paths"),
+            "unexpected worktree add failure: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+        return;
+    }
+    fixture.age("relative");
+    let report = report(&fixture.plan(&fixture.main));
+    assert_eq!(
+        entry_by_name(&fixture, &report, "relative")["decision"]["decision"],
+        "eligible"
+    );
+}

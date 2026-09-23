@@ -430,6 +430,16 @@ pub fn list_linked_worktrees(
     if git_dir != common_dir {
         return Err(not_main_worktree());
     }
+    // The index layout scanned below embeds object names; only the reviewed SHA-1 width is read.
+    let format = git(
+        observer,
+        repository,
+        &["rev-parse", "--show-object-format"],
+        executor,
+    )?;
+    if format.stdout != "sha1\n" {
+        return Err(object_format_unsupported());
+    }
     let record = git_bounded(
         observer,
         repository,
@@ -538,7 +548,7 @@ pub fn observe_linked_worktree(
     let mut populated_submodules_present = directory_nonempty(&git_dir.join("modules"))?;
     for path in &index.gitlink_paths {
         let relative = relative_index_path(path)?;
-        populated_submodules_present |= entry_present(&checkout.join(relative).join(".git"))?;
+        populated_submodules_present |= submodule_path_populated(&checkout.join(relative))?;
     }
 
     let operation_in_progress = OPERATION_MARKERS
@@ -636,11 +646,18 @@ fn read_gitdir_backlink(git_dir: &Path) -> Result<PathBuf, LinkedWorktreeReclaim
         .read_to_string(&mut contents)
         .map_err(|_| administrative_directory_mismatch())?;
     let line = contents.strip_suffix('\n').unwrap_or(&contents);
-    let path = PathBuf::from(line);
-    if line.is_empty() || line.len() > 4_096 || line.contains('\n') || !path.is_absolute() {
+    if line.is_empty() || line.len() > 4_096 || line.contains('\n') || line.contains('\0') {
         return Err(administrative_directory_mismatch());
     }
-    Ok(path)
+    // `worktree add --relative-paths` records the backlink relative to the administrative
+    // directory; resolve it so both layouts compare against the same canonical checkout.
+    let recorded = PathBuf::from(line);
+    let resolved = if recorded.is_absolute() {
+        recorded
+    } else {
+        git_dir.join(recorded)
+    };
+    std::fs::canonicalize(resolved).map_err(|_| administrative_directory_mismatch())
 }
 
 fn parse_worktree_list(
@@ -691,8 +708,9 @@ fn parse_worktree_list(
 // `git ls-files -v` would report the same flags, but its output scales with path length and exceeds
 // the process capture ceiling on ordinary large repositories. The index file itself carries both
 // facts this module needs in a fixed layout, so it is read directly and bounded. Only flags, modes,
-// and paths are interpreted; extensions and the trailing checksum are ignored, and any structural
-// inconsistency fails closed.
+// and paths are interpreted. The checksum is not verified; instead the extension chain must end
+// exactly at the trailing SHA-1, which catches any misparsed layout. A split index keeps entries and
+// their flags in a separate shared file, so its `link` extension is refused rather than trusted.
 
 const INDEX_SIGNATURE: &[u8; 4] = b"DIRC";
 const INDEX_HEADER_BYTES: usize = 12;
@@ -706,6 +724,9 @@ const INDEX_NAME_LENGTH_MASK: u16 = 0x0fff;
 const INDEX_GITLINK_MODE: u32 = 0o160_000;
 const INDEX_MAX_PATH_BYTES: usize = 4_096;
 const INDEX_MAX_VARINT_BYTES: usize = 10;
+const INDEX_EXTENSION_HEADER_BYTES: usize = 8;
+const INDEX_SHA1_BYTES: usize = 20;
+const INDEX_SPLIT_LINK_EXTENSION: &[u8; 4] = b"link";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct IndexScan {
@@ -745,6 +766,9 @@ fn scan_index(bytes: &[u8]) -> Result<IndexScan, LinkedWorktreeReclaimError> {
     let entries = read_u32(bytes, 8)?;
     let mut offset = INDEX_HEADER_BYTES;
     let mut previous: Vec<u8> = Vec::new();
+    // A split index stores placeholder entries with stripped, empty names. They are tolerated only
+    // until the extension walk proves the index is split, which is refused with its own code.
+    let mut empty_path_seen = false;
     for _ in 0..entries {
         let fixed_end = offset
             .checked_add(INDEX_ENTRY_FIXED_BYTES)
@@ -795,10 +819,11 @@ fn scan_index(bytes: &[u8]) -> Result<IndexScan, LinkedWorktreeReclaimError> {
             }
             (bytes[name_start..terminator].to_vec(), next)
         };
-        if path.is_empty() || path.len() > INDEX_MAX_PATH_BYTES {
+        if path.len() > INDEX_MAX_PATH_BYTES {
             return Err(invalid_index());
         }
-        if mode == INDEX_GITLINK_MODE {
+        empty_path_seen |= path.is_empty();
+        if mode == INDEX_GITLINK_MODE && !path.is_empty() {
             if scan.gitlink_paths.len() >= MAX_LINKED_WORKTREE_GITLINKS {
                 return Err(invalid_index());
             }
@@ -806,6 +831,27 @@ fn scan_index(bytes: &[u8]) -> Result<IndexScan, LinkedWorktreeReclaimError> {
         }
         previous = path;
         offset = next;
+    }
+
+    let trailer = bytes
+        .len()
+        .checked_sub(INDEX_SHA1_BYTES)
+        .ok_or_else(invalid_index)?;
+    while offset < trailer {
+        let header_end = offset
+            .checked_add(INDEX_EXTENSION_HEADER_BYTES)
+            .ok_or_else(invalid_index)?;
+        if header_end > trailer {
+            return Err(invalid_index());
+        }
+        if &bytes[offset..offset + 4] == INDEX_SPLIT_LINK_EXTENSION {
+            return Err(split_index_unsupported());
+        }
+        let size = usize::try_from(read_u32(bytes, offset + 4)?).map_err(|_| invalid_index())?;
+        offset = header_end.checked_add(size).ok_or_else(invalid_index)?;
+    }
+    if offset != trailer || empty_path_seen {
+        return Err(invalid_index());
     }
     Ok(scan)
 }
@@ -875,6 +921,19 @@ fn relative_index_path(bytes: &[u8]) -> Result<&Path, LinkedWorktreeReclaimError
 
 fn entry_present(path: &Path) -> Result<bool, LinkedWorktreeReclaimError> {
     match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(unavailable()),
+    }
+}
+
+/// A submodule path holds data unless it is absent or an empty directory.
+///
+/// Status runs with submodules ignored, so anything at a gitlink path -- a repository, a gitfile, or
+/// plain files left behind after its `.git` was deleted -- is invisible to it and must veto here.
+fn submodule_path_populated(path: &Path) -> Result<bool, LinkedWorktreeReclaimError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => directory_nonempty(path),
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(_) => Err(unavailable()),
@@ -1041,6 +1100,22 @@ const fn index_too_large() -> LinkedWorktreeReclaimError {
         LinkedWorktreeReclaimErrorKind::InvalidOutput,
         "index_too_large",
         "the worktree index exceeds the reviewed size bound",
+    )
+}
+
+const fn split_index_unsupported() -> LinkedWorktreeReclaimError {
+    error(
+        LinkedWorktreeReclaimErrorKind::Unavailable,
+        "split_index_unsupported",
+        "the worktree uses a split index, whose shared entries this observer does not read",
+    )
+}
+
+const fn object_format_unsupported() -> LinkedWorktreeReclaimError {
+    error(
+        LinkedWorktreeReclaimErrorKind::InvalidRepository,
+        "object_format_unsupported",
+        "the repository object format is outside the reviewed SHA-1 index layout",
     )
 }
 
@@ -1309,6 +1384,38 @@ worktree /wt/b\0HEAD 3333333333333333333333333333333333333333\0branch refs/heads
     }
 
     #[test]
+    fn index_extension_chain_must_end_at_the_trailer_and_refuses_split_index() {
+        let plain = padded_entry(0o100_644, 0, None, b"a.txt");
+        let mut with_tree = index(2, std::slice::from_ref(&plain));
+        let trailer = with_tree.split_off(with_tree.len() - INDEX_SHA1_BYTES);
+        with_tree.extend_from_slice(b"TREE");
+        with_tree.extend_from_slice(&3_u32.to_be_bytes());
+        with_tree.extend_from_slice(b"abc");
+        let mut valid = with_tree.clone();
+        valid.extend_from_slice(&trailer);
+        assert!(scan_index(&valid).is_ok());
+
+        let mut overrun = with_tree.clone();
+        overrun.pop();
+        overrun.extend_from_slice(&trailer);
+        assert_eq!(
+            scan_index(&overrun).expect_err("overrun").code(),
+            "invalid_index"
+        );
+
+        let mut split = index(2, std::slice::from_ref(&plain));
+        let trailer = split.split_off(split.len() - INDEX_SHA1_BYTES);
+        split.extend_from_slice(INDEX_SPLIT_LINK_EXTENSION);
+        split.extend_from_slice(&20_u32.to_be_bytes());
+        split.extend_from_slice(&[0_u8; 20]);
+        split.extend_from_slice(&trailer);
+        assert_eq!(
+            scan_index(&split).expect_err("split").code(),
+            "split_index_unsupported"
+        );
+    }
+
+    #[test]
     fn index_v4_reconstructs_prefix_compressed_paths() {
         let mut bytes = INDEX_SIGNATURE.to_vec();
         bytes.extend_from_slice(&4_u32.to_be_bytes());
@@ -1325,6 +1432,7 @@ worktree /wt/b\0HEAD 3333333333333333333333333333333333333333\0branch refs/heads
             entry.push(0);
             bytes.extend_from_slice(&entry);
         }
+        bytes.extend_from_slice(&[0_u8; INDEX_SHA1_BYTES]);
         let scan = scan_index(&bytes).expect("scan");
         assert_eq!(scan.gitlink_paths, vec![b"vendor/sub".to_vec()]);
     }
