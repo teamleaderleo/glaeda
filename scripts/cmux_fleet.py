@@ -1014,6 +1014,26 @@ class FleetMutationLock:
             or (held.st_dev, held.st_ino) != self.parent_identity
         ):
             raise FleetError("fleet state directory identity changed")
+        try:
+            named_lock = os.stat(
+                ".mutation.lock", dir_fd=self.parent_fd, follow_symlinks=False
+            )
+            held_lock = os.fstat(self.lock_fd)
+        except OSError as error:
+            raise FleetError("fleet mutation lock identity changed") from error
+        if (
+            (named_lock.st_dev, named_lock.st_ino)
+            != (held_lock.st_dev, held_lock.st_ino)
+            or any(
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size != 0
+                for info in (named_lock, held_lock)
+            )
+        ):
+            raise FleetError("fleet mutation lock identity changed")
 
     def load_enrollment(self) -> object:
         self.revalidate_parent_path()

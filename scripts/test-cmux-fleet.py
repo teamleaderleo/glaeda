@@ -986,6 +986,36 @@ class FleetTests(unittest.TestCase):
 
             self.assertEqual(f.load(enrollment_path)["state"], "eligible")
 
+    def test_transition_refuses_replaced_or_changed_lock_before_publication(self):
+        for change in ("replace", "mode", "unlink", "symlink"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                root.chmod(0o700)
+                path = root / "enrollment.json"
+                original = f.canonical(enrollment())
+                path.write_bytes(original)
+                path.chmod(0o600)
+                transition = f.transition
+
+                def changed_lock(*args):
+                    result = transition(*args)
+                    lock = root / ".mutation.lock"
+                    if change == "mode":
+                        lock.chmod(0o644)
+                    else:
+                        lock.rename(root / "old-lock")
+                        if change == "replace":
+                            lock.touch(mode=0o600)
+                        elif change == "symlink":
+                            lock.symlink_to(root / "old-lock")
+                    return result
+
+                with mock.patch.object(f, "transition", side_effect=changed_lock):
+                    with self.assertRaisesRegex(f.FleetError, "lock"):
+                        f.apply_transition(path, "draining", None, [])
+                self.assertEqual(path.read_bytes(), original)
+                self.assertFalse(list(root.glob(".enrollment.next.*")))
+
     def test_transition_apply_refuses_parent_directory_rebind(self):
         with tempfile.TemporaryDirectory() as temporary:
             outer = Path(temporary).resolve()
