@@ -269,6 +269,12 @@ pub struct ReusableStateMetrics {
     pub lookups: u64,
     pub hits: u64,
     pub misses: u64,
+    /// Consumer attempts that computed this identity and resolved no generation to
+    /// evaluate. These never reach `evaluate_reusable_state_consumption`, so they
+    /// produce no field-level mismatch and are invisible to `lookups`/`misses`.
+    /// Counting them separately is what keeps a structurally unreachable identity
+    /// from reading as an untouched new generation.
+    pub unresolved_identity_attempts: u64,
     pub restore_duration_millis: u64,
     pub publication_duration_millis: u64,
     pub bytes_read: u64,
@@ -337,14 +343,45 @@ impl ReusableStateMetrics {
         })
     }
 
+    /// Every consumer attempt that addressed this identity, resolved or not.
     #[must_use]
-    pub fn hit_rate_basis_points(&self) -> u16 {
-        if self.lookups == 0 {
-            return 0;
-        }
-        let basis_points = (u128::from(self.hits) * 10_000) / u128::from(self.lookups);
-        u16::try_from(basis_points).unwrap_or(10_000)
+    pub fn resolution_attempts(&self) -> u128 {
+        u128::from(self.lookups) + u128::from(self.unresolved_identity_attempts)
     }
+
+    /// Observed hit rate, or `None` when no consumer has addressed this identity at all.
+    ///
+    /// The denominator is every resolution attempt, not only the lookups that resolved a
+    /// generation. An identity no consumer can address therefore reports a measured
+    /// `Some(0)` rather than the `0` that an untouched new generation also reports.
+    #[must_use]
+    pub fn hit_rate_basis_points(&self) -> Option<u16> {
+        let attempts = self.resolution_attempts();
+        if attempts == 0 {
+            return None;
+        }
+        let basis_points = (u128::from(self.hits) * 10_000) / attempts;
+        Some(u16::try_from(basis_points).unwrap_or(10_000))
+    }
+}
+
+/// Why a consumer's computed reuse identity resolved to no generation to evaluate.
+///
+/// `ReusableStateIdentityMismatch` names a disagreement between two identities that are
+/// already in hand. These name the attempts that never got that far: the consumer
+/// addressed a key no publisher could have sealed, or was refused before any candidate
+/// was offered. A reuse path that fails this way produces no mismatch evidence at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReusableStateUnresolvedReason {
+    /// The consumer could not establish an admissible identity for itself, so it never
+    /// addressed a publisher. Every attempt fails identically and the reuse rate this
+    /// produces is structurally zero rather than merely low.
+    ConsumerIdentityUnprovable,
+    /// The consumer's identity is admissible, but no published generation carries it.
+    NoGenerationForIdentity,
+    /// A generation exists under this identity and this consumer may not read it.
+    PublisherBoundaryRefused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -578,6 +615,16 @@ impl ReusableStateGeneration {
         {
             return Ok(ReusableStateRecommendation::Revalidate);
         }
+        // Checked before the lifecycle arms on purpose. `StopPublishing` needs
+        // `min_lookups_for_value` resolved lookups, which an identity nobody can address
+        // never accumulates, so without this a permanently unreachable generation would
+        // stay on `Observe` for its whole life.
+        if self.metrics.hits == 0
+            && self.metrics.unresolved_identity_attempts > 0
+            && self.metrics.unresolved_identity_attempts >= policy.min_unresolved_attempts_for_alarm
+        {
+            return Ok(ReusableStateRecommendation::InvestigateUnreachableIdentity);
+        }
         let utility = self.metrics.utility()?;
         let enough_value_lookups = self.metrics.lookups >= policy.min_lookups_for_value;
         Ok(match self.lifecycle {
@@ -674,6 +721,9 @@ pub struct ReusableStatePromotionPolicy {
     pub min_net_time_saved_millis: i64,
     pub max_validation_failures: u64,
     pub max_resets_per_thousand_lookups: u64,
+    /// Unresolved consumer attempts, with no hit, that make an identity defect the
+    /// likelier explanation than a cold start.
+    pub min_unresolved_attempts_for_alarm: u64,
 }
 
 impl ReusableStatePromotionPolicy {
@@ -686,6 +736,7 @@ impl ReusableStatePromotionPolicy {
             min_net_time_saved_millis: 1,
             max_validation_failures: 0,
             max_resets_per_thousand_lookups: 10,
+            min_unresolved_attempts_for_alarm: 3,
         }
     }
 
@@ -732,6 +783,10 @@ pub enum ReusableStateRecommendation {
     Retire,
     Evict,
     StopPublishing,
+    /// Consumers keep addressing this identity and keep resolving nothing. The defect is
+    /// in the identity the two sides compute, not in the generation's value, so neither
+    /// `StopPublishing` nor `Observe` describes it.
+    InvestigateUnreachableIdentity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -755,8 +810,18 @@ pub enum ReusableStateConsumptionMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "disposition", rename_all = "snake_case")]
 pub enum ReusableStateConsumptionDisposition {
-    Hit { mode: ReusableStateConsumptionMode },
-    MissReset { reason: ReusableStateMissReason },
+    Hit {
+        mode: ReusableStateConsumptionMode,
+    },
+    MissReset {
+        reason: ReusableStateMissReason,
+    },
+    /// No generation was resolved, so no identity comparison happened. A resolver
+    /// reports this; `evaluate_reusable_state_consumption` never returns it, because by
+    /// the time it runs a candidate is already in hand.
+    Unresolved {
+        reason: ReusableStateUnresolvedReason,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1283,7 +1348,10 @@ pub struct ReusableStateUtilityReport {
     pub cache_class: ReusableStateClass,
     pub generation: ReusableStateGenerationId,
     pub storage_size_bytes: u64,
-    pub hit_rate_basis_points: u16,
+    /// `None` when no consumer has addressed this identity, so an unmeasured rate is
+    /// never rendered as a measured zero.
+    pub hit_rate_basis_points: Option<u16>,
+    pub unresolved_identity_attempts: u64,
     pub estimated_saved_per_hit_millis: u64,
     pub restore_duration_millis: u64,
     pub publication_duration_millis: u64,
@@ -1307,6 +1375,7 @@ impl ReusableStateUtilityReport {
             generation: generation.generation.clone(),
             storage_size_bytes: generation.metrics.storage_size_bytes,
             hit_rate_basis_points: generation.metrics.hit_rate_basis_points(),
+            unresolved_identity_attempts: generation.metrics.unresolved_identity_attempts,
             estimated_saved_per_hit_millis: utility.estimated_saved_per_hit_millis,
             restore_duration_millis: generation.metrics.restore_duration_millis,
             publication_duration_millis: generation.metrics.publication_duration_millis,
@@ -1463,6 +1532,7 @@ mod tests {
             lookups,
             hits,
             misses: lookups - hits,
+            unresolved_identity_attempts: 0,
             restore_duration_millis: 100,
             publication_duration_millis: 500,
             bytes_read: 1_000,
@@ -1625,6 +1695,7 @@ mod tests {
             lookups: u64::MAX,
             hits: u64::MAX,
             misses: 0,
+            unresolved_identity_attempts: u64::MAX,
             restore_duration_millis: u64::MAX,
             publication_duration_millis: u64::MAX,
             bytes_read: u64::MAX,
@@ -1641,7 +1712,8 @@ mod tests {
             semantic_mismatches: u64::MAX,
         };
         metrics.validate().expect("full u64 metric range is valid");
-        assert_eq!(metrics.hit_rate_basis_points(), 10_000);
+        assert_eq!(metrics.resolution_attempts(), u128::from(u64::MAX) * 2);
+        assert_eq!(metrics.hit_rate_basis_points(), Some(5_000));
         assert_eq!(
             metrics.utility().unwrap_err(),
             ReusableStatePolicyError::UtilityOverflow
@@ -2180,5 +2252,124 @@ mod tests {
                 "revalidation_required": false
             })
         );
+    }
+
+    /// The failure shape measured in manaflow-ai/cmux#13709: 112 consumer attempts at a
+    /// compiled-product identity, 0 hits, and every refusal raised before any producer
+    /// was considered. In this model those are resolution attempts that never became
+    /// lookups, so before this accounting existed the generation was indistinguishable
+    /// from one nobody had tried yet.
+    #[test]
+    fn unreachable_identity_is_not_reported_as_an_untried_generation() {
+        let untried = candidate(
+            ReusableStateClass::ImmutableCompiledProduct,
+            metrics(0, 0, 1_300_000, 40_000, 890_000_000, 2, 0),
+        );
+        let mut unreachable_metrics = metrics(0, 0, 1_300_000, 40_000, 890_000_000, 2, 0);
+        unreachable_metrics.unresolved_identity_attempts = 112;
+        let unreachable = candidate(
+            ReusableStateClass::ImmutableCompiledProduct,
+            unreachable_metrics,
+        );
+
+        assert_eq!(untried.metrics().hit_rate_basis_points(), None);
+        assert_eq!(unreachable.metrics().hit_rate_basis_points(), Some(0));
+        assert_eq!(untried.metrics().resolution_attempts(), 0);
+        assert_eq!(unreachable.metrics().resolution_attempts(), 112);
+
+        let policy = ReusableStatePromotionPolicy::conservative();
+        assert_eq!(
+            untried.recommendation(policy).unwrap(),
+            ReusableStateRecommendation::Observe
+        );
+        assert_eq!(
+            unreachable.recommendation(policy).unwrap(),
+            ReusableStateRecommendation::InvestigateUnreachableIdentity
+        );
+    }
+
+    /// `StopPublishing` is gated on `min_lookups_for_value` resolved lookups, which an
+    /// unreachable identity can never accumulate. Without the earlier check the
+    /// recommendation would stay `Observe` at every lifecycle stage.
+    #[test]
+    fn unreachable_identity_is_named_at_every_reachable_lifecycle_stage() {
+        let policy = ReusableStatePromotionPolicy::conservative();
+        let mut observed = metrics(2, 0, 1_300_000, 40_000, 890_000_000, 2, 0);
+        observed.unresolved_identity_attempts = 110;
+        let generation = candidate(ReusableStateClass::ImmutableCompiledProduct, observed);
+        assert_eq!(
+            generation.recommendation(policy).unwrap(),
+            ReusableStateRecommendation::InvestigateUnreachableIdentity
+        );
+        let validated = generation
+            .transition(ReusableStateLifecycle::Validated, policy)
+            .unwrap();
+        assert_eq!(
+            validated.recommendation(policy).unwrap(),
+            ReusableStateRecommendation::InvestigateUnreachableIdentity
+        );
+    }
+
+    /// One unresolved attempt against a generation that is being consumed is a cold
+    /// start or a race, not an identity defect. Only a hitless run of them is.
+    #[test]
+    fn occasional_unresolved_attempts_do_not_displace_normal_recommendations() {
+        let policy = ReusableStatePromotionPolicy::conservative();
+        let mut observed = metrics(4, 3, 1_300_000, 40_000, 890_000_000, 2, 3);
+        observed.unresolved_identity_attempts = 9;
+        let generation = candidate(ReusableStateClass::ImmutableCompiledProduct, observed);
+        assert_eq!(
+            generation.recommendation(policy).unwrap(),
+            ReusableStateRecommendation::Observe
+        );
+        assert_eq!(generation.metrics().hit_rate_basis_points(), Some(2_307));
+    }
+
+    #[test]
+    fn zero_alarm_threshold_still_requires_an_observed_unresolved_attempt() {
+        let mut policy = ReusableStatePromotionPolicy::conservative();
+        policy.min_unresolved_attempts_for_alarm = 0;
+        let generation = candidate(
+            ReusableStateClass::ImmutableCompiledProduct,
+            metrics(0, 0, 1_300_000, 40_000, 890_000_000, 2, 0),
+        );
+        assert_eq!(
+            generation.recommendation(policy).unwrap(),
+            ReusableStateRecommendation::Observe
+        );
+    }
+
+    /// Resolution failure carries its own vocabulary because no identity comparison
+    /// happened: there is no mismatching field to name.
+    #[test]
+    fn unresolved_disposition_is_separate_from_every_identity_mismatch() {
+        let unresolved = ReusableStateConsumptionDisposition::Unresolved {
+            reason: ReusableStateUnresolvedReason::ConsumerIdentityUnprovable,
+        };
+        assert_eq!(
+            serde_json::to_value(unresolved).unwrap(),
+            json!({
+                "disposition": "unresolved",
+                "reason": "consumer_identity_unprovable"
+            })
+        );
+        let expected = identity(ReusableStateClass::ImmutableCompiledProduct);
+        let generation = candidate(
+            ReusableStateClass::ImmutableCompiledProduct,
+            metrics(1, 1, 1_300_000, 40_000, 890_000_000, 2, 1),
+        );
+        let resolved = evaluate_reusable_state_consumption(
+            &expected,
+            &generation,
+            ReusableStateConsumerTrust::Trusted,
+            ReusableStateConsumptionPolicy {
+                low_trust_read_only_allowed: false,
+            },
+            &overlay_capabilities(),
+        );
+        assert!(!matches!(
+            resolved,
+            ReusableStateConsumptionDisposition::Unresolved { .. }
+        ));
     }
 }
