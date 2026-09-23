@@ -239,6 +239,107 @@ class BundleTests(unittest.TestCase):
                         b.stage(raw, b.sha256(raw), SOURCE, TARGET, destination, apply=True)
                 self.assertFalse((destination / "stage-receipt.json").exists())
 
+    def test_saved_generation_inspection_is_repeatable_and_read_only(self):
+        payload, manifest = fixture()
+        raw = b.archive_bytes(payload, manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            destination = root / "candidate"
+            b.stage(raw, b.sha256(raw), SOURCE, TARGET, destination, apply=True)
+            before = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+            self.assertEqual((destination / "candidate.tar.gz").read_bytes(), raw)
+            first = b.inspect_generation(destination, b.sha256(raw), SOURCE, TARGET)
+            self.assertEqual(first, b.inspect_generation(destination, b.sha256(raw), SOURCE, TARGET))
+            self.assertEqual(first["state"], "verified")
+            self.assertEqual(first["authority"], "generation_integrity_only")
+            self.assertFalse(first["automaticUpdateAuthorized"])
+            self.assertEqual(before, {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()})
+
+    def test_saved_generation_rejects_damage_and_extra_code(self):
+        payload, manifest = fixture()
+        raw = b.archive_bytes(payload, manifest)
+        for attack in ("archive", "binary", "manifest", "receipt", "missing-archive", "missing-receipt",
+                       "file-mode", "directory-mode", "symlink", "hardlink", "extra", "bytecode"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                destination = root / "candidate"
+                b.stage(raw, b.sha256(raw), SOURCE, TARGET, destination, apply=True)
+                paths = {"archive": "candidate.tar.gz", "binary": "bin/glaeda",
+                         "manifest": "manifest.json", "receipt": "stage-receipt.json"}
+                if attack in paths:
+                    (destination / paths[attack]).write_bytes(b"changed")
+                elif attack == "missing-archive":
+                    (destination / "candidate.tar.gz").unlink()
+                elif attack == "missing-receipt":
+                    (destination / "stage-receipt.json").unlink()
+                elif attack == "file-mode":
+                    (destination / "bin/glaeda").chmod(0o777)
+                elif attack == "directory-mode":
+                    (destination / "scripts").chmod(0o755)
+                elif attack == "symlink":
+                    (destination / "bin/glaeda").unlink()
+                    (destination / "bin/glaeda").symlink_to(root / "missing")
+                elif attack == "hardlink":
+                    os.link(destination / "bin/glaeda", root / "alias")
+                elif attack == "extra":
+                    (destination / "scripts/sitecustomize.py").write_bytes(b"foreign")
+                elif attack == "bytecode":
+                    (destination / "scripts/__pycache__").mkdir()
+                with self.assertRaises((b.BundleError, OSError)):
+                    b.inspect_generation(destination, b.sha256(raw), SOURCE, TARGET)
+
+    def test_saved_generation_requires_independent_archive_pin(self):
+        payload, manifest = fixture()
+        original = b.archive_bytes(payload, manifest)
+        payload["bin/glaeda"] = b"foreign binary"
+        manifest["files"]["bin/glaeda"] = {"sha256": b.sha256(payload["bin/glaeda"]), "size": len(payload["bin/glaeda"])}
+        replacement = b.archive_bytes(payload, manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary).resolve() / "candidate"
+            b.stage(replacement, b.sha256(replacement), SOURCE, TARGET, destination, apply=True)
+            with self.assertRaisesRegex(b.BundleError, "digest"):
+                b.inspect_generation(destination, b.sha256(original), SOURCE, TARGET)
+            for source, target in (("c" * 40, TARGET), (SOURCE, "x86_64-unknown-linux-gnu")):
+                with self.assertRaises(b.BundleError):
+                    b.inspect_generation(destination, b.sha256(replacement), source, target)
+
+    def test_saved_generation_rejects_changes_during_inspection(self):
+        payload, manifest = fixture()
+        raw = b.archive_bytes(payload, manifest)
+        for attack in ("parent", "generation", "directory", "file", "contents", "extra"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                parent = root / "private"
+                parent.mkdir(mode=0o700)
+                destination = parent / "candidate"
+                b.stage(raw, b.sha256(raw), SOURCE, TARGET, destination, apply=True)
+                original_open = b.private_parent
+                calls = 0
+                def mutate(path):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        if attack == "parent":
+                            parent.rename(root / "moved")
+                            parent.mkdir(mode=0o700)
+                        elif attack == "generation":
+                            destination.rename(parent / "moved")
+                            destination.mkdir(mode=0o700)
+                        elif attack == "directory":
+                            (destination / "bin").rename(destination / "moved-bin")
+                            (destination / "bin").mkdir(mode=0o700)
+                        elif attack == "file":
+                            (destination / "bin/glaeda").unlink()
+                            (destination / "bin/glaeda").write_bytes(payload["bin/glaeda"])
+                        elif attack == "contents":
+                            (destination / "bin/glaeda").write_bytes(b"tampered")
+                        elif attack == "extra":
+                            (destination / "scripts/extra.py").write_bytes(b"foreign")
+                    return original_open(path)
+                with mock.patch.object(b, "private_parent", side_effect=mutate):
+                    with self.assertRaises((b.BundleError, OSError)):
+                        b.inspect_generation(destination, b.sha256(raw), SOURCE, TARGET)
+
     def test_source_requires_exact_clean_checkout(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
