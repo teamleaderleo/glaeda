@@ -546,15 +546,18 @@ fn observe_detailed(
     if std::fs::canonicalize(&checkout).map_err(|_| registration_stale())? != checkout {
         return Err(registration_aliased());
     }
-    let observation = observer
-        .observe(&checkout, executor)
-        .map_err(|_| checkout_unobservable())?;
-
     let common_dir = absolute_git_path(observer, &checkout, "--git-common-dir", executor)?;
     if common_dir != inventory.common_dir {
         return Err(foreign_repository());
     }
     let git_dir = absolute_git_path(observer, &checkout, "--git-dir", executor)?;
+    // Taken before any content is read, so every later read -- status, refs, index -- happens after
+    // it. Git activity during observation then shows up as a fingerprint change at removal time
+    // instead of being folded into an already-stale observation.
+    let fingerprint = administrative_fingerprint(&git_dir)?;
+    let observation = observer
+        .observe(&checkout, executor)
+        .map_err(|_| checkout_unobservable())?;
     let linked = git_dir != common_dir;
     if linked && read_gitdir_backlink(&git_dir)? != checkout.join(".git") {
         return Err(administrative_directory_mismatch());
@@ -606,7 +609,6 @@ fn observe_detailed(
         .any(|present| present);
     let locked = entry.locked || entry_present(&git_dir.join("locked"))?;
     let last_activity_seconds = last_activity_seconds(&git_dir, &checkout)?;
-    let fingerprint = administrative_fingerprint(&git_dir)?;
     let branch = match observation.branch() {
         ProjectBranchState::Attached { name } => Some(name.clone()),
         ProjectBranchState::Detached => None,
