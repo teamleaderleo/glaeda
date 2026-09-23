@@ -40,6 +40,9 @@ EGRESS_GUARD_ENFORCEMENT = "external_reviewed_host_firewall_or_gateway"
 MAX_EGRESS_GUARD_BYTES = 4096
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 UNIT_RE = re.compile(r"^glaeda-gha-[0-9a-f]{32}\.service$")
+# This runner keeps the existing focused capacity demand. Name it once so prepare,
+# resume and recovery bind the same reviewed value instead of three defaults.
+DEMAND = admission.VERIFY_FOCUSED_DEMAND
 
 
 def canonical(value: object) -> bytes:
@@ -351,25 +354,38 @@ def _validate_task_state(
     return root
 
 
+def _expected_reservation(
+    arguments: argparse.Namespace, generation: str
+) -> dict[str, object]:
+    """The exact durable reservation identity this runner may own.
+
+    Every term the record carries is reconstructed here, including the reviewed
+    demand, so prepare, resume, probe, phase and recovery cannot drift apart.
+    """
+    return {
+        "schema_version": admission.RESERVATION_SCHEMA_VERSION,
+        "command_fingerprint": arguments.command_fingerprint,
+        "unit": arguments.unit,
+        "generation": generation,
+        "binding_sha256": arguments.binding_sha256,
+        "demand": admission.demand_record(DEMAND),
+    }
+
+
 def _reservation(arguments: argparse.Namespace) -> admission.Reservation:
     store = admission.Store(arguments.admission_root)
     try:
         with store.lock("policy.lock"):
             current = admission.policy(store)
             existing = store.read("reservation.json")
-        expected = {
-            "schema_version": 1,
-            "command_fingerprint": arguments.command_fingerprint,
-            "unit": arguments.unit,
-            "generation": current["generation"],
-            "binding_sha256": arguments.binding_sha256,
-        }
+        expected = _expected_reservation(arguments, current["generation"])
         if existing is None:
             return admission.Reservation(
                 arguments.admission_root,
                 arguments.command_fingerprint,
                 arguments.unit,
                 arguments.binding_sha256,
+                DEMAND,
             )
         if existing == {**expected, "phase": "preparing"}:
             return admission.Reservation.resume(
@@ -377,6 +393,7 @@ def _reservation(arguments: argparse.Namespace) -> admission.Reservation:
                 arguments.command_fingerprint,
                 arguments.unit,
                 arguments.binding_sha256,
+                DEMAND,
             )
         raise task.Refusal("owned runner reservation requires recovery")
     finally:
@@ -416,13 +433,7 @@ def _reservation_phase(arguments: argparse.Namespace) -> str:
         with store.lock("policy.lock"):
             current = admission.policy(store)
             value = store.read("reservation.json")
-            expected = {
-                "schema_version": 1,
-                "command_fingerprint": arguments.command_fingerprint,
-                "unit": arguments.unit,
-                "generation": current["generation"],
-                "binding_sha256": arguments.binding_sha256,
-            }
+            expected = _expected_reservation(arguments, current["generation"])
             if value == {**expected, "phase": "preparing"}:
                 return "preparing"
             if value == {**expected, "phase": "launching"}:
@@ -478,13 +489,7 @@ def probe(arguments: argparse.Namespace) -> int:
         with store.lock("policy.lock"):
             current = admission.policy(store)
             reservation = store.read("reservation.json")
-        expected = {
-            "schema_version": 1,
-            "command_fingerprint": arguments.command_fingerprint,
-            "unit": arguments.unit,
-            "generation": current["generation"],
-            "binding_sha256": arguments.binding_sha256,
-        }
+        expected = _expected_reservation(arguments, current["generation"])
         if not root.exists() and reservation is None:
             state = "absent"
             phase = None
@@ -584,6 +589,7 @@ def launch(arguments: argparse.Namespace) -> int:
         arguments.command_fingerprint,
         arguments.unit,
         arguments.binding_sha256,
+        DEMAND,
     )
     with reservation:
         observation = task.execute(
@@ -623,6 +629,7 @@ def cleanup(arguments: argparse.Namespace) -> int:
         arguments.unit,
         arguments.binding_sha256,
         settle,
+        DEMAND,
     )
     # An already-released exact cleanup may still have task-private state after
     # a controller crash between durable release and final process return.

@@ -38,14 +38,19 @@ network widening, or arbitrary commands are added.
 
 `AdmissionDemand` is intentionally an in-process type instead of a request/CLI document. Both
 fields must be positive bounded integers; booleans, zeroes, foreign objects, and oversized integers
-refuse before host observation or workload launch. `observe(root, demand)` and
-`Reservation(..., demand)` consume the same reviewed value.
+refuse before host observation or workload launch. `observe(root, demand)`,
+`Reservation(..., demand)`, `Reservation.resume(..., demand)` and `recover(..., demand)` consume
+the same reviewed value.
 
 The demand does not grant execution, resource ownership, preemption, routing, queue, persistence,
 or result authority. A remote caller cannot lower its apparent memory/CPU need to bypass admission.
 The local adapter that already owns semantic profile authorization owns the mapping from that
-reviewed identity to one demand. The existing command/profile fingerprint remains the semantic
-binding used for durable reservation and recovery.
+reviewed identity to one demand. The command/profile fingerprint and the reviewed demand together
+are the semantic binding used for durable reservation and recovery: the `reservation.json` record
+(`schema_version` 2) carries the demand, so a resume or recovery that names a different demand
+refuses instead of rechecking the launch boundary against the wrong capacity. The record is
+evidence to match, never authority: the caller still supplies the reviewed demand. A pre-v2 record
+omits part of its own binding and therefore refuses as an explicit operator recovery.
 
 Fresh host availability remains decisive at the final launch boundary. For example, owner-local
 coding-agent work that consumes memory after an advisory readiness check reduces the next fresh
@@ -106,10 +111,12 @@ not run source or recreate a result. Unsettled or mismatched state stays reserve
 ## Evidence and next integration
 
 `python3 scripts/test-owned-linux-admission.py` covers reviewed demand validation, different memory
-and CPU requirements against fresh host headroom, final launch-boundary demand recheck, durable
-contention, crash refusal, exact recovery, serialized control, hold/drain/pressure changes at the
-real child-launch boundary, pre-launch cleanup, real disposable child settlement, immutable replay,
-filesystem substitution, protocol binding, and bounded helper output. These are local child tests
+and CPU requirements against fresh host headroom, final launch-boundary demand recheck, a resumed
+reservation rechecked against its admitted demand rather than the default, resume and recovery
+refusal of another demand, durable contention, crash refusal, exact recovery, serialized control,
+hold/drain/pressure changes at the real child-launch boundary, pre-launch cleanup, real disposable
+child settlement, immutable replay, filesystem substitution, protocol binding, and bounded helper
+output. These are local child tests
 with fixture host facts; they do not prove systemd/bubblewrap verification or a regular ChatGPT
 journey.
 

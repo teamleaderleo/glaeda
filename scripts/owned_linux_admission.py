@@ -23,6 +23,9 @@ from owned_linux_task import Refusal, closed_environment
 MAX_DOCUMENT = 32768
 MAX_EXECUTABLE = 128 * 1024 * 1024
 FRESH_SECONDS = 3
+# v2 adds the reviewed demand to the durable reservation identity. A surviving v1 record
+# omits part of its own binding, so it refuses and stays an explicit operator recovery.
+RESERVATION_SCHEMA_VERSION = 2
 
 
 def canonical(value):
@@ -84,6 +87,19 @@ def validated_demand(value):
     if type(value) is not AdmissionDemand:
         raise Refusal("invalid local admission demand")
     return value
+
+
+def demand_record(demand):
+    """Canonical durable form of one reviewed demand.
+
+    The demand is part of the reservation's semantic binding, so it is written into the
+    record and compared on resume, launch, release and recovery. The record is evidence
+    to match, never the authority: the caller still supplies the reviewed demand and a
+    disagreement refuses instead of adopting whatever survived.
+    """
+    demand = validated_demand(demand)
+    return {"memory_bytes": demand.memory_bytes,
+            "minimum_logical_cpus": demand.minimum_logical_cpus}
 
 
 class Store:
@@ -352,21 +368,26 @@ class Reservation:
                  *, resume_existing=False):
         self.demand = validated_demand(demand)
         self.store = Store(root)
-        self.identity = {"schema_version": 1, "command_fingerprint": fingerprint, "unit": unit,
-                         "binding_sha256": binding}
+        self.identity = {"schema_version": RESERVATION_SCHEMA_VERSION,
+                         "command_fingerprint": fingerprint, "unit": unit,
+                         "binding_sha256": binding, "demand": demand_record(self.demand)}
         self.resume_existing = resume_existing
         self.launch_attempted = False
         self.owned = False
         self.phase = "preparing"
 
     @classmethod
-    def resume(cls, root, fingerprint, unit, binding):
+    def resume(cls, root, fingerprint, unit, binding, demand=VERIFY_FOCUSED_DEMAND):
         """Reacquire one exact pre-launch reservation after a controller boundary.
+
+        The reviewed demand is part of that exact identity: a resumed reservation
+        rechecks the final launch boundary against the demand it was admitted under,
+        and a different demand refuses instead of launching on smaller capacity.
 
         Only the preparing phase is resumable. A launching record is an ambiguous
         physical side effect and therefore remains recovery-only.
         """
-        return cls(root, fingerprint, unit, binding, resume_existing=True)
+        return cls(root, fingerprint, unit, binding, demand, resume_existing=True)
 
     def __enter__(self):
         self.lock = self.store.lock("slot.lock")
@@ -438,12 +459,13 @@ def set_control(root, state):
         store.close()
 
 
-def recover(root, fingerprint, unit, binding, observe_settled):
+def recover(root, fingerprint, unit, binding, observe_settled, demand=VERIFY_FOCUSED_DEMAND):
     """Release only after the verifier has validated its exact terminal receipt.
 
     The callback re-observes exact unit/task absence and settles its matching intent.
     No PID liveness, age, or lock disappearance is sufficient recovery evidence.
     """
+    record = demand_record(demand)
     store = Store(root)
     try:
         with store.lock("slot.lock"), store.lock("policy.lock"):
@@ -451,8 +473,10 @@ def recover(root, fingerprint, unit, binding, observe_settled):
             reservation = store.read("reservation.json")
             if reservation is None:
                 return
-            expected = {"schema_version": 1, "command_fingerprint": fingerprint,
-                        "unit": unit, "generation": current["generation"], "binding_sha256": binding}
+            expected = {"schema_version": RESERVATION_SCHEMA_VERSION,
+                        "command_fingerprint": fingerprint, "unit": unit,
+                        "generation": current["generation"], "binding_sha256": binding,
+                        "demand": record}
             if (reservation not in ({**expected, "phase": "preparing"},
                                     {**expected, "phase": "launching"})):
                 raise Refusal("reservation does not match exact terminal recovery")
