@@ -25,8 +25,8 @@ Anything marked **estimate** or **unverified** should not be quoted as fact.
 | Tuist | Xcode, Gradle and Bazel cache and insights | cache egress 100 GB free, then $0.35/GB (**unverified**, page blocked) | Kura cache; moving compute onto owned Macs |
 | Bitrise | Mobile CI and build cache | credit packages | One REAPI backend for Xcode, Gradle, Bazel |
 
-None of them owns a build graph except RWX (task graph) and the Bazel vendors (Tuist is building one, see below). The large
-runner companies sell fast machines plus state that survives between jobs.
+None of them owns a build graph except RWX (task graph) and the Bazel vendors (Tuist is building
+one, see below). The large runner companies sell fast machines plus state that survives between jobs.
 
 ## Funding, valuation, exits
 
@@ -96,8 +96,7 @@ What users dislike:
   Kura, Bitrise and Depot Cache already serve several tools from one store.
 - Tuist now also caches Bazel and is building "Once", a build system that loads existing
   projects as they are. It argues compute and cache "had to be physically colocated", and says
-  renting a Mac costs its purchase price in about three months; it runs operations and product
-with a team of four
+  renting a Mac costs its purchase price in about three months; it runs operations and product with a team of four
   ([post](https://github.com/tuist/tuist/blob/main/server/priv/marketing/blog/2026/09/12/the-new-tuist.md)).
 
 ## Where glaeda fits
@@ -112,8 +111,8 @@ their secrets.
 
 Pricing shape (inference): software for the customer's own fleet, per Mac per month, not compute
 minutes. That fits Apple's licence (2 VMs per Mac, leases of at least 24 h) and avoids the
-rounding complaint. Reference points: Cirrus charged $150/mo per concurrent Mac (from runner-market-hot-state.md,
-**unverified** here; the service has since shut down); a hosted Mac at 8 h/day and $0.08/min
+rounding complaint. Reference points: Cirrus charged $150/mo per concurrent Mac (sourced in runner-market-hot-state.md;
+Cirrus has since stopped onboarding customers); a hosted Mac at 8 h/day and $0.08/min
 is about $800/mo over 21 workdays (about $1,150 over 30 days). **$100 to $300 per Mac per month** looks credible.
 
 Contested: Tuist is building a colocated owned-Mac stack; Namespace has macOS cache volumes.
