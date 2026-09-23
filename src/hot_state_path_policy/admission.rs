@@ -1,6 +1,8 @@
 use std::fmt;
 use std::marker::PhantomData;
 
+use serde::Serialize;
+
 use crate::project_catalog::ProjectIdentity;
 
 use super::{
@@ -148,7 +150,8 @@ impl fmt::Debug for HotStateAdmissionContext {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HotStateAdmissionMismatchField {
     Family,
     Binding,

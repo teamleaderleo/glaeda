@@ -131,8 +131,8 @@ hold/drain/pressure changes at the real child-launch boundary, pre-launch cleanu
 child settlement, immutable replay, filesystem substitution, protocol binding, and bounded helper
 output. `python3 scripts/test-verify-focused.py` additionally pins both verification profile
 generations and command bytes, checks the closed profile-to-demand mapping, and checks that the
-required demand reaches both the shared reservation and terminal recovery. These tests use local children and fixture host
-facts; they do not prove systemd/bubblewrap required verification or a regular ChatGPT journey.
+required demand reaches both the shared reservation and terminal recovery. These tests use local
+children and fixture host facts; they do not prove systemd/bubblewrap required verification or a regular ChatGPT journey.
 
 The next consumer may map another reviewed semantic action/profile to an `AdmissionDemand`, then
 prove that exact profile through the same physical admission/receipt path. A generic project-worker
