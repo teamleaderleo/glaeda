@@ -117,5 +117,57 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.load_snapshot(snap), (0.0, {}))
 
 
+@unittest.skipUnless(sys.platform == "darwin", "APFS clones are macOS only")
+class DedupeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(dir=os.path.expanduser("~"))
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state.json"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def blob(self, rel: str, data: bytes, mode: int = 0o644, mtime: float = 1_000_000) -> Path:
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        os.chmod(p, mode)
+        os.utime(p, (mtime, mtime))
+        return p
+
+    def test_identical_files_are_cloned_keeping_mode_and_mtime(self) -> None:
+        data = os.urandom(2 * 1024 * 1024)
+        a = self.blob("a/SourcePackages/x.bin", data)
+        b = self.blob("b/SourcePackages/x.bin", data, mode=0o755, mtime=2_000_000)
+        c = self.blob("c/SourcePackages/x.bin", os.urandom(len(data)))
+        ino_b = b.stat().st_ino
+        r = gd.dedupe([self.root / "a", self.root / "b", self.root / "c"], self.state)
+        self.assertEqual(r["cloned_bytes"], len(data))
+        self.assertEqual(b.read_bytes(), data)
+        self.assertNotEqual(b.stat().st_ino, ino_b)
+        self.assertEqual(oct(b.stat().st_mode & 0o777), oct(0o755))
+        self.assertEqual(int(b.stat().st_mtime), 2_000_000)
+        self.assertNotEqual(c.read_bytes(), data)
+        self.assertEqual(a.read_bytes(), data)
+        again = gd.dedupe([self.root / "a", self.root / "b", self.root / "c"], self.state)
+        self.assertEqual((again["hashed_bytes"], again["cloned_bytes"]), (0, 0))
+        self.assertEqual([p.name for p in self.root.rglob("*glaeda-clone*")], [])
+
+    def test_target_changed_after_hash_is_refused(self) -> None:
+        data = os.urandom(2 * 1024 * 1024)
+        a = self.blob("a/x.bin", data)
+        b = self.blob("b/x.bin", data)
+        key = gd._file_key(os.lstat(b))
+        os.utime(b, (3_000_000, 3_000_000))
+        self.assertFalse(gd.clone_over(str(a), str(b), key))
+        self.assertEqual(int(b.stat().st_mtime), 3_000_000)
+
+    def test_small_and_unique_files_are_ignored(self) -> None:
+        self.blob("a/small", b"x" * 10)
+        self.blob("b/small", b"x" * 10)
+        r = gd.dedupe([self.root / "a", self.root / "b"], self.state)
+        self.assertEqual((r["files"], r["cloned_bytes"]), (0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

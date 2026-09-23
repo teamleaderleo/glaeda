@@ -5,6 +5,12 @@
     glaeda-disk --apply             delete every reclaimable item, largest first
     glaeda-disk --pressure --apply  act only under disk pressure, stop at the free target
     glaeda-disk --refresh           re-measure every size now instead of using the snapshot
+    glaeda-disk --dedupe            store identical Xcode package/module files once (APFS clones)
+
+Parallel sessions each keep a full DerivedData, and its SourcePackages artifacts and module
+caches are byte-identical across them. --dedupe replaces each duplicate with a copy-on-write
+clone of one canonical file, keeping the duplicate's mode and timestamps. Builds see the same
+bytes; the disk stores them once. du still counts clones in full; df shows the real saving.
 
 macOS keeps no directory sizes (Spotlight has none for folders), so measuring
 means walking every file, which is disk-latency bound. Sizes are therefore kept
@@ -37,6 +43,9 @@ from pathlib import Path
 
 HOME = Path.home()
 SNAPSHOT = HOME / ".cache/glaeda-disk/sizes.json"
+DEDUPE_STATE = HOME / ".cache/glaeda-disk/dedupe.json"
+DEDUPE_SUBDIRS = ("SourcePackages", "ModuleCache.noindex", "SDKExplicitPrecompiledModules")
+DEDUPE_MIN_BYTES = 1024 * 1024
 GIB = 1024**3
 DARWIN = platform.system() == "Darwin"
 
@@ -329,6 +338,117 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     return released
 
 
+def dedupe_roots(derived_data: Path) -> list[Path]:
+    roots = [derived_data / sub for sub in DEDUPE_SUBDIRS]
+    for d in _children(derived_data):
+        roots += [d / sub for sub in DEDUPE_SUBDIRS]
+    return [r for r in roots if r.is_dir() and not r.is_symlink()]
+
+
+def _file_key(st: os.stat_result) -> list[int]:
+    return [st.st_size, st.st_mtime_ns, st.st_ino]
+
+
+def _sha256(path: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def clone_over(canonical: str, target: str, expect: list[int]) -> bool:
+    """Replace target with an APFS clone of canonical, keeping target's mode and times.
+
+    Refuses when target changed since it was hashed. A process that has target open keeps
+    reading the old inode; the rename only swaps the directory entry.
+    """
+    st = os.lstat(target)
+    if _file_key(st) != expect or not stat.S_ISREG(st.st_mode):
+        return False
+    tmp = os.path.join(os.path.dirname(target), f".{os.path.basename(target)}.glaeda-clone-{os.getpid()}")
+    try:
+        subprocess.run(["/bin/cp", "-c", canonical, tmp], check=True, capture_output=True)
+        os.chmod(tmp, stat.S_IMODE(st.st_mode))
+        os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+        if _file_key(os.lstat(target)) != expect:
+            return False
+        os.rename(tmp, target)
+        return True
+    finally:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+
+
+def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
+           min_bytes: int = DEDUPE_MIN_BYTES) -> dict[str, int]:
+    try:
+        state: dict[str, dict] = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        state = {}
+    files: dict[str, list[int]] = {}
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+            for name in filenames:
+                if ".glaeda-clone-" in name:
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    st = os.lstat(path)
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and st.st_size >= min_bytes and st.st_nlink == 1:
+                    files[path] = _file_key(st)
+    by_size: dict[int, list[str]] = {}
+    for path, key in files.items():
+        by_size.setdefault(key[0], []).append(path)
+    new_state: dict[str, dict] = {}
+    groups: dict[str, list[str]] = {}
+    hashed = 0
+    for paths in by_size.values():
+        if len(paths) < 2:
+            continue
+        for path in paths:
+            old = state.get(path)
+            if old and old.get("key") == files[path]:
+                sha, cloned = old["sha"], old.get("cloned", False)
+            else:
+                try:
+                    sha = _sha256(path)
+                except OSError:
+                    continue
+                cloned, hashed = False, hashed + files[path][0]
+            new_state[path] = {"key": files[path], "sha": sha, "cloned": cloned}
+            groups.setdefault(sha, []).append(path)
+    cloned_bytes = refused = 0
+    for sha, paths in groups.items():
+        if len(paths) < 2:
+            continue
+        paths.sort(key=lambda p: (not new_state[p]["cloned"], p))
+        canonical = paths[0]
+        for target in paths[1:]:
+            if new_state[target]["cloned"]:
+                continue
+            try:
+                ok = clone_over(canonical, target, files[target])
+            except (OSError, subprocess.CalledProcessError):
+                ok = False
+            if ok:
+                cloned_bytes += files[target][0]
+                new_state[target] = {"key": _file_key(os.lstat(target)), "sha": sha, "cloned": True}
+            else:
+                refused += 1
+        new_state[canonical]["cloned"] = True
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = state_path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(new_state))
+    os.replace(tmp, state_path)
+    return {"files": len(files), "hashed_bytes": hashed, "cloned_bytes": cloned_bytes,
+            "refused": refused}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="delete reclaimable items")
@@ -342,6 +462,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--min-mib", type=int, default=50)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--dedupe", action="store_true",
+                    help="clone-dedupe identical Xcode package and module-cache files, then exit")
     ap.add_argument("--refresh", action="store_true", help="re-measure all sizes now")
     ap.add_argument("--max-age", type=float, default=15,
                     help="minutes before the size snapshot is refreshed in the background (default 15)")
@@ -360,6 +482,19 @@ def main(argv: list[str] | None = None) -> int:
     if a.family:
         fams = [f for f in fams if f.id in a.family]
     fs = fams[0].root if fams else HOME
+    if a.dedupe:
+        dd = next((f.root for f in fams if f.id == "xcode-derived-data"), None)
+        if dd is None or not DARWIN:
+            print("nothing to dedupe (no Xcode DerivedData)")
+            return 0
+        before, _ = free_bytes(dd)
+        started = time.time()
+        r = dedupe(dedupe_roots(dd))
+        after, _ = free_bytes(dd)
+        print(f"dedupe: {r['files']} files >= 1 MiB, hashed {gib(r['hashed_bytes']).strip()}, "
+              f"cloned {gib(r['cloned_bytes']).strip()}, refused {r['refused']}, "
+              f"free {gib(before).strip()} -> {gib(after).strip()} in {time.time() - started:.0f}s")
+        return 0
     free, total = free_bytes(fs)
     under = free < a.low * GIB
     if a.pressure and not under:
