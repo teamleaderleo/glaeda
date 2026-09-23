@@ -34,6 +34,7 @@ use std::io::Read as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -581,6 +582,60 @@ pub fn observe_linked_worktree(
     })
 }
 
+/// Most concurrent observations [`observe_linked_worktrees`] runs.
+pub const MAX_LINKED_WORKTREE_OBSERVATION_WORKERS: usize = 8;
+
+/// Observe every inventory entry with a small bounded pool, in inventory order.
+///
+/// Each observation runs several `git status`-class reads, which dominate a sweep: sequentially a
+/// 33-worktree cmux checkout took about 50 seconds. Stale registrations are reported as errors
+/// without being observed, and a worker that panics leaves its entries unobservable rather than
+/// guessed at.
+pub fn observe_linked_worktrees(
+    observer: &ProjectCheckoutObserver,
+    inventory: &LinkedWorktreeInventory,
+    executor: &(impl TimedCommandExecutor + Sync),
+) -> Vec<Result<LinkedWorktreeFacts, LinkedWorktreeReclaimError>> {
+    let entries = &inventory.linked;
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, MAX_LINKED_WORKTREE_OBSERVATION_WORKERS)
+        .min(entries.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut ordered: Vec<Result<LinkedWorktreeFacts, LinkedWorktreeReclaimError>> = (0..entries
+        .len())
+        .map(|_| Err(observation_lost()))
+        .collect();
+    let observed = std::thread::scope(|scope| {
+        let handles = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut local = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(entry) = entries.get(index) else {
+                            break;
+                        };
+                        local.push((
+                            index,
+                            observe_linked_worktree(observer, inventory, entry, executor),
+                        ));
+                    }
+                    local
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect::<Vec<_>>()
+    });
+    for (index, result) in observed {
+        ordered[index] = result;
+    }
+    ordered
+}
+
 fn git(
     observer: &ProjectCheckoutObserver,
     checkout: &Path,
@@ -965,6 +1020,172 @@ fn last_activity_seconds(
     Ok(newest)
 }
 
+// --- Execution -------------------------------------------------------------
+//
+// One reclaim re-observes and re-plans the worktree immediately before acting, so a stale plan never
+// authorizes removal. A detached HEAD that needs a pin gets one first, under a create-only ref; that
+// ref is the durable checkpoint and outlives any later failure. Removal is plain
+// `git worktree remove` without `--force`: Git re-checks cleanliness itself and refuses populated
+// submodules and locks, so its guard backs this module's rather than being overridden by it. Fresh
+// post-effect observation decides the outcome.
+//
+// Removal is irreversible for ignored files. For everything else the accurate compensation is
+// forward reconstruction: `git worktree add` at the preserved commit.
+
+/// Namespace for commits pinned before their only worktree is removed.
+pub const LINKED_WORKTREE_PIN_REF_PREFIX: &str = "refs/glaeda/worktree-pins/";
+
+/// Deadline for one `git worktree remove`, which scales with ignored build output in the tree.
+pub const LINKED_WORKTREE_REMOVE_TIMEOUT: Duration = Duration::from_secs(600);
+
+const ZERO_OBJECT_ID: &str = "0000000000000000000000000000000000000000";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum LinkedWorktreeReclaimOutcome {
+    /// The worktree is gone and its registration removed; a pin was written first when required.
+    Reclaimed { pinned: bool, idle_seconds: i64 },
+    /// Fresh observation no longer supports removal.
+    Refused {
+        vetoes: Vec<LinkedWorktreeReclaimVeto>,
+    },
+    /// Fresh observation failed; nothing was changed.
+    Unobservable { code: &'static str },
+    /// `git worktree remove` refused on its own checks; nothing was removed.
+    GitRefused,
+    /// A pin or removal ran but post-effect observation disagrees with the intended state.
+    /// Callers must stop the batch: this is the circuit breaker.
+    Incomplete { code: &'static str },
+}
+
+impl LinkedWorktreeReclaimOutcome {
+    /// Whether a batch may continue to the next worktree after this outcome.
+    #[must_use]
+    pub const fn batch_may_continue(&self) -> bool {
+        !matches!(self, Self::Incomplete { .. })
+    }
+}
+
+/// Re-observe one worktree and remove it only if a fresh plan still makes it eligible.
+///
+/// Never returns an error: every failure becomes a typed outcome so a batch can record it.
+pub fn reclaim_linked_worktree(
+    observer: &ProjectCheckoutObserver,
+    inventory: &LinkedWorktreeInventory,
+    entry: &LinkedWorktreeEntry,
+    policy: LinkedWorktreeReclaimPolicy,
+    now_seconds: i64,
+    executor: &impl TimedCommandExecutor,
+) -> LinkedWorktreeReclaimOutcome {
+    let facts = match observe_linked_worktree(observer, inventory, entry, executor) {
+        Ok(facts) => facts,
+        Err(error) => return LinkedWorktreeReclaimOutcome::Unobservable { code: error.code() },
+    };
+    let (compensation, idle_seconds) =
+        match plan_linked_worktree_reclaim(&facts, policy, now_seconds).map(|plan| plan.decision) {
+            Ok(LinkedWorktreeReclaimDecision::Eligible {
+                compensation,
+                idle_seconds,
+                ..
+            }) => (compensation, idle_seconds),
+            Ok(LinkedWorktreeReclaimDecision::Refused { vetoes }) => {
+                return LinkedWorktreeReclaimOutcome::Refused { vetoes };
+            }
+            Err(error) => return LinkedWorktreeReclaimOutcome::Unobservable { code: error.code() },
+        };
+
+    let pinned = compensation == LinkedWorktreeReclaimCompensation::PinHeadCommit;
+    if pinned && let Err(error) = pin_head_commit(observer, inventory, &entry.path, executor) {
+        return LinkedWorktreeReclaimOutcome::Incomplete { code: error.code() };
+    }
+
+    let Some(checkout) = entry.path.to_str() else {
+        return LinkedWorktreeReclaimOutcome::Unobservable {
+            code: registration_aliased().code(),
+        };
+    };
+    let removal = observer.git_with_limits(
+        &inventory.repository,
+        &["worktree", "remove", checkout],
+        MAX_CAPTURED_STREAM_BYTES,
+        LINKED_WORKTREE_REMOVE_TIMEOUT,
+        executor,
+    );
+    let removal_succeeded =
+        matches!(&removal, Ok(record) if record.success && record.status == Some(0));
+
+    // Fresh post-effect observation decides the outcome, whatever the command reported.
+    let directory_gone = matches!(entry_present(&entry.path), Ok(false));
+    let still_registered = match git_bounded(
+        observer,
+        &inventory.repository,
+        &["worktree", "list", "--porcelain", "-z"],
+        MAX_CAPTURED_STREAM_BYTES,
+        executor,
+    )
+    .and_then(|record| parse_worktree_list(&record.stdout))
+    {
+        Ok(entries) => entries.iter().any(|listed| listed.path == entry.path),
+        Err(error) => return LinkedWorktreeReclaimOutcome::Incomplete { code: error.code() },
+    };
+    match (removal_succeeded, directory_gone, still_registered) {
+        (true, true, false) => LinkedWorktreeReclaimOutcome::Reclaimed {
+            pinned,
+            idle_seconds,
+        },
+        // Git's own guard refused and left everything in place.
+        (false, false, true) if removal.is_ok() => LinkedWorktreeReclaimOutcome::GitRefused,
+        _ => LinkedWorktreeReclaimOutcome::Incomplete {
+            code: removal_postcondition_failed().code(),
+        },
+    }
+}
+
+/// Pin the worktree's current HEAD under a create-only ref and confirm it resolves.
+fn pin_head_commit(
+    observer: &ProjectCheckoutObserver,
+    inventory: &LinkedWorktreeInventory,
+    checkout: &Path,
+    executor: &impl TimedCommandExecutor,
+) -> Result<(), LinkedWorktreeReclaimError> {
+    let head = git(
+        observer,
+        checkout,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        executor,
+    )?;
+    let commit = head.stdout.strip_suffix('\n').ok_or_else(invalid_output)?;
+    crate::artifact::CommitId::parse(commit).map_err(|_| invalid_output())?;
+    let reference = format!("{LINKED_WORKTREE_PIN_REF_PREFIX}{commit}");
+    let existing = observer
+        .git(
+            &inventory.repository,
+            &["rev-parse", "--quiet", "--verify", &reference],
+            executor,
+        )
+        .map_err(|_| unavailable())?;
+    if existing.stdout.strip_suffix('\n') != Some(commit) {
+        // Create-only: an all-zero old value makes Git refuse to overwrite an existing ref.
+        git(
+            observer,
+            &inventory.repository,
+            &["update-ref", &reference, commit, ZERO_OBJECT_ID],
+            executor,
+        )?;
+    }
+    let confirmed = git(
+        observer,
+        &inventory.repository,
+        &["rev-parse", "--verify", &reference],
+        executor,
+    )?;
+    if confirmed.stdout.strip_suffix('\n') == Some(commit) {
+        Ok(())
+    } else {
+        Err(pin_unconfirmed())
+    }
+}
+
 // --- Errors ----------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1116,6 +1337,30 @@ const fn object_format_unsupported() -> LinkedWorktreeReclaimError {
         LinkedWorktreeReclaimErrorKind::InvalidRepository,
         "object_format_unsupported",
         "the repository object format is outside the reviewed SHA-1 index layout",
+    )
+}
+
+const fn observation_lost() -> LinkedWorktreeReclaimError {
+    error(
+        LinkedWorktreeReclaimErrorKind::Unavailable,
+        "observation_lost",
+        "the observation worker for this worktree did not report a result",
+    )
+}
+
+const fn pin_unconfirmed() -> LinkedWorktreeReclaimError {
+    error(
+        LinkedWorktreeReclaimErrorKind::DisagreeingEvidence,
+        "pin_unconfirmed",
+        "the HEAD pin ref did not resolve to the pinned commit after it was written",
+    )
+}
+
+const fn removal_postcondition_failed() -> LinkedWorktreeReclaimError {
+    error(
+        LinkedWorktreeReclaimErrorKind::DisagreeingEvidence,
+        "removal_postcondition_failed",
+        "after removal the checkout or its registration was observed in an unexpected state",
     )
 }
 
