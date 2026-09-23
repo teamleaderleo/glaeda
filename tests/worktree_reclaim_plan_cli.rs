@@ -278,3 +278,205 @@ fn a_linked_worktree_is_not_accepted_as_the_repository() {
     let error: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON error");
     assert_eq!(error["code"], "not_main_worktree");
 }
+
+fn git_as_user(checkout: &Path, arguments: &[&str]) {
+    let mut full = vec![
+        "-c",
+        "user.name=Glaeda Test",
+        "-c",
+        "user.email=glaeda-test@example.invalid",
+        "-c",
+        "protocol.file.allow=always",
+    ];
+    full.extend_from_slice(arguments);
+    git(checkout, &full);
+}
+
+fn entry_by_name(fixture: &Fixture, report: &serde_json::Value, name: &str) -> serde_json::Value {
+    let ordinal = fixture
+        .linked_order()
+        .iter()
+        .position(|entry| entry == name)
+        .expect("listed")
+        + 1;
+    report["worktrees"]
+        .as_array()
+        .expect("worktree array")
+        .iter()
+        .find(|worktree| worktree["ordinal"] == ordinal)
+        .expect("reported ordinal")
+        .clone()
+}
+
+fn vetoes_of(entry: &serde_json::Value) -> Vec<String> {
+    entry["decision"]["vetoes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("refused entry expected, got {entry}"))
+        .iter()
+        .map(|veto| veto.as_str().expect("veto code").to_owned())
+        .collect()
+}
+
+/// Regression fixtures for state `git status` does not show but removal would destroy.
+#[test]
+fn hidden_unique_state_is_never_eligible() {
+    let fixture = Fixture::new();
+
+    // Edits hidden from status by index flags. skip-worktree also forces an index v3 layout.
+    let assumed = fixture.add("assumed");
+    git(
+        &assumed,
+        &["update-index", "--assume-unchanged", "tracked.txt"],
+    );
+    fs::write(assumed.join("tracked.txt"), "hidden edit\n").expect("edit assumed file");
+    fixture.age("assumed");
+
+    let skipped = fixture.add("skipped");
+    git(
+        &skipped,
+        &["update-index", "--skip-worktree", "tracked.txt"],
+    );
+    fs::write(skipped.join("tracked.txt"), "hidden edit\n").expect("edit skipped file");
+    fixture.age("skipped");
+
+    // A submodule whose repository lives inside the worktree as a `.git` directory.
+    let embedded = fixture.add("embedded");
+    let nested = embedded.join("nested");
+    fs::create_dir(&nested).expect("create nested repository");
+    git(&nested, &["init", "-b", "main"]);
+    commit(&nested, "unique nested commit");
+    git_as_user(&embedded, &["submodule", "add", "./nested", "nested"]);
+    git_as_user(&embedded, &["commit", "-m", "add embedded submodule"]);
+    fixture.age("embedded");
+
+    // A submodule cloned normally, which Git absorbs into the worktree's own modules directory.
+    let source = fixture.root.join("submodule-source");
+    fs::create_dir(&source).expect("create submodule source");
+    git(&source, &["init", "-b", "main"]);
+    commit(&source, "source commit");
+    let absorbed = fixture.add("absorbed");
+    git_as_user(
+        &absorbed,
+        &["submodule", "add", source.to_str().expect("UTF-8"), "sub"],
+    );
+    git_as_user(&absorbed, &["commit", "-m", "add absorbed submodule"]);
+    fixture.age("absorbed");
+
+    // A per-worktree ref pointing at a commit nothing else reaches.
+    let per_worktree = fixture.add("per-worktree");
+    commit(&per_worktree, "only a per-worktree ref reaches this");
+    git(&per_worktree, &["update-ref", "refs/worktree/keep", "HEAD"]);
+    git(&per_worktree, &["reset", "--hard", "HEAD~1"]);
+    fixture.age("per-worktree");
+
+    // An interrupted cherry-pick.
+    git(&fixture.main, &["branch", "conflict-source"]);
+    let conflict_source = fixture.root.join("conflict-source-wt");
+    git(
+        &fixture.main,
+        &[
+            "worktree",
+            "add",
+            conflict_source.to_str().expect("UTF-8"),
+            "conflict-source",
+        ],
+    );
+    fs::write(conflict_source.join("tracked.txt"), "theirs\n").expect("write theirs");
+    git_as_user(&conflict_source, &["commit", "-am", "theirs"]);
+    let operation = fixture.add("operation");
+    fs::write(operation.join("tracked.txt"), "ours\n").expect("write ours");
+    git_as_user(&operation, &["commit", "-am", "ours"]);
+    let status = Command::new(GIT)
+        .arg("-C")
+        .arg(&operation)
+        .args([
+            "-c",
+            "user.name=Glaeda Test",
+            "-c",
+            "user.email=glaeda-test@example.invalid",
+            "cherry-pick",
+            "conflict-source",
+        ])
+        .env_clear()
+        .env("HOME", &operation)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .expect("run conflicting cherry-pick");
+    assert!(
+        !status.status.success(),
+        "cherry-pick must stop on conflict"
+    );
+    fixture.age("operation");
+
+    let report = report(&fixture.plan(&fixture.main));
+    assert_eq!(
+        vetoes_of(&entry_by_name(&fixture, &report, "assumed")),
+        ["hidden_index_entries_present"]
+    );
+    assert_eq!(
+        vetoes_of(&entry_by_name(&fixture, &report, "skipped")),
+        ["hidden_index_entries_present"]
+    );
+    assert_eq!(
+        vetoes_of(&entry_by_name(&fixture, &report, "embedded")),
+        ["populated_submodules_present"]
+    );
+    assert_eq!(
+        vetoes_of(&entry_by_name(&fixture, &report, "absorbed")),
+        ["populated_submodules_present"]
+    );
+    assert_eq!(
+        vetoes_of(&entry_by_name(&fixture, &report, "per-worktree")),
+        ["per_worktree_refs_present"]
+    );
+    assert!(
+        vetoes_of(&entry_by_name(&fixture, &report, "operation"))
+            .contains(&"operation_in_progress".to_owned())
+    );
+}
+
+/// Only branches, tags, and remote-tracking refs preserve a detached HEAD.
+#[test]
+fn detached_head_preservation_ignores_short_lived_refs() {
+    let fixture = Fixture::new();
+
+    let reachable = fixture.add("reachable");
+    git(&reachable, &["checkout", "--detach"]);
+    fixture.age("reachable");
+
+    // The stash contains this commit, but a stash drop would orphan it.
+    let stashed = fixture.add("stashed");
+    git(&stashed, &["checkout", "--detach"]);
+    commit(&stashed, "reached only by the stash");
+    fs::write(stashed.join("tracked.txt"), "to stash\n").expect("edit for stash");
+    git_as_user(&stashed, &["stash"]);
+    git(&fixture.main, &["branch", "-D", "stashed"]);
+    fixture.age("stashed");
+
+    let report = report(&fixture.plan(&fixture.main));
+    let reachable = entry_by_name(&fixture, &report, "reachable");
+    assert_eq!(reachable["decision"]["compensation"], "none_required");
+    let stashed = entry_by_name(&fixture, &report, "stashed");
+    assert_eq!(stashed["decision"]["compensation"], "pin_head_commit");
+}
+
+/// A registration whose path became a symlink to another worktree must not borrow its facts.
+#[test]
+fn aliased_registration_is_unobservable() {
+    let fixture = Fixture::new();
+    let target = fixture.add("target");
+    fixture.age("target");
+    let alias = fixture.add("alias");
+    fs::rename(&alias, fixture.root.join("alias-moved")).expect("move alias checkout away");
+    std::os::unix::fs::symlink(&target, &alias).expect("replace alias with symlink");
+
+    let report = report(&fixture.plan(&fixture.main));
+    let alias = entry_by_name(&fixture, &report, "alias");
+    assert_eq!(alias["result"], "unobservable");
+    assert_eq!(alias["code"], "registration_aliased");
+    assert_eq!(
+        entry_by_name(&fixture, &report, "target")["decision"]["decision"],
+        "eligible"
+    );
+}

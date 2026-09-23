@@ -19,9 +19,12 @@ pub const MAX_PROJECT_CHECKOUT_OUTPUT_BYTES: usize = 65_536;
 /// Bound for the one read that scales with index size: one mode line per tracked file.
 ///
 /// At seven bytes per entry the general bound stops at roughly 9,000 tracked files, which refuses
-/// ordinary large repositories outright. Each line is still validated strictly, so a larger bound
-/// buys coverage without loosening what is accepted.
-pub const MAX_PROJECT_INDEX_MODE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+/// ordinary large repositories outright. This matches the process executor's capture ceiling, the
+/// real limit, so roughly 150,000 tracked files still observe and larger indexes fail closed. Each
+/// line is still validated strictly, so the larger bound buys coverage without loosening what is
+/// accepted.
+pub const MAX_PROJECT_INDEX_MODE_OUTPUT_BYTES: usize = crate::process::MAX_CAPTURED_STREAM_BYTES;
+const _: () = assert!(MAX_PROJECT_INDEX_MODE_OUTPUT_BYTES > MAX_PROJECT_CHECKOUT_OUTPUT_BYTES);
 pub const MAX_PROJECT_REMOTES: usize = 16;
 pub const MAX_REMOTE_NAME_BYTES: usize = 100;
 pub const MAX_BRANCH_NAME_BYTES: usize = 512;
@@ -494,7 +497,8 @@ impl ProjectCheckoutObserver {
         )
     }
 
-    fn git_bounded(
+    /// Like [`Self::git`] with an explicit stdout bound for reads that scale with repository size.
+    pub(crate) fn git_bounded(
         &self,
         checkout: &Path,
         arguments: &[&str],

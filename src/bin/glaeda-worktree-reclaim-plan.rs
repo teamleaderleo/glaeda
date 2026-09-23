@@ -26,7 +26,6 @@ const GIT_PROGRAM: &str = "/usr/bin/git";
 /// out of reach.
 const DEFAULT_IDLE_SECONDS: i64 = 24 * 60 * 60;
 
-const AUTHORITY: &str = "preserved_in_repository";
 // Nothing is removed. The compensation an executor would owe is recorded per decision: none when a
 // shared ref already reaches HEAD, or a HEAD pin before removal.
 const MUTATION_PERFORMED: bool = false;
@@ -63,7 +62,8 @@ enum WorktreeResult {
         facts: LinkedWorktreeFacts,
         decision: LinkedWorktreeReclaimDecision,
     },
-    /// Only metadata remains; `git worktree prune` owns it.
+    /// The registration is stale; see `LinkedWorktreeEntry::prunable`. Nothing here recommends
+    /// pruning, which deletes per-worktree refs and logs.
     Prunable,
     Unobservable {
         code: &'static str,
@@ -92,7 +92,6 @@ struct Summary {
 struct PlanReport {
     document_type: &'static str,
     schema_version: u8,
-    authority: &'static str,
     mutation_performed: bool,
     minimum_idle_seconds: i64,
     summary: Summary,
@@ -170,7 +169,6 @@ fn main() -> ExitCode {
     let report = PlanReport {
         document_type: "glaeda-worktree-reclaim-plan",
         schema_version: REPORT_SCHEMA_VERSION,
-        authority: AUTHORITY,
         mutation_performed: MUTATION_PERFORMED,
         minimum_idle_seconds: policy.minimum_idle_seconds(),
         summary,
@@ -210,6 +208,7 @@ fn render_human(report: &PlanReport) {
                     LinkedWorktreeReclaimDecision::Eligible {
                         compensation,
                         idle_seconds,
+                        ..
                     },
                 ..
             } => format!(
@@ -224,7 +223,9 @@ fn render_human(report: &PlanReport) {
                 decision: LinkedWorktreeReclaimDecision::Refused { vetoes },
                 ..
             } => format!("refused: {}", join_vetoes(vetoes)),
-            WorktreeResult::Prunable => "prunable: directory missing".to_owned(),
+            WorktreeResult::Prunable => {
+                "prunable: registration is stale (directory or .git file missing)".to_owned()
+            }
             WorktreeResult::Unobservable { code } => format!("unobservable: {code}"),
         };
         println!("  #{}: {line}", worktree.ordinal);
