@@ -95,11 +95,6 @@ fn generation_with(
         retention,
     )
     .expect("reviewed trusted publisher candidate")
-    .transition(
-        ReusableStateLifecycle::Validated,
-        ReusableStatePromotionPolicy::conservative(),
-    )
-    .expect("validated generation")
 }
 
 fn validated() -> ReusableStateGeneration {
@@ -110,6 +105,11 @@ fn validated() -> ReusableStateGeneration {
         false,
         retention(),
     )
+    .transition(
+        ReusableStateLifecycle::Validated,
+        ReusableStatePromotionPolicy::conservative(),
+    )
+    .expect("validated generation")
 }
 
 fn capabilities(overlay: bool, private_empty: bool) -> HotStateCapabilityObservation {
@@ -282,9 +282,12 @@ fn a_host_without_the_reviewed_sharing_mode_refuses_reuse_the_identity_check_wou
         }
     );
 
-    let without_any_mode =
-        select_reusable_state_hot_state(published.identity(), &published, &capabilities(false, false))
-            .expect("derivable hot-state context");
+    let without_any_mode = select_reusable_state_hot_state(
+        published.identity(),
+        &published,
+        &capabilities(false, false),
+    )
+    .expect("derivable hot-state context");
     assert!(!without_any_mode.reuse_admitted());
     assert_eq!(
         without_any_mode.receipt().selection(),

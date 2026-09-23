@@ -232,9 +232,9 @@ impl HotStateAdmissionRefusal {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Copy)]
-enum FamilyStanding {
+/// Standing of one reusable-state family as its reviewed owner already observed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotStateFamilyStanding {
     Eligible,
     Quarantined(HotStateQuarantineReason),
     PermanentlyForbidden(HotStateForbiddenReason),
@@ -242,12 +242,38 @@ enum FamilyStanding {
 
 struct AdmissionSeal;
 
-#[cfg_attr(not(test), allow(dead_code))]
-struct HotStateFamilyAdmissionEvidence<'proof> {
+/// One family owner's observation offered as admission evidence.
+///
+/// There is no public constructor. `observed` is crate-visible, so only a reviewed in-crate
+/// reusable-state owner that already holds the family record can offer evidence. Holding this
+/// value is not admission: only `admit_family_evidence` mints `AdmittedHotStateCandidate`, and
+/// the seal that type carries stays private to this module.
+pub struct HotStateFamilyAdmissionEvidence<'proof> {
     context: HotStateAdmissionContext,
-    standing: FamilyStanding,
+    standing: HotStateFamilyStanding,
     unique_local_work: bool,
     _proof: PhantomData<&'proof ()>,
+}
+
+impl<'proof> HotStateFamilyAdmissionEvidence<'proof> {
+    /// Offer one family observation for admission.
+    ///
+    /// `proof` is the live borrow of the family record the observation came from. The returned
+    /// evidence cannot outlive it, so a released or superseded record cannot be re-offered.
+    pub(crate) fn observed<P: ?Sized>(
+        proof: &'proof P,
+        context: HotStateAdmissionContext,
+        standing: HotStateFamilyStanding,
+        unique_local_work: bool,
+    ) -> Self {
+        let _ = proof;
+        Self {
+            context,
+            standing,
+            unique_local_work,
+            _proof: PhantomData,
+        }
+    }
 }
 
 impl fmt::Debug for HotStateFamilyAdmissionEvidence<'_> {
@@ -290,15 +316,24 @@ impl fmt::Debug for AdmittedHotStateCandidate<'_> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn admit_family_evidence<'proof>(
+/// Admit one hot-state reuse candidate from family evidence.
+///
+/// The closed refusal precedence is permanent-forbidden, unique local work, quarantine, exact
+/// candidate/current context mismatch, policy mismatch, then physical resource refusal. The
+/// returned capability is acceleration-only: it encodes no retain, drain, evict, release,
+/// cancellation, or lifetime authority.
+///
+/// # Errors
+///
+/// Returns the first bounded refusal in that precedence order.
+pub fn admit_family_evidence<'proof>(
     evidence: HotStateFamilyAdmissionEvidence<'proof>,
     current_context: &HotStateAdmissionContext,
     policy: &HotStatePathPolicy,
     capabilities: &HotStateCapabilityObservation,
     resource_disposition: HotStateResourceDisposition,
 ) -> Result<AdmittedHotStateCandidate<'proof>, HotStateAdmissionRefusal> {
-    if let FamilyStanding::PermanentlyForbidden(reason) = evidence.standing {
+    if let HotStateFamilyStanding::PermanentlyForbidden(reason) = evidence.standing {
         return Err(HotStateAdmissionRefusal::Forbidden { reason });
     }
     if evidence.unique_local_work {
@@ -306,7 +341,7 @@ fn admit_family_evidence<'proof>(
             reason: HotStateForbiddenReason::UniqueLocalWork,
         });
     }
-    if let FamilyStanding::Quarantined(reason) = evidence.standing {
+    if let HotStateFamilyStanding::Quarantined(reason) = evidence.standing {
         return Err(HotStateAdmissionRefusal::QuarantineRequired { reason });
     }
     if let Some(field) = first_context_mismatch(&evidence.context, current_context) {
@@ -426,16 +461,10 @@ fn first_policy_mismatch(
 fn synthetic_evidence<'proof>(
     proof: &'proof (),
     context: HotStateAdmissionContext,
-    standing: FamilyStanding,
+    standing: HotStateFamilyStanding,
     unique_local_work: bool,
 ) -> HotStateFamilyAdmissionEvidence<'proof> {
-    let _ = proof;
-    HotStateFamilyAdmissionEvidence {
-        context,
-        standing,
-        unique_local_work,
-        _proof: PhantomData,
-    }
+    HotStateFamilyAdmissionEvidence::observed(proof, context, standing, unique_local_work)
 }
 
 #[cfg(test)]
@@ -447,7 +476,12 @@ pub(super) fn admitted_candidate_for_test<'proof>(
     capabilities: &HotStateCapabilityObservation,
 ) -> Result<AdmittedHotStateCandidate<'proof>, HotStateAdmissionRefusal> {
     admit_family_evidence(
-        synthetic_evidence(proof, candidate_context, FamilyStanding::Eligible, false),
+        synthetic_evidence(
+            proof,
+            candidate_context,
+            HotStateFamilyStanding::Eligible,
+            false,
+        ),
         current_context,
         policy,
         capabilities,
@@ -557,7 +591,12 @@ mod tests {
         let policy = base_policy();
         let capabilities = capabilities("capability-1");
         let candidate = admit_family_evidence(
-            synthetic_evidence(&proof, context.clone(), FamilyStanding::Eligible, false),
+            synthetic_evidence(
+                &proof,
+                context.clone(),
+                HotStateFamilyStanding::Eligible,
+                false,
+            ),
             &context,
             &policy,
             &capabilities,
@@ -577,7 +616,12 @@ mod tests {
         let policy = base_policy();
         let capabilities = capabilities("capability-1");
         let candidate = admit_family_evidence(
-            synthetic_evidence(&proof, context.clone(), FamilyStanding::Eligible, false),
+            synthetic_evidence(
+                &proof,
+                context.clone(),
+                HotStateFamilyStanding::Eligible,
+                false,
+            ),
             &context,
             &policy,
             &capabilities,
@@ -662,7 +706,7 @@ mod tests {
                 synthetic_evidence(
                     &proof,
                     candidate_context.clone(),
-                    FamilyStanding::Eligible,
+                    HotStateFamilyStanding::Eligible,
                     false,
                 ),
                 &current_context,
@@ -682,7 +726,7 @@ mod tests {
                 synthetic_evidence(
                     &proof,
                     candidate_context.clone(),
-                    FamilyStanding::Eligible,
+                    HotStateFamilyStanding::Eligible,
                     false,
                 ),
                 &candidate_context,
@@ -735,7 +779,12 @@ mod tests {
             let context = mutable_context();
             let capabilities = capabilities("capability-1");
             let refusal = admit_family_evidence(
-                synthetic_evidence(&proof, context.clone(), FamilyStanding::Eligible, false),
+                synthetic_evidence(
+                    &proof,
+                    context.clone(),
+                    HotStateFamilyStanding::Eligible,
+                    false,
+                ),
                 &context,
                 &policy,
                 &capabilities,
@@ -777,7 +826,7 @@ mod tests {
                 synthetic_evidence(
                     &proof,
                     candidate_context,
-                    FamilyStanding::PermanentlyForbidden(reason),
+                    HotStateFamilyStanding::PermanentlyForbidden(reason),
                     false,
                 ),
                 &current_context,
@@ -819,7 +868,7 @@ mod tests {
                 synthetic_evidence(
                     &proof,
                     candidate_context,
-                    FamilyStanding::Quarantined(reason),
+                    HotStateFamilyStanding::Quarantined(reason),
                     false,
                 ),
                 &current_context,
@@ -848,7 +897,7 @@ mod tests {
             synthetic_evidence(
                 &proof,
                 candidate_context,
-                FamilyStanding::Quarantined(HotStateQuarantineReason::RebindAmbiguous),
+                HotStateFamilyStanding::Quarantined(HotStateQuarantineReason::RebindAmbiguous),
                 true,
             ),
             &current_context,
@@ -872,7 +921,12 @@ mod tests {
         let policy = base_policy();
         let capabilities = capabilities("capability-1");
         let refusal = admit_family_evidence(
-            synthetic_evidence(&proof, context.clone(), FamilyStanding::Eligible, false),
+            synthetic_evidence(
+                &proof,
+                context.clone(),
+                HotStateFamilyStanding::Eligible,
+                false,
+            ),
             &context,
             &policy,
             &capabilities,
@@ -890,7 +944,12 @@ mod tests {
         let admitted_capabilities = capabilities("capability-1");
         let current_capabilities = capabilities("capability-2");
         let candidate = admit_family_evidence(
-            synthetic_evidence(&proof, context.clone(), FamilyStanding::Eligible, false),
+            synthetic_evidence(
+                &proof,
+                context.clone(),
+                HotStateFamilyStanding::Eligible,
+                false,
+            ),
             &context,
             &policy,
             &admitted_capabilities,
@@ -906,7 +965,12 @@ mod tests {
         let context = mutable_context();
         let policy = base_policy();
         let capabilities = capabilities("capability-1");
-        let evidence = synthetic_evidence(&proof, context.clone(), FamilyStanding::Eligible, false);
+        let evidence = synthetic_evidence(
+            &proof,
+            context.clone(),
+            HotStateFamilyStanding::Eligible,
+            false,
+        );
 
         assert_eq!(
             format!("{:?}", context.target.family),
