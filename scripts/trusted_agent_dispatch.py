@@ -3,8 +3,9 @@
 
 The request carries exact source identity, one closed semantic operation, caller/provenance
 correlation, and a bounded lifetime. Caller bytes never grant execution authority. Acceptance
-requires separately observed provenance evidence, then compiles to the caller-neutral external
-execution adapter. Physical attempt identity, backend, resources, reusable-state eligibility,
+requires separately observed provenance evidence, then compiles through the provider-neutral Glaeda
+semantic request and the caller-neutral external workload adapter. Physical attempt identity,
+backend, resources, reusable-state eligibility,
 process lifecycle, and recovery remain Glaeda-owned.
 """
 from __future__ import annotations
@@ -18,6 +19,7 @@ import sys
 from typing import NoReturn
 
 import external_execution_request as external
+import provider_neutral_request as semantic
 
 REQUEST_DOCUMENT_TYPE = "glaeda-trusted-agent-dispatch-request"
 ACCEPTED_DOCUMENT_TYPE = "glaeda-trusted-agent-dispatch-accepted"
@@ -31,8 +33,6 @@ MAX_LIFETIME = dt.timedelta(hours=1)
 MAX_FUTURE_SKEW = dt.timedelta(minutes=5)
 OPERATION_KIND = "verify_named"
 PROFILE_ID = "verify-focused/v1"
-EXTERNAL_OPERATION = "verify_focused"
-CAPABILITY_CLASS = "credentialless_project"
 SUPERSESSION_POLICY = "none"
 AUTHORITY = {
     "authorizes_execution": False,
@@ -74,6 +74,7 @@ ACCEPTED_KEYS = {
     "expires_at",
     "supersession",
     "semantic_request_id",
+    "semantic_request_sha256",
     "external_request_sha256",
     "workload_command_fingerprint",
     "resolved_workload",
@@ -149,6 +150,8 @@ class DispatchRequest:
 @dataclass(frozen=True)
 class AcceptedRequest:
     request: DispatchRequest
+    semantic_request: semantic.SemanticRequest
+    semantic_request_sha256: str
     external_request: external.ExternalRequest
     external_request_sha256: str
     accepted_document: dict[str, object]
@@ -359,6 +362,7 @@ def decode_projection(
         allow_expired=allow_expired,
     )
 
+
 def request_document(request: DispatchRequest) -> dict[str, object]:
     value = identity_document(request)
     value["request_fingerprint"] = request.request_fingerprint
@@ -373,21 +377,6 @@ def semantic_request_id(request: DispatchRequest) -> str:
             "accepted dispatch fingerprint is invalid",
         )
     return "accepted-" + digest[:55]
-
-
-def external_document(request: DispatchRequest) -> dict[str, object]:
-    return {
-        "document_type": external.REQUEST_DOCUMENT_TYPE,
-        "schema_version": external.REQUEST_SCHEMA_VERSION,
-        "external_request_ref": request.request_id,
-        "source": {
-            "repository": request.repository,
-            "commit": request.commit,
-            "tree": request.tree,
-        },
-        "operation": EXTERNAL_OPERATION,
-        "requested_capability_class": CAPABILITY_CLASS,
-    }
 
 
 def _bounded(value: dict[str, object], label: str) -> dict[str, object]:
@@ -411,13 +400,24 @@ def accept_request(
             "observed provenance does not match the request",
         )
 
-    external_request = external.decode_request(
-        canonical_bytes(external_document(request)) + b"\n"
-    )
-    compiled = external.compile_request(
-        external_request,
-        semantic_request_id=semantic_request_id(request),
-    )
+    try:
+        semantic_request = semantic.make_verify_named_request(
+            semantic_request_id(request),
+            request.repository,
+            request.commit,
+            request.tree,
+            request.profile,
+        )
+        compiled_semantic = semantic.compile_request(semantic_request)
+    except semantic.ContractRefusal as error:
+        raise DispatchRefusal(error.code, str(error)) from error
+    if compiled_semantic.workload is None:
+        raise DispatchRefusal(
+            "internal_contract_error",
+            "semantic request did not resolve a source-executing workload",
+        )
+    compiled = compiled_semantic.workload
+    external_request = compiled.external
     planned = external.planned_receipt(compiled)
     resolved = planned.get("resolved_workload")
     if not isinstance(resolved, dict):
@@ -449,6 +449,7 @@ def accept_request(
             "expires_at": request.expires_at,
             "supersession": {"policy": request.supersession_policy},
             "semantic_request_id": semantic_request_id(request),
+            "semantic_request_sha256": compiled_semantic.request_sha256,
             "external_request_sha256": compiled.request_sha256,
             "workload_command_fingerprint": compiled.internal.command_fingerprint,
             "resolved_workload": resolved,
@@ -458,6 +459,8 @@ def accept_request(
     )
     return AcceptedRequest(
         request,
+        semantic_request,
+        compiled_semantic.request_sha256,
         external_request,
         compiled.request_sha256,
         accepted,

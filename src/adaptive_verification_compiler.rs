@@ -2025,10 +2025,24 @@ fn estimate_utility(
         .unwrap_or(0);
     let storage_observed = storage_bytes > 0;
 
-    let relevant_for_hit = related
-        .iter()
-        .filter(|observation| primary_avoided_stage(class, observation.stage))
-        .collect::<Vec<_>>();
+    let restore_hit_evidence = if class == OptimizationClass::RetainLocalImmutableArtifact {
+        related
+            .iter()
+            .filter(|observation| observation.stage == VerificationStage::Restore)
+            .copied()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let relevant_for_hit = if restore_hit_evidence.is_empty() {
+        related
+            .iter()
+            .filter(|observation| primary_avoided_stage(class, observation.stage))
+            .copied()
+            .collect::<Vec<_>>()
+    } else {
+        restore_hit_evidence
+    };
     let hit_count = relevant_for_hit
         .iter()
         .filter(|observation| observation.reuse_class == VerificationReuseClass::Reuse)

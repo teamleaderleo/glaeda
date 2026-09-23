@@ -1127,11 +1127,11 @@ def _bounded_tail(path: Path, ceiling: int = 4096) -> str:
 
 def _git_oid(cmux_root: Path, expression: str) -> str:
     environment = {
-        name: value
-        for name, value in os.environ.items()
-        if not name.startswith("GIT_")
+        "LC_ALL": "C",
+        "LANG": "C",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
     }
-    environment["LC_ALL"] = "C"
     try:
         completed = subprocess.run(
             ["/usr/bin/git", "-C", str(cmux_root), "rev-parse", expression],

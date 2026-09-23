@@ -42,6 +42,7 @@ use glaeda::process::ProcessExecutor;
 use glaeda::project_checkout_observation::{
     ProjectCheckoutObservation, ProjectCheckoutObservationError, ProjectCheckoutObserver,
 };
+use rustix::process::geteuid;
 #[cfg(target_os = "linux")]
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
@@ -1000,6 +1001,12 @@ fn observe_runtime_bin(
     }
     if resolved != path {
         return Err("runtime bin binding contains a symbolic-link component".into());
+    }
+    if details.uid() != 0 && details.uid() != geteuid().as_raw() {
+        return Err("runtime bin binding is not owned by root or the current user".into());
+    }
+    if details.mode() & 0o022 != 0 {
+        return Err("runtime bin binding is writable by an untrusted identity".into());
     }
     Ok(Some(RuntimeBinBinding {
         path: path.to_owned(),
@@ -2826,7 +2833,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn unique_temporary_path(prefix: &str) -> Result<PathBuf, String> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2869,7 +2876,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     use rustix::process::test_kill_process;
 
-    #[cfg(target_os = "linux")]
     fn test_directory(label: &str) -> PathBuf {
         let path = unique_temporary_path(label).unwrap();
         fs::create_dir(&path).unwrap();
@@ -3412,6 +3418,32 @@ mod tests {
         fs::remove_file(moved.join("runtime-descendant")).unwrap();
         fs::remove_file(moved.join("runtime-tool")).unwrap();
         fs::remove_dir(moved).unwrap();
+        fs::remove_dir(fixture).unwrap();
+    }
+
+    #[test]
+    fn runtime_bin_refuses_a_group_or_world_writable_directory() {
+        let fixture = test_directory("glaeda-hot-run-runtime-mode-test")
+            .canonicalize()
+            .unwrap();
+        let runtime_bin = fixture.join("bin");
+        fs::create_dir(&runtime_bin).unwrap();
+        for mode in [0o775, 0o757, 0o777] {
+            fs::set_permissions(&runtime_bin, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                observe_runtime_bin(Some(&runtime_bin), Some("fixture")).unwrap_err(),
+                "runtime bin binding is writable by an untrusted identity"
+            );
+        }
+
+        fs::set_permissions(&runtime_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            observe_runtime_bin(Some(&runtime_bin), Some("fixture"))
+                .unwrap()
+                .is_some()
+        );
+
+        fs::remove_dir(runtime_bin).unwrap();
         fs::remove_dir(fixture).unwrap();
     }
 }
