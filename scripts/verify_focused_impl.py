@@ -151,6 +151,10 @@ REQUIRED_PROFILE = fixed_profile(
     "10G",
     "12G",
 )
+REQUIRED_ADMISSION_DEMAND = owned_admission.AdmissionDemand(
+    memory_bytes=12 * 1024**3,
+    minimum_logical_cpus=8,
+)
 
 # Compatibility aliases for the focused profile and its existing tests/consumers.
 PROFILE_ID = FOCUSED_PROFILE.profile_id
@@ -233,6 +237,15 @@ def reject_json_constant(value: str) -> NoReturn:
 
 def profile_generation(profile: Profile = FOCUSED_PROFILE) -> str:
     return sha256(canonical_bytes(profile_spec(profile)))
+
+
+def admission_demand(profile: Profile) -> owned_admission.AdmissionDemand:
+    """Map one reviewed semantic verification profile to its local physical demand."""
+    if profile == FOCUSED_PROFILE:
+        return owned_admission.VERIFY_FOCUSED_DEMAND
+    if profile == REQUIRED_PROFILE:
+        return REQUIRED_ADMISSION_DEMAND
+    raise Refusal("verification profile has no reviewed local admission demand")
 
 
 def exact_directory(raw: str, label: str) -> Path:
@@ -776,7 +789,7 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
                         sync_directory(command_root)
                 owned_admission.recover(admission_root, request.command_fingerprint,
                                         unit_name(request), admission_binding(request, command_root),
-                                        observe_settled, owned_admission.VERIFY_FOCUSED_DEMAND)
+                                        observe_settled, admission_demand(profile))
             emit(existing)
             return 0
         intent = read_document(intent_path)
@@ -788,14 +801,10 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
             raise Refusal("previous physical execution is ambiguous; redispatch refused")
 
         admission_root = getattr(arguments, "admission_root", None)
-        if admission_root is not None and profile != FOCUSED_PROFILE:
-            raise Refusal("local admission supports only verify-focused/v1")
+        demand = admission_demand(profile) if admission_root is not None else None
         unit = unit_name(request)
-        # This path refuses any profile but verify-focused/v1, so its demand is named
-        # explicitly here and at recovery rather than left to two separate defaults.
         gate = (owned_admission.Reservation(admission_root, request.command_fingerprint, unit,
-                                            admission_binding(request, command_root),
-                                            owned_admission.VERIFY_FOCUSED_DEMAND)
+                                            admission_binding(request, command_root), demand)
                 if admission_root is not None else nullcontext())
         with gate as admission:
             try:
@@ -880,7 +889,7 @@ def parser() -> argparse.ArgumentParser:
         help="accepted provider-neutral request identity; binds exact physical work across transports",
     )
     execute.add_argument("--reconcile-only", action="store_true")
-    execute.add_argument("--admission-root", help="operator-installed focused launch gate; never caller-selected")
+    execute.add_argument("--admission-root", help="operator-installed reviewed launch gate; never caller-selected")
     return root
 
 
