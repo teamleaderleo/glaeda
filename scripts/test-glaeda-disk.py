@@ -162,6 +162,13 @@ class DedupeTest(unittest.TestCase):
         self.assertFalse(gd.clone_over(str(a), str(b), key))
         self.assertEqual(int(b.stat().st_mtime), 3_000_000)
 
+    def test_recently_written_files_wait_for_a_later_pass(self) -> None:
+        data = os.urandom(2 * 1024 * 1024)
+        self.blob("a/x.bin", data)
+        self.blob("b/x.bin", data, mtime=time.time())
+        r = gd.dedupe([self.root / "a", self.root / "b"], self.state, settle_s=600)
+        self.assertEqual((r["young"], r["cloned_bytes"]), (1, 0))
+
     def test_small_and_unique_files_are_ignored(self) -> None:
         self.blob("a/small", b"x" * 10)
         self.blob("b/small", b"x" * 10)

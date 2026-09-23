@@ -382,12 +382,15 @@ def clone_over(canonical: str, target: str, expect: list[int]) -> bool:
 
 
 def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
-           min_bytes: int = DEDUPE_MIN_BYTES) -> dict[str, int]:
+           min_bytes: int = DEDUPE_MIN_BYTES, settle_s: float = 0) -> dict[str, int]:
+    """Clone-dedupe identical files. Files modified within settle_s are left for a later run."""
     try:
         state: dict[str, dict] = json.loads(state_path.read_text())
     except (OSError, ValueError):
         state = {}
     files: dict[str, list[int]] = {}
+    young = 0
+    cutoff = time.time() - settle_s
     for root in roots:
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
@@ -400,6 +403,9 @@ def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
                 except OSError:
                     continue
                 if stat.S_ISREG(st.st_mode) and st.st_size >= min_bytes and st.st_nlink == 1:
+                    if st.st_mtime > cutoff:
+                        young += 1  # still being downloaded or written
+                        continue
                     files[path] = _file_key(st)
     by_size: dict[int, list[str]] = {}
     for path, key in files.items():
@@ -446,7 +452,7 @@ def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
     tmp.write_text(json.dumps(new_state))
     os.replace(tmp, state_path)
     return {"files": len(files), "hashed_bytes": hashed, "cloned_bytes": cloned_bytes,
-            "refused": refused}
+            "refused": refused, "young": young}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -464,6 +470,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--dedupe", action="store_true",
                     help="clone-dedupe identical Xcode package and module-cache files, then exit")
+    ap.add_argument("--settle-minutes", type=float, default=0,
+                    help="with --dedupe: skip files changed this recently, wait and retry (up to 3 passes)")
     ap.add_argument("--refresh", action="store_true", help="re-measure all sizes now")
     ap.add_argument("--max-age", type=float, default=15,
                     help="minutes before the size snapshot is refreshed in the background (default 15)")
@@ -489,11 +497,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         before, _ = free_bytes(dd)
         started = time.time()
-        r = dedupe(dedupe_roots(dd))
-        after, _ = free_bytes(dd)
-        print(f"dedupe: {r['files']} files >= 1 MiB, hashed {gib(r['hashed_bytes']).strip()}, "
-              f"cloned {gib(r['cloned_bytes']).strip()}, refused {r['refused']}, "
-              f"free {gib(before).strip()} -> {gib(after).strip()} in {time.time() - started:.0f}s")
+        for attempt in range(3):
+            r = dedupe(dedupe_roots(dd), settle_s=a.settle_minutes * 60)
+            after, _ = free_bytes(dd)
+            print(f"dedupe: {r['files']} files >= 1 MiB, hashed {gib(r['hashed_bytes']).strip()}, "
+                  f"cloned {gib(r['cloned_bytes']).strip()}, refused {r['refused']}, "
+                  f"still settling {r['young']}, free {gib(before).strip()} -> {gib(after).strip()} "
+                  f"in {time.time() - started:.0f}s", flush=True)
+            if not r["young"] or attempt == 2:
+                break
+            time.sleep(a.settle_minutes * 60)
         return 0
     free, total = free_bytes(fs)
     under = free < a.low * GIB
