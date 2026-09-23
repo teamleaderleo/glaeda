@@ -10,7 +10,7 @@ retains its existing behavior.
 The gate admits one reviewed in-process `AdmissionDemand` at a time. A demand contains only the
 capacity facts the current host observer can enforce truthfully: candidate memory bytes and a
 minimum logical-CPU count. It is constructed by checked-in local adapter code and is never decoded
-from remote request bytes. The default `VERIFY_FOCUSED_DEMAND` exactly preserves the existing
+from remote request bytes. `VERIFY_FOCUSED_DEMAND` exactly preserves the existing
 `verify-focused/v1` requirement: 8 GiB MemoryMax and an eight-logical-CPU host floor. The
 verification adapter maps `verify-required/v1` to 12 GiB candidate memory and the same reviewed
 eight-logical-CPU floor, matching its existing `MemoryMax=12G` execution profile without changing
@@ -43,7 +43,9 @@ network widening, or arbitrary commands are added.
 fields must be positive bounded integers; booleans, zeroes, foreign objects, and oversized integers
 refuse before host observation or workload launch. `observe(root, demand)`,
 `Reservation(..., demand)`, `Reservation.resume(..., demand)` and `recover(..., demand)` consume
-the same reviewed value.
+the same reviewed value. Fresh `Reservation` construction requires an explicit demand; omitting
+it fails before opening the store or observing the host. The advisory `observe()` default remains
+compatible with the focused profile.
 
 The demand does not grant execution, resource ownership, preemption, routing, queue, persistence,
 or result authority. A remote caller cannot lower its apparent memory/CPU need to bypass admission.

@@ -322,6 +322,7 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
             "sha256:" + "6" * 64,
             "glaeda-verify-" + "6" * 32 + ".service",
             "sha256:" + "5" * 64,
+            admission.VERIFY_FOCUSED_DEMAND,
         )
         with direct:
             with self.assertRaisesRegex(task.Refusal, "busy|recovery"):
@@ -342,6 +343,7 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
             arguments.command_fingerprint,
             arguments.unit,
             arguments.binding_sha256,
+            admission.VERIFY_FOCUSED_DEMAND,
         )
         with reservation:
             pass
@@ -362,6 +364,7 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
             arguments.command_fingerprint,
             arguments.unit,
             arguments.binding_sha256,
+            admission.VERIFY_FOCUSED_DEMAND,
         )
         with reservation:
             pass
