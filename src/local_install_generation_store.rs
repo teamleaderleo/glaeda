@@ -903,6 +903,14 @@ impl UnixLocalInstallGenerationStore {
         &self,
         mode: StoreLockMode,
     ) -> Result<StoreLock, LocalInstallGenerationStoreError> {
+        self.acquire_lock_with_observer(mode, |_| {})
+    }
+
+    fn acquire_lock_with_observer(
+        &self,
+        mode: StoreLockMode,
+        after_lock: impl FnOnce(&OwnedFd),
+    ) -> Result<StoreLock, LocalInstallGenerationStoreError> {
         let retained = inspect_private_file(
             &self.lock,
             self.owner,
@@ -937,6 +945,7 @@ impl UnixLocalInstallGenerationStore {
         };
         match fs::flock(&lock, operation) {
             Ok(()) => {
+                after_lock(&lock);
                 // This is the single retained-boundary pass for every locked public operation.
                 self.verify_boundaries()?;
                 Ok(StoreLock { lock })
@@ -4107,6 +4116,37 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn boundary_refusal_unlocks_even_when_a_duplicate_descriptor_survives() {
+        for mode in [StoreLockMode::Shared, StoreLockMode::Exclusive] {
+            let test = TestStore::new("refused-lock-duplicate");
+            std_fs::set_permissions(
+                test.root().join(GENERATIONS_DIRECTORY),
+                std_fs::Permissions::from_mode(0o755),
+            )
+            .expect("make generations boundary unsafe");
+            let mut survivor = None;
+            let refusal = test.store.acquire_lock_with_observer(mode, |lock| {
+                survivor = Some(lock.try_clone().expect("duplicate acquired description"));
+            });
+            assert_eq!(
+                refusal.err().expect("refuse unsafe boundary").kind(),
+                LocalInstallGenerationStoreErrorKind::UnsafeFilesystem
+            );
+            let competing = fs::openat(
+                &test.store.root,
+                LOCK_FILE,
+                EXISTING_LOCK_FLAGS,
+                Mode::empty(),
+            )
+            .expect("open independent description");
+            fs::flock(&competing, FlockOperation::NonBlockingLockExclusive)
+                .expect("refusal explicitly releases lock despite surviving duplicate");
+            fs::flock(&competing, FlockOperation::Unlock).expect("release test lock");
+            drop(survivor.expect("keep duplicate alive through reacquisition"));
+        }
     }
 
     #[test]
