@@ -95,7 +95,7 @@ Reviewed quarantine reasons are:
 
 ## Onboard a Mac
 
-Use an exact reviewed Glaeda checkout and the CMUX checkout that will run acceptance.
+Use an exact reviewed Glaeda checkout and the CMUX checkout that will run acceptance. A [verified native candidate bundle](FLEET_DISTRIBUTION.md) can supply `GLAEDA_BIN` and the matching fleet scripts without building Rust on the node; skip the build/copy step below when using that path.
 
 ```bash
 set -euo pipefail
