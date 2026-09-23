@@ -776,7 +776,7 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
                         sync_directory(command_root)
                 owned_admission.recover(admission_root, request.command_fingerprint,
                                         unit_name(request), admission_binding(request, command_root),
-                                        observe_settled)
+                                        observe_settled, owned_admission.VERIFY_FOCUSED_DEMAND)
             emit(existing)
             return 0
         intent = read_document(intent_path)
@@ -791,8 +791,11 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
         if admission_root is not None and profile != FOCUSED_PROFILE:
             raise Refusal("local admission supports only verify-focused/v1")
         unit = unit_name(request)
+        # This path refuses any profile but verify-focused/v1, so its demand is named
+        # explicitly here and at recovery rather than left to two separate defaults.
         gate = (owned_admission.Reservation(admission_root, request.command_fingerprint, unit,
-                                            admission_binding(request, command_root))
+                                            admission_binding(request, command_root),
+                                            owned_admission.VERIFY_FOCUSED_DEMAND)
                 if admission_root is not None else nullcontext())
         with gate as admission:
             try:
