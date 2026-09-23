@@ -32,7 +32,7 @@ Sources: [Blacksmith pricing](https://www.blacksmith.sh/pricing), [Blacksmith in
 
 Observations:
 
-- **Price floor is $0.06 to $0.08/min** for a 6 to 8 core Mac VM. Unit-priced offers below that exist (Namespace from about $0.04, Buildkite per vCPU-minute), but the differentiators are queue depth, cache, and hardware generation.
+- **The typical range is $0.06 to $0.08/min** for a 6 to 8 core Mac VM. Unit-priced offers below that exist (Namespace from about $0.04, Buildkite per vCPU-minute), but the differentiators are queue depth, cache, and hardware generation.
 - **Hot state is a Linux feature everywhere except Namespace and Buildkite.** WarpBuild says so outright. Blacksmith documents sticky disks only with Ubuntu examples.
 - **The cache winners on macOS are colocated.** Tuist's own benchmarks show remote cache gains shrink versus local (Wikipedia 24% local vs 18% remote; Pocket Casts 36% vs 20%). Separately, #1134 found that the client sends large blobs as file paths on its own disk, so a store on another host cannot receive them; that, not distance, is why the node daemon is required.
 - **Queue depth is the real product for cmux.** The 1 to 3 hour wait is capacity, not speed. Every provider above sells burst capacity from a shared pool; the minis are dedicated capacity.
