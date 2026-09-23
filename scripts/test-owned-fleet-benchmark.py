@@ -927,6 +927,17 @@ class FleetHarnessTests(unittest.TestCase):
                 self.assertEqual(stable, set())
                 self.assertTrue(any("swap" in reason for reason in reasons))
 
+    def test_stability_requires_finite_nonnegative_latency(self) -> None:
+        for invalid in (float("inf"), float("nan"), -1, None, False):
+            with self.subTest(invalid=invalid):
+                values = self._reduced_windows()
+                for value in values:
+                    value["concurrency"]["underfilled"] = False
+                    value["final_result_latency_ms"]["p90"] = invalid
+                stable, reasons = _stable_profile_sets(values)
+                self.assertEqual(stable, set())
+                self.assertTrue(any("p90" in reason for reason in reasons))
+
     def test_collect_json_files_refuses_a_corrupt_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
