@@ -789,7 +789,7 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
                         sync_directory(command_root)
                 owned_admission.recover(admission_root, request.command_fingerprint,
                                         unit_name(request), admission_binding(request, command_root),
-                                        observe_settled, owned_admission.VERIFY_FOCUSED_DEMAND)
+                                        observe_settled, admission_demand(profile))
             emit(existing)
             return 0
         intent = read_document(intent_path)
