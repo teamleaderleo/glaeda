@@ -263,6 +263,28 @@ def enrollment_from_bootstrap(
     return validate_enrollment(enrollment)
 
 
+def renewal_plan(enrollment_value: object, bootstrap_value: object) -> dict[str, Any]:
+    """Plan a new acceptance generation without granting execution authority."""
+    current = validate_enrollment(enrollment_value)
+    if current["state"] != "quarantined":
+        raise FleetError("enrollment renewal requires a quarantined node")
+    if current["enrollmentGeneration"] == 2**31 - 1:
+        raise FleetError("enrollment generation is exhausted")
+    replacement = enrollment_from_bootstrap(
+        bootstrap_value,
+        node_id=current["nodeId"],
+        operator_fleet_scope=current["operatorFleetScope"],
+        enrollment_generation=current["enrollmentGeneration"] + 1,
+    )
+    plan = {
+        "schema": "glaeda-cmux-enrollment-renewal/v1",
+        "currentEnrollmentSha256": digest(current),
+        "bootstrapSha256": digest(bootstrap_value),
+        "replacement": replacement,
+    }
+    return {**plan, "planSha256": digest(plan)}
+
+
 def _cmux_semantic_key(value: dict[str, Any]) -> str:
     source = value["source"]
     profile = value["profile"]
@@ -1387,6 +1409,20 @@ def apply_transition(
         )
         return replacement
 
+def apply_renewal(
+    enrollment_path: Path, bootstrap_path: Path, expected_plan_sha256: str,
+) -> dict[str, Any]:
+    sha256(expected_plan_sha256, "expected renewal plan digest")
+    with FleetMutationLock(enrollment_path) as mutation:
+        current = validate_enrollment(mutation.load_enrollment())
+        plan = renewal_plan(current, load(bootstrap_path))
+        if plan["planSha256"] != expected_plan_sha256:
+            raise FleetError("enrollment renewal plan changed; preview again")
+        replacement = plan["replacement"]
+        durable_replace_enrollment(current, replacement, mutation)
+        return replacement
+
+
 def emit(value: object) -> None:
     sys.stdout.buffer.write(canonical(value))
 
@@ -1416,6 +1452,12 @@ def parser() -> argparse.ArgumentParser:
     ta.add_argument("--to", required=True, choices=STATES)
     ta.add_argument("--reason", choices=QUARANTINE_REASONS)
     ta.add_argument("--acceptance", action="append", type=Path, default=[])
+    for command in ("renew-enrollment", "renew-enrollment-apply"):
+        renewal = sub.add_parser(command)
+        renewal.add_argument("enrollment", type=Path)
+        renewal.add_argument("bootstrap", type=Path)
+        if command.endswith("-apply"):
+            renewal.add_argument("--expected-plan-sha256", required=True)
     al = sub.add_parser("accept-local")
     al.add_argument("enrollment", type=Path)
     al.add_argument("--cmux-root", type=Path, required=True)
@@ -1470,6 +1512,12 @@ def main() -> int:
                     args.acceptance,
                 )
             )
+        elif args.command == "renew-enrollment":
+            emit(renewal_plan(enrollment, load(args.bootstrap)))
+        elif args.command == "renew-enrollment-apply":
+            emit(apply_renewal(
+                args.enrollment, args.bootstrap, args.expected_plan_sha256,
+            ))
         elif args.command == "accept-local":
             receipt = accept_local(
                 args.enrollment,
