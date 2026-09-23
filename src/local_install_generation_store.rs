@@ -945,10 +945,13 @@ impl UnixLocalInstallGenerationStore {
         };
         match fs::flock(&lock, operation) {
             Ok(()) => {
-                after_lock(&lock);
+                // Install the explicit-unlock guard before any fallible validation.
+                // Closing a bare descriptor can leave a duplicate holding the flock.
+                let guard = StoreLock { lock };
+                after_lock(&guard.lock);
                 // This is the single retained-boundary pass for every locked public operation.
                 self.verify_boundaries()?;
-                Ok(StoreLock { lock })
+                Ok(guard)
             }
             Err(Errno::AGAIN) => Err(store_error(
                 LocalInstallGenerationStoreErrorKind::Busy,
@@ -4089,14 +4092,13 @@ mod tests {
                 .kind(),
             LocalInstallGenerationStoreErrorKind::UnsafeFilesystem
         );
-        assert!(matches!(
+        assert_eq!(
             test.store
                 .launcher_targets()
                 .expect_err("launcher observation refuses boundary")
                 .kind(),
             LocalInstallGenerationStoreErrorKind::UnsafeFilesystem
-                | LocalInstallGenerationStoreErrorKind::Busy
-        ));
+        );
         assert_eq!(
             test.store
                 .publish(&publish, &binary)
