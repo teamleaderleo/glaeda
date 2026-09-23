@@ -14,6 +14,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::artifact::{RepositoryRef, Sha256Digest};
+use crate::hot_state_path_policy::HotStateCapabilityObservation;
+use crate::reusable_state_hot_state_policy::select_reusable_state_hot_state;
 
 pub const REUSABLE_STATE_LIFECYCLE_SCHEMA_VERSION: u8 = 1;
 const HOUR_MILLIS: u64 = 60 * 60 * 1_000;
@@ -768,15 +770,23 @@ pub enum ReusableStateMissReason {
     InvalidatedPreferredGeneration,
     LifecycleUnavailable,
     LowTrustConsumptionDisallowed,
+    HotStateReuseUnproven,
 }
 
 /// Evaluate one read-only consumption attempt. Broken or ambiguous state becomes a miss/reset.
+///
+/// Semantic identity is necessary but not sufficient. A hit additionally requires the hot-state
+/// path-class policy in `crate::reusable_state_hot_state_policy` to admit the published generation
+/// against `capabilities` and to select a mode that reuses existing bytes. An unproven ladder
+/// dimension, a stale capability generation, or a host that does not offer the reviewed sharing
+/// mode all become `HotStateReuseUnproven` rather than a hit under the identity check alone.
 #[must_use]
 pub fn evaluate_reusable_state_consumption(
     expected: &ReusableStateIdentityContract,
     generation: &ReusableStateGeneration,
     consumer: ReusableStateConsumerTrust,
     policy: ReusableStateConsumptionPolicy,
+    capabilities: &HotStateCapabilityObservation,
 ) -> ReusableStateConsumptionDisposition {
     if let Some(mismatch) = expected.first_mismatch(&generation.identity) {
         return ReusableStateConsumptionDisposition::MissReset {
@@ -834,8 +844,16 @@ pub fn evaluate_reusable_state_consumption(
         ),
     };
     if usable {
-        ReusableStateConsumptionDisposition::Hit {
-            mode: ReusableStateConsumptionMode::ReadOnly,
+        let admitted = select_reusable_state_hot_state(expected, generation, capabilities)
+            .is_ok_and(|decision| decision.reuse_admitted());
+        if admitted {
+            ReusableStateConsumptionDisposition::Hit {
+                mode: ReusableStateConsumptionMode::ReadOnly,
+            }
+        } else {
+            ReusableStateConsumptionDisposition::MissReset {
+                reason: ReusableStateMissReason::HotStateReuseUnproven,
+            }
         }
     } else {
         ReusableStateConsumptionDisposition::MissReset {
@@ -1309,6 +1327,20 @@ mod tests {
         Sha256Digest::parse(&format!("sha256:{index:064x}")).unwrap()
     }
 
+    fn overlay_capabilities() -> HotStateCapabilityObservation {
+        HotStateCapabilityObservation::new(
+            crate::hot_state_path_policy::HotStateCapabilityGenerationId::parse(
+                "reusable-state-capability-1",
+            )
+            .unwrap(),
+            true,
+            false,
+            true,
+            false,
+            false,
+        )
+    }
+
     fn identity(class: ReusableStateClass) -> ReusableStateIdentityContract {
         ReusableStateIdentityContract::new(
             class,
@@ -1595,6 +1627,7 @@ mod tests {
                 ReusableStateConsumptionPolicy {
                     low_trust_read_only_allowed: true
                 },
+                &overlay_capabilities(),
             ),
             ReusableStateConsumptionDisposition::MissReset { .. }
         ));
@@ -1607,9 +1640,64 @@ mod tests {
                 ReusableStateConsumptionPolicy {
                     low_trust_read_only_allowed: true
                 },
+                &overlay_capabilities(),
             ),
             ReusableStateConsumptionDisposition::Hit {
                 mode: ReusableStateConsumptionMode::ReadOnly
+            }
+        );
+    }
+
+    #[test]
+    fn an_exact_identity_match_without_a_reviewed_sharing_mode_is_miss_reset() {
+        let preferred = preferred(
+            candidate(
+                ReusableStateClass::IncrementalBuildState,
+                metrics(4, 4, 40_000, 4_000, 1_000_000, 2, 4),
+            )
+            .transition(
+                ReusableStateLifecycle::Validated,
+                ReusableStatePromotionPolicy::conservative(),
+            )
+            .unwrap(),
+        );
+        let policy = ReusableStateConsumptionPolicy {
+            low_trust_read_only_allowed: false,
+        };
+        let without_overlay = HotStateCapabilityObservation::new(
+            crate::hot_state_path_policy::HotStateCapabilityGenerationId::parse(
+                "reusable-state-capability-1",
+            )
+            .unwrap(),
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            evaluate_reusable_state_consumption(
+                &preferred.identity,
+                &preferred,
+                ReusableStateConsumerTrust::Trusted,
+                policy,
+                &overlay_capabilities(),
+            ),
+            ReusableStateConsumptionDisposition::Hit {
+                mode: ReusableStateConsumptionMode::ReadOnly
+            }
+        );
+        assert_eq!(
+            evaluate_reusable_state_consumption(
+                &preferred.identity,
+                &preferred,
+                ReusableStateConsumerTrust::Trusted,
+                policy,
+                &without_overlay,
+            ),
+            ReusableStateConsumptionDisposition::MissReset {
+                reason: ReusableStateMissReason::HotStateReuseUnproven
             }
         );
     }
@@ -1634,6 +1722,7 @@ mod tests {
                 ReusableStateConsumptionPolicy {
                     low_trust_read_only_allowed: true,
                 },
+                &overlay_capabilities(),
             )
         };
 
@@ -1717,6 +1806,7 @@ mod tests {
                 ReusableStateConsumptionPolicy {
                     low_trust_read_only_allowed: true,
                 },
+                &overlay_capabilities(),
             ),
             ReusableStateConsumptionDisposition::MissReset {
                 reason: ReusableStateMissReason::InvalidatedPreferredGeneration
