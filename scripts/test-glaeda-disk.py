@@ -117,6 +117,8 @@ class GlaedaDiskTest(unittest.TestCase):
         mods = self.root / "mods"
         (mods / "node_modules/x/y/z/w/v/u").mkdir(parents=True)
         self.assertEqual(gd.git_state(mods), "none")
+        (self.root / "clone/target/.git").mkdir(parents=True)
+        self.assertEqual(gd.git_state(self.root / "clone"), "git")
         (self.root / "repo/sub/.git").mkdir(parents=True)
         self.assertEqual(gd.git_state(self.root / "repo"), "git")
 

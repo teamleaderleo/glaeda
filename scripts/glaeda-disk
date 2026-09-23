@@ -215,7 +215,7 @@ def git_state(path: Path, depth: int = 5, budget: int = 20000) -> str:
     searched without finding one, "unchecked" when the search could not finish.
 
     A clone inside a scratch directory can hold unpushed commits, so callers treat "unchecked"
-    like "git" (fail closed). Package and build-output directories are not searched.
+    like "git" (fail closed). Package and build-output directories are only checked for a .git of their own, not searched.
     """
     frontier = [str(path)]
     for _ in range(depth + 1):
@@ -229,8 +229,11 @@ def git_state(path: Path, depth: int = 5, budget: int = 20000) -> str:
                             return "unchecked"
                         if e.name == ".git":
                             return "git"
-                        if e.is_dir(follow_symlinks=False) and e.name not in REPRODUCIBLE_DIRS:
-                            nxt.append(e.path)
+                        if e.is_dir(follow_symlinks=False):
+                            if e.name not in REPRODUCIBLE_DIRS:
+                                nxt.append(e.path)
+                            elif os.path.lexists(os.path.join(e.path, ".git")):
+                                return "git"  # e.g. `git clone x target`; not searched deeper
             except PermissionError:
                 return "unchecked"
             except OSError:
