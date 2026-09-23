@@ -109,20 +109,14 @@ def _stable_profile_sets(
             continue
         if group[0].get("resource_policy_status") != "enforced":
             continue
-        p90_values = [
-            item.get("final_result_latency_ms", {}).get("p90")
-            for item in group
-        ]
-        if any(
-            isinstance(value, bool) or not isinstance(value, (int, float))
-            for value in p90_values
-        ):
-            continue
-        best_p90 = min(float(value) for value in p90_values)
-
         unmeasured: list[str] = []
         for item in group:
             label = _window_label(item)
+            p90 = _measured_number(item.get("final_result_latency_ms", {}).get("p90"))
+            if p90 is None or p90 < 0:
+                unmeasured.append(
+                    f"{label} has no finite nonnegative p90, so latency stability is unproven"
+                )
             counts = item.get("counts") or {}
             if _measured_number(counts.get("failure_count")) is None:
                 unmeasured.append(
@@ -138,6 +132,7 @@ def _stable_profile_sets(
             unproven.extend(unmeasured)
             continue
 
+        best_p90 = min(item["final_result_latency_ms"]["p90"] for item in group)
         if all(
             item["counts"]["validated_completions"] == item["counts"]["offered"]
             and item["counts"]["unfinished"] == 0
