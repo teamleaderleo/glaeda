@@ -1244,9 +1244,9 @@ def _absent(path: Path) -> bool:
     """
     try:
         os.lstat(path)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return True
-    except OSError:
+    except (OSError, ValueError):
         return False
     return False
 
