@@ -4,6 +4,13 @@
     glaeda-disk                     report: biggest items, verdicts, reclaimable total
     glaeda-disk --apply             delete every reclaimable item, largest first
     glaeda-disk --pressure --apply  act only under disk pressure, stop at the free target
+    glaeda-disk --refresh           re-measure every size now instead of using the snapshot
+
+macOS keeps no directory sizes (Spotlight has none for folders), so measuring
+means walking every file, which is disk-latency bound. Sizes are therefore kept
+in a snapshot: a report prints instantly from it, re-judges every verdict live
+(processes, idle time, git), sizes only new items, and re-measures in the
+background once the snapshot is older than --max-age minutes.
 
 Only families whose contents are reproducible build output or scratch space are
 ever deleted. Everything else is reported so the space is at least visible.
@@ -29,6 +36,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 HOME = Path.home()
+SNAPSHOT = HOME / ".cache/glaeda-disk/sizes.json"
 GIB = 1024**3
 DARWIN = platform.system() == "Darwin"
 
@@ -85,23 +93,36 @@ def du_bytes(path: Path) -> int:
         return 0
 
 
-def newest_mtime(path: Path, levels: int = 2) -> float:
-    newest = 0.0
-    frontier = [path]
-    for _ in range(levels + 1):
-        nxt = []
-        for p in frontier:
+def newest_mtime(path: Path, levels: int = 2, budget: int = 3000) -> float:
+    """Newest mtime of path and entries up to `levels` below it, visiting at most `budget` entries.
+
+    Build tools touch top-level files (DerivedData info.plist, logs) on every run, so a shallow,
+    bounded look is enough to see activity without walking the whole tree.
+    """
+    try:
+        newest = path.lstat().st_mtime
+    except OSError:
+        return 0.0
+    frontier = [str(path)]
+    for _ in range(levels):
+        nxt: list[str] = []
+        for d in frontier:
             try:
-                st = p.lstat()
+                with os.scandir(d) as it:
+                    for e in it:
+                        if budget <= 0:
+                            return newest
+                        budget -= 1
+                        try:
+                            st = e.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        newest = max(newest, st.st_mtime)
+                        if stat.S_ISDIR(st.st_mode):
+                            nxt.append(e.path)
             except OSError:
-                continue
-            newest = max(newest, st.st_mtime)
-            if stat.S_ISDIR(st.st_mode):
-                try:
-                    nxt.extend(p.iterdir())
-                except OSError:
-                    pass
-        frontier = nxt[:5000]
+                pass
+        frontier = nxt
     return newest
 
 
@@ -116,6 +137,8 @@ def process_evidence() -> tuple[list[str], str]:
 
 
 def named_by(path: str, cmds: str) -> bool:
+    if path not in cmds:
+        return False
     return re.search(re.escape(path) + r"(?=$|[/\s'\"=:])", cmds, re.M) is not None
 
 
@@ -153,37 +176,72 @@ def candidates(fam: Family) -> list[Path]:
     return [p for p in level if p.lstat().st_uid == uid]
 
 
-def survey(families: list[Family], idle_hours: float, min_bytes: int) -> list[Item]:
-    cwds, cmds = process_evidence()
+def load_snapshot(path: Path = SNAPSHOT) -> tuple[float, dict[str, int]]:
+    try:
+        doc = json.loads(path.read_text())
+        return float(doc["at"]), {k: int(v) for k, v in doc["sizes"].items()}
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0.0, {}
+
+
+def save_snapshot(sizes: dict[str, int], path: Path = SNAPSHOT) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"at": time.time(), "sizes": sizes}))
+    os.replace(tmp, path)
+
+
+def _fresh(path: Path, seconds: float) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime < seconds
+    except OSError:
+        return False
+
+
+def survey(families: list[Family], idle_hours: float, min_bytes: int,
+           known: dict[str, int] | None = None) -> list[Item]:
+    """Judge every candidate live. Sizes come from `known` when present; the rest are measured."""
+    with ThreadPoolExecutor(max_workers=1) as bg:
+        evidence = bg.submit(process_evidence)  # lsof is the slowest single call; overlap it
+        return _survey(families, idle_hours, min_bytes, known, evidence)
+
+
+def _survey(families, idle_hours, min_bytes, known, evidence) -> list[Item]:
     now = time.time()
     items: list[Item] = []
+    known = known if known is not None else {}
     work = [(fam, path) for fam in families for path in candidates(fam)]
+    missing = [path for _, path in work if str(path) not in known]
     with ThreadPoolExecutor(max_workers=8) as pool:
-        sizes = list(pool.map(lambda fp: du_bytes(fp[1]), work))
-    for (fam, path), size in zip(work, sizes):
-        if True:
-            if size < min_bytes:
-                continue
-            idle = (now - newest_mtime(path)) / 3600
-            sp = str(path)
-            reasons = []
-            if in_cwd(sp, cwds):
-                reasons.append("process cwd inside")
-            if named_by(sp, cmds):
-                reasons.append("named by a running command")
-            if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_hours * 3600):
-                reasons.append("claude session active")
-            if not fam.reclaimable:
-                verdict = "report-only"
-            elif reasons:
-                verdict = "in-use"
-            elif fam.id != "xcode-derived-data" and has_git(path):
-                verdict = "git-checkout"
-            elif idle < idle_hours:
-                verdict = "recent"
-            else:
-                verdict = "reclaimable"
-            items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons))
+        measured = dict(zip(map(str, missing), pool.map(du_bytes, missing)))
+    known.update(measured)
+    sizes = [known[str(path)] for _, path in work]
+    idles = [(now - newest_mtime(path, 2 if fam.reclaimable else 1,
+                                 3000 if fam.reclaimable else 300)) / 3600
+             if size >= min_bytes else 0.0 for (fam, path), size in zip(work, sizes)]
+    cwds, cmds = evidence.result()
+    for (fam, path), size, idle in zip(work, sizes, idles):
+        if size < min_bytes:
+            continue
+        sp = str(path)
+        reasons = []
+        if in_cwd(sp, cwds):
+            reasons.append("process cwd inside")
+        if named_by(sp, cmds):
+            reasons.append("named by a running command")
+        if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_hours * 3600):
+            reasons.append("claude session active")
+        if not fam.reclaimable:
+            verdict = "report-only"
+        elif reasons:
+            verdict = "in-use"
+        elif fam.id != "xcode-derived-data" and has_git(path):
+            verdict = "git-checkout"
+        elif idle < idle_hours:
+            verdict = "recent"
+        else:
+            verdict = "reclaimable"
+        items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons))
     items.sort(key=lambda i: i.bytes, reverse=True)
     return items
 
@@ -275,6 +333,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--min-mib", type=int, default=50)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--refresh", action="store_true", help="re-measure all sizes now")
+    ap.add_argument("--max-age", type=float, default=15,
+                    help="minutes before the size snapshot is refreshed in the background (default 15)")
+    ap.add_argument("--no-snapshot", action="store_true", help=argparse.SUPPRESS)  # tests
     ap.add_argument("--receipt", type=Path,
                     default=HOME / "Projects/recovery/disk-reclaim/receipts.jsonl")
     ap.add_argument("--root-override", action="append", default=[], metavar="ID=PATH",
@@ -295,7 +357,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no pressure: {gib(free).strip()} free >= {a.low:g}G")
         return 0
     idle = a.idle_hours if a.idle_hours is not None else (6 if under else 24)
-    items = survey(fams, idle, a.min_mib * 1024**2)
+    at, known = (0.0, {}) if a.refresh or a.no_snapshot else load_snapshot()
+    before = len(known)
+    items = survey(fams, idle, a.min_mib * 1024**2, known)
+    age_min = (time.time() - at) / 60 if at else 0.0
+    if not a.no_snapshot:
+        lock = SNAPSHOT.with_suffix(".refreshing")
+        if a.refresh:
+            # merge, so a --family refresh keeps the other families' sizes
+            save_snapshot({**load_snapshot()[1], **known})
+            lock.unlink(missing_ok=True)
+        elif not at or len(known) > before:
+            save_snapshot(known)
+        if at and age_min > a.max_age and not a.apply and not _fresh(lock, 600):
+            lock.touch()
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), "--refresh", "--top", "0",
+                              "--min-mib", "0"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+    if at and not a.json:
+        print(f"sizes from {age_min:.0f} min ago"
+              f"{' (refreshing in background)' if age_min > a.max_age and not a.apply else ''};"
+              " verdicts are live\n")
     if a.json:
         print(json.dumps({"free": free, "total": total, "idle_hours": idle,
                           "items": [asdict(i) for i in items]}, indent=2))

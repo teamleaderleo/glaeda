@@ -101,6 +101,21 @@ class GlaedaDiskTest(unittest.TestCase):
         finally:
             receipt.unlink(missing_ok=True)
 
+    def test_known_sizes_are_reused_and_new_items_measured(self) -> None:
+        old, new = make(self.root / "old"), make(self.root / "new")
+        known = {str(old): 7 * 1024**3}
+        sizes = {Path(i.path).name: i.bytes for i in gd.survey([self.fam], 24, 0, known)}
+        self.assertEqual(sizes["old"], 7 * 1024**3)
+        self.assertGreater(sizes["new"], 0)
+        self.assertIn(str(new), known)  # measured size is kept for the next snapshot
+
+    def test_snapshot_round_trip_and_corrupt_snapshot_is_empty(self) -> None:
+        snap = self.root / "sizes.json"
+        gd.save_snapshot({"/a": 1}, snap)
+        self.assertEqual(gd.load_snapshot(snap)[1], {"/a": 1})
+        snap.write_text("{not json")
+        self.assertEqual(gd.load_snapshot(snap), (0.0, {}))
+
 
 if __name__ == "__main__":
     unittest.main()
