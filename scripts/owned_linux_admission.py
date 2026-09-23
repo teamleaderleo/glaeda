@@ -364,7 +364,7 @@ def observe(root, demand=VERIFY_FOCUSED_DEMAND):
 
 
 class Reservation:
-    def __init__(self, root, fingerprint, unit, binding, demand=VERIFY_FOCUSED_DEMAND,
+    def __init__(self, root, fingerprint, unit, binding, demand,
                  *, resume_existing=False):
         self.demand = validated_demand(demand)
         self.store = Store(root)

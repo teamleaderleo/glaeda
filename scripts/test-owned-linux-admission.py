@@ -129,6 +129,15 @@ class AdmissionTests(unittest.TestCase):
             gate.check(self.policy, object())
         self.query_mock.assert_not_called()
 
+    def test_fresh_reservation_requires_demand_before_opening_store(self):
+        before = {p.name: p.read_bytes() for p in self.admission.iterdir()}
+        with mock.patch.object(gate, "Store") as store:
+            with self.assertRaisesRegex(TypeError, "demand"):
+                gate.Reservation(self.admission, self.fingerprint, self.unit, self.binding())
+            store.assert_not_called()
+        self.query_mock.assert_not_called()
+        self.assertEqual({p.name: p.read_bytes() for p in self.admission.iterdir()}, before)
+
     def test_reviewed_demand_is_rechecked_at_launch_boundary(self):
         available = {"bytes": 20 * 1024**3}
 
@@ -270,7 +279,8 @@ class AdmissionTests(unittest.TestCase):
         return "sha256:" + "f" * 64
 
     def reservation(self):
-        return gate.Reservation(self.admission, self.fingerprint, self.unit, self.binding())
+        return gate.Reservation(self.admission, self.fingerprint, self.unit, self.binding(),
+                                gate.VERIFY_FOCUSED_DEMAND)
 
     def test_serial_slot_and_crash_reservation_are_not_reclaimed(self):
         with self.reservation() as first:
