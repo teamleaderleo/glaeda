@@ -91,7 +91,7 @@ let the gate hold the line.
 | `actions_runner_readiness` | `all` | library | 7 |
 | `adaptive_ci_routing` | `all` | none | 0 |
 | `adaptive_verification_compiler` | `all` | library | 2 |
-| `artifact` | `all` | binary | 160 |
+| `artifact` | `all` | binary | 162 |
 | `cache_inventory` | `all` | binary | 5 |
 | `cargo_target_holder_observation` | `target_os="linux"` | binary | 1 |
 | `cargo_target_observation` | `target_os="linux"` | binary | 4 |
@@ -106,8 +106,8 @@ let the gate hold the line.
 | `disposable_attempt_catalog` | `all` | binary | 31 |
 | `disposable_attempt_state` | `all` | binary | 17 |
 | `disposable_clone_runtime` | `unix` | binary | 9 |
-| `disposable_launchd_service` | `all` | binary | 5 |
-| `disposable_launchd_service_status` | `target_os="macos"` | binary | 1 |
+| `disposable_launchd_service` | `all` | binary | 6 |
+| `disposable_launchd_service_status` | `target_os="macos"` | binary | 2 |
 | `disposable_lima_worker` | `all` | binary | 3 |
 | `disposable_prepared_template` | `all` | binary | 22 |
 | `disposable_service_failure_receipt` | `all` | tests | 1 |
@@ -117,7 +117,7 @@ let the gate hold the line.
 | `disposable_worker_reconciler` | `all` | binary | 28 |
 | `disposable_worker_service` | `unix` | binary | 1 |
 | `doctor` | `all` | binary | 1 |
-| `durable_journal` | `all` | binary | 9 |
+| `durable_journal` | `all` | binary | 10 |
 | `durable_lane_execution` | `target_os="linux"` | binary | 6 |
 | `execution_admission` | `all` | binary | 82 |
 | `execution_capacity` | `all` | binary | 3 |
@@ -151,7 +151,7 @@ let the gate hold the line.
 | `immutable_git_object_pool_marker` | `all` | library | 4 |
 | `immutable_git_object_pool_observation` | `target_os="linux"` | library | 2 |
 | `installation_id` | `target_os="linux"` | library | 1 |
-| `journal` | `all` | binary | 37 |
+| `journal` | `all` | binary | 39 |
 | `journal_document` | `all` | binary | 3 |
 | `lane_command` | `all` | binary | 33 |
 | `lane_executable` | `target_os="linux"` | binary | 7 |
@@ -220,7 +220,7 @@ let the gate hold the line.
 | `personal_worker_tick` | `all` | binary | 6 |
 | `personal_worker_verification_plan` | `target_os="linux"` | none | 0 |
 | `plan` | `all` | binary | 1 |
-| `process` | `all` | binary | 72 |
+| `process` | `all` | binary | 73 |
 | `project_catalog` | `all` | binary | 35 |
 | `project_checkout_observation` | `unix` | binary | 11 |
 | `project_discovery` | `unix` | none | 0 |

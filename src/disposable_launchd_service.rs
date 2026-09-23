@@ -7,6 +7,7 @@
 //! and uses only bounded fixed-shape `launchctl` calls. Only bounded path-free reports are public.
 
 pub mod upgrade;
+pub mod upgrade_host;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
