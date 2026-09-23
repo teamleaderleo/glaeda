@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""glaeda-disk: say where the disk went, and reclaim what is safe to rebuild.
+
+    glaeda-disk                     report: biggest items, verdicts, reclaimable total
+    glaeda-disk --apply             delete every reclaimable item, largest first
+    glaeda-disk --pressure --apply  act only under disk pressure, stop at the free target
+
+Only families whose contents are reproducible build output or scratch space are
+ever deleted. Everything else is reported so the space is at least visible.
+An item is never deleted while a process has its cwd inside it, a process command
+line names it, it holds a git checkout, or it changed within the idle window.
+Every deletion is appended to a JSONL receipt.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+HOME = Path.home()
+GIB = 1024**3
+DARWIN = platform.system() == "Darwin"
+
+
+@dataclass(frozen=True)
+class Family:
+    id: str
+    root: Path
+    reclaimable: bool
+    rebuild: str
+    depth: int = 1  # candidates are directories this many levels below root
+    skip: tuple[str, ...] = ()
+
+
+def default_families() -> list[Family]:
+    tmp = Path("/private/tmp") if DARWIN else Path("/tmp")
+    uid = os.getuid()
+    fams = [
+        Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
+               "next xcodebuild rebuilds it"),
+        Family("claude-scratchpad", tmp / f"claude-{uid}", True,
+               "session scratch space; the session is idle", depth=2,
+               skip=("bundled-skills", "bash-edit-diff")),
+        Family("tmp", tmp, True, "agent scratch under the temp dir",
+               skip=(f"claude-{uid}",)),
+        Family("user-cache", HOME / ".cache", False, "tool caches (report only)"),
+        Family("library-caches", HOME / "Library/Caches", False, "app caches (report only)"),
+        Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
+               "use `xcrun simctl delete unavailable` (report only)"),
+        Family("projects", HOME / "Projects", False, "checkouts (report only)",
+               skip=("worktrees", "cmux-worktrees", "glaeda-worktrees")),
+    ]
+    for name in ("worktrees", "cmux-worktrees", "glaeda-worktrees"):
+        fams.append(Family("worktrees", HOME / "Projects" / name, False,
+                           "run glaeda-worktree-reclaim-all (report only)"))
+    return [f for f in fams if f.root.is_dir()]
+
+
+@dataclass
+class Item:
+    family: str
+    path: str
+    bytes: int
+    idle_hours: float
+    verdict: str  # reclaimable | recent | in-use | git-checkout | report-only
+    reasons: list[str] = field(default_factory=list)
+
+
+def du_bytes(path: Path) -> int:
+    out = subprocess.run(["du", "-xsk", str(path)], capture_output=True, text=True)
+    try:
+        return int(out.stdout.split()[0]) * 1024
+    except (IndexError, ValueError):
+        return 0
+
+
+def newest_mtime(path: Path, levels: int = 2) -> float:
+    newest = 0.0
+    frontier = [path]
+    for _ in range(levels + 1):
+        nxt = []
+        for p in frontier:
+            try:
+                st = p.lstat()
+            except OSError:
+                continue
+            newest = max(newest, st.st_mtime)
+            if stat.S_ISDIR(st.st_mode):
+                try:
+                    nxt.extend(p.iterdir())
+                except OSError:
+                    pass
+        frontier = nxt[:5000]
+    return newest
+
+
+def process_evidence() -> tuple[list[str], str]:
+    cwds: list[str] = []
+    lsof = shutil.which("lsof")
+    if lsof:
+        out = subprocess.run([lsof, "-n", "-P", "-d", "cwd", "-Fn"], capture_output=True, text=True)
+        cwds = [line[1:] for line in out.stdout.splitlines() if line.startswith("n/")]
+    cmds = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True).stdout
+    return cwds, cmds
+
+
+def named_by(path: str, cmds: str) -> bool:
+    return re.search(re.escape(path) + r"(?=$|[/\s'\"=:])", cmds, re.M) is not None
+
+
+def in_cwd(path: str, cwds: list[str]) -> bool:
+    return any(c == path or c.startswith(path + "/") for c in cwds)
+
+
+def claude_session_active(session_id: str, idle_s: float) -> bool:
+    for transcript in (HOME / ".claude/projects").glob(f"*/{session_id}.jsonl"):
+        if time.time() - transcript.stat().st_mtime < idle_s:
+            return True
+    return False
+
+
+def has_git(path: Path) -> bool:
+    for probe in [path, *(p for p in _children(path) if p.is_dir())]:
+        if (probe / ".git").exists():
+            return True
+    return False
+
+
+def _children(path: Path) -> list[Path]:
+    try:
+        return list(path.iterdir())
+    except OSError:
+        return []
+
+
+def candidates(fam: Family) -> list[Path]:
+    level = [fam.root]
+    for _ in range(fam.depth):
+        level = [c for p in level for c in _children(p)
+                 if c.name not in fam.skip and c.is_dir() and not c.is_symlink()]
+    uid = os.getuid()
+    return [p for p in level if p.lstat().st_uid == uid]
+
+
+def survey(families: list[Family], idle_hours: float, min_bytes: int) -> list[Item]:
+    cwds, cmds = process_evidence()
+    now = time.time()
+    items: list[Item] = []
+    work = [(fam, path) for fam in families for path in candidates(fam)]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        sizes = list(pool.map(lambda fp: du_bytes(fp[1]), work))
+    for (fam, path), size in zip(work, sizes):
+        if True:
+            if size < min_bytes:
+                continue
+            idle = (now - newest_mtime(path)) / 3600
+            sp = str(path)
+            reasons = []
+            if in_cwd(sp, cwds):
+                reasons.append("process cwd inside")
+            if named_by(sp, cmds):
+                reasons.append("named by a running command")
+            if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_hours * 3600):
+                reasons.append("claude session active")
+            if not fam.reclaimable:
+                verdict = "report-only"
+            elif reasons:
+                verdict = "in-use"
+            elif fam.id != "xcode-derived-data" and has_git(path):
+                verdict = "git-checkout"
+            elif idle < idle_hours:
+                verdict = "recent"
+            else:
+                verdict = "reclaimable"
+            items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons))
+    items.sort(key=lambda i: i.bytes, reverse=True)
+    return items
+
+
+def free_bytes(path: Path) -> tuple[int, int]:
+    u = shutil.disk_usage(path)
+    return u.free, u.total
+
+
+def gib(n: int) -> str:
+    return f"{n / GIB:6.1f}G"
+
+
+def report(items: list[Item], free: int, total: int, limit: int, idle_hours: float) -> None:
+    print(f"free {gib(free).strip()} of {gib(total).strip()} "
+          f"({100 * free / total:.0f}%), idle window {idle_hours:g}h\n")
+    by_fam: dict[str, int] = {}
+    for i in items:
+        by_fam[i.family] = by_fam.get(i.family, 0) + i.bytes
+    print("by family")
+    for fam, n in sorted(by_fam.items(), key=lambda kv: -kv[1]):
+        r = sum(i.bytes for i in items if i.family == fam and i.verdict == "reclaimable")
+        print(f"  {gib(n)}  {fam:20s}  reclaimable {gib(r).strip()}")
+    print(f"\ntop {limit}")
+    for i in items[:limit]:
+        why = f" ({', '.join(i.reasons)})" if i.reasons else ""
+        path = i.path.replace(str(HOME), "~")
+        print(f"  {gib(i.bytes)}  {i.verdict:12s} {i.idle_hours:6.1f}h  {path}{why}")
+    total_r = sum(i.bytes for i in items if i.verdict == "reclaimable")
+    print(f"\nreclaimable now: {gib(total_r).strip()}  ->  glaeda-disk --apply")
+
+
+def remove(path: Path) -> None:
+    if path.is_symlink():
+        raise OSError("refusing symlink")
+    shutil.rmtree(path, ignore_errors=False, onerror=_chmod_retry)
+
+
+def _chmod_retry(func, p, _exc):  # read-only files in SwiftPM/Xcode checkouts
+    os.chmod(p, stat.S_IWUSR | stat.S_IRUSR | stat.S_IXUSR)
+    parent = os.path.dirname(p)
+    os.chmod(parent, stat.S_IWUSR | stat.S_IRUSR | stat.S_IXUSR)
+    func(p)
+
+
+def apply(items: list[Item], families: dict[str, Family], receipt: Path,
+          stop_free: int | None, fs: Path, idle_hours: float) -> int:
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    released = 0
+    cwds, cmds = process_evidence()
+    for i in items:
+        if i.verdict != "reclaimable":
+            continue
+        free, _ = free_bytes(fs)
+        if stop_free is not None and free >= stop_free:
+            break
+        p = Path(i.path)
+        # fresh re-observation right before the destructive step
+        if in_cwd(i.path, cwds) or named_by(i.path, cmds):
+            outcome = "changed:in-use"
+        elif (time.time() - newest_mtime(p)) / 3600 < idle_hours:
+            outcome = "changed:modified"
+        else:
+            try:
+                remove(p)
+                outcome = "reclaimed"
+                released += i.bytes
+            except OSError as e:
+                outcome = f"incomplete:{e.__class__.__name__}"
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
+               "outcome": outcome, "rebuild": families[i.family].rebuild, **asdict(i)}
+        with receipt.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+        print(f"  {outcome:16s} {gib(i.bytes)}  {i.path.replace(str(HOME), '~')}")
+    print(f"released {gib(released).strip()}; receipt {receipt}")
+    return released
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true", help="delete reclaimable items")
+    ap.add_argument("--pressure", action="store_true",
+                    help="only act when free space is below --low; stop at --target")
+    ap.add_argument("--low", type=float, default=60, help="pressure threshold, GiB free (default 60)")
+    ap.add_argument("--target", type=float, default=100, help="stop freeing at this many GiB free (default 100)")
+    ap.add_argument("--idle-hours", type=float, default=None,
+                    help="idle window (default 24h, or 6h under pressure)")
+    ap.add_argument("--family", action="append", help="limit to these family ids")
+    ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--min-mib", type=int, default=50)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--receipt", type=Path,
+                    default=HOME / "Projects/recovery/disk-reclaim/receipts.jsonl")
+    ap.add_argument("--root-override", action="append", default=[], metavar="ID=PATH",
+                    help=argparse.SUPPRESS)  # tests
+    a = ap.parse_args(argv)
+
+    fams = default_families()
+    for ov in a.root_override:
+        fid, _, p = ov.partition("=")
+        fams = [Family(f.id, Path(p), f.reclaimable, f.rebuild, f.depth, f.skip) if f.id == fid else f
+                for f in fams]
+    if a.family:
+        fams = [f for f in fams if f.id in a.family]
+    fs = fams[0].root if fams else HOME
+    free, total = free_bytes(fs)
+    under = free < a.low * GIB
+    if a.pressure and not under:
+        print(f"no pressure: {gib(free).strip()} free >= {a.low:g}G")
+        return 0
+    idle = a.idle_hours if a.idle_hours is not None else (6 if under else 24)
+    items = survey(fams, idle, a.min_mib * 1024**2)
+    if a.json:
+        print(json.dumps({"free": free, "total": total, "idle_hours": idle,
+                          "items": [asdict(i) for i in items]}, indent=2))
+    else:
+        report(items, free, total, a.top, idle)
+    if a.apply:
+        print()
+        apply(items, {f.id: f for f in fams}, a.receipt,
+              int(a.target * GIB) if a.pressure else None, fs, idle)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

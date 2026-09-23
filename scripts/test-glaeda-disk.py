@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Contract tests for scripts/glaeda-disk."""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+loader = importlib.machinery.SourceFileLoader("glaeda_disk", os.fspath(ROOT / "scripts" / "glaeda-disk"))
+spec = importlib.util.spec_from_loader("glaeda_disk", loader)
+gd = importlib.util.module_from_spec(spec)
+sys.modules["glaeda_disk"] = gd
+loader.exec_module(gd)
+
+
+def make(path: Path, mib: int = 1, age_hours: float = 48) -> Path:
+    path.mkdir(parents=True)
+    (path / "blob").write_bytes(b"\0" * (mib * 1024 * 1024))
+    t = time.time() - age_hours * 3600
+    for p in (path / "blob", path):
+        os.utime(p, (t, t))
+    return path
+
+
+class GlaedaDiskTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.fam = gd.Family("xcode-derived-data", self.root, True, "rebuild")
+        self.gd_evidence = gd.process_evidence
+        gd.process_evidence = lambda: ([], "")
+
+    def tearDown(self) -> None:
+        gd.process_evidence = self.gd_evidence
+        self.tmp.cleanup()
+
+    def verdicts(self, idle: float = 24) -> dict[str, str]:
+        return {Path(i.path).name: i.verdict for i in gd.survey([self.fam], idle, 0)}
+
+    def test_idle_is_reclaimable_recent_is_not(self) -> None:
+        make(self.root / "old")
+        make(self.root / "new", age_hours=1)
+        self.assertEqual(self.verdicts(), {"old": "reclaimable", "new": "recent"})
+
+    def test_process_cwd_and_command_line_veto(self) -> None:
+        a, b = make(self.root / "a"), make(self.root / "b")
+        make(self.root / "a-sibling")
+        gd.process_evidence = lambda: ([str(a / "sub")], f"xcodebuild -derivedDataPath {b} build\n")
+        v = self.verdicts()
+        self.assertEqual(v["a"], "in-use")
+        self.assertEqual(v["b"], "in-use")
+        # a prefix of another path must not veto it
+        self.assertEqual(v["a-sibling"], "reclaimable")
+
+    def test_git_checkout_is_never_reclaimable_outside_derived_data(self) -> None:
+        self.fam = gd.Family("tmp", self.root, True, "scratch")
+        repo = make(self.root / "repo")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        os.utime(repo, (time.time() - 48 * 3600,) * 2)
+        os.utime(repo / ".git", (time.time() - 48 * 3600,) * 2)
+        self.assertEqual(gd.survey([self.fam], 24, 0)[0].verdict, "git-checkout")
+
+    def test_report_only_family_is_never_deleted(self) -> None:
+        self.fam = gd.Family("user-cache", self.root, False, "report")
+        make(self.root / "cache")
+        items = gd.survey([self.fam], 24, 0)
+        self.assertEqual(items[0].verdict, "report-only")
+        receipt = self.root.parent / f"{self.root.name}-receipt.jsonl"
+        gd.apply(items, {"user-cache": self.fam}, receipt, None, self.root, 24)
+        self.assertTrue((self.root / "cache").exists())
+        self.assertFalse(receipt.exists())
+
+    def test_apply_deletes_and_writes_receipt(self) -> None:
+        make(self.root / "old")
+        receipt = self.root.parent / f"{self.root.name}-receipt.jsonl"
+        try:
+            items = gd.survey([self.fam], 24, 0)
+            gd.apply(items, {self.fam.id: self.fam}, receipt, None, self.root, 24)
+            self.assertFalse((self.root / "old").exists())
+            self.assertIn('"outcome": "reclaimed"', receipt.read_text())
+        finally:
+            receipt.unlink(missing_ok=True)
+
+    def test_apply_rechecks_and_skips_item_touched_since_survey(self) -> None:
+        d = make(self.root / "old")
+        items = gd.survey([self.fam], 24, 0)
+        (d / "fresh").write_text("x")
+        receipt = self.root.parent / f"{self.root.name}-receipt.jsonl"
+        try:
+            gd.apply(items, {self.fam.id: self.fam}, receipt, None, self.root, 24)
+            self.assertTrue(d.exists())
+            self.assertIn("changed:modified", receipt.read_text())
+        finally:
+            receipt.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    unittest.main()
