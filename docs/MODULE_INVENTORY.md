@@ -35,8 +35,8 @@ being measured.
 
 ## Totals
 
-- Exported modules: **202**
-- Reach: **95 binary**, **62 library**, **11 tests**, **34 none**
+- Exported modules: **203**
+- Reach: **96 binary**, **62 library**, **11 tests**, **34 none**
 - Gate: at most 34 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
 
 ## Exports with no consumer
@@ -163,6 +163,7 @@ let the gate hold the line.
 | `lima_lifecycle` | `all` | binary | 18 |
 | `lima_lifecycle_executor` | `all` | library | 2 |
 | `lima_observation` | `all` | binary | 41 |
+| `linked_worktree_reclaim` | `unix` | binary | 1 |
 | `linux_dynamic_loader_cache` | `target_os="linux"` | library | 1 |
 | `linux_dynamic_loader_config` | `target_os="linux"` | library | 1 |
 | `linux_elf_runtime_dependency` | `target_os="linux"` | library | 2 |
@@ -220,9 +221,9 @@ let the gate hold the line.
 | `personal_worker_tick` | `all` | binary | 6 |
 | `personal_worker_verification_plan` | `target_os="linux"` | none | 0 |
 | `plan` | `all` | binary | 1 |
-| `process` | `all` | binary | 72 |
+| `process` | `all` | binary | 74 |
 | `project_catalog` | `all` | binary | 35 |
-| `project_checkout_observation` | `unix` | binary | 11 |
+| `project_checkout_observation` | `unix` | binary | 13 |
 | `project_discovery` | `unix` | none | 0 |
 | `project_disk_attachment_state` | `all` | none | 0 |
 | `project_disk_filesystem` | `all` | library | 7 |
