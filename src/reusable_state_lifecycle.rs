@@ -14,6 +14,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::artifact::{RepositoryRef, Sha256Digest};
+use crate::hot_state_path_policy::{
+    HotStateAdmissionMismatchField, HotStateAdmissionRefusal, HotStateCapabilityObservation,
+    HotStateForbiddenReason,
+};
+use crate::reusable_state_hot_state_policy::select_reusable_state_hot_state;
 
 pub const REUSABLE_STATE_LIFECYCLE_SCHEMA_VERSION: u8 = 1;
 const HOUR_MILLIS: u64 = 60 * 60 * 1_000;
@@ -768,15 +773,72 @@ pub enum ReusableStateMissReason {
     InvalidatedPreferredGeneration,
     LifecycleUnavailable,
     LowTrustConsumptionDisallowed,
+    HotStateReuseRefused(ReusableStateHotStateRefusal),
+}
+
+/// Why the hot-state reuse ladder refused a generation this layer had already accepted.
+///
+/// Every variant is one cause an operator would act on differently, so a run that never reuses
+/// reports *which* refusal it kept hitting instead of one undifferentiated count. The granularity
+/// is deliberate rather than mechanical: `LadderMismatch` carries the full
+/// `HotStateAdmissionMismatchField` vocabulary because that rung is *derived here*, by comparing
+/// the publisher and consumer admission contexts, and is recoverable from no other record — the
+/// same reason `IdentityMismatch` carries its field. The remaining causes are named classes,
+/// because each is either recoverable from evidence the caller already holds or is structurally
+/// unreachable from this call site (see each variant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "refusal", rename_all = "snake_case")]
+pub enum ReusableStateHotStateRefusal {
+    /// One ladder rung disagreed between the publisher and consumer sides of the same contract.
+    LadderMismatch {
+        rung: HotStateAdmissionMismatchField,
+    },
+    /// The generation holds unique local work, which is permanently ineligible for reuse.
+    UniqueLocalWork,
+    /// The family owner's recorded standing quarantines or permanently forbids the family.
+    ///
+    /// Unreachable from this call site today: `reusable_state_hot_state_policy::family_standing`
+    /// derives standing only from publication, integrity, and revalidation, and
+    /// `evaluate_reusable_state_consumption` has already returned a more specific miss reason for
+    /// each of those before the ladder runs. It stays a named cause so a future standing source
+    /// cannot land here silently.
+    FamilyStandingRefused,
+    /// Physical resource admission refused the candidate.
+    ///
+    /// Unreachable from this call site today: this layer opens no bytes and always offers
+    /// `HotStateResourceDisposition::Accepted`. The family executor owns the real check.
+    ResourceRefused,
+    /// Admission held, but the host offers no reviewed sharing mode that reuses existing bytes.
+    /// This is a host capability gap, not a disagreement about identity.
+    SharingModeUnavailable,
+    /// Admission held but is stale for the current selector — the capability-observation
+    /// generation or the policy path class/reuse identity moved after it was minted.
+    ///
+    /// Unreachable from this call site today: `select_reusable_state_hot_state` mints and spends
+    /// the admission inside one call against one contract and one capability observation, so the
+    /// selector cannot have moved. It guards callers that hold an admission across observations.
+    AdmissionStale,
+    /// The consumer contract cannot be expressed as a hot-state admission context at all.
+    /// This is an error in the contract, not a mismatch between two well-formed sides.
+    ContextUnderivable,
 }
 
 /// Evaluate one read-only consumption attempt. Broken or ambiguous state becomes a miss/reset.
+///
+/// Semantic identity is necessary but not sufficient. A hit additionally requires the hot-state
+/// path-class policy in `crate::reusable_state_hot_state_policy` to admit the published generation
+/// against `capabilities` and to select a mode that reuses existing bytes. An unproven ladder
+/// dimension, a stale capability generation, and a host that does not offer the reviewed sharing
+/// mode each refuse reuse, and each refuses under its own
+/// `HotStateReuseRefused(ReusableStateHotStateRefusal)` cause: a path that never reuses reports
+/// which rung or capability kept refusing rather than one undifferentiated miss.
 #[must_use]
 pub fn evaluate_reusable_state_consumption(
     expected: &ReusableStateIdentityContract,
     generation: &ReusableStateGeneration,
     consumer: ReusableStateConsumerTrust,
     policy: ReusableStateConsumptionPolicy,
+    capabilities: &HotStateCapabilityObservation,
 ) -> ReusableStateConsumptionDisposition {
     if let Some(mismatch) = expected.first_mismatch(&generation.identity) {
         return ReusableStateConsumptionDisposition::MissReset {
@@ -834,8 +896,13 @@ pub fn evaluate_reusable_state_consumption(
         ),
     };
     if usable {
-        ReusableStateConsumptionDisposition::Hit {
-            mode: ReusableStateConsumptionMode::ReadOnly,
+        match hot_state_reuse_refusal(expected, generation, capabilities) {
+            None => ReusableStateConsumptionDisposition::Hit {
+                mode: ReusableStateConsumptionMode::ReadOnly,
+            },
+            Some(refusal) => ReusableStateConsumptionDisposition::MissReset {
+                reason: ReusableStateMissReason::HotStateReuseRefused(refusal),
+            },
         }
     } else {
         ReusableStateConsumptionDisposition::MissReset {
@@ -848,6 +915,50 @@ pub fn evaluate_reusable_state_consumption(
             },
         }
     }
+}
+
+/// The hot-state ladder's verdict on one already-identity-matched generation.
+///
+/// `None` is exactly `select_reusable_state_hot_state(..).is_ok_and(|d| d.reuse_admitted())`, so
+/// the gate is unchanged: every input that refused reuse before still refuses. Only the
+/// attribution is new.
+fn hot_state_reuse_refusal(
+    expected: &ReusableStateIdentityContract,
+    generation: &ReusableStateGeneration,
+    capabilities: &HotStateCapabilityObservation,
+) -> Option<ReusableStateHotStateRefusal> {
+    // An underivable context is an error about the consumer's own contract, not a disagreement
+    // between two well-formed sides, so it must not share a cause with a rung mismatch.
+    let Ok(decision) = select_reusable_state_hot_state(expected, generation, capabilities) else {
+        return Some(ReusableStateHotStateRefusal::ContextUnderivable);
+    };
+    if decision.reuse_admitted() {
+        return None;
+    }
+    if let Some(refusal) = decision.refusal() {
+        return Some(match refusal {
+            HotStateAdmissionRefusal::Mismatch { field } => {
+                ReusableStateHotStateRefusal::LadderMismatch { rung: field }
+            }
+            HotStateAdmissionRefusal::Forbidden {
+                reason: HotStateForbiddenReason::UniqueLocalWork,
+            } => ReusableStateHotStateRefusal::UniqueLocalWork,
+            HotStateAdmissionRefusal::Forbidden { .. }
+            | HotStateAdmissionRefusal::QuarantineRequired { .. } => {
+                ReusableStateHotStateRefusal::FamilyStandingRefused
+            }
+            HotStateAdmissionRefusal::ResourceRefused => {
+                ReusableStateHotStateRefusal::ResourceRefused
+            }
+        });
+    }
+    // Admission held. Either it no longer matches the selector it was minted against, or it does
+    // and the host simply offers no mode that reuses the published bytes.
+    Some(if decision.receipt().candidate_identity_match() {
+        ReusableStateHotStateRefusal::SharingModeUnavailable
+    } else {
+        ReusableStateHotStateRefusal::AdmissionStale
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1309,6 +1420,20 @@ mod tests {
         Sha256Digest::parse(&format!("sha256:{index:064x}")).unwrap()
     }
 
+    fn overlay_capabilities() -> HotStateCapabilityObservation {
+        HotStateCapabilityObservation::new(
+            crate::hot_state_path_policy::HotStateCapabilityGenerationId::parse(
+                "reusable-state-capability-1",
+            )
+            .unwrap(),
+            true,
+            false,
+            true,
+            false,
+            false,
+        )
+    }
+
     fn identity(class: ReusableStateClass) -> ReusableStateIdentityContract {
         ReusableStateIdentityContract::new(
             class,
@@ -1595,6 +1720,7 @@ mod tests {
                 ReusableStateConsumptionPolicy {
                     low_trust_read_only_allowed: true
                 },
+                &overlay_capabilities(),
             ),
             ReusableStateConsumptionDisposition::MissReset { .. }
         ));
@@ -1607,9 +1733,66 @@ mod tests {
                 ReusableStateConsumptionPolicy {
                     low_trust_read_only_allowed: true
                 },
+                &overlay_capabilities(),
             ),
             ReusableStateConsumptionDisposition::Hit {
                 mode: ReusableStateConsumptionMode::ReadOnly
+            }
+        );
+    }
+
+    #[test]
+    fn an_exact_identity_match_without_a_reviewed_sharing_mode_is_miss_reset() {
+        let preferred = preferred(
+            candidate(
+                ReusableStateClass::IncrementalBuildState,
+                metrics(4, 4, 40_000, 4_000, 1_000_000, 2, 4),
+            )
+            .transition(
+                ReusableStateLifecycle::Validated,
+                ReusableStatePromotionPolicy::conservative(),
+            )
+            .unwrap(),
+        );
+        let policy = ReusableStateConsumptionPolicy {
+            low_trust_read_only_allowed: false,
+        };
+        let without_overlay = HotStateCapabilityObservation::new(
+            crate::hot_state_path_policy::HotStateCapabilityGenerationId::parse(
+                "reusable-state-capability-1",
+            )
+            .unwrap(),
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            evaluate_reusable_state_consumption(
+                &preferred.identity,
+                &preferred,
+                ReusableStateConsumerTrust::Trusted,
+                policy,
+                &overlay_capabilities(),
+            ),
+            ReusableStateConsumptionDisposition::Hit {
+                mode: ReusableStateConsumptionMode::ReadOnly
+            }
+        );
+        assert_eq!(
+            evaluate_reusable_state_consumption(
+                &preferred.identity,
+                &preferred,
+                ReusableStateConsumerTrust::Trusted,
+                policy,
+                &without_overlay,
+            ),
+            ReusableStateConsumptionDisposition::MissReset {
+                reason: ReusableStateMissReason::HotStateReuseRefused(
+                    ReusableStateHotStateRefusal::SharingModeUnavailable
+                )
             }
         );
     }
@@ -1634,6 +1817,7 @@ mod tests {
                 ReusableStateConsumptionPolicy {
                     low_trust_read_only_allowed: true,
                 },
+                &overlay_capabilities(),
             )
         };
 
@@ -1717,6 +1901,7 @@ mod tests {
                 ReusableStateConsumptionPolicy {
                     low_trust_read_only_allowed: true,
                 },
+                &overlay_capabilities(),
             ),
             ReusableStateConsumptionDisposition::MissReset {
                 reason: ReusableStateMissReason::InvalidatedPreferredGeneration

@@ -66,6 +66,69 @@ Consumption is always reported as `read_only` by this layer. Trusted consumers m
 validated candidate to build consumer evidence. Lower-trust consumers can receive only a preferred
 generation, and only when the family policy explicitly permits low-trust read-only consumption.
 
+## Sharing-mode admission
+
+Semantic identity is necessary but not sufficient. A hit also requires the hot-state path-class
+policy to admit the published generation and to select a mode that reuses existing bytes. Each
+control below declares its enforcement status and cites the exact path plus symbol the claim rests
+on, the same way `docs/THREAT_MODEL.md` does.
+
+- **enforced** — every read-only consumption hit passes the hot-state reuse ladder.
+  `src/reusable_state_lifecycle.rs::evaluate_reusable_state_consumption` calls
+  `src/reusable_state_hot_state_policy.rs::select_reusable_state_hot_state`, which mints an
+  `AdmittedHotStateCandidate` through
+  `src/hot_state_path_policy/admission.rs::admit_family_evidence` and then asks
+  `src/hot_state_path_policy.rs::HotStatePathPolicy::select` for the mode. Any refusal, any
+  unsupported mode, and any capability-generation drift refuse reuse. Proven by
+  `tests/reusable_state_hot_state_admission.rs`.
+- **enforced** — a ladder refusal is attributed, not counted. Each one carries its own
+  `src/reusable_state_lifecycle.rs::ReusableStateHotStateRefusal` inside
+  `ReusableStateMissReason::HotStateReuseRefused`, mapped by
+  `src/reusable_state_lifecycle.rs::hot_state_reuse_refusal` from
+  `src/reusable_state_hot_state_policy.rs::ReusableStateHotStateDecision::refusal`. A path that
+  refuses 100% of the time therefore reports *what* refused. This is the cmux "0 hits in 112
+  attempts" shape (#1106, #1107) applied to this gate: a refusal you can count but not attribute
+  teaches nothing. Proven by
+  `tests/reusable_state_hot_state_admission.rs::different_hot_state_refusal_causes_produce_distinguishable_miss_reasons`
+  and
+  `tests/reusable_state_hot_state_admission.rs::every_reachable_refusal_cause_reaches_the_serialized_disposition`.
+- **enforced** — the causes this entry point can reach are `sharing_mode_unavailable` (the host
+  offers no reviewed mode that reuses bytes), `unique_local_work`, and `context_underivable` (the
+  contract is not expressible as a hot-state admission context — an error, not a disagreement).
+  `ladder_mismatch` carries the exact refusing rung but is subsumed here:
+  `src/reusable_state_lifecycle.rs::ReusableStateIdentityContract::first_mismatch` runs first and
+  covers every contract field, and
+  `src/reusable_state_hot_state_policy.rs::admission_context` is a pure function of that contract,
+  so contracts that agree on every field derive equal contexts. The rung mismatch is reported one
+  term earlier, by name, as `ReusableStateMissReason::IdentityMismatch`. Pinned by
+  `tests/reusable_state_hot_state_admission.rs::a_ladder_rung_mismatch_is_attributed_by_the_identity_check_that_runs_first`.
+- **required** — `family_standing_refused`, `resource_refused`, and `admission_stale` are named
+  causes for refusals this call site cannot currently produce: standing is derived only from
+  publication, integrity, and revalidation, all of which return a more specific miss reason first;
+  this layer always offers `HotStateResourceDisposition::Accepted`; and the admission is minted and
+  spent inside one `select_reusable_state_hot_state` call. They exist so a future standing source,
+  a real resource check, or a cached admission cannot land in an undifferentiated bucket.
+- **enforced** — the reviewed sharing modes for every reusable-state path class are
+  `immutable_overlay` then `private_empty`
+  (`src/reusable_state_hot_state_policy.rs::REVIEWED_MODES`), because consumption here is
+  read-only. `private_empty` means the consumer reconstructs, which is this contract's miss/reset.
+- **enforced** — the ladder rungs family, binding, project, path class, source, toolchain, policy,
+  profile, validator, and platform are each one field of `ReusableStateIdentityContract`, observed
+  independently on the publisher and consumer sides
+  (`src/reusable_state_hot_state_policy.rs::admission_context`). A mutation of any one of them
+  refuses reuse.
+- **partial** — the trust rung is pinned to
+  `src/reusable_state_hot_state_policy.rs::REUSABLE_STATE_TRUST_GENERATION`. The identity contract
+  records no per-generation trust generation, so that rung is equal on both sides and cannot refuse
+  on its own. Consumer trust stays enforced by this document's own low-trust/lifecycle gate, which
+  runs first. A per-generation trust generation belongs to the family owner that publishes it.
+- **required** — physical resource admission. This layer passes
+  `HotStateResourceDisposition::Accepted` because it opens no bytes; the family executor must
+  re-check leases, descriptors, and capacity immediately before it opens the generation.
+- **required** — lease-mutable reusable state. Published generations are treated as
+  `HotStateReusableState::SealedImmutable`, so a lease-mutable candidate is refused on the state
+  class. Lease-mutable families need their own path class and lease generations.
+
 ## Lifecycle
 
 The accepted progression is:
