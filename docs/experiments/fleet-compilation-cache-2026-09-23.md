@@ -29,7 +29,9 @@ compilation-caching gRPC protocol (swiftlang/llvm-project
 | `keyvalue.v1.KeyValueDB` | `GetValue`, `PutValue` | cache key → result | the only poisoning surface |
 
 So the trust split is narrow: anyone may upload objects, only trusted builders may write
-index entries.
+index entries. (One caveat for the real service: a `CASBytes.file_path` upload makes the service read a
+local path chosen by the client, so the node daemon must accept file paths only from its own
+local clients and only inside their build directories.)
 
 The prototype is [`tools/fleet-cas-prototype`](../../tools/fleet-cas-prototype): about 300
 lines of Rust (tonic), one file per object, SHA-256 IDs, damaged objects read as misses,
@@ -47,6 +49,9 @@ first-writer-wins index entries, and an optional read-only index.
   `…_OTHER_PREFIX_MAPPINGS=<DerivedData>=/^derived`) keeps keys path-independent.
 - Harness: [`xcode-cache-build.sh`](../../tools/fleet-cas-prototype/scripts/xcode-cache-build.sh).
   Hits and misses are counted from Xcode's own `cache hit` / `cache miss` remarks.
+  Xcode emits these per cache query, not per compile step, and a filling build queries more
+  (348 remarks) than a replaying one (190), so compare hit/miss ratios within a row, not
+  counts across rows.
 
 ## Results
 

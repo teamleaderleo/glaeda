@@ -33,6 +33,7 @@ PKG=... SCHEME=... WORK=... scripts/xcode-cache-build.sh fill \
 Keep the socket path short; macOS limits unix socket paths to 104 bytes.
 
 Known prototype gaps, all measured in the experiment: it must run on the same
-host as the build (the client sends large blobs as local file paths), it does
-not require a KV entry's objects to be present before accepting the entry, and
-it has no size budget or eviction.
+host as the build (the client sends large blobs as local file paths, and the
+prototype reads whatever path it is given, so run it only for your own user),
+it does not require a KV entry's objects to be present before accepting the
+entry, and it has no size budget or eviction.

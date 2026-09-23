@@ -76,10 +76,33 @@ fn object_id(refs: &[cas::CasDataId], data: &[u8]) -> Vec<u8> {
     h.finalize().to_vec()
 }
 
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn temp_path(path: &Path) -> PathBuf {
+    let seq = TEMP_SEQ.fetch_add(1, Relaxed);
+    path.with_extension(format!("tmp{}.{seq}", std::process::id()))
+}
+
+/// Replace `path` atomically. Used for CAS objects, where any intact copy is
+/// equivalent, so a concurrent writer winning is harmless.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let tmp = temp_path(path);
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
+}
+
+/// Publish `path` only if it does not exist yet (hard link fails on an
+/// existing target), so concurrent KV writers cannot replace the first entry.
+fn publish_new(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    let tmp = temp_path(path);
+    std::fs::write(&tmp, bytes)?;
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 impl Store {
@@ -139,6 +162,11 @@ impl Store {
     }
 
     fn get(&self, id: &[u8]) -> Result<Option<cas::CasObject>, Status> {
+        // Every ID this store issues is a SHA-256 digest; anything else is a miss.
+        if id.len() != 32 {
+            self.stats.cas_get_miss.fetch_add(1, Relaxed);
+            return Ok(None);
+        }
         match std::fs::read(self.cas_path(id)) {
             Ok(bytes) => {
                 // Corruption is a miss, never a wrong answer.
@@ -247,8 +275,14 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
         let s = &self.0;
         match std::fs::read(s.kv_path(&key)) {
             Ok(bytes) => {
-                let value = kv::Value::decode(bytes.as_slice())
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                // A damaged entry is a miss, like a damaged object.
+                let Ok(value) = kv::Value::decode(bytes.as_slice()) else {
+                    s.stats.kv_get_miss.fetch_add(1, Relaxed);
+                    return Ok(Response::new(kv::GetValueResponse {
+                        outcome: kv::get_value_response::Outcome::KeyNotFound as i32,
+                        contents: None,
+                    }));
+                };
                 s.stats.kv_get_hit.fetch_add(1, Relaxed);
                 Ok(Response::new(kv::GetValueResponse {
                     outcome: kv::get_value_response::Outcome::Success as i32,
@@ -283,18 +317,13 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
         let bytes = req.value.unwrap_or_default().encode_to_vec();
         let path = s.kv_path(&req.key);
         s.stats.kv_put.fetch_add(1, Relaxed);
-        // First writer wins: an existing mapping is never replaced.
-        match std::fs::read(&path) {
-            Ok(existing) => {
-                if existing != bytes {
-                    s.stats.kv_put_conflict.fetch_add(1, Relaxed);
-                }
-            }
-            Err(_) => {
-                std::fs::create_dir_all(path.parent().unwrap())
-                    .and_then(|_| write_atomic(&path, &bytes))
-                    .map_err(|e| Status::internal(e.to_string()))?;
-            }
+        // First writer wins, including under concurrency: an existing mapping
+        // is never replaced, and a differing write is only counted.
+        let published = std::fs::create_dir_all(path.parent().unwrap())
+            .and_then(|_| publish_new(&path, &bytes))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !published && std::fs::read(&path).is_ok_and(|existing| existing != bytes) {
+            s.stats.kv_put_conflict.fetch_add(1, Relaxed);
         }
         Ok(Response::new(kv::PutValueResponse { error: None }))
     }
