@@ -6,6 +6,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location("bundle", Path(__file__).with_name("fleet_bundle.py"))
 b = importlib.util.module_from_spec(SPEC)
@@ -84,6 +85,22 @@ class BundleTests(unittest.TestCase):
                     archive.addfile(entry, io.BytesIO(raw))
             raw = output.getvalue()
             with self.subTest(kind=kind), self.assertRaises(b.BundleError):
+                b.verify(raw, b.sha256(raw), SOURCE, TARGET)
+
+    def test_compressed_extended_headers_cannot_bypass_expansion_limit(self):
+        payload, manifest = fixture()
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
+            for name, raw in {**payload, "manifest.json": b.canonical(manifest)}.items():
+                entry = tarfile.TarInfo(name)
+                entry.size = len(raw)
+                entry.mode = 0o755 if name == "bin/glaeda" else 0o644
+                entry.pax_headers = {"comment": "x" * 65536}
+                archive.addfile(entry, io.BytesIO(raw))
+        raw = output.getvalue()
+        self.assertLess(len(raw), 16384)
+        with mock.patch.object(b, "MAX_TOTAL", 16384):
+            with self.assertRaisesRegex(b.BundleError, "expands beyond"):
                 b.verify(raw, b.sha256(raw), SOURCE, TARGET)
 
     def test_source_requires_exact_clean_checkout(self):

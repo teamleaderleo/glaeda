@@ -135,7 +135,13 @@ def verify(raw: bytes, expected_sha256: str, source: str, target: str) -> dict:
     contents = {}
     total = 0
     try:
-        with tarfile.open(fileobj=io.BytesIO(raw), mode="r|gz") as archive:
+        # tarfile consumes PAX/GNU metadata before yielding members. Bound the
+        # entire decompressed stream, including those headers, before parsing.
+        with gzip.GzipFile(fileobj=io.BytesIO(raw), mode="rb") as compressed:
+            tar_bytes = compressed.read(MAX_TOTAL + 1)
+        if len(tar_bytes) > MAX_TOTAL:
+            raise BundleError("candidate archive expands beyond size limit")
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
             for entry in archive:
                 if (entry.name not in PAYLOAD | {"manifest.json"}
                         or entry.name in contents or not entry.isfile()
