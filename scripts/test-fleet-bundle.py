@@ -204,7 +204,7 @@ class BundleTests(unittest.TestCase):
     def test_stage_rejects_payload_changes_before_completion(self):
         payload, manifest = fixture()
         raw = b.archive_bytes(payload, manifest)
-        for attack in ("directory", "replace", "contents", "mode", "hardlink", "symlink"):
+        for attack in ("directory", "replace", "contents", "mode", "hardlink", "symlink", "generation-mode"):
             with self.subTest(attack=attack), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
                 destination = root / "candidate"
@@ -224,6 +224,8 @@ class BundleTests(unittest.TestCase):
                             binary.write_bytes(b"foreign")
                         elif attack == "contents":
                             binary.write_bytes(b"changed")
+                        elif attack == "generation-mode":
+                            destination.chmod(0o777)
                         elif attack == "mode":
                             binary.chmod(0o777)
                         elif attack == "hardlink":

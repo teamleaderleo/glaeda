@@ -275,7 +275,9 @@ def stage(raw: bytes, digest: str, source: str, target: str, destination: Path, 
             os.close(observed)
         named = os.stat(destination.name, dir_fd=parent, follow_symlinks=False)
         held = os.fstat(generation)
-        if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):
+        if ((named.st_dev, named.st_ino) != (held.st_dev, held.st_ino)
+                or not stat.S_ISDIR(named.st_mode) or named.st_uid != os.geteuid()
+                or stat.S_IMODE(named.st_mode) != 0o700):
             raise BundleError("generation directory moved during staging")
         for name, fd in directories.items():
             named_dir = os.stat(name, dir_fd=generation, follow_symlinks=False)
