@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import copy
 import importlib.machinery
@@ -2096,21 +2097,35 @@ class UpgradeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(mf.Failure, "candidate needs"):
             mf.load_manifest(write_manifest(tmp, data))
 def reservation_line(owner: str = "leo@air", purpose: str = "chromium campaign", since: int | None = None,
-                     until: int | None = None) -> str:
+                     until: int | None = None, raw: bytes | None = None) -> str:
+    """The probe's line for a marker on the host: raw bytes, base64 on one line."""
     now = int(time.time())
-    return f"reservation\t{owner}|{purpose}|{since if since is not None else now - 60}|{until if until is not None else now + 3600}\n"
+    if raw is None:
+        raw = json.dumps({"schema": "glaeda-reservation/v1", "owner": owner, "purpose": purpose,
+                          "since": since if since is not None else now - 60,
+                          "until": until if until is not None else now + 3600}).encode()
+    return "reservation_raw\t" + base64.b64encode(raw).decode() + "\n"
 
 
 class ReservationProbeParsingTests(unittest.TestCase):
-    def test_parses_fields_and_keeps_a_bar_in_the_purpose(self) -> None:
-        got = mf.parse_probe("reservation\tleo@air|build a | b|100|200\nhost_lock\theld\n")
-        self.assertEqual(got["reservation"], {"valid": True, "owner": "leo@air", "purpose": "build a | b",
+    def test_parses_the_raw_marker_with_the_shared_rule(self) -> None:
+        got = mf.parse_probe(reservation_line(purpose="build a | b\tc", since=100, until=200) + "host_lock\theld\n")
+        self.assertEqual(got["reservation"], {"valid": True, "owner": "leo@air", "purpose": "build a | b\tc",
                                               "since": 100, "until": 200})
         self.assertEqual(got["host_lock"], "held")
+        self.assertIs(mf.reservation_rules, sys.modules["glaeda_reservation"])
 
-    def test_invalid_and_malformed_lines_are_invalid(self) -> None:
-        for value in ("invalid", "leo@air|x|1", "leo@air|x|a|2", "|x|1|2", "leo@air||1|2"):
-            self.assertEqual(mf.parse_probe(f"reservation\t{value}\n")["reservation"], {"valid": False}, value)
+    def test_invalid_markers_say_why(self) -> None:
+        good = {"schema": "glaeda-reservation/v1", "owner": "a", "purpose": "b", "since": 1, "until": 2}
+        for raw, why in ((b"not json", "not JSON"), (json.dumps({**good, "until": 2.5}).encode(), "until"),
+                         (json.dumps({**good, "until": True}).encode(), "until"),
+                         (json.dumps({**good, "schema": "v0"}).encode(), "schema"),
+                         (b"\xff", "UTF-8"), (b" " * 4097, "over 4096")):
+            got = mf.parse_probe(reservation_line(raw=raw))["reservation"]
+            self.assertFalse(got["valid"], raw[:30])
+            self.assertIn(why, got["why"])
+        self.assertFalse(mf.parse_probe("reservation_raw\t!!notbase64\n")["reservation"]["valid"])
+        self.assertEqual(mf.parse_probe("reservation\tinvalid\n")["reservation"]["valid"], False)
 
     def test_no_marker_is_none(self) -> None:
         got = mf.parse_probe("user\tbuilder\n")
@@ -2123,7 +2138,7 @@ class ReservationProbeParsingTests(unittest.TestCase):
         self.assertIsNone(mf.reservation_state(None, 0))
 
 
-@unittest.skipUnless(shutil.which("plutil") and shutil.which("perl"), "needs macOS plutil and perl")
+@unittest.skipUnless(shutil.which("perl") and shutil.which("base64"), "needs perl and base64")
 class ReservationProbeScriptTests(unittest.TestCase):
     """Runs the real probe against a temporary fleet root."""
 
@@ -2133,6 +2148,7 @@ class ReservationProbeScriptTests(unittest.TestCase):
                              env={"HOME": os.fspath(root), "PATH": "/usr/bin:/bin"}).stdout
         return mf.parse_probe(out)
 
+    @unittest.skipUnless(os.path.exists("/usr/bin/perl"), "the probe runs /usr/bin/perl")
     def test_marker_and_lock_states(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2143,7 +2159,7 @@ class ReservationProbeScriptTests(unittest.TestCase):
             lock = root / "host.lock"
             lock.touch()
             got = self.run_probe(root)
-            self.assertEqual(got["reservation"], {"valid": True, "owner": "leo@air", "purpose": "two lines",
+            self.assertEqual(got["reservation"], {"valid": True, "owner": "leo@air", "purpose": "two\nlines",
                                                   "since": 5, "until": 9})
             self.assertEqual(got["host_lock"], "free")
             holder = subprocess.Popen(["perl", "-MFcntl=:flock", "-e",
@@ -2159,17 +2175,23 @@ class ReservationProbeScriptTests(unittest.TestCase):
                 holder.wait()
                 holder.stdout.close()
             self.assertEqual(self.run_probe(root)["host_lock"], "free")
+            lock.unlink()
+            lock.symlink_to(root / "reservation.json")
+            self.assertEqual(self.run_probe(root)["host_lock"], "unknown")  # never follows a symlinked lock
 
-    def test_wrong_shapes_are_invalid(self) -> None:
-        good = {"schema": mf.RESERVATION_SCHEMA, "owner": "a", "purpose": "b", "since": 1, "until": 2}
-        for bad in ("not json", json.dumps({**good, "schema": "other"}), json.dumps({**good, "until": 2.5}),
-                    json.dumps({**good, "owner": ""}), json.dumps({**good, "since": "1"}),
-                    json.dumps({**good, "purpose": "x" * 5000})):
-            with tempfile.TemporaryDirectory() as tmp:
-                (Path(tmp) / "reservation.json").write_text(bad)
-                self.assertEqual(self.run_probe(Path(tmp))["reservation"], {"valid": False}, bad[:40])
-                self.assertIsNone(mf.parse_marker(bad), bad[:40])
-        self.assertIsNotNone(mf.parse_marker(json.dumps(good)))
+    def test_symlinked_oversized_and_bad_markers_are_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "reservation.json"
+            marker.write_bytes(b"{" + b" " * 5000 + b"}")
+            self.assertIn("over 4096", self.run_probe(root)["reservation"]["why"])
+            marker.write_text("garbage")
+            self.assertEqual(self.run_probe(root)["reservation"]["why"], "not JSON")
+            marker.unlink()
+            (root / "elsewhere.json").write_text(json.dumps(
+                {"schema": mf.RESERVATION_SCHEMA, "owner": "a", "purpose": "b", "since": 1, "until": 2}))
+            marker.symlink_to(root / "elsewhere.json")
+            self.assertFalse(self.run_probe(root)["reservation"]["valid"])
 
 
 class ReservationCheckAndPoolTests(unittest.TestCase):
@@ -2182,15 +2204,24 @@ class ReservationCheckAndPoolTests(unittest.TestCase):
     def test_active_reservation_is_informational(self) -> None:
         issues = self.issues(reservation_line())
         self.assertEqual(sorted(i["area"] for i in issues), ["pending", "reserved"])
-        self.assertIn("leo@air", [i for i in issues if i["area"] == "reserved"][0]["detail"])
+        self.assertIn("reserved by leo@air for chromium campaign until",
+                      [i for i in issues if i["area"] == "reserved"][0]["detail"])
 
     def test_expired_and_invalid_markers_are_drift_with_release_fix(self) -> None:
         now = int(time.time())
         expired = [i for i in self.issues(reservation_line(since=now - 7200, until=now - 60)) if i["area"] == "reservation"]
         self.assertEqual(len(expired), 1)
         self.assertEqual(expired[0]["fix"], "glaeda-mini-fleet release build-mini-1 --yes")
-        invalid = [i for i in self.issues("reservation\tinvalid\n") if i["area"] == "reservation"]
+        invalid = [i for i in self.issues(reservation_line(raw=b"{}")) if i["area"] == "reservation"]
         self.assertEqual(invalid[0]["fix"].split(", then ")[1], "glaeda-mini-fleet release build-mini-1 --force --yes")
+        self.assertIn("schema", invalid[0]["detail"])
+
+    def test_reservation_beyond_the_cap_is_also_drift(self) -> None:
+        now = int(time.time())
+        areas = [i["area"] for i in self.issues(reservation_line(until=now + 100 * 3600))]
+        self.assertIn("reserved", areas)
+        self.assertIn("reservation", areas)
+        self.assertNotIn("reservation", [i["area"] for i in self.issues(reservation_line(until=now + 71 * 3600))])
 
     def test_expiry_is_judged_at_observation_time(self) -> None:
         obs = observed(**{"build-mini-1": probe_text() + reservation_line(since=100, until=200)})
@@ -2213,6 +2244,7 @@ class ReservationCheckAndPoolTests(unittest.TestCase):
     def test_pools_exclude_reserved_and_busy_members_and_say_why(self) -> None:
         label = "glaeda-std-xcode-26.3"
         for extra, reserved, busy in ((reservation_line(), ["build-mini-1"], []),
+                                      (reservation_line(raw=b"garbage"), ["build-mini-1"], []),  # invalid refuses too
                                       ("host_lock\theld\n", [], ["build-mini-1"]),
                                       (reservation_line() + "host_lock\theld\n", ["build-mini-1"], ["build-mini-1"])):
             got = mf.pools(self.manifest, observed(**{"build-mini-1": probe_text() + extra}), ["build-mini-1"])[label]
@@ -2220,12 +2252,13 @@ class ReservationCheckAndPoolTests(unittest.TestCase):
             self.assertEqual((got["conforming_count"], got["reserved_count"], got["busy_count"]),
                              (0, len(reserved), len(busy)))
         now = int(time.time())
-        for extra in (reservation_line(since=now - 7200, until=now - 1), "host_lock\tfree\n", "reservation\tinvalid\n"):
+        for extra in (reservation_line(since=now - 7200, until=now - 1), "host_lock\tfree\n", "host_lock\tunknown\n"):
             got = mf.pools(self.manifest, observed(**{"build-mini-1": probe_text() + extra}), ["build-mini-1"])[label]
             self.assertEqual((got["conforming"], got["reserved"], got["busy"]), (["build-mini-1"], [], []), extra)
 
 
-@unittest.skipUnless(shutil.which("bash") and shutil.which("shasum"), "needs bash and shasum")
+@unittest.skipUnless(shutil.which("bash") and shutil.which("shasum") and os.path.exists("/usr/bin/perl"),
+                     "needs bash, shasum and /usr/bin/perl")
 class ReserveReleaseTests(unittest.TestCase):
     """SSH is stubbed by running each remote script locally against a temporary fleet root."""
 
@@ -2288,7 +2321,7 @@ class ReserveReleaseTests(unittest.TestCase):
         self.assertGreaterEqual(got["since"], before)
         self.assertEqual(list(got), ["schema", "owner", "purpose", "since", "until"])
         self.assertEqual((self.root / "reservation.json").stat().st_mode & 0o777, 0o664)
-        self.assertEqual([p.name for p in self.root.iterdir()], ["reservation.json"])  # no temp left behind
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), [".reservation.lock", "reservation.json"])  # no temp left behind
         (_n, _u, script, args, stdin), = self.writes()
         self.assertEqual((script, args), (mf.WRITE_RESERVATION, [os.fspath(self.root), "absent"]))
         self.assertEqual(json.loads(stdin), got)
@@ -2311,8 +2344,7 @@ class ReserveReleaseTests(unittest.TestCase):
         theirs = self.put("lawrence@studio", 3600)
         code, out = self.main("reserve", "build-mini-1", "--for", "mine", "--hours", "2", "--yes")
         self.assertEqual(code, 1)
-        self.assertIn("refused: reserved by lawrence@studio", out)
-        self.assertIn("(theirs)", out)
+        self.assertIn("refused: reserved by lawrence@studio for theirs until", out)
         self.assertEqual(self.marker(), theirs)
         self.assertEqual(self.writes(), [])
 
@@ -2360,7 +2392,7 @@ class ReserveReleaseTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("changed since it was read", out)
         self.assertEqual(self.marker()["owner"], "someone@else")
-        self.assertEqual([p.name for p in self.root.iterdir()], ["reservation.json"])
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), [".reservation.lock", "reservation.json"])
 
     def test_release_only_by_owner_unless_forced(self) -> None:
         theirs = self.put("lawrence@studio", 3600)
@@ -2387,6 +2419,37 @@ class ReserveReleaseTests(unittest.TestCase):
         code, out = self.main("release", "build-mini-1", "--yes")
         self.assertEqual(code, 0, out)
         self.assertIn("not reserved", out)
+
+    def test_limits_reject_non_finite_hours(self) -> None:
+        for value in ("nan", "inf"):
+            self.assertEqual(self.main("reserve", "build-mini-1", "--for", "x", "--hours", value)[0], 2)
+        self.assertEqual(self.calls, [])
+
+    def test_writers_serialize_on_the_host(self) -> None:
+        lock = self.root / ".reservation.lock"
+        lock.touch()
+        holder = subprocess.Popen(["perl", "-MFcntl=:flock", "-e",
+                                   'open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; '
+                                   '$| = 1; print "locked\n"; sleep 60', os.fspath(lock)], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline(), "locked\n")
+            code, out = self.main("reserve", "build-mini-1", "--for", "x", "--hours", "1", "--yes")
+        finally:
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
+        self.assertEqual(code, 1)
+        self.assertIn("still running", out)
+        self.assertIsNone(self.marker())
+
+    def test_unwritable_fleet_root_is_refused_plainly(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root writes anywhere")
+        self.root.chmod(0o555)
+        self.addCleanup(self.root.chmod, 0o755)
+        code, out = self.main("reserve", "build-mini-1", "--for", "x", "--hours", "1", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("not writable by", out)
 
     def test_dry_run_leaves_no_file_anywhere(self) -> None:
         self.put("lawrence@studio", -60)

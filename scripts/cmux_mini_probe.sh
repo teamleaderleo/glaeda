@@ -79,25 +79,20 @@ if [ -d "$F" ]; then
   e fleet_worker_sha "$(shasum -a 256 "$F/bin/worker" 2>/dev/null | cut -c1-12)"
   pgrep -f "$F/bin/worker" >/dev/null && e fleet_worker_proc running || e fleet_worker_proc absent
 fi
-# Reservation marker written by glaeda-mini-fleet reserve. plutil reads JSON and checks each type;
-# any other shape, a symlink, or an oversized file is reported as invalid.
+# Reservation marker written by glaeda-mini-fleet reserve. Shipped raw (bounded, base64 on one line)
+# so glaeda_reservation.py parses it on the operator side, as the runner hook does on the host.
 R="$F/reservation.json"
-if [ -e "$R" ] || [ -L "$R" ]; then
-  rv=invalid
-  if [ -f "$R" ] && [ ! -L "$R" ] && [ "$(wc -c < "$R")" -le 4096 ] &&
-     [ "$(plutil -extract schema raw -expect string "$R" 2>/dev/null)" = glaeda-reservation/v1 ] &&
-     ro=$(plutil -extract owner raw -expect string "$R" 2>/dev/null) &&
-     rp=$(plutil -extract purpose raw -expect string "$R" 2>/dev/null) &&
-     rs=$(plutil -extract since raw -expect integer "$R" 2>/dev/null) &&
-     ru=$(plutil -extract until raw -expect integer "$R" 2>/dev/null); then
-    case "$rs$ru" in *[!0-9-]*) ;; *) [ -n "$ro" ] && [ -n "$rp" ] && rv=$(printf '%s|%s|%s|%s' "$ro" "$rp" "$rs" "$ru" | tr '\t\n\r' '   ');; esac
-  fi
-  e reservation "$rv"
+if [ -L "$R" ] || { [ -e "$R" ] && [ ! -f "$R" ]; }; then
+  e reservation invalid
+elif [ -f "$R" ]; then
+  e reservation_raw "$(head -c 4097 "$R" | base64 | tr -d '\n')"
 fi
 # Whether a build holds the fleet host lock right now. A shared, non-blocking flock on a read-only
-# descriptor cannot wait and is dropped at once, so the probe never blocks and never holds admission
-# beyond microseconds (with-host-lock and the worker retry). lsof would miss a root-owned holder
-# and counts an open descriptor as a lock; Python can be a stub on a mini without an Xcode licence.
+# descriptor cannot wait and is dropped at once, so the probe never blocks and holds the lock for
+# microseconds. with-host-lock and the worker retry; a one-shot LOCK_NB taker (recipe-release,
+# disk-pressure) that lands in that window fails or skips that one attempt. lsof would miss a
+# root-owned holder and counts an open descriptor as a lock; Python can be a stub on a mini
+# without an Xcode licence.
 L="$F/host.lock"
 if [ -e "$L" ] || [ -L "$L" ]; then
   hl=$(/usr/bin/perl -MFcntl=:DEFAULT,:flock -e '
