@@ -319,7 +319,7 @@ def bootstrap_problem(code: int, stdout: str, stderr: str) -> str | None:
     doc = read_json_text(stdout)
     if doc is not None and doc.get("eligibleForEnrollment") and code == 0:
         return None
-    if doc is not None and isinstance(doc.get("blockingChecks"), list):
+    if doc is not None and isinstance(doc.get("blockingChecks"), list) and doc["blockingChecks"]:
         missing = (doc.get("observed") or {}).get("toolsMissingFromWorkloadPath") or []
         lines = []
         for check in doc["blockingChecks"]:

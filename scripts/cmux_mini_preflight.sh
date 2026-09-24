@@ -40,10 +40,15 @@ fi
 # Build tools exactly where the workload looks: the fixed PATH, from the checkout (rustup reads
 # rust-toolchain.toml from the working directory).
 cd "$CMUX_ROOT" 2>/dev/null || cd "$HOME"
+# The probe above ran the Xcode shims already; a hashed /usr/bin path would beat WORKLOAD_PATH.
+hash -r
+# Without a developer directory the /usr/bin git, xcodebuild and xcrun shims open an install dialog.
+xcode-select -p >/dev/null 2>&1 && shims=run || shims=skip
 for t in $WORKLOAD_TOOLS; do
   p=$(PATH="$WORKLOAD_PATH" command -v "$t" 2>/dev/null)
   v=""
-  if [ -n "$p" ]; then
+  case "$p" in /usr/bin/*) [ "$shims" = run ] || v="not run: no developer directory selected" ;; esac
+  if [ -n "$p" ] && [ -z "$v" ]; then
     case "$t" in
       zig) v=$("$p" version 2>&1 | first) ;;
       xcodebuild) v=$("$p" -version 2>&1 | first) ;;
@@ -56,7 +61,8 @@ rustup=$(PATH="$WORKLOAD_PATH" command -v rustup 2>/dev/null)
 channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$CMUX_ROOT/Native/DiffSidecar/rust-toolchain.toml" 2>/dev/null | head -1)
 if [ -n "$channel" ] && [ -n "$rustup" ]; then
   out=$(PATH="$WORKLOAD_PATH" "$rustup" run "$channel" rustc --version 2>&1)
-  e pf_rust_channel "$channel|$(printf '%s\n' "$out" | grep -v '^help:' | last)"
+  cargo=$(PATH="$WORKLOAD_PATH" "$rustup" run "$channel" cargo --version 2>&1)
+  e pf_rust_channel "$channel|$(printf '%s\n' "$out" | grep -v '^help:' | last)|$(printf '%s\n' "$cargo" | grep -v '^help:' | last)"
 elif [ -n "$channel" ]; then
   e pf_rust_channel "$channel|"
 fi
@@ -112,8 +118,10 @@ for mark in /opt/homebrew/Cellar /opt/homebrew/bin; do
 done
 
 # A running or prepared macOS update means a restart is coming.
-pgrep -f '(^|[ /])softwareupdate( |$)' >/dev/null && \
-  e pf_update_running "$(pgrep -fl '(^|[ /])softwareupdate( |$)' | grep -v '^[0-9]* sudo ' | head -1 | cut -d' ' -f2- | cut -c1-120)"
+# Only an install or download; softwareupdate -l or --history from a monitoring job is not an update.
+applying='(^|[ /])softwareupdate( .*)? (-i|-ia|-ir|-d|-a|--install|--download|--all|--restart|-R)( |$)'
+pgrep -f "$applying" >/dev/null && \
+  e pf_update_running "$(pgrep -fl "$applying" | grep -v '^[0-9]* sudo ' | head -1 | cut -d' ' -f2- | cut -c1-120)"
 # An update prepared for this build since the last boot is waiting for a restart. One prepared before
 # the last boot survived a restart without applying (suspended), which does not block.
 booted=$(sysctl -n kern.boottime | sed -E 's/^[{] sec = ([0-9]+).*/\1/')

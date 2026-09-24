@@ -458,7 +458,7 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
         path, version = tools.get(tool, ("", ""))
         lines.append(f"pf_tool\t{tool}|{path}|{version if path else ''}")
     if rust:
-        lines.append("pf_rust_channel\t1.88.0|rustc 1.88.0 (abc 2025-06-23)")
+        lines.append("pf_rust_channel\t1.88.0|rustc 1.88.0 (abc 2025-06-23)|cargo 1.88.0 (abc 2025-06-23)")
     lines.append(f"pf_python\t{python}")
     lines += ["pf_cmux\tpresent", "pf_cmux_pin\t26", "pf_zig_min\t0.16.0" if submodules[0][0] == " " else "pf_zig_min\t"]
     lines += [f"pf_submodule\t{s}" for s in submodules]
@@ -567,6 +567,32 @@ class PreflightTests(unittest.TestCase):
         low = preflight_text().replace("disk\t/System/Volumes/Data|460|220", "disk\t/System/Volumes/Data|460|20")
         self.assertEqual(self.states(low)["disk"], "fail")
 
+    def test_bootstrap_refusals_are_predicted(self) -> None:
+        # Each of these passes every tool check yet the fleet bootstrap would refuse the host.
+        pin16 = preflight_text().replace("pf_cmux_pin\t26", "pf_cmux_pin\t16")
+        self.assertEqual(self.states(pin16)["xcode"], "fail")
+        small = preflight_text().replace("cpus\t14", "cpus\t4")
+        self.assertEqual(self.states(small)["os"], "fail")
+        bare = preflight_text().replace("pf_cache_root\tpresent", "pf_cache_root\tmissing")
+        self.assertIn("native cache root", self.result(bare)["checks"]["glaeda"]["detail"])
+        no_cargo = preflight_text().replace("|cargo 1.88.0 (abc 2025-06-23)", "|error: toolchain '1.88.0' is not installed")
+        self.assertEqual(self.states(no_cargo)["rust"], "fail")
+        dubious = preflight_text(submodules=("fatal: detected dubious ownership in repository",))
+        checks = self.result(dubious)["checks"]
+        self.assertIn("dubious ownership", checks["cmux"]["detail"])
+        self.assertEqual(checks["cmux"]["group"], "person")
+
+    def test_unknowns_that_hide_a_refusal_block(self) -> None:
+        del self.manifest["defaults"]["xcode"]
+        result = self.result(preflight_text())
+        self.assertEqual(result["checks"]["xcode"]["state"], "unknown")
+        self.assertFalse(result["ready"])
+
+    def test_metal_is_not_blamed_for_an_unaccepted_licence(self) -> None:
+        text = preflight_text(metal=False).replace("Xcode.app|accepted|done", "Xcode.app|needed|done")
+        checks = self.result(text)["checks"]
+        self.assertEqual((checks["licence"]["state"], checks["metal"]["state"]), ("fail", "unknown"))
+
     def test_zig_minimum_falls_back_to_the_operator_checkout(self) -> None:
         text = preflight_text(zig="0.15.2", submodules=("-a1 ghostty",))
         self.assertEqual(self.states(text)["zig"], "unknown")
@@ -642,7 +668,7 @@ class PreflightScriptTests(unittest.TestCase):
         body = [line.strip() for line in mf.PREFLIGHT_PROBE.read_text().splitlines()
                 if line.strip() and not line.strip().startswith("#")]
         # The update check reports the softwareupdate command line, not the sudo wrapper around it.
-        body = [line.replace("grep -v '^[0-9]* sudo '", "") for line in body]
+        body = [line.replace("grep -v '^[0-9]* sudo '", "") for line in body if not line.startswith("applying='")]
         for word in ("sudo", "rm ", "mv ", "cp ", "brew ", "install", "downloadComponent", "curl", "> ", ">>"):
             self.assertFalse([line for line in body if word in line.replace("2>", "").replace(">/dev/null", "")],
                              word)
@@ -672,7 +698,9 @@ class PreflightScriptTests(unittest.TestCase):
             (runner / ".runner").write_text('﻿{\n  "agentName": "mini-1",\n  "serverUrl": "https://secret.example/"\n}\n')
             header = (f"CMUX_ROOT='~/cmux'\nXCODE_PIN=''\nWORKLOAD_PATH={tools}\n"
                       "WORKLOAD_TOOLS='cargo git zig rustup'\nPYTHONS=''\nCANDIDATE_FALLBACK=''\n")
-            out = subprocess.run(["bash", "-s"], input=header + mf.PREFLIGHT_PROBE.read_text(), capture_output=True,
+            # The whole SSH payload, probe first, as observe_host sends it.
+            script = mf.PROBE.read_text() + "\n" + header + mf.PREFLIGHT_PROBE.read_text()
+            out = subprocess.run(["bash", "-s"], input=script, capture_output=True,
                                  text=True, env={"HOME": tmp, "PATH": "/usr/bin:/bin"}, timeout=60).stdout
             pf = mf.parse_probe(out)["preflight"]
         self.assertEqual(pf["tools"]["zig"], {"path": f"{tools}/zig", "version": "0.15.2"})

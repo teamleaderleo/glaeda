@@ -223,13 +223,13 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
 
     sdks, metal, python = split("pf_sdks", 2), split("pf_metal", 2), split("pf_python", 2)
     prepared = split("pf_update_prepared", 2)
-    channel, candidate = split("pf_rust_channel", 2), split("pf_candidate", 3)
+    channel, candidate = split("pf_rust_channel", 3), split("pf_candidate", 3)
     return {
         "sdks": None if sdks is None else {"state": sdks[0], "detail": sdks[1]},
         "metal": None if metal is None else {"ok": metal[0] == "ok", "detail": metal[1]},
         "tools": {t: {"path": p or None, "version": v} for t, p, v in
                   ((v.split("|", 2) + ["", ""])[:3] for v in out["pf_tool"])},
-        "rust_channel": None if channel is None else {"channel": channel[0], "rustc": channel[1]},
+        "rust_channel": None if channel is None else {"channel": channel[0], "rustc": channel[1], "cargo": channel[2]},
         "python": {"path": python[0] or None, "version": python[1] or None},
         "cmux": out.get("pf_cmux") == "present",
         "cmux_pin": out.get("pf_cmux_pin"),
@@ -546,8 +546,10 @@ def apply(manifest: dict[str, Any], hosts: list[str], yes: bool) -> int:
 
 DEFAULT_CMUX_ROOT = "~/cmux"  # where cmux scripts/persistent-compile up clones it on a mini
 # Columns of the preflight table, in the order onboarding meets them.
-PREFLIGHT_CHECKS = ("xcode", "select", "licence", "launch", "metal", "rust", "zig", "tools", "python",
-                    "cmux", "setup", "power", "disk", "update", "candidate", "node", "enroll", "runner", "brew")
+PREFLIGHT_CHECKS = ("os", "xcode", "select", "licence", "launch", "metal", "rust", "zig", "tools", "python",
+                    "cmux", "setup", "glaeda", "power", "disk", "update", "candidate", "node", "enroll", "runner", "brew")
+# An unknown here means the bootstrap would refuse or cannot be predicted, so it blocks like a failure.
+UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "power", "disk"})
 # Who can apply a fix: the SSH login user alone, the login user with an admin password, or a person.
 FIX_GROUPS = ("self", "password", "person")
 GROUP_TITLES = {"self": "can do itself (no root)", "password": "needs a password", "person": "needs a person"}
@@ -638,6 +640,16 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     brew_group = "person" if owner is None else ("self" if owner == user else "password")
     root = policy.get("cmux_root", DEFAULT_CMUX_ROOT)
 
+    # The bootstrap's supportedOs and hardwareCapability (cmux-mac-build-large).
+    major = int(re.match(r"\d*", obs.get("macos") or "").group() or 0)
+    if major not in {15, 26}:
+        put("os", "fail", f"macOS {obs.get('macos')}; the fleet bootstrap accepts 15 or 26", "install macOS 26", "person")
+    elif not bootstrap.hardware_class_ready("macos", "cmux-mac-build-large", obs.get("cpus", 0), obs.get("memory_gib", 0)):
+        put("os", "fail", f"{obs.get('cpus')} CPUs, {obs.get('memory_gib')} GiB; cmux-mac-build-large needs 8 and 16",
+            "use a larger Mac", "person")
+    else:
+        put("os", "ok", f"macOS {obs.get('macos')}, {obs.get('cpus')} CPUs, {obs.get('memory_gib')} GiB")
+
     # Xcode: the pinned app, selected, licensed, first launch done, plugins loading.
     pin = xcode_pin(manifest, name)
     apps = {a["path"]: a for a in obs.get("xcode_apps", [])}
@@ -658,6 +670,10 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     elif want and (got["version"], got["build"]) != (want["version"], want["build"]):
         put("xcode", "fail", f"{pin} is {got['version']} ({got['build']}), want {want['version']} ({want['build']})",
             f"install Xcode {want['version']} ({want['build']}) at {pin}", "person")
+    elif pf.get("cmux") and not bootstrap.xcode_pin_ready(pf.get("cmux_pin") or "", got["version"], got["version"]):
+        put("xcode", "fail", f"{pin} is {got['version']}; cmux .xcode-version says {pf.get('cmux_pin') or 'nothing'} "
+            f"and the fleet is reviewed on Xcode {bootstrap.REVIEWED_XCODE_MAJOR}",
+            "pin an Xcode of the reviewed major in the manifest", "person")
     else:
         put("xcode", "ok", f"{got['version']} ({got['build']})")
     developer = f"{pin}/Contents/Developer" if pin else None
@@ -687,6 +703,8 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     metal = pf.get("metal")
     if metal is None:
         put("metal", "unknown", "no pinned Xcode to ask")
+    elif not metal["ok"] and checks.get("licence", {}).get("state") != "ok":
+        put("metal", "unknown", "xcrun cannot run until the licence is accepted")
     elif metal["ok"]:
         put("metal", "ok", metal["detail"])
     else:
@@ -705,8 +723,9 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     elif broken_rust:
         detail = "; ".join(f"{t}: {tools[t]['version']}" for t in broken_rust)
         put("rust", "fail", detail, f"cd {root} && rustup default stable (or rustup toolchain install <its channel>)", "self")
-    elif channel and not channel["rustc"].startswith("rustc "):
-        put("rust", "fail", f"DiffSidecar toolchain {channel['channel']}: {channel['rustc'] or 'unavailable'}",
+    elif channel and not (channel["rustc"].startswith("rustc ") and channel["cargo"].startswith("cargo ")):
+        broken = channel["rustc"] if not channel["rustc"].startswith("rustc ") else channel["cargo"]
+        put("rust", "fail", f"DiffSidecar toolchain {channel['channel']}: {broken or 'unavailable'}",
             f"rustup toolchain install {channel['channel']}", "self")
     else:
         put("rust", "ok", (tools.get("rustc") or {}).get("version", ""))
@@ -742,7 +761,11 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
         put("cmux", "fail", f"no checkout at {root}", clone, "self")
         put("setup", "fail", "no checkout", f"after the clone: cd {root} && ./scripts/setup.sh", "self")
     else:
-        if not bootstrap.submodule_status_ready("\n".join(pf.get("submodules", []))):
+        errors = [s for s in pf.get("submodules", []) if s.startswith(("fatal:", "error:", "warning:"))]
+        if errors:
+            put("cmux", "fail", f"git submodule status: {errors[0][:160]}", f"fix the checkout at {root} (git status says why)",
+                "person")
+        elif not bootstrap.submodule_status_ready("\n".join(pf.get("submodules", []))):
             put("cmux", "fail", bootstrap.SUBMODULE_FIX, f"cd {root} && git submodule update --init --recursive --depth 1", "self")
         elif pf.get("dirty"):
             put("cmux", "fail", f"{pf['dirty']} local changes; the bootstrap needs a clean checkout",
@@ -755,6 +778,14 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
             put("setup", "fail", "GhosttyKit or ghostty.h missing (cmux setup.sh has not completed)",
                 f"cd {root} && ./scripts/setup.sh (after metal and zig pass)", "self")
 
+    glaeda_missing = [what for what, present in (("~/glaeda checkout", pf.get("glaeda_checkout")),
+                                                  ("native cache root", pf.get("cache_root"))) if not present]
+    if glaeda_missing:
+        put("glaeda", "fail", f"missing: {', '.join(glaeda_missing)}",
+            "git clone https://github.com/teamleaderleo/glaeda.git ~/glaeda; ~/glaeda/scripts/glaeda-mini-setup --apply",
+            "self")
+    else:
+        put("glaeda", "ok")
     pmset = pf.get("pmset", "")
     if not pmset:
         put("power", "unknown", "pmset -g custom printed nothing")
@@ -823,7 +854,8 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
         put("brew", "fail" if rust_or_zig else "info", "none (no Homebrew)", "install Homebrew (https://brew.sh)", "person")
     else:
         put("brew", "info", owner if owner == user else f"{owner} (installs run as sudo -u {owner})")
-    return {"host": name, "ready": not any(c["state"] == "fail" for c in checks.values()), "checks": checks}
+    blocked = any(c["state"] == "fail" or (c["state"] == "unknown" and k in UNKNOWN_BLOCKS) for k, c in checks.items())
+    return {"host": name, "ready": not blocked, "checks": checks}
 
 
 def preflight(manifest: dict[str, Any], observed: dict[str, Any], hosts: list[str]) -> list[dict[str, Any]]:

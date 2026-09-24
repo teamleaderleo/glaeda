@@ -230,6 +230,12 @@ class BootstrapProblem(unittest.TestCase):
         text = me.bootstrap_problem(1, "", json.dumps({"error": "required command failed: xcrun"}))
         self.assertIn("xcodebuild -downloadComponent MetalToolchain", text)
 
+    def test_a_refusal_without_blocking_checks_falls_back_to_stderr(self) -> None:
+        stdout = json.dumps({"eligibleForEnrollment": True, "blockingChecks": []})
+        stderr = json.dumps({"error": "bootstrap receipt exceeds size ceiling"})
+        self.assertEqual(me.bootstrap_problem(1, stdout, stderr),
+                         "bootstrap could not observe this mini: bootstrap receipt exceeds size ceiling")
+
     def test_output_without_a_verdict_says_so(self) -> None:
         self.assertEqual(me.bootstrap_problem(1, "", "Traceback (most recent call last):\nBoom"),
                          "bootstrap exited 1 without a verdict: Boom")
