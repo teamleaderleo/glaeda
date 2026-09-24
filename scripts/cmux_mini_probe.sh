@@ -79,6 +79,36 @@ if [ -d "$F" ]; then
   e fleet_worker_sha "$(shasum -a 256 "$F/bin/worker" 2>/dev/null | cut -c1-12)"
   pgrep -f "$F/bin/worker" >/dev/null && e fleet_worker_proc running || e fleet_worker_proc absent
 fi
+# Reservation marker written by glaeda-mini-fleet reserve. plutil reads JSON and checks each type;
+# any other shape, a symlink, or an oversized file is reported as invalid.
+R="$F/reservation.json"
+if [ -e "$R" ] || [ -L "$R" ]; then
+  rv=invalid
+  if [ -f "$R" ] && [ ! -L "$R" ] && [ "$(wc -c < "$R")" -le 4096 ] &&
+     [ "$(plutil -extract schema raw -expect string "$R" 2>/dev/null)" = glaeda-reservation/v1 ] &&
+     ro=$(plutil -extract owner raw -expect string "$R" 2>/dev/null) &&
+     rp=$(plutil -extract purpose raw -expect string "$R" 2>/dev/null) &&
+     rs=$(plutil -extract since raw -expect integer "$R" 2>/dev/null) &&
+     ru=$(plutil -extract until raw -expect integer "$R" 2>/dev/null); then
+    case "$rs$ru" in *[!0-9-]*) ;; *) [ -n "$ro" ] && [ -n "$rp" ] && rv=$(printf '%s|%s|%s|%s' "$ro" "$rp" "$rs" "$ru" | tr '\t\n\r' '   ');; esac
+  fi
+  e reservation "$rv"
+fi
+# Whether a build holds the fleet host lock right now. A shared, non-blocking flock on a read-only
+# descriptor cannot wait and is dropped at once, so the probe never blocks and never holds admission
+# beyond microseconds (with-host-lock and the worker retry). lsof would miss a root-owned holder
+# and counts an open descriptor as a lock; Python can be a stub on a mini without an Xcode licence.
+L="$F/host.lock"
+if [ -e "$L" ] || [ -L "$L" ]; then
+  hl=$(/usr/bin/perl -MFcntl=:DEFAULT,:flock -e '
+    my $f;
+    sysopen($f, $ARGV[0], O_RDONLY | O_NOFOLLOW | O_NONBLOCK) && -f $f or do { print "unknown"; exit 0 };
+    if (flock($f, LOCK_SH | LOCK_NB)) { flock($f, LOCK_UN); print "free" }
+    else { print $!{EWOULDBLOCK} ? "held" : "unknown" }' "$L" </dev/null 2>/dev/null)
+  e host_lock "${hl:-unknown}"
+else
+  e host_lock missing
+fi
 for ak in "$HOME"/.ssh/authorized_keys*; do
   [ -f "$ak" ] || continue
   e ak_file "$(basename "$ak")|$(stat -f '%Lp' "$ak")"

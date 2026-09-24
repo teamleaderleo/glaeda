@@ -212,6 +212,20 @@ Each host names its `hardware`, a key into the manifest's `hardware` table (mode
 
 `glaeda-mini-fleet pools --json` prints runner capacity per pool label `glaeda-<class>-xcode-<version>`, the label glaeda-cmux-runner issues. A member is declared for a pool when it is dedicated, has the `ci-runner` role and a runner class (`xl`, `std`, `light`); it conforms when the latest observation shows that exact Xcode build as a real directory, meaning a runner installed or relabelled from this manifest would carry the label (GitHub fixes labels at registration, so this is not proof the registered runner has it yet). The PR pool picker counts conforming members. A host with a `class` must also state its `availability`.
 
+### Reserve a host for dedicated work
+
+The fleet host lock (`/Users/Shared/cmux-build-fleet/host.lock`, taken by `with-host-lock`) covers one build at a time, so it leaves gaps between the builds of a longer campaign. A reservation covers the whole campaign:
+
+```bash
+scripts/glaeda-mini-fleet reserve cmux15 --for "Chromium build campaign" --hours 8          # dry run
+scripts/glaeda-mini-fleet reserve cmux15 --for "Chromium build campaign" --hours 8 --yes
+scripts/glaeda-mini-fleet release cmux15 --yes
+```
+
+`reserve` writes `/Users/Shared/cmux-build-fleet/reservation.json` on each host as the SSH user (temp file then `mv`, mode 664): `{"schema": "glaeda-reservation/v1", "owner", "purpose", "since", "until"}` with Unix-second times. It is active while now is before `until`, which is at most 72 hours ahead (`--hours N` or `--until EPOCH`), so a forgotten reservation expires on its own. The owner defaults to `$USER@$(hostname -s)` on the operator Mac (`--owner` overrides). Rerunning `reserve` as the same owner extends it and keeps `since`. Another owner's active reservation, or a marker that is not a valid v1 object, is printed and refused unless `--force`. `release` removes your own reservation or any expired one; another owner's active reservation or an invalid marker needs `--force`. Both commands are dry runs without `--yes`, write only if the marker is unchanged since they read it, and read it back afterwards.
+
+The probe reports the marker and whether a build holds the host lock right now. It takes a shared, non-blocking `flock` on a read-only descriptor with `/usr/bin/perl` and drops it at once, so it cannot wait and holds nothing past microseconds; `lsof` would miss a root-owned holder. `check` lists an active reservation under `reserved`, which is informational like `pending`; an expired or invalid marker is drift, with the `release` command as its fix. In `pools`, a member with an active reservation or a held host lock at observation time is left out of `conforming` and listed under `reserved` or `busy`, with counts, so the pool picker can see why capacity dropped.
+
 Each host may also carry `roles` (`dev-builds`, `ci-runner`, `nightly`, `ios-simulators`, `cache-host`) and the `sudo` mode it is expected to have (`nopasswd` or `password`, observed with `sudo -n -l`, which runs nothing). `controller_token: "present"` requires the fleet worker's controller token file to exist; the probe tests existence only and never reads it.
 
 ## Class acceptance
