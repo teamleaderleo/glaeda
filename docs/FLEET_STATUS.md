@@ -69,26 +69,43 @@ Each finding:
 
 - `who` is `agent` (the SSH login user can run it), `password` (needs sudo) or
   `person` (a decision, an account, or a physical step).
-- `command` runs from the operator machine, already wrapped in `ssh HOST ...`
-  (`ssh -t` when it needs a password). A fix that reads as prose becomes `note`,
-  never `command`.
-- `safe_to_apply` is true only for read-only commands: refreshing this document,
-  `glaeda-disk`, listing a runner's launchd job. Everything that changes a machine
-  is false, including `glaeda-mini-fleet apply`, which runs every typed fix for a
-  host.
+- `command` runs from the operator machine, already wrapped in `ssh -- HOST ...`
+  (`ssh -t --` when it needs a password), and only for members named in the
+  manifest.
+- A fix becomes a command only if it fits a closed grammar: a known program or a
+  path, then plain words, with no shell metacharacters and no prose words.
+  Anything else becomes `note`. Fix text comes from the members' own probes, so
+  a hostile member cannot plant shell syntax in a command.
+- A command that carries anything secret-looking, a home path, or more than 400
+  characters is withheld: the action goes to a person with a note, because
+  redacting it would change what runs.
+- `safe_to_apply` is true only for read-only commands: refreshing this document
+  and listing a runner's launchd job. Everything that changes a machine is false,
+  including `glaeda-disk` (it refreshes its own snapshot) and
+  `glaeda-mini-fleet apply` (it runs every typed fix for a host, `add_key`
+  included).
 - Members in `never_touch` get no command and no agent action.
 - Severity: `error` means broken now (unreachable, stale or unhealthy worker,
   offline runner, a queued job no online runner can take, cache down). `preflight`
   blockers are `warn`: they block onboarding, not today's builds.
 
-A queued job whose labels include `self-hosted` and match no online runner is its
-own `queue.no_eligible_runner:<labels>` finding, naming the members whose runners
-carry those labels. Hosted and Blacksmith labels are not judged.
+A queued job whose labels include `self-hosted` and match no online runner in
+scope is its own `queue.no_eligible_runner:<labels>` finding, naming the members
+whose runners carry those labels. Hosted and Blacksmith labels are not judged. The
+queue is judged only against a fresh, complete runner list; otherwise it is a
+`queue.unjudged` info finding.
+
+Findings from `check` and `preflight` that name the same command for the same
+member merge into one, keeping the more severe and listing the other in `also`.
 
 ## Bounds and privacy
 
 At most 128 members, 500 findings, 240 characters per text field, 400 per
-command, 512 KiB per document; `fleet.truncated_findings` counts what was dropped.
+command, 512 KiB per document. Member fields are typed (numbers stay numbers,
+text is cleaned and capped). Over the byte limit, info then warn findings drop
+first and `fleet.truncated_findings` counts them; counts always describe the
+findings that remain. An error is never dropped to fit: the tool fails instead.
+A malformed sources bundle fails with exit 2, never a traceback.
 Secrets (`ghp_`, `github_pat_`, `Bearer`, `token=`) are redacted and home paths
 become `~`. Child processes get an allowlisted environment.
 

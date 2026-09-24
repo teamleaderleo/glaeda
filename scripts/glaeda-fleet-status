@@ -74,9 +74,17 @@ CHILD_ENV = ("HOME", "PATH", "LANG", "LC_ALL", "USER", "LOGNAME", "SSH_AUTH_SOCK
 SECRET_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|Bearer\s+\S+|"
                        r"(?i:(?:token|secret|password)\s*[=:]\s*)\S+)")
 PRIVATE_HOME_RE = re.compile(r"/Users/[^/\s'\"]+")
-# Fix text that is a command a shell can run, not prose.
-COMMAND_START = re.compile(r"^([A-Z_][A-Z0-9_]*=\S+\s+)*(sudo|cd|brew|rustup|git|launchctl|xcodebuild|xcode-select|pmset|glaeda[-\w]*|"
-                           r"scripts/|\./|~/|/)\S*")
+# A fix becomes a command only when every ;/&& part is: optional VAR=value words, a known program or a
+# path, then plain argument words. Anything else, including every shell metacharacter, stays a note.
+WORD = r"[A-Za-z0-9_./=:@~+,%-]+"
+PROGRAM = r"(?:sudo|cd|brew|rustup|git|launchctl|xcodebuild|xcode-select|pmset|env|glaeda-[a-z-]+|scripts/\S+|\./\S+|~/\S+|/\S+)"
+COMMAND_PART = re.compile(rf"(?:[A-Z_][A-Z0-9_]*={WORD} )*{PROGRAM}(?: {WORD})*")
+# Words that only prose uses; a part carrying one is a sentence that starts like a command.
+PROSE_WORDS = frozenset({"the", "a", "an", "it", "its", "where", "when", "then", "which", "that", "this", "is",
+                         "are", "was", "on", "if", "after", "before", "first", "see", "shows", "comes", "until"})
+# A host we will put after ssh: no option-looking or shell-looking names.
+HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+LIMA_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 # controller status.py states that need someone.
 CONTROLLER_FINDINGS = {
     "stale": ("error", "restore_worker_heartbeat", "person",
@@ -129,20 +137,31 @@ def canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-PROSE_RE = re.compile(r"\((?:or|then|see|e\.g\.|if)\b|<[a-z][^>]*>")
-
-
-def as_command(fix: str) -> str | None:
-    """The fix when every ;/&&/|| part is a command; None when any part reads as prose."""
-    text = fix.strip()
-    if not text or PROSE_RE.search(text):
+def as_command(fix: Any) -> str | None:
+    """The fix when it is a command in the closed grammar above; None when any part reads as prose."""
+    text = str(fix or "").strip()
+    if not text or text != " ".join(text.split(" ")) or any(ord(ch) < 32 for ch in text):
         return None
-    parts = [p.strip() for p in re.split(r";|&&|\|\|", text)]
-    return text if all(p and COMMAND_START.match(p) for p in parts) else None
+    parts = [p.strip() for p in re.split(r";|&&", text)]
+    for part in parts:
+        if not part or not COMMAND_PART.fullmatch(part) or PROSE_WORDS & set(part.lower().split()):
+            return None
+    return text
 
 
-def remote(host: str, command: str, tty: bool = False) -> str:
-    return f"ssh {'-t ' if tty else ''}{shlex.quote(host)} {shlex.quote(command)}"
+def remote(host: str, command: str, tty: bool = False) -> str | None:
+    """ssh HOST 'command' from the operator machine, or None when the host is not a plain name."""
+    if not HOST_RE.match(host):
+        return None
+    return f"ssh {'-t ' if tty else ''}-- {host} {shlex.quote(command)}"
+
+
+def num(value: Any) -> int | float | None:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def stamp_of(value: Any) -> int | None:
+    return int(value) if num(value) is not None else None
 
 
 # ---------------------------------------------------------------- collection (read-only)
@@ -241,12 +260,14 @@ def collect_runners(gh: str | None, scope: str | None) -> dict[str, Any] | None:
             doc = gh_json(gh, f"{scope}/actions/runners?per_page=100&page={page}")
             batch = doc.get("runners") or []
             for r in batch:
+                labels = [str(label.get("name")) for label in r.get("labels") or []
+                          if isinstance(label, dict) and label.get("name")]
                 runners.append({"name": r.get("name"), "status": r.get("status"), "busy": bool(r.get("busy")),
-                                "labels": sorted(label.get("name") for label in r.get("labels") or [])})
+                                "labels": sorted(labels)})
             if len(batch) < 100:
                 truncated = False
                 break
-    except (Failure, OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+    except (Failure, OSError, subprocess.TimeoutExpired, json.JSONDecodeError, AttributeError, TypeError) as error:
         return source(error=str(error))
     return source({"scope": scope, "runners": runners, "truncated": truncated})
 
@@ -258,12 +279,14 @@ def collect_queue(gh: str | None, repos: list[str]) -> dict[str, Any] | None:
         return source(error="gh is not installed")
     jobs: list[dict[str, Any]] = []
     runs_read = 0
+    left_unread = False
     try:
         for repo in repos:
             for status in ("queued", "in_progress"):
                 runs = gh_json(gh, f"repos/{repo}/actions/runs?status={status}&per_page=20").get("workflow_runs") or []
                 for run in runs:
                     if runs_read >= MAX_QUEUE_RUNS:
+                        left_unread = True
                         break
                     runs_read += 1
                     listed = gh_json(gh, f"repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100")
@@ -275,8 +298,7 @@ def collect_queue(gh: str | None, repos: list[str]) -> dict[str, Any] | None:
                                          "created_at": job.get("created_at")})
     except (Failure, OSError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError, TypeError) as error:
         return source(error=str(error))
-    return source({"repos": repos, "jobs": jobs, "runs_read": runs_read,
-                   "truncated": runs_read >= MAX_QUEUE_RUNS})
+    return source({"repos": repos, "jobs": jobs, "runs_read": runs_read, "truncated": left_unread})
 
 
 def collect_cache(endpoints: list[str]) -> dict[str, Any] | None:
@@ -320,9 +342,10 @@ def lima_host(host: str, user: str) -> dict[str, Any]:
             item = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if item.get("no_lima"):
+        if isinstance(item, dict) and item.get("no_lima"):
             return {"reachable": True, "installed": False, "instances": [], "observed_at": now()}
-        instances.append({"name": clean(item.get("name"), 80), "status": clean(item.get("status"), 20)})
+        if isinstance(item, dict):
+            instances.append({"name": str(item.get("name") or "")[:80], "status": str(item.get("status") or "")[:20]})
     return {"reachable": True, "installed": True, "instances": instances, "observed_at": now()}
 
 
@@ -368,6 +391,7 @@ class Builder:
         self.hosts: dict[str, dict[str, Any]] = manifest.get("hosts") or {}
         self.never = set(manifest.get("never_touch") or [])
         self.findings: list[dict[str, Any]] = []
+        self.state: dict[str, Any] = {}
         self.members: dict[str, dict[str, Any]] = {}
         self.aliases: dict[str, str] = {}
         for name, host in sorted(self.hosts.items()):
@@ -406,10 +430,15 @@ class Builder:
             # never_touch: a person decides, and nothing is marked safe.
             who, safe, command = "person", False, None
             note = clean(f"{member} is never_touch; ask its owner. {note}".strip())
+        if command and clean(command, MAX_COMMAND + 1) != command:
+            # Redacting would change what runs; a person reads the finding instead.
+            who, safe, command = "person", False, None
+            note = clean(f"command withheld: it carried text that looks secret, private or too long. {note}".strip())
         if command and member and on_member:
             command = remote(member, command, tty=tty or who == "password")
-        if command and len(command) > MAX_COMMAND:
-            command, note = None, clean(f"command longer than {MAX_COMMAND} characters; {note}")
+            if command is None:
+                who, safe = "person", False
+                note = clean(f"member name is not a plain host name; no command. {note}".strip())
         return {"id": kind, "who": who, "safe_to_apply": bool(safe and command), "command": command,
                 "note": clean(note) if note else ""}
 
@@ -430,14 +459,16 @@ class Builder:
     # ---- sources
 
     def freshness(self) -> dict[str, Any]:
-        out = {}
+        out: dict[str, Any] = {}
         for name in SOURCE_NAMES:
             src = self.sources.get(name)
             if src is None:
                 out[name] = {"state": "not_collected", "observed_at": None, "age_seconds": None, "error": None}
                 continue
-            stamp = src.get("observed_at")
-            age = None if stamp is None else max(0, self.at - int(stamp))
+            stamp = stamp_of(src.get("observed_at")) if isinstance(src, dict) else None
+            if not isinstance(src, dict):
+                src = {"ok": False, "error": "malformed source"}
+            age = None if stamp is None else max(0, self.at - stamp)
             if not src.get("ok"):
                 state = "unavailable"
                 self.finding(name, "unavailable", "warn", f"{name} could not be read: {src.get('error')}", None, stamp,
@@ -454,13 +485,21 @@ class Builder:
                          "error": clean(src.get("error")) if src.get("error") else None}
         return out
 
-    def data(self, name: str) -> Any:
+    def data(self, name: str) -> dict[str, Any] | None:
         src = self.sources.get(name)
-        return src.get("data") if src and src.get("ok") else None
+        if not isinstance(src, dict) or not src.get("ok"):
+            return None
+        data = src.get("data")
+        if data is not None and not isinstance(data, dict):
+            raise Failure(f"{name}: data is a {type(data).__name__}, want an object")
+        return data
+
+    def fresh(self, name: str) -> bool:
+        return self.state.get(name, {}).get("state") == "fresh"
 
     def stamp(self, name: str) -> int | None:
         src = self.sources.get(name)
-        return src.get("observed_at") if src else None
+        return stamp_of(src.get("observed_at")) if isinstance(src, dict) else None
 
     def fold_check(self) -> None:
         data = self.data("check")
@@ -469,14 +508,18 @@ class Builder:
         stamps = data.get("observed_at") or {}
         for host, at in stamps.items():
             member = self.member_of(host)
-            if member in self.members and at is not None:
-                self.members[member]["observed"]["check"] = at
+            if member in self.members and stamp_of(at) is not None:
+                self.members[member]["observed"]["check"] = stamp_of(at)
         for issue in data.get("issues") or []:
-            member = self.member_of(issue.get("host")) or issue.get("host")
+            if not isinstance(issue, dict):
+                continue
+            member = self.member_of(issue.get("host"))
+            at = stamp_of(stamps.get(issue.get("host"))) or self.stamp("check")
+            if member is None:
+                self.unmapped("check", issue.get("host"), at)
+                continue
             area = str(issue.get("area") or "unknown")
-            at = stamps.get(issue.get("host")) or self.stamp("check")
-            if member in self.members:
-                self.members[member]["observed"]["check"] = at
+            self.members[member]["observed"]["check"] = at
             severity = "info" if area == "pending" else "error" if area in CHECK_ERRORS else "warn"
             fix = str(issue.get("fix") or "")
             typed = issue.get("action") or {}
@@ -490,8 +533,8 @@ class Builder:
                 act = self.action(member, "restore_reach", "person", None,
                                   note="check the host is up, on the tailnet, and the SSH key is loaded")
             elif area == "disk":
-                act = self.action(member, "diagnose_disk", "agent", "glaeda-disk", safe=True,
-                                  note="read-only report of where the space went")
+                act = self.action(member, "diagnose_disk", "agent", "~/.local/bin/glaeda-disk",
+                                  note="reports where the space went; it also refreshes its own snapshot")
             else:
                 command = as_command(fix)
                 who = "password" if command and command.startswith("sudo ") else "agent" if command else "person"
@@ -504,12 +547,18 @@ class Builder:
             return
         stamps = data.get("observed_at") or {}
         for host, result in sorted((data.get("hosts") or {}).items()):
-            member = self.member_of(host) or host
-            at = stamps.get(host) or self.stamp("preflight")
-            if member in self.members:
-                self.members[member]["preflight_ready"] = bool(result.get("ready"))
-                self.members[member]["observed"]["preflight"] = at
+            member = self.member_of(host)
+            at = stamp_of(stamps.get(host)) or self.stamp("preflight")
+            if member is None:
+                self.unmapped("preflight", host, at)
+                continue
+            if not isinstance(result, dict):
+                continue
+            self.members[member]["preflight_ready"] = bool(result.get("ready"))
+            self.members[member]["observed"]["preflight"] = at
             for check_id, c in (result.get("checks") or {}).items():
+                if not isinstance(c, dict):
+                    continue
                 state = c.get("state")
                 # preflight measures onboarding readiness; a blocker there is not a broken member today.
                 if state == "fail" or state == "unknown":
@@ -537,14 +586,16 @@ class Builder:
             return
         at = self.stamp("controller")
         for row in data.get("workers") or []:
+            if not isinstance(row, dict):
+                continue
             member = self.member_of(row.get("host"))
             if member is None:
                 self.unmapped("controller", row.get("host"), at)
                 continue
-            state = str(row.get("state") or "unknown")
+            state = clean(row.get("state") or "unknown", 40)
             self.members[member]["controller"] = {
-                "state": state, "busy": bool(row.get("busy")), "free_gib": row.get("free_gib"),
-                "sample_age_seconds": row.get("sample_age_seconds"), "active_jobs": row.get("active_jobs")}
+                "state": state, "busy": row.get("busy") is True, "free_gib": num(row.get("free_gib")),
+                "sample_age_seconds": num(row.get("sample_age_seconds")), "active_jobs": num(row.get("active_jobs"))}
             self.members[member]["observed"]["controller"] = at
             known = CONTROLLER_FINDINGS.get(state)
             if known is None and state in ("ready", "busy"):
@@ -553,69 +604,87 @@ class Builder:
             if kind == "none":
                 act = self.action(member, kind, who, None, note=note)
             elif kind == "free_disk":
-                act = self.action(member, "diagnose_disk", "agent", "glaeda-disk", safe=True,
-                                  note="read-only report; delete stale build output only after checking nothing builds")
+                act = self.action(member, "diagnose_disk", "agent", "~/.local/bin/glaeda-disk",
+                                  note="reports where the space went; delete stale build output only after "
+                                       "checking nothing builds")
             else:
                 act = self.action(member, kind, who, None, note=note)
             self.finding("controller", state.replace(" ", "_"), severity,
                          f"controller: {state}; {clean(row.get('action'), 160)}", member, at, act)
 
-    def fold_runners(self) -> dict[str, list[dict[str, Any]]]:
+    def fold_runners(self) -> list[tuple[str | None, dict[str, Any]]]:
+        """Every runner in scope with its member (None for hosted or foreign runners)."""
         data = self.data("runners")
         if not data:
-            return {}
+            return []
         at = self.stamp("runners")
+        every: list[tuple[str | None, dict[str, Any]]] = []
         by_member: dict[str, list[dict[str, Any]]] = {}
         for r in data.get("runners") or []:
+            if not isinstance(r, dict):
+                continue
             member = self.member_of(r.get("name"))
-            row = {"name": clean(r.get("name"), 80), "status": r.get("status"), "busy": bool(r.get("busy")),
-                   "labels": sorted(r.get("labels") or [])[:MAX_LABELS]}
+            labels = [str(label) for label in r.get("labels") or [] if isinstance(label, str)]
+            row = {"name": clean(r.get("name"), 80), "status": clean(r.get("status"), 20), "busy": r.get("busy") is True,
+                   "labels": sorted(labels)}
+            every.append((member, row))
             if member is None:
                 continue  # hosted or foreign runners in the same scope are not fleet members
-            by_member.setdefault(member, []).append(row)
-            if r.get("status") != "online":
-                self.finding("runners", "offline", "error", f"runner {row['name']} is {r.get('status')}", member, at,
+            by_member.setdefault(member, []).append({**row, "labels": [clean(x, 60) for x in row["labels"][:MAX_LABELS]]})
+            if row["status"] != "online":
+                self.finding("runners", f"offline:{row['name']}", "error", f"runner {row['name']} is {row['status']}",
+                             member, at,
                              self.action(member, "restart_runner", "agent",
                                          "launchctl list | grep -i actions.runner", safe=True,
                                          note="read-only: shows the runner's launchd job; restart it with "
                                               "launchctl kickstart -k gui/$(id -u)/<label> once confirmed"))
         for member, rows in by_member.items():
-            self.members[member]["runners"] = rows
+            self.members[member]["runners"] = rows[:8]
             self.members[member]["observed"]["runners"] = at
         if data.get("truncated"):
             self.finding("runners", "truncated", "info",
                          f"runner list stopped at {len(data.get('runners') or [])}; missing runners are not judged",
                          None, at, self.action(None, "narrow_runner_scope", "person", None,
                                                note="point --github-runners at the repository the fleet registers to"))
-            return by_member
+            return every
         for name, m in self.members.items():
             if "ci-runner" in m["roles"] and name not in by_member and name not in self.never:
                 self.finding("runners", "missing", "error", "manifest role ci-runner but no runner registered", name, at,
                              self.action(name, "register_runner", "person", None,
                                          note="run scripts/glaeda-cmux-runner on the member with a runner token "
                                               "from an org admin"))
-        return by_member
+        return every
 
-    def fold_queue(self, by_member: dict[str, list[dict[str, Any]]]) -> None:
+    def fold_queue(self, runners: list[tuple[str | None, dict[str, Any]]]) -> None:
         data = self.data("queue")
         if not data:
             return
         at = self.stamp("queue")
-        runners = [(m, r) for m, rows in by_member.items() for r in rows]
+        complete = self.fresh("runners") and not (self.data("runners") or {}).get("truncated")
         groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
         for job in data.get("jobs") or []:
-            labels = tuple(sorted(job.get("labels") or []))
+            if not isinstance(job, dict):
+                continue
+            labels = tuple(sorted(str(label) for label in job.get("labels") or [] if isinstance(label, str)))
             if "self-hosted" not in {label.lower() for label in labels}:
                 continue  # hosted and Blacksmith labels are not ours to judge
             groups.setdefault(labels, []).append(job)
+        if groups and not complete:
+            self.finding("queue", "unjudged", "info",
+                         f"{sum(len(j) for j in groups.values())} queued self-hosted job(s) not judged: the runner "
+                         "list is missing, stale, unavailable or truncated", None, at,
+                         self.action(None, "refresh_status", "agent", "glaeda-fleet-status", safe=True,
+                                     on_member=False, note="collect with --github-runners set to the scope the "
+                                                           "fleet registers to"))
+            return
         for labels, jobs in sorted(groups.items()):
             want = {label.lower() for label in labels}
             fits = [(m, r) for m, r in runners if want <= {label.lower() for label in r["labels"]}]
             online = [(m, r) for m, r in fits if r["status"] == "online"]
             if online:
                 continue
-            members = sorted({m for m, _ in fits})
-            label_text = ",".join(labels)
+            members = sorted({m for m, _ in fits if m})
+            label_text = clean(",".join(labels), 120)
             summary = (f"{len(jobs)} queued job(s) want [{label_text}] and no online runner has those labels; "
                        f"should have taken it: {', '.join(members) or 'no registered runner'}")
             self.finding("queue", f"no_eligible_runner:{label_text}", "error", summary, None, at,
@@ -628,9 +697,14 @@ class Builder:
         if not data:
             return []
         rows = []
-        for row in data.get("endpoints") or []:
-            rows.append({k: row.get(k) for k in ("name", "reachable", "healthy", "http_status", "observed_at")})
-            if row.get("healthy"):
+        for row in (data.get("endpoints") or [])[:16]:
+            if not isinstance(row, dict):
+                continue
+            row = {"name": clean(row.get("name"), 40), "reachable": row.get("reachable") is True,
+                   "healthy": row.get("healthy") is True, "http_status": num(row.get("http_status")),
+                   "observed_at": stamp_of(row.get("observed_at"))}
+            rows.append(row)
+            if row["healthy"]:
                 continue
             code = "unreachable" if not row.get("reachable") else "unhealthy"
             self.finding("cache", f"{code}:{row.get('name')}", "error",
@@ -646,45 +720,62 @@ class Builder:
         if not data:
             return
         for host, row in sorted((data.get("hosts") or {}).items()):
-            member = self.member_of(host) or host
-            at = row.get("observed_at")
-            if member not in self.members:
+            member = self.member_of(host)
+            if member is None or not isinstance(row, dict):
                 continue
+            at = stamp_of(row.get("observed_at"))
             m = self.members[member]
             m["observed"]["lima"] = at
             if not row.get("reachable"):
                 m["lima"] = {"reachable": False}
                 continue
-            instances = row.get("instances") or []
+            instances = [i for i in row.get("instances") or [] if isinstance(i, dict)][:MAX_LIMA]
             expected = set(self.hosts.get(member, {}).get("lima_expected") or [])
-            orphans = [i["name"] for i in instances if i.get("status") != "Running" and i["name"] not in expected]
-            m["lima"] = {"reachable": True, "installed": bool(row.get("installed")), "total": len(instances),
-                         "running": sum(i.get("status") == "Running" for i in instances), "orphans": orphans[:16]}
+            # Stopped or Broken only; an instance with no status is unknown, not an orphan.
+            orphans = [str(i.get("name") or "") for i in instances
+                       if i.get("status") in ("Stopped", "Broken") and i.get("name") not in expected]
+            m["lima"] = {"reachable": True, "installed": row.get("installed") is True, "total": len(instances),
+                         "running": sum(i.get("status") == "Running" for i in instances),
+                         "orphans": [clean(n, 64) for n in orphans[:16]]}
             for name in orphans[:16]:
-                self.finding("lima", f"orphan:{name}", "info", f"Lima instance {name} is stopped and not expected",
-                             member, at,
-                             self.action(member, "delete_lima_instance", "agent",
-                                         f"limactl delete {shlex.quote(name)}",
+                plain = bool(LIMA_NAME_RE.match(name))
+                self.finding("lima", f"orphan:{clean(name, 64)}", "info",
+                             f"Lima instance {clean(name, 64)} is stopped and not expected", member, at,
+                             self.action(member, "delete_lima_instance", "agent" if plain else "person",
+                                         f"limactl delete -- {name}" if plain else None,
                                          note="deletes the VM disk; confirm nothing owns it first"))
 
     # ---- document
 
     def build(self) -> dict[str, Any]:
-        sources = self.freshness()
+        self.state = self.freshness()
         self.fold_check()
         self.fold_preflight()
         self.fold_controller()
-        by_member = self.fold_runners()
-        self.fold_queue(by_member)
+        runners = self.fold_runners()
+        self.fold_queue(runners)
         cache = self.fold_cache()
         self.fold_lima()
         findings = dedupe(self.findings)
         rank = {s: i for i, s in enumerate(SEVERITIES)}
         findings.sort(key=lambda f: (rank[f["severity"]], f["member"] or "", f["id"]))
-        truncated = max(0, len(findings) - MAX_FINDINGS)
+        dropped = max(0, len(findings) - MAX_FINDINGS)
         findings = findings[:MAX_FINDINGS]
+        while True:
+            doc = self.assemble(findings, cache, dropped)
+            if len(canonical(doc)) <= MAX_DOCUMENT_BYTES:
+                return doc
+            # Drop the least severe first; never drop an error to fit.
+            if not findings or findings[-1]["severity"] == "error":
+                raise Failure(f"status document exceeds {MAX_DOCUMENT_BYTES} bytes even with only error findings")
+            findings = findings[:-1]
+            dropped += 1
+
+    def assemble(self, findings: list[dict[str, Any]], cache: list[dict[str, Any]], dropped: int) -> dict[str, Any]:
         members = []
         for name, m in list(sorted(self.members.items()))[:MAX_MEMBERS]:
+            m = {**m, "class": clean(m["class"], 40) if m["class"] else None,
+                 "roles": [clean(r, 40) for r in m["roles"][:8]] if isinstance(m["roles"], list) else []}
             mine = [f for f in findings if f["member"] == name]
             counts = {s: sum(f["severity"] == s for f in mine) for s in SEVERITIES}
             seen = [v for v in m["observed"].values() if v is not None]
@@ -697,7 +788,7 @@ class Builder:
             "schema": SCHEMA,
             "generated_at": self.at,
             "max_age_seconds": self.max_age,
-            "sources": sources,
+            "sources": self.state,
             "fleet": {
                 "members": len(self.members),
                 "by_status": {s: sum(m["status"] == s for m in members)
@@ -706,25 +797,31 @@ class Builder:
                 "safe_to_apply": sum(f["action"]["safe_to_apply"] for f in findings),
                 "never_touch": sorted(self.never),
                 "cache": cache,
-                "truncated_findings": truncated,
+                "truncated_findings": dropped,
             },
             "members": members,
             "findings": findings,
         }
-        return bound(doc)
+        return doc
+
+
+MERGEABLE = frozenset({"check", "preflight"})
 
 
 def dedupe(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """check and preflight often name the same fix; keep the first and record the second source."""
+    """check and preflight often name the same fix for a member: keep one, the more severe, and say so."""
     out: list[dict[str, Any]] = []
     seen: dict[tuple[Any, ...], dict[str, Any]] = {}
     ids: set[str] = set()
+    rank = {s: i for i, s in enumerate(SEVERITIES)}
     for f in findings:
         command = f["action"]["command"]
-        key = (f["member"], command) if command else None
-        if key and key in seen:
+        key = (f["member"], command) if command and f["member"] and f["source"] in MERGEABLE else None
+        if key and key in seen and seen[key]["source"] != f["source"]:
             kept = seen[key]
-            kept["also"] = sorted({*kept.get("also", []), f["source"]})
+            kept["also"] = sorted({*kept.get("also", []), f["id"]})
+            if rank[f["severity"]] < rank[kept["severity"]]:
+                kept["severity"] = f["severity"]
             continue
         base, n = f["id"], 2
         while f["id"] in ids:
@@ -737,21 +834,16 @@ def dedupe(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def bound(doc: dict[str, Any]) -> dict[str, Any]:
-    while len(canonical(doc)) > MAX_DOCUMENT_BYTES and doc["findings"]:
-        drop = max(1, len(doc["findings"]) // 4)
-        doc["findings"] = doc["findings"][:-drop]
-        doc["fleet"]["truncated_findings"] += drop
-    return doc
-
-
 def build(bundle: dict[str, Any], at: int | None = None, max_age: int = DEFAULT_MAX_AGE) -> dict[str, Any]:
     if not isinstance(bundle, dict) or bundle.get("schema") != SOURCES_SCHEMA:
         raise Failure(f"not a {SOURCES_SCHEMA} bundle")
     sources = bundle.get("sources")
     if not isinstance(sources, dict) or "manifest" not in sources:
         raise Failure("sources bundle has no manifest source")
-    return Builder(sources, now() if at is None else at, max_age).build()
+    try:
+        return Builder(sources, now() if at is None else at, max_age).build()
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        raise Failure(f"sources bundle does not match this tool's format ({type(error).__name__}: {error})") from None
 
 
 # ---------------------------------------------------------------- render
