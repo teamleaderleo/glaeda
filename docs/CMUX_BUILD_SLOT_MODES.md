@@ -66,8 +66,9 @@ Catch-up DerivedData lifecycle, since one directory serves every slot on the hos
   451 s whole-target rebuild, and it is not where anyone iterates);
 - the job copies its products out before releasing the host lock, because the next catch-up
   build on the host empties the directory;
-- the local CAS is kept between builds (the 102 s result depends on a filled one), with a size
-  budget and least-recently-used eviction in the node daemon (not built yet).
+- the local CAS is kept between builds (the 102 s result depends on a filled one). It is
+  Xcode's own on-disk CAS, which the node daemon does not manage, so its size budget comes
+  from a separate pruner; the daemon's `node-store` gets its own eviction (both not built yet).
 
 Contract. The host check (`glaeda-mini-fleet check`) can verify:
 
@@ -94,10 +95,14 @@ builds (planned; the prototype has no signed writes yet, see #1134 M3). Nothing 
 Catch-up is only fast when the store already holds the target commit; on a store miss it
 is a cold build (about 750 to 800 s), slower than an incremental caching-off rebuild. So the
 worker asks first: the writer records a marker per commit it has filled (planned), and
-catch-up is chosen only when the marker for the target commit exists.
+catch-up is chosen only when the marker for the target commit exists. The rows below are read
+top to bottom, first match wins, and the writer is exempt: CI's main build always runs catch-up
+with write-through, since filling the store is its job. A PR commit counts as held when its
+merge base with main has a marker (its own changes are few, and they miss either way).
 
 | Situation | Mode |
 | --- | --- |
+| CI main build (the writer) | catch-up, writing |
 | store lacks the target commit | iteration (incremental from wherever the slot is) |
 | no warm iteration DerivedData for this slot, store has the commit | catch-up for the first product; warm iteration behind it |
 | iteration DerivedData at main, change is app-target only | iteration |
@@ -108,8 +113,10 @@ catch-up is chosen only when the marker for the target commit exists.
 started once the catch-up product is delivered. It takes the host lock like any job, and a
 `flock` does not preempt, so a foreground job must be able to cancel it: the warmer registers
 its xcodebuild process, the foreground job stops it and requeues the warm (planned). An
-interrupted incremental build leaves DerivedData usable; the next build redoes the unfinished
-work.
+interrupted incremental build is expected to leave DerivedData usable, with the next build
+redoing the unfinished work (not measured yet; Next, item 1). Because every slot shares the
+host lock, an iteration edit can also wait behind another slot's foreground build, about 100 s
+for a catch-up; edit latency includes that wait.
 
 ## Warming the iteration DerivedData
 
@@ -133,8 +140,9 @@ DerivedData is therefore warmed by its own caching-off builds:
 ## Next
 
 1. On a mini at the fleet pin: caching-off edit and no-op times in a warm iteration
-   DerivedData, the flip-is-a-full-rebuild result, and the mixed-mode edit and no-op runs
-   (with the fresh-build hit loss diagnosed).
+   DerivedData, the flip-is-a-full-rebuild result, a cancelled warm build followed by an
+   incremental one, and the mixed-mode edit and no-op runs (with the fresh-build hit loss
+   diagnosed).
 2. Cut the non-compiler work a catch-up build still does. Summed task time, not wall time:
    SwiftDriver planning and scanning 163 s, script phases 18 s (Rust diff sidecar, nucleo FFI,
    wireguard-go), App Intents extraction 16 s over 89 tasks. Script phases can be cached by
