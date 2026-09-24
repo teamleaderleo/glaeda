@@ -14,7 +14,7 @@ changes nothing. --reaccept forces a fresh accept-local (a cold cmux build, abou
 Run glaeda-mini-setup --apply first; this command assumes its tools and cache root.
 It picks a Python 3.13+ interpreter itself, because accept-local needs os.waitid,
 which CPython on macOS only has from 3.13. It never uses sudo, never registers a
-GitHub runner (cmux scripts/persistent-compile does that), and never reads a token.
+GitHub runner (cmux scripts/persistent-compile up does that), and never reads a token.
 """
 
 from __future__ import annotations
@@ -325,7 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     for leftover in (paths.fleet / "bootstrap.json", paths.install / "glaeda.rollback"):
         leftover.unlink(missing_ok=True)
     print(f"\n{(read_json(paths.enrollment) or {}).get('nodeId')} is eligible. "
-          "Next, from the cmux checkout: scripts/persistent-compile register --apply")
+          "Next, from the cmux checkout: scripts/persistent-compile up")
     return 0
 
 

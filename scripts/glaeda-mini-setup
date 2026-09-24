@@ -707,7 +707,7 @@ def operator_steps(ctx: Context, pre: dict[str, Any], fleet_result: dict[str, An
             "scripts/glaeda-mini-enroll --cmux-root <cmux checkout> --node-id <cmux-mac-NNN> --apply", "operator")
     add("Spotlight should skip build output", "System Settings > Spotlight > Search Privacy: add ~/Library/Developer/Xcode/DerivedData", "human (GUI)")
     add("GitHub Actions runner registration (reserved slot, never automated here)",
-        "from the cmux checkout, once enrolled: scripts/persistent-compile register --apply (cmux docs/ci/mac-fleet.md 5)",
+        "from the cmux checkout, once enrolled: scripts/persistent-compile up (cmux docs/ci/mac-fleet.md 5)",
         "org admin + registration token")
     return steps
 
