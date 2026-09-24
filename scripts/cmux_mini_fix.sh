@@ -183,10 +183,14 @@ share_source() {  # THING ARGS...: exit 0 when this host can seed THING
 
 share_prepare() {  # THING ARGS...: ready THING on the source; for metal, export a bundle once
   if [ "$1" != metal ]; then share_source "$@"; return; fi
-  local stage; stage=$(share_stage metal)
+  local stage tmp; stage=$(share_stage metal)
   mkdir -p "$stage"
   if ! ls -d "$stage"/*.exportedBundle >/dev/null 2>&1; then
-    DEVELOPER_DIR="$2" xcodebuild -downloadComponent MetalToolchain -exportPath "$stage"
+    # Export beside the cache and move it in whole, so an interrupted export is never shipped.
+    tmp=$(mktemp -d "$stage.export.XXXXXX")
+    DEVELOPER_DIR="$2" xcodebuild -downloadComponent MetalToolchain -exportPath "$tmp"
+    mv "$tmp"/*.exportedBundle "$stage"/
+    rmdir "$tmp"
   fi
   share_source "$@"
 }
@@ -209,7 +213,7 @@ share_send() {  # THING ARGS...: a tar stream of THING on stdout; progress on st
     candidate) tar -C "$HOME/Library/Caches/cmux-fleet/glaeda-candidate-$2" -cf - "$3" ;;
     python) local dir; dir=$(python_ours); tar -C "$HOME/.local" -cf - "$(basename "$dir")" ;;
     rustup) tar -C "$HOME/.rustup" -cf - toolchains $(cd "$HOME/.rustup" && ls -d update-hashes 2>/dev/null) ;;
-    brew) local d; d=$(brew_downloads); (cd "$d" && ls | grep -E 'bottle' | tar -cf - -T -) ;;
+    brew) local d; d=$(brew_downloads); (cd "$d" && { ls | grep -E 'bottle' | grep -v '\.incomplete$' || true; } | tar -cf - -T -) ;;
     metal) local stage; stage=$(share_stage metal)
            tar -C "$stage" -cf - "$(basename "$(ls -d "$stage"/*.exportedBundle | tail -1)")" ;;
   esac
@@ -217,6 +221,8 @@ share_send() {  # THING ARGS...: a tar stream of THING on stdout; progress on st
 
 share_recv() {  # THING ARGS...: unpack the stream on stdin into the staging directory
   local stage; stage=$(share_stage "$@")
+  # A staging directory named *.glaeda-share.partial is only ever this file's; start it fresh.
+  case "$stage" in */.glaeda-share.partial) rm -rf "$stage" ;; esac
   mkdir -p "$stage"
   tar -C "$stage" -xf -
 }
@@ -225,7 +231,9 @@ share_finish() {  # THING ARGS...: move what share_recv staged into place, never
   local stage entry; stage=$(share_stage "$@")
   case "$1" in
     xcode)
-      mv -n "$stage/$(basename "$2")" "$2"
+      # mv into an existing directory would nest the copy inside it; refuse instead.
+      if [ -e "$2" ] || [ -L "$2" ]; then refuse "$2 appeared during the copy; the staged copy was left in $stage"; fi
+      mv -n "$stage/$(basename "$2")" "$(dirname "$2")/"
       [ ! -e "$stage/$(basename "$2")" ] || refuse "$2 appeared during the copy; the staged copy was left in $stage"
       rmdir "$stage" 2>/dev/null || true
       xcode_matches "$2" "$3" "$4" || refuse "$2 is not Xcode $3 ($4) after the copy"
@@ -245,7 +253,8 @@ share_finish() {  # THING ARGS...: move what share_recv staged into place, never
         local into; into="$HOME/.rustup/$(basename "$(dirname "$entry")")"
         if [ -e "$into/$(basename "$entry")" ]; then say "unchanged: $into/$(basename "$entry")"; else mv "$entry" "$into/"; say "copied: $(basename "$entry")"; fi
       done
-      say "left in $stage: toolchains this host already had (compare, then remove by hand)" ;;
+      rm -rf "$stage"  # what is left are copies of toolchains this host already had
+      ;;
     metal)
       local bundle; bundle=$(ls -d "$stage"/*.exportedBundle | tail -1)
       DEVELOPER_DIR="$2" xcodebuild -importComponent MetalToolchain -importPath "$bundle"

@@ -1004,11 +1004,15 @@ class FixLibraryTests(unittest.TestCase):
     def test_parses_as_bash_and_never_escalates(self) -> None:
         subprocess.run(["bash", "-n", os.fspath(mf.FIX_LIBRARY)], check=True)
         body = [line for line in mf.FIX_LIBRARY.read_text().splitlines() if not line.lstrip().startswith("#")]
-        for word in ("rm -r", "curl", "--force"):
+        for word in ("curl", "--force"):
             self.assertFalse([line for line in body if word in line], word)
+        # Recursive removal only of this file's own staging directories.
+        self.assertEqual([line.strip() for line in body if "rm -r" in line],
+                         ['case "$stage" in */.glaeda-share.partial) rm -rf "$stage" ;; esac',
+                          'rm -rf "$stage"  # what is left are copies of toolchains this host already had'])
         self.assertFalse([line for line in body if re.search(r"(^|[;&|(]\s*)sudo\b", line.strip())])
         # The only removal is the step lock's own pid file and directory.
-        self.assertEqual([line.strip() for line in body if "rm " in line],
+        self.assertEqual([line.strip() for line in body if "rm " in line and "rm -r" not in line],
                          ["""trap 'rm -f "$HOME/.local/state/glaeda/mini-fleet/step.lock/pid"; rmdir "$HOME/.local/state/glaeda/mini-fleet/step.lock" 2>/dev/null || true' EXIT"""])
 
     @unittest.skipUnless(shutil.which("shasum") or shutil.which("sha256sum"), "needs shasum")
@@ -1248,6 +1252,15 @@ class ShareTests(unittest.TestCase):
                 mock.patch.object(mf, "fix_call", return_value=0), mock.patch.object(mf, "operator_candidate", return_value=self.candidate):
             mf.fix_host(self.manifest, "build-mini-1", result, True, Path(tmp), seed="build-mini-2")
         self.assertEqual(calls, [("python", "build-mini-2"), ("metal", "build-mini-2"), ("candidate", "build-mini-2")])
+        # A seed that cannot provide Python (a Homebrew one, say) falls back to this Mac's copy.
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(mf, "prepare_seed", return_value="share_source python exit 3"), \
+                mock.patch.object(mf, "share_one") as share, mock.patch.object(mf, "ship_python", return_value=(True, "")) as ship, \
+                mock.patch.object(mf, "fix_call", return_value=0), mock.patch.object(mf, "stage_candidate", return_value=(True, "")):
+            out = mf.fix_host(self.manifest, "build-mini-1", result, True, Path(tmp), seed="build-mini-2")
+        share.assert_not_called()
+        ship.assert_called_once()
+        self.assertEqual(out["failed"], [])
 
     def test_a_missing_xcode_waits_for_a_seed(self) -> None:
         self.manifest["defaults"]["toolchain"]["xcode"] = {"app": "/Applications/Xcode_26.6.app", "version": "26.6",

@@ -1445,9 +1445,12 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
     if seed and kind in SEEDABLE:
         thing = SEEDABLE[kind]
         problem = prepare_seed(manifest, seed, thing, log)
-        if problem:
+        if not problem:
+            return share_one(manifest, thing, seed, name, share_args(manifest, name, thing), log, True)
+        if kind == "xcode_share":
             return False, f"{seed} cannot seed {thing} ({problem})"
-        return share_one(manifest, thing, seed, name, share_args(manifest, name, thing), log, True)
+        # Python, the candidate and Metal also have a path without a seed: this Mac, or the internet.
+        note(log, f"{seed} cannot seed {thing} ({problem}); using the path without a seed")
     if kind == "xcode_clone":
         code, text = remote(name, user, CLONE_XCODE, [action["source"], action["path"], action["version"], action["build"]])
         note(log, text)
@@ -1715,6 +1718,9 @@ def cmd_sudo_plan(manifest: dict[str, Any], hosts: list[str], run: bool, sudoers
 
 SHARE_THINGS = ("xcode", "metal", "brew", "rustup", "candidate", "python")
 SHARE_TIMEOUT = 3 * 3600
+SEED_STREAMS_PER_SOURCE = 2
+SEED_STREAMS: dict[str, threading.Semaphore] = {}
+SEED_STREAMS_LOCK = threading.Lock()
 IPV4_RE = re.compile(r"(\d{1,3}\.){3}\d{1,3}\Z")
 
 
@@ -1789,8 +1795,11 @@ def share_one(manifest: dict[str, Any], thing: str, source: str, name: str, args
     send = library_command("share_send", [thing, *args])[len("/bin/bash -c "):]
     pipeline = f"set -o pipefail; /bin/bash -c {send} | {shlex.join(inner)}"
     note(log, f"== share {thing}: {route}")
-    code = ssh_stream(source, user, "/bin/bash -c " + shlex.quote(pipeline), log, timeout=SHARE_TIMEOUT,
-                      options=("-A",) if lan["agent"] else ())
+    with SEED_STREAMS_LOCK:
+        streams = SEED_STREAMS.setdefault(source, threading.Semaphore(SEED_STREAMS_PER_SOURCE))
+    with streams:  # fix and onboard run many peers at once; one source serves a few at a time
+        code = ssh_stream(source, user, "/bin/bash -c " + shlex.quote(pipeline), log, timeout=SHARE_TIMEOUT,
+                          options=("-A",) if lan["agent"] else ())
     if code:
         return False, f"copy failed (exit {code}); rerun to resume, the staged part stays on the peer"
     if ssh_stream(name, user, library_command("share_finish", [thing, *args]), log, timeout=3600):
@@ -1846,7 +1855,9 @@ def prepare_seed(manifest: dict[str, Any], source: str, thing: str, log: Any, ye
             code = ssh_stream(source, manifest["ssh_user"],
                               library_command(func, [thing, *share_args(manifest, source, thing)]), log,
                               timeout=SHARE_TIMEOUT)
-            SEEDS_READY[key] = None if code == 0 else f"{func} {thing} exit {code}"
+            if code:
+                return f"{func} {thing} exit {code}"  # not cached: a later round may succeed
+            SEEDS_READY[key] = None
         return SEEDS_READY[key]
 
 
@@ -2027,9 +2038,11 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         rows[name]["log"] = os.fspath(directory / f"{name}.log")
 
     def fix_round(names: list[str]) -> None:
+        # The seed is fixed first and alone: its step lock would refuse share_prepare while it is busy.
+        outcomes = [fix_host(manifest, seed, results[seed], True, directory, None)] if seed in names else []
+        peers = [h for h in names if h != seed]
         with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-            outcomes = list(pool.map(lambda h: fix_host(manifest, h, results[h], True, directory,
-                                                        seed if h != seed else None), names))
+            outcomes += list(pool.map(lambda h: fix_host(manifest, h, results[h], True, directory, seed), peers))
         for outcome in outcomes:
             if outcome["failed"]:
                 settle(outcome["host"], "fix", "failed: " + "; ".join(outcome["failed"])[:160])
@@ -2095,7 +2108,13 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
             for name in to_register:
                 settle(name, "register", "blocked: the manifest has no runner.org")
         else:
-            token = mint_runner_token(org)
+            try:
+                token = mint_runner_token(org)
+            except Failure as error:
+                for name in to_register:
+                    settle(name, "register", f"blocked: {error}")
+                token = None
+                to_register = []
             logs = {h: directory / f"{h}.log" for h in to_register}
 
             def register_task(name: str) -> Any:
