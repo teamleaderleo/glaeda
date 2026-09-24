@@ -6,6 +6,8 @@
     glaeda-mini-setup --uninstall          plan removal of what --apply installed
     glaeda-mini-setup --uninstall --apply  remove it
     glaeda-mini-setup --cmux-root ~/Projects/cmux   also run the read-only fleet bootstrap
+    glaeda-mini-setup --hygiene-only --apply        any Mac (a laptop, a Studio): only the
+                                                    disk and worktree hygiene tools and agents
 
 First, on a fresh Mac: install the Command Line Tools (xcode-select --install) and, ideally,
 Homebrew. Until the Command Line Tools exist, /usr/bin/python3 and /usr/bin/git are stubs that
@@ -24,6 +26,13 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
     ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim}.plist
     build-host directories and three git defaults, each set only when unset
+
+--hygiene-only is for machines that are not fleet build hosts, such as personal MacBooks.
+It installs the three tools and three LaunchAgents above and nothing else: no build-host
+directories, no git defaults, no operator steps, no fleet bootstrap. Only a missing python3
+blocks it; build-host checks (free disk, Xcode pin, hardware) are reported, not enforced,
+so a nearly full laptop can still install the tool that frees it. Re-running it from a fresh
+checkout is how such a machine picks up newer tools.
 
 Machine enrollment stays with scripts/glaeda-mini-enroll, which drives
 scripts/cmux-fleet-bootstrap-macos and scripts/cmux_fleet.py (docs/CMUX_FLEET_ENROLLMENT.md).
@@ -66,6 +75,8 @@ GIT_DEFAULTS = (
     ("submodule.fetchJobs", "0"),  # cmux has submodules; fetch them in parallel
 )
 DARWIN_REQUIRED = True
+# with --hygiene-only, only these preflight failures block: the agents run python3
+HYGIENE_BLOCKING = frozenset({"python"})
 RUN_TIMEOUT = 20
 
 
@@ -108,8 +119,9 @@ def which(name: str, extra: tuple[str, ...] = ()) -> str | None:
 class Context:
     def __init__(self, home: Path, apply: bool, python: str | None, skip_launchctl: bool,
                  reclaim_binary: Path | None, cmux_root: Path | None, glaeda_bin: Path | None,
-                 xcode_app: str, min_free_gib: int) -> None:
+                 xcode_app: str, min_free_gib: int, hygiene_only: bool = False) -> None:
         self.home = home
+        self.hygiene_only = hygiene_only
         self.apply = apply
         self.uid = os.getuid()
         self.real_home = Path(pwd.getpwuid(self.uid).pw_dir)
@@ -347,7 +359,7 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
 
 
 def directories(ctx: Context) -> list[tuple[Path, int]]:
-    return [
+    dirs = [
         (ctx.bin, 0o755),
         (ctx.agents, 0o755),
         (ctx.logs, 0o755),
@@ -356,6 +368,7 @@ def directories(ctx: Context) -> list[tuple[Path, int]]:
         (ctx.cache_root, 0o700),  # --cache-root for the cmux_macos_native_build role
         (ctx.state, 0o700),
     ]
+    return [d for d in dirs if not (ctx.hygiene_only and d[0] == ctx.cache_root)]
 
 
 def reclaim_source(ctx: Context) -> tuple[str, Path | None, str]:
@@ -475,7 +488,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         not DARWIN_REQUIRED or Path("/Library/Developer/CommandLineTools").exists() or bool(xcode_apps()))
     prior = load_receipt(ctx) or {}
     owned_before = {a.get("key") for a in prior.get("actions", []) if a.get("kind") == "git" and a.get("owned")}
-    for key, value in GIT_DEFAULTS:
+    for key, value in () if ctx.hygiene_only else GIT_DEFAULTS:
         current = git_get(ctx, key) if git_ok else None
         if not git_ok:
             state, note = "blocked", "git needs the Command Line Tools"
@@ -814,6 +827,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--xcode-app", default=CMUX_XCODE_APP, help=f"pinned Xcode (default {CMUX_XCODE_APP})")
     p.add_argument("--min-free-gib", type=int, default=MIN_FREE_GIB)
     p.add_argument("--skip-launchctl", action="store_true", help="write plists but do not load or unload them")
+    p.add_argument("--hygiene-only", action="store_true",
+                   help="only the disk and worktree hygiene tools and agents, for any Mac")
     return p
 
 
@@ -825,8 +840,13 @@ def main(argv: list[str] | None = None) -> int:
     ctx = Context(Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir), args.apply, args.python,
                   args.skip_launchctl, args.reclaim_binary,
                   args.cmux_root.expanduser().resolve() if args.cmux_root else None,
-                  args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, args.min_free_gib)
+                  args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, args.min_free_gib,
+                  args.hygiene_only)
     pre = preflight(ctx)
+    if ctx.hygiene_only:  # build-host checks are reported, not enforced
+        checks = {n: ({**c, "level": "warn"} if c["level"] == "block" and n not in HYGIENE_BLOCKING else c)
+                  for n, c in pre["checks"].items()}
+        pre = {**pre, "checks": checks, "blocking": [n for n in pre["blocking"] if n in HYGIENE_BLOCKING]}
     if args.uninstall:
         actions = plan_uninstall(ctx)
         if args.apply:
@@ -835,19 +855,20 @@ def main(argv: list[str] | None = None) -> int:
         actions = plan_install(ctx)
         if args.apply:
             apply_install(ctx, actions)
-    fleet_result = None if args.uninstall else run_fleet_bootstrap(ctx)
+    fleet_result = None if args.uninstall or ctx.hygiene_only else run_fleet_bootstrap(ctx)
     failed = [a for a in actions if a.get("state") == "failed"]
     receipt = {
         "schema": SCHEMA,
         "mode": "uninstall" if args.uninstall else "install",
+        "profile": "hygiene" if ctx.hygiene_only else "build-host",
         "applied": args.apply,
         "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "sourceRevision": git_revision(),
         "sandboxHome": ctx.sandbox,
         "preflight": pre,
         "actions": actions,
-        "operatorSteps": [] if args.uninstall else operator_steps(ctx, pre, fleet_result),
-        "reserved": {} if args.uninstall else reserved_slots(ctx, fleet_result),
+        "operatorSteps": [] if args.uninstall or ctx.hygiene_only else operator_steps(ctx, pre, fleet_result),
+        "reserved": {} if args.uninstall or ctx.hygiene_only else reserved_slots(ctx, fleet_result),
         "blocking": pre["blocking"] + [f"action:{a.get('path') or a.get('key')}" for a in actions if a.get("state") in {"blocked", "failed"}],
     }
     receipt["ready"] = not receipt["blocking"]
