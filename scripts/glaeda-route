@@ -106,6 +106,8 @@ RESCUE_SECONDS = 90
 FORCE_CANCEL_SECONDS = 90
 CANCEL_GIVE_UP_SECONDS = 180
 KEEP_SECONDS = 3600
+# The agent stops watching a run this long after its reservation (cmux#14234 watched for 60 min).
+WATCH_LIMIT_SECONDS = 2 * 3600
 MAX_RESERVATIONS = 400
 CAS_ATTEMPTS = 4
 ROUTE_DEADLINE_SECONDS = 12
@@ -303,11 +305,18 @@ def app_jwt(app_id: str, key_file: Path, now: float,
 class GitHub:
     """A small REST client. The token lives in a header only; errors never echo it."""
 
-    def __init__(self, token: str, opener: Callable[..., Any] | None = None) -> None:
+    def __init__(self, token: str, opener: Callable[..., Any] | None = None, *,
+                 deadline: float | None = None, clock: Callable[[], float] = time.monotonic) -> None:
         self._token = token
         self._open = opener or urllib.request.urlopen
+        self.deadline, self._clock = deadline, clock
 
     def call(self, method: str, path: str, body: Any = None, *, auth: str = "Bearer") -> tuple[int, Any]:
+        timeout = HTTP_TIMEOUT
+        if self.deadline is not None:
+            timeout = min(HTTP_TIMEOUT, self.deadline - self._clock())
+            if timeout <= 0.5:
+                raise Failure("out of time")
         data = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(f"{API}{path}", data=data, method=method, headers={
             "Accept": "application/vnd.github+json",
@@ -317,7 +326,7 @@ class GitHub:
             **({"Content-Type": "application/json"} if data is not None else {}),
         })
         try:
-            with self._open(request, timeout=HTTP_TIMEOUT) as response:
+            with self._open(request, timeout=timeout) as response:
                 raw = response.read()
                 return response.status, (json.loads(raw) if raw else None)
         except urllib.error.HTTPError as error:
@@ -445,8 +454,13 @@ RESERVATION_FIELDS = {
 }
 
 
+OPTIONAL_TIMES = ("started_at", "ended_at")
+
+
 def valid_reservation(entry: Any) -> bool:
     if not isinstance(entry, dict):
+        return False
+    if any(entry.get(field) is not None and parse_utc(entry.get(field)) is None for field in OPTIONAL_TIMES):
         return False
     for field, kind in RESERVATION_FIELDS.items():
         value = entry.get(field)
@@ -524,11 +538,17 @@ class Ledger:
 
 
 def prune(doc: dict[str, Any], now: float) -> dict[str, Any]:
-    """Drop finished reservations older than KEEP_SECONDS; keep the newest MAX_RESERVATIONS."""
-    kept = [r for r in doc["reservations"]
-            if r["state"] in LIVE_STATES or now - (parse_utc(r["created_at"]) or 0) < KEEP_SECONDS]
+    """Drop finished reservations older than KEEP_SECONDS, then the oldest finished ones beyond
+    MAX_RESERVATIONS. Live reservations are never dropped: losing one would hand its slots out
+    twice. The route refuses to add to a ledger that already holds MAX_RESERVATIONS live ones."""
+    live_entries = [r for r in doc["reservations"] if r["state"] in LIVE_STATES]
+    done = [r for r in doc["reservations"] if r["state"] not in LIVE_STATES
+            and now - (parse_utc(r.get("ended_at") or r["created_at"]) or 0) < KEEP_SECONDS]
+    done.sort(key=lambda r: r["created_at"])
+    room = max(0, MAX_RESERVATIONS - len(live_entries))
+    kept = live_entries + (done[-room:] if room else [])
     kept.sort(key=lambda r: r["created_at"])
-    return {**doc, "reservations": kept[-MAX_RESERVATIONS:]}
+    return {**doc, "reservations": kept}
 
 
 def mutate(ledger: Ledger, change: Callable[[dict[str, Any]], dict[str, Any] | None], message: str,
@@ -612,9 +632,27 @@ def live(entry: dict[str, Any], now: float) -> bool:
     return entry["state"] == "held" and (parse_utc(entry["hold_until"]) or 0) > now
 
 
-def pending(entry: dict[str, Any], now: float) -> int:
-    """Slots a reservation still holds: the ones whose jobs have not started."""
-    return max(0, entry["slots"] - entry["started"]) if live(entry, now) else 0
+def pending(entry: dict[str, Any], now: float, observed_at: float | None = None) -> int:
+    """Slots a reservation still takes from the pool state's `idle` count.
+
+    A held reservation takes the slots whose jobs have not started. A job that started after the
+    pool state was observed still shows as idle there, so until the state is newer than that
+    start (or than the reservation's end), every slot counts: over-counting for one publish
+    interval only sends a run to Blacksmith, under-counting would send it to a busy runner.
+    A rescuing reservation keeps its slots: its pool was busy.
+    """
+    seen = observed_at if observed_at is not None else now
+    if entry["state"] == "rescuing":
+        return entry["slots"]
+    if entry["state"] == "held":
+        if not live(entry, now):
+            return 0
+        started_at = parse_utc(entry.get("started_at"))
+        if started_at is not None and started_at >= seen:
+            return entry["slots"]
+        return max(0, entry["slots"] - entry["started"])
+    ended_at = parse_utc(entry.get("ended_at"))
+    return entry["slots"] if ended_at is not None and ended_at >= seen else 0
 
 
 def default(req: Request, reason: str) -> Decision:
@@ -637,10 +675,14 @@ def decide(state: Any, ledger: dict[str, Any], req: Request, *, now: float,
             return Decision(earlier["pool"], True, "this run already holds a reservation", earlier["pool"], rid)
         return default(req, f"this run's reservation is {earlier['state']}")
     version = xcode_version(req.xcode)
-    pools = [label for label in state["order"] if state["pools"][label]["xcode"] == version] if version else []
+    pools = [label for label in state["order"] if POOL_LABEL.fullmatch(label).group(2) == version] if version else []
     if not pools:
         return default(req, f"no owned pool carries Xcode {version or '(none given)'}")
-    held = {label: sum(pending(r, now) for r in ledger["reservations"] if r["pool"] == label) for label in pools}
+    if sum(1 for r in ledger["reservations"] if r["state"] in LIVE_STATES) >= MAX_RESERVATIONS:
+        return default(req, "the reservation ledger is full")
+    observed = parse_utc(state["observed_at"])
+    held = {label: sum(pending(r, now, observed) for r in ledger["reservations"] if r["pool"] == label)
+            for label in pools}
     free = {label: state["pools"][label]["idle"] - held[label] for label in pools}
     need = req.slots
     if req.priority in LOW:
@@ -669,7 +711,10 @@ def route(req: Request, state_text: str, ledger: Ledger | None, *, now: Callable
         state = json.loads(state_text) if state_text.strip() else None
     except ValueError:
         state = None
-    first = decide(state, empty_ledger(), req, now=now(), allowed_repos=allowed_repos)
+    try:
+        first = decide(state, empty_ledger(), req, now=now(), allowed_repos=allowed_repos)
+    except Exception as error:  # noqa: BLE001 - a malformed state must answer the default, not crash
+        return default(req, f"pool state is malformed ({type(error).__name__})")
     if not first.owned:
         return first  # no ledger call when the state alone says no
     if ledger is None:
@@ -690,8 +735,10 @@ def route(req: Request, state_text: str, ledger: Ledger | None, *, now: Callable
             except Conflict:
                 sleep(0.2 * (attempt + 1))
         return default(req, "the reservation ledger stayed busy")
-    except (Failure, urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as error:
-        return default(req, f"ledger unavailable ({type(error).__name__}: {str(error)[:120]})")
+    except Exception as error:  # noqa: BLE001 - routing never fails a job
+        # Public logs: name the failure, not the private repository or API path.
+        detail = str(error) if isinstance(error, Failure) and str(error).startswith("ledger:") else type(error).__name__
+        return default(req, f"ledger unavailable ({detail[:120]})")
 
 
 # ---------------------------------------------------------------- rescue agent
@@ -755,32 +802,87 @@ def pull_moved(api: GitHub, repo: str, run: dict[str, Any]) -> str:
     return ""
 
 
+def pool_jobs(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str, float],
+              rescue_seconds: int) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """(started, waiting, stuck, refused) for the reservation's pool jobs, as GitHub lists them.
+
+    A job's wait counts from the latest of its creation, the reservation, and the first time the
+    agent saw it waiting, so a job created before its `needs` finished never counts as late.
+    """
+    jobs = [job for job in run_jobs(api, entry["repo"], entry["run_id"], entry["run_attempt"])
+            if entry["pool"] in job_labels(job)]
+    started = sum(1 for job in jobs if job.get("runner_name"))
+    waiting = [job for job in jobs if job.get("status") in ("queued", "waiting") and not job.get("runner_name")]
+    for job in waiting:
+        seen.setdefault(f"job:{job.get('id')}", now)
+    reserved_at = parse_utc(entry["created_at"]) or now
+
+    def queued_for(job: dict[str, Any]) -> float:
+        since = max(parse_utc(job.get("created_at")) or now, seen.get(f"job:{job.get('id')}", now), reserved_at)
+        return now - since
+
+    stuck = [job for job in waiting if queued_for(job) >= rescue_seconds]
+    refused = [job for job in jobs if refused_at_start(job)]
+    return started, waiting, stuck, refused
+
+
+def stuck_reason(entry: dict[str, Any], stuck: list[dict[str, Any]], refused: list[dict[str, Any]],
+                 rescue_seconds: int) -> str:
+    names = ", ".join(sorted(str(job.get("name") or job.get("id")) for job in (stuck or refused)))
+    if stuck:
+        return f"{names} queued on {entry['pool']} for {rescue_seconds} s with no runner"
+    return f"{names} refused at start on {entry['pool']}"
+
+
 def watch_one(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str, float],
               rescue_seconds: int = RESCUE_SECONDS) -> dict[str, Any] | None:
     """One look at one live reservation. Returns field updates, or None when nothing changed.
 
-    held: count the pool jobs that started; release when all did, when the run finished or was
-    re-run, or when the hold lapsed with nothing waiting. A pool job queued with no runner for
-    rescue_seconds, or refused by the runner's job-started hook, starts a rescue: confirm the run
-    with GitHub (and, for a pull request, that it is open at the same head), then cancel it.
-    rescuing: force-cancel after FORCE_CANCEL_SECONDS, give up after CANCEL_GIVE_UP_SECONDS, and
-    once the run has finished, check the pull request again and re-run it. The re-run is attempt 2,
-    and the route never gives a retry an owned machine, so it lands on overflow as a whole run.
+    held: count the pool jobs that started (their slots stop counting once the pool state is newer
+    than the start), and watch until the run finishes, is re-run, or passes WATCH_LIMIT_SECONDS. A
+    pool job queued with no runner for rescue_seconds, or refused by the runner's job-started hook,
+    moves the reservation to `rescuing` once GitHub confirms the run and, for a pull request, that
+    it is open at the same head. Nothing is cancelled yet: the state is written first.
+    rescuing: the ledger is only a claim, so every effect is re-checked against GitHub. If this
+    agent has not cancelled the run, it cancels only a trusted run that is still stuck. If it has,
+    it force-cancels after FORCE_CANCEL_SECONDS and gives up after CANCEL_GIVE_UP_SECONDS. A run
+    that finished is re-run only if this agent cancelled it and it ended `cancelled`, and (for a pull
+    request) the pull request is still open at that head. The re-run is attempt 2, and the route
+    never gives a retry an owned machine, so it lands on overflow as a whole run.
     """
     repo, run_id, attempt = entry["repo"], entry["run_id"], entry["run_attempt"]
     run = api.ok("GET", f"/repos/{repo}/actions/runs/{run_id}")
     if int(run.get("run_attempt") or 0) != attempt:
         return {"state": "rescued" if entry["state"] == "rescuing" else "released",
                 "note": "someone else re-ran the run"}
+    why = trusted_run(run, entry)
     if entry["state"] == "rescuing":
+        if why:
+            return {"state": "failed", "note": f"not rescued: {why}"}
+        key = f"cancel:{repo.lower()}#{run_id}.{attempt}"
+        mine = seen.get(key)
         if run.get("status") != "completed":
-            waited = now - (parse_utc(entry.get("cancel_at")) or now)
+            if mine is None:
+                _, _, stuck, refused = pool_jobs(api, entry, now=now, seen=seen, rescue_seconds=rescue_seconds)
+                if not (stuck or refused):
+                    return {"state": "released", "note": "no pool job is stuck any more"}
+                moved = pull_moved(api, repo, run)
+                if moved:
+                    return {"state": "released", "note": f"not rescued: {moved}"}
+                api.ok("POST", f"/repos/{repo}/actions/runs/{run_id}/cancel")
+                seen[key] = now
+                return {"cancel_at": utc(now)}
+            waited = now - mine
             if waited >= CANCEL_GIVE_UP_SECONDS:
                 return {"state": "failed", "note": f"the run did not finish {CANCEL_GIVE_UP_SECONDS} s after cancel"}
             if waited >= FORCE_CANCEL_SECONDS and not entry.get("forced"):
                 api.ok("POST", f"/repos/{repo}/actions/runs/{run_id}/force-cancel")
                 return {"forced": True}
             return None
+        if mine is None:
+            return {"state": "released", "note": "the run finished before this agent cancelled it"}
+        if run.get("conclusion") != "cancelled":
+            return {"state": "released", "note": f"the run finished on its own ({run.get('conclusion')})"}
         moved = pull_moved(api, repo, run)
         if moved:
             return {"state": "released", "note": f"cancelled, not re-run: {moved}"}
@@ -788,36 +890,22 @@ def watch_one(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str,
         return {"state": "rescued", "note": f"re-ran run {run_id}; attempt {attempt + 1} runs on overflow"}
     if run.get("status") == "completed":
         return {"state": "released", "note": "the run finished"}
-    jobs = [job for job in run_jobs(api, repo, run_id, attempt) if entry["pool"] in job_labels(job)]
-    started = sum(1 for job in jobs if job.get("runner_name"))
-    waiting = [job for job in jobs if job.get("status") in ("queued", "waiting") and not job.get("runner_name")]
-    for job in waiting:
-        seen.setdefault(str(job.get("id")), now)
-    reserved_at = parse_utc(entry["created_at"]) or now
-
-    def queued_for(job: dict[str, Any]) -> float:
-        since = max(parse_utc(job.get("created_at")) or now, seen.get(str(job.get("id")), now), reserved_at)
-        return now - since
-
-    stuck = [job for job in waiting if queued_for(job) >= rescue_seconds]
-    refused = [job for job in jobs if refused_at_start(job)]
+    started, _, stuck, refused = pool_jobs(api, entry, now=now, seen=seen, rescue_seconds=rescue_seconds)
     if stuck or refused:
-        why = trusted_run(run, entry)
         if why:
             return {"state": "released", "note": f"not rescued: {why}"}
         moved = pull_moved(api, repo, run)
         if moved:
             return {"state": "released", "note": f"not rescued: {moved}"}
-        names = ", ".join(sorted(str(job.get("name") or job.get("id")) for job in (stuck or refused)))
-        reason = (f"{names} queued on {entry['pool']} for {rescue_seconds} s with no runner" if stuck
-                  else f"{names} refused at start on {entry['pool']}")
-        api.ok("POST", f"/repos/{repo}/actions/runs/{run_id}/cancel")
-        return {"state": "rescuing", "cancel_at": utc(now), "note": reason, "started": started}
-    if started >= entry["slots"]:
-        return {"state": "released", "started": started, "note": f"all {started} pool job(s) started"}
-    if now >= (parse_utc(entry["hold_until"]) or 0) and not waiting:
-        return {"state": "released", "started": started, "note": "the hold lapsed with no job waiting"}
-    return {"started": started} if started != entry["started"] else None
+        return {"state": "rescuing", "note": stuck_reason(entry, stuck, refused, rescue_seconds), "started": started}
+    if now - (parse_utc(entry["created_at"]) or now) >= WATCH_LIMIT_SECONDS:
+        return {"state": "released", "started": started, "note": "watch limit reached"}
+    if started != entry["started"]:
+        return {"started": started, "started_at": utc(now)}
+    return None
+
+
+TERMINAL = ("released", "rescued", "failed")
 
 
 def apply_updates(doc: dict[str, Any], updates: dict[str, tuple[str, dict[str, Any]]], now: float
@@ -828,6 +916,8 @@ def apply_updates(doc: dict[str, Any], updates: dict[str, tuple[str, dict[str, A
         update = updates.get(entry["id"])
         if update and entry["state"] == update[0]:
             entry.update(update[1])
+            if entry["state"] in TERMINAL and not entry.get("ended_at"):
+                entry["ended_at"] = utc(now)
             changed = True
     pruned = prune(doc, now)
     if len(pruned["reservations"]) != len(doc["reservations"]):
@@ -838,27 +928,43 @@ def apply_updates(doc: dict[str, Any], updates: dict[str, tuple[str, dict[str, A
 def agent_tick(api: GitHub, ledger: Ledger, *, repo: str, now: float, seen: dict[str, float],
                log: Callable[[str], None], sleep: Callable[[float], None] = time.sleep,
                rescue_seconds: int = RESCUE_SECONDS) -> dict[str, Any]:
-    """Watch every live reservation for `repo` once, then record what changed in the ledger."""
-    head, doc = ledger.read()
-    updates: dict[str, tuple[str, dict[str, Any]]] = {}
-    for entry in doc["reservations"]:
-        if entry["state"] not in LIVE_STATES or entry["repo"].lower() != repo.lower():
-            continue
-        try:
-            update = watch_one(api, entry, now=now, seen=seen, rescue_seconds=rescue_seconds)
-        except (Failure, urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as error:
-            log(f"{entry['id']}: watch failed ({type(error).__name__}: {str(error)[:160]})")
-            continue
-        if update:
-            updates[entry["id"]] = (entry["state"], update)
-            log(f"{entry['id']}: {update.get('state', entry['state'])}"
-                + (f" ({update['note']})" if update.get("note") else ""))
+    """Watch every live reservation for `repo` once, and record what changed in the ledger.
+
+    A reservation that becomes `rescuing` is written first and cancelled second, in the same tick,
+    so a lost write never leaves a cancelled run without its re-run.
+    """
+    first = ledger.read()
+
+    def look(entries: list[dict[str, Any]]) -> dict[str, tuple[str, dict[str, Any]]]:
+        updates: dict[str, tuple[str, dict[str, Any]]] = {}
+        for entry in entries:
+            try:
+                update = watch_one(api, entry, now=now, seen=seen, rescue_seconds=rescue_seconds)
+            except (Failure, urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as error:
+                log(f"{entry['id']}: watch failed ({type(error).__name__}: {str(error)[:160]})")
+                continue
+            if update:
+                updates[entry["id"]] = (entry["state"], update)
+                log(f"{entry['id']}: {update.get('state', entry['state'])}"
+                    + (f" ({update['note']})" if update.get("note") else ""))
+        return updates
+
+    def mine(doc: dict[str, Any]) -> list[dict[str, Any]]:
+        return [e for e in doc["reservations"] if e["state"] in LIVE_STATES and e["repo"].lower() == repo.lower()]
+
+    updates = look(mine(first[1]))
+    written = mutate(ledger, lambda fresh: apply_updates(fresh, updates, now),
+                     f"agent: {len(updates)} reservation update(s)", sleep=sleep, first=first)
+    rescuing = {rid for rid, (_, update) in updates.items() if update.get("state") == "rescuing"}
+    second: dict[str, tuple[str, dict[str, Any]]] = {}
+    if written is not None and rescuing:
+        second = look([e for e in mine(written) if e["id"] in rescuing and e["state"] == "rescuing"])
+        if second:
+            mutate(ledger, lambda fresh: apply_updates(fresh, second, now),
+                   f"agent: cancelled {len(second)} run(s)", sleep=sleep)
     for key in [key for key, at in seen.items() if now - at > KEEP_SECONDS]:
         del seen[key]
-    written = mutate(ledger, lambda fresh: apply_updates(fresh, updates, now),
-                     f"agent: {len(updates)} reservation update(s)", sleep=sleep, first=(head, doc))
-    return {"watched": sum(1 for e in doc["reservations"] if e["state"] in LIVE_STATES),
-            "updated": len(updates), "written": written is not None}
+    return {"watched": len(mine(first[1])), "updated": len(updates) + len(second), "written": written is not None}
 
 
 def load_seen(path: Path) -> dict[str, float]:
@@ -974,27 +1080,35 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None,
                                           token_file=args.token_file, env_name="GLAEDA_ROUTE_TOKEN", opener=opener)
         return GitHub(cache["repo"], opener)
 
-    def ledger_client() -> Ledger:
+    def ledger_client(deadline: float | None = None) -> Ledger:
         if not cache.get("ledger"):
             cache["ledger"] = resolve_token(env, args.ledger_repo, now(), app_id=args.ledger_app_id,
                                             app_key_file=args.ledger_app_key_file, token_file=args.ledger_token_file,
                                             env_name="GLAEDA_LEDGER_TOKEN", opener=opener)
-        return Ledger(GitHub(cache["ledger"], opener), args.ledger_repo)
+        return Ledger(GitHub(cache["ledger"], opener, deadline=deadline), args.ledger_repo)
 
     cache: dict[str, str] = {}
     if args.command == "route":
+        # Routing never fails a job: whatever goes wrong, answer the caller's default and exit 0.
         req = request_from(args, env)
-        state_text = args.state.read_text(encoding="utf-8") if args.state and args.state.is_file() \
-            else env.get("GLAEDA_POOL_STATE", "")
-        ledger: Ledger | None = None
-        if not untrusted(req, tuple(args.allowed_repo or (DEFAULT_REPO,))):
-            try:
-                ledger = ledger_client()
-            except (Failure, urllib.error.URLError, OSError, ValueError, KeyError, TypeError):
-                ledger = None
-        decision = route(req, state_text, ledger, now=now, sleep=sleep,
-                         allowed_repos=tuple(args.allowed_repo or (DEFAULT_REPO,)))
-        emit_route(decision, env)
+        try:
+            state_text = args.state.read_text(encoding="utf-8") if args.state \
+                else env.get("GLAEDA_POOL_STATE", "")
+            ledger: Ledger | None = None
+            if not untrusted(req, tuple(args.allowed_repo or (DEFAULT_REPO,))):
+                try:
+                    ledger = ledger_client(deadline=time.monotonic() + ROUTE_DEADLINE_SECONDS)
+                except Exception:  # noqa: BLE001
+                    ledger = None
+            decision = route(req, state_text, ledger, now=now, sleep=sleep,
+                             allowed_repos=tuple(args.allowed_repo or (DEFAULT_REPO,)))
+        except Exception as error:  # noqa: BLE001
+            decision = default(req, f"the route failed ({type(error).__name__})")
+        try:
+            emit_route(decision, env)
+        except OSError as error:
+            print(f"glaeda-route: could not write outputs ({type(error).__name__}); the caller keeps its default",
+                  file=sys.stderr)
         return 0
 
     try:

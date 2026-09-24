@@ -146,7 +146,11 @@ The decision:
 2. Apply the reader rules to the pool state. Answer `--default` if it fails them.
 3. A run asking again (same run, attempt and kind) gets its existing live reservation back.
 4. Consider only the pools whose Xcode is the one the jobs pin, in `order`.
-   `free = idle - slots still pending in live reservations on that pool`.
+   `free = idle - slots still pending in reservations on that pool`. A held reservation's
+   slots count until its jobs start; a slot whose job started, or a reservation that ended,
+   after the pool state was observed still counts, because that state shows the runner idle.
+   A rescuing reservation keeps its slots. A ledger already holding 400 live reservations
+   answers the default.
 5. `pr` and `dev`: the first pool with `free >= slots`. `nightly` and `warm`: only while no
    `pr` or `dev` reservation is still pending anywhere, and only a pool with
    `free >= slots + 1`, so one slot always stays open for a pull request.
@@ -167,9 +171,11 @@ machines the run uses at once.
    "created_at": "2026-09-24T15:40:21Z", "hold_until": "2026-09-24T15:55:21Z"}]}
 ```
 
-States: `held` (slots pending until its jobs start), `rescuing` (cancel sent), and the finished
-`released`, `rescued` and `failed`, kept for an hour. A hold lapses after 15 minutes if the agent
-never released it, so a stopped agent cannot strand capacity for long.
+States: `held` (watched until its run ends; slots pending until its jobs start), `rescuing`
+(a rescue was decided and written; the cancel follows), and the finished `released`, `rescued`
+and `failed`, kept for an hour after `ended_at`. Live reservations are never pruned. A hold stops
+counting against capacity after 15 minutes even if no agent saw it, so a stopped agent cannot
+strand capacity for long.
 
 The ledger is a claim, not authority. The agent cancels or re-runs a run only when GitHub itself
 confirms it: the run is on the routed repository, a trusted event, not from a fork, at the
@@ -180,16 +186,22 @@ A forged ledger entry can therefore only rescue a run that really is stuck on an
 
 Each agent tick, for every live reservation on the routed repository:
 
-- `held`: list the run's jobs for that attempt that carry the pool label. Count the ones with a
-  runner as started. Release when all `slots` started, when the run finished or was re-run by
-  someone else, or when the hold lapsed with nothing waiting. A job queued with no runner for
-  90 s (measured from the latest of its creation, the reservation, and the first time the agent
-  saw it waiting, so a job created before its `needs` finished never counts as late), or a job
-  the runner's job-started hook refused (failed on a runner before any real step), starts a
-  rescue: confirm the run with GitHub, confirm the pull request is open at the same head, cancel.
-- `rescuing`: force-cancel after 90 s, give up (`failed`) after 180 s. Once the run finished,
-  check the pull request again (a push during the cancel starts its own run, which must not be
-  overwritten) and re-run it. The re-run is attempt 2 and lands on overflow as a whole run.
+- `held`: list the run's jobs for that attempt that carry the pool label and count the ones with
+  a runner as started. Keep watching until the run finishes, is re-run by someone else, or two
+  hours pass, so pool jobs that start late (a `needs` chain) are still covered. A job queued with
+  no runner for 90 s (measured from the latest of its creation, the reservation, and the first
+  time the agent saw it waiting, so a job created before its `needs` finished never counts as
+  late), or a job the runner's job-started hook refused (failed on a runner before any real
+  step), decides a rescue once GitHub confirms the run and the pull request is open at the same
+  head. The agent writes `rescuing` first and cancels second, in the same tick, so a lost ledger
+  write never leaves a cancelled run without its re-run.
+- `rescuing`: every effect is checked against GitHub again, because the ledger is only a claim.
+  If this agent has not cancelled the run (its own record, in the agent's state file), it
+  cancels only a trusted run that is still stuck. If it has: force-cancel after 90 s, give up
+  (`failed`) after 180 s. Once the run finished, it is re-run only if this agent cancelled it,
+  it ended `cancelled`, and (for a pull request) the pull request is still open at that head (a
+  push during the cancel starts its own run, which must not be overwritten). The re-run is
+  attempt 2 and lands on overflow as a whole run.
 
 This is cmux#14234's rule, moved into Glaeda and driven by the ledger instead of a marker
 artifact and a watcher workflow per run.

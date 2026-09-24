@@ -646,44 +646,88 @@ class AgentTests(unittest.TestCase):
         return gr.agent_tick(self.api, store_ledger, repo=REPO, now=now, seen=seen, log=self.logs.append,
                              sleep=lambda s: None)
 
-    def test_release_when_every_slot_started(self):
+    def test_started_slots_are_counted_and_the_run_is_watched_until_it_ends(self):
         self.cmux.add_run(jobs=[job(1, runner="m1-glaeda", status="in_progress"), job(2)])
         store, ledger = fake_ledger(ledger_doc(reservation(slots=2)))
         self.tick(ledger)
-        self.assertEqual(store.doc()["reservations"][0]["started"], 1)
-        self.cmux.jobs[7][1].update(runner_name="m2-glaeda", status="in_progress")
-        self.tick(ledger)
         entry = store.doc()["reservations"][0]
-        self.assertEqual((entry["state"], entry["started"]), ("released", 2))
+        self.assertEqual((entry["state"], entry["started"], entry["started_at"]), ("held", 1, gr.utc(NOW)))
+        self.cmux.jobs[7][1].update(runner_name="m2-glaeda", status="in_progress")
+        self.tick(ledger, now=NOW + 20)
+        entry = store.doc()["reservations"][0]
+        self.assertEqual((entry["state"], entry["started"]), ("held", 2))
+        self.cmux.runs[7]["status"] = "completed"
+        self.tick(ledger, now=NOW + 40)
+        entry = store.doc()["reservations"][0]
+        self.assertEqual((entry["state"], entry["ended_at"]), ("released", gr.utc(NOW + 40)))
         self.assertEqual(self.cmux.effects, [])
 
-    def test_stuck_job_is_cancelled_then_rerun_on_overflow(self):
+    def test_stuck_job_is_written_then_cancelled_then_rerun_on_overflow(self):
         self.cmux.add_run(jobs=[job(1, created=NOW - 600)])
         store, ledger = fake_ledger(ledger_doc(reservation(created=NOW - 600)))
         seen = {}
         self.tick(ledger, now=NOW, seen=seen)  # first look: waiting counts from now
         self.assertEqual(self.cmux.effects, [])
+        writes = store.writes
         self.tick(ledger, now=NOW + 91, seen=seen)
         self.assertEqual(self.cmux.effects, [("cancel", 7)])
-        self.assertEqual(store.doc()["reservations"][0]["state"], "rescuing")
+        self.assertEqual(store.writes, writes + 2)  # rescuing first, then the cancel time
+        entry = store.doc()["reservations"][0]
+        self.assertEqual((entry["state"], entry["cancel_at"]), ("rescuing", gr.utc(NOW + 91)))
         self.tick(ledger, now=NOW + 100, seen=seen)  # still cancelling
         self.assertEqual(self.cmux.effects, [("cancel", 7)])
-        self.cmux.runs[7]["status"] = "completed"
+        self.cmux.runs[7].update(status="completed", conclusion="cancelled")
         self.tick(ledger, now=NOW + 110, seen=seen)
         self.assertEqual(self.cmux.effects, [("cancel", 7), ("rerun", 7)])
         entry = store.doc()["reservations"][0]
         self.assertEqual(entry["state"], "rescued")
         self.assertIn("overflow", entry["note"])
 
+    def test_lost_write_means_no_cancel(self):
+        self.cmux.add_run(jobs=[job(1, created=NOW - 600)])
+        store, ledger = fake_ledger(ledger_doc(reservation(created=NOW - 600)))
+
+        def keep_moving(s):
+            s.push_elsewhere(s.doc())
+            s.before_patch = keep_moving
+
+        store.before_patch = keep_moving
+        with self.assertRaises(gr.Failure):
+            self.tick(ledger, seen={"job:1": NOW - 200})
+        self.assertEqual(self.cmux.effects, [])
+
     def test_cancel_that_hangs_is_forced_then_abandoned(self):
         self.cmux.add_run(jobs=[job(1)])
         store, ledger = fake_ledger(ledger_doc(reservation(state="rescuing", cancel_at=gr.utc(NOW))))
-        self.tick(ledger, now=NOW + 91)
+        seen = {f"cancel:{REPO}#7.1": NOW}
+        self.tick(ledger, now=NOW + 91, seen=seen)
         self.assertEqual(self.cmux.effects, [("force-cancel", 7)])
-        self.tick(ledger, now=NOW + 120)
+        self.tick(ledger, now=NOW + 120, seen=seen)
         self.assertEqual(self.cmux.effects, [("force-cancel", 7)])
-        self.tick(ledger, now=NOW + 181)
+        self.tick(ledger, now=NOW + 181, seen=seen)
         self.assertEqual(store.doc()["reservations"][0]["state"], "failed")
+
+    def test_forged_rescuing_entries_cause_no_effect(self):
+        # A finished run this agent never cancelled is never re-run.
+        self.cmux.add_run(run_id=7, status="completed")
+        self.cmux.runs[7]["conclusion"] = "success"
+        # A running run with nothing stuck is never cancelled.
+        self.cmux.add_run(run_id=8, jobs=[job(2, runner="m1-glaeda", status="in_progress")])
+        store, ledger = fake_ledger(ledger_doc(reservation(run_id=7, state="rescuing"),
+                                               reservation(run_id=8, state="rescuing")))
+        self.tick(ledger)
+        self.assertEqual(self.cmux.effects, [])
+        notes = {r["run_id"]: (r["state"], r["note"]) for r in store.doc()["reservations"]}
+        self.assertEqual(notes[7], ("released", "the run finished before this agent cancelled it"))
+        self.assertEqual(notes[8], ("released", "no pool job is stuck any more"))
+
+    def test_a_run_that_finished_on_its_own_is_not_rerun(self):
+        self.cmux.add_run(status="completed")
+        self.cmux.runs[7]["conclusion"] = "success"
+        store, ledger = fake_ledger(ledger_doc(reservation(state="rescuing")))
+        self.tick(ledger, seen={f"cancel:{REPO}#7.1": NOW - 30})
+        self.assertEqual(self.cmux.effects, [])
+        self.assertIn("on its own", store.doc()["reservations"][0]["note"])
 
     def test_job_refused_by_the_runner_hook_is_rescued(self):
         refused = job(1, status="completed", runner="m1-glaeda", conclusion="failure",
@@ -702,37 +746,37 @@ class AgentTests(unittest.TestCase):
         self.cmux.add_run(jobs=[job(1, created=NOW - 600)])
         self.cmux.pulls[5]["head"]["sha"] = OTHER_SHA
         store, ledger = fake_ledger(ledger_doc(reservation(created=NOW - 600)))
-        self.tick(ledger, now=NOW, seen={"1": NOW - 200})
+        self.tick(ledger, now=NOW, seen={"job:1": NOW - 200})
         self.assertEqual(self.cmux.effects, [])
         self.assertIn("newer head", store.doc()["reservations"][0]["note"])
 
-    def test_forged_reservation_cannot_cancel_a_run_github_does_not_confirm(self):
+    def test_forged_held_reservation_cannot_cancel_a_run_github_does_not_confirm(self):
         self.cmux.add_run(jobs=[job(1, created=NOW - 600)], head_repo="fork/cmux")
         store, ledger = fake_ledger(ledger_doc(reservation(created=NOW - 600)))
-        self.tick(ledger, now=NOW, seen={"1": NOW - 200})
+        self.tick(ledger, now=NOW, seen={"job:1": NOW - 200})
         self.assertEqual(self.cmux.effects, [])
         self.assertIn("fork", store.doc()["reservations"][0]["note"])
         self.cmux.add_run(run_id=8, jobs=[job(2, created=NOW - 600)], head=OTHER_SHA)
         store, ledger = fake_ledger(ledger_doc(reservation(run_id=8, created=NOW - 600)))
-        self.tick(ledger, now=NOW, seen={"2": NOW - 200})
+        self.tick(ledger, now=NOW, seen={"job:2": NOW - 200})
         self.assertEqual(self.cmux.effects, [])
 
-    def test_finished_rerun_and_lapsed_runs_are_released(self):
+    def test_finished_rerun_and_old_runs_are_released(self):
         self.cmux.add_run(run_id=7, status="completed")
         self.cmux.add_run(run_id=8, attempt=2)
         self.cmux.add_run(run_id=9, jobs=[])
         store, ledger = fake_ledger(ledger_doc(reservation(run_id=7), reservation(run_id=8),
-                                               reservation(run_id=9, hold=NOW - 1)))
+                                               reservation(run_id=9, created=NOW - gr.WATCH_LIMIT_SECONDS)))
         self.tick(ledger)
         notes = {r["run_id"]: (r["state"], r["note"]) for r in store.doc()["reservations"]}
         self.assertEqual(notes[7], ("released", "the run finished"))
         self.assertEqual(notes[8][1], "someone else re-ran the run")
-        self.assertEqual(notes[9][1], "the hold lapsed with no job waiting")
+        self.assertEqual(notes[9][1], "watch limit reached")
 
     def test_nightly_run_is_rescued_without_a_pull_request(self):
         self.cmux.add_run(event="schedule", pr=None, jobs=[job(1, created=NOW - 600)])
         store, ledger = fake_ledger(ledger_doc(reservation(priority="nightly", created=NOW - 600)))
-        self.tick(ledger, now=NOW, seen={"1": NOW - 200})
+        self.tick(ledger, now=NOW, seen={"job:1": NOW - 200})
         self.assertEqual(self.cmux.effects, [("cancel", 7)])
 
     def test_update_is_reapplied_after_a_lost_race_but_never_over_a_newer_state(self):
@@ -741,19 +785,73 @@ class AgentTests(unittest.TestCase):
         extra = reservation(run_id=99, slots=1)
         store.before_patch = lambda s: s.push_elsewhere(ledger_doc(reservation(slots=1), extra))
         self.tick(ledger)
-        states = {r["run_id"]: r["state"] for r in store.doc()["reservations"]}
-        self.assertEqual(states, {7: "released", 99: "held"})
+        started = {r["run_id"]: (r["state"], r["started"]) for r in store.doc()["reservations"]}
+        self.assertEqual(started, {7: ("held", 1), 99: ("held", 0)})
         self.cmux.add_run(run_id=8, jobs=[job(3, runner="m1-glaeda", status="in_progress")])
         store, ledger = fake_ledger(ledger_doc(reservation(run_id=8, slots=1)))
         store.before_patch = lambda s: s.push_elsewhere(ledger_doc(reservation(run_id=8, slots=1, state="rescued")))
         self.tick(ledger)
         self.assertEqual(store.doc()["reservations"][0]["state"], "rescued")
 
-    def test_old_finished_reservations_are_pruned(self):
-        old = reservation(run_id=1, state="released", created=NOW - 7200)
+    def test_old_finished_reservations_are_pruned_and_live_ones_never_are(self):
+        old = reservation(run_id=1, state="released", created=NOW - 7200, ended_at=gr.utc(NOW - 7000))
         store, ledger = fake_ledger(ledger_doc(old, reservation(run_id=2, state="released")))
         self.tick(ledger)
         self.assertEqual([r["run_id"] for r in store.doc()["reservations"]], [2])
+        many = [reservation(run_id=1000 + i) for i in range(gr.MAX_RESERVATIONS + 5)]
+        pruned = gr.prune(ledger_doc(*many, reservation(run_id=10_000, state="released")), NOW)
+        self.assertEqual(len(pruned["reservations"]), gr.MAX_RESERVATIONS + 5)
+        d = gr.decide(idle_state(std_idle=11), ledger_doc(*many), request(), now=NOW)
+        self.assertFalse(d.owned)
+        self.assertIn("full", d.reason)
+
+
+class CountingTests(unittest.TestCase):
+    def test_a_start_newer_than_the_pool_state_keeps_its_slots(self):
+        # The state was observed at NOW; a job started after that still shows as idle there.
+        fresh_start = reservation(slots=2, started=2, started_at=gr.utc(NOW + 5))
+        self.assertEqual(gr.pending(fresh_start, NOW + 10, NOW), 2)
+        self.assertEqual(gr.pending(fresh_start, NOW + 30, NOW + 25), 0)
+        ended = reservation(slots=2, state="released", ended_at=gr.utc(NOW + 5))
+        self.assertEqual(gr.pending(ended, NOW + 10, NOW), 2)
+        self.assertEqual(gr.pending(ended, NOW + 30, NOW + 25), 0)
+        self.assertEqual(gr.pending(reservation(slots=2, state="rescuing"), NOW, NOW), 2)
+        d = gr.decide(idle_state(std_idle=4, light_idle=0), ledger_doc(fresh_start), request(slots=3), now=NOW + 10)
+        self.assertFalse(d.owned)
+
+    def test_runner_in_two_pools_is_idle_in_one_only(self):
+        both = {"name": "m1-glaeda", "status": "online", "busy": False,
+                "labels": [{"name": STD}, {"name": "glaeda-std-xcode-26.4"}]}
+        pools = {"observed_at": NOW, "pools": {STD: {"conforming": ["m1"]},
+                                               "glaeda-std-xcode-26.4": {"conforming": ["m1"]}}}
+        doc = gr.build_state(pools, {"runners": [both]}, repo=REPO, now=NOW)
+        self.assertEqual((doc["pools"][STD]["idle"], doc["pools"]["glaeda-std-xcode-26.4"]["idle"]), (1, 0))
+
+    def test_malformed_state_answers_the_default_instead_of_crashing(self):
+        store, ledger = fake_ledger()
+        for bad in ({**idle_state(), "order": [STD, 3]},
+                    {**idle_state(), "pools": {STD: {"idle": 1}}, "order": [STD]}):
+            d = gr.route(request(), json.dumps(bad), ledger, now=lambda: NOW)
+            self.assertFalse(d.owned)
+        self.assertEqual(store.writes, 0)
+
+    def test_deadline_stops_a_slow_ledger(self):
+        clock = [0.0]
+        api = gr.GitHub("t", FakeStateRepo(ledger_doc()), deadline=10.0, clock=lambda: clock[0])
+        ledger = gr.Ledger(api, LEDGER_REPO)
+        ledger.read()  # inside the budget
+        clock[0] = 100.0
+        with self.assertRaises(gr.Failure):
+            ledger.read()
+        d = gr.route(request(), json.dumps(idle_state()), ledger, now=lambda: NOW)
+        self.assertFalse(d.owned)
+        self.assertIn("ledger unavailable", d.reason)
+
+    def test_route_command_survives_an_unreadable_state_file(self):
+        code, out, _ = run_main(["route", "--kind", "k", "--priority", "pr", "--default", "bs",
+                                 "--state", "/nonexistent/state.json"], env={})
+        self.assertEqual(code, 0)
+        self.assertIn("runs-on: bs", out)
 
     def test_agent_command_publishes_then_watches(self):
         with tempfile.TemporaryDirectory() as tmp:
