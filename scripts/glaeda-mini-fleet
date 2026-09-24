@@ -222,6 +222,7 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
         return None if value is None else (value.split("|", n - 1) + [""] * n)[:n]
 
     sdks, metal, python = split("pf_sdks", 2), split("pf_metal", 2), split("pf_python", 2)
+    prepared = split("pf_update_prepared", 2)
     channel, candidate = split("pf_rust_channel", 2), split("pf_candidate", 3)
     return {
         "sdks": None if sdks is None else {"state": sdks[0], "detail": sdks[1]},
@@ -244,7 +245,7 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
         "acceptance": out.get("pf_acceptance"),
         "brew_owner": out.get("pf_brew_owner"),
         "update_running": out.get("pf_update_running"),
-        "update_prepared": out.get("pf_update_prepared") == "yes",
+        "update_prepared": None if prepared is None else {"state": prepared[0], "version": prepared[1]},
         "pmset": "\n".join(out["pf_pmset"]),
         "runners": [dict(zip(("dir", "name"), (v.split("|", 1) + [""])[:2])) for v in out["pf_runner"]],
     }
@@ -772,9 +773,11 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     if pf.get("update_running"):
         put("update", "fail", f"macOS update installing: {pf['update_running']}",
             "wait for it to finish and the host to restart, then rerun preflight", "person")
-    elif pf.get("update_prepared"):
-        put("update", "fail", "a macOS update is prepared and waits for a restart",
+    elif (pf.get("update_prepared") or {}).get("state") == "pending":
+        put("update", "fail", f"macOS {pf['update_prepared']['version']} is prepared and waits for a restart",
             "restart the host (sudo shutdown -r now) when no build is running", "password")
+    elif pf.get("update_prepared"):
+        put("update", "ok", f"macOS {pf['update_prepared']['version']} was prepared before the last boot and did not apply")
     else:
         put("update", "ok")
 

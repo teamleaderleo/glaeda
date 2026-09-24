@@ -439,7 +439,7 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
                    sdks: str = "ok", python: str = "/opt/homebrew/bin/python3.13|3.13",
                    submodules: tuple[str, ...] = (" a1 ghostty (heads/main)",), artifacts: bool = True,
                    dirty: int = 0, candidate: str | None = "59ca9c9bd1bb|yes|yes", enroll_state: str | None = "eligible",
-                   acceptance: str | None = "accepted", update_running: str | None = None, prepared: bool = False,
+                   acceptance: str | None = "accepted", update_running: str | None = None, prepared: str | None = None,
                    sleep: int = 0, runners: tuple[str, ...] = ("actions-runner-cmux-persistent-compile|mini-1",),
                    **probe: object) -> str:
     """A probe plus preflight section for a host that is ready unless told otherwise."""
@@ -475,7 +475,7 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
     if update_running:
         lines.append(f"pf_update_running\t{update_running}")
     if prepared:
-        lines.append("pf_update_prepared\tyes")
+        lines.append(f"pf_update_prepared\t{prepared}")
     lines += ["pf_pmset\tAC Power:", f"pf_pmset\t sleep                {sleep}"]
     lines += [f"pf_runner\t{r}" for r in runners]
     return "\n".join(lines) + "\n"
@@ -538,9 +538,12 @@ class PreflightTests(unittest.TestCase):
         running = self.result(preflight_text(update_running="softwareupdate --install macOS 26.7 --restart"))
         self.assertFalse(running["ready"])
         self.assertEqual(running["checks"]["update"]["group"], "person")
-        prepared = self.result(preflight_text(prepared=True))
+        prepared = self.result(preflight_text(prepared="pending|26.7"))
         self.assertEqual(prepared["checks"]["update"]["state"], "fail")
-        self.assertIn("restart", prepared["checks"]["update"]["detail"])
+        self.assertIn("macOS 26.7 is prepared and waits for a restart", prepared["checks"]["update"]["detail"])
+        # cmux14 and cmux15 carry a 26.6.2 prepared before a reboot that never applied; that is not pending.
+        suspended = self.result(preflight_text(prepared="suspended|26.6.2"))
+        self.assertEqual(suspended["checks"]["update"]["state"], "ok")
 
     def test_onboarding_steps_left_do_not_block(self) -> None:
         text = preflight_text(candidate="59ca9c9bd1bb|no|yes", enroll_state=None, acceptance=None, runners=(),

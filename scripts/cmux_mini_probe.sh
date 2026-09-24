@@ -17,7 +17,7 @@ e cpus "$(sysctl -n hw.ncpu)"
 e memory_bytes "$(sysctl -n hw.memsize)"
 e macos "$(sw_vers -productVersion)"
 e macos_build "$(sw_vers -buildVersion)"
-e uptime_boot "$(sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+).*/\1/')"
+e uptime_boot "$(sysctl -n kern.boottime | sed -E 's/^[{] sec = ([0-9]+).*/\1/')"
 for app in /Applications/Xcode*.app; do
   [ -e "$app" ] || [ -L "$app" ] || continue
   kind=dir; [ -L "$app" ] && kind="symlink:$(readlink "$app")"

@@ -114,8 +114,18 @@ done
 # A running or prepared macOS update means a restart is coming.
 pgrep -f '(^|[ /])softwareupdate( |$)' >/dev/null && \
   e pf_update_running "$(pgrep -fl '(^|[ /])softwareupdate( |$)' | grep -v '^[0-9]* sudo ' | head -1 | cut -d' ' -f2- | cut -c1-120)"
-prepared=$(plutil -extract BootedOSVersion raw /System/Volumes/Update/Preflight.plist 2>/dev/null)
-[ -n "$prepared" ] && [ "$prepared" = "$(sw_vers -buildVersion)" ] && e pf_update_prepared yes
+# An update prepared for this build since the last boot is waiting for a restart. One prepared before
+# the last boot survived a restart without applying (suspended), which does not block.
+booted=$(sysctl -n kern.boottime | sed -E 's/^[{] sec = ([0-9]+).*/\1/')
+for f in /System/Volumes/Update/Preflight.plist /System/Volumes/Update/Update.plist; do
+  [ -f "$f" ] || continue
+  from=$(plutil -extract update-asset-attributes.PrerequisiteBuild raw "$f" 2>/dev/null || plutil -extract BootedOSVersion raw "$f" 2>/dev/null)
+  [ -n "$from" ] && [ "$from" = "$(sw_vers -buildVersion)" ] || continue
+  to=$(plutil -extract update-asset-attributes.OSVersion raw "$f" 2>/dev/null)
+  if [ "$(stat -f %m "$f")" -ge "${booted:-0}" ]; then state=pending; else state=suspended; fi
+  e pf_update_prepared "$state|${to:-unknown}"
+  break
+done
 pmset -g custom 2>/dev/null | while IFS= read -r line; do e pf_pmset "$line"; done
 
 # Runners registered for this user: the directory and agent name only.
