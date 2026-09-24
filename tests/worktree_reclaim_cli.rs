@@ -914,3 +914,193 @@ fn a_partial_removal_trips_the_circuit_breaker() {
         "the batch stopped before the next worktree"
     );
 }
+
+/// Commit on the current branch with committer and author dates `seconds` ago.
+fn commit_aged(checkout: &Path, message: &str, seconds: u64) {
+    let at = SystemTime::now() - std::time::Duration::from_secs(seconds);
+    let date = format!(
+        "@{} +0000",
+        at.duration_since(UNIX_EPOCH).expect("epoch").as_secs()
+    );
+    let output = Command::new(GIT)
+        .arg("-C")
+        .arg(checkout)
+        .args([
+            "-c",
+            "user.name=Glaeda Test",
+            "-c",
+            "user.email=glaeda-test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            message,
+        ])
+        .env_clear()
+        .env("HOME", checkout)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_COMMITTER_DATE", &date)
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run fixture Git");
+    assert_child_success("aged commit", &output);
+}
+
+/// Rewrite every entry of one branch's reflog to `seconds` ago.
+fn age_branch_reflog(repository: &Path, branch: &str, seconds: u64) {
+    let at = SystemTime::now() - std::time::Duration::from_secs(seconds);
+    let epoch = at
+        .duration_since(UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs()
+        .to_string();
+    let reflog = repository.join(".git/logs/refs/heads").join(branch);
+    let text = fs::read_to_string(&reflog).expect("read branch reflog");
+    let aged: String = text
+        .lines()
+        .map(|line| {
+            let (header, message) = line.split_once('\t').unwrap_or((line, ""));
+            let mut fields: Vec<&str> = header.split(' ').collect();
+            let at = fields.len() - 2;
+            fields[at] = &epoch;
+            format!("{}\t{message}\n", fields.join(" "))
+        })
+        .collect();
+    fs::write(&reflog, aged).expect("backdate branch reflog");
+}
+
+/// Make a branch off main holding one aged commit that adds `file`; land the same file on main
+/// when `land` is set. Returns to main.
+fn branch_with_work(fixture: &Fixture, name: &str, file: &str, land: bool, seconds: u64) {
+    let main = &fixture.main;
+    git(main, &["checkout", "-q", "-b", name]);
+    fs::write(main.join(file), format!("{name}\n")).expect("write branch file");
+    git(main, &["add", file]);
+    commit_aged(main, name, seconds);
+    git(main, &["checkout", "-q", "main"]);
+    if land {
+        fs::write(main.join(file), format!("{name}\n")).expect("write squashed file");
+        git(main, &["add", file]);
+        commit(main, &format!("{name} (squashed)"));
+    }
+    age_branch_reflog(main, name, seconds);
+}
+
+fn branch_entry(report: &serde_json::Value, name: &str) -> serde_json::Value {
+    report["branches"]["branches"]
+        .as_array()
+        .expect("branch list")
+        .iter()
+        .find(|branch| branch["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("branch {name} missing from {report:#}"))
+}
+
+/// `--branches` deletes only finished, idle, unprotected branches no worktree has checked out.
+#[test]
+fn branches_mode_deletes_only_finished_idle_branches() {
+    let fixture = Fixture::new();
+    let hours = 60 * 60;
+    branch_with_work(&fixture, "landed", "landed.txt", true, 2 * hours);
+    branch_with_work(&fixture, "unfinished", "wip.txt", false, 2 * hours);
+    branch_with_work(&fixture, "recent", "recent.txt", true, 60);
+    branch_with_work(&fixture, "kept", "kept.txt", true, 2 * hours);
+    git(
+        &fixture.main,
+        &["config", "--add", "glaeda.keepBranch", "kept"],
+    );
+    git(
+        &fixture.main,
+        &[
+            "config",
+            "branch.landed.description",
+            "gone with the branch",
+        ],
+    );
+    // Checked out in a worktree: kept even though its work has landed.
+    let checked = fixture.add("checked");
+    fs::write(checked.join("checked.txt"), "checked\n").expect("write checked file");
+    git(&checked, &["add", "checked.txt"]);
+    commit_aged(&checked, "checked", 2 * hours);
+    fs::write(fixture.main.join("checked.txt"), "checked\n").expect("land checked file");
+    git(&fixture.main, &["add", "checked.txt"]);
+    commit(&fixture.main, "checked (squashed)");
+    age_branch_reflog(&fixture.main, "checked", 2 * hours);
+    git(
+        &fixture.main,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    git(
+        &fixture.main,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+
+    let plan = report(&fixture.run(&fixture.main, &["--branches", "--no-github", "--all"]));
+    assert_eq!(plan["branches"]["result"], "listed");
+    assert_eq!(plan["branches"]["eligible"], 1, "{plan:#}");
+    let landed = branch_entry(&plan, "landed");
+    assert_eq!(landed["decision"], "eligible");
+    assert_eq!(landed["evidence"], "default_branch");
+    for (name, reason) in [
+        ("unfinished", "in_progress"),
+        ("recent", "recently_active"),
+        ("kept", "protected"),
+        // Checked out in the main worktree, which is checked before the protected names.
+        ("main", "checked_out"),
+        ("checked", "checked_out"),
+    ] {
+        assert_eq!(branch_entry(&plan, name)["reason"], reason, "{name}");
+    }
+    assert!(
+        ref_exists(&fixture.main, "refs/heads/landed"),
+        "a plan deletes nothing"
+    );
+
+    let applied = report(&fixture.run(&fixture.main, &["--branches", "--no-github", "--apply"]));
+    assert_eq!(applied["branches"]["deleted"], 1, "{applied:#}");
+    assert_eq!(branch_entry(&applied, "landed")["outcome"], "deleted");
+    assert!(!ref_exists(&fixture.main, "refs/heads/landed"));
+    let description = Command::new(GIT)
+        .arg("-C")
+        .arg(&fixture.main)
+        .args(["config", "branch.landed.description"])
+        .output()
+        .expect("run git config");
+    assert!(
+        !description.status.success(),
+        "the branch's config section goes too"
+    );
+    for name in ["unfinished", "recent", "kept", "main", "checked"] {
+        assert!(
+            ref_exists(&fixture.main, &format!("refs/heads/{name}")),
+            "{name} kept"
+        );
+    }
+}
+
+/// Without `--branches` the report has no branch section and no branch is touched.
+#[test]
+fn branches_are_untouched_without_the_flag() {
+    let fixture = Fixture::new();
+    branch_with_work(&fixture, "landed", "landed.txt", true, 2 * 60 * 60);
+    git(
+        &fixture.main,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    git(
+        &fixture.main,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let applied = report(&fixture.run(&fixture.main, &["--apply"]));
+    assert!(applied.get("branches").is_none());
+    assert!(ref_exists(&fixture.main, "refs/heads/landed"));
+}

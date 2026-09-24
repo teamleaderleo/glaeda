@@ -41,6 +41,13 @@ use serde::Serialize;
 use crate::process::{ExecutionRecord, MAX_CAPTURED_STREAM_BYTES, TimedCommandExecutor};
 use crate::project_checkout_observation::{ProjectBranchState, ProjectCheckoutObserver};
 
+mod branches;
+
+pub use branches::{
+    GithubLookup, LocalBranchDecision, LocalBranchDeletion, LocalBranchFinishedEvidence,
+    LocalBranchKeepReason, LocalBranchReport, MAX_LOCAL_BRANCHES, reclaim_local_branches,
+};
+
 pub const LINKED_WORKTREE_RECLAIM_SCHEMA_VERSION: u8 = 1;
 
 /// Most linked worktrees one inventory may describe. Larger inventories fail closed.
