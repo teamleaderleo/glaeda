@@ -20,8 +20,9 @@ job-started refuses (exits 1, so the runner fails the job before any step runs) 
 Any crash also exits non-zero, which refuses the job. An admitted job is then held to the fleet host,
 so a PR job never lands on a mini that is busy with other work. It is refused fast (the pool picker
 re-runs it elsewhere) when:
-  * the host is reserved: /Users/Shared/cmux-build-fleet/reservation.json (glaeda-reservation/v1) with
-    now < until, whoever owns it; an unreadable or malformed file also refuses, an expired one is ignored
+  * the host is reserved: /Users/Shared/cmux-build-fleet/reservation.json (glaeda-reservation/v1, integer
+    Unix seconds) with now < until, whoever owns it; an unreadable or invalid file also refuses, an expired
+    one is ignored (parsed by glaeda_reservation.py, installed next to this hook)
   * free disk is below --min-free-gib
   * another build holds the fleet host lock (/Users/Shared/cmux-build-fleet/host.lock, the flock that
     with-host-lock and the build worker take)
@@ -35,8 +36,9 @@ job-completed only runs the same disk pressure pass and always exits 0.
 from __future__ import annotations
 
 import argparse
-import datetime
 import fcntl
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -51,7 +53,6 @@ DISK_TIMEOUT_S = 120
 FLEET_DIR = os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet"
 HOST_LOCK = f"{FLEET_DIR}/host.lock"
 RESERVATION = f"{FLEET_DIR}/reservation.json"
-RESERVATION_SCHEMA = "glaeda-reservation/v1"
 HOLDER_FILE = "host-lock-holder.pid"
 HOLDER_POLL_S = 2.0
 HOLDER_MAX_S = 12 * 3600  # a job never holds the host longer than GitHub's own job limit allows
@@ -110,36 +111,27 @@ def decide(event_name: str | None, event: Any, repository: str | None,
     return True, f"{event_name} on {repo or '(unknown)'}"
 
 
-def parse_time(value: Any) -> datetime.datetime | None:
-    """ISO 8601 with an explicit zone (python3.9 on the minis has no 'Z' support in fromisoformat)."""
-    if not isinstance(value, str):
-        return None
-    try:
-        when = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return when if when.tzinfo is not None else None
-
-
-def reservation_refusal(path: str, now: datetime.datetime) -> str | None:
-    """Why an active or unreadable reservation refuses this job, or None."""
+def reservation_refusal(path: str, now: float) -> str | None:
+    """Why an active or unreadable reservation refuses this job, or None. Parsed by glaeda_reservation,
+    shared with glaeda-mini-fleet, which the installer copies next to this hook."""
     try:
         text = Path(path).read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError as error:
+    except (OSError, UnicodeDecodeError) as error:
         return f"reservation {path} is unreadable ({type(error).__name__})"
     try:
-        doc = json.loads(text)
-    except ValueError:
-        doc = None
-    until = parse_time(doc.get("until")) if isinstance(doc, dict) else None
-    if not isinstance(doc, dict) or doc.get("schema") != RESERVATION_SCHEMA or until is None:
-        return f"reservation {path} is not a valid {RESERVATION_SCHEMA} marker"
-    if now >= until:
-        return None
-    return (f"host reserved by {doc.get('owner') or '?'} for {doc.get('purpose') or '?'} "
-            f"until {until.isoformat()}")
+        module = Path(__file__).resolve().parent / "glaeda_reservation.py"
+        loader = importlib.machinery.SourceFileLoader("glaeda_reservation", os.fspath(module))
+        spec = importlib.util.spec_from_loader("glaeda_reservation", loader)
+        reservation = importlib.util.module_from_spec(spec)
+        loader.exec_module(reservation)
+    except Exception as error:  # noqa: BLE001  (a marker we cannot read refuses)
+        return f"reservation {path} exists but glaeda_reservation.py is missing ({type(error).__name__})"
+    marker, why = reservation.parse(text)
+    if marker is None:
+        return f"reservation {path} is not a valid {reservation.SCHEMA} marker ({why})"
+    return f"host reserved by {reservation.describe(marker)}" if reservation.active(marker, now) else None
 
 
 def disk_refusal(path: str, min_free_gib: float) -> str | None:
@@ -289,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
                                tuple(args.allow_event))
         if not admit:
             return refuse(reason)
-        why = reservation_refusal(args.reservation, datetime.datetime.now(datetime.timezone.utc)) \
+        why = reservation_refusal(args.reservation, time.time()) \
             or disk_refusal(os.path.dirname(args.host_lock), args.min_free_gib)
         if why:
             return refuse(why)

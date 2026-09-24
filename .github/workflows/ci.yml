@@ -113,6 +113,7 @@ jobs:
               Path("scripts/glaeda-cmux-runner"),
               Path("scripts/glaeda-cmux-runner-hook"),
               Path("scripts/glaeda_fleet_labels.py"),
+              Path("scripts/glaeda_reservation.py"),
               Path("scripts/test-glaeda-cmux-runner.py"),
               Path("scripts/glaeda-mini-fleet"),
               Path("scripts/test-glaeda-mini-fleet.py"),

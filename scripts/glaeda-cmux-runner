@@ -69,6 +69,7 @@ SCHEMA = "glaeda-cmux-runner/v1"
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO = SCRIPT_DIR.parent
 HOOK_SOURCE = SCRIPT_DIR / "glaeda-cmux-runner-hook"
+RESERVATION_SOURCE = SCRIPT_DIR / "glaeda_reservation.py"  # the hook reads reservation markers with it
 LABEL = "com.teamleaderleo.glaeda.cmux-runner"
 DEFAULT_REPO = "manaflow-ai/cmux"
 BASE_LABELS = ("self-hosted", "macOS", "ARM64")
@@ -394,7 +395,8 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
 
 
 def desired_files(ctx: Context) -> dict[Path, tuple[bytes, int]]:
-    files = {ctx.hook_dir / "glaeda-cmux-runner-hook": (HOOK_SOURCE.read_bytes(), 0o755)}
+    files = {ctx.hook_dir / "glaeda-cmux-runner-hook": (HOOK_SOURCE.read_bytes(), 0o755),
+             ctx.hook_dir / "glaeda_reservation.py": (RESERVATION_SOURCE.read_bytes(), 0o644)}
     for name, data in hook_wrappers(ctx).items():
         files[ctx.hook_dir / name] = (data, 0o755)
     files[ctx.plist_path] = (plistlib.dumps(agent_plist(ctx), sort_keys=True), 0o644)

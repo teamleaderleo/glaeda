@@ -296,28 +296,45 @@ class HookTest(unittest.TestCase):
 
     def test_reservation_markers(self) -> None:
         fleet = self.fleet()
-        now = time.time()
-        iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+        now = int(time.time())
+        v1 = {"schema": "glaeda-reservation/v1", "owner": "fleet-session", "purpose": "chromium campaign",
+              "since": now - 60, "until": now + 3600}
         cases = {
-            "active": ({"schema": "glaeda-reservation/v1", "owner": "fleet-session", "purpose": "chromium campaign",
-                        "since": iso(now - 60), "until": iso(now + 3600)}, False, "chromium campaign"),
-            "expired": ({"schema": "glaeda-reservation/v1", "owner": "x", "purpose": "y", "until": iso(now - 60)},
-                        True, "admitted"),
-            "no-zone": ({"schema": "glaeda-reservation/v1", "until": "2099-01-01T00:00:00"}, False, "not a valid"),
-            "wrong-schema": ({"schema": "other/v1", "until": iso(now + 3600)}, False, "not a valid"),
+            "active": (v1, False, "host reserved by fleet-session for chromium campaign until"),
+            "expired": ({**v1, "until": now - 1}, True, "admitted"),
+            "iso-string-until": ({**v1, "until": "2099-01-01T00:00:00Z"}, False, "until is not integer"),
+            "float-until": ({**v1, "until": now + 3600.5}, False, "until is not integer"),
+            "bool-until": ({**v1, "until": True}, False, "until is not integer"),
+            "missing-since": ({k: v for k, v in v1.items() if k != "since"}, False, "since is not integer"),
+            "wrong-schema": ({**v1, "schema": "other/v1"}, False, "schema is not"),
+            "not-json": ("{nope", False, "not JSON"),
         }
         for name, (doc, admitted, text) in cases.items():
             with self.subTest(name):
-                (fleet / "reservation.json").write_text(json.dumps(doc))
+                (fleet / "reservation.json").write_text(doc if isinstance(doc, str) else json.dumps(doc))
                 result = self.started()
                 self.assertEqual(result.returncode == 0, admitted, result.stdout)
                 self.assertIn(text, result.stdout)
                 self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"))
-        (fleet / "reservation.json").write_text("{not json")
-        self.assertEqual(self.started().returncode, 1)
         (fleet / "reservation.json").unlink()
         self.assertEqual(self.started().returncode, 0)
         self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"))
+
+    def test_marker_without_the_parser_refuses(self) -> None:
+        fleet = self.fleet()
+        (fleet / "reservation.json").write_text("{}")
+        lonely = self.dir / "lonely"
+        lonely.mkdir()
+        (lonely / "glaeda-cmux-runner-hook").write_bytes(HOOK.read_bytes())
+        push = event(self.dir, "push", {"repository": CMUX})
+        result = subprocess.run([sys.executable, os.fspath(lonely / "glaeda-cmux-runner-hook"), "job-started",
+                                 "--allowed-repo", "manaflow-ai/cmux", "--no-disk"], capture_output=True, text=True,
+                                timeout=30, env={"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir),
+                                                 "GLAEDA_FLEET_DIR": os.fspath(fleet), "GITHUB_EVENT_NAME": "push",
+                                                 "GITHUB_EVENT_PATH": os.fspath(push),
+                                                 "GITHUB_REPOSITORY": "manaflow-ai/cmux"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("glaeda_reservation.py is missing", result.stdout)
 
     def test_disk_floor_refuses(self) -> None:
         self.fleet()
@@ -803,8 +820,9 @@ class RunnerTest(unittest.TestCase):
         path.write_text(json.dumps(manifest))
         with mock.patch.object(cr, "xcode_present", return_value=True):
             self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
-        started = (self.home / "actions-runner-glaeda/glaeda-hooks/job-started.sh").read_text()
-        self.assertIn("--min-free-gib 100", started)
+        hooks = self.home / "actions-runner-glaeda/glaeda-hooks"
+        self.assertIn("--min-free-gib 100", (hooks / "job-started.sh").read_text())
+        self.assertTrue((hooks / "glaeda_reservation.py").is_file())
 
     def test_manifest_refusals_and_exclusive_flags(self) -> None:
         for args in (("--manifest", self.manifest(), "--member", "laptop"),
@@ -1086,7 +1104,7 @@ class FleetLabelsModuleTest(unittest.TestCase):
 class NoEmDashTest(unittest.TestCase):
     def test_no_em_dashes(self) -> None:
         for path in (ROOT / "scripts/glaeda-cmux-runner", HOOK, Path(__file__), ROOT / "docs/CMUX_MINI_RUNNER.md",
-                     ROOT / "scripts/glaeda_fleet_labels.py"):
+                     ROOT / "scripts/glaeda_fleet_labels.py", ROOT / "scripts/glaeda_reservation.py"):
             self.assertNotIn(chr(0x2014), path.read_text(encoding="utf-8"), path)
 
 
