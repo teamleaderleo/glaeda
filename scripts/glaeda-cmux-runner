@@ -1,0 +1,765 @@
+#!/usr/bin/env python3
+"""glaeda-cmux-runner: turn a cmux Mac mini into a GitHub Actions self-hosted runner.
+
+    glaeda-cmux-runner                                plan: what --apply would do (no side effects)
+    glaeda-cmux-runner --apply                        download, verify, register, load the LaunchAgent
+    glaeda-cmux-runner --uninstall                    plan removal
+    glaeda-cmux-runner --uninstall --apply            deregister and remove what --apply installed
+    glaeda-mini-setup --runner [...]                  same thing, through the mini setup front door
+
+Defaults register to --repo manaflow-ai/cmux. Use --org ORG for an organization runner.
+
+What --apply does, all under $HOME and owned by the current user (no sudo):
+    1. downloads the official actions/runner osx-arm64 release (latest, or --runner-version),
+       verifies its SHA-256 against the release notes (and the asset digest when GitHub has one),
+       and unpacks it into ~/actions-runner-glaeda (or --runner-dir)
+    2. registers it with labels self-hosted,macOS,ARM64,glaeda-mini (+ --labels), persistent
+       (not ephemeral) so the _work tree keeps hot state between jobs
+    3. writes job hooks: job-started refuses fork pull requests and pull_request_target and
+       runs glaeda-disk pressure; job-completed runs disk pressure again (never fatal)
+    4. writes and loads ~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist
+    5. confirms the registration through the GitHub API
+
+The one-time registration token comes from `gh api -X POST .../registration-token` on stdout.
+It is never placed in any argv, written to disk, or printed. It reaches config.sh only through
+ACTIONS_RUNNER_INPUT_TOKEN in that one child's environment, which the runner reads and clears.
+
+Routing is never automated: the plan prints the `gh variable set` commands that point cmux
+workflows at the glaeda-mini label, and the `gh variable delete` commands that roll back.
+The receipt lands in ~/.local/state/glaeda/cmux-runner/receipt.json.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import platform
+import plistlib
+import pwd
+import re
+import secrets
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+SCHEMA = "glaeda-cmux-runner/v1"
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO = SCRIPT_DIR.parent
+HOOK_SOURCE = SCRIPT_DIR / "glaeda-cmux-runner-hook"
+LABEL = "com.teamleaderleo.glaeda.cmux-runner"
+DEFAULT_REPO = "manaflow-ai/cmux"
+BASE_LABELS = ("self-hosted", "macOS", "ARM64")
+MINI_LABEL = "glaeda-mini"
+ROUTE_VARIABLES = ("MACOS_RUNNER_15", "MACOS_RUNNER_26", "MACOS_RUNNER_PR", "MACOS_RUNNER_DUAL_XCODE")
+RUNNER_RELEASE_API = "repos/actions/runner/releases"
+PLATFORM_ASSET = "osx-arm64"
+MARKER = ".glaeda-cmux-runner"
+HOOK_DIR = "glaeda-hooks"
+DARWIN_REQUIRED = True
+RUN_TIMEOUT = 60
+CURL = "/usr/bin/curl"
+LAUNCHCTL = "/bin/launchctl"
+ONLINE_WAIT_S = 90
+
+
+# ---------------------------------------------------------------- small helpers
+
+
+def sha256_bytes(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str | None:
+    try:
+        return sha256_bytes(path.read_bytes())
+    except OSError:
+        return None
+
+
+def run(argv: list[str], timeout: int = RUN_TIMEOUT, env: dict[str, str] | None = None,
+        cwd: Path | None = None) -> tuple[int, str]:
+    """Run a command. Never raises; a missing tool is (127, "")."""
+    try:
+        result = subprocess.run(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=timeout, env=env, cwd=cwd, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return 127, str(error)[:400]
+    return result.returncode, result.stdout.strip()[:65536]
+
+
+def read_token(gh: str, endpoint: str) -> str | None:
+    """POST for a one-time token. Only stdout is kept, in memory; the token is not in argv."""
+    try:
+        result = subprocess.run(
+            [gh, "api", "-X", "POST", endpoint, "--jq", ".token"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=RUN_TIMEOUT, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    token = result.stdout.strip()
+    if result.returncode != 0 or not token or not re.fullmatch(r"[A-Za-z0-9_.\-]+", token):
+        return None
+    return token
+
+
+def run_with_token(argv: list[str], token: str, cwd: Path, timeout: int = 300) -> tuple[int, str]:
+    """Run config.sh with the token only in that child's environment; scrub it from the output."""
+    env = dict(os.environ)
+    env["ACTIONS_RUNNER_INPUT_TOKEN"] = token
+    try:
+        result = subprocess.run(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=timeout, env=env, cwd=cwd, check=False,
+        )
+        code, out = result.returncode, result.stdout
+    except (OSError, subprocess.TimeoutExpired) as error:
+        code, out = 127, str(error)
+    finally:
+        env.pop("ACTIONS_RUNNER_INPUT_TOKEN", None)
+    return code, out.replace(token, "***").strip()[-2000:]
+
+
+def which(name: str, extra: tuple[str, ...] = ()) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    for candidate in extra:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def write_atomic(path: Path, data: bytes, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stage = path.with_name(f".{path.name}.cmux-runner.tmp")
+    stage.write_bytes(data)
+    os.chmod(stage, mode)
+    os.replace(stage, path)
+
+
+def default_name() -> str:
+    host = socket.gethostname().split(".")[0].lower()
+    host = re.sub(r"[^a-z0-9-]+", "-", host).strip("-") or "mac"
+    return f"{host}-glaeda"
+
+
+class Context:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.home = Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir)
+        self.uid = os.getuid()
+        real_home = Path(pwd.getpwuid(self.uid).pw_dir)
+        # A fake HOME (tests, rehearsals) must never reach the real launchd session.
+        self.sandbox = os.path.realpath(self.home) != os.path.realpath(real_home)
+        self.skip_launchctl = args.skip_launchctl or self.sandbox
+        self.apply = args.apply
+        self.org = args.org
+        self.repo = None if args.org else (args.repo or DEFAULT_REPO)
+        self.name = args.name or default_name()
+        extra = [label.strip() for label in (args.labels or "").split(",") if label.strip()]
+        self.labels = list(dict.fromkeys([*BASE_LABELS, MINI_LABEL, *extra]))
+        self.group = args.group
+        self.replace = args.replace
+        self.version = args.runner_version
+        self.pinned_sha = args.runner_sha256
+        self.route_repo = args.route_repo
+        self.runner_dir = (args.runner_dir or self.home / "actions-runner-glaeda").expanduser().absolute()
+        self.hook_dir = self.runner_dir / HOOK_DIR
+        self.gh = args.gh or which("gh", ("/opt/homebrew/bin/gh", "/usr/local/bin/gh"))
+        self.python = args.python or which("python3", ("/opt/homebrew/bin/python3", "/usr/bin/python3"))
+        self.agents = self.home / "Library/LaunchAgents"
+        self.logs = self.home / "Library/Logs"
+        self.state = self.home / ".local/state/glaeda/cmux-runner"
+        self.receipt_path = self.state / "receipt.json"
+        self.plist_path = self.agents / f"{LABEL}.plist"
+
+    @property
+    def scope_api(self) -> str:
+        return f"orgs/{self.org}" if self.org else f"repos/{self.repo}"
+
+    @property
+    def scope_url(self) -> str:
+        return f"https://github.com/{self.org or self.repo}"
+
+    def show(self, path: Path | str) -> str:
+        text, home = os.fspath(path), os.fspath(self.home)
+        return "~" + text[len(home):] if text == home or text.startswith(home + "/") else text
+
+
+def load_receipt(ctx: Context) -> dict[str, Any] | None:
+    try:
+        doc = json.loads(ctx.receipt_path.read_text())
+        return doc if isinstance(doc, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------- GitHub reads
+
+
+def gh_json(ctx: Context, endpoint: str) -> Any:
+    if ctx.gh is None:
+        return None
+    code, out = run([ctx.gh, "api", endpoint])
+    if code != 0:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+def resolve_release(ctx: Context) -> dict[str, Any]:
+    """Latest (or pinned) osx-arm64 runner: version, url, expected sha256. Read-only."""
+    endpoint = f"{RUNNER_RELEASE_API}/tags/v{ctx.version}" if ctx.version else f"{RUNNER_RELEASE_API}/latest"
+    release = gh_json(ctx, endpoint)
+    if not isinstance(release, dict):
+        return {"state": "blocked", "note": f"could not read {endpoint} (is gh installed and logged in?)"}
+    version = str(release.get("tag_name") or "").lstrip("v")
+    asset_name = f"actions-runner-{PLATFORM_ASSET}-{version}.tar.gz"
+    asset = next((a for a in release.get("assets") or [] if a.get("name") == asset_name), None)
+    if asset is None:
+        return {"state": "blocked", "note": f"release v{version} has no {asset_name}"}
+    body = str(release.get("body") or "")
+    match = re.search(rf"<!--\s*BEGIN SHA {re.escape(PLATFORM_ASSET)}\s*-->\s*([0-9a-f]{{64}})\s*<!--\s*END SHA", body)
+    notes_sha = match.group(1) if match else None
+    digest = str(asset.get("digest") or "")
+    digest_sha = digest.split(":", 1)[1] if digest.startswith("sha256:") else None
+    if ctx.pinned_sha:
+        expected = ctx.pinned_sha.lower().removeprefix("sha256:")
+    else:
+        expected = notes_sha or digest_sha
+    if expected is None:
+        return {"state": "blocked", "note": f"release v{version} publishes no SHA-256 for {PLATFORM_ASSET}; pass --runner-sha256"}
+    for other in (notes_sha, digest_sha):
+        if other and other != expected:
+            return {"state": "blocked", "note": f"SHA-256 sources disagree for v{version}; refusing"}
+    return {"state": "ok", "version": version, "asset": asset_name,
+            "url": asset.get("browser_download_url"), "sha256": expected,
+            "shaSources": [n for n, v in (("releaseNotes", notes_sha), ("assetDigest", digest_sha), ("pinned", ctx.pinned_sha)) if v]}
+
+
+def lookup_runner(ctx: Context) -> tuple[bool, dict[str, Any] | None]:
+    """(query succeeded, runner with ctx.name or None). A failed query is not "absent"."""
+    doc = gh_json(ctx, f"{ctx.scope_api}/actions/runners?per_page=100")
+    if not isinstance(doc, dict) or not isinstance(doc.get("runners"), list):
+        return False, None
+    for runner in doc["runners"]:
+        if runner.get("name") == ctx.name:
+            return True, {"id": runner.get("id"), "status": runner.get("status"), "busy": runner.get("busy"),
+                          "labels": sorted(label.get("name") for label in runner.get("labels") or [])}
+    return True, None
+
+
+def find_runner(ctx: Context) -> dict[str, Any] | None:
+    return lookup_runner(ctx)[1]
+
+
+# ---------------------------------------------------------------- desired state
+
+
+def hook_wrappers(ctx: Context) -> dict[str, bytes]:
+    python = shlex.quote(ctx.python or "/usr/bin/python3")
+    hook = shlex.quote(os.fspath(ctx.hook_dir / "glaeda-cmux-runner-hook"))
+    scope = f"--allowed-owner {shlex.quote(ctx.org)}" if ctx.org else f"--allowed-repo {shlex.quote(ctx.repo or '')}"
+    started = (
+        "#!/bin/bash\n"
+        "# glaeda-cmux-runner job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"
+        "# before any step runs. A missing interpreter also exits non-zero, so this fails closed.\n"
+        f"exec {python} {hook} job-started {scope}\n"
+    )
+    completed = (
+        "#!/bin/bash\n"
+        "# glaeda-cmux-runner job-completed hook (generated, receipt-owned). Never fails the job.\n"
+        f"{python} {hook} job-completed || true\n"
+        "exit 0\n"
+    )
+    return {"job-started.sh": started.encode(), "job-completed.sh": completed.encode()}
+
+
+def agent_plist(ctx: Context) -> dict[str, Any]:
+    path = ":".join([os.fspath(ctx.home / ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin",
+                     "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+    return {
+        "Label": LABEL,
+        "ProgramArguments": [os.fspath(ctx.runner_dir / "run.sh")],
+        "WorkingDirectory": os.fspath(ctx.runner_dir),
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "ProcessType": "Interactive",
+        "SessionCreate": True,
+        "EnvironmentVariables": {
+            "ACTIONS_RUNNER_HOOK_JOB_STARTED": os.fspath(ctx.hook_dir / "job-started.sh"),
+            "ACTIONS_RUNNER_HOOK_JOB_COMPLETED": os.fspath(ctx.hook_dir / "job-completed.sh"),
+            "PATH": path,
+        },
+        "StandardOutPath": os.fspath(ctx.logs / "glaeda-cmux-runner.log"),
+        "StandardErrorPath": os.fspath(ctx.logs / "glaeda-cmux-runner.err"),
+    }
+
+
+def desired_files(ctx: Context) -> dict[Path, tuple[bytes, int]]:
+    files = {ctx.hook_dir / "glaeda-cmux-runner-hook": (HOOK_SOURCE.read_bytes(), 0o755)}
+    for name, data in hook_wrappers(ctx).items():
+        files[ctx.hook_dir / name] = (data, 0o755)
+    files[ctx.plist_path] = (plistlib.dumps(agent_plist(ctx), sort_keys=True), 0o644)
+    return files
+
+
+def owned_dir(ctx: Context, receipt: dict[str, Any] | None) -> bool:
+    """The runner directory is ours only if the receipt says so and the marker still matches."""
+    if not receipt or not receipt.get("runnerDirOwned") or receipt.get("runnerDir") != os.fspath(ctx.runner_dir):
+        return False
+    try:
+        return (ctx.runner_dir / MARKER).read_text().strip() == receipt.get("installId")
+    except OSError:
+        return False
+
+
+def launchctl_loaded(ctx: Context) -> bool | None:
+    if ctx.skip_launchctl:
+        return None
+    return run([LAUNCHCTL, "print", f"gui/{ctx.uid}/{LABEL}"])[0] == 0
+
+
+def routing(ctx: Context) -> dict[str, list[str]]:
+    repo = shlex.quote(ctx.route_repo)
+    return {
+        "route": [f"gh variable set {v} --body {MINI_LABEL} --repo {repo}" for v in ROUTE_VARIABLES],
+        "rollback": [f"gh variable delete {v} --repo {repo}" for v in ROUTE_VARIABLES],
+    }
+
+
+# ---------------------------------------------------------------- plan
+
+
+def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    ours = owned_dir(ctx, receipt)
+    configured = (ctx.runner_dir / ".runner").is_file()
+    exists = ctx.runner_dir.exists()
+
+    if ours:
+        actions.append({"kind": "dir", "path": os.fspath(ctx.runner_dir), "state": "unchanged", "owned": True})
+    elif exists:
+        actions.append({"kind": "dir", "path": os.fspath(ctx.runner_dir), "state": "blocked", "owned": False,
+                        "note": "exists and is not owned by this command; pick --runner-dir or remove it"})
+    else:
+        actions.append({"kind": "dir", "path": os.fspath(ctx.runner_dir), "state": "create", "owned": False})
+    blocked_dir = actions[-1]["state"] == "blocked"
+
+    if ours and (ctx.runner_dir / "config.sh").is_file():
+        actions.append({"kind": "download", "state": "unchanged",
+                        "version": (receipt or {}).get("runnerVersion"), "note": "installed; the runner self-updates"})
+    else:
+        rel = resolve_release(ctx)
+        act = {"kind": "download", **rel}
+        act["state"] = "create" if rel["state"] == "ok" else "blocked"
+        if blocked_dir:
+            act["state"] = "blocked"
+        actions.append(act)
+
+    reg = {"kind": "register", "scope": ctx.org or ctx.repo, "name": ctx.name, "labels": ctx.labels,
+           "ephemeral": False}
+    if ctx.gh is None:
+        reg.update(state="blocked", note="gh (GitHub CLI) is required and must be logged in")
+    elif ours and configured:
+        reg.update(state="unchanged")
+    elif blocked_dir:
+        reg.update(state="blocked", note="runner directory is not ours")
+    else:
+        existing = find_runner(ctx)
+        if existing and not ctx.replace:
+            reg.update(state="blocked", existing=existing,
+                       note=f"a runner named {ctx.name} is already registered; pass --name or --replace")
+        else:
+            reg.update(state="create", existing=existing)
+    actions.append(reg)
+
+    prior = {a.get("path"): a.get("ownedSha256") for a in (receipt or {}).get("actions", [])
+             if a.get("kind") in {"hook", "agent"} and a.get("owned")}
+    for path, (data, mode) in desired_files(ctx).items():
+        kind = "agent" if path == ctx.plist_path else "hook"
+        current, want = sha256_file(path), sha256_bytes(data)
+        if current is None:
+            state = "create"
+        elif current == want and (path.stat().st_mode & 0o777) == mode:
+            state = "unchanged"
+        elif prior.get(os.fspath(path)) == current or (kind == "hook" and ours):
+            state = "update"
+        else:
+            state = "blocked"
+        if kind == "hook" and blocked_dir:
+            state = "blocked"
+        owned = prior.get(os.fspath(path)) is not None and prior.get(os.fspath(path)) == current
+        act = {"kind": kind, "path": os.fspath(path), "state": state, "sha256": want, "previousSha256": current,
+               "mode": oct(mode), "owned": owned, "ownedSha256": current if owned else None}
+        if state == "blocked" and not blocked_dir:
+            act["note"] = "exists and was not written by this command"
+        if kind == "agent":
+            act["label"] = LABEL
+            act["loaded"] = launchctl_loaded(ctx)
+            act["launchctl"] = "skipped (sandbox HOME)" if ctx.sandbox else ("skipped" if ctx.skip_launchctl else "managed")
+        actions.append(act)
+    actions.append({"kind": "verify", "state": "pending", "note": f"GET {ctx.scope_api}/actions/runners, name {ctx.name}"})
+    return actions
+
+
+def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    if receipt is None:
+        return [{"kind": "note", "state": "kept",
+                 "note": f"no install receipt at {ctx.show(ctx.receipt_path)}; nothing is removed"}]
+    owned = {a.get("path"): a.get("ownedSha256") for a in receipt.get("actions", [])
+             if a.get("kind") in {"hook", "agent"} and a.get("owned")}
+    plist = os.fspath(ctx.plist_path)
+    current = sha256_file(ctx.plist_path)
+    if current is None:
+        state, note = "absent", ""
+    elif owned.get(plist) == current:
+        state, note = "remove", ""
+    else:
+        state, note = "kept", "not installed by this command, or changed since"
+    actions.append({"kind": "agent", "label": LABEL, "path": plist, "state": state, "note": note,
+                    "loaded": launchctl_loaded(ctx)})
+
+    ours = owned_dir(ctx, receipt)
+    registered = receipt.get("registration") or {}
+    if registered.get("owned") and ours:
+        actions.append({"kind": "deregister", "state": "remove", "scope": registered.get("scope"),
+                        "name": registered.get("name"), "runnerId": registered.get("runnerId")})
+    else:
+        actions.append({"kind": "deregister", "state": "kept",
+                        "note": "no registration owned by this command in this runner directory"})
+    if ours:
+        actions.append({"kind": "dir", "path": os.fspath(ctx.runner_dir), "state": "remove",
+                        "note": "runner, hooks and _work (hot state) go with it"})
+    else:
+        actions.append({"kind": "dir", "path": os.fspath(ctx.runner_dir),
+                        "state": "absent" if not ctx.runner_dir.exists() else "kept",
+                        "note": "" if not ctx.runner_dir.exists() else "not owned by this command (receipt or marker mismatch)"})
+    return actions
+
+
+# ---------------------------------------------------------------- apply
+
+
+def download_and_unpack(ctx: Context, act: dict[str, Any], install_id: str) -> None:
+    ctx.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stage = ctx.state / f".{act['asset']}.part"
+    stage.unlink(missing_ok=True)
+    code, out = run([CURL, "-fsSL", "--retry", "3", "-o", os.fspath(stage), act["url"]], timeout=900)
+    if code != 0:
+        act["state"], act["note"] = "failed", f"download failed: {out[-300:]}"
+        return
+    got = sha256_file(stage)
+    if got != "sha256:" + act["sha256"]:
+        stage.unlink(missing_ok=True)
+        act["state"], act["note"] = "failed", f"SHA-256 mismatch: got {got}, want sha256:{act['sha256']}"
+        return
+    ctx.runner_dir.mkdir(parents=True, mode=0o755)
+    # The marker lands first, so a failed unpack still leaves a directory this command owns.
+    (ctx.runner_dir / MARKER).write_text(install_id + "\n")
+    tar = which("tar", ("/usr/bin/tar",)) or "tar"
+    code, out = run([tar, "-xzf", os.fspath(stage), "-C", os.fspath(ctx.runner_dir)], timeout=600)
+    stage.unlink(missing_ok=True)
+    if code != 0 or not (ctx.runner_dir / "config.sh").is_file():
+        act["state"], act["note"] = "failed", f"unpack failed: {out[-300:]}"
+        return
+    act["applied"] = True
+
+
+def register(ctx: Context, act: dict[str, Any]) -> None:
+    token = read_token(ctx.gh or "gh", f"{ctx.scope_api}/actions/runners/registration-token")
+    if token is None:
+        act["state"], act["note"] = "failed", "could not obtain a registration token (needs repo or org admin)"
+        return
+    argv = [os.fspath(ctx.runner_dir / "config.sh"), "--unattended", "--url", ctx.scope_url,
+            "--name", ctx.name, "--labels", ",".join(l for l in ctx.labels if l not in BASE_LABELS),
+            "--work", "_work"]
+    if ctx.org and ctx.group:
+        argv += ["--runnergroup", ctx.group]
+    if ctx.replace:
+        argv.append("--replace")
+    code, out = run_with_token(argv, token, ctx.runner_dir)
+    del token
+    act["argv"] = argv
+    if code != 0 or not (ctx.runner_dir / ".runner").is_file():
+        act["state"], act["note"] = "failed", f"config.sh failed: {out[-400:]}"
+        return
+    act["applied"] = True
+
+
+def bootout(ctx: Context, wait_s: float = 5.0) -> None:
+    run([LAUNCHCTL, "bootout", f"gui/{ctx.uid}/{LABEL}"])
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline and run([LAUNCHCTL, "print", f"gui/{ctx.uid}/{LABEL}"])[0] == 0:
+        time.sleep(0.25)
+
+
+def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict[str, Any]) -> None:
+    # A plan with any blocked step applies nothing, so a half-installed runner never exists.
+    failed = any(a["state"] == "blocked" for a in actions)
+    for act in actions:
+        act.setdefault("applied", False)
+        if failed:
+            if act["state"] in {"create", "update", "pending"}:
+                act["state"], act["note"] = "skipped", "an earlier step was blocked or failed"
+            continue
+        kind, state = act["kind"], act["state"]
+        if state == "blocked":
+            failed = True
+            continue
+        if kind == "dir" and state == "create":
+            receipt_doc["runnerDirOwned"] = True  # set before anything lands inside it
+        elif kind == "download" and state == "create":
+            download_and_unpack(ctx, act, receipt_doc["installId"])
+            if act["state"] != "failed":
+                receipt_doc["runnerVersion"] = act["version"]
+        elif kind == "register" and state == "create":
+            register(ctx, act)
+            if act["state"] != "failed":
+                receipt_doc["registration"] = {"owned": True, "scope": ctx.org or ctx.repo, "org": bool(ctx.org),
+                                               "name": ctx.name, "labels": ctx.labels}
+        elif kind in {"hook", "agent"} and state in {"create", "update"}:
+            data, mode = desired_files(ctx)[Path(act["path"])]
+            if kind == "agent" and act.get("loaded"):
+                bootout(ctx)
+                act["loaded"] = False
+            write_atomic(Path(act["path"]), data, mode)
+            act["applied"] = act["owned"] = True
+            act["ownedSha256"] = act["sha256"]
+        if kind == "agent" and act["state"] in {"create", "update", "unchanged"} and not ctx.skip_launchctl \
+                and not act.get("loaded"):
+            code, out = run([LAUNCHCTL, "bootstrap", f"gui/{ctx.uid}", act["path"]])
+            act["bootstrapped"] = code == 0
+            if code != 0:
+                act["state"], act["note"] = "failed", ("launchctl bootstrap failed: " + out)[:400]
+        if act["state"] == "failed":
+            failed = True
+        if kind == "verify":
+            verify(ctx, act, wait=not ctx.skip_launchctl)
+            registration = receipt_doc.get("registration")
+            if registration and act.get("runner"):
+                registration["runnerId"] = act["runner"].get("id")
+
+
+def verify(ctx: Context, act: dict[str, Any], wait: bool) -> None:
+    deadline = time.monotonic() + (ONLINE_WAIT_S if wait else 0)
+    while True:
+        found = find_runner(ctx)
+        if found and (found.get("status") == "online" or time.monotonic() >= deadline):
+            break
+        if not found and time.monotonic() >= deadline:
+            break
+        time.sleep(3)
+    if not found:
+        act["state"], act["note"] = "failed", f"GitHub does not list a runner named {ctx.name}"
+        return
+    missing = [label for label in ctx.labels if label not in (found.get("labels") or [])]
+    act.update(runner=found, state="ok" if not missing else "failed",
+               note="" if not missing else "missing labels: " + ",".join(missing))
+    if found.get("status") != "online" and act["state"] == "ok":
+        act["note"] = f"registered, status {found.get('status')}"
+
+
+def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
+    for act in actions:
+        act["applied"] = False
+        if act["state"] != "remove":
+            continue
+        if act["kind"] == "agent":
+            if not ctx.skip_launchctl:
+                bootout(ctx)
+            Path(act["path"]).unlink()
+            act["applied"] = True
+        elif act["kind"] == "deregister":
+            token = read_token(ctx.gh or "gh", f"{ctx.scope_api}/actions/runners/remove-token")
+            code, out = (1, "no removal token")
+            if token is not None:
+                code, out = run_with_token([os.fspath(ctx.runner_dir / "config.sh"), "remove"], token, ctx.runner_dir)
+                del token
+            if code == 0:
+                act["applied"] = True
+                continue
+            listed, runner = lookup_runner(ctx)
+            if runner and runner.get("id") is not None and ctx.gh:
+                code2, out2 = run([ctx.gh, "api", "-X", "DELETE", f"{ctx.scope_api}/actions/runners/{int(runner['id'])}"])
+                if code2 == 0:
+                    act["applied"], act["note"] = True, "config.sh remove failed; deleted by id through the API"
+                    continue
+                out = out2
+            elif listed and runner is None:
+                act["applied"], act["note"] = True, "GitHub no longer lists this runner"
+                continue
+            act["state"], act["note"] = "failed", f"deregistration failed: {out[-300:]}"
+        elif act["kind"] == "dir":
+            if any(a["kind"] == "deregister" and a["state"] == "failed" for a in actions):
+                act["state"], act["note"] = "kept", "kept because deregistration failed; rerun after fixing it"
+                continue
+            shutil.rmtree(act["path"])
+            act["applied"] = True
+
+
+# ---------------------------------------------------------------- output
+
+
+def preflight(ctx: Context) -> dict[str, Any]:
+    checks: dict[str, dict[str, Any]] = {}
+
+    def check(name: str, ok: bool | None, value: object, note: str = "", blocking: bool = False) -> None:
+        level = "ok" if ok else ("info" if ok is None else ("block" if blocking else "warn"))
+        checks[name] = {"level": level, "value": value, "note": note if level != "ok" else ""}
+
+    arch = platform.machine()
+    check("appleSilicon", arch == "arm64" or not DARWIN_REQUIRED, arch, "the runner build is osx-arm64", True)
+    check("gh", ctx.gh is not None, ctx.gh or "missing", "brew install gh && gh auth login", True)
+    if ctx.gh:
+        code, _ = run([ctx.gh, "auth", "status"])
+        check("ghAuth", code == 0, "logged in" if code == 0 else "not logged in", "gh auth login", True)
+    check("python", ctx.python is not None, ctx.python or "missing", "hooks need python3", True)
+    disk = which("glaeda-disk", (os.fspath(ctx.home / ".local/bin/glaeda-disk"),))
+    check("glaedaDisk", disk is not None or None, disk or "not installed",
+          "optional: glaeda-mini-setup --apply installs it; hooks skip disk pressure without it")
+    return {"checks": checks, "blocking": sorted(n for n, c in checks.items() if c["level"] == "block")}
+
+
+def render(ctx: Context, receipt: dict[str, Any]) -> str:
+    mode = receipt["mode"]
+    lines = [f"glaeda-cmux-runner: {mode.upper()}" + ("" if receipt["applied"] else " (nothing changed; add --apply to act)")]
+    if ctx.sandbox:
+        lines.append(f"  sandbox HOME {ctx.home}: launchctl is never called")
+    lines.append(f"target: {ctx.scope_url}  name {ctx.name}  labels {','.join(ctx.labels)}")
+    lines.append("preflight")
+    for name, c in receipt["preflight"]["checks"].items():
+        note = f"  ({c['note']})" if c["note"] else ""
+        lines.append(f"  {c['level']:<5} {name:<13} {c['value']}{note}")
+    lines.append("actions")
+    for act in receipt["actions"]:
+        target = act.get("label") or act.get("version") or act.get("name") or ctx.show(act.get("path", "")) or ""
+        if act["kind"] == "download" and act.get("sha256"):
+            target = f"v{act.get('version')} sha256:{act['sha256'][:12]}..."
+        note = f"  ({act['note']})" if act.get("note") else ""
+        lines.append(f"  {act['state']:<9} {act['kind']:<10} {target}{note}")
+    if mode == "install":
+        lines.append(f"route cmux jobs to this runner (printed only; run one at a time, {ctx.route_repo} admin):")
+        lines.extend(f"  {c}" for c in receipt["routing"]["route"])
+        lines.append("rollback (jobs fall back to Blacksmith immediately):")
+        lines.extend(f"  {c}" for c in receipt["routing"]["rollback"])
+    lines.append("ready: " + ("yes" if receipt["ready"] else "no, blocking: " + ", ".join(receipt["blocking"])))
+    if receipt["applied"]:
+        written = ctx.state / "uninstall-receipt.json" if mode == "uninstall" else ctx.receipt_path
+        lines.append(f"receipt: {ctx.show(written)}")
+    return "\n".join(lines)
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="glaeda-cmux-runner", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--apply", action="store_true", help="make the changes (default is plan only)")
+    p.add_argument("--uninstall", action="store_true", help="deregister and remove what --apply installed")
+    p.add_argument("--output", choices=("human", "json"), default="human")
+    scope = p.add_mutually_exclusive_group()
+    scope.add_argument("--repo", help=f"register to OWNER/REPO (default {DEFAULT_REPO})")
+    scope.add_argument("--org", help="register to an organization instead")
+    p.add_argument("--group", help="runner group (with --org)")
+    p.add_argument("--labels", help=f"extra comma-separated labels beyond {','.join(BASE_LABELS)},{MINI_LABEL}")
+    p.add_argument("--name", help="runner name (default: <short hostname>-glaeda)")
+    p.add_argument("--replace", action="store_true", help="replace an existing runner with the same name")
+    p.add_argument("--runner-dir", type=Path, help="install directory (default ~/actions-runner-glaeda)")
+    p.add_argument("--runner-version", help="pin a runner version such as 2.328.0 (default latest)")
+    p.add_argument("--runner-sha256", help="pin the expected SHA-256 of the tarball")
+    p.add_argument("--route-repo", default=DEFAULT_REPO, help="repository whose variables the printed routing commands set")
+    p.add_argument("--gh", help="gh binary (default: PATH)")
+    p.add_argument("--python", help="interpreter the job hooks run (default: python3 on PATH)")
+    p.add_argument("--skip-launchctl", action="store_true", help="write the plist but do not load or unload it")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    if DARWIN_REQUIRED and platform.system() != "Darwin":
+        print("glaeda-cmux-runner: macOS only", file=sys.stderr)
+        return 2
+    if args.org and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", args.org):
+        print("glaeda-cmux-runner: --org must be an organization login", file=sys.stderr)
+        return 2
+    if args.repo and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+", args.repo):
+        print("glaeda-cmux-runner: --repo must be OWNER/REPO", file=sys.stderr)
+        return 2
+    ctx = Context(args)
+    prior = load_receipt(ctx)
+    if args.uninstall and prior:
+        # Uninstall acts only on what the receipt recorded; flags cannot point it elsewhere.
+        if prior.get("runnerDir"):
+            ctx.runner_dir = Path(prior["runnerDir"])
+            ctx.hook_dir = ctx.runner_dir / HOOK_DIR
+        reg = prior.get("registration") or {}
+        if reg.get("name"):
+            ctx.name = reg["name"]
+        if reg.get("scope"):
+            ctx.org, ctx.repo = (reg["scope"], None) if reg.get("org") else (None, reg["scope"])
+    pre = preflight(ctx)
+    doc: dict[str, Any] = {
+        "schema": SCHEMA,
+        "mode": "uninstall" if args.uninstall else "install",
+        "applied": args.apply,
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "sandboxHome": ctx.sandbox,
+        "runnerDir": os.fspath(ctx.runner_dir),
+        "installId": (prior or {}).get("installId") if owned_dir(ctx, prior) else secrets.token_hex(16),
+        "runnerDirOwned": owned_dir(ctx, prior),
+        "runnerVersion": (prior or {}).get("runnerVersion") if owned_dir(ctx, prior) else None,
+        "registration": (prior or {}).get("registration") if owned_dir(ctx, prior) else None,
+        "preflight": pre,
+    }
+    if args.uninstall:
+        actions = plan_uninstall(ctx, prior)
+        if args.apply:
+            if pre["blocking"] and any(a["kind"] == "deregister" and a["state"] == "remove" for a in actions):
+                for act in actions:
+                    if act["state"] == "remove":
+                        act["state"], act["note"] = "blocked", "preflight blocks: " + ", ".join(pre["blocking"])
+            apply_uninstall(ctx, actions)
+    else:
+        actions = plan_install(ctx, prior)
+        if args.apply and pre["blocking"]:
+            for act in actions:
+                if act["state"] in {"create", "update"}:
+                    act["state"], act["note"] = "blocked", "preflight blocks: " + ", ".join(pre["blocking"])
+        if args.apply:
+            apply_install(ctx, actions, doc)
+        doc["routing"] = routing(ctx)
+    doc["actions"] = actions
+    doc["blocking"] = pre["blocking"] + [f"{a['kind']}:{a.get('path') or a.get('name') or ''}".rstrip(":")
+                                         for a in actions if a.get("state") in {"blocked", "failed"}]
+    doc["ready"] = not doc["blocking"]
+    failed = any(a.get("state") == "failed" for a in actions)
+    if args.apply:
+        ctx.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        data = (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode()
+        if args.uninstall:
+            write_atomic(ctx.state / "uninstall-receipt.json", data, 0o600)
+            if prior is not None and not failed:
+                os.replace(ctx.receipt_path, ctx.state / "receipt.uninstalled.json")
+        elif doc["runnerDirOwned"] or any(a.get("owned") for a in actions):
+            write_atomic(ctx.receipt_path, data, 0o600)
+    if args.output == "json":
+        print(json.dumps(doc, indent=2, sort_keys=True))
+    else:
+        print(render(ctx, doc))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

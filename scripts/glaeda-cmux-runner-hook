@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""glaeda-cmux-runner-hook: job hooks for the glaeda cmux Mac mini runner.
+
+    glaeda-cmux-runner-hook job-started   [--allowed-repo O/R ...] [--allowed-owner O] [--disk PATH]
+    glaeda-cmux-runner-hook job-completed [--disk PATH]
+
+The runner calls these through ACTIONS_RUNNER_HOOK_JOB_STARTED and
+ACTIONS_RUNNER_HOOK_JOB_COMPLETED (small .sh wrappers written by scripts/glaeda-cmux-runner).
+
+job-started refuses (exits 1, so the runner fails the job before any step runs) when:
+  * the event is pull_request_target
+  * the event carries a pull_request whose head repository is a fork, is missing, or differs
+    from the base repository (covers pull_request, pull_request_review, and friends)
+  * the event name starts with pull_request but the payload has no pull_request object
+  * a workflow_run was triggered from a different head repository
+  * the repository is not in the allowlist baked in at install time
+  * GITHUB_EVENT_NAME or GITHUB_EVENT_PATH is missing or unreadable (fail closed)
+Any crash also exits non-zero, which refuses the job. Only after the job is admitted does it run
+glaeda-disk --pressure --apply --top 0, bounded by a timeout and never able to fail the job.
+
+job-completed only runs the same disk pressure pass and always exits 0.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+DISK_TIMEOUT_S = 120
+PREFIX = "glaeda-cmux-runner-hook"
+
+
+def _repo_name(repo: Any) -> str | None:
+    if not isinstance(repo, dict):
+        return None
+    name = repo.get("full_name")
+    return name.lower() if isinstance(name, str) and name else None
+
+
+def decide(event_name: str | None, event: Any, repository: str | None,
+           allowed_repos: list[str], allowed_owner: str | None) -> tuple[bool, str]:
+    """Return (admit, reason). Pure: no I/O, so tests can table-drive it."""
+    if not event_name:
+        return False, "GITHUB_EVENT_NAME is not set"
+    if not isinstance(event, dict):
+        return False, "event payload is missing or not a JSON object"
+    if event_name == "pull_request_target":
+        return False, "pull_request_target runs untrusted PR context with base-repo secrets"
+    repo = (repository or _repo_name(event.get("repository")) or "").lower()
+    if allowed_repos and repo not in {r.lower() for r in allowed_repos}:
+        return False, f"repository {repo or '(unknown)'} is not allowed on this runner"
+    if allowed_owner and repo.split("/", 1)[0] != allowed_owner.lower():
+        return False, f"repository {repo or '(unknown)'} is outside {allowed_owner}"
+
+    pr = event.get("pull_request")
+    if pr is not None or event_name.startswith("pull_request"):
+        if not isinstance(pr, dict):
+            return False, f"{event_name} event without a pull_request object"
+        head = (pr.get("head") or {}).get("repo") if isinstance(pr.get("head"), dict) else None
+        base = (pr.get("base") or {}).get("repo") if isinstance(pr.get("base"), dict) else None
+        if not isinstance(head, dict):
+            return False, "pull request head repository is missing (deleted fork?)"
+        if head.get("fork") is True:
+            return False, f"fork pull request from {head.get('full_name')}"
+        head_name, base_name = _repo_name(head), _repo_name(base)
+        if head_name is None or base_name is None or head_name != base_name:
+            return False, f"cross-repository pull request ({head_name} into {base_name})"
+
+    if event_name == "workflow_run":
+        run = event.get("workflow_run")
+        if not isinstance(run, dict):
+            return False, "workflow_run event without a workflow_run object"
+        head_name = _repo_name(run.get("head_repository"))
+        if head_name is None or head_name != (repo or _repo_name(event.get("repository"))):
+            return False, f"workflow_run triggered from another repository ({head_name})"
+    return True, f"{event_name} on {repo or '(unknown)'}"
+
+
+def load_event(path: str | None) -> Any:
+    if not path:
+        return None
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def find_disk(explicit: str | None) -> str | None:
+    if explicit:
+        return explicit if os.path.isfile(explicit) else None
+    found = shutil.which("glaeda-disk")
+    if found:
+        return found
+    fallback = Path.home() / ".local/bin/glaeda-disk"
+    return os.fspath(fallback) if fallback.is_file() else None
+
+
+def disk_pressure(explicit: str | None) -> str:
+    """Best effort. Returns a one-line note; never raises."""
+    try:
+        disk = find_disk(explicit)
+        if disk is None:
+            return "glaeda-disk not installed; skipped"
+        timeout = float(os.environ.get("GLAEDA_RUNNER_DISK_TIMEOUT") or DISK_TIMEOUT_S)
+        result = subprocess.run(
+            [sys.executable, disk, "--pressure", "--apply", "--top", "0"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=timeout, check=False,
+        )
+        return f"glaeda-disk exited {result.returncode}"
+    except subprocess.TimeoutExpired:
+        return "glaeda-disk timed out; continuing"
+    except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
+        return f"glaeda-disk skipped: {type(error).__name__}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog=PREFIX)
+    p.add_argument("phase", choices=("job-started", "job-completed"))
+    p.add_argument("--allowed-repo", action="append", default=[])
+    p.add_argument("--allowed-owner")
+    p.add_argument("--disk", help="glaeda-disk path (default: PATH, then ~/.local/bin)")
+    p.add_argument("--no-disk", action="store_true")
+    args = p.parse_args(argv)
+
+    if args.phase == "job-started":
+        admit, reason = decide(os.environ.get("GITHUB_EVENT_NAME"), load_event(os.environ.get("GITHUB_EVENT_PATH")),
+                               os.environ.get("GITHUB_REPOSITORY"), args.allowed_repo, args.allowed_owner)
+        if not admit:
+            message = f"{PREFIX}: refused: {reason}"
+            print(message, flush=True)
+            print(f"::error::{message}", flush=True)
+            return 1
+        print(f"{PREFIX}: admitted: {reason}", flush=True)
+    if not args.no_disk:
+        print(f"{PREFIX}: {disk_pressure(args.disk)}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

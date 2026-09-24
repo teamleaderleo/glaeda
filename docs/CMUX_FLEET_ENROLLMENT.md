@@ -102,6 +102,7 @@ scripts/glaeda-mini-setup                              # preflight + plan
 scripts/glaeda-mini-setup --apply                      # install, idempotent
 scripts/glaeda-mini-setup --cmux-root ~/Projects/cmux  # also run the read-only bootstrap below
 scripts/glaeda-mini-setup --uninstall [--apply]        # remove what --apply installed
+scripts/glaeda-mini-setup --runner [--apply]           # GitHub Actions runner, see CMUX_MINI_RUNNER.md
 ```
 
 Preflight reports macOS, hardware against the M4 Pro 14-core 48 GB target, Xcode apps and the cmux pin, Command Line Tools, free disk, Tailscale, Homebrew, the workload PATH and AC power. `--apply` installs `glaeda-disk`, `glaeda-worktree-reclaim` and `glaeda-worktree-reclaim-all` into `~/.local/bin`, their three LaunchAgents templated for the current user, the build-host directories (including a `--cache-root` under `~/.cache/glaeda/cmux-native-cache`) and three git defaults that are set only when unset. Everything is under `$HOME`; nothing uses sudo. Steps that need sudo or a human (pmset, Xcode licence and selection, Tailscale login, runner registration) are printed as operator steps. Runner registration and the compilation-cache node daemon (RFC #1134 M2) are reserved slots that this command never fills. The receipt is `~/.local/state/glaeda/mini-setup/receipt.json` (mode `0600`). With a HOME other than the account's own, launchctl is never called, which is how the tests and rehearsals run.
