@@ -35,7 +35,7 @@ node quarantined (failed_acceptance) with the differing fields named.
 Run glaeda-mini-setup --apply first; this command assumes its tools and cache root.
 It picks a Python 3.13+ interpreter itself (Homebrew, then ~/.local/bin, then PATH),
 because accept-local needs os.waitid, which CPython on macOS only has from 3.13. It never uses sudo, never registers a
-GitHub runner (cmux scripts/persistent-compile up does that), and never reads a token.
+GitHub runner (scripts/glaeda-cmux-runner --apply does that, docs/CMUX_MINI_RUNNER.md), and never reads a token.
 """
 
 from __future__ import annotations
@@ -133,6 +133,10 @@ def python_version(path: str) -> tuple[int, int] | None:
 # A user-local CPython (uv, python.org build, a copy from another Mac) lands here when the
 # login user does not own Homebrew, which is the case on most shared build minis.
 USER_PYTHONS = ("python3.14", "python3.13", "python3")
+# What follows an eligible enrollment. cmux scripts/persistent-compile up is retired; a runner and the routing
+# that sends jobs to its label are glaeda#1174.
+NEXT_STEP = ("Next: register its runner (~/glaeda/scripts/glaeda-cmux-runner --apply, docs/CMUX_MINI_RUNNER.md); "
+             "jobs reach it only once routing points at its label (glaeda#1174).")
 PYTHON_FIX = ("brew install python@3.13 (as the account that owns Homebrew), "
               "or put a CPython 3.13+ at ~/.local/bin/python3")
 
@@ -657,7 +661,7 @@ def main(argv: list[str] | None = None) -> int:
     for leftover in (paths.fleet / "bootstrap.json", paths.install / "glaeda.rollback"):
         leftover.unlink(missing_ok=True)
     print(f"\n{(read_json(paths.enrollment) or {}).get('nodeId')} is eligible. "
-          "Next, from the cmux checkout: scripts/persistent-compile up")
+          f"{NEXT_STEP}")
     return 0
 
 

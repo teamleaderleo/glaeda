@@ -152,10 +152,13 @@ glaeda() {  # PYTHON
   "$(home "$1")" "$dir/scripts/glaeda-mini-setup" --apply
 }
 
-# ~/glaeda at one commit for the whole run (glaeda-mini-fleet passes the tip of main), so every host runs
-# the same glaeda-mini-enroll and staging verifier before a renewal; it must know --renew.
-glaeda_sync() {  # COMMIT
-  local dir="$HOME/glaeda" head enroll
+# ~/glaeda at one commit for the whole run (glaeda-mini-fleet passes --glaeda-ref, else the tip of main), so
+# every host runs the same glaeda-mini-enroll and staging verifier; that commit must know every FLAG onboarding
+# passes (default --renew). A clean fetch of exactly that commit and a detached checkout; local changes refuse.
+glaeda_sync() {  # COMMIT [FLAG...]
+  local dir="$HOME/glaeda" head enroll flag commit="$1"; shift
+  [ $# -gt 0 ] || set -- --renew
+  set -- "$commit" "$@"
   [ -f "$dir/scripts/cmux_fleet.py" ] || refuse "$dir is not a Glaeda checkout; run glaeda-mini-fleet fix first"
   head=$(git -C "$dir" rev-parse -q --verify HEAD || true)
   if [ "$head" = "$1" ]; then say "unchanged: ~/glaeda is at ${1:0:12}"; return; fi
@@ -169,15 +172,49 @@ glaeda_sync() {  # COMMIT
   fi
   # Captured, not piped into grep -q: under pipefail an early grep exit would fail git show.
   enroll=$(git -C "$dir" show "$1:scripts/glaeda-mini-enroll")
-  case "$enroll" in
-    *'"--renew"'*) ;;
-    *) refuse "glaeda ${1:0:12} predates glaeda-mini-enroll --renew" ;;
-  esac
+  for flag in "${@:2}"; do
+    case "$enroll" in
+      *"\"$flag\""*) ;;
+      *) refuse "glaeda ${1:0:12} predates glaeda-mini-enroll $flag" ;;
+    esac
+  done
   git -C "$dir" checkout --quiet --detach "$1"
   say "~/glaeda moved from ${head:0:12} to ${1:0:12}"
 }
 
-# ---- The GitHub Actions runner's launchd agent, which cmux scripts/persistent-compile up installs in the
+# Homebrew in an /opt/homebrew the login user owns (sudo-plan creates it), without the brew.sh installer, which
+# stalls on a Command Line Tools install the selected Xcode makes moot. A shallow fetch of Homebrew/brew from a
+# LAN peer's /opt/homebrew when given (ssh://user@peer/opt/homebrew), else from UPSTREAM; origin is always
+# UPSTREAM afterwards, so brew update reads GitHub. Only an empty prefix (directories alone, as a stalled
+# installer leaves it) is filled; an unfinished fetch (a .git, no brew) resumes.
+homebrew_fetch() {  # UPSTREAM [PEER_URL [IDENTITY]]
+  local dir="${GLAEDA_HOMEBREW_DIR:-/opt/homebrew}" upstream="$1" peer="${2:-}" identity="${3:-}"
+  if [ -x "$dir/bin/brew" ]; then say "unchanged: $dir has brew"; return; fi
+  [ -d "$dir" ] || refuse "$dir does not exist; glaeda-mini-fleet sudo-plan creates it"
+  [ -O "$dir" ] || refuse "$dir is not $(id -un)'s; glaeda-mini-fleet sudo-plan hands it over"
+  if [ ! -d "$dir/.git" ]; then
+    [ -z "$(find "$dir" -mindepth 1 -not -type d 2>/dev/null | head -1)" ] || \
+      refuse "$dir has files but no brew; move them aside"
+    git -C "$dir" init -q
+  fi
+  export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new${identity:+ -i $identity}"
+  if [ -n "$peer" ] && git -C "$dir" fetch --quiet --depth 1 "$peer" HEAD; then
+    say "fetched Homebrew/brew from $peer"
+  else
+    [ -z "$peer" ] || say "could not fetch from $peer; fetching $upstream"
+    git -C "$dir" fetch --quiet --depth 1 "$upstream" HEAD
+  fi
+  git -C "$dir" checkout --quiet --detach FETCH_HEAD
+  if git -C "$dir" remote get-url origin >/dev/null 2>&1; then
+    git -C "$dir" remote set-url origin "$upstream"
+  else
+    git -C "$dir" remote add origin "$upstream"
+  fi
+  [ -x "$dir/bin/brew" ] || refuse "$dir/bin/brew is missing after the checkout"
+  say "Homebrew $(git -C "$dir" describe --tags --always 2>/dev/null) in $dir"
+}
+
+# ---- The GitHub Actions runner's launchd agent, which glaeda-cmux-runner --apply installs in the
 # login user's GUI domain. runner_hold stops it once its current job ends and marks it held; runner_release
 # starts what runner_hold stopped (if-eligible: only while the enrollment is eligible, as after a renewal
 # that failed before it quarantined); runner_kick restarts a loaded agent whose listener is gone. The held
@@ -228,7 +265,7 @@ runner_release() {  # [if-eligible]
     [ -f "$r" ] || continue
     dir=$(dirname "$r")
     [ -f "$(held_dir)/$(basename "$dir")" ] || continue
-    plist=$(runner_plist "$dir") || { say "$dir has no launchd agent; cmux scripts/persistent-compile up installs it"; continue; }
+    plist=$(runner_plist "$dir") || { say "$dir has no launchd agent; glaeda-cmux-runner --apply installs it"; continue; }
     label=$(basename "$plist" .plist)
     launchctl enable "$domain/$label"
     launchctl print "$domain/$label" >/dev/null 2>&1 || launchctl bootstrap "$domain" "$plist" \
@@ -266,7 +303,7 @@ cmux_setup() {  # ROOT DEVELOPER_DIR
   cd "$(home "$1")" && DEVELOPER_DIR="$2" ./scripts/setup.sh
 }
 
-# The reviewed Glaeda candidate, where cmux scripts/persistent-compile up looks for it.
+# The reviewed Glaeda candidate, where glaeda-mini-enroll --candidate is pointed at it.
 candidate_dir() {  # SOURCE12
   mkdir -p "$HOME/Library/Caches/cmux-fleet/glaeda-candidate-$1"
 }

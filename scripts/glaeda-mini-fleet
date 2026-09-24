@@ -27,21 +27,29 @@ material, tokens, or log contents. `plan` prints commands for an operator; it ru
 `preflight` is read-only too. It probes every host in parallel for what the fleet bootstrap,
 glaeda-mini-enroll, local acceptance and cmux scripts/setup.sh will later require (the pinned
 Xcode, its selection, licence and first launch, the Metal toolchain, tool versions on the
-workload PATH, Python 3.13+, the checkout with submodules and setup artifacts, power, disk, a
-pending macOS update) plus onboarding progress (candidate, node id, enrollment, runner). It
+workload PATH, Python 3.13+ for enrollment and as the workload PATH's python3, the checkout with
+submodules and setup artifacts, a ~/glaeda whose glaeda-mini-enroll knows the options onboarding
+passes (and is at --glaeda-ref when given), power, disk, a pending macOS update, Homebrew formulas
+left unpinned) plus onboarding progress (candidate, node id, enrollment, runner). It
 prints one host-by-check table, then each host's fixes split into what the login user can do,
 what needs a password, and what needs a person. It exits 1 when any host is not ready.
 
 `fix` runs, per host and in parallel, every repair preflight found that the login user can make
 without root: a shallow cmux clone with submodules, the pinned Xcode cloned on its volume, a
-relocatable CPython copied from this Mac into ~/.local, Glaeda and its setup, rustup's default and
-pinned toolchains, the Metal toolchain, cmux scripts/setup.sh, and the reviewed Glaeda candidate
+relocatable CPython copied from this Mac into ~/.local, Homebrew git-fetched into an empty
+/opt/homebrew the login user owns (from the --from host's /opt/homebrew over the LAN, else GitHub),
+brew install of rustup, zig and python@3.13 (then brew pin, as class receipts pin toolchain strings)
+with /opt/homebrew/bin/python3 linked to python3.13 for the workload PATH, Glaeda and its setup,
+~/glaeda moved (clean fetch, detached checkout, refused when dirty) to --glaeda-ref or main's tip
+when its glaeda-mini-enroll lacks an option onboarding passes, rustup's default and pinned
+toolchains, the Metal toolchain, cmux scripts/setup.sh, and the reviewed Glaeda candidate
 (downloaded once on this Mac with gh, sha256 checked, copied over). A step whose prerequisite
 needs root waits for sudo-plan. Without --yes it prints what it would run; with --yes it logs each
 host to its own file and ends with a fresh preflight. A rerun resumes: finished steps are skipped.
 
 `sudo-plan` prints one script per host with every root step preflight found (xcode-select,
-licence, first launch, Homebrew installs as the Homebrew owner and the rustup links, pmset). With
+licence, first launch, pmset, an /opt/homebrew directory for the login user that fix then fills,
+and Homebrew installs, pins and links as a Homebrew owner that is someone else). With
 --run it runs each over `ssh -t`, so the operator types each host's password once. --sudoers adds
 a narrow NOPASSWD rule, printed in the script for review: launchctl kickstart of the manifest's
 jobs only. xcode-select and first launch stay password steps, because /Applications is writable by
@@ -161,7 +169,7 @@ SSH = "/usr/bin/ssh"
 PROBE_TIMEOUT = 90
 PREFLIGHT_TIMEOUT = 180
 LIST_KEYS = {"xcode_app", "xcode_ready", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key",
-             "pf_tool", "pf_submodule", "pf_pmset", "pf_runner"}
+             "pf_tool", "pf_submodule", "pf_pmset", "pf_runner", "pf_brew_formula"}
 # Same rule as scripts/cmux_fleet.py NODE_RE: an opaque cmux-* fleet node id.
 NODE_ID_RE = re.compile(r"cmux-[a-z0-9][a-z0-9-]{2,59}\Z")
 VERSION_RE = re.compile(r"\d+(\.\d+){0,2}\Z")
@@ -171,6 +179,14 @@ SAFE_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
 TOOLCHAIN_KEYS = {"xcode", "metal", "zig_min", "rustup_default", "python_min", "cmux"}
 # glaeda-mini-enroll's accept-local needs os.waitid, which CPython on macOS has from 3.13.
 ENROLL_PYTHON_MIN = "3.13"
+# The glaeda-mini-enroll options onboard, repair and upgrade pass; a ~/glaeda without them fails with
+# "unrecognized arguments", so preflight asks for them and fix moves ~/glaeda until it has them.
+ENROLL_FLAGS = ("--renew", "--class-receipt", "--class-receipt-sha256", "--fleet-class")
+# The Homebrew formulas fix installs, all pinned afterwards: class receipts pin toolchain strings, and the
+# reference host (cmux14) runs `brew pin zig rustup python@3.13`.
+BREW_FORMULAS = ("rustup", "zig", "python@3.13")
+# The workload PATH's python3: brew's python@3.13 installs only python3.13, so /usr/bin/python3 (3.9) would win.
+BREW_PYTHON = ("python@3.13", "python3.13")
 # Files sshd reads by default (OpenSSH AuthorizedKeysFile); every other authorized_keys* is a copy.
 LIVE_KEY_FILES = ("authorized_keys", "authorized_keys2")
 # Reservations: a marker on the mini that every scheduler skips until it expires.
@@ -475,6 +491,7 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
         return None if value is None else (value.split("|", n - 1) + [""] * n)[:n]
 
     sdks, metal, python = split("pf_sdks", 2), split("pf_metal", 2), split("pf_python", 2)
+    python3, brew_dir = split("pf_python3", 2), split("pf_brew_dir", 2)
     prepared = split("pf_update_prepared", 2)
     channel, candidate = split("pf_rust_channel", 3), split("pf_candidate", 3)
     return {
@@ -496,6 +513,13 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
          "generation": out.get("pf_candidate_generation") or None},
         "glaeda_checkout": out.get("pf_glaeda") == "present",
         "glaeda_head": out.get("pf_glaeda_head") or None,
+        # The ENROLL_FLAGS ~/glaeda lacks; None from a probe that predates the question.
+        "glaeda_lacking": None if "pf_glaeda_lacking" not in out else out["pf_glaeda_lacking"].split(),
+        "glaeda_dirty": int(out.get("pf_glaeda_dirty") or 0),
+        "python3": None if python3 is None else {"path": python3[0] or None, "version": python3[1] or None},
+        "brew_python3": out.get("pf_brew_python3") or None,
+        "brew_dir": None if brew_dir is None else {"owner": brew_dir[0], "files": brew_dir[1] == "files"},
+        "brew_formulas": {f: state == "pinned" for f, _, state in (v.partition("|") for v in out["pf_brew_formula"])},
         "cache_root": out.get("pf_cache_root") == "present",
         "enroll_state": out.get("pf_enroll_state"),
         "enroll_generation": out.get("pf_enroll_generation") or None,
@@ -1182,8 +1206,9 @@ def cmd_release(manifest: dict[str, Any], hosts: list[str], owner: str | None, f
 
 DEFAULT_CMUX_ROOT = "~/cmux"  # where fix clones cmux on a mini
 # Columns of the preflight table, in the order onboarding meets them.
-PREFLIGHT_CHECKS = ("os", "xcode", "select", "licence", "launch", "metal", "rust", "zig", "tools", "python",
-                    "cmux", "setup", "glaeda", "power", "disk", "update", "candidate", "node", "enroll", "runner", "brew")
+PREFLIGHT_CHECKS = ("os", "xcode", "select", "licence", "launch", "metal", "rust", "zig", "tools", "python", "python3",
+                    "cmux", "setup", "glaeda", "power", "disk", "update", "candidate", "node", "enroll", "runner", "brew",
+                    "pins")
 # An unknown here means the bootstrap would refuse or cannot be predicted, so it blocks like a failure.
 UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "power", "disk"})
 # Who can apply a fix: the SSH login user alone, the login user with an admin password, or a person.
@@ -1216,6 +1241,8 @@ def preflight_script(manifest: dict[str, Any], name: str) -> bytes:
         "WORKLOAD_TOOLS": " ".join(bootstrap.MACOS_WORKLOAD_TOOLS),
         "PYTHONS": " ".join(pythons),
         "CANDIDATE_PIN": operator_candidate_source(),
+        "ENROLL_FLAGS": " ".join(ENROLL_FLAGS),
+        "PIN_FORMULAS": " ".join(BREW_FORMULAS),
     }
     header = "".join(f"{k}={shlex.quote(v)}\n" for k, v in inputs.items())
     return PROBE.read_bytes() + b"\n" + header.encode() + PREFLIGHT_PROBE.read_bytes()
@@ -1264,8 +1291,9 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     declared = toolchain(manifest, name)
     user = obs.get("user") or manifest["ssh_user"]
     owner = pf.get("brew_owner")
-    # Without Homebrew, sudo-plan installs it for the login user, who then installs formulas without root.
-    as_owner = f"after sudo-plan installs Homebrew for {user}: " if owner is None else \
+    # Without Homebrew, fix fetches it into an /opt/homebrew the login user owns (sudo-plan creates that
+    # directory when it is missing), and the login user then installs formulas without root.
+    as_owner = f"once fix puts Homebrew in /opt/homebrew for {user}: " if owner is None else \
         ("" if owner == user else f"sudo -u {owner} ")
     brew_group = "self" if owner in (None, user) else "password"
     checkout = cmux_checkout(manifest, name)
@@ -1423,6 +1451,26 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
         fix = "brew install python@3.13" if owner == user else "put a relocatable CPython 3.13+ at ~/.local/bin/python3"
         put("python", "fail", f"no Python {python_min}+ where glaeda-mini-enroll looks{seen}", fix, "self",
             {"kind": "python", "min": python_min})
+    # python3 as the workload PATH resolves it: the bootstrap's profileRunnerInterpreter needs os.waitid (3.13+).
+    python3 = pf.get("python3")
+    formula, versioned = BREW_PYTHON
+    if python3 is None:
+        put("python3", "unknown", "the probe predates this check; rerun preflight")
+    elif python3["path"] and version_tuple(python3["version"]) >= version_tuple(ENROLL_PYTHON_MIN):
+        put("python3", "ok", f"{python3['version']} at {python3['path']}")
+    else:
+        seen = f"{python3['version'] or '?'} at {python3['path']}" if python3["path"] else "none"
+        detail = f"python3 on the workload PATH is {seen}; the bootstrap needs {ENROLL_PYTHON_MIN}+"
+        if python3["path"] == "/opt/homebrew/bin/python3":
+            put("python3", "fail", detail, f"point /opt/homebrew/bin/python3 at {versioned} (brew install {formula})",
+                "person")
+        elif pf.get("brew_python3") and owner:
+            put("python3", "fail", detail, f"{as_owner}ln -s {versioned} /opt/homebrew/bin/python3", brew_group,
+                {"kind": "python_link", "owner": owner})
+        else:
+            put("python3", "fail", detail,
+                f"{as_owner}brew install {formula}; link /opt/homebrew/bin/python3 to {versioned}", brew_group,
+                brew(formula))
 
     # The checkout acceptance builds.
     depth = f" --depth {checkout['depth']}" if checkout["depth"] else ""
@@ -1454,12 +1502,24 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
 
     glaeda_missing = [what for what, present in (("~/glaeda checkout", pf.get("glaeda_checkout")),
                                                   ("native cache root", pf.get("cache_root"))) if not present]
+    lacking = pf.get("glaeda_lacking") or []
+    head = pf.get("glaeda_head") or ""
+    pinned_ref = GLAEDA_REF
+    sync = f"glaeda-mini-fleet fix moves ~/glaeda to {pinned_ref[:12] if pinned_ref else 'the tip of Glaeda main'} " \
+        "(a clean fetch and a detached checkout; --glaeda-ref pins the commit)"
+    behind = f"at {head[:12] or '?'}, the operator pins {pinned_ref[:12]}" if pinned_ref and head != pinned_ref else \
+        f"at {head[:12] or '?'}, its glaeda-mini-enroll lacks {' '.join(lacking)}" if lacking else ""
     if glaeda_missing:
         put("glaeda", "fail", f"missing: {', '.join(glaeda_missing)}",
             "git clone https://github.com/teamleaderleo/glaeda.git ~/glaeda; ~/glaeda/scripts/glaeda-mini-setup --apply",
             "self", {"kind": "glaeda"})
+    elif behind and pf.get("glaeda_dirty"):
+        put("glaeda", "fail", f"~/glaeda is {behind} and has {pf['glaeda_dirty']} local changes",
+            "commit or move aside the changes in ~/glaeda, then " + sync, "person")
+    elif behind:
+        put("glaeda", "fail", f"~/glaeda is {behind}", sync, "self", {"kind": "glaeda_sync"})
     else:
-        put("glaeda", "ok")
+        put("glaeda", "ok", head[:12])
     pmset = pf.get("pmset", "")
     # autorestart is not a bootstrap check, so it never blocks; a mini that stays off after a power cut idles the lane.
     autorestart_off = re.search(r"^\s*autorestart\s+0\b", pmset, re.MULTILINE) is not None
@@ -1552,13 +1612,33 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
         put("runner", "ok", ", ".join(r["name"] or r["dir"] for r in runners))
     else:
         put("runner", "todo", "no runner registered", RUNNER_HOOK_NOTE, "person")
+    brew_dir = pf.get("brew_dir")
     if owner is None:
-        rust_or_zig = checks["rust"]["state"] == "fail" or checks["zig"]["state"] == "fail"
-        put("brew", "fail" if rust_or_zig else "info", "none (no Homebrew)",
-            f"install Homebrew in /opt/homebrew for {user} (the brew.sh installer; it needs sudo)", "password",
-            {"kind": "homebrew", "user": user})
+        # Only a formula repair makes a missing Homebrew a blocker.
+        needed = any((c.get("action") or {}).get("kind") in {"brew", "python_link"} for c in checks.values()
+                     if c["state"] == "fail")
+        brew_state = "fail" if needed else "info"
+        if brew_dir and brew_dir["files"]:
+            put("brew", brew_state, f"none (/opt/homebrew is {brew_dir['owner']}'s, has files and no brew)",
+                "move /opt/homebrew aside (a stalled Homebrew install?), then rerun preflight", "person")
+        elif brew_dir and brew_dir["owner"] == user:
+            put("brew", brew_state, f"none (/opt/homebrew is {user}'s and empty)",
+                "glaeda-mini-fleet fix fetches Homebrew/brew into it (from --from HOST over the LAN, else GitHub)",
+                "self", {"kind": "homebrew_fetch"})
+        else:
+            where = f"is {brew_dir['owner']}'s" if brew_dir else "does not exist"
+            put("brew", brew_state, f"none (/opt/homebrew {where})",
+                f"sudo mkdir /opt/homebrew and chown it to {user}; fix then fetches Homebrew/brew into it", "password",
+                {"kind": "homebrew", "user": user})
+        put("pins", "info", "no Homebrew")
     else:
         put("brew", "info", owner if owner == user else f"{owner} (installs run as sudo -u {owner})")
+        unpinned = [f for f, pinned in (pf.get("brew_formulas") or {}).items() if not pinned]
+        if unpinned:
+            put("pins", "todo", f"not pinned: {' '.join(unpinned)}; class receipts pin toolchain strings",
+                f"{as_owner}brew pin {' '.join(unpinned)}", brew_group)
+        else:
+            put("pins", "ok", " ".join(pf.get("brew_formulas") or {}) or "none installed")
     blocked = any(c["state"] == "fail" or (c["state"] == "unknown" and k in UNKNOWN_BLOCKS) for k, c in checks.items())
     return {"host": name, "ready": not blocked, "checks": checks,
             "enrollment": {"state": state, "generation": pf.get("enroll_generation"), "stale": stale,
@@ -1649,25 +1729,27 @@ def render_preflight(results: list[dict[str, Any]]) -> str:
 # ---------------------------------------------------------------- fix and sudo-plan
 
 # The order fix runs a host's repairs in, so each runs after what it builds on.
-FIX_ORDER = ("xcode_share", "xcode_clone", "python", "cmux_clone", "submodules", "brew", "rust_default", "rust_channel",
-             "glaeda", "metal", "setup", "candidate")
+FIX_ORDER = ("xcode_share", "xcode_clone", "python", "cmux_clone", "submodules", "homebrew_fetch", "brew", "python_link",
+             "rust_default", "rust_channel", "glaeda", "glaeda_sync", "metal", "setup", "candidate")
 # What each repair needs to pass first (checks, or repairs made earlier in the same run).
 # glaeda-mini-setup builds glaeda-worktree-reclaim with cargo, under the Python enroll will use.
 FIX_NEEDS = {"metal": ("licence", "launch"), "setup": ("cmux", "licence", "launch", "metal", "zig"), "brew": ("brew",),
-             "glaeda": ("python", "rust")}
+             "python_link": ("brew",), "glaeda": ("python", "rust")}
 # Remote functions that only read; every other one takes the host's step lock.
 # share_send only reads, and stays lock-free so one source can feed several peers at once.
 READ_ONLY_FUNCTIONS = {"candidate_check", "share_have", "share_source", "share_send", "host_check"}
 # Steps that honor less of the host gate than the default (both the fleet host lock and reservations):
 # a drain waits out the job holding the lock, and restoring runners never builds anything.
 LOCK_GATE = {"runner_hold": "reservation", "runner_release": "none", "runner_kick": "none"}
-SUDO_ORDER = ("select", "licence", "first_launch", "power", "homebrew", "brew")
-HOMEBREW_INSTALLER = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
+SUDO_ORDER = ("select", "licence", "first_launch", "power", "homebrew", "brew", "python_link")
+# Homebrew itself comes from a git fetch, never the brew.sh installer: that stalls on the Command Line Tools
+# softwareupdate the fleet does not need (the pinned Xcode is selected) and leaves an empty /opt/homebrew.
+HOMEBREW_REPO = "https://github.com/Homebrew/brew"
 FIX_TIMEOUTS = {"cmux_clone": 1800, "submodules": 1800, "brew": 5400, "rust_channel": 1800, "glaeda": 1800,
-                "metal": 3600, "setup": 5400, "python": 1800, "candidate": 1800}
+                "metal": 3600, "setup": 5400, "python": 1800, "candidate": 1800, "homebrew_fetch": 1800,
+                "glaeda_sync": 900}
 RUSTUP_PROXIES = ("cargo", "rustc", "rustup")
 BREW_STAGE = "Library/Caches/glaeda/share/homebrew/downloads"  # under the login user's home; see share brew
-BREW_FORMULAS = ("rustup", "zig")
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path("~/.local/state").expanduser()) / "glaeda" / "mini-fleet"
 OPERATOR_CACHE = Path(os.environ.get("GLAEDA_MINI_FLEET_CACHE", "~/Library/Caches/glaeda/mini-fleet")).expanduser()
 SUDOERS_FILE = "/etc/sudoers.d/glaeda-mini-fleet"
@@ -1733,8 +1815,16 @@ def describe(action: dict[str, Any]) -> str:
     if kind == "submodules":
         return f"initialize submodules in {action['root']}"
     if kind == "brew":
-        link = " and link the rustup proxies into /opt/homebrew/bin" if "rustup" in action["formulas"] else ""
-        return f"brew install {' '.join(action['formulas'])}{link}"
+        links = [what for formula, what in (("rustup", "the rustup proxies"), (BREW_PYTHON[0], "python3"))
+                 if formula in action["formulas"]]
+        link = f", link {' and '.join(links)} into /opt/homebrew/bin" if links else ""
+        return f"brew install {' '.join(action['formulas'])}{link}, then brew pin them"
+    if kind == "python_link":
+        return f"link /opt/homebrew/bin/python3 to {BREW_PYTHON[1]}"
+    if kind == "homebrew_fetch":
+        return f"git fetch Homebrew/brew into /opt/homebrew (a peer's copy, else {HOMEBREW_REPO})"
+    if kind == "glaeda_sync":
+        return f"move ~/glaeda to {GLAEDA_REF[:12] if GLAEDA_REF else 'the tip of Glaeda main'} (clean fetch, detached checkout)"
     if kind == "rust_default":
         return f"rustup default {action['toolchain']}"
     if kind == "rust_channel":
@@ -1864,15 +1954,37 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool) -> list[str]:
              f'  {root}cp -n "$staged"/* "$cache"/ || true',
              *([f'  sudo chown -h {owner} "$cache"/*'] if as_owner else []),
              "fi",
+             # A pinned formula stays as it is: upgrading it would change the toolchain its class receipt names.
+             'pinned=" $({ brew_as list --pinned 2>/dev/null || true; } | tr "\\n" " ") "',
              f"for f in {' '.join(formulas)}; do",
-             '  if brew_as list --versions "$f" >/dev/null 2>&1; then brew_as upgrade "$f"; else brew_as install "$f"; fi',
+             '  if ! brew_as list --versions "$f" >/dev/null 2>&1; then brew_as install "$f"',
+             '  elif [[ "$pinned" == *" $f "* ]]; then echo "$f is pinned, left as it is; brew unpin $f to upgrade it"',
+             '  else brew_as upgrade "$f"; fi',
              "done"]
     if "rustup" in formulas:
         lines += [f"for t in {' '.join(RUSTUP_PROXIES)}; do",
                   f'  [ -e "/opt/homebrew/bin/$t" ] || [ -L "/opt/homebrew/bin/$t" ] || '
                   f'{run}ln -s "/opt/homebrew/opt/rustup/bin/$t" "/opt/homebrew/bin/$t"',
                   "done"]
+    if BREW_PYTHON[0] in formulas:
+        lines += python_link_commands(owner, as_owner)
+    # Class receipts pin toolchain strings; the reference host pins exactly these.
+    lines.append(f"brew_as pin {' '.join(formulas)}")
     return lines
+
+
+def python_link_commands(owner: str, as_owner: bool) -> list[str]:
+    """/opt/homebrew/bin/python3 -> python3.13 (as on cmux14), so the workload PATH's python3 is 3.13, not /usr/bin's."""
+    if not SAFE_WORD_RE.fullmatch(owner):
+        raise Failure(f"refusing the python3 link for owner {owner!r}")
+    run = f"sudo -H -u {owner} " if as_owner else ""
+    versioned = BREW_PYTHON[1]
+    return ["b=/opt/homebrew/bin",
+            f'[ -x "$b/{versioned}" ] || {{ echo "$b/{versioned} is missing: brew install {BREW_PYTHON[0]}" >&2; exit 3; }}',
+            f'if [ "$(readlink "$b/python3" || true)" = {versioned} ]; then echo "unchanged: $b/python3 -> {versioned}"',
+            f'elif [ -e "$b/python3" ] || [ -L "$b/python3" ]; then '
+            f'echo "$b/python3 exists and is not a link to {versioned}; move it aside" >&2; exit 3',
+            f'else {run}ln -s {versioned} "$b/python3"; echo "linked $b/python3 -> {versioned}"; fi']
 
 
 def operator_python_dist(minimum: str) -> tuple[Path, str] | None:
@@ -1919,6 +2031,11 @@ CANDIDATE_TARGET = "aarch64-apple-darwin"
 # writes, or during an upgrade the candidate it rolls out. main sets it for each run.
 PINNED_CANDIDATE: dict[str, str] | None = None
 NO_CANDIDATE = "the fleet manifest pins no candidate; glaeda-mini-fleet upgrade --candidate-run RUN records one"
+# The Glaeda commit the operator pins every host's ~/glaeda to (glaeda-mini-enroll runs from there), from
+# --glaeda-ref; main sets it for each run. Without it, a step that moves ~/glaeda reads main's tip once per run.
+GLAEDA_REF: str | None = None
+GLAEDA_MAIN: dict[str, str] = {}
+GLAEDA_MAIN_LOCK = threading.Lock()
 
 
 def operator_candidate() -> dict[str, str]:
@@ -2010,7 +2127,7 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
             return False, f"{seed} cannot seed {thing} ({problem})"
         # Python, the candidate and Metal also have a path without a seed: this Mac, or the internet.
         note(log, f"{seed} cannot seed {thing} ({problem}); using the path without a seed")
-    if kind in {"xcode_clone", "brew"}:  # neither goes through the fix library's lock(), so ask first
+    if kind in {"xcode_clone", "brew", "python_link"}:  # none goes through the fix library's lock(), so ask first
         code = fix_call(name, user, "host_check", [], log, 120)
         if code:
             return False, held_or(code, None, "could not check the host lock and reservation")
@@ -2022,10 +2139,21 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
         return ship_python(name, user, action, log)
     if kind == "candidate":
         return stage_candidate(name, user, action, log)
-    if kind == "brew":
-        script = "\n".join(["set -euo pipefail", "cd /", *brew_commands(action["owner"], action["formulas"], False)])
+    if kind in {"brew", "python_link"}:
+        lines = brew_commands(action["owner"], action["formulas"], False) if kind == "brew" else \
+            python_link_commands(action["owner"], False)
+        script = "\n".join(["set -euo pipefail", "cd /", *lines])
         code = ssh_stream(name, user, "/bin/bash -c " + shlex.quote(script), log, timeout=FIX_TIMEOUTS["brew"])
         return code == 0, "" if code == 0 else f"exit {code}; see the log"
+    if kind == "homebrew_fetch":
+        return fetch_homebrew(manifest, name, log, seed)
+    if kind == "glaeda_sync":
+        try:
+            ref = glaeda_target()
+        except Failure as error:
+            return False, str(error)
+        code = fix_call(name, user, "glaeda_sync", [ref, *ENROLL_FLAGS], log, FIX_TIMEOUTS["glaeda_sync"])
+        return code == 0, f"~/glaeda at {ref[:12]}" if code == 0 else held_or(code, None, "could not move ~/glaeda")
     calls = {
         "cmux_clone": ("cmux_clone", lambda a: [a["repo"], a["ref"], a["root"], str(a["depth"])]),
         "submodules": ("submodules", lambda a: [a["root"], str(a["depth"])]),
@@ -2038,6 +2166,27 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
     func, args = calls[kind]
     code = fix_call(name, user, func, args(action), log, FIX_TIMEOUTS.get(kind, 600))
     return code == 0, "" if code == 0 else f"exit {code}; see the log"
+
+
+def fetch_homebrew(manifest: dict[str, Any], name: str, log: Any, seed: str | None) -> tuple[bool, str]:
+    """Populate the host's empty /opt/homebrew with Homebrew/brew: from the seed's /opt/homebrew over the LAN
+    when given (the host fetches with the operator's agent, or the manifest's LAN key), else from GitHub."""
+    user = manifest["ssh_user"]
+    args: list[str] = []
+    options: tuple[str, ...] = ()
+    if seed:
+        address, detail = lan_address(manifest, seed, log)
+        if address is None:
+            note(log, f"{detail}; fetching from {HOMEBREW_REPO}")
+        else:
+            lan = lan_settings(manifest)
+            args = [f"ssh://{user}@{address}/opt/homebrew", *([lan["identity"]] if lan["identity"] else [])]
+            options = ("-A",) if lan["agent"] else ()
+    code = ssh_stream(name, user, library_command("homebrew_fetch", [HOMEBREW_REPO, *args]), log,
+                      timeout=FIX_TIMEOUTS["homebrew_fetch"], options=options)
+    if code:
+        return False, held_or(code, None, "could not fetch Homebrew")
+    return True, f"Homebrew in /opt/homebrew (from {seed if args else 'GitHub'})"
 
 
 def fix_host(manifest: dict[str, Any], name: str, result: dict[str, Any], yes: bool,
@@ -2069,7 +2218,7 @@ def fix_host(manifest: dict[str, Any], name: str, result: dict[str, Any], yes: b
                 python = (checks.get("python") or {}).get("detail", "")
                 action = {**action, "python": python.split(" at ", 1)[1] if checks["python"]["state"] == "ok"
                           else "~/.local/bin/python3" if "python" in fixed else "python3"}
-            if seed and action["kind"] in SEEDABLE:
+            if seed and (action["kind"] in SEEDABLE or action["kind"] == "homebrew_fetch"):
                 label += f" [from {seed} over the LAN]"
             if not yes:
                 out["planned"].append(label)
@@ -2209,18 +2358,25 @@ def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any]
             lines += ["sudo pmset -c sleep 0"] if action["sleep"] else []
             lines += ["sudo pmset -a autorestart 1"] if action["autorestart"] else []
         elif kind == "homebrew":
-            # The installer refuses root; as the login user it asks sudo, which this script already primed.
-            # Download first: a failed curl inside "$(...)" would run an empty script and pass.
-            lines += [f"step 'install Homebrew in /opt/homebrew for {action['user']} ({HOMEBREW_INSTALLER})'",
+            # Only the directory needs root. fix then git-fetches Homebrew into it as the login user; the brew.sh
+            # installer is not used because it stalls on a Command Line Tools install the pinned Xcode makes moot.
+            owner = action["user"]
+            if not SAFE_WORD_RE.fullmatch(owner):
+                raise Failure(f"{name}: refusing to chown /opt/homebrew to {owner!r}")
+            lines += [f"step 'create /opt/homebrew for {owner}; glaeda-mini-fleet fix fetches Homebrew into it'",
                       "if [ ! -x /opt/homebrew/bin/brew ]; then",
-                      '  installer=$(mktemp)',
-                      f'  curl -fsSL -o "$installer" {HOMEBREW_INSTALLER}',
-                      '  NONINTERACTIVE=1 /bin/bash "$installer"',
-                      '  rm -f "$installer"',
+                      "  [ -d /opt/homebrew ] || sudo mkdir /opt/homebrew",
+                      '  if [ -n "$(find /opt/homebrew -mindepth 1 -not -type d 2>/dev/null | head -1)" ]; then',
+                      "    echo '/opt/homebrew has files but no brew; move it aside first' >&2; exit 1",
+                      "  fi",
+                      f"  sudo chown -R {owner}:admin /opt/homebrew",
                       "fi"]
         elif kind == "brew":
-            lines.append(f"step 'Homebrew as {action['owner']}: {' '.join(action['formulas'])}'")
+            lines.append(f"step 'Homebrew as {action['owner']}: {' '.join(action['formulas'])}, then pin them'")
             lines += brew_commands(action["owner"], action["formulas"], True)
+        elif kind == "python_link":
+            lines.append(f"step 'as {action['owner']}: link /opt/homebrew/bin/python3 to {BREW_PYTHON[1]}'")
+            lines += python_link_commands(action["owner"], True)
     rule = sudoers_rule(manifest, name) if sudoers else None
     if sudoers and rule is None:
         lines.append("# --sudoers: the manifest declares no launchd jobs, so there is no rule to install.")
@@ -2649,6 +2805,17 @@ def adoption_mismatch(log_path: Path) -> list[str]:
     return []
 
 
+def glaeda_target(repo: str | None = None) -> str:
+    """The commit ~/glaeda moves to in this run: --glaeda-ref, else main's tip, resolved once and then reused."""
+    if GLAEDA_REF:
+        return GLAEDA_REF
+    repo = repo or operator_candidate().get("repo") or CANDIDATE_REPO
+    with GLAEDA_MAIN_LOCK:
+        if repo not in GLAEDA_MAIN:
+            GLAEDA_MAIN[repo] = resolve_glaeda_main(repo)
+        return GLAEDA_MAIN[repo]
+
+
 def resolve_glaeda_main(repo: str) -> str:
     """The commit every host's ~/glaeda moves to before a renewal: the tip of main, read once per run."""
     proc = subprocess.run(["gh", "api", f"repos/{repo}/commits/main", "--jq", ".sha"], capture_output=True, text=True,
@@ -2682,7 +2849,7 @@ def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candi
             note(log, f"== {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {label}")
 
         step(f"sync ~/glaeda to {glaeda_ref[:12]}")
-        code = fix_call(name, user, "glaeda_sync", [glaeda_ref], log, 900)
+        code = fix_call(name, user, "glaeda_sync", [glaeda_ref, *ENROLL_FLAGS], log, FIX_TIMEOUTS["glaeda_sync"])
         if code:
             return False, "sync", held_or(code, log_path, "could not move ~/glaeda")
         step(f"stage candidate {candidate['source'][:12]}")
@@ -2888,7 +3055,7 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
     glaeda_ref = None
     if stale:
         try:
-            glaeda_ref = resolve_glaeda_main(candidate.get("repo") or CANDIDATE_REPO)
+            glaeda_ref = glaeda_target(candidate.get("repo") or CANDIDATE_REPO)
         except Failure as error:
             for name in stale:
                 settle(name, "sync", f"blocked: {error}")
@@ -3226,7 +3393,9 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
         generation = result["enrollment"]["generation"]
         rows[name]["generation"] = short_generation(generation) if generation else ""
         needs[name] = need = enrollment_need(result)
-        failing = [c for c, v in result["checks"].items() if v["state"] == "fail"]
+        fails = [c for c, v in result["checks"].items() if v["state"] == "fail"]
+        # An old ~/glaeda is no blocker here: the renewal's first step moves it (renew_one's sync).
+        failing = [c for c in fails if (result["checks"][c].get("action") or {}).get("kind") != "glaeda_sync"]
         if need == "enroll":
             rows[name]["result"] = f"not enrolled: glaeda-mini-fleet onboard {name} --yes once this pins the candidate"
         elif need == "leave":
@@ -3234,7 +3403,7 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
                                     "upgrade it again once it is eligible")
         elif need == "retired":
             rows[name]["result"] = "retired"
-        elif failing or not result["ready"]:
+        elif failing or (not result["ready"] and not fails):
             rows[name]["result"] = f"not ready: {', '.join(failing) or 'unknown checks'}; glaeda-mini-fleet repair {name}"
         else:
             ready.append(name)
@@ -3303,7 +3472,7 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
     assert directory is not None
     for name in ready:
         rows[name]["log"] = os.fspath(directory / f"{name}.log")
-    glaeda_ref = resolve_glaeda_main(repo)
+    glaeda_ref = glaeda_target(repo)
     manifest_lock = threading.Lock()
 
     def seed_task(klass: str, name: str) -> Any:
@@ -3421,6 +3590,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--owner", help="reserve, release: who holds it (default $USER@$(hostname -s))")
     parser.add_argument("--force", action="store_true",
                         help="reserve, release: override another owner's active reservation or an invalid marker")
+    parser.add_argument("--glaeda-ref", metavar="COMMIT",
+                        help="preflight, fix, onboard, repair, upgrade: the Glaeda commit (40 hex) every host's ~/glaeda "
+                             "must be at (default: ~/glaeda only needs the enroll options; fix and renewals move it "
+                             "to the tip of main)")
     # Intermixed, so hosts may follow options: share xcode --from cmux15 cmux7s cmux8s
     args = parser.parse_intermixed_args(argv)
     thing = None
@@ -3430,8 +3603,12 @@ def main(argv: list[str] | None = None) -> int:
         thing, args.names = args.names[0], args.names[1:]
     if args.names:
         args.hosts = [*(args.hosts or []), *args.names]
-    global PINNED_CANDIDATE
+    global PINNED_CANDIDATE, GLAEDA_REF
     try:
+        if args.glaeda_ref is not None and not re.fullmatch(r"[0-9a-f]{40}", args.glaeda_ref):
+            raise Failure("--glaeda-ref is a full commit id (40 lowercase hex)")
+        GLAEDA_REF = args.glaeda_ref
+        GLAEDA_MAIN.clear()
         manifest = load_manifest(args.manifest)
         PINNED_CANDIDATE = manifest.get("candidate")
         hosts = select_hosts(manifest, args.hosts)

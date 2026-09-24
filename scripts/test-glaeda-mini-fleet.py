@@ -533,7 +533,10 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
                    acceptance: str | None = "accepted", update_running: str | None = None, prepared: str | None = None,
                    sleep: int = 0, runners: tuple[str, ...] = ("actions-runner-cmux-persistent-compile|mini-1",),
                    candidate_generation: str | None = None, enroll_generation: str | None = None,
-                   enroll_reason: str | None = None, **probe: object) -> str:
+                   enroll_reason: str | None = None, python3: str | None = "/opt/homebrew/bin/python3|3.13",
+                   brew_python3: bool = True, glaeda_lacking: str | None = "", glaeda_dirty: int = 0,
+                   pins: tuple[str, ...] = ("rustup|pinned", "zig|pinned", "python@3.13|pinned"),
+                   brew_dir: str | None = None, **probe: object) -> str:
     """A probe plus preflight section for a host that is ready unless told otherwise."""
     lines = [probe_text(**probe).rstrip("\n").replace("user\tbuilder", f"user\t{user}"), READY_XCODE.rstrip("\n")]
     lines.append(f"pf_sdks\t{sdks}")
@@ -552,6 +555,10 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
     if rust:
         lines.append("pf_rust_channel\t1.88.0|rustc 1.88.0 (abc 2025-06-23)|cargo 1.88.0 (abc 2025-06-23)")
     lines.append(f"pf_python\t{python}")
+    if python3 is not None:
+        lines.append(f"pf_python3\t{python3}")
+    if brew_python3:
+        lines.append("pf_brew_python3\t/opt/homebrew/bin/python3.13")
     lines += ["pf_cmux\tpresent", "pf_cmux_pin\t26", "pf_zig_min\t0.16.0" if submodules[0][0] == " " else "pf_zig_min\t"]
     lines += [f"pf_submodule\t{s}" for s in submodules]
     lines += [f"pf_setup_artifacts\t{'yes' if artifacts else 'no'}", f"pf_cmux_dirty\t{dirty}"]
@@ -559,7 +566,9 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
         lines.append(f"pf_candidate\t{candidate}")
     if candidate_generation:
         lines.append(f"pf_candidate_generation\t{candidate_generation}")
-    lines += ["pf_glaeda\tpresent", "pf_cache_root\tpresent"]
+    lines += ["pf_glaeda\tpresent", "pf_cache_root\tpresent", "pf_glaeda_head\t" + "c" * 40]
+    if glaeda_lacking is not None:
+        lines += [f"pf_glaeda_lacking\t{glaeda_lacking}", f"pf_glaeda_dirty\t{glaeda_dirty}"]
     if enroll_state:
         lines.append(f"pf_enroll_state\t{enroll_state}")
     if enroll_generation:
@@ -570,6 +579,9 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
         lines.append(f"pf_acceptance\t{acceptance}")
     if brew_owner:
         lines.append(f"pf_brew_owner\t{brew_owner}")
+        lines += [f"pf_brew_formula\t{pin}" for pin in pins]
+    elif brew_dir:
+        lines.append(f"pf_brew_dir\t{brew_dir}")
     if update_running:
         lines.append(f"pf_update_running\t{update_running}")
     if prepared:
@@ -705,7 +717,7 @@ class PreflightTests(unittest.TestCase):
         checks = result["checks"]
         self.assertEqual((checks["rust"]["group"], checks["brew"]["state"], checks["brew"]["group"]),
                          ("self", "fail", "password"))
-        self.assertIn("after sudo-plan installs Homebrew for cmux", checks["rust"]["fix"])
+        self.assertIn("once fix puts Homebrew in /opt/homebrew for cmux", checks["rust"]["fix"])
         mine, root = mf.planned_actions(result)
         self.assertEqual([a["kind"] for a in root], ["homebrew"])
         self.assertEqual([(a["kind"], a.get("formulas") or a.get("toolchain")) for a in mine],
@@ -716,14 +728,100 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("waits for brew (sudo-plan)", out["waiting"][0])
         self.assertIn("waits for rust", out["waiting"][1])
         script = mf.sudo_plan_script(self.manifest, "build-mini-1", result)
-        self.assertIn(f'  curl -fsSL -o "$installer" {mf.HOMEBREW_INSTALLER}\n  NONINTERACTIVE=1 /bin/bash "$installer"\n',
-                      script)
+        # Root only creates the directory; the brew.sh installer stalled on a Command Line Tools install.
+        self.assertIn("  [ -d /opt/homebrew ] || sudo mkdir /opt/homebrew\n", script)
+        self.assertIn("  sudo chown -R cmux:admin /opt/homebrew\n", script)
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
-        self.assertNotIn("brew install", script)
+        for word in ("brew install", "install.sh", "curl"):
+            self.assertNotIn(word, script)
         # Once Homebrew exists and the login user owns it, fix installs the formulas without root.
         checks["brew"] = {"state": "info", "detail": "cmux", "fix": "", "group": ""}
         out = mf.fix_host(self.manifest, "build-mini-1", result, False, None)
         self.assertEqual([p.split(":")[0] for p in out["planned"]], ["rust/zig", "rust"])
+
+    def test_an_empty_homebrew_prefix_is_filled_by_fix_without_root(self) -> None:
+        # The brew.sh installer stalled on the Command Line Tools and left /opt/homebrew empty, owned by cmux.
+        text = preflight_text(user="cmux", brew_owner=None, brew_dir="cmux|empty", rust=False, zig="0.15.2")
+        result = self.result(text, zig_fallback="0.16.0")
+        brew = result["checks"]["brew"]
+        self.assertEqual((brew["state"], brew["group"], brew["action"]), ("fail", "self", {"kind": "homebrew_fetch"}))
+        mine, root = mf.planned_actions(result)
+        self.assertEqual(root, [])
+        self.assertEqual([a["kind"] for a in mine], ["homebrew_fetch", "brew", "rust_default"])
+        out = mf.fix_host(self.manifest, "build-mini-1", result, False, None, seed="build-mini-2")
+        self.assertEqual(out["waiting"], [])
+        self.assertTrue(out["planned"][0].startswith("brew: git fetch Homebrew/brew into /opt/homebrew"), out["planned"])
+        self.assertIn("[from build-mini-2 over the LAN]", out["planned"][0])
+        # Someone else's empty prefix is handed over by sudo-plan; one with files needs a person.
+        self.assertEqual(result["enrollment"]["state"], "eligible")  # the brew check leaves the enrollment alone
+        self.assertEqual(mf.describe({"kind": "glaeda_sync"}),
+                         "move ~/glaeda to the tip of Glaeda main (clean fetch, detached checkout)")
+        other = self.result(preflight_text(user="cmux", brew_owner=None, brew_dir="root|empty", rust=False))
+        self.assertEqual((other["checks"]["brew"]["group"], other["checks"]["brew"]["action"]["kind"]), ("password", "homebrew"))
+        files = self.result(preflight_text(user="cmux", brew_owner=None, brew_dir="cmux|files", rust=False))
+        self.assertEqual(files["checks"]["brew"]["group"], "person")
+        self.assertIn("move /opt/homebrew aside", files["checks"]["brew"]["fix"])
+
+    def test_workload_python3_must_be_313(self) -> None:
+        # Brew's python@3.13 installs only python3.13, so /usr/bin/python3 (3.9) is what the workload PATH finds.
+        result = self.result(preflight_text(python3="/usr/bin/python3|3.9"))
+        check = result["checks"]["python3"]
+        self.assertFalse(result["ready"])
+        self.assertIn("python3 on the workload PATH is 3.9 at /usr/bin/python3", check["detail"])
+        self.assertEqual((check["group"], check["action"]), ("self", {"kind": "python_link", "owner": "builder"}))
+        mine, _ = mf.planned_actions(result)
+        self.assertEqual([a["kind"] for a in mine], ["python_link"])
+        self.assertEqual(mf.fix_host(self.manifest, "build-mini-1", result, False, None)["planned"],
+                         ["python3: link /opt/homebrew/bin/python3 to python3.13"])
+        # No python3.13 yet: brew installs python@3.13 and links it, as the Homebrew owner when that is not us.
+        bare = self.result(preflight_text(python3="/usr/bin/python3|3.9", brew_python3=False, brew_owner="admin"))
+        _, root = mf.planned_actions(bare)
+        self.assertEqual([(a["kind"], a.get("formulas")) for a in root], [("brew", ["python@3.13"])])
+        script = mf.sudo_plan_script(self.manifest, "build-mini-1", bare)
+        self.assertIn('sudo -H -u admin ln -s python3.13 "$b/python3"', script)
+        self.assertIn("brew_as pin python@3.13", script)
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        linked = self.result(preflight_text(python3="/usr/bin/python3|3.9", brew_owner="admin"))
+        self.assertIn("sudo -H -u admin ln -s python3.13", mf.sudo_plan_script(self.manifest, "build-mini-1", linked))
+        # A python3 in /opt/homebrew/bin that is not 3.13 was put there by someone; a person decides.
+        foreign = self.result(preflight_text(python3="/opt/homebrew/bin/python3|3.12"))
+        self.assertEqual(foreign["checks"]["python3"]["group"], "person")
+
+    def test_unpinned_formulas_warn_and_fix_pins_what_it_installs(self) -> None:
+        result = self.result(preflight_text(pins=("rustup|pinned", "zig|unpinned", "python@3.13|unpinned")))
+        pins = result["checks"]["pins"]
+        self.assertTrue(result["ready"])
+        self.assertEqual(pins["state"], "todo")
+        self.assertEqual(pins["fix"], "brew pin zig python@3.13")
+        lines = mf.brew_commands("builder", ["zig", "python@3.13"], False)
+        self.assertEqual(lines[-1], "brew_as pin zig python@3.13")
+        self.assertIn("brew unpin $f to upgrade it", "\n".join(lines))
+        subprocess.run(["bash", "-n"], input="\n".join(lines), text=True, check=True)
+
+    def test_an_old_glaeda_checkout_is_moved_before_enrolling(self) -> None:
+        # An old ~/glaeda failed onboard with "unrecognized arguments: --class-receipt ...".
+        lacking = "--class-receipt --class-receipt-sha256 --fleet-class"
+        result = self.result(preflight_text(glaeda_lacking=lacking))
+        check = result["checks"]["glaeda"]
+        self.assertFalse(result["ready"])
+        self.assertEqual((check["state"], check["group"], check["action"]), ("fail", "self", {"kind": "glaeda_sync"}))
+        self.assertIn(f"lacks {lacking}", check["detail"])
+        dirty = self.result(preflight_text(glaeda_lacking=lacking, glaeda_dirty=2))["checks"]["glaeda"]
+        self.assertEqual((dirty["group"], "action" in dirty), ("person", False))
+        # --glaeda-ref pins the commit: any other head is moved, even one that has the options.
+        with mock.patch.object(mf, "GLAEDA_REF", "e" * 40):
+            pinned = self.result(preflight_text())["checks"]["glaeda"]
+            self.assertEqual((pinned["state"], pinned["action"]["kind"]), ("fail", "glaeda_sync"))
+            self.assertIn("the operator pins eeeeeeeeeeee", pinned["detail"])
+        calls = []
+        with mock.patch.object(mf, "GLAEDA_MAIN", {}), mock.patch.object(mf, "resolve_glaeda_main", return_value="d" * 40), \
+                mock.patch.object(mf, "fix_call", side_effect=lambda n, u, f, a, log, t: (calls.append((f, a)), 0)[1]), \
+                mock.patch.object(mf, "operator_candidate", return_value={}):
+            for _ in range(2):  # main's tip is read once per run
+                self.assertEqual(mf.run_repair(self.manifest, "build-mini-1", {"kind": "glaeda_sync"}, None),
+                                 (True, "~/glaeda at dddddddddddd"))
+            self.assertEqual(mf.resolve_glaeda_main.call_count, 1)
+        self.assertEqual(calls, [("glaeda_sync", ["d" * 40, *mf.ENROLL_FLAGS])] * 2)
 
     def test_unreachable_and_unprobed_hosts_are_not_ready(self) -> None:
         result = mf.preflight_host(self.manifest, "build-mini-1", {"reachable": False, "error": "timeout"})
@@ -816,11 +914,16 @@ class PreflightScriptTests(unittest.TestCase):
             fleet = home / ".config/glaeda/cmux-fleet"
             fleet.mkdir(parents=True)
             (fleet / "enrollment.json").write_text('{"state": "eligible", "glaedaGeneration": "sha256:old"}')
+            (home / "glaeda/scripts").mkdir(parents=True)
+            (home / "glaeda/scripts/glaeda-mini-enroll").write_text('p.add_argument("--renew")\n')
+            (tools / "python3").write_text("#!/bin/sh\necho 3.9\n")
+            (tools / "python3").chmod(0o755)
             runner = home / "actions-runner-cmux-persistent-compile"
             runner.mkdir()
             (runner / ".runner").write_text('﻿{\n  "agentName": "mini-1",\n  "serverUrl": "https://secret.example/"\n}\n')
             header = (f"CMUX_ROOT='~/cmux'\nXCODE_PIN=''\nWORKLOAD_PATH={tools}\n"
-                      f"WORKLOAD_TOOLS='cargo git zig rustup'\nPYTHONS=''\nCANDIDATE_PIN={'ab' * 20}\n")
+                      f"WORKLOAD_TOOLS='cargo git zig rustup'\nPYTHONS=''\nCANDIDATE_PIN={'ab' * 20}\n"
+                      "ENROLL_FLAGS='--renew --class-receipt --fleet-class'\nPIN_FORMULAS='zig'\n")
             # The whole SSH payload, probe first, as observe_host sends it.
             script = mf.PROBE.read_text() + "\n" + header + mf.PREFLIGHT_PROBE.read_text()
             out = subprocess.run(["bash", "-s"], input=script, capture_output=True,
@@ -838,6 +941,8 @@ class PreflightScriptTests(unittest.TestCase):
                                           "loaded": "unknown", "listening": "no", "held": "no"}])
         self.assertNotIn("secret.example", out)
         self.assertEqual(pf["python"], {"path": None, "version": None})
+        self.assertEqual(pf["python3"], {"path": f"{tools}/python3", "version": "3.9"})
+        self.assertEqual(pf["glaeda_lacking"], ["--class-receipt", "--fleet-class"])
 
 
 def morning_text() -> str:
@@ -1220,7 +1325,59 @@ class FixLibraryTests(unittest.TestCase):
             predates = self.call(home, "glaeda_sync", old)
             self.assertEqual(predates.returncode, 3)
             self.assertIn("predates glaeda-mini-enroll --renew", predates.stderr)
+            # Every option onboarding passes is asked for, not just --renew.
+            lacks = self.call(home, "glaeda_sync", new, *mf.ENROLL_FLAGS)
+            self.assertEqual(lacks.returncode, 3)
+            self.assertIn("predates glaeda-mini-enroll --class-receipt", lacks.stderr)
             self.assertEqual(git("rev-parse", "HEAD", cwd=home / "glaeda"), later)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_homebrew_fetch_fills_an_empty_prefix_from_a_peer_else_upstream(self) -> None:
+        env = {"HOME": "/nonexistent", "PATH": "/usr/bin:/bin", "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e", "GIT_CONFIG_GLOBAL": "/dev/null"}
+
+        def git(*args: str, cwd: Path) -> str:
+            return subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True, text=True).stdout.strip()
+
+        def repo(path: Path, tag: str) -> Path:
+            (path / "bin").mkdir(parents=True)
+            (path / "bin/brew").write_text(f"#!/bin/sh\necho {tag}\n")
+            (path / "bin/brew").chmod(0o755)
+            git("init", "-q", "-b", "main", cwd=path)
+            git("add", ".", cwd=path)
+            git("commit", "-qm", tag, cwd=path)
+            return path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            upstream, peer = repo(home / "upstream", "upstream"), repo(home / "peer", "peer")
+
+            def fetch(prefix: Path, *args: str) -> subprocess.CompletedProcess:
+                with mock.patch.object(mf, "ssh_stream", return_value=0) as ssh:
+                    mf.fix_call("h", "u", "homebrew_fetch", [os.fspath(upstream), *args], None, 10)
+                return subprocess.run(["bash", "-c", ssh.call_args.args[2]], capture_output=True, text=True, timeout=60,
+                                      env={**env, "HOME": tmp, "GLAEDA_HOMEBREW_DIR": os.fspath(prefix),
+                                           "GLAEDA_FLEET_DIR": os.fspath(home / "fleet")})
+
+            prefix = home / "homebrew"
+            (prefix / "Cellar").mkdir(parents=True)  # a stalled installer leaves empty directories
+            done = fetch(prefix, os.fspath(peer))
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual((prefix / "bin/brew").read_text(), "#!/bin/sh\necho peer\n")
+            self.assertEqual(git("remote", "get-url", "origin", cwd=prefix), os.fspath(upstream))
+            self.assertIn("unchanged", fetch(prefix, os.fspath(peer)).stdout)
+            fallback = home / "homebrew2"
+            fallback.mkdir()
+            done = fetch(fallback, os.fspath(home / "no-such-peer"))
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual((fallback / "bin/brew").read_text(), "#!/bin/sh\necho upstream\n")
+            busy = home / "homebrew3"
+            busy.mkdir()
+            (busy / "notes").write_text("mine")
+            refused = fetch(busy)
+            self.assertEqual(refused.returncode, 3)
+            self.assertIn("has files but no brew", refused.stderr)
+            self.assertEqual(fetch(home / "absent").returncode, 3)
 
     @unittest.skipUnless(shutil.which("perl"), "needs perl")
     def test_a_held_host_refuses_every_changing_step(self) -> None:
@@ -1518,6 +1675,20 @@ class ShareTests(unittest.TestCase):
         share.assert_not_called()
         ship.assert_called_once()
         self.assertEqual(out["failed"], [])
+
+    def test_homebrew_comes_from_the_seed_over_the_lan_with_the_operator_agent(self) -> None:
+        calls = []
+        with mock.patch.object(mf, "lan_address", return_value=("10.0.8.5", "10.0.8.5")), \
+                mock.patch.object(mf, "ssh_stream", side_effect=lambda n, u, c, log, stdin=b"", timeout=None, options=():
+                                  (calls.append((n, c, options)), 0)[1]):
+            ok, detail = mf.fetch_homebrew(self.manifest, "build-mini-1", None, "build-mini-2")
+            self.assertEqual((ok, detail), (True, "Homebrew in /opt/homebrew (from build-mini-2)"))
+            mf.fetch_homebrew(self.manifest, "build-mini-1", None, None)
+        (host, command, options), (_, plain, plain_options) = calls
+        self.assertEqual((host, options, plain_options), ("build-mini-1", ("-A",), ()))
+        self.assertTrue(remote_call(command).endswith(
+            f"homebrew_fetch {mf.HOMEBREW_REPO} ssh://builder@10.0.8.5/opt/homebrew"), remote_call(command))
+        self.assertTrue(remote_call(plain).endswith(f"homebrew_fetch {mf.HOMEBREW_REPO}"))
 
     def test_a_missing_xcode_waits_for_a_seed(self) -> None:
         self.manifest["defaults"]["toolchain"]["xcode"] = {"app": "/Applications/Xcode_26.6.app", "version": "26.6",
@@ -1991,6 +2162,19 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual((code, export.call_count), (0, 0), out)
         self.assertEqual(calls_to(calls, ENROLL), [])
         self.assertIn("ok: already on 3809eed51fdd", out)
+
+    def test_an_old_glaeda_checkout_is_synced_by_the_renewal_not_refused(self) -> None:
+        lacking = "--class-receipt --class-receipt-sha256 --fleet-class"
+        fleet = {h: text.replace("pf_glaeda_lacking\t", f"pf_glaeda_lacking\t{lacking}") for h, text in self.fleet().items()}
+        after = {"build-mini-1": on_candidate(generation=NEW_GEN),
+                 "build-mini-2": on_candidate(generation=NEW_GEN, node_id="cmux-mac-002")}
+        code, out, calls, _ = self.upgrade(fleet, "--yes", "--glaeda-ref", "e" * 40, after=after)
+        self.assertEqual(code, 0, out)
+        syncs = [remote_call(c[1]) for c in calls_to(calls, "glaeda_sync")]
+        self.assertEqual(syncs, ["lock; glaeda_sync " + " ".join(["e" * 40, *mf.ENROLL_FLAGS])] * 2)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(mf.main(["preflight", "--glaeda-ref", "main", "--manifest", os.fspath(EXAMPLE)]), 2)
+        self.assertIn("--glaeda-ref is a full commit id", err.getvalue())
 
     def test_a_named_seed_and_a_failed_seed_leave_the_class_untouched(self) -> None:
         code, out, calls, export = self.upgrade(self.fleet(), "--yes", "--seed-per-class", "build-mini-2",

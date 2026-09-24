@@ -7,6 +7,8 @@
 #   WORKLOAD_TOOLS  cmux_fleet_bootstrap.MACOS_WORKLOAD_TOOLS, space separated
 #   PYTHONS         glaeda-mini-enroll's interpreter candidates, space separated, ~ for home
 #   CANDIDATE_PIN   the Glaeda candidate source commit the fleet manifest (or glaeda-mini-fleet upgrade) pins, or empty
+#   ENROLL_FLAGS    the glaeda-mini-enroll options onboarding passes, space separated
+#   PIN_FORMULAS    the Homebrew formulas class receipts pin, space separated
 # Emits "key<TAB>value" lines like the probe. Installs, downloads and writes nothing: rustup runs with
 # RUSTUP_AUTO_INSTALL=0 and git with GIT_OPTIONAL_LOCKS=0. Never prints tokens or runner URLs.
 # The group is parsed whole before it runs, so its </dev/null cannot eat the rest of this script.
@@ -79,6 +81,15 @@ for c in $PYTHONS; do
   [ -n "$py" ] || py="|$v"
 done
 e pf_python "$py"
+# python3 as the workload resolves it; the bootstrap's profileRunnerInterpreter needs 3.13+ (os.waitid).
+p3=$(PATH="$WORKLOAD_PATH" command -v python3 2>/dev/null)
+v3=""
+case "$p3" in /usr/bin/*) [ "$shims" = run ] || v3="not run: no developer directory selected" ;; esac
+if [ -n "$p3" ] && [ -z "$v3" ]; then
+  v3=$("$p3" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>&1 | first)
+fi
+e pf_python3 "$p3|$v3"
+[ -x /opt/homebrew/bin/python3.13 ] && e pf_brew_python3 /opt/homebrew/bin/python3.13
 
 # The cmux checkout: submodules, setup artifacts and local changes. Then the pinned candidate.
 if [ -e "$CMUX_ROOT/.git" ]; then
@@ -109,6 +120,13 @@ if [ -n "$source" ]; then
 fi
 [ -f "$HOME/glaeda/scripts/cmux_fleet.py" ] && e pf_glaeda present || e pf_glaeda missing
 [ -e "$HOME/glaeda/.git" ] && e pf_glaeda_head "$(git -C "$HOME/glaeda" rev-parse -q --verify HEAD 2>/dev/null)"
+# The options an old ~/glaeda cannot run ("unrecognized arguments"), and whether it could be moved.
+if [ -f "$HOME/glaeda/scripts/glaeda-mini-enroll" ]; then
+  lacking=""
+  for f in $ENROLL_FLAGS; do grep -qF -- "\"$f\"" "$HOME/glaeda/scripts/glaeda-mini-enroll" || lacking="$lacking $f"; done
+  e pf_glaeda_lacking "${lacking# }"
+  e pf_glaeda_dirty "$(git -C "$HOME/glaeda" status --porcelain=v1 --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')"
+fi
 [ -d "$HOME/.cache/glaeda/cmux-native-cache" ] && e pf_cache_root present || e pf_cache_root missing
 
 # Enrollment progress (glaeda-mini-enroll); the node id itself comes from the probe.
@@ -122,10 +140,22 @@ fleet="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet"
 [ -f "$fleet/acceptance/cmux_macos_native_build.json" ] && \
   e pf_acceptance_class "$(plutil -extract executionClass raw "$fleet/acceptance/cmux_macos_native_build.json" 2>/dev/null)"
 
-# Homebrew's owner decides whether an install needs sudo -u <owner>.
-for mark in /opt/homebrew/Cellar /opt/homebrew/bin; do
-  [ -e "$mark" ] && { e pf_brew_owner "$(stat -f %Su "$mark")"; break; }
-done
+# Homebrew's owner decides whether an install needs sudo -u <owner>. Only a working brew counts: a stalled
+# installer leaves /opt/homebrew (even Cellar and bin) without one, which pf_brew_dir reports instead.
+hb=/opt/homebrew
+if [ -x "$hb/bin/brew" ]; then
+  for mark in "$hb/Cellar" "$hb/bin"; do
+    [ -e "$mark" ] && { e pf_brew_owner "$(stat -f %Su "$mark")"; break; }
+  done
+  # Class receipts pin toolchain strings, so the reference host pins these formulas.
+  for f in $PIN_FORMULAS; do
+    [ -d "$hb/Cellar/$f" ] || continue
+    [ -L "$hb/var/homebrew/pinned/$f" ] && e pf_brew_formula "$f|pinned" || e pf_brew_formula "$f|unpinned"
+  done
+elif [ -d "$hb" ]; then
+  files=$(find "$hb" -mindepth 1 -not -type d 2>/dev/null | head -1)
+  e pf_brew_dir "$(stat -f %Su "$hb")|$([ -n "$files" ] && echo files || echo empty)"
+fi
 
 # A running or prepared macOS update means a restart is coming.
 # Only an install or download; softwareupdate -l or --history from a monitoring job is not an update.

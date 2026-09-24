@@ -31,6 +31,11 @@ class Plan(unittest.TestCase):
         steps = me.plan(me.State(False, None, False), "cmux-mac-001", False, False)
         self.assertEqual(steps, ["install-glaeda", "bootstrap", "enroll", "accept-local", "eligible", "status"])
 
+    def test_next_step_names_the_runner_not_the_retired_path(self) -> None:
+        self.assertIn("glaeda-cmux-runner --apply", me.NEXT_STEP)
+        self.assertIn("glaeda#1174", me.NEXT_STEP)
+        self.assertNotIn("persistent-compile", me.NEXT_STEP + me.__doc__)
+
     def test_fresh_mini_needs_a_node_id(self) -> None:
         with self.assertRaisesRegex(me.Stop, "--node-id"):
             me.plan(me.State(True, None, False), None, False, False)
