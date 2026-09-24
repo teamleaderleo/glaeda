@@ -320,6 +320,46 @@ class MiniSetupTest(unittest.TestCase):
             self.assertEqual(ms.power(), {"readable": True, "acSleepDisabled": True,
                                           "wakeOnNetwork": True, "autoRestart": True})
 
+    def test_hygiene_only_installs_tools_and_agents_on_any_mac(self) -> None:
+        self.patches[0].stop()
+        pre = fake_preflight()(None)
+        pre["checks"]["diskFree"] = ms.check(False, "40 GiB", "need 120 GiB", True)
+        pre["blocking"] = ["diskFree"]
+        self.patches[0] = mock.patch.object(ms, "preflight", lambda ctx: pre)
+        self.patches[0].start()
+        receipt = self.invoke("--hygiene-only", "--apply")
+        self.assertEqual(receipt["profile"], "hygiene")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        self.assertEqual(receipt["preflight"]["checks"]["diskFree"]["level"], "warn")
+        self.assertEqual(receipt["operatorSteps"], [])
+        self.assertEqual(receipt["reserved"], {})
+        kinds = {a["kind"] for a in receipt["actions"]}
+        self.assertNotIn("git", kinds)
+        self.assertFalse((self.home / ".cache/glaeda/cmux-native-cache").exists())
+        for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
+            self.assertTrue(os.access(self.home / ".local/bin" / name, os.X_OK), name)
+        for label in ("disk-pressure", "disk-dedupe", "worktree-reclaim"):
+            self.assertTrue((self.home / f"Library/LaunchAgents/com.teamleaderleo.glaeda.{label}.plist").is_file())
+        # the build-host profile still blocks on the same machine
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ms.main(["--output", "json", "--python", "/usr/bin/python3",
+                     "--reclaim-binary", os.fspath(self.reclaim)])
+        self.assertIn("diskFree", json.loads(out.getvalue())["blocking"])
+
+    def test_hygiene_only_still_blocks_without_python(self) -> None:
+        self.patches[0].stop()
+        pre = fake_preflight()(None)
+        pre["checks"]["python"] = ms.check(False, "missing", "", True)
+        pre["blocking"] = ["python"]
+        self.patches[0] = mock.patch.object(ms, "preflight", lambda ctx: pre)
+        self.patches[0].start()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ms.main(["--output", "json", "--python", "/usr/bin/python3",
+                     "--reclaim-binary", os.fspath(self.reclaim), "--hygiene-only"])
+        self.assertEqual(json.loads(out.getvalue())["blocking"], ["python"])
+
     def test_no_em_dashes(self) -> None:
         for name in ("glaeda-mini-setup", "glaeda-worktree-reclaim-all", "test-glaeda-mini-setup.py"):
             self.assertNotIn(chr(0x2014), (ROOT / "scripts" / name).read_text(), name)
