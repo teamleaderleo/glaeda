@@ -102,7 +102,8 @@ removes your own or any expired marker (another owner's active one or an invalid
 Both are dry runs without --yes. The probe reports the marker and whether a build holds host.lock
 (a non-blocking shared flock, dropped at once); `check` shows an active reservation as `reserved`
 (informational, like `pending`) and an expired or invalid marker as drift, and `pools` leaves
-reserved (active or invalid marker) and busy members out of `conforming` and lists them.
+reserved members (active or invalid marker) out of `conforming`; it lists them, and lists members
+whose host lock was held (`busy`) without removing them.
 
 The manifest's `toolchain` (in defaults, overridable per host) declares what every build host
 must carry: the Xcode app and build and whether it is selected, the Metal toolchain, the minimum
@@ -820,9 +821,10 @@ def pools(manifest: dict[str, Any], observed: dict[str, Any] | None, hosts: list
     from this manifest would carry the label. It does not prove the registered runner carries it
     today; GitHub fixes labels at registration. Without an observation nothing conforms.
 
-    Capacity is what is free at observation time: a member with an active or invalid reservation
-    (listed in `reserved`; the runner hook refuses both) or a held fleet host lock (listed in `busy`)
-    does not conform, so the picker sees why the count dropped.
+    A member with an active or invalid reservation (listed in `reserved`; the runner hook refuses
+    both) does not conform, so the picker sees why the count dropped. `busy` lists members whose
+    fleet host lock was held at observation time, as information only: they still conform, because
+    a snapshot of a running job must not shrink capacity (the picker counts live jobs itself).
     """
     seen = (observed or {}).get("hosts", {})
 
@@ -853,7 +855,7 @@ def pools(manifest: dict[str, Any], observed: dict[str, Any] | None, hosts: list
             continue
         held = [m for m in mine if reserved(m)]
         running = [m for m in mine if busy(m)]
-        ok = [m for m in conforming.get(label, []) if m in wanted and m not in held and m not in running]
+        ok = [m for m in conforming.get(label, []) if m in wanted and m not in held]
         out[label] = {"declared": mine, "conforming": ok, "reserved": held, "busy": running,
                       "declared_count": len(mine), "conforming_count": len(ok),
                       "reserved_count": len(held), "busy_count": len(running)}

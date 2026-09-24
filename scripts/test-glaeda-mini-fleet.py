@@ -2246,16 +2246,17 @@ class ReservationCheckAndPoolTests(unittest.TestCase):
         self.assertEqual(code, 0, out.getvalue())
         self.assertIn("ok (1 pending, 1 reserved)", out.getvalue())
 
-    def test_pools_exclude_reserved_and_busy_members_and_say_why(self) -> None:
+    def test_pools_exclude_reserved_members_and_only_list_busy_ones(self) -> None:
         label = "glaeda-std-xcode-26.3"
-        for extra, reserved, busy in ((reservation_line(), ["build-mini-1"], []),
-                                      (reservation_line(raw=b"garbage"), ["build-mini-1"], []),  # invalid refuses too
-                                      ("host_lock\theld\n", [], ["build-mini-1"]),
-                                      (reservation_line() + "host_lock\theld\n", ["build-mini-1"], ["build-mini-1"])):
-            got = mf.pools(self.manifest, observed(**{"build-mini-1": probe_text() + extra}), ["build-mini-1"])[label]
-            self.assertEqual((got["conforming"], got["reserved"], got["busy"]), ([], reserved, busy), extra)
+        m = ["build-mini-1"]
+        for extra, conforming, reserved, busy in ((reservation_line(), [], m, []),
+                                                  (reservation_line(raw=b"garbage"), [], m, []),  # invalid refuses too
+                                                  ("host_lock\theld\n", m, [], m),  # busy still conforms
+                                                  (reservation_line() + "host_lock\theld\n", [], m, m)):
+            got = mf.pools(self.manifest, observed(**{"build-mini-1": probe_text() + extra}), m)[label]
+            self.assertEqual((got["conforming"], got["reserved"], got["busy"]), (conforming, reserved, busy), extra)
             self.assertEqual((got["conforming_count"], got["reserved_count"], got["busy_count"]),
-                             (0, len(reserved), len(busy)))
+                             (len(conforming), len(reserved), len(busy)))
         now = int(time.time())
         for extra in (reservation_line(since=now - 7200, until=now - 1), "host_lock\tfree\n", "host_lock\tunknown\n"):
             got = mf.pools(self.manifest, observed(**{"build-mini-1": probe_text() + extra}), ["build-mini-1"])[label]
