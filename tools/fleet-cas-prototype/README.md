@@ -21,19 +21,47 @@ LLVM-exception, copied unmodified into `proto/`):
 Storage is one file per object under the store directory. Counters go to
 `<store>/stats.json`.
 
+One binary plays two roles:
+
+- **Fleet store**: `fleet-cas tcp:<addr> <store>` serves the same two services
+  over TCP to node daemons on other machines.
+- **Node daemon**: `fleet-cas <socket> <store> --upstream http://<addr>` is
+  what Xcode talks to on each machine. Reads try the node's own store, then
+  the fleet store; fetched objects are verified by recomputing their ID and
+  kept. Writes land locally and are forwarded before Xcode gets its answer,
+  so an index entry reaches the fleet store only after the objects Xcode
+  uploaded for it. With `--read-only-kv` the node forwards nothing.
+
 ```sh
 cargo build --release
-target/release/fleet-cas /tmp/fcas.sock /path/to/store [--read-only-kv]
+# writer: fleet store plus a writing node
+target/release/fleet-cas tcp:<lan-ip>:7450 $HOME/.cache/fleet-cas/store
+target/release/fleet-cas $HOME/.cache/fleet-cas/n.sock $HOME/.cache/fleet-cas/node \
+  --upstream http://<lan-ip>:7450
 
-PKG=... SCHEME=... WORK=... scripts/xcode-cache-build.sh fill \
+PKG=... SCHEME=... WORK=... DD=... scripts/xcode-cache-build.sh fill \
   COMPILATION_CACHE_ENABLE_PLUGIN=YES \
-  COMPILATION_CACHE_REMOTE_SERVICE_PATH=/tmp/fcas.sock
+  COMPILATION_CACHE_REMOTE_SERVICE_PATH=$HOME/.cache/fleet-cas/n.sock
+
+# reader: empty read-only node per run, then one run on a warm node
+PKG=... SCHEME=... WORK=... DD=... scripts/reader-runs.sh http://<lan-ip>:7450 3
 ```
 
 Keep the socket path short; macOS limits unix socket paths to 104 bytes.
+Build under `$HOME` (never `/tmp`, see swiftlang/swift#92545). On Xcode 26.3,
+pass `DD=<fixed path>` (the same on every machine) instead of mapping
+DerivedData; see the 2026-09-24 experiment. On a cmux build fleet mini,
+`scripts/with-fleet-lock.pl` keeps the fleet worker from starting a job
+during a measurement.
 
-Known prototype gaps, all measured in the experiment: it must run on the same
-host as the build (the client sends large blobs as local file paths, and the
-prototype reads whatever path it is given, so run it only for your own user),
-it does not require a KV entry's objects to be present before accepting the
-entry, and it has no size budget or eviction.
+Known prototype gaps: the node daemon must run on the same host as the build
+(the client sends large blobs as local file paths, and the node reads whatever
+path it is given, so run it only for your own user; the TCP fleet store
+refuses file-path uploads); the TCP fleet store has no authentication, so bind
+it only to a trusted interface; a KV entry is not checked for its objects'
+presence (`kv_put_dangling` only counts entries that name absent objects);
+there is no size budget or eviction; and a node that cannot reach the fleet
+store answers reads as misses and fails writes (counted in `up_errors`), then
+skips the store for 30 s (`up_skipped`), so an outage costs about a cold build
+and nothing is published half-way. Reads and writes share that backoff, so one
+failed upload also pauses fleet reads for 30 s.

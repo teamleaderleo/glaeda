@@ -8,7 +8,7 @@ fn main() {
     )
     .unwrap();
     tonic_prost_build::configure()
-        .build_client(false)
+        .build_client(true)
         .compile_fds(fds)
         .unwrap();
 }
