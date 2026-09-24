@@ -1115,22 +1115,36 @@ fn newest_reflog_entry_seconds(path: &Path) -> Result<Option<i64>, LinkedWorktre
 }
 
 fn parse_newest_reflog_entry(tail: &[u8]) -> Result<Option<i64>, LinkedWorktreeReclaimError> {
-    let Some(line) = tail
+    // The highest time in the tail, not the last line's: an entry written with a backdated
+    // committer date (GIT_COMMITTER_DATE) must not hide newer entries before it. The first line
+    // may be cut by the tail window, and the last may still be being written, so a line counts
+    // only when the field before its time closes an identity (`<email>`); if none does, the
+    // reflog is unobservable rather than idle.
+    let mut newest = None;
+    let mut saw_line = false;
+    for line in tail
         .split(|byte| *byte == b'\n')
-        .rev()
-        .find(|line| !line.is_empty())
-    else {
-        return Ok(None);
-    };
-    let header = line.split(|byte| *byte == b'\t').next().unwrap_or_default();
-    let mut fields = header.rsplit(|byte| *byte == b' ');
-    let _zone = fields.next();
-    let seconds = fields
-        .next()
-        .and_then(|field| std::str::from_utf8(field).ok())
-        .and_then(|field| field.parse::<i64>().ok())
-        .ok_or_else(unavailable)?;
-    Ok(Some(seconds))
+        .filter(|line| !line.is_empty())
+    {
+        saw_line = true;
+        let header = line.split(|byte| *byte == b'\t').next().unwrap_or_default();
+        let header = header.strip_suffix(b"\r").unwrap_or(header);
+        let mut fields = header.rsplit(|byte| *byte == b' ');
+        let _zone = fields.next();
+        let seconds = fields
+            .next()
+            .and_then(|field| std::str::from_utf8(field).ok())
+            .and_then(|field| field.parse::<i64>().ok());
+        let identity_closed = fields.next().is_some_and(|field| field.ends_with(b">"));
+        if let (Some(seconds), true) = (seconds, identity_closed) {
+            newest = Some(newest.map_or(seconds, |current: i64| current.max(seconds)));
+        }
+    }
+    match (saw_line, newest) {
+        (false, _) => Ok(None),
+        (true, Some(seconds)) => Ok(Some(seconds)),
+        (true, None) => Err(unavailable()),
+    }
 }
 
 // --- Execution -------------------------------------------------------------
@@ -1768,6 +1782,22 @@ mod tests {
         assert_eq!(
             parse_newest_reflog_entry(log.as_bytes()).unwrap(),
             Some(1_790_000_100)
+        );
+        // a backdated last entry does not hide the newer one before it
+        let backdated = format!(
+            "{zero} {one} A <a@b> 1790000500 +0000\tcommit: now\n\
+             {one} {zero} A <a@b> 1577836800 +0000\tcommit: GIT_COMMITTER_DATE=2020\n"
+        );
+        assert_eq!(
+            parse_newest_reflog_entry(backdated.as_bytes()).unwrap(),
+            Some(1_790_000_500)
+        );
+        // a torn first entry (all-zero old id, part of the new id) is not time 0
+        assert_eq!(
+            parse_newest_reflog_entry(format!("{zero} 3010").as_bytes())
+                .unwrap_err()
+                .code(),
+            "unavailable"
         );
         assert_eq!(parse_newest_reflog_entry(b"").unwrap(), None);
         assert_eq!(parse_newest_reflog_entry(b"\n\n").unwrap(), None);
