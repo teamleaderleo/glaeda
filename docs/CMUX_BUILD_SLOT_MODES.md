@@ -10,13 +10,17 @@ Xcode's compilation cache and incremental builds do not mix for the cmux app tar
 
 | Build (full `cmux` app, M4 Pro) | Caching on | Caching off |
 | --- | ---: | ---: |
-| fresh DerivedData, fleet store warm | 90 to 130 s | about 750 s (cold) |
-| one-line app-target edit, warm DerivedData | 451 s (whole target recompiles) | about 40 to 48 s |
-| no-op, warm DerivedData | | about 11 s |
+| fresh DerivedData, fleet store warm | 90 to 130 s | 710 s (cold) |
+| one-line app-target edit, warm DerivedData | 451 s (whole target recompiles) | 125 to 156 s (646 compile steps) |
+| no-op, warm DerivedData | | 13 to 14 s |
+| flip caching on / off in the same DerivedData | 606 s (full rebuild) | 755 s (full rebuild) |
 
-The caching-off edit and no-op numbers are from the Air Blue campaign (Xcode 27) and still
-need measuring on a mini at the fleet pin; the rest are from the minis on Xcode 26.3. The
-fresh-build row assumes the fleet store already holds that commit. With caching on, every
+The caching-off column and the flip row are from cmux8s at the fleet pin, Xcode 26.6
+(17F113); the caching-on column is from the minis on Xcode 26.3. The edit was a new
+file-scope declaration in one app file (`WorkspaceTodoState.swift`), which recompiled 646
+dependent compile steps; its revert took 125 s. An edit inside a function body likely
+recompiles less (the Air Blue campaign saw 40 to 48 s on Xcode 27) and has not been measured
+on the pin. The fresh-build row assumes the fleet store already holds that commit. With caching on, every
 compile job's key covers the whole module, so any edit misses every job in the app target.
 
 Turning caching off for the app target alone (a per-target macro) while packages stay cached
@@ -30,8 +34,8 @@ So a slot keeps two DerivedData directories and picks per job:
 - **Catch-up mode (caching on):** a fresh machine, a slot far behind main, or a one-shot build
   of a commit (CI, a PR product). Fed by the fleet store: about 100 s from nothing.
 - **Iteration mode (caching off):** edit loops on a slot that is already warm at, or near, the
-  commit being edited. About 40 to 48 s per app edit and 11 s no-op (Air Blue, Xcode 27); under
-  20 s needs a smaller app module (manaflow-ai/cmux#13108).
+  commit being edited. 125 to 156 s for an app edit that adds a declaration, 13 to 14 s no-op
+  (Xcode 26.6); well under a minute needs a smaller app module (manaflow-ai/cmux#13108).
 
 A **slot** is one checkout plus its iteration DerivedData, leased to one user or agent at a
 time. Slots on a host never build at the same time: every build takes the host lock.
@@ -135,16 +139,18 @@ merge base with main has a marker (its own changes are few, and they miss either
 started once the catch-up product is delivered. It takes the host lock like any job, and a
 `flock` does not preempt, so a foreground job must be able to cancel it: the warmer registers
 its xcodebuild process, the foreground job stops it and requeues the warm (planned). An
-interrupted incremental build is expected to leave DerivedData usable, with the next build
-redoing the unfinished work (not measured yet; Next, item 1). Because every slot shares the
+interrupted incremental build leaves DerivedData usable: on the pin, a build stopped after 25 s
+was followed by an ordinary incremental one (143 s, the same 646 steps as the uncancelled
+edit). That stop landed during planning; a stop in the middle of compiling is still
+unmeasured. Because every slot shares the
 host lock, an iteration edit can also wait behind another slot's foreground build, about 100 s
 for a catch-up; edit latency includes that wait.
 
 ## Warming the iteration DerivedData
 
 It cannot be derived from the catch-up DerivedData: caching changes every compile job's command
-line, so flipping a DerivedData from caching on to caching off rebuilds everything (776 s on
-Air Blue, Xcode 27; to be confirmed on 26.6 before the worker relies on it). The iteration
+line, so flipping a DerivedData between the modes rebuilds everything, in both directions
+(on the pin: 606 s turning caching on, 755 s turning it off). The iteration
 DerivedData is therefore warmed by its own caching-off builds:
 
 - an idle warmer rebuilds a slot's iteration DerivedData at main's tip, but only a slot with
@@ -161,10 +167,8 @@ DerivedData is therefore warmed by its own caching-off builds:
 
 ## Next
 
-1. On a mini at the fleet pin: caching-off edit and no-op times in a warm iteration
-   DerivedData, the flip-is-a-full-rebuild result, a cancelled warm build followed by an
-   incremental one, and the mixed-mode edit and no-op runs (with the fresh-build hit loss
-   diagnosed).
+1. On the pin: a function-body app edit, a cancellation in the middle of compiling, and the
+   mixed-mode edit and no-op runs (with the fresh-build hit loss diagnosed).
 2. Cut the non-compiler work a catch-up build still does. Summed task time, not wall time:
    SwiftDriver planning and scanning 163 s, script phases 18 s (Rust diff sidecar, nucleo FFI,
    wireguard-go), App Intents extraction 16 s over 89 tasks. Script phases can be cached by
