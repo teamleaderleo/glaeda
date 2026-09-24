@@ -34,7 +34,7 @@
       "status": "review"
     }
   },
-  "classes": {
+  "hardware": {
     "m4pro-48": {
       "model": "Mac16,11",
       "chip": "Apple M4 Pro",
@@ -126,7 +126,9 @@
     "build-mini-1": {
       "hostname": "build-mini-1",
       "node_id": "cmux-mac-001",
-      "class": "m4pro-48",
+      "hardware": "m4pro-48",
+      "class": "std",
+      "availability": "dedicated",
       "roles": [
         "dev-builds",
         "ci-runner"
@@ -136,7 +138,9 @@
     "build-mini-2": {
       "hostname": "Build-Mini-2",
       "node_id": "cmux-mac-002",
-      "class": "m4pro-48",
+      "hardware": "m4pro-48",
+      "class": "std",
+      "availability": "dedicated",
       "roles": [
         "nightly",
         "ios-simulators"
@@ -145,7 +149,9 @@
     },
     "small-mini": {
       "hostname": "small-mini",
-      "class": "m4-16",
+      "hardware": "m4-16",
+      "class": "light",
+      "availability": "dedicated",
       "note": "runs other services; record only",
       "overrides": {
         "apply": false,

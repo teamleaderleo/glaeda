@@ -10,6 +10,7 @@
     glaeda-mini-fleet sudo-plan [HOST ...] [--run] [--sudoers]                  every root step, one password per host
     glaeda-mini-fleet share THING --from HOST HOST ... [--yes]                  seed over the LAN from a prepared host
     glaeda-mini-fleet onboard   [HOST ...] [--yes] [--from HOST]                preflight, fix, sudo-plan, enroll, register
+    glaeda-mini-fleet pools    [HOST ...] [--observed FILE]                     runner capacity per pool label (JSON)
 
 The manifest names every host, its fleet node id (node_id, so every enrollment rerun asks for the
 same one), its hardware class, the toolchain it must carry, the SSH keys that must, may, and must
@@ -93,6 +94,11 @@ from typing import Any
 SCHEMA = "glaeda-mini-fleet/v1"
 # What a host is for; the target end state can give one host several.
 ROLES = ("dev-builds", "ci-runner", "nightly", "ios-simulators", "cache-host")
+# Scheduling class (cmuxterm-hq build-fleet/FLEET-MEMBERSHIP.md). `hardware` names the machine
+# shape the check verifies; `class` says what work the member takes.
+CLASSES = ("xl", "std", "light", "dev", "borrowed")
+RUNNER_CLASSES = ("xl", "std", "light")
+AVAILABILITY = ("dedicated", "opportunistic")
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROBE = SCRIPT_DIR / "cmux_mini_probe.sh"
 PREFLIGHT_PROBE = SCRIPT_DIR / "cmux_mini_preflight.sh"
@@ -149,7 +155,8 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise Failure(f"{path}: invalid JSON: {error}") from None
     if data.get("schema") != SCHEMA:
         raise Failure(f"{path}: schema must be {SCHEMA!r}, got {data.get('schema')!r}")
-    for field in ("ssh_user", "keys", "classes", "defaults", "hosts"):
+    upgrade_legacy_classes(data)
+    for field in ("ssh_user", "keys", "hardware", "defaults", "hosts"):
         if field not in data:
             raise Failure(f"{path}: missing {field!r}")
     never = {host_key(n) for n in data.get("never_touch", [])}
@@ -161,8 +168,15 @@ def load_manifest(path: Path) -> dict[str, Any]:
         unknown = set(host.get("roles", [])) - set(ROLES)
         if unknown:
             raise Failure(f"{path}: host {name} has unknown roles {sorted(unknown)}; known: {', '.join(ROLES)}")
-        if host.get("class") not in data["classes"]:
-            raise Failure(f"{path}: host {name} has unknown class {host.get('class')!r}")
+        if host.get("hardware") not in data["hardware"]:
+            raise Failure(f"{path}: host {name} has unknown hardware {host.get('hardware')!r}")
+        if "class" in host and host["class"] not in CLASSES:
+            raise Failure(f"{path}: host {name} has unknown class {host['class']!r}; known: {', '.join(CLASSES)}")
+        if host.get("availability", "dedicated") not in AVAILABILITY:
+            raise Failure(f"{path}: host {name} has unknown availability {host['availability']!r}; "
+                          f"known: {', '.join(AVAILABILITY)}")
+        if "owner" in host and not isinstance(host["owner"], str):
+            raise Failure(f"{path}: host {name} owner must be a string")
         for key_id in host_policy(data, name)["authorized_keys"].get("require", []) + \
                 host_policy(data, name)["authorized_keys"].get("allow", []):
             if key_id not in data["keys"]:
@@ -273,6 +287,21 @@ def cmux_checkout(manifest: dict[str, Any], name: str) -> dict[str, Any]:
     return {"repo": declared.get("repo", bootstrap.CMUX_REPOSITORY), "ref": declared.get("ref", "main"),
             "root": declared.get("root") or host_policy(manifest, name).get("cmux_root", DEFAULT_CMUX_ROOT),
             "depth": declared.get("submodule_depth", 1)}
+
+
+def upgrade_legacy_classes(data: dict[str, Any]) -> None:
+    """Read a manifest written before `hardware` split from `class`.
+
+    Old manifests keep machine shapes in a top-level `classes` table and name one per host in
+    `class`. Those become `hardware`; the host then has no scheduling class until the manifest
+    gives it one.
+    """
+    if "hardware" in data or "classes" not in data:
+        return
+    data["hardware"] = data.pop("classes")
+    for host in data.get("hosts", {}).values():
+        if isinstance(host, dict) and "class" in host and "hardware" not in host:
+            host["hardware"] = host.pop("class")
 
 
 def host_key(name: str) -> str:
@@ -447,13 +476,13 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
         return issues
     host = manifest["hosts"][name]
     policy = host_policy(manifest, name)
-    klass = manifest["classes"][host["class"]]
+    shape = manifest["hardware"][host["hardware"]]
 
     if host.get("hostname") and obs["hostname"] != host["hostname"]:
         drift("identity", f"hostname {obs['hostname']!r}, manifest says {host['hostname']!r}")
     for field in ("model", "chip", "memory_gib", "cpus"):
-        if field in klass and obs[field] != klass[field]:
-            drift("hardware", f"{field} {obs[field]!r}, class {host['class']} says {klass[field]!r}")
+        if field in shape and obs[field] != shape[field]:
+            drift("hardware", f"{field} {obs[field]!r}, hardware {host['hardware']} says {shape[field]!r}")
 
     # The manifest assigns node ids, so a rerun of enrollment always asks for the same one.
     want_node = host.get("node_id")
@@ -600,6 +629,43 @@ def check(manifest: dict[str, Any], observed: dict[str, Any], hosts: list[str]) 
             continue
         issues.extend(check_host(manifest, name, obs))
     return issues
+
+
+def pool_label(klass: str, version: str) -> str:
+    """The runner label for one class and pinned Xcode; glaeda-cmux-runner issues the same string."""
+    return f"glaeda-{klass}-xcode-{version}"
+
+
+def pools(manifest: dict[str, Any], observed: dict[str, Any] | None, hosts: list[str]) -> dict[str, Any]:
+    """Runner capacity per pool label, as the PR pool picker reads it.
+
+    A member is declared for a pool when it is dedicated, has the ci-runner role, takes a runner
+    class, and its policy pins that Xcode. It conforms when the latest observation shows that
+    exact Xcode (path, version, build) as a real directory, which is also when glaeda-cmux-runner
+    issues the label. Without an observation nothing conforms.
+    """
+    out: dict[str, dict[str, list[str]]] = {}
+    for name in hosts:
+        host = manifest["hosts"][name]
+        klass = host.get("class")
+        if (klass not in RUNNER_CLASSES or host.get("availability", "dedicated") != "dedicated"
+                or "ci-runner" not in host.get("roles", [])):
+            continue
+        obs = (observed or {}).get("hosts", {}).get(name) or {}
+        apps = {a["path"]: a for a in obs.get("xcode_apps", [])} if obs.get("reachable") else {}
+        # One label per Xcode version, however many pinned copies of it the policy lists.
+        versions: dict[str, bool] = {}
+        for want in host_policy(manifest, name).get("xcode", {}).get("apps", []):
+            got = apps.get(want["path"])
+            ok = bool(got) and got["kind"] == "dir" and got["version"] == want["version"] and got["build"] == want["build"]
+            versions[want["version"]] = versions.get(want["version"], False) or ok
+        for version, ok in versions.items():
+            entry = out.setdefault(pool_label(klass, version), {"declared": [], "conforming": []})
+            entry["declared"].append(name)
+            if ok:
+                entry["conforming"].append(name)
+    return {label: {**v, "declared_count": len(v["declared"]), "conforming_count": len(v["conforming"])}
+            for label, v in sorted(out.items())}
 
 
 # ---------------------------------------------------------------- apply
@@ -2157,7 +2223,7 @@ def read_observed(path: Path) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("observe", "check", "plan", "apply", "preflight", "fix", "sudo-plan",
-                                            "share", "onboard"))
+                                            "share", "onboard", "pools"))
     parser.add_argument("names", nargs="*", metavar="HOST", help="hosts to act on (same as --host)")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--host", action="append", dest="hosts")
@@ -2217,6 +2283,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if all(r["ready"] for r in results) else 1
         declared = any(toolchain(manifest, h) for h in hosts) and args.command in {"check", "plan"}
         observed = read_observed(args.observed) if args.observed else observe(manifest, hosts, preflight=declared)
+        if args.command == "pools":
+            stamps = [h.get("observed_at") for h in observed["hosts"].values() if h.get("observed_at")]
+            print(json.dumps({"schema": SCHEMA + "/pools", "observed_at": min(stamps) if stamps else None,
+                              "pools": pools(manifest, observed, hosts)}, indent=2, sort_keys=True))
+            return 0
         if args.command == "observe":
             text = json.dumps(observed, indent=2, sort_keys=True)
             if args.out:
