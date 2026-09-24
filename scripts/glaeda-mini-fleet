@@ -80,6 +80,8 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -636,43 +638,51 @@ def check(manifest: dict[str, Any], observed: dict[str, Any], hosts: list[str]) 
     return issues
 
 
-def pool_label(klass: str, version: str) -> str:
-    """The runner label for one class and pinned Xcode; glaeda-cmux-runner issues the same string."""
-    return f"glaeda-{klass}-xcode-{version}"
+def load_labels_module() -> Any:
+    """glaeda_fleet_labels.py, the label rule glaeda-cmux-runner also uses, so the two never drift."""
+    path = SCRIPT_DIR / "glaeda_fleet_labels.py"
+    loader = importlib.machinery.SourceFileLoader("glaeda_fleet_labels", os.fspath(path))
+    spec = importlib.util.spec_from_loader("glaeda_fleet_labels", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+labels = load_labels_module()
+pool_label = labels.pool_label
 
 
 def pools(manifest: dict[str, Any], observed: dict[str, Any] | None, hosts: list[str]) -> dict[str, Any]:
     """Runner capacity per pool label, as the PR pool picker reads it.
 
-    A member is declared for a pool when it is dedicated, has the ci-runner role, takes a runner
-    class, and its policy pins that Xcode. It conforms when the latest observation shows that
-    exact Xcode (path, version, build) as a real directory: the host meets the pool, so a runner
-    installed or relabelled from this manifest would carry the label. It does not prove the
-    registered runner carries it today; GitHub fixes labels at registration. Without an
-    observation nothing conforms.
+    Declared and conforming come from glaeda_fleet_labels.declared_pools, the rule the runner
+    uses. A member conforms when the latest observation shows that exact Xcode (path, version,
+    build) as a real directory: the host meets the pool, so a runner installed or relabelled
+    from this manifest would carry the label. It does not prove the registered runner carries it
+    today; GitHub fixes labels at registration. Without an observation nothing conforms.
     """
-    out: dict[str, dict[str, list[str]]] = {}
-    for name in hosts:
-        host = manifest["hosts"][name]
-        klass = host.get("class")
-        if (klass not in RUNNER_CLASSES or host.get("availability", "dedicated") != "dedicated"
-                or "ci-runner" not in host.get("roles", [])):
+    seen = (observed or {}).get("hosts", {})
+
+    def xcode_ok(member: str, want: dict[str, Any]) -> bool:
+        obs = seen.get(member) or {}
+        if not obs.get("reachable"):
+            return False
+        got = {a["path"]: a for a in obs.get("xcode_apps", [])}.get(want.get("path"))
+        return bool(got) and got["kind"] == "dir" and got["version"] == want.get("version") \
+            and got["build"] == want.get("build")
+
+    wanted = set(hosts)
+    declared = labels.declared_pools(manifest)
+    conforming = labels.declared_pools(manifest, xcode_ok)
+    out = {}
+    for label, members in declared.items():
+        mine = [m for m in members if m in wanted]
+        if not mine:
             continue
-        obs = (observed or {}).get("hosts", {}).get(name) or {}
-        apps = {a["path"]: a for a in obs.get("xcode_apps", [])} if obs.get("reachable") else {}
-        # One label per Xcode version, however many pinned copies of it the policy lists.
-        versions: dict[str, bool] = {}
-        for want in host_policy(manifest, name).get("xcode", {}).get("apps", []):
-            got = apps.get(want["path"])
-            ok = bool(got) and got["kind"] == "dir" and got["version"] == want["version"] and got["build"] == want["build"]
-            versions[want["version"]] = versions.get(want["version"], False) or ok
-        for version, ok in versions.items():
-            entry = out.setdefault(pool_label(klass, version), {"declared": [], "conforming": []})
-            entry["declared"].append(name)
-            if ok:
-                entry["conforming"].append(name)
-    return {label: {**v, "declared_count": len(v["declared"]), "conforming_count": len(v["conforming"])}
-            for label, v in sorted(out.items())}
+        ok = [m for m in conforming.get(label, []) if m in wanted]
+        out[label] = {"declared": mine, "conforming": ok,
+                      "declared_count": len(mine), "conforming_count": len(ok)}
+    return out
 
 
 # ---------------------------------------------------------------- apply
