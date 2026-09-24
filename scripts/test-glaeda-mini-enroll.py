@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import os
 import sys
 import unittest
@@ -143,6 +145,31 @@ class Python(unittest.TestCase):
              mock.patch.object(me.os, "access", return_value=True), \
              mock.patch.object(me, "python_version", return_value=(3, 9)):
             self.assertIsNone(me.pick_python(None))
+
+    def test_finds_a_user_local_python_when_homebrew_has_none(self) -> None:
+        local = "/home/op/.local/bin/python3"
+        with mock.patch.object(me, "PYTHON_CANDIDATES", ("/a",)), \
+             mock.patch.object(me.shutil, "which", return_value=None), \
+             mock.patch.object(me.os, "access", return_value=True), \
+             mock.patch.object(me, "python_version", side_effect={"/a": (3, 9), local: (3, 14)}.get):
+            self.assertEqual(me.pick_python(None, Path("/home/op")), local)
+
+    def test_path_lookup_never_probes_the_usr_bin_stub(self) -> None:
+        probed: list[str] = []
+        with mock.patch.object(me, "PYTHON_CANDIDATES", ()), \
+             mock.patch.object(me.shutil, "which", return_value="/usr/bin/python3"), \
+             mock.patch.object(me.os, "access", side_effect=lambda p, m: p == "/usr/bin/python3"), \
+             mock.patch.object(me, "python_version", side_effect=lambda p: probed.append(p)):
+            self.assertIsNone(me.pick_python(None, Path("/home/op")))
+        self.assertEqual(probed, [])
+
+    def test_missing_python_names_both_fixes(self) -> None:
+        err = io.StringIO()
+        with mock.patch.object(me, "DARWIN_REQUIRED", False), \
+             mock.patch.object(me, "pick_python", return_value=None), contextlib.redirect_stderr(err):
+            self.assertEqual(me.main(["--cmux-root", "/c"]), 2)
+        self.assertIn("python@3.13", err.getvalue())
+        self.assertIn("~/.local/bin/python3", err.getvalue())
 
     def test_an_explicit_old_python_is_refused(self) -> None:
         with mock.patch.object(me.os, "access", return_value=True), \

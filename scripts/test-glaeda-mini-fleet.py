@@ -36,7 +36,7 @@ STRAY = "SHA256:DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
 
 def probe_text(hostname: str = "build-mini-1", keys: tuple[str, ...] = ("coordinator", "operator"),
                extra_keys: tuple[str, ...] = (), clone: bool = True, license_: str = "26.3",
-               worker: str = "running pid=10") -> str:
+               worker: str = "running pid=10", node_id: str | None = "cmux-mac-001") -> str:
     lines = [
         "user\tbuilder", "uid\t501", "admin_group\tyes", f"hostname\t{hostname}", "computer_name\tMini",
         "model\tMac16,11", "chip\tApple M4 Pro", "cpus\t14", f"memory_bytes\t{48 * 2**30}",
@@ -49,6 +49,8 @@ def probe_text(hostname: str = "build-mini-1", keys: tuple[str, ...] = ("coordin
         "fleet_root\tpresent", "fleet_worker_proc\trunning",
         "ak_file\tauthorized_keys|600",
     ]
+    if node_id is not None:
+        lines.append(f"fleet_node_id\t{node_id}")
     if clone:
         lines.append("xcode_app\t/Applications/Xcode_26.3.app|dir|26.3|17C529")
     for key in keys:
@@ -132,6 +134,18 @@ class ManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(mf.Failure, "unknown key 'ghost'"):
                 mf.load_manifest(path)
 
+    def test_node_ids_must_be_opaque_and_unique(self) -> None:
+        for host, value, error in (("build-mini-1", "mac-3", "not an opaque cmux-"),
+                                   ("build-mini-1", 3, "not an opaque cmux-"),
+                                   ("build-mini-2", "cmux-mac-001", "share node_id cmux-mac-001")):
+            data = copy.deepcopy(self.manifest)
+            data["hosts"][host]["node_id"] = value
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "m.json"
+                path.write_text(json.dumps(data))
+                with self.assertRaisesRegex(mf.Failure, error):
+                    mf.load_manifest(path)
+
     def test_overrides_merge_over_defaults(self) -> None:
         policy = mf.host_policy(self.manifest, "small-mini")
         self.assertEqual(policy["disk"]["min_free_gib"], 40)
@@ -148,6 +162,25 @@ class CheckTests(unittest.TestCase):
     def test_conforming_host_has_only_pending(self) -> None:
         issues = self.issues(probe_text())
         self.assertEqual([i["area"] for i in issues], ["pending"])
+
+    def test_unenrolled_host_is_pending_with_its_assigned_node_id(self) -> None:
+        issues = [i for i in self.issues(probe_text(node_id=None)) if "enrolled" in i["detail"]]
+        self.assertEqual([i["area"] for i in issues], ["pending"])
+        self.assertIn("--node-id cmux-mac-001", issues[0]["fix"])
+
+    def test_enrolled_under_another_node_id_is_drift(self) -> None:
+        issues = [i for i in self.issues(probe_text(node_id="cmux-mac-009")) if i["area"] == "enrollment"]
+        self.assertEqual(len(issues), 1)
+        self.assertIn("enrolled as cmux-mac-009, manifest assigns cmux-mac-001", issues[0]["detail"])
+
+    def test_host_without_node_id_is_not_checked_for_enrollment(self) -> None:
+        issues = self.issues(probe_text(node_id=None), host="small-mini")
+        self.assertFalse([i for i in issues if "enrolled" in i["detail"]])
+
+    def test_probe_reads_the_enrollment_node_id_without_python(self) -> None:
+        probe = mf.PROBE.read_text()
+        self.assertIn("plutil -extract nodeId raw", probe)
+        self.assertIn("glaeda/cmux-fleet/enrollment.json", probe)
 
     def test_missing_required_key_is_drift_with_add_action(self) -> None:
         issues = self.issues(probe_text(keys=("operator",)))

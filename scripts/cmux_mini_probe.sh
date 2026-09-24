@@ -61,6 +61,9 @@ for d in "$HOME/Library/LaunchAgents" /Library/LaunchAgents /Library/LaunchDaemo
     e launchd "$d|$label|$state"
   done
 done
+# The Glaeda fleet node id this login user enrolled under (glaeda-mini-enroll), if any.
+enrollment="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet/enrollment.json"
+[ -f "$enrollment" ] && e fleet_node_id "$(plutil -extract nodeId raw "$enrollment" 2>/dev/null)"
 F=/Users/Shared/cmux-build-fleet
 if [ -d "$F" ]; then
   e fleet_root present

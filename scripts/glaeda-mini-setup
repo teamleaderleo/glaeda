@@ -29,6 +29,11 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
     ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim}.plist
     build-host directories and three git defaults, each set only when unset
+    python@3.13 from Homebrew, only when no Python 3.13+ exists and this user owns Homebrew
+
+glaeda-mini-enroll needs Python 3.13+ (accept-local uses os.waitid). Setup looks for it the way
+enroll does and is not ready without it, so a missing interpreter shows up here, not 13 minutes
+into enrollment. When Homebrew belongs to another account, the fix is printed instead.
 
 --hygiene-only is for machines that are not fleet build hosts, such as personal MacBooks.
 It installs the three tools and three LaunchAgents above and nothing else: no build-host
@@ -81,6 +86,8 @@ DARWIN_REQUIRED = True
 # with --hygiene-only, only these preflight failures block: the agents run python3
 HYGIENE_BLOCKING = frozenset({"python"})
 RUN_TIMEOUT = 20
+ENROLL_PYTHON_FORMULA = "python@3.13"
+BREW_TIMEOUT = 1800
 
 
 # ---------------------------------------------------------------- small helpers
@@ -174,6 +181,64 @@ def pick_python() -> str | None:
     ):
         return "/usr/bin/python3"
     return None
+
+
+_ENROLL: Any = None
+
+
+def enroll_module() -> Any:
+    """scripts/glaeda-mini-enroll, loaded once, so setup and enroll pick the same interpreter."""
+    global _ENROLL
+    if _ENROLL is None:
+        import importlib.machinery
+        import importlib.util
+
+        loader = importlib.machinery.SourceFileLoader("glaeda_mini_enroll", os.fspath(SCRIPT_DIR / "glaeda-mini-enroll"))
+        spec = importlib.util.spec_from_loader("glaeda_mini_enroll", loader)
+        module = sys.modules.get("glaeda_mini_enroll")
+        if module is None:
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["glaeda_mini_enroll"] = module  # its dataclasses look themselves up here
+            loader.exec_module(module)
+        _ENROLL = module
+    return _ENROLL
+
+
+def enroll_python(ctx: Context) -> str | None:
+    """The Python 3.13+ glaeda-mini-enroll would pick for this HOME, or None."""
+    return enroll_module().pick_python(None, ctx.home)
+
+
+def owned_brew() -> str | None:
+    """brew, when this user owns it. Shared minis often have another account's Homebrew.
+
+    Ownership, not write access: the installer makes Cellar group-writable for admin, and
+    another admin installing into it leaves the owner with files it does not own.
+    """
+    brew = which("brew", ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"))
+    if brew is None:
+        return None
+    prefix = Path(brew).parent.parent  # /opt/homebrew, or /usr/local on Intel (root-owned itself)
+    for mark in (prefix / "Cellar", prefix / "bin"):
+        try:
+            return brew if mark.stat().st_uid == os.getuid() else None
+        except OSError:
+            continue
+    return None
+
+
+def brew_allowed(ctx: Context) -> bool:
+    """A sandbox HOME (tests, rehearsals) must never reach the real Homebrew."""
+    return not ctx.sandbox
+
+
+def brew_install(brew: str, formula: str) -> tuple[int, str]:
+    try:
+        result = subprocess.run([brew, "install", formula], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=BREW_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return 1, str(error)
+    return result.returncode, result.stdout
 
 
 # ---------------------------------------------------------------- preflight (read-only)
@@ -516,7 +581,25 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         # owned: this command set the key, on this run or an earlier one, so --uninstall may unset it.
         actions.append({"kind": "git", "key": key, "value": value, "state": state, "previous": current,
                         "note": note, "owned": state == "unchanged" and key in owned_before})
+    if not ctx.hygiene_only:
+        actions.append(plan_enroll_python(ctx))
     return actions
+
+
+def plan_enroll_python(ctx: Context) -> dict[str, Any]:
+    act: dict[str, Any] = {"kind": "python", "key": "enroll-python", "formula": ENROLL_PYTHON_FORMULA}
+    found = enroll_python(ctx)
+    if found:
+        return {**act, "state": "unchanged", "value": found, "note": ""}
+    brew = owned_brew()
+    if brew and not brew_allowed(ctx):
+        return {**act, "state": "blocked", "value": None,
+                "note": f"brew install {ENROLL_PYTHON_FORMULA} is not run with a sandbox HOME"}
+    if brew:
+        return {**act, "state": "create", "value": None, "brew": brew,
+                "note": f"brew install {ENROLL_PYTHON_FORMULA}; glaeda-mini-enroll needs Python 3.13+"}
+    return {**act, "state": "blocked", "value": None,
+            "note": "glaeda-mini-enroll needs Python 3.13+: " + enroll_module().PYTHON_FIX}
 
 
 def load_receipt(ctx: Context) -> dict[str, Any] | None:
@@ -565,7 +648,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         actions.append({"kind": "git", "key": key, "value": current, "state": state,
                         "note": "" if ours or current is None else "not set by this command"})
     actions.append({"kind": "note", "state": "kept",
-                    "note": "directories, logs and caches are left in place; remove them by hand if wanted"})
+                    "note": "directories, logs, caches and any python@3.13 are left in place; remove them by hand if wanted"})
     return actions
 
 
@@ -654,6 +737,15 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             act["bootstrapped"] = code == 0
             if code != 0:
                 act["note"] = ("launchctl bootstrap failed: " + out)[:400]
+        if kind == "python" and state == "create":
+            code, out = brew_install(act["brew"], act["formula"])
+            found = enroll_python(ctx)
+            act["applied"] = found is not None
+            act["value"] = found
+            if found is None:
+                act["state"] = "failed"
+                act["note"] = (f"brew install {act['formula']} exited {code} and no Python 3.13+ was found: "
+                               + out.strip()[-300:])[:400]
         if kind == "git" and state == "create":
             code, out = run([which("git") or "git", "config", "--global", act["key"], act["value"]], env=ctx.git_env())
             act["applied"] = act["owned"] = code == 0
@@ -698,7 +790,8 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
 # ---------------------------------------------------------------- operator steps and reserved slots
 
 
-def operator_steps(ctx: Context, pre: dict[str, Any], fleet_result: dict[str, Any] | None) -> list[dict[str, str]]:
+def operator_steps(ctx: Context, pre: dict[str, Any], fleet_result: dict[str, Any] | None,
+                   actions: list[dict[str, Any]] = ()) -> list[dict[str, str]]:
     steps: list[dict[str, str]] = []
 
     def add(why: str, command: str, needs: str) -> None:
@@ -726,6 +819,9 @@ def operator_steps(ctx: Context, pre: dict[str, Any], fleet_result: dict[str, An
         add("remote access", "install Tailscale and log in to the tailnet", "human")
     elif not pre["tailscale"].get("running"):
         add("remote access", "open Tailscale and log in", "human")
+    if any(a["kind"] == "python" and a["state"] in {"blocked", "failed"} for a in actions):
+        add("glaeda-mini-enroll needs Python 3.13+ (os.waitid)", enroll_module().PYTHON_FIX,
+            "Homebrew owner or operator")
     if c["workloadToolPath"]["level"] != "ok":
         add("cmux build tools must be on the fixed workload PATH", "cd <cmux> && ./scripts/setup.sh", "operator")
     if fleet_result is None:
@@ -808,7 +904,7 @@ def render(ctx: Context, receipt: dict[str, Any]) -> str:
     for act in receipt["actions"]:
         target = act.get("label") or (act.get("key") and (act["key"] if act.get("value") is None else f"{act['key']}={act['value']}")) or ctx.show(act.get("path", ""))
         note = f"  ({act['note']})" if act.get("note") else ""
-        lines.append(f"  {act['state']:<9} {act['kind']:<5} {target}{note}")
+        lines.append(f"  {act['state']:<9} {act['kind']:<6} {target}{note}")
     if receipt["operatorSteps"]:
         lines.append("operator steps (need sudo or a human; this command does not run them)")
     for i, step in enumerate(receipt["operatorSteps"], 1):
@@ -899,7 +995,7 @@ def main(argv: list[str] | None = None) -> int:
         "sandboxHome": ctx.sandbox,
         "preflight": pre,
         "actions": actions,
-        "operatorSteps": [] if args.uninstall or ctx.hygiene_only else operator_steps(ctx, pre, fleet_result),
+        "operatorSteps": [] if args.uninstall or ctx.hygiene_only else operator_steps(ctx, pre, fleet_result, actions),
         "reserved": {} if args.uninstall or ctx.hygiene_only else reserved_slots(ctx, fleet_result),
         "blocking": pre["blocking"] + [f"action:{a.get('path') or a.get('key')}" for a in actions if a.get("state") in {"blocked", "failed"}],
     }

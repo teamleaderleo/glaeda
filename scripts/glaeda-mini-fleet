@@ -6,9 +6,9 @@
     glaeda-mini-fleet plan     [--manifest M] [--host H ...] [--observed FILE]  print the fixes check would need
     glaeda-mini-fleet apply    [--manifest M] --host H ... [--yes]              make the additive fixes
 
-The manifest names every host, its hardware class, the toolchain it must carry, the SSH keys
-that must, may, and must not be in the login user's authorized_keys, and the launchd jobs that
-must be running. `check` diffs fresh observation against it and exits 1 on drift.
+The manifest names every host, its fleet node id (node_id, so every enrollment rerun asks for the
+same one), its hardware class, the toolchain it must carry, the SSH keys that must, may, and must
+not be in the login user's authorized_keys, and the launchd jobs that must be running. `check` diffs fresh observation against it and exits 1 on drift.
 
 observe, check, and plan are read-only. The probe (scripts/cmux_mini_probe.sh) runs as the SSH
 login user with no sudo and no Python, and reports key fingerprints and comments, never key
@@ -32,6 +32,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -47,6 +48,8 @@ DEFAULT_MANIFEST = Path(os.environ.get("GLAEDA_MINI_FLEET_MANIFEST", "~/.config/
 SSH = "/usr/bin/ssh"
 PROBE_TIMEOUT = 90
 LIST_KEYS = {"xcode_app", "xcode_ready", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key"}
+# Same rule as scripts/cmux_fleet.py NODE_RE: an opaque cmux-* fleet node id.
+NODE_ID_RE = re.compile(r"cmux-[a-z0-9][a-z0-9-]{2,59}\Z")
 # Files sshd reads by default (OpenSSH AuthorizedKeysFile); every other authorized_keys* is a copy.
 LIVE_KEY_FILES = ("authorized_keys", "authorized_keys2")
 
@@ -85,6 +88,16 @@ def load_manifest(path: Path) -> dict[str, Any]:
                 host_policy(data, name)["authorized_keys"].get("allow", []):
             if key_id not in data["keys"]:
                 raise Failure(f"{path}: host {name} names unknown key {key_id!r}")
+    node_ids: dict[str, str] = {}
+    for name, host in data["hosts"].items():
+        node_id = host.get("node_id")
+        if node_id is None:
+            continue
+        if not isinstance(node_id, str) or NODE_ID_RE.fullmatch(node_id) is None:
+            raise Failure(f"{path}: host {name} node_id {node_id!r} is not an opaque cmux-* id such as cmux-mac-003")
+        if node_id in node_ids:
+            raise Failure(f"{path}: hosts {node_ids[node_id]} and {name} share node_id {node_id}")
+        node_ids[node_id] = name
     for key_id, key in data["keys"].items():
         public = key.get("public_key")
         if public is not None and (not isinstance(public, str) or "\n" in public.strip()
@@ -166,6 +179,7 @@ def parse_probe(text: str) -> dict[str, Any]:
             "worker_sha256_12": out.get("fleet_worker_sha"),
             "controller_token": out.get("controller_token"),
         },
+        "enrolled_node_id": out.get("fleet_node_id"),
         "authorized_keys_files": [v.split("|")[0] for v in out["ak_file"]],
         "authorized_keys": [parse_key(v) for v in out["ak_key"] if v.split("|", 1)[0] in LIVE_KEY_FILES],
     }
@@ -228,6 +242,16 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
     for field in ("model", "chip", "memory_gib", "cpus"):
         if field in klass and obs[field] != klass[field]:
             drift("hardware", f"{field} {obs[field]!r}, class {host['class']} says {klass[field]!r}")
+
+    # The manifest assigns node ids, so a rerun of enrollment always asks for the same one.
+    want_node = host.get("node_id")
+    got_node = obs.get("enrolled_node_id")
+    if want_node and not got_node:
+        drift("pending", f"not enrolled yet; node id {want_node} is reserved for it",
+              f"glaeda-mini-enroll --node-id {want_node} (or cmux persistent-compile up --node-id {want_node})")
+    elif want_node and got_node != want_node:
+        drift("enrollment", f"enrolled as {got_node}, manifest assigns {want_node}",
+              "fix the manifest; an enrolled node keeps its id (glaeda-mini-enroll refuses a different one)")
 
     macos = policy.get("macos", {})
     if "major" in macos and not (obs["macos"] or "").startswith(f"{macos['major']}."):

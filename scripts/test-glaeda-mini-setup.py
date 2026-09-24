@@ -26,6 +26,7 @@ ms = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_mini_setup"] = ms
 loader.exec_module(ms)
 ms.DARWIN_REQUIRED = False
+REAL_ENROLL_PYTHON = ms.enroll_python
 
 PMSET_SLEEPY = """Battery Power:
  sleep                1
@@ -78,6 +79,8 @@ class MiniSetupTest(unittest.TestCase):
             mock.patch.object(ms, "preflight", fake_preflight()),
             mock.patch.object(ms, "run", recording_run),
             mock.patch.dict(os.environ, {"HOME": os.fspath(self.home)}),
+            mock.patch.object(ms, "enroll_python", lambda ctx: "/opt/homebrew/bin/python3.13"),
+            mock.patch.object(ms, "brew_install", mock.Mock(side_effect=AssertionError("brew must not run"))),
         ]
         for p in self.patches:
             p.start()
@@ -361,6 +364,7 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(receipt["reserved"], {})
         kinds = {a["kind"] for a in receipt["actions"]}
         self.assertNotIn("git", kinds)
+        self.assertNotIn("python", kinds)
         self.assertFalse((self.home / ".cache/glaeda/cmux-native-cache").exists())
         for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
             self.assertTrue(os.access(self.home / ".local/bin" / name, os.X_OK), name)
@@ -385,6 +389,92 @@ class MiniSetupTest(unittest.TestCase):
             ms.main(["--output", "json", "--python", "/usr/bin/python3",
                      "--reclaim-binary", os.fspath(self.reclaim), "--hygiene-only"])
         self.assertEqual(json.loads(out.getvalue())["blocking"], ["python"])
+
+    def python_action(self, receipt: dict) -> dict:
+        return next(a for a in receipt["actions"] if a["kind"] == "python")
+
+    def test_enroll_python_present_is_unchanged(self) -> None:
+        act = self.python_action(self.invoke())
+        self.assertEqual((act["state"], act["value"]), ("unchanged", "/opt/homebrew/bin/python3.13"))
+
+    def test_missing_enroll_python_blocks_with_the_fix_when_brew_is_not_ours(self) -> None:
+        with mock.patch.object(ms, "enroll_python", lambda ctx: None), \
+                mock.patch.object(ms, "owned_brew", lambda: None):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(ms.main(["--output", "json", "--python", "/usr/bin/python3",
+                                          "--reclaim-binary", os.fspath(self.reclaim), "--apply"]), 0)
+        receipt = json.loads(out.getvalue())
+        act = self.python_action(receipt)
+        self.assertEqual(act["state"], "blocked")
+        self.assertIn("~/.local/bin/python3", act["note"])
+        self.assertFalse(receipt["ready"])
+        self.assertIn("action:enroll-python", receipt["blocking"])
+        self.assertTrue(any("~/.local/bin/python3" in s["command"] for s in receipt["operatorSteps"]))
+        ms.brew_install.assert_not_called()
+
+    def test_missing_enroll_python_is_installed_with_our_brew(self) -> None:
+        found = iter([None, "/opt/homebrew/bin/python3.13"])
+        ms.brew_install.side_effect = None
+        ms.brew_install.return_value = (0, "installed")
+        with mock.patch.object(ms, "enroll_python", lambda ctx: next(found)), \
+                mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"), \
+                mock.patch.object(ms, "brew_allowed", lambda ctx: True):
+            receipt = self.invoke("--apply")
+        ms.brew_install.assert_called_once_with("/opt/homebrew/bin/brew", "python@3.13")
+        act = self.python_action(receipt)
+        self.assertEqual((act["state"], act["applied"], act["value"]), ("create", True, "/opt/homebrew/bin/python3.13"))
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+
+    def test_plan_only_names_the_brew_install(self) -> None:
+        with mock.patch.object(ms, "enroll_python", lambda ctx: None), \
+                mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"), \
+                mock.patch.object(ms, "brew_allowed", lambda ctx: True):
+            receipt = self.invoke()
+        self.assertEqual(self.python_action(receipt)["state"], "create")
+        ms.brew_install.assert_not_called()
+
+    def test_failed_brew_install_fails_the_run(self) -> None:
+        ms.brew_install.side_effect = None
+        ms.brew_install.return_value = (1, "Error: permission denied")
+        with mock.patch.object(ms, "enroll_python", lambda ctx: None), \
+                mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"), \
+                mock.patch.object(ms, "brew_allowed", lambda ctx: True):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = ms.main(["--output", "json", "--python", "/usr/bin/python3",
+                                "--reclaim-binary", os.fspath(self.reclaim), "--apply"])
+        self.assertEqual(code, 1)
+        act = self.python_action(json.loads(out.getvalue()))
+        self.assertEqual(act["state"], "failed")
+        self.assertIn("permission denied", act["note"])
+
+    def test_sandbox_home_never_runs_brew(self) -> None:
+        with mock.patch.object(ms, "enroll_python", lambda ctx: None), \
+                mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ms.main(["--output", "json", "--python", "/usr/bin/python3",
+                         "--reclaim-binary", os.fspath(self.reclaim), "--apply"])
+        act = self.python_action(json.loads(out.getvalue()))
+        self.assertEqual(act["state"], "blocked")
+        self.assertIn("sandbox HOME", act["note"])
+        ms.brew_install.assert_not_called()
+
+    def test_owned_brew_needs_ownership_not_write_access(self) -> None:
+        stat = mock.Mock(st_uid=os.getuid() + 1)
+        with mock.patch.object(ms, "which", return_value="/opt/homebrew/bin/brew"), \
+                mock.patch.object(ms.os, "access", return_value=True), \
+                mock.patch.object(ms.Path, "stat", return_value=stat):
+            self.assertIsNone(ms.owned_brew())
+            stat.st_uid = os.getuid()
+            self.assertEqual(ms.owned_brew(), "/opt/homebrew/bin/brew")
+
+    def test_setup_and_enroll_share_one_python_rule(self) -> None:
+        enroll = ms.enroll_module()
+        with mock.patch.object(enroll, "pick_python", return_value="/x/python3.13") as pick:
+            self.assertEqual(REAL_ENROLL_PYTHON(mock.Mock(home=self.home)), "/x/python3.13")
+        pick.assert_called_once_with(None, self.home)
 
     def test_no_em_dashes(self) -> None:
         for name in ("glaeda-mini-setup", "glaeda-worktree-reclaim-all", "test-glaeda-mini-setup.py"):

@@ -93,6 +93,7 @@
   "hosts": {
     "build-mini-1": {
       "hostname": "build-mini-1",
+      "node_id": "cmux-mac-001",
       "class": "m4pro-48",
       "roles": [
         "dev-builds",
@@ -102,6 +103,7 @@
     },
     "build-mini-2": {
       "hostname": "Build-Mini-2",
+      "node_id": "cmux-mac-002",
       "class": "m4pro-48",
       "roles": [
         "nightly",
