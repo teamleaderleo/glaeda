@@ -33,8 +33,10 @@ A tmpfs holds its files in RAM and swap, so its free space says nothing about pr
 --tmpfs-low/--tmpfs-target instead (default: pressure once a quarter of it is in use).
 There the temp dir also counts top-level files (leaked extracted libraries, logs) and small
 items (1 MiB floor), and a scratch checkout is reclaimable when deleting it loses nothing
-git holds: clean, no stash, every local commit on a remote (a linked worktree: HEAD on a
-ref of its repository, which survives). Nested or unverifiable checkouts stay protected.
+git holds: clean, no stash, every local commit on a remote, no submodules and no other
+worktrees (a linked worktree: unlocked, HEAD on a branch, tag or remote ref of its
+repository, which survives). Ignored files go with it: in a temp-dir checkout they are
+build output or copies. Nested or unverifiable checkouts stay protected.
 """
 
 from __future__ import annotations
@@ -337,7 +339,18 @@ def git_loss(path: Path) -> str:
     status = git("status", "--porcelain", "--untracked-files=all")
     if status is None or status.strip():
         return "uncommitted or untracked changes"
+    # status hides edits to files flagged assume-unchanged (lowercase tag) or skip-worktree (S)
+    flags = git("ls-files", "-v")
+    if flags is None or any(ln[:1].islower() or ln[:1] == "S" for ln in flags.splitlines()):
+        return "files hidden from status"
+    if (path / ".gitmodules").exists():
+        return "submodules"  # their commits live only in this checkout's .git/modules
     if dotgit.is_dir():
+        if (dotgit / "modules").exists():
+            return "submodules"
+        wts = git("worktree", "list", "--porcelain")
+        if wts is None or sum(ln.startswith("worktree ") for ln in wts.splitlines()) != 1:
+            return "other worktrees use this repository"
         stash = git("stash", "list")
         if stash is None or stash.strip():
             return "stash entries"
@@ -348,7 +361,12 @@ def git_loss(path: Path) -> str:
         common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
         if common is None or os.path.realpath(common.strip()).startswith(os.path.realpath(path) + "/"):
             return "repository inside the worktree"
-        refs = git("for-each-ref", "--count=1", "--contains", "HEAD", "--format=%(refname)")
+        own = git("rev-parse", "--path-format=absolute", "--git-dir")
+        if own is None or os.path.lexists(os.path.join(own.strip(), "locked")):
+            return "locked worktree"
+        # refs/bisect and refs/worktree belong to the worktree and go with it
+        refs = git("for-each-ref", "--count=1", "--contains", "HEAD", "--format=%(refname)",
+                   "refs/heads", "refs/tags", "refs/remotes")
         if refs is None or not refs.strip():
             return "HEAD on no ref"
     return ""
@@ -852,7 +870,8 @@ def main(argv: list[str] | None = None) -> int:
     fams = default_families()
     for ov in a.root_override:
         fid, _, p = ov.partition("=")
-        fams = [replace(f, root=Path(p)) if f.id == fid else f for f in fams]
+        fams = [replace(f, root=Path(p), files=False, min_bytes=None, git_disposable=False)
+                if f.id == fid else f for f in fams]
     if a.family:
         fams = [f for f in fams if f.id in a.family]
     if a.dedupe:
@@ -879,7 +898,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError:
         ap.error(f"--low/--target/--tmpfs-* take GiB or N%: {a.low!r}, {a.target!r}, "
                  f"{a.tmpfs_low!r}, {a.tmpfs_target!r}")
-    under = any(fs.under for fs in fss.values())
+    # a tmpfs is under pressure at a quarter full, so it shortens the idle window only for
+    # pressure runs, which then touch nothing but that filesystem's families
+    under = any(fs.under for fs in fss.values() if a.pressure or not fs.tmpfs)
     if a.pressure:
         if not under:
             for fs in fss.values():

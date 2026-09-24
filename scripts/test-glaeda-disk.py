@@ -342,6 +342,43 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertNotIn(str(root / "worktree"), listed)  # pruned from its repository
         self.assertIn("refs/heads/wt", self._git("-C", str(origin), "for-each-ref"))
 
+    def test_checkouts_with_hidden_git_state_are_kept(self) -> None:
+        root, origin = self._tmp_repos()
+        # a clean, pushed clone that backs a worktree with an unpushed detached commit
+        self._git("clone", "-q", str(origin), str(root / "main"))
+        self._git("-C", str(root / "main"), "worktree", "add", "-q", "--detach",
+                  str(self.root / "elsewhere"))
+        # a pushed superproject whose submodule commit exists only locally
+        sub = self.root / "subsrc"
+        self._git("clone", "-q", str(origin), str(sub))
+        self._git("clone", "-q", str(origin), str(root / "super"))
+        self._git("-C", str(root / "super"), "-c", "protocol.file.allow=always", "submodule",
+                  "add", "-q", str(sub), "sm")
+        self._git("-C", str(root / "super"), "commit", "-qm", "sm")
+        self._git("-C", str(root / "super"), "push", "-q", "origin", "HEAD:refs/heads/super")
+        self._git("-C", str(root / "super"), "fetch", "-q")
+        # an edit hidden from status by skip-worktree
+        self._git("clone", "-q", str(origin), str(root / "skipped"))
+        self._git("-C", str(root / "skipped"), "update-index", "--skip-worktree", "f")
+        (root / "skipped/f").write_text("edited")
+        # a worktree whose commit only a worktree-local ref holds, and a locked one
+        self._git("-C", str(origin), "worktree", "add", "-q", "--detach", str(root / "bisect"))
+        (root / "bisect/b").write_text("b")
+        self._git("-C", str(root / "bisect"), "add", "b")
+        self._git("-C", str(root / "bisect"), "commit", "-qm", "b")
+        self._git("-C", str(root / "bisect"), "update-ref", "refs/bisect/bad", "HEAD")
+        self._git("-C", str(origin), "worktree", "add", "-q", "-b", "lk", str(root / "locked"))
+        self._git("-C", str(origin), "worktree", "lock", str(root / "locked"))
+        for d in root.iterdir():
+            self._age(d)
+        why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
+        self.assertEqual(why, {
+            "main": ("git-checkout", ["other worktrees use this repository"]),
+            "super": ("git-checkout", ["submodules"]),
+            "skipped": ("git-checkout", ["files hidden from status"]),
+            "bisect": ("git-checkout", ["HEAD on no ref"]),
+            "locked": ("git-checkout", ["locked worktree"])})
+
     def test_apply_rechecks_a_checkout_that_gained_work(self) -> None:
         root, origin = self._tmp_repos()
         self._git("clone", "-q", str(origin), str(root / "c"))
