@@ -27,6 +27,16 @@ Every deletion is appended to a JSONL receipt.
 
 Free space is judged per filesystem. On Linux /tmp is often its own tmpfs, so pressure there
 reclaims only /tmp items, and pressure on the home filesystem never deletes from /tmp.
+
+A tmpfs holds its files in RAM and swap, so its free space says nothing about pressure: a
+16 GiB /tmp at 80% had filled swap while still "2.3G free". A tmpfs is judged by
+--tmpfs-low/--tmpfs-target instead (default: pressure once a quarter of it is in use).
+There the temp dir also counts top-level files (leaked extracted libraries, logs) and small
+items (1 MiB floor), and a scratch checkout is reclaimable when deleting it loses nothing
+git holds: clean, no stash, every local commit on a remote, no submodules and no other
+worktrees (a linked worktree: unlocked, HEAD on a branch, tag or remote ref of its
+repository, which survives). Ignored files go with it: in a temp-dir checkout they are
+build output or copies. Nested or unverifiable checkouts stay protected.
 """
 
 from __future__ import annotations
@@ -42,7 +52,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 HOME = Path.home()
@@ -66,6 +76,9 @@ class Family:
     # root (the first match on a path wins), instead of every directory exactly `depth` down
     match: str = ""
     marker: str = ""  # with match: the candidate must also contain this file
+    files: bool = False  # top-level regular files are candidates too
+    min_bytes: int | None = None  # size floor for this family instead of --min-mib
+    git_disposable: bool = False  # a checkout that loses nothing when deleted is reclaimable
 
 
 WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
@@ -80,8 +93,23 @@ def worktree_roots(projects: Path) -> list[Path]:
     return [projects / n for n in sorted(names)]
 
 
+def fs_type(path: Path, mounts: Path = Path("/proc/mounts")) -> str:
+    """Filesystem type of the mount holding path ("" when unknown, e.g. on macOS)."""
+    try:
+        target = str(mount_point(path))
+        best = ""
+        for line in mounts.read_text().splitlines():
+            f = line.split()
+            if len(f) >= 3 and f[1].replace("\\040", " ") == target:
+                best = f[2]  # a later mount on the same point shadows earlier ones
+        return best
+    except OSError:
+        return ""
+
+
 def default_families() -> list[Family]:
     tmp = Path("/private/tmp") if DARWIN else Path("/tmp")
+    tmpfs = tmp.is_dir() and fs_type(tmp) == "tmpfs"
     uid = os.getuid()
     projects = HOME / "Projects"
     wt_roots = worktree_roots(projects)
@@ -92,7 +120,8 @@ def default_families() -> list[Family]:
                "session scratch space; the session is idle", depth=2,
                skip=("bundled-skills", "bash-edit-diff")),
         Family("tmp", tmp, True, "agent scratch under the temp dir",
-               skip=(f"claude-{uid}",)),
+               skip=(f"claude-{uid}",), files=tmpfs,
+               min_bytes=1024**2 if tmpfs else None, git_disposable=tmpfs),
         Family("user-cache", HOME / ".cache", False, "tool caches (report only)"),
         Family("library-caches", HOME / "Library/Caches", False, "app caches (report only)"),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
@@ -287,6 +316,71 @@ def has_git(path: Path) -> bool:
     return git_state(path) != "none"
 
 
+def git_loss(path: Path) -> str:
+    """"" when deleting this checkout loses nothing git holds, else what it would lose.
+
+    Only a checkout rooted at path is judged; any failure or doubt counts as a loss.
+    """
+    dotgit = path / ".git"
+    if not os.path.lexists(dotgit) or dotgit.is_symlink():
+        return "checkout below the top level"
+
+    def git(*args: str) -> str | None:
+        try:
+            r = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True,
+                               timeout=60, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.stdout if r.returncode == 0 else None
+
+    top = git("rev-parse", "--show-toplevel")
+    if top is None or os.path.realpath(top.strip()) != os.path.realpath(path):
+        return "not a readable checkout"
+    status = git("status", "--porcelain", "--untracked-files=all")
+    if status is None or status.strip():
+        return "uncommitted or untracked changes"
+    # status hides edits to files flagged assume-unchanged (lowercase tag) or skip-worktree (S)
+    flags = git("ls-files", "-v")
+    if flags is None or any(ln[:1].islower() or ln[:1] == "S" for ln in flags.splitlines()):
+        return "files hidden from status"
+    if (path / ".gitmodules").exists():
+        return "submodules"  # their commits live only in this checkout's .git/modules
+    if dotgit.is_dir():
+        if (dotgit / "modules").exists():
+            return "submodules"
+        wts = git("worktree", "list", "--porcelain")
+        if wts is None or sum(ln.startswith("worktree ") for ln in wts.splitlines()) != 1:
+            return "other worktrees use this repository"
+        stash = git("stash", "list")
+        if stash is None or stash.strip():
+            return "stash entries"
+        local = git("rev-list", "-n1", "HEAD", "--branches", "--tags", "--not", "--remotes")
+        if local is None or local.strip():
+            return "commits not on any remote"
+    else:  # linked worktree: branches and stash live in the repository, which stays
+        common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
+        if common is None or os.path.realpath(common.strip()).startswith(os.path.realpath(path) + "/"):
+            return "repository inside the worktree"
+        own = git("rev-parse", "--path-format=absolute", "--git-dir")
+        if own is None or os.path.lexists(os.path.join(own.strip(), "locked")):
+            return "locked worktree"
+        # refs/bisect and refs/worktree belong to the worktree and go with it
+        refs = git("for-each-ref", "--count=1", "--contains", "HEAD", "--format=%(refname)",
+                   "refs/heads", "refs/tags", "refs/remotes")
+        if refs is None or not refs.strip():
+            return "HEAD on no ref"
+    return ""
+
+
+def git_common_dir(path: Path) -> str:
+    """The repository of a linked worktree, so its record can be pruned after deletion."""
+    if not (path / ".git").is_file():
+        return ""
+    r = subprocess.run(["git", "-C", str(path), "rev-parse", "--path-format=absolute",
+                        "--git-common-dir"], capture_output=True, text=True, timeout=60)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 UNREADABLE: set[str] = set()
 
 
@@ -360,7 +454,8 @@ def candidates(fam: Family) -> list[Path]:
         level = [fam.root]
         for _ in range(fam.depth):
             level = [c for p in level for c in _children(p)
-                     if c.name not in fam.skip and c.is_dir() and not c.is_symlink()]
+                     if c.name not in fam.skip and not c.is_symlink()
+                     and (c.is_dir() or (fam.files and c.is_file()))]
     uid = os.getuid()
     owned = []
     for p in level:
@@ -412,16 +507,17 @@ def _survey(families, idle_hours, min_bytes, known, evidence) -> list[Item]:
         measured = dict(zip(map(str, missing), pool.map(du_bytes, missing)))
     known.update(measured)
     sizes = [known[str(path)] for _, path in work]
+    floors = [min_bytes if fam.min_bytes is None else fam.min_bytes for fam, _ in work]
     idles = [(now - newest_mtime(path, 2 if fam.reclaimable else 1,
                                  3000 if fam.reclaimable else 300)) / 3600
-             if size >= min_bytes else 0.0 for (fam, path), size in zip(work, sizes)]
+             if size >= floor else 0.0 for (fam, path), size, floor in zip(work, sizes, floors)]
     try:
         cwds, cmds = evidence.result()
         blind = ""
     except NoEvidence as e:
         cwds, cmds, blind = [], "", f"no process evidence ({e})"
-    for (fam, path), size, idle in zip(work, sizes, idles):
-        if size < min_bytes:
+    for (fam, path), size, idle, floor in zip(work, sizes, idles, floors):
+        if size < floor:
             continue
         sp = str(path)
         reasons = []
@@ -439,10 +535,14 @@ def _survey(families, idle_hours, min_bytes, known, evidence) -> list[Item]:
             verdict = "report-only"
         elif reasons:
             verdict = "in-use"
-        elif fam.id != "xcode-derived-data" and (g := git_state(path)) != "none":
+        elif (fam.id != "xcode-derived-data" and (g := git_state(path)) != "none"
+              and not (g == "git" and fam.git_disposable and idle >= idle_hours
+                       and not (loss := git_loss(path)))):
             verdict = "git-checkout" if g == "git" else "unchecked"
             if g == "unchecked":
                 reasons.append("too deep or large to rule out a git checkout")
+            elif fam.git_disposable and idle >= idle_hours:
+                reasons.append(loss)
         elif idle < idle_hours:
             verdict = "recent"
         else:
@@ -481,20 +581,24 @@ class Fs:
     total: int
     low: int
     target: int
+    tmpfs: bool = False
 
     @property
     def under(self) -> bool:
         return self.free < self.low
 
 
-def filesystems(fams: list[Family], low: str, target: str) -> dict[int, Fs]:
+def filesystems(fams: list[Family], low: str, target: str,
+                tmpfs_low: str = "75%", tmpfs_target: str = "90%") -> dict[int, Fs]:
     out: dict[int, Fs] = {}
     for f in fams:
         dev = f.root.stat().st_dev
         if dev not in out:
             free, total = free_bytes(f.root)
+            tmpfs = not DARWIN and fs_type(f.root) == "tmpfs"
+            lo, tg = (tmpfs_low, tmpfs_target) if tmpfs else (low, target)
             out[dev] = Fs(dev, str(mount_point(f.root)), free, total,
-                          space(low, total), space(target, total))
+                          space(lo, total), space(tg, total), tmpfs)
     return out
 
 
@@ -507,7 +611,8 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
     for fs in fss:
         print(f"free {gib(fs.free).strip()} of {gib(fs.total).strip()} "
               f"({100 * fs.free / max(fs.total, 1):.0f}%) on {fs.mount}, pressure below "
-              f"{gib(fs.low).strip()}{' (under pressure)' if fs.under else ''}")
+              f"{gib(fs.low).strip()}{' (tmpfs: RAM and swap)' if fs.tmpfs else ''}"
+              f"{' (under pressure)' if fs.under else ''}")
     print(f"idle window {idle_hours:g}h\n")
     by_fam: dict[str, int] = {}
     for i in items:
@@ -533,6 +638,9 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
 def remove(path: Path) -> None:
     if path.is_symlink():
         raise OSError("refusing symlink")
+    if not path.is_dir():
+        path.unlink()
+        return
     shutil.rmtree(path, ignore_errors=False, onerror=_chmod_retry)
 
 
@@ -573,12 +681,19 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             outcome = "changed:in-use"
         elif (time.time() - newest_mtime(p)) / 3600 < idle_hours:
             outcome = "changed:modified"
+        elif (families[i.family].git_disposable and p.is_dir()
+              and (g := git_state(p)) != "none" and (g != "git" or git_loss(p))):
+            outcome = "changed:git"  # the checkout gained something to lose since the survey
         else:
             try:
+                common = git_common_dir(p) if families[i.family].git_disposable else ""
                 remove(p)
                 outcome = "reclaimed"
                 released += i.bytes
-            except OSError as e:
+                if common:  # drop the deleted worktree's record from its repository
+                    subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
+                                   capture_output=True, timeout=60)
+            except (OSError, subprocess.SubprocessError) as e:
                 outcome = f"incomplete:{e.__class__.__name__}"
         rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
                "outcome": outcome, "rebuild": families[i.family].rebuild, **asdict(i)}
@@ -727,6 +842,11 @@ def main(argv: list[str] | None = None) -> int:
                          "(default %(default)s)")
     ap.add_argument("--target", default=target,
                     help="stop freeing at this much free, GiB or N%% (default %(default)s)")
+    ap.add_argument("--tmpfs-low", default="75%",
+                    help="pressure threshold for a tmpfs, whose files live in RAM and swap "
+                         "(default %(default)s free)")
+    ap.add_argument("--tmpfs-target", default="90%",
+                    help="stop freeing a tmpfs at this much free (default %(default)s)")
     ap.add_argument("--idle-hours", type=float, default=None,
                     help="idle window (default 24h, or 6h under pressure)")
     ap.add_argument("--family", action="append", help="limit to these family ids")
@@ -750,8 +870,8 @@ def main(argv: list[str] | None = None) -> int:
     fams = default_families()
     for ov in a.root_override:
         fid, _, p = ov.partition("=")
-        fams = [Family(f.id, Path(p), f.reclaimable, f.rebuild, f.depth, f.skip) if f.id == fid else f
-                for f in fams]
+        fams = [replace(f, root=Path(p), files=False, min_bytes=None, git_disposable=False)
+                if f.id == fid else f for f in fams]
     if a.family:
         fams = [f for f in fams if f.id in a.family]
     if a.dedupe:
@@ -773,11 +893,14 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(a.settle_minutes * 60)
         return 0
     try:
-        fss = filesystems(fams, a.low, a.target) if fams else filesystems(
-            [Family("home", HOME, False, "")], a.low, a.target)
+        fss = filesystems(fams or [Family("home", HOME, False, "")], a.low, a.target,
+                          a.tmpfs_low, a.tmpfs_target)
     except ValueError:
-        ap.error(f"--low/--target take GiB or N%: {a.low!r}, {a.target!r}")
-    under = any(fs.under for fs in fss.values())
+        ap.error(f"--low/--target/--tmpfs-* take GiB or N%: {a.low!r}, {a.target!r}, "
+                 f"{a.tmpfs_low!r}, {a.tmpfs_target!r}")
+    # a tmpfs is under pressure at a quarter full, so it shortens the idle window only for
+    # pressure runs, which then touch nothing but that filesystem's families
+    under = any(fs.under for fs in fss.values() if a.pressure or not fs.tmpfs)
     if a.pressure:
         if not under:
             for fs in fss.values():

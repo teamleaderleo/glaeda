@@ -232,6 +232,166 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(d.exists())
         self.assertIn("changed:in-use", receipt.read_text())
 
+    def _age(self, root: Path, hours: float = 48) -> None:
+        t = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(root):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(root, (t, t))
+
+    def _git(self, *args: str) -> str:
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        return subprocess.run(["git", *args], check=True, capture_output=True, text=True,
+                              env=env).stdout
+
+    def _tmp_repos(self) -> tuple[Path, Path]:
+        """A tmp-family root plus an origin repository with one commit outside it."""
+        self.fam = gd.Family("tmp", self.root / "tmp", True, "scratch", files=True,
+                             min_bytes=0, git_disposable=True)
+        self.fam.root.mkdir()
+        origin = self.root / "origin"
+        self._git("init", "-q", "-b", "main", str(origin))
+        (origin / "f").write_text("x")
+        self._git("-C", str(origin), "add", "f")
+        self._git("-C", str(origin), "commit", "-qm", "c")
+        return self.fam.root, origin
+
+    def test_tmpfs_is_judged_by_its_own_thresholds(self) -> None:
+        mounts = self.root / "mounts"
+        mounts.write_text(f"tmpfs {self.root} tmpfs rw 0 0\n")
+        saved = gd.mount_point
+        gd.mount_point = lambda p: self.root
+        try:
+            self.assertEqual(gd.fs_type(self.root, mounts), "tmpfs")
+            mounts.write_text(f"/dev/x {self.root} ext4 rw 0 0\n")
+            self.assertEqual(gd.fs_type(self.root, mounts), "ext4")
+            self.assertEqual(gd.fs_type(self.root, self.root / "missing"), "")
+        finally:
+            gd.mount_point = saved
+        saved_type, saved_darwin = gd.fs_type, gd.DARWIN
+        gd.fs_type, gd.DARWIN = (lambda p, *_: "tmpfs"), False
+        try:
+            fs = next(iter(gd.filesystems([self.fam], "0", "0", "100%", "100%").values()))
+        finally:
+            gd.fs_type, gd.DARWIN = saved_type, saved_darwin
+        self.assertTrue(fs.tmpfs)
+        self.assertTrue(fs.under)  # free space alone would say no pressure with low "0"
+        self.assertEqual(fs.target, fs.total)
+
+    def test_tmp_files_are_candidates_and_removed(self) -> None:
+        root, _ = self._tmp_repos()
+        (root / "leaked.so").write_bytes(b"\0" * 4096)
+        (root / "fresh.log").write_bytes(b"\0" * 4096)
+        self._age(root / "leaked.so")
+        v = {Path(i.path).name: i.verdict for i in gd.survey([self.fam], 24, 0)}
+        self.assertEqual(v, {"leaked.so": "reclaimable", "fresh.log": "recent"})
+        plain = gd.Family("tmp", root, True, "scratch")
+        self.assertEqual(gd.survey([plain], 24, 0), [])  # files only when the family opts in
+        gd.apply(gd.survey([self.fam], 24, 0), {"tmp": self.fam}, self.receipt(), None, 24)
+        self.assertFalse((root / "leaked.so").exists())
+        self.assertTrue((root / "fresh.log").exists())
+
+    def test_family_size_floor_overrides_min_mib(self) -> None:
+        root, _ = self._tmp_repos()
+        (root / "small").write_bytes(b"\0" * 4096)
+        self._age(root / "small")
+        self.assertEqual(len(gd.survey([self.fam], 24, 1 << 30)), 1)
+        self.fam = gd.replace(self.fam, min_bytes=None)
+        self.assertEqual(gd.survey([self.fam], 24, 1 << 30), [])
+
+    def test_disposable_checkouts_in_tmp(self) -> None:
+        root, origin = self._tmp_repos()
+        self._git("clone", "-q", str(origin), str(root / "pushed"))
+        self._git("clone", "-q", str(origin), str(root / "unpushed"))
+        (root / "unpushed/g").write_text("y")
+        self._git("-C", str(root / "unpushed"), "add", "g")
+        self._git("-C", str(root / "unpushed"), "commit", "-qm", "local")
+        self._git("clone", "-q", str(origin), str(root / "dirty"))
+        (root / "dirty/untracked").write_text("z")
+        self._git("clone", "-q", str(origin), str(root / "stashed"))
+        (root / "stashed/f").write_text("changed")
+        self._git("-C", str(root / "stashed"), "stash", "-q")
+        (root / "nested").mkdir()
+        self._git("clone", "-q", str(origin), str(root / "nested/inner"))
+        self._git("-C", str(origin), "worktree", "add", "-q", "-b", "wt", str(root / "worktree"))
+        self._git("-C", str(origin), "worktree", "add", "-q", "--detach", str(root / "detached"))
+        (root / "detached/h").write_text("w")
+        self._git("-C", str(root / "detached"), "add", "h")
+        self._git("-C", str(root / "detached"), "commit", "-qm", "orphan")
+        self._git("clone", "-q", str(origin), str(root / "young"))
+        for d in root.iterdir():
+            if d.name != "young":
+                self._age(d)
+        items = gd.survey([self.fam], 24, 0)
+        v = {Path(i.path).name: i.verdict for i in items}
+        self.assertEqual(v, {"pushed": "reclaimable", "worktree": "reclaimable",
+                             "unpushed": "git-checkout", "dirty": "git-checkout",
+                             "stashed": "git-checkout", "nested": "git-checkout",
+                             "detached": "git-checkout", "young": "git-checkout"})
+        why = {Path(i.path).name: i.reasons for i in items}
+        self.assertEqual(why["unpushed"], ["commits not on any remote"])
+        self.assertEqual(why["detached"], ["HEAD on no ref"])
+        # without the opt-in every checkout stays protected
+        plain = gd.replace(self.fam, git_disposable=False)
+        self.assertEqual({i.verdict for i in gd.survey([plain], 24, 0)}, {"git-checkout"})
+        gd.apply(items, {"tmp": self.fam}, self.receipt(), None, 24)
+        self.assertEqual(sorted(p.name for p in root.iterdir()),
+                         ["detached", "dirty", "nested", "stashed", "unpushed", "young"])
+        listed = self._git("-C", str(origin), "worktree", "list", "--porcelain")
+        self.assertNotIn(str(root / "worktree"), listed)  # pruned from its repository
+        self.assertIn("refs/heads/wt", self._git("-C", str(origin), "for-each-ref"))
+
+    def test_checkouts_with_hidden_git_state_are_kept(self) -> None:
+        root, origin = self._tmp_repos()
+        # a clean, pushed clone that backs a worktree with an unpushed detached commit
+        self._git("clone", "-q", str(origin), str(root / "main"))
+        self._git("-C", str(root / "main"), "worktree", "add", "-q", "--detach",
+                  str(self.root / "elsewhere"))
+        # a pushed superproject whose submodule commit exists only locally
+        sub = self.root / "subsrc"
+        self._git("clone", "-q", str(origin), str(sub))
+        self._git("clone", "-q", str(origin), str(root / "super"))
+        self._git("-C", str(root / "super"), "-c", "protocol.file.allow=always", "submodule",
+                  "add", "-q", str(sub), "sm")
+        self._git("-C", str(root / "super"), "commit", "-qm", "sm")
+        self._git("-C", str(root / "super"), "push", "-q", "origin", "HEAD:refs/heads/super")
+        self._git("-C", str(root / "super"), "fetch", "-q")
+        # an edit hidden from status by skip-worktree
+        self._git("clone", "-q", str(origin), str(root / "skipped"))
+        self._git("-C", str(root / "skipped"), "update-index", "--skip-worktree", "f")
+        (root / "skipped/f").write_text("edited")
+        # a worktree whose commit only a worktree-local ref holds, and a locked one
+        self._git("-C", str(origin), "worktree", "add", "-q", "--detach", str(root / "bisect"))
+        (root / "bisect/b").write_text("b")
+        self._git("-C", str(root / "bisect"), "add", "b")
+        self._git("-C", str(root / "bisect"), "commit", "-qm", "b")
+        self._git("-C", str(root / "bisect"), "update-ref", "refs/bisect/bad", "HEAD")
+        self._git("-C", str(origin), "worktree", "add", "-q", "-b", "lk", str(root / "locked"))
+        self._git("-C", str(origin), "worktree", "lock", str(root / "locked"))
+        for d in root.iterdir():
+            self._age(d)
+        why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
+        self.assertEqual(why, {
+            "main": ("git-checkout", ["other worktrees use this repository"]),
+            "super": ("git-checkout", ["submodules"]),
+            "skipped": ("git-checkout", ["files hidden from status"]),
+            "bisect": ("git-checkout", ["HEAD on no ref"]),
+            "locked": ("git-checkout", ["locked worktree"])})
+
+    def test_apply_rechecks_a_checkout_that_gained_work(self) -> None:
+        root, origin = self._tmp_repos()
+        self._git("clone", "-q", str(origin), str(root / "c"))
+        self._age(root / "c")
+        items = gd.survey([self.fam], 24, 0)
+        self.assertEqual(items[0].verdict, "reclaimable")
+        (root / "c/new").write_text("n")
+        self._age(root / "c")
+        receipt = self.receipt()
+        gd.apply(items, {"tmp": self.fam}, receipt, None, 24)
+        self.assertTrue((root / "c").exists())
+        self.assertIn("changed:git", receipt.read_text())
+
     def test_cargo_target_search_is_report_only(self) -> None:
         fam = gd.Family("cargo-target", self.root, False, "cargo clean", depth=4,
                         match="target", marker="CACHEDIR.TAG")
