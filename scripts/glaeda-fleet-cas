@@ -203,7 +203,7 @@ case $role in
     if [ -n "$apply" ]; then
       for _ in 1 2 3 4 5 6 7 8 9 10; do nc -z -G 1 "${listen%:*}" "${listen##*:}" 2>/dev/null && break; sleep 0.5; done
       nc -z -G 2 "${listen%:*}" "${listen##*:}" 2>/dev/null || health_failed store
-      echo "ok store listening on $listen (writers: ${writers:-none}, signed entries only: ${trusted:+yes}${trusted:-no})"
+      echo "ok store listening on $listen (writers: ${writers:-none}, signed entries only: $([ -n "$trusted" ] && echo yes || echo no))"
     fi
     ;;
   uninstall)
