@@ -212,6 +212,7 @@ case $role in
       say "stop and remove $label (stores kept)"
       [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true; rm -f "$AGENTS/$label.plist"; }
     done
+    do_ rm -f "$ROOT/fleet-cas.env"
     ;;
   *) sed -n '2,7p' "$0" >&2; exit 2 ;;
 esac

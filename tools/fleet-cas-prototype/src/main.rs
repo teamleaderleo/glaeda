@@ -56,6 +56,12 @@ struct Stats {
     kv_put_replaced: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    /// Writes answered with an error, for any reason (refused, fleet store
+    /// down or backing off, local failure). The writer's marker needs 0.
+    write_failed: AtomicU64,
+    /// Identifies this process, so a reader of stats.json can tell that the
+    /// counters restarted from 0.
+    instance: AtomicU64,
     /// Refused writes: on a fleet store, writes it refused from a peer not
     /// on `--writers`; on a node, writes the fleet store refused.
     write_refused: AtomicU64,
@@ -102,6 +108,8 @@ impl Stats {
             ("kv_put_dangling", &self.kv_put_dangling),
             ("kv_sig_fail", &self.kv_sig_fail),
             ("write_refused", &self.write_refused),
+            ("write_failed", &self.write_failed),
+            ("instance", &self.instance),
             ("bytes_in", &self.bytes_in),
             ("bytes_out", &self.bytes_out),
             ("up_cas_fetch", &self.up_cas_fetch),
@@ -511,6 +519,18 @@ impl Store {
         refs: Vec<cas::CasDataId>,
         data: Vec<u8>,
     ) -> Result<Vec<u8>, Status> {
+        let r = self.put_through_inner(refs, data).await;
+        if r.is_err() {
+            self.stats.write_failed.fetch_add(1, Relaxed);
+        }
+        r
+    }
+
+    async fn put_through_inner(
+        &self,
+        refs: Vec<cas::CasDataId>,
+        data: Vec<u8>,
+    ) -> Result<Vec<u8>, Status> {
         let forward = match &self.upstream {
             Some(up) if !self.read_only_kv => Some((up, data_object(refs.clone(), data.clone()))),
             _ => None,
@@ -783,7 +803,20 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
         &self,
         r: Request<kv::PutValueRequest>,
     ) -> Result<Response<kv::PutValueResponse>, Status> {
-        let s = &self.0;
+        let resp = self.0.kv_put(r).await;
+        if !matches!(&resp, Ok(r) if r.get_ref().error.is_none()) {
+            self.0.stats.write_failed.fetch_add(1, Relaxed);
+        }
+        resp
+    }
+}
+
+impl Store {
+    async fn kv_put(
+        &self,
+        r: Request<kv::PutValueRequest>,
+    ) -> Result<Response<kv::PutValueResponse>, Status> {
+        let s = self;
         s.check_writer(&r)?;
         if s.read_only_kv {
             s.stats.kv_put_refused.fetch_add(1, Relaxed);
@@ -1056,11 +1089,13 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
         if listen.starts_with("tcp:") {
             return Err("--sign-key belongs on the writer's node daemon, not a fleet store".into());
         }
-        // The writer serves its own entries back to local builds.
-        if let Some(keys) = &mut trusted {
-            if !keys.contains(&sk.verifying_key()) {
-                keys.push(sk.verifying_key());
-            }
+        // The writer serves fetched entries too, so it checks them like any
+        // reader, and trusts its own.
+        let Some(keys) = &mut trusted else {
+            return Err("--sign-key needs --trusted-keys".into());
+        };
+        if !keys.contains(&sk.verifying_key()) {
+            keys.push(sk.verifying_key());
         }
     }
     std::fs::create_dir_all(&root)?;
@@ -1101,7 +1136,10 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
         trusted,
         strip_signatures: !listen.starts_with("tcp:"),
         upstream_down_until: AtomicU64::new(0),
-        stats: Stats::default(),
+        stats: Stats {
+            instance: AtomicU64::new(now_ms() ^ u64::from(std::process::id()) << 44),
+            ..Stats::default()
+        },
     });
 
     let stats_store = store.clone();
@@ -1112,7 +1150,8 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let line = stats_store.stats.line();
             if line != last {
-                let _ = std::fs::write(&stats_path, &line);
+                // Atomically, so a reader never sees a half-written file.
+                let _ = write_atomic(&stats_path, line.as_bytes());
                 last = line;
             }
         }

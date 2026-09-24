@@ -36,6 +36,9 @@ if [ -n "$writer" ]; then
 elif [ -n "$sign_key" ]; then
   echo "--sign-key needs --writer HOST" >&2; exit 2
 fi
+# The rollout is stateless: whatever it is given replaces the deployed configuration.
+[ -n "$trusted" ] || echo "warning: no --trusted-keys: the store keeps, and nodes use, unsigned index entries" >&2
+[ -n "$writer" ] || echo "warning: no --writer: the store will accept no writes" >&2
 for h in "$store" ${writer:+"$writer"} ${nodes[@]+"${nodes[@]}"}; do
   target=$(ssh -G "$h" | awk '/^hostname /{print $2}')
   case "$h $target" in *lawrence*) echo "refusing $h ($target): cmux-lawrence is the fleet coordinator" >&2; exit 2 ;; esac
@@ -50,7 +53,8 @@ run() {  # host, args...
   local h=$1; shift
   echo "== $h"
   ship "$h"
-  ssh -o BatchMode=yes "$h" "PATH=\$HOME/.cargo/bin:\$PATH ~/.cache/glaeda-fleet-cas/glaeda/scripts/glaeda-fleet-cas $*"
+  # Quote each argument for the remote shell.
+  ssh -o BatchMode=yes "$h" "PATH=\$HOME/.cargo/bin:\$PATH ~/.cache/glaeda-fleet-cas/glaeda/scripts/glaeda-fleet-cas $(printf '%q ' "$@")"
 }
 
 lan_ip() {

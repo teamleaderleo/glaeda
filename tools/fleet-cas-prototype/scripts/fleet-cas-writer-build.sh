@@ -15,7 +15,10 @@
 # is down (nothing is built); 4 if the build passed but no marker was written.
 # The writer node keeps its own copy of what it wrote, so a fleet store that is
 # emptied needs the writer's node store emptied too, or later markers can
-# claim entries the store lost.
+# claim entries the store lost. Writer builds should start from an empty
+# local CAS (COMPILATION_CACHE_CAS_PATH): an entry whose upload failed may
+# otherwise be answered from it and never uploaded again (not observed; how
+# Xcode orders the local and remote lookups is unverified).
 set -u
 repo=${1:?usage: fleet-cas-writer-build.sh REPO COMMIT -- CMD...}
 commit=${2:?usage: fleet-cas-writer-build.sh REPO COMMIT -- CMD...}
@@ -28,25 +31,33 @@ env_get() { sed -n "s/^$1=//p" "$ROOT/fleet-cas.env" | tail -1; }
 store=$(env_get FLEET_CAS_STORE) key=$(env_get FLEET_CAS_SIGN_KEY)
 [ -n "$store" ] && [ -n "$key" ] || { echo "$ROOT/fleet-cas.env has no writer settings" >&2; exit 2; }
 stats=$ROOT/node-store/stats.json
-# Sum of the named node counters; empty if the stats file is unreadable.
+# Sum of the named node counters; empty unless every one is in the stats file.
 count() {
   perl -e 'open my $f, "<", shift or exit 1; my $s = <$f>; my $n = 0;
-    for my $k (@ARGV) { $n += $1 if $s =~ /"$k":(\d+)/ } print $n' "$stats" "$@"
+    for my $k (@ARGV) { $s =~ /"$k":(\d+)/ or exit 1; $n += $1 } print $n' "$stats" "$@"
 }
-# A write may not have reached the fleet store.
-failures() { count write_refused up_errors up_skipped; }
+# The node process: its counters restart from 0 with it, so a restart during
+# the build would hide failures before it.
+instance() { count instance; }
+# A write that did not reach the fleet store (write_failed counts every write
+# Xcode got an error for), or a skipped fleet-store call.
+failures() { count write_failed write_refused up_errors up_skipped; }
 # Xcode talked to the node (a build without the plugin settings does not).
 activity() { count kv_get_hit kv_get_miss kv_put; }
 xcode=$(xcodebuild -version | awk '/Build version/ {print $3}')
 [ -n "$xcode" ] || { echo "no Xcode build version" >&2; exit 2; }
 "$ROOT/bin/fleet-cas-settings.sh" "$ROOT/fleet-cas.sock" >/dev/null || exit 3
-f0=$(failures) a0=$(activity)
-[ -n "$f0" ] && [ -n "$a0" ] || { echo "cannot read $stats" >&2; exit 3; }
+i0=$(instance) f0=$(failures) a0=$(activity)
+[ -n "$i0" ] && [ -n "$f0" ] && [ -n "$a0" ] || { echo "cannot read $stats" >&2; exit 3; }
 "$@"
 rc=$?
 [ "$rc" -eq 0 ] || exit "$rc"
 sleep 1  # the node rewrites stats.json every 500 ms
-f1=$(failures) a1=$(activity)
+i1=$(instance) f1=$(failures) a1=$(activity)
+if [ "$i1" != "$i0" ]; then
+  echo "fleet-cas: the node restarted during the build; no marker for $repo/$commit" >&2
+  exit 4
+fi
 if [ -z "$f1" ] || [ "$f1" != "$f0" ]; then
   echo "fleet-cas: failed or skipped fleet-store calls during the build; no marker for $repo/$commit" >&2
   exit 4

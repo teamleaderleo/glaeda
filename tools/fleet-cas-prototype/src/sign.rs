@@ -123,8 +123,12 @@ pub fn keygen(path: &Path) -> Result<VerifyingKey, String> {
         .mode(0o600)
         .open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    writeln!(f, "{}", hex::encode(seed)).map_err(|e| format!("{}: {e}", path.display()))?;
-    f.sync_all().map_err(|e| format!("{}: {e}", path.display()))?;
+    let written = writeln!(f, "{}", hex::encode(seed)).and_then(|_| f.sync_all());
+    if let Err(e) = written {
+        // A partial key must not block the retry (keygen never overwrites).
+        let _ = std::fs::remove_file(path);
+        return Err(format!("{}: {e}", path.display()));
+    }
     Ok(sk.verifying_key())
 }
 

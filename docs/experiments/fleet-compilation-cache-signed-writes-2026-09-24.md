@@ -13,10 +13,12 @@ Objects are content-addressed and every reader recomputes their IDs, so only ind
   reserved entry in Xcode's value map, so Xcode's protocol is unchanged; nodes strip it
   before answering Xcode.
 - A store or node with `--trusted-keys` accepts and serves only entries signed by a trusted
-  key. Readers verify for themselves, so they do not have to trust the store host, the
-  network, or the peer-address allowlist.
+  key. Readers verify for themselves, so the store host, the network and the peer-address
+  allowlist cannot make them use a poisoned entry. (A store can still withhold entries, and
+  a marker says only that the writer's fill succeeded, not that the store still serves it.)
 - A per-commit marker is itself a signed index entry under its own key prefix. The writer
-  publishes it only after a build with no failed or skipped fleet-store call.
+  publishes it only after a build that used the node with no write error, no failed or
+  skipped fleet-store call and no node restart.
 
 ## Test
 
@@ -39,7 +41,9 @@ Locally (no Xcode):
 - markers from an untrusted key are refused;
 - a store with trusted keys serves an entry altered on disk as a miss;
 - after a key rotation, an entry signed by the dropped key reads as a miss and the next
-  signed write replaces it (`kv_put_replaced`).
+  signed write replaces it (`kv_put_replaced`);
+- `fleet-cas-writer-build.sh` refuses the marker (exit 4) for a build that never used the node
+  and for a node restart during the build.
 
 Unit tests cover signing and verification:
 
@@ -57,7 +61,10 @@ Signing cost does not show at this size (711 entries); the full app writes about
 - Object uploads are still gated only by the peer address, so a LAN spoofer can fill the
   store's disk but cannot make a reader use anything.
 - The writer node keeps its own copy of what it wrote. A fleet store that is emptied needs the
-  writer's node store emptied too, or a later marker can claim entries the store lost.
+  writer's node store emptied too, or a later marker can claim entries the store lost. Key
+  rotation therefore starts the store over (design doc).
+- Writer builds should start from an empty local CAS. Whether Xcode answers a lookup from its
+  local CAS without asking the node (so a failed upload is never retried) is unverified.
 - The full app has not been filled through a signing node yet.
 
 ## Next

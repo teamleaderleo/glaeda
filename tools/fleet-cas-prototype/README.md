@@ -76,7 +76,9 @@ Signed index entries (#1134 M3, `src/sign.rs`):
   recomputed from content.
 - `fleet-cas marker put|get` writes or checks a signed per-commit marker.
   `scripts/fleet-cas-writer-build.sh REPO COMMIT -- BUILD...` runs the writer's build
-  and publishes the marker only if every fleet-store call succeeded;
+  and publishes the marker only if the build used the node with no write error
+  (`write_failed`), no failed or skipped fleet-store call and no node restart
+  (`instance`);
   `scripts/fleet-cas-marker.sh REPO COMMIT` tells a worker whether the store holds a
   commit for its Xcode build.
 Build under `$HOME` (never `/tmp`, see swiftlang/swift#92545). On Xcode 26.3,

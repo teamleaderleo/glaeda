@@ -102,10 +102,12 @@ CI's main build is the only writer (#1134 M3; tested in
 - It runs on one dedicated writer mini whose node daemon holds the signing key and signs
   every index entry (`glaeda-fleet-cas writer`). The store keeps, and every node uses, only
   entries signed by a trusted key (`--trusted-keys`); objects need no signature.
-- The main build runs under `xcode/bin/fleet-cas-writer-build.sh cmux <sha> -- <build>`. After
-  a successful build with no failed or skipped fleet-store call, it publishes the signed
-  marker `cmux/<sha>/<Xcode build>`; otherwise it exits 4 and the next main build fills the
-  rest.
+- The main build runs under `xcode/bin/fleet-cas-writer-build.sh cmux <sha> -- <build>`. It
+  publishes the signed marker `cmux/<sha>/<Xcode build>` only after a successful build that
+  used the node, with no write error, no failed or skipped fleet-store call and no node
+  restart; otherwise it exits 4 and later main builds fill the rest. Writer builds start
+  from an empty local CAS, so every lookup reaches the node (an entry answered from the
+  local CAS would never be uploaded again; whether Xcode does that is unverified).
 - The writer mini runs no PR or other untrusted job. Any process running as the build user
   there can read the key, so a PR job on that host could sign a poisoned entry. It leaves the
   PR pools (a reservation or a manifest role without `ci-runner`) before its key exists.
@@ -118,8 +120,10 @@ ssh <writer> 'mkdir -m 700 -p ~/.config/glaeda &&
   /Users/Shared/cmux-build-fleet/xcode/bin/fleet-cas keygen ~/.config/glaeda/fleet-cas-writer.key'
 ```
 
-The command prints the public key, which is all the rollout needs (`--trusted-keys`). The
-private key never leaves the host and is never in a repository, a log or a job's environment.
+The command prints the public key, which is all the rollout needs (`--trusted-keys`). This
+design never copies the private key anywhere: not into a repository, a log or a job's
+environment. Anything running as the build user on the writer could still read it and send
+it elsewhere, which is why that host runs main builds only.
 The alternatives were considered and not proposed:
 
 - A GitHub environment secret for a main-only job restricts which workflow gets the key, but
@@ -130,9 +134,12 @@ The alternatives were considered and not proposed:
 
 The step that would add real isolation is running the writer's node as its own user, so the
 build user cannot read the key; it matters only if the writer host ever runs anything but main
-builds. Rotation: a new key, then `--trusted-keys OLD,NEW` everywhere, then the writer switches,
-then OLD is dropped (entries signed by OLD stop verifying, so they become misses and are
-rewritten by later main builds).
+builds. Rotation starts the store over: create the new key, empty the fleet store and the
+writer's node store, and roll out with only the new key trusted. Nodes treat entries signed
+by the old key as misses and replace them with verified fetches, and the store refills from
+the next main builds. A gradual rotation with both keys trusted would leave old-key entries
+behind new-key markers, and those markers would claim commits the store stops serving once
+the old key is dropped.
 
 ## Deployment
 
