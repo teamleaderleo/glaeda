@@ -91,7 +91,7 @@ let the gate hold the line.
 | `actions_runner_readiness` | `all` | library | 7 |
 | `adaptive_ci_routing` | `all` | none | 0 |
 | `adaptive_verification_compiler` | `all` | library | 2 |
-| `artifact` | `all` | binary | 161 |
+| `artifact` | `all` | binary | 162 |
 | `cache_inventory` | `all` | binary | 5 |
 | `cargo_target_holder_observation` | `target_os="linux"` | binary | 1 |
 | `cargo_target_observation` | `target_os="linux"` | binary | 4 |
@@ -221,9 +221,9 @@ let the gate hold the line.
 | `personal_worker_tick` | `all` | binary | 6 |
 | `personal_worker_verification_plan` | `target_os="linux"` | none | 0 |
 | `plan` | `all` | binary | 1 |
-| `process` | `all` | binary | 74 |
+| `process` | `all` | binary | 75 |
 | `project_catalog` | `all` | binary | 35 |
-| `project_checkout_observation` | `unix` | binary | 13 |
+| `project_checkout_observation` | `unix` | binary | 14 |
 | `project_discovery` | `unix` | none | 0 |
 | `project_disk_attachment_state` | `all` | none | 0 |
 | `project_disk_filesystem` | `all` | library | 7 |
