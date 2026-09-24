@@ -2,9 +2,11 @@
 //! COMPILATION_CACHE_REMOTE_SERVICE_PATH (LLVM compilation_cache_service
 //! protocol). Disk-backed CAS + KV behind a unix socket or a TCP port.
 //!
-//! Trust model under test: CAS object IDs are computed here from content, so
-//! CAS writes cannot impersonate. KV writes (cache key -> result) are the only
-//! poisoning surface; `--read-only-kv` refuses them.
+//! Trust model: CAS object IDs are computed here from content, so CAS writes
+//! cannot impersonate. KV writes (cache key -> result) are the only poisoning
+//! surface: `--read-only-kv` refuses them, and with `--trusted-keys` only
+//! entries signed by the trusted writer (`--sign-key`) are stored or served
+//! (see `sign.rs`).
 //!
 //! Two roles, one binary:
 //! - fleet store: `fleet-cas tcp:<addr> <store>`, reached over the network.
@@ -37,6 +39,7 @@ pub mod kv {
 pub mod fleet {
     tonic::include_proto!("glaeda.fleetcas.v1");
 }
+mod sign;
 
 #[derive(Default)]
 struct Stats {
@@ -49,6 +52,8 @@ struct Stats {
     kv_put: AtomicU64,
     kv_put_refused: AtomicU64,
     kv_put_conflict: AtomicU64,
+    /// Existing entries replaced because this store would not serve them.
+    kv_put_replaced: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
     /// Refused writes: on a fleet store, writes it refused from a peer not
@@ -56,6 +61,9 @@ struct Stats {
     write_refused: AtomicU64,
     /// KV entries whose 32-byte values name objects this store lacks.
     kv_put_dangling: AtomicU64,
+    /// Index entries answered as misses because their signature is missing
+    /// or not from a trusted key (local copies and fetched ones).
+    kv_sig_fail: AtomicU64,
     // Node daemon only: traffic to the fleet store.
     up_cas_fetch: AtomicU64,
     up_cas_fetch_miss: AtomicU64,
@@ -90,7 +98,9 @@ impl Stats {
             ("kv_put", &self.kv_put),
             ("kv_put_refused", &self.kv_put_refused),
             ("kv_put_conflict", &self.kv_put_conflict),
+            ("kv_put_replaced", &self.kv_put_replaced),
             ("kv_put_dangling", &self.kv_put_dangling),
+            ("kv_sig_fail", &self.kv_sig_fail),
             ("write_refused", &self.write_refused),
             ("bytes_in", &self.bytes_in),
             ("bytes_out", &self.bytes_out),
@@ -148,6 +158,15 @@ struct Store {
     /// would read any file on its host for whoever connects.
     allow_file_paths: bool,
     upstream: Option<Upstream>,
+    /// The trusted writer's key: every index entry this node accepts from
+    /// Xcode is signed with it before it is stored or forwarded.
+    sign_key: Option<ed25519_dalek::SigningKey>,
+    /// When set, only index entries signed by one of these keys are stored
+    /// (on a put) or served (local or fetched); others are refused or misses.
+    trusted: Option<Vec<ed25519_dalek::VerifyingKey>>,
+    /// Answer Xcode (a unix-socket node): drop the signature entry, which is
+    /// not part of Xcode's record. A fleet store keeps it for its readers.
+    strip_signatures: bool,
     /// Unix millis until which fleet-store calls are skipped after a failure.
     upstream_down_until: AtomicU64,
     stats: Stats,
@@ -308,6 +327,19 @@ impl Store {
                 Err(Status::permission_denied("not a fleet-cas writer"))
             }
         }
+    }
+
+    /// An index entry this store may keep or serve: any entry when no keys
+    /// are configured, else only one signed by a trusted key.
+    fn trusts(&self, key: &[u8], value: &kv::Value) -> bool {
+        let Some(keys) = &self.trusted else {
+            return true;
+        };
+        let ok = sign::verify(keys, key, value);
+        if !ok {
+            self.stats.kv_sig_fail.fetch_add(1, Relaxed);
+        }
+        ok
     }
 
     fn cas_path(&self, id: &[u8]) -> PathBuf {
@@ -692,13 +724,21 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
     ) -> Result<Response<kv::GetValueResponse>, Status> {
         let key = r.into_inner().key;
         let s = &self.0;
+        let answer = |v: kv::Value| {
+            kv_response(Some(if s.strip_signatures { sign::strip(v) } else { v }))
+        };
         let path = s.kv_path(&key);
+        // A local copy that does not verify is replaced by a verified fetch.
+        let mut replace = false;
         match std::fs::read(&path) {
             Ok(bytes) => {
                 // A damaged entry is a miss, like a damaged object.
                 if let Ok(value) = kv::Value::decode(bytes.as_slice()) {
-                    s.stats.kv_get_hit.fetch_add(1, Relaxed);
-                    return Ok(kv_response(Some(value)));
+                    if s.trusts(&key, &value) {
+                        s.stats.kv_get_hit.fetch_add(1, Relaxed);
+                        return Ok(answer(value));
+                    }
+                    replace = true;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -709,7 +749,7 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
             return Ok(kv_response(None));
         };
         let mut client = up.kv.clone();
-        let fetch = client.get_value(kv::GetValueRequest { key });
+        let fetch = client.get_value(kv::GetValueRequest { key: key.clone() });
         let Ok(resp) = s.stats.upstream(fetch).await else {
             s.upstream_failed();
             return Ok(kv_response(None));
@@ -719,12 +759,24 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
             s.stats.up_kv_fetch_miss.fetch_add(1, Relaxed);
             return Ok(kv_response(None));
         };
+        // The fleet store is not trusted for index entries either: an entry
+        // without the writer's signature is a miss, and nothing it names is
+        // prefetched.
+        if !s.trusts(&key, &value) {
+            return Ok(kv_response(None));
+        }
         s.stats.up_kv_fetch.fetch_add(1, Relaxed);
         s.prefetch(&value).await;
         // Keep it: the next lookup on this node is local.
-        let _ = std::fs::create_dir_all(path.parent().unwrap())
-            .and_then(|_| publish_new(&path, &value.encode_to_vec()));
-        Ok(kv_response(Some(value)))
+        let bytes = value.encode_to_vec();
+        let _ = std::fs::create_dir_all(path.parent().unwrap()).and_then(|_| {
+            if replace {
+                write_atomic(&path, &bytes)
+            } else {
+                publish_new(&path, &bytes).map(|_| ())
+            }
+        });
+        Ok(answer(value))
     }
 
     async fn put_value(
@@ -742,7 +794,17 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
             }));
         }
         let req = r.into_inner();
-        let value = req.value.unwrap_or_default();
+        let mut value = req.value.unwrap_or_default();
+        if let Some(sk) = &s.sign_key {
+            sign::sign(sk, &req.key, &mut value);
+        } else if !s.trusts(&req.key, &value) {
+            if s.stats.write_refused.fetch_add(1, Relaxed) == 0 {
+                eprintln!("refused an index entry without a trusted signature");
+            }
+            return Err(Status::permission_denied(
+                "index entry is not signed by a trusted writer",
+            ));
+        }
         s.count_dangling(&value);
         // Forward first: this node's copy must not claim an entry the fleet
         // store refused. (If the fleet store already held a different value,
@@ -770,13 +832,28 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
         let bytes = value.encode_to_vec();
         let path = s.kv_path(&req.key);
         s.stats.kv_put.fetch_add(1, Relaxed);
-        // First writer wins, including under concurrency: an existing mapping
-        // is never replaced, and a differing write is only counted.
+        // First writer wins, including under concurrency: an existing valid
+        // mapping is never replaced, and a differing write is only counted.
+        // An existing entry this store would not serve (damaged, or not signed
+        // by a trusted key, e.g. after a key rotation) is replaced, or it
+        // would stay a miss forever.
         let published = std::fs::create_dir_all(path.parent().unwrap())
             .and_then(|_| publish_new(&path, &bytes))
             .map_err(|e| Status::internal(e.to_string()))?;
-        if !published && std::fs::read(&path).is_ok_and(|existing| existing != bytes) {
-            s.stats.kv_put_conflict.fetch_add(1, Relaxed);
+        if !published {
+            if let Ok(existing) = std::fs::read(&path) {
+                if existing != bytes {
+                    let servable = kv::Value::decode(existing.as_slice())
+                        .is_ok_and(|v| s.trusts(&req.key, &v));
+                    if servable {
+                        s.stats.kv_put_conflict.fetch_add(1, Relaxed);
+                    } else {
+                        write_atomic(&path, &bytes)
+                            .map_err(|e| Status::internal(e.to_string()))?;
+                        s.stats.kv_put_replaced.fetch_add(1, Relaxed);
+                    }
+                }
+            }
         }
         Ok(Response::new(kv::PutValueResponse { error: None }))
     }
@@ -839,11 +916,106 @@ impl fleet::fleet_cas_server::FleetCas for FleetSvc {
     }
 }
 
-const USAGE: &str = "usage: fleet-cas <socket | tcp:ADDR> <store> [--read-only-kv] [--upstream http://HOST:PORT] [--no-prefetch] [--writers IP,IP]";
+const USAGE: &str = "usage: fleet-cas <socket | tcp:ADDR> <store> [--read-only-kv] [--upstream http://HOST:PORT] [--no-prefetch] [--writers IP,IP] [--trusted-keys HEX,HEX] [--sign-key PATH]
+       fleet-cas keygen PATH        create a writer signing key (mode 0600), print its public key
+       fleet-cas pubkey PATH        print a signing key's public key
+       fleet-cas marker put http://HOST:PORT NAME --sign-key PATH [--entry K=V]...
+       fleet-cas marker get http://HOST:PORT NAME --trusted-keys HEX,HEX
+                                    exit 0 and print the entries if the marker exists and verifies,
+                                    1 if it is absent, 2 if it does not verify or on error";
+
+/// Per-commit markers: small signed index entries under their own key prefix,
+/// written by the trusted writer after a complete fill and checked by workers
+/// before they pick catch-up mode.
+async fn marker(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
+    let (Some(op), Some(url), Some(name)) = (args.first(), args.get(1), args.get(2)) else {
+        return Err(USAGE.into());
+    };
+    let mut sign_key = None;
+    let mut trusted = None;
+    let mut value = kv::Value::default();
+    let mut rest = args[3..].iter();
+    while let Some(a) = rest.next() {
+        let v = rest.next().ok_or(USAGE)?;
+        match a.as_str() {
+            "--sign-key" => sign_key = Some(sign::load_signing_key(Path::new(v))?),
+            "--trusted-keys" => trusted = Some(sign::parse_trusted(v)?),
+            "--entry" => {
+                let (k, val) = v.split_once('=').ok_or("--entry needs K=V")?;
+                if k == sign::SIG_ENTRY {
+                    return Err("reserved entry name".into());
+                }
+                value.entries.insert(k.into(), val.as_bytes().to_vec());
+            }
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let ch = tonic::transport::Endpoint::from_shared(url.clone())?
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(10))
+        .connect()
+        .await?;
+    let mut client = kv::key_value_db_client::KeyValueDbClient::new(ch);
+    let key = sign::marker_key(name);
+    match op.as_str() {
+        "put" => {
+            let sk = sign_key.ok_or("marker put needs --sign-key")?;
+            sign::sign(&sk, &key, &mut value);
+            let resp = client
+                .put_value(kv::PutValueRequest { key, value: Some(value) })
+                .await?
+                .into_inner();
+            if let Some(e) = resp.error {
+                return Err(e.description.into());
+            }
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        "get" => {
+            let keys = trusted.ok_or("marker get needs --trusted-keys")?;
+            let resp = client.get_value(kv::GetValueRequest { key: key.clone() }).await?;
+            let Some(kv::get_value_response::Contents::Value(v)) = resp.into_inner().contents
+            else {
+                return Ok(std::process::ExitCode::from(1));
+            };
+            if !sign::verify(&keys, &key, &v) {
+                eprintln!("marker {name} is not signed by a trusted key");
+                return Ok(std::process::ExitCode::from(2));
+            }
+            let mut entries: Vec<_> = sign::strip(v).entries.into_iter().collect();
+            entries.sort();
+            for (k, val) in entries {
+                println!("{k}={}", String::from_utf8_lossy(&val));
+            }
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        _ => Err(USAGE.into()),
+    }
+}
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("keygen") => {
+            let path = args.get(1).ok_or(USAGE)?;
+            println!("{}", hex::encode(sign::keygen(Path::new(path))?.as_bytes()));
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+        Some("pubkey") => {
+            let path = args.get(1).ok_or(USAGE)?;
+            let sk = sign::load_signing_key(Path::new(path))?;
+            println!("{}", hex::encode(sk.verifying_key().as_bytes()));
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+        Some("marker") => {
+            // Errors are exit 2, so a caller can tell them from "absent" (1).
+            return Ok(marker(&args[1..]).await.unwrap_or_else(|e| {
+                eprintln!("fleet-cas marker: {e}");
+                std::process::ExitCode::from(2)
+            }));
+        }
+        _ => {}
+    }
     let (Some(listen), Some(root)) = (args.first(), args.get(1)) else {
         return Err(USAGE.into());
     };
@@ -852,6 +1024,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut upstream_url = None;
     let mut prefetch = true;
     let mut writer_list: Vec<std::net::IpAddr> = Vec::new();
+    let mut sign_key = None;
+    let mut trusted: Option<Vec<ed25519_dalek::VerifyingKey>> = None;
     let mut rest = args[2..].iter();
     while let Some(a) = rest.next() {
         match a.as_str() {
@@ -868,7 +1042,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "--upstream" => upstream_url = Some(rest.next().ok_or(USAGE)?.clone()),
+            "--sign-key" => {
+                sign_key = Some(sign::load_signing_key(Path::new(rest.next().ok_or(USAGE)?))?)
+            }
+            "--trusted-keys" => trusted = Some(sign::parse_trusted(rest.next().ok_or(USAGE)?)?),
             _ => return Err(USAGE.into()),
+        }
+    }
+    if let Some(sk) = &sign_key {
+        if read_only_kv {
+            return Err("--sign-key writes; it cannot be combined with --read-only-kv".into());
+        }
+        if listen.starts_with("tcp:") {
+            return Err("--sign-key belongs on the writer's node daemon, not a fleet store".into());
+        }
+        // The writer serves its own entries back to local builds.
+        if let Some(keys) = &mut trusted {
+            if !keys.contains(&sk.verifying_key()) {
+                keys.push(sk.verifying_key());
+            }
         }
     }
     std::fs::create_dir_all(&root)?;
@@ -905,6 +1097,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         allow_file_paths: !listen.starts_with("tcp:"),
         writers: listen.starts_with("tcp:").then_some(writer_list),
         upstream,
+        sign_key,
+        trusted,
+        strip_signatures: !listen.starts_with("tcp:"),
         upstream_down_until: AtomicU64::new(0),
         stats: Stats::default(),
     });
@@ -924,10 +1119,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     eprintln!(
-        "fleet-cas listening on {listen} store={} read_only_kv={read_only_kv} upstream={} writers={:?}",
+        "fleet-cas listening on {listen} store={} read_only_kv={read_only_kv} upstream={} writers={:?} trusted_keys={} signing={}",
         root.display(),
         upstream_url.as_deref().unwrap_or("none"),
-        store.writers
+        store.writers,
+        store.trusted.as_ref().map_or("any".into(), |k| k
+            .iter()
+            .map(|k| hex::encode(k.as_bytes()))
+            .collect::<Vec<_>>()
+            .join(",")),
+        store
+            .sign_key
+            .as_ref()
+            .map_or("no".into(), |k| hex::encode(k.verifying_key().as_bytes()))
     );
     let final_store = store.clone();
     let router = tonic::transport::Server::builder()
@@ -964,5 +1168,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     }
     eprintln!("{}", final_store.stats.line());
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }

@@ -94,8 +94,45 @@ The worker recipe must enforce, since a host check cannot see a job's settings:
   build against a 26.3 store compiled everything, consistent with the compiler being in the
   key (the key inputs were not inspected). A per-build segment is planned only for eviction.
 
-Writer: CI's main build is the trusted writer, filling the store for every main commit it
-builds (planned; the prototype has no signed writes yet, see #1134 M3). Nothing else writes.
+## Writer
+
+CI's main build is the only writer (#1134 M3; tested in
+[signed writes](experiments/fleet-compilation-cache-signed-writes-2026-09-24.md)):
+
+- It runs on one dedicated writer mini whose node daemon holds the signing key and signs
+  every index entry (`glaeda-fleet-cas writer`). The store keeps, and every node uses, only
+  entries signed by a trusted key (`--trusted-keys`); objects need no signature.
+- The main build runs under `xcode/bin/fleet-cas-writer-build.sh cmux <sha> -- <build>`. After
+  a successful build with no failed or skipped fleet-store call, it publishes the signed
+  marker `cmux/<sha>/<Xcode build>`; otherwise it exits 4 and the next main build fills the
+  rest.
+- The writer mini runs no PR or other untrusted job. Any process running as the build user
+  there can read the key, so a PR job on that host could sign a poisoned entry. It leaves the
+  PR pools (a reservation or a manifest role without `ci-runner`) before its key exists.
+
+Key custody (proposed): a 0600 file on the writer mini at
+`/Users/cmux/.config/glaeda/fleet-cas-writer.key`, created there by Leo:
+
+```sh
+ssh <writer> 'mkdir -m 700 -p ~/.config/glaeda &&
+  /Users/Shared/cmux-build-fleet/xcode/bin/fleet-cas keygen ~/.config/glaeda/fleet-cas-writer.key'
+```
+
+The command prints the public key, which is all the rollout needs (`--trusted-keys`). The
+private key never leaves the host and is never in a repository, a log or a job's environment.
+The alternatives were considered and not proposed:
+
+- A GitHub environment secret for a main-only job restricts which workflow gets the key, but
+  the signer is the long-running node daemon, not the job, so a job would have to write the
+  secret to disk on the mini anyway, as the same user every other job on that host runs as.
+- The login keychain adds an unlock step for a LaunchAgent and no protection from same-user
+  processes.
+
+The step that would add real isolation is running the writer's node as its own user, so the
+build user cannot read the key; it matters only if the writer host ever runs anything but main
+builds. Rotation: a new key, then `--trusted-keys OLD,NEW` everywhere, then the writer switches,
+then OLD is dropped (entries signed by OLD stop verifying, so they become misses and are
+rewritten by later main builds).
 
 ## Deployment
 
@@ -110,8 +147,9 @@ which builds the prototype and installs user LaunchAgents:
 - `com.teamleaderleo.glaeda.fleet-cas-node` on every build host: the node daemon on the socket
   above, read-only (`--read-only-kv`) until then, and `xcode/bin/fleet-cas-settings.sh`.
 
-A writer host must not run untrusted jobs: the allowlist trusts every process on an allowed
-address until signed writes (M3) exist. The store listens on a DHCP address, so the store host
+`--writer HOST --sign-key PATH --trusted-keys HEX` makes that host the writer (above) and
+its LAN address the store's only allowed writer; `--trusted-keys` alone makes every node and
+the store use only signed entries. The store listens on a DHCP address, so the store host
 needs a DHCP reservation. The agents need the build user's GUI session; the fleet minis log in
 automatically. `glaeda-fleet-cas uninstall
 --apply` removes both agents and keeps the stores. Deployed on cmux7s (store and node) and
@@ -121,8 +159,9 @@ cmux8s (node) on 2026-09-24.
 
 Catch-up is only fast when the store already holds the target commit; on a store miss it
 is a cold build (756 s on Xcode 26.3 minis; a full caching-on rebuild took 606 s on 26.6), slower than an incremental caching-off rebuild. So the
-worker asks first: the writer records a marker per commit it has filled (planned), and
-catch-up is chosen only when the marker for the target commit exists. The rows below are read
+worker asks first: the writer records a marker per commit it has filled, and catch-up is
+chosen only when `xcode/bin/fleet-cas-marker.sh cmux <sha>` exits 0 (the signed marker for
+that commit and this host's Xcode build exists). The rows below are read
 top to bottom, first match wins, and the writer is exempt: CI's main build always runs catch-up
 with write-through, since filling the store is its job. A PR commit counts as held when its
 merge base with main has a marker (its own changes are few, and they miss either way).
@@ -177,5 +216,6 @@ DerivedData is therefore warmed by its own caching-off builds:
    the largest item and has no lever yet. How far below the 77 to 86 s warm-node floor this
    gets has to be measured.
 3. Worker and recipe change in cmuxterm-hq build-fleet: move catch-up builds from per-job
-   `job-volumes` DerivedData to the fixed path, add the iteration directories, the writer's
-   per-commit marker, and warmer cancellation.
+   `job-volumes` DerivedData to the fixed path, add the iteration directories, run the main
+   build under `fleet-cas-writer-build.sh` on the writer mini, check `fleet-cas-marker.sh`
+   before catch-up, and add warmer cancellation.
