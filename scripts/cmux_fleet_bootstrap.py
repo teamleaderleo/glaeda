@@ -31,6 +31,22 @@ CMUX_WORKLOAD_TOOL_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/s
 # script runs to describe the machine.
 MACOS_WORKLOAD_TOOLS = ("cargo", "git", "rustc", "rustup", "xcodebuild", "xcrun", "zig")
 LINUX_WORKLOAD_TOOLS = ("git", "python3")
+# Free disk a macOS build host needs before admission: a base so a macOS update can download
+# and install, plus one cmux working set per concurrent build slot. A working set is at most
+# 15 GiB DerivedData for the app and test products (8.7 GiB was the largest app-only one
+# measured on Air Blue), the 3 GiB compilation-cache cap CI uses, about 3 GiB of packages and
+# 4 GiB of checkout or worktree. glaeda-disk keeps it there once admitted.
+MACOS_BASE_FREE_GIB = 25
+MACOS_SLOT_FREE_GIB = 25
+LINUX_MIN_FREE_GIB = 40
+
+
+def default_min_free_gib(platform_name: str, build_slots: int = 1) -> int:
+    if build_slots < 1:
+        raise ValueError("build slots must be at least 1")
+    if platform_name == "macos":
+        return MACOS_BASE_FREE_GIB + MACOS_SLOT_FREE_GIB * build_slots
+    return LINUX_MIN_FREE_GIB
 # CMUX publishes GhosttyKit at the repository root when setup takes the
 # prebuilt archive, and under the Ghostty submodule when it builds from source.
 CMUX_GHOSTTYKIT_LOCATIONS = (
@@ -640,7 +656,10 @@ def parser() -> argparse.ArgumentParser:
         type=Path,
         help="Existing operator-owned native build/cache root; path is never emitted",
     )
-    p.add_argument("--min-free-gib", type=int)
+    p.add_argument("--min-free-gib", type=int,
+                   help="override the free-disk admission floor (default: from --build-slots)")
+    p.add_argument("--build-slots", type=int, default=1,
+                   help="concurrent cmux builds this host runs (default 1: one runner)")
     return p
 
 
@@ -665,7 +684,9 @@ def main() -> int:
             raise BootstrapError(
                 "macOS native-build role requires --cache-root"
             )
-        minimum = args.min_free_gib or (120 if args.platform == "macos" else 40)
+        if args.build_slots < 1:
+            raise BootstrapError("build slots must be at least 1")
+        minimum = args.min_free_gib or default_min_free_gib(args.platform, args.build_slots)
         if minimum <= 0:
             raise BootstrapError("minimum free disk must be positive")
         observation = (
