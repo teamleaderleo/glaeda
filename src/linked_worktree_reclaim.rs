@@ -69,12 +69,22 @@ const OPERATION_MARKERS: [&str; 6] = [
     "rebase-apply",
 ];
 
-/// Per-worktree Git entries whose modification time records Git activity in that worktree.
+/// Per-worktree Git entry whose modification time records Git activity in that worktree.
 ///
 /// The index is deliberately absent: any tool running a plain `git status` rewrites it, so its
 /// mtime measures who looked rather than who worked, and staged changes already veto as tracked
-/// changes.
-const ACTIVITY_ENTRIES: [&str; 2] = ["HEAD", "logs/HEAD"];
+/// changes. So is the mtime of `logs/HEAD`: `git gc` (and `git maintenance run --auto`) runs
+/// `reflog expire --all`, which rewrites every worktree's reflog file. On a repository busy
+/// enough to keep gc running (Big Red, 2026-09-24: gc every ~30 s) every worktree looked active
+/// and a gc landing mid-run read as a future timestamp. The reflog's newest entry keeps the time
+/// Git wrote it, so activity comes from that instead.
+const ACTIVITY_ENTRY: &str = "HEAD";
+
+/// The per-worktree HEAD reflog, whose newest entry records the last HEAD move.
+const HEAD_REFLOG: &str = "logs/HEAD";
+
+/// How much of a reflog's end is read to find its newest entry.
+const REFLOG_TAIL_BYTES: u64 = 64 * 1024;
 
 /// `rev-list` selectors for the ref namespaces whose tips survive routine Git commands and so can
 /// preserve a commit: branches, tags, and remote-tracking refs.
@@ -1071,14 +1081,56 @@ fn last_activity_seconds(
     let mut newest = std::fs::symlink_metadata(checkout)
         .map_err(|_| unavailable())?
         .mtime();
-    for name in ACTIVITY_ENTRIES {
-        match std::fs::symlink_metadata(git_dir.join(name)) {
-            Ok(metadata) => newest = newest.max(metadata.mtime()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(unavailable()),
-        }
+    match std::fs::symlink_metadata(git_dir.join(ACTIVITY_ENTRY)) {
+        Ok(metadata) => newest = newest.max(metadata.mtime()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(unavailable()),
+    }
+    if let Some(entry) = newest_reflog_entry_seconds(&git_dir.join(HEAD_REFLOG))? {
+        newest = newest.max(entry);
     }
     Ok(newest)
+}
+
+/// Time of the newest entry in a reflog, `None` when it is absent or empty.
+///
+/// An entry is `<old> <new> <identity> <seconds> <zone>\t<message>`; the seconds are the
+/// second-to-last field before the tab. A tail that cannot be parsed is unobservable.
+fn newest_reflog_entry_seconds(path: &Path) -> Result<Option<i64>, LinkedWorktreeReclaimError> {
+    use std::io::{Seek as _, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(unavailable()),
+    };
+    let length = file.metadata().map_err(|_| unavailable())?.len();
+    let start = length.saturating_sub(REFLOG_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|_| unavailable())?;
+    let mut tail = Vec::new();
+    file.take(REFLOG_TAIL_BYTES)
+        .read_to_end(&mut tail)
+        .map_err(|_| unavailable())?;
+    parse_newest_reflog_entry(&tail)
+}
+
+fn parse_newest_reflog_entry(tail: &[u8]) -> Result<Option<i64>, LinkedWorktreeReclaimError> {
+    let Some(line) = tail
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find(|line| !line.is_empty())
+    else {
+        return Ok(None);
+    };
+    let header = line.split(|byte| *byte == b'\t').next().unwrap_or_default();
+    let mut fields = header.rsplit(|byte| *byte == b' ');
+    let _zone = fields.next();
+    let seconds = fields
+        .next()
+        .and_then(|field| std::str::from_utf8(field).ok())
+        .and_then(|field| field.parse::<i64>().ok())
+        .ok_or_else(unavailable)?;
+    Ok(Some(seconds))
 }
 
 // --- Execution -------------------------------------------------------------
@@ -1703,6 +1755,62 @@ mod tests {
         };
         let error = plan_linked_worktree_reclaim(&facts, policy(), NOW).expect_err("future");
         assert_eq!(error.code(), "future_timestamp");
+    }
+
+    #[test]
+    fn newest_reflog_entry_time_is_read_from_the_last_line() {
+        let zero = "0".repeat(40);
+        let one = "1".repeat(40);
+        let log = format!(
+            "{zero} {one} A U Thor <a@example.com> 1790000000 -0700\tclone: from x\n\
+             {one} {zero} A U Thor <a@example.com> 1790000100 +0000\tcheckout: moving\n"
+        );
+        assert_eq!(
+            parse_newest_reflog_entry(log.as_bytes()).unwrap(),
+            Some(1_790_000_100)
+        );
+        assert_eq!(parse_newest_reflog_entry(b"").unwrap(), None);
+        assert_eq!(parse_newest_reflog_entry(b"\n\n").unwrap(), None);
+        assert_eq!(
+            parse_newest_reflog_entry(b"garbage without a time\n")
+                .unwrap_err()
+                .code(),
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn rewriting_the_reflog_file_is_not_activity() {
+        let dir = std::env::temp_dir().join(format!(
+            "glaeda-reclaim-reflog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let checkout = dir.join("checkout");
+        let git_dir = dir.join("gitdir");
+        std::fs::create_dir_all(git_dir.join("logs")).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/x\n").unwrap();
+        let zero = "0".repeat(40);
+        std::fs::write(
+            git_dir.join("logs/HEAD"),
+            format!("{zero} {zero} A <a@b> 1000 +0000\tcommit: x\n"),
+        )
+        .unwrap();
+        let old = std::time::UNIX_EPOCH + Duration::from_secs(500);
+        for path in [&checkout, &git_dir.join("HEAD")] {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        // gc just rewrote logs/HEAD: its mtime is now, its newest entry is still 1000
+        let activity = last_activity_seconds(&git_dir, &checkout);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(activity.unwrap(), 1000);
     }
 
     #[test]
