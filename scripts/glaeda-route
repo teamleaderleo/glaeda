@@ -144,6 +144,9 @@ def build_state(pools_doc: Any, runners: Any, *, repo: str, now: float,
     observed = min(t for t in (fleet_at, github_at) if t is not None)
     labels = sorted((label for label in pools_doc["pools"] if pool_key(label)), key=pool_key)
     pools: dict[str, Any] = {}
+    # A runner that carries two pool labels (two verified Xcodes) is capacity in the first pool of
+    # the order only, so it is never offered to two runs at once.
+    counted: set[str] = set()
     for rank, label in enumerate(labels):
         entry = pools_doc["pools"][label]
         if not isinstance(entry, dict):
@@ -155,7 +158,9 @@ def build_state(pools_doc: Any, runners: Any, *, repo: str, now: float,
         mine = [row for row in rows if label in row["labels"]]
         online = [row for row in mine if row["online"]]
         busy = [row for row in online if row["busy"]]
-        idle = [row for row in online if not row["busy"] and member_of(row["name"]) in eligible]
+        idle = [row for row in online if not row["busy"] and member_of(row["name"]) in eligible
+                and row["name"] not in counted]
+        counted.update(row["name"] for row in idle)
         match = POOL_LABEL.fullmatch(label)
         pools[label] = {
             "class": match.group(1),
@@ -202,7 +207,8 @@ def validate_state(doc: Any, *, now: float, repo: str | None = None,
     if age > max_age:
         return False, f"pool state is stale ({int(age)} s old, limit {max_age} s)"
     pools, order = doc.get("pools"), doc.get("order")
-    if not isinstance(pools, dict) or not isinstance(order, list) or sorted(order) != sorted(pools):
+    if not isinstance(pools, dict) or not isinstance(order, list) or not all(isinstance(x, str) for x in order) \
+            or sorted(order) != sorted(pools):
         return False, "pool state is malformed (order and pools disagree)"
     for label, entry in pools.items():
         if not pool_key(str(label)) or not isinstance(entry, dict):

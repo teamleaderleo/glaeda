@@ -136,6 +136,14 @@ class StateTests(unittest.TestCase):
         doc = state(pools={"observed_at": NOW, "pools": {"glaeda-std-xcode-26.4": {}, STD: {}}})
         self.assertEqual(doc["order"], [STD, "glaeda-std-xcode-26.4"])
 
+    def test_runner_in_two_pools_is_idle_in_one_only(self):
+        both = {"name": "m1-glaeda", "status": "online", "busy": False,
+                "labels": [{"name": STD}, {"name": "glaeda-std-xcode-26.4"}]}
+        pools = {"observed_at": NOW, "pools": {STD: {"conforming": ["m1"]},
+                                               "glaeda-std-xcode-26.4": {"conforming": ["m1"]}}}
+        doc = gr.build_state(pools, {"runners": [both]}, repo=REPO, now=NOW)
+        self.assertEqual((doc["pools"][STD]["idle"], doc["pools"]["glaeda-std-xcode-26.4"]["idle"]), (1, 0))
+
     def test_malformed_inputs_fail(self):
         with self.assertRaises(gr.Failure):
             state(pools={"pools": []})
@@ -164,6 +172,7 @@ class ValidateTests(unittest.TestCase):
             lambda d: d.update(generated_at="2027-01-15"),
             lambda d: d.update(observed_at=None),
             lambda d: d.update(order=[STD]),
+            lambda d: d.update(order=[STD, 3]),
             lambda d: d["pools"][STD].update(idle=-1),
             lambda d: d["pools"][STD].update(idle=True),
             lambda d: d["pools"][STD].update(idle=9),
