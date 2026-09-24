@@ -4,6 +4,7 @@
     glaeda-disk                     report: biggest items, verdicts, reclaimable total
     glaeda-disk --apply             delete every reclaimable item, largest first
     glaeda-disk --pressure --apply  act only under disk pressure, stop at the free target
+    glaeda-disk --low 15% --target 25%  thresholds as GiB free or as a share of each filesystem
     glaeda-disk --refresh           re-measure every size now instead of using the snapshot
     glaeda-disk --dedupe            store identical Xcode package/module files once (APFS clones)
 
@@ -23,6 +24,9 @@ ever deleted. Everything else is reported so the space is at least visible.
 An item is never deleted while a process has its cwd inside it, a process command
 line names it, it holds a git checkout, or it changed within the idle window.
 Every deletion is appended to a JSONL receipt.
+
+Free space is judged per filesystem. On Linux /tmp is often its own tmpfs, so pressure there
+reclaims only /tmp items, and pressure on the home filesystem never deletes from /tmp.
 """
 
 from __future__ import annotations
@@ -58,11 +62,29 @@ class Family:
     rebuild: str
     depth: int = 1  # candidates are directories this many levels below root
     skip: tuple[str, ...] = ()
+    # when set, candidates are directories with this name found up to `depth` levels below
+    # root (the first match on a path wins), instead of every directory exactly `depth` down
+    match: str = ""
+    marker: str = ""  # with match: the candidate must also contain this file
+
+
+WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
+
+
+def worktree_roots(projects: Path) -> list[Path]:
+    """Worktree parents under ~/Projects: the fixed names plus any `<name>-worktrees`."""
+    names = set(WORKTREE_DIRS)
+    for c in _children(projects):
+        if c.name.endswith("-worktrees") and c.is_dir() and not c.is_symlink():
+            names.add(c.name)
+    return [projects / n for n in sorted(names)]
 
 
 def default_families() -> list[Family]:
     tmp = Path("/private/tmp") if DARWIN else Path("/tmp")
     uid = os.getuid()
+    projects = HOME / "Projects"
+    wt_roots = worktree_roots(projects)
     fams = [
         Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
                "next xcodebuild rebuilds it"),
@@ -75,12 +97,17 @@ def default_families() -> list[Family]:
         Family("library-caches", HOME / "Library/Caches", False, "app caches (report only)"),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
                "use `xcrun simctl delete unavailable` (report only)"),
-        Family("projects", HOME / "Projects", False, "checkouts (report only)",
-               skip=("worktrees", "cmux-worktrees", "glaeda-worktrees")),
+        Family("projects", projects, False, "checkouts (report only)",
+               skip=tuple(r.name for r in wt_roots)),
     ]
-    for name in ("worktrees", "cmux-worktrees", "glaeda-worktrees"):
-        fams.append(Family("worktrees", HOME / "Projects" / name, False,
+    for root in wt_roots:
+        fams.append(Family("worktrees", root, False,
                            "run glaeda-worktree-reclaim-all (report only)"))
+    # Cargo owns target validity and RFC #1137 owns Cargo reclaim, so this is visibility only.
+    # Sizes here are also counted inside their checkout under projects or worktrees.
+    fams.append(Family("cargo-target", projects, False,
+                       "report only: cargo clean; also counted in its checkout",
+                       depth=4, match="target", marker="CACHEDIR.TAG"))
     return [f for f in fams if f.root.is_dir()]
 
 
@@ -159,6 +186,8 @@ def process_evidence() -> tuple[list[str], str]:
                     opened.append(os.readlink(link))
                 except OSError:
                     pass
+        if not opened:  # at least this process has a cwd, so empty means /proc is unusable
+            raise NoEvidence("/proc showed no open paths")
     else:
         lsof = shutil.which("lsof") or "/usr/sbin/lsof"
         try:
@@ -199,10 +228,22 @@ def in_cwd(path: str, opened: list[str]) -> bool:
     return any(o == sp or o.startswith(sp + "/") for sp in spellings(path) for o in opened)
 
 
+def claude_config_dirs() -> list[Path]:
+    """~/.claude plus alternate config dirs (~/.claude-<account>, $CLAUDE_CONFIG_DIR)."""
+    dirs = [HOME / ".claude", *sorted(HOME.glob(".claude-*"))]
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        dirs.append(Path(os.environ["CLAUDE_CONFIG_DIR"]))
+    return [d for d in dirs if d.is_dir()]
+
+
 def claude_session_active(session_id: str, idle_s: float) -> bool:
-    for transcript in (HOME / ".claude/projects").glob(f"*/{session_id}.jsonl"):
-        if time.time() - transcript.stat().st_mtime < idle_s:
-            return True
+    for config in claude_config_dirs():
+        for transcript in (config / "projects").glob(f"*/{session_id}.jsonl"):
+            try:
+                if time.time() - transcript.stat().st_mtime < idle_s:
+                    return True
+            except OSError:
+                continue
     return False
 
 
@@ -259,11 +300,67 @@ def _children(path: Path) -> list[Path]:
         return []
 
 
-def candidates(fam: Family) -> list[Path]:
+def holds_socket(path: Path, levels: int = 2, budget: int = 3000) -> bool:
+    """True when a Unix socket sits up to `levels` below path (tmux, ssh-agent, X11, IDE servers).
+
+    /proc shows a socket a process holds as socket:[inode], not as a path, so neither the open
+    file nor the command line check sees it. A directory holding one is treated as in use.
+    """
+    frontier = [str(path)]
+    for _ in range(levels):
+        nxt: list[str] = []
+        for d in frontier:
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        budget -= 1
+                        if budget < 0:
+                            return False
+                        try:
+                            st = e.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if stat.S_ISSOCK(st.st_mode):
+                            return True
+                        if stat.S_ISDIR(st.st_mode):
+                            nxt.append(e.path)
+            except OSError:
+                pass
+        frontier = nxt
+    return False
+
+
+SEARCH_SKIP = REPRODUCIBLE_DIRS | {".git"}
+
+
+def _search(fam: Family, budget: int = 20000) -> list[Path]:
+    found: list[Path] = []
     level = [fam.root]
     for _ in range(fam.depth):
-        level = [c for p in level for c in _children(p)
-                 if c.name not in fam.skip and c.is_dir() and not c.is_symlink()]
+        nxt: list[Path] = []
+        for p in level:
+            for c in _children(p):
+                budget -= 1
+                if budget < 0:
+                    return found
+                if c.name in fam.skip or c.is_symlink() or not c.is_dir():
+                    continue
+                if c.name == fam.match and (not fam.marker or (c / fam.marker).exists()):
+                    found.append(c)
+                elif c.name not in SEARCH_SKIP:
+                    nxt.append(c)
+        level = nxt
+    return found
+
+
+def candidates(fam: Family) -> list[Path]:
+    if fam.match:
+        level = _search(fam)
+    else:
+        level = [fam.root]
+        for _ in range(fam.depth):
+            level = [c for p in level for c in _children(p)
+                     if c.name not in fam.skip and c.is_dir() and not c.is_symlink()]
     uid = os.getuid()
     owned = []
     for p in level:
@@ -336,6 +433,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence) -> list[Item]:
             reasons.append("named by a running command")
         if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_hours * 3600):
             reasons.append("claude session active")
+        if fam.reclaimable and holds_socket(path):
+            reasons.append("holds a socket")
         if not fam.reclaimable:
             verdict = "report-only"
         elif reasons:
@@ -358,28 +457,75 @@ def free_bytes(path: Path) -> tuple[int, int]:
     return u.free, u.total
 
 
+def space(spec: str, total: int) -> int:
+    """A threshold as bytes: "60" is 60 GiB, "15%" is 15% of this filesystem's size."""
+    spec = str(spec).strip()
+    if spec.endswith("%"):
+        return int(total * float(spec[:-1]) / 100)
+    return int(float(spec) * GIB)
+
+
+def mount_point(path: Path) -> Path:
+    path = Path(os.path.realpath(path))
+    dev = path.stat().st_dev
+    while path.parent != path and path.parent.stat().st_dev == dev:
+        path = path.parent
+    return path
+
+
+@dataclass
+class Fs:
+    dev: int
+    mount: str
+    free: int
+    total: int
+    low: int
+    target: int
+
+    @property
+    def under(self) -> bool:
+        return self.free < self.low
+
+
+def filesystems(fams: list[Family], low: str, target: str) -> dict[int, Fs]:
+    out: dict[int, Fs] = {}
+    for f in fams:
+        dev = f.root.stat().st_dev
+        if dev not in out:
+            free, total = free_bytes(f.root)
+            out[dev] = Fs(dev, str(mount_point(f.root)), free, total,
+                          space(low, total), space(target, total))
+    return out
+
+
 def gib(n: int) -> str:
     return f"{n / GIB:6.1f}G"
 
 
-def report(items: list[Item], free: int, total: int, limit: int, idle_hours: float) -> None:
-    print(f"free {gib(free).strip()} of {gib(total).strip()} "
-          f"({100 * free / total:.0f}%), idle window {idle_hours:g}h\n")
+def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
+           notes: dict[str, str] | None = None) -> None:
+    for fs in fss:
+        print(f"free {gib(fs.free).strip()} of {gib(fs.total).strip()} "
+              f"({100 * fs.free / max(fs.total, 1):.0f}%) on {fs.mount}, pressure below "
+              f"{gib(fs.low).strip()}{' (under pressure)' if fs.under else ''}")
+    print(f"idle window {idle_hours:g}h\n")
     by_fam: dict[str, int] = {}
     for i in items:
         by_fam[i.family] = by_fam.get(i.family, 0) + i.bytes
     print("by family")
     for fam, n in sorted(by_fam.items(), key=lambda kv: -kv[1]):
         r = sum(i.bytes for i in items if i.family == fam and i.verdict == "reclaimable")
-        print(f"  {gib(n)}  {fam:20s}  reclaimable {gib(r).strip()}")
+        note = f"  ({notes[fam]})" if notes and fam in notes else ""
+        print(f"  {gib(n)}  {fam:20s}  reclaimable {gib(r).strip()}{note}")
     print(f"\ntop {limit}")
     for i in items[:limit]:
         why = f" ({', '.join(i.reasons)})" if i.reasons else ""
         path = i.path.replace(str(HOME), "~")
         print(f"  {gib(i.bytes)}  {i.verdict:12s} {i.idle_hours:6.1f}h  {path}{why}")
     for u in sorted(UNREADABLE):
-        print(f"\ncannot read {u}: permission denied (background jobs need Full Disk Access for "
-              f"{os.path.realpath(sys.executable)})", file=sys.stderr)
+        hint = (f"background jobs need Full Disk Access for {os.path.realpath(sys.executable)}"
+                if DARWIN else f"not readable by uid {os.getuid()}; its items are skipped")
+        print(f"\ncannot read {u}: permission denied ({hint})", file=sys.stderr)
     total_r = sum(i.bytes for i in items if i.verdict == "reclaimable")
     print(f"\nreclaimable now: {gib(total_r).strip()}  ->  glaeda-disk --apply")
 
@@ -401,7 +547,9 @@ def _chmod_retry(func, p, _exc):  # read-only files in SwiftPM/Xcode checkouts
 
 
 def apply(items: list[Item], families: dict[str, Family], receipt: Path,
-          stop_free: int | None, fs: Path, idle_hours: float) -> int:
+          targets: dict[int, int] | None, idle_hours: float) -> int:
+    """Delete reclaimable items, largest first. With `targets` (filesystem device -> free bytes
+    to stop at), only items on those filesystems are touched, each until its own target."""
     receipt.parent.mkdir(parents=True, exist_ok=True)
     released = 0
     try:
@@ -412,12 +560,16 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     for i in items:
         if i.verdict != "reclaimable":
             continue
-        free, _ = free_bytes(fs)
-        if stop_free is not None and free >= stop_free:
-            break
         p = Path(i.path)
+        if targets is not None:
+            try:
+                dev = p.parent.stat().st_dev
+            except OSError:
+                continue
+            if dev not in targets or free_bytes(p.parent)[0] >= targets[dev]:
+                continue
         # fresh re-observation right before the destructive step
-        if in_cwd(i.path, cwds) or named_by(i.path, cmds):
+        if in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p):
             outcome = "changed:in-use"
         elif (time.time() - newest_mtime(p)) / 3600 < idle_hours:
             outcome = "changed:modified"
@@ -569,8 +721,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--apply", action="store_true", help="delete reclaimable items")
     ap.add_argument("--pressure", action="store_true",
                     help="only act when free space is below --low; stop at --target")
-    ap.add_argument("--low", type=float, default=60, help="pressure threshold, GiB free (default 60)")
-    ap.add_argument("--target", type=float, default=100, help="stop freeing at this many GiB free (default 100)")
+    low, target = ("60", "100") if DARWIN else ("10%", "20%")
+    ap.add_argument("--low", default=low,
+                    help="pressure threshold per filesystem, GiB free or N%% of its size "
+                         "(default %(default)s)")
+    ap.add_argument("--target", default=target,
+                    help="stop freeing at this much free, GiB or N%% (default %(default)s)")
     ap.add_argument("--idle-hours", type=float, default=None,
                     help="idle window (default 24h, or 6h under pressure)")
     ap.add_argument("--family", action="append", help="limit to these family ids")
@@ -598,11 +754,10 @@ def main(argv: list[str] | None = None) -> int:
                 for f in fams]
     if a.family:
         fams = [f for f in fams if f.id in a.family]
-    fs = fams[0].root if fams else HOME
     if a.dedupe:
         dd = next((f.root for f in fams if f.id == "xcode-derived-data"), None)
         if dd is None or not DARWIN:
-            print("nothing to dedupe (no Xcode DerivedData)")
+            print("nothing to dedupe (APFS clones of Xcode DerivedData are macOS only)")
             return 0
         before, _ = free_bytes(dd)
         started = time.time()
@@ -617,11 +772,19 @@ def main(argv: list[str] | None = None) -> int:
                 break
             time.sleep(a.settle_minutes * 60)
         return 0
-    free, total = free_bytes(fs)
-    under = free < a.low * GIB
-    if a.pressure and not under:
-        print(f"no pressure: {gib(free).strip()} free >= {a.low:g}G")
-        return 0
+    try:
+        fss = filesystems(fams, a.low, a.target) if fams else filesystems(
+            [Family("home", HOME, False, "")], a.low, a.target)
+    except ValueError:
+        ap.error(f"--low/--target take GiB or N%: {a.low!r}, {a.target!r}")
+    under = any(fs.under for fs in fss.values())
+    if a.pressure:
+        if not under:
+            for fs in fss.values():
+                print(f"no pressure: {gib(fs.free).strip()} free >= {gib(fs.low).strip()} on {fs.mount}")
+            return 0
+        # only families on a filesystem under pressure are surveyed or touched
+        fams = [f for f in fams if fss[f.root.stat().st_dev].under]
     idle = a.idle_hours if a.idle_hours is not None else (6 if under else 24)
     at, known = (0.0, {}) if a.refresh or a.no_snapshot else load_snapshot()
     if a.apply:
@@ -655,15 +818,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"sizes from {age_min:.0f} min ago"
               f"{' (refreshing in background)' if age_min > a.max_age and not a.apply else ''};"
               " verdicts are live\n")
+    shown = [fs for fs in fss.values() if not a.pressure or fs.under]
     if a.json:
-        print(json.dumps({"free": free, "total": total, "idle_hours": idle,
+        print(json.dumps({"free": shown[0].free, "total": shown[0].total, "idle_hours": idle,
+                          "filesystems": [asdict(fs) for fs in shown],
                           "items": [asdict(i) for i in items]}, indent=2))
     else:
-        report(items, free, total, a.top, idle)
+        report(items, shown, a.top, idle,
+               {f.id: f.rebuild for f in fams if f.id == "cargo-target"})
     if a.apply:
         print()
         apply(items, {f.id: f for f in fams}, a.receipt,
-              int(a.target * GIB) if a.pressure else None, fs, idle)
+              {fs.dev: fs.target for fs in shown} if a.pressure else None, idle)
     return 0
 
 

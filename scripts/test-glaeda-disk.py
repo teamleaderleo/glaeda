@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import contextlib
+import io
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -74,7 +77,7 @@ class GlaedaDiskTest(unittest.TestCase):
         items = gd.survey([self.fam], 24, 0)
         self.assertEqual(items[0].verdict, "report-only")
         receipt = self.root.parent / f"{self.root.name}-receipt.jsonl"
-        gd.apply(items, {"user-cache": self.fam}, receipt, None, self.root, 24)
+        gd.apply(items, {"user-cache": self.fam}, receipt, None, 24)
         self.assertTrue((self.root / "cache").exists())
         self.assertFalse(receipt.exists())
 
@@ -83,7 +86,7 @@ class GlaedaDiskTest(unittest.TestCase):
         receipt = self.root.parent / f"{self.root.name}-receipt.jsonl"
         try:
             items = gd.survey([self.fam], 24, 0)
-            gd.apply(items, {self.fam.id: self.fam}, receipt, None, self.root, 24)
+            gd.apply(items, {self.fam.id: self.fam}, receipt, None, 24)
             self.assertFalse((self.root / "old").exists())
             self.assertIn('"outcome": "reclaimed"', receipt.read_text())
         finally:
@@ -95,7 +98,7 @@ class GlaedaDiskTest(unittest.TestCase):
         (d / "fresh").write_text("x")
         receipt = self.root.parent / f"{self.root.name}-receipt.jsonl"
         try:
-            gd.apply(items, {self.fam.id: self.fam}, receipt, None, self.root, 24)
+            gd.apply(items, {self.fam.id: self.fam}, receipt, None, 24)
             self.assertTrue(d.exists())
             self.assertIn("changed:modified", receipt.read_text())
         finally:
@@ -138,7 +141,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(items[0].verdict, "in-use")
         forced = [gd.Item(i.family, i.path, i.bytes, i.idle_hours, "reclaimable") for i in items]
         receipt = self.root.parent / f"{self.root.name}-receipt.jsonl"
-        gd.apply(forced, {self.fam.id: self.fam}, receipt, None, self.root, 24)
+        gd.apply(forced, {self.fam.id: self.fam}, receipt, None, 24)
         self.assertTrue((self.root / "old").exists())
 
     def test_remove_never_chmods_through_symlinks(self) -> None:
@@ -171,6 +174,145 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.load_snapshot(snap)[1], {"/a": 1})
         snap.write_text("{not json")
         self.assertEqual(gd.load_snapshot(snap), (0.0, {}))
+
+    def receipt(self) -> Path:
+        r = self.root.parent / f"{self.root.name}-receipt.jsonl"
+        self.addCleanup(r.unlink, missing_ok=True)
+        return r
+
+    def test_help_renders(self) -> None:  # argparse %-formats help; a bare % breaks it
+        with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as e:
+            gd.main(["--help"])
+        self.assertEqual(e.exception.code, 0)
+        self.assertIn("--low", out.getvalue())
+
+    def test_thresholds_take_gib_or_percent(self) -> None:
+        self.assertEqual(gd.space("60", 10**15), 60 * 1024**3)
+        self.assertEqual(gd.space("15%", 1000), 150)
+        self.assertEqual(gd.space("2.5", 0), int(2.5 * 1024**3))
+        with self.assertRaises(ValueError):
+            gd.space("lots", 1000)
+
+    def test_pressure_targets_are_per_filesystem(self) -> None:
+        make(self.root / "old")
+        items = gd.survey([self.fam], 24, 0)
+        fams = {self.fam.id: self.fam}
+        dev = self.root.stat().st_dev
+        # this filesystem is not under pressure: nothing on it may go
+        gd.apply(items, fams, self.receipt(), {dev + 1: 1 << 62}, 24)
+        self.assertTrue((self.root / "old").exists())
+        # under pressure but already at its free target: stop before deleting
+        gd.apply(items, fams, self.receipt(), {dev: 0}, 24)
+        self.assertTrue((self.root / "old").exists())
+        gd.apply(items, fams, self.receipt(), {dev: 1 << 62}, 24)
+        self.assertFalse((self.root / "old").exists())
+
+    def test_filesystems_group_roots_and_apply_thresholds(self) -> None:
+        other = gd.Family("tmp", self.root, True, "scratch")
+        fss = gd.filesystems([self.fam, other], "0", "100%")
+        self.assertEqual(len(fss), 1)
+        fs = next(iter(fss.values()))
+        self.assertFalse(fs.under)
+        self.assertEqual(fs.target, fs.total)
+        self.assertEqual(gd.filesystems([self.fam], "100%", "100%")[fs.dev].low, fs.total)
+
+    def test_directory_holding_a_socket_is_in_use(self) -> None:
+        d = make(self.root / "tmux-1000")
+        make(self.root / "plain")
+        sock = socket.socket(socket.AF_UNIX)
+        self.addCleanup(sock.close)
+        sock.bind(str(d / "default"))
+        os.utime(d, (time.time() - 48 * 3600,) * 2)
+        v = self.verdicts()
+        self.assertEqual(v["tmux-1000"], "in-use")
+        self.assertEqual(v["plain"], "reclaimable")
+        forced = [gd.Item("xcode-derived-data", str(d), 1, 48, "reclaimable")]
+        receipt = self.receipt()
+        gd.apply(forced, {self.fam.id: self.fam}, receipt, None, 24)
+        self.assertTrue(d.exists())
+        self.assertIn("changed:in-use", receipt.read_text())
+
+    def test_cargo_target_search_is_report_only(self) -> None:
+        fam = gd.Family("cargo-target", self.root, False, "cargo clean", depth=4,
+                        match="target", marker="CACHEDIR.TAG")
+        for rel in ("glaeda/target", "wts/branch/target", "mono/crates/cli/target"):
+            make(self.root / rel)
+            (self.root / rel / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55")
+        make(self.root / "site/target")  # not Cargo: no CACHEDIR.TAG
+        (self.root / "web/node_modules/pkg/target").mkdir(parents=True)
+        (self.root / "web/node_modules/pkg/target/CACHEDIR.TAG").write_text("x")
+        (self.root / "glaeda/target/debug/target").mkdir(parents=True)  # never searched inside a match
+        (self.root / "glaeda/target/debug/target/CACHEDIR.TAG").write_text("x")
+        found = sorted(str(p.relative_to(self.root)) for p in gd.candidates(fam))
+        self.assertEqual(found, ["glaeda/target", "mono/crates/cli/target", "wts/branch/target"])
+        items = gd.survey([fam], 24, 0)
+        self.assertEqual({i.verdict for i in items}, {"report-only"})
+        receipt = self.receipt()
+        gd.apply(items, {fam.id: fam}, receipt, None, 24)
+        self.assertTrue((self.root / "glaeda/target").exists())
+        self.assertFalse(receipt.exists())
+
+
+class LinuxLayoutTest(unittest.TestCase):
+    """The Linux layout, checked on every platform by pointing HOME and DARWIN at a fake host."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd.DARWIN)
+        gd.HOME, gd.DARWIN = self.home, False
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.DARWIN = self.saved
+        gd.UNREADABLE.clear()
+        self.tmp.cleanup()
+
+    def test_linux_families(self) -> None:
+        for rel in ("Projects/glaeda", "Projects/glaeda-worktrees/a", "Projects/botany-sim-worktrees/b",
+                    ".cache/pip"):
+            (self.home / rel).mkdir(parents=True)
+        fams = gd.default_families()
+        by_id: dict[str, list[Path]] = {}
+        for f in fams:
+            by_id.setdefault(f.id, []).append(f.root)
+        self.assertEqual(by_id["tmp"], [Path("/tmp")])
+        self.assertNotIn("library-caches", by_id)
+        self.assertNotIn("xcode-derived-data", by_id)
+        self.assertEqual(sorted(p.name for p in by_id["worktrees"]),
+                         ["botany-sim-worktrees", "glaeda-worktrees"])
+        reclaimable = {f.id for f in fams if f.reclaimable}
+        self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad"})
+        projects = next(f for f in fams if f.id == "projects")
+        self.assertIn("botany-sim-worktrees", projects.skip)
+        tmp = next(f for f in fams if f.id == "tmp")
+        self.assertIn(f"claude-{os.getuid()}", tmp.skip)
+
+    def test_claude_session_seen_in_alternate_config_dir(self) -> None:
+        t = self.home / ".claude-outlook/projects/-home-leo-Projects/abc-123.jsonl"
+        t.parent.mkdir(parents=True)
+        t.write_text("{}")
+        self.assertTrue(gd.claude_session_active("abc-123", 3600))
+        self.assertFalse(gd.claude_session_active("other", 3600))
+
+    def test_unreadable_message_names_no_full_disk_access_on_linux(self) -> None:
+        gd.UNREADABLE.add("/tmp/locked")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            gd.report([], [], 5, 24)
+        self.assertIn("cannot read /tmp/locked", err.getvalue())
+        self.assertNotIn("Full Disk Access", err.getvalue())
+
+    def test_linux_paths_have_one_spelling(self) -> None:
+        self.assertEqual(gd.spellings("/tmp/claude-1000/x"), ["/tmp/claude-1000/x"])
+        self.assertTrue(gd.named_by("/tmp/claude-1000/x", "cargo build --target-dir /tmp/claude-1000/x/t\n"))
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "reads /proc")
+class ProcEvidenceTest(unittest.TestCase):
+    def test_proc_evidence_sees_own_cwd(self) -> None:
+        opened, cmds = gd.process_evidence()
+        self.assertIn(os.getcwd(), opened)
+        self.assertTrue(cmds.strip())
 
 
 @unittest.skipUnless(sys.platform == "darwin", "APFS clones are macOS only")
