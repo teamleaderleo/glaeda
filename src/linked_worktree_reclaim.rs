@@ -100,8 +100,8 @@ const PER_WORKTREE_REF_PATTERNS: [&str; 3] = ["refs/worktree/", "refs/bisect/", 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkState {
-    /// HEAD moved since the worktree was created, and the result is in a remote's default branch
-    /// or every file it changed is already identical there (a squash merge).
+    /// The worktree made a commit of its own, and HEAD is in a remote's default branch or every
+    /// file it changed is already identical there (a squash merge).
     Finished,
     /// Anything else, including every case the checks could not settle.
     InProgress,
@@ -527,8 +527,8 @@ const MAX_FINISHED_COMPARE_PATHS: usize = 512;
 
 /// Decide whether `commit` has landed.
 ///
-/// A worktree whose HEAD is still where it was created did nothing yet, however recently that
-/// commit reached a default branch, so it stays in progress. An upstream marked `[gone]` is not
+/// A worktree that never made a commit of its own did nothing yet, however recently what it
+/// checked out reached a default branch, so it stays in progress. An upstream marked `[gone]` is not
 /// used: follow-up commits after the remote branch was deleted are common. Every question is asked
 /// from the main worktree, and any failure answers "in progress", which only keeps the worktree
 /// longer.
@@ -536,10 +536,10 @@ fn observe_work_state(
     observer: &ProjectCheckoutObserver,
     repository: &Path,
     commit: &str,
-    created_at: Option<&str>,
+    authored: bool,
     executor: &impl TimedCommandExecutor,
 ) -> WorkState {
-    if created_at.is_none_or(|created| created == commit) {
+    if !authored {
         return WorkState::InProgress;
     }
     let run = |arguments: &[&str]| observer.git(repository, arguments, executor).ok();
@@ -588,16 +588,31 @@ fn observe_work_state(
     WorkState::InProgress
 }
 
-/// The commit a worktree was created at: the new id of the oldest entry in its HEAD reflog.
-/// `None` when the reflog is absent, empty or unreadable.
-fn creation_commit(git_dir: &Path) -> Option<String> {
-    let text = std::fs::read(git_dir.join(HEAD_REFLOG)).ok()?;
-    let first = text
-        .split(|byte| *byte == b'\n')
-        .find(|line| !line.is_empty())?;
-    let new = first.split(|byte| *byte == b' ').nth(1)?;
-    let new = std::str::from_utf8(new).ok()?;
-    (new.len() >= 40 && new.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| new.to_owned())
+/// Whether this worktree made a commit of its own, according to its HEAD reflog.
+///
+/// Moving HEAD by syncing (`merge --ff-only`, `pull` fast-forward, `reset`, `checkout`) is not
+/// work: such a worktree would otherwise look finished as soon as main contains what it synced to.
+/// An expired or unreadable reflog answers `false`, which only keeps the worktree longer.
+fn authored_work(git_dir: &Path) -> bool {
+    let Ok(text) = std::fs::read(git_dir.join(HEAD_REFLOG)) else {
+        return false;
+    };
+    text.split(|byte| *byte == b'\n').any(|line| {
+        let Some(tab) = line.iter().position(|byte| *byte == b'\t') else {
+            return false;
+        };
+        let subject = &line[tab + 1..];
+        let fast_forward = subject.windows(12).any(|window| window == b"Fast-forward");
+        [
+            &b"commit"[..],
+            b"cherry-pick",
+            b"revert",
+            b"rebase (finish)",
+        ]
+        .iter()
+        .any(|action| subject.starts_with(action))
+            || ((subject.starts_with(b"merge ") || subject.starts_with(b"pull")) && !fast_forward)
+    })
 }
 
 // --- Observation -----------------------------------------------------------
@@ -878,7 +893,7 @@ fn observe_detailed(
         observer,
         &inventory.repository,
         &head,
-        creation_commit(&git_dir).as_deref(),
+        authored_work(&git_dir),
         executor,
     );
 

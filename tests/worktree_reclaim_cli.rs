@@ -256,6 +256,18 @@ fn work_state_picks_the_window_and_a_working_process_vetoes() {
     fixture.add("fresh");
     fixture.age_by("fresh", 2 * 60 * 60);
 
+    // Only synced to main (fast-forward), never committed: not finished either.
+    let synced = fixture.add("synced");
+    git(&synced, &["reset", "-q", "--hard", "HEAD~1"]);
+    git(&synced, &["merge", "--ff-only", "main"]);
+    let reflog = fs::read_to_string(fixture.main.join(".git/worktrees/synced/logs/HEAD"))
+        .expect("synced reflog");
+    assert!(
+        reflog.contains("Fast-forward"),
+        "the sync really moved HEAD"
+    );
+    fixture.age_by("synced", 2 * 60 * 60);
+
     // Renamed tracked.txt to renamed.txt; main gained renamed.txt but kept tracked.txt.
     let renamed = fixture.add("renamed");
     git(&renamed, &["mv", "tracked.txt", "renamed.txt"]);
@@ -317,7 +329,7 @@ fn work_state_picks_the_window_and_a_working_process_vetoes() {
         serde_json::json!(["recently_active"])
     );
 
-    for name in ["fresh", "renamed"] {
+    for name in ["fresh", "synced", "renamed"] {
         let worktree = by_name(name);
         assert_eq!(worktree["facts"]["work_state"], "in_progress", "{name}");
         assert_eq!(
