@@ -242,6 +242,24 @@ class MiniSetupTest(unittest.TestCase):
         self.assertTrue(disk.exists())
         self.assertFalse((self.home / ".local/bin/glaeda-worktree-reclaim-all").exists())
 
+    def test_blocked_rerun_keeps_ownership_of_earlier_install(self) -> None:
+        self.invoke("--apply")
+        self.reclaim.unlink()  # the re-run cannot find --reclaim-binary
+        rerun = self.invoke("--apply")
+        by_path = {a.get("path"): a for a in rerun["actions"]}
+        binary = self.home / ".local/bin/glaeda-worktree-reclaim"
+        agent = self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.worktree-reclaim.plist"
+        for path in (binary, agent):
+            self.assertEqual(by_path[os.fspath(path)]["state"], "blocked")
+            self.assertTrue(by_path[os.fspath(path)]["owned"], path)
+        self.invoke("--apply")  # a second blocked run must not lose it either
+        plan = self.invoke("--uninstall", "--apply")
+        states = {a.get("path"): a["state"] for a in plan["actions"]}
+        self.assertEqual(states[os.fspath(binary)], "remove")
+        self.assertEqual(states[os.fspath(agent)], "remove")
+        self.assertFalse(binary.exists())
+        self.assertFalse(agent.exists())
+
     def test_reclaim_agent_blocked_without_binary(self) -> None:
         self.reclaim.unlink()
         receipt = self.invoke("--apply")

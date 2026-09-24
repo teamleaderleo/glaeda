@@ -437,7 +437,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
 
     reclaim_act = actions[-1]
     prior_receipt = load_receipt(ctx) or {}
-    owned_files = {a.get("path"): a.get("sha256") for a in prior_receipt.get("actions", [])
+    owned_files = {a.get("path"): a.get("ownedSha256") or a.get("sha256") for a in prior_receipt.get("actions", [])
                    if a.get("kind") in {"tool", "agent"} and a.get("owned")}
     for label, doc in agent_plists(ctx).items():
         dest = ctx.agents / f"{label}.plist"
@@ -462,10 +462,13 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
 
     # owned: this command wrote the file (now or on an earlier run) and it is still those bytes.
     # A file that was already identical before the first install is never owned, so never removed.
+    # Ownership follows the bytes on disk, not this run's outcome: a blocked or failed step
+    # (missing cargo, missing --reclaim-binary) must not orphan a file an earlier run installed.
     for act in actions:
         if act["kind"] in {"tool", "agent"}:
             recorded = owned_files.get(act["path"])
-            act["owned"] = act["state"] == "unchanged" and recorded is not None and recorded == act.get("sha256")
+            act["owned"] = recorded is not None and recorded == act.get("previousSha256")
+            act["ownedSha256"] = recorded if act["owned"] else None
 
     # /usr/bin/git is an install-dialog stub until the Command Line Tools (or Xcode) exist.
     git_ok = which("git") is not None and (
@@ -498,7 +501,7 @@ def load_receipt(ctx: Context) -> dict[str, Any] | None:
 def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
     receipt = load_receipt(ctx)
     # Only files this command wrote (create or update, carried forward as "owned") are removable.
-    installed = {a["path"]: a.get("sha256") for a in (receipt or {}).get("actions", [])
+    installed = {a["path"]: a.get("ownedSha256") or a.get("sha256") for a in (receipt or {}).get("actions", [])
                  if a.get("kind") in {"tool", "agent"} and a.get("owned")}
     git_set = {a["key"]: a["value"] for a in (receipt or {}).get("actions", [])
                if a.get("kind") == "git" and a.get("owned")}
@@ -617,6 +620,7 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
                 act["loaded"] = False
             write_atomic(dest, data, int(act["mode"], 8))
             act["applied"] = act["owned"] = True
+            act["ownedSha256"] = act["sha256"]
         if kind == "agent" and state in {"create", "update", "unchanged"} and not ctx.skip_launchctl and not act.get("loaded"):
             code, out = bootstrap(ctx, act["path"])
             act["bootstrapped"] = code == 0
