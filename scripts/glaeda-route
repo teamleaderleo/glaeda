@@ -54,6 +54,7 @@ import datetime as dt
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -98,11 +99,23 @@ STATES = ("held", "rescuing", "released", "rescued", "failed")
 LIVE_STATES = ("held", "rescuing")
 TRUSTED_EVENTS = ("pull_request", "push", "merge_group", "schedule", "workflow_dispatch")
 MAX_SLOTS = 10
+# Overflow load: running and queued jobs per Blacksmith label, from the repository's in-flight runs.
+# A run's jobs are re-listed only when its updated_at moves, so a quiet tick costs two requests.
+OVERFLOW_PREFIX = "blacksmith-"
+OVERFLOW_RUN_LOOKUPS = 10
+# A cached run's jobs are listed again after this long even when its updated_at has not moved,
+# since a job taking a runner is not documented to touch the run.
+OVERFLOW_RELIST_SECONDS = 150
+# Overflow listing stops while the credential has fewer requests than this left, so the rescue
+# watch that shares it always has budget.
+OVERFLOW_RATE_FLOOR = 1500
+OVERFLOW_STATUSES = ("queued", "in_progress")
 # A reservation holds its slots until its jobs start; the agent releases it sooner. The hold only
 # bounds a reservation the agent never saw.
 HOLD_SECONDS = 900
-# A pool job queued this long with no runner is rescued (cmux#14234's budget).
-RESCUE_SECONDS = 90
+# A pool job queued this long with no runner is rescued. cmux runs its own rescue at 30 s
+# (CI_OWNED_POOL_RESCUE_SECONDS); an idle owned runner picks a job up within a few seconds.
+RESCUE_SECONDS = 30
 FORCE_CANCEL_SECONDS = 90
 CANCEL_GIVE_UP_SECONDS = 180
 KEEP_SECONDS = 3600
@@ -111,6 +124,9 @@ WATCH_LIMIT_SECONDS = 2 * 3600
 MAX_RESERVATIONS = 400
 CAS_ATTEMPTS = 4
 ROUTE_DEADLINE_SECONDS = 12
+# Wall-clock limit on the whole route command, token minting included: past it the caller's default
+# is answered, so a hung openssl or socket read never fails the asking job.
+ROUTE_WALL_SECONDS = 20
 
 
 class Failure(Exception):
@@ -228,6 +244,27 @@ def build_state(pools_doc: Any, runners: Any, *, repo: str, now: float,
     }
 
 
+def overflow_load(jobs: Any) -> dict[str, dict[str, int]]:
+    """Running and queued jobs per overflow (Blacksmith) label. Pure: the jobs are an argument.
+
+    A job counts on the first Blacksmith label it asks for; a job with none is not overflow load.
+    """
+    load: dict[str, dict[str, int]] = {}
+    for job in jobs or []:
+        if not isinstance(job, dict) or job.get("status") not in OVERFLOW_STATUSES:
+            continue
+        label = next((str(x) for x in job.get("labels") or [] if str(x).startswith(OVERFLOW_PREFIX)), None)
+        if label is None:
+            continue
+        entry = load.setdefault(label, {"running": 0, "queued": 0})
+        entry["running" if job["status"] == "in_progress" else "queued"] += 1
+    return dict(sorted(load.items()))
+
+
+def overflow_section(jobs: Any, *, observed_at: float, complete: bool) -> dict[str, Any]:
+    return {"observed_at": utc(observed_at), "complete": complete, "pools": overflow_load(jobs)}
+
+
 COUNT_FIELDS = ("declared", "conforming", "reserved", "locked", "runners", "online", "busy", "idle")
 
 
@@ -261,6 +298,18 @@ def validate_state(doc: Any, *, now: float, repo: str | None = None,
                 return False, f"pool state {label}.{field} is not a count"
         if entry["idle"] > entry["online"] or entry["busy"] > entry["online"]:
             return False, f"pool state {label} counts more idle or busy runners than online ones"
+    overflow = doc.get("overflow")
+    if overflow is not None:
+        if not isinstance(overflow, dict) or parse_utc(overflow.get("observed_at")) is None \
+                or not isinstance(overflow.get("complete"), bool) or not isinstance(overflow.get("pools"), dict):
+            return False, "pool state overflow section is malformed"
+        for label, entry in overflow["pools"].items():
+            if not str(label).startswith(OVERFLOW_PREFIX) or not isinstance(entry, dict):
+                return False, f"pool state overflow names an unknown pool {label!r}"
+            for field in ("running", "queued"):
+                value = entry.get(field)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    return False, f"pool state overflow {label}.{field} is not a count"
     return True, f"pool state from {doc['generated_at']} ({int(age)} s old)"
 
 
@@ -310,6 +359,8 @@ class GitHub:
         self._token = token
         self._open = opener or urllib.request.urlopen
         self.deadline, self._clock = deadline, clock
+        # X-RateLimit-Remaining from the last answer that carried it; None until one does.
+        self.remaining: int | None = None
 
     def call(self, method: str, path: str, body: Any = None, *, auth: str = "Bearer") -> tuple[int, Any]:
         timeout = HTTP_TIMEOUT
@@ -328,6 +379,9 @@ class GitHub:
         try:
             with self._open(request, timeout=timeout) as response:
                 raw = response.read()
+                remaining = (getattr(response, "headers", None) or {}).get("X-RateLimit-Remaining")
+                if isinstance(remaining, str) and remaining.isdigit():
+                    self.remaining = int(remaining)
                 return response.status, (json.loads(raw) if raw else None)
         except urllib.error.HTTPError as error:
             try:
@@ -354,6 +408,71 @@ class GitHub:
             if len(batch) < 100:
                 return rows
         raise Failure("runners: more than 1000 runners; refusing a partial listing")
+
+    def active_jobs(self, repo: str, cache: dict[str, Any], *, now: float) -> tuple[list[dict[str, Any]], bool]:
+        """Every job of the repository's queued and in-progress runs, and whether the listing is whole.
+
+        `cache` maps a run id to {"key": "<attempt>:<updated_at>", "at": listed-at, "jobs": [...]}
+        (labels and status only). A run is listed again when its key moves or its entry is older than
+        OVERFLOW_RELIST_SECONDS, at most OVERFLOW_RUN_LOOKUPS runs a call (oldest entry first), and
+        not at all while the rate budget is under OVERFLOW_RATE_FLOOR. Runs no longer in flight drop.
+        """
+        runs: dict[str, dict[str, Any]] = {}
+        complete = True
+        for status in ("queued", "in_progress"):
+            for page in range(1, 4):
+                data = self.ok("GET", f"/repos/{repo}/actions/runs?status={status}&per_page=100&page={page}")
+                batch = (data or {}).get("workflow_runs") or []
+                for run in batch:
+                    # A run that moved from queued to in progress between the two listings is one run.
+                    if isinstance(run, dict) and isinstance(run.get("id"), int):
+                        runs[str(run["id"])] = run
+                if len(batch) < 100:
+                    break
+            else:
+                complete = False
+
+        def key(run: dict[str, Any]) -> str:
+            return f"{run.get('run_attempt') or 1}:{run.get('updated_at') or ''}"
+
+        def due(run_id: str) -> bool:
+            entry = cache.get(run_id)
+            return not (isinstance(entry, dict) and entry.get("key") == key(runs[run_id])
+                        and isinstance(entry.get("at"), (int, float)) and now - entry["at"] < OVERFLOW_RELIST_SECONDS
+                        and isinstance(entry.get("jobs"), list))
+
+        stale = [run_id for run_id in runs if due(run_id)]
+        # Never listed first, then the oldest listing.
+        stale.sort(key=lambda run_id: (cache.get(run_id) or {}).get("at", 0) if isinstance(cache.get(run_id), dict) else 0)
+        lookups = 0
+        for run_id in stale:
+            if lookups >= OVERFLOW_RUN_LOOKUPS or (self.remaining is not None and self.remaining < OVERFLOW_RATE_FLOOR):
+                complete = False
+                break
+            lookups += 1
+            run = runs[run_id]
+            listed: list[dict[str, Any]] = []
+            for page in range(1, 6):
+                data = self.ok("GET", f"/repos/{repo}/actions/runs/{run_id}/attempts/"
+                                      f"{run.get('run_attempt') or 1}/jobs?per_page=100&page={page}")
+                batch = [job for job in (data or {}).get("jobs") or [] if isinstance(job, dict)]
+                listed.extend({"status": job.get("status"), "labels": [str(x) for x in job.get("labels") or []]}
+                              for job in batch)
+                if len(batch) < 100:
+                    break
+            else:
+                complete = False
+            cache[run_id] = {"key": key(run), "at": now, "jobs": listed}
+        jobs: list[dict[str, Any]] = []
+        for run_id in runs:
+            entry = cache.get(run_id)
+            if isinstance(entry, dict) and isinstance(entry.get("jobs"), list):
+                jobs.extend(entry["jobs"])
+            else:
+                complete = False
+        for run_id in [run_id for run_id in cache if run_id not in runs]:
+            del cache[run_id]
+        return jobs, complete
 
     def set_variable(self, repo: str, name: str, value: str) -> str:
         status, _ = self.call("PATCH", f"/repos/{repo}/actions/variables/{name}", {"name": name, "value": value})
@@ -433,7 +552,30 @@ def current_state(args: argparse.Namespace, env: dict[str, str], now: Callable[[
     else:
         at = now()
         runners = client().runners(args.repo)
-    return build_state(pools_doc, runners, repo=args.repo, now=now(), runners_observed_at=at)
+    doc = build_state(pools_doc, runners, repo=args.repo, now=now(), runners_observed_at=at)
+    if getattr(args, "overflow_load", False):
+        cache_file: Path = args.overflow_cache
+        try:
+            cache = json.loads(cache_file.read_text(encoding="utf-8"))
+            cache = cache if isinstance(cache, dict) else {}
+        except (OSError, ValueError):
+            cache = {}
+        at = now()
+        try:
+            jobs, complete = client().active_jobs(args.repo, cache, now=at)
+        except (Failure, urllib.error.URLError, OSError, ValueError) as error:
+            # The owned pools still publish; readers without an overflow section keep their own source.
+            print(f"glaeda-route: overflow load unavailable: {str(error)[:160]}", file=sys.stderr)
+        else:
+            doc["overflow"] = overflow_section(jobs, observed_at=at, complete=complete)
+            try:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cache_file.with_suffix(".tmp")
+                tmp.write_text(json.dumps(cache, sort_keys=True), encoding="utf-8")
+                os.replace(tmp, cache_file)
+            except OSError as error:
+                print(f"glaeda-route: could not save the overflow cache ({type(error).__name__})", file=sys.stderr)
+    return doc
 
 
 # ---------------------------------------------------------------- ledger
@@ -1039,6 +1181,10 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None,
         cmd.add_argument("--manifest", type=Path, help="fleet manifest for glaeda-mini-fleet pools")
         cmd.add_argument("--pools", type=Path, help="read a glaeda-mini-fleet pools document instead of probing")
         cmd.add_argument("--runners", type=Path, help="read a GitHub runners listing instead of the API")
+        cmd.add_argument("--overflow-load", action=argparse.BooleanOptionalAction, default=cmd.prog.endswith("agent"),
+                         help="also publish running and queued jobs per Blacksmith label (default on for agent)")
+        cmd.add_argument("--overflow-cache", type=Path,
+                         default=Path.home() / ".local/state/glaeda/route/overflow-jobs.json")
 
     for name in ("state", "publish"):
         cmd = sub.add_parser(name)
@@ -1074,7 +1220,16 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None,
     init = sub.add_parser("init-ledger", help="create the empty ledger branch (dry run without --yes)")
     init.add_argument("--yes", action="store_true")
     ledger_credentials(init)
-    args = parser.parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    try:
+        args = parser.parse_args(raw)
+    except SystemExit as exit_:
+        if raw[:1] != ["route"] or exit_.code == 0:
+            raise
+        # Routing never fails a job: with arguments this command cannot read, the caller keeps its
+        # own runs-on expression (an empty runs_on output).
+        emit_route(Decision("", False, "glaeda-route could not read its arguments"), env)
+        return 0
 
     def repo_client() -> GitHub:
         if not cache.get("repo"):
@@ -1093,19 +1248,49 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None,
     if args.command == "route":
         # Routing never fails a job: whatever goes wrong, answer the caller's default and exit 0.
         req = request_from(args, env)
+
+        # The alarm raises at most once (armed), and a raise that lands while the route is already
+        # answering or disarming is caught by the outer handler, so it can never escape as exit 1.
+        armed = {"on": False}
+
+        def out_of_time(_signum: int, _frame: Any) -> None:
+            if armed["on"]:
+                armed["on"] = False
+                raise Failure(f"no answer within {ROUTE_WALL_SECONDS} s")
+
+        def disarm() -> None:
+            armed["on"] = False
+            if alarm:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous)
+
+        alarm = hasattr(signal, "setitimer") and env.get("GLAEDA_ROUTE_NO_ALARM") != "1"
+        previous = signal.signal(signal.SIGALRM, out_of_time) if alarm else None
+        decision: Decision | None = None
         try:
-            state_text = args.state.read_text(encoding="utf-8") if args.state \
-                else env.get("GLAEDA_POOL_STATE", "")
-            ledger: Ledger | None = None
-            if not untrusted(req, tuple(args.allowed_repo or (DEFAULT_REPO,))):
-                try:
-                    ledger = ledger_client(deadline=time.monotonic() + ROUTE_DEADLINE_SECONDS)
-                except Exception:  # noqa: BLE001
-                    ledger = None
-            decision = route(req, state_text, ledger, now=now, sleep=sleep,
-                             allowed_repos=tuple(args.allowed_repo or (DEFAULT_REPO,)))
-        except Exception as error:  # noqa: BLE001
-            decision = default(req, f"the route failed ({type(error).__name__})")
+            try:
+                if alarm:
+                    armed["on"] = True
+                    signal.setitimer(signal.ITIMER_REAL, ROUTE_WALL_SECONDS)
+                state_text = args.state.read_text(encoding="utf-8") if args.state \
+                    else env.get("GLAEDA_POOL_STATE", "")
+                ledger: Ledger | None = None
+                if not untrusted(req, tuple(args.allowed_repo or (DEFAULT_REPO,))):
+                    try:
+                        ledger = ledger_client(deadline=time.monotonic() + ROUTE_DEADLINE_SECONDS)
+                    except Exception:  # noqa: BLE001
+                        ledger = None
+                decision = route(req, state_text, ledger, now=now, sleep=sleep,
+                                 allowed_repos=tuple(args.allowed_repo or (DEFAULT_REPO,)))
+            except Exception as error:  # noqa: BLE001
+                decision = default(req, f"the route failed ({type(error).__name__}: {str(error)[:80]})"
+                                   if isinstance(error, Failure) else f"the route failed ({type(error).__name__})")
+            finally:
+                disarm()
+        except Failure as error:
+            disarm()
+            if decision is None:
+                decision = default(req, f"the route failed (Failure: {str(error)[:80]})")
         try:
             emit_route(decision, env)
         except OSError as error:
@@ -1132,7 +1317,9 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None,
                     text = json.dumps(doc, sort_keys=True, separators=(",", ":"))
                     repo_client().set_variable(args.repo, args.variable, text)
                     print(f"published {args.variable}: "
-                          + (", ".join(f"{k} {v['idle']} idle" for k, v in doc["pools"].items()) or "no owned pools"))
+                          + (", ".join(f"{k} {v['idle']} idle" for k, v in doc["pools"].items()) or "no owned pools")
+                          + "".join(f"; {k} {v['running']} running {v['queued']} queued"
+                                    for k, v in (doc.get("overflow") or {}).get("pools", {}).items()))
                 except (Failure, urllib.error.URLError, OSError) as error:
                     # The watch still runs: a stale state only means new runs go to Blacksmith.
                     print(f"glaeda-route: publish failed: {error}", file=sys.stderr)

@@ -34,7 +34,7 @@ Three pieces, and no new inbound endpoint anywhere:
    the slots other runs already reserved, and reserves its own slots in the **ledger** with a
    compare-and-swap commit. Any failure answers with the caller's default.
 3. **Rescue.** The same agent watches every live reservation through the GitHub API. It releases
-   a reservation when its jobs start or its run ends. A pool job queued with no runner for 90 s,
+   a reservation when its jobs start or its run ends. A pool job queued with no runner for 30 s,
    or refused by the runner's job-started hook, gets its run cancelled and re-run; the re-run is
    attempt 2, which never takes an owned machine, so it lands on overflow as a whole run.
 
@@ -123,6 +123,30 @@ job keeps its Blacksmith route. `glaeda-route check --state FILE` applies the sa
 placed since `generated_at`, and must still expect a job to queue: GitHub never re-routes a
 queued job, so a rescue that re-runs a stuck run on Blacksmith is required (glaeda#1174).
 
+### Overflow load (`overflow`, optional)
+
+The agent also publishes what the Blacksmith pools are doing, so cmux's Blacksmith picker reads
+live counts instead of the queue janitor's 10 to 30 minute old snapshot:
+
+```json
+"overflow": {"observed_at": "...", "complete": true,
+             "pools": {"blacksmith-6vcpu-macos-26": {"running": 9, "queued": 2}}}
+```
+
+- `running` and `queued` count the jobs of the repository's queued and in-progress runs, per the
+  first `blacksmith-*` label each job asks for.
+- A run's jobs are listed again when the run's `updated_at` moves or its listing is 150 s old
+  (cache in `~/.local/state/glaeda/route/overflow-jobs.json`), at most 10 runs a tick, oldest
+  first, and not while the credential has under 1,500 requests left, so the rescue watch keeps
+  its budget. Anything skipped keeps its last listing and sets `complete` to false.
+- A failed listing leaves the section out; the owned pools still publish. Readers without the
+  section keep their own source.
+- On by default for `agent`; `state` and `publish` take `--overflow-load`.
+
+The counts say where jobs are waiting, not how many machines a pool has: Blacksmith ran at most
+about 5 concurrent jobs on `blacksmith-12vcpu-macos-26` and 18 on each 6vcpu pool (2026-09-24),
+so a reader needs its own capacity per label.
+
 Compatible changes (new fields, new pools) keep `v1`. Removing or redefining a field bumps the
 schema, and the publisher then writes both documents until readers move.
 
@@ -189,7 +213,7 @@ Each agent tick, for every live reservation on the routed repository:
 - `held`: list the run's jobs for that attempt that carry the pool label and count the ones with
   a runner as started. Keep watching until the run finishes, is re-run by someone else, or two
   hours pass, so pool jobs that start late (a `needs` chain) are still covered. A job queued with
-  no runner for 90 s (measured from the latest of its creation, the reservation, and the first
+  no runner for 30 s (measured from the latest of its creation, the reservation, and the first
   time the agent saw it waiting, so a job created before its `needs` finished never counts as
   late), or a job the runner's job-started hook refused (failed on a runner before any real
   step), decides a rescue once GitHub confirms the run and the pull request is open at the same
@@ -266,7 +290,8 @@ reservations lapse on their own.
 ### API cost
 
 The route step: 2 reads, plus 3 writes when it reserves. The agent, per 20 s tick: 1 runner
-listing, 1 variable write, 2 ledger reads, 2 reads per live reservation, 3 writes when something
+listing, 2 run listings plus one job listing per run whose `updated_at` moved (overflow load),
+1 variable write, 2 ledger reads, 2 reads per live reservation, 3 writes when something
 changed. The two Apps have separate rate budgets (5,000 requests an hour each).
 
 ## Replaces in cmux
