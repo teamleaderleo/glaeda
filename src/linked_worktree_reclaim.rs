@@ -93,6 +93,20 @@ const PRESERVING_REF_SELECTORS: [&str; 3] = ["--branches", "--tags", "--remotes"
 /// Per-worktree ref namespaces that vanish with the worktree.
 const PER_WORKTREE_REF_PATTERNS: [&str; 3] = ["refs/worktree/", "refs/bisect/", "refs/rewritten/"];
 
+/// Whether the work a worktree holds has landed, which decides how long it is kept once idle.
+///
+/// Removal is already lossless (see the module docs), so this only weighs disruption: a finished
+/// worktree nobody touches is clutter, while an unfinished one may be picked up again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkState {
+    /// The worktree made a commit of its own, and HEAD is in a remote's default branch or every
+    /// file it changed is already identical there (a squash merge).
+    Finished,
+    /// Anything else, including every case the checks could not settle.
+    InProgress,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HeadReachability {
@@ -122,8 +136,11 @@ pub struct LinkedWorktreeFacts {
     /// The checkout directory belongs to the effective user that would remove it.
     pub owned_by_current_user: bool,
     pub head_reachability: HeadReachability,
-    /// Newest modification time, in Unix seconds, across per-worktree Git activity entries and
-    /// the checkout root directory.
+    /// A process has its working directory (or, on Linux, an open file) inside the checkout.
+    pub in_use: bool,
+    pub work_state: WorkState,
+    /// Newest of the checkout root's and HEAD's modification times and the newest HEAD reflog
+    /// entry, in Unix seconds.
     pub last_activity_seconds: i64,
 }
 
@@ -149,7 +166,9 @@ pub enum LinkedWorktreeReclaimVeto {
     PerWorktreeRefsPresent,
     /// The checkout belongs to a different user than the one planning its removal.
     NotOwnedByCurrentUser,
-    /// Git activity happened inside the policy's idle window.
+    /// A running process is working inside the checkout.
+    InUse,
+    /// Git activity happened inside the idle window for its work state.
     RecentlyActive,
 }
 
@@ -166,6 +185,7 @@ impl LinkedWorktreeReclaimVeto {
             Self::PopulatedSubmodulesPresent => "populated_submodules_present",
             Self::PerWorktreeRefsPresent => "per_worktree_refs_present",
             Self::NotOwnedByCurrentUser => "not_owned_by_current_user",
+            Self::InUse => "in_use",
             Self::RecentlyActive => "recently_active",
         }
     }
@@ -197,26 +217,55 @@ pub enum LinkedWorktreeReclaimCompensation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkedWorktreeReclaimPolicy {
     minimum_idle_seconds: i64,
+    finished_idle_seconds: i64,
 }
 
 impl LinkedWorktreeReclaimPolicy {
-    /// Build a policy from an explicit idle window.
+    /// Build a policy whose one idle window applies to finished and unfinished work alike.
     ///
     /// # Errors
     ///
     /// Refuses a window below [`MIN_LINKED_WORKTREE_RECLAIM_IDLE_SECONDS`].
     pub const fn new(minimum_idle_seconds: i64) -> Result<Self, LinkedWorktreeReclaimError> {
-        if minimum_idle_seconds < MIN_LINKED_WORKTREE_RECLAIM_IDLE_SECONDS {
+        Self::with_finished_window(minimum_idle_seconds, minimum_idle_seconds)
+    }
+
+    /// Build a policy with a separate, usually shorter, window for finished work.
+    ///
+    /// # Errors
+    ///
+    /// Refuses either window below [`MIN_LINKED_WORKTREE_RECLAIM_IDLE_SECONDS`].
+    pub const fn with_finished_window(
+        minimum_idle_seconds: i64,
+        finished_idle_seconds: i64,
+    ) -> Result<Self, LinkedWorktreeReclaimError> {
+        if minimum_idle_seconds < MIN_LINKED_WORKTREE_RECLAIM_IDLE_SECONDS
+            || finished_idle_seconds < MIN_LINKED_WORKTREE_RECLAIM_IDLE_SECONDS
+        {
             return Err(idle_window_too_small());
         }
         Ok(Self {
             minimum_idle_seconds,
+            finished_idle_seconds,
         })
     }
 
+    /// The idle window for unfinished work.
     #[must_use]
     pub const fn minimum_idle_seconds(self) -> i64 {
         self.minimum_idle_seconds
+    }
+
+    #[must_use]
+    pub const fn finished_idle_seconds(self) -> i64 {
+        self.finished_idle_seconds
+    }
+
+    const fn window_for(self, work_state: WorkState) -> i64 {
+        match work_state {
+            WorkState::Finished => self.finished_idle_seconds,
+            WorkState::InProgress => self.minimum_idle_seconds,
+        }
     }
 }
 
@@ -252,7 +301,8 @@ impl LinkedWorktreeReclaimDecision {
 pub struct LinkedWorktreeReclaimPlan {
     schema_version: u8,
     decision: LinkedWorktreeReclaimDecision,
-    minimum_idle_seconds: i64,
+    /// The idle window that applied to this worktree's work state.
+    idle_window_seconds: i64,
 }
 
 impl LinkedWorktreeReclaimPlan {
@@ -267,8 +317,8 @@ impl LinkedWorktreeReclaimPlan {
     }
 
     #[must_use]
-    pub const fn minimum_idle_seconds(&self) -> i64 {
-        self.minimum_idle_seconds
+    pub const fn idle_window_seconds(&self) -> i64 {
+        self.idle_window_seconds
     }
 }
 
@@ -314,6 +364,9 @@ pub fn plan_linked_worktree_reclaim(
     if !facts.owned_by_current_user {
         vetoes.push(LinkedWorktreeReclaimVeto::NotOwnedByCurrentUser);
     }
+    if facts.in_use {
+        vetoes.push(LinkedWorktreeReclaimVeto::InUse);
+    }
 
     let idle_seconds = now_seconds
         .checked_sub(facts.last_activity_seconds)
@@ -321,7 +374,8 @@ pub fn plan_linked_worktree_reclaim(
     if idle_seconds < 0 {
         return Err(future_timestamp());
     }
-    if idle_seconds < policy.minimum_idle_seconds {
+    let window = policy.window_for(facts.work_state);
+    if idle_seconds < window {
         vetoes.push(LinkedWorktreeReclaimVeto::RecentlyActive);
     }
 
@@ -348,7 +402,216 @@ pub fn plan_linked_worktree_reclaim(
     Ok(LinkedWorktreeReclaimPlan {
         schema_version: LINKED_WORKTREE_RECLAIM_SCHEMA_VERSION,
         decision,
-        minimum_idle_seconds: policy.minimum_idle_seconds,
+        idle_window_seconds: window,
+    })
+}
+
+// --- Process evidence ------------------------------------------------------
+
+/// Where running processes of this user are working, from one bounded observation.
+///
+/// Linux reads every readable process's working directory and open files from `/proc`. macOS asks
+/// `lsof` for working directories only: every open file of every process exceeds the 1 MiB capture
+/// limit on a busy Mac, and a process working in a checkout normally has its cwd there. Paths are
+/// kept private and only ever compared.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProcessUseEvidence {
+    paths: Vec<PathBuf>,
+}
+
+impl fmt::Debug for ProcessUseEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessUseEvidence")
+            .field("paths", &self.paths.len())
+            .finish()
+    }
+}
+
+const LSOF_PROGRAM: &str = "/usr/sbin/lsof";
+const LSOF_TIMEOUT: Duration = Duration::from_secs(60);
+
+impl ProcessUseEvidence {
+    /// Evidence from explicit paths, for callers that observed processes themselves and for tests.
+    #[must_use]
+    pub fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            paths: paths.into_iter().collect(),
+        }
+    }
+
+    /// Observe the processes running now.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no process could be observed at all (this process always has a working
+    /// directory, so empty evidence means the source is unusable) or `lsof` fails. Callers must
+    /// then treat every checkout as possibly in use.
+    pub fn collect(
+        executor: &impl TimedCommandExecutor,
+    ) -> Result<Self, LinkedWorktreeReclaimError> {
+        let proc_root = Path::new("/proc/self/cwd");
+        let paths = if proc_root.exists() {
+            collect_proc_paths()
+        } else {
+            let spec = crate::process::CommandSpec::new(LSOF_PROGRAM)
+                .argument("-n")
+                .argument("-P")
+                .argument("-w")
+                .argument("-Fn")
+                .argument("-a")
+                .argument("-d")
+                .argument("cwd");
+            let record = executor
+                .execute_with_timeout(&spec, LSOF_TIMEOUT)
+                .map_err(|_| process_evidence_unavailable())?;
+            // lsof exits 1 when some process could not be fully read; anything else is a failure.
+            if !matches!(record.status, Some(0 | 1)) {
+                return Err(process_evidence_unavailable());
+            }
+            parse_lsof_names(&record.stdout)
+        };
+        if paths.is_empty() {
+            return Err(process_evidence_unavailable());
+        }
+        Ok(Self { paths })
+    }
+
+    /// Whether any observed path is `directory` itself or inside it.
+    #[must_use]
+    pub fn uses(&self, directory: &Path) -> bool {
+        self.paths.iter().any(|path| path.starts_with(directory))
+    }
+}
+
+fn collect_proc_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return paths;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.as_bytes().iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let process = entry.path();
+        // Other users' processes are unreadable; that is expected, not a finding.
+        if let Ok(cwd) = std::fs::read_link(process.join("cwd")) {
+            paths.push(cwd);
+        }
+        if let Ok(descriptors) = std::fs::read_dir(process.join("fd")) {
+            paths.extend(
+                descriptors
+                    .flatten()
+                    .filter_map(|descriptor| std::fs::read_link(descriptor.path()).ok())
+                    .filter(|target| target.is_absolute()),
+            );
+        }
+    }
+    paths
+}
+
+fn parse_lsof_names(output: &str) -> Vec<PathBuf> {
+    output
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .filter(|name| name.starts_with('/'))
+        .map(PathBuf::from)
+        .collect()
+}
+
+// --- Work state ------------------------------------------------------------
+
+/// Most changed paths compared against a default branch; a larger branch counts as unfinished.
+const MAX_FINISHED_COMPARE_PATHS: usize = 512;
+
+/// Decide whether `commit` has landed.
+///
+/// A worktree that never made a commit of its own did nothing yet, however recently what it
+/// checked out reached a default branch, so it stays in progress. An upstream marked `[gone]` is not
+/// used: follow-up commits after the remote branch was deleted are common. Every question is asked
+/// from the main worktree, and any failure answers "in progress", which only keeps the worktree
+/// longer.
+fn observe_work_state(
+    observer: &ProjectCheckoutObserver,
+    repository: &Path,
+    commit: &str,
+    authored: bool,
+    executor: &impl TimedCommandExecutor,
+) -> WorkState {
+    if !authored {
+        return WorkState::InProgress;
+    }
+    let run = |arguments: &[&str]| observer.git(repository, arguments, executor).ok();
+    let Some(heads) = run(&["for-each-ref", "--format=%(symref)", "refs/remotes/*/HEAD"])
+        .filter(|record| record.success)
+    else {
+        return WorkState::InProgress;
+    };
+    for target in heads
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("refs/remotes/"))
+    {
+        match run(&["merge-base", "--is-ancestor", commit, target]).and_then(|r| r.status) {
+            Some(0) => return WorkState::Finished,
+            Some(1) => {}
+            _ => continue,
+        }
+        let Some(base) = run(&["merge-base", commit, target]).filter(|record| record.success)
+        else {
+            continue;
+        };
+        let base = base.stdout.trim().to_owned();
+        // --no-renames: a rename must list both names, or a branch that renamed `a` to `a2`
+        // would compare only `a2` and miss that the default branch still has `a`.
+        let Some(changed) = run(&["diff", "--no-renames", "--name-only", "-z", &base, commit])
+            .filter(|record| record.success)
+        else {
+            continue;
+        };
+        let paths: Vec<String> = changed
+            .stdout
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(|path| format!(":(literal){path}"))
+            .collect();
+        if paths.is_empty() || paths.len() > MAX_FINISHED_COMPARE_PATHS {
+            continue;
+        }
+        let mut arguments = vec!["diff", "--no-renames", "--quiet", commit, target, "--"];
+        arguments.extend(paths.iter().map(String::as_str));
+        if run(&arguments).and_then(|record| record.status) == Some(0) {
+            return WorkState::Finished;
+        }
+    }
+    WorkState::InProgress
+}
+
+/// Whether this worktree made a commit of its own, according to its HEAD reflog.
+///
+/// Moving HEAD by syncing (`merge --ff-only`, `pull` fast-forward, `reset`, `checkout`) is not
+/// work: such a worktree would otherwise look finished as soon as main contains what it synced to.
+/// An expired or unreadable reflog answers `false`, which only keeps the worktree longer.
+fn authored_work(git_dir: &Path) -> bool {
+    let Ok(text) = std::fs::read(git_dir.join(HEAD_REFLOG)) else {
+        return false;
+    };
+    text.split(|byte| *byte == b'\n').any(|line| {
+        let Some(tab) = line.iter().position(|byte| *byte == b'\t') else {
+            return false;
+        };
+        let subject = &line[tab + 1..];
+        let fast_forward = subject.windows(12).any(|window| window == b"Fast-forward");
+        [
+            &b"commit"[..],
+            b"cherry-pick",
+            b"revert",
+            b"rebase (finish)",
+        ]
+        .iter()
+        .any(|action| subject.starts_with(action))
+            || ((subject.starts_with(b"merge ") || subject.starts_with(b"pull")) && !fast_forward)
     })
 }
 
@@ -495,9 +758,10 @@ pub fn observe_linked_worktree(
     observer: &ProjectCheckoutObserver,
     inventory: &LinkedWorktreeInventory,
     entry: &LinkedWorktreeEntry,
+    evidence: &ProcessUseEvidence,
     executor: &impl TimedCommandExecutor,
 ) -> Result<LinkedWorktreeFacts, LinkedWorktreeReclaimError> {
-    observe_detailed(observer, inventory, entry, executor).map(|observed| observed.facts)
+    observe_detailed(observer, inventory, entry, evidence, executor).map(|observed| observed.facts)
 }
 
 /// Facts plus the exact identities an executor must bind its action to.
@@ -541,6 +805,7 @@ fn observe_detailed(
     observer: &ProjectCheckoutObserver,
     inventory: &LinkedWorktreeInventory,
     entry: &LinkedWorktreeEntry,
+    evidence: &ProcessUseEvidence,
     executor: &impl TimedCommandExecutor,
 ) -> Result<ObservedWorktree, LinkedWorktreeReclaimError> {
     if entry.prunable {
@@ -624,6 +889,13 @@ fn observe_detailed(
         ProjectBranchState::Detached => None,
     };
     let head = observation.commit().as_str().to_owned();
+    let work_state = observe_work_state(
+        observer,
+        &inventory.repository,
+        &head,
+        authored_work(&git_dir),
+        executor,
+    );
 
     let facts = LinkedWorktreeFacts {
         linked,
@@ -642,6 +914,8 @@ fn observe_detailed(
             .uid()
             == rustix::process::geteuid().as_raw(),
         head_reachability,
+        in_use: evidence.uses(&checkout),
+        work_state,
         last_activity_seconds,
     };
     Ok(ObservedWorktree {
@@ -665,6 +939,7 @@ pub const MAX_LINKED_WORKTREE_OBSERVATION_WORKERS: usize = 8;
 pub fn observe_linked_worktrees(
     observer: &ProjectCheckoutObserver,
     inventory: &LinkedWorktreeInventory,
+    evidence: &ProcessUseEvidence,
     executor: &(impl TimedCommandExecutor + Sync),
 ) -> Vec<Result<LinkedWorktreeFacts, LinkedWorktreeReclaimError>> {
     let entries = &inventory.linked;
@@ -689,7 +964,7 @@ pub fn observe_linked_worktrees(
                         };
                         local.push((
                             index,
-                            observe_linked_worktree(observer, inventory, entry, executor),
+                            observe_linked_worktree(observer, inventory, entry, evidence, executor),
                         ));
                     }
                     local
@@ -1274,7 +1549,12 @@ pub fn reclaim_linked_worktree(
     now_seconds: i64,
     executor: &impl TimedCommandExecutor,
 ) -> LinkedWorktreeReclaimOutcome {
-    let observed = match observe_detailed(observer, inventory, entry, executor) {
+    // Fresh process evidence for this removal: the run-wide snapshot may be minutes old.
+    let evidence = match ProcessUseEvidence::collect(executor) {
+        Ok(evidence) => evidence,
+        Err(error) => return LinkedWorktreeReclaimOutcome::Unobservable { code: error.code() },
+    };
+    let observed = match observe_detailed(observer, inventory, entry, &evidence, executor) {
         Ok(observed) => observed,
         Err(error) => return LinkedWorktreeReclaimOutcome::Unobservable { code: error.code() },
     };
@@ -1376,7 +1656,7 @@ pub fn reclaim_linked_worktree(
     let observed_intact = exit == RemovalExit::ExitedNonZero
         && !directory_gone
         && still_registered
-        && observe_detailed(observer, inventory, entry, executor)
+        && observe_detailed(observer, inventory, entry, &evidence, executor)
             .is_ok_and(|after| !after.facts.tracked_changes_present && after.head == observed.head);
     match classify_removal(exit, directory_gone, still_registered, observed_intact) {
         RemovalClass::Reclaimed => LinkedWorktreeReclaimOutcome::Reclaimed {
@@ -1631,6 +1911,14 @@ const fn idle_overflow() -> LinkedWorktreeReclaimError {
     )
 }
 
+const fn process_evidence_unavailable() -> LinkedWorktreeReclaimError {
+    error(
+        LinkedWorktreeReclaimErrorKind::Unavailable,
+        "process_evidence_unavailable",
+        "which processes are working in checkouts could not be observed",
+    )
+}
+
 const fn unavailable() -> LinkedWorktreeReclaimError {
     error(
         LinkedWorktreeReclaimErrorKind::Unavailable,
@@ -1670,8 +1958,66 @@ mod tests {
             per_worktree_refs_present: false,
             owned_by_current_user: true,
             head_reachability: HeadReachability::ReachableFromSharedRef,
+            in_use: false,
+            work_state: WorkState::InProgress,
             last_activity_seconds: NOW - 2 * DAY,
         }
+    }
+
+    #[test]
+    fn a_process_working_inside_vetoes_however_idle() {
+        let facts = LinkedWorktreeFacts {
+            in_use: true,
+            last_activity_seconds: NOW - 30 * DAY,
+            ..clean_idle()
+        };
+        let plan = plan_linked_worktree_reclaim(&facts, policy(), NOW).expect("plan");
+        assert_eq!(plan.decision().vetoes(), [LinkedWorktreeReclaimVeto::InUse]);
+    }
+
+    #[test]
+    fn finished_work_uses_the_shorter_window() {
+        let policy =
+            LinkedWorktreeReclaimPolicy::with_finished_window(3 * DAY, 3_600).expect("policy");
+        let two_hours = LinkedWorktreeFacts {
+            last_activity_seconds: NOW - 2 * 3_600,
+            ..clean_idle()
+        };
+        let unfinished = plan_linked_worktree_reclaim(&two_hours, policy, NOW).expect("plan");
+        assert_eq!(
+            unfinished.decision().vetoes(),
+            [LinkedWorktreeReclaimVeto::RecentlyActive]
+        );
+        assert_eq!(unfinished.idle_window_seconds(), 3 * DAY);
+        let finished = LinkedWorktreeFacts {
+            work_state: WorkState::Finished,
+            ..two_hours
+        };
+        let plan = plan_linked_worktree_reclaim(&finished, policy, NOW).expect("plan");
+        assert!(plan.decision().is_eligible());
+        assert_eq!(plan.idle_window_seconds(), 3_600);
+        assert_eq!(
+            LinkedWorktreeReclaimPolicy::with_finished_window(DAY, 60)
+                .unwrap_err()
+                .code(),
+            "idle_window_too_small"
+        );
+    }
+
+    #[test]
+    fn process_evidence_matches_whole_path_components() {
+        let evidence = ProcessUseEvidence::from_paths([
+            PathBuf::from("/w/a/src/main.rs"),
+            PathBuf::from("/w/b"),
+        ]);
+        assert!(evidence.uses(Path::new("/w/a")));
+        assert!(evidence.uses(Path::new("/w/b")));
+        assert!(!evidence.uses(Path::new("/w/a-sibling")));
+        assert!(!evidence.uses(Path::new("/w/c")));
+        assert_eq!(
+            parse_lsof_names("p1\nfcwd\nn/w/a\np2\nfcwd\nn/\nnnot-a-path\n"),
+            [PathBuf::from("/w/a"), PathBuf::from("/")]
+        );
     }
 
     #[test]
@@ -1716,6 +2062,8 @@ mod tests {
             per_worktree_refs_present: true,
             owned_by_current_user: false,
             head_reachability: HeadReachability::OnlyFromThisWorktree,
+            in_use: true,
+            work_state: WorkState::InProgress,
             last_activity_seconds: NOW,
         };
         let plan = plan_linked_worktree_reclaim(&facts, policy(), NOW).expect("plan");
@@ -1731,6 +2079,7 @@ mod tests {
                 LinkedWorktreeReclaimVeto::PopulatedSubmodulesPresent,
                 LinkedWorktreeReclaimVeto::PerWorktreeRefsPresent,
                 LinkedWorktreeReclaimVeto::NotOwnedByCurrentUser,
+                LinkedWorktreeReclaimVeto::InUse,
                 LinkedWorktreeReclaimVeto::RecentlyActive,
             ]
         );

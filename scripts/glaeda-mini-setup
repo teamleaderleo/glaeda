@@ -429,7 +429,8 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "Label": LABEL_PREFIX + "worktree-reclaim",
             "ProgramArguments": ["/bin/bash", os.fspath(ctx.bin / "glaeda-worktree-reclaim-all"),
                                  "--apply", "--output", "json"],
-            "StartCalendarInterval": {"Hour": 4, "Minute": 30},
+            # hourly: finished work is reclaimable after an hour idle, unfinished after three days
+            "StartInterval": 3600,
             "LowPriorityIO": True,
             "Nice": 10,
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-worktree-reclaim.jsonl"),
