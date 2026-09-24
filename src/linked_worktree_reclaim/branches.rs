@@ -3,7 +3,8 @@
 //! Removing a worktree keeps its branch, so agent sessions leave one local branch per task. A
 //! branch here is deleted only when every one of these holds:
 //!
-//! - no worktree has it checked out;
+//! - no worktree has it checked out, or is rebasing or bisecting it (Git detaches HEAD for both,
+//!   so `%(worktreepath)` alone misses them);
 //! - it is not protected: a remote default branch's name (`main`, `master`, whatever a
 //!   `refs/remotes/*/HEAD` names) or a name listed in `glaeda.keepBranch`;
 //! - its work is finished: a merged pull request from a branch of that name contains the tip
@@ -44,11 +45,30 @@ const MAX_GITHUB_LOOKUPS: usize = 1_000;
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How to ask GitHub whether a branch's pull request merged. `None` in the run means git-only.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GithubLookup {
     pub gh_program: PathBuf,
-    /// Passed through so `gh` finds its configuration and stored credentials.
+    /// Passed through so `gh` finds its configuration and stored credentials. Values of
+    /// [`GITHUB_SECRET_ENVIRONMENT`] keys are passed as secrets.
     pub environment: Vec<(String, String)>,
+}
+
+/// Environment keys whose values are credentials.
+pub const GITHUB_SECRET_ENVIRONMENT: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
+
+impl std::fmt::Debug for GithubLookup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<&str> = self
+            .environment
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect();
+        formatter
+            .debug_struct("GithubLookup")
+            .field("gh_program", &self.gh_program)
+            .field("environment_keys", &keys)
+            .finish()
+    }
 }
 
 /// Why a branch counts as finished.
@@ -57,7 +77,7 @@ pub struct GithubLookup {
 pub enum LocalBranchFinishedEvidence {
     /// The tip is in a remote default branch, or every file it changed is identical there.
     DefaultBranch,
-    /// A merged pull request's head contains the tip.
+    /// A pull request merged into the repository's default branch has a head containing the tip.
     MergedPullRequest { repository: String, number: u64 },
 }
 
@@ -138,6 +158,14 @@ pub fn reclaim_local_branches(
     let branches = list_local_branches(observer, repository, executor)?;
     let protected = protected_names(observer, repository, executor)?;
     let common_dir = inventory.common_dir.as_path();
+    let busy = busy_branches(common_dir)?;
+    let branches: Vec<LocalBranch> = branches
+        .into_iter()
+        .map(|mut branch| {
+            branch.checked_out |= busy.contains(&branch.name);
+            branch
+        })
+        .collect();
 
     let screened: Vec<Result<i64, LocalBranchKeepReason>> = branches
         .iter()
@@ -163,6 +191,7 @@ pub fn reclaim_local_branches(
     });
 
     let mut reports = Vec::new();
+    let mut halted = false;
     for (branch, screen) in branches.into_iter().zip(screened) {
         let decision = match screen {
             Err(reason) => LocalBranchDecision::Kept { reason },
@@ -189,9 +218,12 @@ pub fn reclaim_local_branches(
             }
         };
         let eligible = matches!(decision, LocalBranchDecision::Eligible { .. });
-        let deletion = if eligible && apply && *budget > 0 {
+        let deletion = if eligible && apply && !halted && *budget > 0 {
             *budget -= 1;
-            Some(delete(observer, repository, &branch, executor))
+            let deletion = delete(observer, repository, &branch, executor);
+            // An unexpected refusal stops this run's deletions; the caller trips its breaker.
+            halted |= deletion == LocalBranchDeletion::GitRefused;
+            Some(deletion)
         } else {
             None
         };
@@ -205,6 +237,41 @@ pub fn reclaim_local_branches(
         }
     }
     Ok(reports)
+}
+
+/// Branches a worktree is rebasing or bisecting, read from every worktree's Git directory.
+///
+/// Both detach HEAD, so the branch looks free to `%(worktreepath)`, but `rebase --continue` and
+/// `bisect reset` need it back. A directory that cannot be read fails the whole listing.
+fn busy_branches(common_dir: &Path) -> Result<Vec<String>, LinkedWorktreeReclaimError> {
+    let mut git_dirs = vec![common_dir.to_path_buf()];
+    match std::fs::read_dir(common_dir.join("worktrees")) {
+        Ok(entries) => {
+            for entry in entries {
+                git_dirs.push(entry.map_err(|_| super::unavailable())?.path());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(super::unavailable()),
+    }
+    let mut busy = Vec::new();
+    for git_dir in git_dirs {
+        for marker in [
+            "rebase-merge/head-name",
+            "rebase-apply/head-name",
+            "BISECT_START",
+        ] {
+            match std::fs::read_to_string(git_dir.join(marker)) {
+                Ok(text) => {
+                    let name = text.trim();
+                    busy.push(name.strip_prefix(BRANCH_PREFIX).unwrap_or(name).to_owned());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(super::unavailable()),
+            }
+        }
+    }
+    Ok(busy)
 }
 
 /// Cheap local checks; `Ok` carries the idle time of a branch that may be finished.
@@ -339,7 +406,11 @@ fn github_slug(url: &str) -> Option<String> {
 fn gh(github: &GithubLookup, arguments: &[&str]) -> CommandSpec {
     let mut spec = CommandSpec::new(&github.gh_program);
     for (key, value) in &github.environment {
-        spec = spec.environment(key.clone(), value.clone());
+        spec = if GITHUB_SECRET_ENVIRONMENT.contains(&key.as_str()) {
+            spec.secret_environment(key.clone(), value.clone())
+        } else {
+            spec.environment(key.clone(), value.clone())
+        };
     }
     spec = spec
         .environment("GH_PROMPT_DISABLED", "1")
@@ -365,11 +436,11 @@ fn merged_heads(
     for index in 0..batch.len() {
         declarations.push(format!("$b{index}:String!"));
         fields.push_str(&format!(
-            "b{index}:pullRequests(headRefName:$b{index},states:MERGED,first:10){{nodes{{number headRefOid}}}} "
+            "b{index}:pullRequests(headRefName:$b{index},states:MERGED,first:10){{nodes{{number headRefOid baseRefName}}}} "
         ));
     }
     let query = format!(
-        "query({}){{repository(owner:$owner,name:$name){{{fields}}}}}",
+        "query({}){{repository(owner:$owner,name:$name){{defaultBranchRef{{name}} {fields}}}}}",
         declarations.join(",")
     );
     let owner_field = format!("owner={owner}");
@@ -401,6 +472,9 @@ fn merged_heads(
     }
     let document: serde_json::Value = serde_json::from_str(&record.stdout).ok()?;
     let repository = document.get("data")?.get("repository")?;
+    // Only a merge into the default branch lands work; a stacked PR merged into another PR's
+    // branch may never reach it.
+    let default_branch = repository.get("defaultBranchRef")?.get("name")?.as_str()?;
     (0..batch.len())
         .map(|index| {
             let nodes = repository
@@ -411,6 +485,9 @@ fn merged_heads(
                 nodes
                     .iter()
                     .filter_map(|node| {
+                        if node.get("baseRefName")?.as_str()? != default_branch {
+                            return None;
+                        }
                         let number = node.get("number")?.as_u64()?;
                         let head = node.get("headRefOid")?.as_str()?;
                         crate::artifact::CommitId::parse(head).ok()?;
@@ -484,15 +561,17 @@ fn delete(
         Ok(record) if record.stdout == expected => {}
         _ => return LocalBranchDeletion::Changed,
     }
-    // Compare-and-swap: Git deletes only if the ref still points at the observed commit.
-    if git(
-        observer,
-        repository,
-        &["update-ref", "-d", &reference, &branch.commit],
-        executor,
-    )
-    .is_err()
-    {
+    // Compare-and-swap: Git deletes only if the ref still points at the observed commit. A
+    // checkout landing between the check above and this delete is not caught; the receipt's tip
+    // recreates the branch. Success is the exit status: a warning on stderr is not a refusal.
+    let deleted = observer
+        .git(
+            repository,
+            &["update-ref", "-d", &reference, &branch.commit],
+            executor,
+        )
+        .is_ok_and(|record| record.status == Some(0));
+    if !deleted {
         return LocalBranchDeletion::GitRefused;
     }
     // `git branch -D` also drops the branch's config section; absent sections fail harmlessly.

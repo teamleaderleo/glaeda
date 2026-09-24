@@ -44,8 +44,9 @@ use crate::project_checkout_observation::{ProjectBranchState, ProjectCheckoutObs
 mod branches;
 
 pub use branches::{
-    GithubLookup, LocalBranchDecision, LocalBranchDeletion, LocalBranchFinishedEvidence,
-    LocalBranchKeepReason, LocalBranchReport, MAX_LOCAL_BRANCHES, reclaim_local_branches,
+    GITHUB_SECRET_ENVIRONMENT, GithubLookup, LocalBranchDecision, LocalBranchDeletion,
+    LocalBranchFinishedEvidence, LocalBranchKeepReason, LocalBranchReport, MAX_LOCAL_BRANCHES,
+    reclaim_local_branches,
 };
 
 pub const LINKED_WORKTREE_RECLAIM_SCHEMA_VERSION: u8 = 1;

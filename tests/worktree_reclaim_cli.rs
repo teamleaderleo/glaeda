@@ -1006,6 +1006,23 @@ fn branches_mode_deletes_only_finished_idle_branches() {
     branch_with_work(&fixture, "unfinished", "wip.txt", false, 2 * hours);
     branch_with_work(&fixture, "recent", "recent.txt", true, 60);
     branch_with_work(&fixture, "kept", "kept.txt", true, 2 * hours);
+    // Landed and idle, but a worktree is mid-rebase of it (HEAD detached) or bisecting it.
+    branch_with_work(&fixture, "rebasing", "rebasing.txt", true, 2 * hours);
+    branch_with_work(&fixture, "bisecting", "bisecting.txt", true, 2 * hours);
+    let rebase_worktree = fixture.root.join("rebase-wt");
+    git(
+        &fixture.main,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            rebase_worktree.to_str().expect("UTF-8 fixture path"),
+        ],
+    );
+    let rebase_state = fixture.main.join(".git/worktrees/rebase-wt/rebase-merge");
+    fs::create_dir_all(&rebase_state).expect("create rebase state");
+    fs::write(rebase_state.join("head-name"), "refs/heads/rebasing\n").expect("write head-name");
+    fs::write(fixture.main.join(".git/BISECT_START"), "bisecting\n").expect("write BISECT_START");
     git(
         &fixture.main,
         &["config", "--add", "glaeda.keepBranch", "kept"],
@@ -1053,6 +1070,8 @@ fn branches_mode_deletes_only_finished_idle_branches() {
         // Checked out in the main worktree, which is checked before the protected names.
         ("main", "checked_out"),
         ("checked", "checked_out"),
+        ("rebasing", "checked_out"),
+        ("bisecting", "checked_out"),
     ] {
         assert_eq!(branch_entry(&plan, name)["reason"], reason, "{name}");
     }
@@ -1075,7 +1094,15 @@ fn branches_mode_deletes_only_finished_idle_branches() {
         !description.status.success(),
         "the branch's config section goes too"
     );
-    for name in ["unfinished", "recent", "kept", "main", "checked"] {
+    for name in [
+        "unfinished",
+        "recent",
+        "kept",
+        "main",
+        "checked",
+        "rebasing",
+        "bisecting",
+    ] {
         assert!(
             ref_exists(&fixture.main, &format!("refs/heads/{name}")),
             "{name} kept"

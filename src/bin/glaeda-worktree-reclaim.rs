@@ -44,17 +44,21 @@ const DEFAULT_MAX_BRANCH_DELETIONS: usize = 64;
 const GH_CANDIDATES: [&str; 3] = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"];
 
 /// Environment passed to `gh` so it finds its configuration and stored credentials.
-const GH_ENVIRONMENT: [&str; 5] = [
+const GH_ENVIRONMENT: [&str; 6] = [
     "HOME",
     "XDG_CONFIG_HOME",
     "GH_CONFIG_DIR",
     "GH_TOKEN",
+    "GITHUB_TOKEN",
     "USER",
 ];
 
 // Ignored files are gone for good; everything else comes back with `git worktree add` at the
 // preserved commit, and a detached HEAD is pinned under refs/glaeda/worktree-pins/ first.
 const COMPENSATION: &str = "git_worktree_add_at_preserved_commit";
+
+// A deleted branch comes back with `git branch <name> <commit>` from the receipt.
+const BRANCH_COMPENSATION: &str = "git_branch_at_receipt_commit";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -203,6 +207,8 @@ struct Report {
     schema_version: u8,
     mutation_performed: bool,
     compensation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_compensation: Option<&'static str>,
     minimum_idle_seconds: i64,
     finished_idle_seconds: i64,
     max_reclaims: usize,
@@ -401,7 +407,11 @@ fn main() -> ExitCode {
                         .iter()
                         .filter(|branch| branch.deletion.is_some())
                         .count();
-                    branch_budget_exhausted |= cli.apply && eligible > attempted;
+                    circuit_breaker_tripped |= branches
+                        .iter()
+                        .any(|branch| branch.deletion == Some(LocalBranchDeletion::GitRefused));
+                    branch_budget_exhausted |=
+                        cli.apply && !circuit_breaker_tripped && eligible > attempted;
                     BranchSection::Listed {
                         eligible,
                         deleted,
@@ -429,6 +439,7 @@ fn main() -> ExitCode {
         schema_version: REPORT_SCHEMA_VERSION,
         mutation_performed,
         compensation: COMPENSATION,
+        branch_compensation: cli.branches.then_some(BRANCH_COMPENSATION),
         minimum_idle_seconds: policy.minimum_idle_seconds(),
         finished_idle_seconds: policy.finished_idle_seconds(),
         max_reclaims: cli.max_reclaims,
@@ -450,10 +461,10 @@ fn main() -> ExitCode {
         },
         OutputFormat::Human => render_human(&report, cli.apply, cli.all),
     }
-    let any_unlisted = report
-        .repositories
-        .iter()
-        .any(|repository| matches!(repository.result, RepositoryResult::Unlisted { .. }));
+    let any_unlisted = report.repositories.iter().any(|repository| {
+        matches!(repository.result, RepositoryResult::Unlisted { .. })
+            || matches!(repository.branches, Some(BranchSection::Unlisted { .. }))
+    });
     if circuit_breaker_tripped {
         ExitCode::from(3)
     } else if any_unlisted {
