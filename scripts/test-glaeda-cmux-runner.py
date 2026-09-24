@@ -500,6 +500,26 @@ class HookTest(unittest.TestCase):
         finally:
             self.finish("l0")
 
+    def test_capacity_a_releasing_holder_is_not_a_waiter(self) -> None:
+        self.fleet()
+        state = self.dir / "state"
+        state.mkdir()
+        (state / "host-lock-holder-gone.pid.releasing").write_text("4242\n")
+        (state / "host-lock-holder-live.pid").write_text("4343\n")
+        self.assertEqual(hook.holder_pids(state), {os.getpid(), 4242, 4343})
+        try:  # job-completed on one runner while another admits: never "a fleet build is waiting"
+            self.assertEqual(self.job("cli-product-tests", "a0").returncode, 0)
+            for n in range(3):
+                self.finish("a0")
+                self.assertEqual(self.job("cli-product-tests", "a0").returncode, 0)
+                result = self.job("cli-product-tests", f"b{n}")
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.finish(f"b{n}")
+        finally:
+            self.finish("a0")
+        self.assertTrue(self.lock_free())
+        self.assertEqual(sorted(p.name for p in state.glob("*.releasing")), ["host-lock-holder-gone.pid.releasing"])
+
     def test_capacity_toolchain_gate_requires_gh(self) -> None:
         self.fleet()
         self.node(gh=False)
@@ -1196,6 +1216,11 @@ class RunnerTest(unittest.TestCase):
         self.assertTrue((self.home / ".local/state/glaeda/cmux-runner/receipt.json").is_file())
         for runner in ("actions-runner-glaeda", "actions-runner-glaeda-3"):
             self.assertIn("--capacity-units 4", (self.home / runner / "glaeda-hooks/job-started.sh").read_text())
+        # a plain re-run keeps the member's capacity, gate and floor
+        self.invoke("--apply", "--instance", "3")
+        wrapper = (self.home / "actions-runner-glaeda-3/glaeda-hooks/job-started.sh").read_text()
+        self.assertIn("--capacity-units 4", wrapper)
+        self.assertIn("--require-eligible --fleet-class m4pro-48", wrapper)
         err = io.StringIO()
         with mock.patch.object(cr, "xcode_present", return_value=True), contextlib.redirect_stderr(err):
             self.assertEqual(cr.main(["--gh", os.fspath(self.gh), "--manifest", self.manifest(), "--member",

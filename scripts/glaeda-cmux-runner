@@ -1050,6 +1050,14 @@ def main(argv: list[str] | None = None) -> int:
                 ctx.unreadable_registration = True
     if not args.uninstall and owned_dir(ctx, prior):
         registered = (prior or {}).get("registration") or {}
+        kept = (prior or {}).get("member")
+        if ctx.member is None and isinstance(kept, dict) and kept.get("hardware"):
+            # a plain re-run keeps the member's gate, capacity and disk floor, not just its labels
+            ctx.member = kept
+            if not args.capacity_units:
+                ctx.capacity_units = int(kept.get("capacityUnits") or 0)
+            if not args.min_free_gib:
+                ctx.min_free_gib = float(kept.get("minFreeGib") or 0)
         # a re-run that names nothing keeps what this install registered, not the hostname default
         if not ctx.labels_requested and isinstance(registered.get("labels"), list) and registered["labels"]:
             ctx.labels = registered["labels"]

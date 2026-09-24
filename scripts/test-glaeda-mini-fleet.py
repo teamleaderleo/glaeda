@@ -1440,7 +1440,27 @@ class FixLibraryTests(unittest.TestCase):
                 self.assertEqual(gate.stdout.strip(), "free")
             finally:
                 os.close(fd)
+            fd = os.open(fleet / "host.lock", os.O_RDONLY)
+            try:  # a PR job on a mini with several runners holds it shared: still busy
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                self.assertEqual(self.call(home, "host_check").returncode, 20)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
             self.assertEqual(self.call(home, "candidate_dir", "abc").returncode, 0)
+
+    def test_runner_plist_knows_every_glaeda_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            agents = home / "Library/LaunchAgents"
+            agents.mkdir(parents=True)
+            for suffix, label in (("", "com.teamleaderleo.glaeda.cmux-runner"), ("-3", "com.teamleaderleo.glaeda.cmux-runner.3")):
+                (home / f"actions-runner-glaeda{suffix}").mkdir()
+                (agents / f"{label}.plist").write_text("")
+                got = self.call(home, "runner_plist", os.fspath(home / f"actions-runner-glaeda{suffix}"))
+                self.assertEqual(got.stdout.strip(), os.fspath(agents / f"{label}.plist"), got.stderr)
+            (home / "actions-runner-glaeda-x").mkdir()
+            self.assertNotEqual(self.call(home, "runner_plist", os.fspath(home / "actions-runner-glaeda-x")).returncode, 0)
 
     def test_runner_hold_release_and_kick(self) -> None:
         # launchctl and pgrep are shims ahead of the real ones on the workload PATH, so this runs anywhere.
@@ -2380,6 +2400,13 @@ class ReservationProbeScriptTests(unittest.TestCase):
                 holder.wait()
                 holder.stdout.close()
             self.assertEqual(self.run_probe(root)["host_lock"], "free")
+            import fcntl
+            shared = os.open(lock, os.O_RDONLY)
+            try:  # a PR job's shared share of the host counts as held
+                fcntl.flock(shared, fcntl.LOCK_SH)
+                self.assertEqual(self.run_probe(root)["host_lock"], "held")
+            finally:
+                os.close(shared)
             lock.unlink()
             lock.symlink_to(root / "reservation.json")
             self.assertEqual(self.run_probe(root)["host_lock"], "unknown")  # never follows a symlinked lock
