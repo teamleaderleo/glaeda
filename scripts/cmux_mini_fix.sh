@@ -89,6 +89,103 @@ glaeda() {  # PYTHON
   "$(home "$1")" "$dir/scripts/glaeda-mini-setup" --apply
 }
 
+# ~/glaeda at the candidate's own source commit, so glaeda-mini-enroll and the staging verifier it
+# runs match the candidate they stage (glaeda-mini-fleet upgrade and repair, before a renewal).
+glaeda_sync() {  # COMMIT
+  local dir="$HOME/glaeda" head enroll
+  [ -f "$dir/scripts/cmux_fleet.py" ] || refuse "$dir is not a Glaeda checkout; run glaeda-mini-fleet fix first"
+  head=$(git -C "$dir" rev-parse -q --verify HEAD || true)
+  if [ "$head" = "$1" ]; then say "unchanged: ~/glaeda is at ${1:0:12}"; return; fi
+  [ -z "$(git -C "$dir" status --porcelain=v1 --untracked-files=no)" ] || refuse "$dir has local changes; commit or move them aside"
+  if ! git -C "$dir" cat-file -e "$1^{commit}" 2>/dev/null; then
+    if [ "$(git -C "$dir" rev-parse --is-shallow-repository)" = true ]; then
+      git -C "$dir" fetch --quiet --depth 1 origin "$1"
+    else
+      git -C "$dir" fetch --quiet origin "$1"
+    fi
+  fi
+  # Captured, not piped into grep -q: under pipefail an early grep exit would fail git show.
+  enroll=$(git -C "$dir" show "$1:scripts/glaeda-mini-enroll")
+  case "$enroll" in
+    *'"--renew"'*) ;;
+    *) refuse "candidate ${1:0:12} predates glaeda-mini-enroll --renew; roll a candidate built from a later commit" ;;
+  esac
+  git -C "$dir" checkout --quiet --detach "$1"
+  say "~/glaeda moved from ${head:0:12} to ${1:0:12}"
+}
+
+# ---- The GitHub Actions runner's launchd agent, which cmux scripts/persistent-compile up installs in the
+# login user's GUI domain. runner_hold stops it once its current job ends and marks it held; runner_release
+# starts what runner_hold stopped (all: every registered runner that is not loaded); runner_kick restarts a
+# loaded agent whose listener is gone (all: every loaded one). The held marks are what repair reads.
+held_dir() { printf '%s' "$HOME/.local/state/glaeda/mini-fleet/runner-held"; }
+
+runner_plist() {  # DIR: the runner's LaunchAgent (svc.sh records it in .service; glaeda-cmux-runner's is fixed), or fail
+  local plist; plist=$(cat "$1/.service" 2>/dev/null || true)
+  if [ -z "$plist" ] && [ "$(basename "$1")" = actions-runner-glaeda ]; then
+    plist="$HOME/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist"
+  fi
+  [ -n "$plist" ] && [ -f "$plist" ] || return 1
+  printf '%s' "$plist"
+}
+
+runner_hold() {  # WAIT_SECONDS
+  local r dir plist label domain deadline
+  domain="gui/$(id -u)"
+  mkdir -p "$(held_dir)"
+  for r in "$HOME"/actions-runner*/.runner; do
+    [ -f "$r" ] || continue
+    dir=$(dirname "$r")
+    plist=$(runner_plist "$dir") || { say "$dir has no launchd agent; nothing to stop"; continue; }
+    label=$(basename "$plist" .plist)
+    if ! launchctl print "$domain/$label" >/dev/null 2>&1; then say "unchanged: $label is not loaded"; continue; fi
+    deadline=$(( $(date +%s) + $1 ))
+    while pgrep -f "$dir/bin/Runner.Worker" >/dev/null 2>&1; do
+      [ "$(date +%s)" -lt "$deadline" ] || refuse "$label is still running a job after $1 seconds; rerun once it ends"
+      say "$label is running a job; waiting for it to end"
+      sleep 30
+    done
+    : > "$(held_dir)/$(basename "$dir")"
+    launchctl disable "$domain/$label"
+    launchctl bootout "$domain/$label" 2>/dev/null || true
+    ! launchctl print "$domain/$label" >/dev/null 2>&1 || refuse "could not stop $label"
+    say "stopped $label; it starts again once the node is eligible"
+  done
+}
+
+runner_release() {  # [all]
+  local r dir plist label domain
+  domain="gui/$(id -u)"
+  for r in "$HOME"/actions-runner*/.runner; do
+    [ -f "$r" ] || continue
+    dir=$(dirname "$r")
+    [ -f "$(held_dir)/$(basename "$dir")" ] || [ "${1:-}" = all ] || continue
+    plist=$(runner_plist "$dir") || { say "$dir has no launchd agent; cmux scripts/persistent-compile up installs it"; continue; }
+    label=$(basename "$plist" .plist)
+    launchctl enable "$domain/$label"
+    launchctl print "$domain/$label" >/dev/null 2>&1 || launchctl bootstrap "$domain" "$plist" \
+      || refuse "could not start $label; the runner runs in the GUI session, so log in on the mini (or enable auto-login)"
+    rm -f "$(held_dir)/$(basename "$dir")"
+    say "started $label"
+  done
+}
+
+runner_kick() {  # [all]
+  local r dir plist label domain
+  domain="gui/$(id -u)"
+  for r in "$HOME"/actions-runner*/.runner; do
+    [ -f "$r" ] || continue
+    dir=$(dirname "$r")
+    plist=$(runner_plist "$dir") || continue
+    label=$(basename "$plist" .plist)
+    launchctl print "$domain/$label" >/dev/null 2>&1 || continue
+    if [ "${1:-}" = all ] || ! pgrep -f "$dir/bin/Runner.Listener" >/dev/null 2>&1; then
+      launchctl kickstart -k "$domain/$label"
+      say "restarted $label"
+    fi
+  done
+}
+
 # Xcode 26 ships Metal separately; the fleet bootstrap runs xcrun metal.
 metal() {  # DEVELOPER_DIR
   if DEVELOPER_DIR="$1" xcrun metal --version >/dev/null 2>&1; then say "unchanged: Metal toolchain present"; return; fi

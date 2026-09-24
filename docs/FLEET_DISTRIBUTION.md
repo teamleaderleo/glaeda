@@ -114,17 +114,13 @@ is the fleet contract generation every acceptance binds. So a new candidate stal
 every node and class acceptance. Roll one out like this:
 
 1. After the change merges, dispatch `fleet-candidate.yml` on the merged commit and
-   take the run ID, source, archive SHA-256 and artifact `expires_at` from that run.
-2. In manaflow-ai/cmux `scripts/ci/persistent_compile_fleet.py`, set
-   `CANDIDATE_RUN`, `CANDIDATE_SOURCE`, `CANDIDATE_SHA256` and `CANDIDATE_EXPIRES`
-   to them (`CANDIDATE_ARTIFACT` and `CANDIDATE_REPO` stay). `persistent-compile up`
-   and `glaeda-mini-fleet onboard` read the candidate from there.
-3. On one node per class (for `std`, cmux-mac-001): stage the candidate with
-   `fleet_bundle.py stage`, quarantine the enrollment, run the new generation's
-   bootstrap into a private file, `renew-enrollment` and `renew-enrollment-apply`,
-   then `glaeda-mini-enroll ... --apply` runs the one `accept-local`. Then
-   `export-class-acceptance` ([Class acceptance](CMUX_FLEET_ENROLLMENT.md#class-acceptance))
-   and record the receipt and its `receiptSha256` under the manifest's `hardware.<key>.acceptance`.
-4. `glaeda-mini-fleet onboard --acceptance class --yes` joins the rest of the class.
+   take the run ID from it.
+2. From the operator Mac, `glaeda-mini-fleet upgrade --candidate-run RUN` shows the plan;
+   with `--yes` it downloads and checks the candidate, runs one `accept-local` per hardware
+   class on a seed, exports and records the class receipt and the candidate pin in the
+   fleet manifest, and renews every other node onto the candidate by class adoption. See
+   [Updating the fleet](CMUX_FLEET_ENROLLMENT.md#updating-the-fleet). The fleet manifest's
+   `candidate` is the pin `onboard` and `repair` then use; nothing reads a pin from cmux.
+
 Repository-side automation should build on this same bundle, without requiring
 the CMUX team to design a second distribution system.

@@ -9,7 +9,9 @@
     glaeda-mini-fleet fix       [HOST ...] [--yes]                              every repair that needs no root
     glaeda-mini-fleet sudo-plan [HOST ...] [--run] [--sudoers]                  every root step, one password per host
     glaeda-mini-fleet share THING --from HOST HOST ... [--yes]                  seed over the LAN from a prepared host
-    glaeda-mini-fleet onboard   [HOST ...] [--yes] [--from HOST]                preflight, fix, sudo-plan, enroll, register
+    glaeda-mini-fleet onboard   [HOST ...] [--yes] [--from HOST]                preflight, fix, sudo-plan, enroll
+    glaeda-mini-fleet repair    [HOST ...] [--yes] [--from HOST]                preflight, fix, sudo-plan, renew, runners
+    glaeda-mini-fleet upgrade   [HOST ...] --candidate-run RUN [--yes]         roll a new candidate over the fleet
     glaeda-mini-fleet pools    [HOST ...] [--observed FILE]                     runner capacity per pool label (JSON)
 
 The manifest names every host, its fleet node id (node_id, so every enrollment rerun asks for the
@@ -52,12 +54,35 @@ Python, the candidate and the Metal toolchain. Dry run by default.
 
 `onboard` runs the whole sequence on every host that has a node_id and a compile-lane class (or
 the named ones): preflight, fix, the sudo-plans (--sudo run over ssh -t, wait for the operator,
-or stop), fix again, a fresh preflight, enrollment in parallel with a heartbeat line every 30
-seconds, and runner registration with one org token minted here and passed over stdin. It ends
-with one table: host, node id, step reached, result, log. Acceptance is proved once per class and
-Xcode build: by default a host joins on the class's recorded acceptance (hardware.<h>.acceptance)
-and enrolls without accept-local; --acceptance node runs accept-local on the host instead. Dry
-run by default; never_touch hosts are refused.
+or stop), fix again, a fresh preflight, then enrollment in parallel with a heartbeat line every 30
+seconds. It ends with one table: host, class, node id, generation, step reached, result, log.
+Acceptance is proved once per class and Xcode build: by default a host joins on the class's
+recorded acceptance (hardware.<h>.acceptance) and enrolls without accept-local; --acceptance node
+runs accept-local on the host instead. Runner registration is a hook (runner_register_command,
+glaeda#1174) that nothing fills yet, so onboard ends at an eligible enrollment. Dry run by default;
+never_touch hosts are refused.
+
+`repair` is the same pipeline for hosts that are already enrolled (onboard is repair for a host
+with no enrollment yet): preflight, fix, sudo-plan (printed, --sudo stop by default), then every
+enrolled host that is quarantined, enrolling, not accepted or on another Glaeda than the pinned
+candidate is renewed onto it with glaeda-mini-enroll --renew, re-adopting its class receipt, and
+its runners are started again (a loaded runner whose listener is gone is restarted). Draining
+nodes are left to their operator. Dry run by default.
+
+`upgrade --candidate-run RUN` rolls a new candidate out. It checks the run (the dispatched
+`Fleet candidate bundles` workflow, successful, from a commit on main, artifact unexpired),
+downloads the macOS archive once on this Mac with gh and checks it against the build's own
+receipt (and --candidate-sha256, from the run's summary, when given). Then per hardware class it
+picks a seed (--seed-per-class, else the first ready host), moves ~/glaeda to main's tip, stages
+the candidate, stops its runners after their current job, renews the enrollment and runs the one
+accept-local, exports the class receipt, and records it with the candidate pin in the manifest
+file (printing the diff). Every other host of the class then renews and adopts that receipt in
+parallel; one that differs is left quarantined with the differing fields named. A rerun resumes:
+a class that already records a receipt for the candidate is not seeded again, and a host already
+on it is left alone. Dry run by default.
+
+The manifest's `candidate` pins the reviewed Glaeda candidate the fleet runs (source, sha256, run,
+artifact, repo, expires). upgrade writes it; preflight, fix, onboard and repair read it.
 
 The manifest's `toolchain` (in defaults, overridable per host) declares what every build host
 must carry: the Xcode app and build and whether it is selected, the Metal toolchain, the minimum
@@ -280,6 +305,16 @@ def validate_onboarding(path: Path, data: dict[str, Any]) -> None:
                 and re.fullmatch(r"(sha256:[0-9a-f]{64})?", str(accepted.get("receipt_sha256", "")))):
             raise Failure(f"{path}: hardware {shape} acceptance needs xcode_build, candidate (12 hex) and node (a node id), "
                           "and receipt (a file path) with receipt_sha256 (sha256:<64 hex>) together")
+    pin = data.get("candidate")
+    if pin is not None and not (
+            isinstance(pin, dict) and {"source", "sha256", "run", "artifact", "repo"} <= set(pin)
+            and set(pin) <= {"source", "sha256", "run", "artifact", "repo", "expires", "note"}
+            and re.fullmatch(r"[0-9a-f]{40}", str(pin["source"])) and re.fullmatch(r"[0-9a-f]{64}", str(pin["sha256"]))
+            and re.fullmatch(r"[0-9]+", str(pin["run"])) and re.fullmatch(r"[A-Za-z0-9._-]+", str(pin["artifact"]))
+            and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", str(pin["repo"]))
+            and re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)?", str(pin.get("expires", "")))):
+        raise Failure(f"{path}: candidate needs source (40 hex), sha256 (64 hex), run, artifact and repo, "
+                      "and optionally expires (an ISO time such as 2026-10-24T15:15:27Z)")
     for name, host in data["hosts"].items():
         if "lan_ip" in host and not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", str(host["lan_ip"])):
             raise Failure(f"{path}: host {name} lan_ip must be an IPv4 address")
@@ -419,16 +454,22 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
         "setup_artifacts": out.get("pf_setup_artifacts") == "yes",
         "dirty": int(out.get("pf_cmux_dirty") or 0),
         "candidate": None if candidate is None else
-        {"source12": candidate[0], "staged": candidate[1] == "yes", "archive": candidate[2] == "yes"},
+        {"source12": candidate[0], "staged": candidate[1] == "yes", "archive": candidate[2] == "yes",
+         "generation": out.get("pf_candidate_generation") or None},
         "glaeda_checkout": out.get("pf_glaeda") == "present",
+        "glaeda_head": out.get("pf_glaeda_head") or None,
         "cache_root": out.get("pf_cache_root") == "present",
         "enroll_state": out.get("pf_enroll_state"),
+        "enroll_generation": out.get("pf_enroll_generation") or None,
+        "enroll_reason": out.get("pf_enroll_reason") or None,
         "acceptance": out.get("pf_acceptance"),
         "brew_owner": out.get("pf_brew_owner"),
         "update_running": out.get("pf_update_running"),
         "update_prepared": None if prepared is None else {"state": prepared[0], "version": prepared[1]},
         "pmset": "\n".join(out["pf_pmset"]),
-        "runners": [dict(zip(("dir", "name"), (v.split("|", 1) + [""])[:2])) for v in out["pf_runner"]],
+        # dir|name|loaded|listening|held; an older probe sends only dir|name, which reads as unknown.
+        "runners": [dict(zip(("dir", "name", "loaded", "listening", "held"),
+                             (v.split("|", 4) + ["", "unknown", "", ""])[:5])) for v in out["pf_runner"]],
     }
 
 
@@ -500,7 +541,7 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
     got_node = obs.get("enrolled_node_id")
     if want_node and not got_node:
         drift("pending", f"not enrolled yet; node id {want_node} is reserved for it",
-              f"glaeda-mini-enroll --node-id {want_node} (or cmux persistent-compile up --node-id {want_node})")
+              f"glaeda-mini-fleet onboard {name} --yes (glaeda-mini-enroll --node-id {want_node})")
     elif want_node and got_node != want_node:
         drift("enrollment", f"enrolled as {got_node}, manifest assigns {want_node}",
               "fix the manifest; an enrolled node keeps its id (glaeda-mini-enroll refuses a different one)")
@@ -794,7 +835,7 @@ def apply(manifest: dict[str, Any], hosts: list[str], yes: bool) -> int:
 
 # ---------------------------------------------------------------- preflight
 
-DEFAULT_CMUX_ROOT = "~/cmux"  # where cmux scripts/persistent-compile up clones it on a mini
+DEFAULT_CMUX_ROOT = "~/cmux"  # where fix clones cmux on a mini
 # Columns of the preflight table, in the order onboarding meets them.
 PREFLIGHT_CHECKS = ("os", "xcode", "select", "licence", "launch", "metal", "rust", "zig", "tools", "python",
                     "cmux", "setup", "glaeda", "power", "disk", "update", "candidate", "node", "enroll", "runner", "brew")
@@ -829,7 +870,7 @@ def preflight_script(manifest: dict[str, Any], name: str) -> bytes:
         "WORKLOAD_PATH": bootstrap.CMUX_WORKLOAD_TOOL_PATH,
         "WORKLOAD_TOOLS": " ".join(bootstrap.MACOS_WORKLOAD_TOOLS),
         "PYTHONS": " ".join(pythons),
-        "CANDIDATE_FALLBACK": operator_candidate_source(),
+        "CANDIDATE_PIN": operator_candidate_source(),
     }
     header = "".join(f"{k}={shlex.quote(v)}\n" for k, v in inputs.items())
     return PROBE.read_bytes() + b"\n" + header.encode() + PREFLIGHT_PROBE.read_bytes()
@@ -848,7 +889,7 @@ def operator_zig_minimum() -> str | None:
 
 
 def operator_candidate_source() -> str:
-    """The candidate cmux persistent-compile installs, from the operator's cmux checkout, for a host without one."""
+    """The pinned candidate's source commit, which the probe looks for on the host, or empty."""
     return operator_candidate().get("source", "")
 
 
@@ -1111,10 +1152,11 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     enrolled = obs.get("enrolled_node_id")
     state = pf.get("enroll_state")
     candidate = pf.get("candidate")
-    if enrolled and state == "eligible":
+    stale = enrollment_stale(pf)
+    if enrolled and state == "eligible" and not stale:
         put("candidate", "ok", "enrolled")
     elif candidate is None:
-        put("candidate", "unknown", "the cmux checkout names no candidate (scripts/ci/persistent_compile_fleet.py)")
+        put("candidate", "unknown", NO_CANDIDATE)
     elif candidate["staged"]:
         put("candidate", "ok", f"{candidate['source12']} staged")
     else:
@@ -1132,19 +1174,36 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
         put("node", "fail", "no node id: not enrolled and the manifest assigns none",
             f"assign hosts.{name}.node_id (cmux-mac-NNN) in the manifest", "person")
     accepted = pf.get("acceptance") == "accepted"
-    if state == "eligible" and accepted:
+    renew = f"glaeda-mini-fleet repair {name} --yes (renews it onto the candidate and re-adopts its class acceptance)"
+    if state == "eligible" and accepted and not stale:
         put("enroll", "ok", "eligible, accepted")
-    elif state in {"quarantined", "retired"}:
-        put("enroll", "fail", f"enrollment is {state}", "see docs/CMUX_FLEET_ENROLLMENT.md", "person")
+    elif state == "retired":
+        put("enroll", "fail", "enrollment is retired", "see docs/CMUX_FLEET_ENROLLMENT.md", "person")
+    elif state == "quarantined":
+        put("enroll", "todo", f"quarantined ({pf.get('enroll_reason') or 'no reason'})", renew, "self")
+    elif state == "draining":
+        put("enroll", "info", "draining (an operator drain; upgrade and repair leave it alone)")
+    elif state == "eligible":
+        why = (f"runs Glaeda {short_generation(pf.get('enroll_generation'))}, not candidate "
+               f"{(candidate or {}).get('source12')}") if stale else f"acceptance {pf.get('acceptance') or 'missing'}"
+        put("enroll", "todo", f"eligible, but {why}", renew, "self")
     else:
         progress = "not enrolled" if not state else f"{state}, acceptance {pf.get('acceptance') or 'not run'}"
         put("enroll", "todo", progress,
             f"glaeda-mini-enroll --cmux-root {root} --node-id {enrolled or node or '<cmux-mac-NNN>'} --apply", "self")
     runners = pf.get("runners") or []
-    if runners:
+    held = [r for r in runners if r.get("held") == "yes"]
+    down = [r for r in runners if r.get("loaded") == "yes" and r.get("listening") == "no"]
+    if held:
+        put("runner", "todo", "stopped by glaeda-mini-fleet for a renewal: " + ", ".join(r["name"] or r["dir"] for r in held),
+            f"glaeda-mini-fleet repair {name} --yes starts it once the node is eligible", "self")
+    elif down:
+        put("runner", "todo", "loaded, listener not running: " + ", ".join(r["name"] or r["dir"] for r in down),
+            f"glaeda-mini-fleet repair {name} --yes restarts it", "self")
+    elif runners:
         put("runner", "ok", ", ".join(r["name"] or r["dir"] for r in runners))
     else:
-        put("runner", "todo", "no runner registered", f"cd {root} && scripts/persistent-compile up (runner token from an org admin)", "person")
+        put("runner", "todo", "no runner registered", RUNNER_HOOK_NOTE, "person")
     if owner is None:
         rust_or_zig = checks["rust"]["state"] == "fail" or checks["zig"]["state"] == "fail"
         put("brew", "fail" if rust_or_zig else "info", "none (no Homebrew)",
@@ -1153,7 +1212,29 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     else:
         put("brew", "info", owner if owner == user else f"{owner} (installs run as sudo -u {owner})")
     blocked = any(c["state"] == "fail" or (c["state"] == "unknown" and k in UNKNOWN_BLOCKS) for k, c in checks.items())
-    return {"host": name, "ready": not blocked, "checks": checks}
+    return {"host": name, "ready": not blocked, "checks": checks,
+            "enrollment": {"state": state, "generation": pf.get("enroll_generation"), "stale": stale,
+                           "accepted": accepted, "reason": pf.get("enroll_reason")},
+            "runners": runners}
+
+
+def enrollment_stale(pf: dict[str, Any]) -> bool:
+    """Whether an enrolled node runs another Glaeda than the fleet's candidate.
+
+    The candidate not staged there means no enrollment records it yet; staged, the enrollment's
+    glaedaGeneration must be that generation's binary digest. Without a candidate nothing is stale."""
+    candidate = pf.get("candidate")
+    if not pf.get("enroll_state") or pf.get("enroll_state") == "retired" or candidate is None:
+        return False
+    if not candidate["staged"]:
+        return True
+    got, want = pf.get("enroll_generation"), candidate.get("generation")
+    return bool(got and want and got != want)
+
+
+def short_generation(value: str | None) -> str:
+    """sha256:0123456789ab..., the way the tables show a glaedaGeneration."""
+    return value.removeprefix("sha256:")[:12] if value else "?"
 
 
 def preflight(manifest: dict[str, Any], observed: dict[str, Any], hosts: list[str]) -> list[dict[str, Any]]:
@@ -1420,37 +1501,19 @@ def ship_python(name: str, user: str, action: dict[str, Any], log: Any) -> tuple
     return True, f"CPython {version} at {target}"
 
 
-def read_operator_cmux_fleet() -> str:
-    """cmux scripts/ci/persistent_compile_fleet.py from the operator's checkout, or its upstream tip."""
-    root = operator_cmux_root()
-    relative = "scripts/ci/persistent_compile_fleet.py"
-    try:
-        return (root / relative).read_text()
-    except OSError:
-        pass
-    # The working tree may be on an older branch; the upstream tip names the current candidate.
-    for ref in ("upstream/main", "origin/main"):
-        try:
-            shown = subprocess.run(["git", "-C", os.fspath(root), "show", f"{ref}:{relative}"],
-                                   capture_output=True, text=True, timeout=10, check=False)
-        except (OSError, subprocess.TimeoutExpired):
-            break
-        if shown.returncode == 0:
-            return shown.stdout
-    return ""
+CANDIDATE_REPO = "teamleaderleo/glaeda"
+CANDIDATE_ARTIFACT = "glaeda-candidate-aarch64-apple-darwin"
+CANDIDATE_WORKFLOW = "Fleet candidate bundles"
+CANDIDATE_TARGET = "aarch64-apple-darwin"
+# The reviewed Glaeda candidate the fleet runs: the manifest's `candidate`, which glaeda-mini-fleet upgrade
+# writes, or during an upgrade the candidate it rolls out. main sets it for each run.
+PINNED_CANDIDATE: dict[str, str] | None = None
+NO_CANDIDATE = "the fleet manifest pins no candidate; glaeda-mini-fleet upgrade --candidate-run RUN records one"
 
 
 def operator_candidate() -> dict[str, str]:
-    """The reviewed candidate cmux persistent-compile installs: source, sha256, run, artifact, repo."""
-    text = read_operator_cmux_fleet()
-    patterns = {"source": r"[0-9a-f]{40}", "sha256": r"[0-9a-f]{64}", "run": r"[0-9]+",
-                "artifact": r"[A-Za-z0-9._-]+", "repo": r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"}
-    out = {}
-    for field, pattern in patterns.items():
-        match = re.search(rf'^CANDIDATE_{field.upper()} = "({pattern})"', text, re.MULTILINE)
-        if match:
-            out[field] = match.group(1)
-    return out
+    """The pinned candidate: source, sha256, run, artifact, repo and expires; {} when none is pinned."""
+    return dict(PINNED_CANDIDATE or {})
 
 
 def sha256_file(path: Path) -> str:
@@ -1471,7 +1534,7 @@ def fetch_candidate(candidate: dict[str, str], log: Any) -> Path:
     import tempfile
     missing = {"source", "sha256", "run", "artifact", "repo"} - set(candidate)
     if missing:
-        raise Failure(f"this Mac's cmux checkout does not name the candidate's {', '.join(sorted(missing))}")
+        raise Failure(f"{NO_CANDIDATE} (missing {', '.join(sorted(missing))})")
     with CANDIDATE_LOCK:
         cache = OPERATOR_CACHE / f"glaeda-candidate-{candidate['source'][:12]}"
         archive = cache / candidate_archive_name(candidate)
@@ -1496,10 +1559,9 @@ def stage_candidate(name: str, user: str, action: dict[str, Any], log: Any) -> t
     candidate = operator_candidate()
     source12 = action["source12"]
     if candidate.get("source", "")[:12] != source12:
-        return False, (f"the host's cmux checkout names candidate {source12}, this Mac's names "
-                       f"{candidate.get('source', 'none')[:12]}; update the older checkout")
+        return False, f"the host was probed for candidate {source12}, the manifest pins {candidate.get('source', 'none')[:12]}"
     if "sha256" not in candidate:
-        return False, "this Mac's cmux checkout names no candidate sha256"
+        return False, NO_CANDIDATE
     archive_name = candidate_archive_name(candidate)
     code = fix_call(name, user, "candidate_check", [source12, archive_name, candidate["sha256"]], log, 120)
     if code == 0:
@@ -1827,7 +1889,7 @@ def share_args(manifest: dict[str, Any], name: str, thing: str) -> list[str]:
     if thing == "candidate":
         candidate = operator_candidate()
         if not {"source", "sha256"} <= set(candidate):
-            raise Failure("share candidate needs this Mac's cmux checkout to name CANDIDATE_SOURCE and CANDIDATE_SHA256")
+            raise Failure(f"share candidate: {NO_CANDIDATE}")
         return [candidate["source"][:12], candidate_archive_name(candidate), candidate["sha256"]]
     if thing == "python":
         return [declared.get("python_min") or ENROLL_PYTHON_MIN]
@@ -1948,11 +2010,18 @@ def prepare_seed(manifest: dict[str, Any], source: str, thing: str, log: Any, ye
         return SEEDS_READY[key]
 
 
-# ---------------------------------------------------------------- onboard
+# ---------------------------------------------------------------- onboard, repair and upgrade
 
-ONBOARD_STEPS = ("preflight", "fix", "sudo-plan", "enroll", "register")
 HEARTBEAT_SECONDS = 30
 ENROLL_TIMEOUT = 3 * 3600
+# How long a renewal waits for a runner's current job before giving up (cmux jobs time out at 35 minutes).
+RUNNER_DRAIN_SECONDS = 40 * 60
+EXPORT_TIMEOUT = 900
+RUNNER_HOOK_NOTE = ("runner registration is not wired into glaeda-mini-fleet yet (glaeda#1174); "
+                    "glaeda-cmux-runner --apply registers one by hand")
+# glaeda-mini-enroll's --fleet-class rule: the manifest hardware key a class receipt names.
+FLEET_CLASS_RE = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
+DIFFERS_RE = re.compile(r"Differs in: (.+)")
 
 
 def compile_lane_class(manifest: dict[str, Any], name: str) -> bool:
@@ -1989,7 +2058,7 @@ def class_receipt_bytes(recorded: dict[str, Any], klass: str) -> tuple[bytes | N
 
 
 def onboard_hosts(manifest: dict[str, Any], wanted: list[str] | None) -> tuple[list[str], dict[str, str]]:
-    """Hosts onboard works on, and why every other named or default host is skipped."""
+    """Hosts onboard, repair and upgrade work on, and why every other named or default host is skipped."""
     names = select_hosts(manifest, wanted)
     skipped: dict[str, str] = {}
     for name in names:
@@ -1997,7 +2066,7 @@ def onboard_hosts(manifest: dict[str, Any], wanted: list[str] | None) -> tuple[l
         if not host.get("node_id"):
             skipped[name] = "no node_id in the manifest"
         elif not compile_lane_class(manifest, name):
-            skipped[name] = f"class {host['class']} does not take the app compile (compile_lane: false)"
+            skipped[name] = f"hardware {host['hardware']} does not take the app compile (compile_lane: false)"
         elif host.get("overrides", {}).get("apply") is False:
             skipped[name] = "apply: false"
     if not wanted:  # the default set names only hosts that could join
@@ -2006,32 +2075,56 @@ def onboard_hosts(manifest: dict[str, Any], wanted: list[str] | None) -> tuple[l
     return [h for h in names if h not in skipped], skipped
 
 
+def remote_word(value: str) -> str:
+    """One shell word for the host; a leading ~/ still expands there."""
+    return shlex.quote(value).replace("'~/", "~/'", 1) if value.startswith("~/") else shlex.quote(value)
+
+
+def host_python(result: dict[str, Any]) -> str:
+    return result["checks"]["python"]["detail"].split(" at ", 1)[1]
+
+
 def enroll_command(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str],
-                   no_accept: bool, class_receipt: tuple[str, str] | None = None) -> str:
-    """glaeda-mini-enroll on the host. class_receipt (class, receipt_sha256): the receipt arrives on stdin."""
+                   no_accept: bool, class_receipt: tuple[str, str] | None = None, renew: bool = False) -> str:
+    """glaeda-mini-enroll on the host. class_receipt (class, receipt_sha256): the receipt arrives on stdin.
+
+    renew: an enrolled node is quarantined, renewed onto the candidate and accepted again when it needs to be."""
     checkout = cmux_checkout(manifest, name)
-    python = result["checks"]["python"]["detail"].split(" at ", 1)[1]
     archive = f"~/Library/Caches/cmux-fleet/glaeda-candidate-{candidate['source'][:12]}/{candidate_archive_name(candidate)}"
-    argv = [python, "~/glaeda/scripts/glaeda-mini-enroll", "--cmux-root", checkout["root"],
+    argv = [host_python(result), "~/glaeda/scripts/glaeda-mini-enroll", "--cmux-root", checkout["root"],
             "--node-id", manifest["hosts"][name]["node_id"], "--candidate", archive, "--sha256", candidate["sha256"],
             "--source", candidate["source"], "--apply"]
+    if renew:
+        argv.append("--renew")
     if class_receipt:
         argv += ["--class-receipt", "-", "--class-receipt-sha256", class_receipt[1], "--fleet-class", class_receipt[0]]
     elif no_accept:
         argv.append("--no-accept")
-    # ~ must expand on the host: quote everything, then let the leading ~/ through.
-    quoted = " ".join(shlex.quote(a).replace("'~/", "~/'", 1) if a.startswith("~/") else shlex.quote(a) for a in argv)
     return (f"export PATH={shlex.quote(bootstrap.CMUX_WORKLOAD_TOOL_PATH)}:\"$HOME/.local/bin\"; cd \"$HOME\" && "
-            f"{quoted}")
+            + " ".join(remote_word(a) for a in argv))
 
 
-def register_command(manifest: dict[str, Any], name: str) -> str:
-    """cmux persistent-compile up on the host; the token arrives on stdin, never in argv or the environment of ssh."""
+def export_command(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str],
+                   klass: str) -> str:
+    """cmux_fleet.py export-class-acceptance from the candidate's own generation on the seed; read-only there."""
     root = cmux_checkout(manifest, name)["root"]
     root = root.replace("~/", "$HOME/", 1) if root.startswith("~/") else root
-    return (f"set -e; export PATH=\"$HOME/.local/bin\":{shlex.quote(bootstrap.CMUX_WORKLOAD_TOOL_PATH)}; "
-            f"IFS= read -r CMUX_RUNNER_TOKEN; export CMUX_RUNNER_TOKEN; cd \"{root}\" && "
-            f"./scripts/persistent-compile up --yes --node-id {shlex.quote(manifest['hosts'][name]['node_id'])}")
+    return (f"export PATH={shlex.quote(bootstrap.CMUX_WORKLOAD_TOOL_PATH)}:\"$HOME/.local/bin\"; cd \"$HOME\" && "
+            f"F=\"${{XDG_CONFIG_HOME:-$HOME/.config}}/glaeda/cmux-fleet\" && "
+            f"G=\"$HOME/Projects/glaeda-generations/{candidate['source'][:12]}\" && "
+            f"{remote_word(host_python(result))} -B \"$G/scripts/cmux_fleet.py\" export-class-acceptance "
+            f"\"$F/enrollment.json\" --acceptance \"$F/acceptance/cmux_macos_native_build.json\" "
+            f"--fleet-class {shlex.quote(klass)} --cmux-root \"{root}\" --glaeda \"$G/bin/glaeda\" "
+            f"--cache-root \"$HOME/.cache/glaeda/cmux-native-cache\"")
+
+
+def runner_register_command(manifest: dict[str, Any], name: str) -> str | None:
+    """The hook where runner registration plugs in (glaeda#1174): the remote command that registers this
+    host's runner, reading a one-hour registration token from stdin, or None while nothing is wired.
+
+    onboard calls it for every eligible host without a runner and mints one org token per run
+    (manifest runner.org) for all the hosts it returns a command for. The token never reaches argv or a log."""
+    return None
 
 
 def mint_runner_token(org: str) -> str:
@@ -2074,27 +2167,141 @@ def run_with_heartbeat(tasks: dict[str, Any], logs: dict[str, Path], label: str,
     return results
 
 
-def render_onboard(rows: dict[str, dict[str, str]]) -> str:
-    headers = ("host", "node id", "step", "result", "log")
-    keys = ("host", "node", "step", "result", "log")
-    table = [headers, *([r.get(k) or "-" for k in keys] for r in rows.values())]
-    widths = [max(len(row[i]) for row in table) for i in range(len(headers) - 1)]
+ROW_COLUMNS = (("host", "host"), ("class", "class"), ("node id", "node"), ("generation", "generation"),
+               ("step", "step"), ("result", "result"), ("log", "log"))
+
+
+def new_row(manifest: dict[str, Any], name: str, result: str = "", step: str = "-") -> dict[str, str]:
+    host = manifest["hosts"][name]
+    return {"host": name, "class": host.get("hardware") or "", "node": host.get("node_id") or "", "generation": "",
+            "step": step, "result": result, "log": ""}
+
+
+def render_rows(rows: dict[str, dict[str, str]]) -> str:
+    """The one table onboard, repair and upgrade end with. generation is the enrollment's Glaeda, old->new."""
+    table = [[title for title, _ in ROW_COLUMNS], *([r.get(k) or "-" for _, k in ROW_COLUMNS] for r in rows.values())]
+    widths = [max(len(row[i]) for row in table) for i in range(len(ROW_COLUMNS) - 1)]
     return "\n".join("  ".join([*(f"{row[i]:<{widths[i]}}" for i in range(len(widths))), row[-1]]) for row in table)
 
 
+render_onboard = render_rows
+
+
+def enrollment_need(result: dict[str, Any]) -> str:
+    """What a probed host's enrollment needs: enroll (none yet), renew, ok, leave (an operator drain) or retired."""
+    enrollment = result.get("enrollment") or {}
+    state = enrollment.get("state")
+    if not state:
+        return "enroll"
+    if state in {"retired", "draining"}:
+        return {"retired": "retired", "draining": "leave"}[state]
+    if state in {"quarantined", "enrolling"} or enrollment.get("stale") or not enrollment.get("accepted"):
+        return "renew"
+    return "ok"
+
+
+def adoption_mismatch(log_path: Path) -> list[str]:
+    """The fields a refused class adoption names (cmux_fleet.py's `Differs in:`), from the host's log."""
+    try:
+        text = log_path.read_bytes()[-65536:].decode(errors="replace")
+    except OSError:
+        return []
+    for line in reversed(text.splitlines()):
+        try:
+            error = json.loads(line).get("error", "")
+        except (ValueError, AttributeError):
+            continue
+        match = DIFFERS_RE.search(error if isinstance(error, str) else "")
+        if match:
+            return [part.split(" (here", 1)[0].strip() for part in match.group(1).split("; ") if part.strip()]
+    return []
+
+
+def resolve_glaeda_main(repo: str) -> str:
+    """The commit every host's ~/glaeda moves to before a renewal: the tip of main, read once per run."""
+    proc = subprocess.run(["gh", "api", f"repos/{repo}/commits/main", "--jq", ".sha"], capture_output=True, text=True,
+                          timeout=60, check=False)
+    sha = proc.stdout.strip()
+    if proc.returncode or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise Failure(f"could not read {repo} main with gh ({proc.stderr.strip()[:160] or 'no sha'})")
+    return sha
+
+
+def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str], glaeda_ref: str,
+              receipt: tuple[str, str, bytes] | None, log_path: Path, seed: str | None = None) -> tuple[bool, str, str]:
+    """Move one enrolled host onto the pinned candidate; (ok, step reached, detail).
+
+    sync: ~/glaeda to glaeda_ref (glaeda-mini-enroll --renew and the staging verifier come from it).
+    stage: the candidate archive (from this Mac, or from `seed` over the LAN). drain: its runners stop once
+    their current job ends. renew: glaeda-mini-enroll --renew, adopting `receipt` (class, sha256, bytes) or,
+    without one, running accept-local. resume: the runners it stopped start again."""
+    user = manifest["ssh_user"]
+    klass = manifest["hosts"][name]["hardware"]
+    with open(log_path, "ab") as log:
+        def step(label: str) -> None:
+            note(log, f"== {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {label}")
+
+        step(f"sync ~/glaeda to {glaeda_ref[:12]}")
+        if fix_call(name, user, "glaeda_sync", [glaeda_ref], log, 900):
+            return False, "sync", f"could not move ~/glaeda: {last_line(log_path)}"
+        step(f"stage candidate {candidate['source'][:12]}")
+        ok, detail = run_repair(manifest, name, {"kind": "candidate", "source12": candidate["source"][:12]}, log, seed)
+        if not ok:
+            return False, "stage", detail
+        step("drain: stop the runners once their current job ends")
+        if fix_call(name, user, "runner_hold", [str(RUNNER_DRAIN_SECONDS)], log, RUNNER_DRAIN_SECONDS + 600):
+            return False, "drain", last_line(log_path)
+        command = enroll_command(manifest, name, result, candidate, False, receipt[:2] if receipt else None, renew=True)
+        step(f"renew ({command})")
+        code = ssh_stream(name, user, command, log, stdin=receipt[2] if receipt else b"", timeout=ENROLL_TIMEOUT)
+    if code:
+        differs = adoption_mismatch(log_path) if receipt else []
+        if differs:
+            return False, "renew", (f"quarantined: differs from class {klass} in {', '.join(differs)}. Fix: make those "
+                                    f"match the class, then glaeda-mini-fleet repair {name} --yes; or accept it on its "
+                                    f"own: glaeda-mini-fleet repair {name} --acceptance node --yes")
+        return False, "renew", f"exit {code}: {last_line(log_path)}"
+    with open(log_path, "ab") as log:
+        note(log, "== resume: start the runners the drain stopped")
+        if fix_call(name, user, "runner_release", [], log, 300):
+            return False, "resume", f"eligible, but its runner did not start: {last_line(log_path)}"
+    return True, "resume", "eligible"
+
+
+def _enroll_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str],
+                no_accept: bool, log_path: Path, class_receipt: tuple[str, str, bytes] | None = None) -> int:
+    command = enroll_command(manifest, name, result, candidate, no_accept,
+                             class_receipt[:2] if class_receipt else None)
+    with open(log_path, "ab") as log:
+        note(log, f"== enroll ({command})")
+        return ssh_stream(name, manifest["ssh_user"], command, log, stdin=class_receipt[2] if class_receipt else b"",
+                          timeout=ENROLL_TIMEOUT)
+
+
+def runner_actions(result: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """(runners held stopped by a renewal, runners loaded whose listener is not running), by name."""
+    runners = result.get("runners") or []
+    held = [r["name"] or r["dir"] for r in runners if r.get("held") == "yes"]
+    down = [r["name"] or r["dir"] for r in runners if r.get("loaded") == "yes" and r.get("listening") == "no"]
+    return held, down
+
+
 def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, sudo: str, acceptance: str,
-                seed: str | None, log_dir: Path | None, heartbeat: float = HEARTBEAT_SECONDS) -> int:
+                seed: str | None, log_dir: Path | None, heartbeat: float = HEARTBEAT_SECONDS, mode: str = "onboard") -> int:
+    """onboard and repair: one pipeline. preflight, fix, sudo-plans, fix again, then the enrollment and runners.
+
+    onboard enrolls a host that has no enrollment yet; repair leaves it (onboard's job). Both renew an
+    enrolled host that is stale, quarantined or not accepted onto the pinned candidate (re-adopting its
+    class receipt), start runners a renewal held, and restart a loaded runner whose listener is gone."""
     if yes and sudo == "run" and not sys.stdin.isatty():
-        raise Failure("onboard --sudo run asks for each host's password; run it from a terminal")
+        raise Failure(f"{mode} --sudo run asks for each host's password; run it from a terminal")
     targets, skipped = onboard_hosts(manifest, wanted)
-    rows = {h: {"host": h, "node": manifest["hosts"][h].get("node_id") or "", "step": "-", "result": f"skipped: {why}",
-                "log": ""} for h, why in skipped.items()}
+    rows = {h: new_row(manifest, h, f"skipped: {why}") for h, why in skipped.items()}
     for name in targets:
-        rows[name] = {"host": name, "node": manifest["hosts"][name]["node_id"], "step": "preflight", "result": "",
-                      "log": ""}
+        rows[name] = new_row(manifest, name, step="preflight")
     if seed:
         select_hosts(manifest, [seed])
-    directory = run_log_dir("onboard", log_dir) if yes else None
+    directory = run_log_dir(mode, log_dir) if yes else None
     live = list(targets)
 
     def settle(name: str, step: str, result: str) -> None:
@@ -2113,40 +2320,60 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
     for name in list(live):
         if "reach" in results[name]["checks"]:
             settle(name, "preflight", f"unreachable: {results[name]['checks']['reach']['detail']}")
-        elif blockers(results[name], ("person",)):
+            continue
+        rows[name]["generation"] = short_generation(results[name]["enrollment"]["generation"]) \
+            if results[name]["enrollment"]["generation"] else ""
+        if blockers(results[name], ("person",)):
             settle(name, "preflight", "needs a person: " + ", ".join(blockers(results[name], ("person",))))
+    needs = {h: enrollment_need(results[h]) for h in live}
+    for name in list(live):
+        if needs[name] == "enroll" and mode == "repair":
+            settle(name, "enroll", f"not enrolled: glaeda-mini-fleet onboard {name} --yes")
     candidate = operator_candidate()
     receipts: dict[str, tuple[str, str, bytes]] = {}  # host: (class, receipt_sha256, receipt bytes)
     if acceptance == "class":
         for name in list(live):
+            if needs[name] not in {"enroll", "renew"}:
+                continue
             recorded, why = class_acceptance(manifest, name)
-            enrolled = results[name]["checks"]["enroll"]["state"] == "ok"
-            if recorded is None and not enrolled:
-                settle(name, "preflight", f"blocked: {why}; accept one host of the class first "
-                                          f"(onboard {name} --acceptance node --yes)")
-            elif recorded is not None and "receipt" in recorded:
-                klass = manifest["hosts"][name]["hardware"]  # the key the acceptance is recorded under
+            klass = manifest["hosts"][name]["hardware"]  # the key the acceptance is recorded under
+            if recorded is None:
+                if needs[name] == "enroll":
+                    settle(name, "preflight", f"blocked: {why}; accept one host of the class first "
+                                              f"(onboard {name} --acceptance node --yes)")
+                else:
+                    settle(name, "enroll", f"blocked: {why}; glaeda-mini-fleet upgrade records it "
+                                           f"(or {mode} {name} --acceptance node --yes)")
+            elif "receipt" in recorded:
                 data, why = class_receipt_bytes(recorded, klass)
                 if data is None:
                     settle(name, "preflight", f"blocked: {why}")
                 else:
                     receipts[name] = (klass, recorded["receipt_sha256"], data)
+            elif needs[name] == "renew":
+                settle(name, "enroll", f"blocked: class {klass} records no receipt file; glaeda-mini-fleet upgrade "
+                                       "records one")
 
     if not yes:
         for name in live:
             mine, root = planned_actions(results[name])
-            checks = results[name]["checks"]
             parts = [f"fix {len(mine)}"] if mine else []
             parts += [f"sudo-plan {', '.join(c for a in root for c in a['checks'])}"] if root else []
-            if checks["enroll"]["state"] != "ok":
+            if needs[name] == "enroll":
                 parts.append("enroll" + (" on the class receipt" if name in receipts else
                                          " without acceptance (class)" if acceptance == "class" else " with acceptance"))
-            if checks["runner"]["state"] != "ok" and (acceptance == "node" or name in receipts
-                                                      or checks["enroll"]["state"] == "ok"):
+            elif needs[name] == "renew":
+                parts.append("renew and " + ("adopt the class receipt" if name in receipts else "accept-local"))
+            elif needs[name] == "leave":
+                parts.append("leave the draining node")
+            held, down = runner_actions(results[name])
+            parts += ["start held runner"] if held else []
+            parts += ["restart runner"] if down else []
+            if not (results[name].get("runners") or []) and runner_register_command(manifest, name) is not None:
                 parts.append("register")
-            rows[name]["result"] = "would: " + (", ".join(parts) or "nothing, already onboarded")
-        print(render_onboard(rows))
-        print("dry run; pass --yes to onboard")
+            rows[name]["result"] = "would: " + (", ".join(parts) or f"nothing, already {'onboarded' if mode == 'onboard' else 'healthy'}")
+        print(render_rows(rows))
+        print(f"dry run; pass --yes to {mode}")
         return 0
 
     assert directory is not None
@@ -2184,7 +2411,7 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
             input()
         else:
             for name in plans:
-                settle(name, "sudo-plan", f"waiting: glaeda-mini-fleet sudo-plan {name} --run, then onboard again")
+                settle(name, "sudo-plan", f"waiting: glaeda-mini-fleet sudo-plan {name} --run, then {mode} again")
         fix_round([h for h in live if h in plans])
         results.update(probe([h for h in live if h in plans]))
     for name in list(live):
@@ -2192,73 +2419,470 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         if failing or not results[name]["ready"]:
             settle(name, "preflight", "not ready: " + ", ".join(failing or ["unknown checks"]))
 
-    # Enroll: bootstrap and enroll every ready host at once; node acceptance only when asked for.
-    to_enroll = [h for h in live if results[h]["checks"]["enroll"]["state"] != "ok"]
-    if to_enroll:
-        if not {"source", "sha256"} <= set(candidate):
-            for name in to_enroll:
-                settle(name, "enroll", "blocked: this Mac's cmux checkout names no candidate")
-            to_enroll = []
-        logs = {h: directory / f"{h}.log" for h in to_enroll}
+    # Enroll new hosts and renew stale ones, all at once; node acceptance only when asked for.
+    fresh = [h for h in live if needs[h] == "enroll"]
+    stale = [h for h in live if needs[h] == "renew"]
+    if (fresh or stale) and not {"source", "sha256"} <= set(candidate):
+        for name in fresh + stale:
+            settle(name, "enroll", f"blocked: {NO_CANDIDATE}")
+        fresh, stale = [], []
+    glaeda_ref = None
+    if stale:
+        try:
+            glaeda_ref = resolve_glaeda_main(candidate.get("repo") or CANDIDATE_REPO)
+        except Failure as error:
+            for name in stale:
+                settle(name, "sync", f"blocked: {error}")
+            stale = []
+    logs = {h: directory / f"{h}.log" for h in fresh + stale}
 
-        def enroll_task(name: str) -> Any:
+    def enroll_task(name: str) -> Any:
+        if name in fresh:
             return lambda: _enroll_one(manifest, name, results[name], candidate, acceptance == "class", logs[name],
                                        receipts.get(name))
+        return lambda: renew_one(manifest, name, results[name], candidate, glaeda_ref, receipts.get(name),
+                                 logs[name], seed)
 
-        outcomes = run_with_heartbeat({h: enroll_task(h) for h in to_enroll}, logs, "enroll", heartbeat)
-        for name, code in outcomes.items():
-            if code:
-                settle(name, "enroll", f"failed: exit {code}")
-            elif acceptance == "class" and name not in receipts:
-                settle(name, "enroll", "enrolled without node acceptance; record the class receipt "
-                                       "(classes.<class>.acceptance.receipt) to make it eligible")
+    outcomes = run_with_heartbeat({h: enroll_task(h) for h in fresh + stale}, logs, "enroll", heartbeat) \
+        if fresh or stale else {}
+    for name, outcome in outcomes.items():
+        if name in stale:
+            ok, step, detail = outcome
+            if ok:
+                rows[name].update(step="renew", result="eligible")
             else:
-                rows[name].update(step="enroll", result="eligible")
-
-    # Register the runner on every eligible host that has none, with one token minted here.
-    to_register = [h for h in live if results[h]["checks"]["runner"]["state"] != "ok"]
-    for name in live:
-        if name not in to_register:
-            rows[name].update(step="register", result="ok: already onboarded")
-    if to_register:
-        org = (manifest.get("runner") or {}).get("org")
-        if not org:
-            for name in to_register:
-                settle(name, "register", "blocked: the manifest has no runner.org")
+                settle(name, step, f"failed: {detail}")
+        elif outcome:
+            settle(name, "enroll", f"failed: exit {outcome}")
+        elif acceptance == "class" and name not in receipts:
+            settle(name, "enroll", "enrolled without node acceptance; record the class receipt "
+                                   "(hardware.<key>.acceptance.receipt) to make it eligible")
         else:
-            try:
-                token = mint_runner_token(org)
-            except Failure as error:
-                for name in to_register:
-                    settle(name, "register", f"blocked: {error}")
-                token = None
-                to_register = []
-            logs = {h: directory / f"{h}.log" for h in to_register}
+            rows[name].update(step="enroll", result="eligible")
 
-            def register_task(name: str) -> Any:
-                def run() -> int:
-                    with open(logs[name], "ab") as log:
-                        note(log, f"== register ({register_command(manifest, name)})")
-                        return ssh_stream(name, manifest["ssh_user"], register_command(manifest, name), log,
-                                          stdin=(token + "\n").encode(), timeout=1800)
-                return run
-
-            outcomes = run_with_heartbeat({h: register_task(h) for h in to_register}, logs, "register", heartbeat)
-            for name, code in outcomes.items():
-                rows[name].update(step="register", result="ok" if code == 0 else f"failed: exit {code}")
+    # Runners: start the ones a renewal held, restart a loaded one whose listener is gone, and hand hosts
+    # without one to the registration hook.
+    after = probe(list(live))
+    to_register = []
+    for name in list(live):
+        result = after[name]
+        if "reach" in result["checks"]:
+            settle(name, "runner", f"unreachable after {rows[name]['step']}: {result['checks']['reach']['detail']}")
+            continue
+        new = result["enrollment"]["generation"]
+        if new and short_generation(new) != rows[name]["generation"]:
+            rows[name]["generation"] = f"{rows[name]['generation'] or '-'}->{short_generation(new)}"
+        eligible = enrollment_need(result) == "ok"
+        if not rows[name]["result"]:  # nothing to enroll or renew here
+            rows[name].update(step="enroll", result="ok: eligible" if eligible else
+                              f"ok: {result['checks']['enroll']['detail']}")
+        held, down = runner_actions(result)
+        with open(logs.get(name) or directory / f"{name}.log", "ab") as log:
+            if held and eligible:
+                code = fix_call(name, manifest["ssh_user"], "runner_release", [], log, 300)
+                rows[name].update(step="runner", result=rows[name]["result"] + ("; runner started" if code == 0 else
+                                                                                 "; runner did not start (see the log)"))
+            elif held:
+                rows[name]["result"] += "; runner held until the node is eligible"
+            if down:
+                code = fix_call(name, manifest["ssh_user"], "runner_kick", [], log, 120)
+                rows[name].update(step="runner", result=rows[name]["result"] + ("; runner restarted" if code == 0 else
+                                                                                 "; runner restart failed (see the log)"))
+        if not result.get("runners") and eligible:
+            if mode == "onboard" and runner_register_command(manifest, name) is not None:
+                to_register.append(name)
+            else:
+                rows[name]["result"] += f"; no runner: {RUNNER_HOOK_NOTE}"
+    if to_register:
+        register_runners(manifest, to_register, rows, directory, heartbeat)
     print()
-    print(render_onboard(rows))
-    return 0 if all(r["result"].startswith(("ok", "eligible", "skipped")) for r in rows.values()) else 1
+    print(render_rows(rows))
+    return 0 if all(r["result"].startswith(("ok", "eligible", "skipped")) and "failed" not in r["result"]
+                    for r in rows.values()) else 1
 
 
-def _enroll_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str],
-                no_accept: bool, log_path: Path, class_receipt: tuple[str, str, bytes] | None = None) -> int:
-    command = enroll_command(manifest, name, result, candidate, no_accept,
-                             class_receipt[:2] if class_receipt else None)
+def register_runners(manifest: dict[str, Any], names: list[str], rows: dict[str, dict[str, str]], directory: Path,
+                     heartbeat: float) -> None:
+    """Run the registration hook's command on each host, with one org token minted here and sent on stdin."""
+    org = (manifest.get("runner") or {}).get("org")
+    if not org:
+        for name in names:
+            rows[name]["result"] += "; not registered: the manifest has no runner.org"
+        return
+    try:
+        token = mint_runner_token(org)
+    except Failure as error:
+        for name in names:
+            rows[name]["result"] += f"; not registered: {error}"
+        return
+    logs = {h: directory / f"{h}.log" for h in names}
+
+    def register_task(name: str) -> Any:
+        def run() -> int:
+            command = runner_register_command(manifest, name) or "false"
+            with open(logs[name], "ab") as log:
+                note(log, f"== register ({command})")
+                return ssh_stream(name, manifest["ssh_user"], command, log, stdin=(token + "\n").encode(), timeout=1800)
+        return run
+
+    for name, code in run_with_heartbeat({h: register_task(h) for h in names}, logs, "register", heartbeat).items():
+        rows[name].update(step="register", result=rows[name]["result"] + ("; registered" if code == 0 else
+                                                                           f"; registration failed: exit {code}"))
+
+
+# ---- upgrade: a new candidate, one accept-local per class, class adoption everywhere else
+
+
+def gh_json(args: list[str]) -> Any:
+    proc = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=120, check=False)
+    if proc.returncode:
+        raise Failure(f"gh {' '.join(args[:3])}: {proc.stderr.strip()[:200] or f'exit {proc.returncode}'}")
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        raise Failure(f"gh {' '.join(args[:3])} printed no JSON") from None
+
+
+def resolve_candidate_run(run: str, repo: str, sha256: str | None) -> dict[str, str]:
+    """The candidate a fleet-candidate.yml run built, after checking the run is a reviewed install source.
+
+    The run must be the `Fleet candidate bundles` workflow, dispatched (a pull request run is a build test,
+    docs/FLEET_DISTRIBUTION.md), completed successfully, from a commit on main, with an unexpired macOS artifact."""
+    if not re.fullmatch(r"[0-9]+", run):
+        raise Failure(f"--candidate-run {run!r} is not a run id")
+    if sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise Failure("--candidate-sha256 is the archive's 64-hex sha256 from the run's summary")
+    view = gh_json(["run", "view", run, "--repo", repo, "--json", "headSha,event,status,conclusion,workflowName"])
+    problems = []
+    if view.get("workflowName") != CANDIDATE_WORKFLOW:
+        problems.append(f"workflow {view.get('workflowName')!r}, not {CANDIDATE_WORKFLOW!r}")
+    if view.get("event") != "workflow_dispatch":
+        problems.append(f"event {view.get('event')}; only a dispatched run is an install source")
+    if (view.get("status"), view.get("conclusion")) != ("completed", "success"):
+        problems.append(f"{view.get('status')}/{view.get('conclusion')}, not completed/success")
+    source = str(view.get("headSha") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", source):
+        problems.append("no source commit")
+    if problems:
+        raise Failure(f"run {run} is not a reviewed candidate: " + "; ".join(problems))
+    status = gh_json(["api", f"repos/{repo}/compare/main...{source}", "--jq", "{status: .status}"]).get("status")
+    if status not in {"identical", "behind"}:
+        raise Failure(f"candidate source {source[:12]} is not on {repo} main (compare says {status})")
+    artifacts = gh_json(["api", f"repos/{repo}/actions/runs/{run}/artifacts",
+                         "--jq", "[.artifacts[] | {name, expired, expires_at}]"])
+    artifact = next((a for a in artifacts if a.get("name") == CANDIDATE_ARTIFACT), None)
+    if artifact is None or artifact.get("expired"):
+        raise Failure(f"run {run} has no unexpired {CANDIDATE_ARTIFACT}; dispatch fleet-candidate.yml again")
+    out = {"source": source, "run": run, "artifact": CANDIDATE_ARTIFACT, "repo": repo,
+           "expires": str(artifact.get("expires_at") or "")}
+    if not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", out["expires"]):
+        del out["expires"]
+    if sha256:
+        out["sha256"] = sha256
+    return out
+
+
+def download_run_candidate(candidate: dict[str, str], log: Any) -> str:
+    """Download the run's macOS candidate once on this Mac; the archive's sha256 after checking it.
+
+    The digest is the receipt the same build job wrote (its receipt.json), for this run's source and
+    target, and must equal --candidate-sha256 when that was given. The archive must hash to it."""
+    import tempfile
+    cache = OPERATOR_CACHE / f"glaeda-candidate-{candidate['source'][:12]}"
+    archive = cache / candidate_archive_name(candidate)
+    receipt_path = cache / "receipt.json"
+    with CANDIDATE_LOCK:
+        cache.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=cache) as tmp:
+            staged_archive, staged_receipt = archive, receipt_path
+            if not (archive.is_file() and receipt_path.is_file()):
+                note(log, f"gh run download {candidate['run']} --repo {candidate['repo']} -n {candidate['artifact']}")
+                code = run_logged(["gh", "run", "download", candidate["run"], "--repo", candidate["repo"],
+                                   "-n", candidate["artifact"], "--dir", tmp], log, timeout=FIX_TIMEOUTS["candidate"])
+                staged_archive, staged_receipt = Path(tmp) / archive.name, Path(tmp) / "receipt.json"
+                if code or not staged_archive.is_file() or not staged_receipt.is_file():
+                    raise Failure(f"gh run download {candidate['run']} failed or has no {archive.name} and receipt.json")
+            try:
+                receipt = json.loads(staged_receipt.read_text())
+            except (OSError, ValueError) as error:
+                raise Failure(f"the run's receipt.json: {error}") from None
+            want = str(receipt.get("sha256") or "")
+            if not (re.fullmatch(r"[0-9a-f]{64}", want) and receipt.get("archive") == archive.name
+                    and receipt.get("target") == CANDIDATE_TARGET
+                    and (receipt.get("source") or {}).get("commit") == candidate["source"]):
+                raise Failure(f"the run's receipt does not describe {archive.name} built from {candidate['source'][:12]}")
+            if candidate.get("sha256") and candidate["sha256"] != want:
+                raise Failure(f"--candidate-sha256 {candidate['sha256'][:12]} differs from the run's receipt {want[:12]}")
+            got = sha256_file(staged_archive)
+            if got != want:
+                raise Failure(f"the downloaded archive has sha256 {got}, the run's receipt says {want}")
+            if staged_archive != archive:
+                os.replace(staged_receipt, receipt_path)
+                os.replace(staged_archive, archive)
+        note(log, f"candidate {candidate['source'][:12]} sha256 {want} at {archive}")
+        return want
+
+
+def write_private(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        out.write(data)
+    os.replace(tmp, path)
+
+
+def rewrite_manifest(path: Path, change: Any, write: bool = True) -> str:
+    """Apply change(raw) to the manifest file's JSON; the unified diff. Written atomically, and only if it still loads."""
+    import difflib
+    text = path.read_text()
+    raw = json.loads(text)
+    change(raw)
+    new = json.dumps(raw, indent=2, ensure_ascii=False) + "\n"
+    diff = "".join(difflib.unified_diff(text.splitlines(True), new.splitlines(True), os.fspath(path),
+                                        os.fspath(path) + " (after upgrade)"))
+    if write and new != text:
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, path.stat().st_mode & 0o777)
+        with os.fdopen(fd, "w") as out:
+            out.write(new)
+        try:
+            load_manifest(tmp)
+        except Failure:
+            tmp.unlink()
+            raise
+        os.replace(tmp, path)
+    return diff
+
+
+def candidate_pin(candidate: dict[str, str]) -> dict[str, str]:
+    return {k: candidate[k] for k in ("source", "sha256", "run", "artifact", "repo", "expires") if k in candidate}
+
+
+def class_receipt_path(manifest_path: Path, klass: str, source12: str) -> Path:
+    return manifest_path.expanduser().resolve().parent / "class-acceptance" / f"{klass}-{source12}.json"
+
+
+def acceptance_entry(manifest: dict[str, Any], seed: str, candidate: dict[str, str], receipt: Path,
+                     receipt_sha256: str) -> dict[str, str]:
+    build = (toolchain(manifest, seed).get("xcode") or {}).get("build")
+    if not build:
+        raise Failure(f"{seed}: declare toolchain.xcode (app, version, build); class acceptance is recorded per Xcode build")
+    return {"xcode_build": build, "candidate": candidate["source"][:12], "node": manifest["hosts"][seed]["node_id"],
+            "receipt": os.fspath(receipt), "receipt_sha256": receipt_sha256}
+
+
+def record_class_acceptance(manifest_path: Path, manifest: dict[str, Any], klass: str, entry: dict[str, str],
+                            candidate: dict[str, str], write: bool = True) -> str:
+    """hardware.<klass>.acceptance and the fleet's candidate pin, in the operator's manifest file and in memory."""
+    def change(raw: dict[str, Any]) -> None:
+        table = raw["hardware"] if "hardware" in raw else raw["classes"]  # a manifest from before #1169
+        table[klass]["acceptance"] = entry
+        raw["candidate"] = candidate_pin(candidate)
+    diff = rewrite_manifest(manifest_path, change, write)
+    if write:
+        manifest["hardware"][klass]["acceptance"] = entry
+        manifest["candidate"] = candidate_pin(candidate)
+    return diff
+
+
+def export_class_receipt(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str],
+                         klass: str, log_path: Path) -> bytes:
+    """The class receipt the seed exports, checked here before anything records it."""
+    import cmux_fleet
+    command = export_command(manifest, name, result, candidate, klass)
     with open(log_path, "ab") as log:
-        note(log, f"== enroll ({command})")
-        return ssh_stream(name, manifest["ssh_user"], command, log, stdin=class_receipt[2] if class_receipt else b"",
-                          timeout=ENROLL_TIMEOUT)
+        note(log, f"== export ({command})")
+        try:
+            proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", manifest["ssh_user"],
+                                   name, command], capture_output=True, timeout=EXPORT_TIMEOUT, check=False)
+        except subprocess.TimeoutExpired:
+            raise Failure(f"export-class-acceptance on {name} timed out") from None
+        log.write(proc.stderr)
+        note(log, f"== export exit {proc.returncode}, {len(proc.stdout)} bytes")
+    if proc.returncode:
+        raise Failure(f"export-class-acceptance on {name} exited {proc.returncode}: {last_line(log_path)}")
+    try:
+        doc = cmux_fleet.validate_class_acceptance(json.loads(proc.stdout))
+    except (ValueError, cmux_fleet.FleetError) as error:
+        raise Failure(f"{name} exported an invalid class receipt: {error}") from None
+    wrong = [what for what, ok in (("class", doc["fleetClass"] == klass),
+                                   ("candidate", doc["glaedaCandidate"]["commit"] == candidate["source"]),
+                                   ("node", doc["acceptingNodeId"] == manifest["hosts"][name]["node_id"])) if not ok]
+    if wrong:
+        raise Failure(f"{name} exported a class receipt for another {', '.join(wrong)}")
+    return proc.stdout
+
+
+def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str] | None, run: str, repo: str,
+                sha256: str | None, seeds: list[str], yes: bool, share_from: str | None, log_dir: Path | None,
+                heartbeat: float = HEARTBEAT_SECONDS) -> int:
+    """Roll a new candidate over the fleet: one accept-local per class on a seed, then class adoption on the rest."""
+    global PINNED_CANDIDATE
+    candidate = resolve_candidate_run(run, repo, sha256)
+    targets, skipped = onboard_hosts(manifest, wanted)
+    chosen: dict[str, str] = {}
+    for name in seeds:
+        select_hosts(manifest, [name])
+        if name not in targets:
+            raise Failure(f"--seed-per-class {name} is not one of the hosts upgrade works on")
+        klass = manifest["hosts"][name]["hardware"]
+        if klass in chosen:
+            raise Failure(f"--seed-per-class names two seeds for class {klass}: {chosen[klass]} and {name}")
+        chosen[klass] = name
+    if share_from:
+        select_hosts(manifest, [share_from])
+    directory = run_log_dir("upgrade", log_dir) if yes else None
+    if yes:
+        with open(directory / "operator.log", "ab") as log:
+            candidate["sha256"] = download_run_candidate(candidate, log)
+    PINNED_CANDIDATE = candidate
+    source12 = candidate["source"][:12]
+    say(f"candidate {source12} from run {run} ({repo}), sha256 "
+        f"{candidate.get('sha256') or 'read from the run receipt at download (--yes)'}, expires {candidate.get('expires', '?')}")
+
+    rows = {h: new_row(manifest, h, f"skipped: {why}") for h, why in skipped.items()}
+    results = {r["host"]: r for r in preflight(manifest, observe(manifest, targets, preflight=True), targets)} \
+        if targets else {}
+    ready: list[str] = []  # enrolled, reachable, ready hosts that need the new candidate or already run it
+    needs: dict[str, str] = {}
+    for name in targets:
+        rows[name] = new_row(manifest, name, step="preflight")
+        result = results[name]
+        if "reach" in result["checks"]:
+            rows[name]["result"] = f"unreachable: {result['checks']['reach']['detail']}"
+            continue
+        generation = result["enrollment"]["generation"]
+        rows[name]["generation"] = short_generation(generation) if generation else ""
+        needs[name] = need = enrollment_need(result)
+        failing = [c for c, v in result["checks"].items() if v["state"] == "fail"]
+        if need == "enroll":
+            rows[name]["result"] = f"not enrolled: glaeda-mini-fleet onboard {name} --yes once this pins the candidate"
+        elif need == "leave":
+            rows[name]["result"] = "draining: left for its operator; upgrade it again once it is eligible"
+        elif need == "retired":
+            rows[name]["result"] = "retired"
+        elif failing or not result["ready"]:
+            rows[name]["result"] = f"not ready: {', '.join(failing) or 'unknown checks'}; glaeda-mini-fleet repair {name}"
+        else:
+            ready.append(name)
+
+    # Per class: the recorded acceptance when it already covers this candidate (a resumed run), else a seed.
+    classes: dict[str, list[str]] = {}
+    for name in ready:
+        classes.setdefault(manifest["hosts"][name]["hardware"], []).append(name)
+    for klass, name in chosen.items():
+        if name not in ready:
+            raise Failure(f"--seed-per-class {name} is not ready to seed class {klass}: {rows[name]['result']}")
+    plan: dict[str, str | None] = {}  # class: seed, or None when the class already holds a receipt for this candidate
+    receipts: dict[str, tuple[str, str, bytes]] = {}
+    for klass, members in classes.items():
+        blocked = None if FLEET_CLASS_RE.fullmatch(klass) else \
+            f"blocked: hardware key {klass!r} is not a fleet class name ([a-z][a-z0-9-]*)"
+        if not blocked and not (toolchain(manifest, members[0]).get("xcode") or {}).get("build"):
+            blocked = ("blocked: the manifest declares no toolchain.xcode (app, version, build); "
+                       "class acceptance is recorded per Xcode build")
+        if blocked:
+            for name in members:
+                rows[name]["result"] = blocked
+            continue
+        recorded, _ = class_acceptance(manifest, members[0])
+        data = class_receipt_bytes(recorded, klass)[0] if recorded and "receipt" in recorded else None
+        if data is not None:
+            plan[klass] = None
+            receipts[klass] = (klass, recorded["receipt_sha256"], data)
+            continue
+        # A host already on the candidate only needs the export; otherwise the first ready host of the class.
+        plan[klass] = chosen.get(klass) or next((h for h in members if needs[h] == "ok"), members[0])
+
+    if not yes:
+        for klass, seed in plan.items():
+            for name in classes[klass]:
+                if needs[name] == "ok" and name != seed:
+                    rows[name]["result"] = f"ok: already on {source12}"
+                    continue
+                record = [f"export class {klass} receipt", f"record hardware.{klass}.acceptance"]
+                if needs[name] == "ok":  # a seed from an earlier run that already runs the candidate
+                    steps = record
+                else:
+                    steps = ["sync ~/glaeda", f"stage {source12}", "drain runner",
+                             *(["renew + accept-local (a cold cmux build on the mini)", *record] if name == seed
+                               else [f"renew + adopt class {klass} receipt"]), "start runner"]
+                rows[name].update(step="plan", result="would: " + ", ".join(steps))
+            if seed:
+                entry = acceptance_entry(manifest, seed, candidate, class_receipt_path(manifest_path, klass, source12),
+                                         "sha256:<from the export>")
+                print(f"class {klass}: seed {seed}; the manifest would change like this:")
+                print(record_class_acceptance(manifest_path, manifest, klass, entry, candidate, write=False) or "(no change)")
+            else:
+                print(f"class {klass}: already accepted for {source12}; hosts adopt its receipt")
+        print(render_rows(rows))
+        print("dry run; pass --yes to upgrade")
+        return 0
+
+    assert directory is not None
+    for name in ready:
+        rows[name]["log"] = os.fspath(directory / f"{name}.log")
+    glaeda_ref = resolve_glaeda_main(repo)
+    manifest_lock = threading.Lock()
+
+    def seed_task(klass: str, name: str) -> Any:
+        def run() -> tuple[bool, str, str]:
+            log_path = directory / f"{name}.log"
+            if needs[name] != "ok":
+                ok, step, detail = renew_one(manifest, name, results[name], candidate, glaeda_ref, None, log_path, share_from)
+                if not ok:
+                    return ok, step, detail
+            try:
+                data = export_class_receipt(manifest, name, results[name], candidate, klass, log_path)
+                receipt = class_receipt_path(manifest_path, klass, source12)
+                write_private(receipt, data)
+                sha = json.loads(data)["receiptSha256"]
+                with manifest_lock:
+                    diff = record_class_acceptance(manifest_path, manifest, klass,
+                                                   acceptance_entry(manifest, name, candidate, receipt, sha), candidate)
+                    say(f"class {klass}: recorded in {manifest_path}\n{diff}")
+            except (Failure, OSError, ValueError) as error:
+                return False, "export", f"eligible on {source12}, but the class receipt was not recorded: {error}"
+            receipts[klass] = (klass, sha, data)
+            return True, "record", f"eligible; class {klass} accepted here ({sha[:19]})"
+        return run
+
+    seeds_now = {seed: seed_task(klass, seed) for klass, seed in plan.items() if seed}
+    if seeds_now:
+        say(f"seeding {len(seeds_now)} class(es): {', '.join(seeds_now)} (accept-local is a cold cmux build on each)")
+        logs = {h: directory / f"{h}.log" for h in seeds_now}
+        for name, (ok, step, detail) in run_with_heartbeat(seeds_now, logs, "seed", heartbeat).items():
+            rows[name].update(step=step, result=detail if ok else f"failed: {detail}")
+    peers = []
+    for klass, members in classes.items():
+        if klass not in plan:
+            continue
+        for name in members:
+            if name == plan.get(klass):
+                continue
+            if klass not in receipts:
+                rows[name]["result"] = f"blocked: class {klass} has no receipt for {source12} (its seed {plan.get(klass)} failed)"
+            elif needs[name] == "ok":
+                rows[name]["result"] = f"ok: already on {source12}"
+            else:
+                peers.append(name)
+    if peers:
+        logs = {h: directory / f"{h}.log" for h in peers}
+        tasks = {h: (lambda h=h: renew_one(manifest, h, results[h], candidate, glaeda_ref,
+                                           receipts[manifest["hosts"][h]["hardware"]], logs[h], share_from))
+                 for h in peers}
+        for name, (ok, step, detail) in run_with_heartbeat(tasks, logs, "adopt", heartbeat).items():
+            rows[name].update(step=step, result=detail if ok else f"failed: {detail}")
+    touched = [h for h in ready if rows[h]["step"] not in {"preflight", "-"}]
+    for result in preflight(manifest, observe(manifest, touched, preflight=True), touched) if touched else []:
+        new = (result.get("enrollment") or {}).get("generation")
+        name = result["host"]
+        if new and short_generation(new) != rows[name]["generation"]:
+            rows[name]["generation"] = f"{rows[name]['generation'] or '-'}->{short_generation(new)}"
+    print()
+    print(render_rows(rows))
+    return 0 if all(r["result"].startswith(("ok", "eligible", "skipped")) for r in rows.values()) else 1
 
 
 # ---------------------------------------------------------------- cli
@@ -2277,7 +2901,7 @@ def read_observed(path: Path) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("observe", "check", "plan", "apply", "preflight", "fix", "sudo-plan",
-                                            "share", "onboard", "pools"))
+                                            "share", "onboard", "repair", "upgrade", "pools"))
     parser.add_argument("names", nargs="*", metavar="HOST", help="hosts to act on (same as --host)")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--host", action="append", dest="hosts")
@@ -2285,18 +2909,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, help="observe: also write the JSON here")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--output", choices=("text", "json"), default="text", help="preflight: output format")
-    parser.add_argument("--yes", action="store_true", help="apply, fix: make the changes instead of printing them")
+    parser.add_argument("--yes", action="store_true",
+                        help="apply, fix, share, onboard, repair, upgrade: make the changes instead of printing them")
     parser.add_argument("--run", action="store_true", help="sudo-plan: run each host's plan over ssh -t")
     parser.add_argument("--sudoers", action="store_true",
                         help="sudo-plan: also install a narrow NOPASSWD rule (printed in the plan for review)")
     parser.add_argument("--log-dir", type=Path, help="fix, sudo-plan, share, onboard: where per-host logs and plans go")
     parser.add_argument("--from", dest="seed", metavar="HOST",
-                        help="share, fix, onboard: copy large things from this prepared host over the LAN")
+                        help="share, fix, onboard, repair, upgrade: copy large things from this prepared host over the LAN")
     parser.add_argument("--jobs", type=int, default=2, help="share: peers copied at once from the source (default 2)")
-    parser.add_argument("--sudo", choices=("run", "wait", "stop"), default="wait",
-                        help="onboard: run each sudo-plan over ssh -t, wait for the operator (default), or stop there")
+    parser.add_argument("--sudo", choices=("run", "wait", "stop"),
+                        help="onboard, repair: run each sudo-plan over ssh -t, wait for the operator (onboard's default), "
+                             "or print it and stop there (repair's default)")
     parser.add_argument("--acceptance", choices=("class", "node"), default="class",
-                        help="onboard: join on the class's recorded acceptance (default) or run accept-local here")
+                        help="onboard, repair: join on the class's recorded acceptance (default) or run accept-local here")
+    parser.add_argument("--candidate-run", metavar="RUN", help="upgrade: the fleet-candidate.yml run to roll out")
+    parser.add_argument("--candidate-repo", default=CANDIDATE_REPO, help=f"upgrade: its repository (default {CANDIDATE_REPO})")
+    parser.add_argument("--candidate-sha256", metavar="SHA256",
+                        help="upgrade: the archive sha256 from the run's summary, checked against its receipt")
+    parser.add_argument("--seed-per-class", dest="seeds", action="append", default=[], metavar="HOST",
+                        help="upgrade: the host that runs its class's one accept-local (default: the first ready one)")
     # Intermixed, so hosts may follow options: share xcode --from cmux15 cmux7s cmux8s
     args = parser.parse_intermixed_args(argv)
     thing = None
@@ -2306,15 +2938,24 @@ def main(argv: list[str] | None = None) -> int:
         thing, args.names = args.names[0], args.names[1:]
     if args.names:
         args.hosts = [*(args.hosts or []), *args.names]
+    global PINNED_CANDIDATE
     try:
         manifest = load_manifest(args.manifest)
+        PINNED_CANDIDATE = manifest.get("candidate")
         hosts = select_hosts(manifest, args.hosts)
         if args.command == "apply":
             if not args.hosts:
                 raise Failure("apply needs explicit --host arguments")
             return apply(manifest, hosts, args.yes)
-        if args.command == "onboard":
-            return cmd_onboard(manifest, args.hosts, args.yes, args.sudo, args.acceptance, args.seed, args.log_dir)
+        if args.command in {"onboard", "repair"}:
+            sudo = args.sudo or ("wait" if args.command == "onboard" else "stop")
+            return cmd_onboard(manifest, args.hosts, args.yes, sudo, args.acceptance, args.seed, args.log_dir,
+                               mode=args.command)
+        if args.command == "upgrade":
+            if not args.candidate_run:
+                raise Failure("upgrade needs --candidate-run RUN (a fleet-candidate.yml run)")
+            return cmd_upgrade(manifest, args.manifest, args.hosts, args.candidate_run, args.candidate_repo,
+                               args.candidate_sha256, args.seeds, args.yes, args.seed, args.log_dir)
         if args.command == "share":
             if not args.hosts:
                 raise Failure("share needs explicit destination hosts")

@@ -6,7 +6,7 @@
 #   WORKLOAD_PATH   cmux_fleet_bootstrap.CMUX_WORKLOAD_TOOL_PATH
 #   WORKLOAD_TOOLS  cmux_fleet_bootstrap.MACOS_WORKLOAD_TOOLS, space separated
 #   PYTHONS         glaeda-mini-enroll's interpreter candidates, space separated, ~ for home
-#   CANDIDATE_FALLBACK  the candidate source commit the operator's cmux checkout names, or empty
+#   CANDIDATE_PIN   the Glaeda candidate source commit the fleet manifest (or glaeda-mini-fleet upgrade) pins, or empty
 # Emits "key<TAB>value" lines like the probe. Installs, downloads and writes nothing: rustup runs with
 # RUSTUP_AUTO_INSTALL=0 and git with GIT_OPTIONAL_LOCKS=0. Never prints tokens or runner URLs.
 # The group is parsed whole before it runs, so its </dev/null cannot eat the rest of this script.
@@ -80,7 +80,7 @@ for c in $PYTHONS; do
 done
 e pf_python "$py"
 
-# The cmux checkout: submodules, setup artifacts, local changes, and the candidate it names.
+# The cmux checkout: submodules, setup artifacts and local changes. Then the pinned candidate.
 if [ -e "$CMUX_ROOT/.git" ]; then
   e pf_cmux present
   e pf_cmux_pin "$(cat "$CMUX_ROOT/.xcode-version" 2>/dev/null)"
@@ -94,23 +94,28 @@ if [ -e "$CMUX_ROOT/.git" ]; then
   fi
   e pf_setup_artifacts "$artifacts"
   e pf_cmux_dirty "$(git -C "$CMUX_ROOT" status --porcelain=v1 --untracked-files=all 2>/dev/null | wc -l | tr -d ' ')"
-  source=$(sed -nE 's/^CANDIDATE_SOURCE = "([0-9a-f]{40})".*/\1/p' "$CMUX_ROOT/scripts/ci/persistent_compile_fleet.py" 2>/dev/null | head -1)
 else
   e pf_cmux missing
 fi
-source="${source:-$CANDIDATE_FALLBACK}"
+source="$CANDIDATE_PIN"
 if [ -n "$source" ]; then
   short=${source:0:12}
   staged=no; [ -f "$HOME/Projects/glaeda-generations/$short/stage-receipt.json" ] && staged=yes
   archive=no; [ -f "$HOME/Library/Caches/cmux-fleet/glaeda-candidate-$short/glaeda-$source-aarch64-apple-darwin.tar.gz" ] && archive=yes
   e pf_candidate "$short|$staged|$archive"
+  # The digest the enrollment records for a node that runs this candidate (the bootstrap's glaedaGeneration).
+  bin="$HOME/Projects/glaeda-generations/$short/bin/glaeda"
+  [ "$staged" = yes ] && [ -f "$bin" ] && e pf_candidate_generation "sha256:$(shasum -a 256 "$bin" | cut -d' ' -f1)"
 fi
 [ -f "$HOME/glaeda/scripts/cmux_fleet.py" ] && e pf_glaeda present || e pf_glaeda missing
+[ -e "$HOME/glaeda/.git" ] && e pf_glaeda_head "$(git -C "$HOME/glaeda" rev-parse -q --verify HEAD 2>/dev/null)"
 [ -d "$HOME/.cache/glaeda/cmux-native-cache" ] && e pf_cache_root present || e pf_cache_root missing
 
 # Enrollment progress (glaeda-mini-enroll); the node id itself comes from the probe.
 fleet="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet"
 [ -f "$fleet/enrollment.json" ] && e pf_enroll_state "$(plutil -extract state raw "$fleet/enrollment.json" 2>/dev/null)"
+[ -f "$fleet/enrollment.json" ] && e pf_enroll_generation "$(plutil -extract glaedaGeneration raw "$fleet/enrollment.json" 2>/dev/null)"
+[ -f "$fleet/enrollment.json" ] && e pf_enroll_reason "$(plutil -extract quarantineReason raw "$fleet/enrollment.json" 2>/dev/null)"
 [ -f "$fleet/acceptance/cmux_macos_native_build.json" ] && \
   e pf_acceptance "$(plutil -extract result raw "$fleet/acceptance/cmux_macos_native_build.json" 2>/dev/null)"
 
@@ -138,9 +143,19 @@ for f in /System/Volumes/Update/Preflight.plist /System/Volumes/Update/Update.pl
 done
 pmset -g custom 2>/dev/null | while IFS= read -r line; do e pf_pmset "$line"; done
 
-# Runners registered for this user: the directory and agent name only.
+# Runners registered for this user: the directory and agent name, whether its launchd agent is
+# loaded in the GUI domain, whether its listener runs, and whether glaeda-mini-fleet holds it stopped.
 for r in "$HOME"/actions-runner*/.runner; do
   [ -f "$r" ] || continue
-  e pf_runner "$(basename "$(dirname "$r")")|$(grep -o '"agentName": *"[^"]*"' "$r" | sed -E 's/.*"([^"]*)"$/\1/')"
+  dir=$(dirname "$r"); loaded=unknown; listening=no; held=no
+  plist=$(cat "$dir/.service" 2>/dev/null || true)
+  [ -z "$plist" ] && [ "$(basename "$dir")" = actions-runner-glaeda ] && \
+    plist="$HOME/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist"
+  if [ -n "$plist" ]; then
+    launchctl print "gui/$(id -u)/$(basename "$plist" .plist)" >/dev/null 2>&1 && loaded=yes || loaded=no
+  fi
+  pgrep -f "$dir/bin/Runner.Listener" >/dev/null 2>&1 && listening=yes
+  [ -f "$HOME/.local/state/glaeda/mini-fleet/runner-held/$(basename "$dir")" ] && held=yes
+  e pf_runner "$(basename "$dir")|$(grep -o '"agentName": *"[^"]*"' "$r" | sed -E 's/.*"([^"]*)"$/\1/')|$loaded|$listening|$held"
 done
 } </dev/null
