@@ -108,6 +108,17 @@ Preflight reports macOS, hardware against the M4 Pro 14-core 48 GB target, Xcode
 
 This command does not replace the bootstrap below: it imports its read-only helpers and runs it unchanged, so fleet-contract generations and acceptance receipts are unaffected.
 
+## Enroll a Mac in one command
+
+After `glaeda-mini-setup --apply` and cmux `./scripts/setup.sh`, one command runs every step of [Onboard a Mac](#onboard-a-mac) below: it installs the glaeda binary, then runs bootstrap, enroll, `accept-local`, the transition to `eligible`, and `status`:
+
+```bash
+scripts/glaeda-mini-enroll --cmux-root ~/Projects/cmux --node-id cmux-mac-001           # plan
+scripts/glaeda-mini-enroll --cmux-root ~/Projects/cmux --node-id cmux-mac-001 --apply   # do it
+```
+
+It uses the same paths as the manual steps: the enrollment and acceptance receipt under `~/.config/glaeda/cmux-fleet`, the binary under `~/.local/share/glaeda/cmux-fleet`, and `glaeda-mini-setup`'s cache root. It finds a Python 3.13+ interpreter itself, because `accept-local` needs `os.waitid`. Each step is skipped when its result already holds, so a re-run after a rejected acceptance resumes at `accept-local`, a re-run on a draining node returns it to `eligible`, and a re-run on an eligible node only prints status. `--reaccept` forces a fresh acceptance. It refuses a quarantined or retired node and a `--node-id` that differs from the existing enrollment. It never uses sudo and never registers a GitHub runner; in the cmux checkout, `scripts/persistent-compile register --apply` does that.
+
 ## Onboard a Mac
 
 Use an exact reviewed Glaeda checkout and the CMUX checkout that will run acceptance. A [verified native candidate bundle](FLEET_DISTRIBUTION.md) can supply `GLAEDA_BIN` and the matching fleet scripts without building Rust on the node; skip the build/copy step below when using that path.

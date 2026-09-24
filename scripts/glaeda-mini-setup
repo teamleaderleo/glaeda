@@ -25,9 +25,9 @@ What --apply installs (templated for the current user):
     ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim}.plist
     build-host directories and three git defaults, each set only when unset
 
-Machine enrollment stays with scripts/cmux-fleet-bootstrap-macos and scripts/cmux_fleet.py
-(docs/CMUX_FLEET_ENROLLMENT.md). This command only runs that bootstrap read-only and
-records its verdict. The receipt lands in ~/.local/state/glaeda/mini-setup/receipt.json.
+Machine enrollment stays with scripts/glaeda-mini-enroll, which drives
+scripts/cmux-fleet-bootstrap-macos and scripts/cmux_fleet.py (docs/CMUX_FLEET_ENROLLMENT.md).
+This command only runs that bootstrap read-only and records its verdict. The receipt lands in ~/.local/state/glaeda/mini-setup/receipt.json.
 """
 
 from __future__ import annotations
@@ -702,9 +702,12 @@ def operator_steps(ctx: Context, pre: dict[str, Any], fleet_result: dict[str, An
         add("cmux build tools must be on the fixed workload PATH", "cd <cmux> && ./scripts/setup.sh", "operator")
     if fleet_result is None:
         add("fleet enrollment verdict", "rerun with --cmux-root <cmux checkout> once cmux ./scripts/setup.sh has run", "operator")
+    elif fleet_result.get("eligibleForEnrollment"):
+        add("enroll and accept this mini as a fleet node",
+            "scripts/glaeda-mini-enroll --cmux-root <cmux checkout> --node-id <cmux-mac-NNN> --apply", "operator")
     add("Spotlight should skip build output", "System Settings > Spotlight > Search Privacy: add ~/Library/Developer/Xcode/DerivedData", "human (GUI)")
     add("GitHub Actions runner registration (reserved slot, never automated here)",
-        "follow cmux docs/ci/mac-fleet.md 3.2: group cmux-persistent-compile, labels self-hosted,macOS,ARM64,cmux-persistent-macos-compile",
+        "from the cmux checkout, once enrolled: scripts/persistent-compile register --apply (cmux docs/ci/mac-fleet.md 5)",
         "org admin + registration token")
     return steps
 
