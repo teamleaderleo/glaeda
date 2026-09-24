@@ -79,6 +79,31 @@ if [ -d "$F" ]; then
   e fleet_worker_sha "$(shasum -a 256 "$F/bin/worker" 2>/dev/null | cut -c1-12)"
   pgrep -f "$F/bin/worker" >/dev/null && e fleet_worker_proc running || e fleet_worker_proc absent
 fi
+# Reservation marker written by glaeda-mini-fleet reserve. Shipped raw (bounded, base64 on one line)
+# so glaeda_reservation.py parses it on the operator side, as the runner hook does on the host.
+R="$F/reservation.json"
+if [ -L "$R" ] || { [ -e "$R" ] && { [ ! -f "$R" ] || [ ! -r "$R" ]; }; }; then
+  e reservation invalid
+elif [ -f "$R" ]; then
+  e reservation_raw "$(head -c 4097 "$R" | base64 | tr -d '\n')"
+fi
+# Whether a build holds the fleet host lock right now. A shared, non-blocking flock on a read-only
+# descriptor cannot wait and is dropped at once, so the probe never blocks and holds the lock for
+# microseconds. with-host-lock and the worker retry; a one-shot LOCK_NB taker (recipe-release,
+# disk-pressure) that lands in that window fails or skips that one attempt. lsof would miss a
+# root-owned holder and counts an open descriptor as a lock; Python can be a stub on a mini
+# without an Xcode licence.
+L="$F/host.lock"
+if [ -e "$L" ] || [ -L "$L" ]; then
+  hl=$(/usr/bin/perl -MFcntl=:DEFAULT,:flock -e '
+    my $f;
+    sysopen($f, $ARGV[0], O_RDONLY | O_NOFOLLOW | O_NONBLOCK) && -f $f or do { print "unknown"; exit 0 };
+    if (flock($f, LOCK_SH | LOCK_NB)) { flock($f, LOCK_UN); print "free" }
+    else { print $!{EWOULDBLOCK} ? "held" : "unknown" }' "$L" </dev/null 2>/dev/null)
+  e host_lock "${hl:-unknown}"
+else
+  e host_lock missing
+fi
 for ak in "$HOME"/.ssh/authorized_keys*; do
   [ -f "$ak" ] || continue
   e ak_file "$(basename "$ak")|$(stat -f '%Lp' "$ak")"

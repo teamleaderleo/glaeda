@@ -13,6 +13,8 @@
     glaeda-mini-fleet repair    [HOST ...] [--yes] [--from HOST]                preflight, fix, sudo-plan, renew, runners
     glaeda-mini-fleet upgrade   [HOST ...] --candidate-run RUN [--yes]         roll a new candidate over the fleet
     glaeda-mini-fleet pools    [HOST ...] [--observed FILE]                     runner capacity per pool label (JSON)
+    glaeda-mini-fleet reserve  HOST ... --for TEXT (--hours N | --until EPOCH) [--owner O] [--force] [--yes]
+    glaeda-mini-fleet release  HOST ... [--owner O] [--force] [--yes]           drop a reservation
 
 The manifest names every host, its fleet node id (node_id, so every enrollment rerun asks for the
 same one), its hardware and scheduling class, the toolchain it must carry, the SSH keys that must, may, and must
@@ -88,6 +90,21 @@ exit 1; --wait waits up to 4 hours instead. Every changing step on a host checks
 The manifest's `candidate` pins the reviewed Glaeda candidate the fleet runs (source, sha256, run,
 artifact, repo, expires). upgrade writes it; preflight, fix, onboard and repair read it.
 
+`reserve` holds hosts for dedicated work that spans several builds (a Chromium campaign), which
+the fleet host lock cannot cover between builds. It writes /Users/Shared/cmux-build-fleet/
+reservation.json on each host ({"schema": "glaeda-reservation/v1", owner, purpose, since, until},
+temp file then mv, mode 664), active while now < until and never longer than 72 hours ahead, so a
+forgotten one expires. The owner defaults to $USER@$(hostname -s). It refuses another owner's
+active reservation or an invalid marker without --force; extending your own keeps its since. Writes
+and removals hold a per-host writer lock and are compare-and-swap on the marker read just before,
+and each is read back. The marker is parsed by glaeda_reservation.py, as the runner hook does. `release`
+removes your own or any expired marker (another owner's active one or an invalid one needs --force).
+Both are dry runs without --yes. The probe reports the marker and whether a build holds host.lock
+(a non-blocking shared flock, dropped at once); `check` shows an active reservation as `reserved`
+(informational, like `pending`) and an expired or invalid marker as drift, and `pools` leaves
+reserved members (active or invalid marker) out of `conforming`; it lists them, and lists members
+whose host lock was held (`busy`) without removing them.
+
 The manifest's `toolchain` (in defaults, overridable per host) declares what every build host
 must carry: the Xcode app and build and whether it is selected, the Metal toolchain, the minimum
 Zig, rustup's default toolchain, the minimum Python, and the cmux checkout (repo, ref, root,
@@ -108,13 +125,18 @@ $GLAEDA_MINI_FLEET_MANIFEST). examples/mini-fleet/manifest.example.json shows th
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
+import getpass
+import hashlib
+import math
 import importlib.machinery
 import importlib.util
 import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import threading
@@ -151,6 +173,16 @@ TOOLCHAIN_KEYS = {"xcode", "metal", "zig_min", "rustup_default", "python_min", "
 ENROLL_PYTHON_MIN = "3.13"
 # Files sshd reads by default (OpenSSH AuthorizedKeysFile); every other authorized_keys* is a copy.
 LIVE_KEY_FILES = ("authorized_keys", "authorized_keys2")
+# Reservations: a marker on the mini that every scheduler skips until it expires.
+FLEET_ROOT = "/Users/Shared/cmux-build-fleet"
+RESERVATION_FILE = "reservation.json"
+RESERVATION_SCHEMA = "glaeda-reservation/v1"
+RESERVATION_MAX_HOURS = 72
+RESERVATION_MAX_BYTES = 4096  # the probe ships at most one byte more, so a larger marker reads as invalid
+OWNER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}\Z")
+PURPOSE_MAX = 200
+# Check areas that inform without counting as drift.
+INFO_AREAS = ("pending", "reserved")
 
 
 class Failure(Exception):
@@ -428,6 +460,8 @@ def parse_probe(text: str) -> dict[str, Any]:
             "controller_token": out.get("controller_token"),
         },
         "enrolled_node_id": out.get("fleet_node_id"),
+        "reservation": probe_reservation(out.get("reservation"), out.get("reservation_raw")),
+        "host_lock": out.get("host_lock"),
         "authorized_keys_files": [v.split("|")[0] for v in out["ak_file"]],
         "authorized_keys": [parse_key(v) for v in out["ak_key"] if v.split("|", 1)[0] in LIVE_KEY_FILES],
         **({"preflight": parse_preflight(out)} if "pf_python" in out else {}),
@@ -476,6 +510,59 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
         "runners": [dict(zip(("dir", "name", "loaded", "listening", "held"),
                              (v.split("|", 4) + ["", "unknown", "", ""])[:5])) for v in out["pf_runner"]],
     }
+
+
+def marker_from_bytes(raw: bytes) -> dict[str, Any]:
+    """{"valid": True, owner, purpose, since, until} or {"valid": False, "why": ...}, by glaeda_reservation."""
+    if len(raw) > RESERVATION_MAX_BYTES:
+        return {"valid": False, "why": f"over {RESERVATION_MAX_BYTES} bytes"}
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return {"valid": False, "why": "not UTF-8"}
+    marker, why = reservation_rules.parse(text)
+    return {"valid": True, **marker} if marker else {"valid": False, "why": why}
+
+
+def probe_reservation(flag: str | None, raw_b64: str | None) -> dict[str, Any] | None:
+    """The probe's reservation lines as a marker; None when the host has none."""
+    if raw_b64 is not None:
+        try:
+            raw = base64.b64decode(raw_b64, validate=True)
+        except ValueError:
+            return {"valid": False, "why": "the probe sent unreadable content"}
+        return marker_from_bytes(raw)
+    if flag is not None:
+        return {"valid": False, "why": "a symlink, not a regular file, or unreadable"}
+    return None
+
+
+def reservation_state(reservation: dict[str, Any] | None, now: float) -> str | None:
+    """None (no marker), invalid, active (now < until) or expired."""
+    if reservation is None:
+        return None
+    if not reservation.get("valid"):
+        return "invalid"
+    return "active" if reservation_rules.active(reservation, now) else "expired"
+
+
+def utc(epoch: float) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(epoch))
+    except (ValueError, OverflowError, OSError):
+        return f"epoch {epoch}"  # a hand-written marker can carry a time no calendar holds
+
+
+def printable(text: str) -> str:
+    """Remote text for a terminal: control characters become spaces."""
+    return "".join(c if c.isprintable() else " " for c in text)
+
+
+def describe_reservation(reservation: dict[str, Any]) -> str:
+    try:
+        return printable(reservation_rules.describe(reservation))
+    except (ValueError, OverflowError, OSError):
+        return printable(f"{reservation['owner'] or '?'} for {reservation['purpose'] or '?'} until epoch {reservation['until']}")
 
 
 def parse_key(value: str) -> dict[str, Any]:
@@ -534,6 +621,27 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
     host = manifest["hosts"][name]
     policy = host_policy(manifest, name)
     shape = manifest["hardware"][host["hardware"]]
+
+    reservation = obs.get("reservation")
+    seen_at = obs.get("observed_at") or time.time()
+    state = reservation_state(reservation, seen_at)
+    marker = f"{FLEET_ROOT}/{RESERVATION_FILE}"
+    if state == "active":
+        drift("reserved", f"reserved by {describe_reservation(reservation)}; the runner hook and pools skip it")
+        if reservation["until"] - seen_at > RESERVATION_MAX_HOURS * 3600:
+            drift("reservation", f"reservation ends {utc(reservation['until'])}, more than {RESERVATION_MAX_HOURS} h "
+                  "ahead, so it will not expire when forgotten",
+                  f"ask {printable(reservation['owner'])} to re-reserve for less, or glaeda-mini-fleet release {name} --force --yes")
+    elif state == "expired":
+        drift("reservation", f"expired reservation by {describe_reservation(reservation)}",
+              f"glaeda-mini-fleet release {name} --yes")
+    elif state == "invalid":
+        drift("reservation", f"{marker} is not a valid {RESERVATION_SCHEMA} marker ({reservation.get('why')}); "
+              "the runner hook and pools treat it as reserved",
+              f"inspect {marker}, then glaeda-mini-fleet release {name} --force --yes")
+    if obs.get("host_lock") == "unknown":
+        drift("host-lock", f"{FLEET_ROOT}/host.lock exists but its state is unknown to {obs.get('user')}",
+              "make host.lock a regular file readable by the SSH user (660 cmux:staff)")
 
     if host.get("hostname") and obs["hostname"] != host["hostname"]:
         drift("identity", f"hostname {obs['hostname']!r}, manifest says {host['hostname']!r}")
@@ -699,6 +807,8 @@ def load_labels_module() -> Any:
 
 
 labels = load_labels_module()
+# The reservation rule the runner hook also uses (glaeda_reservation.py), so the two never drift.
+reservation_rules = _load("glaeda_reservation", SCRIPT_DIR / "glaeda_reservation.py")
 pool_label = labels.pool_label
 
 
@@ -710,6 +820,11 @@ def pools(manifest: dict[str, Any], observed: dict[str, Any] | None, hosts: list
     build) as a real directory: the host meets the pool, so a runner installed or relabelled
     from this manifest would carry the label. It does not prove the registered runner carries it
     today; GitHub fixes labels at registration. Without an observation nothing conforms.
+
+    A member with an active or invalid reservation (listed in `reserved`; the runner hook refuses
+    both) does not conform, so the picker sees why the count dropped. `busy` lists members whose
+    fleet host lock was held at observation time, as information only: they still conform, because
+    a snapshot of a running job must not shrink capacity (the picker counts live jobs itself).
     """
     seen = (observed or {}).get("hosts", {})
 
@@ -721,6 +836,15 @@ def pools(manifest: dict[str, Any], observed: dict[str, Any] | None, hosts: list
         return bool(got) and got["kind"] == "dir" and got["version"] == want.get("version") \
             and got["build"] == want.get("build")
 
+    def reserved(member: str) -> bool:
+        obs = seen.get(member) or {}
+        return bool(obs.get("reachable")) and reservation_state(
+            obs.get("reservation"), obs.get("observed_at") or time.time()) in ("active", "invalid")
+
+    def busy(member: str) -> bool:
+        obs = seen.get(member) or {}
+        return bool(obs.get("reachable")) and obs.get("host_lock") == "held"
+
     wanted = set(hosts)
     declared = labels.declared_pools(manifest)
     conforming = labels.declared_pools(manifest, xcode_ok)
@@ -729,9 +853,12 @@ def pools(manifest: dict[str, Any], observed: dict[str, Any] | None, hosts: list
         mine = [m for m in members if m in wanted]
         if not mine:
             continue
-        ok = [m for m in conforming.get(label, []) if m in wanted]
-        out[label] = {"declared": mine, "conforming": ok,
-                      "declared_count": len(mine), "conforming_count": len(ok)}
+        held = [m for m in mine if reserved(m)]
+        running = [m for m in mine if busy(m)]
+        ok = [m for m in conforming.get(label, []) if m in wanted and m not in held]
+        out[label] = {"declared": mine, "conforming": ok, "reserved": held, "busy": running,
+                      "declared_count": len(mine), "conforming_count": len(ok),
+                      "reserved_count": len(held), "busy_count": len(running)}
     return out
 
 
@@ -836,6 +963,219 @@ def apply(manifest: dict[str, Any], hosts: list[str], yes: bool) -> int:
     for i in left:
         print(f"still drifting: {i['host']}: {i['detail']}")
     return 1 if failed or left else 0
+
+
+# ---------------------------------------------------------------- reservations
+
+# Each script takes the fleet root as $1. The read writes nothing; the operator side hashes the
+# bytes it got. Writes and removals are compare-and-swap on that digest ($2, or "absent"), so a
+# marker that changed after it was read is never overwritten or removed.
+READ_LIMIT = 65536  # a bigger marker is never bound to a digest, so it is left for a person
+READ_RESERVATION = r"""set -eu
+R="$1/reservation.json"
+if [ -L "$R" ]; then echo symlink; exit 0; fi
+if [ ! -e "$R" ]; then echo absent; exit 0; fi
+if [ ! -f "$R" ]; then echo notfile; exit 0; fi
+echo present
+head -c 65537 "$R"
+"""
+
+# Writers serialize on $F/.reservation.lock: the fd stays open in bash, perl only takes the flock
+# on it (waiting at most 20 s), so the check and the mv or rm cannot interleave with another writer.
+RESERVATION_LOCK = r"""[ -d "$F" ] && [ ! -L "$F" ] || { echo "refused: $F is not a directory" >&2; exit 3; }
+[ -w "$F" ] || { echo "refused: $F is not writable by $(id -un)" >&2; exit 3; }
+[ ! -L "$F/.reservation.lock" ] || { echo "refused: $F/.reservation.lock is a symlink" >&2; exit 3; }
+exec 9>>"$F/.reservation.lock"
+chmod 664 "$F/.reservation.lock" 2>/dev/null || true
+/usr/bin/perl -MFcntl=:flock -e 'open(my $l, ">>&=", 9) or die "lock: $!\n";
+  local $SIG{ALRM} = sub { die "another reserve or release is still running on this host\n" };
+  alarm 20; flock($l, LOCK_EX) or die "lock: $!\n"' </dev/null || exit 3
+"""
+
+RESERVATION_CAS = r"""current() {
+  if [ -L "$R" ]; then echo symlink
+  elif [ ! -e "$R" ]; then echo absent
+  elif [ ! -f "$R" ]; then echo notfile
+  else shasum -a 256 < "$R" | awk '{print $1}'; fi
+}
+"""
+
+WRITE_RESERVATION = r"""set -eu
+F="$1"; R="$F/reservation.json"; want="$2"
+""" + RESERVATION_LOCK + RESERVATION_CAS + r"""case "$(current)" in symlink|notfile) echo "refused: $R is not a regular file; inspect it" >&2; exit 3;; esac
+t=$(mktemp "$F/.reservation.json.XXXXXX")
+trap 'rm -f "$t"' EXIT
+cat > "$t"
+chmod 664 "$t"
+[ "$(current)" = "$want" ] || { echo "refused: $R changed since it was read; re-run" >&2; exit 3; }
+mv -f "$t" "$R"
+trap - EXIT
+echo "reserved"
+"""
+
+REMOVE_RESERVATION = r"""set -eu
+F="$1"; R="$F/reservation.json"; want="$2"
+""" + RESERVATION_CAS + r"""[ -e "$R" ] || [ -L "$R" ] || { echo "released (already absent)"; exit 0; }
+""" + RESERVATION_LOCK + r"""got=$(current)
+[ "$got" != absent ] || { echo "released (already absent)"; exit 0; }
+[ "$got" = "$want" ] || { echo "refused: $R changed since it was read; re-run" >&2; exit 3; }
+rm -f "$R"
+echo "released"
+"""
+
+
+def reservation_ssh(name: str, user: str, script: str, args: list[str], stdin: str = "") -> tuple[int, bytes, str]:
+    """Run one reservation script on a host: (exit code, raw stdout, stderr). Bounded and batch-mode."""
+    command = "/bin/bash -c " + shlex.quote(script) + " glaeda " + " ".join(shlex.quote(a) for a in args)
+    try:
+        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name, command],
+                              input=stdin.encode(), capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return 124, b"", "timed out after 60s; outcome unknown, re-run check"
+    return proc.returncode, proc.stdout, proc.stderr.decode(errors="replace").strip()[-400:]
+
+
+def read_reservation(name: str, user: str) -> dict[str, Any]:
+    """{"state": absent|invalid|active|expired|error, "token": CAS token, "reservation": parsed or None}."""
+    code, out, err = reservation_ssh(name, user, READ_RESERVATION, [FLEET_ROOT])
+    if code != 0:
+        return {"state": "error", "error": (err.splitlines() or [f"ssh exit {code}"])[-1][:200]}
+    head, _, body = out.partition(b"\n")
+    if head == b"absent":
+        return {"state": "absent", "token": "absent", "reservation": None}
+    if head in (b"symlink", b"notfile"):
+        return {"state": "invalid", "token": None, "reservation": None, "detail": f"marker is a {head.decode()}"}
+    if head != b"present":
+        return {"state": "error", "error": f"unexpected reply {printable(head.decode(errors='replace'))[:80]!r}"}
+    if len(body) > READ_LIMIT:
+        return {"state": "invalid", "token": None, "reservation": None, "detail": f"marker is over {READ_LIMIT} bytes"}
+    token = hashlib.sha256(body).hexdigest()
+    reservation = marker_from_bytes(body)
+    if not reservation["valid"]:
+        return {"state": "invalid", "token": token, "reservation": None,
+                "detail": f"marker is not a valid {RESERVATION_SCHEMA} object ({reservation['why']})"}
+    return {"state": reservation_state(reservation, time.time()), "token": token, "reservation": reservation}
+
+
+def default_owner() -> str:
+    """The operator: local $USER@$(hostname -s)."""
+    return f"{os.environ.get('USER') or getpass.getuser()}@{socket.gethostname().split('.')[0]}"
+
+
+def reservation_until(hours: float | None, until: int | None, now: int) -> int:
+    if (hours is None) == (until is None):
+        raise Failure("reserve needs exactly one of --hours N or --until EPOCH")
+    if hours is not None and not math.isfinite(hours):
+        raise Failure("--hours must be a finite number")
+    end = now + round(hours * 3600) if hours is not None else until
+    if end <= now:
+        raise Failure(f"reservation must end in the future (until {end}, now {now})")
+    if end - now > RESERVATION_MAX_HOURS * 3600:
+        raise Failure(f"reservations last at most {RESERVATION_MAX_HOURS} h; extend one before it ends instead")
+    return end
+
+
+def check_owner(owner: str) -> str:
+    if not OWNER_RE.fullmatch(owner):
+        raise Failure(f"owner {owner!r} must be letters, digits and . _ @ + - (at most 100), such as leo@air-blue")
+    return owner
+
+
+def cmd_reserve(manifest: dict[str, Any], hosts: list[str], purpose: str | None, hours: float | None,
+                until: int | None, owner: str | None, force: bool, yes: bool) -> int:
+    if not purpose or not purpose.strip():
+        raise Failure("reserve needs --for TEXT saying what the host is reserved for")
+    if len(purpose) > PURPOSE_MAX or not purpose.isprintable():
+        raise Failure(f"--for must be printable text of at most {PURPOSE_MAX} characters")
+    owner = check_owner(owner or default_owner())
+    now = int(time.time())
+    end = reservation_until(hours, until, now)
+    user = manifest["ssh_user"]
+    failed = 0
+    for name in hosts:
+        current = read_reservation(name, user)
+        state, held = current["state"], current.get("reservation")
+        since = now
+        if state == "error":
+            print(f"{name}: cannot read reservation: {current['error']}")
+            failed += 1
+            continue
+        if state == "invalid":
+            if not force or current["token"] is None:
+                why = "inspect it, then pass --force to replace it" if current["token"] else "fix it by hand; --force cannot"
+                print(f"{name}: refused: {current['detail']}; {why}")
+                failed += 1
+                continue
+        elif state == "active" and held["owner"] == owner:
+            since = held["since"]
+        elif state == "active" and not force:
+            print(f"{name}: refused: reserved by {describe_reservation(held)}; pass --force to take it over")
+            failed += 1
+            continue
+        record = {"schema": RESERVATION_SCHEMA, "owner": owner, "purpose": purpose, "since": since, "until": end}
+        text = json.dumps(record) + "\n"
+        verb = {"absent": "reserve", "expired": "replace expired", "invalid": "replace invalid"}.get(state) or \
+            ("extend" if held["owner"] == owner else f"take over from {printable(held['owner'])}")
+        if not yes:
+            print(f"{name}: would {verb}: {FLEET_ROOT}/{RESERVATION_FILE} = {text.strip()}")
+            continue
+        code, out, err = reservation_ssh(name, user, WRITE_RESERVATION, [FLEET_ROOT, current["token"]], text)
+        if code != 0:
+            print(f"{name}: {err or f'ssh exit {code}'}")
+            failed += 1
+            continue
+        after = read_reservation(name, user)
+        if after.get("reservation") != {"valid": True, **{k: record[k] for k in ("owner", "purpose", "since", "until")}}:
+            print(f"{name}: wrote the marker but a fresh read shows {after['state']}; re-run check")
+            failed += 1
+            continue
+        print(f"{name}: done ({verb}): reserved by {describe_reservation(after['reservation'])}")
+    if not yes:
+        print("dry run; pass --yes to write")
+    return 1 if failed else 0
+
+
+def cmd_release(manifest: dict[str, Any], hosts: list[str], owner: str | None, force: bool, yes: bool) -> int:
+    owner = check_owner(owner or default_owner())
+    user = manifest["ssh_user"]
+    failed = 0
+    for name in hosts:
+        current = read_reservation(name, user)
+        state, held = current["state"], current.get("reservation")
+        if state == "error":
+            print(f"{name}: cannot read reservation: {current['error']}")
+            failed += 1
+            continue
+        if state == "absent":
+            print(f"{name}: not reserved")
+            continue
+        if state == "invalid" and (not force or current["token"] is None):
+            why = "inspect it, then pass --force to remove it" if current["token"] else "fix it by hand; --force cannot"
+            print(f"{name}: refused: {current['detail']}; {why}")
+            failed += 1
+            continue
+        if state == "active" and held["owner"] != owner and not force:
+            print(f"{name}: refused: reserved by {describe_reservation(held)}, not {owner}; pass --force to release it")
+            failed += 1
+            continue
+        what = "invalid marker" if state == "invalid" else f"{state} reservation by {describe_reservation(held)}"
+        if not yes:
+            print(f"{name}: would release {what}")
+            continue
+        code, out, err = reservation_ssh(name, user, REMOVE_RESERVATION, [FLEET_ROOT, current["token"]])
+        if code != 0:
+            print(f"{name}: {err or f'ssh exit {code}'}")
+            failed += 1
+            continue
+        after = read_reservation(name, user)
+        if after["state"] != "absent":
+            print(f"{name}: removed the marker but a fresh read shows {after['state']}; re-run check")
+            failed += 1
+            continue
+        print(f"{name}: released {what}")
+    if not yes:
+        print("dry run; pass --yes to release")
+    return 1 if failed else 0
 
 
 # ---------------------------------------------------------------- preflight
@@ -3044,7 +3384,7 @@ def read_observed(path: Path) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("observe", "check", "plan", "apply", "preflight", "fix", "sudo-plan",
-                                            "share", "onboard", "repair", "upgrade", "pools"))
+                                            "share", "onboard", "repair", "upgrade", "pools", "reserve", "release"))
     parser.add_argument("names", nargs="*", metavar="HOST", help="hosts to act on (same as --host)")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--host", action="append", dest="hosts")
@@ -3075,6 +3415,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="upgrade: the archive sha256 from the run's summary, checked against its receipt")
     parser.add_argument("--seed-per-class", dest="seeds", action="append", default=[], metavar="HOST",
                         help="upgrade: the host that runs its class's one accept-local (default: the first ready one)")
+    parser.add_argument("--for", dest="purpose", metavar="TEXT", help="reserve: what the hosts are reserved for")
+    parser.add_argument("--hours", type=float, help=f"reserve: how long, at most {RESERVATION_MAX_HOURS}")
+    parser.add_argument("--until", type=int, metavar="EPOCH", help="reserve: end time in Unix seconds")
+    parser.add_argument("--owner", help="reserve, release: who holds it (default $USER@$(hostname -s))")
+    parser.add_argument("--force", action="store_true",
+                        help="reserve, release: override another owner's active reservation or an invalid marker")
     # Intermixed, so hosts may follow options: share xcode --from cmux15 cmux7s cmux8s
     args = parser.parse_intermixed_args(argv)
     thing = None
@@ -3093,6 +3439,12 @@ def main(argv: list[str] | None = None) -> int:
             if not args.hosts:
                 raise Failure("apply needs explicit --host arguments")
             return apply(manifest, hosts, args.yes)
+        if args.command in ("reserve", "release"):
+            if not args.hosts:
+                raise Failure(f"{args.command} needs explicit hosts")
+            if args.command == "reserve":
+                return cmd_reserve(manifest, hosts, args.purpose, args.hours, args.until, args.owner, args.force, args.yes)
+            return cmd_release(manifest, hosts, args.owner, args.force, args.yes)
         if args.command in {"onboard", "repair"}:
             sudo = args.sudo or ("wait" if args.command == "onboard" else "stop")
             return cmd_onboard(manifest, args.hosts, args.yes, sudo, args.acceptance, args.seed, args.log_dir,
@@ -3153,17 +3505,17 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  {fix}")
     else:
         width = max((len(h) for h in hosts), default=0)
-        drifting = [i for i in issues if i["area"] != "pending"]
+        drifting = [i for i in issues if i["area"] not in INFO_AREAS]
         for name in hosts:
             mine = [i for i in issues if i["host"] == name]
-            count = sum(i["area"] != "pending" for i in mine)
-            pending = len(mine) - count
+            count = sum(i["area"] not in INFO_AREAS for i in mine)
+            info = ", ".join(f"{n} {area}" for area in INFO_AREAS if (n := sum(i["area"] == area for i in mine)))
             status = f"{count} drift" if count else "ok"
-            print(f"{name:<{width}}  {status}{f' ({pending} pending)' if pending else ''}")
+            print(f"{name:<{width}}  {status}{f' ({info})' if info else ''}")
             for i in mine:
                 print(f"{'':<{width}}    {i['area']}: {i['detail']}")
         print(f"{len(hosts)} hosts, {len({i['host'] for i in drifting})} drifting, {len(drifting)} findings")
-    return 1 if any(i["area"] != "pending" for i in issues) else 0
+    return 1 if any(i["area"] not in INFO_AREAS for i in issues) else 0
 
 
 if __name__ == "__main__":
