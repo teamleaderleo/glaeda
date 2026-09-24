@@ -45,6 +45,8 @@ DEFAULT_MANIFEST = Path(os.environ.get("GLAEDA_MINI_FLEET_MANIFEST", "~/.config/
 SSH = "/usr/bin/ssh"
 PROBE_TIMEOUT = 90
 LIST_KEYS = {"xcode_app", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key"}
+# Files sshd reads by default (OpenSSH AuthorizedKeysFile); every other authorized_keys* is a copy.
+LIVE_KEY_FILES = ("authorized_keys", "authorized_keys2")
 
 
 class Failure(Exception):
@@ -66,9 +68,11 @@ def load_manifest(path: Path) -> dict[str, Any]:
     for field in ("ssh_user", "keys", "classes", "defaults", "hosts"):
         if field not in data:
             raise Failure(f"{path}: missing {field!r}")
-    never = set(data.get("never_touch", []))
+    never = {host_key(n) for n in data.get("never_touch", [])}
     for name, host in data["hosts"].items():
-        if name in never:
+        if name.startswith("-") or not name:
+            raise Failure(f"{path}: host name {name!r} is not usable as an SSH destination")
+        if host_key(name) in never or host_key(host.get("hostname") or "") in never:
             raise Failure(f"{path}: host {name} is also in never_touch")
         if host.get("class") not in data["classes"]:
             raise Failure(f"{path}: host {name} has unknown class {host.get('class')!r}")
@@ -76,7 +80,18 @@ def load_manifest(path: Path) -> dict[str, Any]:
                 host_policy(data, name)["authorized_keys"].get("allow", []):
             if key_id not in data["keys"]:
                 raise Failure(f"{path}: host {name} names unknown key {key_id!r}")
+    for key_id, key in data["keys"].items():
+        public = key.get("public_key")
+        if public is not None and (not isinstance(public, str) or "\n" in public.strip()
+                                   or not public.startswith(("ssh-", "ecdsa-", "sk-"))):
+            raise Failure(f"{path}: key {key_id} public_key must be one bare key line, no options")
     return data
+
+
+def host_key(name: str) -> str:
+    """Compare host names case-insensitively and without a trailing .local."""
+    name = name.strip().lower()
+    return name[: -len(".local")] if name.endswith(".local") else name
 
 
 def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
@@ -95,9 +110,9 @@ def select_hosts(manifest: dict[str, Any], wanted: list[str] | None) -> list[str
     names = list(manifest["hosts"])
     if not wanted:
         return names
-    never = set(manifest.get("never_touch", []))
+    never = {host_key(n) for n in manifest.get("never_touch", [])}
     for name in wanted:
-        if name in never:
+        if host_key(name) in never:
             raise Failure(f"{name} is in never_touch; this tool does not connect to it")
         if name not in manifest["hosts"]:
             raise Failure(f"{name} is not in the manifest")
@@ -143,17 +158,17 @@ def parse_probe(text: str) -> dict[str, Any]:
             "worker_sha256_12": out.get("fleet_worker_sha"),
         },
         "authorized_keys_files": [v.split("|")[0] for v in out["ak_file"]],
-        "authorized_keys": [parse_key(v) for v in out["ak_key"] if v.startswith("authorized_keys|")],
+        "authorized_keys": [parse_key(v) for v in out["ak_key"] if v.split("|", 1)[0] in LIVE_KEY_FILES],
     }
 
 
 def parse_key(value: str) -> dict[str, Any]:
-    _file, options, fp = value.split("|", 2)
+    file, options, fp = value.split("|", 2)
     parts = fp.split(" ", 2)
     if len(parts) < 3 or not parts[1].startswith("SHA256:"):
-        return {"fingerprint": None, "comment": fp, "options": options == "yes"}
+        return {"file": file, "fingerprint": None, "comment": fp, "options": options == "yes"}
     comment, _, kind = parts[2].rpartition(" (")
-    return {"fingerprint": parts[1], "comment": comment, "type": kind.rstrip(")"), "options": options == "yes"}
+    return {"file": file, "fingerprint": parts[1], "comment": comment, "type": kind.rstrip(")"), "options": options == "yes"}
 
 
 def observe_host(name: str, user: str) -> dict[str, Any]:
@@ -222,6 +237,8 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
                        "version": want["version"], "build": want["build"]})
             else:
                 drift("xcode", f"{want['path']} missing", "install it")
+        elif got["kind"] != "dir":
+            drift("xcode", f"{want['path']} is a {got['kind']}, want a real directory (symlinked paths break cache replay)")
         elif (got["version"], got["build"]) != (want["version"], want["build"]):
             drift("xcode", f"{want['path']} is {got['version']} ({got['build']}), want {want['version']} ({want['build']})")
     if xcode.get("select") and obs["xcode_select"] != xcode["select"]:
@@ -253,9 +270,12 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
             drift("ssh", "authorized_keys has an unparseable line")
         elif k["options"]:
             drift("ssh", f"key {k['fingerprint'][7:19]} carries options; review them")
-    stray = [f for f in obs["authorized_keys_files"] if f != "authorized_keys"]
+    for k in obs["authorized_keys"]:
+        if k.get("file") != "authorized_keys":
+            drift("ssh", f"key {(k['fingerprint'] or '?')[7:19]} ({k['comment']}) is in {k['file']}, which sshd also reads")
+    stray = [f for f in obs["authorized_keys_files"] if f not in LIVE_KEY_FILES]
     if stray and keys.get("no_backups"):
-        drift("ssh", f"stale authorized_keys copies: {', '.join(stray)}", "archive them outside ~/.ssh")
+        drift("ssh", f"stale authorized_keys copies: {', '.join(stray)}", "move them out of ~/.ssh")
 
     running = {j["label"]: j["state"] for j in obs["launchd"]}
     for label in policy.get("launchd", {}).get("running", []):
@@ -276,10 +296,12 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
 
 
 def version_tuple(value: str | None) -> tuple[int, ...]:
+    """Three-part version, zero-padded, so 26.3 == 26.3.0 and 26 == 26.0."""
     try:
-        return tuple(int(p) for p in (value or "0").split("."))
+        parts = [int(p) for p in (value or "0").split(".")]
     except ValueError:
-        return (0,)
+        parts = [0]
+    return tuple((parts + [0, 0, 0])[:3])
 
 
 def check(manifest: dict[str, Any], observed: dict[str, Any], hosts: list[str]) -> list[dict[str, str]]:
@@ -302,9 +324,18 @@ have=$(ssh-keygen -lf "$ak" 2>/dev/null | awk '{print $2}' | grep -cxF "$1" || t
 if [ "$have" != 0 ]; then echo "unchanged: key $1 already present"; exit 0; fi
 got=$(printf '%s\n' "$line" | ssh-keygen -lf /dev/stdin | awk '{print $2}')
 [ "$got" = "$1" ] || { echo "refused: supplied key is $got, want $1" >&2; exit 3; }
-backup="$ak.glaeda-$(date -u +%Y%m%dT%H%M%SZ)"
-cp -p "$ak" "$backup"
-[ -z "$(tail -c1 "$ak")" ] || printf '\n' >> "$ak"
+# Backups live outside ~/.ssh so they are never read as keys or reported as stray copies.
+state="$HOME/.local/state/glaeda/mini-fleet"
+mkdir -p "$state" && chmod 700 "$state"
+if [ -e "$ak" ]; then
+  backup="$state/authorized_keys.$(date -u +%Y%m%dT%H%M%SZ)"
+  cp -p "$ak" "$backup"
+else
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  : > "$ak"
+  backup="none (file was absent)"
+fi
+[ ! -s "$ak" ] || [ -z "$(tail -c1 "$ak")" ] || printf '\n' >> "$ak"
 printf '%s\n' "$line" >> "$ak"
 chmod 600 "$ak"
 echo "added: key $1 (backup $backup)"
@@ -312,16 +343,17 @@ echo "added: key $1 (backup $backup)"
 
 CLONE_XCODE = r"""set -eu
 src="$1"; dst="$2"; want="$3|$4"
-if [ -e "$dst" ]; then echo "unchanged: $dst exists"; exit 0; fi
+if [ -e "$dst" ] || [ -L "$dst" ]; then echo "unchanged: $dst exists"; exit 0; fi
 [ -d "$src" ] && [ ! -L "$src" ] || { echo "refused: $src is not a real directory" >&2; exit 3; }
 v=$(plutil -extract CFBundleShortVersionString raw "$src/Contents/Info.plist")
 b=$(plutil -extract ProductBuildVersion raw "$src/Contents/version.plist")
 [ "$v|$b" = "$want" ] || { echo "refused: $src is $v|$b, want $want" >&2; exit 3; }
-[ "$(stat -f %Sd /Applications)" = "$(stat -f %Sd "$src")" ] || { echo "refused: not one volume" >&2; exit 3; }
+[ "$(stat -f %Sd "$(dirname "$dst")")" = "$(stat -f %Sd "$src")" ] || { echo "refused: not one volume" >&2; exit 3; }
 tmp="$dst.glaeda-partial"
 [ ! -e "$tmp" ] || { echo "refused: $tmp exists from an earlier run; inspect it" >&2; exit 3; }
 cp -c -R "$src" "$tmp"
-mv "$tmp" "$dst"
+mv -n "$tmp" "$dst"
+[ ! -e "$tmp" ] || { echo "refused: $dst appeared during the clone; $tmp left for inspection" >&2; exit 3; }
 echo "cloned: $src -> $dst ($v $b)"
 """
 
@@ -329,8 +361,11 @@ echo "cloned: $src -> $dst ($v $b)"
 def remote(name: str, user: str, script: str, args: list[str], stdin: str = "") -> tuple[int, str]:
     import shlex
     command = "/bin/bash -c " + shlex.quote(script) + " glaeda " + " ".join(shlex.quote(a) for a in args)
-    proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name, command],
-                          input=stdin.encode(), capture_output=True, timeout=600)
+    try:
+        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name, command],
+                              input=stdin.encode(), capture_output=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        return 124, "timed out after 600s; outcome unknown, re-run check"
     text = (proc.stdout + proc.stderr).decode(errors="replace").strip()
     return proc.returncode, text[-400:]
 
@@ -342,7 +377,12 @@ def apply(manifest: dict[str, Any], hosts: list[str], yes: bool) -> int:
         if manifest["hosts"][name].get("overrides", {}).get("apply") is False:
             print(f"{name}: skipped (apply: false)")
             continue
-        actions = [i["action"] for i in check(manifest, observed, [name]) if i.get("action")]
+        before = check(manifest, observed, [name])
+        if any(i["area"] == "reach" for i in before):
+            print(f"{name}: unreachable before apply: {before[0]['detail']}")
+            failed += 1
+            continue
+        actions = [i["action"] for i in before if i.get("action")]
         if not actions:
             print(f"{name}: nothing to apply")
             continue
@@ -367,13 +407,23 @@ def apply(manifest: dict[str, Any], hosts: list[str], yes: bool) -> int:
         print("dry run; pass --yes to apply")
         return 0
     after = check(manifest, observe(manifest, hosts), hosts)
-    left = [i for i in after if i.get("action")]
+    left = [i for i in after if i.get("action") or i["area"] == "reach"]
     for i in left:
         print(f"still drifting: {i['host']}: {i['detail']}")
     return 1 if failed or left else 0
 
 
 # ---------------------------------------------------------------- cli
+
+
+def read_observed(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise Failure(f"{path}: {error}") from None
+    if not isinstance(data, dict) or not isinstance(data.get("hosts"), dict):
+        raise Failure(f"{path}: not an observe output (no hosts object)")
+    return data
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -393,14 +443,17 @@ def main(argv: list[str] | None = None) -> int:
             if not args.hosts:
                 raise Failure("apply needs explicit --host arguments")
             return apply(manifest, hosts, args.yes)
-        observed = json.loads(args.observed.read_text()) if args.observed else observe(manifest, hosts)
+        observed = read_observed(args.observed) if args.observed else observe(manifest, hosts)
         if args.command == "observe":
             text = json.dumps(observed, indent=2, sort_keys=True)
             if args.out:
                 args.out.write_text(text + "\n")
             print(text)
             return 0
-        issues = check(manifest, observed, hosts)
+        try:
+            issues = check(manifest, observed, hosts)
+        except (KeyError, TypeError, ValueError, AttributeError) as error:
+            raise Failure(f"observation does not match this tool's format ({type(error).__name__}: {error})") from None
     except Failure as error:
         print(f"glaeda-mini-fleet: {error}", file=sys.stderr)
         return 2
