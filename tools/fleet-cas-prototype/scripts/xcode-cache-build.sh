@@ -41,6 +41,18 @@ else
   cas="$WORK/localcas-$label"
   map_derived=(SWIFT_OTHER_PREFIX_MAPPINGS="$dd=/^derived" CLANG_OTHER_PREFIX_MAPPINGS="$dd=/^derived")
 fi
+# A plugin socket nobody answers on makes Xcode crawl instead of failing:
+# drop the plugin settings and build with the local cache alone.
+args=()
+for a in "$@"; do
+  case $a in COMPILATION_CACHE_REMOTE_SERVICE_PATH=*) sock=${a#*=} ;; esac
+done
+if [ -n "${sock:-}" ] && ! "$(dirname "$0")/fleet-cas-settings.sh" "$sock" >/dev/null; then
+  for a in "$@"; do
+    case $a in COMPILATION_CACHE_ENABLE_PLUGIN=* | COMPILATION_CACHE_REMOTE_SERVICE_PATH=*) ;; *) args+=("$a") ;; esac
+  done
+  set -- ${args[@]+"${args[@]}"}
+fi
 log="$WORK/log-$label.txt"
 cd "$PKG" || exit 2
 where=()

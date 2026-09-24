@@ -98,10 +98,12 @@ per fresh machine.
   as a miss; no mismatches occurred.
 - **Read-only reader.** Every reader-side index write was refused (15 on the chain with the old
   CAS path, 2,657 on the full app), and nothing reached the fleet store.
-- **Publication order.** The fleet store's own `kv_put_dangling` counter was 0 after a full-app
-  fill (7,705 entries): with write-through, no index entry reached the fleet store before the
-  objects it names. (The writer node's counter was 0 on every fill too, but that only shows
-  the objects were local.)
+- **Publication order.** Every one of the 7,705 entries in a full-app fleet store names only
+  objects that store holds (25,031 references, none absent; checked offline by walking
+  Xcode's nested index records, see the [prefetch follow-up](fleet-compilation-cache-prefetch-2026-09-24.md)).
+  With write-through, no index entry reached the fleet store before its objects. (An earlier
+  version of this doc cited the `kv_put_dangling` counter; it only looked at top-level values
+  and saw no IDs, so its zero proved nothing.)
 
 ## Findings
 

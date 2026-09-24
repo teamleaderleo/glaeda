@@ -3,7 +3,8 @@
 # whose only warm source is the fleet store, then builds in a fresh
 # DerivedData. A last run keeps the node's store to measure a warm node.
 #
-# usage: PKG=... SCHEME=... WORK=... DD=... reader-runs.sh <upstream-url> <runs> [label-prefix]
+# usage: PKG=... SCHEME=... WORK=... DD=... [NODE_FLAGS=--no-prefetch] \
+#          reader-runs.sh <upstream-url> <runs> [label-prefix]
 set -u
 : "${PKG:?}" "${SCHEME:?}" "${WORK:?}" "${DD:?}"
 up=$1; runs=$2; prefix=${3:-fresh}
@@ -27,7 +28,7 @@ start_node() {
   stop_node
   [ "${1:-}" = keep ] || rm -rf "$store"
   rm -f "$sock"
-  "$bin" "$sock" "$store" --read-only-kv --upstream "$up" >"$WORK/node-r.log" 2>&1 &
+  "$bin" "$sock" "$store" --read-only-kv --upstream "$up" ${NODE_FLAGS:-} >"$WORK/node-r.log" 2>&1 &
   np=$!
   for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$sock" ] && return; sleep 0.5; done
   cat "$WORK/node-r.log"; exit 1
