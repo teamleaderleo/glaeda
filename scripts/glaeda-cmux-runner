@@ -87,6 +87,7 @@ RUN_TIMEOUT = 60
 CURL = "/usr/bin/curl"
 LAUNCHCTL = "/bin/launchctl"
 ONLINE_WAIT_S = 90
+WORKLOAD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 PUBLIC_API = "https://api.github.com/"
 TOKEN_RE = r"[A-Za-z0-9_.\-]+"
 LISTENING = "Listening for Jobs"
@@ -378,8 +379,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
 
 
 def agent_plist(ctx: Context) -> dict[str, Any]:
-    path = ":".join([os.fspath(ctx.home / ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin",
-                     "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+    # Exactly cmux's workload PATH (cmux_fleet_bootstrap CMUX_WORKLOAD_TOOL_PATH): a tool under the
+    # user's home, such as an old ~/.local/bin/zig, must never shadow the one the class accepted.
+    path = WORKLOAD_PATH
     return {
         "Label": LABEL,
         "ProgramArguments": [os.fspath(ctx.runner_dir / "run.sh")],

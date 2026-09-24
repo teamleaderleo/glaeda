@@ -422,7 +422,8 @@ class HookTest(unittest.TestCase):
     def node(self, state: str = "eligible", routing: bool = True, receipt_sha: str = "sha256:aa",
              enrolled_sha: str = "sha256:aa", tools: dict | None = None, generation: bool = True,
              valid: bool = True, role: str = "cmux_macos_native_build", receipt_toolchain: dict | None = None,
-             hang: str | None = None) -> None:
+             hang: str | None = None, default: str = "1.98.1-aarch64-apple-darwin",
+             installed: tuple = ("1.88.0-aarch64-apple-darwin", "1.98.1-aarch64-apple-darwin")) -> None:
         """A fake Glaeda node under HOME (self.dir): enrollment, class receipt, staged CLI, toolchain."""
         config = self.dir / ".config/glaeda/cmux-fleet"
         (config / "class-acceptance").mkdir(parents=True, exist_ok=True)
@@ -446,7 +447,37 @@ class HookTest(unittest.TestCase):
         cargo = self.dir / "jobpath"
         cargo.mkdir(parents=True, exist_ok=True)
         have = {**self.TOOLCHAIN, **(tools or {})}
-        outputs = {"rustc": have["rustcVersion"], "cargo": have["cargoVersion"], "zig": have["zigVersion"],
+        (self.dir / "rustup-default").write_text(default)
+        (self.dir / "rustup-installed").write_text("\n".join(installed))
+        versions = {"1.98.1-aarch64-apple-darwin": self.TOOLCHAIN["rustcVersion"],
+                    "1.88.0-aarch64-apple-darwin": "rustc 1.88.0 (6b00bc388 2025-06-23)"}
+        (self.dir / "rustc-by-toolchain.json").write_text(json.dumps(versions))
+        state = os.fspath(self.dir)
+        make_executable(cargo / "rustup", f"""#!{sys.executable}
+import json, sys
+state = {state!r}
+default = open(state + "/rustup-default").read().strip()
+installed = open(state + "/rustup-installed").read().split()
+args = sys.argv[1:]
+if args[:2] == ["toolchain", "list"]:
+    for name in installed:
+        print(name + (" (active, default)" if name == default else ""))
+elif args == ["default"]:
+    print(default + " (default)")
+elif args[:1] == ["default"] and args[1] in installed:
+    open(state + "/rustup-default", "w").write(args[1])
+    print("info: default toolchain set to " + args[1])
+elif args[:1] == ["run"]:
+    print(json.load(open(state + "/rustc-by-toolchain.json")).get(args[1] + "-aarch64-apple-darwin", ""))
+else:
+    sys.exit(1)
+""")
+        rustc = have["rustcVersion"] if (tools or {}).get("rustcVersion") else None
+        make_executable(cargo / "rustc", f"#!{sys.executable}\nimport json\n"
+                        + (f"print({rustc!r})\n" if rustc else
+                           f"print(json.load(open({state!r} + '/rustc-by-toolchain.json'))"
+                           f"[open({state!r} + '/rustup-default').read().strip()])\n"))
+        outputs = {"cargo": have["cargoVersion"], "zig": have["zigVersion"],
                    "xcrun": have["macosSdkVersion"],
                    "xcodebuild": f"Xcode {have['xcodeVersion']}\nBuild version {have['xcodeBuild']}"}
         for name, text in outputs.items():
@@ -497,6 +528,39 @@ class HookTest(unittest.TestCase):
                 self.assertIn("refused: node not eligible", result.stdout)
                 self.assertIn(text, result.stdout)
                 self.assertTrue(self.lock_free(), "a refused job never takes the host lock")
+
+    def test_drifted_rustup_default_is_realigned_under_the_lock(self) -> None:
+        self.fleet()
+        self.node(default="1.88.0-aarch64-apple-darwin")  # another fleet job flipped the global default
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("set the rustup default to 1.98.1-aarch64-apple-darwin (was 1.88.0-aarch64-apple-darwin)",
+                      result.stdout)
+        self.assertEqual((self.dir / "rustup-default").read_text(), "1.98.1-aarch64-apple-darwin")
+        self.assertFalse(self.lock_free())
+        self.done()
+
+    def test_toolchain_refusal_after_the_lock_releases_it(self) -> None:
+        self.fleet()
+        self.node(default="1.88.0-aarch64-apple-darwin", installed=("1.88.0-aarch64-apple-darwin",))
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("rust toolchain 1.98.1-aarch64-apple-darwin is not installed", result.stdout)
+        self.assertTrue(self.lock_free())
+        self.assertEqual((self.dir / "rustup-default").read_text(), "1.88.0-aarch64-apple-darwin")
+
+    def test_diff_sidecar_pin_is_checked(self) -> None:
+        self.fleet()
+        receipt = {**self.TOOLCHAIN, "diffRustToolchain": "1.88.0",
+                   "diffRustcVersion": "rustc 1.88.0 (6b00bc388 2025-06-23)"}
+        self.node(receipt_toolchain=receipt)
+        self.assertEqual(self.eligible_start().returncode, 0)
+        self.done()
+        self.node(receipt_toolchain={**receipt, "diffRustcVersion": "rustc 1.88.1 (x)"})
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("diffRustcVersion", result.stdout)
+        self.assertTrue(self.lock_free())
 
     def test_hung_tool_refuses_within_the_budget(self) -> None:
         self.fleet()

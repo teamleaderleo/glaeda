@@ -90,7 +90,16 @@ What `--apply` does:
      `validate_class_acceptance`) and records all six toolchain strings, and `rustc`,
      `cargo`, `zig`, `xcodebuild` and `xcrun --show-sdk-version`, run from `$HOME` on the
      runner's own PATH (the job's PATH), print exactly those strings, all within one
-     20 s budget. The check takes about a second and runs
+     20 s budget. Other fleet jobs on the same mini (the cmux-ci dev-build worker) flip
+     the global `rustup default`, so after taking the host lock the hook first sets it
+     back to the receipt's toolchain, provided that toolchain is already installed.
+     Under the lock no other fleet job runs, so the default holds for the whole job.
+     `RUSTUP_TOOLCHAIN` is deliberately not used: it would override cmux's
+     `rust-toolchain.toml` pins (DiffSidecar 1.88.0, cmux-tui 1.95.0, iroh-relay-minter
+     1.91.0). The DiffSidecar pin itself is checked with `rustup run`. A refusal after
+     the lock is taken releases it. The runner's PATH is exactly cmux's workload PATH
+     (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`), so a tool under
+     the user's home never shadows the accepted one. The check takes about a second and runs
      on every job, so a mini that drifts or loses eligibility stops taking PR jobs at
      once, and refusal recovery re-runs the job elsewhere.
    - job-completed releases the host lock, runs the same disk pressure pass and always exits 0.
