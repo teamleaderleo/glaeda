@@ -135,6 +135,10 @@ struct Upstream {
 struct Store {
     root: PathBuf,
     read_only_kv: bool,
+    /// Who may write over TCP: `None` for a unix-socket node (its clients
+    /// are local builds), else the allowed peer addresses. The fleet store
+    /// has no other authentication, so an empty list makes it read-only.
+    writers: Option<Vec<std::net::IpAddr>>,
     /// Accept `CASBytes.file_path` uploads. Only a node daemon, whose clients
     /// are local builds, may read paths it is handed; a network-facing store
     /// would read any file on its host for whoever connects.
@@ -288,6 +292,20 @@ fn publish_new(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
 }
 
 impl Store {
+    /// Refuse a write from a TCP peer that is not an allowed writer.
+    fn check_writer<T>(&self, r: &Request<T>) -> Result<(), Status> {
+        let Some(allowed) = &self.writers else {
+            return Ok(());
+        };
+        match r.remote_addr() {
+            Some(peer) if allowed.contains(&peer.ip()) => Ok(()),
+            _ => {
+                self.stats.kv_put_refused.fetch_add(1, Relaxed);
+                Err(Status::permission_denied("not a fleet-cas writer"))
+            }
+        }
+    }
+
     fn cas_path(&self, id: &[u8]) -> PathBuf {
         let h = hex::encode(id);
         self.root.join("cas").join(&h[..2]).join(h)
@@ -576,6 +594,7 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         &self,
         r: Request<cas::CasPutRequest>,
     ) -> Result<Response<cas::CasPutResponse>, Status> {
+        self.0.check_writer(&r)?;
         let obj = r.into_inner().data.unwrap_or_default();
         let data = self.0.bytes_of(obj.blob)?;
         let id = self.0.put_through(obj.references, data).await?;
@@ -607,6 +626,7 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         &self,
         r: Request<cas::CasSaveRequest>,
     ) -> Result<Response<cas::CasSaveResponse>, Status> {
+        self.0.check_writer(&r)?;
         let blob = r.into_inner().data.unwrap_or_default();
         let data = self.0.bytes_of(blob.blob)?;
         let id = self.0.put_through(Vec::new(), data).await?;
@@ -698,6 +718,7 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
         r: Request<kv::PutValueRequest>,
     ) -> Result<Response<kv::PutValueResponse>, Status> {
         let s = &self.0;
+        s.check_writer(&r)?;
         if s.read_only_kv {
             s.stats.kv_put_refused.fetch_add(1, Relaxed);
             return Ok(Response::new(kv::PutValueResponse {
@@ -804,7 +825,7 @@ impl fleet::fleet_cas_server::FleetCas for FleetSvc {
     }
 }
 
-const USAGE: &str = "usage: fleet-cas <socket | tcp:ADDR> <store> [--read-only-kv] [--upstream http://HOST:PORT] [--no-prefetch]";
+const USAGE: &str = "usage: fleet-cas <socket | tcp:ADDR> <store> [--read-only-kv] [--upstream http://HOST:PORT] [--no-prefetch] [--writers IP,IP]";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -816,11 +837,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut read_only_kv = false;
     let mut upstream_url = None;
     let mut prefetch = true;
+    let mut writer_list: Vec<std::net::IpAddr> = Vec::new();
     let mut rest = args[2..].iter();
     while let Some(a) = rest.next() {
         match a.as_str() {
             "--read-only-kv" => read_only_kv = true,
             "--no-prefetch" => prefetch = false,
+            "--writers" => {
+                for ip in rest
+                    .next()
+                    .ok_or(USAGE)?
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                {
+                    writer_list.push(ip.parse()?);
+                }
+            }
             "--upstream" => upstream_url = Some(rest.next().ok_or(USAGE)?.clone()),
             _ => return Err(USAGE.into()),
         }
@@ -857,6 +889,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         root: root.clone(),
         read_only_kv,
         allow_file_paths: !listen.starts_with("tcp:"),
+        writers: listen.starts_with("tcp:").then_some(writer_list),
         upstream,
         upstream_down_until: AtomicU64::new(0),
         stats: Stats::default(),
@@ -877,9 +910,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     eprintln!(
-        "fleet-cas listening on {listen} store={} read_only_kv={read_only_kv} upstream={}",
+        "fleet-cas listening on {listen} store={} read_only_kv={read_only_kv} upstream={} writers={:?}",
         root.display(),
-        upstream_url.as_deref().unwrap_or("none")
+        upstream_url.as_deref().unwrap_or("none"),
+        store.writers
     );
     let final_store = store.clone();
     let router = tonic::transport::Server::builder()

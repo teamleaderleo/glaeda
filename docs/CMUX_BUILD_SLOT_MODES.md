@@ -90,6 +90,24 @@ The worker recipe must enforce, since a host check cannot see a job's settings:
 Writer: CI's main build is the trusted writer, filling the store for every main commit it
 builds (planned; the prototype has no signed writes yet, see #1134 M3). Nothing else writes.
 
+## Deployment
+
+`scripts/glaeda-fleet-cas-rollout --store HOST NODE_HOST... [--apply]` from an operator Mac
+deploys both services (plan by default). On each host it runs `scripts/glaeda-fleet-cas`,
+which builds the prototype and installs user LaunchAgents:
+
+- `com.teamleaderleo.glaeda.fleet-cas-store` on the store host: the fleet store on the host's
+  LAN address, port 7450, store under `xcode/fleet-store`. Only `--writers` addresses may
+  write (checked per request against the TCP peer address); none by default, so a new store
+  is read-only until the trusted writer exists. Other LANs need a tailnet grant for the port.
+- `com.teamleaderleo.glaeda.fleet-cas-node` on every build host: the node daemon on the socket
+  above, read-only (`--read-only-kv`) until then, and `xcode/bin/fleet-cas-settings.sh`.
+
+Cache keys include the compiler, so entries from different Xcode builds never collide in one
+store; a per-build segment would only help eviction and accounting. `glaeda-fleet-cas uninstall
+--apply` removes both agents and keeps the stores. Deployed on cmux7s (store and node) and
+cmux8s (node) on 2026-09-24.
+
 ## When to switch
 
 Catch-up is only fast when the store already holds the target commit; on a store miss it
