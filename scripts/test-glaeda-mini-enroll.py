@@ -232,6 +232,106 @@ class ClassReceipt(unittest.TestCase):
             me.read_class_receipt("-")
 
 
+class Renew(unittest.TestCase):
+    """--renew moves an enrolled node onto a new candidate or toolchain in one run."""
+
+    def test_a_new_candidate_on_an_eligible_node_renews_then_accepts(self) -> None:
+        steps = me.plan(me.State(False, enrollment("eligible"), False, stale=True), "cmux-mac-001", False, False,
+                        candidate=True, renew=True)
+        self.assertEqual(steps, ["stage", "bootstrap", "renew", "accept-local", "eligible", "status"])
+        steps = me.plan(me.State(True, enrollment("eligible"), True, stale=True), None, False, False,
+                        candidate=True, class_receipt=True, renew=True)
+        self.assertEqual(steps, ["bootstrap", "renew", "adopt-class", "eligible", "status"])
+
+    def test_a_current_node_is_left_alone(self) -> None:
+        steps = me.plan(me.State(True, enrollment("eligible"), True), None, False, False, candidate=True,
+                        class_receipt=True, renew=True)
+        self.assertEqual(steps, ["status"])
+
+    def test_quarantined_and_drifted_nodes_renew_instead_of_stopping(self) -> None:
+        for state, current in (("quarantined", False), ("eligible", False), ("draining", False), ("enrolling", False)):
+            with self.subTest(state=state):
+                steps = me.plan(me.State(True, enrollment(state, reason="failed_acceptance" if state == "quarantined"
+                                                          else None), current), None, False, False,
+                                candidate=True, renew=True)
+                self.assertEqual(steps[:2], ["bootstrap", "renew"])
+
+    def test_renew_keeps_the_refusals(self) -> None:
+        with self.assertRaisesRegex(me.Stop, "retired"):
+            me.plan(me.State(True, enrollment("retired"), False), None, False, False, candidate=True, renew=True)
+        with self.assertRaisesRegex(me.Stop, "already enrolled as cmux-mac-001"):
+            me.plan(me.State(True, enrollment("eligible"), True, stale=True), "cmux-mac-002", False, False,
+                    candidate=True, renew=True)
+        with self.assertRaisesRegex(me.Stop, "--candidate"):
+            me.plan(me.State(True, enrollment("eligible"), True), None, False, False, renew=True)
+        # A fresh mini under --renew is a first enrollment.
+        self.assertEqual(me.plan(me.State(False, None, False), "cmux-mac-009", False, False, candidate=True, renew=True),
+                         ["stage", "bootstrap", "enroll", "accept-local", "eligible", "status"])
+
+    def test_reasons(self) -> None:
+        self.assertEqual(me.renewal_reason(True, True), "stale_glaeda_generation")
+        self.assertEqual(me.renewal_reason(False, True), "toolchain_mismatch")
+        self.assertEqual(me.renewal_reason(False, False), "failed_acceptance")
+
+    def fleet_calls(self, enrolled: dict, observed: dict) -> list[list[str]]:
+        runner = me.Runner("/py", me.Paths(Path("/Users/op")), Path("/cmux"), Path("/g"))
+        calls: list[list[str]] = []
+
+        def fleet(*args: str, capture: bool = True):
+            calls.append(list(args))
+            out = json.dumps({"planSha256": "sha256:" + "e" * 64}) if args[0] == "renew-enrollment" else "{}"
+            return me.subprocess.CompletedProcess([], 0, stdout=out)
+
+        documents = iter([enrolled, observed, {"nodeId": "cmux-mac-001", "enrollmentGeneration": 3}])
+        with mock.patch.object(runner, "fleet", side_effect=fleet), \
+             mock.patch.object(me, "read_json", side_effect=lambda path: next(documents)), \
+             mock.patch("builtins.print"):
+            runner.renew(Path("/Users/op/.config/glaeda/cmux-fleet/bootstrap.json"))
+        return calls
+
+    def test_renew_quarantines_with_the_reason_then_applies_the_previewed_plan(self) -> None:
+        old = {"nodeId": "cmux-mac-001", "state": "eligible", "glaedaGeneration": "sha256:old",
+               "supportedToolchainGenerations": ["sha256:tc"]}
+        calls = self.fleet_calls(old, {"glaedaGeneration": "sha256:new", "toolchainGeneration": "sha256:tc"})
+        self.assertEqual([c[0] for c in calls], ["transition-apply", "renew-enrollment", "renew-enrollment-apply"])
+        self.assertEqual(calls[0][-4:], ["--to", "quarantined", "--reason", "stale_glaeda_generation"])
+        self.assertEqual(calls[2][-2:], ["--expected-plan-sha256", "sha256:" + "e" * 64])
+        # Already quarantined: no second quarantine; already renewed and enrolling: nothing at all.
+        calls = self.fleet_calls({**old, "state": "quarantined"},
+                                 {"glaedaGeneration": "sha256:old", "toolchainGeneration": "sha256:tc"})
+        self.assertEqual([c[0] for c in calls], ["renew-enrollment", "renew-enrollment-apply"])
+        calls = self.fleet_calls({**old, "state": "enrolling"},
+                                 {"glaedaGeneration": "sha256:old", "toolchainGeneration": "sha256:tc"})
+        self.assertEqual(calls, [])
+
+    def test_a_node_already_on_the_candidate_is_replanned_after_staging_not_renewed(self) -> None:
+        # Its generation directory was removed, so it read as stale; staging the same bytes shows it is current.
+        enrolled = {"nodeId": "cmux-mac-001", "state": "eligible", "glaedaGeneration": "sha256:same"}
+        done = []
+        with mock.patch.object(me, "DARWIN_REQUIRED", False), mock.patch.object(me, "pick_python", return_value="/py"), \
+             mock.patch.object(me, "read_json", return_value=enrolled), \
+             mock.patch.object(me.Path, "is_file", return_value=False), \
+             mock.patch.object(me.Path, "exists", return_value=False), \
+             mock.patch.object(me, "glaeda_digest", return_value="sha256:same"), \
+             mock.patch.object(me.Runner, "stage", side_effect=lambda *a: done.append("stage")), \
+             mock.patch.object(me.Runner, "acceptance_current", return_value=True), \
+             mock.patch.object(me.Runner, "bootstrap", side_effect=lambda: done.append("bootstrap")), \
+             mock.patch.object(me.Runner, "renew", side_effect=lambda *a: done.append("renew")), \
+             mock.patch.object(me.Runner, "status", side_effect=lambda: done.append("status") or
+                               {"routingCandidateEligible": True}), \
+             mock.patch("builtins.print"):
+            code = me.main(["--cmux-root", "/c", "--candidate", "/a", "--sha256", "s", "--renew", "--apply",
+                            "--source", "36e07e36ea7b9bc9e04c366547a5312dd348024d"])
+        self.assertEqual((code, done), (0, ["stage", "status"]))
+
+    def test_renew_flag_needs_a_candidate(self) -> None:
+        with mock.patch.object(me, "DARWIN_REQUIRED", False), mock.patch.object(me, "pick_python", return_value="/py"), \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            code = me.main(["--cmux-root", "/cmux", "--renew"])
+        self.assertEqual(code, 2)
+        self.assertIn("--renew needs --candidate", err.getvalue())
+
+
 class Python(unittest.TestCase):
     def test_picks_the_first_313_or_newer(self) -> None:
         versions = {"/a": (3, 12), "/b": (3, 13), "/c": (3, 14)}

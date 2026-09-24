@@ -23,6 +23,15 @@ read-only bootstrap and requires this node's hardware, Xcode build, SDK, toolcha
 Glaeda candidate to equal the class receipt's, whose digest must equal the one given.
 Any difference names the field and stops; run accept-local on that node instead.
 
+With --renew (and --candidate), an enrolled node moves onto this candidate or its changed
+toolchain in the same run: when the staged generation's binary is not the one the enrollment
+records, the acceptance is not current, or the node is quarantined, it runs the generation's
+bootstrap into a private file, quarantines the enrollment (stale_glaeda_generation,
+toolchain_mismatch or failed_acceptance), renews it from that bootstrap, then accepts it
+(accept-local, or adopt-class with --class-receipt). A node that already runs this candidate
+with a current acceptance is left as it is. A class adoption that does not match leaves the
+node quarantined (failed_acceptance) with the differing fields named.
+
 Run glaeda-mini-setup --apply first; this command assumes its tools and cache root.
 It picks a Python 3.13+ interpreter itself (Homebrew, then ~/.local/bin, then PATH),
 because accept-local needs os.waitid, which CPython on macOS only has from 3.13. It never uses sudo, never registers a
@@ -157,17 +166,22 @@ class State:
     binary: bool
     enrollment: dict[str, Any] | None
     acceptance_current: bool
+    # The enrollment records another Glaeda binary than the candidate's (or the candidate is not staged yet).
+    stale: bool = False
 
 
 def plan(state: State, node_id: str | None, reaccept: bool, rebuild: bool, candidate: bool = False,
-         no_accept: bool = False, class_receipt: bool = False) -> list[str]:
+         no_accept: bool = False, class_receipt: bool = False, renew: bool = False) -> list[str]:
     """The steps still needed, in order. Pure, so it is tested without a Mac.
 
     no_accept stops at a bootstrapped, enrolled (enrolling) node without any acceptance. class_receipt
     replaces accept-local with adopt-class: the node's own receipt is minted from its class's
-    acceptance after a fresh bootstrap matches it exactly."""
+    acceptance after a fresh bootstrap matches it exactly. renew moves an enrolled node that is
+    stale, quarantined or without a current acceptance back to enrolling on this candidate first."""
     if class_receipt and (no_accept or reaccept):
         raise Stop("--class-receipt joins on the class acceptance; drop --no-accept and --reaccept")
+    if renew and not candidate:
+        raise Stop("--renew moves the node onto a reviewed candidate; pass --candidate, --sha256 and --source")
     acceptance = "adopt-class" if class_receipt else "accept-local"
     steps = []
     if candidate:
@@ -177,6 +191,17 @@ def plan(state: State, node_id: str | None, reaccept: bool, rebuild: bool, candi
     elif rebuild or not state.binary:
         steps.append("install-glaeda")
     enrollment_state = (state.enrollment or {}).get("state")
+    if renew and state.enrollment is not None:
+        if node_id and state.enrollment.get("nodeId") != node_id:
+            raise Stop(f"this mini is already enrolled as {state.enrollment.get('nodeId')}; "
+                       "drop --node-id or retire that enrollment first")
+        if enrollment_state == "retired":
+            raise Stop("node is retired; remove the enrollment to enroll this machine again")
+        if enrollment_state == "quarantined" or state.stale or reaccept or not state.acceptance_current:
+            steps += ["bootstrap", "renew"]
+            if no_accept:
+                return steps + ["status"]
+            return steps + [acceptance, "eligible", "status"]
     if state.enrollment is None:
         if not node_id:
             raise Stop("no enrollment yet: pass --node-id (an opaque id such as cmux-mac-001, "
@@ -187,7 +212,7 @@ def plan(state: State, node_id: str | None, reaccept: bool, rebuild: bool, candi
                    "drop --node-id or retire that enrollment first")
     elif enrollment_state == "quarantined":
         raise Stop(f"node is quarantined ({state.enrollment.get('quarantineReason')}); "
-                   "move it to enrolling with cmux_fleet.py transition-apply, then re-run")
+                   "move it to enrolling with cmux_fleet.py transition-apply, then re-run (or re-run with --renew)")
     elif enrollment_state == "retired":
         raise Stop("node is retired; remove the enrollment to enroll this machine again")
     if no_accept:
@@ -346,6 +371,38 @@ class Runner:
             pending.unlink(missing_ok=True)
         self.write_private(self.paths.acceptance, result.stdout)
 
+    def renew(self, bootstrap: Path) -> None:
+        """Quarantine the enrollment when needed and renew it from this generation's bootstrap."""
+        enrollment = read_json(self.paths.enrollment) or {}
+        observed = read_json(bootstrap) or {}
+        glaeda_changed = observed.get("glaedaGeneration") != enrollment.get("glaedaGeneration")
+        toolchain_changed = observed.get("toolchainGeneration") not in (enrollment.get("supportedToolchainGenerations") or [])
+        state = enrollment.get("state")
+        if state == "enrolling" and not glaeda_changed and not toolchain_changed:
+            print("renew: the enrollment already records this candidate and toolchain; nothing to renew")
+            return
+        if state != "quarantined":
+            reason = renewal_reason(glaeda_changed, toolchain_changed)
+            print(f"renew: quarantine {enrollment.get('nodeId')} ({reason})", flush=True)
+            self.quarantine(reason)
+        preview = self.fleet("renew-enrollment", os.fspath(self.paths.enrollment), os.fspath(bootstrap))
+        digest = (read_json_text(preview.stdout) or {}).get("planSha256")
+        if preview.returncode or not isinstance(digest, str):
+            raise Stop("renew-enrollment refused the fresh bootstrap (see the error above)")
+        applied = self.fleet("renew-enrollment-apply", os.fspath(self.paths.enrollment), os.fspath(bootstrap),
+                             "--expected-plan-sha256", digest)
+        if applied.returncode:
+            raise Stop("renew-enrollment-apply was refused (see the error above)")
+        renewed = read_json(self.paths.enrollment) or {}
+        print(f"renew: {renewed.get('nodeId')} is enrolling at enrollment generation "
+              f"{renewed.get('enrollmentGeneration')} on {str(renewed.get('glaedaGeneration'))[:19]}")
+
+    def quarantine(self, reason: str) -> None:
+        result = self.fleet("transition-apply", os.fspath(self.paths.enrollment), "--to", "quarantined",
+                            "--reason", reason)
+        if result.returncode:
+            raise Stop(f"transition to quarantined ({reason}) was refused (see the error above)")
+
     def eligible(self) -> None:
         enrollment = read_json(self.paths.enrollment) or {}
         if enrollment.get("state") == "eligible":
@@ -358,6 +415,28 @@ class Runner:
     def status(self) -> dict[str, Any]:
         result = self.fleet("status", os.fspath(self.paths.enrollment), "--acceptance", os.fspath(self.paths.acceptance))
         return read_json_text(result.stdout) or {}
+
+
+def renewal_reason(glaeda_changed: bool, toolchain_changed: bool) -> str:
+    """The reviewed quarantine reason for a renewal."""
+    if glaeda_changed:
+        return "stale_glaeda_generation"
+    if toolchain_changed:
+        return "toolchain_mismatch"
+    return "failed_acceptance"  # same software, but the acceptance no longer holds
+
+
+def glaeda_digest(path: Path) -> str | None:
+    """The enrollment's glaedaGeneration form of a binary: sha256:<hex>, as the bootstrap computes it."""
+    import hashlib
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+    except OSError:
+        return None
+    return "sha256:" + digest.hexdigest()
 
 
 def bootstrap_problem(code: int, stdout: str, stderr: str) -> str | None:
@@ -401,6 +480,7 @@ DESCRIPTIONS = {
     "stage": "verify and stage the reviewed candidate bundle as a new generation (no Rust build)",
     "install-glaeda": "build and install the glaeda binary (keeps one rollback copy)",
     "bootstrap": "read-only bootstrap of this mini against the cmux checkout",
+    "renew": "quarantine and renew the enrollment onto this candidate and toolchain (skipped when it already matches)",
     "enroll": "create the enrollment record (state: enrolling)",
     "accept-local": "local acceptance: a cold cmux.macos.dev-check@1 build under Glaeda",
     "adopt-class": "class acceptance: re-check this mini against its class receipt (bootstrap only, no build)",
@@ -419,6 +499,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--no-accept", action="store_true",
                    help="bootstrap and enroll only; skip accept-local (its class already holds an acceptance)")
     p.add_argument("--rebuild", action="store_true", help="rebuild and reinstall the glaeda binary")
+    p.add_argument("--renew", action="store_true",
+                   help="move an enrolled node onto --candidate: quarantine, renew and accept again when needed")
     p.add_argument("--python", help="Python 3.13+ interpreter (default: found automatically)")
     p.add_argument("--candidate", type=Path, help="downloaded candidate archive (docs/FLEET_DISTRIBUTION.md)")
     p.add_argument("--sha256", help="candidate archive SHA-256 from the trusted run's receipt")
@@ -467,6 +549,9 @@ def main(argv: list[str] | None = None) -> int:
         print("glaeda-mini-enroll: --candidate, --sha256 and --source go together", file=sys.stderr)
         return 2
     klass = [args.class_receipt, args.class_receipt_sha256, args.fleet_class]
+    if args.renew and not args.candidate:
+        print("glaeda-mini-enroll: --renew needs --candidate, --sha256 and --source", file=sys.stderr)
+        return 2
     if any(klass) and not (all(klass) and args.candidate):
         print("glaeda-mini-enroll: --class-receipt, --class-receipt-sha256 and --fleet-class go together, "
               "with --candidate (class acceptance binds the candidate)", file=sys.stderr)
@@ -502,8 +587,11 @@ def main(argv: list[str] | None = None) -> int:
             runner.inspect(args.sha256, args.source)
         if generation is None or staged:
             state.acceptance_current = runner.acceptance_current(enrollment)
+        if generation is not None and enrollment is not None:
+            # An unstaged candidate is new here, so no enrollment records its binary yet.
+            state.stale = not staged or enrollment.get("glaedaGeneration") != glaeda_digest(generation / "bin/glaeda")
         steps = plan(state, args.node_id, args.reaccept, args.rebuild, candidate=generation is not None,
-                     no_accept=args.no_accept, class_receipt=bool(args.class_receipt))
+                     no_accept=args.no_accept, class_receipt=bool(args.class_receipt), renew=args.renew)
         print(f"glaeda-mini-enroll ({python})")
         for step in steps:
             print(f"  - {DESCRIPTIONS[step]}")
@@ -511,14 +599,28 @@ def main(argv: list[str] | None = None) -> int:
             print("\nRe-run with --apply to do it.")
             return 0
         bootstrap_path: Path | None = None
-        for step in steps:
+        queue = list(steps)
+        while queue:
+            step = queue.pop(0)
             print(f"\n== {step}", flush=True)
             if step == "install-glaeda":
                 runner.install_glaeda()
             elif step == "stage":
                 runner.stage(args.candidate.expanduser().resolve(), args.sha256, args.source)
+                if args.renew and enrollment is not None:
+                    # Unstaged read as stale; now the staged binary says whether the node already runs it
+                    # (its generation directory had only been removed), so a current node is not renewed.
+                    state.binary = True
+                    state.acceptance_current = runner.acceptance_current(enrollment)
+                    state.stale = enrollment.get("glaedaGeneration") != glaeda_digest(generation / "bin/glaeda")
+                    queue = plan(state, args.node_id, args.reaccept, args.rebuild, candidate=True,
+                                 no_accept=args.no_accept, class_receipt=bool(args.class_receipt), renew=True)
+                    print("staged; still to do: " + ", ".join(queue))
             elif step == "bootstrap":
                 bootstrap_path = runner.bootstrap()
+            elif step == "renew":
+                assert bootstrap_path is not None
+                runner.renew(bootstrap_path)
             elif step == "enroll":
                 assert bootstrap_path is not None
                 runner.enroll(bootstrap_path, args.node_id)
@@ -526,7 +628,15 @@ def main(argv: list[str] | None = None) -> int:
                 runner.accept_local()
             elif step == "adopt-class":
                 assert class_bytes is not None
-                runner.adopt_class(class_bytes, args.class_receipt_sha256, args.fleet_class)
+                try:
+                    runner.adopt_class(class_bytes, args.class_receipt_sha256, args.fleet_class)
+                except Stop:
+                    if args.renew:
+                        # Not left enrolling: quarantine says why, and the next --renew starts clean.
+                        runner.quarantine("failed_acceptance")
+                        print("\nglaeda-mini-enroll: quarantined (failed_acceptance) until it matches its class or "
+                              "accepts locally", file=sys.stderr)
+                    raise
             elif step == "eligible":
                 runner.eligible()
             elif step == "status":

@@ -11,6 +11,7 @@ import io
 import json
 import re
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -530,7 +531,8 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
                    dirty: int = 0, candidate: str | None = "59ca9c9bd1bb|yes|yes", enroll_state: str | None = "eligible",
                    acceptance: str | None = "accepted", update_running: str | None = None, prepared: str | None = None,
                    sleep: int = 0, runners: tuple[str, ...] = ("actions-runner-cmux-persistent-compile|mini-1",),
-                   **probe: object) -> str:
+                   candidate_generation: str | None = None, enroll_generation: str | None = None,
+                   enroll_reason: str | None = None, **probe: object) -> str:
     """A probe plus preflight section for a host that is ready unless told otherwise."""
     lines = [probe_text(**probe).rstrip("\n").replace("user\tbuilder", f"user\t{user}"), READY_XCODE.rstrip("\n")]
     lines.append(f"pf_sdks\t{sdks}")
@@ -554,9 +556,15 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
     lines += [f"pf_setup_artifacts\t{'yes' if artifacts else 'no'}", f"pf_cmux_dirty\t{dirty}"]
     if candidate:
         lines.append(f"pf_candidate\t{candidate}")
+    if candidate_generation:
+        lines.append(f"pf_candidate_generation\t{candidate_generation}")
     lines += ["pf_glaeda\tpresent", "pf_cache_root\tpresent"]
     if enroll_state:
         lines.append(f"pf_enroll_state\t{enroll_state}")
+    if enroll_generation:
+        lines.append(f"pf_enroll_generation\t{enroll_generation}")
+    if enroll_reason:
+        lines.append(f"pf_enroll_reason\t{enroll_reason}")
     if acceptance:
         lines.append(f"pf_acceptance\t{acceptance}")
     if brew_owner:
@@ -800,16 +808,18 @@ class PreflightScriptTests(unittest.TestCase):
                 (tools / name).chmod(0o755)
             cmux = home / "cmux"
             subprocess.run(["git", "init", "-q", os.fspath(cmux)], check=True)
-            (cmux / "scripts/ci").mkdir(parents=True)
-            (cmux / "scripts/ci/persistent_compile_fleet.py").write_text(f'CANDIDATE_SOURCE = "{"ab" * 20}"\n')
             generation = home / "Projects/glaeda-generations" / ("ab" * 6)
-            generation.mkdir(parents=True)
+            (generation / "bin").mkdir(parents=True)
             (generation / "stage-receipt.json").write_text("{}")
+            (generation / "bin/glaeda").write_bytes(b"glaeda")
+            fleet = home / ".config/glaeda/cmux-fleet"
+            fleet.mkdir(parents=True)
+            (fleet / "enrollment.json").write_text('{"state": "eligible", "glaedaGeneration": "sha256:old"}')
             runner = home / "actions-runner-cmux-persistent-compile"
             runner.mkdir()
             (runner / ".runner").write_text('﻿{\n  "agentName": "mini-1",\n  "serverUrl": "https://secret.example/"\n}\n')
             header = (f"CMUX_ROOT='~/cmux'\nXCODE_PIN=''\nWORKLOAD_PATH={tools}\n"
-                      "WORKLOAD_TOOLS='cargo git zig rustup'\nPYTHONS=''\nCANDIDATE_FALLBACK=''\n")
+                      f"WORKLOAD_TOOLS='cargo git zig rustup'\nPYTHONS=''\nCANDIDATE_PIN={'ab' * 20}\n")
             # The whole SSH payload, probe first, as observe_host sends it.
             script = mf.PROBE.read_text() + "\n" + header + mf.PREFLIGHT_PROBE.read_text()
             out = subprocess.run(["bash", "-s"], input=script, capture_output=True,
@@ -819,8 +829,12 @@ class PreflightScriptTests(unittest.TestCase):
         self.assertEqual(pf["tools"]["cargo"]["version"], "cargo 1.88.0 (x)")
         self.assertIsNone(pf["tools"]["rustup"]["path"])
         self.assertTrue(pf["cmux"])
-        self.assertEqual(pf["candidate"], {"source12": "ab" * 6, "staged": True, "archive": False})
-        self.assertEqual(pf["runners"], [{"dir": "actions-runner-cmux-persistent-compile", "name": "mini-1"}])
+        import hashlib
+        self.assertEqual(pf["candidate"], {"source12": "ab" * 6, "staged": True, "archive": False,
+                                           "generation": "sha256:" + hashlib.sha256(b"glaeda").hexdigest()})
+        # No launchd agent recorded: loaded is unknown, and nothing listens in the sandbox.
+        self.assertEqual(pf["runners"], [{"dir": "actions-runner-cmux-persistent-compile", "name": "mini-1",
+                                          "loaded": "unknown", "listening": "no", "held": "no"}])
         self.assertNotIn("secret.example", out)
         self.assertEqual(pf["python"], {"path": None, "version": None})
 
@@ -998,7 +1012,7 @@ class FixPlanTests(unittest.TestCase):
     def test_fix_command_skips_record_only_hosts_and_probes_once(self) -> None:
         obs = observed(**{"build-mini-1": morning_text()})
         with mock.patch.object(mf, "observe", return_value=obs) as probe, mock.patch.object(mf, "run_repair") as run, \
-                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stdout(io.StringIO()) as out, mock.patch.object(mf, "host_check", return_value=None), \
                 mock.patch.object(mf, "operator_zig_minimum", return_value="0.16.0"):
             code = mf.main(["fix", "build-mini-1", "small-mini", "--manifest", os.fspath(EXAMPLE)])
         self.assertEqual(code, 0)
@@ -1086,7 +1100,8 @@ class FixLibraryTests(unittest.TestCase):
         command = ssh.call_args.args[2]
         self.assertTrue(command.startswith("/bin/bash -c "))
         return subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=60,
-                              env={"HOME": os.fspath(home), "PATH": "/usr/bin:/bin"})
+                              env={"HOME": os.fspath(home), "PATH": "/usr/bin:/bin",
+                                   "GLAEDA_FLEET_DIR": os.fspath(home / "fleet")})
 
     def test_parses_as_bash_and_never_escalates(self) -> None:
         subprocess.run(["bash", "-n", os.fspath(mf.FIX_LIBRARY)], check=True)
@@ -1098,9 +1113,10 @@ class FixLibraryTests(unittest.TestCase):
                          ['case "$stage" in */.glaeda-share.partial) rm -rf "$stage" ;; esac',
                           'rm -rf "$stage"  # what is left are copies of toolchains this host already had'])
         self.assertFalse([line for line in body if re.search(r"(^|[;&|(]\s*)sudo\b", line.strip())])
-        # The only removal is the step lock's own pid file and directory.
+        # The only removals are the step lock's own pid file and directory, and the runner held marks it writes.
         self.assertEqual([line.strip() for line in body if "rm " in line and "rm -r" not in line],
-                         ["""trap 'rm -f "$HOME/.local/state/glaeda/mini-fleet/step.lock/pid"; rmdir "$HOME/.local/state/glaeda/mini-fleet/step.lock" 2>/dev/null || true' EXIT"""])
+                         ["""trap 'rm -f "$HOME/.local/state/glaeda/mini-fleet/step.lock/pid"; rmdir "$HOME/.local/state/glaeda/mini-fleet/step.lock" 2>/dev/null || true' EXIT""",
+                          'rm -f "$(held_dir)/$(basename "$dir")"'])
 
     @unittest.skipUnless(shutil.which("shasum") or shutil.which("sha256sum"), "needs shasum")
     def test_candidate_is_placed_only_when_its_digest_matches(self) -> None:
@@ -1159,6 +1175,159 @@ class FixLibraryTests(unittest.TestCase):
             self.assertFalse(lock.exists())
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_glaeda_sync_moves_only_a_clean_checkout_to_a_commit_that_can_renew(self) -> None:
+        env = {"HOME": "/nonexistent", "PATH": "/usr/bin:/bin", "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e", "GIT_CONFIG_GLOBAL": "/dev/null"}
+
+        def git(*args: str, cwd: Path) -> str:
+            return subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            origin = home / "origin"
+            (origin / "scripts").mkdir(parents=True)
+            git("init", "-q", "-b", "main", cwd=origin)
+            (origin / "scripts/cmux_fleet.py").write_text("")
+            (origin / "scripts/glaeda-mini-enroll").write_text('p.add_argument("--no-accept")\n')
+            git("add", ".", cwd=origin)
+            git("commit", "-qm", "old", cwd=origin)
+            old = git("rev-parse", "HEAD", cwd=origin)
+            (origin / "scripts/glaeda-mini-enroll").write_text('p.add_argument("--renew")\n')
+            git("commit", "-qam", "renew", cwd=origin)
+            new = git("rev-parse", "HEAD", cwd=origin)
+            git("clone", "-q", os.fspath(origin), os.fspath(home / "glaeda"), cwd=home)
+            git("checkout", "-q", "--detach", old, cwd=home / "glaeda")
+            (origin / "scripts/cmux_fleet.py").write_text("# later\n")
+            git("commit", "-qam", "later", cwd=origin)
+            later = git("rev-parse", "HEAD", cwd=origin)
+
+            refused = self.call(home, "glaeda_sync", "f" * 40)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertEqual(git("rev-parse", "HEAD", cwd=home / "glaeda"), old)
+            moved = self.call(home, "glaeda_sync", new)
+            self.assertEqual(moved.returncode, 0, moved.stderr)
+            self.assertEqual(git("rev-parse", "HEAD", cwd=home / "glaeda"), new)
+            self.assertIn("unchanged", self.call(home, "glaeda_sync", new).stdout)
+            fetched = self.call(home, "glaeda_sync", later)  # not in the clone yet: fetched from origin
+            self.assertEqual(fetched.returncode, 0, fetched.stderr)
+            self.assertEqual(git("rev-parse", "HEAD", cwd=home / "glaeda"), later)
+            (home / "glaeda/scripts/cmux_fleet.py").write_text("local edit\n")
+            dirty = self.call(home, "glaeda_sync", new)
+            self.assertEqual(dirty.returncode, 3)
+            self.assertIn("local changes", dirty.stderr)
+            (home / "glaeda/scripts/cmux_fleet.py").write_text("# later\n")
+            predates = self.call(home, "glaeda_sync", old)
+            self.assertEqual(predates.returncode, 3)
+            self.assertIn("predates glaeda-mini-enroll --renew", predates.stderr)
+            self.assertEqual(git("rev-parse", "HEAD", cwd=home / "glaeda"), later)
+
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_a_held_host_refuses_every_changing_step(self) -> None:
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            fleet = home / "fleet"
+            fleet.mkdir()
+            self.assertEqual(self.call(home, "host_check").returncode, 0)
+            marker = {"schema": "glaeda-reservation/v1", "owner": "cache-bench", "purpose": "measurement",
+                      "since": 1, "until": 4102444800}
+            (fleet / "reservation.json").write_text(json.dumps(marker))
+            checked = self.call(home, "host_check")
+            self.assertEqual(checked.returncode, 20)
+            self.assertIn("held: reserved by cache-bench for measurement until 2100-01-01T00:00:00Z", checked.stdout)
+            refused = self.call(home, "candidate_dir", "abc")  # a changing step: lock() asks first
+            self.assertEqual(refused.returncode, 20)
+            self.assertIn("reserved by cache-bench", refused.stderr)
+            self.assertFalse((home / "Library").exists())
+            for bad in ({**marker, "until": "4102444800"}, {**marker, "until": 4102444800.5},
+                        {**marker, "schema": "v2"}, "not json"):
+                (fleet / "reservation.json").write_text(bad if isinstance(bad, str) else json.dumps(bad))
+                self.assertEqual(self.call(home, "host_check").returncode, 20, bad)  # invalid counts as held
+            # A far-future until overflowed gmtime and crashed perl, which once read as free.
+            (fleet / "reservation.json").write_text(json.dumps({**marker, "until": 9223372036854775807}))
+            self.assertEqual(self.call(home, "host_check").returncode, 20)
+            (fleet / "reservation.json").write_text(json.dumps(marker).replace("4102444800", "2e3"))  # Python: a float
+            self.assertEqual(self.call(home, "host_check").returncode, 20)
+            (fleet / "reservation.json").write_text(json.dumps({**marker, "until": 2}))  # expired
+            (fleet / "host.lock").write_text("")
+            self.assertEqual(self.call(home, "host_check").returncode, 0)
+            fd = os.open(fleet / "host.lock", os.O_RDONLY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                locked = self.call(home, "host_check")
+                self.assertEqual(locked.returncode, 20)
+                self.assertIn("held by another build (fleet host lock", locked.stdout)
+                # A drain honors only reservations: it waits out the job that holds the lock.
+                gate = subprocess.run(["bash", "-c", 'say() { :; }; eval "$(sed -n "/^# >>> host gate/,/^# <<< host gate/p" '
+                                       f'{mf.FIX_LIBRARY})"; host_held reservation || echo free'],
+                                      capture_output=True, text=True, env={"PATH": "/usr/bin:/bin",
+                                                                           "GLAEDA_FLEET_DIR": os.fspath(fleet)})
+                self.assertEqual(gate.stdout.strip(), "free")
+            finally:
+                os.close(fd)
+            self.assertEqual(self.call(home, "candidate_dir", "abc").returncode, 0)
+
+    def test_runner_hold_release_and_kick(self) -> None:
+        # launchctl and pgrep are shims ahead of the real ones on the workload PATH, so this runs anywhere.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            shims = home / "shims"
+            shims.mkdir()
+            (shims / "launchctl").write_text("""#!/bin/bash
+echo "$*" >> "$HOME/launchctl.log"
+state="$HOME/loaded"; mkdir -p "$state"
+case "$1" in
+  print) [ -e "$state/$(basename "$2")" ] ;;
+  bootout) rm -f "$state/$(basename "$2")" ;;
+  bootstrap) : > "$state/$(basename "$3" .plist)" ;;
+  *) exit 0 ;;
+esac
+""")
+            (shims / "pgrep").write_text("""#!/bin/bash
+case "$*" in
+  *Runner.Worker*) [ -e "$HOME/worker-running" ] ;;
+  *Runner.Listener*) [ -e "$HOME/listener-running" ] ;;
+  *) exit 1 ;;
+esac
+""")
+            for shim in shims.iterdir():
+                shim.chmod(0o755)
+            runner = home / "actions-runner-x"
+            runner.mkdir()
+            (runner / ".runner").write_text('{"agentName": "mini-1"}')
+            plist = home / "Library/LaunchAgents/actions.runner.x.plist"
+            plist.parent.mkdir(parents=True)
+            plist.write_text("")
+            (runner / ".service").write_text(f"{plist}\n")
+            (home / "loaded").mkdir()
+            (home / "loaded/actions.runner.x").write_text("")
+            held = home / ".local/state/glaeda/mini-fleet/runner-held/actions-runner-x"
+            with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{shims}:/usr/bin:/bin"):
+                (home / "worker-running").write_text("")
+                busy = self.call(home, "runner_hold", "0")
+                self.assertEqual(busy.returncode, 3)
+                self.assertIn("still running a job", busy.stderr)
+                self.assertFalse(held.exists())
+                (home / "worker-running").unlink()
+                stopped = self.call(home, "runner_hold", "60")
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                self.assertTrue(held.exists())
+                self.assertFalse((home / "loaded/actions.runner.x").exists())
+                self.assertIn("unchanged", self.call(home, "runner_hold", "60").stdout)  # a rerun changes nothing
+                started = self.call(home, "runner_release")
+                self.assertEqual(started.returncode, 0, started.stderr)
+                self.assertFalse(held.exists())
+                self.assertTrue((home / "loaded/actions.runner.x").exists())
+                self.assertEqual(self.call(home, "runner_kick").returncode, 0)  # loaded, no listener: restarted
+                (home / "listener-running").write_text("")
+                self.assertEqual(self.call(home, "runner_kick").returncode, 0)  # listening: left alone
+            log = (home / "launchctl.log").read_text()
+            uid = os.getuid()
+            self.assertIn(f"disable gui/{uid}/actions.runner.x", log)
+            self.assertIn(f"bootstrap gui/{uid} {plist}", log)
+            self.assertEqual(log.count("kickstart -k"), 1)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_an_unfinished_clone_is_not_built_on(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -1182,18 +1351,13 @@ SOURCE = "59ca9c9bd1bb" + "0" * 28
 
 
 class OperatorSideTests(unittest.TestCase):
-    CONSTANTS = ('CANDIDATE_RUN = "35991372390"\nCANDIDATE_ARTIFACT = "glaeda-candidate-aarch64-apple-darwin"\n'
-                 f'CANDIDATE_SOURCE = "{SOURCE}"\nCANDIDATE_SHA256 = "{{sha}}"\n'
-                 'CANDIDATE_REPO = "teamleaderleo/glaeda"\n')
-
     def test_candidate_downloads_once_and_is_digest_checked(self) -> None:
         import hashlib
         payload = b"archive"
         sha = hashlib.sha256(payload).hexdigest()
+        pin = {"source": SOURCE, "sha256": sha, "run": "35991372390", "artifact": "glaeda-candidate-aarch64-apple-darwin",
+               "repo": "teamleaderleo/glaeda"}
         with tempfile.TemporaryDirectory() as tmp:
-            cmux = Path(tmp) / "cmux/scripts/ci"
-            cmux.mkdir(parents=True)
-            (cmux / "persistent_compile_fleet.py").write_text(self.CONSTANTS.replace("{sha}", sha))
             downloads = []
 
             def gh(argv, log, stdin=b"", timeout=None):
@@ -1202,7 +1366,7 @@ class OperatorSideTests(unittest.TestCase):
                 (target / f"glaeda-{SOURCE}-aarch64-apple-darwin.tar.gz").write_bytes(payload)
                 return 0
 
-            with mock.patch.dict(os.environ, {"GLAEDA_CMUX_ROOT": os.fspath(Path(tmp) / "cmux")}), \
+            with mock.patch.object(mf, "PINNED_CANDIDATE", pin), \
                     mock.patch.object(mf, "OPERATOR_CACHE", Path(tmp) / "cache"), \
                     mock.patch.object(mf, "run_logged", side_effect=gh):
                 candidate = mf.operator_candidate()
@@ -1215,6 +1379,11 @@ class OperatorSideTests(unittest.TestCase):
                 self.assertEqual(downloads[0][:3], ["gh", "run", "download"])
                 with self.assertRaisesRegex(mf.Failure, "sha256"):
                     mf.fetch_candidate({**candidate, "sha256": "f" * 64}, None)
+        # Nothing pinned: no candidate, and the reason says how to pin one.
+        with mock.patch.object(mf, "PINNED_CANDIDATE", None):
+            self.assertEqual(mf.operator_candidate(), {})
+            with self.assertRaisesRegex(mf.Failure, "upgrade --candidate-run"):
+                mf.fetch_candidate({}, None)
 
     def test_python_dist_is_the_newest_that_meets_the_minimum(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1361,6 +1530,59 @@ class ShareTests(unittest.TestCase):
         self.assertTrue(planned[0].startswith("xcode: copy /Applications/Xcode_26.6.app"))
 
 
+def run_command(texts: dict[str, str], *extra: str, tokens: list[str] | None = None,
+                manifest: Path = EXAMPLE, command: str = "onboard", after: dict[str, str] | None = None,
+                ssh_codes: dict[str, int] | None = None, ssh_output: dict[str, bytes] | None = None,
+                held: dict[str, str] | None = None) -> tuple[int, str, list]:
+    """Run a command with SSH stubbed. Probes return `texts` until something enrolls, then `after`
+    (default: each host eligible, no runner). ssh_codes and ssh_output: the exit code and log output
+    for commands containing a needle."""
+    calls: list = []
+    loaded = mf.load_manifest(manifest)
+    if after is None:
+        after = {h: preflight_text(runners=(), node_id=loaded["hosts"][h].get("node_id")) for h in texts}
+
+    def ssh(name, user, command, log, stdin=b"", timeout=None, options=()):
+        calls.append((name, command, stdin))
+        for needle, output in (ssh_output or {}).items():
+            if needle in command and log is not None:
+                log.write(output)
+        for needle, code in (ssh_codes or {}).items():
+            if needle in command:
+                return code
+        return 0
+
+    def probe(manifest, names, preflight=False):
+        enrolled = any(ENROLL in c[1] for c in calls)
+        return observed(**{h: (after if enrolled else texts)[h] for h in names})
+
+    with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as out, \
+            mock.patch.object(mf, "observe", side_effect=probe), mock.patch.object(mf, "ssh_stream", side_effect=ssh), \
+            mock.patch.object(mf, "mint_runner_token", return_value="AAAATOKENTOKENTOKENTOKEN") as mint, \
+            mock.patch.object(mf, "resolve_glaeda_main", return_value="d" * 40), \
+            mock.patch.object(mf, "host_check", side_effect=lambda m, h: (held or {}).get(h)), \
+            mock.patch.object(mf, "operator_zig_minimum", return_value="0.16.0"):
+        code = mf.main([command, *texts, "--manifest", os.fspath(manifest), "--log-dir", tmp, *extra])
+    if tokens is not None:
+        tokens.append(mint.call_count)
+    return code, out.getvalue(), calls
+
+
+def remote_call(command: str) -> str:
+    """The function call a fix-library command ends with (its last line), or the command itself."""
+    if not command.startswith("/bin/bash -c "):
+        return command
+    return [line for line in shlex.split(command)[2].splitlines() if line.strip()][-1]
+
+
+def calls_to(calls: list, needle: str) -> list:
+    return [c for c in calls if needle in remote_call(c[1])]
+
+
+# glaeda-mini-enroll as enroll_command quotes it; the fix library also names the script, never this way.
+ENROLL = "~/'glaeda/scripts/glaeda-mini-enroll'"
+
+
 class OnboardTests(unittest.TestCase):
     def setUp(self) -> None:
         self.manifest = mf.load_manifest(EXAMPLE)
@@ -1393,23 +1615,8 @@ class OnboardTests(unittest.TestCase):
         self.assertIsNone(recorded)
         self.assertIn("not 17C999", why)
 
-    def run_onboard(self, texts: dict[str, str], *extra: str, tokens: list[str] | None = None,
-                    manifest: Path = EXAMPLE) -> tuple[int, str, list]:
-        calls: list = []
-
-        def ssh(name, user, command, log, stdin=b"", timeout=None, options=()):
-            calls.append((name, command, stdin))
-            return 0
-
-        obs = observed(**texts)
-        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as out, \
-                mock.patch.object(mf, "observe", return_value=obs), mock.patch.object(mf, "ssh_stream", side_effect=ssh), \
-                mock.patch.object(mf, "mint_runner_token", return_value="AAAATOKENTOKENTOKENTOKEN") as mint, \
-                mock.patch.object(mf, "operator_zig_minimum", return_value="0.16.0"):
-            code = mf.main(["onboard", *texts, "--manifest", os.fspath(manifest), "--log-dir", tmp, *extra])
-        if tokens is not None:
-            tokens.append(mint.call_count)
-        return code, out.getvalue(), calls
+    def run_onboard(self, texts: dict[str, str], *extra: str, **kwargs: object) -> tuple[int, str, list]:
+        return run_command(texts, *extra, **kwargs)
 
     def test_dry_run_prints_the_plan_and_touches_nothing(self) -> None:
         code, out, calls = self.run_onboard({"build-mini-1": self.fresh(), "build-mini-2": morning_text()})
@@ -1417,13 +1624,13 @@ class OnboardTests(unittest.TestCase):
         self.assertIn("would: enroll without acceptance (class)", out)
         self.assertIn("sudo-plan select, rust, zig", out)
         self.assertIn("dry run; pass --yes", out)
-        self.assertEqual(out.splitlines()[0].split(), ["host", "node", "id", "step", "result", "log"])
+        self.assertEqual(out.splitlines()[0].split(), ["host", "class", "node", "id", "generation", "step", "result", "log"])
         self.assertNotIn("—", out)
 
     def test_class_mode_enrolls_without_acceptance_and_does_not_register(self) -> None:
         minted: list = []
         code, out, calls = self.run_onboard({"build-mini-1": self.fresh()}, "--yes", tokens=minted)
-        enroll = [c for c in calls if "glaeda-mini-enroll" in c[1]]
+        enroll = calls_to(calls, ENROLL)
         self.assertEqual(len(enroll), 1)
         self.assertIn("--no-accept", enroll[0][1])
         self.assertIn("--node-id cmux-mac-001", enroll[0][1])
@@ -1444,38 +1651,45 @@ class OnboardTests(unittest.TestCase):
             path = write_manifest(tmp, data)
             code, out, calls = self.run_onboard({"build-mini-1": self.fresh()}, "--yes", manifest=path)
             self.assertEqual(code, 0, out)
-            enroll = [c for c in calls if "glaeda-mini-enroll" in c[1]]
+            enroll = calls_to(calls, ENROLL)
             self.assertEqual(len(enroll), 1)
             self.assertNotIn("--no-accept", enroll[0][1])
             self.assertIn(f"--class-receipt - --class-receipt-sha256 {receipt['receiptSha256']} --fleet-class m4pro-48",
                           enroll[0][1])
             self.assertEqual(enroll[0][2], receipt_path.read_bytes())
-            self.assertTrue([c for c in calls if "persistent-compile up" in c[1]])
+            # Enrollment is where onboard ends: nothing registers a runner until the hook is wired.
+            self.assertIn("no runner: runner registration is not wired", out)
             # A receipt that is not the recorded one blocks the host before anything runs on it.
             data["hardware"]["m4pro-48"]["acceptance"]["receipt_sha256"] = "sha256:" + "d" * 64
             path = write_manifest(tmp, data)
             code, out, calls = self.run_onboard({"build-mini-1": self.fresh()}, "--yes", manifest=path)
         self.assertEqual(code, 1)
         self.assertIn("is not the recorded", out)
-        self.assertFalse([c for c in calls if "glaeda-mini-enroll" in c[1]])
+        self.assertFalse(calls_to(calls, ENROLL))
 
-    def test_node_mode_accepts_then_registers_with_the_token_on_stdin(self) -> None:
+    def test_node_mode_accepts_and_the_registration_hook_gets_the_token_on_stdin(self) -> None:
         minted: list = []
-        code, out, calls = self.run_onboard({"build-mini-1": self.fresh(), "build-mini-2": self.fresh(hostname="Build-Mini-2")},
-                                            "--yes", "--acceptance", "node", tokens=minted)
+        hook = mock.patch.object(mf, "runner_register_command", return_value="IFS= read -r TOKEN; register")
+        with hook:
+            code, out, calls = self.run_onboard(
+                {"build-mini-1": self.fresh(), "build-mini-2": self.fresh(hostname="Build-Mini-2")},
+                "--yes", "--acceptance", "node", tokens=minted)
         self.assertEqual(code, 0, out)
         self.assertEqual(minted, [1])  # one token for the whole run
-        enroll = [c for c in calls if "glaeda-mini-enroll" in c[1]]
+        enroll = calls_to(calls, ENROLL)
         self.assertTrue(enroll and all("--no-accept" not in c[1] for c in enroll))
-        register = [c for c in calls if "persistent-compile up" in c[1]]
+        register = [c for c in calls if c[1] == "IFS= read -r TOKEN; register"]
         self.assertEqual(sorted(c[0] for c in register), ["build-mini-1", "build-mini-2"])
         for _, command, stdin in register:
             self.assertEqual(stdin, b"AAAATOKENTOKENTOKENTOKEN\n")
-            self.assertNotIn("AAAATOKEN", command)
-            self.assertIn("IFS= read -r CMUX_RUNNER_TOKEN", command)
         self.assertNotIn("AAAATOKEN", out)
         rows = [line for line in out.splitlines() if line.startswith("build-mini-")]
-        self.assertTrue(all(" register " in line and " ok " in line for line in rows), rows)
+        self.assertTrue(all(" register " in line and "registered" in line for line in rows), rows)
+        # Without the hook, no token is minted and the table says where registration lives.
+        minted = []
+        code, out, calls = self.run_onboard({"build-mini-1": self.fresh()}, "--yes", "--acceptance", "node", tokens=minted)
+        self.assertEqual((code, minted), (0, [0]))
+        self.assertIn("glaeda#1174", out)
 
     def test_a_host_needing_a_person_stops_at_preflight(self) -> None:
         text = self.fresh(update_running="softwareupdate --install macOS 26.7 --restart")
@@ -1519,6 +1733,368 @@ class OnboardTests(unittest.TestCase):
             target[keys[-1]] = value
             with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(mf.Failure, error):
                 mf.load_manifest(write_manifest(tmp, data))
+
+
+
+NEW = "3809eed51fdd" + "1" * 28
+OLD_GEN, NEW_GEN = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+RECEIPT_SHA = "sha256:" + "c" * 64
+
+
+def pinned_manifest(tmp: str, recorded_for: str | None = NEW, receipt: bool = True) -> Path:
+    """The example manifest pinning candidate NEW, with class m4pro-48 accepted for `recorded_for`."""
+    data = json.loads(EXAMPLE.read_text())
+    data["candidate"] = {"source": NEW, "sha256": "a" * 64, "run": "36018123850",
+                         "artifact": "glaeda-candidate-aarch64-apple-darwin", "repo": "teamleaderleo/glaeda"}
+    acceptance = data["hardware"]["m4pro-48"]["acceptance"]
+    if recorded_for:
+        acceptance["candidate"] = recorded_for[:12]
+    if receipt:
+        path = Path(tmp) / "m4pro-48.json"
+        path.write_text(json.dumps({"fleetClass": "m4pro-48", "receiptSha256": RECEIPT_SHA}))
+        acceptance.update(receipt=os.fspath(path), receipt_sha256=RECEIPT_SHA)
+    path = Path(tmp) / "m.json"
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    return path
+
+
+def on_candidate(staged: bool = True, generation: str = OLD_GEN, state: str = "eligible", **kwargs: object) -> str:
+    """An enrolled host probed for candidate NEW: staged or not, its enrollment on `generation`."""
+    return preflight_text(candidate=f"{NEW[:12]}|{'yes' if staged else 'no'}|{'yes' if staged else 'no'}",
+                          candidate_generation=NEW_GEN if staged else None, enroll_state=state,
+                          enroll_generation=generation, **kwargs)
+
+
+class PinnedRustTests(unittest.TestCase):
+    def test_a_pinned_rust_version_is_held_like_stable(self) -> None:
+        # Class adoption compares rustc byte for byte, so the manifest may pin rustup_default to 1.98.1.
+        manifest = mf.load_manifest(EXAMPLE)
+        manifest["defaults"]["toolchain"]["rustup_default"] = "1.98.1"
+        for default, state in (("1.98.1-aarch64-apple-darwin (default)", "ok"), ("stable-aarch64-apple-darwin", "fail")):
+            text = preflight_text().replace("pf_python", f"pf_rust_default\t{default}\npf_python", 1)
+            result = mf.preflight_host(manifest, "build-mini-1", observed(h=text)["hosts"]["h"])
+            self.assertEqual(result["checks"]["rust"]["state"], state, result["checks"]["rust"])
+        mine, _ = mf.planned_actions(result)
+        self.assertEqual([(a["kind"], a.get("toolchain")) for a in mine], [("rust_default", "1.98.1")])
+
+
+class HostGateTests(unittest.TestCase):
+    def test_held_hosts_are_skipped_and_the_run_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = pinned_manifest(tmp)
+            texts = {"build-mini-1": on_candidate(), "build-mini-2": on_candidate(node_id="cmux-mac-002")}
+            why = "reserved by cache-bench for measurement until 2100-01-01T00:00:00Z"
+            code, out, calls = run_command(texts, "--yes", command="repair", manifest=manifest,
+                                           after={h: on_candidate(generation=NEW_GEN) for h in texts},
+                                           held={"build-mini-2": why})
+        self.assertEqual(code, 1)
+        self.assertIn(f"held: {why}, skipped", out)
+        self.assertEqual({c[0] for c in calls}, {"build-mini-1"})
+
+    def test_wait_polls_until_the_host_is_free(self) -> None:
+        answers = iter(["held by another build", "held by another build", None])
+        with mock.patch.object(mf, "host_check", side_effect=lambda m, h: next(answers)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(mf.gate_hosts({}, ["a"], wait=True, poll=0), {})
+        self.assertEqual(out.getvalue().count("waiting: a held"), 2)
+        with mock.patch.object(mf, "host_check", return_value="held by another build"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(mf.gate_hosts({}, ["a"], wait=True, poll=0, limit=0), {"a": "held by another build"})
+            self.assertEqual(mf.gate_hosts({}, ["a"]), {"a": "held by another build"})
+        self.assertIn("a: held: held by another build, skipped (--wait waits for it)", out.getvalue())
+
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_a_sudo_plan_checks_the_host_before_it_asks_for_a_password(self) -> None:
+        manifest = mf.load_manifest(EXAMPLE)
+        text = preflight_text().replace("xcode_select\t/Applications/Xcode.app/Contents/Developer",
+                                        "xcode_select\t/Library/Developer/CommandLineTools")
+        script = mf.sudo_plan_script(manifest, "build-mini-1",
+                                     mf.preflight_host(manifest, "build-mini-1", observed(h=text)["hosts"]["h"], "0.16.0"))
+        self.assertLess(script.index("host_held"), script.index("sudo -v"))
+        with tempfile.TemporaryDirectory() as tmp:
+            fleet = Path(tmp) / "fleet"
+            fleet.mkdir()
+            (fleet / "reservation.json").write_text(json.dumps(
+                {"schema": "glaeda-reservation/v1", "owner": "o", "purpose": "p", "since": 1, "until": 4102444800}))
+            shims = Path(tmp) / "bin"
+            shims.mkdir()
+            (shims / "sudo").write_text(f"#!/bin/sh\ntouch {tmp}/sudo-ran\n")
+            (shims / "sudo").chmod(0o755)
+            run = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                                 env={"PATH": f"{shims}:/usr/bin:/bin", "GLAEDA_FLEET_DIR": os.fspath(fleet)})
+            self.assertEqual(run.returncode, 20, run.stderr)
+            self.assertIn("held: reserved by o for p", run.stdout)
+            self.assertFalse((Path(tmp) / "sudo-ran").exists())
+
+
+class RepairTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.manifest = pinned_manifest(self.tmp.name)
+
+    def test_staleness_and_quarantine_are_steps_not_blockers(self) -> None:
+        manifest = mf.load_manifest(self.manifest)
+        with mock.patch.object(mf, "PINNED_CANDIDATE", manifest["candidate"]):
+            for text, need, detail in ((on_candidate(), "renew", "runs Glaeda 111111111111"),
+                                       (on_candidate(staged=False), "renew", "not candidate 3809eed51fdd"),
+                                       (on_candidate(generation=NEW_GEN), "ok", "eligible, accepted"),
+                                       (on_candidate(state="quarantined", enroll_reason="failed_acceptance"), "renew",
+                                        "quarantined (failed_acceptance)"),
+                                       (on_candidate(state="draining"), "leave", "draining")):
+                result = mf.preflight_host(manifest, "build-mini-1", observed(h=text)["hosts"]["h"])
+                self.assertEqual(mf.enrollment_need(result), need, detail)
+                self.assertIn(detail, result["checks"]["enroll"]["detail"])
+                self.assertTrue(result["ready"], result["checks"]["enroll"])
+            held = on_candidate(generation=NEW_GEN, runners=("actions-runner-x|mini-1|no|no|yes",))
+            down = on_candidate(generation=NEW_GEN, runners=("actions-runner-x|mini-1|yes|no|no",))
+            for text, want in ((held, "stopped by glaeda-mini-fleet"), (down, "listener not running")):
+                check = mf.preflight_host(manifest, "build-mini-1", observed(h=text)["hosts"]["h"])["checks"]["runner"]
+                self.assertEqual(check["state"], "todo")
+                self.assertIn(want, check["detail"])
+
+    def test_dry_run_names_what_it_would_do_and_touches_nothing(self) -> None:
+        code, out, calls = run_command({"build-mini-1": on_candidate(), "build-mini-2": on_candidate(
+            state=None, generation=None, node_id=None)}, command="repair", manifest=self.manifest)
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("would: renew and adopt the class receipt", out)
+        self.assertIn("not enrolled: glaeda-mini-fleet onboard build-mini-2 --yes", out)
+        self.assertIn("dry run; pass --yes to repair", out)
+
+    def test_a_stale_host_is_renewed_in_order_and_its_runner_comes_back(self) -> None:
+        after = {"build-mini-1": on_candidate(generation=NEW_GEN)}
+        code, out, calls = run_command({"build-mini-1": on_candidate()}, "--yes", command="repair",
+                                       manifest=self.manifest, after=after)
+        self.assertEqual(code, 0, out)
+        order = ("lock; glaeda_sync " + "d" * 40, "candidate_check", "lock reservation; runner_hold 2400", "host_check",
+                 ENROLL, "lock none; runner_release")
+        self.assertEqual([next(k for k in order if k in remote_call(c[1])) for c in calls], list(order))
+        enroll = calls_to(calls, ENROLL)[0]
+        self.assertIn(f"--renew --class-receipt - --class-receipt-sha256 {RECEIPT_SHA} --fleet-class m4pro-48",
+                      enroll[1])
+        self.assertEqual(json.loads(enroll[2])["receiptSha256"], RECEIPT_SHA)
+        row = next(line for line in out.splitlines() if line.startswith("build-mini-1"))
+        self.assertIn("111111111111->222222222222", row)
+        self.assertIn("eligible", row)
+
+    def test_an_adoption_that_differs_is_named_and_left_quarantined(self) -> None:
+        error = {"error": "this node is not covered by the class m4pro-48 acceptance; run accept-local on it instead. "
+                          'Differs in: toolchain.rustc (here "rustc 1.90.0", class "rustc 1.89.0"); '
+                          "hardware.memoryGiB (here 64, class 48)"}
+        code, out, calls = run_command({"build-mini-1": on_candidate()}, "--yes", command="repair",
+                                       manifest=self.manifest, ssh_codes={ENROLL: 1},
+                                       ssh_output={ENROLL: (json.dumps(error) + "\n").encode()})
+        self.assertEqual(code, 1)
+        self.assertIn("quarantined: differs from class m4pro-48 in toolchain.rustc, hardware.memoryGiB", out)
+        self.assertIn("glaeda-mini-fleet repair build-mini-1 --acceptance node --yes", out)
+        # After a failed renewal the runners come back only if the node still serves; the host decides.
+        self.assertEqual([remote_call(c[1]) for c in calls_to(calls, "runner_release")], ["lock none; runner_release if-eligible"])
+
+    def test_no_receipt_for_the_candidate_blocks_before_anything_runs(self) -> None:
+        manifest = pinned_manifest(self.tmp.name, recorded_for="59ca9c9bd1bb")
+        code, out, calls = run_command({"build-mini-1": on_candidate(state="quarantined",
+                                                                     enroll_reason="stale_glaeda_generation")},
+                                       "--yes", command="repair", manifest=manifest)
+        self.assertEqual((code, calls), (1, []))
+        self.assertIn("glaeda-mini-fleet upgrade records it", out)
+
+    def test_an_operator_quarantine_is_left_alone(self) -> None:
+        text = on_candidate(state="quarantined", enroll_reason="hardware_failure")
+        code, out, calls = run_command({"build-mini-1": text}, "--yes", command="repair", manifest=self.manifest)
+        self.assertEqual((code, calls), (1, []))
+        self.assertIn("needs a person: enroll", out)
+        manifest = mf.load_manifest(self.manifest)
+        with mock.patch.object(mf, "PINNED_CANDIDATE", manifest["candidate"]):
+            result = mf.preflight_host(manifest, "build-mini-1", observed(h=text)["hosts"]["h"])
+        self.assertEqual(mf.enrollment_need(result), "leave")
+        self.assertIn("transition-apply ENROLLMENT --to enrolling", result["checks"]["enroll"]["fix"])
+
+    def test_runners_are_restarted_or_released_and_drains_are_left_alone(self) -> None:
+        texts = {"build-mini-1": on_candidate(generation=NEW_GEN, runners=("actions-runner-x|mini-1|yes|no|no",)),
+                 "build-mini-2": on_candidate(generation=NEW_GEN, runners=("actions-runner-x|mini-2|no|no|yes",),
+                                              node_id="cmux-mac-002")}
+        code, out, calls = run_command(texts, "--yes", command="repair", manifest=self.manifest, after=texts)
+        self.assertEqual(code, 0, out)
+        self.assertEqual([c[0] for c in calls_to(calls, "lock none; runner_kick")], ["build-mini-1"])
+        self.assertEqual([c[0] for c in calls_to(calls, "lock none; runner_release")], ["build-mini-2"])
+        self.assertEqual(calls_to(calls, ENROLL), [])
+        draining = {"build-mini-1": on_candidate(state="draining")}
+        code, out, calls = run_command(draining, "--yes", command="repair", manifest=self.manifest, after=draining)
+        self.assertEqual(calls, [])
+        self.assertIn("draining", out)
+
+
+class UpgradeTests(unittest.TestCase):
+    RUN = {"source": NEW, "run": "36018123850", "artifact": "glaeda-candidate-aarch64-apple-darwin",
+           "repo": "teamleaderleo/glaeda", "expires": "2026-10-24T15:15:27Z"}
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.manifest = Path(self.tmp.name) / "m.json"  # class m4pro-48 accepted for 59ca9c9bd1bb, no pin
+        self.manifest.write_text(EXAMPLE.read_text())
+        self.receipt = json.dumps({"schema": "glaeda-cmux-fleet-class-acceptance/v1", "fleetClass": "m4pro-48",
+                                   "receiptSha256": RECEIPT_SHA}).encode()
+
+    def upgrade(self, texts: dict[str, str], *extra: str, after: dict[str, str] | None = None,
+                **kwargs: object) -> tuple[int, str, list, mock.Mock]:
+        with mock.patch.object(mf, "resolve_candidate_run", return_value=dict(self.RUN)), \
+                mock.patch.object(mf, "download_run_candidate", return_value="a" * 64), \
+                mock.patch.object(mf, "export_class_receipt", return_value=self.receipt) as export:
+            code, out, calls = run_command(texts, "--candidate-run", "36018123850", *extra, command="upgrade",
+                                           manifest=self.manifest, after=after, **kwargs)
+        return code, out, calls, export
+
+    def fleet(self) -> dict[str, str]:
+        return {"build-mini-1": on_candidate(staged=False),
+                "build-mini-2": on_candidate(staged=False, node_id="cmux-mac-002")}
+
+    def test_dry_run_plans_one_seed_per_class_and_shows_the_manifest_change(self) -> None:
+        before = self.manifest.read_text()
+        code, out, calls, export = self.upgrade(self.fleet())
+        self.assertEqual((code, calls, export.call_count), (0, [], 0))
+        self.assertEqual(self.manifest.read_text(), before)
+        self.assertIn("class m4pro-48: seed build-mini-1", out)
+        self.assertIn('+        "candidate": "3809eed51fdd"', out)
+        self.assertIn('"receipt_sha256": "sha256:<from the export>"', out)
+        rows = {line.split()[0]: line for line in out.splitlines() if line.startswith("build-mini-")}
+        self.assertIn("renew + accept-local", rows["build-mini-1"])
+        self.assertIn("record hardware.m4pro-48.acceptance", rows["build-mini-1"])
+        self.assertIn("renew + adopt class m4pro-48 receipt", rows["build-mini-2"])
+        self.assertNotIn("—", out)
+
+    def test_the_seed_accepts_records_the_class_and_the_rest_adopt_it(self) -> None:
+        after = {"build-mini-1": on_candidate(generation=NEW_GEN),
+                 "build-mini-2": on_candidate(generation=NEW_GEN, node_id="cmux-mac-002")}
+        code, out, calls, export = self.upgrade(self.fleet(), "--yes", after=after)
+        self.assertEqual(code, 0, out)
+        enrolls = calls_to(calls, ENROLL)
+        self.assertEqual([c[0] for c in enrolls], ["build-mini-1", "build-mini-2"])  # the seed first
+        self.assertIn("--renew", enrolls[0][1])
+        self.assertNotIn("--class-receipt", enrolls[0][1])
+        self.assertIn(f"--class-receipt - --class-receipt-sha256 {RECEIPT_SHA} --fleet-class m4pro-48", enrolls[1][1])
+        self.assertEqual(enrolls[1][2], self.receipt)
+        self.assertEqual(export.call_args.args[1], "build-mini-1")
+        data = json.loads(self.manifest.read_text())
+        acceptance = data["hardware"]["m4pro-48"]["acceptance"]
+        self.assertEqual((acceptance["candidate"], acceptance["node"], acceptance["receipt_sha256"]),
+                         ("3809eed51fdd", "cmux-mac-001", RECEIPT_SHA))
+        self.assertEqual(Path(acceptance["receipt"]).read_bytes(), self.receipt)
+        self.assertEqual(Path(acceptance["receipt"]).stat().st_mode & 0o777, 0o600)
+        self.assertEqual(data["candidate"], {**self.RUN, "sha256": "a" * 64})
+        self.assertIn(f"+  \"candidate\": {{", out)  # the diff is printed
+        rows = {line.split()[0]: line for line in out.splitlines() if line.startswith("build-mini-")}
+        self.assertIn("111111111111->222222222222", rows["build-mini-2"])
+        # A rerun resumes: the class is recorded for this candidate, every host already runs it.
+        code, out, calls, export = self.upgrade(after, "--yes", after=after)
+        self.assertEqual((code, export.call_count), (0, 0), out)
+        self.assertEqual(calls_to(calls, ENROLL), [])
+        self.assertIn("ok: already on 3809eed51fdd", out)
+
+    def test_a_named_seed_and_a_failed_seed_leave_the_class_untouched(self) -> None:
+        code, out, calls, export = self.upgrade(self.fleet(), "--yes", "--seed-per-class", "build-mini-2",
+                                                ssh_codes={ENROLL: 1})
+        self.assertEqual(code, 1)
+        self.assertEqual([c[0] for c in calls_to(calls, ENROLL)], ["build-mini-2"])
+        self.assertIn("blocked: class m4pro-48 has no receipt for 3809eed51fdd (its seed build-mini-2 failed)", out)
+        self.assertEqual(export.call_count, 0)
+        self.assertNotIn("candidate", json.loads(self.manifest.read_text()))
+        # No declared Xcode build: nothing to record the acceptance under, so the class is not seeded.
+        data = json.loads(self.manifest.read_text())
+        del data["defaults"]["toolchain"]["xcode"]
+        self.manifest.write_text(json.dumps(data, indent=2) + "\n")
+        code, out, calls, export = self.upgrade(self.fleet(), "--yes")
+        self.assertEqual((code, calls_to(calls, ENROLL)), (1, []))
+        self.assertIn("declares no toolchain.xcode", out)
+        with self.assertRaisesRegex(mf.Failure, "two seeds for class m4pro-48"):
+            with mock.patch.object(mf, "resolve_candidate_run", return_value=dict(self.RUN)):
+                mf.cmd_upgrade(mf.load_manifest(self.manifest), self.manifest, None, "1", "a/b", None,
+                               ["build-mini-1", "build-mini-2"], False, None, None)
+
+    def test_a_host_that_adopted_its_class_cannot_seed_it(self) -> None:
+        adopted = on_candidate(generation=NEW_GEN).replace("pf_acceptance\taccepted",
+                                                           "pf_acceptance\taccepted\npf_acceptance_class\tglaeda-class-acceptance/v1")
+        local = on_candidate(generation=NEW_GEN, node_id="cmux-mac-002").replace(
+            "pf_acceptance\taccepted", "pf_acceptance\taccepted\npf_acceptance_class\tglaeda-local-acceptance/v1")
+        code, out, calls, export = self.upgrade({"build-mini-1": adopted, "build-mini-2": local})
+        self.assertIn("class m4pro-48: seed build-mini-2", out)
+        code, out, calls, export = self.upgrade({"build-mini-1": adopted, "build-mini-2": adopted})
+        self.assertIn("recorded receipt is gone", out)
+
+    def test_the_run_must_be_a_reviewed_candidate(self) -> None:
+        good = {"headSha": NEW, "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
+                "workflowName": "Fleet candidate bundles"}
+        artifacts = [{"name": "glaeda-candidate-aarch64-apple-darwin", "expired": False,
+                      "expires_at": "2026-10-24T15:15:27Z"}]
+
+        def gh(view: dict, compare: str = "behind", arts: list = artifacts):
+            return lambda args: view if args[0] == "run" else ({"status": compare} if "compare" in args[1] else arts)
+
+        with mock.patch.object(mf, "gh_json", side_effect=gh(good)):
+            got = mf.resolve_candidate_run("36018123850", "teamleaderleo/glaeda", None)
+        self.assertEqual(got, {**self.RUN})
+        for view, compare, arts, error in (({**good, "event": "pull_request"}, "behind", artifacts, "only a dispatched"),
+                                           ({**good, "conclusion": "failure"}, "behind", artifacts, "completed/success"),
+                                           (good, "diverged", artifacts, "not on teamleaderleo/glaeda main"),
+                                           (good, "behind", [{**artifacts[0], "expired": True}], "no unexpired")):
+            with self.subTest(error=error), mock.patch.object(mf, "gh_json", side_effect=gh(view, compare, arts)), \
+                    self.assertRaisesRegex(mf.Failure, error):
+                mf.resolve_candidate_run("36018123850", "teamleaderleo/glaeda", None)
+        with self.assertRaisesRegex(mf.Failure, "64-hex"):
+            mf.resolve_candidate_run("1", "a/b", "abc")
+
+    def test_the_download_is_checked_against_the_build_receipt(self) -> None:
+        import hashlib
+        payload = b"candidate archive"
+        sha = hashlib.sha256(payload).hexdigest()
+        name = f"glaeda-{NEW}-aarch64-apple-darwin.tar.gz"
+
+        def download(receipt: dict):
+            def run(argv, log, stdin=b"", timeout=None):
+                target = Path(argv[argv.index("--dir") + 1])
+                (target / name).write_bytes(payload)
+                (target / "receipt.json").write_text(json.dumps(receipt))
+                return 0
+            return run
+
+        good = {"archive": name, "sha256": sha, "target": "aarch64-apple-darwin",
+                "source": {"repository": "teamleaderleo/glaeda", "commit": NEW, "tree": "e" * 40}}
+        for receipt, pinned, error in (({**good, "sha256": "f" * 64}, None, "receipt says"),
+                                       ({**good, "source": {**good["source"], "commit": "0" * 40}}, None, "does not describe"),
+                                       (good, "f" * 64, "differs from the run's receipt")):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(mf, "OPERATOR_CACHE", Path(tmp)), \
+                    mock.patch.object(mf, "run_logged", side_effect=download(receipt)), \
+                    self.assertRaisesRegex(mf.Failure, error):
+                mf.download_run_candidate({**self.RUN, **({"sha256": pinned} if pinned else {})}, None)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(mf, "OPERATOR_CACHE", Path(tmp)), \
+                mock.patch.object(mf, "run_logged", side_effect=download(good)) as run:
+            self.assertEqual(mf.download_run_candidate(dict(self.RUN), None), sha)
+            self.assertEqual(mf.download_run_candidate({**self.RUN, "sha256": sha}, None), sha)  # cached
+            self.assertEqual(run.call_count, 1)
+            cached = mf.fetch_candidate({**self.RUN, "sha256": sha}, None)  # what stage_candidate then uses
+            self.assertEqual(cached.read_bytes(), payload)
+            self.assertEqual(run.call_count, 1)
+            mf.download_run_candidate({**self.RUN, "run": "36018123851"}, None)  # another run of the source: fetched
+            self.assertEqual(run.call_count, 2)
+
+    def test_commands_quote_for_the_host(self) -> None:
+        manifest = mf.load_manifest(EXAMPLE)
+        result = mf.preflight_host(manifest, "build-mini-1", observed(h=preflight_text())["hosts"]["h"])
+        candidate = {**self.RUN, "sha256": "a" * 64}
+        command = mf.enroll_command(manifest, "build-mini-1", result, candidate, False, ("m4pro-48", RECEIPT_SHA), renew=True)
+        self.assertIn(" --apply --renew --class-receipt - ", command)
+        self.assertIn("~/'glaeda/scripts/glaeda-mini-enroll'", command)
+        export = mf.export_command(manifest, "build-mini-1", result, candidate, "m4pro-48")
+        self.assertIn('G="$HOME/Projects/glaeda-generations/3809eed51fdd"', export)
+        self.assertIn('export-class-acceptance "$F/enrollment.json" --acceptance', export)
+        self.assertIn('--cmux-root "$HOME/cmux"', export)
+
+    def test_the_manifest_pin_is_validated(self) -> None:
+        data = json.loads(EXAMPLE.read_text())
+        data["candidate"] = {"source": "x", "sha256": "a" * 64, "run": "1", "artifact": "a", "repo": "a/b"}
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(mf.Failure, "candidate needs"):
+            mf.load_manifest(write_manifest(tmp, data))
 
 
 if __name__ == "__main__":

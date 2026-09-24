@@ -15,10 +15,73 @@ say() { printf 'glaeda-mini-fleet: %s\n' "$*"; }
 refuse() { say "refused: $*" >&2; exit 3; }
 home() { printf '%s' "${1/#\~/$HOME}"; }
 
+# >>> host gate (sudo-plan scripts inline this block too)
+# The host is held while another build holds the fleet host lock (the flock with-host-lock, the build
+# worker and the runner hook take) or an active glaeda-reservation/v1 marker names it; an unreadable or
+# invalid marker counts as held (glaeda_reservation.py's rule). host_held prints why and succeeds when
+# held; only perl's explicit "free" answer (exit 3) reads as free, so a perl failure holds the host.
+# host_held reservation checks the reservation alone (a runner drain waits out the job holding the lock).
+# perl, because a fresh mini has no Python and macOS has no flock(1).
+GLAEDA_FLEET_DIR="${GLAEDA_FLEET_DIR:-/Users/Shared/cmux-build-fleet}"
+host_held() {
+  local out rc
+  out=$(perl -MFcntl=:flock -MJSON::PP -MB -MPOSIX=strftime -e '
+    my ($dir, $mode) = @ARGV;
+    eval {
+      sub flags { my $v = shift; return ref($v) ? 0 : B::svref_2object(\$v)->FLAGS }
+      sub is_int { my $f = flags($_[0]); defined $_[0] && ($f & B::SVp_IOK) && !($f & (B::SVp_POK | B::SVp_NOK)) }
+      sub is_str { my $f = flags($_[0]); defined $_[0] && ($f & B::SVp_POK) && !($f & (B::SVp_IOK | B::SVp_NOK)) }
+      my $res = "$dir/reservation.json";
+      if (-e $res) {
+        open(my $fh, "<", $res) or do { print "reservation $res is unreadable\n"; exit 0 };
+        my $text = do { local $/; <$fh> };
+        my $doc = eval { JSON::PP->new->decode($text) };
+        # JSON::PP reads 1e3 as an integer; Python (glaeda_reservation.py) does not, so require plain digits.
+        my $plain = $text =~ /"since"\s*:\s*-?\d+\s*[,}]/ && $text =~ /"until"\s*:\s*-?\d+\s*[,}]/;
+        my $why = ref($doc) ne "HASH" ? "not a JSON object"
+          : (($doc->{schema} // "") ne "glaeda-reservation/v1") ? "schema is not glaeda-reservation/v1"
+          : !(is_str($doc->{owner}) && is_str($doc->{purpose})) ? "owner or purpose is not a string"
+          : !($plain && is_int($doc->{since}) && is_int($doc->{until})) ? "since or until is not integer Unix seconds" : "";
+        if ($why ne "") { print "reservation $res is not a valid glaeda-reservation/v1 marker ($why)\n"; exit 0 }
+        if (time() < $doc->{until}) {
+          my $when = eval { strftime("%Y-%m-%dT%H:%M:%SZ", gmtime($doc->{until})) } // "Unix time $doc->{until}";
+          printf "reserved by %s for %s until %s\n", $doc->{owner} || "?", $doc->{purpose} || "?", $when;
+          exit 0;
+        }
+      }
+      my $lock = "$dir/host.lock";
+      if (($mode // "") ne "reservation" && -e $lock) {
+        open(my $fh, "<", $lock) or do { print "cannot open the fleet host lock $lock\n"; exit 0 };
+        flock($fh, LOCK_SH | LOCK_NB) or do { print "held by another build (fleet host lock $lock)\n"; exit 0 };
+      }
+      print "free\n";
+      exit 3;
+    };
+    print "cannot read the host lock and reservation: $@";
+    exit 0;
+  ' "$GLAEDA_FLEET_DIR" "${1:-all}" 2>&1) && rc=0 || rc=$?
+  [ "$rc" = 3 ] && [ "$out" = free ] && return 1
+  printf '%s\n' "${out:-cannot read the host lock and reservation (perl exit $rc)}"
+  return 0
+}
+# <<< host gate
+
+held_refuse() { say "held: $*, skipped" >&2; exit 20; }
+
+host_check() {  # exit 0 when the host is free, 20 (and why on stdout) when it is held
+  local why
+  if why=$(host_held); then say "held: $why"; exit 20; fi
+  say "free"
+}
+
 # One changing step at a time per host: an SSH timeout on the operator side does not stop the remote
 # step, so a rerun must not start the same work beside it. A lock whose process is gone is taken over.
-lock() {
-  local dir="$HOME/.local/state/glaeda/mini-fleet/step.lock" pid
+# No step starts while the host is held (see host_held). runner_hold honors only reservations: it exists to
+# wait out the job that holds the fleet host lock. runner_release and runner_kick only restore runners,
+# whose job hook guards the lock itself, so they skip the gate.
+lock() {  # [reservation|none]: how much of the host gate this step honors (default: all)
+  local dir="$HOME/.local/state/glaeda/mini-fleet/step.lock" pid why
+  if [ "${1:-all}" != none ] && why=$(host_held "${1:-all}"); then held_refuse "$why"; fi
   mkdir -p "$(dirname "$dir")"
   if ! mkdir "$dir" 2>/dev/null; then
     pid=$(cat "$dir/pid" 2>/dev/null || true)
@@ -87,6 +150,108 @@ glaeda() {  # PYTHON
     git clone --depth 1 --progress https://github.com/teamleaderleo/glaeda.git "$dir"
   fi
   "$(home "$1")" "$dir/scripts/glaeda-mini-setup" --apply
+}
+
+# ~/glaeda at one commit for the whole run (glaeda-mini-fleet passes the tip of main), so every host runs
+# the same glaeda-mini-enroll and staging verifier before a renewal; it must know --renew.
+glaeda_sync() {  # COMMIT
+  local dir="$HOME/glaeda" head enroll
+  [ -f "$dir/scripts/cmux_fleet.py" ] || refuse "$dir is not a Glaeda checkout; run glaeda-mini-fleet fix first"
+  head=$(git -C "$dir" rev-parse -q --verify HEAD || true)
+  if [ "$head" = "$1" ]; then say "unchanged: ~/glaeda is at ${1:0:12}"; return; fi
+  [ -z "$(git -C "$dir" status --porcelain=v1 --untracked-files=no)" ] || refuse "$dir has local changes; commit or move them aside"
+  if ! git -C "$dir" cat-file -e "$1^{commit}" 2>/dev/null; then
+    if [ "$(git -C "$dir" rev-parse --is-shallow-repository)" = true ]; then
+      git -C "$dir" fetch --quiet --depth 1 origin "$1"
+    else
+      git -C "$dir" fetch --quiet origin "$1"
+    fi
+  fi
+  # Captured, not piped into grep -q: under pipefail an early grep exit would fail git show.
+  enroll=$(git -C "$dir" show "$1:scripts/glaeda-mini-enroll")
+  case "$enroll" in
+    *'"--renew"'*) ;;
+    *) refuse "glaeda ${1:0:12} predates glaeda-mini-enroll --renew" ;;
+  esac
+  git -C "$dir" checkout --quiet --detach "$1"
+  say "~/glaeda moved from ${head:0:12} to ${1:0:12}"
+}
+
+# ---- The GitHub Actions runner's launchd agent, which cmux scripts/persistent-compile up installs in the
+# login user's GUI domain. runner_hold stops it once its current job ends and marks it held; runner_release
+# starts what runner_hold stopped (if-eligible: only while the enrollment is eligible, as after a renewal
+# that failed before it quarantined); runner_kick restarts a loaded agent whose listener is gone. The held
+# marks are what repair reads.
+held_dir() { printf '%s' "$HOME/.local/state/glaeda/mini-fleet/runner-held"; }
+
+runner_plist() {  # DIR: the runner's LaunchAgent (svc.sh records it in .service; glaeda-cmux-runner's is fixed), or fail
+  local plist; plist=$(cat "$1/.service" 2>/dev/null || true)
+  if [ -z "$plist" ] && [ "$(basename "$1")" = actions-runner-glaeda ]; then
+    plist="$HOME/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist"
+  fi
+  [ -n "$plist" ] && [ -f "$plist" ] || return 1
+  printf '%s' "$plist"
+}
+
+runner_hold() {  # WAIT_SECONDS
+  local r dir plist label domain deadline
+  domain="gui/$(id -u)"
+  mkdir -p "$(held_dir)"
+  for r in "$HOME"/actions-runner*/.runner; do
+    [ -f "$r" ] || continue
+    dir=$(dirname "$r")
+    plist=$(runner_plist "$dir") || { say "$dir has no launchd agent; nothing to stop"; continue; }
+    label=$(basename "$plist" .plist)
+    if ! launchctl print "$domain/$label" >/dev/null 2>&1; then say "unchanged: $label is not loaded"; continue; fi
+    deadline=$(( $(date +%s) + $1 ))
+    while pgrep -f "$dir/bin/Runner.Worker" >/dev/null 2>&1; do
+      [ "$(date +%s)" -lt "$deadline" ] || refuse "$label is still running a job after $1 seconds; rerun once it ends"
+      say "$label is running a job; waiting for it to end"
+      sleep 30
+    done
+    : > "$(held_dir)/$(basename "$dir")"
+    launchctl disable "$domain/$label"
+    launchctl bootout "$domain/$label" 2>/dev/null || true
+    ! launchctl print "$domain/$label" >/dev/null 2>&1 || refuse "could not stop $label"
+    say "stopped $label; it starts again once the node is eligible"
+  done
+}
+
+runner_release() {  # [if-eligible]
+  local r dir plist label domain state
+  domain="gui/$(id -u)"
+  if [ "${1:-}" = if-eligible ]; then
+    state=$(plutil -extract state raw "${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet/enrollment.json" 2>/dev/null || true)
+    if [ "$state" != eligible ]; then say "runners stay held: the node is ${state:-not enrolled}"; return; fi
+  fi
+  for r in "$HOME"/actions-runner*/.runner; do
+    [ -f "$r" ] || continue
+    dir=$(dirname "$r")
+    [ -f "$(held_dir)/$(basename "$dir")" ] || continue
+    plist=$(runner_plist "$dir") || { say "$dir has no launchd agent; cmux scripts/persistent-compile up installs it"; continue; }
+    label=$(basename "$plist" .plist)
+    launchctl enable "$domain/$label"
+    launchctl print "$domain/$label" >/dev/null 2>&1 || launchctl bootstrap "$domain" "$plist" \
+      || refuse "could not start $label; the runner runs in the GUI session, so log in on the mini (or enable auto-login)"
+    rm -f "$(held_dir)/$(basename "$dir")"
+    say "started $label"
+  done
+}
+
+runner_kick() {
+  local r dir plist label domain
+  domain="gui/$(id -u)"
+  for r in "$HOME"/actions-runner*/.runner; do
+    [ -f "$r" ] || continue
+    dir=$(dirname "$r")
+    plist=$(runner_plist "$dir") || continue
+    label=$(basename "$plist" .plist)
+    launchctl print "$domain/$label" >/dev/null 2>&1 || continue
+    if ! pgrep -f "$dir/bin/Runner.Listener" >/dev/null 2>&1; then
+      launchctl kickstart -k "$domain/$label"
+      say "restarted $label"
+    fi
+  done
 }
 
 # Xcode 26 ships Metal separately; the fleet bootstrap runs xcrun metal.
