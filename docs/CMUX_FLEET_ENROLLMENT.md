@@ -108,6 +108,20 @@ Preflight reports macOS, hardware against the M4 Pro 14-core 48 GB target, Xcode
 
 This command does not replace the bootstrap below: it imports its read-only helpers and runs it unchanged, so fleet-contract generations and acceptance receipts are unaffected.
 
+## Enroll a Mac in one command
+
+After `glaeda-mini-setup --apply` and cmux `./scripts/setup.sh`, one command runs every step of [Onboard a Mac](#onboard-a-mac) below. Give it the downloaded [candidate bundle](FLEET_DISTRIBUTION.md) and the checksum and source from the trusted run's receipt:
+
+```bash
+scripts/glaeda-mini-enroll --cmux-root ~/Projects/cmux --node-id cmux-mac-001 \
+  --candidate ./glaeda-candidate/ARCHIVE.tar.gz --sha256 SHA256 --source COMMIT          # plan
+# the same command with --apply does it
+```
+
+It stages the archive with this checkout's `fleet_bundle.py` into `~/Projects/glaeda-generations/<first 12 of source>`, then runs bootstrap, enroll, `accept-local`, the transition to `eligible`, and `status`. Every fleet step uses that generation's own binary and tools, so the node runs exactly the reviewed candidate and builds no Rust. Without `--candidate` it builds glaeda from this checkout instead, which is for development hosts only.
+
+It uses the same paths as the manual steps: the enrollment and acceptance receipt under `~/.config/glaeda/cmux-fleet`, and `glaeda-mini-setup`'s cache root. It finds a Python 3.13+ interpreter itself, because `accept-local` needs `os.waitid`. Each step is skipped when its result already holds, so a re-run re-inspects the staged generation instead of restaging it, resumes at `accept-local` after a rejected acceptance, returns a draining node to `eligible`, and only prints status on an eligible node. An interrupted stage is left in place and reported rather than reused. `--reaccept` forces a fresh acceptance. It refuses a quarantined or retired node and a `--node-id` that differs from the existing enrollment. It never uses sudo and never registers a GitHub runner; in a cmux checkout, `scripts/persistent-compile up` downloads the pinned candidate, runs this command and then registers the runner.
+
 ## Onboard a Mac
 
 Use an exact reviewed Glaeda checkout and the CMUX checkout that will run acceptance. A [verified native candidate bundle](FLEET_DISTRIBUTION.md) can supply `GLAEDA_BIN` and the matching fleet scripts without building Rust on the node; skip the build/copy step below when using that path.

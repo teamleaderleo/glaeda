@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""glaeda-mini-enroll: take a set-up cmux Mac mini to an eligible fleet node in one command.
+
+    glaeda-mini-enroll --cmux-root ~/cmux --node-id cmux-mac-001 \
+        --candidate ARCHIVE --sha256 SHA256 --source COMMIT [--apply]
+
+Runs the sequence in docs/CMUX_FLEET_ENROLLMENT.md (cmux docs/fleet-enrollment.md):
+stage the reviewed candidate bundle, bootstrap, enroll, accept-local, transition to
+eligible, status. With --candidate, the archive is verified and staged by this
+checkout's fleet_bundle.py (docs/FLEET_DISTRIBUTION.md) into a new generation
+directory, and every fleet step runs that generation's own binary and tools, so the
+node runs exactly the reviewed candidate and no Rust is built. Without --candidate,
+it builds glaeda from this checkout instead, for development hosts. The staging
+verifier is this checkout's: a later change to fleet_bundle.py's file inventory
+needs a matching new candidate. Each step is skipped when its result already holds, so re-running after a
+failure or a reboot resumes where it stopped, and re-running on an eligible node
+changes nothing. --reaccept forces a fresh accept-local (a cold cmux build, about
+13 minutes on an M4 Pro).
+
+Run glaeda-mini-setup --apply first; this command assumes its tools and cache root.
+It picks a Python 3.13+ interpreter itself, because accept-local needs os.waitid,
+which CPython on macOS only has from 3.13. It never uses sudo, never registers a
+GitHub runner (cmux scripts/persistent-compile up does that), and never reads a token.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO = SCRIPT_DIR.parent
+ROLE = "cmux_macos_native_build"
+HARDWARE_CLASS = "cmux-mac-build-large"
+SCOPE = "cmux-founders"
+TARGET = "aarch64-apple-darwin"
+PYTHON_CANDIDATES = (
+    "/opt/homebrew/bin/python3.14",
+    "/opt/homebrew/bin/python3.13",
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "/opt/homebrew/opt/python@3.13/bin/python3.13",
+    "/usr/local/bin/python3.14",
+    "/usr/local/bin/python3.13",
+    "/opt/homebrew/bin/python3",
+    "/usr/local/bin/python3",
+)
+DARWIN_REQUIRED = True
+
+
+class Stop(Exception):
+    pass
+
+
+@dataclass
+class Paths:
+    home: Path
+
+    @property
+    def fleet(self) -> Path:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.fspath(self.home / ".config")
+        return Path(base) / "glaeda" / "cmux-fleet"
+
+    @property
+    def install(self) -> Path:
+        base = os.environ.get("XDG_DATA_HOME") or os.fspath(self.home / ".local/share")
+        return Path(base) / "glaeda" / "cmux-fleet"
+
+    @property
+    def glaeda_bin(self) -> Path:
+        return self.install / "glaeda"
+
+    @property
+    def enrollment(self) -> Path:
+        return self.fleet / "enrollment.json"
+
+    @property
+    def acceptance(self) -> Path:
+        return self.fleet / "acceptance" / f"{ROLE}.json"
+
+    @property
+    def generations(self) -> Path:
+        return self.home / "Projects/glaeda-generations"
+
+    def generation(self, source: str) -> Path:
+        return self.generations / source[:12]
+
+    @property
+    def cache_root(self) -> Path:
+        # Same default as glaeda-mini-setup, so the LaunchAgents it installs clean this cache.
+        return self.home / ".cache/glaeda/cmux-native-cache"
+
+
+def python_version(path: str) -> tuple[int, int] | None:
+    try:
+        out = subprocess.run([path, "-c", "import sys; print(*sys.version_info[:2])"],
+                             capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    parts = out.stdout.split()
+    return (int(parts[0]), int(parts[1])) if out.returncode == 0 and len(parts) == 2 else None
+
+
+def pick_python(explicit: str | None) -> str | None:
+    candidates = [explicit] if explicit else [*PYTHON_CANDIDATES, shutil.which("python3.14"),
+                                             shutil.which("python3.13"), shutil.which("python3")]
+    for candidate in candidates:
+        if candidate and os.access(candidate, os.X_OK):
+            version = python_version(candidate)
+            if version and version >= (3, 13):
+                return candidate
+    return None
+
+
+def read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+@dataclass
+class State:
+    binary: bool
+    enrollment: dict[str, Any] | None
+    acceptance_current: bool
+
+
+def plan(state: State, node_id: str | None, reaccept: bool, rebuild: bool, candidate: bool = False) -> list[str]:
+    """The steps still needed, in order. Pure, so it is tested without a Mac."""
+    steps = []
+    if candidate:
+        # A staged generation is re-inspected before anything runs, outside the plan.
+        if not state.binary:
+            steps.append("stage")
+    elif rebuild or not state.binary:
+        steps.append("install-glaeda")
+    enrollment_state = (state.enrollment or {}).get("state")
+    if state.enrollment is None:
+        if not node_id:
+            raise Stop("no enrollment yet: pass --node-id (an opaque id such as cmux-mac-001, "
+                       "not a hostname or serial)")
+        steps += ["bootstrap", "enroll"]
+    elif node_id and state.enrollment.get("nodeId") != node_id:
+        raise Stop(f"this mini is already enrolled as {state.enrollment.get('nodeId')}; "
+                   "drop --node-id or retire that enrollment first")
+    elif enrollment_state == "quarantined":
+        raise Stop(f"node is quarantined ({state.enrollment.get('quarantineReason')}); "
+                   "move it to enrolling with cmux_fleet.py transition-apply, then re-run")
+    elif enrollment_state == "retired":
+        raise Stop("node is retired; remove the enrollment to enroll this machine again")
+    if reaccept or state.enrollment is None or not state.acceptance_current:
+        # cmux_fleet.py accepts only an enrolling node; re-acceptance of an
+        # eligible or draining one goes through quarantine, which advances the
+        # enrollment generation. That is an operator decision, not a side effect.
+        if enrollment_state in {"eligible", "draining"}:
+            raise Stop(f"node is {enrollment_state} but needs a fresh acceptance (new candidate, changed toolchain "
+                       "or --reaccept), and accept-local runs only on an enrolling node. Move it there, then re-run:\n"
+                       "  cmux_fleet.py transition-apply ENROLLMENT --to quarantined --reason stale_glaeda_generation\n"
+                       "  cmux_fleet.py transition-apply ENROLLMENT --to enrolling")
+        steps.append("accept-local")
+    if enrollment_state != "eligible" or "accept-local" in steps:
+        steps.append("eligible")
+    steps.append("status")
+    return steps
+
+
+class Runner:
+    def __init__(self, python: str, paths: Paths, cmux_root: Path, generation: Path | None = None) -> None:
+        self.python = python
+        self.paths = paths
+        self.cmux_root = cmux_root
+        # A staged candidate runs its own tools and binary; a development host runs this checkout's.
+        self.generation = generation
+        self.tools = generation / "scripts" if generation else SCRIPT_DIR
+        self.glaeda_bin = generation / "bin/glaeda" if generation else paths.glaeda_bin
+        self.fleet_py = os.fspath(self.tools / "cmux_fleet.py")
+
+    def fleet(self, *args: str, capture: bool = True) -> subprocess.CompletedProcess[str]:
+        # -B keeps bytecode out of a staged generation, whose file inventory is closed.
+        return subprocess.run([self.python, "-B", self.fleet_py, *args], cwd=REPO, text=True,
+                              stdout=subprocess.PIPE if capture else None, check=False)
+
+    def bundle(self, *args: str) -> dict[str, Any]:
+        result = subprocess.run([self.python, "-B", os.fspath(SCRIPT_DIR / "fleet_bundle.py"), *args],
+                                cwd=REPO, text=True, stdout=subprocess.PIPE, check=False)
+        doc = read_json_text(result.stdout) or {}
+        if result.returncode or doc.get("error"):
+            raise Stop(f"fleet_bundle.py {args[0]}: {doc.get('error') or 'failed'}")
+        return doc
+
+    def stage(self, archive: Path, sha256: str, source: str) -> None:
+        assert self.generation is not None
+        if self.generation.exists():
+            raise Stop(f"{self.generation} holds an interrupted stage; move it aside for inspection and re-run")
+        parent = self.generation.parent
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(parent, 0o700)
+        doc = self.bundle("stage", os.fspath(archive), "--sha256", sha256, "--source", source,
+                          "--target", TARGET, "--directory", os.fspath(self.generation), "--apply")
+        if doc.get("state") != "staged":
+            raise Stop(f"candidate was not staged (state {doc.get('state')})")
+        print(f"staged {source[:12]} in {self.generation}")
+
+    def inspect(self, sha256: str, source: str) -> None:
+        doc = self.bundle("inspect", "--directory", os.fspath(self.generation), "--sha256", sha256,
+                          "--source", source, "--target", TARGET)
+        if doc.get("state") != "verified":
+            raise Stop(f"staged generation {self.generation} does not verify; stage the candidate into a fresh directory")
+
+    def write_private(self, path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        with os.fdopen(fd, "w") as out:
+            out.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+
+    def acceptance_current(self, enrollment: dict[str, Any] | None) -> bool:
+        if enrollment is None or not self.paths.acceptance.is_file():
+            return False
+        if enrollment.get("state") == "eligible":
+            status = self.fleet("status", os.fspath(self.paths.enrollment),
+                                "--acceptance", os.fspath(self.paths.acceptance))
+            return status.returncode == 0 and bool((json.loads(status.stdout or "{}")).get("routingCandidateEligible"))
+        # A dry transition succeeds exactly when the receipt matches this enrollment.
+        dry = self.fleet("transition", os.fspath(self.paths.enrollment), "--to", "eligible",
+                         "--acceptance", os.fspath(self.paths.acceptance))
+        return dry.returncode == 0
+
+    def install_glaeda(self) -> None:
+        cargo = shutil.which("cargo") or os.path.expanduser("~/.cargo/bin/cargo")
+        if subprocess.run([cargo, "build", "--locked", "--release", "--bin", "glaeda"], cwd=REPO, check=False).returncode:
+            raise Stop("cargo build of glaeda failed")
+        install = self.paths.install
+        install.mkdir(parents=True, exist_ok=True, mode=0o700)
+        binary = self.paths.glaeda_bin
+        rollback = install / "glaeda.rollback"
+        if binary.is_file() and not rollback.exists():
+            shutil.copy2(binary, rollback)
+        staged = install / ".glaeda.next"
+        shutil.copy2(REPO / "target/release/glaeda", staged)
+        os.chmod(staged, 0o755)
+        os.replace(staged, binary)
+
+    def bootstrap(self) -> Path:
+        result = subprocess.run(
+            ["bash", os.fspath(self.tools / "cmux-fleet-bootstrap-macos"), "--cmux-root", os.fspath(self.cmux_root),
+             "--glaeda", os.fspath(self.glaeda_bin), "--cache-root", os.fspath(self.paths.cache_root),
+             "--hardware-class", HARDWARE_CLASS, "--role", ROLE],
+            cwd=REPO, text=True, stdout=subprocess.PIPE, check=False)
+        doc = None
+        try:
+            doc = json.loads(result.stdout)
+        except ValueError:
+            pass
+        if not isinstance(doc, dict) or not doc.get("eligibleForEnrollment"):
+            blocking = ", ".join((doc or {}).get("blockingChecks") or []) or "unreadable bootstrap output"
+            raise Stop(f"bootstrap does not allow enrollment: {blocking}. "
+                       "Run glaeda-mini-setup --cmux-root <cmux> for what to fix.")
+        path = self.paths.fleet / "bootstrap.json"
+        self.write_private(path, result.stdout)
+        return path
+
+    def enroll(self, bootstrap: Path, node_id: str) -> None:
+        result = self.fleet("enroll", os.fspath(bootstrap), "--node-id", node_id, "--scope", SCOPE, "--generation", "1")
+        if result.returncode:
+            raise Stop("enroll was refused (see the error above)")
+        self.write_private(self.paths.enrollment, result.stdout)
+
+    def accept_local(self) -> None:
+        print(f"accept-local: cold cmux build of {self.cmux_root}; this takes a while", flush=True)
+        result = self.fleet("accept-local", os.fspath(self.paths.enrollment), "--cmux-root", os.fspath(self.cmux_root),
+                            "--glaeda", os.fspath(self.glaeda_bin), "--cache-root", os.fspath(self.paths.cache_root),
+                            "--role", ROLE)
+        receipt = read_json_text(result.stdout)
+        if result.returncode or (receipt or {}).get("result") != "accepted":
+            if receipt:
+                self.write_private(self.paths.fleet / "acceptance" / f"{ROLE}.rejected.json", result.stdout)
+            raise Stop("accept-local did not accept this mini; the retained attempt log path is printed above")
+        self.write_private(self.paths.acceptance, result.stdout)
+
+    def eligible(self) -> None:
+        enrollment = read_json(self.paths.enrollment) or {}
+        if enrollment.get("state") == "eligible":
+            return
+        result = self.fleet("transition-apply", os.fspath(self.paths.enrollment), "--to", "eligible",
+                            "--acceptance", os.fspath(self.paths.acceptance))
+        if result.returncode:
+            raise Stop("transition to eligible was refused (see the error above)")
+
+    def status(self) -> dict[str, Any]:
+        result = self.fleet("status", os.fspath(self.paths.enrollment), "--acceptance", os.fspath(self.paths.acceptance))
+        return read_json_text(result.stdout) or {}
+
+
+def read_json_text(text: str | None) -> dict[str, Any] | None:
+    try:
+        value = json.loads(text or "")
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+DESCRIPTIONS = {
+    "stage": "verify and stage the reviewed candidate bundle as a new generation (no Rust build)",
+    "install-glaeda": "build and install the glaeda binary (keeps one rollback copy)",
+    "bootstrap": "read-only bootstrap of this mini against the cmux checkout",
+    "enroll": "create the enrollment record (state: enrolling)",
+    "accept-local": "local acceptance: a cold cmux.macos.dev-check@1 build under Glaeda",
+    "eligible": "transition the enrollment to eligible",
+    "status": "print the node status",
+}
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="glaeda-mini-enroll", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--cmux-root", type=Path, required=True, help="clean cmux checkout (after ./scripts/setup.sh)")
+    p.add_argument("--node-id", help="opaque node id for a first enrollment, such as cmux-mac-001")
+    p.add_argument("--apply", action="store_true", help="run the steps (default is plan only)")
+    p.add_argument("--reaccept", action="store_true", help="run accept-local even if the receipt is current")
+    p.add_argument("--rebuild", action="store_true", help="rebuild and reinstall the glaeda binary")
+    p.add_argument("--python", help="Python 3.13+ interpreter (default: found automatically)")
+    p.add_argument("--candidate", type=Path, help="downloaded candidate archive (docs/FLEET_DISTRIBUTION.md)")
+    p.add_argument("--sha256", help="candidate archive SHA-256 from the trusted run's receipt")
+    p.add_argument("--source", help="candidate's exact 40-character source commit")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    if DARWIN_REQUIRED and platform.system() != "Darwin":
+        print("glaeda-mini-enroll: macOS only", file=sys.stderr)
+        return 2
+    python = pick_python(args.python)
+    if python is None:
+        print("glaeda-mini-enroll: needs Python 3.13 or newer (accept-local uses os.waitid). "
+              "Install it: brew install python@3.13", file=sys.stderr)
+        return 2
+    candidate = [args.candidate, args.sha256, args.source]
+    if any(candidate) and not all(candidate):
+        print("glaeda-mini-enroll: --candidate, --sha256 and --source go together", file=sys.stderr)
+        return 2
+    paths = Paths(Path.home())
+    cmux_root = args.cmux_root.expanduser().resolve()
+    generation = paths.generation(args.source) if args.source else None
+    runner = Runner(python, paths, cmux_root, generation)
+    enrollment = read_json(paths.enrollment)
+    if enrollment is None and paths.enrollment.exists():
+        print(f"glaeda-mini-enroll: {paths.enrollment} exists but cannot be read; inspect it rather than "
+              "letting a new enrollment replace it", file=sys.stderr)
+        return 2
+    staged = generation is not None and (generation / "stage-receipt.json").is_file()
+    state = State(binary=staged if generation else paths.glaeda_bin.is_file(), enrollment=enrollment,
+                  acceptance_current=False)
+    try:
+        if staged:
+            # Verify the saved bytes before running any of the generation's code.
+            runner.inspect(args.sha256, args.source)
+        if generation is None or staged:
+            state.acceptance_current = runner.acceptance_current(enrollment)
+        steps = plan(state, args.node_id, args.reaccept, args.rebuild, candidate=generation is not None)
+        print(f"glaeda-mini-enroll ({python})")
+        for step in steps:
+            print(f"  - {DESCRIPTIONS[step]}")
+        if not args.apply:
+            print("\nRe-run with --apply to do it.")
+            return 0
+        bootstrap_path: Path | None = None
+        for step in steps:
+            print(f"\n== {step}", flush=True)
+            if step == "install-glaeda":
+                runner.install_glaeda()
+            elif step == "stage":
+                runner.stage(args.candidate.expanduser().resolve(), args.sha256, args.source)
+            elif step == "bootstrap":
+                bootstrap_path = runner.bootstrap()
+            elif step == "enroll":
+                assert bootstrap_path is not None
+                runner.enroll(bootstrap_path, args.node_id)
+            elif step == "accept-local":
+                runner.accept_local()
+            elif step == "eligible":
+                runner.eligible()
+            elif step == "status":
+                status = runner.status()
+                print(json.dumps(status, indent=2, sort_keys=True))
+                if not status.get("routingCandidateEligible"):
+                    raise Stop("status does not report this node as a routing candidate")
+    except Stop as stop:
+        print(f"\nglaeda-mini-enroll: {stop}", file=sys.stderr)
+        return 1
+    # Accepted: the transient bootstrap and the one-step rollback are no longer needed.
+    for leftover in (paths.fleet / "bootstrap.json", paths.install / "glaeda.rollback"):
+        leftover.unlink(missing_ok=True)
+    print(f"\n{(read_json(paths.enrollment) or {}).get('nodeId')} is eligible. "
+          "Next, from the cmux checkout: scripts/persistent-compile up")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
