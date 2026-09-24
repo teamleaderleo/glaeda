@@ -110,6 +110,9 @@ jobs:
               Path("scripts/test-glaeda-mini-setup.py"),
               Path("scripts/glaeda-mini-enroll"),
               Path("scripts/test-glaeda-mini-enroll.py"),
+              Path("scripts/glaeda-cmux-runner"),
+              Path("scripts/glaeda-cmux-runner-hook"),
+              Path("scripts/test-glaeda-cmux-runner.py"),
               Path("scripts/cmux_execution_roles.py"),
               Path("scripts/test-cmux-fleet.py"),
               Path("scripts/test-cmux-execution-roles.py"),
@@ -174,6 +177,7 @@ jobs:
           python3 scripts/test-cmux-fleet-bootstrap.py
           python3 scripts/test-glaeda-mini-setup.py
           python3 scripts/test-glaeda-mini-enroll.py
+          python3 scripts/test-glaeda-cmux-runner.py
           python3 scripts/test-cmux-execution-roles.py
           python3 scripts/test-cmux-workload-request.py
           python3 scripts/test-owned-fleet-benchmark.py

@@ -8,6 +8,8 @@
     glaeda-mini-setup --cmux-root ~/Projects/cmux   also run the read-only fleet bootstrap
     glaeda-mini-setup --hygiene-only --apply        any Mac (a laptop, a Studio): only the
                                                     disk and worktree hygiene tools and agents
+    glaeda-mini-setup --runner [--apply]   GitHub Actions runner for manaflow-ai/cmux
+                                           (scripts/glaeda-cmux-runner, docs/CMUX_MINI_RUNNER.md)
 
 First, on a fresh Mac: install the Command Line Tools (xcode-select --install) and, ideally,
 Homebrew. Until the Command Line Tools exist, /usr/bin/python3 and /usr/bin/git are stubs that
@@ -18,7 +20,8 @@ Planning performs no side effects. --apply is idempotent: a second run reports e
 action as unchanged. Everything it touches is under $HOME and owned by the current user.
 Nothing here uses sudo, changes system or security settings, installs Xcode, accepts a
 licence, registers a runner, or reads a token. Steps that need any of those are printed
-as operator steps instead.
+as operator steps instead. The one exception is the explicit --runner mode, which registers a
+GitHub Actions runner and is documented in docs/CMUX_MINI_RUNNER.md.
 
 What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-disk                   from scripts/glaeda-disk
@@ -832,7 +835,24 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def run_runner_mode(argv: list[str]) -> int:
+    """--runner: hand everything else to scripts/glaeda-cmux-runner (same plan/apply/uninstall style)."""
+    import importlib.machinery
+    import importlib.util
+
+    loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner", os.fspath(SCRIPT_DIR / "glaeda-cmux-runner"))
+    spec = importlib.util.spec_from_loader("glaeda_cmux_runner", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    module.DARWIN_REQUIRED = DARWIN_REQUIRED
+    return module.main(argv)
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--runner" in argv:
+        argv.remove("--runner")
+        return run_runner_mode(argv)
     args = parser().parse_args(argv)
     if DARWIN_REQUIRED and platform.system() != "Darwin":
         print("glaeda-mini-setup: macOS only", file=sys.stderr)
