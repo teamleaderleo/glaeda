@@ -22,7 +22,8 @@ RUNNER_ROLE = "ci-runner"
 VERSION_RE = r"[0-9][0-9.]*"
 # Runners per member and the weighted capacity units they share (glaeda-cmux-runner-hook): a compile is
 # 2 units, a light or GUI job 1. The manifest's defaults.runner.classes.<class> {runners, capacityUnits}
-# overrides these, and a host's overrides.runner.classes likewise.
+# overrides these, and a host's overrides.runner.classes likewise. compileSlots (default 1) is how many
+# compiles run at once: more than one needs cmux's compile admission to keep its state per runner.
 CLASS_CAPACITY = {"xl": (8, 8), "std": (4, 4), "light": (2, 2)}
 MAX_RUNNERS = 16
 
@@ -91,15 +92,21 @@ def member_labels(manifest: Any, member: str,
         if not isinstance(declared, dict):
             return None, f"runner.classes.{klass} is not an object"
         runners, units = declared.get("runners", runners), declared.get("capacityUnits", units)
+        compile_slots = declared.get("compileSlots", 1)
+    else:
+        compile_slots = 1
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
     if not (isinstance(units, int) and not isinstance(units, bool) and 2 <= units <= 4 * MAX_RUNNERS):
         return None, f"runner.classes.{klass}.capacityUnits must be 2 to {4 * MAX_RUNNERS} (a compile is 2)"
+    if not (isinstance(compile_slots, int) and not isinstance(compile_slots, bool)
+            and 1 <= compile_slots <= max(1, units // 2)):
+        return None, f"runner.classes.{klass}.compileSlots must be 1 to {max(1, units // 2)} (a compile is 2 units)"
     return {"member": member, "class": klass, "availability": availability, "roles": roles,
             "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready],
-            "runners": runners, "capacityUnits": units}, None
+            "runners": runners, "capacityUnits": units, "compileSlots": compile_slots}, None
 
 
 def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool] | None = None) -> dict[str, list[str]]:

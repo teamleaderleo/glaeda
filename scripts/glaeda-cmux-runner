@@ -372,6 +372,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
             scope += f" --toolchain-xcode {shlex.quote(ctx.member['xcodeApps'][0])}"
     if ctx.capacity_units:  # every runner on this mini shares these units (the hook's capacity ledger)
         scope += f" --capacity-units {int(ctx.capacity_units)}"
+        slots = int((ctx.member or {}).get("compileSlots") or 1)
+        if slots > 1:
+            scope += f" --compile-slots {slots}"
     started = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"

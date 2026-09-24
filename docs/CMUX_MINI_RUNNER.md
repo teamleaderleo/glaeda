@@ -116,7 +116,8 @@ What `--apply` does:
      from `GITHUB_JOB`: `macos-compile-admission` 2 units plus the `persistent-dd`
      token (one writer of the kept DerivedData at a time), `app-host-unit-tests` and
      `tests-build-and-lag` 1 unit plus the `gui` token (one console session),
-     `cli-product-tests` and `swift-package-tests` 1 unit, and any other job counts
+     `cli-product-tests`, `swift-package-tests` and the side lanes `cli-pipe-regressions`,
+     `remote-daemon-macos-tests` and `claude-wrapper` 1 unit, and any other job counts
      as a compile. When units or a token are taken it refuses at once with
      `refused: capacity: ...`, which the refusal rescue re-runs elsewhere; it never
      waits. Because `flock` gives no preference to the exclusive waiter, it also
@@ -221,8 +222,12 @@ or pass `--name` with the existing name to relabel it in place.
 
 A manifest class carries a runner count and the capacity units they share
 (defaults: `std` 4 runners and 4 units, `light` 2 and 2, `xl` 8 and 8). Override
-them with `defaults.runner.classes.<class>` `{"runners": N, "capacityUnits": U}`,
-or per host under `overrides.runner.classes.<class>`. Each runner is one
+them with `defaults.runner.classes.<class>` `{"runners": N, "capacityUnits": U,
+"compileSlots": C}`, or per host under `overrides.runner.classes.<class>`.
+`compileSlots` (default 1, at most U/2) is how many compiles run at once, one
+`persistent-dd` token each (`persistent-dd.token`, `persistent-dd-1.token`, ...).
+Raise it only once cmux's compile admission keeps its canonical root and kept
+state per runner; with shared paths two compiles would clobber each other. Each runner is one
 `--instance K`:
 
     for k in 0 1 2 3; do
