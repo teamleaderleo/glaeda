@@ -917,32 +917,80 @@ class OverflowTests(unittest.TestCase):
                                  "junk", {"status": "queued"}])
         self.assertEqual(load, {BS12: {"running": 0, "queued": 1}, BS26: {"running": 1, "queued": 1}})
 
+    def listing(self, runs, jobs=None):
+        return FakeGitHub({
+            ("GET", f"/repos/{REPO}/actions/runs?status=queued"): lambda _: (200, {"workflow_runs": runs["q"]}),
+            ("GET", f"/repos/{REPO}/actions/runs?status=in_progress"): lambda _: (200, {"workflow_runs": runs["p"]}),
+            ("GET", f"/repos/{REPO}/actions/runs/"): jobs or (200, {"jobs": [job_row("queued", BS26)]})})
+
     def test_listing_reuses_unchanged_runs_and_drops_finished_ones(self):
         runs = {"q": [run_row(1), run_row(2)], "p": [run_row(3, updated="2027-01-15T08:01:00Z")]}
-        api = FakeGitHub({("GET", f"/repos/{REPO}/actions/runs?status=queued"): lambda _: (200, {"workflow_runs": runs["q"]}),
-                          ("GET", f"/repos/{REPO}/actions/runs?status=in_progress"): lambda _: (200, {"workflow_runs": runs["p"]}),
-                          ("GET", f"/repos/{REPO}/actions/runs/"): (200, {"jobs": [job_row("queued", BS26)]})})
-        client, cache = gr.GitHub(SECRET, api), {"999:1:old": [job_row("queued", BS26)]}
-        jobs, complete = client.active_jobs(REPO, cache)
+        api = self.listing(runs)
+        client, cache = gr.GitHub(SECRET, api), {"999": {"key": "1:old", "at": NOW, "jobs": [job_row("queued", BS26)]}}
+        jobs, complete = client.active_jobs(REPO, cache, now=NOW)
         self.assertTrue(complete)
         self.assertEqual(len(jobs), 3)
-        self.assertNotIn("999:1:old", cache)
+        self.assertNotIn("999", cache)
         first = len(api.calls)
-        client.active_jobs(REPO, cache)
+        client.active_jobs(REPO, cache, now=NOW + 20)
         self.assertEqual(len(api.calls) - first, 2, "a quiet tick lists runs only")
         runs["p"] = [run_row(3, updated="2027-01-15T08:02:00Z")]
         first = len(api.calls)
-        client.active_jobs(REPO, cache)
+        client.active_jobs(REPO, cache, now=NOW + 40)
         self.assertEqual(len(api.calls) - first, 3, "a moved run is listed again")
+        first = len(api.calls)
+        client.active_jobs(REPO, cache, now=NOW + 40 + gr.OVERFLOW_RELIST_SECONDS)
+        self.assertEqual(len(api.calls) - first, 5, "an old listing is refreshed even when the run did not move")
 
-    def test_too_many_new_runs_is_a_partial_listing(self):
-        many = [run_row(i) for i in range(gr.OVERFLOW_RUN_LOOKUPS + 5)]
-        api = FakeGitHub({("GET", f"/repos/{REPO}/actions/runs?status=queued"): (200, {"workflow_runs": many}),
-                          ("GET", f"/repos/{REPO}/actions/runs?status=in_progress"): (200, {"workflow_runs": []}),
-                          ("GET", f"/repos/{REPO}/actions/runs/"): (200, {"jobs": [job_row("queued", BS26)]})})
-        jobs, complete = gr.GitHub(SECRET, api).active_jobs(REPO, {})
+    def test_a_run_in_both_listings_counts_once(self):
+        runs = {"q": [run_row(1)], "p": [run_row(1, updated="2027-01-15T08:03:00Z")]}
+        jobs, complete = gr.GitHub(SECRET, self.listing(runs)).active_jobs(REPO, {}, now=NOW)
+        self.assertEqual(len(jobs), 1)
+        self.assertTrue(complete)
+
+    def test_jobs_are_read_past_the_first_page(self):
+        pages = {1: [job_row("queued", BS26)] * 100, 2: [job_row("in_progress", BS26)] * 3}
+
+        def jobs(_body, calls=[]):
+            calls.append(1)
+            return 200, {"jobs": pages[len(calls)]}
+
+        api = self.listing({"q": [run_row(1)], "p": []}, jobs=jobs)
+        found, complete = gr.GitHub(SECRET, api).active_jobs(REPO, {}, now=NOW)
+        self.assertEqual(len(found), 103)
+        self.assertTrue(complete)
+
+    def test_too_many_new_runs_is_a_partial_listing_that_catches_up(self):
+        runs = {"q": [run_row(i) for i in range(gr.OVERFLOW_RUN_LOOKUPS + 5)], "p": []}
+        client, cache = gr.GitHub(SECRET, self.listing(runs)), {}
+        jobs, complete = client.active_jobs(REPO, cache, now=NOW)
         self.assertFalse(complete)
         self.assertEqual(len(jobs), gr.OVERFLOW_RUN_LOOKUPS)
+        jobs, complete = client.active_jobs(REPO, cache, now=NOW + 20)
+        self.assertTrue(complete)
+        self.assertEqual(len(jobs), gr.OVERFLOW_RUN_LOOKUPS + 5)
+
+    def test_low_rate_budget_stops_job_listings(self):
+        runs = {"q": [run_row(1)], "p": []}
+        client = gr.GitHub(SECRET, self.listing(runs))
+        client.remaining = gr.OVERFLOW_RATE_FLOOR - 1
+        original = client.call
+
+        def keep_low(*a, **k):  # the fake answers carry no rate header, so the budget stays low
+            return original(*a, **k)
+
+        client.call = keep_low
+        jobs, complete = client.active_jobs(REPO, {}, now=NOW)
+        self.assertFalse(complete)
+        self.assertEqual(jobs, [])
+
+    def test_rate_header_is_recorded(self):
+        class Headed(FakeResponse):
+            headers = {"X-RateLimit-Remaining": "42"}
+
+        client = gr.GitHub(SECRET, lambda request, timeout=None: Headed(200, {}))
+        client.ok("GET", "/rate_limit")
+        self.assertEqual(client.remaining, 42)
 
     def test_overflow_section_is_validated(self):
         doc = state()

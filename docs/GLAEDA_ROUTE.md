@@ -135,9 +135,10 @@ live counts instead of the queue janitor's 10 to 30 minute old snapshot:
 
 - `running` and `queued` count the jobs of the repository's queued and in-progress runs, per the
   first `blacksmith-*` label each job asks for.
-- A run's jobs are listed again only when the run's `updated_at` moves (cache in
-  `~/.local/state/glaeda/route/overflow-jobs.json`), and at most 60 new runs a tick; past that
-  `complete` is false.
+- A run's jobs are listed again when the run's `updated_at` moves or its listing is 150 s old
+  (cache in `~/.local/state/glaeda/route/overflow-jobs.json`), at most 10 runs a tick, oldest
+  first, and not while the credential has under 1,500 requests left, so the rescue watch keeps
+  its budget. Anything skipped keeps its last listing and sets `complete` to false.
 - A failed listing leaves the section out; the owned pools still publish. Readers without the
   section keep their own source.
 - On by default for `agent`; `state` and `publish` take `--overflow-load`.
