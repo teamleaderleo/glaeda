@@ -45,9 +45,15 @@ class Plan(unittest.TestCase):
     def test_draining_node_comes_back(self) -> None:
         self.assertEqual(me.plan(me.State(True, enrollment("draining"), True), None, False, False), ["eligible", "status"])
 
-    def test_reaccept_forces_a_build(self) -> None:
-        steps = me.plan(me.State(True, enrollment("eligible"), True), None, True, False)
+    def test_reaccept_on_an_enrolling_node_runs_acceptance(self) -> None:
+        steps = me.plan(me.State(True, enrollment("enrolling"), True), None, True, False)
         self.assertEqual(steps, ["accept-local", "eligible", "status"])
+
+    def test_reacceptance_of_an_eligible_or_draining_node_stops_with_the_transition(self) -> None:
+        # cmux_fleet.py refuses accept-local unless the node is enrolling.
+        for state, reaccept, current in (("eligible", True, True), ("draining", False, False)):
+            with self.subTest(state=state), self.assertRaisesRegex(me.Stop, "--to enrolling"):
+                me.plan(me.State(True, enrollment(state), current), None, reaccept, False)
 
     def test_rebuild_does_not_force_acceptance(self) -> None:
         steps = me.plan(me.State(True, enrollment("eligible"), True), None, False, True)
@@ -71,9 +77,35 @@ class CandidatePlan(unittest.TestCase):
         steps = me.plan(me.State(False, None, False), "cmux-mac-001", False, False, candidate=True)
         self.assertEqual(steps, ["stage", "bootstrap", "enroll", "accept-local", "eligible", "status"])
 
-    def test_a_staged_generation_is_reinspected_not_restaged(self) -> None:
+    def test_a_staged_generation_is_not_restaged(self) -> None:
         steps = me.plan(me.State(True, enrollment("eligible"), True), None, False, False, candidate=True)
-        self.assertEqual(steps, ["inspect", "status"])
+        self.assertEqual(steps, ["status"])
+
+    def test_a_new_candidate_on_an_eligible_node_stops_before_staging_work(self) -> None:
+        with self.assertRaisesRegex(me.Stop, "fresh acceptance"):
+            me.plan(me.State(False, enrollment("eligible"), False), None, False, False, candidate=True)
+
+    def test_staged_code_is_inspected_before_it_runs(self) -> None:
+        order = []
+        with mock.patch.object(me, "DARWIN_REQUIRED", False), \
+             mock.patch.object(me, "pick_python", return_value="/py"), \
+             mock.patch.object(me, "read_json", return_value=None), \
+             mock.patch.object(me.Path, "is_file", return_value=True), \
+             mock.patch.object(me.Path, "exists", return_value=False), \
+             mock.patch.object(me.Runner, "inspect", side_effect=lambda *a: order.append("inspect")), \
+             mock.patch.object(me.Runner, "acceptance_current", side_effect=lambda *a: order.append("run") or False), \
+             mock.patch("builtins.print"):
+            me.main(["--cmux-root", "/c", "--node-id", "n", "--candidate", "/a", "--sha256", "s",
+                     "--source", "36e07e36ea7b9bc9e04c366547a5312dd348024d"])
+        self.assertEqual(order, ["inspect", "run"])
+
+    def test_an_unreadable_enrollment_is_not_replaced(self) -> None:
+        with mock.patch.object(me, "DARWIN_REQUIRED", False), \
+             mock.patch.object(me, "pick_python", return_value="/py"), \
+             mock.patch.object(me, "read_json", return_value=None), \
+             mock.patch.object(me.Path, "exists", return_value=True), \
+             mock.patch("builtins.print"):
+            self.assertEqual(me.main(["--cmux-root", "/c", "--node-id", "n"]), 2)
 
     def test_candidate_steps_run_the_generation_tools_and_binary(self) -> None:
         generation = Path("/Users/op/Projects/glaeda-generations/36e07e36ea7b")

@@ -10,7 +10,9 @@ eligible, status. With --candidate, the archive is verified and staged by this
 checkout's fleet_bundle.py (docs/FLEET_DISTRIBUTION.md) into a new generation
 directory, and every fleet step runs that generation's own binary and tools, so the
 node runs exactly the reviewed candidate and no Rust is built. Without --candidate,
-it builds glaeda from this checkout instead, for development hosts. Each step is skipped when its result already holds, so re-running after a
+it builds glaeda from this checkout instead, for development hosts. The staging
+verifier is this checkout's: a later change to fleet_bundle.py's file inventory
+needs a matching new candidate. Each step is skipped when its result already holds, so re-running after a
 failure or a reboot resumes where it stopped, and re-running on an eligible node
 changes nothing. --reaccept forces a fresh accept-local (a cold cmux build, about
 13 minutes on an M4 Pro).
@@ -137,7 +139,9 @@ def plan(state: State, node_id: str | None, reaccept: bool, rebuild: bool, candi
     """The steps still needed, in order. Pure, so it is tested without a Mac."""
     steps = []
     if candidate:
-        steps.append("inspect" if state.binary else "stage")
+        # A staged generation is re-inspected before anything runs, outside the plan.
+        if not state.binary:
+            steps.append("stage")
     elif rebuild or not state.binary:
         steps.append("install-glaeda")
     enrollment_state = (state.enrollment or {}).get("state")
@@ -155,6 +159,14 @@ def plan(state: State, node_id: str | None, reaccept: bool, rebuild: bool, candi
     elif enrollment_state == "retired":
         raise Stop("node is retired; remove the enrollment to enroll this machine again")
     if reaccept or state.enrollment is None or not state.acceptance_current:
+        # cmux_fleet.py accepts only an enrolling node; re-acceptance of an
+        # eligible or draining one goes through quarantine, which advances the
+        # enrollment generation. That is an operator decision, not a side effect.
+        if enrollment_state in {"eligible", "draining"}:
+            raise Stop(f"node is {enrollment_state} but needs a fresh acceptance (new candidate, changed toolchain "
+                       "or --reaccept), and accept-local runs only on an enrolling node. Move it there, then re-run:\n"
+                       "  cmux_fleet.py transition-apply ENROLLMENT --to quarantined --reason stale_glaeda_generation\n"
+                       "  cmux_fleet.py transition-apply ENROLLMENT --to enrolling")
         steps.append("accept-local")
     if enrollment_state != "eligible" or "accept-local" in steps:
         steps.append("eligible")
@@ -301,7 +313,6 @@ def read_json_text(text: str | None) -> dict[str, Any] | None:
 
 DESCRIPTIONS = {
     "stage": "verify and stage the reviewed candidate bundle as a new generation (no Rust build)",
-    "inspect": "re-verify the staged candidate generation",
     "install-glaeda": "build and install the glaeda binary (keeps one rollback copy)",
     "bootstrap": "read-only bootstrap of this mini against the cmux checkout",
     "enroll": "create the enrollment record (state: enrolling)",
@@ -345,10 +356,17 @@ def main(argv: list[str] | None = None) -> int:
     generation = paths.generation(args.source) if args.source else None
     runner = Runner(python, paths, cmux_root, generation)
     enrollment = read_json(paths.enrollment)
+    if enrollment is None and paths.enrollment.exists():
+        print(f"glaeda-mini-enroll: {paths.enrollment} exists but cannot be read; inspect it rather than "
+              "letting a new enrollment replace it", file=sys.stderr)
+        return 2
     staged = generation is not None and (generation / "stage-receipt.json").is_file()
     state = State(binary=staged if generation else paths.glaeda_bin.is_file(), enrollment=enrollment,
                   acceptance_current=False)
     try:
+        if staged:
+            # Verify the saved bytes before running any of the generation's code.
+            runner.inspect(args.sha256, args.source)
         if generation is None or staged:
             state.acceptance_current = runner.acceptance_current(enrollment)
         steps = plan(state, args.node_id, args.reaccept, args.rebuild, candidate=generation is not None)
@@ -365,8 +383,6 @@ def main(argv: list[str] | None = None) -> int:
                 runner.install_glaeda()
             elif step == "stage":
                 runner.stage(args.candidate.expanduser().resolve(), args.sha256, args.source)
-            elif step == "inspect":
-                runner.inspect(args.sha256, args.source)
             elif step == "bootstrap":
                 bootstrap_path = runner.bootstrap()
             elif step == "enroll":
