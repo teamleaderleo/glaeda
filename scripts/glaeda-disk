@@ -37,9 +37,13 @@ its items count from 1 MiB.
 
 The temp dir also counts top-level files (leaked extracted libraries, logs), and a scratch
 checkout there is reclaimable when deleting it loses nothing
-git holds: clean, no stash, every local commit on a remote (submodules too) and no other
-worktrees (a linked worktree: unlocked, HEAD on a branch, tag or remote ref of its
-repository, which survives). Ignored files go with it: in a temp-dir checkout they are
+git holds: clean, no stash, no other worktrees, and every commit it points at (refs, HEAD,
+reflogs) on a remote-tracking ref or confirmed by a remote server (`fetch --negotiate-only`:
+no objects move, no refs change; unreachable means keep). Every submodule repository it would
+take along, in its git dir or embedded in its tree, must pass the same test; pinned submodule
+commits fetched by id are what the server confirms. A linked worktree must be unlocked, with
+HEAD on a branch, tag or remote ref of its repository, which survives, and no commit only its
+own reflog holds. Ignored files go with it: in a temp-dir checkout they are
 build output or copies. Nested or unverifiable checkouts stay protected.
 """
 
@@ -353,18 +357,14 @@ def git_loss(path: Path) -> str:
         return "not a readable checkout"
     # submodule repositories live in this checkout's git dir (a linked worktree's own one),
     # so they are deleted with it
-    if (loss := module_loss(Path(own.strip()) / "modules")):
+    if (loss := submodule_loss(path, Path(own.strip()))):
         return loss
     if dotgit.is_dir():
         wts = git("worktree", "list", "--porcelain")
         if wts is None or sum(ln.startswith("worktree ") for ln in wts.splitlines()) != 1:
             return "other worktrees use this repository"
-        stash = git("stash", "list")
-        if stash is None or stash.strip():
-            return "stash entries"
-        local = git("rev-list", "-n1", "HEAD", "--branches", "--tags", "--not", "--remotes")
-        if local is None or local.strip():
-            return "commits not on any remote"
+        if (loss := repo_loss(dotgit)):
+            return loss
     else:  # linked worktree: branches and stash live in the repository, which stays
         common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
         if common is None or os.path.realpath(common.strip()).startswith(os.path.realpath(path) + "/"):
@@ -376,66 +376,168 @@ def git_loss(path: Path) -> str:
                    "refs/heads", "refs/tags", "refs/remotes")
         if refs is None or not refs.strip():
             return "HEAD on no ref"
+        # so does its HEAD reflog: a commit made here and then checked away from lives only there
+        tips = local_tips(Path(own.strip()), worktree_only=True)
+        if tips is None:
+            return "unreadable worktree reflog"
+        left = git("rev-list", "-n1", *tips, "--not", "--branches", "--tags", "--remotes") \
+            if tips else ""
+        if left is None or left.strip():
+            return "commits only this worktree's reflog holds"
     return ""
 
 
-# reflog subjects that move a ref to a commit without creating one
-FETCHED_ONLY = re.compile(r"(checkout: |clone: |reset: moving to |branch: Created from |"
-                          r"pull: Fast-forward|merge [^:]*: Fast-forward|update by push|fetch)")
+def _git_dir_run(gitdir: Path, *args: str, timeout: int = 60,
+                 network: bool = False) -> str | None:
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"}
+    if network and "GIT_SSH_COMMAND" not in env:
+        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=10"
+    try:
+        r = subprocess.run(["git", "--git-dir", str(gitdir), *args], capture_output=True,
+                           text=True, timeout=timeout, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
 
 
-def module_loss(modules: Path, budget: int = 200) -> str:
-    """"" when every submodule repository under `modules` (nested ones too) has no stash and
-    no commit made here that its remotes lack, else what deleting them would lose.
+ZERO = re.compile(r"0{40}(0{24})?$")
 
-    `submodule update` fetches the pinned commit by id, so no remote-tracking ref contains it.
-    Such commits are fine; one the module's reflog shows being created here (commit, merge,
-    rebase, ...) is not. A module with commits outside its remotes and no reflog is kept."""
-    if not modules.exists():
+
+# refs a linked worktree keeps for itself; they are deleted with it
+WORKTREE_REFS = ("refs/bisect", "refs/worktree", "refs/rewritten")
+
+
+def local_tips(gitdir: Path, worktree_only: bool = False) -> list[str] | None:
+    """Every commit this repository points at on its own: HEAD, all refs but remote-tracking
+    ones, and every reflog entry (a commit left behind by `submodule update` lives only there).
+    With worktree_only, only what a linked worktree's git dir holds for itself: HEAD, its
+    per-worktree refs and its reflogs. None when they cannot all be read."""
+    refs = _git_dir_run(gitdir, "for-each-ref",
+                        "--format=%(refname)%09%(objectname)%09%(*objectname)",
+                        *(WORKTREE_REFS if worktree_only else ()))
+    head = _git_dir_run(gitdir, "rev-parse", "--verify", "-q", "HEAD")
+    if refs is None or head is None:
+        return None
+    tips = {head.strip()}
+    for line in refs.splitlines():
+        name, obj, peeled = (line.split("\t") + ["", ""])[:3]
+        if not name.startswith("refs/remotes/"):
+            tips.add(peeled or obj)
+    logs = gitdir / "logs"
+    if logs.is_dir():
+        for f in logs.rglob("*"):
+            if f.is_file() and not f.relative_to(logs).parts[:2] == ("refs", "remotes"):
+                try:
+                    lines = f.read_text(errors="replace").splitlines()
+                except OSError:
+                    return None
+                tips.update(ln.split(" ", 2)[1] for ln in lines if ln.count(" ") >= 2)
+    return sorted(t for t in tips if t and not ZERO.match(t))
+
+
+def remote_has(gitdir: Path, commits: list[str]) -> bool:
+    """True when some remote of this repository confirms it holds every one of `commits`.
+
+    `fetch --negotiate-only` asks the server which of these it has in common and transfers no
+    objects and writes no refs. An unreachable server, a refusal or a partial answer is False.
+    """
+    remotes = _git_dir_run(gitdir, "remote")
+    if not remotes:
+        return False
+    missing = set(commits)
+    for remote in remotes.split():
+        acked = _git_dir_run(gitdir, "-c", "protocol.version=2", "fetch", "--negotiate-only",
+                             *[f"--negotiation-tip={c}" for c in sorted(missing)], remote,
+                             network=True)
+        if acked is not None:
+            missing -= set(acked.split())
+        if not missing:
+            return True
+    return False
+
+
+def repo_loss(gitdir: Path) -> str:
+    """"" when deleting this (submodule) repository loses nothing: no stash, no worktrees of
+    its own, and every local commit on a remote-tracking ref or confirmed by a remote."""
+    if (gitdir / "worktrees").is_dir() and any((gitdir / "worktrees").iterdir()):
+        return "has worktrees of its own"
+    stash = _git_dir_run(gitdir, "for-each-ref", "--count=1", "refs/stash")
+    if stash is None or stash.strip():
+        return "stash entries"
+    tips = local_tips(gitdir)
+    if tips is None:
+        return "unreadable refs"
+    if not tips:
         return ""
-    if modules.is_symlink() or not modules.is_dir():
-        return "unreadable submodule store"
-    frontier = [modules]
+    try:
+        r = subprocess.run(["git", "--git-dir", str(gitdir), "rev-list", "--max-count=5001",
+                            "--stdin", "--not", "--remotes"], input="\n".join(tips) + "\n",
+                           capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    except (OSError, subprocess.TimeoutExpired):
+        return "unreadable history"
+    if r.returncode != 0 or len(r.stdout.split()) > 5000:
+        return "unreadable history"
+    outside = set(r.stdout.split())
+    unconfirmed = [t for t in tips if t in outside]  # every outside commit is below one of these
+    if not unconfirmed:
+        return ""
+    if len(unconfirmed) > 64 or not remote_has(gitdir, unconfirmed):
+        return "commits no remote confirms"
+    return ""
+
+
+def submodule_loss(worktree: Path, gitdir: Path, seen: set[str] | None = None,
+                   depth: int = 0) -> str:
+    """"" when every submodule repository this checkout would take with it loses nothing.
+
+    Those are the repositories stored under its git dir (`modules/`, nested ones included) and
+    any embedded in its tree (a submodule whose `.git` is a directory), recursively.
+    """
+    seen = set() if seen is None else seen
+    if depth > 8 or len(seen) > 200:
+        return "submodules nested too deep to check"
+    repos: list[tuple[str, Path]] = []
+    frontier = [gitdir / "modules"] if (gitdir / "modules").exists() else []
     while frontier:
         d = frontier.pop()
+        if d.is_symlink() or not d.is_dir():
+            return "unreadable submodule store"
         for c in _children(d):
-            budget -= 1
-            if budget < 0:
-                return "too many submodules to check"
             if c.is_symlink() or not c.is_dir():
                 continue
-            if not ((c / "HEAD").is_file() and (c / "objects").is_dir()):
+            if (c / "HEAD").is_file() and (c / "objects").is_dir():
+                repos.append((os.path.relpath(c, gitdir / "modules"), c))
+                if (c / "modules").exists():
+                    frontier.append(c / "modules")
+            else:
                 frontier.append(c)  # a path component of a nested submodule name
-                continue
-
-            def git(*args: str) -> str | None:
-                try:
-                    r = subprocess.run(["git", "--git-dir", str(c), *args], capture_output=True,
-                                       text=True, timeout=60,
-                                       env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
-                except (OSError, subprocess.TimeoutExpired):
-                    return None
-                return r.stdout if r.returncode == 0 else None
-
-            name = os.path.relpath(c, modules)
-            if git("for-each-ref", "--count=1", "refs/stash") != "":
-                return f"submodule {name}: stash entries"
-            local = git("rev-list", "--max-count=5001", "HEAD", "--branches", "--tags",
-                        "--not", "--remotes")
-            if local is None or len(local.split()) > 5000:
-                return f"submodule {name}: commits not on any remote"
-            if local.strip():
-                made = git("log", "-g", "--all", "--format=%H%x09%gs") if (
-                    c / "logs/HEAD").is_file() else None
-                if made is None:
-                    return f"submodule {name}: commits not on any remote"
-                outside = set(local.split())
-                for line in made.splitlines():
-                    sha, _, subject = line.partition("\t")
-                    if sha in outside and not FETCHED_ONLY.match(subject):
-                        return f"submodule {name}: commits made here and not on any remote"
-            if (c / "modules").exists():
-                frontier.append(c / "modules")
+    links = subprocess.run(["git", "-C", str(worktree), "ls-files", "-s"], capture_output=True,
+                           text=True, timeout=60, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    if links.returncode != 0:
+        return "unreadable index"
+    subs = [worktree / ln.split("\t", 1)[1] for ln in links.stdout.splitlines()
+            if ln.startswith("160000 ")]
+    for sub in subs:
+        dotgit = sub / ".git"
+        if dotgit.is_dir() and not dotgit.is_symlink():
+            repos.append((os.path.relpath(sub, worktree), dotgit))
+    for name, repo in repos:
+        key = os.path.realpath(repo)
+        if key in seen:
+            continue
+        seen.add(key)
+        if (loss := repo_loss(repo)):
+            return f"submodule {name}: {loss}"
+    for sub in subs:  # submodules of submodules, wherever their repositories live
+        if not os.path.lexists(sub / ".git"):
+            continue  # not initialized: nothing of it is here
+        own = subprocess.run(["git", "-C", str(sub), "rev-parse", "--path-format=absolute",
+                              "--git-dir"], capture_output=True, text=True, timeout=60)
+        if own.returncode != 0:
+            return f"submodule {os.path.relpath(sub, worktree)}: not readable"
+        if (loss := submodule_loss(sub, Path(own.stdout.strip()), seen, depth + 1)):
+            return loss
     return ""
 
 
@@ -626,7 +728,8 @@ def free_bytes(path: Path) -> tuple[int, int]:
 
 def space(spec: str, total: int) -> int:
     """A threshold as bytes: "60" is 60 GiB, "15%" is 15% of this filesystem's size, and
-    "15%:40-150" is that share held between 40 and 150 GiB."""
+    "15%:40-150" is that share held between 40 and 150 GiB. LO never lifts it past twice the
+    share, so a small disk (a 30 GiB VM) is not left permanently under pressure."""
     spec = str(spec).strip()
     share, _, bounds = spec.partition(":")
     if not share.endswith("%"):
@@ -641,7 +744,7 @@ def space(spec: str, total: int) -> int:
         lo_b, hi_b = int(float(lo) * GIB), int(float(hi) * GIB)
         if lo_b > hi_b:
             raise ValueError(f"bounds are LOW-HIGH GiB: {spec!r}")
-        n = min(max(n, lo_b), hi_b)
+        n = min(max(n, min(lo_b, 2 * n)), hi_b)
     return n
 
 

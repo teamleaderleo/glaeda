@@ -8,6 +8,7 @@ import importlib.util
 import contextlib
 import io
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -193,6 +194,9 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.space("15%:40-150", 238 * gib), 40 * gib)
         self.assertEqual(gd.space("15%:40-150", 931 * gib), int(931 * gib * 0.15))
         self.assertEqual(gd.space("15%:40-150", 7450 * gib), 150 * gib)
+        # a 30 GiB VM: the 40 GiB floor stops at twice the share instead of exceeding the disk
+        self.assertEqual(gd.space("15%:40-150", 30 * gib), int(30 * gib * 0.15) * 2)
+        self.assertLess(gd.space("25%:80-300", 30 * gib), 30 * gib)
         for bad in ("60:1-2", "15%:9", "15%:50-40", "15%:a-b"):
             with self.assertRaises(ValueError):
                 gd.space(bad, 1000)
@@ -338,7 +342,7 @@ class GlaedaDiskTest(unittest.TestCase):
                              "stashed": "git-checkout", "nested": "git-checkout",
                              "detached": "git-checkout", "young": "git-checkout"})
         why = {Path(i.path).name: i.reasons for i in items}
-        self.assertEqual(why["unpushed"], ["commits not on any remote"])
+        self.assertEqual(why["unpushed"], ["commits no remote confirms"])
         self.assertEqual(why["detached"], ["HEAD on no ref"])
         # without the opt-in every checkout stays protected
         plain = gd.replace(self.fam, git_disposable=False)
@@ -386,7 +390,7 @@ class GlaedaDiskTest(unittest.TestCase):
         why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
         self.assertEqual(why, {
             "main": ("git-checkout", ["other worktrees use this repository"]),
-            "super": ("git-checkout", ["submodule sm: commits made here and not on any remote"]),
+            "super": ("git-checkout", ["submodule sm: commits no remote confirms"]),
             "skipped": ("git-checkout", ["files hidden from status"]),
             "bisect": ("git-checkout", ["HEAD on no ref"]),
             "locked": ("git-checkout", ["locked worktree"])})
@@ -449,8 +453,80 @@ class GlaedaDiskTest(unittest.TestCase):
             "wt-pushed": ("reclaimable", []),
             "dirty": ("git-checkout", ["uncommitted or untracked changes"]),
             "stashed": ("git-checkout", ["submodule sm: stash entries"]),
-            "wt-local": ("git-checkout",
-                         ["submodule sm: commits made here and not on any remote"])})
+            "wt-local": ("git-checkout", ["submodule sm: commits no remote confirms"])})
+
+    def test_submodule_work_the_remote_lacks_is_kept(self) -> None:
+        """The #1149 review repros: local submodule commits with no telltale reflog entry."""
+        root, origin = self._tmp_repos()
+        sub = self.root / "subsrc"
+        self._git("clone", "-q", str(origin), str(sub))
+        file_ok = ("-c", "protocol.file.allow=always")
+
+        def superproject(name: str) -> Path:
+            d = root / name
+            self._git("clone", "-q", str(origin), str(d))
+            self._git("-C", str(d), *file_ok, "submodule", "add", "-q", str(sub), "sm")
+            self._git("-C", str(d), "commit", "-qm", "sm")
+            self._git("-C", str(d), "push", "-q", "origin", f"HEAD:refs/heads/{name}")
+            self._git("-C", str(d), "fetch", "-q")
+            return d
+
+        def commit(repo: Path, msg: str) -> str:
+            self._git("-C", str(repo), "commit", "-q", "--allow-empty", "-m", msg)
+            return self._git("-C", str(repo), "rev-parse", "HEAD").strip()
+
+        d = superproject("orphaned")  # detached commit, then `submodule update` moves away
+        commit(d / "sm", "local")
+        self._git("-C", str(d), *file_ok, "submodule", "update", "-q")
+        d = superproject("commit-tree")  # no commit-shaped reflog entry, only "branch: Created"
+        c = self._git("-C", str(d / "sm"), "commit-tree", "HEAD^{tree}", "-p", "HEAD",
+                      "-m", "ct").strip()
+        self._git("-C", str(d / "sm"), "branch", "keep", c)
+        d = superproject("expired")  # reflog expired
+        self._git("-C", str(d / "sm"), "checkout", "-q", "-b", "feat")
+        commit(d / "sm", "local")
+        self._git("-C", str(d / "sm"), "checkout", "-q", "--detach", "HEAD~1")
+        self._git("-C", str(d / "sm"), "reflog", "expire", "--expire=now", "--all")
+        d = superproject("embedded")  # the submodule's .git is a directory in the tree
+        self._git("-C", str(d), "submodule", "deinit", "-q", "-f", "sm")
+        gitdir = self._git("-C", str(d), "rev-parse", "--path-format=absolute", "--git-dir")
+        shutil.rmtree(Path(gitdir.strip()) / "modules/sm")
+        shutil.rmtree(d / "sm")
+        self._git("clone", "-q", str(sub), str(d / "sm"))
+        self._git("-C", str(d / "sm"), "checkout", "-q", "-b", "feat")
+        commit(d / "sm", "local")
+        self._git("-C", str(d / "sm"), "checkout", "-q", "--detach", "origin/HEAD")
+        d = superproject("sub-worktree")  # the submodule backs a worktree elsewhere
+        self._git("-C", str(d / "sm"), "worktree", "add", "-q", "--detach",
+                  str(self.root / "sub-wt"))
+        d = superproject("local-fetch")  # commits fetched from another scratch repo
+        other = self.root / "other"
+        self._git("clone", "-q", str(sub), str(other))
+        commit(other, "other")
+        self._git("-C", str(d / "sm"), "fetch", "-q", str(other), "HEAD:refs/heads/fromother")
+        for c in root.iterdir():
+            self._age(c)
+        why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
+        confirm = ["submodule sm: commits no remote confirms"]
+        self.assertEqual(why, {
+            "orphaned": ("git-checkout", confirm),
+            "commit-tree": ("git-checkout", confirm),
+            "expired": ("git-checkout", confirm),
+            "embedded": ("git-checkout", confirm),
+            "sub-worktree": ("git-checkout", ["submodule sm: has worktrees of its own"]),
+            "local-fetch": ("git-checkout", confirm)})
+
+    def test_worktree_reflog_only_commit_is_kept(self) -> None:
+        root, origin = self._tmp_repos()
+        wt = root / "wt"
+        self._git("-C", str(origin), "worktree", "add", "-q", "-b", "wt", str(wt))
+        self._git("-C", str(wt), "checkout", "-q", "--detach")
+        self._git("-C", str(wt), "commit", "-q", "--allow-empty", "-m", "made here")
+        self._git("-C", str(wt), "checkout", "-q", "wt")
+        self._age(wt)
+        item = gd.survey([self.fam], 24, 0)[0]
+        self.assertEqual((item.verdict, item.reasons),
+                         ("git-checkout", ["commits only this worktree's reflog holds"]))
 
     def test_apply_rechecks_a_checkout_that_gained_work(self) -> None:
         root, origin = self._tmp_repos()
