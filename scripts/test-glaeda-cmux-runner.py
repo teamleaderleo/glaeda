@@ -633,6 +633,29 @@ class RunnerTest(unittest.TestCase):
         self.assertTrue(next(a for a in removed["actions"] if a["kind"] == "deregister")["applied"])
         self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
 
+    def test_interrupted_registration_uninstall_uses_the_runners_own_name_and_scope(self) -> None:
+        with mock.patch.object(cr, "run_with_token", side_effect=lambda argv, token, cwd, timeout=900: (
+                subprocess.run(argv, env={**os.environ, "ACTIONS_RUNNER_INPUT_TOKEN": token}, cwd=cwd,
+                               capture_output=True, check=False), (124, "timed out"))[1]):
+            self.invoke("--apply", "--repo", "teamleaderleo/cmux", "--name", "custom-glaeda", expect=1)
+        removed = self.invoke("--uninstall", "--apply")
+        self.assertTrue(next(a for a in removed["actions"] if a["kind"] == "deregister")["applied"])
+        tokens = [e["argv"] for e in self.log() if e["tool"] == "gh" and "-X" in e["argv"]]
+        self.assertIn("repos/teamleaderleo/cmux/actions/runners/remove-token", tokens[-1])
+        self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
+
+    def test_timeout_kills_the_whole_process_group(self) -> None:
+        marker = self.home / "grandchild-survived"
+        script = make_executable(self.home / "slow-config.sh",
+                                 "#!/bin/bash\n(sleep 3; touch " + os.fspath(marker) + ") &\nsleep 30\n")
+        start = time.monotonic()
+        code, out = cr.run_with_token([os.fspath(script)], REG_TOKEN, self.home, timeout=1)
+        self.assertEqual(code, 124)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertNotIn(REG_TOKEN, out)
+        time.sleep(4)
+        self.assertFalse(marker.exists())
+
     def test_config_remove_failure_falls_back_to_api_delete(self) -> None:
         self.invoke("--apply")
         (self.state / "fail-config-remove").touch()

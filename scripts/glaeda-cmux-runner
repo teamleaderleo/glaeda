@@ -41,6 +41,7 @@ The receipt lands in ~/.local/state/glaeda/cmux-runner/receipt.json.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import json
@@ -52,6 +53,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -130,12 +132,21 @@ def run_with_token(argv: list[str], token: str, cwd: Path, timeout: int = 900) -
     env = dict(os.environ)
     env["ACTIONS_RUNNER_INPUT_TOKEN"] = token
     try:
-        result = subprocess.run(
+        # Own process group: config.sh runs Runner.Listener as a child, which would otherwise outlive
+        # a timeout, keep the token in its environment, and register behind our back.
+        proc = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=timeout, env=env, cwd=cwd, check=False,
+            text=True, env=env, cwd=cwd, start_new_session=True,
         )
-        code, out = result.returncode, result.stdout
-    except (OSError, subprocess.TimeoutExpired) as error:
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+            code = proc.returncode
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+            code, out = 124, f"config.sh timed out after {timeout} seconds; its process group was killed"
+    except OSError as error:
         code, out = 127, str(error)
     finally:
         env.pop("ACTIONS_RUNNER_INPUT_TOKEN", None)
@@ -855,6 +866,14 @@ def main(argv: list[str] | None = None) -> int:
             ctx.name = reg["name"]
         if reg.get("scope"):
             ctx.org, ctx.repo = (reg["scope"], None) if reg.get("org") else (None, reg["scope"])
+        elif not reg and owned_dir(ctx, prior):
+            # an interrupted --apply registered without recording it: .runner says where
+            local = local_runner(ctx) or {}
+            scope = re.fullmatch(r"https://github\.com/([A-Za-z0-9-]+)(?:/([A-Za-z0-9._-]+))?/?",
+                                 str(local.get("gitHubUrl") or ""))
+            if local.get("agentName") and scope:
+                ctx.name = str(local["agentName"])
+                ctx.org, ctx.repo = (None, f"{scope[1]}/{scope[2]}") if scope[2] else (scope[1], None)
     pre = preflight(ctx)
     doc: dict[str, Any] = {
         "schema": SCHEMA,
