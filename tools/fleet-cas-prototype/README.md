@@ -63,4 +63,5 @@ presence (`kv_put_dangling` only counts entries that name absent objects);
 there is no size budget or eviction; and a node that cannot reach the fleet
 store answers reads as misses and fails writes (counted in `up_errors`), then
 skips the store for 30 s (`up_skipped`), so an outage costs about a cold build
-and nothing is published half-way.
+and nothing is published half-way. Reads and writes share that backoff, so one
+failed upload also pauses fleet reads for 30 s.

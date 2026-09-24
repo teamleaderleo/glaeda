@@ -29,7 +29,8 @@ for v in WORK ${DD:+DD}; do
 done
 if [ -n "${DD:-}" ]; then
   case ${DD%/} in
-    "" | "$HOME" | "$HOME/Library/Developer/Xcode/DerivedData") echo "refusing DD=$DD" >&2; exit 2 ;;
+    "" | "$HOME" | "$HOME/Library/Developer/Xcode/DerivedData" | "${WORK%/}" | "${PKG%/}")
+      echo "refusing DD=$DD" >&2; exit 2 ;;
   esac
   dd=$DD
   cas="$WORK/localcas"

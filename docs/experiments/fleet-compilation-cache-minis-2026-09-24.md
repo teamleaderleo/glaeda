@@ -1,10 +1,14 @@
 # Fleet-shared Xcode compilation cache: mini to mini
 
 Status: **holds on the full app.** Two Manaflow build minis, Xcode 26.3, the full `cmux` scheme:
-a fresh reader whose only warm source is a fleet store on another mini builds in **132 s**
-against **756 s** cold (5.7x), with 4,191 of 4,191 cacheable tasks hitting and every compiler
-output byte-identical to the writer's. Getting there took two cache-key fixes that apply to any
-machine sharing entries: a fixed DerivedData path and a fixed local CAS path. Follow-up to
+a fresh build whose only warm source is a fleet store on the other mini, across the LAN, takes
+**132 s** against **756 s** cold (5.7x), with 4,191 of 4,191 cacheable tasks hitting and every
+compiler output byte-identical to the build that filled the store. Getting there took two
+cache-key fixes that apply to any machine sharing entries: a fixed DerivedData path and a fixed
+local CAS path. One limit: for the full app, the filling build and the reading build ran on the
+same mini (the other one was busy), so full-app portability *between* machines rests on the
+chain, where writer and reader were different minis. A cross-machine full-app read is the
+first measurement of the next step. Follow-up to
 [the 2026-09-23 Air Blue measurement](fleet-compilation-cache-2026-09-23.md); design and plan
 in #1134.
 
@@ -31,9 +35,12 @@ in #1134.
   - reader: a new, empty node daemon per run with `--read-only-kv`, whose only warm source is
     the fleet store ([`reader-runs.sh`](../../tools/fleet-cas-prototype/scripts/reader-runs.sh)).
     A last run keeps the node's store, to separate network cost from everything else.
-- A Chromium fleet job occupied cmux7s from about 10:52 UTC onward (load 20 to 60), so for the full app cmux8s
-  wrote, the store was copied to cmux7s and served from there, and cmux8s read. The serving
-  side was loaded, which makes the reader numbers pessimistic, not flattering.
+- Which mini did what: chain with per-run CAS paths, cmux7s wrote (store on cmux7s) and
+  cmux8s read; chain with the fixed CAS path, cmux8s wrote to a store on cmux7s and cmux8s read.
+  A Chromium fleet job occupied cmux7s from about 10:52 UTC onward (load 20 to 60), so for the
+  full app cmux8s wrote, the store was copied to cmux7s and served from there, and cmux8s read
+  with an emptied DerivedData, local CAS and node store. The serving side was loaded, which makes
+  the reader numbers pessimistic, not flattering.
 
 ## Results
 
@@ -82,8 +89,8 @@ per fresh machine.
 
 ### Correctness
 
-- **Byte-identical outputs.** Chain: all 669 `.o`, `.swiftmodule`, `.swiftdoc` and ABI files
-  identical between writer and reader. Full app: 7,631 of 7,633 `.o`, `.swiftmodule`, `.pcm`,
+- **Byte-identical outputs.** Chain, writer cmux7s and reader cmux8s: all 669 `.o`,
+  `.swiftmodule`, `.swiftdoc` and ABI files identical. Full app (same mini, see Setup): 7,631 of 7,633 `.o`, `.swiftmodule`, `.pcm`,
   `.a` and debug-dylib files identical; the two that differ are the Go-built WireGuard
   library (`libwg-go.a`), which a script phase builds and Xcode never caches. With fixed paths
   even the linked per-product objects match (they differed on Air Blue, where paths were mapped).
@@ -91,8 +98,10 @@ per fresh machine.
   as a miss; no mismatches occurred.
 - **Read-only reader.** Every reader-side index write was refused (15 on the chain with the old
   CAS path, 2,657 on the full app), and nothing reached the fleet store.
-- **Publication order.** `kv_put_dangling` stayed 0 on every fill: with write-through, no
-  index entry reached the fleet store before the objects it names.
+- **Publication order.** The fleet store's own `kv_put_dangling` counter was 0 after a full-app
+  fill (7,705 entries): with write-through, no index entry reached the fleet store before the
+  objects it names. (The writer node's counter was 0 on every fill too, but that only shows
+  the objects were local.)
 
 ## Findings
 
@@ -102,8 +111,8 @@ per fresh machine.
    different cache keys. Every Swift compile in the target carries that key as
    `-bridging-header-pch-key`, so the whole `cmux` target (2,657 tasks) missed, and not
    reproducibly: two reader runs shared no miss keys with each other or with the fill. The only
-   difference in the target's arguments was the CAS path. With the same absolute CAS path on
-   both minis (emptied per run), the app target hit completely, and the chain's 15 leftover
+   difference in the target's arguments was the CAS path. With one fixed absolute CAS path
+   (emptied per run), the app target hit completely, and the chain's 15 leftover
    misses disappeared too. Rule: every machine and job that shares cache entries uses the same
    `COMPILATION_CACHE_CAS_PATH`. Package-only measurements hide this, since packages have no
    bridging header. Posted on manaflow-ai/cmux#13514.
