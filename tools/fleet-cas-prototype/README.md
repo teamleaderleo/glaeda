@@ -60,6 +60,27 @@ the entry's whole object closure in one streamed call (`GetClosure` in
 A TCP store accepts writes only from `--writers IP,IP` (the peer address of each request);
 with no list it is read-only. Fleet deployment: `scripts/glaeda-fleet-cas-rollout` and
 `docs/CMUX_BUILD_SLOT_MODES.md`.
+
+Signed index entries (#1134 M3, `src/sign.rs`):
+
+- `fleet-cas keygen PATH` creates the writer's Ed25519 key (a 0600 file, never
+  overwritten) and prints its public key; `fleet-cas pubkey PATH` prints it again.
+- The writer's node runs with `--sign-key PATH` and signs every index entry Xcode
+  writes before storing or forwarding it. The signature is one reserved entry
+  (`glaeda.fleet-cas.sig.v1`) inside Xcode's value map, so the protocol is unchanged;
+  nodes strip it before answering Xcode.
+- `--trusted-keys HEX,HEX` on a store or node: only entries signed by those keys are
+  accepted on a put or served on a get (local or fetched). Anything else is refused or
+  a miss (`kv_sig_fail`). Readers check signatures themselves, so a tampered or
+  impersonated store cannot poison them. Objects stay unsigned: their IDs are
+  recomputed from content.
+- `fleet-cas marker put|get` writes or checks a signed per-commit marker.
+  `scripts/fleet-cas-writer-build.sh REPO COMMIT -- BUILD...` runs the writer's build
+  and publishes the marker only if the build used the node with no write error
+  (`write_failed`), no failed or skipped fleet-store call and no node restart
+  (`instance`);
+  `scripts/fleet-cas-marker.sh REPO COMMIT` tells a worker whether the store holds a
+  commit for its Xcode build.
 Build under `$HOME` (never `/tmp`, see swiftlang/swift#92545). On Xcode 26.3,
 pass `DD=<fixed path>` (the same on every machine) instead of mapping
 DerivedData; see the 2026-09-24 experiment. On a cmux build fleet mini,
@@ -69,10 +90,11 @@ during a measurement.
 Known prototype gaps: the node daemon must run on the same host as the build
 (the client sends large blobs as local file paths, and the node reads whatever
 path it is given, so run it only for your own user; the TCP fleet store
-refuses file-path uploads); the TCP fleet store authenticates nothing but the
-peer address (`--writers`), which anyone on the LAN can spoof for a
-connection, so bind it only to a trusted interface and treat signed writes
-(#1134 M3) as the real gate; a KV entry is not checked for its objects'
+refuses file-path uploads); object uploads are gated only by the peer address
+(`--writers`), which anyone on the LAN can spoof for a connection, so a spoofer
+can fill the disk but not poison a build once readers use `--trusted-keys`; the
+signing key is a file readable by the build user, so any process on the writer
+host can sign; a KV entry is not checked for its objects'
 presence (`kv_put_dangling` only counts entries that name absent objects);
 there is no size budget or eviction; and a node that cannot reach the fleet
 store answers reads as misses and fails writes (counted in `up_errors`), then

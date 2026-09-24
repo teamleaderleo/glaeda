@@ -1,11 +1,15 @@
 #!/bin/bash
 # glaeda-fleet-cas-rollout: deploy the fleet compilation cache from an operator Mac.
 #
-#   glaeda-fleet-cas-rollout --store HOST [--writers IP,IP] NODE_HOST...            plan
-#   glaeda-fleet-cas-rollout --store HOST [--writers IP,IP] NODE_HOST... --apply    deploy
+#   glaeda-fleet-cas-rollout --store HOST [--trusted-keys HEX] [--writer HOST --sign-key PATH]
+#                            NODE_HOST... [--apply]
 #
-# HOST names are ssh aliases (User cmux). The store listens on the store host's LAN address
-# (en0) port 7450; every NODE_HOST gets a read-only node daemon pointed at it. Each host
+# Plans by default; --apply deploys. HOST names are ssh aliases (User cmux). The store
+# listens on the store host's LAN address (en0) port 7450; every NODE_HOST gets a read-only
+# node daemon pointed at it. With --trusted-keys, the store keeps and every node uses only
+# index entries signed by those keys. --writer makes that host the signing writer: its node
+# signs with the key at --sign-key (a path on the writer, created there beforehand with
+# `fleet-cas keygen`), and its LAN address becomes the store's only allowed writer. Each host
 # receives scripts/glaeda-fleet-cas and tools/fleet-cas-prototype under
 # ~/.cache/glaeda-fleet-cas (also when planning) and runs `glaeda-fleet-cas` there
 # (docs/CMUX_BUILD_SLOT_MODES.md).
@@ -13,19 +17,29 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 PORT=7450
-store= writers= apply= nodes=()
+store= apply= trusted= writer= sign_key= nodes=()
 while [ $# -gt 0 ]; do
   case $1 in
     --store) store=${2:?}; shift ;;
-    --writers) writers=${2:?}; shift ;;
+    --trusted-keys) trusted=${2:?}; shift ;;
+    --writer) writer=${2:?}; shift ;;
+    --sign-key) sign_key=${2:?}; shift ;;
     --apply) apply=--apply ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *) nodes+=("$1") ;;
   esac
   shift
 done
-[ -n "$store" ] || { sed -n '2,5p' "$0" >&2; exit 2; }
-for h in "$store" ${nodes[@]+"${nodes[@]}"}; do
+[ -n "$store" ] || { sed -n '2,6p' "$0" >&2; exit 2; }
+if [ -n "$writer" ]; then
+  [ -n "$sign_key" ] && [ -n "$trusted" ] || { echo "--writer needs --sign-key PATH and --trusted-keys HEX" >&2; exit 2; }
+elif [ -n "$sign_key" ]; then
+  echo "--sign-key needs --writer HOST" >&2; exit 2
+fi
+# The rollout is stateless: whatever it is given replaces the deployed configuration.
+[ -n "$trusted" ] || echo "warning: no --trusted-keys: the store keeps, and nodes use, unsigned index entries" >&2
+[ -n "$writer" ] || echo "warning: no --writer: the store will accept no writes" >&2
+for h in "$store" ${writer:+"$writer"} ${nodes[@]+"${nodes[@]}"}; do
   target=$(ssh -G "$h" | awk '/^hostname /{print $2}')
   case "$h $target" in *lawrence*) echo "refusing $h ($target): cmux-lawrence is the fleet coordinator" >&2; exit 2 ;; esac
 done
@@ -39,12 +53,21 @@ run() {  # host, args...
   local h=$1; shift
   echo "== $h"
   ship "$h"
-  ssh -o BatchMode=yes "$h" "PATH=\$HOME/.cargo/bin:\$PATH ~/.cache/glaeda-fleet-cas/glaeda/scripts/glaeda-fleet-cas $*"
+  # Quote each argument for the remote shell.
+  ssh -o BatchMode=yes "$h" "PATH=\$HOME/.cargo/bin:\$PATH ~/.cache/glaeda-fleet-cas/glaeda/scripts/glaeda-fleet-cas $(printf '%q ' "$@")"
 }
 
-ip=$(ssh -o BatchMode=yes "$store" 'ipconfig getifaddr en0')
-[ -n "$ip" ] || { echo "no en0 address on $store" >&2; exit 1; }
-run "$store" store --listen "$ip:$PORT" ${writers:+--writers "$writers"} $apply
+lan_ip() {
+  local ip; ip=$(ssh -o BatchMode=yes "$1" 'ipconfig getifaddr en0')
+  [ -n "$ip" ] || { echo "no en0 address on $1" >&2; exit 1; }
+  echo "$ip"
+}
+ip=$(lan_ip "$store")
+writer_ip=
+[ -z "$writer" ] || writer_ip=$(lan_ip "$writer")
+run "$store" store --listen "$ip:$PORT" ${writer_ip:+--writers "$writer_ip"} ${trusted:+--trusted-keys "$trusted"} $apply
+[ -z "$writer" ] || run "$writer" writer --store "$ip:$PORT" --sign-key "$sign_key" --trusted-keys "$trusted" $apply
 for n in ${nodes[@]+"${nodes[@]}"}; do
-  run "$n" node --store "$ip:$PORT" $apply
+  [ "$n" = "$writer" ] && continue
+  run "$n" node --store "$ip:$PORT" ${trusted:+--trusted-keys "$trusted"} $apply
 done

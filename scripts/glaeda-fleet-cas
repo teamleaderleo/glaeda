@@ -1,10 +1,10 @@
 #!/bin/bash
 # glaeda-fleet-cas: install the fleet compilation-cache services on this cmux mini.
 #
-#   glaeda-fleet-cas node --store HOST:PORT            plan the node daemon
-#   glaeda-fleet-cas node --store HOST:PORT --apply    install and start it
-#   glaeda-fleet-cas store --listen IP:PORT [--writers IP,IP] [--apply]
-#   glaeda-fleet-cas uninstall [--apply]               remove both, keep the stores
+#   glaeda-fleet-cas node --store HOST:PORT [--trusted-keys HEX] [--apply]
+#   glaeda-fleet-cas writer --store HOST:PORT --sign-key PATH --trusted-keys HEX [--apply]
+#   glaeda-fleet-cas store --listen IP:PORT [--writers IP,IP] [--trusted-keys HEX] [--apply]
+#   glaeda-fleet-cas uninstall [--apply]               remove both agents, keep the stores
 #
 # Run from a glaeda checkout on the mini (scripts/glaeda-fleet-cas-rollout does that from
 # an operator Mac). Planning changes nothing on this host; --apply is idempotent and restarts
@@ -13,14 +13,22 @@
 # com.teamleaderleo.glaeda.fleet-cas-{node,store}, which need the user's GUI session
 # (the fleet minis log in automatically). No sudo.
 #
-# node:  Xcode talks to /Users/Shared/cmux-build-fleet/xcode/fleet-cas.sock. The node is
-#        read-only (--read-only-kv) until the trusted writer exists (#1134 M3). Builds add
-#        the plugin settings only from `xcode/bin/fleet-cas-settings.sh <socket>`.
-# store: the fleet store on the LAN. Only --writers addresses may write; none by default,
-#        so a new store is read-only. A writer host must not run untrusted jobs: the
-#        allowlist trusts every process on it until signed writes (#1134 M3) exist. The
-#        listen address should be a DHCP reservation, or the store stops binding after a
-#        lease change.
+# node:   Xcode talks to /Users/Shared/cmux-build-fleet/xcode/fleet-cas.sock. The node is
+#         read-only (--read-only-kv). With --trusted-keys it uses only index entries signed
+#         by the writer. Builds add the plugin settings only from
+#         `xcode/bin/fleet-cas-settings.sh <socket>`; `xcode/bin/fleet-cas-marker.sh` says
+#         whether the store holds a commit.
+# writer: the node daemon on the one trusted writer host (#1134 M3): it signs every index
+#         entry with --sign-key (a 0600 key file made by `fleet-cas keygen`, which stays on
+#         this host) and writes through to the store. Its main builds run under
+#         `xcode/bin/fleet-cas-writer-build.sh`, which publishes the per-commit marker. The
+#         writer host must run no PR or other untrusted job: any process there can use the key.
+# store:  the fleet store on the LAN. Only --writers addresses may write, and with
+#         --trusted-keys only signed index entries are kept; no writers by default, so a new
+#         store is read-only. The listen address should be a DHCP reservation, or the store
+#         stops binding after a lease change.
+# The node and writer roles write xcode/fleet-cas.env (store address, trusted keys, signing
+# key path) for the scripts above.
 # Design: docs/CMUX_BUILD_SLOT_MODES.md. Prototype: tools/fleet-cas-prototype.
 set -euo pipefail
 
@@ -35,13 +43,15 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 proto=$here/tools/fleet-cas-prototype
 
 role=${1:-}; shift || true
-apply= store= listen= writers=
+apply= store= listen= writers= trusted= sign_key=
 while [ $# -gt 0 ]; do
   case $1 in
     --apply) apply=1 ;;
     --store) store=${2:?--store HOST:PORT}; shift ;;
     --listen) listen=${2:?--listen IP:PORT}; shift ;;
     --writers) writers=${2:?--writers IP,IP}; shift ;;
+    --trusted-keys) trusted=${2:?--trusted-keys HEX,HEX}; shift ;;
+    --sign-key) sign_key=${2:?--sign-key PATH}; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -131,38 +141,69 @@ install_binaries() {
     fi
     mkdir -p "$BIN"
     local f src
-    for f in fleet-cas fleet-cas-settings.sh; do
+    for f in fleet-cas fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-writer-build.sh; do
       src=$proto/target/release/$f; [ "$f" = fleet-cas ] || src=$proto/scripts/$f
       if ! cmp -s "$src" "$BIN/$f"; then
         install -m 0755 "$src" "$BIN/$f.new" && mv "$BIN/$f.new" "$BIN/$f"
       fi
     done
   fi
-  say "install $BIN/fleet-cas and $BIN/fleet-cas-settings.sh"
+  say "install $BIN/fleet-cas and its scripts"
+}
+
+write_env() {  # store HOST:PORT, signing key path or empty
+  say "write $ROOT/fleet-cas.env: store $1, trusted keys ${trusted:-none}${2:+, signing key $2}"
+  [ -n "$apply" ] || return 0
+  printf 'FLEET_CAS_STORE=%s\nFLEET_CAS_TRUSTED_KEYS=%s\nFLEET_CAS_SIGN_KEY=%s\n' "$1" "$trusted" "$2" \
+    >"$ROOT/fleet-cas.env.tmp" && mv "$ROOT/fleet-cas.env.tmp" "$ROOT/fleet-cas.env"
+}
+
+check_key_args() {  # hex keys only: they end up in a plist and an env file
+  case $trusted in *[!0-9a-f,]*) echo "--trusted-keys takes hex public keys (fleet-cas pubkey)" >&2; exit 2 ;; esac
 }
 
 case $role in
-  node)
-    [ -n "$store" ] || { echo "node needs --store HOST:PORT" >&2; exit 2; }
+  node | writer)
+    [ -n "$store" ] || { echo "$role needs --store HOST:PORT" >&2; exit 2; }
+    check_key_args
+    node_args=(--read-only-kv)
+    if [ "$role" = writer ]; then
+      [ -n "$sign_key" ] && [ -n "$trusted" ] || { echo "writer needs --sign-key PATH and --trusted-keys HEX" >&2; exit 2; }
+      case $sign_key in /*) ;; *) echo "--sign-key must be an absolute path" >&2; exit 2 ;; esac
+      # The key is Leo's to create (fleet-cas keygen); never made here.
+      [ -f "$sign_key" ] || { echo "no signing key at $sign_key; create it with: fleet-cas keygen $sign_key" >&2; exit 2; }
+      [ "$(stat -f %Lp "$sign_key")" = 600 ] || { echo "$sign_key must be mode 600" >&2; exit 2; }
+      [ "$(stat -f %u "$sign_key")" = "$(id -u)" ] || { echo "$sign_key is not owned by $(id -un)" >&2; exit 2; }
+      node_args=(--sign-key "$sign_key")
+    elif [ -n "$sign_key" ]; then
+      echo "--sign-key is for the writer role" >&2; exit 2
+    fi
     install_binaries
+    if [ -n "$apply" ] && [ "$role" = writer ]; then
+      pub=$("$BIN/fleet-cas" pubkey "$sign_key")
+      case ,$trusted, in *,"$pub",*) ;; *) echo "the key at $sign_key ($pub) is not in --trusted-keys" >&2; exit 2 ;; esac
+    fi
     do_ mkdir -p "$NODE_STORE"
-    write_plist node "$SOCK" "$NODE_STORE" --read-only-kv --upstream "http://$store"
+    write_env "$store" "$sign_key"
+    write_plist node "$SOCK" "$NODE_STORE" "${node_args[@]}" --upstream "http://$store" ${trusted:+--trusted-keys "$trusted"}
     if [ -n "$apply" ]; then
       for _ in 1 2 3 4 5 6 7 8 9 10; do "$BIN/fleet-cas-settings.sh" "$SOCK" >/dev/null 2>&1 && break; sleep 0.5; done
       "$BIN/fleet-cas-settings.sh" "$SOCK" >/dev/null 2>&1 || health_failed node
-      echo "ok node answering on $SOCK (upstream $store)"
+      echo "ok $role answering on $SOCK (upstream $store)"
     fi
     ;;
   store)
     [ -n "$listen" ] || { echo "store needs --listen IP:PORT (a LAN address, never 0.0.0.0)" >&2; exit 2; }
     case $listen in 0.0.0.0:* | \[::\]:*) echo "refusing a wildcard listen address" >&2; exit 2 ;; esac
+    check_key_args
+    [ -z "$sign_key" ] || { echo "--sign-key is for the writer role" >&2; exit 2; }
     install_binaries
     do_ mkdir -p "$FLEET_STORE"
-    write_plist store "tcp:$listen" "$FLEET_STORE" --writers "$writers"
+    write_plist store "tcp:$listen" "$FLEET_STORE" --writers "$writers" ${trusted:+--trusted-keys "$trusted"}
     if [ -n "$apply" ]; then
       for _ in 1 2 3 4 5 6 7 8 9 10; do nc -z -G 1 "${listen%:*}" "${listen##*:}" 2>/dev/null && break; sleep 0.5; done
       nc -z -G 2 "${listen%:*}" "${listen##*:}" 2>/dev/null || health_failed store
-      echo "ok store listening on $listen (writers: ${writers:-none})"
+      echo "ok store listening on $listen (writers: ${writers:-none}, signed entries only: ${trusted:+yes}${trusted:-no})"
     fi
     ;;
   uninstall)
@@ -171,6 +212,7 @@ case $role in
       say "stop and remove $label (stores kept)"
       [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true; rm -f "$AGENTS/$label.plist"; }
     done
+    do_ rm -f "$ROOT/fleet-cas.env"
     ;;
-  *) sed -n '2,8p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,7p' "$0" >&2; exit 2 ;;
 esac

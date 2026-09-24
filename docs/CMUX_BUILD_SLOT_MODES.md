@@ -11,15 +11,16 @@ Xcode's compilation cache and incremental builds do not mix for the cmux app tar
 | Build (full `cmux` app, M4 Pro) | Caching on | Caching off |
 | --- | ---: | ---: |
 | fresh DerivedData, fleet store warm | 90 to 130 s | 710 s (cold) |
-| one-line app-target edit, warm DerivedData | 451 s (whole target recompiles) | 125 to 156 s (646 compile steps) |
+| one-line app-target edit, warm DerivedData | 451 s (whole target recompiles) | 125 to 156 s (323 files recompiled) |
 | no-op, warm DerivedData | | 13 to 14 s |
 | flip caching on / off in the same DerivedData | 606 s (full rebuild) | 755 s (full rebuild) |
 
 The caching-off column and the flip row are from cmux8s at the fleet pin, Xcode 26.6
 (17F113); the caching-on column is from the minis on Xcode 26.3, with a different edit, so the
 two edit cells are not a strict pair. The edit was a new
-file-scope declaration in one app file (`WorkspaceTodoState.swift`), which recompiled 646
-dependent compile steps; its revert took 125 s. An edit inside a function body likely
+file-scope declaration (`private let`) in one app file (`WorkspaceTodoState.swift`), which
+recompiled 323 of the app target's 2,655 Swift files (Xcode 26.6 logs each compile twice, 646
+lines); its revert took 125 s. An edit inside a function body likely
 recompiles less (the Air Blue campaign saw 40 to 48 s on Xcode 27) and has not been measured
 on the pin. The fresh-build row assumes the fleet store already holds that commit. With caching on, every
 compile job's key covers the whole module, so any edit misses every job in the app target.
@@ -71,8 +72,8 @@ Catch-up DerivedData lifecycle, since one directory serves every slot on the hos
   451 s whole-target rebuild, and it is not where anyone iterates);
 - the job copies its products out before releasing the host lock, because the next catch-up
   build on the host empties the directory;
-- the local CAS is kept between builds (the 102 s result depends on a filled one). It is
-  Xcode's own on-disk CAS, which the node daemon does not manage, so its size budget comes
+- the local CAS is kept between builds (the 102 s result depends on a filled one), except on
+  the writer, whose builds start from an empty one (Writer, below). It is Xcode's own on-disk CAS, which the node daemon does not manage, so its size budget comes
   from a separate pruner; the daemon's `node-store` gets its own eviction (both not built yet).
 
 Contract. The host check (`glaeda-mini-fleet check`) can verify:
@@ -94,8 +95,52 @@ The worker recipe must enforce, since a host check cannot see a job's settings:
   build against a 26.3 store compiled everything, consistent with the compiler being in the
   key (the key inputs were not inspected). A per-build segment is planned only for eviction.
 
-Writer: CI's main build is the trusted writer, filling the store for every main commit it
-builds (planned; the prototype has no signed writes yet, see #1134 M3). Nothing else writes.
+## Writer
+
+CI's main build is the only writer (#1134 M3; tested in
+[signed writes](experiments/fleet-compilation-cache-signed-writes-2026-09-24.md)):
+
+- It runs on one dedicated writer mini whose node daemon holds the signing key and signs
+  every index entry (`glaeda-fleet-cas writer`). The store keeps, and every node uses, only
+  entries signed by a trusted key (`--trusted-keys`); objects need no signature.
+- The main build runs under `xcode/bin/fleet-cas-writer-build.sh cmux <sha> -- <build>`. It
+  publishes the signed marker `cmux/<sha>/<Xcode build>` only after a successful build that
+  used the node, with no write error, no failed or skipped fleet-store call and no node
+  restart, and with the node still up afterwards; otherwise it exits 4 and later main builds
+  fill the rest. It empties the local CAS (`xcode/cas`) first, so every lookup reaches the node (an entry answered from the
+  local CAS would never be uploaded again; whether Xcode does that is unverified).
+- The writer mini runs no PR or other untrusted job. Any process running as the build user
+  there can read the key, so a PR job on that host could sign a poisoned entry. It leaves the
+  PR pools (a reservation or a manifest role without `ci-runner`) before its key exists.
+
+Key custody (proposed): a 0600 file on the writer mini at
+`/Users/cmux/.config/glaeda/fleet-cas-writer.key`, created there by Leo:
+
+```sh
+ssh <writer> 'mkdir -m 700 -p ~/.config/glaeda &&
+  /Users/Shared/cmux-build-fleet/xcode/bin/fleet-cas keygen ~/.config/glaeda/fleet-cas-writer.key'
+```
+
+The command prints the public key, which is all the rollout needs (`--trusted-keys`). This
+design never copies the private key anywhere: not into a repository, a log or a job's
+environment. Anything running as the build user on the writer could still read it and send
+it elsewhere, which is why that host runs main builds only.
+The alternatives were considered and not proposed:
+
+- A GitHub environment secret for a main-only job restricts which workflow gets the key, but
+  the signer is the long-running node daemon, not the job, so a job would have to write the
+  secret to disk on the mini anyway, as the same user every other job on that host runs as.
+- The login keychain adds an unlock step for a LaunchAgent and no protection from same-user
+  processes.
+
+The step that would add real isolation is running the writer's node as its own user, so the
+build user cannot read the key; it matters only if the writer host ever runs anything but main
+builds. Rotation starts the store over: create the new key, empty the fleet store and the
+writer's node store, and roll out with only the new key trusted. Nodes treat entries signed
+by the old key as misses and replace them with verified fetches, and the store refills from
+the next main builds. A gradual rotation with both keys trusted would leave old-key entries
+behind new-key markers, and those markers would claim commits the store stops serving once
+the old key is dropped.
 
 ## Deployment
 
@@ -110,8 +155,9 @@ which builds the prototype and installs user LaunchAgents:
 - `com.teamleaderleo.glaeda.fleet-cas-node` on every build host: the node daemon on the socket
   above, read-only (`--read-only-kv`) until then, and `xcode/bin/fleet-cas-settings.sh`.
 
-A writer host must not run untrusted jobs: the allowlist trusts every process on an allowed
-address until signed writes (M3) exist. The store listens on a DHCP address, so the store host
+`--writer HOST --sign-key PATH --trusted-keys HEX` makes that host the writer (above) and
+its LAN address the store's only allowed writer; `--trusted-keys` alone makes every node and
+the store use only signed entries. The store listens on a DHCP address, so the store host
 needs a DHCP reservation. The agents need the build user's GUI session; the fleet minis log in
 automatically. `glaeda-fleet-cas uninstall
 --apply` removes both agents and keeps the stores. Deployed on cmux7s (store and node) and
@@ -121,8 +167,9 @@ cmux8s (node) on 2026-09-24.
 
 Catch-up is only fast when the store already holds the target commit; on a store miss it
 is a cold build (756 s on Xcode 26.3 minis; a full caching-on rebuild took 606 s on 26.6), slower than an incremental caching-off rebuild. So the
-worker asks first: the writer records a marker per commit it has filled (planned), and
-catch-up is chosen only when the marker for the target commit exists. The rows below are read
+worker asks first: the writer records a marker per commit it has filled, and catch-up is
+chosen only when `xcode/bin/fleet-cas-marker.sh cmux <sha>` exits 0 (the signed marker for
+that commit and this host's Xcode build exists). The rows below are read
 top to bottom, first match wins, and the writer is exempt: CI's main build always runs catch-up
 with write-through, since filling the store is its job. A PR commit counts as held when its
 merge base with main has a marker (its own changes are few, and they miss either way).
@@ -141,7 +188,7 @@ started once the catch-up product is delivered. It takes the host lock like any 
 `flock` does not preempt, so a foreground job must be able to cancel it: the warmer registers
 its xcodebuild process, the foreground job stops it and requeues the warm (planned). An
 build stopped during planning left DerivedData usable: on the pin, a build stopped after 25 s
-was followed by an ordinary incremental one (143 s, the same 646 steps as the uncancelled
+was followed by an ordinary incremental one (143 s, the same 323 files as the uncancelled
 edit). That stop landed during planning; a stop in the middle of compiling is still
 unmeasured. Because every slot shares the
 host lock, an iteration edit can also wait behind another slot's foreground build, about 100 s
@@ -177,5 +224,6 @@ DerivedData is therefore warmed by its own caching-off builds:
    the largest item and has no lever yet. How far below the 77 to 86 s warm-node floor this
    gets has to be measured.
 3. Worker and recipe change in cmuxterm-hq build-fleet: move catch-up builds from per-job
-   `job-volumes` DerivedData to the fixed path, add the iteration directories, the writer's
-   per-commit marker, and warmer cancellation.
+   `job-volumes` DerivedData to the fixed path, add the iteration directories, run the main
+   build under `fleet-cas-writer-build.sh` on the writer mini, check `fleet-cas-marker.sh`
+   before catch-up, and add warmer cancellation.
