@@ -40,7 +40,7 @@ scripts/glaeda-mini-setup --runner            # plan, no side effects
 scripts/glaeda-mini-setup --runner --apply    # install, register, start
 ```
 
-Useful flags: `--name NAME` (default `<short hostname>-glaeda`), `--labels a,b`
+Useful flags: `--name NAME` (default `<short hostname>-glaeda`), `--labels a,b` or `--manifest M --member NAME` (section 2c)
 (extra labels), `--org ORG [--group GROUP]` instead of the default
 `--repo manaflow-ai/cmux`, `--runner-dir DIR` (default `~/actions-runner-glaeda`),
 `--runner-version V --runner-sha256 HEX` to pin, `--replace` to take over an existing
@@ -105,6 +105,47 @@ gh api -X POST repos/manaflow-ai/cmux/actions/runners/remove-token --jq .token \
 
 If that removal fails there is no API fallback on the mini; delete it by id from
 the operator's machine with `gh api -X DELETE repos/manaflow-ai/cmux/actions/runners/ID`.
+
+## 2c. Labels come from the fleet manifest
+
+For a fleet member, pass the manifest instead of `--labels` (the two are exclusive):
+
+```bash
+glaeda-cmux-runner --apply --token-stdin --manifest ~/glaeda-runner/mini-fleet.json --member cmux10s-mac-mini
+```
+
+The manifest is cmuxterm-hq `build-fleet/mini-fleet.json`; see that repository's
+`build-fleet/FLEET-MEMBERSHIP.md`. The member's entry decides everything, and the
+runner is named `<member>-glaeda` unless `--name` says otherwise:
+
+| Manifest field | Label |
+| --- | --- |
+| always | `glaeda-mini` |
+| `class`: `xl`, `std` or `light` | `glaeda-class-<class>` |
+| `availability`: `dedicated` or `opportunistic` | `glaeda-<availability>` |
+| each `defaults.xcode.apps` entry (with host `overrides`) that is really installed | `xcode-<version>` |
+| the same, only for `dedicated` members | `glaeda-<class>-xcode-<version>` |
+
+"Really installed" means the path is a real directory, not a symlink, and
+`xcodebuild -version` under it prints exactly that `Build version`. The combined
+`glaeda-<class>-xcode-<version>` label (for example `glaeda-std-xcode-26.6`) is the
+one a pool picker routes a whole run to. Opportunistic members never carry it, so
+they never receive a required job.
+
+The installer refuses a member whose roles lack `ci-runner`, and refuses class `dev`
+(takes no jobs) and `borrowed` (jobs only inside a VM, not through this tool).
+
+GitHub fixes labels at registration, and changing them through the API needs an
+admin token that a mini does not hold. So when the manifest's labels differ from
+what the receipt registered, `--apply --token-stdin` re-registers the same runner
+in place. It stops the LaunchAgent, clears the local registration files, runs
+`config.sh --replace` under the same name, and starts the agent again. `_work` and
+its hot state stay. It refuses while a job is running. If `config.sh` fails midway,
+the runner stays stopped with the old registration still listed. Re-running with
+a fresh token re-registers the same name with `--replace`; when `gh` is on the mini,
+it refuses first if that name now belongs to a different runner id. A re-run that
+passes neither `--labels` nor `--manifest` keeps the labels and name it registered
+and never relabels.
 
 ## 3. Verify
 

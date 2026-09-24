@@ -126,10 +126,20 @@ if token != os.environ["FAKE_REG_TOKEN"]:
     print("bad token " + str(token)); sys.exit(1)
 name = argv[argv.index("--name") + 1]
 labels = ["self-hosted", "macOS", "ARM64"] + argv[argv.index("--labels") + 1].split(",")
-json.dump({"agentId": 4242, "agentName": name, "gitHubUrl": argv[argv.index("--url") + 1]},
-          open(os.path.join(here, ".runner"), "w"))
 doc = runners()
-doc["runners"].append({"id": 4242, "name": name, "status": "online", "busy": False,
+if "--replace" in argv:
+    doc["runners"] = [r for r in doc["runners"] if r["name"] != name]
+elif any(r["name"] == name for r in doc["runners"]):
+    print("A runner exists with the same name"); sys.exit(1)
+count_path = os.path.join(state, "registrations")
+count = int(open(count_path).read()) if os.path.exists(count_path) else 0
+open(count_path, "w").write(str(count + 1))
+rid = 4242 + count
+json.dump({"agentId": rid, "agentName": name, "gitHubUrl": argv[argv.index("--url") + 1]},
+          open(os.path.join(here, ".runner"), "w"))
+for extra in (".credentials", ".credentials_rsaparams"):
+    open(os.path.join(here, extra), "w").write("{}")
+doc["runners"].append({"id": rid, "name": name, "status": "online", "busy": False,
                        "labels": [{"name": l} for l in labels]})
 save(doc)
 print("registered with token " + token)  # a leaky runner must still not leak it through us
@@ -656,6 +666,94 @@ class RunnerTest(unittest.TestCase):
         time.sleep(4)
         self.assertFalse(marker.exists())
 
+    def manifest(self) -> str:
+        path = self.state / "mini-fleet.json"
+        path.write_text(json.dumps(MANIFEST))
+        return os.fspath(path)
+
+    def config_argvs(self) -> list[list[str]]:
+        return [e["argv"] for e in self.log() if e["tool"] == "config.sh" and e["argv"][:1] != ["remove"]]
+
+    def test_manifest_install_derives_labels_and_name(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+        argv = self.config_argvs()[0]
+        self.assertEqual(argv[argv.index("--name") + 1], "mini-std-glaeda")
+        self.assertEqual(argv[argv.index("--labels") + 1], "glaeda-mini,glaeda-class-std,glaeda-dedicated,xcode-26.6,glaeda-std-xcode-26.6")
+        self.assertEqual(receipt["member"]["class"], "std")
+        self.assertEqual(self.by_kind(receipt)["verify"]["state"], "ok")
+        # a plain re-run keeps the registered labels and never asks for a relabel
+        again = self.invoke("--apply")
+        self.assertEqual(self.by_kind(again)["register"]["state"], "unchanged")
+        self.assertEqual(len(self.config_argvs()), 1)
+
+    def test_manifest_refusals_and_exclusive_flags(self) -> None:
+        for args in (("--manifest", self.manifest(), "--member", "laptop"),
+                     ("--manifest", self.manifest(), "--member", "mini-std", "--labels", "x"),
+                     ("--manifest", self.manifest()), ("--member", "mini-std")):
+            with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(cr.main(["--gh", os.fspath(self.gh), *args]), 2)
+        self.assertEqual(self.tree(), {})
+
+    def test_relabel_reregisters_in_place_and_keeps_work(self) -> None:
+        self.invoke("--apply", "--labels", "ram48")  # the pre-manifest fleet install
+        runner = self.home / "actions-runner-glaeda"
+        (runner / "_work").mkdir(exist_ok=True)
+        (runner / "_work" / "hot").write_text("derived data")
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            plan = self.invoke("--manifest", self.manifest(), "--member", "mini-std", "--name", "mini-test-glaeda")
+            self.assertEqual(self.by_kind(plan)["register"]["state"], "relabel")
+            self.assertEqual(self.by_kind(plan)["register"]["previousLabels"],
+                             ["self-hosted", "macOS", "ARM64", "glaeda-mini", "ram48"])
+            receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                  "--name", "mini-test-glaeda")
+        reg = self.by_kind(receipt)["register"]
+        self.assertEqual(reg["state"], "updated", reg)
+        argv = self.config_argvs()[-1]
+        self.assertIn("--replace", argv)
+        self.assertEqual(argv[argv.index("--labels") + 1], "glaeda-mini,glaeda-class-std,glaeda-dedicated,xcode-26.6,glaeda-std-xcode-26.6")
+        runners = json.loads((self.state / "runners.json").read_text())["runners"]
+        self.assertEqual([(r["name"], r["id"]) for r in runners], [("mini-test-glaeda", 4243)])
+        self.assertEqual((runner / "_work" / "hot").read_text(), "derived data")
+        saved = json.loads((self.home / ".local/state/glaeda/cmux-runner/receipt.json").read_text())
+        self.assertEqual(saved["registration"]["runnerId"], 4243)
+        self.assertIn("glaeda-class-std", saved["registration"]["labels"])
+        self.assertEqual(self.by_kind(receipt)["verify"]["state"], "ok")
+
+    def test_relabel_without_a_token_blocks_and_changes_nothing(self) -> None:
+        self.invoke("--apply", "--labels", "ram48")
+        before = self.tree()
+        real_which = cr.which
+        with mock.patch.object(cr, "which", lambda name, extra=(): None if name == "gh" else real_which(name, extra)), \
+                mock.patch.object(cr, "xcode_present", return_value=False):
+            blocked = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                  "--name", "mini-test-glaeda", gh=False, expect=1)
+        self.assertIn("--token-stdin", self.by_kind(blocked)["register"]["note"])
+        after = self.tree()
+        for tree in (before, after):
+            tree.pop(".local/state/glaeda/cmux-runner/receipt.json", None)
+        self.assertEqual(before, after)
+
+    def test_interrupted_relabel_reregisters_its_own_name(self) -> None:
+        self.invoke("--apply", "--labels", "ram48")
+        (self.state / "fail-register").touch()
+        real = cr.register
+
+        def failing(ctx, act):  # config.sh fails after the local registration was cleared
+            act["state"], act["note"] = "failed", "config.sh failed: network"
+        with mock.patch.object(cr, "register", failing), mock.patch.object(cr, "xcode_present", return_value=False):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                        "--name", "mini-test-glaeda", expect=1)
+        runner = self.home / "actions-runner-glaeda"
+        self.assertFalse((runner / ".runner").exists())
+        with mock.patch.object(cr, "register", real), mock.patch.object(cr, "xcode_present", return_value=False):
+            receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                  "--name", "mini-test-glaeda")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        self.assertIn("--replace", self.config_argvs()[-1])
+        runners = json.loads((self.state / "runners.json").read_text())["runners"]
+        self.assertEqual(len(runners), 1)
+
     def test_config_remove_failure_falls_back_to_api_delete(self) -> None:
         self.invoke("--apply")
         (self.state / "fail-config-remove").touch()
@@ -732,6 +830,58 @@ class RunnerTest(unittest.TestCase):
                 self.assertNotIn("rm -rf", err.getvalue())
         self.assertEqual(self.tree(), {})
         self.assertEqual(self.log(), [])
+
+
+MANIFEST = {
+    "defaults": {"xcode": {"apps": [{"path": "/Applications/Xcode_26.6.app", "version": "26.6", "build": "17F113"}]}},
+    "hosts": {
+        "mini-std": {"class": "std", "availability": "dedicated", "roles": ["dev-builds", "ci-runner"]},
+        "mini-light": {"class": "light", "availability": "opportunistic", "roles": ["ci-runner"], "owner": "x"},
+        "mini-no-role": {"class": "std", "availability": "dedicated", "roles": ["dev-builds"]},
+        "laptop": {"class": "dev", "availability": "opportunistic", "roles": ["ci-runner"]},
+        "borrowed": {"class": "borrowed", "availability": "opportunistic", "roles": ["ci-runner"]},
+        "old-shape": {"class": "m4pro-48", "roles": ["ci-runner"]},
+        "bad-avail": {"class": "std", "availability": "sometimes", "roles": ["ci-runner"]},
+        "override": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"],
+                     "overrides": {"xcode": {"apps": [{"path": "/Applications/Xcode.app", "version": "26.3",
+                                                       "build": "17C529"}]}}},
+    },
+}
+
+
+class ManifestLabelsTest(unittest.TestCase):
+    def test_member_labels_table(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            std, _ = cr.member_labels(MANIFEST, "mini-std")
+            self.assertEqual(std["labels"], ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated", "xcode-26.6",
+                                             "glaeda-std-xcode-26.6"])
+            light, _ = cr.member_labels(MANIFEST, "mini-light")
+            self.assertEqual(light["labels"], ["glaeda-mini", "glaeda-class-light", "glaeda-opportunistic", "xcode-26.6"])
+            self.assertEqual(cr.member_labels(MANIFEST, "override")[0]["labels"][-2:],
+                             ["xcode-26.3", "glaeda-std-xcode-26.3"])
+        with mock.patch.object(cr, "xcode_present", return_value=False):
+            self.assertEqual(cr.member_labels(MANIFEST, "mini-std")[0]["labels"],
+                             ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated"])
+        for name, why in (("mini-no-role", "ci-runner"), ("laptop", "never runs"), ("borrowed", "never runs"),
+                          ("old-shape", "m4pro-48"), ("bad-avail", "availability"), ("absent", "not a member")):
+            with self.subTest(name):
+                member, reason = cr.member_labels(MANIFEST, name)
+                self.assertIsNone(member)
+                self.assertIn(why, reason)
+
+    def test_xcode_present_needs_the_exact_build(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "Xcode_26.6.app"
+            app.mkdir()
+            for out, want in (("Xcode 26.6\nBuild version 17F113", True), ("Xcode 26.6\nBuild version 17F1134", False),
+                              ("Xcode 26.6\nBuild version 17F11", False)):
+                with self.subTest(out=out), mock.patch.object(cr, "run", return_value=(0, out)):
+                    got = cr.xcode_present({"path": os.fspath(app), "version": "26.6", "build": "17F113"})
+                    self.assertEqual(got, want)
+            link = Path(tmp) / "Link.app"
+            link.symlink_to(app)
+            with mock.patch.object(cr, "run", return_value=(0, "Build version 17F113")):
+                self.assertFalse(cr.xcode_present({"path": os.fspath(link), "build": "17F113"}))
 
 
 class NoEmDashTest(unittest.TestCase):

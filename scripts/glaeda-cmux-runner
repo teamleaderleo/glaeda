@@ -8,6 +8,8 @@
     glaeda-mini-setup --runner [...]                  same thing, through the mini setup front door
 
 Defaults register to --repo manaflow-ai/cmux. Use --org ORG for an organization runner.
+A fleet member passes --manifest M --member NAME instead of --labels: its class, availability and
+verified Xcodes become the labels, and a later change re-registers it in place (docs/CMUX_MINI_RUNNER.md 2c).
 
 What --apply does, all under $HOME and owned by the current user (no sudo):
     1. downloads the official actions/runner osx-arm64 release (latest, or --runner-version),
@@ -69,6 +71,12 @@ LABEL = "com.teamleaderleo.glaeda.cmux-runner"
 DEFAULT_REPO = "manaflow-ai/cmux"
 BASE_LABELS = ("self-hosted", "macOS", "ARM64")
 MINI_LABEL = "glaeda-mini"
+# Fleet membership (cmuxterm-hq build-fleet/FLEET-MEMBERSHIP.md): a runner's labels come only from its
+# manifest entry. dev machines take no jobs; borrowed machines run jobs only inside a VM, not here.
+RUNNER_CLASSES = ("xl", "std", "light")
+MEMBER_CLASSES = RUNNER_CLASSES + ("dev", "borrowed")
+AVAILABILITY = ("dedicated", "opportunistic")
+RUNNER_ROLE = "ci-runner"
 ROUTE_VARIABLES = ("MACOS_RUNNER_15", "MACOS_RUNNER_26", "MACOS_RUNNER_PR", "MACOS_RUNNER_DUAL_XCODE")
 RUNNER_RELEASE_API = "repos/actions/runner/releases"
 PLATFORM_ASSET = "osx-arm64"
@@ -192,6 +200,10 @@ class Context:
         self.name = args.name or default_name()
         extra = [label.strip() for label in (args.labels or "").split(",") if label.strip()]
         self.labels = list(dict.fromkeys([*BASE_LABELS, MINI_LABEL, *extra]))
+        # True when this run says what the labels must be (--labels or --manifest); otherwise a
+        # re-run keeps whatever the receipt registered and never asks for a relabel.
+        self.labels_requested = bool(extra)
+        self.member: dict[str, Any] | None = None
         self.group = args.group
         self.replace = args.replace
         self.version = args.runner_version
@@ -230,6 +242,53 @@ class Context:
     def show(self, path: Path | str) -> str:
         text, home = os.fspath(path), os.fspath(self.home)
         return "~" + text[len(home):] if text == home or text.startswith(home + "/") else text
+
+
+def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
+    """Same deep merge glaeda-mini-fleet uses for a host's overrides over the manifest defaults."""
+    out = dict(base)
+    for key, value in over.items():
+        out[key] = merge(out[key], value) if isinstance(value, dict) and isinstance(out.get(key), dict) else value
+    return out
+
+
+def xcode_present(app: dict[str, Any]) -> bool:
+    """The manifest's Xcode is really here: a real directory whose xcodebuild reports that exact build."""
+    path, build = Path(str(app.get("path") or "")), str(app.get("build") or "")
+    if not path.is_absolute() or not build or not path.is_dir() or path.is_symlink():
+        return False
+    code, out = run(["/usr/bin/xcodebuild", "-version"],
+                    env={**os.environ, "DEVELOPER_DIR": os.fspath(path / "Contents/Developer")})
+    return code == 0 and re.search(rf"^Build version {re.escape(build)}$", out, re.M) is not None
+
+
+def member_labels(manifest: Any, member: str) -> tuple[dict[str, Any] | None, str | None]:
+    """(member summary with labels, None) or (None, why this member cannot be a runner). Reads only."""
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("hosts"), dict):
+        return None, "manifest has no hosts table"
+    host = manifest["hosts"].get(member)
+    if not isinstance(host, dict):
+        return None, f"{member} is not a member in the manifest"
+    klass, availability = host.get("class"), host.get("availability")
+    roles = host.get("roles") if isinstance(host.get("roles"), list) else []
+    if klass not in MEMBER_CLASSES:
+        return None, f"{member} class {klass!r} is not one of {', '.join(MEMBER_CLASSES)}"
+    if klass not in RUNNER_CLASSES:
+        return None, f"{member} is class {klass}, which never runs a GitHub runner on the host"
+    if availability not in AVAILABILITY:
+        return None, f"{member} availability {availability!r} is not one of {', '.join(AVAILABILITY)}"
+    if RUNNER_ROLE not in roles:
+        return None, f"{member} roles do not include {RUNNER_ROLE}"
+    policy = merge(manifest.get("defaults") or {}, host.get("overrides") or {})
+    apps = ((policy.get("xcode") or {}).get("apps")) or []
+    versions = [str(a["version"]) for a in apps
+                if isinstance(a, dict) and re.fullmatch(r"[0-9][0-9.]*", str(a.get("version") or "")) and xcode_present(a)]
+    # One label a pool picker can route a whole run to: this class, this verified Xcode, and counted
+    # capacity. Opportunistic members never carry it, so they never receive a required job.
+    pools = [f"glaeda-{klass}-xcode-{v}" for v in versions] if availability == "dedicated" else []
+    labels = [MINI_LABEL, f"glaeda-class-{klass}", f"glaeda-{availability}", *[f"xcode-{v}" for v in versions], *pools]
+    return {"member": member, "class": klass, "availability": availability, "roles": roles,
+            "labels": list(dict.fromkeys(labels))}, None
 
 
 def load_receipt(ctx: Context) -> dict[str, Any] | None:
@@ -429,7 +488,20 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
 
     reg = {"kind": "register", "scope": ctx.org or ctx.repo, "name": ctx.name, "labels": ctx.labels,
            "ephemeral": False}
-    if ours and configured:
+    registered = ((receipt or {}).get("registration") or {}) if ours else {}
+    had = registered.get("labels")
+    # This install registered that name before and lost its local .runner (an interrupted relabel):
+    # registering again replaces its own server-side entry instead of colliding with it.
+    own_name = bool(ours and not configured and registered.get("owned") and registered.get("name") == ctx.name)
+    if ours and configured and ctx.labels_requested and had is not None and sorted(had) != sorted(ctx.labels):
+        # GitHub fixes labels at registration, and the labels API needs an admin token the mini does
+        # not hold, so relabelling re-registers this same runner in place with --replace.
+        reg.update(state="relabel", previousLabels=had)
+        if ctx.gh is None and not ctx.token_stdin:
+            reg.update(state="blocked", note="labels changed; pipe a registration token to --token-stdin to re-register")
+        elif runner_busy(ctx):
+            reg.update(state="blocked", note="the runner is running a job; re-run when it is idle")
+    elif ours and configured:
         reg.update(state="unchanged")
     elif ctx.gh is None and not ctx.token_stdin:
         reg.update(state="blocked", note="needs gh logged in as an admin, or a token through --token-stdin")
@@ -439,11 +511,17 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
         reg.update(state="create", note="no gh here: config.sh refuses a name that is already registered")
     else:
         existing = find_runner(ctx)
-        if existing and not ctx.replace:
+        if existing and own_name and registered.get("runnerId") not in (None, existing.get("id")):
+            reg.update(state="blocked", existing=existing,
+                       note=f"{ctx.name} is now registered as id {existing.get('id')}, not this install's "
+                            f"{registered.get('runnerId')}; another machine may hold the name")
+        elif existing and not (ctx.replace or own_name):
             reg.update(state="blocked", existing=existing,
                        note=f"a runner named {ctx.name} is already registered; pass --name or --replace")
         else:
             reg.update(state="create", existing=existing)
+    if own_name and reg["state"] == "create":
+        reg.update(replace=True, note="re-registers this install's own name with --replace")
     actions.append(reg)
 
     prior = {a.get("path"): a.get("ownedSha256") for a in (receipt or {}).get("actions", [])
@@ -557,7 +635,7 @@ def register(ctx: Context, act: dict[str, Any]) -> None:
             "--work", "_work"]
     if ctx.org and ctx.group:
         argv += ["--runnergroup", ctx.group]
-    if ctx.replace:
+    if ctx.replace or act.get("replace"):
         argv.append("--replace")
     code, out = run_with_token(argv, token, ctx.runner_dir)
     del token
@@ -567,6 +645,37 @@ def register(ctx: Context, act: dict[str, Any]) -> None:
         return
     act["applied"] = True
     act["runnerId"] = (local_runner(ctx) or {}).get("agentId")
+
+
+LOCAL_REGISTRATION = (".runner", ".credentials", ".credentials_rsaparams")
+
+
+def runner_busy(ctx: Context) -> bool:
+    """A Runner.Worker from this install means a job is running right now."""
+    return run(["/usr/bin/pgrep", "-f", os.fspath(ctx.runner_dir / "bin/Runner.Worker")])[0] == 0
+
+
+def relabel(ctx: Context, act: dict[str, Any]) -> None:
+    """Re-register this runner under the same name with the manifest's labels. _work stays."""
+    if runner_busy(ctx):
+        act["state"], act["note"] = "failed", "the runner started a job; nothing changed, re-run when idle"
+        return
+    if not ctx.skip_launchctl:
+        bootout(ctx)
+    for name in LOCAL_REGISTRATION:
+        (ctx.runner_dir / name).unlink(missing_ok=True)
+    act["replace"] = True
+    register(ctx, act)
+    if act["state"] == "failed":
+        act["note"] += ("; the old registration is still on GitHub and this runner is stopped: re-run with a "
+                        "fresh token (it re-registers the same name with --replace)")
+        return
+    if not ctx.skip_launchctl:
+        ctx.log_offset = ctx.log_path.stat().st_size if ctx.log_path.is_file() else 0
+        code, out = run([LAUNCHCTL, "bootstrap", f"gui/{ctx.uid}", os.fspath(ctx.plist_path)])
+        act["bootstrapped"] = code == 0
+        if code != 0:
+            act["state"], act["note"] = "failed", ("re-registered, but launchctl bootstrap failed: " + out)[:400]
 
 
 def bootout(ctx: Context, wait_s: float = 5.0) -> None:
@@ -601,6 +710,12 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                 receipt_doc["registration"] = {"owned": True, "scope": ctx.org or ctx.repo, "org": bool(ctx.org),
                                                "name": ctx.name, "labels": ctx.labels,
                                                "runnerId": act.get("runnerId")}
+        elif kind == "register" and state == "relabel":
+            relabel(ctx, act)
+            if act["state"] != "failed":
+                receipt_doc["registration"] = {**(receipt_doc.get("registration") or {}), "labels": ctx.labels,
+                                               "runnerId": act.get("runnerId"), "owned": True}
+                act["state"] = "updated"
         elif kind == "register" and state == "unchanged" and not receipt_doc.get("registration"):
             adopted = adopt_registration(ctx)
             if adopted:
@@ -821,6 +936,9 @@ def parser() -> argparse.ArgumentParser:
     scope.add_argument("--org", help="register to an organization instead")
     p.add_argument("--group", help="runner group (with --org)")
     p.add_argument("--labels", help=f"extra comma-separated labels beyond {','.join(BASE_LABELS)},{MINI_LABEL}")
+    p.add_argument("--manifest", type=Path, help="fleet manifest (cmuxterm-hq build-fleet/mini-fleet.json); labels "
+                   "come from --member's class, availability and present Xcodes instead of --labels")
+    p.add_argument("--member", help="this machine's key in the manifest's hosts table (default name <member>-glaeda)")
     p.add_argument("--name", help="runner name (default: <short hostname>-glaeda)")
     p.add_argument("--replace", action="store_true", help="replace an existing runner with the same name")
     p.add_argument("--runner-dir", type=Path, help="install directory (default ~/actions-runner-glaeda)")
@@ -849,7 +967,28 @@ def main(argv: list[str] | None = None) -> int:
     if args.repo and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+", args.repo):
         print("glaeda-cmux-runner: --repo must be OWNER/REPO", file=sys.stderr)
         return 2
+    if args.manifest and args.labels:
+        print("glaeda-cmux-runner: --labels and --manifest are exclusive; labels come from one source", file=sys.stderr)
+        return 2
+    if bool(args.manifest) != bool(args.member):
+        print("glaeda-cmux-runner: --manifest and --member go together", file=sys.stderr)
+        return 2
     ctx = Context(args)
+    if args.manifest:
+        try:
+            manifest = json.loads(args.manifest.expanduser().read_text())
+        except (OSError, ValueError) as error:
+            print(f"glaeda-cmux-runner: cannot read manifest: {type(error).__name__}", file=sys.stderr)
+            return 2
+        member, why = member_labels(manifest, args.member)
+        if member is None:
+            print(f"glaeda-cmux-runner: {why}", file=sys.stderr)
+            return 2
+        ctx.member = member
+        ctx.labels = list(dict.fromkeys([*BASE_LABELS, *member["labels"]]))
+        ctx.labels_requested = True
+        if not args.name:
+            ctx.name = f"{args.member}-glaeda"
     if args.token_stdin and args.apply:  # a plan previews the stdin path but never reads a token
         token = sys.stdin.readline(4096).strip()
         if not re.fullmatch(TOKEN_RE, token):
@@ -880,6 +1019,13 @@ def main(argv: list[str] | None = None) -> int:
                 ctx.org, ctx.repo = (None, f"{scope[1]}/{scope[2]}") if scope[2] else (scope[1], None)
             elif local:
                 ctx.unreadable_registration = True
+    if not args.uninstall and owned_dir(ctx, prior):
+        registered = (prior or {}).get("registration") or {}
+        # a re-run that names nothing keeps what this install registered, not the hostname default
+        if not ctx.labels_requested and isinstance(registered.get("labels"), list) and registered["labels"]:
+            ctx.labels = registered["labels"]
+        if not args.name and not args.member and registered.get("name"):
+            ctx.name = registered["name"]
     pre = preflight(ctx)
     doc: dict[str, Any] = {
         "schema": SCHEMA,
@@ -893,6 +1039,7 @@ def main(argv: list[str] | None = None) -> int:
         "runnerVersion": (prior or {}).get("runnerVersion") if owned_dir(ctx, prior) else None,
         "registration": (prior or {}).get("registration") if owned_dir(ctx, prior) else None,
         "preflight": pre,
+        "member": ctx.member,
     }
     if args.uninstall:
         actions = plan_uninstall(ctx, prior)
