@@ -93,7 +93,8 @@ per fresh machine.
   `.swiftmodule`, `.swiftdoc` and ABI files identical. Full app (same mini, see Setup): 7,631 of 7,633 `.o`, `.swiftmodule`, `.pcm`,
   `.a` and debug-dylib files identical; the two that differ are the Go-built WireGuard
   library (`libwg-go.a`), which a script phase builds and Xcode never caches. With fixed paths
-  even the linked per-product objects match (they differed on Air Blue, where paths were mapped).
+  even the linked per-product objects match on the same host (they differed on Air Blue, where
+paths were mapped).
 - **Verified fetches.** The node recomputes every fetched object's ID and treats a mismatch
   as a miss; no mismatches occurred.
 - **Read-only reader.** Every reader-side index write was refused (15 on the chain with the old
@@ -118,14 +119,19 @@ were 26.3's). cmux8s filled the store and served it; cmux7s read with an empty n
 | warm node | cmux7s | 77.3 s | 4,191 / 4,191 |
 | fresh reader, same-host reference | cmux8s | 107.8 s | 4,191 / 4,191 |
 
-cmux7s started the fresh run at load 27, still settling from the Chromium job, so its wall
-time is an upper bound. Outputs: 7,631 of 7,634 `.o`, `.swiftmodule`, `.pcm`, `.a` and
-debug-dylib files identical between the two machines. The three that differ are the
-script-built Go WireGuard library (two copies) and the app's debug dylib, which links it;
-none of them goes through the compilation cache.
+Both nodes ran the prototype at 7af907c (closure prefetch on). cmux7s started the fresh run at
+load 27, still settling from the Chromium job, so its wall time is likely pessimistic.
+Outputs: 7,631 of 7,634 compared `.o`, `.swiftmodule`, `.pcm`, `.a` and debug-dylib files are
+identical between the two machines (one more file than the same-host comparison, the
+architecture-specific `libwg-go-arm64.a` copy). The three that differ are the script-built Go
+WireGuard library (two copies) and the app's debug dylib; none of them goes through the
+compilation cache. Why the dylib differs across machines was not examined (on the same host it
+matched even though the WireGuard library differed, so it is probably a host-specific link
+input). Everything Xcode caches matched.
 
-A related rule for the fleet: cache keys include the compiler, so members share entries only
-when they build with the same Xcode build number. The store should be segmented or keyed by
+A related rule for the fleet: members should share entries only when they build with the same
+Xcode build number. Consistent with that, the unpinned 26.6 attempt against the 26.3 store
+compiled everything; the key inputs themselves were not inspected. The store should be segmented or keyed by
 it, and the fleet check should treat the selected Xcode as part of the cache contract.
 
 ## Findings
@@ -161,10 +167,12 @@ it, and the fleet check should treat the selected Xcode as part of the cache con
    node now answers reads as misses and skips the store for 30 s after a failure: 18.9 s, about
    a cold build. Writes fail immediately during the backoff (not measured: the outage runs were
    read-only readers), so nothing is published half-way.
-5. **Network cost is about 40% of a full-app fresh read.** 132 s fresh against 80 s from a warm
-   node: about 52 s is fetching 1.47 GB in about 25,500 requests (one per object or index
-   entry, about six in flight at a time; about 28 MB/s effective on a LAN that carries far
-   more). The chain's split is 6.5 s against 5.6 s.
+5. **Fetching adds about 20 to 30 s to a full-app fresh read on the LAN.** The first fresh read
+   (132 s against an 80 s warm node) was taken while the store host ran a Chromium build; later
+   runs put the network share near 20 s (127 s across machines against 108 s with the store on
+   the same host, and 91 to 97 s same-host in the
+   [prefetch follow-up](fleet-compilation-cache-prefetch-2026-09-24.md)). So most of the
+   original 52 s gap was the loaded store host. The chain's split is 6.5 s against 5.6 s.
 6. **The tailnet blocks mini-to-mini TCP.** ICMP passes (2.1 ms), but TCP on 22 and on the
    cache port time out; the LAN is open. A fleet store reachable from every machine needs a
    Manaflow ACL grant for the cache port between tagged devices (their admin's change), or a
@@ -174,9 +182,9 @@ it, and the fleet check should treat the selected Xcode as part of the cache con
 
 M2, node daemon (the prototype now does the tiering; these are what it lacks):
 
-- **Batch and prefetch fetches.** Fetch an entry's whole object closure in one request
-  (the store knows the references), fetch concurrently, and prefetch by target. Target: the
-  full-app fresh read near the 80 s warm-node floor instead of 132 s.
+- **Batch and prefetch fetches.** Closure prefetch has landed (see the
+  [prefetch follow-up](fleet-compilation-cache-prefetch-2026-09-24.md)); the remaining change
+  is answering the index lookup before the prefetch finishes.
 - **Supervision.** A launchd unit per mini, a health check the build wrapper runs before it
   sets the plugin settings (finding 3), and a bounded local store with eviction.
 - **Fixed paths as the contract.** The wrapper sets one DerivedData path and one CAS path per
