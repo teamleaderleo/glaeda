@@ -77,7 +77,9 @@ PRIVATE_HOME_RE = re.compile(r"/Users/[^/\s'\"]+")
 # A fix becomes a command only when every ;/&& part is: optional VAR=value words, a known program or a
 # path, then plain argument words. Anything else, including every shell metacharacter, stays a note.
 WORD = r"[A-Za-z0-9_./=:@~+,%-]+"
-PROGRAM = r"(?:sudo|cd|brew|rustup|git|launchctl|xcodebuild|xcode-select|pmset|env|glaeda-[a-z-]+|scripts/\S+|\./\S+|~/\S+|/\S+)"
+PROGRAM = r"(?:sudo|cd|brew|rustup|git|launchctl|xcodebuild|xcode-select|pmset|env|glaeda-[a-z-]+|(?:/|\./|~/|scripts/)[A-Za-z0-9_./@+-]+)"
+# Shell syntax anywhere means the text is not ours to run; ; and && are the only separators allowed.
+SHELL_SYNTAX = re.compile(r"[$`|<>()*?!{}\[\]'\"\\#&]")
 COMMAND_PART = re.compile(rf"(?:[A-Z_][A-Z0-9_]*={WORD} )*{PROGRAM}(?: {WORD})*")
 # Words that only prose uses; a part carrying one is a sentence that starts like a command.
 PROSE_WORDS = frozenset({"the", "a", "an", "it", "its", "where", "when", "then", "which", "that", "this", "is",
@@ -141,6 +143,8 @@ def as_command(fix: Any) -> str | None:
     """The fix when it is a command in the closed grammar above; None when any part reads as prose."""
     text = str(fix or "").strip()
     if not text or text != " ".join(text.split(" ")) or any(ord(ch) < 32 for ch in text):
+        return None
+    if SHELL_SYNTAX.search(text.replace("&&", "")):
         return None
     parts = [p.strip() for p in re.split(r";|&&", text)]
     for part in parts:
@@ -425,6 +429,8 @@ class Builder:
 
     def action(self, member: str | None, kind: str, who: str, command: str | None, safe: bool = False,
                note: str = "", tty: bool = False, on_member: bool = True) -> dict[str, Any]:
+        """safe=True is only ever passed with a literal, read-only command written in this file,
+        never with text derived from a source."""
         assert who in WHO
         if member and member in self.never:
             # never_touch: a person decides, and nothing is marked safe.
@@ -474,7 +480,12 @@ class Builder:
                 self.finding(name, "unavailable", "warn", f"{name} could not be read: {src.get('error')}", None, stamp,
                              self.action(None, "restore_source", "person", None,
                                          note=f"fix access to the {name} source, then refresh"))
-            elif age is not None and age > self.max_age:
+            elif age is None:
+                state = "stale"
+                self.finding(name, "no_observation_time", "warn", f"{name} carries no usable observation time", None,
+                             None, self.action(None, "refresh_status", "agent", "glaeda-fleet-status", safe=True,
+                                               on_member=False))
+            elif age > self.max_age:
                 state = "stale"
                 self.finding(name, "stale", "warn", f"{name} is {age} s old (limit {self.max_age} s)", None, stamp,
                              self.action(None, "refresh_status", "agent", "glaeda-fleet-status", safe=True,
@@ -729,7 +740,7 @@ class Builder:
             if not row.get("reachable"):
                 m["lima"] = {"reachable": False}
                 continue
-            instances = [i for i in row.get("instances") or [] if isinstance(i, dict)][:MAX_LIMA]
+            instances = [i for i in row.get("instances") or [] if isinstance(i, dict) and i.get("name")][:MAX_LIMA]
             expected = set(self.hosts.get(member, {}).get("lima_expected") or [])
             # Stopped or Broken only; an instance with no status is unknown, not an orphan.
             orphans = [str(i.get("name") or "") for i in instances
