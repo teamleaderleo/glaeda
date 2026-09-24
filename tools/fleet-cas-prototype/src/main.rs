@@ -513,6 +513,16 @@ impl Store {
                 up.closure.store(false, Relaxed);
                 return;
             }
+            // A busy or refusing store: skip this prefetch only; the objects
+            // still come one by one.
+            Err(e)
+                if matches!(
+                    e.code(),
+                    tonic::Code::ResourceExhausted | tonic::Code::InvalidArgument
+                ) =>
+            {
+                return;
+            }
             Err(_) => {
                 self.upstream_failed();
                 return;

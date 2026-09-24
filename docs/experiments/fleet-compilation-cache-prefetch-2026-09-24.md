@@ -39,7 +39,8 @@ All reader runs: 4,191 of 4,191 cacheable tasks hit.
 3. **With compilation caching on, the app target has no incremental builds.** A one-line edit
    to one app-target file, from a warm DerivedData and a warm node, took 451 s: all 5,310 of the
    `cmux` target's compile steps ran again (the same count as a full build), and none in any
-   other target. Each compile job's key covers the
+   other target. (Compile steps are log entries; the minis doc's "2,657 tasks" counts cacheable
+   tasks, a different unit.) Each compile job's key covers the
    module's sources, so any edit misses every job in the module. (The Air Blue campaign saw
    the same on Xcode 27: 604 s against 48 s with caching off.) Consequence for "<1 min
    day-to-day": the fleet cache is for fresh machines and for catching up after main moves;
