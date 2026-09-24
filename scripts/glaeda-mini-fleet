@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""glaeda-mini-fleet: one declarative inventory for a fleet of cmux build Mac minis.
+
+    glaeda-mini-fleet observe  [--manifest M] [--host H ...] [--out FILE]   probe hosts over SSH, print observed JSON
+    glaeda-mini-fleet check    [--manifest M] [--host H ...] [--observed FILE] [--json]
+    glaeda-mini-fleet plan     [--manifest M] [--host H ...] [--observed FILE]  print the fixes check would need
+    glaeda-mini-fleet apply    [--manifest M] --host H ... [--yes]              make the additive fixes
+
+The manifest names every host, its hardware class, the toolchain it must carry, the SSH keys
+that must, may, and must not be in the login user's authorized_keys, and the launchd jobs that
+must be running. `check` diffs fresh observation against it and exits 1 on drift.
+
+observe, check, and plan are read-only. The probe (scripts/cmux_mini_probe.sh) runs as the SSH
+login user with no sudo and no Python, and reports key fingerprints and comments, never key
+material, tokens, or log contents. `plan` prints commands for an operator; it runs none of them.
+
+`apply` only adds, and only what the manifest can prove: it appends a required key whose
+`public_key` the manifest carries and whose fingerprint matches, after copying authorized_keys
+aside; and it APFS-clones an Xcode (`cp -c`, a real directory sharing blocks, never a symlink)
+when the source's version and build match the target. It never removes keys, never uses sudo,
+and skips hosts marked `"apply": false`. Without --yes it prints what it would run. Every run
+ends with a fresh observation and check of the hosts it touched.
+
+A real fleet manifest names hosts, people, and keys. Keep it out of this public repository:
+the default path is ~/.config/glaeda/mini-fleet.json (override with --manifest or
+$GLAEDA_MINI_FLEET_MANIFEST). examples/mini-fleet/manifest.example.json shows the shape.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+SCHEMA = "glaeda-mini-fleet/v1"
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROBE = SCRIPT_DIR / "cmux_mini_probe.sh"
+DEFAULT_MANIFEST = Path(os.environ.get("GLAEDA_MINI_FLEET_MANIFEST", "~/.config/glaeda/mini-fleet.json")).expanduser()
+SSH = "/usr/bin/ssh"
+PROBE_TIMEOUT = 90
+LIST_KEYS = {"xcode_app", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key"}
+
+
+class Failure(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- manifest
+
+
+def load_manifest(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise Failure(f"no manifest at {path}; pass --manifest or set GLAEDA_MINI_FLEET_MANIFEST") from None
+    except json.JSONDecodeError as error:
+        raise Failure(f"{path}: invalid JSON: {error}") from None
+    if data.get("schema") != SCHEMA:
+        raise Failure(f"{path}: schema must be {SCHEMA!r}, got {data.get('schema')!r}")
+    for field in ("ssh_user", "keys", "classes", "defaults", "hosts"):
+        if field not in data:
+            raise Failure(f"{path}: missing {field!r}")
+    never = set(data.get("never_touch", []))
+    for name, host in data["hosts"].items():
+        if name in never:
+            raise Failure(f"{path}: host {name} is also in never_touch")
+        if host.get("class") not in data["classes"]:
+            raise Failure(f"{path}: host {name} has unknown class {host.get('class')!r}")
+        for key_id in host_policy(data, name)["authorized_keys"].get("require", []) + \
+                host_policy(data, name)["authorized_keys"].get("allow", []):
+            if key_id not in data["keys"]:
+                raise Failure(f"{path}: host {name} names unknown key {key_id!r}")
+    return data
+
+
+def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for key, value in over.items():
+        out[key] = merge(out[key], value) if isinstance(value, dict) and isinstance(out.get(key), dict) else value
+    return out
+
+
+def host_policy(manifest: dict[str, Any], name: str) -> dict[str, Any]:
+    host = manifest["hosts"][name]
+    return merge(manifest["defaults"], host.get("overrides", {}))
+
+
+def select_hosts(manifest: dict[str, Any], wanted: list[str] | None) -> list[str]:
+    names = list(manifest["hosts"])
+    if not wanted:
+        return names
+    never = set(manifest.get("never_touch", []))
+    for name in wanted:
+        if name in never:
+            raise Failure(f"{name} is in never_touch; this tool does not connect to it")
+        if name not in manifest["hosts"]:
+            raise Failure(f"{name} is not in the manifest")
+    return [n for n in names if n in wanted]
+
+
+# ---------------------------------------------------------------- observe
+
+
+def parse_probe(text: str) -> dict[str, Any]:
+    out: dict[str, Any] = {k: [] for k in LIST_KEYS}
+    for line in text.splitlines():
+        key, sep, value = line.partition("\t")
+        if not sep:
+            continue
+        if key in LIST_KEYS:
+            out[key].append(value)
+        else:
+            out[key] = value
+    return {
+        "user": out.get("user"),
+        "admin_group": out.get("admin_group") == "yes",
+        "hostname": out.get("hostname"),
+        "computer_name": out.get("computer_name"),
+        "model": out.get("model"),
+        "chip": out.get("chip"),
+        "cpus": int(out.get("cpus") or 0),
+        "memory_gib": round(int(out.get("memory_bytes") or 0) / 2**30),
+        "macos": out.get("macos"),
+        "macos_build": out.get("macos_build"),
+        "xcode_apps": [dict(zip(("path", "kind", "version", "build"), v.split("|", 3))) for v in out["xcode_app"]],
+        "xcode_select": out.get("xcode_select"),
+        "xcode_license_accepted": out.get("xcode_license_accepted"),
+        "disk": {p: {"total_gib": int(t), "free_gib": int(f)}
+                 for p, t, f in (v.split("|") for v in out["disk"])},
+        "launchd": [dict(zip(("domain", "label", "state"), v.split("|", 2))) for v in out["launchd"]],
+        "fleet_worker": {
+            "root": out.get("fleet_root") == "present",
+            "process": out.get("fleet_worker_proc"),
+            "labels": out.get("fleet_labels"),
+            "last_job": out.get("fleet_last_job"),
+            "recipe": out.get("fleet_recipe"),
+            "worker_sha256_12": out.get("fleet_worker_sha"),
+        },
+        "authorized_keys_files": [v.split("|")[0] for v in out["ak_file"]],
+        "authorized_keys": [parse_key(v) for v in out["ak_key"] if v.startswith("authorized_keys|")],
+    }
+
+
+def parse_key(value: str) -> dict[str, Any]:
+    _file, options, fp = value.split("|", 2)
+    parts = fp.split(" ", 2)
+    if len(parts) < 3 or not parts[1].startswith("SHA256:"):
+        return {"fingerprint": None, "comment": fp, "options": options == "yes"}
+    comment, _, kind = parts[2].rpartition(" (")
+    return {"fingerprint": parts[1], "comment": comment, "type": kind.rstrip(")"), "options": options == "yes"}
+
+
+def observe_host(name: str, user: str) -> dict[str, Any]:
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name, "/bin/bash", "-s"],
+            input=PROBE.read_bytes(), capture_output=True, timeout=PROBE_TIMEOUT, env={"PATH": "/usr/bin:/bin",
+                                                                                       "HOME": os.environ["HOME"],
+                                                                                       "SSH_AUTH_SOCK": os.environ.get("SSH_AUTH_SOCK", "")},
+        )
+    except subprocess.TimeoutExpired:
+        return {"host": name, "reachable": False, "error": f"probe timed out after {PROBE_TIMEOUT}s"}
+    if proc.returncode != 0:
+        err = proc.stderr.decode(errors="replace").strip().splitlines()
+        return {"host": name, "reachable": False, "error": (err[-1] if err else f"ssh exit {proc.returncode}")[:200]}
+    data = parse_probe(proc.stdout.decode(errors="replace"))
+    return {"host": name, "reachable": True, "observed_at": int(started), **data}
+
+
+def observe(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(lambda h: observe_host(h, manifest["ssh_user"]), hosts))
+    return {"schema": SCHEMA + "/observed", "hosts": {r["host"]: r for r in results}}
+
+
+# ---------------------------------------------------------------- check
+
+
+def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+
+    def drift(area: str, detail: str, fix: str = "", action: dict[str, str] | None = None) -> None:
+        issue = {"host": name, "area": area, "detail": detail, "fix": fix}
+        if action:
+            issue["action"] = action
+        issues.append(issue)
+
+    if not obs.get("reachable"):
+        drift("reach", obs.get("error", "unreachable"))
+        return issues
+    host = manifest["hosts"][name]
+    policy = host_policy(manifest, name)
+    klass = manifest["classes"][host["class"]]
+
+    if host.get("hostname") and obs["hostname"] != host["hostname"]:
+        drift("identity", f"hostname {obs['hostname']!r}, manifest says {host['hostname']!r}")
+    for field in ("model", "chip", "memory_gib", "cpus"):
+        if field in klass and obs[field] != klass[field]:
+            drift("hardware", f"{field} {obs[field]!r}, class {host['class']} says {klass[field]!r}")
+
+    macos = policy.get("macos", {})
+    if "major" in macos and not (obs["macos"] or "").startswith(f"{macos['major']}."):
+        drift("macos", f"macOS {obs['macos']}, want major {macos['major']}")
+    if "min" in macos and version_tuple(obs["macos"]) < version_tuple(macos["min"]):
+        drift("macos", f"macOS {obs['macos']} is below the fleet floor {macos['min']}", "update macOS")
+
+    xcode = policy.get("xcode", {})
+    apps = {a["path"]: a for a in obs["xcode_apps"]}
+    for want in xcode.get("apps", []):
+        got = apps.get(want["path"])
+        if not got:
+            if want.get("clone_from"):
+                drift("xcode", f"{want['path']} missing", f"clone {want['clone_from']} to {want['path']}",
+                      {"kind": "clone_xcode", "path": want["path"], "source": want["clone_from"],
+                       "version": want["version"], "build": want["build"]})
+            else:
+                drift("xcode", f"{want['path']} missing", "install it")
+        elif (got["version"], got["build"]) != (want["version"], want["build"]):
+            drift("xcode", f"{want['path']} is {got['version']} ({got['build']}), want {want['version']} ({want['build']})")
+    if xcode.get("select") and obs["xcode_select"] != xcode["select"]:
+        drift("xcode", f"xcode-select {obs['xcode_select']!r}, want {xcode['select']!r}", f"sudo xcode-select -s {xcode['select']}")
+    # Xcode treats a licence accepted for a newer version as covering older ones.
+    if xcode.get("license") and version_tuple(obs["xcode_license_accepted"]) < version_tuple(xcode["license"]):
+        drift("xcode", f"licence accepted for {obs['xcode_license_accepted'] or 'nothing'}, want {xcode['license']}",
+              "sudo xcodebuild -license accept && sudo xcodebuild -runFirstLaunch")
+
+    for want in xcode.get("pending", []):
+        if want["path"] not in apps:
+            drift("pending", f"{want['path']} ({want['version']}) not yet installed; {want.get('note', 'staged next')}")
+
+    keys = policy.get("authorized_keys", {})
+    by_fp = {k["fingerprint"]: k for k in obs["authorized_keys"] if k.get("fingerprint")}
+    known = {manifest["keys"][k]["fingerprint"]: k for k in manifest["keys"]}
+    for key_id in keys.get("require", []):
+        if manifest["keys"][key_id]["fingerprint"] not in by_fp:
+            drift("ssh", f"required key {key_id} ({manifest['keys'][key_id]['comment']}) missing", f"add key {key_id}",
+                  {"kind": "add_key", "key": key_id})
+    allowed = {manifest["keys"][k]["fingerprint"] for k in keys.get("require", []) + keys.get("allow", [])}
+    if keys.get("exclusive"):
+        for fp, k in by_fp.items():
+            if fp not in allowed:
+                label = known.get(fp, "unlisted")
+                drift("ssh", f"{label} key {fp[7:19]} ({k['comment']}) not allowed here", f"remove key {fp}")
+    for k in obs["authorized_keys"]:
+        if not k.get("fingerprint"):
+            drift("ssh", "authorized_keys has an unparseable line")
+        elif k["options"]:
+            drift("ssh", f"key {k['fingerprint'][7:19]} carries options; review them")
+    stray = [f for f in obs["authorized_keys_files"] if f != "authorized_keys"]
+    if stray and keys.get("no_backups"):
+        drift("ssh", f"stale authorized_keys copies: {', '.join(stray)}", "archive them outside ~/.ssh")
+
+    running = {j["label"]: j["state"] for j in obs["launchd"]}
+    for label in policy.get("launchd", {}).get("running", []):
+        state = running.get(label)
+        if state is None:
+            drift("launchd", f"{label} not installed")
+        elif not state.startswith("running"):
+            drift("launchd", f"{label} is {state}")
+    for label in policy.get("launchd", {}).get("absent", []):
+        if label in running:
+            drift("launchd", f"{label} installed, manifest says absent")
+
+    floor = policy.get("disk", {}).get("min_free_gib")
+    data = obs["disk"].get("/System/Volumes/Data") or obs["disk"].get("/")
+    if floor and data and data["free_gib"] < floor:
+        drift("disk", f"{data['free_gib']} GiB free, floor {floor}", "glaeda-disk")
+    return issues
+
+
+def version_tuple(value: str | None) -> tuple[int, ...]:
+    try:
+        return tuple(int(p) for p in (value or "0").split("."))
+    except ValueError:
+        return (0,)
+
+
+def check(manifest: dict[str, Any], observed: dict[str, Any], hosts: list[str]) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    for name in hosts:
+        obs = observed["hosts"].get(name)
+        if obs is None:
+            issues.append({"host": name, "area": "reach", "detail": "not observed", "fix": ""})
+            continue
+        issues.extend(check_host(manifest, name, obs))
+    return issues
+
+
+# ---------------------------------------------------------------- apply
+
+ADD_KEY = r"""set -eu
+ak="$HOME/.ssh/authorized_keys"
+line=$(cat)
+have=$(ssh-keygen -lf "$ak" 2>/dev/null | awk '{print $2}' | grep -cxF "$1" || true)
+if [ "$have" != 0 ]; then echo "unchanged: key $1 already present"; exit 0; fi
+got=$(printf '%s\n' "$line" | ssh-keygen -lf /dev/stdin | awk '{print $2}')
+[ "$got" = "$1" ] || { echo "refused: supplied key is $got, want $1" >&2; exit 3; }
+backup="$ak.glaeda-$(date -u +%Y%m%dT%H%M%SZ)"
+cp -p "$ak" "$backup"
+[ -z "$(tail -c1 "$ak")" ] || printf '\n' >> "$ak"
+printf '%s\n' "$line" >> "$ak"
+chmod 600 "$ak"
+echo "added: key $1 (backup $backup)"
+"""
+
+CLONE_XCODE = r"""set -eu
+src="$1"; dst="$2"; want="$3|$4"
+if [ -e "$dst" ]; then echo "unchanged: $dst exists"; exit 0; fi
+[ -d "$src" ] && [ ! -L "$src" ] || { echo "refused: $src is not a real directory" >&2; exit 3; }
+v=$(plutil -extract CFBundleShortVersionString raw "$src/Contents/Info.plist")
+b=$(plutil -extract ProductBuildVersion raw "$src/Contents/version.plist")
+[ "$v|$b" = "$want" ] || { echo "refused: $src is $v|$b, want $want" >&2; exit 3; }
+[ "$(stat -f %Sd /Applications)" = "$(stat -f %Sd "$src")" ] || { echo "refused: not one volume" >&2; exit 3; }
+tmp="$dst.glaeda-partial"
+[ ! -e "$tmp" ] || { echo "refused: $tmp exists from an earlier run; inspect it" >&2; exit 3; }
+cp -c -R "$src" "$tmp"
+mv "$tmp" "$dst"
+echo "cloned: $src -> $dst ($v $b)"
+"""
+
+
+def remote(name: str, user: str, script: str, args: list[str], stdin: str = "") -> tuple[int, str]:
+    import shlex
+    command = "/bin/bash -c " + shlex.quote(script) + " glaeda " + " ".join(shlex.quote(a) for a in args)
+    proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name, command],
+                          input=stdin.encode(), capture_output=True, timeout=600)
+    text = (proc.stdout + proc.stderr).decode(errors="replace").strip()
+    return proc.returncode, text[-400:]
+
+
+def apply(manifest: dict[str, Any], hosts: list[str], yes: bool) -> int:
+    observed = observe(manifest, hosts)
+    failed = 0
+    for name in hosts:
+        if manifest["hosts"][name].get("overrides", {}).get("apply") is False:
+            print(f"{name}: skipped (apply: false)")
+            continue
+        actions = [i["action"] for i in check(manifest, observed, [name]) if i.get("action")]
+        if not actions:
+            print(f"{name}: nothing to apply")
+            continue
+        for action in actions:
+            if action["kind"] == "add_key":
+                key = manifest["keys"][action["key"]]
+                if not key.get("public_key"):
+                    print(f"{name}: cannot add {action['key']}: manifest has no public_key")
+                    failed += 1
+                    continue
+                label, script, args, stdin = f"add key {action['key']}", ADD_KEY, [key["fingerprint"]], key["public_key"] + "\n"
+            else:
+                label, script = f"clone {action['source']} -> {action['path']}", CLONE_XCODE
+                args, stdin = [action["source"], action["path"], action["version"], action["build"]], ""
+            if not yes:
+                print(f"{name}: would {label}")
+                continue
+            code, text = remote(name, manifest["ssh_user"], script, args, stdin)
+            print(f"{name}: {text or label}")
+            failed += code != 0
+    if not yes:
+        print("dry run; pass --yes to apply")
+        return 0
+    after = check(manifest, observe(manifest, hosts), hosts)
+    left = [i for i in after if i.get("action")]
+    for i in left:
+        print(f"still drifting: {i['host']}: {i['detail']}")
+    return 1 if failed or left else 0
+
+
+# ---------------------------------------------------------------- cli
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("command", choices=("observe", "check", "plan", "apply"))
+    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--host", action="append", dest="hosts")
+    parser.add_argument("--observed", type=Path, help="reuse an observe output instead of probing")
+    parser.add_argument("--out", type=Path, help="observe: also write the JSON here")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--yes", action="store_true", help="apply: make the changes instead of printing them")
+    args = parser.parse_args(argv)
+    try:
+        manifest = load_manifest(args.manifest)
+        hosts = select_hosts(manifest, args.hosts)
+        if args.command == "apply":
+            if not args.hosts:
+                raise Failure("apply needs explicit --host arguments")
+            return apply(manifest, hosts, args.yes)
+        observed = json.loads(args.observed.read_text()) if args.observed else observe(manifest, hosts)
+        if args.command == "observe":
+            text = json.dumps(observed, indent=2, sort_keys=True)
+            if args.out:
+                args.out.write_text(text + "\n")
+            print(text)
+            return 0
+        issues = check(manifest, observed, hosts)
+    except Failure as error:
+        print(f"glaeda-mini-fleet: {error}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"schema": SCHEMA + "/check", "hosts": hosts, "issues": issues}, indent=2))
+    elif args.command == "plan":
+        for name in hosts:
+            fixes = [i["fix"] for i in issues if i["host"] == name and i["fix"]]
+            if fixes:
+                print(f"{name}:")
+                for fix in dict.fromkeys(fixes):
+                    print(f"  {fix}")
+    else:
+        width = max((len(h) for h in hosts), default=0)
+        drifting = [i for i in issues if i["area"] != "pending"]
+        for name in hosts:
+            mine = [i for i in issues if i["host"] == name]
+            count = sum(i["area"] != "pending" for i in mine)
+            pending = len(mine) - count
+            status = f"{count} drift" if count else "ok"
+            print(f"{name:<{width}}  {status}{f' ({pending} pending)' if pending else ''}")
+            for i in mine:
+                print(f"{'':<{width}}    {i['area']}: {i['detail']}")
+        print(f"{len(hosts)} hosts, {len({i['host'] for i in drifting})} drifting, {len(drifting)} findings")
+    return 1 if any(i["area"] != "pending" for i in issues) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
