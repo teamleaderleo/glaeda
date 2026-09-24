@@ -11,6 +11,8 @@ const GIT: &str = "/usr/bin/git";
 const TOUCH: &str = "/usr/bin/touch";
 /// Older than any idle window the tests use.
 const LONG_AGO: &str = "202001010000";
+/// `LONG_AGO` (2020-01-01 00:00 local) as reflog seconds; any time that old is idle.
+const LONG_AGO_SECONDS: &str = "1577836800";
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
 struct Fixture {
@@ -56,9 +58,24 @@ impl Fixture {
         path
     }
 
-    /// Make every activity signal of one linked worktree old.
+    /// Make every activity signal of one linked worktree old: its reflog entries' own times and
+    /// the modification times of the checkout, HEAD and the reflog file.
     fn age(&self, name: &str) {
         let git_dir = self.main.join(".git/worktrees").join(name);
+        let reflog = git_dir.join("logs/HEAD");
+        if let Ok(text) = std::fs::read_to_string(&reflog) {
+            let aged: String = text
+                .lines()
+                .map(|line| {
+                    let (header, message) = line.split_once('\t').unwrap_or((line, ""));
+                    let mut fields: Vec<&str> = header.split(' ').collect();
+                    let at = fields.len() - 2;
+                    fields[at] = LONG_AGO_SECONDS;
+                    format!("{}\t{message}\n", fields.join(" "))
+                })
+                .collect();
+            std::fs::write(&reflog, aged).expect("backdate reflog entries");
+        }
         for path in [
             self.root.join(name),
             git_dir.join("HEAD"),
