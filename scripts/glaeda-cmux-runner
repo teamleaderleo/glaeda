@@ -203,6 +203,7 @@ class Context:
         # re-run keeps whatever the receipt registered and never asks for a relabel.
         self.labels_requested = bool(extra)
         self.member: dict[str, Any] | None = None
+        self.min_free_gib: float = args.min_free_gib or 0
         self.group = args.group
         self.replace = args.replace
         self.version = args.runner_version
@@ -354,6 +355,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     python = shlex.quote(ctx.python or "/usr/bin/python3")
     hook = shlex.quote(os.fspath(ctx.hook_dir / "glaeda-cmux-runner-hook"))
     scope = f"--allowed-owner {shlex.quote(ctx.org)}" if ctx.org else f"--allowed-repo {shlex.quote(ctx.repo or '')}"
+    if ctx.min_free_gib:
+        scope += f" --min-free-gib {ctx.min_free_gib:g}"
     started = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"
@@ -928,6 +931,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--labels", help=f"extra comma-separated labels beyond {','.join(BASE_LABELS)},{MINI_LABEL}")
     p.add_argument("--manifest", type=Path, help="fleet manifest (cmuxterm-hq build-fleet/mini-fleet.json); labels "
                    "come from --member's class, availability and present Xcodes instead of --labels")
+    p.add_argument("--min-free-gib", type=float, help="job-started refuses a job below this much free disk "
+                   "(default: the manifest's disk.min_free_gib with --manifest, else no floor)")
     p.add_argument("--member", help="this machine's key in the manifest's hosts table (default name <member>-glaeda)")
     p.add_argument("--name", help="runner name (default: <short hostname>-glaeda)")
     p.add_argument("--replace", action="store_true", help="replace an existing runner with the same name")
@@ -975,6 +980,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"glaeda-cmux-runner: {why}", file=sys.stderr)
             return 2
         ctx.member = member
+        if not args.min_free_gib:
+            ctx.min_free_gib = float(member.get("minFreeGib") or 0)
         ctx.labels = list(dict.fromkeys([*BASE_LABELS, *member["labels"]]))
         ctx.labels_requested = True
         if not args.name:

@@ -201,7 +201,8 @@ class HookTest(unittest.TestCase):
 
     def run_hook(self, phase: str, event_name: str | None, event_path: Path | None,
                  *extra: str, repo: str | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
-        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir)}
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir),
+                   "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet")}
         if event_name is not None:
             environ["GITHUB_EVENT_NAME"] = event_name
         if event_path is not None:
@@ -266,6 +267,113 @@ class HookTest(unittest.TestCase):
                                "manaflow-ai/cmux", "--disk", os.fspath(disk), repo="manaflow-ai/cmux")
         self.assertEqual(result.returncode, 1)
         self.assertFalse(marker.exists())
+
+    # ------------------------------------------------------------ host lock, reservation, disk floor
+
+    def fleet(self) -> Path:
+        fleet = self.dir / "fleet"
+        fleet.mkdir(exist_ok=True)
+        (fleet / "host.lock").touch()
+        return fleet
+
+    def started(self, *extra: str, watch: int | None = None) -> subprocess.CompletedProcess:
+        push = event(self.dir, "push", {"repository": CMUX})
+        args = ["--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
+                "--watch-pid", str(watch or os.getpid()), *extra]
+        return self.run_hook("job-started", "push", push, *args, repo="manaflow-ai/cmux")
+
+    def lock_free(self) -> bool:
+        import fcntl
+        fd = os.open(self.fleet() / "host.lock", os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+
+    def test_reservation_markers(self) -> None:
+        fleet = self.fleet()
+        now = time.time()
+        iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+        cases = {
+            "active": ({"schema": "glaeda-reservation/v1", "owner": "fleet-session", "purpose": "chromium campaign",
+                        "since": iso(now - 60), "until": iso(now + 3600)}, False, "chromium campaign"),
+            "expired": ({"schema": "glaeda-reservation/v1", "owner": "x", "purpose": "y", "until": iso(now - 60)},
+                        True, "admitted"),
+            "no-zone": ({"schema": "glaeda-reservation/v1", "until": "2099-01-01T00:00:00"}, False, "not a valid"),
+            "wrong-schema": ({"schema": "other/v1", "until": iso(now + 3600)}, False, "not a valid"),
+        }
+        for name, (doc, admitted, text) in cases.items():
+            with self.subTest(name):
+                (fleet / "reservation.json").write_text(json.dumps(doc))
+                result = self.started()
+                self.assertEqual(result.returncode == 0, admitted, result.stdout)
+                self.assertIn(text, result.stdout)
+                self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"))
+        (fleet / "reservation.json").write_text("{not json")
+        self.assertEqual(self.started().returncode, 1)
+        (fleet / "reservation.json").unlink()
+        self.assertEqual(self.started().returncode, 0)
+        self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"))
+
+    def test_disk_floor_refuses(self) -> None:
+        self.fleet()
+        result = self.started("--min-free-gib", "999999999")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("GiB required", result.stdout)
+        self.assertTrue(self.lock_free())
+
+    def test_lock_held_by_another_build_refuses_fast(self) -> None:
+        fleet = self.fleet()
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,sys,time\n"
+                                   f"fd=os.open({os.fspath(fleet / 'host.lock')!r},os.O_RDWR)\n"
+                                   "fcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(30)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            start = time.monotonic()
+            result = self.started()
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("another build holds the fleet host lock", result.stdout)
+            self.assertLess(time.monotonic() - start, 10)
+        finally:
+            holder.kill()
+            holder.wait()
+
+    def test_job_holds_the_lock_until_completed(self) -> None:
+        self.fleet()
+        start = time.monotonic()
+        result = self.started()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("holding the fleet host lock", result.stdout)
+        self.assertLess(time.monotonic() - start, 10, "the holder must not keep the hook's output open")
+        self.assertFalse(self.lock_free())
+        done = self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"))
+        self.assertIn("released the fleet host lock", done.stdout)
+        self.assertTrue(self.lock_free())
+
+    def test_lock_frees_itself_when_the_job_dies(self) -> None:
+        self.fleet()
+        worker = subprocess.Popen(["/bin/sleep", "30"])
+        try:
+            self.assertEqual(self.started(watch=worker.pid).returncode, 0)
+            self.assertFalse(self.lock_free())
+        finally:
+            worker.kill()
+            worker.wait()
+        deadline = time.monotonic() + 10
+        while not self.lock_free() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertTrue(self.lock_free())
+
+    def test_no_fleet_lock_file_admits(self) -> None:
+        result = self.started()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("no fleet host lock", result.stdout)
 
     def test_decide_is_pure_table(self) -> None:
         for name, (event_name, payload, admitted) in SAMPLE_EVENTS.items():
@@ -417,6 +525,7 @@ class RunnerTest(unittest.TestCase):
                 result = subprocess.run(["/bin/bash", os.fspath(hooks / "job-started.sh")], capture_output=True,
                                         text=True, timeout=60, check=False, env={
                                             "PATH": "/usr/bin:/bin", "HOME": os.fspath(self.home),
+                                            "GLAEDA_FLEET_DIR": os.fspath(self.home / "fleet"),
                                             "GITHUB_EVENT_NAME": event_name, "GITHUB_EVENT_PATH": os.fspath(path),
                                             "GITHUB_REPOSITORY": (payload.get("repository") or {}).get("full_name", "")})
                 self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
@@ -686,6 +795,16 @@ class RunnerTest(unittest.TestCase):
         again = self.invoke("--apply")
         self.assertEqual(self.by_kind(again)["register"]["state"], "unchanged")
         self.assertEqual(len(self.config_argvs()), 1)
+
+    def test_manifest_disk_floor_is_baked_into_the_hook(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["disk"] = {"min_free_gib": 100}
+        path = self.state / "floor.json"
+        path.write_text(json.dumps(manifest))
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
+        started = (self.home / "actions-runner-glaeda/glaeda-hooks/job-started.sh").read_text()
+        self.assertIn("--min-free-gib 100", started)
 
     def test_manifest_refusals_and_exclusive_flags(self) -> None:
         for args in (("--manifest", self.manifest(), "--member", "laptop"),

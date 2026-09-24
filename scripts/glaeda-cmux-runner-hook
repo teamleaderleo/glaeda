@@ -17,8 +17,17 @@ job-started refuses (exits 1, so the runner fails the job before any step runs) 
   * a workflow_run was triggered from a different head repository
   * the repository is not in the allowlist baked in at install time
   * GITHUB_EVENT_NAME or GITHUB_EVENT_PATH is missing or unreadable (fail closed)
-Any crash also exits non-zero, which refuses the job. Only after the job is admitted does it run
-glaeda-disk --pressure --apply --top 0, bounded by a timeout and never able to fail the job.
+Any crash also exits non-zero, which refuses the job. An admitted job is then held to the fleet host,
+so a PR job never lands on a mini that is busy with other work. It is refused fast (the pool picker
+re-runs it elsewhere) when:
+  * the host is reserved: /Users/Shared/cmux-build-fleet/reservation.json (glaeda-reservation/v1) with
+    now < until, whoever owns it; an unreadable or malformed file also refuses, an expired one is ignored
+  * free disk is below --min-free-gib
+  * another build holds the fleet host lock (/Users/Shared/cmux-build-fleet/host.lock, the flock that
+    with-host-lock and the build worker take)
+Otherwise it takes that lock for the job: a small detached holder keeps it until job-completed releases
+it or the job's Runner.Worker exits, so fleet builds wait for the PR job and a crash cannot strand it.
+Only then does it run glaeda-disk --pressure --apply --top 0, bounded and never able to fail the job.
 
 job-completed only runs the same disk pressure pass and always exits 0.
 """
@@ -26,15 +35,26 @@ job-completed only runs the same disk pressure pass and always exits 0.
 from __future__ import annotations
 
 import argparse
+import datetime
+import fcntl
 import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 DISK_TIMEOUT_S = 120
+# The runner's own environment (its LaunchAgent), never a job's env:, which does not reach hooks.
+FLEET_DIR = os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet"
+HOST_LOCK = f"{FLEET_DIR}/host.lock"
+RESERVATION = f"{FLEET_DIR}/reservation.json"
+RESERVATION_SCHEMA = "glaeda-reservation/v1"
+HOLDER_FILE = "host-lock-holder.pid"
+HOLDER_POLL_S = 2.0
+HOLDER_MAX_S = 12 * 3600  # a job never holds the host longer than GitHub's own job limit allows
 # Events whose code is the repository's own, or a same-repo pull request checked below. Comment,
 # check and review-comment events can run with secrets on behalf of a fork PR, so they are left out.
 ADMITTED_EVENTS = ("push", "pull_request", "merge_group", "workflow_dispatch", "schedule", "workflow_run")
@@ -90,6 +110,124 @@ def decide(event_name: str | None, event: Any, repository: str | None,
     return True, f"{event_name} on {repo or '(unknown)'}"
 
 
+def parse_time(value: Any) -> datetime.datetime | None:
+    """ISO 8601 with an explicit zone (python3.9 on the minis has no 'Z' support in fromisoformat)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        when = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.tzinfo is not None else None
+
+
+def reservation_refusal(path: str, now: datetime.datetime) -> str | None:
+    """Why an active or unreadable reservation refuses this job, or None."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return f"reservation {path} is unreadable ({type(error).__name__})"
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        doc = None
+    until = parse_time(doc.get("until")) if isinstance(doc, dict) else None
+    if not isinstance(doc, dict) or doc.get("schema") != RESERVATION_SCHEMA or until is None:
+        return f"reservation {path} is not a valid {RESERVATION_SCHEMA} marker"
+    if now >= until:
+        return None
+    return (f"host reserved by {doc.get('owner') or '?'} for {doc.get('purpose') or '?'} "
+            f"until {until.isoformat()}")
+
+
+def disk_refusal(path: str, min_free_gib: float) -> str | None:
+    if min_free_gib <= 0:
+        return None
+    try:
+        free = shutil.disk_usage(path if os.path.isdir(path) else str(Path.home())).free / 1024**3
+    except OSError as error:
+        return f"cannot read free disk ({type(error).__name__})"
+    return None if free >= min_free_gib else f"{free:.1f} GiB free, {min_free_gib:g} GiB required"
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def take_host_lock(path: str, watch_pid: int, state_dir: Path) -> tuple[bool, str]:
+    """Take the fleet host lock without waiting and leave it with a detached holder for this job."""
+    if not os.path.exists(path):
+        return True, "no fleet host lock on this machine"
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    except OSError as error:
+        return False, f"cannot open the fleet host lock ({type(error).__name__})"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False, "another build holds the fleet host lock"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    holder_file = state_dir / HOLDER_FILE
+    child = os.fork()
+    if child == 0:  # detach twice so the runner never waits on the holder
+        try:
+            os.setsid()
+            if os.fork():
+                os._exit(0)
+            null = os.open(os.devnull, os.O_RDWR)
+            for std in (0, 1, 2):  # the runner reads the hook's output until EOF
+                os.dup2(null, std)
+            me = str(os.getpid())
+            holder_file.write_text(me + "\n")
+            deadline = time.monotonic() + HOLDER_MAX_S
+            while pid_alive(watch_pid) and time.monotonic() < deadline:
+                try:
+                    if holder_file.read_text().strip() != me:
+                        break  # job-completed released it
+                except OSError:
+                    break
+                time.sleep(HOLDER_POLL_S)
+        finally:
+            os._exit(0)  # the lock goes with this process
+    os.waitpid(child, 0)
+    os.close(fd)  # the holder keeps the same open file, so the lock stays held
+    for _ in range(50):
+        if holder_file.is_file():
+            break
+        time.sleep(0.05)
+    return True, f"holding the fleet host lock for this job (watching pid {watch_pid})"
+
+
+def release_host_lock(state_dir: Path) -> str:
+    """job-completed: tell this job's holder to let go, and wait briefly for it."""
+    holder_file = state_dir / HOLDER_FILE
+    try:
+        pid = int(holder_file.read_text().strip())
+    except (OSError, ValueError):
+        return "no host lock holder to release"
+    holder_file.unlink(missing_ok=True)
+    deadline = time.monotonic() + HOLDER_POLL_S * 3
+    while pid_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    return "released the fleet host lock" if not pid_alive(pid) else f"holder {pid} still exiting"
+
+
+def refuse(reason: str) -> int:
+    message = f"{PREFIX}: refused: {reason}"
+    print(message, flush=True)
+    print(f"::error::{message}", flush=True)
+    return 1
+
+
 def load_event(path: str | None) -> Any:
     if not path:
         return None
@@ -137,6 +275,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="admit another event name (pull_request_target is always refused)")
     p.add_argument("--disk", help="glaeda-disk path (default: PATH, then ~/.local/bin)")
     p.add_argument("--no-disk", action="store_true")
+    p.add_argument("--min-free-gib", type=float, default=0, help="refuse a job below this much free disk")
+    p.add_argument("--host-lock", default=HOST_LOCK, help=argparse.SUPPRESS)
+    p.add_argument("--reservation", default=RESERVATION, help=argparse.SUPPRESS)
+    p.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/glaeda/cmux-runner",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--watch-pid", type=int, default=0, help=argparse.SUPPRESS)
     args = p.parse_args(argv)
 
     if args.phase == "job-started":
@@ -144,11 +288,18 @@ def main(argv: list[str] | None = None) -> int:
                                os.environ.get("GITHUB_REPOSITORY"), args.allowed_repo, args.allowed_owner,
                                tuple(args.allow_event))
         if not admit:
-            message = f"{PREFIX}: refused: {reason}"
-            print(message, flush=True)
-            print(f"::error::{message}", flush=True)
-            return 1
-        print(f"{PREFIX}: admitted: {reason}", flush=True)
+            return refuse(reason)
+        why = reservation_refusal(args.reservation, datetime.datetime.now(datetime.timezone.utc)) \
+            or disk_refusal(os.path.dirname(args.host_lock), args.min_free_gib)
+        if why:
+            return refuse(why)
+        # The wrapper execs this script, so the parent is the job's Runner.Worker.
+        held, note = take_host_lock(args.host_lock, args.watch_pid or os.getppid(), args.state_dir)
+        if not held:
+            return refuse(note)
+        print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
+    else:
+        print(f"{PREFIX}: {release_host_lock(args.state_dir)}", flush=True)
     if not args.no_disk:
         print(f"{PREFIX}: {disk_pressure(args.disk)}", flush=True)
     return 0

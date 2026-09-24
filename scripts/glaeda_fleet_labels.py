@@ -72,8 +72,11 @@ def member_labels(manifest: Any, member: str,
     # Opportunistic members never carry a pool label, so they never receive a required job.
     pools = [pool_label(klass, v) for v in versions] if availability == "dedicated" else []
     labels = [MINI_LABEL, f"glaeda-class-{klass}", f"glaeda-{availability}", *[f"xcode-{v}" for v in versions], *pools]
+    disk = merge(manifest.get("defaults") or {}, host.get("overrides") or {}).get("disk")
+    floor = disk.get("min_free_gib") if isinstance(disk, dict) else None
     return {"member": member, "class": klass, "availability": availability, "roles": roles,
-            "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools))}, None
+            "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
+            "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None}, None
 
 
 def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool] | None = None) -> dict[str, list[str]]:

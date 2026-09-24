@@ -67,7 +67,18 @@ What `--apply` does:
      event payload is missing or unreadable. Admitted jobs then run
      `glaeda-disk --pressure --apply --top 0` with a 120 s timeout that never fails
      the job.
-   - job-completed runs the same disk pressure pass and always exits 0.
+   - An admitted job is then held to the fleet host (`/Users/Shared/cmux-build-fleet`),
+     so a PR job never lands on a mini that is busy with other work. It is refused fast,
+     so the pool picker re-runs it elsewhere, when the host is reserved
+     (`reservation.json`, `glaeda-reservation/v1`, active while now is before `until`,
+     whoever owns it; an unreadable or malformed marker also refuses, an expired one is
+     ignored), when free disk is below `--min-free-gib` (from the manifest's
+     `disk.min_free_gib` with `--manifest`), or when another build holds `host.lock`, the
+     `flock` that `with-host-lock` and the build worker take. Otherwise the job takes that
+     lock: a small detached holder keeps it until job-completed releases it or the job's
+     `Runner.Worker` exits, so fleet builds wait for the PR job and a crash cannot leave
+     the lock held. A machine without `host.lock` skips the lock.
+   - job-completed releases the host lock, runs the same disk pressure pass and always exits 0.
 4. Writes and loads `~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist`
    (runs `run.sh`, restarts on crash, logs to `~/Library/Logs/glaeda-cmux-runner.log`).
 5. Confirms through the GitHub API that the runner is listed with every label and
