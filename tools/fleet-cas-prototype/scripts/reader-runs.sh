@@ -36,7 +36,7 @@ start_node() {
 
 run() {
   rm -f "$WORK/log-$1.txt"
-  "$here/with-fleet-lock.pl" "$here/xcode-cache-build.sh" "$1" \
+  REQUIRE_NODE=1 "$here/with-fleet-lock.pl" "$here/xcode-cache-build.sh" "$1" \
     COMPILATION_CACHE_ENABLE_PLUGIN=YES COMPILATION_CACHE_REMOTE_SERVICE_PATH="$sock" \
     || { echo "$1 failed rc=$?"; exit 1; }
   sleep 1

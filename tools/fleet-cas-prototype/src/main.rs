@@ -481,6 +481,19 @@ impl Store {
     /// instead of one fleet round trip each. Best effort: anything missed
     /// here is still fetched object by object.
     async fn prefetch(&self, value: &kv::Value) {
+        // The channel's per-call timeout covers only the response headers,
+        // not a streamed body: bound the whole prefetch, so a store that
+        // stalls mid-stream costs one timeout, then the backoff.
+        let limit = std::time::Duration::from_secs(30);
+        if tokio::time::timeout(limit, self.prefetch_inner(value))
+            .await
+            .is_err()
+        {
+            self.upstream_failed();
+        }
+    }
+
+    async fn prefetch_inner(&self, value: &kv::Value) {
         let Some(up) = &self.upstream else { return };
         if !up.closure.load(Relaxed) {
             return;
@@ -519,11 +532,10 @@ impl Store {
             if self.cas_path(&m.id).exists() {
                 continue;
             }
-            self.stats
-                .up_prefetch_bytes
-                .fetch_add(data.len() as u64, Relaxed);
+            let len = data.len() as u64;
             if self.put(obj.references, data).is_ok() {
                 self.stats.up_prefetched.fetch_add(1, Relaxed);
+                self.stats.up_prefetch_bytes.fetch_add(len, Relaxed);
             }
         }
         self.stats.up_calls.fetch_add(1, Relaxed);
@@ -533,7 +545,8 @@ impl Store {
     }
 
     /// Count entries that name absent objects (the M3 publication rule,
-    /// measured here, not enforced yet).
+    /// measured here, not enforced yet). Any 32-byte field in the record
+    /// counts as an ID, so this can over-count, never under-count.
     fn count_dangling(&self, value: &kv::Value) {
         let dangling = embedded_ids(value)
             .iter()
@@ -726,6 +739,12 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
 
 struct FleetSvc(Arc<Store>);
 
+/// Bounds on the unauthenticated closure RPC: roots per call, and walks in
+/// flight (each holds a blocking-pool thread while it streams).
+const MAX_CLOSURE_ROOTS: usize = 4096;
+static CLOSURE_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(64)));
+
 #[tonic::async_trait]
 impl fleet::fleet_cas_server::FleetCas for FleetSvc {
     type GetClosureStream =
@@ -736,19 +755,30 @@ impl fleet::fleet_cas_server::FleetCas for FleetSvc {
         r: Request<fleet::ClosureRequest>,
     ) -> Result<Response<Self::GetClosureStream>, Status> {
         let mut queue = r.into_inner().roots;
+        queue.sort();
+        queue.dedup();
+        if queue.len() > MAX_CLOSURE_ROOTS {
+            return Err(Status::invalid_argument("too many closure roots"));
+        }
+        let permit = CLOSURE_SLOTS
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("closure walks busy"))?;
         let store = self.0.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         tokio::task::spawn_blocking(move || {
-            let mut seen = HashSet::new();
+            let _permit = permit;
+            let mut seen: HashSet<Vec<u8>> = queue.iter().cloned().collect();
             while let Some(id) = queue.pop() {
-                if !seen.insert(id.clone()) {
-                    continue;
-                }
                 // `get` verifies the object and treats damage as absence.
                 let Ok(Some(obj)) = store.get(&id) else {
                     continue;
                 };
-                queue.extend(obj.references.iter().map(|r| r.id.clone()));
+                for r in &obj.references {
+                    if seen.insert(r.id.clone()) {
+                        queue.push(r.id.clone());
+                    }
+                }
                 let msg = fleet::ClosureObject {
                     id,
                     object: obj.encode_to_vec(),
@@ -797,6 +827,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .tcp_nodelay(true)
                 .connect_timeout(std::time::Duration::from_secs(2))
                 .timeout(std::time::Duration::from_secs(30))
+                .http2_keep_alive_interval(std::time::Duration::from_secs(10))
+                .keep_alive_timeout(std::time::Duration::from_secs(5))
+                .keep_alive_while_idle(true)
                 .connect_lazy();
             Some(Upstream {
                 cas: cas::casdb_service_client::CasdbServiceClient::new(ch.clone())
@@ -841,6 +874,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let final_store = store.clone();
     let router = tonic::transport::Server::builder()
         .tcp_nodelay(true)
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(10)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
         .add_service(
             cas::casdb_service_server::CasdbServiceServer::new(CasSvc(store.clone()))
                 .max_decoding_message_size(512 << 20)

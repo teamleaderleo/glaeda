@@ -43,11 +43,13 @@ else
 fi
 # A plugin socket nobody answers on makes Xcode crawl instead of failing:
 # drop the plugin settings and build with the local cache alone.
-args=()
+args=() sock= node_down=
 for a in "$@"; do
   case $a in COMPILATION_CACHE_REMOTE_SERVICE_PATH=*) sock=${a#*=} ;; esac
 done
-if [ -n "${sock:-}" ] && ! "$(dirname "$0")/fleet-cas-settings.sh" "$sock" >/dev/null; then
+if [ -n "$sock" ] && ! "$(dirname "$0")/fleet-cas-settings.sh" "$sock" >/dev/null; then
+  [ -n "${REQUIRE_NODE:-}" ] && { echo "$label: node down on $sock" >&2; exit 3; }
+  node_down=1
   for a in "$@"; do
     case $a in COMPILATION_CACHE_ENABLE_PLUGIN=* | COMPILATION_CACHE_REMOTE_SERVICE_PATH=*) ;; *) args+=("$a") ;; esac
   done
@@ -72,5 +74,6 @@ rc=$?
 end=$(date +%s.%N)
 printf '%s rc=%s %.1fs hits=%s misses=%s\n' "$label" "$rc" "$(echo "$end - $start" | bc)" \
   "$(grep -c 'cache hit' "$log")" "$(grep -c 'cache miss' "$log")"
+if [ -n "$node_down" ]; then echo "$label: node was down; built with the local cache only"; fi
 if grep -q bad_optional_access "$log"; then echo "$label: compiler crashed (bad_optional_access)"; fi
 exit "$rc"
