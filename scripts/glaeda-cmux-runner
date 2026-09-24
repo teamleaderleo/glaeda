@@ -144,7 +144,8 @@ def run_with_token(argv: list[str], token: str, cwd: Path, timeout: int = 900) -
         except subprocess.TimeoutExpired:
             with contextlib.suppress(OSError):
                 os.killpg(proc.pid, signal.SIGKILL)
-            proc.communicate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.communicate(timeout=10)
             code, out = 124, f"config.sh timed out after {timeout} seconds; its process group was killed"
     except OSError as error:
         code, out = 127, str(error)
@@ -498,6 +499,9 @@ def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[st
     if registered.get("owned") and ours:
         actions.append({"kind": "deregister", "state": "remove", "scope": registered.get("scope"),
                         "name": registered.get("name"), "runnerId": registered.get("runnerId")})
+    elif local and getattr(ctx, "unreadable_registration", False):
+        return [{"kind": "deregister", "state": "blocked", "path": os.fspath(ctx.runner_dir / ".runner"),
+                 "note": "a .runner here has no github.com URL or name to deregister by; remove it by hand"}]
     elif local:
         # config.sh finished after this command gave up on it: the directory is ours, so is its .runner
         actions.append({"kind": "deregister", "state": "remove", "name": local.get("agentName"),
@@ -874,6 +878,8 @@ def main(argv: list[str] | None = None) -> int:
             if local.get("agentName") and scope:
                 ctx.name = str(local["agentName"])
                 ctx.org, ctx.repo = (None, f"{scope[1]}/{scope[2]}") if scope[2] else (scope[1], None)
+            elif local:
+                ctx.unreadable_registration = True
     pre = preflight(ctx)
     doc: dict[str, Any] = {
         "schema": SCHEMA,
