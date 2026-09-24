@@ -8,6 +8,7 @@ import importlib.util
 import contextlib
 import io
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -188,6 +189,17 @@ class GlaedaDiskTest(unittest.TestCase):
 
     def test_thresholds_take_gib_or_percent(self) -> None:
         self.assertEqual(gd.space("60", 10**15), 60 * 1024**3)
+        gib = 1024**3
+        # one default across a 256 GB laptop, a 1 TB mini and an 8 TB studio
+        self.assertEqual(gd.space("15%:40-150", 238 * gib), 40 * gib)
+        self.assertEqual(gd.space("15%:40-150", 931 * gib), int(931 * gib * 0.15))
+        self.assertEqual(gd.space("15%:40-150", 7450 * gib), 150 * gib)
+        # a 30 GiB VM: the 40 GiB floor stops at twice the share instead of exceeding the disk
+        self.assertEqual(gd.space("15%:40-150", 30 * gib), int(30 * gib * 0.15) * 2)
+        self.assertLess(gd.space("25%:80-300", 30 * gib), 30 * gib)
+        for bad in ("60:1-2", "15%:9", "15%:50-40", "15%:a-b"):
+            with self.assertRaises(ValueError):
+                gd.space(bad, 1000)
         self.assertEqual(gd.space("15%", 1000), 150)
         self.assertEqual(gd.space("2.5", 0), int(2.5 * 1024**3))
         with self.assertRaises(ValueError):
@@ -251,6 +263,9 @@ class GlaedaDiskTest(unittest.TestCase):
                              min_bytes=0, git_disposable=True)
         self.fam.root.mkdir()
         origin = self.root / "origin"
+        # these stand in for a network server; any other local remote vouches for nothing
+        gd.TRUSTED_LOCAL_REMOTES = (str(origin), str(self.root / "subsrc"))
+        self.addCleanup(setattr, gd, "TRUSTED_LOCAL_REMOTES", ())
         self._git("init", "-q", "-b", "main", str(origin))
         (origin / "f").write_text("x")
         self._git("-C", str(origin), "add", "f")
@@ -330,7 +345,7 @@ class GlaedaDiskTest(unittest.TestCase):
                              "stashed": "git-checkout", "nested": "git-checkout",
                              "detached": "git-checkout", "young": "git-checkout"})
         why = {Path(i.path).name: i.reasons for i in items}
-        self.assertEqual(why["unpushed"], ["commits not on any remote"])
+        self.assertEqual(why["unpushed"], ["commits no remote confirms"])
         self.assertEqual(why["detached"], ["HEAD on no ref"])
         # without the opt-in every checkout stays protected
         plain = gd.replace(self.fam, git_disposable=False)
@@ -354,6 +369,10 @@ class GlaedaDiskTest(unittest.TestCase):
         self._git("clone", "-q", str(origin), str(root / "super"))
         self._git("-C", str(root / "super"), "-c", "protocol.file.allow=always", "submodule",
                   "add", "-q", str(sub), "sm")
+        (root / "super/sm/local").write_text("only here")
+        self._git("-C", str(root / "super/sm"), "add", "local")
+        self._git("-C", str(root / "super/sm"), "commit", "-qm", "local")
+        self._git("-C", str(root / "super"), "add", "sm")
         self._git("-C", str(root / "super"), "commit", "-qm", "sm")
         self._git("-C", str(root / "super"), "push", "-q", "origin", "HEAD:refs/heads/super")
         self._git("-C", str(root / "super"), "fetch", "-q")
@@ -374,10 +393,165 @@ class GlaedaDiskTest(unittest.TestCase):
         why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
         self.assertEqual(why, {
             "main": ("git-checkout", ["other worktrees use this repository"]),
-            "super": ("git-checkout", ["submodules"]),
+            "super": ("git-checkout", ["submodule sm: commits no remote confirms"]),
             "skipped": ("git-checkout", ["files hidden from status"]),
             "bisect": ("git-checkout", ["HEAD on no ref"]),
             "locked": ("git-checkout", ["locked worktree"])})
+
+    def test_submodules_are_judged_not_vetoed(self) -> None:
+        root, origin = self._tmp_repos()
+        sub = self.root / "subsrc"
+        self._git("clone", "-q", str(origin), str(sub))
+        add = ("-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "sm")
+
+        def superproject(name: str, worktree: bool = False) -> Path:
+            d = root / name
+            if worktree:
+                self._git("-C", str(origin), "worktree", "add", "-q", "-b", name, str(d))
+            else:
+                self._git("clone", "-q", str(origin), str(d))
+            self._git("-C", str(d), *add)
+            self._git("-C", str(d), "commit", "-qm", "sm")
+            if not worktree:
+                self._git("-C", str(d), "push", "-q", "origin", f"HEAD:refs/heads/{name}")
+                self._git("-C", str(d), "fetch", "-q")
+            return d
+
+        superproject("pushed")  # submodule at a commit its remote has
+        # pinned at a commit fetched by id: on the remote, but no remote-tracking ref has it
+        extra = self.root / "extra"
+        self._git("clone", "-q", str(sub), str(extra))
+        (extra / "e").write_text("e")
+        self._git("-C", str(extra), "add", "e")
+        self._git("-C", str(extra), "commit", "-qm", "e")
+        pinned = self._git("-C", str(extra), "rev-parse", "HEAD").strip()
+        self._git("-C", str(extra), "push", "-q", "origin", "HEAD:refs/pinned/e")  # no branch
+        d = superproject("fetched")
+        self._git("-C", str(d / "sm"), "-c", "uploadpack.allowAnySHA1InWant=true", "fetch", "-q",
+                  "origin", pinned)
+        self._git("-C", str(d / "sm"), "checkout", "-q", pinned)
+        self.assertTrue(self._git("-C", str(d / "sm"), "rev-list", "HEAD", "--not", "--remotes"))
+        self._git("-C", str(d), "add", "sm")
+        self._git("-C", str(d), "commit", "-qm", "pin")
+        self._git("-C", str(d), "push", "-q", "origin", "HEAD:refs/heads/fetched")
+        self._git("-C", str(d), "fetch", "-q")
+        superproject("wt-pushed", worktree=True)
+        d = superproject("dirty")
+        (d / "sm/untracked").write_text("u")
+        d = superproject("stashed")
+        (d / "sm/f").write_text("changed")
+        self._git("-C", str(d / "sm"), "stash", "-q")
+        d = superproject("wt-local", worktree=True)  # modules live in the worktree's git dir
+        (d / "sm/g").write_text("g")
+        self._git("-C", str(d / "sm"), "add", "g")
+        self._git("-C", str(d / "sm"), "commit", "-qm", "g")
+        self._git("-C", str(d), "add", "sm")
+        self._git("-C", str(d), "commit", "-qm", "bump")
+        for c in root.iterdir():
+            self._age(c)
+        why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
+        self.assertEqual(why, {
+            "pushed": ("reclaimable", []),
+            "fetched": ("reclaimable", []),
+            "wt-pushed": ("reclaimable", []),
+            "dirty": ("git-checkout", ["uncommitted or untracked changes"]),
+            "stashed": ("git-checkout", ["submodule sm: stash entries"]),
+            "wt-local": ("git-checkout", ["submodule sm: commits no remote confirms"])})
+
+    def test_submodule_work_the_remote_lacks_is_kept(self) -> None:
+        """The #1149 review repros: local submodule commits with no telltale reflog entry."""
+        root, origin = self._tmp_repos()
+        sub = self.root / "subsrc"
+        self._git("clone", "-q", str(origin), str(sub))
+        file_ok = ("-c", "protocol.file.allow=always")
+
+        def superproject(name: str) -> Path:
+            d = root / name
+            self._git("clone", "-q", str(origin), str(d))
+            self._git("-C", str(d), *file_ok, "submodule", "add", "-q", str(sub), "sm")
+            self._git("-C", str(d), "commit", "-qm", "sm")
+            self._git("-C", str(d), "push", "-q", "origin", f"HEAD:refs/heads/{name}")
+            self._git("-C", str(d), "fetch", "-q")
+            return d
+
+        def commit(repo: Path, msg: str) -> str:
+            self._git("-C", str(repo), "commit", "-q", "--allow-empty", "-m", msg)
+            return self._git("-C", str(repo), "rev-parse", "HEAD").strip()
+
+        d = superproject("orphaned")  # detached commit, then `submodule update` moves away
+        commit(d / "sm", "local")
+        self._git("-C", str(d), *file_ok, "submodule", "update", "-q")
+        d = superproject("commit-tree")  # no commit-shaped reflog entry, only "branch: Created"
+        c = self._git("-C", str(d / "sm"), "commit-tree", "HEAD^{tree}", "-p", "HEAD",
+                      "-m", "ct").strip()
+        self._git("-C", str(d / "sm"), "branch", "keep", c)
+        d = superproject("expired")  # reflog expired
+        self._git("-C", str(d / "sm"), "checkout", "-q", "-b", "feat")
+        commit(d / "sm", "local")
+        self._git("-C", str(d / "sm"), "checkout", "-q", "--detach", "HEAD~1")
+        self._git("-C", str(d / "sm"), "reflog", "expire", "--expire=now", "--all")
+        d = superproject("embedded")  # the submodule's .git is a directory in the tree
+        self._git("-C", str(d), "submodule", "deinit", "-q", "-f", "sm")
+        gitdir = self._git("-C", str(d), "rev-parse", "--path-format=absolute", "--git-dir")
+        shutil.rmtree(Path(gitdir.strip()) / "modules/sm")
+        shutil.rmtree(d / "sm")
+        self._git("clone", "-q", str(sub), str(d / "sm"))
+        self._git("-C", str(d / "sm"), "checkout", "-q", "-b", "feat")
+        commit(d / "sm", "local")
+        self._git("-C", str(d / "sm"), "checkout", "-q", "--detach", "origin/HEAD")
+        d = superproject("sub-worktree")  # the submodule backs a worktree elsewhere
+        self._git("-C", str(d / "sm"), "worktree", "add", "-q", "--detach",
+                  str(self.root / "sub-wt"))
+        d = superproject("local-fetch")  # commits fetched from another scratch repo
+        other = self.root / "other"
+        self._git("clone", "-q", str(sub), str(other))
+        commit(other, "other")
+        self._git("-C", str(d / "sm"), "fetch", "-q", str(other), "HEAD:refs/heads/fromother")
+        for c in root.iterdir():
+            self._age(c)
+        why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
+        confirm = ["submodule sm: commits no remote confirms"]
+        self.assertEqual(why, {
+            "orphaned": ("git-checkout", confirm),
+            "commit-tree": ("git-checkout", confirm),
+            "expired": ("git-checkout", confirm),
+            "embedded": ("git-checkout", confirm),
+            "sub-worktree": ("git-checkout", ["submodule sm: has worktrees of its own"]),
+            "local-fetch": ("git-checkout", confirm)})
+
+    def test_local_remotes_never_vouch_for_commits(self) -> None:
+        root, origin = self._tmp_repos()
+        a, b = root / "a", root / "b"
+        self._git("clone", "-q", str(origin), str(a))
+        self._git("-C", str(a), "commit", "-q", "--allow-empty", "-m", "only here")
+        self._git("clone", "-q", str(a), str(b))  # b's origin is a
+        self._git("-C", str(a), "remote", "add", "b", str(b))
+        self._git("-C", str(a), "fetch", "-q", "b")
+        for c in (a, b):
+            self._age(c)
+        v = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
+        self.assertEqual(v, {"a": ("git-checkout", ["commits no remote confirms"]),
+                             "b": ("git-checkout", ["commits no remote confirms"])})
+        self.assertEqual(gd.network_remotes(a / ".git"), ["origin"])  # not the sibling b
+
+    def test_network_remote_urls(self) -> None:
+        for url in ("https://github.com/o/r.git", "ssh://git@h/o/r", "git@github.com:o/r.git",
+                    "big-red:Projects/x", "git://h/r"):
+            self.assertTrue(gd.NETWORK_URL.match(url), url)
+        for url in ("/tmp/x", "../b", "./b", "file:///tmp/x", "b", "/c/x"):
+            self.assertFalse(gd.NETWORK_URL.match(url) and not url.startswith("file:"), url)
+
+    def test_worktree_reflog_only_commit_is_kept(self) -> None:
+        root, origin = self._tmp_repos()
+        wt = root / "wt"
+        self._git("-C", str(origin), "worktree", "add", "-q", "-b", "wt", str(wt))
+        self._git("-C", str(wt), "checkout", "-q", "--detach")
+        self._git("-C", str(wt), "commit", "-q", "--allow-empty", "-m", "made here")
+        self._git("-C", str(wt), "checkout", "-q", "wt")
+        self._age(wt)
+        item = gd.survey([self.fam], 24, 0)[0]
+        self.assertEqual((item.verdict, item.reasons),
+                         ("git-checkout", ["commits only this worktree's reflog holds"]))
 
     def test_apply_rechecks_a_checkout_that_gained_work(self) -> None:
         root, origin = self._tmp_repos()
@@ -446,6 +620,8 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertIn("botany-sim-worktrees", projects.skip)
         tmp = next(f for f in fams if f.id == "tmp")
         self.assertIn(f"claude-{os.getuid()}", tmp.skip)
+        # scratch clones and leaked files are judged on any filesystem, not only a tmpfs
+        self.assertTrue(tmp.files and tmp.git_disposable)
 
     def test_claude_session_seen_in_alternate_config_dir(self) -> None:
         t = self.home / ".claude-outlook/projects/-home-leo-Projects/abc-123.jsonl"
