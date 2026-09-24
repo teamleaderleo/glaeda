@@ -41,6 +41,7 @@ The receipt lands in ~/.local/state/glaeda/cmux-runner/receipt.json.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import json
@@ -52,6 +53,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -125,17 +127,27 @@ def read_token(gh: str, endpoint: str) -> str | None:
     return token
 
 
-def run_with_token(argv: list[str], token: str, cwd: Path, timeout: int = 300) -> tuple[int, str]:
+def run_with_token(argv: list[str], token: str, cwd: Path, timeout: int = 900) -> tuple[int, str]:
     """Run config.sh with the token only in that child's environment; scrub it from the output."""
     env = dict(os.environ)
     env["ACTIONS_RUNNER_INPUT_TOKEN"] = token
     try:
-        result = subprocess.run(
+        # Own process group: config.sh runs Runner.Listener as a child, which would otherwise outlive
+        # a timeout, keep the token in its environment, and register behind our back.
+        proc = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=timeout, env=env, cwd=cwd, check=False,
+            text=True, env=env, cwd=cwd, start_new_session=True,
         )
-        code, out = result.returncode, result.stdout
-    except (OSError, subprocess.TimeoutExpired) as error:
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+            code = proc.returncode
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.communicate(timeout=10)
+            code, out = 124, f"config.sh timed out after {timeout} seconds; its process group was killed"
+    except OSError as error:
         code, out = 127, str(error)
     finally:
         env.pop("ACTIONS_RUNNER_INPUT_TOKEN", None)
@@ -483,9 +495,17 @@ def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[st
 
     ours = owned_dir(ctx, receipt)
     registered = receipt.get("registration") or {}
+    local = local_runner(ctx) if ours else None
     if registered.get("owned") and ours:
         actions.append({"kind": "deregister", "state": "remove", "scope": registered.get("scope"),
                         "name": registered.get("name"), "runnerId": registered.get("runnerId")})
+    elif local and getattr(ctx, "unreadable_registration", False):
+        return [{"kind": "deregister", "state": "blocked", "path": os.fspath(ctx.runner_dir / ".runner"),
+                 "note": "a .runner here has no github.com URL or name to deregister by; remove it by hand"}]
+    elif local:
+        # config.sh finished after this command gave up on it: the directory is ours, so is its .runner
+        actions.append({"kind": "deregister", "state": "remove", "name": local.get("agentName"),
+                        "runnerId": local.get("agentId"), "note": "registered by an interrupted --apply"})
     else:
         actions.append({"kind": "deregister", "state": "kept",
                         "note": "no registration owned by this command in this runner directory"})
@@ -581,6 +601,11 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                 receipt_doc["registration"] = {"owned": True, "scope": ctx.org or ctx.repo, "org": bool(ctx.org),
                                                "name": ctx.name, "labels": ctx.labels,
                                                "runnerId": act.get("runnerId")}
+        elif kind == "register" and state == "unchanged" and not receipt_doc.get("registration"):
+            adopted = adopt_registration(ctx)
+            if adopted:
+                receipt_doc["registration"] = adopted
+                act["note"] = "adopted the registration an interrupted --apply finished in this directory"
         elif kind in {"hook", "agent"} and state in {"create", "update"}:
             data, mode = desired_files(ctx)[Path(act["path"])]
             if kind == "agent" and act.get("loaded"):
@@ -612,6 +637,18 @@ def local_runner(ctx: Context) -> dict[str, Any] | None:
     except (OSError, ValueError):
         return None
     return doc if isinstance(doc, dict) else None
+
+
+def adopt_registration(ctx: Context) -> dict[str, Any] | None:
+    """An earlier --apply timed out while config.sh kept going and registered anyway. Only called for
+    a directory this command owns (marker + receipt), and only for the exact name and scope asked for."""
+    local = local_runner(ctx)
+    if not local or local.get("agentName") != ctx.name:
+        return None
+    if str(local.get("gitHubUrl") or "").rstrip("/").lower() != ctx.scope_url.lower():
+        return None
+    return {"owned": True, "scope": ctx.org or ctx.repo, "org": bool(ctx.org), "name": ctx.name,
+            "labels": ctx.labels, "runnerId": local.get("agentId"), "adopted": True}
 
 
 def verify_local(ctx: Context, act: dict[str, Any], wait: bool) -> None:
@@ -833,6 +870,16 @@ def main(argv: list[str] | None = None) -> int:
             ctx.name = reg["name"]
         if reg.get("scope"):
             ctx.org, ctx.repo = (reg["scope"], None) if reg.get("org") else (None, reg["scope"])
+        elif not reg and owned_dir(ctx, prior):
+            # an interrupted --apply registered without recording it: .runner says where
+            local = local_runner(ctx) or {}
+            scope = re.fullmatch(r"https://github\.com/([A-Za-z0-9-]+)(?:/([A-Za-z0-9._-]+))?/?",
+                                 str(local.get("gitHubUrl") or ""))
+            if local.get("agentName") and scope:
+                ctx.name = str(local["agentName"])
+                ctx.org, ctx.repo = (None, f"{scope[1]}/{scope[2]}") if scope[2] else (scope[1], None)
+            elif local:
+                ctx.unreadable_registration = True
     pre = preflight(ctx)
     doc: dict[str, Any] = {
         "schema": SCHEMA,

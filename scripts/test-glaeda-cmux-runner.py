@@ -126,7 +126,8 @@ if token != os.environ["FAKE_REG_TOKEN"]:
     print("bad token " + str(token)); sys.exit(1)
 name = argv[argv.index("--name") + 1]
 labels = ["self-hosted", "macOS", "ARM64"] + argv[argv.index("--labels") + 1].split(",")
-json.dump({"agentId": 4242, "agentName": name}, open(os.path.join(here, ".runner"), "w"))
+json.dump({"agentId": 4242, "agentName": name, "gitHubUrl": argv[argv.index("--url") + 1]},
+          open(os.path.join(here, ".runner"), "w"))
 doc = runners()
 doc["runners"].append({"id": 4242, "name": name, "status": "online", "busy": False,
                        "labels": [{"name": l} for l in labels]})
@@ -603,6 +604,57 @@ class RunnerTest(unittest.TestCase):
         receipt = self.invoke("--apply")
         self.assertTrue(receipt["ready"], receipt["blocking"])
         self.assertTrue((runner / ".runner").is_file())
+
+    def test_registration_finished_after_timeout_is_adopted_then_removed(self) -> None:
+        # config.sh outlived our timeout: .runner exists but the receipt recorded no registration
+        with mock.patch.object(cr, "run_with_token", side_effect=lambda argv, token, cwd, timeout=900: (
+                subprocess.run(argv, env={**os.environ, "ACTIONS_RUNNER_INPUT_TOKEN": token}, cwd=cwd,
+                               capture_output=True, check=False), (127, "timed out after 900 seconds"))[1]):
+            first = self.invoke("--apply", expect=1)
+        self.assertEqual(self.by_kind(first)["register"]["state"], "failed")
+        runner = self.home / "actions-runner-glaeda"
+        self.assertTrue((runner / ".runner").is_file())
+        second = self.invoke("--apply")
+        self.assertTrue(second["ready"], second["blocking"])
+        self.assertIn("adopted", self.by_kind(second)["register"]["note"])
+        receipt = json.loads((self.home / ".local/state/glaeda/cmux-runner/receipt.json").read_text())
+        self.assertEqual(receipt["registration"]["runnerId"], 4242)
+        removed = self.invoke("--uninstall", "--apply")
+        self.assertTrue(next(a for a in removed["actions"] if a["kind"] == "deregister")["applied"])
+        self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
+        self.assertFalse(runner.exists())
+
+    def test_uninstall_deregisters_an_unadopted_interrupted_registration(self) -> None:
+        with mock.patch.object(cr, "run_with_token", side_effect=lambda argv, token, cwd, timeout=900: (
+                subprocess.run(argv, env={**os.environ, "ACTIONS_RUNNER_INPUT_TOKEN": token}, cwd=cwd,
+                               capture_output=True, check=False), (127, "timed out"))[1]):
+            self.invoke("--apply", expect=1)
+        removed = self.invoke("--uninstall", "--apply")
+        self.assertTrue(next(a for a in removed["actions"] if a["kind"] == "deregister")["applied"])
+        self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
+
+    def test_interrupted_registration_uninstall_uses_the_runners_own_name_and_scope(self) -> None:
+        with mock.patch.object(cr, "run_with_token", side_effect=lambda argv, token, cwd, timeout=900: (
+                subprocess.run(argv, env={**os.environ, "ACTIONS_RUNNER_INPUT_TOKEN": token}, cwd=cwd,
+                               capture_output=True, check=False), (124, "timed out"))[1]):
+            self.invoke("--apply", "--repo", "teamleaderleo/cmux", "--name", "custom-glaeda", expect=1)
+        removed = self.invoke("--uninstall", "--apply")
+        self.assertTrue(next(a for a in removed["actions"] if a["kind"] == "deregister")["applied"])
+        tokens = [e["argv"] for e in self.log() if e["tool"] == "gh" and "-X" in e["argv"]]
+        self.assertIn("repos/teamleaderleo/cmux/actions/runners/remove-token", tokens[-1])
+        self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
+
+    def test_timeout_kills_the_whole_process_group(self) -> None:
+        marker = self.home / "grandchild-survived"
+        script = make_executable(self.home / "slow-config.sh",
+                                 "#!/bin/bash\n(sleep 3; touch " + os.fspath(marker) + ") &\nsleep 30\n")
+        start = time.monotonic()
+        code, out = cr.run_with_token([os.fspath(script)], REG_TOKEN, self.home, timeout=1)
+        self.assertEqual(code, 124)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertNotIn(REG_TOKEN, out)
+        time.sleep(4)
+        self.assertFalse(marker.exists())
 
     def test_config_remove_failure_falls_back_to_api_delete(self) -> None:
         self.invoke("--apply")
