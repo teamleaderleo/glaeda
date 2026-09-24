@@ -28,8 +28,7 @@ material, tokens, or log contents. `plan` prints commands for an operator; it ru
 glaeda-mini-enroll, local acceptance and cmux scripts/setup.sh will later require (the pinned
 Xcode, its selection, licence and first launch, the Metal toolchain, tool versions on the
 workload PATH, Python 3.13+ for enrollment and as the workload PATH's python3, gh on the workload
-PATH, the checkout with
-submodules and setup artifacts, a ~/glaeda whose glaeda-mini-enroll knows the options onboarding
+PATH, the checkout with submodules and setup artifacts, a ~/glaeda whose glaeda-mini-enroll knows the options onboarding
 passes (and is at --glaeda-ref when given), power, disk, a pending macOS update, Homebrew formulas
 left unpinned) plus onboarding progress (candidate, node id, enrollment, runner). It
 prints one host-by-check table, then each host's fixes split into what the login user can do,
@@ -1787,7 +1786,7 @@ def say(text: str) -> None:
 def planned_actions(result: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """(repairs fix runs, in FIX_ORDER; root steps for sudo-plan, in SUDO_ORDER) from one preflight result.
 
-    Each carries the checks it makes pass. The two Homebrew formulas become one step."""
+    Each carries the checks it makes pass. The Homebrew formulas become one step."""
     mine: list[dict[str, Any]] = []
     root: list[dict[str, Any]] = []
     for check, c in result["checks"].items():
@@ -1964,7 +1963,8 @@ def host_gate_block() -> str:
 
 
 def brew_commands(owner: str, formulas: list[str], as_owner: bool) -> list[str]:
-    """Install or upgrade formulas in /opt/homebrew as its owner, then link rustup's proxies onto the workload PATH."""
+    """Install or upgrade formulas in /opt/homebrew as its owner, link rustup's proxies, python3 and an unlinked gh
+    onto the workload PATH, then pin the BREW_FORMULAS among them (never BREW_UNPINNED)."""
     if not SAFE_WORD_RE.fullmatch(owner) or set(formulas) - set(BREW_FORMULAS) - set(BREW_UNPINNED):
         raise Failure(f"refusing Homebrew step for owner {owner!r}, formulas {formulas}")
     run = f"sudo -H -u {owner} " if as_owner else ""
