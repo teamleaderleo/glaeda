@@ -39,6 +39,8 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = "glaeda-mini-fleet/v1"
+# What a host is for; the target end state can give one host several.
+ROLES = ("dev-builds", "ci-runner", "nightly", "ios-simulators", "cache-host")
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROBE = SCRIPT_DIR / "cmux_mini_probe.sh"
 DEFAULT_MANIFEST = Path(os.environ.get("GLAEDA_MINI_FLEET_MANIFEST", "~/.config/glaeda/mini-fleet.json")).expanduser()
@@ -74,6 +76,9 @@ def load_manifest(path: Path) -> dict[str, Any]:
             raise Failure(f"{path}: host name {name!r} is not usable as an SSH destination")
         if host_key(name) in never or host_key(host.get("hostname") or "") in never:
             raise Failure(f"{path}: host {name} is also in never_touch")
+        unknown = set(host.get("roles", [])) - set(ROLES)
+        if unknown:
+            raise Failure(f"{path}: host {name} has unknown roles {sorted(unknown)}; known: {', '.join(ROLES)}")
         if host.get("class") not in data["classes"]:
             raise Failure(f"{path}: host {name} has unknown class {host.get('class')!r}")
         for key_id in host_policy(data, name)["authorized_keys"].get("require", []) + \
@@ -134,6 +139,7 @@ def parse_probe(text: str) -> dict[str, Any]:
             out[key] = value
     return {
         "user": out.get("user"),
+        "sudo": out.get("sudo"),
         "admin_group": out.get("admin_group") == "yes",
         "hostname": out.get("hostname"),
         "computer_name": out.get("computer_name"),
@@ -156,6 +162,7 @@ def parse_probe(text: str) -> dict[str, Any]:
             "last_job": out.get("fleet_last_job"),
             "recipe": out.get("fleet_recipe"),
             "worker_sha256_12": out.get("fleet_worker_sha"),
+            "controller_token": out.get("controller_token"),
         },
         "authorized_keys_files": [v.split("|")[0] for v in out["ak_file"]],
         "authorized_keys": [parse_key(v) for v in out["ak_key"] if v.split("|", 1)[0] in LIVE_KEY_FILES],
@@ -288,6 +295,14 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
         if label in running:
             drift("launchd", f"{label} installed, manifest says absent")
 
+    # sudo is declared per host because fixes that need it go to an operator, not to this tool.
+    if host.get("sudo") and obs.get("sudo") and obs["sudo"] != host["sudo"]:
+        drift("sudo", f"sudo is {obs['sudo']}, manifest says {host['sudo']}")
+    token = policy.get("controller_token")
+    got_token = obs["fleet_worker"].get("controller_token")
+    if token and got_token and got_token != token:
+        drift("worker", f"controller token {got_token}, want {token}", "provision secrets/controller.token (operator)")
+
     floor = policy.get("disk", {}).get("min_free_gib")
     data = obs["disk"].get("/System/Volumes/Data") or obs["disk"].get("/")
     if floor and data and data["free_gib"] < floor:
@@ -328,7 +343,7 @@ got=$(printf '%s\n' "$line" | ssh-keygen -lf /dev/stdin | awk '{print $2}')
 state="$HOME/.local/state/glaeda/mini-fleet"
 mkdir -p "$state" && chmod 700 "$state"
 if [ -e "$ak" ]; then
-  backup="$state/authorized_keys.$(date -u +%Y%m%dT%H%M%SZ)"
+  backup="$state/authorized_keys.$(date -u +%Y%m%dT%H%M%SZ).$$"
   cp -p "$ak" "$backup"
 else
   mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
@@ -353,7 +368,9 @@ tmp="$dst.glaeda-partial"
 [ ! -e "$tmp" ] || { echo "refused: $tmp exists from an earlier run; inspect it" >&2; exit 3; }
 cp -c -R "$src" "$tmp"
 mv -n "$tmp" "$dst"
-[ ! -e "$tmp" ] || { echo "refused: $dst appeared during the clone; $tmp left for inspection" >&2; exit 3; }
+if [ -e "$tmp" ] || [ -e "$dst/$(basename "$tmp")" ]; then
+  echo "refused: $dst appeared during the clone; the partial copy was left for inspection" >&2; exit 3
+fi
 echo "cloned: $src -> $dst ($v $b)"
 """
 
@@ -373,9 +390,11 @@ def remote(name: str, user: str, script: str, args: list[str], stdin: str = "") 
 def apply(manifest: dict[str, Any], hosts: list[str], yes: bool) -> int:
     observed = observe(manifest, hosts)
     failed = 0
+    skipped = set()
     for name in hosts:
         if manifest["hosts"][name].get("overrides", {}).get("apply") is False:
             print(f"{name}: skipped (apply: false)")
+            skipped.add(name)
             continue
         before = check(manifest, observed, [name])
         if any(i["area"] == "reach" for i in before):
@@ -405,8 +424,9 @@ def apply(manifest: dict[str, Any], hosts: list[str], yes: bool) -> int:
             failed += code != 0
     if not yes:
         print("dry run; pass --yes to apply")
-        return 0
-    after = check(manifest, observe(manifest, hosts), hosts)
+        return 1 if failed else 0
+    touched = [h for h in hosts if h not in skipped]
+    after = check(manifest, observe(manifest, touched), touched)
     left = [i for i in after if i.get("action") or i["area"] == "reach"]
     for i in left:
         print(f"still drifting: {i['host']}: {i['detail']}")

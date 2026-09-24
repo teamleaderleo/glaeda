@@ -114,6 +114,15 @@ class ManifestTests(unittest.TestCase):
                                     "--observed", os.fspath(obs)])
                 self.assertEqual(code, 2, text)
 
+    def test_unknown_role_is_refused(self) -> None:
+        data = copy.deepcopy(self.manifest)
+        data["hosts"]["build-mini-1"]["roles"] = ["dev-builds", "coffee"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "m.json"
+            path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(mf.Failure, "unknown roles"):
+                mf.load_manifest(path)
+
     def test_unknown_key_reference_is_refused(self) -> None:
         data = copy.deepcopy(self.manifest)
         data["defaults"]["authorized_keys"]["allow"].append("ghost")
@@ -183,6 +192,13 @@ class CheckTests(unittest.TestCase):
     def test_symlinked_xcode_is_drift(self) -> None:
         text = probe_text(clone=False) + "xcode_app\t/Applications/Xcode_26.3.app|symlink:Xcode.app|26.3|17C529\n"
         self.assertTrue([i for i in self.issues(text) if "real directory" in i["detail"]])
+
+    def test_sudo_and_token_drift(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["sudo"] = "password"
+        self.manifest["defaults"]["controller_token"] = "present"
+        text = probe_text() + "sudo\tnopasswd\ncontroller_token\tmissing\n"
+        areas = {i["area"] for i in self.issues(text)}
+        self.assertTrue({"sudo", "worker"} <= areas)
 
     def test_versions_compare_padded(self) -> None:
         self.assertEqual(mf.version_tuple("26.3"), mf.version_tuple("26.3.0"))
@@ -357,10 +373,12 @@ class ProbeScriptTests(unittest.TestCase):
     def test_probe_parses_as_bash(self) -> None:
         subprocess.run(["bash", "-n", os.fspath(ROOT / "scripts" / "cmux_mini_probe.sh")], check=True)
 
-    def test_probe_never_reads_key_material_or_tokens(self) -> None:
+    def test_probe_never_reads_tokens_or_runs_privileged_commands(self) -> None:
         text = (ROOT / "scripts" / "cmux_mini_probe.sh").read_text()
-        self.assertNotIn("secrets/", text)
-        self.assertNotIn("sudo", text.replace("no sudo", ""))
+        secret_lines = [line.strip() for line in text.splitlines() if "secrets/" in line and not line.strip().startswith("#")]
+        self.assertEqual(secret_lines, ['[ -f "$F/secrets/controller.token" ] && e controller_token present || e controller_token missing'])
+        sudo_lines = [line.strip() for line in text.splitlines() if "sudo" in line and not line.strip().startswith("#")]
+        self.assertEqual(sudo_lines, ["if sudo -n -l >/dev/null 2>&1; then e sudo nopasswd; else e sudo password; fi"])
 
 
 if __name__ == "__main__":

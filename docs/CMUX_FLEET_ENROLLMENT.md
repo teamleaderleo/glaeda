@@ -124,6 +124,8 @@ Observation runs `scripts/cmux_mini_probe.sh` over SSH as the login user, with n
 
 A real manifest names hosts, people, and keys, so it does not belong in this repository. The default path is `~/.config/glaeda/mini-fleet.json` (or `--manifest`, or `$GLAEDA_MINI_FLEET_MANIFEST`); `examples/mini-fleet/manifest.example.json` shows the shape. Keys that nobody has ruled on carry `"status": "review"` and sit in `allow`, so `check` stays quiet about them but flags any key the manifest does not name. Xcode apps listed under `pending` are reported without counting as drift.
 
+Each host may also carry `roles` (`dev-builds`, `ci-runner`, `nightly`, `ios-simulators`, `cache-host`) and the `sudo` mode it is expected to have (`nopasswd` or `password`, observed with `sudo -n -l`, which runs nothing). `controller_token: "present"` requires the fleet worker's controller token file to exist; the probe tests existence only and never reads it.
+
 ## Enroll a Mac in one command
 
 After `glaeda-mini-setup --apply` and cmux `./scripts/setup.sh`, one command runs every step of [Onboard a Mac](#onboard-a-mac) below. Give it the downloaded [candidate bundle](FLEET_DISTRIBUTION.md) and the checksum and source from the trusted run's receipt:
