@@ -85,9 +85,10 @@ health_failed() {  # role
   exit 1
 }
 
-# ProcessType Standard: builds wait on these daemons. Adaptive, with no XPC activity, ran
+# ProcessType Interactive: builds wait on these daemons. Adaptive, with no XPC activity, ran
 # them in the background band (priority 4), and a full-app fill on cmux7s (Xcode 26.6) then
-# timed out 187 store calls under compile load and published no marker.
+# timed out 187 store calls under compile load and published no marker. Standard gave
+# priority 20; Interactive matches a process started from a shell (31).
 write_plist() {  # role, args...
   local r=$1; shift
   local label; label=$(label_for "$r")
@@ -115,7 +116,7 @@ $args    </array>
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>ProcessType</key>
-    <string>Standard</string>
+    <string>Interactive</string>
     <key>StandardOutPath</key>
     <string>$LOGS/glaeda-fleet-cas-$r.log</string>
     <key>StandardErrorPath</key>
