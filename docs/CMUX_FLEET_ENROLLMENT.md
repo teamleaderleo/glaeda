@@ -108,6 +108,22 @@ Preflight reports macOS, hardware against the M4 Pro 14-core 48 GB target, Xcode
 
 This command does not replace the bootstrap below: it imports its read-only helpers and runs it unchanged, so fleet-contract generations and acceptance receipts are unaffected.
 
+## Keep a fleet in line with its manifest
+
+`scripts/glaeda-mini-fleet` holds a whole fleet of build minis to one declarative manifest: each host's hardware class, macOS floor, the Xcode apps and selection it must carry, the SSH keys its login user must, may, and must not accept, the launchd jobs that must be running, and a free-disk floor.
+
+```bash
+scripts/glaeda-mini-fleet check                       # observe every host over SSH, diff, exit 1 on drift
+scripts/glaeda-mini-fleet check --host <name> --json  # one host, machine-readable
+scripts/glaeda-mini-fleet observe --out observed.json # raw observation; check/plan accept --observed
+scripts/glaeda-mini-fleet plan                        # the fixes, as operator steps
+scripts/glaeda-mini-fleet apply --host <name> [--yes] # the additive fixes; dry run without --yes
+```
+
+Observation runs `scripts/cmux_mini_probe.sh` over SSH as the login user, with no sudo and no Python, because a mini without an accepted Xcode licence has only a stub `/usr/bin/python3`. It reports key fingerprints and comments, never key material, tokens, or log contents. `apply` only adds: it appends a required key whose `public_key` is in the manifest and whose fingerprint matches, after copying `authorized_keys` aside, and it APFS-clones an Xcode with `cp -c` when the source's version and build match. A clone is a real directory that shares blocks with its source, so it costs no disk and avoids the symlinked-path compilation-cache replay failure. `apply` never removes keys, never uses sudo, skips hosts whose overrides say `"apply": false`, refuses hosts in `never_touch`, and ends with a fresh observation. Licence acceptance, `xcode-select`, and macOS updates need sudo and stay operator steps in `plan`.
+
+A real manifest names hosts, people, and keys, so it does not belong in this repository. The default path is `~/.config/glaeda/mini-fleet.json` (or `--manifest`, or `$GLAEDA_MINI_FLEET_MANIFEST`); `examples/mini-fleet/manifest.example.json` shows the shape. Keys that nobody has ruled on carry `"status": "review"` and sit in `allow`, so `check` stays quiet about them but flags any key the manifest does not name. Xcode apps listed under `pending` are reported without counting as drift.
+
 ## Enroll a Mac in one command
 
 After `glaeda-mini-setup --apply` and cmux `./scripts/setup.sh`, one command runs every step of [Onboard a Mac](#onboard-a-mac) below. Give it the downloaded [candidate bundle](FLEET_DISTRIBUTION.md) and the checksum and source from the trusted run's receipt:

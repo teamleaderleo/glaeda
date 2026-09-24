@@ -1,0 +1,63 @@
+{
+  "schema": "glaeda-mini-fleet/v1",
+  "fleet": "example build minis",
+  "ssh_user": "builder",
+  "never_touch": ["coordinator-mini"],
+  "keys": {
+    "coordinator": {
+      "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "comment": "fleet-coordinator",
+      "role": "fleet coordinator",
+      "status": "keep",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExampl fleet-coordinator"
+    },
+    "operator": {
+      "fingerprint": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "comment": "operator laptop",
+      "role": "operator",
+      "status": "keep"
+    },
+    "service-cache": {
+      "fingerprint": "SHA256:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "comment": "cache service",
+      "role": "service; owner decides",
+      "status": "review"
+    }
+  },
+  "classes": {
+    "m4pro-48": {"model": "Mac16,11", "chip": "Apple M4 Pro", "cpus": 14, "memory_gib": 48},
+    "m4-16": {"model": "Mac16,10", "chip": "Apple M4", "memory_gib": 16}
+  },
+  "defaults": {
+    "macos": {"major": 26, "min": "26.5"},
+    "xcode": {
+      "apps": [
+        {"path": "/Applications/Xcode.app", "version": "26.3", "build": "17C529"},
+        {"path": "/Applications/Xcode_26.3.app", "version": "26.3", "build": "17C529", "clone_from": "/Applications/Xcode.app"}
+      ],
+      "select": "/Applications/Xcode.app/Contents/Developer",
+      "license": "26.3",
+      "pending": [
+        {"path": "/Applications/Xcode_26.6.app", "version": "26.6", "build": "17F113", "note": "next CI pin"}
+      ]
+    },
+    "authorized_keys": {
+      "require": ["coordinator", "operator"],
+      "allow": ["service-cache"],
+      "exclusive": true,
+      "no_backups": false
+    },
+    "launchd": {"running": ["com.example.build-worker"]},
+    "disk": {"min_free_gib": 100}
+  },
+  "hosts": {
+    "build-mini-1": {"hostname": "build-mini-1", "class": "m4pro-48"},
+    "build-mini-2": {"hostname": "Build-Mini-2", "class": "m4pro-48"},
+    "small-mini": {
+      "hostname": "small-mini",
+      "class": "m4-16",
+      "note": "runs other services; record only",
+      "overrides": {"apply": false, "disk": {"min_free_gib": 40}}
+    }
+  }
+}
