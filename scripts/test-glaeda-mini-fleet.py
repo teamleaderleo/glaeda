@@ -123,6 +123,28 @@ class ManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(mf.Failure, "unknown roles"):
                 mf.load_manifest(path)
 
+    def test_alias_selects_its_host(self) -> None:
+        data = copy.deepcopy(self.manifest)
+        first = next(iter(data["hosts"]))
+        data["hosts"][first]["alias"] = "browser-a"
+        self.assertEqual(mf.select_hosts(data, ["browser-a"]), [first])
+        self.assertEqual(mf.select_hosts(data, [first]), [first])
+
+    def test_bad_or_duplicate_alias_is_refused(self) -> None:
+        names = list(self.manifest["hosts"])
+        cases = [({names[0]: "Browser A"}, "lowercase"),
+                 ({names[0]: "dup", names[1]: "dup"}, "names both"),
+                 ({names[0]: names[1]}, "names both")]
+        for aliases, message in cases:
+            data = copy.deepcopy(self.manifest)
+            for host, alias in aliases.items():
+                data["hosts"][host]["alias"] = alias
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "m.json"
+                path.write_text(json.dumps(data))
+                with self.assertRaisesRegex(mf.Failure, message):
+                    mf.load_manifest(path)
+
     def test_unknown_key_reference_is_refused(self) -> None:
         data = copy.deepcopy(self.manifest)
         data["defaults"]["authorized_keys"]["allow"].append("ghost")

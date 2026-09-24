@@ -32,6 +32,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -40,7 +41,7 @@ from typing import Any
 
 SCHEMA = "glaeda-mini-fleet/v1"
 # What a host is for; the target end state can give one host several.
-ROLES = ("dev-builds", "ci-runner", "nightly", "ios-simulators", "cache-host")
+ROLES = ("dev-builds", "ci-runner", "nightly", "ios-simulators", "cache-host", "chromium-builds")
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROBE = SCRIPT_DIR / "cmux_mini_probe.sh"
 DEFAULT_MANIFEST = Path(os.environ.get("GLAEDA_MINI_FLEET_MANIFEST", "~/.config/glaeda/mini-fleet.json")).expanduser()
@@ -76,6 +77,12 @@ def load_manifest(path: Path) -> dict[str, Any]:
             raise Failure(f"{path}: host name {name!r} is not usable as an SSH destination")
         if host_key(name) in never or host_key(host.get("hostname") or "") in never:
             raise Failure(f"{path}: host {name} is also in never_touch")
+        alias = host.get("alias")
+        if alias is not None:
+            if not isinstance(alias, str) or not re.fullmatch(r"[a-z][a-z0-9-]*", alias):
+                raise Failure(f"{path}: host {name} alias {alias!r} must be lowercase letters, digits and hyphens")
+            if host_key(alias) in never:
+                raise Failure(f"{path}: host {name} alias {alias!r} is in never_touch")
         unknown = set(host.get("roles", [])) - set(ROLES)
         if unknown:
             raise Failure(f"{path}: host {name} has unknown roles {sorted(unknown)}; known: {', '.join(ROLES)}")
@@ -85,6 +92,14 @@ def load_manifest(path: Path) -> dict[str, Any]:
                 host_policy(data, name)["authorized_keys"].get("allow", []):
             if key_id not in data["keys"]:
                 raise Failure(f"{path}: host {name} names unknown key {key_id!r}")
+    seen: dict[str, str] = {}
+    for name, host in data["hosts"].items():
+        for label in (name, host.get("alias")):
+            if label is None:
+                continue
+            if host_key(label) in seen and seen[host_key(label)] != name:
+                raise Failure(f"{path}: {label!r} names both {seen[host_key(label)]} and {name}")
+            seen[host_key(label)] = name
     for key_id, key in data["keys"].items():
         public = key.get("public_key")
         if public is not None and (not isinstance(public, str) or "\n" in public.strip()
@@ -116,12 +131,16 @@ def select_hosts(manifest: dict[str, Any], wanted: list[str] | None) -> list[str
     if not wanted:
         return names
     never = {host_key(n) for n in manifest.get("never_touch", [])}
+    aliases = {host_key(h["alias"]): n for n, h in manifest["hosts"].items() if h.get("alias")}
+    resolved = set()
     for name in wanted:
         if host_key(name) in never:
             raise Failure(f"{name} is in never_touch; this tool does not connect to it")
+        name = aliases.get(host_key(name), name)
         if name not in manifest["hosts"]:
             raise Failure(f"{name} is not in the manifest")
-    return [n for n in names if n in wanted]
+        resolved.add(name)
+    return [n for n in names if n in resolved]
 
 
 # ---------------------------------------------------------------- observe
