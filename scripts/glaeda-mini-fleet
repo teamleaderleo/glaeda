@@ -151,7 +151,7 @@ def parse_probe(text: str) -> dict[str, Any]:
         "macos_build": out.get("macos_build"),
         "xcode_apps": [dict(zip(("path", "kind", "version", "build"), v.split("|", 3))) for v in out["xcode_app"]],
         "xcode_ready": {path: {"licence": lic, "first_launch": first}
-                        for path, lic, first in (v.split("|", 2) for v in out["xcode_ready"])},
+                        for path, lic, first in (v.rsplit("|", 2) for v in out["xcode_ready"])},
         "xcode_select": out.get("xcode_select"),
         "xcode_license_accepted": out.get("xcode_license_accepted"),
         "disk": {p: {"total_gib": int(t), "free_gib": int(f)}
@@ -253,6 +253,8 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
         else:
             ready = obs.get("xcode_ready", {}).get(want["path"])
             developer = f"{want['path']}/Contents/Developer"
+            if obs.get("xcode_ready") and not ready:
+                drift("xcode", f"{want['path']} has no runnable xcodebuild; licence and first launch unknown")
             if ready and ready["licence"] != "accepted":
                 drift("xcode", f"{want['path']} licence not accepted",
                       f"sudo env DEVELOPER_DIR={developer} xcodebuild -license accept")

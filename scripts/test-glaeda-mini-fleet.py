@@ -172,12 +172,18 @@ class CheckTests(unittest.TestCase):
 
     def test_licence_and_first_launch_come_from_xcodebuild(self) -> None:
         base = probe_text(license_="26.0")
-        ok = base + "xcode_ready\t/Applications/Xcode_26.3.app|accepted|done\n"
+        ok = base + "xcode_ready\t/Applications/Xcode.app|accepted|done\n" \
+            + "xcode_ready\t/Applications/Xcode_26.3.app|accepted|done\n"
         self.assertFalse([i for i in self.issues(ok) if "licence" in i["detail"] or "first launch" in i["detail"]])
-        bad = base + "xcode_ready\t/Applications/Xcode_26.3.app|needed|needed\n"
+        bad = base + "xcode_ready\t/Applications/Xcode.app|accepted|done\n" \
+            + "xcode_ready\t/Applications/Xcode_26.3.app|needed|needed\n"
         details = [i["detail"] for i in self.issues(bad)]
         self.assertIn("/Applications/Xcode_26.3.app licence not accepted", details)
         self.assertIn("/Applications/Xcode_26.3.app first launch not run", details)
+        partial = base + "xcode_ready\t/Applications/Xcode.app|accepted|done\n"
+        self.assertTrue([i for i in self.issues(partial) if "no runnable xcodebuild" in i["detail"]])
+        self.assertEqual(mf.parse_probe("xcode_ready\t/Applications/X|y.app|accepted|done\n")["xcode_ready"],
+                         {"/Applications/X|y.app": {"licence": "accepted", "first_launch": "done"}})
 
     def test_newer_licence_covers_older_xcode(self) -> None:
         self.assertFalse([i for i in self.issues(probe_text(license_="26.5")) if "licence" in i["detail"]])
