@@ -872,6 +872,10 @@ class CountingTests(unittest.TestCase):
             pools.write_text(json.dumps(pools_doc()))
             store = FakeStateRepo(ledger_doc())
             api = FakeGitHub({("GET", f"/repos/{REPO}/actions/runners"): (200, runners()),
+                              ("GET", f"/repos/{REPO}/actions/runs?status=queued"): (200, {"workflow_runs": [run_row(7)]}),
+                              ("GET", f"/repos/{REPO}/actions/runs?status=in_progress"): (200, {"workflow_runs": []}),
+                              ("GET", f"/repos/{REPO}/actions/runs/7/attempts/1/jobs"): (200, {"jobs": [
+                                  job_row("queued", BS26)]}),
                               ("PATCH", f"/repos/{REPO}/actions/variables/GLAEDA_POOL_STATE"): (204, None)})
 
             def opener(request, timeout=None):
@@ -879,14 +883,124 @@ class CountingTests(unittest.TestCase):
                     return store(request, timeout)
                 return api(request, timeout)
 
-            code, out, err = run_main(["agent", "--pools", str(pools), "--seen-file", str(Path(tmp) / "seen.json")],
+            code, out, err = run_main(["agent", "--pools", str(pools), "--seen-file", str(Path(tmp) / "seen.json"),
+                                       "--overflow-cache", str(Path(tmp) / "overflow.json")],
                                       env={"GLAEDA_ROUTE_TOKEN": "repo-secret", "GLAEDA_LEDGER_TOKEN": SECRET},
                                       opener=opener)
             self.assertEqual(code, 0, err)
             self.assertIn("published GLAEDA_POOL_STATE", out)
+            self.assertIn(f"{BS26} 0 running 1 queued", out)
+            published = json.loads(next(c[2]["value"] for c in api.calls if c[0] == "PATCH"))
+            self.assertTrue(gr.validate_state(published, now=NOW, repo=REPO)[0])
+            self.assertEqual(published["overflow"]["pools"], {BS26: {"running": 0, "queued": 1}})
             self.assertIn("watched 0 reservation(s)", out)
             self.assertNotIn(SECRET, out + err)
             self.assertTrue((Path(tmp) / "seen.json").is_file())
+
+
+BS26 = "blacksmith-6vcpu-macos-26"
+BS12 = "blacksmith-12vcpu-macos-26"
+
+
+def run_row(run_id, attempt=1, updated="2027-01-15T08:00:00Z"):
+    return {"id": run_id, "run_attempt": attempt, "updated_at": updated, "created_at": "2027-01-15T07:00:00Z"}
+
+
+def job_row(status, *labels):
+    return {"status": status, "labels": list(labels), "runner_name": "r" if status == "in_progress" else None}
+
+
+class OverflowTests(unittest.TestCase):
+    def test_load_counts_running_and_queued_per_blacksmith_label(self):
+        load = gr.overflow_load([job_row("queued", BS26), job_row("in_progress", BS26), job_row("queued", BS12),
+                                 job_row("completed", BS26), job_row("queued", STD), job_row("queued", "ubuntu-24.04"),
+                                 "junk", {"status": "queued"}])
+        self.assertEqual(load, {BS12: {"running": 0, "queued": 1}, BS26: {"running": 1, "queued": 1}})
+
+    def test_listing_reuses_unchanged_runs_and_drops_finished_ones(self):
+        runs = {"q": [run_row(1), run_row(2)], "p": [run_row(3, updated="2027-01-15T08:01:00Z")]}
+        api = FakeGitHub({("GET", f"/repos/{REPO}/actions/runs?status=queued"): lambda _: (200, {"workflow_runs": runs["q"]}),
+                          ("GET", f"/repos/{REPO}/actions/runs?status=in_progress"): lambda _: (200, {"workflow_runs": runs["p"]}),
+                          ("GET", f"/repos/{REPO}/actions/runs/"): (200, {"jobs": [job_row("queued", BS26)]})})
+        client, cache = gr.GitHub(SECRET, api), {"999:1:old": [job_row("queued", BS26)]}
+        jobs, complete = client.active_jobs(REPO, cache)
+        self.assertTrue(complete)
+        self.assertEqual(len(jobs), 3)
+        self.assertNotIn("999:1:old", cache)
+        first = len(api.calls)
+        client.active_jobs(REPO, cache)
+        self.assertEqual(len(api.calls) - first, 2, "a quiet tick lists runs only")
+        runs["p"] = [run_row(3, updated="2027-01-15T08:02:00Z")]
+        first = len(api.calls)
+        client.active_jobs(REPO, cache)
+        self.assertEqual(len(api.calls) - first, 3, "a moved run is listed again")
+
+    def test_too_many_new_runs_is_a_partial_listing(self):
+        many = [run_row(i) for i in range(gr.OVERFLOW_RUN_LOOKUPS + 5)]
+        api = FakeGitHub({("GET", f"/repos/{REPO}/actions/runs?status=queued"): (200, {"workflow_runs": many}),
+                          ("GET", f"/repos/{REPO}/actions/runs?status=in_progress"): (200, {"workflow_runs": []}),
+                          ("GET", f"/repos/{REPO}/actions/runs/"): (200, {"jobs": [job_row("queued", BS26)]})})
+        jobs, complete = gr.GitHub(SECRET, api).active_jobs(REPO, {})
+        self.assertFalse(complete)
+        self.assertEqual(len(jobs), gr.OVERFLOW_RUN_LOOKUPS)
+
+    def test_overflow_section_is_validated(self):
+        doc = state()
+        doc["overflow"] = gr.overflow_section([job_row("queued", BS26)], observed_at=NOW, complete=True)
+        self.assertTrue(gr.validate_state(doc, now=NOW, repo=REPO)[0])
+        for bad in ({"observed_at": "x", "complete": True, "pools": {}},
+                    {**doc["overflow"], "pools": {STD: {"running": 0, "queued": 0}}},
+                    {**doc["overflow"], "pools": {BS26: {"running": -1, "queued": 0}}},
+                    {**doc["overflow"], "complete": "yes"}):
+            self.assertFalse(gr.validate_state({**doc, "overflow": bad}, now=NOW, repo=REPO)[0], bad)
+
+    def test_a_failed_overflow_listing_still_publishes_the_owned_pools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pools = Path(tmp) / "pools.json"
+            pools.write_text(json.dumps(pools_doc()))
+            api = FakeGitHub({("GET", f"/repos/{REPO}/actions/runners"): (200, runners()),
+                              ("GET", f"/repos/{REPO}/actions/runs"): (502, {"message": "bad gateway"})})
+            code, out, err = run_main(["state", "--pools", str(pools), "--overflow-load",
+                                       "--overflow-cache", str(Path(tmp) / "c.json")],
+                                      env={"GLAEDA_ROUTE_TOKEN": SECRET}, opener=api)
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("overflow", json.loads(out))
+            self.assertIn("overflow load unavailable", err)
+            self.assertNotIn(SECRET, out + err)
+
+    def test_state_and_publish_leave_overflow_off_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pools = Path(tmp) / "pools.json"
+            pools.write_text(json.dumps(pools_doc()))
+            api = FakeGitHub({("GET", f"/repos/{REPO}/actions/runners"): (200, runners())})
+            code, out, _ = run_main(["state", "--pools", str(pools)], env={"GLAEDA_ROUTE_TOKEN": SECRET}, opener=api)
+            self.assertEqual(code, 0)
+            self.assertNotIn("overflow", json.loads(out))
+
+
+class RouteFailOpenTests(unittest.TestCase):
+    def test_unreadable_route_arguments_answer_the_caller_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_file = Path(tmp) / "out"
+            code, out, _ = run_main(["route", "--priority", "bogus"], env={"GITHUB_OUTPUT": str(out_file)})
+            self.assertEqual(code, 0)
+            self.assertIn("runs_on=\n", out_file.read_text())
+            self.assertIn("could not read its arguments", out)
+
+    def test_a_hung_route_is_cut_off_and_answers_the_default(self):
+        import time as _time
+        original, wall = gr.route, gr.ROUTE_WALL_SECONDS
+        gr.route = lambda *a, **k: _time.sleep(5)
+        gr.ROUTE_WALL_SECONDS = 0.2
+        try:
+            started = _time.monotonic()
+            code, out, _ = run_main(["route", "--kind", "k", "--priority", "pr", "--default", "bs"], env={})
+        finally:
+            gr.route, gr.ROUTE_WALL_SECONDS = original, wall
+        self.assertEqual(code, 0)
+        self.assertLess(_time.monotonic() - started, 2)
+        self.assertIn("runs-on: bs", out)
+        self.assertIn("no answer within", out)
 
 
 if __name__ == "__main__":
