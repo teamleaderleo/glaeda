@@ -306,7 +306,10 @@ class Tests(unittest.TestCase):
         if name == "xcodebuild":
             return "Xcode 26.0\nBuild version 26A123"
         if name == "xcrun":
-            return "metal version 32023" if "metal" in rest else "26.0"
+            if "metal" in rest:
+                return ("metal version 32023\nTarget: air64-apple-darwin25.5.0\n"
+                        "InstalledDir: /private/var/run/mnt/MetalToolchain-v17.6.7KPGHG/bin")
+            return "26.0"
         if name == "zig":
             return "0.16.0"
         if name == "rustup":
@@ -318,6 +321,10 @@ class Tests(unittest.TestCase):
         if name == "pmset":
             return "AC Power:\n sleep 0\nBattery Power:\n sleep 10"
         if name == "sysctl":
+            if "hw.model" in rest:
+                return "Mac16,11"
+            if "machdep.cpu.brand_string" in rest:
+                return "Apple M4 Pro"
             return str(64 * 1024**3)
         raise AssertionError(argv)
 
@@ -380,6 +387,32 @@ class Tests(unittest.TestCase):
             cache_root = root / "cache"
             cache_root.mkdir()
             self.assertTrue(self._collect_macos(root, cache_root, visible=True)["checks"]["xcodePin"])
+
+    def test_macos_observation_reports_class_identity(self):
+        # cmux_fleet.py class acceptance binds these; the digest must be the
+        # toolchain generation so a node cannot report one and run another.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._macos_checkout(root)
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+            cache_root = root / "cache"
+            cache_root.mkdir()
+            observed = self._collect_macos(root, cache_root, visible=True)
+        self.assertEqual(
+            observed["observed"]["hardware"],
+            {"model": "Mac16,11", "chip": "Apple M4 Pro", "memoryGiB": 64},
+        )
+        toolchain = observed["observed"]["toolchain"]
+        self.assertEqual(toolchain["xcodeBuild"], "26A123")
+        self.assertEqual(toolchain["xcodeVersion"], "26.0")
+        # The asset mount path differs between identical hosts, so only the version line counts.
+        self.assertEqual(toolchain["metalVersion"], "metal version 32023")
+        self.assertEqual(
+            observed["toolchainGeneration"], b.digest_bytes(b.canonical(toolchain))
+        )
+        self.assertNotIn("serial", json.dumps(observed).lower())
 
     def test_macos_observation_reports_workload_tool_visibility(self):
         # collect_macos cannot run on the host that runs this suite, so its

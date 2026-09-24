@@ -474,7 +474,10 @@ def collect_macos(
     xcode = run([executable("xcodebuild"), "-version"])
     xcrun = executable("xcrun")
     sdk = run([xcrun, "--sdk", "macosx", "--show-sdk-version"])
-    metal = run([xcrun, "metal", "--version"])
+    # Only the version line: the rest names the per-machine cryptex mount the
+    # Metal toolchain asset landed in, which differs between identical hosts.
+    metal = run([xcrun, "metal", "--version"]).strip().splitlines()[:1]
+    metal = metal[0] if metal else ""
     git = run([executable("git"), "--version"])
     zig = run([executable("zig"), "version"])
     zig_required = cmux_required_zig_version(cmux_root)
@@ -491,10 +494,14 @@ def collect_macos(
     diff_rustc = run([rustup, "run", diff_rust, "rustc", "--version"], cwd=cmux_root)
     pmset = run([executable("pmset"), "-g", "custom"])
     xcode_match = re.search(r"^Xcode\s+(\d+(?:\.\d+)*)$", xcode, re.MULTILINE)
+    xcode_build = re.search(r"^Build version\s+([0-9A-Za-z]+)$", xcode, re.MULTILINE)
     sdk_match = re.fullmatch(r"(\d+)(?:\.\d+)*", sdk)
     toolchain = {
         "cmuxXcodePin": pin,
         "xcodeVersion": xcode_match.group(1) if xcode_match else "unknown",
+        # Two builds share a version (a release candidate and the release), and
+        # class acceptance is proved per Xcode build, so the build is identity.
+        "xcodeBuild": xcode_build.group(1) if xcode_build else "unknown",
         "macosSdkVersion": sdk,
         "gitVersion": git,
         "metalVersion": metal,
@@ -517,6 +524,7 @@ def collect_macos(
     cache_free_gib = disk_free_gib(cache_root) if cache_ready and cache_root else 0
     cpus = os.cpu_count() or 0
     memory_gib = mac_total_memory_gib()
+    hardware = mac_hardware(memory_gib)
     invisible = missing_workload_tools(MACOS_WORKLOAD_TOOLS)
     return {
         "platform": "macos",
@@ -582,6 +590,12 @@ def collect_macos(
             "totalMemoryGiBClass": (
                 "ge-16" if memory_gib >= 16 else "lt-16"
             ),
+            # What a class acceptance receipt binds (cmux_fleet.py
+            # export-class-acceptance): the model, chip and memory, and the
+            # toolchain whose digest is toolchainGeneration. None of it names
+            # this machine.
+            "hardware": hardware,
+            "toolchain": toolchain,
         },
     }
 
@@ -606,6 +620,16 @@ def linux_memory_gib(field: str) -> int:
 def mac_total_memory_gib() -> int:
     raw = run([executable("sysctl"), "-n", "hw.memsize"])
     return int(raw) // (1024**3)
+
+
+def mac_hardware(memory_gib: int) -> dict[str, Any]:
+    """The hardware class identity: model identifier, chip and memory. No serial number."""
+    sysctl = executable("sysctl")
+    return {
+        "model": run([sysctl, "-n", "hw.model"]).strip(),
+        "chip": run([sysctl, "-n", "machdep.cpu.brand_string"]).strip(),
+        "memoryGiB": memory_gib,
+    }
 
 
 def hardware_class_ready(

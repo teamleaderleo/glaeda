@@ -17,6 +17,12 @@ failure or a reboot resumes where it stopped, and re-running on an eligible node
 changes nothing. --reaccept forces a fresh accept-local (a cold cmux build, about
 13 minutes on an M4 Pro).
 
+With --class-receipt, --class-receipt-sha256 and --fleet-class, the node joins on its
+class's acceptance instead of building: cmux_fleet.py adopt-class-acceptance re-runs the
+read-only bootstrap and requires this node's hardware, Xcode build, SDK, toolchain and
+Glaeda candidate to equal the class receipt's, whose digest must equal the one given.
+Any difference names the field and stops; run accept-local on that node instead.
+
 Run glaeda-mini-setup --apply first; this command assumes its tools and cache root.
 It picks a Python 3.13+ interpreter itself (Homebrew, then ~/.local/bin, then PATH),
 because accept-local needs os.waitid, which CPython on macOS only has from 3.13. It never uses sudo, never registers a
@@ -29,6 +35,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -87,6 +94,9 @@ class Paths:
     @property
     def acceptance(self) -> Path:
         return self.fleet / "acceptance" / f"{ROLE}.json"
+
+    def class_receipt(self, fleet_class: str) -> Path:
+        return self.fleet / "class-acceptance" / f"{fleet_class}.json"
 
     @property
     def generations(self) -> Path:
@@ -150,12 +160,15 @@ class State:
 
 
 def plan(state: State, node_id: str | None, reaccept: bool, rebuild: bool, candidate: bool = False,
-         no_accept: bool = False) -> list[str]:
+         no_accept: bool = False, class_receipt: bool = False) -> list[str]:
     """The steps still needed, in order. Pure, so it is tested without a Mac.
 
-    no_accept stops at a bootstrapped, enrolled (enrolling) node without running accept-local: for a
-    host whose class and Xcode build already hold an acceptance, until cmux_fleet.py can take a class
-    receipt for the eligible transition (a node receipt is bound to its nodeId and generation)."""
+    no_accept stops at a bootstrapped, enrolled (enrolling) node without any acceptance. class_receipt
+    replaces accept-local with adopt-class: the node's own receipt is minted from its class's
+    acceptance after a fresh bootstrap matches it exactly."""
+    if class_receipt and (no_accept or reaccept):
+        raise Stop("--class-receipt joins on the class acceptance; drop --no-accept and --reaccept")
+    acceptance = "adopt-class" if class_receipt else "accept-local"
     steps = []
     if candidate:
         # A staged generation is re-inspected before anything runs, outside the plan.
@@ -190,11 +203,11 @@ def plan(state: State, node_id: str | None, reaccept: bool, rebuild: bool, candi
         # enrollment generation. That is an operator decision, not a side effect.
         if enrollment_state in {"eligible", "draining"}:
             raise Stop(f"node is {enrollment_state} but needs a fresh acceptance (new candidate, changed toolchain "
-                       "or --reaccept), and accept-local runs only on an enrolling node. Move it there, then re-run:\n"
+                       f"or --reaccept), and {acceptance} runs only on an enrolling node. Move it there, then re-run:\n"
                        "  cmux_fleet.py transition-apply ENROLLMENT --to quarantined --reason stale_glaeda_generation\n"
                        "  cmux_fleet.py transition-apply ENROLLMENT --to enrolling")
-        steps.append("accept-local")
-    if enrollment_state != "eligible" or "accept-local" in steps:
+        steps.append(acceptance)
+    if enrollment_state != "eligible" or acceptance in steps:
         steps.append("eligible")
     steps.append("status")
     return steps
@@ -312,6 +325,27 @@ class Runner:
             raise Stop("accept-local did not accept this mini; the retained attempt log path is printed above")
         self.write_private(self.paths.acceptance, result.stdout)
 
+    def adopt_class(self, receipt: bytes, sha256: str, fleet_class: str) -> None:
+        # The receipt the node relies on stays next to its enrollment, which records its digest; one
+        # this node does not match is not kept there.
+        path = self.paths.class_receipt(fleet_class)
+        pending = path.with_name(f".{path.name}.pending")
+        self.write_private(pending, receipt.decode("utf-8"))
+        print(f"adopt-class: bootstrap re-check against class {fleet_class} ({sha256[:19]}); no build", flush=True)
+        try:
+            result = self.fleet("adopt-class-acceptance", os.fspath(self.paths.enrollment), "--class-receipt",
+                                os.fspath(pending), "--expected-sha256", sha256, "--fleet-class", fleet_class,
+                                "--cmux-root", os.fspath(self.cmux_root), "--glaeda", os.fspath(self.glaeda_bin),
+                                "--cache-root", os.fspath(self.paths.cache_root))
+            receipt_doc = read_json_text(result.stdout)
+            if result.returncode or (receipt_doc or {}).get("result") != "accepted":
+                raise Stop(f"this mini does not match the class {fleet_class} acceptance (the differing fields "
+                           "are above); run accept-local on it: re-run without --class-receipt")
+            os.replace(pending, path)
+        finally:
+            pending.unlink(missing_ok=True)
+        self.write_private(self.paths.acceptance, result.stdout)
+
     def eligible(self) -> None:
         enrollment = read_json(self.paths.enrollment) or {}
         if enrollment.get("state") == "eligible":
@@ -369,6 +403,7 @@ DESCRIPTIONS = {
     "bootstrap": "read-only bootstrap of this mini against the cmux checkout",
     "enroll": "create the enrollment record (state: enrolling)",
     "accept-local": "local acceptance: a cold cmux.macos.dev-check@1 build under Glaeda",
+    "adopt-class": "class acceptance: re-check this mini against its class receipt (bootstrap only, no build)",
     "eligible": "transition the enrollment to eligible",
     "status": "print the node status",
 }
@@ -388,7 +423,33 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--candidate", type=Path, help="downloaded candidate archive (docs/FLEET_DISTRIBUTION.md)")
     p.add_argument("--sha256", help="candidate archive SHA-256 from the trusted run's receipt")
     p.add_argument("--source", help="candidate's exact 40-character source commit")
+    p.add_argument("--class-receipt", help="class acceptance receipt file, or - for stdin (glaeda-mini-fleet onboard)")
+    p.add_argument("--class-receipt-sha256", help="its receiptSha256, from the operator's manifest")
+    p.add_argument("--fleet-class", help="this mini's class: the manifest hardware key, such as m4pro-48")
     return p
+
+
+CLASS_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
+SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
+MAX_CLASS_RECEIPT_BYTES = 64 * 1024
+
+
+def read_class_receipt(value: str) -> bytes:
+    """The class receipt's bytes; cmux_fleet.py checks everything in them."""
+    if value == "-":
+        data = sys.stdin.buffer.read(MAX_CLASS_RECEIPT_BYTES + 1)
+    else:
+        try:
+            data = Path(value).expanduser().read_bytes()
+        except OSError as error:
+            raise Stop(f"cannot read the class receipt: {error}") from None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = ""
+    if not data or len(data) > MAX_CLASS_RECEIPT_BYTES or read_json_text(text) is None:
+        raise Stop("the class receipt is empty, too large, or not a UTF-8 JSON object")
+    return data
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -405,6 +466,24 @@ def main(argv: list[str] | None = None) -> int:
     if any(candidate) and not all(candidate):
         print("glaeda-mini-enroll: --candidate, --sha256 and --source go together", file=sys.stderr)
         return 2
+    klass = [args.class_receipt, args.class_receipt_sha256, args.fleet_class]
+    if any(klass) and not (all(klass) and args.candidate):
+        print("glaeda-mini-enroll: --class-receipt, --class-receipt-sha256 and --fleet-class go together, "
+              "with --candidate (class acceptance binds the candidate)", file=sys.stderr)
+        return 2
+    if args.fleet_class and (not CLASS_RE.fullmatch(args.fleet_class)
+                             or not SHA256_RE.fullmatch(args.class_receipt_sha256)):
+        print("glaeda-mini-enroll: --fleet-class is lowercase (a hardware key such as m4pro-48) and --class-receipt-sha256 is "
+              "sha256:<64 hex>", file=sys.stderr)
+        return 2
+    class_bytes = None
+    if args.class_receipt and args.apply:
+        # Only when it will be used: a plan-only run with `-` would otherwise wait on a terminal.
+        try:
+            class_bytes = read_class_receipt(args.class_receipt)
+        except Stop as stop:
+            print(f"glaeda-mini-enroll: {stop}", file=sys.stderr)
+            return 2
     paths = Paths(Path.home())
     cmux_root = args.cmux_root.expanduser().resolve()
     generation = paths.generation(args.source) if args.source else None
@@ -424,7 +503,7 @@ def main(argv: list[str] | None = None) -> int:
         if generation is None or staged:
             state.acceptance_current = runner.acceptance_current(enrollment)
         steps = plan(state, args.node_id, args.reaccept, args.rebuild, candidate=generation is not None,
-                     no_accept=args.no_accept)
+                     no_accept=args.no_accept, class_receipt=bool(args.class_receipt))
         print(f"glaeda-mini-enroll ({python})")
         for step in steps:
             print(f"  - {DESCRIPTIONS[step]}")
@@ -445,6 +524,9 @@ def main(argv: list[str] | None = None) -> int:
                 runner.enroll(bootstrap_path, args.node_id)
             elif step == "accept-local":
                 runner.accept_local()
+            elif step == "adopt-class":
+                assert class_bytes is not None
+                runner.adopt_class(class_bytes, args.class_receipt_sha256, args.fleet_class)
             elif step == "eligible":
                 runner.eligible()
             elif step == "status":
@@ -458,8 +540,8 @@ def main(argv: list[str] | None = None) -> int:
     enrolled = read_json(paths.enrollment) or {}
     if args.no_accept and enrolled.get("state") != "eligible":
         print(f"\n{enrolled.get('nodeId')} is enrolled ({enrolled.get('state')}) without a node acceptance "
-              "(--no-accept). It becomes eligible after accept-local, or from a class acceptance once "
-              "cmux_fleet.py accepts one.")
+              "(--no-accept). It becomes eligible after accept-local, or on its class's acceptance: re-run "
+              "with --class-receipt, --class-receipt-sha256 and --fleet-class.")
         return 0
     # Accepted: the transient bootstrap and the one-step rollback are no longer needed.
     for leftover in (paths.fleet / "bootstrap.json", paths.install / "glaeda.rollback"):

@@ -1393,7 +1393,8 @@ class OnboardTests(unittest.TestCase):
         self.assertIsNone(recorded)
         self.assertIn("not 17C999", why)
 
-    def run_onboard(self, texts: dict[str, str], *extra: str, tokens: list[str] | None = None) -> tuple[int, str, list]:
+    def run_onboard(self, texts: dict[str, str], *extra: str, tokens: list[str] | None = None,
+                    manifest: Path = EXAMPLE) -> tuple[int, str, list]:
         calls: list = []
 
         def ssh(name, user, command, log, stdin=b"", timeout=None, options=()):
@@ -1405,7 +1406,7 @@ class OnboardTests(unittest.TestCase):
                 mock.patch.object(mf, "observe", return_value=obs), mock.patch.object(mf, "ssh_stream", side_effect=ssh), \
                 mock.patch.object(mf, "mint_runner_token", return_value="AAAATOKENTOKENTOKENTOKEN") as mint, \
                 mock.patch.object(mf, "operator_zig_minimum", return_value="0.16.0"):
-            code = mf.main(["onboard", *texts, "--manifest", os.fspath(EXAMPLE), "--log-dir", tmp, *extra])
+            code = mf.main(["onboard", *texts, "--manifest", os.fspath(manifest), "--log-dir", tmp, *extra])
         if tokens is not None:
             tokens.append(mint.call_count)
         return code, out.getvalue(), calls
@@ -1430,6 +1431,33 @@ class OnboardTests(unittest.TestCase):
         self.assertEqual(minted, [0])
         self.assertIn("enrolled without node acceptance", out)
         self.assertEqual(code, 1)
+
+    def test_class_receipt_goes_over_stdin_and_the_host_registers(self) -> None:
+        receipt = {"schema": "glaeda-cmux-fleet-class-acceptance/v1", "fleetClass": "m4pro-48",
+                   "receiptSha256": "sha256:" + "c" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt_path = Path(tmp) / "m4pro-48.json"
+            receipt_path.write_text(json.dumps(receipt))
+            data = copy.deepcopy(self.manifest)
+            data["hardware"]["m4pro-48"]["acceptance"].update(receipt=os.fspath(receipt_path),
+                                                             receipt_sha256=receipt["receiptSha256"])
+            path = write_manifest(tmp, data)
+            code, out, calls = self.run_onboard({"build-mini-1": self.fresh()}, "--yes", manifest=path)
+            self.assertEqual(code, 0, out)
+            enroll = [c for c in calls if "glaeda-mini-enroll" in c[1]]
+            self.assertEqual(len(enroll), 1)
+            self.assertNotIn("--no-accept", enroll[0][1])
+            self.assertIn(f"--class-receipt - --class-receipt-sha256 {receipt['receiptSha256']} --fleet-class m4pro-48",
+                          enroll[0][1])
+            self.assertEqual(enroll[0][2], receipt_path.read_bytes())
+            self.assertTrue([c for c in calls if "persistent-compile up" in c[1]])
+            # A receipt that is not the recorded one blocks the host before anything runs on it.
+            data["hardware"]["m4pro-48"]["acceptance"]["receipt_sha256"] = "sha256:" + "d" * 64
+            path = write_manifest(tmp, data)
+            code, out, calls = self.run_onboard({"build-mini-1": self.fresh()}, "--yes", manifest=path)
+        self.assertEqual(code, 1)
+        self.assertIn("is not the recorded", out)
+        self.assertFalse([c for c in calls if "glaeda-mini-enroll" in c[1]])
 
     def test_node_mode_accepts_then_registers_with_the_token_on_stdin(self) -> None:
         minted: list = []
