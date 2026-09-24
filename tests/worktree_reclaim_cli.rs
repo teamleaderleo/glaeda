@@ -90,6 +90,36 @@ impl Fixture {
         }
     }
 
+    /// Make every activity signal of one linked worktree exactly `seconds` old.
+    fn age_by(&self, name: &str, seconds: u64) {
+        let at = SystemTime::now() - std::time::Duration::from_secs(seconds);
+        let epoch = at
+            .duration_since(UNIX_EPOCH)
+            .expect("epoch")
+            .as_secs()
+            .to_string();
+        let git_dir = self.main.join(".git/worktrees").join(name);
+        let reflog = git_dir.join("logs/HEAD");
+        let text = fs::read_to_string(&reflog).expect("read reflog");
+        let aged: String = text
+            .lines()
+            .map(|line| {
+                let (header, message) = line.split_once('\t').unwrap_or((line, ""));
+                let mut fields: Vec<&str> = header.split(' ').collect();
+                let at = fields.len() - 2;
+                fields[at] = &epoch;
+                format!("{}\t{message}\n", fields.join(" "))
+            })
+            .collect();
+        fs::write(&reflog, aged).expect("backdate reflog entries");
+        for path in [self.root.join(name), git_dir.join("HEAD"), reflog] {
+            fs::File::open(&path)
+                .expect("open for times")
+                .set_times(fs::FileTimes::new().set_modified(at))
+                .expect("backdate");
+        }
+    }
+
     fn plan(&self, repository: &Path) -> Output {
         self.run(repository, &[])
     }
@@ -192,6 +222,87 @@ fn report(output: &Output) -> serde_json::Value {
     let document = document(output);
     assert_eq!(document["repositories"][0]["result"], "listed");
     document["repositories"][0].clone()
+}
+
+/// Landed work goes after the short window, unfinished work waits for the long one, and a process
+/// working inside keeps any worktree however old its Git activity is.
+#[test]
+fn work_state_picks_the_window_and_a_working_process_vetoes() {
+    let fixture = Fixture::new();
+
+    // Squash-merged: main gains the same file content in a different commit.
+    let landed = fixture.add("landed");
+    fs::write(landed.join("feature.txt"), "feature\n").expect("write feature");
+    git(&landed, &["add", "feature.txt"]);
+    commit(&landed, "feature on its branch");
+    fs::write(fixture.main.join("feature.txt"), "feature\n").expect("write squashed feature");
+    git(&fixture.main, &["add", "feature.txt"]);
+    commit(&fixture.main, "feature (squashed)");
+    git(
+        &fixture.main,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    git(
+        &fixture.main,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    fixture.age_by("landed", 2 * 60 * 60);
+
+    let unfinished = fixture.add("unfinished");
+    fs::write(unfinished.join("wip.txt"), "wip\n").expect("write wip");
+    git(&unfinished, &["add", "wip.txt"]);
+    commit(&unfinished, "work in progress");
+    fixture.age_by("unfinished", 2 * 60 * 60);
+
+    let busy = fixture.add("busy");
+    fixture.age("busy");
+    let mut sleeper = Command::new("/bin/sleep")
+        .arg("60")
+        .current_dir(&busy)
+        .spawn()
+        .expect("start a process working in the worktree");
+
+    let output = fixture.plan(&fixture.main);
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    let document = document(&output);
+    assert_eq!(document["finished_idle_seconds"], 3_600);
+    assert_eq!(document["minimum_idle_seconds"], 3 * 24 * 60 * 60);
+    let report = document["repositories"][0].clone();
+    let order = fixture.linked_order();
+    let by_name = |name: &str| {
+        let ordinal = order
+            .iter()
+            .position(|entry| entry == name)
+            .expect("listed")
+            + 1;
+        report["worktrees"]
+            .as_array()
+            .expect("worktree array")
+            .iter()
+            .find(|worktree| worktree["ordinal"] == ordinal)
+            .expect("reported ordinal")
+            .clone()
+    };
+
+    let landed = by_name("landed");
+    assert_eq!(landed["facts"]["work_state"], "finished");
+    assert_eq!(landed["decision"]["decision"], "eligible");
+
+    let unfinished = by_name("unfinished");
+    assert_eq!(unfinished["facts"]["work_state"], "in_progress");
+    assert_eq!(
+        unfinished["decision"]["vetoes"],
+        serde_json::json!(["recently_active"])
+    );
+
+    let busy = by_name("busy");
+    assert_eq!(busy["facts"]["in_use"], true);
+    assert_eq!(busy["decision"]["vetoes"], serde_json::json!(["in_use"]));
 }
 
 /// Every worktree state the planner distinguishes, observed through the real binary and real Git.

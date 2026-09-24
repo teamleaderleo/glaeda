@@ -9,8 +9,8 @@ use clap::{Parser, ValueEnum};
 use glaeda::linked_worktree_reclaim::{
     LinkedWorktreeFacts, LinkedWorktreeReclaimCompensation, LinkedWorktreeReclaimDecision,
     LinkedWorktreeReclaimOutcome, LinkedWorktreeReclaimPolicy, LinkedWorktreeReclaimVeto,
-    list_linked_worktrees, observe_linked_worktrees, plan_linked_worktree_reclaim,
-    reclaim_linked_worktree,
+    ProcessUseEvidence, list_linked_worktrees, observe_linked_worktrees,
+    plan_linked_worktree_reclaim, reclaim_linked_worktree,
 };
 use glaeda::process::ProcessExecutor;
 use glaeda::project_checkout_observation::ProjectCheckoutObserver;
@@ -20,13 +20,16 @@ const REPORT_SCHEMA_VERSION: u8 = 1;
 const GIT_PROGRAM: &str = "/usr/bin/git";
 const MAX_REPOSITORIES: usize = 32;
 
-/// Default idle window: a day.
+/// Default idle window for unfinished work: three days.
 ///
-/// The Cargo target planner defaults to a week because a wrong reclaim costs a rebuild. Here every
-/// eligible worktree is already clean and preserved, so recreating one costs a single
-/// `git worktree add`. Agent scratch worktrees churn daily, and a week would leave most of them
-/// out of reach.
-const DEFAULT_IDLE_SECONDS: i64 = 24 * 60 * 60;
+/// Every eligible worktree is already clean and preserved, so the window only weighs disruption:
+/// someone may come back to unfinished work, and a worktree a process is working in is refused
+/// outright however old its Git activity looks. Under disk pressure a caller passes a shorter one.
+const DEFAULT_IDLE_SECONDS: i64 = 3 * 24 * 60 * 60;
+
+/// Default idle window for finished work (landed in a remote default branch, squash-merged, or
+/// upstream deleted): an hour, the policy floor. Nobody returns to it, so it is only clutter.
+const DEFAULT_FINISHED_IDLE_SECONDS: i64 = 60 * 60;
 
 /// Default number of worktrees one run may remove. A budget keeps an unattended run bounded even
 /// if every observation is wrong in the same way.
@@ -59,9 +62,13 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_MAX_RECLAIMS)]
     max_reclaims: usize,
 
-    /// Seconds without Git activity before a worktree may be reclaimed.
+    /// Seconds without Git activity before a worktree holding unfinished work may be reclaimed.
     #[arg(long, default_value_t = DEFAULT_IDLE_SECONDS)]
     minimum_idle_seconds: i64,
+
+    /// Seconds without Git activity before a worktree whose work has landed may be reclaimed.
+    #[arg(long, default_value_t = DEFAULT_FINISHED_IDLE_SECONDS)]
+    finished_idle_seconds: i64,
 
     /// List every worktree in human output, not only the actionable ones.
     #[arg(long)]
@@ -146,6 +153,7 @@ struct Report {
     mutation_performed: bool,
     compensation: &'static str,
     minimum_idle_seconds: i64,
+    finished_idle_seconds: i64,
     max_reclaims: usize,
     budget_exhausted: bool,
     circuit_breaker_tripped: bool,
@@ -161,7 +169,10 @@ fn main() -> ExitCode {
             "one run accepts at most 32 repositories",
         );
     }
-    let policy = match LinkedWorktreeReclaimPolicy::new(cli.minimum_idle_seconds) {
+    let policy = match LinkedWorktreeReclaimPolicy::with_finished_window(
+        cli.minimum_idle_seconds,
+        cli.finished_idle_seconds,
+    ) {
         Ok(policy) => policy,
         Err(error) => return fail(cli.output, error.code(), error.problem()),
     };
@@ -202,7 +213,19 @@ fn main() -> ExitCode {
             }
         };
         let available_bytes_before = cli.apply.then(|| available_bytes(repository)).flatten();
-        let observations = observe_linked_worktrees(&observer, &inventory, &executor);
+        let evidence = match ProcessUseEvidence::collect(&executor) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                repositories.push(RepositoryReport {
+                    ordinal: index + 1,
+                    available_bytes_before: None,
+                    available_bytes_after: None,
+                    result: RepositoryResult::Unlisted { code: error.code() },
+                });
+                continue;
+            }
+        };
+        let observations = observe_linked_worktrees(&observer, &inventory, &evidence, &executor);
         let mut summary = Summary {
             linked: inventory.linked().len(),
             ..Summary::default()
@@ -290,6 +313,7 @@ fn main() -> ExitCode {
         mutation_performed,
         compensation: COMPENSATION,
         minimum_idle_seconds: policy.minimum_idle_seconds(),
+        finished_idle_seconds: policy.finished_idle_seconds(),
         max_reclaims: cli.max_reclaims,
         budget_exhausted,
         circuit_breaker_tripped,
