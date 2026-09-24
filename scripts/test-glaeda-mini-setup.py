@@ -228,7 +228,8 @@ class MiniSetupTest(unittest.TestCase):
         self.assertIn("sudo pmset -c sleep 0", commands)
         self.assertIn("sudo pmset -c womp 1", commands)
         self.assertIn("sudo pmset -a autorestart 1", commands)
-        self.assertTrue(any("persistent-compile up" in c for c in commands))
+        self.assertTrue(any("glaeda-cmux-runner --apply" in c for c in commands))
+        self.assertFalse(any("persistent-compile" in c for c in commands))
         source = (ROOT / "scripts/glaeda-mini-setup").read_text()
         self.assertIsNone(re.search(r'\[\s*"sudo"', source))
 
