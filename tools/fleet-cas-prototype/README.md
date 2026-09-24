@@ -61,4 +61,5 @@ store has no authentication, so bind it only to a trusted interface; a KV
 entry is not checked for its objects' presence (`kv_put_dangling` only counts
 entries that name absent objects); there is no size budget or eviction; and
 a node that cannot reach the fleet store answers reads as misses (counted in
-`up_read_errors`) but fails writes, so nothing is published half-way.
+`up_read_errors`, and skips the store for 30 s after a failed read) but fails
+writes, so nothing is published half-way.

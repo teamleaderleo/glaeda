@@ -117,7 +117,17 @@ struct Store {
     root: PathBuf,
     read_only_kv: bool,
     upstream: Option<Upstream>,
+    /// Unix millis until which fleet-store reads are skipped after a failure.
+    upstream_down_until: AtomicU64,
     stats: Stats,
+}
+
+const UPSTREAM_BACKOFF_MS: u64 = 30_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 fn blob_data(obj: &cas::CasObject) -> &[u8] {
@@ -261,12 +271,29 @@ impl Store {
 }
 
 impl Store {
+    /// The fleet store to read from, unless a recent read failed: then every
+    /// lookup is a local miss for a while instead of a connect timeout each.
+    fn readable_upstream(&self) -> Option<&Upstream> {
+        let up = self.upstream.as_ref()?;
+        if now_ms() < self.upstream_down_until.load(Relaxed) {
+            self.stats.up_read_errors.fetch_add(1, Relaxed);
+            return None;
+        }
+        Some(up)
+    }
+
+    fn upstream_read_failed(&self) {
+        self.stats.up_read_errors.fetch_add(1, Relaxed);
+        self.upstream_down_until
+            .store(now_ms() + UPSTREAM_BACKOFF_MS, Relaxed);
+    }
+
     /// Local object, else fetch it from the fleet store, verify it, keep it.
     async fn get_or_fetch(&self, id: &[u8]) -> Result<Option<cas::CasObject>, Status> {
         if let Some(obj) = self.get(id)? {
             return Ok(Some(obj));
         }
-        let Some(up) = &self.upstream else {
+        let Some(up) = self.readable_upstream() else {
             return Ok(None);
         };
         let req = cas::CasGetRequest {
@@ -276,7 +303,7 @@ impl Store {
         // An unreachable fleet store degrades to a local miss: the build
         // compiles instead of failing or waiting.
         let Ok(resp) = self.stats.upstream(up.cas.clone().get(req)).await else {
-            self.stats.up_read_errors.fetch_add(1, Relaxed);
+            self.upstream_read_failed();
             return Ok(None);
         };
         let Some(cas::cas_get_response::Contents::Data(obj)) = resp.into_inner().contents else {
@@ -447,13 +474,13 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
             Err(e) => return Err(Status::internal(e.to_string())),
         }
         s.stats.kv_get_miss.fetch_add(1, Relaxed);
-        let Some(up) = &s.upstream else {
+        let Some(up) = s.readable_upstream() else {
             return Ok(kv_response(None));
         };
         let mut client = up.kv.clone();
         let fetch = client.get_value(kv::GetValueRequest { key });
         let Ok(resp) = s.stats.upstream(fetch).await else {
-            s.stats.up_read_errors.fetch_add(1, Relaxed);
+            s.upstream_read_failed();
             return Ok(kv_response(None));
         };
         let Some(kv::get_value_response::Contents::Value(value)) = resp.into_inner().contents
@@ -562,6 +589,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         root: root.clone(),
         read_only_kv,
         upstream,
+        upstream_down_until: AtomicU64::new(0),
         stats: Stats::default(),
     });
 
