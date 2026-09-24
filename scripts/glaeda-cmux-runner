@@ -259,7 +259,9 @@ def xcode_present(app: dict[str, Any]) -> bool:
         return False
     code, out = run(["/usr/bin/xcodebuild", "-version"],
                     env={**os.environ, "DEVELOPER_DIR": os.fspath(path / "Contents/Developer")})
-    return code == 0 and re.search(rf"^Build version {re.escape(build)}$", out, re.M) is not None
+    version = str(app.get("version") or "")
+    return (code == 0 and re.search(rf"^Build version {re.escape(build)}$", out, re.M) is not None
+            and re.search(rf"^Xcode {re.escape(version)}$", out, re.M) is not None)
 
 
 def member_labels(manifest: Any, member: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -279,8 +281,13 @@ def member_labels(manifest: Any, member: str) -> tuple[dict[str, Any] | None, st
         return None, f"{member} availability {availability!r} is not one of {', '.join(AVAILABILITY)}"
     if RUNNER_ROLE not in roles:
         return None, f"{member} roles do not include {RUNNER_ROLE}"
-    policy = merge(manifest.get("defaults") or {}, host.get("overrides") or {})
-    apps = ((policy.get("xcode") or {}).get("apps")) or []
+    defaults, overrides = manifest.get("defaults") or {}, host.get("overrides") or {}
+    if not isinstance(defaults, dict) or not isinstance(overrides, dict):
+        return None, f"manifest defaults or {member} overrides is not an object"
+    xcode = merge(defaults, overrides).get("xcode") or {}
+    apps = xcode.get("apps") if isinstance(xcode, dict) else None
+    if not isinstance(apps, list):
+        apps = []
     versions = [str(a["version"]) for a in apps
                 if isinstance(a, dict) and re.fullmatch(r"[0-9][0-9.]*", str(a.get("version") or "")) and xcode_present(a)]
     # One label a pool picker can route a whole run to: this class, this verified Xcode, and counted
@@ -511,10 +518,11 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
         reg.update(state="create", note="no gh here: config.sh refuses a name that is already registered")
     else:
         existing = find_runner(ctx)
-        if existing and own_name and registered.get("runnerId") not in (None, existing.get("id")):
+        if existing and own_name and not ctx.replace and registered.get("runnerId") not in (None, existing.get("id")):
             reg.update(state="blocked", existing=existing,
                        note=f"{ctx.name} is now registered as id {existing.get('id')}, not this install's "
-                            f"{registered.get('runnerId')}; another machine may hold the name")
+                            f"{registered.get('runnerId')}; another machine may hold the name. If it was "
+                            "this install's own interrupted --replace, pass --replace")
         elif existing and not (ctx.replace or own_name):
             reg.update(state="blocked", existing=existing,
                        note=f"a runner named {ctx.name} is already registered; pass --name or --replace")
@@ -647,7 +655,10 @@ def register(ctx: Context, act: dict[str, Any]) -> None:
     act["runnerId"] = (local_runner(ctx) or {}).get("agentId")
 
 
-LOCAL_REGISTRATION = (".runner", ".credentials", ".credentials_rsaparams")
+# Newer runners also keep a migrated identity (.runner_migrated, .credentials_migrated) and try it
+# first; left behind, it would point the Listener at the agent id --replace just deleted.
+LOCAL_REGISTRATION = (".runner", ".credentials", ".credentials_rsaparams", ".runner_migrated",
+                      ".credentials_migrated")
 
 
 def runner_busy(ctx: Context) -> bool:
@@ -674,6 +685,7 @@ def relabel(ctx: Context, act: dict[str, Any]) -> None:
         ctx.log_offset = ctx.log_path.stat().st_size if ctx.log_path.is_file() else 0
         code, out = run([LAUNCHCTL, "bootstrap", f"gui/{ctx.uid}", os.fspath(ctx.plist_path)])
         act["bootstrapped"] = code == 0
+        ctx.agent_started = code == 0  # the agent step must not bootstrap it a second time
         if code != 0:
             act["state"], act["note"] = "failed", ("re-registered, but launchctl bootstrap failed: " + out)[:400]
 
@@ -729,6 +741,8 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             write_atomic(Path(act["path"]), data, mode)
             act["applied"] = act["owned"] = True
             act["ownedSha256"] = act["sha256"]
+        if kind == "agent" and getattr(ctx, "agent_started", False) and not act.get("applied"):
+            act["loaded"] = True  # relabel already started this exact, unchanged plist
         if kind == "agent" and act["state"] in {"create", "update", "unchanged"} and not ctx.skip_launchctl \
                 and not act.get("loaded"):
             ctx.log_offset = ctx.log_path.stat().st_size if ctx.log_path.is_file() else 0
@@ -1039,7 +1053,7 @@ def main(argv: list[str] | None = None) -> int:
         "runnerVersion": (prior or {}).get("runnerVersion") if owned_dir(ctx, prior) else None,
         "registration": (prior or {}).get("registration") if owned_dir(ctx, prior) else None,
         "preflight": pre,
-        "member": ctx.member,
+        "member": ctx.member or ((prior or {}).get("member") if owned_dir(ctx, prior) else None),
     }
     if args.uninstall:
         actions = plan_uninstall(ctx, prior)
@@ -1054,7 +1068,7 @@ def main(argv: list[str] | None = None) -> int:
         actions = plan_install(ctx, prior)
         if args.apply and pre["blocking"]:
             for act in actions:
-                if act["state"] in {"create", "update"}:
+                if act["state"] in {"create", "update", "relabel"}:
                     act["state"], act["note"] = "blocked", "preflight blocks: " + ", ".join(pre["blocking"])
         if args.apply:
             apply_install(ctx, actions, doc)

@@ -700,6 +700,8 @@ class RunnerTest(unittest.TestCase):
         runner = self.home / "actions-runner-glaeda"
         (runner / "_work").mkdir(exist_ok=True)
         (runner / "_work" / "hot").write_text("derived data")
+        for stale in (".runner_migrated", ".credentials_migrated"):
+            (runner / stale).write_text("{}")
         with mock.patch.object(cr, "xcode_present", return_value=True):
             plan = self.invoke("--manifest", self.manifest(), "--member", "mini-std", "--name", "mini-test-glaeda")
             self.assertEqual(self.by_kind(plan)["register"]["state"], "relabel")
@@ -715,10 +717,23 @@ class RunnerTest(unittest.TestCase):
         runners = json.loads((self.state / "runners.json").read_text())["runners"]
         self.assertEqual([(r["name"], r["id"]) for r in runners], [("mini-test-glaeda", 4243)])
         self.assertEqual((runner / "_work" / "hot").read_text(), "derived data")
+        self.assertFalse((runner / ".runner_migrated").exists())
+        self.assertFalse((runner / ".credentials_migrated").exists())
         saved = json.loads((self.home / ".local/state/glaeda/cmux-runner/receipt.json").read_text())
         self.assertEqual(saved["registration"]["runnerId"], 4243)
         self.assertIn("glaeda-class-std", saved["registration"]["labels"])
         self.assertEqual(self.by_kind(receipt)["verify"]["state"], "ok")
+
+    def test_relabel_starts_a_stopped_agent_exactly_once(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--labels", "ram48")
+            with mock.patch.object(cr, "xcode_present", return_value=True):
+                receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                      "--name", "mini-test-glaeda")
+        self.assertEqual(self.by_kind(receipt)["register"]["state"], "updated")
+        verbs = [e["argv"][0] for e in self.log() if e["tool"] == "launchctl"]
+        self.assertEqual(verbs.count("bootstrap"), 2, verbs)  # install, then relabel; never a third
 
     def test_relabel_without_a_token_blocks_and_changes_nothing(self) -> None:
         self.invoke("--apply", "--labels", "ram48")
@@ -874,14 +889,27 @@ class ManifestLabelsTest(unittest.TestCase):
             app = Path(tmp) / "Xcode_26.6.app"
             app.mkdir()
             for out, want in (("Xcode 26.6\nBuild version 17F113", True), ("Xcode 26.6\nBuild version 17F1134", False),
-                              ("Xcode 26.6\nBuild version 17F11", False)):
+                              ("Xcode 26.6\nBuild version 17F11", False), ("Xcode 26.3\nBuild version 17F113", False)):
                 with self.subTest(out=out), mock.patch.object(cr, "run", return_value=(0, out)):
                     got = cr.xcode_present({"path": os.fspath(app), "version": "26.6", "build": "17F113"})
                     self.assertEqual(got, want)
             link = Path(tmp) / "Link.app"
             link.symlink_to(app)
-            with mock.patch.object(cr, "run", return_value=(0, "Build version 17F113")):
-                self.assertFalse(cr.xcode_present({"path": os.fspath(link), "build": "17F113"}))
+            with mock.patch.object(cr, "run", return_value=(0, "Xcode 26.6\nBuild version 17F113")):
+                self.assertFalse(cr.xcode_present({"path": os.fspath(link), "version": "26.6", "build": "17F113"}))
+
+    def test_malformed_manifest_is_refused_not_a_traceback(self) -> None:
+        for manifest in ({"hosts": {"m": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"],
+                                          "overrides": ["x"]}}},
+                         {"defaults": {"xcode": "26.6"},
+                          "hosts": {"m": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"]}}},
+                         {"hosts": {"m": "std"}}, {"hosts": []}, []):
+            with self.subTest(manifest=manifest):
+                member, why = cr.member_labels(manifest, "m")
+                if member is not None:  # a non-object xcode block just means no Xcode labels
+                    self.assertEqual(member["labels"], ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated"])
+                else:
+                    self.assertTrue(why)
 
 
 class NoEmDashTest(unittest.TestCase):

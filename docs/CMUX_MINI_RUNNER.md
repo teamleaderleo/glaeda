@@ -137,15 +137,23 @@ The installer refuses a member whose roles lack `ci-runner`, and refuses class `
 
 GitHub fixes labels at registration, and changing them through the API needs an
 admin token that a mini does not hold. So when the manifest's labels differ from
-what the receipt registered, `--apply --token-stdin` re-registers the same runner
-in place. It stops the LaunchAgent, clears the local registration files, runs
+what the receipt registered, `--apply` with a registration token (`--token-stdin`,
+or a logged-in admin `gh`) re-registers the same runner in place. It stops the
+LaunchAgent, clears the local registration files (including the runner's
+`_migrated` copies), runs
 `config.sh --replace` under the same name, and starts the agent again. `_work` and
 its hot state stay. It refuses while a job is running. If `config.sh` fails midway,
 the runner stays stopped with the old registration still listed. Re-running with
 a fresh token re-registers the same name with `--replace`; when `gh` is on the mini,
 it refuses first if that name now belongs to a different runner id. A re-run that
 passes neither `--labels` nor `--manifest` keeps the labels and name it registered
-and never relabels.
+and never relabels. If `--replace` itself was interrupted after GitHub assigned the
+new id, the id check blocks; pass `--replace` to take the name back.
+
+Relabelling keeps the runner's name. Moving an existing `<hostname>-glaeda` runner
+to a member whose name `<member>-glaeda` differs is a different install: the
+command refuses it as a conflict until `--uninstall --apply` removes the old one,
+or pass `--name` with the existing name to relabel it in place.
 
 ## 3. Verify
 
