@@ -159,15 +159,16 @@ class Context:
 def pick_python() -> str | None:
     """The interpreter the glaeda-disk LaunchAgents run.
 
-    /usr/bin/python3 is a stub that opens an install dialog until the Command Line Tools exist,
-    so it only counts once they do.
+    /usr/bin/python3 is a stub that opens an install dialog until the Command Line Tools or
+    an Xcode exist, so it only counts once one does. The fleet's Xcode is a versioned app
+    such as Xcode_26.6.app, not only Xcode.app.
     """
     for candidate in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
         if os.access(candidate, os.X_OK):
             return candidate
-    if Path("/Library/Developer/CommandLineTools/usr/bin/python3").exists() or Path(
-        "/Applications/Xcode.app"
-    ).exists():
+    if Path("/Library/Developer/CommandLineTools/usr/bin/python3").exists() or any(
+        Path("/Applications").glob("Xcode*.app")
+    ):
         return "/usr/bin/python3"
     return None
 

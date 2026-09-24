@@ -115,6 +115,18 @@ class MiniSetupTest(unittest.TestCase):
             steps = ms.operator_steps(mock.Mock(xcode_app=ms.CMUX_XCODE_APP), pre, None)
             self.assertEqual(any(s["command"] == "xcode-select --install" for s in steps), wanted, level)
 
+    def test_pick_python_trusts_the_shim_beside_a_versioned_xcode(self) -> None:
+        def fake_glob(self, pattern):
+            return iter([Path("/Applications/Xcode_26.6.app")]) if pattern == "Xcode*.app" else iter([])
+        with mock.patch.object(ms.os, "access", return_value=False), \
+             mock.patch.object(ms.Path, "exists", return_value=False), \
+             mock.patch.object(ms.Path, "glob", fake_glob):
+            self.assertEqual(ms.pick_python(), "/usr/bin/python3")
+        with mock.patch.object(ms.os, "access", return_value=False), \
+             mock.patch.object(ms.Path, "exists", return_value=False), \
+             mock.patch.object(ms.Path, "glob", lambda self, pattern: iter([])):
+            self.assertIsNone(ms.pick_python())
+
     def test_default_xcode_pin_matches_the_cmux_pull_request_lane(self) -> None:
         self.assertEqual(ms.CMUX_XCODE_APP, "/Applications/Xcode_26.6.app")
 
