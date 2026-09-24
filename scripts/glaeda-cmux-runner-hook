@@ -41,6 +41,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -53,9 +54,9 @@ DISK_TIMEOUT_S = 120
 FLEET_DIR = os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet"
 HOST_LOCK = f"{FLEET_DIR}/host.lock"
 RESERVATION = f"{FLEET_DIR}/reservation.json"
-HOLDER_FILE = "host-lock-holder.pid"
+HOLDER_FILE = "host-lock-holder"
 HOLDER_POLL_S = 2.0
-HOLDER_MAX_S = 12 * 3600  # a job never holds the host longer than GitHub's own job limit allows
+HOLDER_MAX_S = 5 * 24 * 3600  # GitHub's limit for a self-hosted job; the job's own exit releases it sooner
 # Events whose code is the repository's own, or a same-repo pull request checked below. Comment,
 # check and review-comment events can run with secrets on behalf of a fork PR, so they are left out.
 ADMITTED_EVENTS = ("push", "pull_request", "merge_group", "workflow_dispatch", "schedule", "workflow_run")
@@ -154,12 +155,19 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def holder_file(state_dir: Path) -> Path:
+    """One pid file per runner (RUNNER_NAME comes from the runner, not the job)."""
+    name = "".join(c for c in os.environ.get("RUNNER_NAME", "") if c.isalnum() or c in "-_.")
+    return state_dir / (f"{HOLDER_FILE}-{name}.pid" if name else f"{HOLDER_FILE}.pid")
+
+
 def take_host_lock(path: str, watch_pid: int, state_dir: Path) -> tuple[bool, str]:
-    """Take the fleet host lock without waiting and leave it with a detached holder for this job."""
+    """Take the fleet host lock without waiting and leave it with a detached holder for this job.
+    Admitted only once the holder itself reports its pid, so a holder that died never counts."""
     if not os.path.exists(path):
         return True, "no fleet host lock on this machine"
     try:
-        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)  # flock needs no write access
     except OSError as error:
         return False, f"cannot open the fleet host lock ({type(error).__name__})"
     try:
@@ -167,11 +175,27 @@ def take_host_lock(path: str, watch_pid: int, state_dir: Path) -> tuple[bool, st
     except OSError:
         os.close(fd)
         return False, "another build holds the fleet host lock"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    holder_file = state_dir / HOLDER_FILE
-    child = os.fork()
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        pid_file = holder_file(state_dir)
+        pid_file.unlink(missing_ok=True)  # a stale file from a crashed holder must not look like success
+    except OSError as error:
+        os.close(fd)
+        return False, f"cannot prepare the host lock holder ({type(error).__name__})"
+    try:
+        ready_r, ready_w = os.pipe()
+    except OSError as error:
+        os.close(fd)
+        return False, f"cannot start the host lock holder ({type(error).__name__})"
+    try:
+        child = os.fork()
+    except OSError as error:
+        for leftover in (fd, ready_r, ready_w):
+            os.close(leftover)
+        return False, f"cannot start the host lock holder ({type(error).__name__})"
     if child == 0:  # detach twice so the runner never waits on the holder
         try:
+            os.close(ready_r)
             os.setsid()
             if os.fork():
                 os._exit(0)
@@ -179,34 +203,38 @@ def take_host_lock(path: str, watch_pid: int, state_dir: Path) -> tuple[bool, st
             for std in (0, 1, 2):  # the runner reads the hook's output until EOF
                 os.dup2(null, std)
             me = str(os.getpid())
-            holder_file.write_text(me + "\n")
+            pid_file.write_text(me + "\n")
+            os.write(ready_w, me.encode())
+            os.close(ready_w)
             deadline = time.monotonic() + HOLDER_MAX_S
             while pid_alive(watch_pid) and time.monotonic() < deadline:
                 try:
-                    if holder_file.read_text().strip() != me:
+                    if pid_file.read_text().strip() != me:
                         break  # job-completed released it
                 except OSError:
                     break
                 time.sleep(HOLDER_POLL_S)
         finally:
             os._exit(0)  # the lock goes with this process
+    os.close(ready_w)
     os.waitpid(child, 0)
-    os.close(fd)  # the holder keeps the same open file, so the lock stays held
-    for _ in range(50):
-        if holder_file.is_file():
-            break
-        time.sleep(0.05)
-    return True, f"holding the fleet host lock for this job (watching pid {watch_pid})"
+    os.close(fd)  # the holder keeps the same open file, so the lock stays held while it lives
+    ready, _, _ = select.select([ready_r], [], [], 10)
+    reported = os.read(ready_r, 32).decode().strip() if ready else ""
+    os.close(ready_r)
+    if not reported.isdigit() or not pid_alive(int(reported)):
+        return False, "the host lock holder did not start; refusing rather than run unlocked"
+    return True, f"holding the fleet host lock for this job (holder {reported}, watching pid {watch_pid})"
 
 
 def release_host_lock(state_dir: Path) -> str:
     """job-completed: tell this job's holder to let go, and wait briefly for it."""
-    holder_file = state_dir / HOLDER_FILE
+    pid_file = holder_file(state_dir)
     try:
-        pid = int(holder_file.read_text().strip())
+        pid = int(pid_file.read_text().strip())
     except (OSError, ValueError):
         return "no host lock holder to release"
-    holder_file.unlink(missing_ok=True)
+    pid_file.unlink(missing_ok=True)
     deadline = time.monotonic() + HOLDER_POLL_S * 3
     while pid_alive(pid) and time.monotonic() < deadline:
         time.sleep(0.1)

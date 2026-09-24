@@ -305,6 +305,8 @@ class HookTest(unittest.TestCase):
             "iso-string-until": ({**v1, "until": "2099-01-01T00:00:00Z"}, False, "until is not integer"),
             "float-until": ({**v1, "until": now + 3600.5}, False, "until is not integer"),
             "bool-until": ({**v1, "until": True}, False, "until is not integer"),
+            "millisecond-until": ({**v1, "until": now * 1000}, False, "until is outside"),
+            "negative-since": ({**v1, "since": -1}, False, "since is outside"),
             "missing-since": ({k: v for k, v in v1.items() if k != "since"}, False, "since is not integer"),
             "wrong-schema": ({**v1, "schema": "other/v1"}, False, "schema is not"),
             "not-json": ("{nope", False, "not JSON"),
@@ -360,6 +362,7 @@ class HookTest(unittest.TestCase):
         finally:
             holder.kill()
             holder.wait()
+            holder.stdout.close()
 
     def test_job_holds_the_lock_until_completed(self) -> None:
         self.fleet()
@@ -386,6 +389,23 @@ class HookTest(unittest.TestCase):
         while not self.lock_free() and time.monotonic() < deadline:
             time.sleep(0.2)
         self.assertTrue(self.lock_free())
+
+    def test_stale_holder_file_is_not_success(self) -> None:
+        self.fleet()
+        state = self.dir / "state"
+        state.mkdir()
+        (state / "host-lock-holder.pid").write_text(f"{os.getpid()}\n")  # a live pid, but not a holder
+        with mock.patch.object(hook.os, "fork", side_effect=OSError("no fork")):
+            held, note = hook.take_host_lock(os.fspath(self.dir / "fleet/host.lock"), os.getpid(), state)
+        self.assertFalse(held)
+        self.assertIn("cannot start the host lock holder", note)
+        self.assertFalse((state / "host-lock-holder.pid").exists())
+        self.assertTrue(self.lock_free())
+
+    def test_huge_until_is_described_not_raised(self) -> None:
+        reservation = load("glaeda_reservation_under_test", ROOT / "scripts" / "glaeda_reservation.py")
+        text = reservation.describe({"owner": "o", "purpose": "p", "since": 0, "until": 10**30})
+        self.assertIn("not a representable time", text)
 
     def test_no_fleet_lock_file_admits(self) -> None:
         result = self.started()
@@ -550,6 +570,36 @@ class RunnerTest(unittest.TestCase):
                                       text=True, timeout=60, check=False, env={"PATH": "/usr/bin:/bin",
                                                                                "HOME": os.fspath(self.home)})
                 self.assertEqual(done.returncode, 0)
+
+    def test_installed_wrapper_holds_the_lock_for_its_real_parent(self) -> None:
+        self.invoke("--apply")
+        hooks = self.home / "actions-runner-glaeda/glaeda-hooks"
+        fleet = self.home / "fleet"
+        fleet.mkdir()
+        (fleet / "host.lock").touch()
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.home), "GLAEDA_FLEET_DIR": os.fspath(fleet),
+               "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(event(self.state, "push", SAMPLE_EVENTS["push"][1])),
+               "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
+        # No --watch-pid: the wrapper execs python, so the holder watches this test process, which lives on.
+        started = subprocess.run(["/bin/bash", os.fspath(hooks / "job-started.sh")], capture_output=True,
+                                 text=True, timeout=60, check=False, env=env)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.assertIn(f"watching pid {os.getpid()}", started.stdout)
+        time.sleep(3)  # longer than one holder poll: a holder watching a dead parent would have let go
+        import fcntl
+        fd = os.open(fleet / "host.lock", os.O_RDONLY)
+        try:
+            with self.assertRaises(OSError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+        subprocess.run(["/bin/bash", os.fspath(hooks / "job-completed.sh")], capture_output=True, timeout=60,
+                       check=False, env=env)
+        fd = os.open(fleet / "host.lock", os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
 
     def test_missing_interpreter_fails_closed(self) -> None:
         self.invoke("--apply", "--python", "/nonexistent/python3")
