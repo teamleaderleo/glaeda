@@ -372,12 +372,16 @@ def collect_macos(
     zig = run([executable("zig"), "version"])
     zig_required = cmux_required_zig_version(cmux_root)
     rustup = executable("rustup")
-    rustup_version = run([rustup, "--version"])
-    cargo = run([executable("cargo"), "--version"])
-    rustc = run([executable("rustc"), "--version"])
+    # rustup resolves the active toolchain from the working directory's
+    # rust-toolchain.toml, so observe it where the CMUX build runs. From any
+    # other directory (a Glaeda checkout pins its own Rust) the toolchain
+    # generation differs between enrollment and acceptance.
+    rustup_version = run([rustup, "--version"], cwd=cmux_root)
+    cargo = run([executable("cargo"), "--version"], cwd=cmux_root)
+    rustc = run([executable("rustc"), "--version"], cwd=cmux_root)
     diff_rust = cmux_diff_rust_toolchain(cmux_root)
-    diff_cargo = run([rustup, "run", diff_rust, "cargo", "--version"])
-    diff_rustc = run([rustup, "run", diff_rust, "rustc", "--version"])
+    diff_cargo = run([rustup, "run", diff_rust, "cargo", "--version"], cwd=cmux_root)
+    diff_rustc = run([rustup, "run", diff_rust, "rustc", "--version"], cwd=cmux_root)
     pmset = run([executable("pmset"), "-g", "custom"])
     xcode_match = re.search(r"^Xcode\s+(\d+(?:\.\d+)*)$", xcode, re.MULTILINE)
     sdk_match = re.fullmatch(r"(\d+)(?:\.\d+)*", sdk)

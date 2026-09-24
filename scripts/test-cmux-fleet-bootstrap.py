@@ -335,6 +335,29 @@ class Tests(unittest.TestCase):
         ):
             return b.collect_macos(root, root / "glaeda", 1, "cmux-mac-build-large", cache_root)
 
+    def test_rust_is_observed_from_the_cmux_checkout(self):
+        # rustup picks the toolchain from the working directory, so a probe run
+        # elsewhere (a Glaeda checkout pins its own Rust) moves the toolchain
+        # generation between enrollment and acceptance.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._macos_checkout(root)
+            (root / "glaeda").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            cache_root = root / "cache"
+            cache_root.mkdir()
+            seen = {}
+            original = self._macos_command
+
+            def command(argv, **kwargs):
+                if Path(argv[0]).name in ("rustup", "cargo", "rustc"):
+                    seen[" ".join(argv[1:])] = kwargs.get("cwd")
+                return original(argv, **kwargs)
+
+            with mock.patch.object(self, "_macos_command", side_effect=command):
+                self._collect_macos(root, cache_root, visible=True)
+            self.assertTrue(seen)
+            self.assertEqual(set(seen.values()), {root}, seen)
+
     def test_xcode_pin_accepts_the_major_cmux_pins(self):
         # cmux#14050 changed .xcode-version from "26.0" to "26".
         for pin in ("26", "26.0", "26\n".strip()):

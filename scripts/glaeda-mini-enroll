@@ -257,7 +257,10 @@ class Runner:
             ["bash", os.fspath(self.tools / "cmux-fleet-bootstrap-macos"), "--cmux-root", os.fspath(self.cmux_root),
              "--glaeda", os.fspath(self.glaeda_bin), "--cache-root", os.fspath(self.paths.cache_root),
              "--hardware-class", HARDWARE_CLASS, "--role", ROLE],
-            cwd=REPO, text=True, stdout=subprocess.PIPE, check=False)
+            # accept-local re-runs the bootstrap from the staged generation and
+            # requires the same toolchain generation; this checkout's
+            # rust-toolchain.toml would otherwise change what rustc reports.
+            cwd=self.tools.parent, text=True, stdout=subprocess.PIPE, check=False)
         doc = None
         try:
             doc = json.loads(result.stdout)
