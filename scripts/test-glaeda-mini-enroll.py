@@ -165,7 +165,8 @@ class Python(unittest.TestCase):
 
     def test_missing_python_names_both_fixes(self) -> None:
         err = io.StringIO()
-        with mock.patch.object(me, "pick_python", return_value=None), contextlib.redirect_stderr(err):
+        with mock.patch.object(me, "DARWIN_REQUIRED", False), \
+             mock.patch.object(me, "pick_python", return_value=None), contextlib.redirect_stderr(err):
             self.assertEqual(me.main(["--cmux-root", "/c"]), 2)
         self.assertIn("python@3.13", err.getvalue())
         self.assertIn("~/.local/bin/python3", err.getvalue())
