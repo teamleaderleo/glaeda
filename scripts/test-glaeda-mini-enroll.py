@@ -186,26 +186,50 @@ class ClassReceipt(unittest.TestCase):
     def test_adopt_class_keeps_the_receipt_and_asks_the_generation(self) -> None:
         generation = Path("/g")
         runner = me.Runner("/py", me.Paths(Path("/Users/op")), Path("/cmux"), generation)
+        class_path = me.Paths(Path("/Users/op")).class_receipt("std")
+        pending = class_path.with_name(".std.json.pending")
         written = {}
         accepted = json.dumps({"result": "accepted"})
         with mock.patch.object(me.Runner, "write_private", side_effect=lambda p, t: written.__setitem__(p, t)), \
+             mock.patch.object(me.os, "replace") as replace, mock.patch.object(me.Path, "unlink"), \
              mock.patch.object(me.subprocess, "run",
                                return_value=me.subprocess.CompletedProcess([], 0, stdout=accepted)) as run, \
              mock.patch("builtins.print"):
             runner.adopt_class(b'{"k": 1}', self.SHA, "std")
         argv = run.call_args.args[0]
         self.assertEqual(argv[:4], ["/py", "-B", "/g/scripts/cmux_fleet.py", "adopt-class-acceptance"])
+        self.assertEqual(argv[argv.index("--class-receipt") + 1], os.fspath(pending))
         self.assertEqual(argv[argv.index("--expected-sha256") + 1], self.SHA)
         self.assertEqual(argv[argv.index("--glaeda") + 1], "/g/bin/glaeda")
         self.assertIn("--cache-root", argv)
-        class_path = me.Paths(Path("/Users/op")).class_receipt("std")
-        self.assertEqual(written[class_path], '{"k": 1}')
+        self.assertEqual(written[pending], '{"k": 1}')
+        replace.assert_called_once_with(pending, class_path)
         self.assertEqual(written[me.Paths(Path("/Users/op")).acceptance], accepted)
-        with mock.patch.object(me.Runner, "write_private"), \
+        # A receipt this node does not match is neither kept nor turned into an acceptance.
+        with mock.patch.object(me.Runner, "write_private") as write, \
+             mock.patch.object(me.os, "replace") as replace, mock.patch.object(me.Path, "unlink") as unlink, \
              mock.patch.object(me.subprocess, "run",
                                return_value=me.subprocess.CompletedProcess([], 1, stdout="")), \
              mock.patch("builtins.print"), self.assertRaisesRegex(me.Stop, "run accept-local"):
             runner.adopt_class(b"{}", self.SHA, "std")
+        replace.assert_not_called()
+        unlink.assert_called_once()
+        self.assertEqual(write.call_count, 1)
+
+    def test_plan_mode_does_not_read_the_receipt(self) -> None:
+        with mock.patch.object(me, "read_class_receipt") as read, \
+             mock.patch.object(me, "read_json", return_value=None), \
+             mock.patch.object(me.Path, "is_file", return_value=False), \
+             mock.patch.object(me.Path, "exists", return_value=False):
+            code = self.main("--node-id", "cmux-mac-003", "--candidate", "/a", "--sha256", "s", "--source", "3" * 40,
+                             "--class-receipt", "-", "--class-receipt-sha256", self.SHA, "--fleet-class", "std")
+        self.assertEqual(code, 0)
+        read.assert_not_called()
+
+    def test_a_receipt_that_is_not_utf8_json_stops(self) -> None:
+        with mock.patch.object(me.sys, "stdin", mock.Mock(buffer=io.BytesIO(b'{"a": "\xff"}'))), \
+             self.assertRaisesRegex(me.Stop, "UTF-8"):
+            me.read_class_receipt("-")
 
 
 class Python(unittest.TestCase):

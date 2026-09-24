@@ -326,18 +326,24 @@ class Runner:
         self.write_private(self.paths.acceptance, result.stdout)
 
     def adopt_class(self, receipt: bytes, sha256: str, fleet_class: str) -> None:
-        # The receipt the node relies on stays next to its enrollment, which records its digest.
+        # The receipt the node relies on stays next to its enrollment, which records its digest; one
+        # this node does not match is not kept there.
         path = self.paths.class_receipt(fleet_class)
-        self.write_private(path, receipt.decode())
+        pending = path.with_name(f".{path.name}.pending")
+        self.write_private(pending, receipt.decode("utf-8"))
         print(f"adopt-class: bootstrap re-check against class {fleet_class} ({sha256[:19]}); no build", flush=True)
-        result = self.fleet("adopt-class-acceptance", os.fspath(self.paths.enrollment), "--class-receipt",
-                            os.fspath(path), "--expected-sha256", sha256, "--fleet-class", fleet_class,
-                            "--cmux-root", os.fspath(self.cmux_root), "--glaeda", os.fspath(self.glaeda_bin),
-                            "--cache-root", os.fspath(self.paths.cache_root))
-        receipt_doc = read_json_text(result.stdout)
-        if result.returncode or (receipt_doc or {}).get("result") != "accepted":
-            raise Stop(f"this mini does not match the class {fleet_class} acceptance (the differing fields are "
-                       "above); run accept-local on it: re-run without --class-receipt")
+        try:
+            result = self.fleet("adopt-class-acceptance", os.fspath(self.paths.enrollment), "--class-receipt",
+                                os.fspath(pending), "--expected-sha256", sha256, "--fleet-class", fleet_class,
+                                "--cmux-root", os.fspath(self.cmux_root), "--glaeda", os.fspath(self.glaeda_bin),
+                                "--cache-root", os.fspath(self.paths.cache_root))
+            receipt_doc = read_json_text(result.stdout)
+            if result.returncode or (receipt_doc or {}).get("result") != "accepted":
+                raise Stop(f"this mini does not match the class {fleet_class} acceptance (the differing fields "
+                           "are above); run accept-local on it: re-run without --class-receipt")
+            os.replace(pending, path)
+        finally:
+            pending.unlink(missing_ok=True)
         self.write_private(self.paths.acceptance, result.stdout)
 
     def eligible(self) -> None:
@@ -437,8 +443,12 @@ def read_class_receipt(value: str) -> bytes:
             data = Path(value).expanduser().read_bytes()
         except OSError as error:
             raise Stop(f"cannot read the class receipt: {error}") from None
-    if not data or len(data) > MAX_CLASS_RECEIPT_BYTES or read_json_text(data.decode(errors="replace")) is None:
-        raise Stop("the class receipt is empty, too large, or not a JSON object")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = ""
+    if not data or len(data) > MAX_CLASS_RECEIPT_BYTES or read_json_text(text) is None:
+        raise Stop("the class receipt is empty, too large, or not a UTF-8 JSON object")
     return data
 
 
@@ -467,7 +477,8 @@ def main(argv: list[str] | None = None) -> int:
               "sha256:<64 hex>", file=sys.stderr)
         return 2
     class_bytes = None
-    if args.class_receipt:
+    if args.class_receipt and args.apply:
+        # Only when it will be used: a plan-only run with `-` would otherwise wait on a terminal.
         try:
             class_bytes = read_class_receipt(args.class_receipt)
         except Stop as stop:
@@ -492,7 +503,7 @@ def main(argv: list[str] | None = None) -> int:
         if generation is None or staged:
             state.acceptance_current = runner.acceptance_current(enrollment)
         steps = plan(state, args.node_id, args.reaccept, args.rebuild, candidate=generation is not None,
-                     no_accept=args.no_accept, class_receipt=class_bytes is not None)
+                     no_accept=args.no_accept, class_receipt=bool(args.class_receipt))
         print(f"glaeda-mini-enroll ({python})")
         for step in steps:
             print(f"  - {DESCRIPTIONS[step]}")

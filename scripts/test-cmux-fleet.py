@@ -1665,6 +1665,26 @@ class ClassAcceptanceTests(unittest.TestCase):
             f.ENROLLMENT_KEYS,
         )
 
+    def test_a_class_receipt_counts_only_while_the_enrollment_names_it(self):
+        klass, _ = std_class_receipt()
+        node = class_enrollment("cmux-fixture-002", state="enrolling")
+        derived = self.adopt(klass, node)
+        eligible = f.transition(node, "eligible", None, [derived])
+        # Swapped onto a node that became eligible some other way, it does not count.
+        legacy = {k: v for k, v in eligible.items() if k != "classAcceptanceSha256"}
+        by_role = {r["role"]: r for r in f.node_status(legacy, [derived])["roles"]}
+        self.assertEqual(by_role["cmux_macos_native_build"]["reason"], "acceptance_class_stale")
+        # Draining and back re-records the same class receipt.
+        draining = f.transition(eligible, "draining", None)
+        back = f.transition(draining, "eligible", None, [derived])
+        self.assertEqual(back["classAcceptanceSha256"], klass["receiptSha256"])
+        # A class receipt offered next to a stale one records nothing it did not rest on.
+        stale = dict(derived, enrollmentGeneration=derived["enrollmentGeneration"] + 1)
+        with self.assertRaisesRegex(f.FleetError, "current accepted role receipt"):
+            f.transition(node, "eligible", None, [stale])
+        with self.assertRaisesRegex(f.FleetError, "no local execution attempt"):
+            f.validate_acceptance_receipt(dict(derived, localExecutionAttemptSha256=E))
+
     def test_candidate_identity_believes_only_the_running_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

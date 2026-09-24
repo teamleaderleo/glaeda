@@ -474,7 +474,10 @@ def collect_macos(
     xcode = run([executable("xcodebuild"), "-version"])
     xcrun = executable("xcrun")
     sdk = run([xcrun, "--sdk", "macosx", "--show-sdk-version"])
-    metal = run([xcrun, "metal", "--version"])
+    # Only the version line: the rest names the per-machine cryptex mount the
+    # Metal toolchain asset landed in, which differs between identical hosts.
+    metal = run([xcrun, "metal", "--version"]).strip().splitlines()[:1]
+    metal = metal[0] if metal else ""
     git = run([executable("git"), "--version"])
     zig = run([executable("zig"), "version"])
     zig_required = cmux_required_zig_version(cmux_root)

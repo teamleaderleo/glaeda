@@ -306,7 +306,10 @@ class Tests(unittest.TestCase):
         if name == "xcodebuild":
             return "Xcode 26.0\nBuild version 26A123"
         if name == "xcrun":
-            return "metal version 32023" if "metal" in rest else "26.0"
+            if "metal" in rest:
+                return ("metal version 32023\nTarget: air64-apple-darwin25.5.0\n"
+                        "InstalledDir: /private/var/run/mnt/MetalToolchain-v17.6.7KPGHG/bin")
+            return "26.0"
         if name == "zig":
             return "0.16.0"
         if name == "rustup":
@@ -404,6 +407,8 @@ class Tests(unittest.TestCase):
         toolchain = observed["observed"]["toolchain"]
         self.assertEqual(toolchain["xcodeBuild"], "26A123")
         self.assertEqual(toolchain["xcodeVersion"], "26.0")
+        # The asset mount path differs between identical hosts, so only the version line counts.
+        self.assertEqual(toolchain["metalVersion"], "metal version 32023")
         self.assertEqual(
             observed["toolchainGeneration"], b.digest_bytes(b.canonical(toolchain))
         )

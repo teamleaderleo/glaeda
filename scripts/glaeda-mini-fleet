@@ -1964,12 +1964,8 @@ def class_acceptance(manifest: dict[str, Any], name: str) -> tuple[dict[str, Any
     return recorded, f"class {klass} accepted on {recorded.get('node')} (Xcode {build}, candidate {source12})"
 
 
-def class_receipt_bytes(manifest: dict[str, Any], name: str) -> tuple[bytes | None, str]:
-    """The class acceptance receipt this host is sent, checked against the manifest's digest, if one is recorded."""
-    klass = manifest["hosts"][name]["class"]
-    recorded = manifest["classes"][klass].get("acceptance") or {}
-    if "receipt" not in recorded:
-        return None, f"class {klass} records no receipt"
+def class_receipt_bytes(recorded: dict[str, Any], klass: str) -> tuple[bytes | None, str]:
+    """The class acceptance receipt a host of `klass` is sent, checked against the recorded digest."""
     path = Path(str(recorded["receipt"])).expanduser()
     try:
         data = path.read_bytes()
@@ -2001,8 +1997,8 @@ def onboard_hosts(manifest: dict[str, Any], wanted: list[str] | None) -> tuple[l
 
 
 def enroll_command(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str],
-                   no_accept: bool, class_receipt: bool = False) -> str:
-    """glaeda-mini-enroll on the host. class_receipt: the class receipt arrives on stdin (--class-receipt -)."""
+                   no_accept: bool, class_receipt: tuple[str, str] | None = None) -> str:
+    """glaeda-mini-enroll on the host. class_receipt (class, receipt_sha256): the receipt arrives on stdin."""
     checkout = cmux_checkout(manifest, name)
     python = result["checks"]["python"]["detail"].split(" at ", 1)[1]
     archive = f"~/Library/Caches/cmux-fleet/glaeda-candidate-{candidate['source'][:12]}/{candidate_archive_name(candidate)}"
@@ -2010,9 +2006,7 @@ def enroll_command(manifest: dict[str, Any], name: str, result: dict[str, Any], 
             "--node-id", manifest["hosts"][name]["node_id"], "--candidate", archive, "--sha256", candidate["sha256"],
             "--source", candidate["source"], "--apply"]
     if class_receipt:
-        klass = manifest["hosts"][name]["class"]
-        argv += ["--class-receipt", "-", "--class-receipt-sha256",
-                 manifest["classes"][klass]["acceptance"]["receipt_sha256"], "--fleet-class", klass]
+        argv += ["--class-receipt", "-", "--class-receipt-sha256", class_receipt[1], "--fleet-class", class_receipt[0]]
     elif no_accept:
         argv.append("--no-accept")
     # ~ must expand on the host: quote everything, then let the leading ~/ through.
@@ -2112,7 +2106,7 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         elif blockers(results[name], ("person",)):
             settle(name, "preflight", "needs a person: " + ", ".join(blockers(results[name], ("person",))))
     candidate = operator_candidate()
-    receipts: dict[str, bytes] = {}
+    receipts: dict[str, tuple[str, str, bytes]] = {}  # host: (class, receipt_sha256, receipt bytes)
     if acceptance == "class":
         for name in list(live):
             recorded, why = class_acceptance(manifest, name)
@@ -2121,11 +2115,12 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
                 settle(name, "preflight", f"blocked: {why}; accept one host of the class first "
                                           f"(onboard {name} --acceptance node --yes)")
             elif recorded is not None and "receipt" in recorded:
-                data, why = class_receipt_bytes(manifest, name)
+                klass = manifest["hosts"][name]["class"]
+                data, why = class_receipt_bytes(recorded, klass)
                 if data is None:
                     settle(name, "preflight", f"blocked: {why}")
                 else:
-                    receipts[name] = data
+                    receipts[name] = (klass, recorded["receipt_sha256"], data)
 
     if not yes:
         for name in live:
@@ -2247,11 +2242,12 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
 
 
 def _enroll_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str],
-                no_accept: bool, log_path: Path, class_receipt: bytes | None = None) -> int:
-    command = enroll_command(manifest, name, result, candidate, no_accept, class_receipt is not None)
+                no_accept: bool, log_path: Path, class_receipt: tuple[str, str, bytes] | None = None) -> int:
+    command = enroll_command(manifest, name, result, candidate, no_accept,
+                             class_receipt[:2] if class_receipt else None)
     with open(log_path, "ab") as log:
         note(log, f"== enroll ({command})")
-        return ssh_stream(name, manifest["ssh_user"], command, log, stdin=class_receipt or b"",
+        return ssh_stream(name, manifest["ssh_user"], command, log, stdin=class_receipt[2] if class_receipt else b"",
                           timeout=ENROLL_TIMEOUT)
 
 

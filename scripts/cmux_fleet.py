@@ -644,6 +644,8 @@ def validate_acceptance_receipt(value: object) -> dict[str, Any]:
         raise FleetError("acceptance execution class is invalid")
     if class_derived:
         sha256(doc["classAcceptanceSha256"], "class acceptance digest")
+        if doc["localExecutionAttemptSha256"] is not None:
+            raise FleetError("a class-derived receipt has no local execution attempt")
     local_attempt = sha256(
         doc["localExecutionAttemptSha256"],
         "local execution attempt",
@@ -686,12 +688,12 @@ def acceptance_matches_enrollment(enrollment: dict[str, Any], receipt: dict[str,
         return False, "acceptance_toolchain_stale"
     if receipt.get("profile") != enrollment["roleProfiles"].get(role):
         return False, "acceptance_profile_stale"
-    recorded = enrollment.get("classAcceptanceSha256")
     if (
         receipt.get("executionClass") == CLASS_EXECUTION_CLASS
-        and recorded is not None
-        and receipt.get("classAcceptanceSha256") != recorded
+        and receipt.get("classAcceptanceSha256") != enrollment.get("classAcceptanceSha256")
     ):
+        # The enrollment names the class receipt its eligibility rests on; a
+        # class-derived receipt counts only while it is that one.
         return False, "acceptance_class_stale"
     return True, "accepted"
 
@@ -876,7 +878,19 @@ def transition(
         enrollment.pop("classAcceptanceSha256", None)
     enrollment["state"] = target
     if target == "eligible":
+        # Record which class receipt, if any, the roles rest on, so the
+        # enrollment says whether this node was built on or only matched.
+        receipts = [validate_acceptance_receipt(v) for v in acceptance_values or []]
+        offered = sorted({
+            r["classAcceptanceSha256"]
+            for r in receipts
+            if r["executionClass"] == CLASS_EXECUTION_CLASS
+        })
+        if len(offered) > 1:
+            raise FleetError("receipts rest on different class acceptances")
         enrollment.pop("classAcceptanceSha256", None)
+        if offered:
+            enrollment["classAcceptanceSha256"] = offered[0]
     enrollment = validate_enrollment(enrollment)
     if target == "eligible":
         status = node_status(enrollment, acceptance_values or [])
@@ -884,20 +898,13 @@ def transition(
             raise FleetError(
                 "eligible transition requires a current accepted role receipt"
             )
-        # Record which class receipt, if any, the eligible roles rest on, so the
-        # enrollment says whether this node was built on or only matched.
         eligible_roles = {r["role"] for r in status["roles"] if r["eligible"]}
-        relied = sorted({
-            receipt["classAcceptanceSha256"]
-            for receipt in map(validate_acceptance_receipt, acceptance_values or [])
-            if receipt["role"] in eligible_roles
-            and receipt["executionClass"] == CLASS_EXECUTION_CLASS
-        })
-        if len(relied) > 1:
-            raise FleetError("eligible roles rest on different class acceptances")
-        if relied:
-            enrollment["classAcceptanceSha256"] = relied[0]
-            enrollment = validate_enrollment(enrollment)
+        if "classAcceptanceSha256" in enrollment and not any(
+            r["executionClass"] == CLASS_EXECUTION_CLASS and r["role"] in eligible_roles
+            for r in receipts
+        ):
+            # The class receipt offered did not count; nothing rests on it.
+            enrollment.pop("classAcceptanceSha256")
     return enrollment
 
 
@@ -1665,17 +1672,13 @@ def _validate_toolchain_observations(value: object, label: str) -> dict[str, Any
         not isinstance(value, dict)
         or not value
         or len(value) > 32
-        or any(
-            not isinstance(name, str)
-            or TOKEN_RE.fullmatch(name.lower()) is None
-            or not (
-                (isinstance(item, str) and len(item) <= 512)
-                or type(item) is int
-            )
-            for name, item in value.items()
-        )
     ):
         raise FleetError(f"{label} toolchain observations are invalid")
+    for name, item in value.items():
+        if not isinstance(name, str) or TOKEN_RE.fullmatch(name.lower()) is None:
+            raise FleetError(f"{label} toolchain observation name {name!r} is invalid")
+        if not ((isinstance(item, str) and len(item) <= 512) or type(item) is int):
+            raise FleetError(f"{label} toolchain.{name} is not a short string or integer")
     return value
 
 
