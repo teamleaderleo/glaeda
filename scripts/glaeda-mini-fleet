@@ -463,6 +463,7 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
         "enroll_generation": out.get("pf_enroll_generation") or None,
         "enroll_reason": out.get("pf_enroll_reason") or None,
         "acceptance": out.get("pf_acceptance"),
+        "acceptance_class": out.get("pf_acceptance_class") or None,
         "brew_owner": out.get("pf_brew_owner"),
         "update_running": out.get("pf_update_running"),
         "update_prepared": None if prepared is None else {"state": prepared[0], "version": prepared[1]},
@@ -1179,8 +1180,11 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
         put("enroll", "ok", "eligible, accepted")
     elif state == "retired":
         put("enroll", "fail", "enrollment is retired", "see docs/CMUX_FLEET_ENROLLMENT.md", "person")
+    elif state == "quarantined" and pf.get("enroll_reason") in RENEWABLE_REASONS:
+        put("enroll", "todo", f"quarantined ({pf.get('enroll_reason')})", renew, "self")
     elif state == "quarantined":
-        put("enroll", "todo", f"quarantined ({pf.get('enroll_reason') or 'no reason'})", renew, "self")
+        put("enroll", "fail", f"quarantined ({pf.get('enroll_reason') or 'no reason'}) by an operator",
+            "fix the cause, then cmux_fleet.py transition-apply ENROLLMENT --to enrolling; repair then renews it", "person")
     elif state == "draining":
         put("enroll", "info", "draining (an operator drain; upgrade and repair leave it alone)")
     elif state == "eligible":
@@ -1214,8 +1218,13 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     blocked = any(c["state"] == "fail" or (c["state"] == "unknown" and k in UNKNOWN_BLOCKS) for k, c in checks.items())
     return {"host": name, "ready": not blocked, "checks": checks,
             "enrollment": {"state": state, "generation": pf.get("enroll_generation"), "stale": stale,
-                           "accepted": accepted, "reason": pf.get("enroll_reason")},
+                           "accepted": accepted, "reason": pf.get("enroll_reason"),
+                           "local": pf.get("acceptance_class") not in {None, "glaeda-class-acceptance/v1"}},
             "runners": runners}
+
+
+# Quarantine reasons a renewal fixes; any other reason is an operator's, and upgrade and repair leave it.
+RENEWABLE_REASONS = frozenset({"stale_glaeda_generation", "toolchain_mismatch", "failed_acceptance"})
 
 
 def enrollment_stale(pf: dict[str, Any]) -> bool:
@@ -2195,6 +2204,8 @@ def enrollment_need(result: dict[str, Any]) -> str:
         return "enroll"
     if state in {"retired", "draining"}:
         return {"retired": "retired", "draining": "leave"}[state]
+    if state == "quarantined" and enrollment.get("reason") not in RENEWABLE_REASONS:
+        return "leave"
     if state in {"quarantined", "enrolling"} or enrollment.get("stale") or not enrollment.get("accepted"):
         return "renew"
     return "ok"
@@ -2255,6 +2266,9 @@ def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candi
         step(f"renew ({command})")
         code = ssh_stream(name, user, command, log, stdin=receipt[2] if receipt else b"", timeout=ENROLL_TIMEOUT)
     if code:
+        with open(log_path, "ab") as log:
+            note(log, "== the renewal failed; start the runners again if the node is still eligible")
+            fix_call(name, user, "runner_release", ["if-eligible"], log, 300)
         differs = adoption_mismatch(log_path) if receipt else []
         if differs:
             return False, "renew", (f"quarantined: differs from class {klass} in {', '.join(differs)}. Fix: make those "
@@ -2264,7 +2278,7 @@ def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candi
     with open(log_path, "ab") as log:
         note(log, "== resume: start the runners the drain stopped")
         if fix_call(name, user, "runner_release", [], log, 300):
-            return False, "resume", f"eligible, but its runner did not start: {last_line(log_path)}"
+            return False, "resume", f"eligible, but its runner start failed: {last_line(log_path)}"
     return True, "resume", "eligible"
 
 
@@ -2473,15 +2487,16 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         if new and short_generation(new) != rows[name]["generation"]:
             rows[name]["generation"] = f"{rows[name]['generation'] or '-'}->{short_generation(new)}"
         eligible = enrollment_need(result) == "ok"
+        serving = result["enrollment"]["state"] == "eligible"  # held runners go back even on an older candidate
         if not rows[name]["result"]:  # nothing to enroll or renew here
             rows[name].update(step="enroll", result="ok: eligible" if eligible else
                               f"ok: {result['checks']['enroll']['detail']}")
         held, down = runner_actions(result)
         with open(logs.get(name) or directory / f"{name}.log", "ab") as log:
-            if held and eligible:
+            if held and serving:
                 code = fix_call(name, manifest["ssh_user"], "runner_release", [], log, 300)
                 rows[name].update(step="runner", result=rows[name]["result"] + ("; runner started" if code == 0 else
-                                                                                 "; runner did not start (see the log)"))
+                                                                                 "; runner start failed (see the log)"))
             elif held:
                 rows[name]["result"] += "; runner held until the node is eligible"
             if down:
@@ -2591,11 +2606,13 @@ def download_run_candidate(candidate: dict[str, str], log: Any) -> str:
     cache = OPERATOR_CACHE / f"glaeda-candidate-{candidate['source'][:12]}"
     archive = cache / candidate_archive_name(candidate)
     receipt_path = cache / "receipt.json"
+    run_path = cache / "run"  # another run of the same source may have built other bytes
     with CANDIDATE_LOCK:
         cache.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=cache) as tmp:
             staged_archive, staged_receipt = archive, receipt_path
-            if not (archive.is_file() and receipt_path.is_file()):
+            cached_run = run_path.read_text().strip() if run_path.is_file() else None
+            if not (archive.is_file() and receipt_path.is_file() and cached_run == candidate["run"]):
                 note(log, f"gh run download {candidate['run']} --repo {candidate['repo']} -n {candidate['artifact']}")
                 code = run_logged(["gh", "run", "download", candidate["run"], "--repo", candidate["repo"],
                                    "-n", candidate["artifact"], "--dir", tmp], log, timeout=FIX_TIMEOUTS["candidate"])
@@ -2619,6 +2636,7 @@ def download_run_candidate(candidate: dict[str, str], log: Any) -> str:
             if staged_archive != archive:
                 os.replace(staged_receipt, receipt_path)
                 os.replace(staged_archive, archive)
+                run_path.write_text(candidate["run"] + "\n")
         note(log, f"candidate {candidate['source'][:12]} sha256 {want} at {archive}")
         return want
 
@@ -2759,7 +2777,8 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
         if need == "enroll":
             rows[name]["result"] = f"not enrolled: glaeda-mini-fleet onboard {name} --yes once this pins the candidate"
         elif need == "leave":
-            rows[name]["result"] = "draining: left for its operator; upgrade it again once it is eligible"
+            rows[name]["result"] = (f"{result['checks']['enroll']['detail']}: left for its operator; "
+                                    "upgrade it again once it is eligible")
         elif need == "retired":
             rows[name]["result"] = "retired"
         elif failing or not result["ready"]:
@@ -2792,8 +2811,16 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
             plan[klass] = None
             receipts[klass] = (klass, recorded["receipt_sha256"], data)
             continue
-        # A host already on the candidate only needs the export; otherwise the first ready host of the class.
-        plan[klass] = chosen.get(klass) or next((h for h in members if needs[h] == "ok"), members[0])
+        # A host already on the candidate with its own acceptance only needs the export; otherwise the first
+        # host that still renews. One that joined on a class receipt cannot seed (class acceptance does not chain).
+        seed = chosen.get(klass) or next((h for h in members if needs[h] == "ok" and results[h]["enrollment"]["local"]),
+                                         next((h for h in members if needs[h] != "ok"), None))
+        if seed is None or (needs[seed] == "ok" and not results[seed]["enrollment"]["local"]):
+            for name in members:
+                rows[name]["result"] = (f"blocked: every {klass} host is on {source12} by class adoption and the "
+                                        f"recorded receipt is gone; restore it (hardware.{klass}.acceptance.receipt)")
+            continue
+        plan[klass] = seed
 
     if not yes:
         for klass, seed in plan.items():
@@ -2861,10 +2888,13 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
         for name in members:
             if name == plan.get(klass):
                 continue
+            recorded, why = class_acceptance(manifest, name)  # per host: an override may pin another Xcode build
             if klass not in receipts:
                 rows[name]["result"] = f"blocked: class {klass} has no receipt for {source12} (its seed {plan.get(klass)} failed)"
             elif needs[name] == "ok":
                 rows[name]["result"] = f"ok: already on {source12}"
+            elif recorded is None:
+                rows[name]["result"] = f"blocked: {why}"
             else:
                 peers.append(name)
     if peers:

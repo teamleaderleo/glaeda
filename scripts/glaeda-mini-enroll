@@ -599,12 +599,23 @@ def main(argv: list[str] | None = None) -> int:
             print("\nRe-run with --apply to do it.")
             return 0
         bootstrap_path: Path | None = None
-        for step in steps:
+        queue = list(steps)
+        while queue:
+            step = queue.pop(0)
             print(f"\n== {step}", flush=True)
             if step == "install-glaeda":
                 runner.install_glaeda()
             elif step == "stage":
                 runner.stage(args.candidate.expanduser().resolve(), args.sha256, args.source)
+                if args.renew and enrollment is not None:
+                    # Unstaged read as stale; now the staged binary says whether the node already runs it
+                    # (its generation directory had only been removed), so a current node is not renewed.
+                    state.binary = True
+                    state.acceptance_current = runner.acceptance_current(enrollment)
+                    state.stale = enrollment.get("glaedaGeneration") != glaeda_digest(generation / "bin/glaeda")
+                    queue = plan(state, args.node_id, args.reaccept, args.rebuild, candidate=True,
+                                 no_accept=args.no_accept, class_receipt=bool(args.class_receipt), renew=True)
+                    print("staged; still to do: " + ", ".join(queue))
             elif step == "bootstrap":
                 bootstrap_path = runner.bootstrap()
             elif step == "renew":

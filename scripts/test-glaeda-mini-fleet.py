@@ -1790,14 +1790,27 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("quarantined: differs from class m4pro-48 in toolchain.rustc, hardware.memoryGiB", out)
         self.assertIn("glaeda-mini-fleet repair build-mini-1 --acceptance node --yes", out)
-        self.assertEqual(calls_to(calls, "runner_release"), [])
+        # After a failed renewal the runners come back only if the node still serves; the host decides.
+        self.assertEqual([remote_call(c[1]) for c in calls_to(calls, "runner_release")], ["lock; runner_release if-eligible"])
 
     def test_no_receipt_for_the_candidate_blocks_before_anything_runs(self) -> None:
         manifest = pinned_manifest(self.tmp.name, recorded_for="59ca9c9bd1bb")
-        code, out, calls = run_command({"build-mini-1": on_candidate(state="quarantined")}, "--yes",
-                                       command="repair", manifest=manifest)
+        code, out, calls = run_command({"build-mini-1": on_candidate(state="quarantined",
+                                                                     enroll_reason="stale_glaeda_generation")},
+                                       "--yes", command="repair", manifest=manifest)
         self.assertEqual((code, calls), (1, []))
         self.assertIn("glaeda-mini-fleet upgrade records it", out)
+
+    def test_an_operator_quarantine_is_left_alone(self) -> None:
+        text = on_candidate(state="quarantined", enroll_reason="hardware_failure")
+        code, out, calls = run_command({"build-mini-1": text}, "--yes", command="repair", manifest=self.manifest)
+        self.assertEqual((code, calls), (1, []))
+        self.assertIn("needs a person: enroll", out)
+        manifest = mf.load_manifest(self.manifest)
+        with mock.patch.object(mf, "PINNED_CANDIDATE", manifest["candidate"]):
+            result = mf.preflight_host(manifest, "build-mini-1", observed(h=text)["hosts"]["h"])
+        self.assertEqual(mf.enrollment_need(result), "leave")
+        self.assertIn("transition-apply ENROLLMENT --to enrolling", result["checks"]["enroll"]["fix"])
 
     def test_runners_are_restarted_or_released_and_drains_are_left_alone(self) -> None:
         texts = {"build-mini-1": on_candidate(generation=NEW_GEN, runners=("actions-runner-x|mini-1|yes|no|no",)),
@@ -1901,6 +1914,16 @@ class UpgradeTests(unittest.TestCase):
                 mf.cmd_upgrade(mf.load_manifest(self.manifest), self.manifest, None, "1", "a/b", None,
                                ["build-mini-1", "build-mini-2"], False, None, None)
 
+    def test_a_host_that_adopted_its_class_cannot_seed_it(self) -> None:
+        adopted = on_candidate(generation=NEW_GEN).replace("pf_acceptance\taccepted",
+                                                           "pf_acceptance\taccepted\npf_acceptance_class\tglaeda-class-acceptance/v1")
+        local = on_candidate(generation=NEW_GEN, node_id="cmux-mac-002").replace(
+            "pf_acceptance\taccepted", "pf_acceptance\taccepted\npf_acceptance_class\tglaeda-local-acceptance/v1")
+        code, out, calls, export = self.upgrade({"build-mini-1": adopted, "build-mini-2": local})
+        self.assertIn("class m4pro-48: seed build-mini-2", out)
+        code, out, calls, export = self.upgrade({"build-mini-1": adopted, "build-mini-2": adopted})
+        self.assertIn("recorded receipt is gone", out)
+
     def test_the_run_must_be_a_reviewed_candidate(self) -> None:
         good = {"headSha": NEW, "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
                 "workflowName": "Fleet candidate bundles"}
@@ -1955,6 +1978,8 @@ class UpgradeTests(unittest.TestCase):
             cached = mf.fetch_candidate({**self.RUN, "sha256": sha}, None)  # what stage_candidate then uses
             self.assertEqual(cached.read_bytes(), payload)
             self.assertEqual(run.call_count, 1)
+            mf.download_run_candidate({**self.RUN, "run": "36018123851"}, None)  # another run of the source: fetched
+            self.assertEqual(run.call_count, 2)
 
     def test_commands_quote_for_the_host(self) -> None:
         manifest = mf.load_manifest(EXAMPLE)

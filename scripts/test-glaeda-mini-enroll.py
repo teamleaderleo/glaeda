@@ -304,6 +304,26 @@ class Renew(unittest.TestCase):
                                  {"glaedaGeneration": "sha256:old", "toolchainGeneration": "sha256:tc"})
         self.assertEqual(calls, [])
 
+    def test_a_node_already_on_the_candidate_is_replanned_after_staging_not_renewed(self) -> None:
+        # Its generation directory was removed, so it read as stale; staging the same bytes shows it is current.
+        enrolled = {"nodeId": "cmux-mac-001", "state": "eligible", "glaedaGeneration": "sha256:same"}
+        done = []
+        with mock.patch.object(me, "DARWIN_REQUIRED", False), mock.patch.object(me, "pick_python", return_value="/py"), \
+             mock.patch.object(me, "read_json", return_value=enrolled), \
+             mock.patch.object(me.Path, "is_file", return_value=False), \
+             mock.patch.object(me.Path, "exists", return_value=False), \
+             mock.patch.object(me, "glaeda_digest", return_value="sha256:same"), \
+             mock.patch.object(me.Runner, "stage", side_effect=lambda *a: done.append("stage")), \
+             mock.patch.object(me.Runner, "acceptance_current", return_value=True), \
+             mock.patch.object(me.Runner, "bootstrap", side_effect=lambda: done.append("bootstrap")), \
+             mock.patch.object(me.Runner, "renew", side_effect=lambda *a: done.append("renew")), \
+             mock.patch.object(me.Runner, "status", side_effect=lambda: done.append("status") or
+                               {"routingCandidateEligible": True}), \
+             mock.patch("builtins.print"):
+            code = me.main(["--cmux-root", "/c", "--candidate", "/a", "--sha256", "s", "--renew", "--apply",
+                            "--source", "36e07e36ea7b9bc9e04c366547a5312dd348024d"])
+        self.assertEqual((code, done), (0, ["stage", "status"]))
+
     def test_renew_flag_needs_a_candidate(self) -> None:
         with mock.patch.object(me, "DARWIN_REQUIRED", False), mock.patch.object(me, "pick_python", return_value="/py"), \
              contextlib.redirect_stderr(io.StringIO()) as err:

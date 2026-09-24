@@ -118,6 +118,9 @@ fleet="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet"
 [ -f "$fleet/enrollment.json" ] && e pf_enroll_reason "$(plutil -extract quarantineReason raw "$fleet/enrollment.json" 2>/dev/null)"
 [ -f "$fleet/acceptance/cmux_macos_native_build.json" ] && \
   e pf_acceptance "$(plutil -extract result raw "$fleet/acceptance/cmux_macos_native_build.json" 2>/dev/null)"
+# A node that adopted a class receipt cannot export one (class acceptance does not chain).
+[ -f "$fleet/acceptance/cmux_macos_native_build.json" ] && \
+  e pf_acceptance_class "$(plutil -extract executionClass raw "$fleet/acceptance/cmux_macos_native_build.json" 2>/dev/null)"
 
 # Homebrew's owner decides whether an install needs sudo -u <owner>.
 for mark in /opt/homebrew/Cellar /opt/homebrew/bin; do

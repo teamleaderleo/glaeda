@@ -89,8 +89,8 @@ glaeda() {  # PYTHON
   "$(home "$1")" "$dir/scripts/glaeda-mini-setup" --apply
 }
 
-# ~/glaeda at the candidate's own source commit, so glaeda-mini-enroll and the staging verifier it
-# runs match the candidate they stage (glaeda-mini-fleet upgrade and repair, before a renewal).
+# ~/glaeda at one commit for the whole run (glaeda-mini-fleet passes the tip of main), so every host runs
+# the same glaeda-mini-enroll and staging verifier before a renewal; it must know --renew.
 glaeda_sync() {  # COMMIT
   local dir="$HOME/glaeda" head enroll
   [ -f "$dir/scripts/cmux_fleet.py" ] || refuse "$dir is not a Glaeda checkout; run glaeda-mini-fleet fix first"
@@ -108,7 +108,7 @@ glaeda_sync() {  # COMMIT
   enroll=$(git -C "$dir" show "$1:scripts/glaeda-mini-enroll")
   case "$enroll" in
     *'"--renew"'*) ;;
-    *) refuse "candidate ${1:0:12} predates glaeda-mini-enroll --renew; roll a candidate built from a later commit" ;;
+    *) refuse "glaeda ${1:0:12} predates glaeda-mini-enroll --renew" ;;
   esac
   git -C "$dir" checkout --quiet --detach "$1"
   say "~/glaeda moved from ${head:0:12} to ${1:0:12}"
@@ -116,8 +116,9 @@ glaeda_sync() {  # COMMIT
 
 # ---- The GitHub Actions runner's launchd agent, which cmux scripts/persistent-compile up installs in the
 # login user's GUI domain. runner_hold stops it once its current job ends and marks it held; runner_release
-# starts what runner_hold stopped (all: every registered runner that is not loaded); runner_kick restarts a
-# loaded agent whose listener is gone (all: every loaded one). The held marks are what repair reads.
+# starts what runner_hold stopped (if-eligible: only while the enrollment is eligible, as after a renewal
+# that failed before it quarantined); runner_kick restarts a loaded agent whose listener is gone. The held
+# marks are what repair reads.
 held_dir() { printf '%s' "$HOME/.local/state/glaeda/mini-fleet/runner-held"; }
 
 runner_plist() {  # DIR: the runner's LaunchAgent (svc.sh records it in .service; glaeda-cmux-runner's is fixed), or fail
@@ -153,13 +154,17 @@ runner_hold() {  # WAIT_SECONDS
   done
 }
 
-runner_release() {  # [all]
-  local r dir plist label domain
+runner_release() {  # [if-eligible]
+  local r dir plist label domain state
   domain="gui/$(id -u)"
+  if [ "${1:-}" = if-eligible ]; then
+    state=$(plutil -extract state raw "${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet/enrollment.json" 2>/dev/null || true)
+    if [ "$state" != eligible ]; then say "runners stay held: the node is ${state:-not enrolled}"; return; fi
+  fi
   for r in "$HOME"/actions-runner*/.runner; do
     [ -f "$r" ] || continue
     dir=$(dirname "$r")
-    [ -f "$(held_dir)/$(basename "$dir")" ] || [ "${1:-}" = all ] || continue
+    [ -f "$(held_dir)/$(basename "$dir")" ] || continue
     plist=$(runner_plist "$dir") || { say "$dir has no launchd agent; cmux scripts/persistent-compile up installs it"; continue; }
     label=$(basename "$plist" .plist)
     launchctl enable "$domain/$label"
@@ -170,7 +175,7 @@ runner_release() {  # [all]
   done
 }
 
-runner_kick() {  # [all]
+runner_kick() {
   local r dir plist label domain
   domain="gui/$(id -u)"
   for r in "$HOME"/actions-runner*/.runner; do
@@ -179,7 +184,7 @@ runner_kick() {  # [all]
     plist=$(runner_plist "$dir") || continue
     label=$(basename "$plist" .plist)
     launchctl print "$domain/$label" >/dev/null 2>&1 || continue
-    if [ "${1:-}" = all ] || ! pgrep -f "$dir/bin/Runner.Listener" >/dev/null 2>&1; then
+    if ! pgrep -f "$dir/bin/Runner.Listener" >/dev/null 2>&1; then
       launchctl kickstart -k "$domain/$label"
       say "restarted $label"
     fi
