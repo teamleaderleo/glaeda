@@ -87,6 +87,7 @@ RUN_TIMEOUT = 60
 CURL = "/usr/bin/curl"
 LAUNCHCTL = "/bin/launchctl"
 ONLINE_WAIT_S = 90
+WORKLOAD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 PUBLIC_API = "https://api.github.com/"
 TOKEN_RE = r"[A-Za-z0-9_.\-]+"
 LISTENING = "Listening for Jobs"
@@ -358,6 +359,10 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     scope = f"--allowed-owner {shlex.quote(ctx.org)}" if ctx.org else f"--allowed-repo {shlex.quote(ctx.repo or '')}"
     if ctx.min_free_gib:
         scope += f" --min-free-gib {ctx.min_free_gib:g}"
+    if ctx.member:  # a fleet member runs PR jobs only while it is an eligible node on its class toolchain
+        scope += f" --require-eligible --fleet-class {shlex.quote(ctx.member['hardware'])}"
+        if ctx.member.get("xcodeApps"):
+            scope += f" --toolchain-xcode {shlex.quote(ctx.member['xcodeApps'][0])}"
     started = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"
@@ -374,8 +379,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
 
 
 def agent_plist(ctx: Context) -> dict[str, Any]:
-    path = ":".join([os.fspath(ctx.home / ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin",
-                     "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+    # Exactly cmux's workload PATH (cmux_fleet_bootstrap CMUX_WORKLOAD_TOOL_PATH): a tool under the
+    # user's home, such as an old ~/.local/bin/zig, must never shadow the one the class accepted.
+    path = WORKLOAD_PATH
     return {
         "Label": LABEL,
         "ProgramArguments": [os.fspath(ctx.runner_dir / "run.sh")],

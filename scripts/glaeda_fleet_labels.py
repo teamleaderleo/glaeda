@@ -64,11 +64,14 @@ def member_labels(manifest: Any, member: str,
         return None, f"{member} availability {availability!r} is not one of {', '.join(AVAILABILITY)}"
     if RUNNER_ROLE not in roles:
         return None, f"{member} roles do not include {RUNNER_ROLE}"
+    hardware = host.get("hardware")
+    if not isinstance(hardware, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", hardware):
+        return None, f"{member} has no hardware class, which names its fleet class receipt"
     apps = xcode_apps(manifest, member)
     if apps is None:
         return None, f"manifest defaults or {member} overrides is not an object"
-    versions = [str(a["version"]) for a in apps
-                if re.fullmatch(VERSION_RE, str(a.get("version") or "")) and xcode_ok(a)]
+    ready = [a for a in apps if re.fullmatch(VERSION_RE, str(a.get("version") or "")) and xcode_ok(a)]
+    versions = [str(a["version"]) for a in ready]
     # Opportunistic members never carry a pool label, so they never receive a required job.
     pools = [pool_label(klass, v) for v in versions] if availability == "dedicated" else []
     labels = [MINI_LABEL, f"glaeda-class-{klass}", f"glaeda-{availability}", *[f"xcode-{v}" for v in versions], *pools]
@@ -76,7 +79,8 @@ def member_labels(manifest: Any, member: str,
     floor = disk.get("min_free_gib") if isinstance(disk, dict) else None
     return {"member": member, "class": klass, "availability": availability, "roles": roles,
             "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
-            "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None}, None
+            "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
+            "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready]}, None
 
 
 def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool] | None = None) -> dict[str, list[str]]:

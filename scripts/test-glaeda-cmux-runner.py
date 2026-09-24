@@ -276,11 +276,11 @@ class HookTest(unittest.TestCase):
         (fleet / "host.lock").touch()
         return fleet
 
-    def started(self, *extra: str, watch: int | None = None) -> subprocess.CompletedProcess:
+    def started(self, *extra: str, watch: int | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
         push = event(self.dir, "push", {"repository": CMUX})
         args = ["--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
                 "--watch-pid", str(watch or os.getpid()), *extra]
-        return self.run_hook("job-started", "push", push, *args, repo="manaflow-ai/cmux")
+        return self.run_hook("job-started", "push", push, *args, repo="manaflow-ai/cmux", env=env)
 
     def lock_free(self) -> bool:
         import fcntl
@@ -412,6 +412,207 @@ class HookTest(unittest.TestCase):
         result = self.started()
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("no fleet host lock", result.stdout)
+
+    # ------------------------------------------------------------ eligibility gate
+
+    COMMIT = "3809eed51fdd9f1464452f2cd37dbf3148a831fd"
+    TOOLCHAIN = {"rustcVersion": "rustc 1.98.1 (48a229cea 2026-09-01)", "cargoVersion": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+                 "zigVersion": "0.16.0", "xcodeVersion": "26.6", "xcodeBuild": "17F113", "macosSdkVersion": "26.5"}
+
+    def node(self, state: str = "eligible", routing: bool = True, receipt_sha: str = "sha256:aa",
+             enrolled_sha: str = "sha256:aa", tools: dict | None = None, generation: bool = True,
+             valid: bool = True, role: str = "cmux_macos_native_build", receipt_toolchain: dict | None = None,
+             hang: str | None = None, default: str = "1.98.1-aarch64-apple-darwin",
+             installed: tuple = ("1.88.0-aarch64-apple-darwin", "1.98.1-aarch64-apple-darwin"),
+             python: str = "3.13") -> None:
+        """A fake Glaeda node under HOME (self.dir): enrollment, class receipt, staged CLI, toolchain."""
+        config = self.dir / ".config/glaeda/cmux-fleet"
+        (config / "class-acceptance").mkdir(parents=True, exist_ok=True)
+        (config / "acceptance").mkdir(exist_ok=True)
+        (config / "enrollment.json").write_text(json.dumps({"state": state, "classAcceptanceSha256": enrolled_sha}))
+        (config / "acceptance/cmux_macos_native_build.json").write_text("{}")
+        (config / "class-acceptance/m4pro-48.json").write_text(json.dumps(
+            {"receiptSha256": receipt_sha, "glaedaCandidate": {"commit": self.COMMIT},
+             "toolchain": self.TOOLCHAIN if receipt_toolchain is None else receipt_toolchain}))
+        gen = self.dir / "Projects/glaeda-generations" / self.COMMIT[:12] / "scripts"
+        if generation:
+            gen.mkdir(parents=True, exist_ok=True)
+            status = {"schema": "glaeda-cmux-fleet-node-status/v1", "state": state, "routingCandidateEligible": routing,
+                      "roles": [{"role": role, "eligible": routing,
+                                 "reason": "ok" if routing else "acceptance_missing_or_rejected"}]}
+            (gen / "cmux_fleet.py").write_text(
+                "import json\n"
+                f"def validate_class_acceptance(doc):\n    if not {valid!r}:\n        raise ValueError('digest')\n"
+                "    return doc\n"
+                f"if __name__ == '__main__':\n    print(json.dumps({status!r}))\n")
+        cargo = self.dir / "jobpath"
+        cargo.mkdir(parents=True, exist_ok=True)
+        have = {**self.TOOLCHAIN, **(tools or {})}
+        (self.dir / "rustup-default").write_text(default)
+        (self.dir / "rustup-installed").write_text("\n".join(installed))
+        versions = {"1.98.1-aarch64-apple-darwin": self.TOOLCHAIN["rustcVersion"],
+                    "1.88.0-aarch64-apple-darwin": "rustc 1.88.0 (6b00bc388 2025-06-23)"}
+        (self.dir / "rustc-by-toolchain.json").write_text(json.dumps(versions))
+        state = os.fspath(self.dir)
+        make_executable(cargo / "rustup", f"""#!{sys.executable}
+import json, sys
+state = {state!r}
+default = open(state + "/rustup-default").read().strip()
+installed = open(state + "/rustup-installed").read().split()
+args = sys.argv[1:]
+if args[:2] == ["toolchain", "list"]:
+    for name in installed:
+        print(name + (" (active, default)" if name == default else ""))
+elif args == ["default"]:
+    print(default + " (default)")
+elif args == ["show"]:
+    print("Default host: aarch64-apple-darwin")
+elif args[:1] == ["default"] and args[1] in installed:
+    open(state + "/rustup-default", "w").write(args[1])
+    print("info: default toolchain set to " + args[1])
+elif args[:1] == ["run"]:
+    print(json.load(open(state + "/rustc-by-toolchain.json")).get(args[1] + "-aarch64-apple-darwin", ""))
+else:
+    sys.exit(1)
+""")
+        rustc = have["rustcVersion"] if (tools or {}).get("rustcVersion") else None
+        make_executable(cargo / "rustc", f"#!{sys.executable}\nimport json\n"
+                        + (f"print({rustc!r})\n" if rustc else
+                           f"import os\nprint(json.load(open({state!r} + '/rustc-by-toolchain.json'))"
+                           f"[os.environ.get('RUSTUP_TOOLCHAIN') or open({state!r} + '/rustup-default').read().strip()])\n"))
+        make_executable(cargo / "python3", f"#!/bin/sh\necho {python}\n")
+        outputs = {"cargo": have["cargoVersion"], "zig": have["zigVersion"],
+                   "xcrun": have["macosSdkVersion"],
+                   "xcodebuild": f"Xcode {have['xcodeVersion']}\nBuild version {have['xcodeBuild']}"}
+        for name, text in outputs.items():
+            if text is None:
+                (cargo / name).unlink(missing_ok=True)
+                continue
+            body = "sleep 60\n" if name == hang else f"cat <<'OUT'\n{text}\nOUT\n"
+            make_executable(cargo / name, f"#!/bin/sh\n{body}")
+
+    def eligible_start(self) -> subprocess.CompletedProcess:
+        # The fake toolchain is on the job's PATH, which is the runner's PATH the hook inherits.
+        return self.started("--require-eligible", "--fleet-class", "m4pro-48", "--toolchain-xcode",
+                            "/Applications/Xcode_26.6.app", env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin"})
+
+    def done(self) -> None:
+        self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"))
+
+    def test_eligible_node_on_its_toolchain_is_admitted(self) -> None:
+        self.fleet()
+        self.node()
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.done()
+
+    def test_ineligible_nodes_refuse(self) -> None:
+        self.fleet()
+        cases = {
+            "enrolling": (dict(state="enrolling", routing=False), "state enrolling"),
+            "routing-false": (dict(routing=False), "acceptance_missing_or_rejected"),
+            "other-receipt": (dict(enrolled_sha="sha256:bb"), "does not reference the m4pro-48 class receipt"),
+            "rustc-drift": (dict(tools={"rustcVersion": "rustc 1.99.0"}), "rustcVersion 'rustc 1.99.0'"),
+            "xcode-drift": (dict(tools={"xcodeBuild": "17F999"}), "xcodeBuild '17F999' != '17F113'"),
+            "zig-missing": (dict(tools={"zigVersion": None}), "zigVersion '' != '0.16.0'"),
+            "no-generation": (dict(generation=False), "no node status from generation 3809eed51fdd"),
+            "receipt-invalid": (dict(valid=False), "class receipt does not validate"),
+            "wrong-role": (dict(role="some_other_role"), "some_other_role: ok"),
+            "receipt-without-toolchain": (dict(receipt_toolchain={}), "records no rustcVersion"),
+            "receipt-unknown-zig": (dict(receipt_toolchain={**self.TOOLCHAIN, "zigVersion": "unknown"}),
+                                    "records no zigVersion"),
+        }
+        for name, (kwargs, text) in cases.items():
+            with self.subTest(name):
+                import shutil as _sh
+                _sh.rmtree(self.dir / "Projects", ignore_errors=True)
+                self.node(**kwargs)
+                result = self.eligible_start()
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("refused: node not eligible", result.stdout)
+                self.assertIn(text, result.stdout)
+                self.assertTrue(self.lock_free(), "a refused job never takes the host lock")
+
+    def test_drifted_rustup_default_is_realigned_under_the_lock(self) -> None:
+        self.fleet()
+        self.node(default="1.88.0-aarch64-apple-darwin")  # another fleet job flipped the global default
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("set the rustup default to 1.98.1-aarch64-apple-darwin (was 1.88.0-aarch64-apple-darwin)",
+                      result.stdout)
+        self.assertEqual((self.dir / "rustup-default").read_text(), "1.98.1-aarch64-apple-darwin")
+        self.assertFalse(self.lock_free())
+        self.done()
+
+    def test_check_is_read_only_and_predicts_the_alignment(self) -> None:
+        self.node(default="1.88.0-aarch64-apple-darwin")
+        push = event(self.dir, "push", {"repository": CMUX})
+        result = self.run_hook("check", "push", push, "--fleet-class", "m4pro-48", "--toolchain-xcode",
+                               "/Applications/Xcode_26.6.app", env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin"})
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("eligible (would set the rustup default to 1.98.1-aarch64-apple-darwin)", result.stdout)
+        self.assertEqual((self.dir / "rustup-default").read_text(), "1.88.0-aarch64-apple-darwin")
+        self.assertFalse((self.dir / "state").exists())
+
+    def test_old_python_on_the_job_path_refuses(self) -> None:
+        self.fleet()
+        self.node(python="3.9")
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("python3 on the job PATH is 3.9", result.stdout)
+        self.assertTrue(self.lock_free())
+
+    def test_matching_stable_default_is_left_alone(self) -> None:
+        self.fleet()
+        self.node(default="stable-aarch64-apple-darwin", installed=("stable-aarch64-apple-darwin",))
+        json_path = self.dir / "rustc-by-toolchain.json"
+        versions = json.loads(json_path.read_text())
+        versions["stable-aarch64-apple-darwin"] = self.TOOLCHAIN["rustcVersion"]
+        json_path.write_text(json.dumps(versions))
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("set the rustup default", result.stdout)
+        self.assertEqual((self.dir / "rustup-default").read_text(), "stable-aarch64-apple-darwin")
+        self.done()
+
+    def test_toolchain_refusal_after_the_lock_releases_it(self) -> None:
+        self.fleet()
+        self.node(default="1.88.0-aarch64-apple-darwin", installed=("1.88.0-aarch64-apple-darwin",))
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("rust toolchain 1.98.1-aarch64-apple-darwin is not installed", result.stdout)
+        self.assertTrue(self.lock_free())
+        self.assertEqual((self.dir / "rustup-default").read_text(), "1.88.0-aarch64-apple-darwin")
+
+    def test_diff_sidecar_pin_is_checked(self) -> None:
+        self.fleet()
+        receipt = {**self.TOOLCHAIN, "diffRustToolchain": "1.88.0",
+                   "diffRustcVersion": "rustc 1.88.0 (6b00bc388 2025-06-23)"}
+        self.node(receipt_toolchain=receipt)
+        self.assertEqual(self.eligible_start().returncode, 0)
+        self.done()
+        self.node(receipt_toolchain={**receipt, "diffRustcVersion": "rustc 1.88.1 (x)"})
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("diffRustcVersion", result.stdout)
+        self.assertTrue(self.lock_free())
+
+    def test_hung_tool_refuses_within_the_budget(self) -> None:
+        self.fleet()
+        self.node(hang="xcodebuild")
+        with mock.patch.dict(os.environ, {}):
+            start = time.monotonic()
+            result = self.started("--require-eligible", "--fleet-class", "m4pro-48",
+                                  env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("xcodeVersion '' != '26.6'", result.stdout)
+        self.assertLess(time.monotonic() - start, 30)
+
+    def test_no_enrollment_refuses(self) -> None:
+        self.fleet()
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no Glaeda enrollment", result.stdout)
 
     def test_decide_is_pure_table(self) -> None:
         for name, (event_name, payload, admitted) in SAMPLE_EVENTS.items():
@@ -873,6 +1074,8 @@ class RunnerTest(unittest.TestCase):
             self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
         hooks = self.home / "actions-runner-glaeda/glaeda-hooks"
         self.assertIn("--min-free-gib 100", (hooks / "job-started.sh").read_text())
+        self.assertIn("--require-eligible --fleet-class m4pro-48 --toolchain-xcode /Applications/Xcode_26.6.app",
+                      (hooks / "job-started.sh").read_text())
         self.assertTrue((hooks / "glaeda_reservation.py").is_file())
 
     def test_manifest_refusals_and_exclusive_flags(self) -> None:
@@ -1059,14 +1262,17 @@ class RunnerTest(unittest.TestCase):
 MANIFEST = {
     "defaults": {"xcode": {"apps": [{"path": "/Applications/Xcode_26.6.app", "version": "26.6", "build": "17F113"}]}},
     "hosts": {
-        "mini-std": {"class": "std", "availability": "dedicated", "roles": ["dev-builds", "ci-runner"]},
-        "mini-light": {"class": "light", "availability": "opportunistic", "roles": ["ci-runner"], "owner": "x"},
+        "mini-std": {"class": "std", "availability": "dedicated", "roles": ["dev-builds", "ci-runner"],
+                     "hardware": "m4pro-48"},
+        "mini-light": {"class": "light", "availability": "opportunistic", "roles": ["ci-runner"], "owner": "x",
+                       "hardware": "m4-16"},
+        "no-hardware": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"]},
         "mini-no-role": {"class": "std", "availability": "dedicated", "roles": ["dev-builds"]},
         "laptop": {"class": "dev", "availability": "opportunistic", "roles": ["ci-runner"]},
         "borrowed": {"class": "borrowed", "availability": "opportunistic", "roles": ["ci-runner"]},
         "old-shape": {"class": "m4pro-48", "roles": ["ci-runner"]},
         "bad-avail": {"class": "std", "availability": "sometimes", "roles": ["ci-runner"]},
-        "override": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"],
+        "override": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"], "hardware": "m4pro-48",
                      "overrides": {"xcode": {"apps": [{"path": "/Applications/Xcode.app", "version": "26.3",
                                                        "build": "17C529"}]}}},
     },
@@ -1087,7 +1293,8 @@ class ManifestLabelsTest(unittest.TestCase):
             self.assertEqual(cr.member_labels(MANIFEST, "mini-std")[0]["labels"],
                              ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated"])
         for name, why in (("mini-no-role", "ci-runner"), ("laptop", "never runs"), ("borrowed", "never runs"),
-                          ("old-shape", "m4pro-48"), ("bad-avail", "availability"), ("absent", "not a member")):
+                          ("old-shape", "m4pro-48"), ("bad-avail", "availability"), ("absent", "not a member"),
+                          ("no-hardware", "no hardware class")):
             with self.subTest(name):
                 member, reason = cr.member_labels(MANIFEST, name)
                 self.assertIsNone(member)

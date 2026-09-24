@@ -79,6 +79,34 @@ What `--apply` does:
      lock: a small detached holder keeps it until job-completed releases it or the job's
      `Runner.Worker` exits, so fleet builds wait for the PR job and a crash cannot leave
      the lock held. A machine without `host.lock` skips the lock.
+   - With `--manifest`, the hook also requires an eligible Glaeda node on its class
+     toolchain (`--require-eligible --fleet-class <hardware> --toolchain-xcode <app>`,
+     baked in from the member's `hardware` and first verified Xcode). It refuses with
+     `refused: node not eligible (...)` unless the node status from the staged
+     generation's `cmux_fleet.py status` (the command `glaeda-mini-enroll` uses) says
+     `eligible` with `routingCandidateEligible` true and the build role eligible, the
+     enrollment references `~/.config/glaeda/cmux-fleet/class-acceptance/<hardware>.json`,
+     that receipt validates (its digest recomputed by the generation's
+     `validate_class_acceptance`) and records all six toolchain strings, and `rustc`,
+     `cargo`, `zig`, `xcodebuild` and `xcrun --show-sdk-version`, run from `$HOME` on the
+     runner's own PATH (the job's PATH), print exactly those strings, all within one
+     20 s budget. Other fleet jobs on the same mini (the cmux-ci dev-build worker) flip
+     the global `rustup default`, so after taking the host lock the hook first sets it
+     back to the receipt's toolchain, provided that toolchain is already installed.
+     Under the lock no other fleet job runs, so the default holds for the whole job.
+     `RUSTUP_TOOLCHAIN` is deliberately not used: it would override cmux's
+     `rust-toolchain.toml` pins (DiffSidecar 1.88.0, cmux-tui 1.95.0, iroh-relay-minter
+     1.91.0). The DiffSidecar pin itself is checked with `rustup run`. A refusal after
+     the lock is taken releases it. The runner's PATH is exactly cmux's workload PATH
+     (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`), so a tool under
+     the user's home never shadows the accepted one. The default is only changed when
+     `rustc --version` differs from the receipt, and `python3` on that PATH must be 3.13
+     or newer (cmux's profile runner needs it). To see what a job would get without
+     touching anything: `glaeda-cmux-runner-hook check --fleet-class <hardware>
+     --toolchain-xcode <app>`, run with the workload PATH, is read-only (no lock, no
+     rustup change). The check takes about a second and runs
+     on every job, so a mini that drifts or loses eligibility stops taking PR jobs at
+     once, and refusal recovery re-runs the job elsewhere.
    - job-completed releases the host lock, runs the same disk pressure pass and always exits 0.
 4. Writes and loads `~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist`
    (runs `run.sh`, restarts on crash, logs to `~/Library/Logs/glaeda-cmux-runner.log`).
