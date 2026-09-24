@@ -7,6 +7,11 @@
     glaeda-mini-setup --uninstall --apply  remove it
     glaeda-mini-setup --cmux-root ~/Projects/cmux   also run the read-only fleet bootstrap
 
+First, on a fresh Mac: install the Command Line Tools (xcode-select --install) and, ideally,
+Homebrew. Until the Command Line Tools exist, /usr/bin/python3 and /usr/bin/git are stubs that
+only open an install dialog, so this command cannot run with them. Run it with a Homebrew
+python3 or after the Command Line Tools are installed.
+
 Planning performs no side effects. --apply is idempotent: a second run reports every
 action as unchanged. Everything it touches is under $HOME and owned by the current user.
 Nothing here uses sudo, changes system or security settings, installs Xcode, accepts a
@@ -39,6 +44,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -409,13 +415,18 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         actions.append(act)
     mode, source, note = reclaim_source(ctx)
     dest = ctx.bin / "glaeda-worktree-reclaim"
-    if mode == "build":
+    if mode == "blocked":
+        act = file_action(ctx, "tool", dest, None, 0o755, note)
+        act["source"] = None
+        actions.append(act)
+    elif mode == "build":
         # The binary does not exist until cargo runs, so plan says build and compares afterwards.
         prior = source.read_bytes() if source is not None and source.is_file() else None
         act = file_action(ctx, "tool", dest, prior, 0o755, note)
         if prior is None:
             act["state"] = "create" if not dest.exists() else "update"
-        act["build"] = True
+        # An unchanged binary needs no cargo run at apply time.
+        act["build"] = act["state"] != "unchanged"
         act["source"] = os.fspath(source)
         actions.append(act)
     else:
@@ -424,6 +435,10 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         act["source"] = os.fspath(source) if source else None
         actions.append(act)
 
+    reclaim_act = actions[-1]
+    prior_receipt = load_receipt(ctx) or {}
+    owned_files = {a.get("path"): a.get("sha256") for a in prior_receipt.get("actions", [])
+                   if a.get("kind") in {"tool", "agent"} and a.get("owned")}
     for label, doc in agent_plists(ctx).items():
         dest = ctx.agents / f"{label}.plist"
         data = plistlib.dumps(doc, sort_keys=True)
@@ -438,10 +453,19 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
                 pass
         if ctx.python is None and label.startswith(LABEL_PREFIX + "disk"):
             act["state"], act["note"] = "blocked", "no usable python3 yet"
+        if label == LABEL_PREFIX + "worktree-reclaim" and reclaim_act["state"] == "blocked":
+            act["state"], act["note"] = "blocked", "glaeda-worktree-reclaim could not be installed"
         act["label"] = label
         act["loaded"] = launchctl_loaded(ctx, label)
         act["launchctl"] = "skipped (sandbox HOME)" if ctx.sandbox else ("skipped" if ctx.skip_launchctl else "managed")
         actions.append(act)
+
+    # owned: this command wrote the file (now or on an earlier run) and it is still those bytes.
+    # A file that was already identical before the first install is never owned, so never removed.
+    for act in actions:
+        if act["kind"] in {"tool", "agent"}:
+            recorded = owned_files.get(act["path"])
+            act["owned"] = act["state"] == "unchanged" and recorded is not None and recorded == act.get("sha256")
 
     # /usr/bin/git is an install-dialog stub until the Command Line Tools (or Xcode) exist.
     git_ok = which("git") is not None and (
@@ -472,13 +496,16 @@ def load_receipt(ctx: Context) -> dict[str, Any] | None:
 
 
 def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
-    receipt = load_receipt(ctx) or {}
-    installed = {a["path"]: a.get("sha256") for a in receipt.get("actions", [])
-                 if a.get("kind") in {"tool", "agent"} and a.get("state") in {"create", "update", "unchanged"}}
-    git_set = {a["key"]: a["value"] for a in receipt.get("actions", [])
+    receipt = load_receipt(ctx)
+    # Only files this command wrote (create or update, carried forward as "owned") are removable.
+    installed = {a["path"]: a.get("sha256") for a in (receipt or {}).get("actions", [])
+                 if a.get("kind") in {"tool", "agent"} and a.get("owned")}
+    git_set = {a["key"]: a["value"] for a in (receipt or {}).get("actions", [])
                if a.get("kind") == "git" and a.get("owned")}
-    fresh = {a["path"]: a.get("sha256") for a in plan_install(ctx) if a["kind"] in {"tool", "agent"}}
     actions: list[dict[str, Any]] = []
+    if receipt is None:
+        actions.append({"kind": "note", "state": "kept",
+                        "note": f"no install receipt at {ctx.show(ctx.receipt_path)}; nothing is removed"})
     for label in agent_plists(ctx):
         path = ctx.agents / f"{label}.plist"
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
@@ -486,15 +513,19 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
     for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     for act in actions:
+        if act["kind"] == "note":
+            continue
         path = Path(act["path"])
         current = sha256_file(path)
-        expected = installed.get(act["path"]) or fresh.get(act["path"])
+        expected = installed.get(act["path"])
         if current is None:
             act["state"] = "absent"
+        elif expected is None:
+            act["state"], act["note"] = "kept", "not installed by this command"
         elif current == expected:
             act["state"] = "remove"
         else:
-            act["state"], act["note"] = "kept", "differs from what this command installed"
+            act["state"], act["note"] = "kept", "changed since this command installed it"
         act["sha256"] = current
     for key, value in GIT_DEFAULTS:
         current = git_get(ctx, key)
@@ -529,7 +560,28 @@ def launchctl(ctx: Context, *args: str) -> tuple[int, str]:
     return run(["/bin/launchctl", *args])
 
 
+def bootout(ctx: Context, label: str, wait_s: float = 5.0) -> bool:
+    """Unload a job and wait (bounded) until launchd no longer lists it."""
+    launchctl(ctx, "bootout", f"gui/{ctx.uid}/{label}")
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        if launchctl(ctx, "print", f"gui/{ctx.uid}/{label}")[0] != 0:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def bootstrap(ctx: Context, plist: str) -> tuple[int, str]:
+    """Load a job. launchd answers EIO (5) while a just-removed job is still settling; retry once."""
+    code, out = launchctl(ctx, "bootstrap", f"gui/{ctx.uid}", plist)
+    if code != 0 and ("Input/output error" in out or code == 5 or re.search(r"\b5:", out)):
+        time.sleep(1.0)
+        code, out = launchctl(ctx, "bootstrap", f"gui/{ctx.uid}", plist)
+    return code, out
+
+
 def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
+    reclaim_failed = False
     for act in actions:
         kind, state = act["kind"], act["state"]
         act["applied"] = False
@@ -539,11 +591,15 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
                 path.mkdir(parents=True, exist_ok=True, mode=int(act["mode"], 8))
                 act["applied"] = True
             continue
+        if kind == "agent" and act["label"] == LABEL_PREFIX + "worktree-reclaim" and reclaim_failed:
+            act["state"], act["note"] = "blocked", "glaeda-worktree-reclaim could not be installed"
+            continue
         if kind == "tool" and act.get("build"):
             code, out = build_reclaim(ctx)
             source = Path(act["source"])
             if code != 0 or not source.is_file():
                 act["state"], act["note"] = "failed", "cargo build failed: " + out[-400:]
+                reclaim_failed = True
                 continue
             fresh = file_action(ctx, "tool", Path(act["path"]), source.read_bytes(), 0o755, act["note"])
             act.update({k: fresh[k] for k in ("state", "sha256", "previousSha256")})
@@ -557,12 +613,12 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             if state == "update":
                 act["backup"] = backup(ctx, dest)
             if kind == "agent" and act.get("loaded"):
-                launchctl(ctx, "bootout", f"gui/{ctx.uid}/{act['label']}")
+                bootout(ctx, act["label"])
                 act["loaded"] = False
             write_atomic(dest, data, int(act["mode"], 8))
-            act["applied"] = True
+            act["applied"] = act["owned"] = True
         if kind == "agent" and state in {"create", "update", "unchanged"} and not ctx.skip_launchctl and not act.get("loaded"):
-            code, out = launchctl(ctx, "bootstrap", f"gui/{ctx.uid}", act["path"])
+            code, out = bootstrap(ctx, act["path"])
             act["bootstrapped"] = code == 0
             if code != 0:
                 act["note"] = ("launchctl bootstrap failed: " + out)[:400]
@@ -595,7 +651,7 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
         act["applied"] = False
         if act["kind"] == "agent":
             if act.get("loaded") and act["state"] == "remove":
-                launchctl(ctx, "bootout", f"gui/{ctx.uid}/{act['label']}")
+                bootout(ctx, act["label"])
             if act["state"] == "remove":
                 Path(act["path"]).unlink()
                 act["applied"] = True
@@ -689,7 +745,12 @@ def run_fleet_bootstrap(ctx: Context) -> dict[str, Any] | None:
         except ValueError:
             note = result.stderr.strip()[-400:]
         return {"state": "refused", "note": note}
-    doc = json.loads(result.stdout)
+    try:
+        doc = json.loads(result.stdout)
+        if not isinstance(doc, dict):
+            raise ValueError("not an object")
+    except ValueError:
+        return {"state": "unparsed", "note": "bootstrap output was not JSON", "raw": result.stdout[-2000:]}
     return {"state": "observed", "schema": doc.get("schema"),
             "eligibleForEnrollment": doc.get("eligibleForEnrollment"),
             "blockingChecks": doc.get("blockingChecks")}
@@ -710,7 +771,7 @@ def render(ctx: Context, receipt: dict[str, Any]) -> str:
         lines.append(f"  {c['level']:<5} {name:<17} {c['value']}{note}")
     lines.append("actions")
     for act in receipt["actions"]:
-        target = act.get("label") or (act.get("key") and f"{act['key']}={act.get('value')}") or ctx.show(act.get("path", ""))
+        target = act.get("label") or (act.get("key") and (act["key"] if act.get("value") is None else f"{act['key']}={act['value']}")) or ctx.show(act.get("path", ""))
         note = f"  ({act['note']})" if act.get("note") else ""
         lines.append(f"  {act['state']:<9} {act['kind']:<5} {target}{note}")
     if receipt["operatorSteps"]:

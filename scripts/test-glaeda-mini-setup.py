@@ -216,6 +216,84 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(act["state"], "blocked")
         self.assertFalse(receipt["ready"])
 
+    def test_uninstall_without_receipt_removes_nothing(self) -> None:
+        self.invoke("--apply")
+        (self.home / ".local/state/glaeda/mini-setup/receipt.json").unlink()
+        before = self.tree()
+        plan = self.invoke("--uninstall", "--apply")
+        self.assertEqual({a["state"] for a in plan["actions"] if a["kind"] in {"tool", "agent", "git"}} - {"absent"}, {"kept"})
+        self.assertTrue(any("nothing is removed" in a.get("note", "") for a in plan["actions"]))
+        after = self.tree()
+        after.pop(".local/state/glaeda/mini-setup/uninstall-receipt.json")
+        self.assertEqual(before, after)
+
+    def test_preexisting_identical_file_is_unchanged_and_never_removed(self) -> None:
+        (self.home / ".local/bin").mkdir(parents=True)
+        disk = self.home / ".local/bin/glaeda-disk"
+        disk.write_bytes((ROOT / "scripts/glaeda-disk").read_bytes())
+        disk.chmod(0o755)
+        first = self.invoke("--apply")
+        act = next(a for a in first["actions"] if a.get("path") == os.fspath(disk))
+        self.assertEqual((act["state"], act["owned"]), ("unchanged", False))
+        self.invoke("--apply")
+        plan = self.invoke("--uninstall", "--apply")
+        by_path = {a.get("path"): a["state"] for a in plan["actions"]}
+        self.assertEqual(by_path[os.fspath(disk)], "kept")
+        self.assertTrue(disk.exists())
+        self.assertFalse((self.home / ".local/bin/glaeda-worktree-reclaim-all").exists())
+
+    def test_reclaim_agent_blocked_without_binary(self) -> None:
+        self.reclaim.unlink()
+        receipt = self.invoke("--apply")
+        agent = next(a for a in receipt["actions"] if a.get("label") == "com.teamleaderleo.glaeda.worktree-reclaim")
+        self.assertEqual(agent["state"], "blocked")
+        self.assertFalse((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.worktree-reclaim.plist").exists())
+
+    def test_cargo_build_skipped_when_binary_unchanged(self) -> None:
+        target = Path(self.tmp.name) / "target"
+        (target / "release").mkdir(parents=True)
+        (target / "release/glaeda-worktree-reclaim").write_bytes(self.reclaim.read_bytes())
+        (self.home / ".local/bin").mkdir(parents=True)
+        installed = self.home / ".local/bin/glaeda-worktree-reclaim"
+        installed.write_bytes(self.reclaim.read_bytes())
+        installed.chmod(0o755)
+        builds: list[int] = []
+        with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": os.fspath(target)}), \
+                mock.patch.object(ms, "find_cargo", lambda ctx: "/bin/false"), \
+                mock.patch.object(ms, "build_reclaim", lambda ctx: builds.append(1) or (1, "")):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(ms.main(["--output", "json", "--python", "/usr/bin/python3", "--apply"]), 0)
+        self.assertEqual(builds, [])
+        act = next(a for a in json.loads(out.getvalue())["actions"] if a.get("path") == os.fspath(installed))
+        self.assertEqual(act["state"], "unchanged")
+
+    def test_fleet_bootstrap_non_json_is_recorded(self) -> None:
+        glaeda = Path(self.tmp.name) / "glaeda"
+        glaeda.write_text("")
+        (self.home / ".cache/glaeda/cmux-native-cache").mkdir(parents=True)
+        done = mock.Mock(returncode=0, stdout="warning: not json\n", stderr="")
+        with mock.patch.object(ms.subprocess, "run", return_value=done):
+            receipt = self.invoke("--cmux-root", self.tmp.name, "--glaeda", os.fspath(glaeda))
+        slot = receipt["reserved"]["fleetEnrollment"]
+        self.assertEqual(slot["state"], "unparsed")
+        self.assertIn("not json", slot["raw"])
+
+    def test_bootout_waits_and_bootstrap_retries_eio(self) -> None:
+        calls: list[tuple[str, ...]] = []
+        answers = {"print": [(0, ""), (0, ""), (113, "")], "bootstrap": [(5, "Bootstrap failed: 5: Input/output error"), (0, "")]}
+
+        def fake(ctx, *args):
+            calls.append(args)
+            queue = answers.get(args[0])
+            return queue.pop(0) if queue else (0, "")
+
+        ctx = mock.Mock(uid=501)
+        with mock.patch.object(ms, "launchctl", fake), mock.patch.object(ms.time, "sleep", lambda s: None):
+            self.assertTrue(ms.bootout(ctx, "x"))
+            self.assertEqual(ms.bootstrap(ctx, "/p.plist")[0], 0)
+        self.assertEqual([c[0] for c in calls], ["bootout", "print", "print", "print", "bootstrap", "bootstrap"])
+
     def test_power_parser_reuses_fleet_rule(self) -> None:
         with mock.patch.object(ms, "run", lambda argv, **kw: (0, PMSET_SLEEPY)):
             self.assertEqual(ms.power(), {"readable": True, "acSleepDisabled": False,
