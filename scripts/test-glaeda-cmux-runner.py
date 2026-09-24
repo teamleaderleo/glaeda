@@ -126,7 +126,8 @@ if token != os.environ["FAKE_REG_TOKEN"]:
     print("bad token " + str(token)); sys.exit(1)
 name = argv[argv.index("--name") + 1]
 labels = ["self-hosted", "macOS", "ARM64"] + argv[argv.index("--labels") + 1].split(",")
-json.dump({"agentId": 4242, "agentName": name}, open(os.path.join(here, ".runner"), "w"))
+json.dump({"agentId": 4242, "agentName": name, "gitHubUrl": argv[argv.index("--url") + 1]},
+          open(os.path.join(here, ".runner"), "w"))
 doc = runners()
 doc["runners"].append({"id": 4242, "name": name, "status": "online", "busy": False,
                        "labels": [{"name": l} for l in labels]})
@@ -603,6 +604,34 @@ class RunnerTest(unittest.TestCase):
         receipt = self.invoke("--apply")
         self.assertTrue(receipt["ready"], receipt["blocking"])
         self.assertTrue((runner / ".runner").is_file())
+
+    def test_registration_finished_after_timeout_is_adopted_then_removed(self) -> None:
+        # config.sh outlived our timeout: .runner exists but the receipt recorded no registration
+        with mock.patch.object(cr, "run_with_token", side_effect=lambda argv, token, cwd, timeout=900: (
+                subprocess.run(argv, env={**os.environ, "ACTIONS_RUNNER_INPUT_TOKEN": token}, cwd=cwd,
+                               capture_output=True, check=False), (127, "timed out after 900 seconds"))[1]):
+            first = self.invoke("--apply", expect=1)
+        self.assertEqual(self.by_kind(first)["register"]["state"], "failed")
+        runner = self.home / "actions-runner-glaeda"
+        self.assertTrue((runner / ".runner").is_file())
+        second = self.invoke("--apply")
+        self.assertTrue(second["ready"], second["blocking"])
+        self.assertIn("adopted", self.by_kind(second)["register"]["note"])
+        receipt = json.loads((self.home / ".local/state/glaeda/cmux-runner/receipt.json").read_text())
+        self.assertEqual(receipt["registration"]["runnerId"], 4242)
+        removed = self.invoke("--uninstall", "--apply")
+        self.assertTrue(next(a for a in removed["actions"] if a["kind"] == "deregister")["applied"])
+        self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
+        self.assertFalse(runner.exists())
+
+    def test_uninstall_deregisters_an_unadopted_interrupted_registration(self) -> None:
+        with mock.patch.object(cr, "run_with_token", side_effect=lambda argv, token, cwd, timeout=900: (
+                subprocess.run(argv, env={**os.environ, "ACTIONS_RUNNER_INPUT_TOKEN": token}, cwd=cwd,
+                               capture_output=True, check=False), (127, "timed out"))[1]):
+            self.invoke("--apply", expect=1)
+        removed = self.invoke("--uninstall", "--apply")
+        self.assertTrue(next(a for a in removed["actions"] if a["kind"] == "deregister")["applied"])
+        self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
 
     def test_config_remove_failure_falls_back_to_api_delete(self) -> None:
         self.invoke("--apply")

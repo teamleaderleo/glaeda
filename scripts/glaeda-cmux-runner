@@ -125,7 +125,7 @@ def read_token(gh: str, endpoint: str) -> str | None:
     return token
 
 
-def run_with_token(argv: list[str], token: str, cwd: Path, timeout: int = 300) -> tuple[int, str]:
+def run_with_token(argv: list[str], token: str, cwd: Path, timeout: int = 900) -> tuple[int, str]:
     """Run config.sh with the token only in that child's environment; scrub it from the output."""
     env = dict(os.environ)
     env["ACTIONS_RUNNER_INPUT_TOKEN"] = token
@@ -483,9 +483,14 @@ def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[st
 
     ours = owned_dir(ctx, receipt)
     registered = receipt.get("registration") or {}
+    local = local_runner(ctx) if ours else None
     if registered.get("owned") and ours:
         actions.append({"kind": "deregister", "state": "remove", "scope": registered.get("scope"),
                         "name": registered.get("name"), "runnerId": registered.get("runnerId")})
+    elif local:
+        # config.sh finished after this command gave up on it: the directory is ours, so is its .runner
+        actions.append({"kind": "deregister", "state": "remove", "name": local.get("agentName"),
+                        "runnerId": local.get("agentId"), "note": "registered by an interrupted --apply"})
     else:
         actions.append({"kind": "deregister", "state": "kept",
                         "note": "no registration owned by this command in this runner directory"})
@@ -581,6 +586,11 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                 receipt_doc["registration"] = {"owned": True, "scope": ctx.org or ctx.repo, "org": bool(ctx.org),
                                                "name": ctx.name, "labels": ctx.labels,
                                                "runnerId": act.get("runnerId")}
+        elif kind == "register" and state == "unchanged" and not receipt_doc.get("registration"):
+            adopted = adopt_registration(ctx)
+            if adopted:
+                receipt_doc["registration"] = adopted
+                act["note"] = "adopted the registration an interrupted --apply finished in this directory"
         elif kind in {"hook", "agent"} and state in {"create", "update"}:
             data, mode = desired_files(ctx)[Path(act["path"])]
             if kind == "agent" and act.get("loaded"):
@@ -612,6 +622,18 @@ def local_runner(ctx: Context) -> dict[str, Any] | None:
     except (OSError, ValueError):
         return None
     return doc if isinstance(doc, dict) else None
+
+
+def adopt_registration(ctx: Context) -> dict[str, Any] | None:
+    """An earlier --apply timed out while config.sh kept going and registered anyway. Only called for
+    a directory this command owns (marker + receipt), and only for the exact name and scope asked for."""
+    local = local_runner(ctx)
+    if not local or local.get("agentName") != ctx.name:
+        return None
+    if str(local.get("gitHubUrl") or "").rstrip("/").lower() != ctx.scope_url.lower():
+        return None
+    return {"owned": True, "scope": ctx.org or ctx.repo, "org": bool(ctx.org), "name": ctx.name,
+            "labels": ctx.labels, "runnerId": local.get("agentId"), "adopted": True}
 
 
 def verify_local(ctx: Context, act: dict[str, Any], wait: bool) -> None:
