@@ -264,16 +264,16 @@ def validate_onboarding(path: Path, data: dict[str, Any]) -> None:
     runner = data.get("runner")
     if runner is not None and (not isinstance(runner, dict) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", str(runner.get("org", "")))):
         raise Failure(f"{path}: runner.org must be a GitHub organization name")
-    for klass, spec in data["classes"].items():
+    for shape, spec in data["hardware"].items():
         if not isinstance(spec.get("compile_lane", True), bool):
-            raise Failure(f"{path}: class {klass} compile_lane must be true or false")
+            raise Failure(f"{path}: hardware {shape} compile_lane must be true or false")
         accepted = spec.get("acceptance")
         if accepted is not None and not (
                 isinstance(accepted, dict) and set(accepted) <= {"xcode_build", "candidate", "node", "note"}
                 and re.fullmatch(r"[0-9A-Za-z]+", str(accepted.get("xcode_build", "")))
                 and re.fullmatch(r"[0-9a-f]{12}", str(accepted.get("candidate", "")))
                 and NODE_ID_RE.fullmatch(str(accepted.get("node", "")))):
-            raise Failure(f"{path}: class {klass} acceptance needs xcode_build, candidate (12 hex) and node (a node id)")
+            raise Failure(f"{path}: hardware {shape} acceptance needs xcode_build, candidate (12 hex) and node (a node id)")
     for name, host in data["hosts"].items():
         if "lan_ip" in host and not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", str(host["lan_ip"])):
             raise Failure(f"{path}: host {name} lan_ip must be an IPv4 address")
@@ -1943,13 +1943,13 @@ ENROLL_TIMEOUT = 3 * 3600
 
 def compile_lane_class(manifest: dict[str, Any], name: str) -> bool:
     """Whether the host's class may take the app compile (a 16 GB `light` class sets compile_lane: false)."""
-    return manifest["classes"][manifest["hosts"][name]["class"]].get("compile_lane", True) is not False
+    return manifest["hardware"][manifest["hosts"][name]["hardware"]].get("compile_lane", True) is not False
 
 
 def class_acceptance(manifest: dict[str, Any], name: str) -> tuple[dict[str, Any] | None, str]:
     """The class-level acceptance the host joins on, if the manifest records one for its Xcode build and candidate."""
-    klass = manifest["hosts"][name]["class"]
-    recorded = manifest["classes"][klass].get("acceptance")
+    klass = manifest["hosts"][name]["hardware"]
+    recorded = manifest["hardware"][klass].get("acceptance")
     build = (toolchain(manifest, name).get("xcode") or {}).get("build")
     source12 = operator_candidate().get("source", "")[:12]
     if not recorded:

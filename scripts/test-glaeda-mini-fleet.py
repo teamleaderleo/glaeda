@@ -1378,7 +1378,7 @@ class OnboardTests(unittest.TestCase):
         self.assertEqual(mf.onboard_hosts(self.manifest, None), (["build-mini-1", "build-mini-2"], {}))
         targets, skipped = mf.onboard_hosts(self.manifest, ["small-mini"])
         self.assertEqual((targets, skipped), ([], {"small-mini": "no node_id in the manifest"}))
-        self.manifest["hosts"]["build-mini-2"]["class"] = "m4-16"  # a 16 GB class never takes the app compile
+        self.manifest["hosts"]["build-mini-2"]["hardware"] = "m4-16"  # 16 GB hardware never takes the app compile
         targets, skipped = mf.onboard_hosts(self.manifest, ["build-mini-1", "build-mini-2"])
         self.assertEqual(targets, ["build-mini-1"])
         self.assertIn("compile_lane: false", skipped["build-mini-2"])
@@ -1479,8 +1479,8 @@ class OnboardTests(unittest.TestCase):
     def test_onboarding_fields_are_validated(self) -> None:
         cases = ((("lan",), {"auth": "password"}, "lan.auth"),
                  (("runner",), {"org": "a b"}, "runner.org"),
-                 (("classes", "m4-16", "compile_lane"), "no", "compile_lane"),
-                 (("classes", "m4pro-48", "acceptance"), {"xcode_build": "17C529", "candidate": "x", "node": "cmux-mac-001"},
+                 (("hardware", "m4-16", "compile_lane"), "no", "compile_lane"),
+                 (("hardware", "m4pro-48", "acceptance"), {"xcode_build": "17C529", "candidate": "x", "node": "cmux-mac-001"},
                   "acceptance needs"),
                  (("hosts", "build-mini-1", "lan_ip"), "mini-1.lan", "lan_ip"))
         for keys, value, error in cases:
