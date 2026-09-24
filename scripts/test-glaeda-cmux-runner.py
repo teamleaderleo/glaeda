@@ -413,6 +413,82 @@ class HookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("no fleet host lock", result.stdout)
 
+    # ------------------------------------------------------------ eligibility gate
+
+    COMMIT = "3809eed51fdd9f1464452f2cd37dbf3148a831fd"
+    TOOLCHAIN = {"rustcVersion": "rustc 1.98.1 (48a229cea 2026-09-01)", "cargoVersion": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+                 "zigVersion": "0.16.0", "xcodeVersion": "26.6", "xcodeBuild": "17F113", "macosSdkVersion": "26.5"}
+
+    def node(self, state: str = "eligible", routing: bool = True, receipt_sha: str = "sha256:aa",
+             enrolled_sha: str = "sha256:aa", tools: dict | None = None, generation: bool = True) -> None:
+        """A fake Glaeda node under HOME (self.dir): enrollment, class receipt, staged CLI, toolchain."""
+        config = self.dir / ".config/glaeda/cmux-fleet"
+        (config / "class-acceptance").mkdir(parents=True, exist_ok=True)
+        (config / "acceptance").mkdir(exist_ok=True)
+        (config / "enrollment.json").write_text(json.dumps({"state": state, "classAcceptanceSha256": enrolled_sha}))
+        (config / "acceptance/cmux_macos_native_build.json").write_text("{}")
+        (config / "class-acceptance/m4pro-48.json").write_text(json.dumps(
+            {"receiptSha256": receipt_sha, "glaedaCandidate": {"commit": self.COMMIT}, "toolchain": self.TOOLCHAIN}))
+        gen = self.dir / "Projects/glaeda-generations" / self.COMMIT[:12] / "scripts"
+        if generation:
+            gen.mkdir(parents=True, exist_ok=True)
+            (gen / "cmux_fleet.py").write_text("import json\nprint(json.dumps(" + repr({
+                "schema": "glaeda-cmux-fleet-node-status/v1", "state": state, "routingCandidateEligible": routing,
+                "roles": [{"role": "cmux_macos_native_build", "eligible": routing,
+                           "reason": "ok" if routing else "acceptance_missing_or_rejected"}]}) + "))\n")
+        cargo = self.dir / ".cargo/bin"
+        cargo.mkdir(parents=True, exist_ok=True)
+        have = {**self.TOOLCHAIN, **(tools or {})}
+        outputs = {"rustc": have["rustcVersion"], "cargo": have["cargoVersion"], "zig": have["zigVersion"],
+                   "xcrun": have["macosSdkVersion"],
+                   "xcodebuild": f"Xcode {have['xcodeVersion']}\nBuild version {have['xcodeBuild']}"}
+        for name, text in outputs.items():
+            if text is None:
+                (cargo / name).unlink(missing_ok=True)
+                continue
+            make_executable(cargo / name, f"#!/bin/sh\ncat <<'OUT'\n{text}\nOUT\n")
+
+    def eligible_start(self) -> subprocess.CompletedProcess:
+        return self.started("--require-eligible", "--fleet-class", "m4pro-48", "--toolchain-xcode", "/Applications/Xcode_26.6.app")
+
+    def done(self) -> None:
+        self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"))
+
+    def test_eligible_node_on_its_toolchain_is_admitted(self) -> None:
+        self.fleet()
+        self.node()
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.done()
+
+    def test_ineligible_nodes_refuse(self) -> None:
+        self.fleet()
+        cases = {
+            "enrolling": (dict(state="enrolling", routing=False), "state enrolling"),
+            "routing-false": (dict(routing=False), "acceptance_missing_or_rejected"),
+            "other-receipt": (dict(enrolled_sha="sha256:bb"), "does not reference the m4pro-48 class receipt"),
+            "rustc-drift": (dict(tools={"rustcVersion": "rustc 1.99.0"}), "rustcVersion 'rustc 1.99.0'"),
+            "xcode-drift": (dict(tools={"xcodeBuild": "17F999"}), "xcodeBuild '17F999' != '17F113'"),
+            "zig-missing": (dict(tools={"zigVersion": None}), "zigVersion '' != '0.16.0'"),
+            "no-generation": (dict(generation=False), "no node status from generation 3809eed51fdd"),
+        }
+        for name, (kwargs, text) in cases.items():
+            with self.subTest(name):
+                import shutil as _sh
+                _sh.rmtree(self.dir / "Projects", ignore_errors=True)
+                self.node(**kwargs)
+                result = self.eligible_start()
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("refused: node not eligible", result.stdout)
+                self.assertIn(text, result.stdout)
+                self.assertTrue(self.lock_free(), "a refused job never takes the host lock")
+
+    def test_no_enrollment_refuses(self) -> None:
+        self.fleet()
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no Glaeda enrollment", result.stdout)
+
     def test_decide_is_pure_table(self) -> None:
         for name, (event_name, payload, admitted) in SAMPLE_EVENTS.items():
             with self.subTest(name):
@@ -873,6 +949,8 @@ class RunnerTest(unittest.TestCase):
             self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
         hooks = self.home / "actions-runner-glaeda/glaeda-hooks"
         self.assertIn("--min-free-gib 100", (hooks / "job-started.sh").read_text())
+        self.assertIn("--require-eligible --fleet-class m4pro-48 --toolchain-xcode /Applications/Xcode_26.6.app",
+                      (hooks / "job-started.sh").read_text())
         self.assertTrue((hooks / "glaeda_reservation.py").is_file())
 
     def test_manifest_refusals_and_exclusive_flags(self) -> None:
@@ -1059,14 +1137,17 @@ class RunnerTest(unittest.TestCase):
 MANIFEST = {
     "defaults": {"xcode": {"apps": [{"path": "/Applications/Xcode_26.6.app", "version": "26.6", "build": "17F113"}]}},
     "hosts": {
-        "mini-std": {"class": "std", "availability": "dedicated", "roles": ["dev-builds", "ci-runner"]},
-        "mini-light": {"class": "light", "availability": "opportunistic", "roles": ["ci-runner"], "owner": "x"},
+        "mini-std": {"class": "std", "availability": "dedicated", "roles": ["dev-builds", "ci-runner"],
+                     "hardware": "m4pro-48"},
+        "mini-light": {"class": "light", "availability": "opportunistic", "roles": ["ci-runner"], "owner": "x",
+                       "hardware": "m4-16"},
+        "no-hardware": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"]},
         "mini-no-role": {"class": "std", "availability": "dedicated", "roles": ["dev-builds"]},
         "laptop": {"class": "dev", "availability": "opportunistic", "roles": ["ci-runner"]},
         "borrowed": {"class": "borrowed", "availability": "opportunistic", "roles": ["ci-runner"]},
         "old-shape": {"class": "m4pro-48", "roles": ["ci-runner"]},
         "bad-avail": {"class": "std", "availability": "sometimes", "roles": ["ci-runner"]},
-        "override": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"],
+        "override": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"], "hardware": "m4pro-48",
                      "overrides": {"xcode": {"apps": [{"path": "/Applications/Xcode.app", "version": "26.3",
                                                        "build": "17C529"}]}}},
     },
@@ -1087,7 +1168,8 @@ class ManifestLabelsTest(unittest.TestCase):
             self.assertEqual(cr.member_labels(MANIFEST, "mini-std")[0]["labels"],
                              ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated"])
         for name, why in (("mini-no-role", "ci-runner"), ("laptop", "never runs"), ("borrowed", "never runs"),
-                          ("old-shape", "m4pro-48"), ("bad-avail", "availability"), ("absent", "not a member")):
+                          ("old-shape", "m4pro-48"), ("bad-avail", "availability"), ("absent", "not a member"),
+                          ("no-hardware", "no hardware class")):
             with self.subTest(name):
                 member, reason = cr.member_labels(MANIFEST, name)
                 self.assertIsNone(member)

@@ -79,6 +79,17 @@ What `--apply` does:
      lock: a small detached holder keeps it until job-completed releases it or the job's
      `Runner.Worker` exits, so fleet builds wait for the PR job and a crash cannot leave
      the lock held. A machine without `host.lock` skips the lock.
+   - With `--manifest`, the hook also requires an eligible Glaeda node on its class
+     toolchain (`--require-eligible --fleet-class <hardware> --toolchain-xcode <app>`,
+     baked in from the member's `hardware` and first verified Xcode). It refuses with
+     `refused: node not eligible (...)` unless the node status from the staged
+     generation's `cmux_fleet.py status` (the command `glaeda-mini-enroll` uses) says
+     `eligible` with `routingCandidateEligible` true, the enrollment references
+     `~/.config/glaeda/cmux-fleet/class-acceptance/<hardware>.json`, and `rustc`,
+     `cargo`, `zig`, `xcodebuild` and `xcrun --show-sdk-version`, run from `$HOME`,
+     print exactly the class receipt's strings. The check takes about a second and runs
+     on every job, so a mini that drifts or loses eligibility stops taking PR jobs at
+     once, and refusal recovery re-runs the job elsewhere.
    - job-completed releases the host lock, runs the same disk pressure pass and always exits 0.
 4. Writes and loads `~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist`
    (runs `run.sh`, restarts on crash, logs to `~/Library/Logs/glaeda-cmux-runner.log`).

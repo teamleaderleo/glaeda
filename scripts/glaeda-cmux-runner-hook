@@ -26,6 +26,11 @@ re-runs it elsewhere) when:
   * free disk is below --min-free-gib
   * another build holds the fleet host lock (/Users/Shared/cmux-build-fleet/host.lock, the flock that
     with-host-lock and the build worker take)
+  * with --require-eligible (every fleet member): the local Glaeda node is not eligible, or its toolchain
+    drifted from its class receipt. Eligibility is the node status that glaeda-mini-enroll reads, from the
+    staged generation's cmux_fleet.py (state eligible, routingCandidateEligible true), and the enrollment
+    must reference ~/.config/glaeda/cmux-fleet/class-acceptance/<class>.json. The toolchain check runs
+    rustc, cargo, zig, xcodebuild and xcrun and compares them with that receipt's strings, exactly.
 Otherwise it takes that lock for the job: a small detached holder keeps it until job-completed releases
 it or the job's Runner.Worker exits, so fleet builds wait for the PR job and a crash cannot strand it.
 Only then does it run glaeda-disk --pressure --apply --top 0, bounded and never able to fail the job.
@@ -41,6 +46,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -133,6 +139,82 @@ def reservation_refusal(path: str, now: float) -> str | None:
     if marker is None:
         return f"reservation {path} is not a valid {reservation.SCHEMA} marker ({why})"
     return f"host reserved by {reservation.describe(marker)}" if reservation.active(marker, now) else None
+
+
+FLEET_ROLE = "cmux_macos_native_build"
+NODE_STATUS_SCHEMA = "glaeda-cmux-fleet-node-status/v1"
+# (class receipt toolchain field, command) run from $HOME, so no checkout's rust-toolchain.toml applies.
+TOOLCHAIN_PROBES = (("rustcVersion", ["rustc", "--version"]), ("cargoVersion", ["cargo", "--version"]),
+                    ("zigVersion", ["zig", "version"]),
+                    ("macosSdkVersion", ["xcrun", "--sdk", "macosx", "--show-sdk-version"]))
+
+
+def _json_file(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def _probe(argv: list[str], env: dict[str, str], cwd: Path) -> str:
+    try:
+        out = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env,
+                             cwd=cwd, timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def eligibility_refusal(fleet_class: str | None, xcode_app: str | None) -> str | None:
+    """Why this node may not run a PR job now (not eligible, or toolchain drift), or None."""
+    home = Path.home()
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "glaeda" / "cmux-fleet"
+    if not fleet_class:
+        return "node not eligible (no fleet class configured for this runner)"
+    receipt = _json_file(config / "class-acceptance" / f"{fleet_class}.json")
+    enrollment = _json_file(config / "enrollment.json")
+    if not isinstance(enrollment, dict):
+        return "node not eligible (no Glaeda enrollment on this mini)"
+    if not isinstance(receipt, dict):
+        return f"node not eligible (no {fleet_class} class receipt)"
+    if not receipt.get("receiptSha256") or enrollment.get("classAcceptanceSha256") != receipt.get("receiptSha256"):
+        return f"node not eligible (the enrollment does not reference the {fleet_class} class receipt)"
+    commit = str(((receipt.get("glaedaCandidate") or {}) if isinstance(receipt.get("glaedaCandidate"), dict) else {})
+                 .get("commit") or "")
+    if not re.fullmatch(r"[0-9a-f]{12,40}", commit):
+        return "node not eligible (the class receipt names no Glaeda candidate)"
+    generation = home / "Projects" / "glaeda-generations" / commit[:12]
+    status_out = _probe([sys.executable, "-B", os.fspath(generation / "scripts" / "cmux_fleet.py"), "status",
+                         os.fspath(config / "enrollment.json"), "--acceptance",
+                         os.fspath(config / "acceptance" / f"{FLEET_ROLE}.json")], dict(os.environ), generation
+                        if generation.is_dir() else home)
+    try:
+        status = json.loads(status_out)
+    except ValueError:
+        status = None
+    if not isinstance(status, dict) or status.get("schema") != NODE_STATUS_SCHEMA:
+        return f"node not eligible (no node status from generation {commit[:12]})"
+    if status.get("state") != "eligible" or status.get("routingCandidateEligible") is not True:
+        roles = status.get("roles") if isinstance(status.get("roles"), list) else []
+        why = ", ".join(str(r.get("reason")) for r in roles if isinstance(r, dict) and r.get("reason")) or "?"
+        return f"node not eligible (state {status.get('state')}, {why})"
+    want = receipt.get("toolchain") if isinstance(receipt.get("toolchain"), dict) else {}
+    env = dict(os.environ)
+    env["PATH"] = ":".join([os.fspath(home / ".cargo/bin"), os.fspath(home / ".local/bin"), env.get("PATH", "")])
+    if xcode_app:
+        env["DEVELOPER_DIR"] = os.fspath(Path(xcode_app) / "Contents" / "Developer")
+    have: dict[str, str] = {}
+    for field, argv in TOOLCHAIN_PROBES:
+        if field in want:
+            have[field] = _probe(argv, env, home)
+    if "xcodeVersion" in want or "xcodeBuild" in want:
+        lines = _probe(["xcodebuild", "-version"], env, home).splitlines()
+        have["xcodeVersion"] = lines[0].removeprefix("Xcode ").strip() if lines else ""
+        have["xcodeBuild"] = lines[1].removeprefix("Build version ").strip() if len(lines) > 1 else ""
+    drift = [f"{field} {have[field]!r} != {want[field]!r}" for field in have if field in want and have[field] != str(want[field])]
+    if drift:
+        return f"node not eligible (toolchain drifted from the {fleet_class} class receipt: {'; '.join(drift)})"
+    return None
 
 
 def disk_refusal(path: str, min_free_gib: float) -> str | None:
@@ -296,6 +378,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--disk", help="glaeda-disk path (default: PATH, then ~/.local/bin)")
     p.add_argument("--no-disk", action="store_true")
     p.add_argument("--min-free-gib", type=float, default=0, help="refuse a job below this much free disk")
+    p.add_argument("--require-eligible", action="store_true",
+                   help="refuse unless this is an eligible Glaeda node on its class receipt's toolchain")
+    p.add_argument("--fleet-class", help="hardware class naming class-acceptance/<class>.json (with --require-eligible)")
+    p.add_argument("--toolchain-xcode", help="the Xcode app the class receipt's xcodeVersion and SDK refer to")
     p.add_argument("--host-lock", default=HOST_LOCK, help=argparse.SUPPRESS)
     p.add_argument("--reservation", default=RESERVATION, help=argparse.SUPPRESS)
     p.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/glaeda/cmux-runner",
@@ -309,7 +395,8 @@ def main(argv: list[str] | None = None) -> int:
                                tuple(args.allow_event))
         if not admit:
             return refuse(reason)
-        why = reservation_refusal(args.reservation, time.time()) \
+        why = (eligibility_refusal(args.fleet_class, args.toolchain_xcode) if args.require_eligible else None) \
+            or reservation_refusal(args.reservation, time.time()) \
             or disk_refusal(os.path.dirname(args.host_lock), args.min_free_gib)
         if why:
             return refuse(why)
