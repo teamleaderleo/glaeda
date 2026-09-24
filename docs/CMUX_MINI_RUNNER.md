@@ -15,8 +15,10 @@ them back to Blacksmith.
   (`xcode-select --install`) and Homebrew.
 - `scripts/glaeda-mini-setup --apply` already run, so `glaeda-disk` is on
   `~/.local/bin` (optional: without it the hooks skip disk pressure).
-- `gh` installed and logged in as a `manaflow-ai/cmux` admin (runner registration
-  needs admin): `brew install gh && gh auth login`.
+- Either `gh` on the mini, logged in as a `manaflow-ai/cmux` admin (runner
+  registration needs admin): `brew install gh && gh auth login`. Or no `gh` on the
+  mini at all, with the token minted on the operator's machine (section 2b). The
+  second keeps admin credentials off a shared build host.
 - A glaeda checkout: `git clone https://github.com/teamleaderleo/glaeda ~/Projects/glaeda`.
 - The cmux Xcode pin and `pmset` settings from `glaeda-mini-setup` operator steps, so
   jobs can build once routed.
@@ -63,6 +65,33 @@ What `--apply` does:
 
 The receipt is `~/.local/state/glaeda/cmux-runner/receipt.json`. A second `--apply`
 reports every step as unchanged. A plan with any blocked step applies nothing.
+
+## 2b. No gh on the mini: pipe the token over SSH
+
+Mint the one-time token on the operator's machine and pipe it in. It travels only
+through the pipe: never an argv, a file, or the output on either side.
+
+```bash
+ssh MINI '~/glaeda/scripts/glaeda-cmux-runner --token-stdin'    # plan the gh-free path
+gh api -X POST repos/manaflow-ai/cmux/actions/runners/registration-token --jq .token \
+  | ssh MINI '~/glaeda/scripts/glaeda-cmux-runner --apply --token-stdin'
+```
+
+Only `glaeda-cmux-runner` and `glaeda-cmux-runner-hook` need to be on the mini, side
+by side. Without `gh`, the release metadata comes from the public API through curl,
+a name that is already registered is refused by `config.sh` itself, and step 5 is
+confirmed from the runner's own log (`Listening for Jobs`) and `.runner` instead of
+the API. Check the labels from the operator's machine (section 3).
+
+Uninstall works the same way with a removal token:
+
+```bash
+gh api -X POST repos/manaflow-ai/cmux/actions/runners/remove-token --jq .token \
+  | ssh MINI '~/glaeda/scripts/glaeda-cmux-runner --uninstall --apply --token-stdin'
+```
+
+If that removal fails there is no API fallback on the mini; delete it by id from
+the operator's machine with `gh api -X DELETE repos/manaflow-ai/cmux/actions/runners/ID`.
 
 ## 3. Verify
 
@@ -113,7 +142,7 @@ scripts/glaeda-mini-setup --runner --uninstall --apply    # deregister and remov
 
 Uninstall acts on the directory, name and scope in the receipt; flags cannot redirect it. It unloads and removes the LaunchAgent
 only if it still has the bytes this tool wrote, deregisters with a one-time removal
-token (falling back to `DELETE .../actions/runners/<id>`), and removes
+token (falling back to `DELETE .../actions/runners/<id>` when `gh` is present), and removes
 `~/actions-runner-glaeda` (including `_work`) only if the receipt created it and
 the directory's marker still matches. If deregistration fails, the directory and
 receipt stay so the command can be re-run. Nothing outside those paths is touched.

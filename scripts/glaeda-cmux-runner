@@ -24,6 +24,15 @@ The one-time registration token comes from `gh api -X POST .../registration-toke
 It is never placed in any argv, written to disk, or printed. It reaches config.sh only through
 ACTIONS_RUNNER_INPUT_TOKEN in that one child's environment, which the runner reads and clears.
 
+A mini without gh (or without admin credentials on it) takes the token on stdin instead, minted
+on the operator's own machine, so no GitHub credential ever lands on the mini:
+
+    gh api -X POST repos/OWNER/REPO/actions/runners/registration-token --jq .token \
+      | ssh MINI glaeda-cmux-runner --apply --repo OWNER/REPO --token-stdin
+
+Without gh the release is read from the public API with curl, a name collision is left to
+config.sh (which refuses one), and step 5 is confirmed locally from the runner log instead.
+
 Routing is never automated: the plan prints the `gh variable set` commands that point cmux
 workflows at the glaeda-mini label, and the `gh variable delete` commands that roll back.
 The receipt lands in ~/.local/state/glaeda/cmux-runner/receipt.json.
@@ -68,6 +77,9 @@ RUN_TIMEOUT = 60
 CURL = "/usr/bin/curl"
 LAUNCHCTL = "/bin/launchctl"
 ONLINE_WAIT_S = 90
+PUBLIC_API = "https://api.github.com/"
+TOKEN_RE = r"[A-Za-z0-9_.\-]+"
+LISTENING = "Listening for Jobs"
 
 
 # ---------------------------------------------------------------- small helpers
@@ -108,7 +120,7 @@ def read_token(gh: str, endpoint: str) -> str | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     token = result.stdout.strip()
-    if result.returncode != 0 or not token or not re.fullmatch(r"[A-Za-z0-9_.\-]+", token):
+    if result.returncode != 0 or not token or not re.fullmatch(TOKEN_RE, token):
         return None
     return token
 
@@ -176,12 +188,23 @@ class Context:
         self.runner_dir = (args.runner_dir or self.home / "actions-runner-glaeda").expanduser().absolute()
         self.hook_dir = self.runner_dir / HOOK_DIR
         self.gh = args.gh or which("gh", ("/opt/homebrew/bin/gh", "/usr/local/bin/gh"))
+        self.gh_state = "missing" if self.gh is None else "logged in"
         self.python = args.python or which("python3", ("/opt/homebrew/bin/python3", "/usr/bin/python3"))
         self.agents = self.home / "Library/LaunchAgents"
         self.logs = self.home / "Library/Logs"
         self.state = self.home / ".local/state/glaeda/cmux-runner"
         self.receipt_path = self.state / "receipt.json"
         self.plist_path = self.agents / f"{LABEL}.plist"
+        self.log_path = self.logs / "glaeda-cmux-runner.log"
+        self.token_stdin = args.token_stdin
+        self.stdin_token: str | None = None  # set by main() from stdin; used once, never stored
+
+    def take_token(self, endpoint: str) -> str | None:
+        """The stdin token when one was given (single use), otherwise a fresh one from gh."""
+        if self.token_stdin:
+            token, self.stdin_token = self.stdin_token, None
+            return token
+        return read_token(self.gh or "gh", endpoint)
 
     @property
     def scope_api(self) -> str:
@@ -207,10 +230,14 @@ def load_receipt(ctx: Context) -> dict[str, Any] | None:
 # ---------------------------------------------------------------- GitHub reads
 
 
-def gh_json(ctx: Context, endpoint: str) -> Any:
-    if ctx.gh is None:
+def gh_json(ctx: Context, endpoint: str, public: bool = False) -> Any:
+    if ctx.gh is None and public:
+        code, out = run([CURL, "-fsSL", "--retry", "3", "-H", "Accept: application/vnd.github+json",
+                         PUBLIC_API + endpoint])
+    elif ctx.gh is None:
         return None
-    code, out = run([ctx.gh, "api", endpoint])
+    else:
+        code, out = run([ctx.gh, "api", endpoint])
     if code != 0:
         return None
     try:
@@ -222,9 +249,9 @@ def gh_json(ctx: Context, endpoint: str) -> Any:
 def resolve_release(ctx: Context) -> dict[str, Any]:
     """Latest (or pinned) osx-arm64 runner: version, url, expected sha256. Read-only."""
     endpoint = f"{RUNNER_RELEASE_API}/tags/v{ctx.version}" if ctx.version else f"{RUNNER_RELEASE_API}/latest"
-    release = gh_json(ctx, endpoint)
+    release = gh_json(ctx, endpoint, public=True)
     if not isinstance(release, dict):
-        return {"state": "blocked", "note": f"could not read {endpoint} (is gh installed and logged in?)"}
+        return {"state": "blocked", "note": f"could not read {endpoint}"}
     version = str(release.get("tag_name") or "").lstrip("v")
     asset_name = f"actions-runner-{PLATFORM_ASSET}-{version}.tar.gz"
     asset = next((a for a in release.get("assets") or [] if a.get("name") == asset_name), None)
@@ -371,12 +398,14 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
 
     reg = {"kind": "register", "scope": ctx.org or ctx.repo, "name": ctx.name, "labels": ctx.labels,
            "ephemeral": False}
-    if ctx.gh is None:
-        reg.update(state="blocked", note="gh (GitHub CLI) is required and must be logged in")
-    elif ours and configured:
+    if ours and configured:
         reg.update(state="unchanged")
+    elif ctx.gh is None and not ctx.token_stdin:
+        reg.update(state="blocked", note="needs gh logged in as an admin, or a token through --token-stdin")
     elif blocked_dir:
         reg.update(state="blocked", note="runner directory is not ours")
+    elif ctx.gh is None:
+        reg.update(state="create", note="no gh here: config.sh refuses a name that is already registered")
     else:
         existing = find_runner(ctx)
         if existing and not ctx.replace:
@@ -480,7 +509,7 @@ def download_and_unpack(ctx: Context, act: dict[str, Any], install_id: str) -> N
 
 
 def register(ctx: Context, act: dict[str, Any]) -> None:
-    token = read_token(ctx.gh or "gh", f"{ctx.scope_api}/actions/runners/registration-token")
+    token = ctx.take_token(f"{ctx.scope_api}/actions/runners/registration-token")
     if token is None:
         act["state"], act["note"] = "failed", "could not obtain a registration token (needs repo or org admin)"
         return
@@ -541,6 +570,7 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             act["ownedSha256"] = act["sha256"]
         if kind == "agent" and act["state"] in {"create", "update", "unchanged"} and not ctx.skip_launchctl \
                 and not act.get("loaded"):
+            ctx.log_offset = ctx.log_path.stat().st_size if ctx.log_path.is_file() else 0
             code, out = run([LAUNCHCTL, "bootstrap", f"gui/{ctx.uid}", act["path"]])
             act["bootstrapped"] = code == 0
             if code != 0:
@@ -554,7 +584,47 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                 registration["runnerId"] = act["runner"].get("id")
 
 
+def local_runner(ctx: Context) -> dict[str, Any] | None:
+    """What the runner itself recorded at registration (.runner is JSON, sometimes with a BOM)."""
+    try:
+        doc = json.loads((ctx.runner_dir / ".runner").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def verify_local(ctx: Context, act: dict[str, Any], wait: bool) -> None:
+    """No gh: trust .runner for the identity and the runner's own log for being online."""
+    local = local_runner(ctx)
+    if local is None or local.get("agentName") != ctx.name:
+        act["state"], act["note"] = "failed", "no .runner for this name; registration did not complete"
+        return
+    offset = getattr(ctx, "log_offset", None)
+    deadline = time.monotonic() + (ONLINE_WAIT_S if wait else 0)
+    online = False
+    while offset is not None:
+        try:
+            with ctx.log_path.open("rb") as log:
+                log.seek(offset)
+                online = LISTENING.encode() in log.read()
+        except OSError:
+            pass
+        if online or time.monotonic() >= deadline:
+            break
+        time.sleep(3)
+    act["runner"] = {"id": local.get("agentId"), "status": "online" if online else "unknown", "source": "local"}
+    if offset is not None and not online:
+        act["state"], act["note"] = "failed", f"runner did not log '{LISTENING}' within {ONLINE_WAIT_S}s; see {ctx.show(ctx.log_path)}"
+        return
+    act["state"] = "ok"
+    act["note"] = ("online per the runner log" if online else "registered locally") + \
+        f"; no gh here, so confirm labels from an admin machine: gh api {ctx.scope_api}/actions/runners"
+
+
 def verify(ctx: Context, act: dict[str, Any], wait: bool) -> None:
+    if ctx.gh is None:
+        verify_local(ctx, act, wait)
+        return
     deadline = time.monotonic() + (ONLINE_WAIT_S if wait else 0)
     while True:
         found = find_runner(ctx)
@@ -584,13 +654,16 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
             Path(act["path"]).unlink()
             act["applied"] = True
         elif act["kind"] == "deregister":
-            token = read_token(ctx.gh or "gh", f"{ctx.scope_api}/actions/runners/remove-token")
+            token = ctx.take_token(f"{ctx.scope_api}/actions/runners/remove-token")
             code, out = (1, "no removal token")
             if token is not None:
                 code, out = run_with_token([os.fspath(ctx.runner_dir / "config.sh"), "remove"], token, ctx.runner_dir)
                 del token
             if code == 0:
                 act["applied"] = True
+                continue
+            if ctx.gh is None:
+                act["state"], act["note"] = "failed", f"deregistration failed: {out[-300:]}"
                 continue
             listed, runner = lookup_runner(ctx)
             if runner and runner.get("id") is not None and ctx.gh:
@@ -623,10 +696,14 @@ def preflight(ctx: Context) -> dict[str, Any]:
 
     arch = platform.machine()
     check("appleSilicon", arch == "arm64" or not DARWIN_REQUIRED, arch, "the runner build is osx-arm64", True)
-    check("gh", ctx.gh is not None, ctx.gh or "missing", "brew install gh && gh auth login", True)
+    # Never blocking here: the steps that need a token block themselves (register, deregister),
+    # so an installed runner can be re-checked or re-applied on a mini with no gh.
     if ctx.gh:
-        code, _ = run([ctx.gh, "auth", "status"])
-        check("ghAuth", code == 0, "logged in" if code == 0 else "not logged in", "gh auth login", True)
+        check("gh", True, f"{ctx.gh} (logged in)")
+    elif ctx.token_stdin:
+        check("gh", None, ctx.gh_state, "token from stdin; release read with curl, runner confirmed locally")
+    else:
+        check("gh", False, ctx.gh_state, "gh auth login as an admin, or pipe a token to --token-stdin")
     check("python", ctx.python is not None, ctx.python or "missing", "hooks need python3", True)
     disk = which("glaeda-disk", (os.fspath(ctx.home / ".local/bin/glaeda-disk"),))
     check("glaedaDisk", disk is not None or None, disk or "not installed",
@@ -681,6 +758,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--runner-sha256", help="pin the expected SHA-256 of the tarball")
     p.add_argument("--route-repo", default=DEFAULT_REPO, help="repository whose variables the printed routing commands set")
     p.add_argument("--gh", help="gh binary (default: PATH)")
+    p.add_argument("--token-stdin", action="store_true",
+                   help="with --apply, read the registration (or, with --uninstall, removal) token from stdin; "
+                        "without --apply, plan that path")
     p.add_argument("--python", help="interpreter the job hooks run (default: python3 on PATH)")
     p.add_argument("--skip-launchctl", action="store_true", help="write the plist but do not load or unload it")
     return p
@@ -698,6 +778,15 @@ def main(argv: list[str] | None = None) -> int:
         print("glaeda-cmux-runner: --repo must be OWNER/REPO", file=sys.stderr)
         return 2
     ctx = Context(args)
+    if args.token_stdin and args.apply:  # a plan previews the stdin path but never reads a token
+        token = sys.stdin.readline(4096).strip()
+        if not re.fullmatch(TOKEN_RE, token):
+            print("glaeda-cmux-runner: --token-stdin read no usable token", file=sys.stderr)
+            return 2
+        ctx.stdin_token = token
+        del token
+    if ctx.gh and run([ctx.gh, "auth", "status"])[0] != 0:
+        ctx.gh, ctx.gh_state = None, "installed, not logged in"  # a logged-out gh is no gh
     prior = load_receipt(ctx)
     if args.uninstall and prior:
         # Uninstall acts only on what the receipt recorded; flags cannot point it elsewhere.
@@ -725,6 +814,11 @@ def main(argv: list[str] | None = None) -> int:
     }
     if args.uninstall:
         actions = plan_uninstall(ctx, prior)
+        if ctx.gh is None and not ctx.token_stdin and \
+                any(a["kind"] == "deregister" and a["state"] == "remove" for a in actions):
+            for act in actions:  # removing the agent or directory without deregistering strands the runner
+                if act["state"] == "remove":
+                    act["state"], act["note"] = "blocked", "deregistering needs gh as an admin, or --token-stdin"
         if args.apply:
             if pre["blocking"] and any(a["kind"] == "deregister" and a["state"] == "remove" for a in actions):
                 for act in actions:
@@ -750,7 +844,7 @@ def main(argv: list[str] | None = None) -> int:
         data = (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode()
         if args.uninstall:
             write_atomic(ctx.state / "uninstall-receipt.json", data, 0o600)
-            if prior is not None and not failed:
+            if prior is not None and doc["ready"]:  # a blocked or failed uninstall keeps the receipt for a re-run
                 os.replace(ctx.receipt_path, ctx.state / "receipt.uninstalled.json")
         elif doc["runnerDirOwned"] or any(a.get("owned") for a in actions):
             write_atomic(ctx.receipt_path, data, 0o600)

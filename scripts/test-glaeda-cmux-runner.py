@@ -98,6 +98,8 @@ else:
 FAKE_CURL = FAKE_LOG_HEADER + r'''
 argv = sys.argv[1:]
 log("curl", argv)
+if "-o" not in argv:  # the gh-free path reads the public release API
+    sys.stdout.write(open(os.path.join(state, "release.json")).read()); sys.exit(0)
 dest = argv[argv.index("-o") + 1]
 open(dest, "wb").write(open(os.path.join(state, "runner.tar.gz"), "rb").read())
 '''
@@ -124,7 +126,7 @@ if token != os.environ["FAKE_REG_TOKEN"]:
     print("bad token " + str(token)); sys.exit(1)
 name = argv[argv.index("--name") + 1]
 labels = ["self-hosted", "macOS", "ARM64"] + argv[argv.index("--labels") + 1].split(",")
-json.dump({"agentName": name}, open(os.path.join(here, ".runner"), "w"))
+json.dump({"agentId": 4242, "agentName": name}, open(os.path.join(here, ".runner"), "w"))
 doc = runners()
 doc["runners"].append({"id": 4242, "name": name, "status": "online", "busy": False,
                        "labels": [{"name": l} for l in labels]})
@@ -305,10 +307,11 @@ class RunnerTest(unittest.TestCase):
             "assets": [{"name": asset, "browser_download_url": f"https://github.com/actions/runner/releases/download/v{VERSION}/{asset}"}],
         }))
 
-    def invoke(self, *args: str, expect: int = 0, via_setup: bool = False) -> dict:
+    def invoke(self, *args: str, expect: int = 0, via_setup: bool = False, gh: bool = True,
+               stdin: str = "") -> dict:
         out = io.StringIO()
-        argv = ["--output", "json", "--gh", os.fspath(self.gh), "--python", sys.executable, *args]
-        with contextlib.redirect_stdout(out):
+        argv = ["--output", "json", *(["--gh", os.fspath(self.gh)] if gh else []), "--python", sys.executable, *args]
+        with contextlib.redirect_stdout(out), mock.patch.object(sys, "stdin", io.StringIO(stdin)):
             code = setup.main(["--runner", *argv]) if via_setup else cr.main(argv)
         self.assertEqual(code, expect, out.getvalue()[-3000:])
         self.last_output = out.getvalue()
@@ -565,6 +568,63 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("deleted by id", dereg["note"])
         self.assertTrue(any(e["tool"] == "gh" and "DELETE" in e["argv"] for e in self.log()))
         self.assertFalse((self.home / "actions-runner-glaeda").exists())
+
+
+    # ------------------------------------------------------------ --token-stdin, no gh on the mini
+
+    def test_token_stdin_without_gh_installs_and_uninstalls(self) -> None:
+        real_which = cr.which
+        with mock.patch.object(cr, "which", lambda name, extra=(): None if name == "gh" else real_which(name, extra)):
+            plan = self.invoke(gh=False)
+            self.assertEqual(self.by_kind(plan)["register"]["state"], "blocked")
+            preview = self.invoke("--token-stdin", gh=False, stdin=REG_TOKEN + "\n")
+            self.assertTrue(preview["ready"], preview["blocking"])
+            self.assertEqual(self.by_kind(preview)["register"]["state"], "create")
+            self.assertEqual(self.tree(), {})
+            for entry in self.log():  # plans only read the public release API
+                self.assertEqual(entry["tool"], "curl", entry)
+                self.assertNotIn("-o", entry["argv"], entry)
+            receipt = self.invoke("--apply", "--token-stdin", gh=False, stdin=REG_TOKEN + "\n")
+            kinds = self.by_kind(receipt)
+            self.assertTrue(receipt["ready"], receipt["blocking"])
+            self.assertEqual(kinds["download"]["version"], VERSION)
+            self.assertEqual(kinds["verify"]["state"], "ok", kinds["verify"])
+            self.assertEqual(kinds["verify"]["runner"]["id"], 4242)
+            self.assertFalse(any(e["tool"] == "gh" for e in self.log()))
+            config = [e for e in self.log() if e["tool"] == "config.sh"][0]
+            self.assertEqual(config["envToken"], REG_TOKEN)
+            for entry in self.log():
+                self.assertNotIn(REG_TOKEN, " ".join(entry["argv"]))
+            self.assertNotIn(REG_TOKEN, self.last_output)
+            for name, data in self.tree().items():
+                self.assertNotIn(REG_TOKEN.encode(), data or b"", name)
+
+            again = self.invoke("--apply", gh=False)  # an installed mini re-applies without gh or a token
+            self.assertTrue(again["ready"], again["blocking"])
+            self.assertEqual({a["state"] for a in again["actions"] if a["kind"] != "verify"}, {"unchanged"})
+
+            before = self.tree()
+            stuck = self.invoke("--uninstall", "--apply", gh=False)  # no way to deregister: touch nothing
+            self.assertFalse(stuck["ready"])
+            self.assertTrue(all(a["state"] == "blocked" for a in stuck["actions"]), stuck["actions"])
+            after = self.tree()
+            after.pop(".local/state/glaeda/cmux-runner/uninstall-receipt.json")
+            self.assertEqual(before, after)
+
+            removed = self.invoke("--uninstall", "--apply", "--token-stdin", gh=False, stdin=REMOVE_TOKEN + "\n")
+            self.assertTrue(next(a for a in removed["actions"] if a["kind"] == "deregister")["applied"])
+            self.assertFalse((self.home / "actions-runner-glaeda").exists())
+            self.assertNotIn(REMOVE_TOKEN, self.last_output)
+
+    def test_token_stdin_apply_needs_a_token(self) -> None:
+        for args, stdin in ((("--apply", "--token-stdin"), ""),
+                            (("--apply", "--token-stdin"), "not a token; rm -rf /\n")):
+            with self.subTest(args=args, stdin=stdin[:8]), contextlib.redirect_stderr(io.StringIO()) as err, \
+                    mock.patch.object(sys, "stdin", io.StringIO(stdin)):
+                self.assertEqual(cr.main(["--gh", os.fspath(self.gh), *args]), 2)
+                self.assertNotIn("rm -rf", err.getvalue())
+        self.assertEqual(self.tree(), {})
+        self.assertEqual(self.log(), [])
 
 
 class NoEmDashTest(unittest.TestCase):
