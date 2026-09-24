@@ -53,6 +53,8 @@ CMUX_GHOSTTYKIT_LOCATIONS = (
     "GhosttyKit.xcframework",
     "ghostty/macos/GhosttyKit.xcframework",
 )
+# The Xcode major the fleet is reviewed against (CMUX .xcode-version).
+REVIEWED_XCODE_MAJOR = 26
 CMUX_RESULT_CONTRACT = "cmux-workload-result/v1"
 CMUX_PROFILE_REGISTRY = "scripts/ci/cmux-workload-profiles.json"
 MAX_PROFILE_REGISTRY_BYTES = 64 * 1024
@@ -284,6 +286,25 @@ def cmux_setup_artifacts_present(root: Path) -> bool:
     )
 
 
+def xcode_pin_ready(pin: str, xcode_version: str | None, sdk_version: str) -> bool:
+    """Whether the selected Xcode and SDK satisfy CMUX's .xcode-version.
+
+    CMUX pins a major version there: "26" since cmux#14050, "26.0" before it.
+    The exact app and build are the CI Xcode variables' job, which the hosted
+    adopter revalidates; this check keeps a node on the reviewed major.
+    """
+    def major(version: str | None) -> int | None:
+        match = re.fullmatch(r"(\d+)(?:\.\d+)*", version or "")
+        return int(match.group(1)) if match else None
+
+    wanted = major(pin)
+    return (
+        wanted == REVIEWED_XCODE_MAJOR
+        and major(xcode_version) == wanted
+        and major(sdk_version) == wanted
+    )
+
+
 def cmux_required_zig_version(root: Path) -> str:
     manifest = root / "ghostty/build.zig.zon"
     match = re.search(
@@ -405,12 +426,10 @@ def collect_macos(
             "canonicalCheckoutClean": cmux_checkout_clean(cmux_root),
             "submodulesReady": cmux_submodules_ready(cmux_root),
             "cmuxSetupArtifacts": cmux_setup_artifacts_present(cmux_root),
-            "xcodePin": bool(
-                xcode_match
-                and sdk_match
-                and pin == "26.0"
-                and xcode_match.group(1).startswith("26")
-                and int(sdk_match.group(1)) == 26
+            "xcodePin": xcode_pin_ready(
+                pin,
+                xcode_match.group(1) if xcode_match else None,
+                sdk,
             ),
             "git": git.startswith("git version "),
             "profileRunnerInterpreter": profile_runner_interpreter_ready(),
