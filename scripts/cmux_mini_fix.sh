@@ -161,8 +161,9 @@ glaeda_sync() {  # COMMIT [FLAG...]
   set -- "$commit" "$@"
   [ -f "$dir/scripts/cmux_fleet.py" ] || refuse "$dir is not a Glaeda checkout; run glaeda-mini-fleet fix first"
   head=$(git -C "$dir" rev-parse -q --verify HEAD || true)
-  if [ "$head" = "$1" ]; then say "unchanged: ~/glaeda is at ${1:0:12}"; return; fi
-  [ -z "$(git -C "$dir" status --porcelain=v1 --untracked-files=no)" ] || refuse "$dir has local changes; commit or move them aside"
+  if [ "$head" != "$1" ]; then
+    [ -z "$(git -C "$dir" status --porcelain=v1 --untracked-files=no)" ] || refuse "$dir has local changes; commit or move them aside"
+  fi
   if ! git -C "$dir" cat-file -e "$1^{commit}" 2>/dev/null; then
     if [ "$(git -C "$dir" rev-parse --is-shallow-repository)" = true ]; then
       git -C "$dir" fetch --quiet --depth 1 origin "$1"
@@ -178,6 +179,8 @@ glaeda_sync() {  # COMMIT [FLAG...]
       *) refuse "glaeda ${1:0:12} predates glaeda-mini-enroll $flag" ;;
     esac
   done
+  # Checked after the options, so a head that lacks one is refused rather than reported unchanged.
+  if [ "$head" = "$1" ]; then say "unchanged: ~/glaeda is at ${1:0:12}"; return; fi
   git -C "$dir" checkout --quiet --detach "$1"
   say "~/glaeda moved from ${head:0:12} to ${1:0:12}"
 }
@@ -188,7 +191,7 @@ glaeda_sync() {  # COMMIT [FLAG...]
 # UPSTREAM afterwards, so brew update reads GitHub. Only an empty prefix (directories alone, as a stalled
 # installer leaves it) is filled; an unfinished fetch (a .git, no brew) resumes.
 homebrew_fetch() {  # UPSTREAM [PEER_URL [IDENTITY]]
-  local dir="${GLAEDA_HOMEBREW_DIR:-/opt/homebrew}" upstream="$1" peer="${2:-}" identity="${3:-}"
+  local dir="${GLAEDA_HOMEBREW_DIR:-/opt/homebrew}" upstream="$1" peer="${2:-}" identity="${3:-}" tag ref
   if [ -x "$dir/bin/brew" ]; then say "unchanged: $dir has brew"; return; fi
   [ -d "$dir" ] || refuse "$dir does not exist; glaeda-mini-fleet sudo-plan creates it"
   [ -O "$dir" ] || refuse "$dir is not $(id -un)'s; glaeda-mini-fleet sudo-plan hands it over"
@@ -202,7 +205,11 @@ homebrew_fetch() {  # UPSTREAM [PEER_URL [IDENTITY]]
     say "fetched Homebrew/brew from $peer"
   else
     [ -z "$peer" ] || say "could not fetch from $peer; fetching $upstream"
-    git -C "$dir" fetch --quiet --depth 1 "$upstream" HEAD
+    # The newest release tag, as the brew.sh installer checks out; HEAD only when there is none.
+    tag=$(git ls-remote --tags --refs "$upstream" | sed -n 's#.*refs/tags/\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$#\1#p' \
+      | sort -t. -k1,1n -k2,2n -k3,3n | tail -1 || true)
+    ref=HEAD; [ -z "$tag" ] || ref="refs/tags/$tag"
+    git -C "$dir" fetch --quiet --depth 1 "$upstream" "$ref"
   fi
   git -C "$dir" checkout --quiet --detach FETCH_HEAD
   if git -C "$dir" remote get-url origin >/dev/null 2>&1; then

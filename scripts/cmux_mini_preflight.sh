@@ -153,8 +153,10 @@ if [ -x "$hb/bin/brew" ]; then
     [ -L "$hb/var/homebrew/pinned/$f" ] && e pf_brew_formula "$f|pinned" || e pf_brew_formula "$f|unpinned"
   done
 elif [ -d "$hb" ]; then
+  # partial: an interrupted homebrew_fetch (git init done, no brew yet), which fix resumes.
   files=$(find "$hb" -mindepth 1 -not -type d 2>/dev/null | head -1)
-  e pf_brew_dir "$(stat -f %Su "$hb")|$([ -n "$files" ] && echo files || echo empty)"
+  if [ -d "$hb/.git" ]; then kind=partial; elif [ -n "$files" ]; then kind=files; else kind=empty; fi
+  e pf_brew_dir "$(stat -f %Su "$hb")|$kind"
 fi
 
 # A running or prepared macOS update means a restart is coming.

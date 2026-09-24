@@ -518,7 +518,8 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
         "glaeda_dirty": int(out.get("pf_glaeda_dirty") or 0),
         "python3": None if python3 is None else {"path": python3[0] or None, "version": python3[1] or None},
         "brew_python3": out.get("pf_brew_python3") or None,
-        "brew_dir": None if brew_dir is None else {"owner": brew_dir[0], "files": brew_dir[1] == "files"},
+        # state: empty (directories only), partial (an interrupted homebrew_fetch: a .git, no brew) or files.
+        "brew_dir": None if brew_dir is None else {"owner": brew_dir[0], "state": brew_dir[1]},
         "brew_formulas": {f: state == "pinned" for f, _, state in (v.partition("|") for v in out["pf_brew_formula"])},
         "cache_root": out.get("pf_cache_root") == "present",
         "enroll_state": out.get("pf_enroll_state"),
@@ -1618,18 +1619,21 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
         needed = any((c.get("action") or {}).get("kind") in {"brew", "python_link"} for c in checks.values()
                      if c["state"] == "fail")
         brew_state = "fail" if needed else "info"
-        if brew_dir and brew_dir["files"]:
-            put("brew", brew_state, f"none (/opt/homebrew is {brew_dir['owner']}'s, has files and no brew)",
-                "move /opt/homebrew aside (a stalled Homebrew install?), then rerun preflight", "person")
-        elif brew_dir and brew_dir["owner"] == user:
-            put("brew", brew_state, f"none (/opt/homebrew is {user}'s and empty)",
+        if brew_dir and brew_dir["owner"] == user and brew_dir["state"] in {"empty", "partial"}:
+            how = "and empty" if brew_dir["state"] == "empty" else "with an unfinished fetch"
+            put("brew", brew_state, f"none (/opt/homebrew is {user}'s {how})",
                 "glaeda-mini-fleet fix fetches Homebrew/brew into it (from --from HOST over the LAN, else GitHub)",
                 "self", {"kind": "homebrew_fetch"})
+        elif brew_dir and brew_dir["state"] != "empty":
+            put("brew", brew_state, f"none (/opt/homebrew is {brew_dir['owner']}'s, has files and no brew)",
+                "move /opt/homebrew aside (a stalled Homebrew install?), then rerun preflight", "person")
         else:
+            # Someone else's directory may hide files from this probe; sudo-plan looks again as root and
+            # hands it over only when it holds nothing but directories.
             where = f"is {brew_dir['owner']}'s" if brew_dir else "does not exist"
             put("brew", brew_state, f"none (/opt/homebrew {where})",
-                f"sudo mkdir /opt/homebrew and chown it to {user}; fix then fetches Homebrew/brew into it", "password",
-                {"kind": "homebrew", "user": user})
+                f"sudo mkdir /opt/homebrew and chown it to {user} (only when it holds no files); fix then fetches "
+                "Homebrew/brew into it", "password", {"kind": "homebrew", "user": user})
         put("pins", "info", "no Homebrew")
     else:
         put("brew", "info", owner if owner == user else f"{owner} (installs run as sudo -u {owner})")
@@ -1734,7 +1738,9 @@ FIX_ORDER = ("xcode_share", "xcode_clone", "python", "cmux_clone", "submodules",
 # What each repair needs to pass first (checks, or repairs made earlier in the same run).
 # glaeda-mini-setup builds glaeda-worktree-reclaim with cargo, under the Python enroll will use.
 FIX_NEEDS = {"metal": ("licence", "launch"), "setup": ("cmux", "licence", "launch", "metal", "zig"), "brew": ("brew",),
-             "python_link": ("brew",), "glaeda": ("python", "rust")}
+             "python_link": ("brew",), "glaeda": ("python", "rust"),
+             # git runs through the /usr/bin shim, which needs a selected, licensed developer directory.
+             "homebrew_fetch": ("select", "licence")}
 # Remote functions that only read; every other one takes the host's step lock.
 # share_send only reads, and stays lock-free so one source can feed several peers at once.
 READ_ONLY_FUNCTIONS = {"candidate_check", "share_have", "share_source", "share_send", "host_check"}
@@ -2366,7 +2372,8 @@ def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any]
             lines += [f"step 'create /opt/homebrew for {owner}; glaeda-mini-fleet fix fetches Homebrew into it'",
                       "if [ ! -x /opt/homebrew/bin/brew ]; then",
                       "  [ -d /opt/homebrew ] || sudo mkdir /opt/homebrew",
-                      '  if [ -n "$(find /opt/homebrew -mindepth 1 -not -type d 2>/dev/null | head -1)" ]; then',
+                      # As root: the login user may not be able to read into someone else's directory.
+                      '  if [ -n "$(sudo find /opt/homebrew -mindepth 1 -not -type d | head -1)" ]; then',
                       "    echo '/opt/homebrew has files but no brew; move it aside first' >&2; exit 1",
                       "  fi",
                       f"  sudo chown -R {owner}:admin /opt/homebrew",
@@ -3393,9 +3400,10 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
         generation = result["enrollment"]["generation"]
         rows[name]["generation"] = short_generation(generation) if generation else ""
         needs[name] = need = enrollment_need(result)
-        fails = [c for c, v in result["checks"].items() if v["state"] == "fail"]
         # An old ~/glaeda is no blocker here: the renewal's first step moves it (renew_one's sync).
-        failing = [c for c in fails if (result["checks"][c].get("action") or {}).get("kind") != "glaeda_sync"]
+        failing = [c for c, v in result["checks"].items() if v["state"] == "fail"
+                   and (v.get("action") or {}).get("kind") != "glaeda_sync"]
+        failing += [c for c, v in result["checks"].items() if v["state"] == "unknown" and c in UNKNOWN_BLOCKS]
         if need == "enroll":
             rows[name]["result"] = f"not enrolled: glaeda-mini-fleet onboard {name} --yes once this pins the candidate"
         elif need == "leave":
@@ -3403,8 +3411,8 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
                                     "upgrade it again once it is eligible")
         elif need == "retired":
             rows[name]["result"] = "retired"
-        elif failing or (not result["ready"] and not fails):
-            rows[name]["result"] = f"not ready: {', '.join(failing) or 'unknown checks'}; glaeda-mini-fleet repair {name}"
+        elif failing:
+            rows[name]["result"] = f"not ready: {', '.join(failing)}; glaeda-mini-fleet repair {name}"
         else:
             ready.append(name)
 

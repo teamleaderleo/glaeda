@@ -731,6 +731,7 @@ class PreflightTests(unittest.TestCase):
         # Root only creates the directory; the brew.sh installer stalled on a Command Line Tools install.
         self.assertIn("  [ -d /opt/homebrew ] || sudo mkdir /opt/homebrew\n", script)
         self.assertIn("  sudo chown -R cmux:admin /opt/homebrew\n", script)
+        self.assertIn('"$(sudo find /opt/homebrew -mindepth 1 -not -type d | head -1)"', script)  # root looks
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
         for word in ("brew install", "install.sh", "curl"):
             self.assertNotIn(word, script)
@@ -758,6 +759,9 @@ class PreflightTests(unittest.TestCase):
                          "move ~/glaeda to the tip of Glaeda main (clean fetch, detached checkout)")
         other = self.result(preflight_text(user="cmux", brew_owner=None, brew_dir="root|empty", rust=False))
         self.assertEqual((other["checks"]["brew"]["group"], other["checks"]["brew"]["action"]["kind"]), ("password", "homebrew"))
+        # An interrupted fetch (a .git, no brew) resumes in fix instead of going to a person.
+        partial = self.result(preflight_text(user="cmux", brew_owner=None, brew_dir="cmux|partial", rust=False))
+        self.assertEqual(partial["checks"]["brew"]["action"], {"kind": "homebrew_fetch"})
         files = self.result(preflight_text(user="cmux", brew_owner=None, brew_dir="cmux|files", rust=False))
         self.assertEqual(files["checks"]["brew"]["group"], "person")
         self.assertIn("move /opt/homebrew aside", files["checks"]["brew"]["fix"])
@@ -1329,6 +1333,10 @@ class FixLibraryTests(unittest.TestCase):
             lacks = self.call(home, "glaeda_sync", new, *mf.ENROLL_FLAGS)
             self.assertEqual(lacks.returncode, 3)
             self.assertIn("predates glaeda-mini-enroll --class-receipt", lacks.stderr)
+            # Already at a commit that lacks an option: refused, never reported unchanged (fix would loop).
+            same = self.call(home, "glaeda_sync", later, *mf.ENROLL_FLAGS)
+            self.assertEqual(same.returncode, 3)
+            self.assertNotIn("unchanged", same.stdout)
             self.assertEqual(git("rev-parse", "HEAD", cwd=home / "glaeda"), later)
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
@@ -1351,6 +1359,9 @@ class FixLibraryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             upstream, peer = repo(home / "upstream", "upstream"), repo(home / "peer", "peer")
+            git("tag", "4.6.0", cwd=upstream)  # the newest release; GitHub's fallback takes it, not HEAD
+            (upstream / "bin/brew").write_text("#!/bin/sh\necho unreleased\n")
+            git("commit", "-qam", "unreleased", cwd=upstream)
 
             def fetch(prefix: Path, *args: str) -> subprocess.CompletedProcess:
                 with mock.patch.object(mf, "ssh_stream", return_value=0) as ssh:
@@ -1371,6 +1382,12 @@ class FixLibraryTests(unittest.TestCase):
             done = fetch(fallback, os.fspath(home / "no-such-peer"))
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertEqual((fallback / "bin/brew").read_text(), "#!/bin/sh\necho upstream\n")
+            resumed = home / "homebrew4"  # an interrupted fetch: git init done, nothing checked out
+            resumed.mkdir()
+            git("init", "-q", cwd=resumed)
+            done = fetch(resumed)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual((resumed / "bin/brew").read_text(), "#!/bin/sh\necho upstream\n")
             busy = home / "homebrew3"
             busy.mkdir()
             (busy / "notes").write_text("mine")
@@ -2172,6 +2189,10 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         syncs = [remote_call(c[1]) for c in calls_to(calls, "glaeda_sync")]
         self.assertEqual(syncs, ["lock; glaeda_sync " + " ".join(["e" * 40, *mf.ENROLL_FLAGS])] * 2)
+        # A blocking unknown still blocks when the old checkout is the only failure.
+        unknown = {h: re.sub(r"pf_pmset\t.*\n", "", text) for h, text in fleet.items()}
+        code, out, calls, _ = self.upgrade(unknown)
+        self.assertIn("not ready: power; glaeda-mini-fleet repair build-mini-1", out)
         with contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(mf.main(["preflight", "--glaeda-ref", "main", "--manifest", os.fspath(EXAMPLE)]), 2)
         self.assertIn("--glaeda-ref is a full commit id", err.getvalue())
