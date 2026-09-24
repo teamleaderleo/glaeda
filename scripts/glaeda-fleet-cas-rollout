@@ -1,0 +1,50 @@
+#!/bin/bash
+# glaeda-fleet-cas-rollout: deploy the fleet compilation cache from an operator Mac.
+#
+#   glaeda-fleet-cas-rollout --store HOST [--writers IP,IP] NODE_HOST...            plan
+#   glaeda-fleet-cas-rollout --store HOST [--writers IP,IP] NODE_HOST... --apply    deploy
+#
+# HOST names are ssh aliases (User cmux). The store listens on the store host's LAN address
+# (en0) port 7450; every NODE_HOST gets a read-only node daemon pointed at it. Each host
+# receives scripts/glaeda-fleet-cas and tools/fleet-cas-prototype under
+# ~/.cache/glaeda-fleet-cas (also when planning) and runs `glaeda-fleet-cas` there
+# (docs/CMUX_BUILD_SLOT_MODES.md).
+# Minis on another LAN cannot reach the store until the tailnet grants the port.
+set -euo pipefail
+here=$(cd "$(dirname "$0")/.." && pwd)
+PORT=7450
+store= writers= apply= nodes=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --store) store=${2:?}; shift ;;
+    --writers) writers=${2:?}; shift ;;
+    --apply) apply=--apply ;;
+    -*) echo "unknown option: $1" >&2; exit 2 ;;
+    *) nodes+=("$1") ;;
+  esac
+  shift
+done
+[ -n "$store" ] || { sed -n '2,5p' "$0" >&2; exit 2; }
+for h in "$store" ${nodes[@]+"${nodes[@]}"}; do
+  target=$(ssh -G "$h" | awk '/^hostname /{print $2}')
+  case "$h $target" in *lawrence*) echo "refusing $h ($target): cmux-lawrence is the fleet coordinator" >&2; exit 2 ;; esac
+done
+
+ship() {  # host
+  ssh -o BatchMode=yes "$1" 'mkdir -p ~/.cache/glaeda-fleet-cas/glaeda/scripts ~/.cache/glaeda-fleet-cas/glaeda/tools'
+  rsync -a -e 'ssh -o BatchMode=yes' "$here/scripts/glaeda-fleet-cas" "$1:.cache/glaeda-fleet-cas/glaeda/scripts/"
+  rsync -a -e 'ssh -o BatchMode=yes' --delete --exclude target "$here/tools/fleet-cas-prototype" "$1:.cache/glaeda-fleet-cas/glaeda/tools/"
+}
+run() {  # host, args...
+  local h=$1; shift
+  echo "== $h"
+  ship "$h"
+  ssh -o BatchMode=yes "$h" "PATH=\$HOME/.cargo/bin:\$PATH ~/.cache/glaeda-fleet-cas/glaeda/scripts/glaeda-fleet-cas $*"
+}
+
+ip=$(ssh -o BatchMode=yes "$store" 'ipconfig getifaddr en0')
+[ -n "$ip" ] || { echo "no en0 address on $store" >&2; exit 1; }
+run "$store" store --listen "$ip:$PORT" ${writers:+--writers "$writers"} $apply
+for n in ${nodes[@]+"${nodes[@]}"}; do
+  run "$n" node --store "$ip:$PORT" $apply
+done

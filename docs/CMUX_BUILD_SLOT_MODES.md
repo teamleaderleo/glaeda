@@ -10,13 +10,18 @@ Xcode's compilation cache and incremental builds do not mix for the cmux app tar
 
 | Build (full `cmux` app, M4 Pro) | Caching on | Caching off |
 | --- | ---: | ---: |
-| fresh DerivedData, fleet store warm | 90 to 130 s | about 750 s (cold) |
-| one-line app-target edit, warm DerivedData | 451 s (whole target recompiles) | about 40 to 48 s |
-| no-op, warm DerivedData | | about 11 s |
+| fresh DerivedData, fleet store warm | 90 to 130 s | 710 s (cold) |
+| one-line app-target edit, warm DerivedData | 451 s (whole target recompiles) | 125 to 156 s (646 compile steps) |
+| no-op, warm DerivedData | | 13 to 14 s |
+| flip caching on / off in the same DerivedData | 606 s (full rebuild) | 755 s (full rebuild) |
 
-The caching-off edit and no-op numbers are from the Air Blue campaign (Xcode 27) and still
-need measuring on a mini at the fleet pin; the rest are from the minis on Xcode 26.3. The
-fresh-build row assumes the fleet store already holds that commit. With caching on, every
+The caching-off column and the flip row are from cmux8s at the fleet pin, Xcode 26.6
+(17F113); the caching-on column is from the minis on Xcode 26.3, with a different edit, so the
+two edit cells are not a strict pair. The edit was a new
+file-scope declaration in one app file (`WorkspaceTodoState.swift`), which recompiled 646
+dependent compile steps; its revert took 125 s. An edit inside a function body likely
+recompiles less (the Air Blue campaign saw 40 to 48 s on Xcode 27) and has not been measured
+on the pin. The fresh-build row assumes the fleet store already holds that commit. With caching on, every
 compile job's key covers the whole module, so any edit misses every job in the app target.
 
 Turning caching off for the app target alone (a per-target macro) while packages stay cached
@@ -30,8 +35,8 @@ So a slot keeps two DerivedData directories and picks per job:
 - **Catch-up mode (caching on):** a fresh machine, a slot far behind main, or a one-shot build
   of a commit (CI, a PR product). Fed by the fleet store: about 100 s from nothing.
 - **Iteration mode (caching off):** edit loops on a slot that is already warm at, or near, the
-  commit being edited. About 40 to 48 s per app edit and 11 s no-op (Air Blue, Xcode 27); under
-  20 s needs a smaller app module (manaflow-ai/cmux#13108).
+  commit being edited. 125 to 156 s for an app edit that adds a declaration, 13 to 14 s no-op
+  (Xcode 26.6); well under a minute needs a smaller app module (manaflow-ai/cmux#13108).
 
 A **slot** is one checkout plus its iteration DerivedData, leased to one user or agent at a
 time. Slots on a host never build at the same time: every build takes the host lock.
@@ -85,15 +90,37 @@ The worker recipe must enforce, since a host check cannot see a job's settings:
 - the two plugin settings come only from `fleet-cas-settings.sh <socket>`, which prints them
   only when the node answers (a dead socket makes a build crawl instead of failing; the script
   exists, the recipe change is planned);
-- the fleet store is segmented by Xcode build (planned; the prototype has one namespace).
+- entries from different Xcode builds are kept apart. One store serves every build: a 26.6
+  build against a 26.3 store compiled everything, consistent with the compiler being in the
+  key (the key inputs were not inspected). A per-build segment is planned only for eviction.
 
 Writer: CI's main build is the trusted writer, filling the store for every main commit it
 builds (planned; the prototype has no signed writes yet, see #1134 M3). Nothing else writes.
 
+## Deployment
+
+`scripts/glaeda-fleet-cas-rollout --store HOST NODE_HOST... [--apply]` from an operator Mac
+deploys both services (plan by default). On each host it runs `scripts/glaeda-fleet-cas`,
+which builds the prototype and installs user LaunchAgents:
+
+- `com.teamleaderleo.glaeda.fleet-cas-store` on the store host: the fleet store on the host's
+  LAN address, port 7450, store under `xcode/fleet-store`. Only `--writers` addresses may
+  write (checked per request against the TCP peer address); none by default, so a new store
+  is read-only until the trusted writer exists. Other LANs need a tailnet grant for the port.
+- `com.teamleaderleo.glaeda.fleet-cas-node` on every build host: the node daemon on the socket
+  above, read-only (`--read-only-kv`) until then, and `xcode/bin/fleet-cas-settings.sh`.
+
+A writer host must not run untrusted jobs: the allowlist trusts every process on an allowed
+address until signed writes (M3) exist. The store listens on a DHCP address, so the store host
+needs a DHCP reservation. The agents need the build user's GUI session; the fleet minis log in
+automatically. `glaeda-fleet-cas uninstall
+--apply` removes both agents and keeps the stores. Deployed on cmux7s (store and node) and
+cmux8s (node) on 2026-09-24.
+
 ## When to switch
 
 Catch-up is only fast when the store already holds the target commit; on a store miss it
-is a cold build (about 750 to 800 s), slower than an incremental caching-off rebuild. So the
+is a cold build (756 s on Xcode 26.3 minis; a full caching-on rebuild took 606 s on 26.6), slower than an incremental caching-off rebuild. So the
 worker asks first: the writer records a marker per commit it has filled (planned), and
 catch-up is chosen only when the marker for the target commit exists. The rows below are read
 top to bottom, first match wins, and the writer is exempt: CI's main build always runs catch-up
@@ -113,16 +140,18 @@ merge base with main has a marker (its own changes are few, and they miss either
 started once the catch-up product is delivered. It takes the host lock like any job, and a
 `flock` does not preempt, so a foreground job must be able to cancel it: the warmer registers
 its xcodebuild process, the foreground job stops it and requeues the warm (planned). An
-interrupted incremental build is expected to leave DerivedData usable, with the next build
-redoing the unfinished work (not measured yet; Next, item 1). Because every slot shares the
+build stopped during planning left DerivedData usable: on the pin, a build stopped after 25 s
+was followed by an ordinary incremental one (143 s, the same 646 steps as the uncancelled
+edit). That stop landed during planning; a stop in the middle of compiling is still
+unmeasured. Because every slot shares the
 host lock, an iteration edit can also wait behind another slot's foreground build, about 100 s
 for a catch-up; edit latency includes that wait.
 
 ## Warming the iteration DerivedData
 
 It cannot be derived from the catch-up DerivedData: caching changes every compile job's command
-line, so flipping a DerivedData from caching on to caching off rebuilds everything (776 s on
-Air Blue, Xcode 27; to be confirmed on 26.6 before the worker relies on it). The iteration
+line, so flipping a DerivedData between the modes rebuilds everything, in both directions
+(on the pin: 606 s turning caching on, 755 s turning it off). The iteration
 DerivedData is therefore warmed by its own caching-off builds:
 
 - an idle warmer rebuilds a slot's iteration DerivedData at main's tip, but only a slot with
@@ -132,17 +161,15 @@ DerivedData is therefore warmed by its own caching-off builds:
   36 s for a new tag into a warm pair and 620 s when a low-level package changed. How often a
   main commit touches a low-level package has not been counted, so the warmer's average cost
   is unknown;
-- warming a slot from nothing is a cold caching-off build (about 750 s on a mini), so a host
+- warming a slot from nothing is a cold caching-off build (710 s on a mini at the pin), so a host
   warms its slots one at a time, idle only, and a new slot is usable in catch-up mode before
   its iteration DerivedData is ready;
 - the source checkout per slot stays at a fixed path, so incremental state stays valid.
 
 ## Next
 
-1. On a mini at the fleet pin: caching-off edit and no-op times in a warm iteration
-   DerivedData, the flip-is-a-full-rebuild result, a cancelled warm build followed by an
-   incremental one, and the mixed-mode edit and no-op runs (with the fresh-build hit loss
-   diagnosed).
+1. On the pin: a function-body app edit, a cancellation in the middle of compiling, and the
+   mixed-mode edit and no-op runs (with the fresh-build hit loss diagnosed).
 2. Cut the non-compiler work a catch-up build still does. Summed task time, not wall time:
    SwiftDriver planning and scanning 163 s, script phases 18 s (Rust diff sidecar, nucleo FFI,
    wireguard-go), App Intents extraction 16 s over 89 tasks. Script phases can be cached by

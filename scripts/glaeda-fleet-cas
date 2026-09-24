@@ -1,0 +1,176 @@
+#!/bin/bash
+# glaeda-fleet-cas: install the fleet compilation-cache services on this cmux mini.
+#
+#   glaeda-fleet-cas node --store HOST:PORT            plan the node daemon
+#   glaeda-fleet-cas node --store HOST:PORT --apply    install and start it
+#   glaeda-fleet-cas store --listen IP:PORT [--writers IP,IP] [--apply]
+#   glaeda-fleet-cas uninstall [--apply]               remove both, keep the stores
+#
+# Run from a glaeda checkout on the mini (scripts/glaeda-fleet-cas-rollout does that from
+# an operator Mac). Planning changes nothing on this host; --apply is idempotent and restarts
+# a service only when its plist or binary changed. Everything is owned by the current user:
+# binaries and stores under /Users/Shared/cmux-build-fleet/xcode, user LaunchAgents
+# com.teamleaderleo.glaeda.fleet-cas-{node,store}, which need the user's GUI session
+# (the fleet minis log in automatically). No sudo.
+#
+# node:  Xcode talks to /Users/Shared/cmux-build-fleet/xcode/fleet-cas.sock. The node is
+#        read-only (--read-only-kv) until the trusted writer exists (#1134 M3). Builds add
+#        the plugin settings only from `xcode/bin/fleet-cas-settings.sh <socket>`.
+# store: the fleet store on the LAN. Only --writers addresses may write; none by default,
+#        so a new store is read-only. A writer host must not run untrusted jobs: the
+#        allowlist trusts every process on it until signed writes (#1134 M3) exist. The
+#        listen address should be a DHCP reservation, or the store stops binding after a
+#        lease change.
+# Design: docs/CMUX_BUILD_SLOT_MODES.md. Prototype: tools/fleet-cas-prototype.
+set -euo pipefail
+
+ROOT=/Users/Shared/cmux-build-fleet/xcode
+BIN=$ROOT/bin
+SOCK=$ROOT/fleet-cas.sock
+NODE_STORE=$ROOT/node-store
+FLEET_STORE=$ROOT/fleet-store
+AGENTS=$HOME/Library/LaunchAgents
+LOGS=$HOME/Library/Logs
+here=$(cd "$(dirname "$0")/.." && pwd)
+proto=$here/tools/fleet-cas-prototype
+
+role=${1:-}; shift || true
+apply= store= listen= writers=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --apply) apply=1 ;;
+    --store) store=${2:?--store HOST:PORT}; shift ;;
+    --listen) listen=${2:?--listen IP:PORT}; shift ;;
+    --writers) writers=${2:?--writers IP,IP}; shift ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+say() { printf '%s %s\n' "$([ -n "$apply" ] && echo apply || echo plan)" "$*"; }
+do_() { say "$*"; [ -z "$apply" ] || "$@"; }
+
+label_for() { echo "com.teamleaderleo.glaeda.fleet-cas-$1"; }
+xml() { local v=${1//&/"&amp;"}; v=${v//</"&lt;"}; v=${v//>/"&gt;"}; printf '%s' "$v"; }
+
+check_owner() {
+  if [ -e "$ROOT" ] && [ "$(stat -f %u "$ROOT")" != "$(id -u)" ]; then
+    echo "$ROOT is not owned by $(id -un); refusing to install into it" >&2; exit 1
+  fi
+}
+
+bootstrap() {  # label, plist: bootout then bootstrap, retrying the known teardown race
+  launchctl bootout "gui/$(id -u)/$1" 2>/dev/null || true
+  local i
+  for i in 1 2 3 4 5; do
+    launchctl bootstrap "gui/$(id -u)" "$2" 2>/dev/null && return 0
+    sleep 1
+  done
+  launchctl bootstrap "gui/$(id -u)" "$2"
+}
+
+health_failed() {  # role
+  echo "fleet-cas $1 is not healthy; last log lines:" >&2
+  tail -5 "$LOGS/glaeda-fleet-cas-$1.log" >&2 2>/dev/null || true
+  exit 1
+}
+
+write_plist() {  # role, args...
+  local r=$1; shift
+  local label; label=$(label_for "$r")
+  local plist=$AGENTS/$label.plist
+  say "write $plist: $BIN/fleet-cas $*"
+  [ -n "$apply" ] || return 0
+  mkdir -p "$AGENTS" "$LOGS"
+  local args="" a
+  for a in "$BIN/fleet-cas" "$@"; do args+="        <string>$(xml "$a")</string>"$'\n'; done
+  cat >"$plist.tmp" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- fleet-cas binary sha256 $(shasum -a 256 "$BIN/fleet-cas" | cut -c1-64): a new binary changes this plist, so every role restarts -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$label</string>
+    <key>ProgramArguments</key>
+    <array>
+$args    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Adaptive</string>
+    <key>StandardOutPath</key>
+    <string>$LOGS/glaeda-fleet-cas-$r.log</string>
+    <key>StandardErrorPath</key>
+    <string>$LOGS/glaeda-fleet-cas-$r.log</string>
+</dict>
+</plist>
+PLIST
+  plutil -lint -s "$plist.tmp"
+  if cmp -s "$plist.tmp" "$plist" \
+    && launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+    rm -f "$plist.tmp"; echo "unchanged $label"; return 0
+  fi
+  mv "$plist.tmp" "$plist"
+  bootstrap "$label" "$plist"
+}
+
+install_binaries() {
+  say "build $proto (cargo build --release --locked)"
+  if [ -n "$apply" ]; then
+    check_owner
+    # cargo competes with builds for the mini, so it takes the fleet host lock where one exists.
+    if [ -e "${FLEET_HOST_LOCK:-/Users/Shared/cmux-build-fleet/host.lock}" ]; then
+      (cd "$proto" && scripts/with-fleet-lock.pl cargo build --release --locked -q)
+    else
+      (cd "$proto" && cargo build --release --locked -q)
+    fi
+    mkdir -p "$BIN"
+    local f src
+    for f in fleet-cas fleet-cas-settings.sh; do
+      src=$proto/target/release/$f; [ "$f" = fleet-cas ] || src=$proto/scripts/$f
+      if ! cmp -s "$src" "$BIN/$f"; then
+        install -m 0755 "$src" "$BIN/$f.new" && mv "$BIN/$f.new" "$BIN/$f"
+      fi
+    done
+  fi
+  say "install $BIN/fleet-cas and $BIN/fleet-cas-settings.sh"
+}
+
+case $role in
+  node)
+    [ -n "$store" ] || { echo "node needs --store HOST:PORT" >&2; exit 2; }
+    install_binaries
+    do_ mkdir -p "$NODE_STORE"
+    write_plist node "$SOCK" "$NODE_STORE" --read-only-kv --upstream "http://$store"
+    if [ -n "$apply" ]; then
+      for _ in 1 2 3 4 5 6 7 8 9 10; do "$BIN/fleet-cas-settings.sh" "$SOCK" >/dev/null 2>&1 && break; sleep 0.5; done
+      "$BIN/fleet-cas-settings.sh" "$SOCK" >/dev/null 2>&1 || health_failed node
+      echo "ok node answering on $SOCK (upstream $store)"
+    fi
+    ;;
+  store)
+    [ -n "$listen" ] || { echo "store needs --listen IP:PORT (a LAN address, never 0.0.0.0)" >&2; exit 2; }
+    case $listen in 0.0.0.0:* | \[::\]:*) echo "refusing a wildcard listen address" >&2; exit 2 ;; esac
+    install_binaries
+    do_ mkdir -p "$FLEET_STORE"
+    write_plist store "tcp:$listen" "$FLEET_STORE" --writers "$writers"
+    if [ -n "$apply" ]; then
+      for _ in 1 2 3 4 5 6 7 8 9 10; do nc -z -G 1 "${listen%:*}" "${listen##*:}" 2>/dev/null && break; sleep 0.5; done
+      nc -z -G 2 "${listen%:*}" "${listen##*:}" 2>/dev/null || health_failed store
+      echo "ok store listening on $listen (writers: ${writers:-none})"
+    fi
+    ;;
+  uninstall)
+    for r in node store; do
+      label=$(label_for "$r")
+      say "stop and remove $label (stores kept)"
+      [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true; rm -f "$AGENTS/$label.plist"; }
+    done
+    ;;
+  *) sed -n '2,8p' "$0" >&2; exit 2 ;;
+esac

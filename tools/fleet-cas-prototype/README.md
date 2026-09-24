@@ -56,6 +56,10 @@ The node prefetches: after fetching an index entry it asks the fleet store for
 the entry's whole object closure in one streamed call (`GetClosure` in
 `proto/fleet_cas.proto`, a glaeda extension, not part of Xcode's protocol).
 `--no-prefetch` turns it off.
+
+A TCP store accepts writes only from `--writers IP,IP` (the peer address of each request);
+with no list it is read-only. Fleet deployment: `scripts/glaeda-fleet-cas-rollout` and
+`docs/CMUX_BUILD_SLOT_MODES.md`.
 Build under `$HOME` (never `/tmp`, see swiftlang/swift#92545). On Xcode 26.3,
 pass `DD=<fixed path>` (the same on every machine) instead of mapping
 DerivedData; see the 2026-09-24 experiment. On a cmux build fleet mini,
@@ -65,8 +69,10 @@ during a measurement.
 Known prototype gaps: the node daemon must run on the same host as the build
 (the client sends large blobs as local file paths, and the node reads whatever
 path it is given, so run it only for your own user; the TCP fleet store
-refuses file-path uploads); the TCP fleet store has no authentication, so bind
-it only to a trusted interface; a KV entry is not checked for its objects'
+refuses file-path uploads); the TCP fleet store authenticates nothing but the
+peer address (`--writers`), which anyone on the LAN can spoof for a
+connection, so bind it only to a trusted interface and treat signed writes
+(#1134 M3) as the real gate; a KV entry is not checked for its objects'
 presence (`kv_put_dangling` only counts entries that name absent objects);
 there is no size budget or eviction; and a node that cannot reach the fleet
 store answers reads as misses and fails writes (counted in `up_errors`), then
