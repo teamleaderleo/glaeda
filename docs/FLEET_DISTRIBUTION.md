@@ -107,5 +107,24 @@ rollback. No automatic predecessor upgrade is authorized by this format.
 
 For now, an operator selects an exact reviewed candidate, preserves the previous
 generation, and runs the enrollment renewal and acceptance sequence after updating.
+
+A fleet tool change (`cmux_fleet.py`, `cmux_fleet_bootstrap.py`) reaches minis only in
+a new candidate: a staged generation runs its own copy, and the digest of both files
+is the fleet contract generation every acceptance binds. So a new candidate stales
+every node and class acceptance. Roll one out like this:
+
+1. After the change merges, dispatch `fleet-candidate.yml` on the merged commit and
+   take the run ID, source, archive SHA-256 and artifact `expires_at` from that run.
+2. In manaflow-ai/cmux `scripts/ci/persistent_compile_fleet.py`, set
+   `CANDIDATE_RUN`, `CANDIDATE_SOURCE`, `CANDIDATE_SHA256` and `CANDIDATE_EXPIRES`
+   to them (`CANDIDATE_ARTIFACT` and `CANDIDATE_REPO` stay). `persistent-compile up`
+   and `glaeda-mini-fleet onboard` read the candidate from there.
+3. On one node per class (for `std`, cmux-mac-001): stage the candidate with
+   `fleet_bundle.py stage`, quarantine the enrollment, run the new generation's
+   bootstrap into a private file, `renew-enrollment` and `renew-enrollment-apply`,
+   then `glaeda-mini-enroll ... --apply` runs the one `accept-local`. Then
+   `export-class-acceptance` ([Class acceptance](CMUX_FLEET_ENROLLMENT.md#class-acceptance))
+   and record the receipt and its `receiptSha256` in the manifest class.
+4. `glaeda-mini-fleet onboard --acceptance class --yes` joins the rest of the class.
 Repository-side automation should build on this same bundle, without requiring
 the CMUX team to design a second distribution system.

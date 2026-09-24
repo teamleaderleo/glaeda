@@ -18,6 +18,8 @@ from typing import Any
 
 ENROLLMENT_SCHEMA = "glaeda-cmux-fleet-enrollment/v1"
 ACCEPTANCE_SCHEMA = "glaeda-cmux-fleet-acceptance/v2"
+CLASS_ACCEPTANCE_SCHEMA = "glaeda-cmux-fleet-class-acceptance/v1"
+CANDIDATE_MANIFEST_SCHEMA = "glaeda-fleet-candidate/v1"
 STATUS_SCHEMA = "glaeda-cmux-fleet-node-status/v1"
 BOOTSTRAP_SCHEMA = "glaeda-cmux-fleet-bootstrap/v1"
 MAX_DOCUMENT_BYTES = 64 * 1024
@@ -26,6 +28,8 @@ SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,79}\Z")
 NODE_RE = re.compile(r"cmux-[a-z0-9][a-z0-9-]{2,59}\Z")
+FLEET_CLASS_RE = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
+HARDWARE_TEXT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ,.()_@-]{0,79}\Z")
 REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}/[A-Za-z0-9_.-]{1,100}\Z")
 
 ROLES = (
@@ -55,6 +59,9 @@ RETAINED_ATTEMPT_LIMIT = 3
 ATTEMPT_SUFFIX = re.compile(r"[a-z0-9_]{8}")
 LOCAL_EXECUTION_CLASS = "glaeda-local-profile/v1"
 EXTERNAL_EVIDENCE_CLASS = "external-evidence/v1"
+# A node receipt minted from a class acceptance: no build ran on this node; it
+# re-observed itself and matched the class receipt exactly (adopt_class_acceptance).
+CLASS_EXECUTION_CLASS = "glaeda-class-acceptance/v1"
 ACCEPTANCE_CHILD_ENV_KEYS = (
     "PATH",
     "HOME",
@@ -97,6 +104,10 @@ ENROLLMENT_KEYS = {
     "allowedExecutionRoles", "operatorFleetScope",
     "enrollmentGeneration", "glaedaGeneration", "state", "quarantineReason",
 }
+# Present only on a node that became eligible on a class acceptance: the
+# receiptSha256 of the class receipt it relied on. Absent keeps older
+# enrollments valid byte for byte.
+ENROLLMENT_OPTIONAL_KEYS = {"classAcceptanceSha256"}
 
 class FleetError(RuntimeError):
     """A closed fleet enrollment/status refusal."""
@@ -180,7 +191,11 @@ def sorted_unique_strings(value: object, label: str, *, allowed: set[str] | None
 
 
 def validate_enrollment(value: object) -> dict[str, Any]:
-    doc = exact_keys(value, ENROLLMENT_KEYS, "enrollment")
+    if isinstance(value, dict) and set(value) == ENROLLMENT_KEYS | ENROLLMENT_OPTIONAL_KEYS:
+        sha256(value["classAcceptanceSha256"], "enrollment class acceptance digest")
+        doc = value
+    else:
+        doc = exact_keys(value, ENROLLMENT_KEYS, "enrollment")
     if doc["schema"] != ENROLLMENT_SCHEMA:
         raise FleetError("enrollment schema is unsupported")
     if not isinstance(doc["nodeId"], str) or NODE_RE.fullmatch(doc["nodeId"]) is None:
@@ -573,7 +588,15 @@ ACCEPTANCE_RECEIPT_KEYS = {
 
 
 def validate_acceptance_receipt(value: object) -> dict[str, Any]:
-    doc = exact_keys(value, ACCEPTANCE_RECEIPT_KEYS, "acceptance receipt")
+    class_derived = (
+        isinstance(value, dict)
+        and value.get("executionClass") == CLASS_EXECUTION_CLASS
+    )
+    doc = exact_keys(
+        value,
+        ACCEPTANCE_RECEIPT_KEYS | ({"classAcceptanceSha256"} if class_derived else set()),
+        "acceptance receipt",
+    )
     if doc["schema"] != ACCEPTANCE_SCHEMA:
         raise FleetError("acceptance receipt schema is unsupported")
     if not isinstance(doc["nodeId"], str) or NODE_RE.fullmatch(doc["nodeId"]) is None:
@@ -616,8 +639,11 @@ def validate_acceptance_receipt(value: object) -> dict[str, Any]:
     if doc["executionClass"] not in {
         LOCAL_EXECUTION_CLASS,
         EXTERNAL_EVIDENCE_CLASS,
+        CLASS_EXECUTION_CLASS,
     }:
         raise FleetError("acceptance execution class is invalid")
+    if class_derived:
+        sha256(doc["classAcceptanceSha256"], "class acceptance digest")
     local_attempt = sha256(
         doc["localExecutionAttemptSha256"],
         "local execution attempt",
@@ -635,8 +661,10 @@ def validate_acceptance_receipt(value: object) -> dict[str, Any]:
     accepted = (
         doc["cmuxSemanticResultState"] == "passed"
         and doc["processSettlement"] == "complete"
-        and doc["executionClass"] == LOCAL_EXECUTION_CLASS
-        and local_attempt is not None
+        and (
+            (doc["executionClass"] == LOCAL_EXECUTION_CLASS and local_attempt is not None)
+            or class_derived
+        )
     )
     if (doc["result"] == "accepted") != accepted:
         raise FleetError("acceptance receipt result disagrees with semantic result")
@@ -658,6 +686,13 @@ def acceptance_matches_enrollment(enrollment: dict[str, Any], receipt: dict[str,
         return False, "acceptance_toolchain_stale"
     if receipt.get("profile") != enrollment["roleProfiles"].get(role):
         return False, "acceptance_profile_stale"
+    recorded = enrollment.get("classAcceptanceSha256")
+    if (
+        receipt.get("executionClass") == CLASS_EXECUTION_CLASS
+        and recorded is not None
+        and receipt.get("classAcceptanceSha256") != recorded
+    ):
+        return False, "acceptance_class_stale"
     return True, "accepted"
 
 
@@ -837,7 +872,11 @@ def transition(
         if enrollment["enrollmentGeneration"] == 2**31 - 1:
             raise FleetError("enrollment generation is exhausted")
         enrollment["enrollmentGeneration"] += 1
+        # A new generation relies on no earlier acceptance, class or local.
+        enrollment.pop("classAcceptanceSha256", None)
     enrollment["state"] = target
+    if target == "eligible":
+        enrollment.pop("classAcceptanceSha256", None)
     enrollment = validate_enrollment(enrollment)
     if target == "eligible":
         status = node_status(enrollment, acceptance_values or [])
@@ -845,6 +884,20 @@ def transition(
             raise FleetError(
                 "eligible transition requires a current accepted role receipt"
             )
+        # Record which class receipt, if any, the eligible roles rest on, so the
+        # enrollment says whether this node was built on or only matched.
+        eligible_roles = {r["role"] for r in status["roles"] if r["eligible"]}
+        relied = sorted({
+            receipt["classAcceptanceSha256"]
+            for receipt in map(validate_acceptance_receipt, acceptance_values or [])
+            if receipt["role"] in eligible_roles
+            and receipt["executionClass"] == CLASS_EXECUTION_CLASS
+        })
+        if len(relied) > 1:
+            raise FleetError("eligible roles rest on different class acceptances")
+        if relied:
+            enrollment["classAcceptanceSha256"] = relied[0]
+            enrollment = validate_enrollment(enrollment)
     return enrollment
 
 
@@ -1361,6 +1414,61 @@ def _decode_bootstrap_output(raw: bytes) -> object:
     return value
 
 
+def _run_bootstrap(
+    bootstrap_script: Path,
+    enrollment: dict[str, Any],
+    role: str,
+    cmux_root: Path,
+    glaeda: Path,
+    cache_root: Path | None,
+    min_free_gib: int | None,
+    environment: dict[str, str],
+) -> dict[str, Any]:
+    """Run this Glaeda's read-only bootstrap for the enrolled role and parse it."""
+    argv = [
+        sys.executable,
+        "-I",
+        str(bootstrap_script),
+        "--platform",
+        enrollment["os"]["family"],
+        "--cmux-root",
+        str(cmux_root),
+        "--glaeda",
+        str(glaeda),
+        "--hardware-class",
+        enrollment["hardwareCapabilityClass"],
+        "--role",
+        role,
+    ]
+    if cache_root is not None:
+        argv.extend(["--cache-root", str(cache_root)])
+    if min_free_gib is not None:
+        argv.extend(["--min-free-gib", str(min_free_gib)])
+    try:
+        bootstrap = subprocess.run(
+            argv,
+            cwd=Path(__file__).resolve().parents[1],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            check=False,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise FleetError("post-acceptance bootstrap timed out") from error
+    if bootstrap.returncode != 0:
+        detail = bootstrap.stderr.decode("utf-8", errors="replace").strip()
+        raise FleetError(
+            "post-acceptance bootstrap refused"
+            + (f": {detail[:1024]}" if detail else "")
+        )
+    value = _decode_bootstrap_output(bootstrap.stdout)
+    if not isinstance(value, dict):
+        raise FleetError("post-acceptance bootstrap is not an object")
+    return value
+
+
 def accept_local(
     enrollment_path: Path,
     cmux_root_value: Path,
@@ -1478,47 +1586,16 @@ def accept_local(
         if cmux_result.get("source") != expected_source:
             raise FleetError("CMUX acceptance result does not match requested source")
 
-        bootstrap_argv = [
-            sys.executable,
-            "-I",
-            str(bootstrap_script),
-            "--platform",
-            family,
-            "--cmux-root",
-            str(cmux_root),
-            "--glaeda",
-            str(glaeda),
-            "--hardware-class",
-            enrollment["hardwareCapabilityClass"],
-            "--role",
+        post_bootstrap = _run_bootstrap(
+            bootstrap_script,
+            enrollment,
             role,
-        ]
-        if cache_root is not None:
-            bootstrap_argv.extend(["--cache-root", str(cache_root)])
-        if min_free_gib is not None:
-            bootstrap_argv.extend(["--min-free-gib", str(min_free_gib)])
-        try:
-            bootstrap = subprocess.run(
-                bootstrap_argv,
-                cwd=Path(__file__).resolve().parents[1],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=child_environment,
-                check=False,
-                timeout=180,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise FleetError("post-acceptance bootstrap timed out") from error
-        if bootstrap.returncode != 0:
-            detail = bootstrap.stderr.decode("utf-8", errors="replace").strip()
-            raise FleetError(
-                "post-acceptance bootstrap refused"
-                + (f": {detail[:1024]}" if detail else "")
-            )
-        post_bootstrap = _decode_bootstrap_output(bootstrap.stdout)
-        if not isinstance(post_bootstrap, dict):
-            raise FleetError("post-acceptance bootstrap is not an object")
+            cmux_root,
+            glaeda,
+            cache_root,
+            min_free_gib,
+            child_environment,
+        )
         toolchain_generation = post_bootstrap.get("toolchainGeneration")
         sha256(toolchain_generation, "post-acceptance toolchain generation")
         if toolchain_generation not in enrollment["supportedToolchainGenerations"]:
@@ -1558,6 +1635,436 @@ def accept_local(
                 _notice(f"acceptance attempt directory remains: {state_root}")
         else:
             _retain_attempt(state_root, fleet_root)
+
+
+CLASS_ACCEPTANCE_KEYS = {
+    "schema", "fleetClass", "role", "profile", "architecture", "osVersionClass",
+    "hardware", "toolchain", "toolchainGeneration", "glaedaGeneration",
+    "glaedaFleetContractGeneration", "glaedaCandidate", "source",
+    "cmuxSemanticResultSha256", "cmuxEnvironmentClass", "cmuxToolchainIdentity",
+    "acceptingNodeId", "acceptingEnrollmentGeneration", "acceptingReceiptSha256",
+    "receiptSha256",
+}
+# Compared field by field, in this order, when a node adopts a class receipt.
+CLASS_IDENTITY_FIELDS = ("architecture", "osVersionClass", "hardware", "toolchain")
+
+
+def fleet_class(value: object) -> str:
+    if not isinstance(value, str) or FLEET_CLASS_RE.fullmatch(value) is None:
+        raise FleetError("fleet class is invalid (lowercase, such as std or light)")
+    return value
+
+
+def toolchain_generation_of(toolchain: dict[str, Any]) -> str:
+    """cmux_fleet_bootstrap's toolchainGeneration for these observations."""
+    return "sha256:" + hashlib.sha256(canonical(toolchain)).hexdigest()
+
+
+def _validate_toolchain_observations(value: object, label: str) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or not value
+        or len(value) > 32
+        or any(
+            not isinstance(name, str)
+            or TOKEN_RE.fullmatch(name.lower()) is None
+            or not (
+                (isinstance(item, str) and len(item) <= 512)
+                or type(item) is int
+            )
+            for name, item in value.items()
+        )
+    ):
+        raise FleetError(f"{label} toolchain observations are invalid")
+    return value
+
+
+def _validate_hardware(value: object, label: str) -> dict[str, Any]:
+    hardware = exact_keys(value, {"model", "chip", "memoryGiB"}, f"{label} hardware")
+    for name in ("model", "chip"):
+        if (
+            not isinstance(hardware[name], str)
+            or HARDWARE_TEXT_RE.fullmatch(hardware[name]) is None
+        ):
+            raise FleetError(f"{label} hardware {name} is invalid")
+    positive_int(hardware["memoryGiB"], f"{label} hardware memory")
+    return hardware
+
+
+def bootstrap_class_identity(bootstrap_value: dict[str, Any]) -> dict[str, Any]:
+    """What a class receipt binds, as this node's bootstrap reports it."""
+    observed = bootstrap_value.get("observed")
+    if not isinstance(observed, dict) or "hardware" not in observed or "toolchain" not in observed:
+        raise FleetError(
+            "bootstrap reports no hardware or toolchain identity; class acceptance "
+            "needs a macOS bootstrap from a candidate that reports them"
+        )
+    toolchain = _validate_toolchain_observations(observed["toolchain"], "bootstrap")
+    if toolchain_generation_of(toolchain) != bootstrap_value.get("toolchainGeneration"):
+        raise FleetError("bootstrap toolchain observations disagree with its toolchain generation")
+    return {
+        "architecture": bootstrap_value.get("architecture"),
+        "osVersionClass": bootstrap_value.get("osVersionClass"),
+        "hardware": _validate_hardware(observed["hardware"], "bootstrap"),
+        "toolchain": toolchain,
+        "toolchainGeneration": bootstrap_value["toolchainGeneration"],
+        "glaedaGeneration": bootstrap_value.get("glaedaGeneration"),
+    }
+
+
+def candidate_identity(glaeda_generation: str, root: Path | None = None) -> dict[str, str]:
+    """The staged Glaeda candidate this code and binary came from.
+
+    Read from the generation's manifest.json, and believed only where it names
+    the bytes actually running: this file, the bootstrap, and the glaeda binary
+    whose digest is the Glaeda generation. A checkout has no manifest, so class
+    acceptance is a candidate-only path.
+    """
+    root = root or Path(__file__).resolve().parents[1]
+    manifest_path = root / "manifest.json"
+    try:
+        raw = manifest_path.read_bytes()
+    except OSError as error:
+        raise FleetError(
+            "class acceptance needs a staged Glaeda candidate "
+            "(docs/FLEET_DISTRIBUTION.md); this cmux_fleet.py has no manifest.json"
+        ) from error
+    if len(raw) > MAX_DOCUMENT_BYTES:
+        raise FleetError("Glaeda candidate manifest exceeds size ceiling")
+    try:
+        manifest = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise FleetError("Glaeda candidate manifest is invalid JSON") from error
+    if not isinstance(manifest, dict) or manifest.get("schema") != CANDIDATE_MANIFEST_SCHEMA:
+        raise FleetError("Glaeda candidate manifest schema is unsupported")
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise FleetError("Glaeda candidate manifest lists no files")
+
+    def listed(name: str) -> str | None:
+        entry = files.get(name)
+        value = entry.get("sha256") if isinstance(entry, dict) else None
+        return "sha256:" + value if isinstance(value, str) else None
+
+    running = {
+        "scripts/cmux_fleet.py": _file_sha256(root / "scripts/cmux_fleet.py"),
+        "scripts/cmux_fleet_bootstrap.py": _file_sha256(root / "scripts/cmux_fleet_bootstrap.py"),
+        "bin/glaeda": glaeda_generation,
+    }
+    for name, actual in running.items():
+        if listed(name) != actual:
+            raise FleetError(
+                f"Glaeda candidate manifest does not describe the running {name}"
+            )
+    source = exact_keys(
+        manifest.get("source"), {"repository", "commit", "tree"}, "Glaeda candidate source"
+    )
+    if (
+        not isinstance(source["repository"], str)
+        or REPOSITORY_RE.fullmatch(source["repository"]) is None
+        or not isinstance(source["commit"], str)
+        or COMMIT_RE.fullmatch(source["commit"]) is None
+        or not isinstance(source["tree"], str)
+        or COMMIT_RE.fullmatch(source["tree"]) is None
+    ):
+        raise FleetError("Glaeda candidate source is invalid")
+    return dict(source)
+
+
+def validate_class_acceptance(value: object) -> dict[str, Any]:
+    doc = exact_keys(value, CLASS_ACCEPTANCE_KEYS, "class acceptance receipt")
+    if doc["schema"] != CLASS_ACCEPTANCE_SCHEMA:
+        raise FleetError("class acceptance receipt schema is unsupported")
+    fleet_class(doc["fleetClass"])
+    if doc["role"] not in ENROLLABLE_ROLES:
+        raise FleetError("class acceptance role lacks a reviewed v1 profile")
+    if doc["profile"] != ROLE_PROFILES[doc["role"]]:
+        raise FleetError("class acceptance profile is not the reviewed role profile")
+    if doc["architecture"] not in {"arm64", "x86_64"}:
+        raise FleetError("class acceptance architecture is unsupported")
+    token(doc["osVersionClass"], "class acceptance OS version class")
+    _validate_hardware(doc["hardware"], "class acceptance")
+    _validate_toolchain_observations(doc["toolchain"], "class acceptance")
+    if doc["toolchainGeneration"] != toolchain_generation_of(doc["toolchain"]):
+        raise FleetError("class acceptance toolchain generation disagrees with its observations")
+    for name in (
+        "glaedaGeneration",
+        "glaedaFleetContractGeneration",
+        "cmuxSemanticResultSha256",
+        "cmuxToolchainIdentity",
+        "acceptingReceiptSha256",
+        "receiptSha256",
+    ):
+        sha256(doc[name], f"class acceptance {name}")
+    candidate = exact_keys(
+        doc["glaedaCandidate"], {"repository", "commit", "tree"}, "class acceptance candidate"
+    )
+    source = exact_keys(doc["source"], {"repository", "commit", "tree"}, "class acceptance source")
+    if (
+        source["repository"] != CMUX_REPOSITORY
+        or not isinstance(candidate["repository"], str)
+        or REPOSITORY_RE.fullmatch(candidate["repository"]) is None
+        or any(
+            not isinstance(item[key], str) or COMMIT_RE.fullmatch(item[key]) is None
+            for item in (candidate, source)
+            for key in ("commit", "tree")
+        )
+    ):
+        raise FleetError("class acceptance source or candidate is invalid")
+    token(doc["cmuxEnvironmentClass"], "class acceptance CMUX environment class")
+    if not isinstance(doc["acceptingNodeId"], str) or NODE_RE.fullmatch(doc["acceptingNodeId"]) is None:
+        raise FleetError("class acceptance accepting node is invalid")
+    positive_int(doc["acceptingEnrollmentGeneration"], "class acceptance enrollment generation")
+    body = {name: item for name, item in doc.items() if name != "receiptSha256"}
+    if doc["receiptSha256"] != digest(body):
+        raise FleetError("class acceptance receipt digest does not match its content")
+    if len(canonical(doc)) > MAX_STATUS_BYTES:
+        raise FleetError("class acceptance receipt exceeds size ceiling")
+    return doc
+
+
+def build_class_acceptance(
+    enrollment_value: object,
+    receipt_value: object,
+    bootstrap_value: object,
+    fleet_class_value: str,
+    candidate: dict[str, str],
+) -> dict[str, Any]:
+    """Promote one node's own local acceptance to a class receipt. Pure."""
+    enrollment = validate_enrollment(enrollment_value)
+    receipt = validate_acceptance_receipt(receipt_value)
+    role = receipt["role"]
+    if receipt["executionClass"] != LOCAL_EXECUTION_CLASS or receipt["result"] != "accepted":
+        raise FleetError(
+            "only an accepted local acceptance (a build on this node) can seed a class; "
+            "a class-derived receipt does not chain"
+        )
+    if enrollment["state"] != "eligible":
+        raise FleetError("export a class acceptance from an eligible node")
+    current, reason = acceptance_matches_enrollment(enrollment, receipt, role)
+    if not current:
+        raise FleetError(f"the node's acceptance is not current ({reason})")
+    validate_post_acceptance_bootstrap(enrollment, bootstrap_value, receipt["toolchainGeneration"])
+    identity = bootstrap_class_identity(bootstrap_value)  # type: ignore[arg-type]
+    body = {
+        "schema": CLASS_ACCEPTANCE_SCHEMA,
+        "fleetClass": fleet_class(fleet_class_value),
+        "role": role,
+        "profile": receipt["profile"],
+        "architecture": identity["architecture"],
+        "osVersionClass": identity["osVersionClass"],
+        "hardware": identity["hardware"],
+        "toolchain": identity["toolchain"],
+        "toolchainGeneration": receipt["toolchainGeneration"],
+        "glaedaGeneration": receipt["glaedaGeneration"],
+        "glaedaFleetContractGeneration": receipt["glaedaFleetContractGeneration"],
+        "glaedaCandidate": dict(candidate),
+        "source": receipt["source"],
+        "cmuxSemanticResultSha256": receipt["cmuxSemanticResultSha256"],
+        "cmuxEnvironmentClass": receipt["cmuxEnvironmentClass"],
+        "cmuxToolchainIdentity": receipt["cmuxToolchainIdentity"],
+        "acceptingNodeId": receipt["nodeId"],
+        "acceptingEnrollmentGeneration": receipt["enrollmentGeneration"],
+        "acceptingReceiptSha256": digest(receipt),
+    }
+    return validate_class_acceptance({**body, "receiptSha256": digest(body)})
+
+
+def _describe(value: object) -> str:
+    text = json.dumps(value, sort_keys=True)
+    return text if len(text) <= 80 else text[:77] + "..."
+
+
+def class_acceptance_mismatches(
+    class_receipt: dict[str, Any],
+    identity: dict[str, Any],
+    contract_generation: str,
+    candidate: dict[str, str],
+) -> list[str]:
+    """Every field in which this node differs from the class receipt, named."""
+    found: list[str] = []
+
+    def compare(name: str, here: object, there: object) -> None:
+        if here != there:
+            found.append(f"{name} (here {_describe(here)}, class {_describe(there)})")
+
+    for field in CLASS_IDENTITY_FIELDS:
+        here, there = identity[field], class_receipt[field]
+        if isinstance(here, dict) and isinstance(there, dict):
+            for key in sorted(set(here) | set(there)):
+                compare(f"{field}.{key}", here.get(key), there.get(key))
+        else:
+            compare(field, here, there)
+    compare("toolchainGeneration", identity["toolchainGeneration"], class_receipt["toolchainGeneration"])
+    compare("glaedaGeneration", identity["glaedaGeneration"], class_receipt["glaedaGeneration"])
+    compare(
+        "glaedaFleetContractGeneration",
+        contract_generation,
+        class_receipt["glaedaFleetContractGeneration"],
+    )
+    compare("glaedaCandidate", candidate, class_receipt["glaedaCandidate"])
+    return found
+
+
+def adopt_class_receipt(
+    enrollment_value: object,
+    class_value: object,
+    expected_sha256: str,
+    fleet_class_value: str,
+    bootstrap_value: object,
+    contract_generation: str,
+    candidate: dict[str, str],
+) -> dict[str, Any]:
+    """This node's receipt from a class acceptance, or a refusal naming what differs. Pure."""
+    sha256(expected_sha256, "expected class acceptance digest")
+    enrollment = validate_enrollment(enrollment_value)
+    if enrollment["state"] != "enrolling":
+        raise FleetError("class acceptance adoption requires an enrolling node")
+    klass = validate_class_acceptance(class_value)
+    if klass["receiptSha256"] != expected_sha256:
+        raise FleetError(
+            f"class acceptance receipt is {klass['receiptSha256']}, "
+            f"the operator expected {expected_sha256}"
+        )
+    if klass["fleetClass"] != fleet_class(fleet_class_value):
+        raise FleetError(
+            f"class acceptance is for class {klass['fleetClass']}, "
+            f"this node is class {fleet_class_value}"
+        )
+    role = klass["role"]
+    if role not in enrollment["allowedExecutionRoles"]:
+        raise FleetError("class acceptance role is outside the enrollment allowlist")
+    if klass["profile"] != enrollment["roleProfiles"][role]:
+        raise FleetError("class acceptance profile differs from the enrolled role profile")
+    if not isinstance(bootstrap_value, dict):
+        raise FleetError("bootstrap is not an object")
+    toolchain = sha256(bootstrap_value.get("toolchainGeneration"), "bootstrap toolchain generation")
+    if toolchain not in enrollment["supportedToolchainGenerations"]:
+        raise FleetError("bootstrap toolchain is outside the enrollment allowlist; renew the enrollment")
+    post_bootstrap_sha256 = validate_post_acceptance_bootstrap(enrollment, bootstrap_value, toolchain)
+    identity = bootstrap_class_identity(bootstrap_value)
+    mismatches = class_acceptance_mismatches(klass, identity, contract_generation, candidate)
+    if mismatches:
+        raise FleetError(
+            f"this node is not covered by the class {klass['fleetClass']} acceptance; "
+            "run accept-local on it instead. Differs in: " + "; ".join(mismatches)
+        )
+    receipt = {
+        "schema": ACCEPTANCE_SCHEMA,
+        "nodeId": enrollment["nodeId"],
+        "enrollmentGeneration": enrollment["enrollmentGeneration"],
+        "role": role,
+        "source": klass["source"],
+        "profile": klass["profile"],
+        "toolchainGeneration": toolchain,
+        "glaedaGeneration": enrollment["glaedaGeneration"],
+        "glaedaFleetContractGeneration": contract_generation,
+        "cmuxSemanticResultSha256": klass["cmuxSemanticResultSha256"],
+        "cmuxSemanticResultState": "passed",
+        "cmuxEnvironmentClass": klass["cmuxEnvironmentClass"],
+        "cmuxToolchainIdentity": klass["cmuxToolchainIdentity"],
+        "postBootstrapSha256": post_bootstrap_sha256,
+        "executionClass": CLASS_EXECUTION_CLASS,
+        "localExecutionAttemptSha256": None,
+        "classAcceptanceSha256": klass["receiptSha256"],
+        "processSettlement": "complete",
+        "result": "accepted",
+    }
+    return validate_acceptance_receipt(receipt)
+
+
+def bootstrap_environment() -> dict[str, str]:
+    """The closed environment accept-local gives its bootstrap, without a scratch TMPDIR."""
+    environment = {
+        "LC_ALL": "C",
+        "LANG": "C",
+        "PATH": os.environ.get(
+            "PATH",
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        ),
+    }
+    for name in ACCEPTANCE_CHILD_ENV_KEYS:
+        value = os.environ.get(name)
+        if name != "PATH" and value:
+            environment[name] = value
+    return environment
+
+
+def _observe_for_class(
+    enrollment: dict[str, Any],
+    role: str,
+    cmux_root_value: Path,
+    glaeda_value: Path,
+    cache_root_value: Path | None,
+    min_free_gib: int | None,
+) -> tuple[dict[str, Any], str, dict[str, str]]:
+    """A fresh read-only bootstrap, the running contract, and the candidate it came from."""
+    if role not in enrollment["allowedExecutionRoles"]:
+        raise FleetError("class acceptance role is outside the enrollment allowlist")
+    cmux_root = cmux_root_value.resolve(strict=True)
+    glaeda = glaeda_value.resolve(strict=True)
+    if not glaeda.is_file() or not os.access(glaeda, os.X_OK):
+        raise FleetError("Glaeda executable is unavailable")
+    cache_root = cache_root_value.resolve(strict=True) if cache_root_value is not None else None
+    if enrollment["os"]["family"] == "macos" and cache_root is None:
+        raise FleetError("macOS class acceptance requires --cache-root")
+    bootstrap_script = Path(__file__).with_name("cmux_fleet_bootstrap.py")
+    if not bootstrap_script.is_file() or bootstrap_script.is_symlink():
+        raise FleetError("fleet bootstrap implementation is unavailable")
+    contract = fleet_contract_generation()
+    observed = _run_bootstrap(
+        bootstrap_script,
+        enrollment,
+        role,
+        cmux_root,
+        glaeda,
+        cache_root,
+        min_free_gib,
+        bootstrap_environment(),
+    )
+    if fleet_contract_generation() != contract:
+        raise FleetError("Glaeda fleet contract changed during the bootstrap")
+    generation = sha256(observed.get("glaedaGeneration"), "bootstrap Glaeda generation")
+    return observed, contract, candidate_identity(generation)  # type: ignore[arg-type]
+
+
+def export_class_acceptance(
+    enrollment_path: Path,
+    acceptance_path: Path,
+    fleet_class_value: str,
+    cmux_root: Path,
+    glaeda: Path,
+    cache_root: Path | None = None,
+    min_free_gib: int | None = None,
+) -> dict[str, Any]:
+    enrollment = validate_enrollment(load(enrollment_path))
+    receipt = validate_acceptance_receipt(load(acceptance_path))
+    observed, _contract, candidate = _observe_for_class(
+        enrollment, receipt["role"], cmux_root, glaeda, cache_root, min_free_gib,
+    )
+    return build_class_acceptance(enrollment, receipt, observed, fleet_class_value, candidate)
+
+
+def adopt_class_acceptance(
+    enrollment_path: Path,
+    class_path: Path,
+    expected_sha256: str,
+    fleet_class_value: str,
+    cmux_root: Path,
+    glaeda: Path,
+    cache_root: Path | None = None,
+    min_free_gib: int | None = None,
+) -> dict[str, Any]:
+    enrollment = validate_enrollment(load(enrollment_path))
+    if enrollment["state"] != "enrolling":
+        raise FleetError("class acceptance adoption requires an enrolling node")
+    klass = validate_class_acceptance(load(class_path))
+    observed, contract, candidate = _observe_for_class(
+        enrollment, klass["role"], cmux_root, glaeda, cache_root, min_free_gib,
+    )
+    return adopt_class_receipt(
+        enrollment, klass, expected_sha256, fleet_class_value, observed, contract, candidate,
+    )
 
 
 def apply_transition(
@@ -1633,6 +2140,21 @@ def parser() -> argparse.ArgumentParser:
     al.add_argument("--role", required=True, choices=sorted(ENROLLABLE_ROLES))
     al.add_argument("--cache-root", type=Path)
     al.add_argument("--min-free-gib", type=int)
+    for command in ("export-class-acceptance", "adopt-class-acceptance"):
+        ca = sub.add_parser(command)
+        ca.add_argument("enrollment", type=Path)
+        if command == "export-class-acceptance":
+            ca.add_argument("--acceptance", type=Path, required=True)
+        else:
+            ca.add_argument("--class-receipt", type=Path, required=True)
+            ca.add_argument("--expected-sha256", required=True)
+        ca.add_argument("--fleet-class", required=True)
+        ca.add_argument("--cmux-root", type=Path, required=True)
+        ca.add_argument("--glaeda", type=Path, required=True)
+        ca.add_argument("--cache-root", type=Path)
+        ca.add_argument("--min-free-gib", type=int)
+    vc = sub.add_parser("verify-class-acceptance")
+    vc.add_argument("class_receipt", type=Path)
     a = sub.add_parser("finalize-acceptance")
     a.add_argument("enrollment", type=Path)
     a.add_argument("cmux_result", type=Path)
@@ -1654,6 +2176,9 @@ def main() -> int:
                     enrollment_generation=args.generation,
                 )
             )
+            return 0
+        if args.command == "verify-class-acceptance":
+            emit(validate_class_acceptance(load(args.class_receipt)))
             return 0
         enrollment = load(args.enrollment)
         if args.command == "validate":
@@ -1697,6 +2222,16 @@ def main() -> int:
             )
             emit(receipt)
             return 0 if receipt["result"] == "accepted" else 1
+        elif args.command == "export-class-acceptance":
+            emit(export_class_acceptance(
+                args.enrollment, args.acceptance, args.fleet_class, args.cmux_root,
+                args.glaeda, args.cache_root, args.min_free_gib,
+            ))
+        elif args.command == "adopt-class-acceptance":
+            emit(adopt_class_acceptance(
+                args.enrollment, args.class_receipt, args.expected_sha256, args.fleet_class,
+                args.cmux_root, args.glaeda, args.cache_root, args.min_free_gib,
+            ))
         elif args.command == "finalize-acceptance":
             cmux_result, cmux_result_sha256 = load_cmux_semantic_result(args.cmux_result)
             post_bootstrap = load(args.post_bootstrap)

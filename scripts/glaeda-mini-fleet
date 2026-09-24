@@ -269,11 +269,15 @@ def validate_onboarding(path: Path, data: dict[str, Any]) -> None:
             raise Failure(f"{path}: hardware {shape} compile_lane must be true or false")
         accepted = spec.get("acceptance")
         if accepted is not None and not (
-                isinstance(accepted, dict) and set(accepted) <= {"xcode_build", "candidate", "node", "note"}
+                isinstance(accepted, dict)
+                and set(accepted) <= {"xcode_build", "candidate", "node", "note", "receipt", "receipt_sha256"}
                 and re.fullmatch(r"[0-9A-Za-z]+", str(accepted.get("xcode_build", "")))
                 and re.fullmatch(r"[0-9a-f]{12}", str(accepted.get("candidate", "")))
-                and NODE_ID_RE.fullmatch(str(accepted.get("node", "")))):
-            raise Failure(f"{path}: hardware {shape} acceptance needs xcode_build, candidate (12 hex) and node (a node id)")
+                and NODE_ID_RE.fullmatch(str(accepted.get("node", "")))
+                and ("receipt" in accepted) == ("receipt_sha256" in accepted)
+                and re.fullmatch(r"(sha256:[0-9a-f]{64})?", str(accepted.get("receipt_sha256", "")))):
+            raise Failure(f"{path}: hardware {shape} acceptance needs xcode_build, candidate (12 hex) and node (a node id), "
+                          "and receipt (a file path) with receipt_sha256 (sha256:<64 hex>) together")
     for name, host in data["hosts"].items():
         if "lan_ip" in host and not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", str(host["lan_ip"])):
             raise Failure(f"{path}: host {name} lan_ip must be an IPv4 address")
@@ -1960,6 +1964,24 @@ def class_acceptance(manifest: dict[str, Any], name: str) -> tuple[dict[str, Any
     return recorded, f"class {klass} accepted on {recorded.get('node')} (Xcode {build}, candidate {source12})"
 
 
+def class_receipt_bytes(manifest: dict[str, Any], name: str) -> tuple[bytes | None, str]:
+    """The class acceptance receipt this host is sent, checked against the manifest's digest, if one is recorded."""
+    klass = manifest["hosts"][name]["class"]
+    recorded = manifest["classes"][klass].get("acceptance") or {}
+    if "receipt" not in recorded:
+        return None, f"class {klass} records no receipt"
+    path = Path(str(recorded["receipt"])).expanduser()
+    try:
+        data = path.read_bytes()
+        doc = json.loads(data)
+    except (OSError, ValueError) as error:
+        return None, f"class {klass} receipt {path}: {error}"
+    # The host recomputes the digest over the content; this only catches the wrong file early.
+    if not isinstance(doc, dict) or doc.get("receiptSha256") != recorded["receipt_sha256"] or doc.get("fleetClass") != klass:
+        return None, f"class {klass} receipt {path} is not the recorded {recorded['receipt_sha256'][:19]} for class {klass}"
+    return data, "ok"
+
+
 def onboard_hosts(manifest: dict[str, Any], wanted: list[str] | None) -> tuple[list[str], dict[str, str]]:
     """Hosts onboard works on, and why every other named or default host is skipped."""
     names = select_hosts(manifest, wanted)
@@ -1979,13 +2001,20 @@ def onboard_hosts(manifest: dict[str, Any], wanted: list[str] | None) -> tuple[l
 
 
 def enroll_command(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str],
-                   no_accept: bool) -> str:
+                   no_accept: bool, class_receipt: bool = False) -> str:
+    """glaeda-mini-enroll on the host. class_receipt: the class receipt arrives on stdin (--class-receipt -)."""
     checkout = cmux_checkout(manifest, name)
     python = result["checks"]["python"]["detail"].split(" at ", 1)[1]
     archive = f"~/Library/Caches/cmux-fleet/glaeda-candidate-{candidate['source'][:12]}/{candidate_archive_name(candidate)}"
     argv = [python, "~/glaeda/scripts/glaeda-mini-enroll", "--cmux-root", checkout["root"],
             "--node-id", manifest["hosts"][name]["node_id"], "--candidate", archive, "--sha256", candidate["sha256"],
-            "--source", candidate["source"], "--apply", *(["--no-accept"] if no_accept else [])]
+            "--source", candidate["source"], "--apply"]
+    if class_receipt:
+        klass = manifest["hosts"][name]["class"]
+        argv += ["--class-receipt", "-", "--class-receipt-sha256",
+                 manifest["classes"][klass]["acceptance"]["receipt_sha256"], "--fleet-class", klass]
+    elif no_accept:
+        argv.append("--no-accept")
     # ~ must expand on the host: quote everything, then let the leading ~/ through.
     quoted = " ".join(shlex.quote(a).replace("'~/", "~/'", 1) if a.startswith("~/") else shlex.quote(a) for a in argv)
     return (f"export PATH={shlex.quote(bootstrap.CMUX_WORKLOAD_TOOL_PATH)}:\"$HOME/.local/bin\"; cd \"$HOME\" && "
@@ -2083,6 +2112,7 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         elif blockers(results[name], ("person",)):
             settle(name, "preflight", "needs a person: " + ", ".join(blockers(results[name], ("person",))))
     candidate = operator_candidate()
+    receipts: dict[str, bytes] = {}
     if acceptance == "class":
         for name in list(live):
             recorded, why = class_acceptance(manifest, name)
@@ -2090,6 +2120,12 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
             if recorded is None and not enrolled:
                 settle(name, "preflight", f"blocked: {why}; accept one host of the class first "
                                           f"(onboard {name} --acceptance node --yes)")
+            elif recorded is not None and "receipt" in recorded:
+                data, why = class_receipt_bytes(manifest, name)
+                if data is None:
+                    settle(name, "preflight", f"blocked: {why}")
+                else:
+                    receipts[name] = data
 
     if not yes:
         for name in live:
@@ -2098,8 +2134,10 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
             parts = [f"fix {len(mine)}"] if mine else []
             parts += [f"sudo-plan {', '.join(c for a in root for c in a['checks'])}"] if root else []
             if checks["enroll"]["state"] != "ok":
-                parts.append("enroll" + (" without acceptance (class)" if acceptance == "class" else " with acceptance"))
-            if checks["runner"]["state"] != "ok" and (acceptance == "node" or checks["enroll"]["state"] == "ok"):
+                parts.append("enroll" + (" on the class receipt" if name in receipts else
+                                         " without acceptance (class)" if acceptance == "class" else " with acceptance"))
+            if checks["runner"]["state"] != "ok" and (acceptance == "node" or name in receipts
+                                                      or checks["enroll"]["state"] == "ok"):
                 parts.append("register")
             rows[name]["result"] = "would: " + (", ".join(parts) or "nothing, already onboarded")
         print(render_onboard(rows))
@@ -2159,14 +2197,16 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         logs = {h: directory / f"{h}.log" for h in to_enroll}
 
         def enroll_task(name: str) -> Any:
-            return lambda: _enroll_one(manifest, name, results[name], candidate, acceptance == "class", logs[name])
+            return lambda: _enroll_one(manifest, name, results[name], candidate, acceptance == "class", logs[name],
+                                       receipts.get(name))
 
         outcomes = run_with_heartbeat({h: enroll_task(h) for h in to_enroll}, logs, "enroll", heartbeat)
         for name, code in outcomes.items():
             if code:
                 settle(name, "enroll", f"failed: exit {code}")
-            elif acceptance == "class":
-                settle(name, "enroll", "enrolled without node acceptance; eligible needs class receipts in cmux_fleet.py")
+            elif acceptance == "class" and name not in receipts:
+                settle(name, "enroll", "enrolled without node acceptance; record the class receipt "
+                                       "(classes.<class>.acceptance.receipt) to make it eligible")
             else:
                 rows[name].update(step="enroll", result="eligible")
 
@@ -2207,11 +2247,12 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
 
 
 def _enroll_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str],
-                no_accept: bool, log_path: Path) -> int:
-    command = enroll_command(manifest, name, result, candidate, no_accept)
+                no_accept: bool, log_path: Path, class_receipt: bytes | None = None) -> int:
+    command = enroll_command(manifest, name, result, candidate, no_accept, class_receipt is not None)
     with open(log_path, "ab") as log:
         note(log, f"== enroll ({command})")
-        return ssh_stream(name, manifest["ssh_user"], command, log, timeout=ENROLL_TIMEOUT)
+        return ssh_stream(name, manifest["ssh_user"], command, log, stdin=class_receipt or b"",
+                          timeout=ENROLL_TIMEOUT)
 
 
 # ---------------------------------------------------------------- cli
