@@ -27,7 +27,8 @@ material, tokens, or log contents. `plan` prints commands for an operator; it ru
 `preflight` is read-only too. It probes every host in parallel for what the fleet bootstrap,
 glaeda-mini-enroll, local acceptance and cmux scripts/setup.sh will later require (the pinned
 Xcode, its selection, licence and first launch, the Metal toolchain, tool versions on the
-workload PATH, Python 3.13+ for enrollment and as the workload PATH's python3, the checkout with
+workload PATH, Python 3.13+ for enrollment and as the workload PATH's python3, gh on the workload
+PATH, the checkout with
 submodules and setup artifacts, a ~/glaeda whose glaeda-mini-enroll knows the options onboarding
 passes (and is at --glaeda-ref when given), power, disk, a pending macOS update, Homebrew formulas
 left unpinned) plus onboarding progress (candidate, node id, enrollment, runner). It
@@ -39,7 +40,8 @@ without root: a shallow cmux clone with submodules, the pinned Xcode cloned on i
 relocatable CPython copied from this Mac into ~/.local, Homebrew git-fetched into an empty
 /opt/homebrew the login user owns (from the --from host's /opt/homebrew over the LAN, else GitHub),
 brew install of rustup, zig and python@3.13 (then brew pin, as class receipts pin toolchain strings)
-with /opt/homebrew/bin/python3 linked to python3.13 for the workload PATH, Glaeda and its setup,
+with /opt/homebrew/bin/python3 linked to python3.13 for the workload PATH, and of gh (left unpinned:
+no receipt names it) for cmux CI jobs that call it, Glaeda and its setup,
 ~/glaeda moved (clean fetch, detached checkout, refused when dirty) to --glaeda-ref or main's tip
 when its glaeda-mini-enroll lacks an option onboarding passes, rustup's default and pinned
 toolchains, the Metal toolchain, cmux scripts/setup.sh, and the reviewed Glaeda candidate
@@ -187,6 +189,9 @@ ENROLL_FLAGS = ("--renew", "--class-receipt", "--class-receipt-sha256", "--fleet
 BREW_FORMULAS = ("rustup", "zig", "python@3.13")
 # The workload PATH's python3: brew's python@3.13 installs only python3.13, so /usr/bin/python3 (3.9) would win.
 BREW_PYTHON = ("python@3.13", "python3.13")
+# Homebrew formulas fix installs and never pins: cmux CI jobs call gh (authenticated by GH_TOKEN, so no gh auth),
+# and no class receipt names it (cmux_fleet_bootstrap's toolchain observations and MACOS_WORKLOAD_TOOLS omit it).
+BREW_UNPINNED = ("gh",)
 # Files sshd reads by default (OpenSSH AuthorizedKeysFile); every other authorized_keys* is a copy.
 LIVE_KEY_FILES = ("authorized_keys", "authorized_keys2")
 # Reservations: a marker on the mini that every scheduler skips until it expires.
@@ -518,6 +523,8 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
         "glaeda_dirty": int(out.get("pf_glaeda_dirty") or 0),
         "python3": None if python3 is None else {"path": python3[0] or None, "version": python3[1] or None},
         "brew_python3": out.get("pf_brew_python3") or None,
+        # gh as the workload PATH resolves it: its path, "" when none, None from a probe that predates the question.
+        "gh": out.get("pf_gh"),
         # state: empty (directories only), partial (an interrupted homebrew_fetch: a .git, no brew) or files.
         "brew_dir": None if brew_dir is None else {"owner": brew_dir[0], "state": brew_dir[1]},
         "brew_formulas": {f: state == "pinned" for f, _, state in (v.partition("|") for v in out["pf_brew_formula"])},
@@ -1208,8 +1215,8 @@ def cmd_release(manifest: dict[str, Any], hosts: list[str], owner: str | None, f
 DEFAULT_CMUX_ROOT = "~/cmux"  # where fix clones cmux on a mini
 # Columns of the preflight table, in the order onboarding meets them.
 PREFLIGHT_CHECKS = ("os", "xcode", "select", "licence", "launch", "metal", "rust", "zig", "tools", "python", "python3",
-                    "cmux", "setup", "glaeda", "power", "disk", "update", "candidate", "node", "enroll", "runner", "brew",
-                    "pins")
+                    "gh", "cmux", "setup", "glaeda", "power", "disk", "update", "candidate", "node", "enroll", "runner",
+                    "brew", "pins")
 # An unknown here means the bootstrap would refuse or cannot be predicted, so it blocks like a failure.
 UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "power", "disk"})
 # Who can apply a fix: the SSH login user alone, the login user with an admin password, or a person.
@@ -1472,6 +1479,15 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
             put("python3", "fail", detail,
                 f"{as_owner}brew install {formula}; link /opt/homebrew/bin/python3 to {versioned}", brew_group,
                 brew(formula))
+    # cmux CI jobs call gh (with GH_TOKEN) and fail with FileNotFoundError when the workload PATH has none.
+    gh = pf.get("gh")
+    if gh is None:
+        put("gh", "unknown", "the probe predates this check; rerun preflight")
+    elif gh:
+        put("gh", "ok", gh)
+    else:
+        put("gh", "fail", "not on the workload PATH; cmux CI jobs call gh", f"{as_owner}brew install gh", brew_group,
+            brew("gh"))
 
     # The checkout acceptance builds.
     depth = f" --depth {checkout['depth']}" if checkout["depth"] else ""
@@ -1824,7 +1840,9 @@ def describe(action: dict[str, Any]) -> str:
         links = [what for formula, what in (("rustup", "the rustup proxies"), (BREW_PYTHON[0], "python3"))
                  if formula in action["formulas"]]
         link = f", link {' and '.join(links)} into /opt/homebrew/bin" if links else ""
-        return f"brew install {' '.join(action['formulas'])}{link}, then brew pin them"
+        pinned = [f for f in action["formulas"] if f in BREW_FORMULAS]
+        pin = f", then brew pin {' '.join(pinned)}" if pinned else ""
+        return f"brew install {' '.join(action['formulas'])}{link}{pin}"
     if kind == "python_link":
         return f"link /opt/homebrew/bin/python3 to {BREW_PYTHON[1]}"
     if kind == "homebrew_fetch":
@@ -1947,7 +1965,7 @@ def host_gate_block() -> str:
 
 def brew_commands(owner: str, formulas: list[str], as_owner: bool) -> list[str]:
     """Install or upgrade formulas in /opt/homebrew as its owner, then link rustup's proxies onto the workload PATH."""
-    if not SAFE_WORD_RE.fullmatch(owner) or set(formulas) - set(BREW_FORMULAS):
+    if not SAFE_WORD_RE.fullmatch(owner) or set(formulas) - set(BREW_FORMULAS) - set(BREW_UNPINNED):
         raise Failure(f"refusing Homebrew step for owner {owner!r}, formulas {formulas}")
     run = f"sudo -H -u {owner} " if as_owner else ""
     root = "sudo " if as_owner else ""
@@ -1974,8 +1992,13 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool) -> list[str]:
                   "done"]
     if BREW_PYTHON[0] in formulas:
         lines += python_link_commands(owner, as_owner)
-    # Class receipts pin toolchain strings; the reference host pins exactly these.
-    lines.append(f"brew_as pin {' '.join(formulas)}")
+    for f in (f for f in formulas if f in BREW_UNPINNED):
+        # Installed but unlinked (a keg someone unlinked) still leaves the workload PATH without it.
+        lines.append(f'[ -e "/opt/homebrew/bin/{f}" ] || brew_as link {f}')
+    # Class receipts pin toolchain strings; the reference host pins exactly these, and no receipt names the rest.
+    pinned = [f for f in formulas if f in BREW_FORMULAS]
+    if pinned:
+        lines.append(f"brew_as pin {' '.join(pinned)}")
     return lines
 
 
@@ -2379,7 +2402,9 @@ def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any]
                       f"  sudo chown -R {owner}:admin /opt/homebrew",
                       "fi"]
         elif kind == "brew":
-            lines.append(f"step 'Homebrew as {action['owner']}: {' '.join(action['formulas'])}, then pin them'")
+            pinned = [f for f in action["formulas"] if f in BREW_FORMULAS]
+            pin = f", then pin {' '.join(pinned)}" if pinned else ""
+            lines.append(f"step 'Homebrew as {action['owner']}: {' '.join(action['formulas'])}{pin}'")
             lines += brew_commands(action["owner"], action["formulas"], True)
         elif kind == "python_link":
             lines.append(f"step 'as {action['owner']}: link /opt/homebrew/bin/python3 to {BREW_PYTHON[1]}'")

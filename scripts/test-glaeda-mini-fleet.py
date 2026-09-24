@@ -536,7 +536,7 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
                    enroll_reason: str | None = None, python3: str | None = "/opt/homebrew/bin/python3|3.13",
                    brew_python3: bool = True, glaeda_lacking: str | None = "", glaeda_dirty: int = 0,
                    pins: tuple[str, ...] = ("rustup|pinned", "zig|pinned", "python@3.13|pinned"),
-                   brew_dir: str | None = None, **probe: object) -> str:
+                   brew_dir: str | None = None, gh: str | None = "/opt/homebrew/bin/gh", **probe: object) -> str:
     """A probe plus preflight section for a host that is ready unless told otherwise."""
     lines = [probe_text(**probe).rstrip("\n").replace("user\tbuilder", f"user\t{user}"), READY_XCODE.rstrip("\n")]
     lines.append(f"pf_sdks\t{sdks}")
@@ -559,6 +559,8 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
         lines.append(f"pf_python3\t{python3}")
     if brew_python3:
         lines.append("pf_brew_python3\t/opt/homebrew/bin/python3.13")
+    if gh is not None:
+        lines.append(f"pf_gh\t{gh}")
     lines += ["pf_cmux\tpresent", "pf_cmux_pin\t26", "pf_zig_min\t0.16.0" if submodules[0][0] == " " else "pf_zig_min\t"]
     lines += [f"pf_submodule\t{s}" for s in submodules]
     lines += [f"pf_setup_artifacts\t{'yes' if artifacts else 'no'}", f"pf_cmux_dirty\t{dirty}"]
@@ -802,6 +804,44 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("brew unpin $f to upgrade it", "\n".join(lines))
         subprocess.run(["bash", "-n"], input="\n".join(lines), text=True, check=True)
 
+    def test_missing_gh_is_brew_installed_and_left_unpinned(self) -> None:
+        # cmux CI jobs call gh with GH_TOKEN and failed with FileNotFoundError on minis without it.
+        result = self.result(preflight_text(gh=""))
+        check = result["checks"]["gh"]
+        self.assertFalse(result["ready"])
+        self.assertEqual((check["state"], check["group"], check["fix"]), ("fail", "self", "brew install gh"))
+        self.assertEqual(check["action"], {"kind": "brew", "formula": "gh", "owner": "builder"})
+        self.assertEqual(result["checks"]["pins"]["state"], "ok")  # no class receipt names gh
+        mine, root = mf.planned_actions(result)
+        self.assertEqual(([(a["kind"], a["formulas"]) for a in mine], root), ([("brew", ["gh"])], []))
+        self.assertEqual(mf.fix_host(self.manifest, "build-mini-1", result, False, None)["planned"],
+                         ["gh: brew install gh"])
+        lines = mf.brew_commands("builder", ["gh"], False)
+        self.assertIn('[ -e "/opt/homebrew/bin/gh" ] || brew_as link gh', lines)
+        self.assertFalse([line for line in lines if "brew_as pin" in line], lines)
+        subprocess.run(["bash", "-n"], input="\n".join(lines), text=True, check=True)
+        # Merged with a pinned formula, only that one is pinned; no gh auth step anywhere (jobs use GH_TOKEN).
+        both = mf.brew_commands("builder", ["zig", "gh"], False)
+        self.assertEqual(both[-1], "brew_as pin zig")
+        self.assertFalse([line for line in both if "auth" in line], both)
+        self.assertEqual(mf.describe({"kind": "brew", "formulas": ["zig", "gh"]}),
+                         "brew install zig gh, then brew pin zig")
+        # Someone else's Homebrew: sudo-plan installs it as that owner, still unpinned.
+        other = self.result(preflight_text(gh="", brew_owner="admin"))
+        self.assertEqual(other["checks"]["gh"]["fix"], "sudo -u admin brew install gh")
+        script = mf.sudo_plan_script(self.manifest, "build-mini-1", other)
+        self.assertIn("step 'Homebrew as admin: gh'", script)
+        self.assertIn('[ -e "/opt/homebrew/bin/gh" ] || brew_as link gh', script)
+        self.assertNotIn("brew_as pin", script)
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        # No Homebrew yet: gh makes it a blocker, like any formula.
+        bare = self.result(preflight_text(user="cmux", brew_owner=None, gh=""))
+        self.assertEqual((bare["checks"]["brew"]["state"], bare["checks"]["gh"]["group"]), ("fail", "self"))
+        # A gh elsewhere on the workload PATH counts; an older probe is unknown and does not block.
+        self.assertEqual(self.result(preflight_text(gh="/usr/local/bin/gh"))["checks"]["gh"]["state"], "ok")
+        old = self.result(preflight_text(gh=None))
+        self.assertEqual((old["checks"]["gh"]["state"], old["ready"]), ("unknown", True))
+
     def test_an_old_glaeda_checkout_is_moved_before_enrolling(self) -> None:
         # An old ~/glaeda failed onboard with "unrecognized arguments: --class-receipt ...".
         lacking = "--class-receipt --class-receipt-sha256 --fleet-class"
@@ -903,7 +943,8 @@ class PreflightScriptTests(unittest.TestCase):
             home = Path(tmp)
             tools = home / "workload-bin"
             tools.mkdir()
-            for name, text in (("zig", "0.15.2"), ("cargo", "cargo 1.88.0 (x)"), ("git", None)):
+            for name, text in (("zig", "0.15.2"), ("cargo", "cargo 1.88.0 (x)"), ("gh", "gh version 2.80.0"),
+                               ("git", None)):
                 if text is None:
                     (tools / name).symlink_to(shutil.which("git"))
                     continue
@@ -947,6 +988,7 @@ class PreflightScriptTests(unittest.TestCase):
         self.assertEqual(pf["python"], {"path": None, "version": None})
         self.assertEqual(pf["python3"], {"path": f"{tools}/python3", "version": "3.9"})
         self.assertEqual(pf["glaeda_lacking"], ["--class-receipt", "--fleet-class"])
+        self.assertEqual(pf["gh"], f"{tools}/gh")
 
 
 def morning_text() -> str:
@@ -1185,6 +1227,7 @@ class SudoPlanTests(unittest.TestCase):
             mf.brew_commands("admin; rm -rf /", ["zig"], True)
         with self.assertRaises(mf.Failure):
             mf.brew_commands("admin", ["zig", "openssl"], True)
+        self.assertIn("brew_as pin zig", mf.brew_commands("admin", ["zig", "gh"], True))
 
     def test_run_needs_a_terminal_and_plans_are_saved(self) -> None:
         obs = observed(**{"build-mini-1": morning_text()})
