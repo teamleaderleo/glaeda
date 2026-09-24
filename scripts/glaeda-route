@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""glaeda-route: Glaeda's CI routing for cmux (glaeda#1174).
+
+    glaeda-route state   [--pools FILE] [--runners FILE] [--manifest M] [--repo O/R]
+    glaeda-route publish [--pools FILE] [--runners FILE] [--manifest M] [--repo O/R] [--yes] [credentials]
+    glaeda-route check   --state FILE [--max-age SECONDS]
+
+`state` builds the pool-state document (schema glaeda-pool-state/v1, docs/GLAEDA_ROUTE.md) from two
+observations and prints it:
+
+  * the fleet: `glaeda-mini-fleet pools` (declared and conforming members per pool label, and, once
+    the probe reports them, members held by a reservation or by the fleet host lock), or --pools FILE;
+  * GitHub: the repository's self-hosted runners (online, busy, labels), or --runners FILE.
+
+A member counts as idle only when both agree: the fleet saw it reachable with the pool's exact Xcode,
+not reserved and not holding the host lock, and GitHub shows its runner (`<member>-glaeda`) online,
+not busy and carrying the pool label. The document carries counts only, never host names, because
+cmux workflow logs are public.
+
+`publish` builds the same document and writes it to the repository variable GLAEDA_POOL_STATE, where
+a workflow reads it as `vars.GLAEDA_POOL_STATE` with no token and no tailnet. Without --yes it prints
+what it would write. It is one-shot: run it from launchd or a systemd timer every 20 seconds on an
+always-on operator host (never cmux-lawrence). A publisher that stops simply lets the document go
+stale, and every reader then treats owned pools as unavailable, which routes to Blacksmith.
+
+`check` applies the reader's rules to a document and exits 1 when a router must not use it.
+
+Credentials (publish only): GLAEDA_ROUTE_TOKEN in the environment, --token-file PATH (a file only
+its owner can read), or --app-id ID --app-key-file PATH to mint a GitHub App installation token with
+/usr/bin/openssl. Tokens are never taken from argv, printed, or written anywhere. The token needs, on
+the repository only: Administration read (list runners) and Variables read and write.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Callable
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+STATE_SCHEMA = "glaeda-pool-state/v1"
+DEFAULT_REPO = "manaflow-ai/cmux"
+STATE_VARIABLE = "GLAEDA_POOL_STATE"
+# Readers treat an older document as missing. The publisher runs every 20 s, so two missed runs
+# still leave a fresh document.
+MAX_AGE_SECONDS = 60
+# Future skew tolerated between the publisher's clock and a reader's.
+MAX_SKEW_SECONDS = 30
+# Leo's order for every job type: std (48 GB) minis, then light (16 GB), then Blacksmith, then
+# GitHub-hosted. Only the owned classes are pools here; overflow belongs to the caller.
+CLASS_ORDER = ("std", "light")
+POOL_LABEL = re.compile(r"glaeda-(std|light|xl)-xcode-([0-9]+(?:\.[0-9]+)*)")
+RUNNER_SUFFIX = "-glaeda"
+MINI_FLEET = SCRIPT_DIR / "glaeda-mini-fleet"
+POOLS_TIMEOUT = 40
+API = "https://api.github.com"
+HTTP_TIMEOUT = 10
+OPENSSL = "/usr/bin/openssl"
+USER_AGENT = "glaeda-route"
+
+
+class Failure(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- time
+
+
+def utc(ts: float) -> str:
+    return dt.datetime.fromtimestamp(int(ts), dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_utc(value: Any) -> float | None:
+    """Seconds since the epoch for an RFC 3339 UTC string with a zone, else None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
+
+
+# ---------------------------------------------------------------- pool state
+
+
+def pool_key(label: str) -> tuple[int, tuple[int, ...]] | None:
+    """Sort key for an owned pool label: class rank first, then the newest Xcode."""
+    match = POOL_LABEL.fullmatch(label)
+    if not match or match.group(1) not in CLASS_ORDER:
+        return None
+    version = tuple(int(part) for part in match.group(2).split("."))
+    return CLASS_ORDER.index(match.group(1)), tuple(-part for part in version)
+
+
+def member_of(runner_name: str) -> str | None:
+    """The fleet member a runner belongs to: glaeda-cmux-runner names it `<member>-glaeda`."""
+    if not runner_name.endswith(RUNNER_SUFFIX) or len(runner_name) <= len(RUNNER_SUFFIX):
+        return None
+    return runner_name[: -len(RUNNER_SUFFIX)]
+
+
+def runner_rows(runners: Any) -> list[dict[str, Any]]:
+    """Normalize the GitHub runners listing (a page object or a bare list) into typed rows."""
+    items = runners.get("runners") if isinstance(runners, dict) else runners
+    if not isinstance(items, list):
+        raise Failure("runners: not a GitHub runners listing")
+    rows = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        labels = [str(label.get("name")) if isinstance(label, dict) else str(label)
+                  for label in item.get("labels") or []]
+        rows.append({"name": item["name"], "online": item.get("status") == "online",
+                     "busy": item.get("busy") is True, "labels": labels})
+    return rows
+
+
+def build_state(pools_doc: Any, runners: Any, *, repo: str, now: float,
+                runners_observed_at: float | None = None) -> dict[str, Any]:
+    """The glaeda-pool-state/v1 document. Pure: both observations are arguments."""
+    if not isinstance(pools_doc, dict) or not isinstance(pools_doc.get("pools"), dict):
+        raise Failure("pools: not a glaeda-mini-fleet pools document")
+    rows = runner_rows(runners)
+    fleet_at = pools_doc.get("observed_at")
+    fleet_at = float(fleet_at) if isinstance(fleet_at, (int, float)) and not isinstance(fleet_at, bool) else None
+    github_at = runners_observed_at if runners_observed_at is not None else now
+    # The document is as old as its oldest input; a fleet with nothing reachable has no
+    # observation time, and then nothing in it is idle anyway.
+    observed = min(t for t in (fleet_at, github_at) if t is not None)
+    labels = sorted((label for label in pools_doc["pools"] if pool_key(label)), key=pool_key)
+    pools: dict[str, Any] = {}
+    for rank, label in enumerate(labels):
+        entry = pools_doc["pools"][label]
+        if not isinstance(entry, dict):
+            raise Failure(f"pools: {label} is not an object")
+        eligible = {str(m) for m in entry.get("conforming") or []}
+        reserved = {str(m) for m in entry.get("reserved") or []}
+        locked = {str(m) for m in entry.get("busy") or []}
+        eligible -= reserved | locked
+        mine = [row for row in rows if label in row["labels"]]
+        online = [row for row in mine if row["online"]]
+        busy = [row for row in online if row["busy"]]
+        idle = [row for row in online if not row["busy"] and member_of(row["name"]) in eligible]
+        match = POOL_LABEL.fullmatch(label)
+        pools[label] = {
+            "class": match.group(1),
+            "xcode": match.group(2),
+            "rank": rank,
+            "declared": len(entry.get("declared") or []),
+            "conforming": len(eligible),
+            "reserved": len(reserved),
+            "locked": len(locked),
+            "runners": len(mine),
+            "online": len(online),
+            "busy": len(busy),
+            "idle": len(idle),
+        }
+    return {
+        "schema": STATE_SCHEMA,
+        "repo": repo,
+        "generated_at": utc(now),
+        "observed_at": utc(observed),
+        "max_age_seconds": MAX_AGE_SECONDS,
+        "order": labels,
+        "pools": pools,
+    }
+
+
+COUNT_FIELDS = ("declared", "conforming", "reserved", "locked", "runners", "online", "busy", "idle")
+
+
+def validate_state(doc: Any, *, now: float, repo: str | None = None,
+                   max_age: int = MAX_AGE_SECONDS) -> tuple[bool, str]:
+    """(usable, reason): the rules every reader applies before routing to an owned pool."""
+    if not isinstance(doc, dict):
+        return False, "no pool state"
+    if doc.get("schema") != STATE_SCHEMA:
+        return False, f"pool state schema is {doc.get('schema')!r}, not {STATE_SCHEMA}"
+    if repo is not None and str(doc.get("repo") or "").lower() != repo.lower():
+        return False, f"pool state is for {doc.get('repo')!r}, not {repo}"
+    generated, observed = parse_utc(doc.get("generated_at")), parse_utc(doc.get("observed_at"))
+    if generated is None or observed is None:
+        return False, "pool state is undated"
+    if generated > now + MAX_SKEW_SECONDS or observed > generated + MAX_SKEW_SECONDS:
+        return False, "pool state is dated in the future"
+    age = now - observed
+    if age > max_age:
+        return False, f"pool state is stale ({int(age)} s old, limit {max_age} s)"
+    pools, order = doc.get("pools"), doc.get("order")
+    if not isinstance(pools, dict) or not isinstance(order, list) or sorted(order) != sorted(pools):
+        return False, "pool state is malformed (order and pools disagree)"
+    for label, entry in pools.items():
+        if not pool_key(str(label)) or not isinstance(entry, dict):
+            return False, f"pool state names an unknown pool {label!r}"
+        for field in COUNT_FIELDS:
+            value = entry.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                return False, f"pool state {label}.{field} is not a count"
+        if entry["idle"] > entry["online"] or entry["busy"] > entry["online"]:
+            return False, f"pool state {label} counts more idle or busy runners than online ones"
+    return True, f"pool state from {doc['generated_at']} ({int(age)} s old)"
+
+
+# ---------------------------------------------------------------- credentials
+
+
+def read_secret_file(path: Path) -> str:
+    """A token or key file: a regular file, not a symlink, readable by its owner only."""
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise Failure(f"{path}: {error.strerror}") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise Failure(f"{path}: not a regular file")
+    if info.st_mode & 0o077:
+        raise Failure(f"{path}: readable by group or others; chmod 600 it")
+    return path.read_text(encoding="utf-8").strip()
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def app_jwt(app_id: str, key_file: Path, now: float,
+            run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> str:
+    """A GitHub App JWT signed by /usr/bin/openssl; the key stays in its file."""
+    read_secret_file(key_file)  # permission check only
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    claims = {"iat": int(now) - 60, "exp": int(now) + 540, "iss": str(app_id)}
+    payload = b64url(json.dumps(claims, separators=(",", ":")).encode())
+    signing_input = f"{header}.{payload}".encode()
+    proc = run([OPENSSL, "dgst", "-sha256", "-sign", os.fspath(key_file)], input=signing_input,
+               capture_output=True, timeout=20, check=False, env={"PATH": "/usr/bin:/bin"})
+    if proc.returncode != 0 or not proc.stdout:
+        raise Failure("openssl could not sign the GitHub App JWT (check the key file)")
+    return f"{header}.{payload}.{b64url(proc.stdout)}"
+
+
+# ---------------------------------------------------------------- GitHub
+
+
+class GitHub:
+    """A small REST client. The token lives in a header only; errors never echo it."""
+
+    def __init__(self, token: str, opener: Callable[..., Any] | None = None) -> None:
+        self._token = token
+        self._open = opener or urllib.request.urlopen
+
+    def call(self, method: str, path: str, body: Any = None, *, auth: str = "Bearer") -> tuple[int, Any]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"{API}{path}", data=data, method=method, headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"{auth} {self._token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": USER_AGENT,
+            **({"Content-Type": "application/json"} if data is not None else {}),
+        })
+        try:
+            with self._open(request, timeout=HTTP_TIMEOUT) as response:
+                raw = response.read()
+                return response.status, (json.loads(raw) if raw else None)
+        except urllib.error.HTTPError as error:
+            try:
+                detail = json.loads(error.read() or b"{}")
+            except ValueError:
+                detail = {}
+            return error.code, detail if isinstance(detail, dict) else {}
+
+    def ok(self, method: str, path: str, body: Any = None) -> Any:
+        status, data = self.call(method, path, body)
+        if status >= 300:
+            message = data.get("message") if isinstance(data, dict) else None
+            raise Failure(f"GitHub {method} {path.split('?')[0]}: {status} {message or ''}".strip())
+        return data
+
+    def runners(self, repo: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for page in range(1, 11):
+            data = self.ok("GET", f"/repos/{repo}/actions/runners?per_page=100&page={page}")
+            batch = (data or {}).get("runners") or []
+            rows.extend(batch)
+            if len(batch) < 100:
+                return rows
+        raise Failure("runners: more than 1000 runners; refusing a partial listing")
+
+    def set_variable(self, repo: str, name: str, value: str) -> str:
+        status, _ = self.call("PATCH", f"/repos/{repo}/actions/variables/{name}", {"name": name, "value": value})
+        if status == 404:
+            self.ok("POST", f"/repos/{repo}/actions/variables", {"name": name, "value": value})
+            return "created"
+        if status >= 300:
+            raise Failure(f"GitHub PATCH variable {name}: {status}")
+        return "updated"
+
+
+def installation_token(app_id: str, key_file: Path, repo: str, now: float,
+                       opener: Callable[..., Any] | None = None,
+                       run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> str:
+    """An installation token for the App's installation on `repo`, limited to that repository."""
+    jwt = GitHub(app_jwt(app_id, key_file, now, run), opener)
+    installation = jwt.ok("GET", f"/repos/{repo}/installation")
+    token = jwt.ok("POST", f"/app/installations/{int(installation['id'])}/access_tokens",
+                   {"repositories": [repo.split("/", 1)[1]]})
+    value = (token or {}).get("token")
+    if not isinstance(value, str) or not value:
+        raise Failure("GitHub returned no installation token")
+    return value
+
+
+def resolve_token(args: argparse.Namespace, env: dict[str, str], repo: str, now: float) -> str:
+    if getattr(args, "app_id", None) or getattr(args, "app_key_file", None):
+        if not (args.app_id and args.app_key_file):
+            raise Failure("--app-id and --app-key-file go together")
+        return installation_token(args.app_id, args.app_key_file, repo, now)
+    if getattr(args, "token_file", None):
+        return read_secret_file(args.token_file)
+    token = env.get("GLAEDA_ROUTE_TOKEN", "")
+    if not token:
+        raise Failure("no credentials: set GLAEDA_ROUTE_TOKEN, --token-file, or --app-id with --app-key-file")
+    return token
+
+
+# ---------------------------------------------------------------- inputs
+
+
+def load_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise Failure(f"{path}: {error}") from None
+
+
+def fleet_pools(args: argparse.Namespace) -> Any:
+    if args.pools:
+        return load_json(args.pools)
+    argv = [sys.executable, os.fspath(MINI_FLEET), "pools"]
+    if args.manifest:
+        argv += ["--manifest", os.fspath(args.manifest)]
+    try:
+        proc = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              timeout=POOLS_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        raise Failure(f"glaeda-mini-fleet pools took over {POOLS_TIMEOUT} s") from None
+    if proc.returncode != 0:
+        tail = (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[-1]
+        raise Failure(f"glaeda-mini-fleet pools: {tail[:200]}")
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        raise Failure("glaeda-mini-fleet pools printed no JSON") from None
+
+
+def current_state(args: argparse.Namespace, env: dict[str, str], now: Callable[[], float],
+                  client: Callable[[], GitHub]) -> dict[str, Any]:
+    pools_doc = fleet_pools(args)
+    if args.runners:
+        runners, at = load_json(args.runners), None
+    else:
+        at = now()
+        runners = client().runners(args.repo)
+    return build_state(pools_doc, runners, repo=args.repo, now=now(), runners_observed_at=at)
+
+
+# ---------------------------------------------------------------- main
+
+
+def main(argv: list[str] | None = None, env: dict[str, str] | None = None,
+         now: Callable[[], float] = time.time, opener: Callable[..., Any] | None = None) -> int:
+    env = dict(os.environ if env is None else env)
+    parser = argparse.ArgumentParser(prog="glaeda-route", description=__doc__.split("\n\n")[0],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("state", "publish"):
+        cmd = sub.add_parser(name)
+        cmd.add_argument("--repo", default=DEFAULT_REPO)
+        cmd.add_argument("--manifest", type=Path, help="fleet manifest for glaeda-mini-fleet pools")
+        cmd.add_argument("--pools", type=Path, help="read a glaeda-mini-fleet pools document instead of probing")
+        cmd.add_argument("--runners", type=Path, help="read a GitHub runners listing instead of the API")
+        cmd.add_argument("--token-file", type=Path)
+        cmd.add_argument("--app-id")
+        cmd.add_argument("--app-key-file", type=Path)
+        if name == "publish":
+            cmd.add_argument("--variable", default=STATE_VARIABLE)
+            cmd.add_argument("--yes", action="store_true", help="write the variable (default: print what would be written)")
+    check = sub.add_parser("check")
+    check.add_argument("--state", type=Path, required=True)
+    check.add_argument("--repo")
+    check.add_argument("--max-age", type=int, default=MAX_AGE_SECONDS)
+    args = parser.parse_args(argv)
+
+    try:
+        if args.command == "check":
+            usable, reason = validate_state(load_json(args.state), now=now(), repo=args.repo, max_age=args.max_age)
+            print(("usable: " if usable else "unusable: ") + reason)
+            return 0 if usable else 1
+
+        token: list[str] = []
+
+        def client() -> GitHub:
+            if not token:
+                token.append(resolve_token(args, env, args.repo, now()))
+            return GitHub(token[0], opener)
+
+        doc = current_state(args, env, now, client)
+        text = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+        if args.command == "state":
+            print(json.dumps(doc, indent=2, sort_keys=True))
+            return 0
+        if not args.yes:
+            print(f"would write {args.variable} on {args.repo} ({len(text)} bytes):")
+            print(json.dumps(doc, indent=2, sort_keys=True))
+            return 0
+        outcome = client().set_variable(args.repo, args.variable, text)
+        idle = ", ".join(f"{label} {entry['idle']} idle" for label, entry in doc["pools"].items()) or "no owned pools"
+        print(f"{outcome} {args.variable} on {args.repo}: {idle}; observed {doc['observed_at']}")
+        return 0
+    except Failure as error:
+        print(f"glaeda-route: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
