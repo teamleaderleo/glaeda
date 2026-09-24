@@ -55,11 +55,12 @@ DerivedData; see the 2026-09-24 experiment. On a cmux build fleet mini,
 during a measurement.
 
 Known prototype gaps: the node daemon must run on the same host as the build
-(the client sends large blobs as local file paths, and the prototype reads
-whatever path it is given, so run it only for your own user); the TCP fleet
-store has no authentication, so bind it only to a trusted interface; a KV
-entry is not checked for its objects' presence (`kv_put_dangling` only counts
-entries that name absent objects); there is no size budget or eviction; and
-a node that cannot reach the fleet store answers reads as misses (counted in
-`up_read_errors`, and skips the store for 30 s after a failed read) but fails
-writes, so nothing is published half-way.
+(the client sends large blobs as local file paths, and the node reads whatever
+path it is given, so run it only for your own user; the TCP fleet store
+refuses file-path uploads); the TCP fleet store has no authentication, so bind
+it only to a trusted interface; a KV entry is not checked for its objects'
+presence (`kv_put_dangling` only counts entries that name absent objects);
+there is no size budget or eviction; and a node that cannot reach the fleet
+store answers reads as misses and fails writes (counted in `up_errors`), then
+skips the store for 30 s (`up_skipped`), so an outage costs about a cold build
+and nothing is published half-way.

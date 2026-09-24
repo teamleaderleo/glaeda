@@ -16,5 +16,5 @@ if (!flock($lock, LOCK_EX | LOCK_NB)) {
     flock($lock, LOCK_EX) or die "lock: $!\n";
     alarm 0;
 }
-system(@ARGV);
-exit($? == -1 ? 127 : $? >> 8);
+system { $ARGV[0] } @ARGV;
+exit($? == -1 ? 127 : ($? & 127) ? 128 + ($? & 127) : $? >> 8);

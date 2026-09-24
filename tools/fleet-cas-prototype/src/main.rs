@@ -59,8 +59,12 @@ struct Stats {
     up_bytes_fetched: AtomicU64,
     up_calls: AtomicU64,
     up_micros: AtomicU64,
-    /// Fleet-store reads that failed and were answered as local misses.
-    up_read_errors: AtomicU64,
+    /// Fleet-store calls that failed; reads were answered as local misses.
+    up_errors: AtomicU64,
+    /// Fleet-store calls skipped during the backoff after a failure.
+    up_skipped: AtomicU64,
+    /// Fetched objects whose recomputed ID did not match (answered as misses).
+    up_cas_verify_fail: AtomicU64,
 }
 
 impl Stats {
@@ -87,7 +91,9 @@ impl Stats {
             ("up_bytes_fetched", &self.up_bytes_fetched),
             ("up_calls", &self.up_calls),
             ("up_micros", &self.up_micros),
-            ("up_read_errors", &self.up_read_errors),
+            ("up_errors", &self.up_errors),
+            ("up_skipped", &self.up_skipped),
+            ("up_cas_verify_fail", &self.up_cas_verify_fail),
         ];
         let body: Vec<String> = fields
             .iter()
@@ -116,8 +122,12 @@ struct Upstream {
 struct Store {
     root: PathBuf,
     read_only_kv: bool,
+    /// Accept `CASBytes.file_path` uploads. Only a node daemon, whose clients
+    /// are local builds, may read paths it is handed; a network-facing store
+    /// would read any file on its host for whoever connects.
+    allow_file_paths: bool,
     upstream: Option<Upstream>,
-    /// Unix millis until which fleet-store reads are skipped after a failure.
+    /// Unix millis until which fleet-store calls are skipped after a failure.
     upstream_down_until: AtomicU64,
     stats: Stats,
 }
@@ -203,10 +213,13 @@ impl Store {
         self.root.join("kv").join(&h[..2]).join(h)
     }
 
-    fn bytes_of(b: Option<cas::CasBytes>) -> Result<Vec<u8>, Status> {
+    fn bytes_of(&self, b: Option<cas::CasBytes>) -> Result<Vec<u8>, Status> {
         match b.and_then(|b| b.contents) {
             None => Ok(Vec::new()),
             Some(cas::cas_bytes::Contents::Data(d)) => Ok(d),
+            Some(cas::cas_bytes::Contents::FilePath(_)) if !self.allow_file_paths => Err(
+                Status::invalid_argument("file_path uploads are accepted only on the build host"),
+            ),
             Some(cas::cas_bytes::Contents::FilePath(p)) => {
                 std::fs::read(&p).map_err(|e| Status::invalid_argument(format!("read {p}: {e}")))
             }
@@ -271,27 +284,45 @@ impl Store {
 }
 
 impl Store {
-    /// The fleet store to read from, unless a recent read failed: then every
-    /// lookup is a local miss for a while instead of a connect timeout each.
-    fn readable_upstream(&self) -> Option<&Upstream> {
-        let up = self.upstream.as_ref()?;
-        if now_ms() < self.upstream_down_until.load(Relaxed) {
-            self.stats.up_read_errors.fetch_add(1, Relaxed);
-            return None;
+    fn upstream_backing_off(&self) -> bool {
+        let skip = now_ms() < self.upstream_down_until.load(Relaxed);
+        if skip {
+            self.stats.up_skipped.fetch_add(1, Relaxed);
         }
-        Some(up)
+        skip
     }
 
-    fn upstream_read_failed(&self) {
-        self.stats.up_read_errors.fetch_add(1, Relaxed);
+    /// The fleet store to read from, unless a recent call failed: then every
+    /// lookup is a local miss for a while instead of a timeout each.
+    fn readable_upstream(&self) -> Option<&Upstream> {
+        let up = self.upstream.as_ref()?;
+        (!self.upstream_backing_off()).then_some(up)
+    }
+
+    fn upstream_failed(&self) {
+        self.stats.up_errors.fetch_add(1, Relaxed);
         self.upstream_down_until
             .store(now_ms() + UPSTREAM_BACKOFF_MS, Relaxed);
+    }
+
+    /// A forwarded write failed or was skipped: the build gets an error (and
+    /// compiles on), and nothing is published half-way.
+    fn write_unavailable(&self, e: Option<Status>) -> Status {
+        if let Some(e) = e {
+            self.upstream_failed();
+            return upstream_err(e);
+        }
+        Status::unavailable("fleet store unavailable (backing off)")
     }
 
     /// Local object, else fetch it from the fleet store, verify it, keep it.
     async fn get_or_fetch(&self, id: &[u8]) -> Result<Option<cas::CasObject>, Status> {
         if let Some(obj) = self.get(id)? {
             return Ok(Some(obj));
+        }
+        // Every ID the fleet store issues is a SHA-256 digest.
+        if id.len() != 32 {
+            return Ok(None);
         }
         let Some(up) = self.readable_upstream() else {
             return Ok(None);
@@ -303,25 +334,26 @@ impl Store {
         // An unreachable fleet store degrades to a local miss: the build
         // compiles instead of failing or waiting.
         let Ok(resp) = self.stats.upstream(up.cas.clone().get(req)).await else {
-            self.upstream_read_failed();
+            self.upstream_failed();
             return Ok(None);
         };
         let Some(cas::cas_get_response::Contents::Data(obj)) = resp.into_inner().contents else {
             self.stats.up_cas_fetch_miss.fetch_add(1, Relaxed);
             return Ok(None);
         };
-        // The fleet store is not trusted for content: recompute the ID.
+        // The fleet store is not trusted for content: recompute the ID, and
+        // hand Xcode an object rebuilt from the verified bytes only.
         let data = blob_data(&obj).to_vec();
         if object_id(&obj.references, &data) != id {
-            self.stats.up_cas_fetch_miss.fetch_add(1, Relaxed);
+            self.stats.up_cas_verify_fail.fetch_add(1, Relaxed);
             return Ok(None);
         }
         self.stats.up_cas_fetch.fetch_add(1, Relaxed);
         self.stats
             .up_bytes_fetched
             .fetch_add(data.len() as u64, Relaxed);
-        self.put(obj.references.clone(), data)?;
-        Ok(Some(obj))
+        self.put(obj.references.clone(), data.clone())?;
+        Ok(Some(data_object(obj.references, data)))
     }
 
     /// Store locally, then forward to the fleet store before acknowledging.
@@ -336,12 +368,15 @@ impl Store {
         };
         let id = self.put(refs, data)?;
         if let Some((up, obj)) = forward {
+            if self.upstream_backing_off() {
+                return Err(self.write_unavailable(None));
+            }
             let req = cas::CasPutRequest { data: Some(obj) };
             let resp = self
                 .stats
                 .upstream(up.cas.clone().put(req))
                 .await
-                .map_err(upstream_err)?
+                .map_err(|e| self.write_unavailable(Some(e)))?
                 .into_inner();
             match resp.contents {
                 Some(cas::cas_put_response::Contents::CasId(c)) if c.id == id => {
@@ -380,7 +415,7 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         r: Request<cas::CasPutRequest>,
     ) -> Result<Response<cas::CasPutResponse>, Status> {
         let obj = r.into_inner().data.unwrap_or_default();
-        let data = Store::bytes_of(obj.blob)?;
+        let data = self.0.bytes_of(obj.blob)?;
         let id = self.0.put_through(obj.references, data).await?;
         Ok(Response::new(cas::CasPutResponse {
             contents: Some(cas::cas_put_response::Contents::CasId(cas::CasDataId {
@@ -411,7 +446,7 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         r: Request<cas::CasSaveRequest>,
     ) -> Result<Response<cas::CasSaveResponse>, Status> {
         let blob = r.into_inner().data.unwrap_or_default();
-        let data = Store::bytes_of(blob.blob)?;
+        let data = self.0.bytes_of(blob.blob)?;
         let id = self.0.put_through(Vec::new(), data).await?;
         Ok(Response::new(cas::CasSaveResponse {
             contents: Some(cas::cas_save_response::Contents::CasId(cas::CasDataId {
@@ -480,7 +515,7 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
         let mut client = up.kv.clone();
         let fetch = client.get_value(kv::GetValueRequest { key });
         let Ok(resp) = s.stats.upstream(fetch).await else {
-            s.upstream_read_failed();
+            s.upstream_failed();
             return Ok(kv_response(None));
         };
         let Some(kv::get_value_response::Contents::Value(value)) = resp.into_inner().contents
@@ -511,9 +546,14 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
         let req = r.into_inner();
         let value = req.value.unwrap_or_default();
         s.count_dangling(&value);
-        // Forward first: the fleet store decides, and this node's copy
-        // must not claim an entry the fleet store refused.
+        // Forward first: this node's copy must not claim an entry the fleet
+        // store refused. (If the fleet store already held a different value,
+        // it keeps its own and this node keeps the one it computed; both came
+        // from real compiles.)
         if let Some(up) = &s.upstream {
+            if s.upstream_backing_off() {
+                return Err(s.write_unavailable(None));
+            }
             let fwd = kv::PutValueRequest {
                 key: req.key.clone(),
                 value: Some(value.clone()),
@@ -522,7 +562,7 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
                 .stats
                 .upstream(up.kv.clone().put_value(fwd))
                 .await
-                .map_err(upstream_err)?
+                .map_err(|e| s.write_unavailable(Some(e)))?
                 .into_inner();
             if resp.error.is_some() {
                 return Ok(Response::new(resp));
@@ -569,8 +609,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let upstream = match &upstream_url {
         Some(url) => {
             // Lazy: the node starts (and serves local hits) while the fleet
-            // store is down; each call is bounded so a dead store cannot
-            // stall a build.
+            // store is down. Each call is bounded, and after a failure calls
+            // are skipped for UPSTREAM_BACKOFF_MS, so a dead store costs a
+            // build at most one timeout per backoff window.
             let ch = tonic::transport::Endpoint::from_shared(url.clone())?
                 .tcp_nodelay(true)
                 .connect_timeout(std::time::Duration::from_secs(2))
@@ -588,6 +629,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(Store {
         root: root.clone(),
         read_only_kv,
+        allow_file_paths: !listen.starts_with("tcp:"),
         upstream,
         upstream_down_until: AtomicU64::new(0),
         stats: Stats::default(),

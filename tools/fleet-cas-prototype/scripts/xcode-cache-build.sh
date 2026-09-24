@@ -23,7 +23,14 @@
 set -u
 : "${PKG:?}" "${SCHEME:?}" "${WORK:?}"
 label=$1; shift
+# Paths are resolved after the cd below, and DD mode empties them: absolute only.
+for v in WORK ${DD:+DD}; do
+  case ${!v} in /*) ;; *) echo "$v must be an absolute path" >&2; exit 2 ;; esac
+done
 if [ -n "${DD:-}" ]; then
+  case ${DD%/} in
+    "" | "$HOME" | "$HOME/Library/Developer/Xcode/DerivedData") echo "refusing DD=$DD" >&2; exit 2 ;;
+  esac
   dd=$DD
   cas="$WORK/localcas"
   rm -rf "$dd" "$cas"
@@ -52,4 +59,5 @@ rc=$?
 end=$(date +%s.%N)
 printf '%s rc=%s %.1fs hits=%s misses=%s\n' "$label" "$rc" "$(echo "$end - $start" | bc)" \
   "$(grep -c 'cache hit' "$log")" "$(grep -c 'cache miss' "$log")"
-grep -q bad_optional_access "$log" && echo "$label: compiler crashed (bad_optional_access)"
+if grep -q bad_optional_access "$log"; then echo "$label: compiler crashed (bad_optional_access)"; fi
+exit "$rc"

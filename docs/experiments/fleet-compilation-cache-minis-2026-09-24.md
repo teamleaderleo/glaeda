@@ -58,7 +58,7 @@ The fill moved 184 MB (1,665 objects, 711 index entries). A fresh reader fetches
 | Run | Wall | Xcode hits / cacheable | Notes |
 | --- | ---: | ---: | --- |
 | cold, caching off | 756.5 s | n/a | |
-| fill | 703.9, 784.8 s | 0 / 4,191 | 2.26 GB uploaded; store 1.4 GB, 17,803 objects, 7,705 entries |
+| fill | 703.9, 784.8 s | 0 / 4,191 | 2.26 GB uploaded; store 1.4 GiB on disk, 17,803 objects, 7,705 entries |
 | fresh reader, per-run CAS path | 656.7, 669.3 s | 1,534 / 4,191 | the app target missed |
 | warm node, per-run CAS path | 618.8 s | 1,534 / 4,191 | |
 | **fresh reader, fixed CAS path** | **132.2 s** | **4,191 / 4,191** | 1.47 GB fetched, 0 errors |
@@ -122,13 +122,15 @@ per fresh machine.
    `COMPILATION_CACHE_REMOTE_SERVICE_PATH` naming a socket nobody listens on, the chain took
    about 400 s instead of about 17 s, and succeeded. Anything that turns the plugin on must first
    check that the node daemon is up.
-4. **A dead fleet store must be cheap.** A node that answered an unreachable store with errors
-   (or retried every call) cost 45 s on a 17 s build: each of 149 lookups waited out the connect
-   timeout. The node now answers reads as misses and skips the store for 30 s after a failure:
-   18.9 s, about a cold build. Writes still fail, so nothing is published half-way.
+4. **A dead fleet store must be cheap.** A reader node that tried the unreachable store on
+   every lookup turned a 17 s build into 45 s: 149 lookups failed slowly, adding about 28 s. The
+   node now answers reads as misses and skips the store for 30 s after a failure: 18.9 s, about
+   a cold build. Writes fail immediately during the backoff (not measured: the outage runs were
+   read-only readers), so nothing is published half-way.
 5. **Network cost is about 40% of a full-app fresh read.** 132 s fresh against 80 s from a warm
-   node: about 52 s is fetching 1.47 GB as 25,506 one-object requests, about six in flight at a time (about
-   28 MB/s effective on a LAN that carries far more). The chain's split is 6.5 s against 5.6 s.
+   node: about 52 s is fetching 1.47 GB in about 25,500 requests (one per object or index
+   entry, about six in flight at a time; about 28 MB/s effective on a LAN that carries far
+   more). The chain's split is 6.5 s against 5.6 s.
 6. **The tailnet blocks mini-to-mini TCP.** ICMP passes (2.1 ms), but TCP on 22 and on the
    cache port time out; the LAN is open. A fleet store reachable from every machine needs a
    Manaflow ACL grant for the cache port between tagged devices (their admin's change), or a

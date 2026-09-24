@@ -13,7 +13,14 @@ sock="$HOME/.cache/fleet-cas/nr.sock"
 store="$WORK/node-r"
 np=
 
-stop_node() { [ -n "$np" ] && kill -INT "$np" && wait "$np" 2>/dev/null; np=; }
+stop_node() {
+  [ -n "$np" ] || return 0
+  kill -INT "$np" 2>/dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$np" 2>/dev/null || break; sleep 1; done
+  kill -9 "$np" 2>/dev/null
+  wait "$np" 2>/dev/null
+  np=
+}
 trap stop_node EXIT
 
 start_node() {
@@ -27,8 +34,10 @@ start_node() {
 }
 
 run() {
+  rm -f "$WORK/log-$1.txt"
   "$here/with-fleet-lock.pl" "$here/xcode-cache-build.sh" "$1" \
-    COMPILATION_CACHE_ENABLE_PLUGIN=YES COMPILATION_CACHE_REMOTE_SERVICE_PATH="$sock"
+    COMPILATION_CACHE_ENABLE_PLUGIN=YES COMPILATION_CACHE_REMOTE_SERVICE_PATH="$sock" \
+    || { echo "$1 failed rc=$?"; exit 1; }
   sleep 1
   echo "$1 node: $(cat "$store/stats.json")"
   echo "$1 xcode: $(grep -oE '[0-9]+ hits / [0-9]+ cacheable' "$WORK/log-$1.txt")"
