@@ -154,6 +154,15 @@ class Python(unittest.TestCase):
              mock.patch.object(me, "python_version", side_effect={"/a": (3, 9), local: (3, 14)}.get):
             self.assertEqual(me.pick_python(None, Path("/home/op")), local)
 
+    def test_path_lookup_never_probes_the_usr_bin_stub(self) -> None:
+        probed: list[str] = []
+        with mock.patch.object(me, "PYTHON_CANDIDATES", ()), \
+             mock.patch.object(me.shutil, "which", return_value="/usr/bin/python3"), \
+             mock.patch.object(me.os, "access", side_effect=lambda p, m: p == "/usr/bin/python3"), \
+             mock.patch.object(me, "python_version", side_effect=lambda p: probed.append(p)):
+            self.assertIsNone(me.pick_python(None, Path("/home/op")))
+        self.assertEqual(probed, [])
+
     def test_missing_python_names_both_fixes(self) -> None:
         err = io.StringIO()
         with mock.patch.object(me, "pick_python", return_value=None), contextlib.redirect_stderr(err):

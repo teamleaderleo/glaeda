@@ -195,10 +195,12 @@ def enroll_module() -> Any:
 
         loader = importlib.machinery.SourceFileLoader("glaeda_mini_enroll", os.fspath(SCRIPT_DIR / "glaeda-mini-enroll"))
         spec = importlib.util.spec_from_loader("glaeda_mini_enroll", loader)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules.setdefault("glaeda_mini_enroll", module)  # its dataclasses look themselves up here
-        loader.exec_module(module)
-        _ENROLL = sys.modules["glaeda_mini_enroll"]
+        module = sys.modules.get("glaeda_mini_enroll")
+        if module is None:
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["glaeda_mini_enroll"] = module  # its dataclasses look themselves up here
+            loader.exec_module(module)
+        _ENROLL = module
     return _ENROLL
 
 
@@ -208,14 +210,26 @@ def enroll_python(ctx: Context) -> str | None:
 
 
 def owned_brew() -> str | None:
-    """brew, when this user can write its prefix. Shared minis often have another account's Homebrew."""
+    """brew, when this user owns it. Shared minis often have another account's Homebrew.
+
+    Ownership, not write access: the installer makes Cellar group-writable for admin, and
+    another admin installing into it leaves the owner with files it does not own.
+    """
     brew = which("brew", ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"))
     if brew is None:
         return None
-    prefix = Path(brew).parent.parent
-    cellar = prefix / "Cellar"
-    writable = os.access(prefix, os.W_OK) and (not cellar.exists() or os.access(cellar, os.W_OK))
-    return brew if writable else None
+    prefix = Path(brew).parent.parent  # /opt/homebrew, or /usr/local on Intel (root-owned itself)
+    for mark in (prefix / "Cellar", prefix / "bin"):
+        try:
+            return brew if mark.stat().st_uid == os.getuid() else None
+        except OSError:
+            continue
+    return None
+
+
+def brew_allowed(ctx: Context) -> bool:
+    """A sandbox HOME (tests, rehearsals) must never reach the real Homebrew."""
+    return not ctx.sandbox
 
 
 def brew_install(brew: str, formula: str) -> tuple[int, str]:
@@ -578,6 +592,9 @@ def plan_enroll_python(ctx: Context) -> dict[str, Any]:
     if found:
         return {**act, "state": "unchanged", "value": found, "note": ""}
     brew = owned_brew()
+    if brew and not brew_allowed(ctx):
+        return {**act, "state": "blocked", "value": None,
+                "note": f"brew install {ENROLL_PYTHON_FORMULA} is not run with a sandbox HOME"}
     if brew:
         return {**act, "state": "create", "value": None, "brew": brew,
                 "note": f"brew install {ENROLL_PYTHON_FORMULA}; glaeda-mini-enroll needs Python 3.13+"}
@@ -887,7 +904,7 @@ def render(ctx: Context, receipt: dict[str, Any]) -> str:
     for act in receipt["actions"]:
         target = act.get("label") or (act.get("key") and (act["key"] if act.get("value") is None else f"{act['key']}={act['value']}")) or ctx.show(act.get("path", ""))
         note = f"  ({act['note']})" if act.get("note") else ""
-        lines.append(f"  {act['state']:<9} {act['kind']:<5} {target}{note}")
+        lines.append(f"  {act['state']:<9} {act['kind']:<6} {target}{note}")
     if receipt["operatorSteps"]:
         lines.append("operator steps (need sudo or a human; this command does not run them)")
     for i, step in enumerate(receipt["operatorSteps"], 1):
