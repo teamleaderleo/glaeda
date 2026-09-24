@@ -269,7 +269,7 @@ def member_labels(manifest: Any, member: str) -> tuple[dict[str, Any] | None, st
     """(member summary with labels, None) or (None, why this member cannot be a runner). Reads only."""
     try:
         rule = fleet_labels()
-    except (OSError, SyntaxError) as error:
+    except Exception as error:  # noqa: BLE001  (missing, broken or stale module: explain, never a traceback)
         return None, f"{LABELS_MODULE} must sit next to this script for --manifest ({type(error).__name__})"
     return rule.member_labels(manifest, member, lambda app: xcode_present(app))
 

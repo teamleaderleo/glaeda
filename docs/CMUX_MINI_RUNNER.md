@@ -90,8 +90,8 @@ gh api -X POST repos/manaflow-ai/cmux/actions/runners/registration-token --jq .t
   | ssh MINI '~/glaeda/scripts/glaeda-cmux-runner --apply --token-stdin'
 ```
 
-Only `glaeda-cmux-runner` and `glaeda-cmux-runner-hook` need to be on the mini, side
-by side, plus `glaeda_fleet_labels.py` when you pass `--manifest` (section 2c). Without `gh`, the release metadata comes from the public API through curl,
+`glaeda-cmux-runner` and `glaeda-cmux-runner-hook` must sit side by side on the
+mini, plus `glaeda_fleet_labels.py` for `--manifest` (section 2c). Without `gh`, the release metadata comes from the public API through curl,
 a name that is already registered is refused by `config.sh` itself, and step 5 is
 confirmed from the runner's own log (`Listening for Jobs`) and `.runner` instead of
 the API. Check the labels from the operator's machine (section 3).
