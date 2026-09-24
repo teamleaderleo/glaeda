@@ -1,19 +1,30 @@
 //! Prototype fleet compilation-cache server for Xcode's
 //! COMPILATION_CACHE_REMOTE_SERVICE_PATH (LLVM compilation_cache_service
-//! protocol). Disk-backed CAS + KV behind a unix socket.
+//! protocol). Disk-backed CAS + KV behind a unix socket or a TCP port.
 //!
 //! Trust model under test: CAS object IDs are computed here from content, so
 //! CAS writes cannot impersonate. KV writes (cache key -> result) are the only
 //! poisoning surface; `--read-only-kv` refuses them.
+//!
+//! Two roles, one binary:
+//! - fleet store: `fleet-cas tcp:<addr> <store>`, reached over the network.
+//! - node daemon: `fleet-cas <socket> <store> --upstream http://<addr>`. Xcode
+//!   talks to it on the same host (the client sends large blobs as local file
+//!   paths). Reads try the local store, then the fleet store, and keep what
+//!   they fetch. Writes land locally and are forwarded before they are
+//!   acknowledged, so an index entry never reaches the fleet store ahead of
+//!   the objects it names. With `--read-only-kv` nothing is forwarded.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::Instant;
 
 use prost::Message;
 use sha2::{Digest, Sha256};
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
 pub mod cas {
@@ -36,31 +47,97 @@ struct Stats {
     kv_put_conflict: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    /// KV entries whose 32-byte values name objects this store lacks.
+    kv_put_dangling: AtomicU64,
+    // Node daemon only: traffic to the fleet store.
+    up_cas_fetch: AtomicU64,
+    up_cas_fetch_miss: AtomicU64,
+    up_kv_fetch: AtomicU64,
+    up_kv_fetch_miss: AtomicU64,
+    up_cas_push: AtomicU64,
+    up_kv_push: AtomicU64,
+    up_bytes_fetched: AtomicU64,
+    up_calls: AtomicU64,
+    up_micros: AtomicU64,
+    /// Fleet-store reads that failed and were answered as local misses.
+    up_read_errors: AtomicU64,
 }
 
 impl Stats {
     fn line(&self) -> String {
-        format!(
-            "{{\"cas_put\":{},\"cas_put_new\":{},\"cas_get_hit\":{},\"cas_get_miss\":{},\"kv_get_hit\":{},\"kv_get_miss\":{},\"kv_put\":{},\"kv_put_refused\":{},\"kv_put_conflict\":{},\"bytes_in\":{},\"bytes_out\":{}}}",
-            self.cas_put.load(Relaxed),
-            self.cas_put_new.load(Relaxed),
-            self.cas_get_hit.load(Relaxed),
-            self.cas_get_miss.load(Relaxed),
-            self.kv_get_hit.load(Relaxed),
-            self.kv_get_miss.load(Relaxed),
-            self.kv_put.load(Relaxed),
-            self.kv_put_refused.load(Relaxed),
-            self.kv_put_conflict.load(Relaxed),
-            self.bytes_in.load(Relaxed),
-            self.bytes_out.load(Relaxed),
-        )
+        let fields = [
+            ("cas_put", &self.cas_put),
+            ("cas_put_new", &self.cas_put_new),
+            ("cas_get_hit", &self.cas_get_hit),
+            ("cas_get_miss", &self.cas_get_miss),
+            ("kv_get_hit", &self.kv_get_hit),
+            ("kv_get_miss", &self.kv_get_miss),
+            ("kv_put", &self.kv_put),
+            ("kv_put_refused", &self.kv_put_refused),
+            ("kv_put_conflict", &self.kv_put_conflict),
+            ("kv_put_dangling", &self.kv_put_dangling),
+            ("bytes_in", &self.bytes_in),
+            ("bytes_out", &self.bytes_out),
+            ("up_cas_fetch", &self.up_cas_fetch),
+            ("up_cas_fetch_miss", &self.up_cas_fetch_miss),
+            ("up_kv_fetch", &self.up_kv_fetch),
+            ("up_kv_fetch_miss", &self.up_kv_fetch_miss),
+            ("up_cas_push", &self.up_cas_push),
+            ("up_kv_push", &self.up_kv_push),
+            ("up_bytes_fetched", &self.up_bytes_fetched),
+            ("up_calls", &self.up_calls),
+            ("up_micros", &self.up_micros),
+            ("up_read_errors", &self.up_read_errors),
+        ];
+        let body: Vec<String> = fields
+            .iter()
+            .map(|(k, v)| format!("\"{k}\":{}", v.load(Relaxed)))
+            .collect();
+        format!("{{{}}}", body.join(","))
     }
+
+    /// Time one call to the fleet store.
+    async fn upstream<T>(&self, f: impl std::future::Future<Output = T>) -> T {
+        let t = Instant::now();
+        let r = f.await;
+        self.up_calls.fetch_add(1, Relaxed);
+        self.up_micros
+            .fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+        r
+    }
+}
+
+#[derive(Clone)]
+struct Upstream {
+    cas: cas::casdb_service_client::CasdbServiceClient<Channel>,
+    kv: kv::key_value_db_client::KeyValueDbClient<Channel>,
 }
 
 struct Store {
     root: PathBuf,
     read_only_kv: bool,
+    upstream: Option<Upstream>,
     stats: Stats,
+}
+
+fn blob_data(obj: &cas::CasObject) -> &[u8] {
+    match obj.blob.as_ref().and_then(|b| b.contents.as_ref()) {
+        Some(cas::cas_bytes::Contents::Data(d)) => d.as_slice(),
+        _ => &[],
+    }
+}
+
+fn data_object(refs: Vec<cas::CasDataId>, data: Vec<u8>) -> cas::CasObject {
+    cas::CasObject {
+        blob: Some(cas::CasBytes {
+            contents: Some(cas::cas_bytes::Contents::Data(data)),
+        }),
+        references: refs,
+    }
+}
+
+fn upstream_err(e: Status) -> Status {
+    Status::unavailable(format!("fleet store: {}", e.message()))
 }
 
 fn object_id(refs: &[cas::CasDataId], data: &[u8]) -> Vec<u8> {
@@ -133,12 +210,7 @@ impl Store {
         let path = self.cas_path(&id);
         // Rewrite when absent or damaged, so a re-upload repairs corruption.
         if !self.intact(&path, &id) {
-            let obj = cas::CasObject {
-                blob: Some(cas::CasBytes {
-                    contents: Some(cas::cas_bytes::Contents::Data(data)),
-                }),
-                references: refs,
-            };
+            let obj = data_object(refs, data);
             std::fs::create_dir_all(path.parent().unwrap())
                 .and_then(|_| write_atomic(&path, &obj.encode_to_vec()))
                 .map_err(|e| Status::internal(e.to_string()))?;
@@ -154,11 +226,7 @@ impl Store {
         let Ok(obj) = cas::CasObject::decode(bytes.as_slice()) else {
             return false;
         };
-        let data = match obj.blob.as_ref().and_then(|b| b.contents.as_ref()) {
-            Some(cas::cas_bytes::Contents::Data(d)) => d.as_slice(),
-            _ => &[],
-        };
-        object_id(&obj.references, data) == id
+        object_id(&obj.references, blob_data(&obj)) == id
     }
 
     fn get(&self, id: &[u8]) -> Result<Option<cas::CasObject>, Status> {
@@ -174,10 +242,7 @@ impl Store {
                     self.stats.cas_get_miss.fetch_add(1, Relaxed);
                     return Ok(None);
                 };
-                let data = match obj.blob.as_ref().and_then(|b| b.contents.as_ref()) {
-                    Some(cas::cas_bytes::Contents::Data(d)) => d.as_slice(),
-                    _ => &[],
-                };
+                let data = blob_data(&obj);
                 if object_id(&obj.references, data) != id {
                     self.stats.cas_get_miss.fetch_add(1, Relaxed);
                     return Ok(None);
@@ -195,6 +260,89 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Local object, else fetch it from the fleet store, verify it, keep it.
+    async fn get_or_fetch(&self, id: &[u8]) -> Result<Option<cas::CasObject>, Status> {
+        if let Some(obj) = self.get(id)? {
+            return Ok(Some(obj));
+        }
+        let Some(up) = &self.upstream else {
+            return Ok(None);
+        };
+        let req = cas::CasGetRequest {
+            cas_id: Some(cas::CasDataId { id: id.to_vec() }),
+            write_to_disk: false,
+        };
+        // An unreachable fleet store degrades to a local miss: the build
+        // compiles instead of failing or waiting.
+        let Ok(resp) = self.stats.upstream(up.cas.clone().get(req)).await else {
+            self.stats.up_read_errors.fetch_add(1, Relaxed);
+            return Ok(None);
+        };
+        let Some(cas::cas_get_response::Contents::Data(obj)) = resp.into_inner().contents else {
+            self.stats.up_cas_fetch_miss.fetch_add(1, Relaxed);
+            return Ok(None);
+        };
+        // The fleet store is not trusted for content: recompute the ID.
+        let data = blob_data(&obj).to_vec();
+        if object_id(&obj.references, &data) != id {
+            self.stats.up_cas_fetch_miss.fetch_add(1, Relaxed);
+            return Ok(None);
+        }
+        self.stats.up_cas_fetch.fetch_add(1, Relaxed);
+        self.stats
+            .up_bytes_fetched
+            .fetch_add(data.len() as u64, Relaxed);
+        self.put(obj.references.clone(), data)?;
+        Ok(Some(obj))
+    }
+
+    /// Store locally, then forward to the fleet store before acknowledging.
+    async fn put_through(
+        &self,
+        refs: Vec<cas::CasDataId>,
+        data: Vec<u8>,
+    ) -> Result<Vec<u8>, Status> {
+        let forward = match &self.upstream {
+            Some(up) if !self.read_only_kv => Some((up, data_object(refs.clone(), data.clone()))),
+            _ => None,
+        };
+        let id = self.put(refs, data)?;
+        if let Some((up, obj)) = forward {
+            let req = cas::CasPutRequest { data: Some(obj) };
+            let resp = self
+                .stats
+                .upstream(up.cas.clone().put(req))
+                .await
+                .map_err(upstream_err)?
+                .into_inner();
+            match resp.contents {
+                Some(cas::cas_put_response::Contents::CasId(c)) if c.id == id => {
+                    self.stats.up_cas_push.fetch_add(1, Relaxed);
+                }
+                Some(cas::cas_put_response::Contents::Error(e)) => {
+                    return Err(Status::unavailable(e.description));
+                }
+                _ => return Err(Status::internal("fleet store returned a different ID")),
+            }
+        }
+        Ok(id)
+    }
+
+    /// Count entries that name absent objects. Xcode's values map names to
+    /// 32-byte object IDs here; this measures the M3 publication rule
+    /// without enforcing it yet.
+    fn count_dangling(&self, value: &kv::Value) {
+        let dangling = value
+            .entries
+            .values()
+            .any(|v| v.len() == 32 && !self.cas_path(v).exists());
+        if dangling {
+            self.stats.kv_put_dangling.fetch_add(1, Relaxed);
+        }
+    }
+}
+
 struct CasSvc(Arc<Store>);
 struct KvSvc(Arc<Store>);
 
@@ -206,7 +354,7 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
     ) -> Result<Response<cas::CasPutResponse>, Status> {
         let obj = r.into_inner().data.unwrap_or_default();
         let data = Store::bytes_of(obj.blob)?;
-        let id = self.0.put(obj.references, data)?;
+        let id = self.0.put_through(obj.references, data).await?;
         Ok(Response::new(cas::CasPutResponse {
             contents: Some(cas::cas_put_response::Contents::CasId(cas::CasDataId {
                 id,
@@ -219,7 +367,7 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         r: Request<cas::CasGetRequest>,
     ) -> Result<Response<cas::CasGetResponse>, Status> {
         let id = r.into_inner().cas_id.unwrap_or_default().id;
-        Ok(Response::new(match self.0.get(&id)? {
+        Ok(Response::new(match self.0.get_or_fetch(&id).await? {
             Some(obj) => cas::CasGetResponse {
                 outcome: cas::cas_get_response::Outcome::Success as i32,
                 contents: Some(cas::cas_get_response::Contents::Data(obj)),
@@ -237,7 +385,7 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
     ) -> Result<Response<cas::CasSaveResponse>, Status> {
         let blob = r.into_inner().data.unwrap_or_default();
         let data = Store::bytes_of(blob.blob)?;
-        let id = self.0.put(Vec::new(), data)?;
+        let id = self.0.put_through(Vec::new(), data).await?;
         Ok(Response::new(cas::CasSaveResponse {
             contents: Some(cas::cas_save_response::Contents::CasId(cas::CasDataId {
                 id,
@@ -250,7 +398,7 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         r: Request<cas::CasLoadRequest>,
     ) -> Result<Response<cas::CasLoadResponse>, Status> {
         let id = r.into_inner().cas_id.unwrap_or_default().id;
-        Ok(Response::new(match self.0.get(&id)? {
+        Ok(Response::new(match self.0.get_or_fetch(&id).await? {
             Some(obj) => cas::CasLoadResponse {
                 outcome: cas::cas_load_response::Outcome::Success as i32,
                 contents: Some(cas::cas_load_response::Contents::Data(cas::CasBlob {
@@ -265,6 +413,19 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
     }
 }
 
+fn kv_response(value: Option<kv::Value>) -> Response<kv::GetValueResponse> {
+    Response::new(match value {
+        Some(v) => kv::GetValueResponse {
+            outcome: kv::get_value_response::Outcome::Success as i32,
+            contents: Some(kv::get_value_response::Contents::Value(v)),
+        },
+        None => kv::GetValueResponse {
+            outcome: kv::get_value_response::Outcome::KeyNotFound as i32,
+            contents: None,
+        },
+    })
+}
+
 #[tonic::async_trait]
 impl kv::key_value_db_server::KeyValueDb for KvSvc {
     async fn get_value(
@@ -273,31 +434,38 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
     ) -> Result<Response<kv::GetValueResponse>, Status> {
         let key = r.into_inner().key;
         let s = &self.0;
-        match std::fs::read(s.kv_path(&key)) {
+        let path = s.kv_path(&key);
+        match std::fs::read(&path) {
             Ok(bytes) => {
                 // A damaged entry is a miss, like a damaged object.
-                let Ok(value) = kv::Value::decode(bytes.as_slice()) else {
-                    s.stats.kv_get_miss.fetch_add(1, Relaxed);
-                    return Ok(Response::new(kv::GetValueResponse {
-                        outcome: kv::get_value_response::Outcome::KeyNotFound as i32,
-                        contents: None,
-                    }));
-                };
-                s.stats.kv_get_hit.fetch_add(1, Relaxed);
-                Ok(Response::new(kv::GetValueResponse {
-                    outcome: kv::get_value_response::Outcome::Success as i32,
-                    contents: Some(kv::get_value_response::Contents::Value(value)),
-                }))
+                if let Ok(value) = kv::Value::decode(bytes.as_slice()) {
+                    s.stats.kv_get_hit.fetch_add(1, Relaxed);
+                    return Ok(kv_response(Some(value)));
+                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                s.stats.kv_get_miss.fetch_add(1, Relaxed);
-                Ok(Response::new(kv::GetValueResponse {
-                    outcome: kv::get_value_response::Outcome::KeyNotFound as i32,
-                    contents: None,
-                }))
-            }
-            Err(e) => Err(Status::internal(e.to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Status::internal(e.to_string())),
         }
+        s.stats.kv_get_miss.fetch_add(1, Relaxed);
+        let Some(up) = &s.upstream else {
+            return Ok(kv_response(None));
+        };
+        let mut client = up.kv.clone();
+        let fetch = client.get_value(kv::GetValueRequest { key });
+        let Ok(resp) = s.stats.upstream(fetch).await else {
+            s.stats.up_read_errors.fetch_add(1, Relaxed);
+            return Ok(kv_response(None));
+        };
+        let Some(kv::get_value_response::Contents::Value(value)) = resp.into_inner().contents
+        else {
+            s.stats.up_kv_fetch_miss.fetch_add(1, Relaxed);
+            return Ok(kv_response(None));
+        };
+        s.stats.up_kv_fetch.fetch_add(1, Relaxed);
+        // Keep it: the next lookup on this node is local.
+        let _ = std::fs::create_dir_all(path.parent().unwrap())
+            .and_then(|_| publish_new(&path, &value.encode_to_vec()));
+        Ok(kv_response(Some(value)))
     }
 
     async fn put_value(
@@ -314,7 +482,27 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
             }));
         }
         let req = r.into_inner();
-        let bytes = req.value.unwrap_or_default().encode_to_vec();
+        let value = req.value.unwrap_or_default();
+        s.count_dangling(&value);
+        // Forward first: the fleet store decides, and this node's copy
+        // must not claim an entry the fleet store refused.
+        if let Some(up) = &s.upstream {
+            let fwd = kv::PutValueRequest {
+                key: req.key.clone(),
+                value: Some(value.clone()),
+            };
+            let resp = s
+                .stats
+                .upstream(up.kv.clone().put_value(fwd))
+                .await
+                .map_err(upstream_err)?
+                .into_inner();
+            if resp.error.is_some() {
+                return Ok(Response::new(resp));
+            }
+            s.stats.up_kv_push.fetch_add(1, Relaxed);
+        }
+        let bytes = value.encode_to_vec();
         let path = s.kv_path(&req.key);
         s.stats.kv_put.fetch_add(1, Relaxed);
         // First writer wins, including under concurrency: an existing mapping
@@ -329,20 +517,51 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
     }
 }
 
+const USAGE: &str =
+    "usage: fleet-cas <socket | tcp:ADDR> <store> [--read-only-kv] [--upstream http://HOST:PORT]";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    let socket = PathBuf::from(
-        args.next()
-            .expect("usage: fleet-cas <socket> <store> [--read-only-kv]"),
-    );
-    let root = PathBuf::from(args.next().expect("store dir"));
-    let read_only_kv = args.any(|a| a == "--read-only-kv");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (Some(listen), Some(root)) = (args.first(), args.get(1)) else {
+        return Err(USAGE.into());
+    };
+    let root = PathBuf::from(root);
+    let mut read_only_kv = false;
+    let mut upstream_url = None;
+    let mut rest = args[2..].iter();
+    while let Some(a) = rest.next() {
+        match a.as_str() {
+            "--read-only-kv" => read_only_kv = true,
+            "--upstream" => upstream_url = Some(rest.next().ok_or(USAGE)?.clone()),
+            _ => return Err(USAGE.into()),
+        }
+    }
     std::fs::create_dir_all(&root)?;
-    let _ = std::fs::remove_file(&socket);
+
+    let upstream = match &upstream_url {
+        Some(url) => {
+            // Lazy: the node starts (and serves local hits) while the fleet
+            // store is down; each call is bounded so a dead store cannot
+            // stall a build.
+            let ch = tonic::transport::Endpoint::from_shared(url.clone())?
+                .tcp_nodelay(true)
+                .connect_timeout(std::time::Duration::from_secs(2))
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_lazy();
+            Some(Upstream {
+                cas: cas::casdb_service_client::CasdbServiceClient::new(ch.clone())
+                    .max_decoding_message_size(512 << 20)
+                    .max_encoding_message_size(512 << 20),
+                kv: kv::key_value_db_client::KeyValueDbClient::new(ch),
+            })
+        }
+        None => None,
+    };
     let store = Arc::new(Store {
         root: root.clone(),
         read_only_kv,
+        upstream,
         stats: Stats::default(),
     });
 
@@ -360,24 +579,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let listener = UnixListener::bind(&socket)?;
     eprintln!(
-        "fleet-cas listening on {} store={} read_only_kv={read_only_kv}",
-        socket.display(),
-        root.display()
+        "fleet-cas listening on {listen} store={} read_only_kv={read_only_kv} upstream={}",
+        root.display(),
+        upstream_url.as_deref().unwrap_or("none")
     );
     let final_store = store.clone();
-    tonic::transport::Server::builder()
+    let router = tonic::transport::Server::builder()
+        .tcp_nodelay(true)
         .add_service(
             cas::casdb_service_server::CasdbServiceServer::new(CasSvc(store.clone()))
                 .max_decoding_message_size(512 << 20)
                 .max_encoding_message_size(512 << 20),
         )
-        .add_service(kv::key_value_db_server::KeyValueDbServer::new(KvSvc(store)))
-        .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+        .add_service(kv::key_value_db_server::KeyValueDbServer::new(KvSvc(store)));
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    if let Some(addr) = listen.strip_prefix("tcp:") {
+        router.serve_with_shutdown(addr.parse()?, shutdown).await?;
+    } else {
+        let socket = PathBuf::from(listen);
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket)?;
+        router
+            .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
+            .await?;
+    }
     eprintln!("{}", final_store.stats.line());
     Ok(())
 }
