@@ -2,7 +2,7 @@
 
 Status: design. Owner issue: #149 (automated updates with canary checks and rollback).
 Builds on [host reconciliation](HOST_RECONCILIATION.md), [fleet distribution](FLEET_DISTRIBUTION.md),
-the mini-fleet manifest, host reservations (`glaeda_reservation.py`), and the journaled
+the mini-fleet manifest, host reservations (`scripts/glaeda_reservation.py`), and the journaled
 service updater (`src/disposable_launchd_service/upgrade.rs`, #1131).
 
 Desired state (the fleet manifest `build-fleet/mini-fleet.json` and `channels.json`) lives in
@@ -114,8 +114,8 @@ restart step (`SIGTERM` instead of reloading a user agent), which becomes a hook
 3. **Apply**, only when all of these hold:
    - the host is not in `never_touch` and not `pin: manual`;
    - the wrapper target is one the agent installed, or the manifest's `adopt` names it. Any other
-     target is `needs_inspection` and is adopted without overwrite, as in host reconciliation.
-     This is the cmux11s case;
+     target is `needs_inspection` and left untouched until `adopt` names it, then adopted without
+     overwrite, as in host reconciliation. This is the cmux11s case;
    - the target hash is not quarantined on this host (see Quarantine);
    - the release verifies: hashes match and the attestation passes (see Security);
    - the controller advertises every capability the release lists;
@@ -129,7 +129,8 @@ restart step (`SIGTERM` instead of reloading a user agent), which becomes a hook
       the marker and retry later.
    3. Take `host.lock`, install `bin/worker-<hash>` and the recipe release (`recipe-release.py`),
       write `bin/worker.env`, swap the wrapper by rename, and keep the previous wrapper.
-   4. Restart the worker, verify, then release the marker.
+   4. Restart the worker and verify (or roll back), still holding `host.lock`, then release the
+      lock and the marker.
 4. **Verify.** Within 2 minutes the relaunched worker must run the new hash and heartbeat without
    errors. `worker cache-check` also runs, but it checks the cache, not the worker, so it only
    counts alongside the heartbeat check.
@@ -187,8 +188,8 @@ them, and an old controller drops unknown fields.
 
 ### 6. The coordinator is excluded
 
-cmux-lawrence is in `never_touch`. The agent is not installed there and refuses it by name and
-address (as `glaeda-fleet-cas-rollout` already does). Controller changes install only after its
+cmux-lawrence is in `never_touch`. The agent is not installed there and refuses it by name (as
+`glaeda-fleet-cas-rollout` already does) and also by address, which that script does not check. Controller changes install only after its
 owner approves a specific hash. Until then the capability rules keep new workers useful against
 the old controller.
 
