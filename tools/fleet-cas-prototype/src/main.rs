@@ -51,7 +51,8 @@ struct Stats {
     kv_put_conflict: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
-    /// Writes refused because the TCP peer is not an allowed writer.
+    /// Refused writes: on a fleet store, writes it refused from a peer not
+    /// on `--writers`; on a node, writes the fleet store refused.
     write_refused: AtomicU64,
     /// KV entries whose 32-byte values name objects this store lacks.
     kv_put_dangling: AtomicU64,

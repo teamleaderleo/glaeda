@@ -124,7 +124,7 @@ install_binaries() {
   if [ -n "$apply" ]; then
     check_owner
     # cargo competes with builds for the mini, so it takes the fleet host lock where one exists.
-    if [ -e /Users/Shared/cmux-build-fleet/host.lock ]; then
+    if [ -e "${FLEET_HOST_LOCK:-/Users/Shared/cmux-build-fleet/host.lock}" ]; then
       (cd "$proto" && scripts/with-fleet-lock.pl cargo build --release --locked -q)
     else
       (cd "$proto" && cargo build --release --locked -q)
