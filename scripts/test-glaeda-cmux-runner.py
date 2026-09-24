@@ -603,8 +603,8 @@ else:
         make_executable(cargo / "python3", f"#!/bin/sh\necho {python}\n")
         if gh:
             make_executable(cargo / "gh", "#!/bin/sh\necho 'gh version 2.101.0 (2026-09-15)'\n")
-        else:
-            (cargo / "gh").unlink(missing_ok=True)
+        else:  # shadows a gh the host has on /usr/bin (GitHub's hosted images do)
+            make_executable(cargo / "gh", "#!/bin/sh\nexit 127\n")
         outputs = {"cargo": have["cargoVersion"], "zig": have["zigVersion"],
                    "xcrun": have["macosSdkVersion"],
                    "xcodebuild": f"Xcode {have['xcodeVersion']}\nBuild version {have['xcodeBuild']}"}
