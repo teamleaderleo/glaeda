@@ -9,11 +9,13 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import re
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -868,7 +870,7 @@ class FixPlanTests(unittest.TestCase):
         self.result["checks"]["zig"] = {"state": "ok", "detail": "", "fix": "", "group": ""}
         calls = []
 
-        def repair(manifest, name, action, log):
+        def repair(manifest, name, action, log, seed=None):
             calls.append(action["kind"])
             return action["kind"] != "metal", "boom" if action["kind"] == "metal" else ""
 
@@ -902,7 +904,7 @@ class FixPlanTests(unittest.TestCase):
         self.result["checks"]["rust"] = {"state": "ok", "detail": "", "fix": "", "group": ""}
         seen = {}
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), \
-                mock.patch.object(mf, "run_repair", side_effect=lambda m, n, a, log: (seen.setdefault(a["kind"], a), (True, ""))[1]):
+                mock.patch.object(mf, "run_repair", side_effect=lambda m, n, a, log, seed=None: (seen.setdefault(a["kind"], a), (True, ""))[1]):
             mf.fix_host(self.manifest, "build-mini-1", self.result, True, Path(tmp))
         self.assertEqual(seen["glaeda"]["python"], "~/.local/bin/python3")
 
@@ -1002,8 +1004,9 @@ class FixLibraryTests(unittest.TestCase):
     def test_parses_as_bash_and_never_escalates(self) -> None:
         subprocess.run(["bash", "-n", os.fspath(mf.FIX_LIBRARY)], check=True)
         body = [line for line in mf.FIX_LIBRARY.read_text().splitlines() if not line.lstrip().startswith("#")]
-        for word in ("sudo", "rm -r", "curl", "--force"):
+        for word in ("rm -r", "curl", "--force"):
             self.assertFalse([line for line in body if word in line], word)
+        self.assertFalse([line for line in body if re.search(r"(^|[;&|(]\s*)sudo\b", line.strip())])
         # The only removal is the step lock's own pid file and directory.
         self.assertEqual([line.strip() for line in body if "rm " in line],
                          ["""trap 'rm -f "$HOME/.local/state/glaeda/mini-fleet/step.lock/pid"; rmdir "$HOME/.local/state/glaeda/mini-fleet/step.lock" 2>/dev/null || true' EXIT"""])
@@ -1133,6 +1136,261 @@ class OperatorSideTests(unittest.TestCase):
                 os.environ.pop("GLAEDA_MINI_FLEET_PYTHON", None)
                 self.assertEqual(mf.operator_python_dist("3.13")[1], "3.14.0")
                 self.assertIsNone(mf.operator_python_dist("3.15"))
+
+
+SSH_SHIM = """#!/bin/bash
+# Test stand-in for ssh: each host is a directory under $SHIM_ROOT used as that host's HOME.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|-i|-l) shift 2 ;;
+    -A|-t|-T) shift ;;
+    *) break ;;
+  esac
+done
+host=$1; shift
+exec env HOME="$SHIM_ROOT/$host" bash -c "$*"
+"""
+
+
+class ShareTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest = mf.load_manifest(EXAMPLE)
+        self.candidate = {"source": SOURCE, "sha256": "a" * 64, "run": "1", "artifact": "x", "repo": "a/b"}
+
+    def test_share_arguments_come_from_the_manifest_and_this_mac(self) -> None:
+        with mock.patch.object(mf, "operator_candidate", return_value=self.candidate):
+            self.assertEqual(mf.share_args(self.manifest, "build-mini-1", "xcode"), ["/Applications/Xcode.app", "26.3", "17C529"])
+            self.assertEqual(mf.share_args(self.manifest, "build-mini-1", "metal"), ["/Applications/Xcode.app/Contents/Developer"])
+            self.assertEqual(mf.share_args(self.manifest, "build-mini-1", "candidate"),
+                             [SOURCE[:12], f"glaeda-{SOURCE}-aarch64-apple-darwin.tar.gz", "a" * 64])
+            self.assertEqual(mf.share_args(self.manifest, "build-mini-1", "python"), ["3.13"])
+
+    def test_lan_address_must_be_on_the_fleet_lan(self) -> None:
+        self.manifest["hosts"]["build-mini-2"]["lan_ip"] = "10.0.8.7"
+        self.assertEqual(mf.lan_address(self.manifest, "build-mini-2", None), ("10.0.8.7", "10.0.8.7"))
+        self.manifest["hosts"]["build-mini-2"]["lan_ip"] = "100.64.1.2"  # a tailnet address is not the LAN
+        address, why = mf.lan_address(self.manifest, "build-mini-2", None)
+        self.assertIsNone(address)
+        self.assertIn("outside the fleet LAN 10.0.8.", why)
+
+    def test_dry_run_checks_the_peer_and_copies_nothing(self) -> None:
+        self.manifest["hosts"]["build-mini-2"]["lan_ip"] = "10.0.8.7"
+        with mock.patch.object(mf, "ssh_stream", return_value=1) as ssh:
+            ok, detail = mf.share_one(self.manifest, "xcode", "build-mini-1", "build-mini-2",
+                                      ["/Applications/Xcode.app", "26.3", "17C529"], None, False)
+        self.assertTrue(ok)
+        self.assertEqual(detail, "would copy over build-mini-1 -> 10.0.8.7 (ssh -A from this Mac)")
+        self.assertEqual(ssh.call_count, 1)
+        self.assertIn("share_have xcode", ssh.call_args.args[2])
+
+    @unittest.skipUnless(shutil.which("shasum") or shutil.which("sha256sum"), "needs shasum")
+    def test_candidate_goes_from_seed_to_peer_over_the_lan_and_verifies(self) -> None:
+        import hashlib
+        payload = b"candidate bytes"
+        sha = hashlib.sha256(payload).hexdigest()
+        name = f"glaeda-{SOURCE}-aarch64-apple-darwin.tar.gz"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shim = root / "ssh"
+            shim.write_text(SSH_SHIM)
+            shim.chmod(0o755)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            if not shutil.which("shasum"):
+                (bin_dir / "shasum").write_text('#!/bin/sh\nshift 2\nexec sha256sum "$@"\n')
+                (bin_dir / "shasum").chmod(0o755)
+            seed = root / "build-mini-1/Library/Caches/cmux-fleet" / f"glaeda-candidate-{SOURCE[:12]}"
+            seed.mkdir(parents=True)
+            (seed / name).write_bytes(payload)
+            (root / "build-mini-2").mkdir()
+            (root / "10.0.8.7").symlink_to(root / "build-mini-2")
+            self.manifest["hosts"]["build-mini-2"]["lan_ip"] = "10.0.8.7"
+            args = [SOURCE[:12], name, sha]
+            with mock.patch.object(mf, "SSH", os.fspath(shim)), \
+                    mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{bin_dir}:/usr/bin:/bin"), \
+                    mock.patch.dict(os.environ, {"SHIM_ROOT": tmp}), \
+                    mock.patch.object(mf, "operator_candidate", return_value={"source": SOURCE, "sha256": sha}):
+                self.assertIsNone(mf.prepare_seed(self.manifest, "build-mini-1", "candidate", None, True))
+                ok, detail = mf.share_one(self.manifest, "candidate", "build-mini-1", "build-mini-2", args, None, True)
+                self.assertTrue(ok, detail)
+                placed = root / "build-mini-2/Library/Caches/cmux-fleet" / f"glaeda-candidate-{SOURCE[:12]}" / name
+                self.assertEqual(placed.read_bytes(), payload)
+                self.assertFalse((placed.parent / ".glaeda-share.partial").exists())
+                # A rerun finds it in place and copies nothing.
+                self.assertEqual(mf.share_one(self.manifest, "candidate", "build-mini-1", "build-mini-2", args, None, True),
+                                 (True, "already there"))
+                # A peer holding a different archive under that name is refused, not overwritten.
+                placed.write_bytes(b"something else")
+                ok, _ = mf.share_one(self.manifest, "candidate", "build-mini-1", "build-mini-2", args, None, True)
+                self.assertFalse(ok)
+                self.assertEqual(placed.read_bytes(), b"something else")
+
+    def test_share_command_needs_a_source_and_refuses_never_touch(self) -> None:
+        for argv, error in ((["share", "xcode", "build-mini-2"], "--from HOST"),
+                            (["share", "xcode", "build-mini-2", "--from", "coordinator-mini"], "never_touch"),
+                            (["share", "xcode", "--from", "build-mini-1"], "destination"),
+                            (["share", "teapot", "build-mini-2", "--from", "build-mini-1"], "share what")):
+            with contextlib.redirect_stderr(io.StringIO()) as err, mock.patch.object(mf, "ssh_stream") as ssh:
+                self.assertEqual(mf.main([*argv, "--manifest", os.fspath(EXAMPLE)]), 2, argv)
+            self.assertIn(error, err.getvalue())
+            ssh.assert_not_called()
+
+    def test_fix_from_a_seed_copies_over_the_lan(self) -> None:
+        obs = observed(**{"build-mini-1": morning_text()})["hosts"]["build-mini-1"]
+        result = mf.preflight_host(self.manifest, "build-mini-1", obs, "0.16.0")
+        out = mf.fix_host(self.manifest, "build-mini-1", result, False, None, seed="build-mini-2")
+        self.assertIn("python: copy a relocatable CPython 3.13+ from this Mac into ~/.local [from build-mini-2 over the LAN]",
+                      out["planned"])
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(mf, "prepare_seed", return_value=None), \
+                mock.patch.object(mf, "share_one", side_effect=lambda m, thing, src, dst, a, log, yes: (calls.append((thing, src)), (True, ""))[1]), \
+                mock.patch.object(mf, "fix_call", return_value=0), mock.patch.object(mf, "operator_candidate", return_value=self.candidate):
+            mf.fix_host(self.manifest, "build-mini-1", result, True, Path(tmp), seed="build-mini-2")
+        self.assertEqual(calls, [("python", "build-mini-2"), ("metal", "build-mini-2"), ("candidate", "build-mini-2")])
+
+    def test_a_missing_xcode_waits_for_a_seed(self) -> None:
+        self.manifest["defaults"]["toolchain"]["xcode"] = {"app": "/Applications/Xcode_26.6.app", "version": "26.6",
+                                                           "build": "17F113"}
+        obs = observed(**{"build-mini-1": preflight_text()})["hosts"]["build-mini-1"]
+        result = mf.preflight_host(self.manifest, "build-mini-1", obs)
+        self.assertEqual(result["checks"]["xcode"]["action"]["kind"], "xcode_share")
+        waiting = mf.fix_host(self.manifest, "build-mini-1", result, False, None)["waiting"]
+        self.assertIn("waits for --from HOST, a host that has it", waiting[0])
+        planned = mf.fix_host(self.manifest, "build-mini-1", result, False, None, seed="build-mini-2")["planned"]
+        self.assertTrue(planned[0].startswith("xcode: copy /Applications/Xcode_26.6.app"))
+
+
+class OnboardTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest = mf.load_manifest(EXAMPLE)
+        self.candidate = {"source": "59ca9c9bd1bb" + "0" * 28, "sha256": "a" * 64, "run": "1", "artifact": "x", "repo": "a/b"}
+        patcher = mock.patch.object(mf, "operator_candidate", return_value=self.candidate)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fresh(self, **kwargs: object) -> str:
+        """A host that passes every check and is not enrolled or registered yet."""
+        return preflight_text(enroll_state=None, acceptance=None, runners=(), node_id=None, **kwargs)
+
+    def test_default_hosts_are_node_ids_on_compile_lane_classes(self) -> None:
+        # By default, hosts that could never join (no node id, a light class) are left out silently.
+        self.assertEqual(mf.onboard_hosts(self.manifest, None), (["build-mini-1", "build-mini-2"], {}))
+        targets, skipped = mf.onboard_hosts(self.manifest, ["small-mini"])
+        self.assertEqual((targets, skipped), ([], {"small-mini": "no node_id in the manifest"}))
+        self.manifest["hosts"]["build-mini-2"]["class"] = "m4-16"  # a 16 GB class never takes the app compile
+        targets, skipped = mf.onboard_hosts(self.manifest, ["build-mini-1", "build-mini-2"])
+        self.assertEqual(targets, ["build-mini-1"])
+        self.assertIn("compile_lane: false", skipped["build-mini-2"])
+        with self.assertRaisesRegex(mf.Failure, "never_touch"):
+            mf.onboard_hosts(self.manifest, ["coordinator-mini"])
+
+    def test_class_acceptance_must_match_xcode_build_and_candidate(self) -> None:
+        recorded, why = mf.class_acceptance(self.manifest, "build-mini-1")
+        self.assertEqual(recorded["node"], "cmux-mac-001")
+        self.manifest["defaults"]["toolchain"]["xcode"]["build"] = "17C999"
+        recorded, why = mf.class_acceptance(self.manifest, "build-mini-1")
+        self.assertIsNone(recorded)
+        self.assertIn("not 17C999", why)
+
+    def run_onboard(self, texts: dict[str, str], *extra: str, tokens: list[str] | None = None) -> tuple[int, str, list]:
+        calls: list = []
+
+        def ssh(name, user, command, log, stdin=b"", timeout=None, options=()):
+            calls.append((name, command, stdin))
+            return 0
+
+        obs = observed(**texts)
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as out, \
+                mock.patch.object(mf, "observe", return_value=obs), mock.patch.object(mf, "ssh_stream", side_effect=ssh), \
+                mock.patch.object(mf, "mint_runner_token", return_value="AAAATOKENTOKENTOKENTOKEN") as mint, \
+                mock.patch.object(mf, "operator_zig_minimum", return_value="0.16.0"):
+            code = mf.main(["onboard", *texts, "--manifest", os.fspath(EXAMPLE), "--log-dir", tmp, *extra])
+        if tokens is not None:
+            tokens.append(mint.call_count)
+        return code, out.getvalue(), calls
+
+    def test_dry_run_prints_the_plan_and_touches_nothing(self) -> None:
+        code, out, calls = self.run_onboard({"build-mini-1": self.fresh(), "build-mini-2": morning_text()})
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("would: enroll without acceptance (class)", out)
+        self.assertIn("sudo-plan select, rust, zig", out)
+        self.assertIn("dry run; pass --yes", out)
+        self.assertEqual(out.splitlines()[0].split(), ["host", "node", "id", "step", "result", "log"])
+        self.assertNotIn("—", out)
+
+    def test_class_mode_enrolls_without_acceptance_and_does_not_register(self) -> None:
+        minted: list = []
+        code, out, calls = self.run_onboard({"build-mini-1": self.fresh()}, "--yes", tokens=minted)
+        enroll = [c for c in calls if "glaeda-mini-enroll" in c[1]]
+        self.assertEqual(len(enroll), 1)
+        self.assertIn("--no-accept", enroll[0][1])
+        self.assertIn("--node-id cmux-mac-001", enroll[0][1])
+        self.assertIn("~/'glaeda/scripts/glaeda-mini-enroll'", enroll[0][1])
+        self.assertEqual(minted, [0])
+        self.assertIn("enrolled without node acceptance", out)
+        self.assertEqual(code, 1)
+
+    def test_node_mode_accepts_then_registers_with_the_token_on_stdin(self) -> None:
+        minted: list = []
+        code, out, calls = self.run_onboard({"build-mini-1": self.fresh(), "build-mini-2": self.fresh(hostname="Build-Mini-2")},
+                                            "--yes", "--acceptance", "node", tokens=minted)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(minted, [1])  # one token for the whole run
+        enroll = [c for c in calls if "glaeda-mini-enroll" in c[1]]
+        self.assertTrue(enroll and all("--no-accept" not in c[1] for c in enroll))
+        register = [c for c in calls if "persistent-compile up" in c[1]]
+        self.assertEqual(sorted(c[0] for c in register), ["build-mini-1", "build-mini-2"])
+        for _, command, stdin in register:
+            self.assertEqual(stdin, b"AAAATOKENTOKENTOKENTOKEN\n")
+            self.assertNotIn("AAAATOKEN", command)
+            self.assertIn("IFS= read -r CMUX_RUNNER_TOKEN", command)
+        self.assertNotIn("AAAATOKEN", out)
+        rows = [line for line in out.splitlines() if line.startswith("build-mini-")]
+        self.assertTrue(all(" register " in line and " ok " in line for line in rows), rows)
+
+    def test_a_host_needing_a_person_stops_at_preflight(self) -> None:
+        text = self.fresh(update_running="softwareupdate --install macOS 26.7 --restart")
+        code, out, calls = self.run_onboard({"build-mini-1": text}, "--yes")
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, [])
+        self.assertIn("needs a person: update", out)
+
+    def test_sudo_plans_stop_the_host_without_a_terminal(self) -> None:
+        text = self.fresh().replace("xcode_select\t/Applications/Xcode.app/Contents/Developer",
+                                    "xcode_select\t/Library/Developer/CommandLineTools")
+        with mock.patch.object(sys.stdin, "isatty", return_value=False):
+            code, out, _ = self.run_onboard({"build-mini-1": text}, "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("waiting: glaeda-mini-fleet sudo-plan build-mini-1 --run", out)
+        with mock.patch.object(sys.stdin, "isatty", return_value=False), contextlib.redirect_stderr(io.StringIO()) as err:
+            code, _, calls = self.run_onboard({"build-mini-1": text}, "--yes", "--sudo", "run")
+        self.assertEqual((code, calls), (2, []))
+        self.assertIn("from a terminal", err.getvalue())
+
+    def test_heartbeat_reports_each_running_host(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as out:
+            log = Path(tmp) / "a.log"
+            log.write_text("== enroll\naccept-local: cold cmux build\n")
+            results = mf.run_with_heartbeat({"a": lambda: (time.sleep(0.3), 0)[1]}, {"a": log}, "enroll", every=0.1)
+        self.assertEqual(results, {"a": 0})
+        self.assertIn("heartbeat enroll 0m00s: a: accept-local: cold cmux build", out.getvalue())
+
+    def test_onboarding_fields_are_validated(self) -> None:
+        cases = ((("lan",), {"auth": "password"}, "lan.auth"),
+                 (("runner",), {"org": "a b"}, "runner.org"),
+                 (("classes", "m4-16", "compile_lane"), "no", "compile_lane"),
+                 (("classes", "m4pro-48", "acceptance"), {"xcode_build": "17C529", "candidate": "x", "node": "cmux-mac-001"},
+                  "acceptance needs"),
+                 (("hosts", "build-mini-1", "lan_ip"), "mini-1.lan", "lan_ip"))
+        for keys, value, error in cases:
+            data = copy.deepcopy(self.manifest)
+            target = data
+            for key in keys[:-1]:
+                target = target[key]
+            target[keys[-1]] = value
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(mf.Failure, error):
+                mf.load_manifest(write_manifest(tmp, data))
 
 
 if __name__ == "__main__":

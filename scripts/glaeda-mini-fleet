@@ -8,6 +8,8 @@
     glaeda-mini-fleet preflight [HOST ...] [--output text|json]                 every onboarding blocker, one pass
     glaeda-mini-fleet fix       [HOST ...] [--yes]                              every repair that needs no root
     glaeda-mini-fleet sudo-plan [HOST ...] [--run] [--sudoers]                  every root step, one password per host
+    glaeda-mini-fleet share THING --from HOST HOST ... [--yes]                  seed over the LAN from a prepared host
+    glaeda-mini-fleet onboard   [HOST ...] [--yes] [--from HOST]                preflight, fix, sudo-plan, enroll, register
 
 The manifest names every host, its fleet node id (node_id, so every enrollment rerun asks for the
 same one), its hardware class, the toolchain it must carry, the SSH keys that must, may, and must
@@ -39,6 +41,22 @@ licence, first launch, Homebrew installs as the Homebrew owner and the rustup li
 a narrow NOPASSWD rule, printed in the script for review: launchctl kickstart of the manifest's
 jobs only. xcode-select and first launch stay password steps, because /Applications is writable by
 the admin group and a path rule for an Xcode tool there would be passwordless root.
+
+`share THING --from HOST` copies THING (xcode, metal, brew, rustup, candidate, python) from a
+prepared host straight to each peer over the minis' LAN: `ssh -A` from this Mac to the source, which
+pipes a tar to the peer's LAN address (manifest `lan`, hosts.<name>.lan_ip or its en0). The peer
+stages it beside the target and moves it into place only after the copy completes and verifies; it
+never replaces something already there. fix --from HOST uses the same path for the Xcode app,
+Python, the candidate and the Metal toolchain. Dry run by default.
+
+`onboard` runs the whole sequence on every host that has a node_id and a compile-lane class (or
+the named ones): preflight, fix, the sudo-plans (--sudo run over ssh -t, wait for the operator,
+or stop), fix again, a fresh preflight, enrollment in parallel with a heartbeat line every 30
+seconds, and runner registration with one org token minted here and passed over stdin. It ends
+with one table: host, node id, step reached, result, log. Acceptance is proved once per class and
+Xcode build: by default a host joins on the class's recorded acceptance (classes.<c>.acceptance)
+and enrolls without accept-local; --acceptance node runs accept-local on the host instead. Dry
+run by default; never_touch hosts are refused.
 
 The manifest's `toolchain` (in defaults, overridable per host) declares what every build host
 must carry: the Xcode app and build and whether it is selected, the Metal toolchain, the minimum
@@ -159,6 +177,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
         if node_id in node_ids:
             raise Failure(f"{path}: hosts {node_ids[node_id]} and {name} share node_id {node_id}")
         node_ids[node_id] = name
+    validate_onboarding(path, data)
     validate_toolchain(path, "defaults", data["defaults"].get("toolchain"))
     for name, host in data["hosts"].items():
         validate_toolchain(path, f"host {name}", host.get("overrides", {}).get("toolchain"))
@@ -211,6 +230,36 @@ def validate_toolchain(path: Path, where: str, toolchain: Any) -> None:
         depth = cmux.get("submodule_depth", 1)
         if not isinstance(depth, int) or isinstance(depth, bool) or depth < 0:
             raise Failure(f"{path}: {where} toolchain.cmux.submodule_depth must be 0 (full) or a positive depth")
+
+
+def validate_onboarding(path: Path, data: dict[str, Any]) -> None:
+    """lan, runner, per-class compile_lane and acceptance, per-host lan_ip: what share and onboard read."""
+    lan = data.get("lan")
+    if lan is not None:
+        if not isinstance(lan, dict) or set(lan) - {"subnet", "auth", "note"}:
+            raise Failure(f"{path}: lan takes subnet, auth and note")
+        if "subnet" in lan and not re.fullmatch(r"(\d{1,3}\.){1,3}", str(lan["subnet"])):
+            raise Failure(f"{path}: lan.subnet is an address prefix ending in a dot, such as 172.20.21.")
+        auth = lan.get("auth", "agent")
+        if auth != "agent" and not (isinstance(auth, dict) and set(auth) == {"identity_file"}
+                                    and re.fullmatch(r"~?/?[A-Za-z0-9._/-]+", str(auth["identity_file"]))):
+            raise Failure(f"{path}: lan.auth is \"agent\" (ssh -A from the operator) or {{\"identity_file\": PATH}} on the seed")
+    runner = data.get("runner")
+    if runner is not None and (not isinstance(runner, dict) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", str(runner.get("org", "")))):
+        raise Failure(f"{path}: runner.org must be a GitHub organization name")
+    for klass, spec in data["classes"].items():
+        if not isinstance(spec.get("compile_lane", True), bool):
+            raise Failure(f"{path}: class {klass} compile_lane must be true or false")
+        accepted = spec.get("acceptance")
+        if accepted is not None and not (
+                isinstance(accepted, dict) and set(accepted) <= {"xcode_build", "candidate", "node", "note"}
+                and re.fullmatch(r"[0-9A-Za-z]+", str(accepted.get("xcode_build", "")))
+                and re.fullmatch(r"[0-9a-f]{12}", str(accepted.get("candidate", "")))
+                and NODE_ID_RE.fullmatch(str(accepted.get("node", "")))):
+            raise Failure(f"{path}: class {klass} acceptance needs xcode_build, candidate (12 hex) and node (a node id)")
+    for name, host in data["hosts"].items():
+        if "lan_ip" in host and not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", str(host["lan_ip"])):
+            raise Failure(f"{path}: host {name} lan_ip must be an IPv4 address")
 
 
 def toolchain(manifest: dict[str, Any], name: str) -> dict[str, Any]:
@@ -778,6 +827,11 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
             put("xcode", "fail", f"{pin} missing", f"APFS clone of {want['clone_from']} (glaeda-mini-fleet fix)", "self",
                 {"kind": "xcode_clone", "path": pin, "source": want["clone_from"],
                  "version": want["version"], "build": want["build"]})
+        elif want and want.get("version") and SAFE_PATH_RE.fullmatch(pin):
+            put("xcode", "fail", f"{pin} missing",
+                f"LAN copy from a host that has it: glaeda-mini-fleet share xcode --from <host> {name} --yes "
+                "(or fix --from <host>)", "self",
+                {"kind": "xcode_share", "path": pin, "version": want["version"], "build": want["build"]})
         else:
             put("xcode", "fail", f"{pin} missing",
                 (want or {}).get("fix") or f"install {pin} (LAN copy from a host that has it)", "person")
@@ -1074,19 +1128,21 @@ def render_preflight(results: list[dict[str, Any]]) -> str:
 # ---------------------------------------------------------------- fix and sudo-plan
 
 # The order fix runs a host's repairs in, so each runs after what it builds on.
-FIX_ORDER = ("xcode_clone", "python", "cmux_clone", "submodules", "brew", "rust_default", "rust_channel",
+FIX_ORDER = ("xcode_share", "xcode_clone", "python", "cmux_clone", "submodules", "brew", "rust_default", "rust_channel",
              "glaeda", "metal", "setup", "candidate")
 # What each repair needs to pass first (checks, or repairs made earlier in the same run).
 # glaeda-mini-setup builds glaeda-worktree-reclaim with cargo, under the Python enroll will use.
 FIX_NEEDS = {"metal": ("licence", "launch"), "setup": ("cmux", "licence", "launch", "metal", "zig"), "brew": ("brew",),
              "glaeda": ("python", "rust")}
 # Remote functions that only read; every other one takes the host's step lock.
-READ_ONLY_FUNCTIONS = {"candidate_check"}
+# share_send only reads, and stays lock-free so one source can feed several peers at once.
+READ_ONLY_FUNCTIONS = {"candidate_check", "share_have", "share_source", "share_send"}
 SUDO_ORDER = ("select", "licence", "first_launch", "power", "homebrew", "brew")
 HOMEBREW_INSTALLER = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
 FIX_TIMEOUTS = {"cmux_clone": 1800, "submodules": 1800, "brew": 5400, "rust_channel": 1800, "glaeda": 1800,
                 "metal": 3600, "setup": 5400, "python": 1800, "candidate": 1800}
 RUSTUP_PROXIES = ("cargo", "rustc", "rustup")
+BREW_STAGE = "Library/Caches/glaeda/share/homebrew/downloads"  # under the login user's home; see share brew
 BREW_FORMULAS = ("rustup", "zig")
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path("~/.local/state").expanduser()) / "glaeda" / "mini-fleet"
 OPERATOR_CACHE = Path(os.environ.get("GLAEDA_MINI_FLEET_CACHE", "~/Library/Caches/glaeda/mini-fleet")).expanduser()
@@ -1144,6 +1200,8 @@ def describe(action: dict[str, Any]) -> str:
     kind = action["kind"]
     if kind == "xcode_clone":
         return f"APFS clone {action['source']} to {action['path']}"
+    if kind == "xcode_share":
+        return f"copy {action['path']} ({action['version']} {action['build']}) from a peer over the LAN"
     if kind == "python":
         return f"copy a relocatable CPython {action['min']}+ from this Mac into ~/.local"
     if kind == "cmux_clone":
@@ -1198,11 +1256,19 @@ def ssh_stream(name: str, user: str, command: str, log: Any, stdin: bytes = b"",
                        *options, "-l", user, name, command], log, stdin, timeout)
 
 
+def library_command(func: str, args: list[str], keep_stdin: bool = False) -> str:
+    """`/bin/bash -c` running one cmux_mini_fix.sh function, ready to hand to ssh as its command.
+
+    Every function that changes the host first takes its step lock."""
+    call = shlex.join([func, *args]) if func in READ_ONLY_FUNCTIONS else "lock; " + shlex.join([func, *args])
+    script = (f"WORKLOAD_PATH={shlex.quote(bootstrap.CMUX_WORKLOAD_TOOL_PATH)}\n" + ("KEEP_STDIN=1\n" if keep_stdin else "")
+              + FIX_LIBRARY.read_text() + "\n" + call + "\n")
+    return "/bin/bash -c " + shlex.quote(script)
+
+
 def fix_call(name: str, user: str, func: str, args: list[str], log: Any, timeout: float | None) -> int:
     """Run one function of cmux_mini_fix.sh on the host."""
-    call = shlex.join([func, *args]) if func in READ_ONLY_FUNCTIONS else "lock; " + shlex.join([func, *args])
-    script = f"WORKLOAD_PATH={shlex.quote(bootstrap.CMUX_WORKLOAD_TOOL_PATH)}\n" + FIX_LIBRARY.read_text() + "\n" + call + "\n"
-    return ssh_stream(name, user, "/bin/bash -c " + shlex.quote(script), log, timeout=timeout)
+    return ssh_stream(name, user, library_command(func, args), log, timeout=timeout)
 
 
 def brew_commands(owner: str, formulas: list[str], as_owner: bool) -> list[str]:
@@ -1210,7 +1276,16 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool) -> list[str]:
     if not SAFE_WORD_RE.fullmatch(owner) or set(formulas) - set(BREW_FORMULAS):
         raise Failure(f"refusing Homebrew step for owner {owner!r}, formulas {formulas}")
     run = f"sudo -H -u {owner} " if as_owner else ""
+    root = "sudo " if as_owner else ""
     lines = [f'brew_as() {{ {run}/opt/homebrew/bin/brew "$@"; }}',
+             # Bottles glaeda-mini-fleet share brew staged from a peer; brew checks their digests before use.
+             f'staged="$HOME/{BREW_STAGE}"',
+             'if [ -n "$(ls "$staged" 2>/dev/null)" ]; then',
+             '  cache="$(brew_as --cache)/downloads"',
+             f'  {run}mkdir -p "$cache"',
+             f'  {root}cp -n "$staged"/* "$cache"/ || true',
+             *([f'  sudo chown -h {owner} "$cache"/*'] if as_owner else []),
+             "fi",
              f"for f in {' '.join(formulas)}; do",
              '  if brew_as list --versions "$f" >/dev/null 2>&1; then brew_as upgrade "$f"; else brew_as install "$f"; fi',
              "done"]
@@ -1359,9 +1434,20 @@ def stage_candidate(name: str, user: str, action: dict[str, Any], log: Any) -> t
     return True, f"{source12} staged for enrollment"
 
 
-def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log: Any) -> tuple[bool, str]:
+# Repairs fix makes from a seed host over the LAN when given --from, and the share thing for each.
+SEEDABLE = {"xcode_share": "xcode", "python": "python", "candidate": "candidate", "metal": "metal"}
+
+
+def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log: Any,
+               seed: str | None = None) -> tuple[bool, str]:
     user = manifest["ssh_user"]
     kind = action["kind"]
+    if seed and kind in SEEDABLE:
+        thing = SEEDABLE[kind]
+        problem = prepare_seed(manifest, seed, thing, log)
+        if problem:
+            return False, f"{seed} cannot seed {thing} ({problem})"
+        return share_one(manifest, thing, seed, name, share_args(manifest, name, thing), log, True)
     if kind == "xcode_clone":
         code, text = remote(name, user, CLONE_XCODE, [action["source"], action["path"], action["version"], action["build"]])
         note(log, text)
@@ -1389,8 +1475,10 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
 
 
 def fix_host(manifest: dict[str, Any], name: str, result: dict[str, Any], yes: bool,
-             log_dir: Path | None) -> dict[str, Any]:
-    """Run (or, without yes, plan) one host's non-root repairs in order. Nothing is retried within a run."""
+             log_dir: Path | None, seed: str | None = None) -> dict[str, Any]:
+    """Run (or, without yes, plan) one host's non-root repairs in order. Nothing is retried within a run.
+
+    With a seed host, the Xcode app, Python, the candidate and the Metal toolchain come from it over the LAN."""
     mine, root = planned_actions(result)
     checks = result["checks"]
     out: dict[str, Any] = {"host": name, "planned": [], "done": [], "failed": [], "waiting": [], "log": None,
@@ -1406,6 +1494,8 @@ def fix_host(manifest: dict[str, Any], name: str, result: dict[str, Any], yes: b
         for action in mine:
             label = f"{'/'.join(action['checks'])}: {describe(action)}"
             blocker = waiting_on(action, checks, fixed)
+            if action["kind"] == "xcode_share" and not seed:
+                blocker = "--from HOST, a host that has it"
             if blocker:
                 out["waiting"].append(f"{label} (waits for {blocker})")
                 continue
@@ -1413,6 +1503,8 @@ def fix_host(manifest: dict[str, Any], name: str, result: dict[str, Any], yes: b
                 python = (checks.get("python") or {}).get("detail", "")
                 action = {**action, "python": python.split(" at ", 1)[1] if checks["python"]["state"] == "ok"
                           else "~/.local/bin/python3" if "python" in fixed else "python3"}
+            if seed and action["kind"] in SEEDABLE:
+                label += f" [from {seed} over the LAN]"
             if not yes:
                 out["planned"].append(label)
                 fixed.update(action["checks"])
@@ -1420,7 +1512,7 @@ def fix_host(manifest: dict[str, Any], name: str, result: dict[str, Any], yes: b
             say(f"{name}: {label}")
             note(log, f"== {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {label}")
             try:
-                ok, detail = run_repair(manifest, name, action, log)
+                ok, detail = run_repair(manifest, name, action, log, seed)
             except (Failure, OSError, subprocess.SubprocessError) as error:
                 ok, detail = False, f"{type(error).__name__}: {error}"
             note(log, f"== {'done' if ok else 'FAILED'} {detail}")
@@ -1469,15 +1561,17 @@ def eligible_hosts(manifest: dict[str, Any], hosts: list[str]) -> tuple[list[str
     return [h for h in hosts if h not in skipped], skipped
 
 
-def cmd_fix(manifest: dict[str, Any], hosts: list[str], yes: bool, log_dir: Path | None) -> int:
-    targets, skipped = eligible_hosts(manifest, hosts)
+def cmd_fix(manifest: dict[str, Any], hosts: list[str], yes: bool, log_dir: Path | None, seed: str | None = None) -> int:
+    if seed:
+        select_hosts(manifest, [seed])
+    targets, skipped = eligible_hosts(manifest, [h for h in hosts if h != seed])
     results = {r["host"]: r for r in preflight(manifest, observe(manifest, targets, preflight=True), targets)}
     directory = run_log_dir("fix", log_dir) if yes else None
     reachable = [h for h in targets if "reach" not in results[h]["checks"]]
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-        done = dict(zip(reachable, pool.map(lambda h: fix_host(manifest, h, results[h], yes, directory), reachable)))
+        done = dict(zip(reachable, pool.map(lambda h: fix_host(manifest, h, results[h], yes, directory, seed), reachable)))
     outcomes = []
-    for name in hosts:
+    for name in [h for h in hosts if h != seed]:
         if name in skipped:
             outcomes.append({"host": name, "skipped": skipped[name]})
         elif name not in done:
@@ -1617,6 +1711,417 @@ def cmd_sudo_plan(manifest: dict[str, Any], hosts: list[str], run: bool, sudoers
     return 1 if failed else 0
 
 
+# ---------------------------------------------------------------- share (LAN seeding)
+
+SHARE_THINGS = ("xcode", "metal", "brew", "rustup", "candidate", "python")
+SHARE_TIMEOUT = 3 * 3600
+IPV4_RE = re.compile(r"(\d{1,3}\.){3}\d{1,3}\Z")
+
+
+def share_args(manifest: dict[str, Any], name: str, thing: str) -> list[str]:
+    """The arguments cmux_mini_fix.sh's share functions take for THING, from the manifest and this Mac."""
+    declared = toolchain(manifest, name)
+    if thing == "xcode":
+        xcode = declared.get("xcode")
+        if not xcode:
+            raise Failure("share xcode needs toolchain.xcode (app, version, build) in the manifest")
+        return [xcode["app"], xcode["version"], xcode["build"]]
+    if thing == "metal":
+        pin = xcode_pin(manifest, name)
+        if not pin:
+            raise Failure("share metal needs the pinned Xcode (toolchain.xcode) in the manifest")
+        return [f"{pin}/Contents/Developer"]
+    if thing == "candidate":
+        candidate = operator_candidate()
+        if not {"source", "sha256"} <= set(candidate):
+            raise Failure("share candidate needs this Mac's cmux checkout to name CANDIDATE_SOURCE and CANDIDATE_SHA256")
+        return [candidate["source"][:12], candidate_archive_name(candidate), candidate["sha256"]]
+    if thing == "python":
+        return [declared.get("python_min") or ENROLL_PYTHON_MIN]
+    return []
+
+
+def lan_settings(manifest: dict[str, Any]) -> dict[str, Any]:
+    lan = manifest.get("lan") or {}
+    auth = lan.get("auth", "agent")
+    return {"subnet": lan.get("subnet"), "agent": auth == "agent",
+            "identity": None if auth == "agent" else auth["identity_file"]}
+
+
+def lan_address(manifest: dict[str, Any], name: str, log: Any) -> tuple[str | None, str]:
+    """The peer's LAN IPv4 (manifest lan_ip, else its en0), checked against the manifest's LAN subnet."""
+    address = manifest["hosts"][name].get("lan_ip")
+    if not address:
+        try:
+            proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", manifest["ssh_user"], name,
+                                   "ipconfig getifaddr en0"], capture_output=True, text=True, timeout=30, check=False)
+            address = proc.stdout.strip()
+        except subprocess.TimeoutExpired:
+            address = ""
+    subnet = lan_settings(manifest)["subnet"]
+    if not IPV4_RE.fullmatch(address or ""):
+        return None, f"{name} has no LAN address on en0; set hosts.{name}.lan_ip"
+    if subnet and not address.startswith(subnet):
+        return None, f"{name} en0 is {address}, outside the fleet LAN {subnet}; set hosts.{name}.lan_ip"
+    note(log, f"{name} LAN address {address}")
+    return address, address
+
+
+def share_one(manifest: dict[str, Any], thing: str, source: str, name: str, args: list[str], log: Any,
+              yes: bool) -> tuple[bool, str]:
+    """Copy THING from source to one peer straight over the LAN. Without yes, only say what would run."""
+    user = manifest["ssh_user"]
+    have = ssh_stream(name, user, library_command("share_have", [thing, *args]), log, timeout=120)
+    if have == 0:
+        return True, "already there"
+    if have not in (1, 10):
+        return False, "refused on the peer (see the log)"
+    address, detail = lan_address(manifest, name, log)
+    if address is None:
+        return False, detail
+    lan = lan_settings(manifest)
+    route = f"{source} -> {address} ({'ssh -A from this Mac' if lan['agent'] else 'fleet key ' + lan['identity']})"
+    if not yes:
+        return True, f"would copy over {route}"
+    inner = [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new",
+             *(["-i", lan["identity"]] if lan["identity"] else []), "-l", user, address,
+             library_command("share_recv", [thing, *args], keep_stdin=True)]
+    send = library_command("share_send", [thing, *args])[len("/bin/bash -c "):]
+    pipeline = f"set -o pipefail; /bin/bash -c {send} | {shlex.join(inner)}"
+    note(log, f"== share {thing}: {route}")
+    code = ssh_stream(source, user, "/bin/bash -c " + shlex.quote(pipeline), log, timeout=SHARE_TIMEOUT,
+                      options=("-A",) if lan["agent"] else ())
+    if code:
+        return False, f"copy failed (exit {code}); rerun to resume, the staged part stays on the peer"
+    if ssh_stream(name, user, library_command("share_finish", [thing, *args]), log, timeout=3600):
+        return False, "the copy did not finish or verify on the peer (see the log)"
+    return True, f"copied over {route}"
+
+
+def cmd_share(manifest: dict[str, Any], thing: str, source: str | None, hosts: list[str], yes: bool, jobs: int,
+              log_dir: Path | None) -> int:
+    if thing not in SHARE_THINGS:
+        raise Failure(f"share what? one of {', '.join(SHARE_THINGS)}")
+    if not source:
+        raise Failure("share needs --from HOST, a prepared host that has it")
+    select_hosts(manifest, [source])
+    targets, skipped = eligible_hosts(manifest, [h for h in hosts if h != source])
+    if not targets:
+        raise Failure("share needs at least one destination host besides --from")
+    directory = run_log_dir(f"share-{thing}", log_dir)
+    args = {h: share_args(manifest, h, thing) for h in [source, *targets]}
+    with open(directory / f"{source}.source.log", "ab") as log:
+        problem = prepare_seed(manifest, source, thing, log, yes)
+        if problem:
+            raise Failure(f"{source} cannot seed {thing}: {problem}; see {directory / (source + '.source.log')}")
+
+    def one(name: str) -> tuple[str, bool, str]:
+        with open(directory / f"{name}.log", "ab") as log:
+            ok, detail = share_one(manifest, thing, source, name, args[name], log, yes)
+        say(f"{name}: {'ok' if ok else 'FAILED'} {detail}")
+        return name, ok, detail
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        outcomes = list(pool.map(one, targets))
+    for name, why in skipped.items():
+        print(f"{name}: skipped ({why})")
+    print(f"logs: {directory}")
+    if not yes:
+        print("dry run; pass --yes to copy")
+    return 1 if any(not ok for _, ok, _ in outcomes) else 0
+
+
+SEED_LOCK = threading.Lock()
+SEEDS_READY: dict[tuple[str, str, bool], str | None] = {}
+
+
+def prepare_seed(manifest: dict[str, Any], source: str, thing: str, log: Any, yes: bool = True) -> str | None:
+    """Ready THING on the source once per run (a Metal export downloads there); None when it can seed.
+
+    A dry run only checks: for metal, that the source has a working Metal toolchain to export."""
+    with SEED_LOCK:
+        key = (source, thing, yes)
+        if key not in SEEDS_READY:
+            func = "share_prepare" if yes else ("share_have" if thing == "metal" else "share_source")
+            code = ssh_stream(source, manifest["ssh_user"],
+                              library_command(func, [thing, *share_args(manifest, source, thing)]), log,
+                              timeout=SHARE_TIMEOUT)
+            SEEDS_READY[key] = None if code == 0 else f"{func} {thing} exit {code}"
+        return SEEDS_READY[key]
+
+
+# ---------------------------------------------------------------- onboard
+
+ONBOARD_STEPS = ("preflight", "fix", "sudo-plan", "enroll", "register")
+HEARTBEAT_SECONDS = 30
+ENROLL_TIMEOUT = 3 * 3600
+
+
+def compile_lane_class(manifest: dict[str, Any], name: str) -> bool:
+    """Whether the host's class may take the app compile (a 16 GB `light` class sets compile_lane: false)."""
+    return manifest["classes"][manifest["hosts"][name]["class"]].get("compile_lane", True) is not False
+
+
+def class_acceptance(manifest: dict[str, Any], name: str) -> tuple[dict[str, Any] | None, str]:
+    """The class-level acceptance the host joins on, if the manifest records one for its Xcode build and candidate."""
+    klass = manifest["hosts"][name]["class"]
+    recorded = manifest["classes"][klass].get("acceptance")
+    build = (toolchain(manifest, name).get("xcode") or {}).get("build")
+    source12 = operator_candidate().get("source", "")[:12]
+    if not recorded:
+        return None, f"class {klass} has no recorded acceptance"
+    if recorded.get("xcode_build") != build or recorded.get("candidate") != source12:
+        return None, (f"class {klass} was accepted on Xcode {recorded.get('xcode_build')} and candidate "
+                      f"{recorded.get('candidate')}, not {build} and {source12 or 'none'}")
+    return recorded, f"class {klass} accepted on {recorded.get('node')} (Xcode {build}, candidate {source12})"
+
+
+def onboard_hosts(manifest: dict[str, Any], wanted: list[str] | None) -> tuple[list[str], dict[str, str]]:
+    """Hosts onboard works on, and why every other named or default host is skipped."""
+    names = select_hosts(manifest, wanted)
+    skipped: dict[str, str] = {}
+    for name in names:
+        host = manifest["hosts"][name]
+        if not host.get("node_id"):
+            skipped[name] = "no node_id in the manifest"
+        elif not compile_lane_class(manifest, name):
+            skipped[name] = f"class {host['class']} does not take the app compile (compile_lane: false)"
+        elif host.get("overrides", {}).get("apply") is False:
+            skipped[name] = "apply: false"
+    if not wanted:  # the default set names only hosts that could join
+        skipped = {h: why for h, why in skipped.items() if why == "apply: false"}
+        names = [h for h in names if manifest["hosts"][h].get("node_id") and compile_lane_class(manifest, h)]
+    return [h for h in names if h not in skipped], skipped
+
+
+def enroll_command(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str],
+                   no_accept: bool) -> str:
+    checkout = cmux_checkout(manifest, name)
+    python = result["checks"]["python"]["detail"].split(" at ", 1)[1]
+    archive = f"~/Library/Caches/cmux-fleet/glaeda-candidate-{candidate['source'][:12]}/{candidate_archive_name(candidate)}"
+    argv = [python, "~/glaeda/scripts/glaeda-mini-enroll", "--cmux-root", checkout["root"],
+            "--node-id", manifest["hosts"][name]["node_id"], "--candidate", archive, "--sha256", candidate["sha256"],
+            "--source", candidate["source"], "--apply", *(["--no-accept"] if no_accept else [])]
+    # ~ must expand on the host: quote everything, then let the leading ~/ through.
+    quoted = " ".join(shlex.quote(a).replace("'~/", "~/'", 1) if a.startswith("~/") else shlex.quote(a) for a in argv)
+    return (f"export PATH={shlex.quote(bootstrap.CMUX_WORKLOAD_TOOL_PATH)}:\"$HOME/.local/bin\"; cd \"$HOME\" && "
+            f"{quoted}")
+
+
+def register_command(manifest: dict[str, Any], name: str) -> str:
+    """cmux persistent-compile up on the host; the token arrives on stdin, never in argv or the environment of ssh."""
+    root = cmux_checkout(manifest, name)["root"]
+    root = root.replace("~/", "$HOME/", 1) if root.startswith("~/") else root
+    return (f"set -e; export PATH=\"$HOME/.local/bin\":{shlex.quote(bootstrap.CMUX_WORKLOAD_TOOL_PATH)}; "
+            f"IFS= read -r CMUX_RUNNER_TOKEN; export CMUX_RUNNER_TOKEN; cd \"{root}\" && "
+            f"./scripts/persistent-compile up --yes --node-id {shlex.quote(manifest['hosts'][name]['node_id'])}")
+
+
+def mint_runner_token(org: str) -> str:
+    """A one-hour org runner registration token from this Mac's gh login. Never logged."""
+    proc = subprocess.run(["gh", "api", "-X", "POST", f"orgs/{org}/actions/runners/registration-token", "--jq", ".token"],
+                          capture_output=True, text=True, timeout=60, check=False)
+    token = proc.stdout.strip()
+    if proc.returncode or not re.fullmatch(r"[A-Za-z0-9_-]{20,}", token):
+        raise Failure(f"could not mint a runner registration token for {org} (gh auth refresh -s admin:org?)")
+    return token
+
+
+def last_line(path: Path) -> str:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(max(0, path.stat().st_size - 4096))
+            lines = [line for line in handle.read().decode(errors="replace").splitlines() if line.strip()]
+    except OSError:
+        return ""
+    return (lines[-1].strip() if lines else "")[:100]
+
+
+def run_with_heartbeat(tasks: dict[str, Any], logs: dict[str, Path], label: str,
+                       every: float = HEARTBEAT_SECONDS) -> dict[str, Any]:
+    """Run one callable per host in parallel; every `every` seconds print one line per host still running."""
+    started = time.monotonic()
+    results: dict[str, Any] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(tasks))) as pool:
+        futures = {pool.submit(task): name for name, task in tasks.items()}
+        pending = set(futures)
+        while pending:
+            done, pending = concurrent.futures.wait(pending, timeout=every)
+            for future in done:
+                results[futures[future]] = future.result()
+            if pending:
+                minutes, seconds = divmod(int(time.monotonic() - started), 60)
+                running = sorted(futures[f] for f in pending)
+                say(f"heartbeat {label} {minutes}m{seconds:02d}s: " +
+                    "; ".join(f"{h}: {last_line(logs[h]) or 'running'}" for h in running))
+    return results
+
+
+def render_onboard(rows: dict[str, dict[str, str]]) -> str:
+    headers = ("host", "node id", "step", "result", "log")
+    keys = ("host", "node", "step", "result", "log")
+    table = [headers, *([r.get(k) or "-" for k in keys] for r in rows.values())]
+    widths = [max(len(row[i]) for row in table) for i in range(len(headers) - 1)]
+    return "\n".join("  ".join([*(f"{row[i]:<{widths[i]}}" for i in range(len(widths))), row[-1]]) for row in table)
+
+
+def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, sudo: str, acceptance: str,
+                seed: str | None, log_dir: Path | None, heartbeat: float = HEARTBEAT_SECONDS) -> int:
+    if yes and sudo == "run" and not sys.stdin.isatty():
+        raise Failure("onboard --sudo run asks for each host's password; run it from a terminal")
+    targets, skipped = onboard_hosts(manifest, wanted)
+    rows = {h: {"host": h, "node": manifest["hosts"][h].get("node_id") or "", "step": "-", "result": f"skipped: {why}",
+                "log": ""} for h, why in skipped.items()}
+    for name in targets:
+        rows[name] = {"host": name, "node": manifest["hosts"][name]["node_id"], "step": "preflight", "result": "",
+                      "log": ""}
+    if seed:
+        select_hosts(manifest, [seed])
+    directory = run_log_dir("onboard", log_dir) if yes else None
+    live = list(targets)
+
+    def settle(name: str, step: str, result: str) -> None:
+        rows[name].update(step=step, result=result)
+        if name in live:
+            live.remove(name)
+
+    def probe(names: list[str]) -> dict[str, dict[str, Any]]:
+        return {r["host"]: r for r in preflight(manifest, observe(manifest, names, preflight=True), names)} if names else {}
+
+    def blockers(result: dict[str, Any], groups: tuple[str, ...]) -> list[str]:
+        return [c for c, v in result["checks"].items()
+                if v["state"] == "fail" and (v["group"] or "person") in groups]
+
+    results = probe(live)
+    for name in list(live):
+        if "reach" in results[name]["checks"]:
+            settle(name, "preflight", f"unreachable: {results[name]['checks']['reach']['detail']}")
+        elif blockers(results[name], ("person",)):
+            settle(name, "preflight", "needs a person: " + ", ".join(blockers(results[name], ("person",))))
+    candidate = operator_candidate()
+    if acceptance == "class":
+        for name in list(live):
+            recorded, why = class_acceptance(manifest, name)
+            enrolled = results[name]["checks"]["enroll"]["state"] == "ok"
+            if recorded is None and not enrolled:
+                settle(name, "preflight", f"blocked: {why}; accept one host of the class first "
+                                          f"(onboard {name} --acceptance node --yes)")
+
+    if not yes:
+        for name in live:
+            mine, root = planned_actions(results[name])
+            checks = results[name]["checks"]
+            parts = [f"fix {len(mine)}"] if mine else []
+            parts += [f"sudo-plan {', '.join(c for a in root for c in a['checks'])}"] if root else []
+            if checks["enroll"]["state"] != "ok":
+                parts.append("enroll" + (" without acceptance (class)" if acceptance == "class" else " with acceptance"))
+            if checks["runner"]["state"] != "ok" and (acceptance == "node" or checks["enroll"]["state"] == "ok"):
+                parts.append("register")
+            rows[name]["result"] = "would: " + (", ".join(parts) or "nothing, already onboarded")
+        print(render_onboard(rows))
+        print("dry run; pass --yes to onboard")
+        return 0
+
+    assert directory is not None
+    for name in targets:
+        rows[name]["log"] = os.fspath(directory / f"{name}.log")
+
+    def fix_round(names: list[str]) -> None:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            outcomes = list(pool.map(lambda h: fix_host(manifest, h, results[h], True, directory,
+                                                        seed if h != seed else None), names))
+        for outcome in outcomes:
+            if outcome["failed"]:
+                settle(outcome["host"], "fix", "failed: " + "; ".join(outcome["failed"])[:160])
+
+    fix_round(list(live))
+    results.update(probe(list(live)))
+    plans = {h: s for h in live if (s := sudo_plan_script(manifest, h, results[h])) is not None}
+    if plans:
+        for name, script in plans.items():
+            path = directory / f"{name}.sudo-plan.sh"
+            path.write_text(script)
+            path.chmod(0o600)
+        if sudo == "run":
+            for name, script in plans.items():
+                print(f"\n==== {name}: sudo-plan over ssh -t; type the password for {manifest['ssh_user']}@{name}", flush=True)
+                code = subprocess.run([SSH, "-t", "-o", "ConnectTimeout=10", "-l", manifest["ssh_user"], name,
+                                       "/bin/bash -c " + shlex.quote(script)], check=False).returncode
+                if code:
+                    settle(name, "sudo-plan", f"failed: exit {code}")
+        elif sudo == "wait" and sys.stdin.isatty():
+            print(f"\nRoot steps are needed on {', '.join(plans)}. Review the plans in {directory}, then run:\n"
+                  f"  glaeda-mini-fleet sudo-plan {' '.join(plans)} --run\nPress Enter here when they are done.", flush=True)
+            input()
+        else:
+            for name in plans:
+                settle(name, "sudo-plan", f"waiting: glaeda-mini-fleet sudo-plan {name} --run, then onboard again")
+        fix_round([h for h in live if h in plans])
+        results.update(probe([h for h in live if h in plans]))
+    for name in list(live):
+        failing = blockers(results[name], ("self", "password", "person"))
+        if failing or not results[name]["ready"]:
+            settle(name, "preflight", "not ready: " + ", ".join(failing or ["unknown checks"]))
+
+    # Enroll: bootstrap and enroll every ready host at once; node acceptance only when asked for.
+    to_enroll = [h for h in live if results[h]["checks"]["enroll"]["state"] != "ok"]
+    if to_enroll:
+        if not {"source", "sha256"} <= set(candidate):
+            for name in to_enroll:
+                settle(name, "enroll", "blocked: this Mac's cmux checkout names no candidate")
+            to_enroll = []
+        logs = {h: directory / f"{h}.log" for h in to_enroll}
+
+        def enroll_task(name: str) -> Any:
+            return lambda: _enroll_one(manifest, name, results[name], candidate, acceptance == "class", logs[name])
+
+        outcomes = run_with_heartbeat({h: enroll_task(h) for h in to_enroll}, logs, "enroll", heartbeat)
+        for name, code in outcomes.items():
+            if code:
+                settle(name, "enroll", f"failed: exit {code}")
+            elif acceptance == "class":
+                settle(name, "enroll", "enrolled without node acceptance; eligible needs class receipts in cmux_fleet.py")
+            else:
+                rows[name].update(step="enroll", result="eligible")
+
+    # Register the runner on every eligible host that has none, with one token minted here.
+    to_register = [h for h in live if results[h]["checks"]["runner"]["state"] != "ok"]
+    for name in live:
+        if name not in to_register:
+            rows[name].update(step="register", result="ok: already onboarded")
+    if to_register:
+        org = (manifest.get("runner") or {}).get("org")
+        if not org:
+            for name in to_register:
+                settle(name, "register", "blocked: the manifest has no runner.org")
+        else:
+            token = mint_runner_token(org)
+            logs = {h: directory / f"{h}.log" for h in to_register}
+
+            def register_task(name: str) -> Any:
+                def run() -> int:
+                    with open(logs[name], "ab") as log:
+                        note(log, f"== register ({register_command(manifest, name)})")
+                        return ssh_stream(name, manifest["ssh_user"], register_command(manifest, name), log,
+                                          stdin=(token + "\n").encode(), timeout=1800)
+                return run
+
+            outcomes = run_with_heartbeat({h: register_task(h) for h in to_register}, logs, "register", heartbeat)
+            for name, code in outcomes.items():
+                rows[name].update(step="register", result="ok" if code == 0 else f"failed: exit {code}")
+    print()
+    print(render_onboard(rows))
+    return 0 if all(r["result"].startswith(("ok", "eligible", "skipped")) for r in rows.values()) else 1
+
+
+def _enroll_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str],
+                no_accept: bool, log_path: Path) -> int:
+    command = enroll_command(manifest, name, result, candidate, no_accept)
+    with open(log_path, "ab") as log:
+        note(log, f"== enroll ({command})")
+        return ssh_stream(name, manifest["ssh_user"], command, log, timeout=ENROLL_TIMEOUT)
+
+
 # ---------------------------------------------------------------- cli
 
 
@@ -1632,7 +2137,8 @@ def read_observed(path: Path) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=("observe", "check", "plan", "apply", "preflight", "fix", "sudo-plan"))
+    parser.add_argument("command", choices=("observe", "check", "plan", "apply", "preflight", "fix", "sudo-plan",
+                                            "share", "onboard"))
     parser.add_argument("names", nargs="*", metavar="HOST", help="hosts to act on (same as --host)")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--host", action="append", dest="hosts")
@@ -1644,8 +2150,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run", action="store_true", help="sudo-plan: run each host's plan over ssh -t")
     parser.add_argument("--sudoers", action="store_true",
                         help="sudo-plan: also install a narrow NOPASSWD rule (printed in the plan for review)")
-    parser.add_argument("--log-dir", type=Path, help="fix, sudo-plan: where per-host logs and plans go")
-    args = parser.parse_args(argv)
+    parser.add_argument("--log-dir", type=Path, help="fix, sudo-plan, share, onboard: where per-host logs and plans go")
+    parser.add_argument("--from", dest="seed", metavar="HOST",
+                        help="share, fix, onboard: copy large things from this prepared host over the LAN")
+    parser.add_argument("--jobs", type=int, default=2, help="share: peers copied at once from the source (default 2)")
+    parser.add_argument("--sudo", choices=("run", "wait", "stop"), default="wait",
+                        help="onboard: run each sudo-plan over ssh -t, wait for the operator (default), or stop there")
+    parser.add_argument("--acceptance", choices=("class", "node"), default="class",
+                        help="onboard: join on the class's recorded acceptance (default) or run accept-local here")
+    # Intermixed, so hosts may follow options: share xcode --from cmux15 cmux7s cmux8s
+    args = parser.parse_intermixed_args(argv)
+    thing = None
+    if args.command == "share":
+        if not args.names:
+            parser.error(f"share needs what to share: {', '.join(SHARE_THINGS)}")
+        thing, args.names = args.names[0], args.names[1:]
     if args.names:
         args.hosts = [*(args.hosts or []), *args.names]
     try:
@@ -1655,8 +2174,14 @@ def main(argv: list[str] | None = None) -> int:
             if not args.hosts:
                 raise Failure("apply needs explicit --host arguments")
             return apply(manifest, hosts, args.yes)
+        if args.command == "onboard":
+            return cmd_onboard(manifest, args.hosts, args.yes, args.sudo, args.acceptance, args.seed, args.log_dir)
+        if args.command == "share":
+            if not args.hosts:
+                raise Failure("share needs explicit destination hosts")
+            return cmd_share(manifest, thing, args.seed, hosts, args.yes, args.jobs, args.log_dir)
         if args.command == "fix":
-            return cmd_fix(manifest, hosts, args.yes, args.log_dir)
+            return cmd_fix(manifest, hosts, args.yes, args.log_dir, args.seed)
         if args.command == "sudo-plan":
             return cmd_sudo_plan(manifest, hosts, args.run, args.sudoers, args.log_dir)
         if args.command == "preflight":
