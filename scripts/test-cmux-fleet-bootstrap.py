@@ -480,5 +480,68 @@ class Tests(unittest.TestCase):
         )
 
 
+    def test_failed_commands_name_the_missing_thing_and_its_fix(self):
+        def fake(output, code=1):
+            return subprocess.CompletedProcess([], code, stdout=output)
+
+        cases = (
+            (["/usr/bin/xcrun", "metal", "--version"],
+             "error: error: cannot execute tool 'metal' due to missing Metal Toolchain; use: xcodebuild -downloadComponent MetalToolchain",
+             "xcrun metal --version failed: Metal Toolchain missing; run xcodebuild -downloadComponent MetalToolchain"),
+            (["/usr/bin/xcodebuild", "-version"],
+             "DVTPlugInLoading: Failed to load code for plug-in; run xcodebuild -runFirstLaunch",
+             "xcodebuild -version failed: " + b.FIRST_LAUNCH_FIX),
+            (["/opt/homebrew/bin/rustup", "run", "1.88.0"],
+             "error: toolchain '1.88.0-aarch64-apple-darwin' is not installed",
+             "rustup run 1.88.0 failed: Rust toolchain 1.88.0-aarch64-apple-darwin is not installed; "
+             "run rustup toolchain install 1.88.0-aarch64-apple-darwin"),
+            (["/usr/bin/git", "status"], "fatal: not a git repository\n", "git status failed: exit 1: fatal: not a git repository"),
+        )
+        for argv, output, message in cases:
+            with self.subTest(argv=argv), mock.patch.object(b.subprocess, "run", return_value=fake(output)):
+                with self.assertRaises(b.BootstrapError) as raised:
+                    b.run(argv)
+                self.assertEqual(str(raised.exception), message)
+
+    def test_missing_tools_and_files_name_their_fix(self):
+        with mock.patch.object(b.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(b.BootstrapError, "required command is missing: zig; brew install zig as the Homebrew owner"):
+                b.executable("zig")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(b.BootstrapError, "git submodule update --init"):
+                b.cmux_required_zig_version(root)
+            with self.assertRaisesRegex(b.BootstrapError, "rust-toolchain.toml is missing"):
+                b.cmux_diff_rust_toolchain(root)
+        self.assertEqual(b.minimum_zig_version('.{\n    .minimum_zig_version = "0.16.0",\n}\n'), "0.16.0")
+        self.assertIsNone(b.minimum_zig_version(".{}"))
+        self.assertTrue(b.submodule_status_ready(" a1 ghostty (heads/main)\n a2 vendor/bonsplit"))
+        self.assertFalse(b.submodule_status_ready("-a1 ghostty"))
+        self.assertFalse(b.submodule_status_ready(""))
+
+    def test_errors_from_older_candidates_are_explained(self):
+        self.assertEqual(
+            b.explain_error("[Errno 2] No such file or directory: '/Users/cmux/cmux/ghostty/build.zig.zon'"),
+            b.SUBMODULE_FIX,
+        )
+        self.assertIn("xcodebuild -downloadComponent MetalToolchain",
+                      b.explain_error("required command failed: xcrun"))
+        self.assertIn("brew install rustup", b.explain_error("required command is missing: cargo"))
+        self.assertEqual(b.explain_error("something else"), "something else")
+
+    def test_every_check_the_collectors_emit_has_a_fix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._macos_checkout(root)
+            (root / "glaeda").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            cache_root = root / "cache"
+            cache_root.mkdir()
+            macos = self._collect_macos(root, cache_root, visible=True)
+        linux = observation("linux")
+        for checks in (macos["checks"], linux["checks"]):
+            self.assertEqual(set(checks) - set(b.BLOCKING_FIXES), set())
+        self.assertNotIn("\u2014", " ".join(b.BLOCKING_FIXES.values()))
+
+
 if __name__ == "__main__":
     unittest.main()

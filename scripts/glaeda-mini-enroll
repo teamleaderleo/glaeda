@@ -39,6 +39,8 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO = SCRIPT_DIR.parent
+sys.path.insert(0, os.fspath(SCRIPT_DIR))
+import cmux_fleet_bootstrap as fleet_bootstrap  # noqa: E402  (fix texts only; this checkout's, not the candidate's)
 ROLE = "cmux_macos_native_build"
 HARDWARE_CLASS = "cmux-mac-build-large"
 SCOPE = "cmux-founders"
@@ -272,16 +274,10 @@ class Runner:
             # accept-local re-runs the bootstrap from the staged generation and
             # requires the same toolchain generation; this checkout's
             # rust-toolchain.toml would otherwise change what rustc reports.
-            cwd=self.tools.parent, text=True, stdout=subprocess.PIPE, check=False)
-        doc = None
-        try:
-            doc = json.loads(result.stdout)
-        except ValueError:
-            pass
-        if not isinstance(doc, dict) or not doc.get("eligibleForEnrollment"):
-            blocking = ", ".join((doc or {}).get("blockingChecks") or []) or "unreadable bootstrap output"
-            raise Stop(f"bootstrap does not allow enrollment: {blocking}. "
-                       "Run glaeda-mini-setup --cmux-root <cmux> for what to fix.")
+            cwd=self.tools.parent, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        problem = bootstrap_problem(result.returncode, result.stdout, result.stderr)
+        if problem:
+            raise Stop(problem)
         path = self.paths.fleet / "bootstrap.json"
         self.write_private(path, result.stdout)
         return path
@@ -316,6 +312,35 @@ class Runner:
     def status(self) -> dict[str, Any]:
         result = self.fleet("status", os.fspath(self.paths.enrollment), "--acceptance", os.fspath(self.paths.acceptance))
         return read_json_text(result.stdout) or {}
+
+
+def bootstrap_problem(code: int, stdout: str, stderr: str) -> str | None:
+    """What stops enrollment, naming each missing thing and its fix; None when eligible."""
+    doc = read_json_text(stdout)
+    if doc is not None and doc.get("eligibleForEnrollment") and code == 0:
+        return None
+    if doc is not None and isinstance(doc.get("blockingChecks"), list) and doc["blockingChecks"]:
+        missing = (doc.get("observed") or {}).get("toolsMissingFromWorkloadPath") or []
+        lines = []
+        for check in doc["blockingChecks"]:
+            fix = fleet_bootstrap.BLOCKING_FIXES.get(check, "see docs/CMUX_FLEET_ENROLLMENT.md")
+            if check == "workloadToolPath" and missing:
+                fix = f"not on the workload PATH: {', '.join(missing)}; " + "; ".join(
+                    dict.fromkeys(fleet_bootstrap.TOOL_FIXES.get(t, f"install {t}") for t in missing))
+            lines.append(f"  {check}: {fix}")
+        return "bootstrap does not allow enrollment:\n" + "\n".join(lines) + \
+            "\nglaeda-mini-fleet preflight (from the operator Mac) checks all of these at once."
+    # The bootstrap prints {"error": ...} on stderr when it cannot observe the node at all.
+    error = None
+    for line in reversed(stderr.strip().splitlines()):
+        parsed = read_json_text(line)
+        if parsed and isinstance(parsed.get("error"), str):
+            error = parsed["error"]
+            break
+    if error:
+        return f"bootstrap could not observe this mini: {fleet_bootstrap.explain_error(error)}"
+    tail = (stderr.strip().splitlines() or [""])[-1][:300]
+    return f"bootstrap exited {code} without a verdict" + (f": {tail}" if tail else "")
 
 
 def read_json_text(text: str | None) -> dict[str, Any] | None:

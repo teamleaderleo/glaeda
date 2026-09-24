@@ -5,6 +5,7 @@
     glaeda-mini-fleet check    [--manifest M] [--host H ...] [--observed FILE] [--json]
     glaeda-mini-fleet plan     [--manifest M] [--host H ...] [--observed FILE]  print the fixes check would need
     glaeda-mini-fleet apply    [--manifest M] --host H ... [--yes]              make the additive fixes
+    glaeda-mini-fleet preflight [HOST ...] [--output text|json]                 every onboarding blocker, one pass
 
 The manifest names every host, its fleet node id (node_id, so every enrollment rerun asks for the
 same one), its hardware class, the toolchain it must carry, the SSH keys that must, may, and must
@@ -13,6 +14,14 @@ not be in the login user's authorized_keys, and the launchd jobs that must be ru
 observe, check, and plan are read-only. The probe (scripts/cmux_mini_probe.sh) runs as the SSH
 login user with no sudo and no Python, and reports key fingerprints and comments, never key
 material, tokens, or log contents. `plan` prints commands for an operator; it runs none of them.
+
+`preflight` is read-only too. It probes every host in parallel for what the fleet bootstrap,
+glaeda-mini-enroll, local acceptance and cmux scripts/setup.sh will later require (the pinned
+Xcode, its selection, licence and first launch, the Metal toolchain, tool versions on the
+workload PATH, Python 3.13+, the checkout with submodules and setup artifacts, power, disk, a
+pending macOS update) plus onboarding progress (candidate, node id, enrollment, runner). It
+prints one host-by-check table, then each host's fixes split into what the login user can do,
+what needs a password, and what needs a person. It exits 1 when any host is not ready.
 
 `apply` only adds, and only what the manifest can prove: it appends a required key whose
 `public_key` the manifest carries and whose fingerprint matches, after copying authorized_keys
@@ -44,10 +53,13 @@ SCHEMA = "glaeda-mini-fleet/v1"
 ROLES = ("dev-builds", "ci-runner", "nightly", "ios-simulators", "cache-host")
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROBE = SCRIPT_DIR / "cmux_mini_probe.sh"
+PREFLIGHT_PROBE = SCRIPT_DIR / "cmux_mini_preflight.sh"
 DEFAULT_MANIFEST = Path(os.environ.get("GLAEDA_MINI_FLEET_MANIFEST", "~/.config/glaeda/mini-fleet.json")).expanduser()
 SSH = "/usr/bin/ssh"
 PROBE_TIMEOUT = 90
-LIST_KEYS = {"xcode_app", "xcode_ready", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key"}
+PREFLIGHT_TIMEOUT = 180
+LIST_KEYS = {"xcode_app", "xcode_ready", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key",
+             "pf_tool", "pf_submodule", "pf_pmset", "pf_runner"}
 # Same rule as scripts/cmux_fleet.py NODE_RE: an opaque cmux-* fleet node id.
 NODE_ID_RE = re.compile(r"cmux-[a-z0-9][a-z0-9-]{2,59}\Z")
 # Files sshd reads by default (OpenSSH AuthorizedKeysFile); every other authorized_keys* is a copy.
@@ -56,6 +68,23 @@ LIVE_KEY_FILES = ("authorized_keys", "authorized_keys2")
 
 class Failure(Exception):
     pass
+
+
+def _load(name: str, path: Path) -> Any:
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader(name, os.fspath(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
+# preflight holds hosts to the same rules as the steps it predicts, so it reads them from their owners.
+sys.path.insert(0, os.fspath(SCRIPT_DIR))
+import cmux_fleet_bootstrap as bootstrap  # noqa: E402
+enroll = _load("glaeda_mini_enroll", SCRIPT_DIR / "glaeda-mini-enroll")
 
 
 # ---------------------------------------------------------------- manifest
@@ -182,6 +211,43 @@ def parse_probe(text: str) -> dict[str, Any]:
         "enrolled_node_id": out.get("fleet_node_id"),
         "authorized_keys_files": [v.split("|")[0] for v in out["ak_file"]],
         "authorized_keys": [parse_key(v) for v in out["ak_key"] if v.split("|", 1)[0] in LIVE_KEY_FILES],
+        **({"preflight": parse_preflight(out)} if "pf_python" in out else {}),
+    }
+
+
+def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
+    """The cmux_mini_preflight.sh section of a probe, as plain data."""
+    def split(key: str, n: int) -> list[str] | None:
+        value = out.get(key)
+        return None if value is None else (value.split("|", n - 1) + [""] * n)[:n]
+
+    sdks, metal, python = split("pf_sdks", 2), split("pf_metal", 2), split("pf_python", 2)
+    prepared = split("pf_update_prepared", 2)
+    channel, candidate = split("pf_rust_channel", 3), split("pf_candidate", 3)
+    return {
+        "sdks": None if sdks is None else {"state": sdks[0], "detail": sdks[1]},
+        "metal": None if metal is None else {"ok": metal[0] == "ok", "detail": metal[1]},
+        "tools": {t: {"path": p or None, "version": v} for t, p, v in
+                  ((v.split("|", 2) + ["", ""])[:3] for v in out["pf_tool"])},
+        "rust_channel": None if channel is None else {"channel": channel[0], "rustc": channel[1], "cargo": channel[2]},
+        "python": {"path": python[0] or None, "version": python[1] or None},
+        "cmux": out.get("pf_cmux") == "present",
+        "cmux_pin": out.get("pf_cmux_pin"),
+        "submodules": out["pf_submodule"],
+        "zig_min": out.get("pf_zig_min") or None,
+        "setup_artifacts": out.get("pf_setup_artifacts") == "yes",
+        "dirty": int(out.get("pf_cmux_dirty") or 0),
+        "candidate": None if candidate is None else
+        {"source12": candidate[0], "staged": candidate[1] == "yes", "archive": candidate[2] == "yes"},
+        "glaeda_checkout": out.get("pf_glaeda") == "present",
+        "cache_root": out.get("pf_cache_root") == "present",
+        "enroll_state": out.get("pf_enroll_state"),
+        "acceptance": out.get("pf_acceptance"),
+        "brew_owner": out.get("pf_brew_owner"),
+        "update_running": out.get("pf_update_running"),
+        "update_prepared": None if prepared is None else {"state": prepared[0], "version": prepared[1]},
+        "pmset": "\n".join(out["pf_pmset"]),
+        "runners": [dict(zip(("dir", "name"), (v.split("|", 1) + [""])[:2])) for v in out["pf_runner"]],
     }
 
 
@@ -194,17 +260,17 @@ def parse_key(value: str) -> dict[str, Any]:
     return {"file": file, "fingerprint": parts[1], "comment": comment, "type": kind.rstrip(")"), "options": options == "yes"}
 
 
-def observe_host(name: str, user: str) -> dict[str, Any]:
+def observe_host(name: str, user: str, script: bytes | None = None, timeout: int = PROBE_TIMEOUT) -> dict[str, Any]:
     started = time.time()
     try:
         proc = subprocess.run(
             [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name, "/bin/bash", "-s"],
-            input=PROBE.read_bytes(), capture_output=True, timeout=PROBE_TIMEOUT, env={"PATH": "/usr/bin:/bin",
+            input=script or PROBE.read_bytes(), capture_output=True, timeout=timeout, env={"PATH": "/usr/bin:/bin",
                                                                                        "HOME": os.environ["HOME"],
                                                                                        "SSH_AUTH_SOCK": os.environ.get("SSH_AUTH_SOCK", "")},
         )
     except subprocess.TimeoutExpired:
-        return {"host": name, "reachable": False, "error": f"probe timed out after {PROBE_TIMEOUT}s"}
+        return {"host": name, "reachable": False, "error": f"probe timed out after {timeout}s"}
     if proc.returncode != 0:
         err = proc.stderr.decode(errors="replace").strip().splitlines()
         return {"host": name, "reachable": False, "error": (err[-1] if err else f"ssh exit {proc.returncode}")[:200]}
@@ -212,9 +278,14 @@ def observe_host(name: str, user: str) -> dict[str, Any]:
     return {"host": name, "reachable": True, "observed_at": int(started), **data}
 
 
-def observe(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
+def observe(manifest: dict[str, Any], hosts: list[str], preflight: bool = False) -> dict[str, Any]:
+    def one(name: str) -> dict[str, Any]:
+        if not preflight:
+            return observe_host(name, manifest["ssh_user"])
+        return observe_host(name, manifest["ssh_user"], preflight_script(manifest, name), PREFLIGHT_TIMEOUT)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-        results = list(pool.map(lambda h: observe_host(h, manifest["ssh_user"]), hosts))
+        results = list(pool.map(one, hosts))
     return {"schema": SCHEMA + "/observed", "hosts": {r["host"]: r for r in results}}
 
 
@@ -471,6 +542,378 @@ def apply(manifest: dict[str, Any], hosts: list[str], yes: bool) -> int:
     return 1 if failed or left else 0
 
 
+# ---------------------------------------------------------------- preflight
+
+DEFAULT_CMUX_ROOT = "~/cmux"  # where cmux scripts/persistent-compile up clones it on a mini
+# Columns of the preflight table, in the order onboarding meets them.
+PREFLIGHT_CHECKS = ("os", "xcode", "select", "licence", "launch", "metal", "rust", "zig", "tools", "python",
+                    "cmux", "setup", "glaeda", "power", "disk", "update", "candidate", "node", "enroll", "runner", "brew")
+# An unknown here means the bootstrap would refuse or cannot be predicted, so it blocks like a failure.
+UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "power", "disk"})
+# Who can apply a fix: the SSH login user alone, the login user with an admin password, or a person.
+FIX_GROUPS = ("self", "password", "person")
+GROUP_TITLES = {"self": "can do itself (no root)", "password": "needs a password", "person": "needs a person"}
+
+
+def xcode_pin(manifest: dict[str, Any], name: str) -> str | None:
+    """The Xcode app builds must use: the manifest's selection, else its first required app."""
+    xcode = host_policy(manifest, name).get("xcode", {})
+    if xcode.get("select"):
+        return xcode["select"].removesuffix("/Contents/Developer")
+    apps = xcode.get("apps") or []
+    return apps[0]["path"] if apps else None
+
+
+def preflight_script(manifest: dict[str, Any], name: str) -> bytes:
+    import shlex
+    policy = host_policy(manifest, name)
+    home = "~/.local/bin/"
+    pythons = [*enroll.PYTHON_CANDIDATES, *(home + n for n in enroll.USER_PYTHONS)]
+    inputs = {
+        "CMUX_ROOT": policy.get("cmux_root", DEFAULT_CMUX_ROOT),
+        "XCODE_PIN": xcode_pin(manifest, name) or "",
+        "WORKLOAD_PATH": bootstrap.CMUX_WORKLOAD_TOOL_PATH,
+        "WORKLOAD_TOOLS": " ".join(bootstrap.MACOS_WORKLOAD_TOOLS),
+        "PYTHONS": " ".join(pythons),
+        "CANDIDATE_FALLBACK": operator_candidate_source(),
+    }
+    header = "".join(f"{k}={shlex.quote(v)}\n" for k, v in inputs.items())
+    return PROBE.read_bytes() + b"\n" + header.encode() + PREFLIGHT_PROBE.read_bytes()
+
+
+def operator_cmux_root() -> Path:
+    return Path(os.environ.get("GLAEDA_CMUX_ROOT", "~/Projects/cmux")).expanduser()
+
+
+def operator_zig_minimum() -> str | None:
+    """Ghostty's minimum Zig from the operator's own cmux checkout, for a host without submodules."""
+    try:
+        return bootstrap.minimum_zig_version((operator_cmux_root() / "ghostty/build.zig.zon").read_text())
+    except OSError:
+        return None
+
+
+def operator_candidate_source() -> str:
+    """The candidate cmux persistent-compile installs, from the operator's cmux checkout, for a host without one."""
+    root = operator_cmux_root()
+    relative = "scripts/ci/persistent_compile_fleet.py"
+    try:
+        text = (root / relative).read_text()
+    except OSError:
+        # The working tree may be on an older branch; the upstream tip names the current candidate.
+        text = ""
+        for ref in ("upstream/main", "origin/main"):
+            try:
+                shown = subprocess.run(["git", "-C", os.fspath(root), "show", f"{ref}:{relative}"],
+                                       capture_output=True, text=True, timeout=10, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                break
+            if shown.returncode == 0:
+                text = shown.stdout
+                break
+    match = re.search(r'^CANDIDATE_SOURCE = "([0-9a-f]{40})"', text, re.MULTILINE)
+    return match.group(1) if match else ""
+
+
+def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
+                   zig_fallback: str | None = None) -> dict[str, Any]:
+    """Every check for one host: {id: {state, detail, fix, group}}, state ok|fail|todo|unknown|info.
+
+    fail blocks onboarding; todo is a step onboarding itself performs (stage, enroll, register)."""
+    checks: dict[str, dict[str, Any]] = {}
+
+    def put(check: str, state: str, detail: str = "", fix: str = "", group: str = "") -> None:
+        checks[check] = {"state": state, "detail": detail, "fix": fix, "group": group}
+
+    if not obs.get("reachable"):
+        put("reach", "fail", obs.get("error", "unreachable"), "check the host is up and the SSH key is loaded", "person")
+        return {"host": name, "ready": False, "checks": checks}
+    pf = obs.get("preflight")
+    if pf is None:
+        put("reach", "fail", "observation has no preflight section", "rerun glaeda-mini-fleet preflight", "self")
+        return {"host": name, "ready": False, "checks": checks}
+    host = manifest["hosts"][name]
+    policy = host_policy(manifest, name)
+    user = obs.get("user") or manifest["ssh_user"]
+    owner = pf.get("brew_owner")
+    as_owner = "install Homebrew, then " if owner is None else ("" if owner == user else f"sudo -u {owner} ")
+    brew_group = "person" if owner is None else ("self" if owner == user else "password")
+    root = policy.get("cmux_root", DEFAULT_CMUX_ROOT)
+
+    # The bootstrap's supportedOs and hardwareCapability (cmux-mac-build-large).
+    major = int(re.match(r"\d*", obs.get("macos") or "").group() or 0)
+    if major not in {15, 26}:
+        put("os", "fail", f"macOS {obs.get('macos')}; the fleet bootstrap accepts 15 or 26", "install macOS 26", "person")
+    elif not bootstrap.hardware_class_ready("macos", "cmux-mac-build-large", obs.get("cpus", 0), obs.get("memory_gib", 0)):
+        put("os", "fail", f"{obs.get('cpus')} CPUs, {obs.get('memory_gib')} GiB; cmux-mac-build-large needs 8 and 16",
+            "use a larger Mac", "person")
+    else:
+        put("os", "ok", f"macOS {obs.get('macos')}, {obs.get('cpus')} CPUs, {obs.get('memory_gib')} GiB")
+
+    # Xcode: the pinned app, selected, licensed, first launch done, plugins loading.
+    pin = xcode_pin(manifest, name)
+    apps = {a["path"]: a for a in obs.get("xcode_apps", [])}
+    want = next((a for a in policy.get("xcode", {}).get("apps", []) if a["path"] == pin), None)
+    got = apps.get(pin) if pin else None
+    if not pin:
+        put("xcode", "unknown", "the manifest declares no Xcode (xcode.apps or xcode.select)",
+            "declare the pinned Xcode in the manifest", "person")
+    elif not got:
+        if want and want.get("clone_from"):
+            fix, group = f"glaeda-mini-fleet apply --host {name} --yes (clones {want['clone_from']})", "self"
+        else:
+            fix, group = (want or {}).get("fix") or f"install {pin} (LAN copy from a host that has it)", "person"
+        put("xcode", "fail", f"{pin} missing", fix, group)
+    elif got["kind"] != "dir":
+        put("xcode", "fail", f"{pin} is a {got['kind']}; symlinked Xcode paths break cache replay",
+            f"replace the symlink with a real copy of {pin}", "person")
+    elif want and (got["version"], got["build"]) != (want["version"], want["build"]):
+        put("xcode", "fail", f"{pin} is {got['version']} ({got['build']}), want {want['version']} ({want['build']})",
+            f"install Xcode {want['version']} ({want['build']}) at {pin}", "person")
+    elif pf.get("cmux") and not bootstrap.xcode_pin_ready(pf.get("cmux_pin") or "", got["version"], got["version"]):
+        put("xcode", "fail", f"{pin} is {got['version']}; cmux .xcode-version says {pf.get('cmux_pin') or 'nothing'} "
+            f"and the fleet is reviewed on Xcode {bootstrap.REVIEWED_XCODE_MAJOR}",
+            "pin an Xcode of the reviewed major in the manifest", "person")
+    else:
+        put("xcode", "ok", f"{got['version']} ({got['build']})")
+    developer = f"{pin}/Contents/Developer" if pin else None
+    if developer and obs.get("xcode_select") != developer:
+        put("select", "fail", f"xcode-select is {obs.get('xcode_select') or 'unset'}", f"sudo xcode-select -s {pin}", "password")
+    elif developer:
+        put("select", "ok", developer)
+    ready = obs.get("xcode_ready", {}).get(pin) if got else None
+    if ready is None:
+        put("licence", "unknown", "no runnable xcodebuild in the pinned Xcode")
+        put("launch", "unknown", "no runnable xcodebuild in the pinned Xcode")
+    else:
+        if ready["licence"] == "accepted":
+            put("licence", "ok")
+        else:
+            put("licence", "fail", "licence not accepted", f"sudo env DEVELOPER_DIR={developer} xcodebuild -license accept", "password")
+        sdks = pf.get("sdks") or {}
+        if ready["first_launch"] != "done" or sdks.get("state") == "plugin_error":
+            why = "xcodebuild -checkFirstLaunchStatus says first launch is needed" if ready["first_launch"] != "done" \
+                else f"plugins fail to load: {sdks.get('detail')}"
+            put("launch", "fail", why, f"sudo env DEVELOPER_DIR={developer} xcodebuild -runFirstLaunch", "password")
+        elif sdks.get("state") == "fail":
+            put("launch", "fail", f"xcodebuild -showsdks failed: {sdks.get('detail')}",
+                f"sudo env DEVELOPER_DIR={developer} xcodebuild -runFirstLaunch", "password")
+        else:
+            put("launch", "ok")
+    metal = pf.get("metal")
+    if metal is None:
+        put("metal", "unknown", "no pinned Xcode to ask")
+    elif not metal["ok"] and checks.get("licence", {}).get("state") != "ok":
+        put("metal", "unknown", "xcrun cannot run until the licence is accepted")
+    elif metal["ok"]:
+        put("metal", "ok", metal["detail"])
+    else:
+        put("metal", "fail", f"xcrun metal --version: {metal['detail']}",
+            f"DEVELOPER_DIR={developer} xcodebuild -downloadComponent MetalToolchain", "self")
+
+    # Build tools on the workload's fixed PATH, with versions.
+    tools = pf.get("tools", {})
+    missing_rust = [t for t in ("rustup", "cargo", "rustc") if not (tools.get(t) or {}).get("path")]
+    broken_rust = [t for t in ("rustup", "cargo", "rustc") if t not in missing_rust
+                   and not (tools[t]["version"] or "").startswith(f"{t} ")]
+    channel = pf.get("rust_channel")
+    if missing_rust:
+        put("rust", "fail", f"not on the workload PATH: {', '.join(missing_rust)}",
+            f"{as_owner}brew install rustup; link its cargo, rustc and rustup proxies into /opt/homebrew/bin", brew_group)
+    elif broken_rust:
+        detail = "; ".join(f"{t}: {tools[t]['version']}" for t in broken_rust)
+        put("rust", "fail", detail, f"cd {root} && rustup default stable (or rustup toolchain install <its channel>)", "self")
+    elif channel and not (channel["rustc"].startswith("rustc ") and channel["cargo"].startswith("cargo ")):
+        broken = channel["rustc"] if not channel["rustc"].startswith("rustc ") else channel["cargo"]
+        put("rust", "fail", f"DiffSidecar toolchain {channel['channel']}: {broken or 'unavailable'}",
+            f"rustup toolchain install {channel['channel']}", "self")
+    else:
+        put("rust", "ok", (tools.get("rustc") or {}).get("version", ""))
+    zig = tools.get("zig") or {}
+    required = pf.get("zig_min") or zig_fallback
+    if not zig.get("path"):
+        put("zig", "fail", "not on the workload PATH", f"{as_owner}brew install zig", brew_group)
+    elif required is None:
+        put("zig", "unknown", f"{zig['version']} at {zig['path']}; Ghostty's minimum is unknown (no ghostty/build.zig.zon)")
+    elif not bootstrap.zig_version_compatible(zig["version"], required):
+        put("zig", "fail", f"{zig['version']} at {zig['path']}, Ghostty needs {required}",
+            f"{as_owner}brew install zig (or brew upgrade zig); /opt/homebrew/bin comes first on the workload PATH",
+            brew_group)
+    else:
+        put("zig", "ok", f"{zig['version']} (needs {required})")
+    absent = [t for t in ("git", "xcodebuild", "xcrun") if not (tools.get(t) or {}).get("path")]
+    if absent:
+        put("tools", "fail", f"not on the workload PATH: {', '.join(absent)}", bootstrap.TOOL_FIXES[absent[0]], "person")
+    else:
+        git = re.sub(r"^git version (\S+).*", r"git \1", tools["git"]["version"] or "git ?")
+        put("tools", "ok", f"{git}, {tools['xcodebuild']['version'] or 'xcodebuild ?'} selected")
+    python = pf.get("python") or {}
+    if python.get("path"):
+        put("python", "ok", f"{python['version']} at {python['path']}")
+    else:
+        seen = f" (best found: {python['version']})" if python.get("version") else ""
+        fix = "brew install python@3.13" if owner == user else "put a relocatable CPython 3.13+ at ~/.local/bin/python3"
+        put("python", "fail", f"no Python 3.13+ where glaeda-mini-enroll looks{seen}", fix, "self")
+
+    # The checkout acceptance builds.
+    clone = f"git clone --depth 1 https://github.com/{bootstrap.CMUX_REPOSITORY}.git {root}"
+    if not pf.get("cmux"):
+        put("cmux", "fail", f"no checkout at {root}", clone, "self")
+        put("setup", "fail", "no checkout", f"after the clone: cd {root} && ./scripts/setup.sh", "self")
+    else:
+        errors = [s for s in pf.get("submodules", []) if s.startswith(("fatal:", "error:", "warning:"))]
+        if errors:
+            put("cmux", "fail", f"git submodule status: {errors[0][:160]}", f"fix the checkout at {root} (git status says why)",
+                "person")
+        elif not bootstrap.submodule_status_ready("\n".join(pf.get("submodules", []))):
+            put("cmux", "fail", bootstrap.SUBMODULE_FIX, f"cd {root} && git submodule update --init --recursive --depth 1", "self")
+        elif pf.get("dirty"):
+            put("cmux", "fail", f"{pf['dirty']} local changes; the bootstrap needs a clean checkout",
+                f"review git -C {root} status; commit, stash or remove them", "person")
+        else:
+            put("cmux", "ok", f"xcode pin {pf.get('cmux_pin') or '?'}")
+        if pf.get("setup_artifacts"):
+            put("setup", "ok")
+        else:
+            put("setup", "fail", "GhosttyKit or ghostty.h missing (cmux setup.sh has not completed)",
+                f"cd {root} && ./scripts/setup.sh (after metal and zig pass)", "self")
+
+    glaeda_missing = [what for what, present in (("~/glaeda checkout", pf.get("glaeda_checkout")),
+                                                  ("native cache root", pf.get("cache_root"))) if not present]
+    if glaeda_missing:
+        put("glaeda", "fail", f"missing: {', '.join(glaeda_missing)}",
+            "git clone https://github.com/teamleaderleo/glaeda.git ~/glaeda; ~/glaeda/scripts/glaeda-mini-setup --apply",
+            "self")
+    else:
+        put("glaeda", "ok")
+    pmset = pf.get("pmset", "")
+    if not pmset:
+        put("power", "unknown", "pmset -g custom printed nothing")
+    elif bootstrap.mac_sleep_disabled_on_ac(pmset):
+        put("power", "ok")
+    else:
+        put("power", "fail", "sleeps on AC power (bootstrap check unattendedPower)", "sudo pmset -c sleep 0", "password")
+    floor = policy.get("disk", {}).get("min_free_gib") or bootstrap.default_min_free_gib("macos")
+    data = obs.get("disk", {}).get("/System/Volumes/Data") or obs.get("disk", {}).get("/")
+    if not data:
+        put("disk", "unknown", "df printed nothing")
+    elif data["free_gib"] < floor:
+        put("disk", "fail", f"{data['free_gib']} GiB free, need {floor}", "glaeda-disk on the host shows where it went", "person")
+    else:
+        put("disk", "ok", f"{data['free_gib']} GiB free")
+    if pf.get("update_running"):
+        put("update", "fail", f"macOS update installing: {pf['update_running']}",
+            "wait for it to finish and the host to restart, then rerun preflight", "person")
+    elif (pf.get("update_prepared") or {}).get("state") == "pending":
+        put("update", "fail", f"macOS {pf['update_prepared']['version']} is prepared and waits for a restart",
+            "restart the host (sudo shutdown -r now) when no build is running", "password")
+    elif pf.get("update_prepared"):
+        put("update", "ok", f"macOS {pf['update_prepared']['version']} was prepared before the last boot and did not apply")
+    else:
+        put("update", "ok")
+
+    # Onboarding progress: candidate, node id, enrollment, runner.
+    enrolled = obs.get("enrolled_node_id")
+    state = pf.get("enroll_state")
+    candidate = pf.get("candidate")
+    if enrolled and state == "eligible":
+        put("candidate", "ok", "enrolled")
+    elif candidate is None:
+        put("candidate", "unknown", "the cmux checkout names no candidate (scripts/ci/persistent_compile_fleet.py)")
+    elif candidate["staged"]:
+        put("candidate", "ok", f"{candidate['source12']} staged")
+    else:
+        where = "archive downloaded, not staged" if candidate["archive"] else "not downloaded"
+        put("candidate", "todo", f"{candidate['source12']}: {where}",
+            "download on the operator Mac, check its sha256, scp it over; glaeda-mini-enroll --candidate stages it", "self")
+    node = host.get("node_id")
+    if enrolled and node and enrolled != node:
+        put("node", "fail", f"enrolled as {enrolled}, manifest assigns {node}",
+            "fix the manifest; an enrolled node keeps its id", "person")
+    elif enrolled or node:
+        put("node", "ok", enrolled or node)
+    else:
+        put("node", "fail", "no node id: not enrolled and the manifest assigns none",
+            f"assign hosts.{name}.node_id (cmux-mac-NNN) in the manifest", "person")
+    accepted = pf.get("acceptance") == "accepted"
+    if state == "eligible" and accepted:
+        put("enroll", "ok", "eligible, accepted")
+    elif state in {"quarantined", "retired"}:
+        put("enroll", "fail", f"enrollment is {state}", "see docs/CMUX_FLEET_ENROLLMENT.md", "person")
+    else:
+        progress = "not enrolled" if not state else f"{state}, acceptance {pf.get('acceptance') or 'not run'}"
+        put("enroll", "todo", progress,
+            f"glaeda-mini-enroll --cmux-root {root} --node-id {enrolled or node or '<cmux-mac-NNN>'} --apply", "self")
+    runners = pf.get("runners") or []
+    if runners:
+        put("runner", "ok", ", ".join(r["name"] or r["dir"] for r in runners))
+    else:
+        put("runner", "todo", "no runner registered", f"cd {root} && scripts/persistent-compile up (runner token from an org admin)", "person")
+    if owner is None:
+        rust_or_zig = checks["rust"]["state"] == "fail" or checks["zig"]["state"] == "fail"
+        put("brew", "fail" if rust_or_zig else "info", "none (no Homebrew)", "install Homebrew (https://brew.sh)", "person")
+    else:
+        put("brew", "info", owner if owner == user else f"{owner} (installs run as sudo -u {owner})")
+    blocked = any(c["state"] == "fail" or (c["state"] == "unknown" and k in UNKNOWN_BLOCKS) for k, c in checks.items())
+    return {"host": name, "ready": not blocked, "checks": checks}
+
+
+def preflight(manifest: dict[str, Any], observed: dict[str, Any], hosts: list[str]) -> list[dict[str, Any]]:
+    fallback = operator_zig_minimum()
+    return [preflight_host(manifest, name, observed["hosts"].get(name) or {"reachable": False, "error": "not observed"},
+                           fallback) for name in hosts]
+
+
+def grouped_fixes(result: dict[str, Any]) -> dict[str, list[str]]:
+    """A host's fixes by who can apply them, each once, in check order. Blockers before todos."""
+    out: dict[str, list[str]] = {g: [] for g in FIX_GROUPS}
+    for wanted in ("fail", "todo"):
+        for check, c in result["checks"].items():
+            if c["state"] == wanted and c["fix"] and c["fix"] not in out[c["group"] or "person"]:
+                out[c["group"] or "person"].append(f"{check}: {c['fix']}")
+    return out
+
+
+def render_preflight(results: list[dict[str, Any]]) -> str:
+    cell = {"ok": "ok", "fail": "FAIL", "todo": "todo", "unknown": "?"}
+    width = max([len("host"), *(len(r["host"]) for r in results)])
+    lines = []
+    columns = [c for c in PREFLIGHT_CHECKS if any(c in r["checks"] for r in results)] or ["reach"]
+    if any("reach" in r["checks"] for r in results):
+        columns = ["reach", *columns]
+    sizes = {c: max(len(c), 4) for c in columns}
+    for r in results:
+        if "brew" in r["checks"]:
+            sizes["brew"] = max(sizes["brew"], len(r["checks"]["brew"]["detail"].split(" ")[0]))
+    lines.append("  ".join([f"{'host':<{width}}", *(f"{c:<{sizes[c]}}" for c in columns), "ready"]))
+    for r in results:
+        row = []
+        for c in columns:
+            got = r["checks"].get(c)
+            text = "" if got is None else cell.get(got["state"], "")
+            if c == "brew" and got and got["state"] == "info":
+                text = got["detail"].split(" ")[0]
+            row.append(f"{text:<{sizes[c]}}")
+        lines.append("  ".join([f"{r['host']:<{width}}", *row, "yes" if r["ready"] else "NO"]))
+    for r in results:
+        problems = [(c, v) for c, v in r["checks"].items() if v["state"] in {"fail", "todo", "unknown"}]
+        if not problems:
+            continue
+        lines.append("")
+        lines.append(f"{r['host']}: {'ready' if r['ready'] else 'not ready'}")
+        for c, v in problems:
+            lines.append(f"  {cell[v['state']]:<4} {c}: {v['detail']}")
+        grouped = grouped_fixes(r)
+        for group in FIX_GROUPS:
+            if grouped[group]:
+                lines.append(f"  {GROUP_TITLES[group]}:")
+                lines.extend(f"    {f}" for f in grouped[group])
+    ready = sum(r["ready"] for r in results)
+    lines.append("")
+    lines.append(f"{len(results)} hosts, {ready} ready, {len(results) - ready} not ready")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- cli
 
 
@@ -486,14 +929,18 @@ def read_observed(path: Path) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=("observe", "check", "plan", "apply"))
+    parser.add_argument("command", choices=("observe", "check", "plan", "apply", "preflight"))
+    parser.add_argument("names", nargs="*", metavar="HOST", help="hosts to act on (same as --host)")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--host", action="append", dest="hosts")
     parser.add_argument("--observed", type=Path, help="reuse an observe output instead of probing")
     parser.add_argument("--out", type=Path, help="observe: also write the JSON here")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--output", choices=("text", "json"), default="text", help="preflight: output format")
     parser.add_argument("--yes", action="store_true", help="apply: make the changes instead of printing them")
     args = parser.parse_args(argv)
+    if args.names:
+        args.hosts = [*(args.hosts or []), *args.names]
     try:
         manifest = load_manifest(args.manifest)
         hosts = select_hosts(manifest, args.hosts)
@@ -501,6 +948,18 @@ def main(argv: list[str] | None = None) -> int:
             if not args.hosts:
                 raise Failure("apply needs explicit --host arguments")
             return apply(manifest, hosts, args.yes)
+        if args.command == "preflight":
+            observed = read_observed(args.observed) if args.observed else observe(manifest, hosts, preflight=True)
+            try:
+                results = preflight(manifest, observed, hosts)
+            except (KeyError, TypeError, ValueError, AttributeError) as error:
+                raise Failure(f"observation does not match this tool's format ({type(error).__name__}: {error})") from None
+            if args.output == "json" or args.json:
+                print(json.dumps({"schema": SCHEMA + "/preflight",
+                                  "hosts": {r["host"]: {**r, "fixes": grouped_fixes(r)} for r in results}}, indent=2))
+            else:
+                print(render_preflight(results))
+            return 0 if all(r["ready"] for r in results) else 1
         observed = read_observed(args.observed) if args.observed else observe(manifest, hosts)
         if args.command == "observe":
             text = json.dumps(observed, indent=2, sort_keys=True)

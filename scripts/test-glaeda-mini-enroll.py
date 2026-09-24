@@ -7,6 +7,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import sys
 import unittest
@@ -205,6 +206,40 @@ class PlanOnlyHasNoSideEffects(unittest.TestCase):
         install.assert_not_called()
         bootstrap.assert_not_called()
         accept.assert_not_called()
+
+
+
+class BootstrapProblem(unittest.TestCase):
+    def test_eligible_output_is_no_problem(self) -> None:
+        self.assertIsNone(me.bootstrap_problem(0, json.dumps({"eligibleForEnrollment": True}), ""))
+
+    def test_blocking_checks_come_with_their_fixes(self) -> None:
+        doc = {"eligibleForEnrollment": False, "blockingChecks": ["metalToolchain", "workloadToolPath"],
+               "observed": {"toolsMissingFromWorkloadPath": ["cargo", "zig"]}}
+        text = me.bootstrap_problem(0, json.dumps(doc), "")
+        self.assertIn("metalToolchain: Metal Toolchain missing; run xcodebuild -downloadComponent MetalToolchain", text)
+        self.assertIn("workloadToolPath: not on the workload PATH: cargo, zig; brew install rustup", text)
+        self.assertIn("brew install zig", text)
+        self.assertIn("glaeda-mini-fleet preflight", text)
+
+    def test_an_observation_error_is_explained_not_called_unreadable(self) -> None:
+        # What cmux-austin-mini-1 printed on 2026-09-24 with a shallow clone and no submodules.
+        stderr = json.dumps({"error": "[Errno 2] No such file or directory: '/Users/cmux/cmux/ghostty/build.zig.zon'"})
+        text = me.bootstrap_problem(1, "", stderr + "\n")
+        self.assertIn("submodules not initialized; run git submodule update --init", text)
+        self.assertNotIn("unreadable", text)
+        text = me.bootstrap_problem(1, "", json.dumps({"error": "required command failed: xcrun"}))
+        self.assertIn("xcodebuild -downloadComponent MetalToolchain", text)
+
+    def test_a_refusal_without_blocking_checks_falls_back_to_stderr(self) -> None:
+        stdout = json.dumps({"eligibleForEnrollment": True, "blockingChecks": []})
+        stderr = json.dumps({"error": "bootstrap receipt exceeds size ceiling"})
+        self.assertEqual(me.bootstrap_problem(1, stdout, stderr),
+                         "bootstrap could not observe this mini: bootstrap receipt exceeds size ceiling")
+
+    def test_output_without_a_verdict_says_so(self) -> None:
+        self.assertEqual(me.bootstrap_problem(1, "", "Traceback (most recent call last):\nBoom"),
+                         "bootstrap exited 1 without a verdict: Boom")
 
 
 if __name__ == "__main__":
