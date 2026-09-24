@@ -154,6 +154,93 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(policy["macos"]["major"], 26)
 
 
+class ClassAndPoolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest = mf.load_manifest(EXAMPLE)
+
+    def write(self, data: dict) -> Path:
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        path = Path(tmp) / "m.json"
+        path.write_text(json.dumps(data))
+        return path
+
+    def test_example_splits_hardware_from_class(self) -> None:
+        host = self.manifest["hosts"]["build-mini-1"]
+        self.assertEqual((host["hardware"], host["class"], host["availability"]), ("m4pro-48", "std", "dedicated"))
+        self.assertIn("m4pro-48", self.manifest["hardware"])
+
+    def test_legacy_classes_table_still_loads_as_hardware(self) -> None:
+        data = json.loads(EXAMPLE.read_text())
+        data["classes"] = data.pop("hardware")
+        for host in data["hosts"].values():
+            host["class"] = host.pop("hardware")
+            host.pop("availability", None)
+        loaded = mf.load_manifest(self.write(data))
+        self.assertEqual(loaded["hosts"]["small-mini"]["hardware"], "m4-16")
+        self.assertNotIn("class", loaded["hosts"]["small-mini"])
+
+    def test_unknown_class_availability_and_hardware_are_refused(self) -> None:
+        for field, value, message in (("class", "huge", "unknown class"),
+                                      ("availability", "sometimes", "unknown availability"),
+                                      ("hardware", "m9-1", "unknown hardware")):
+            data = json.loads(EXAMPLE.read_text())
+            data["hosts"]["build-mini-1"][field] = value
+            with self.assertRaisesRegex(mf.Failure, message):
+                mf.load_manifest(self.write(data))
+
+    def test_hardware_drift_names_the_hardware(self) -> None:
+        obs = observed(**{"build-mini-1": probe_text().replace("cpus\t14", "cpus\t12")})
+        issues = mf.check(self.manifest, obs, ["build-mini-1"])
+        self.assertTrue(any(i["area"] == "hardware" and "hardware m4pro-48" in i["detail"] for i in issues))
+
+    def test_pools_count_declared_and_conforming_once_per_version(self) -> None:
+        obs = observed(**{"build-mini-1": probe_text()})
+        result = mf.pools(self.manifest, obs, list(self.manifest["hosts"]))
+        # build-mini-2 lacks ci-runner and small-mini has no runner role, so only build-mini-1 counts.
+        self.assertEqual(list(result), ["glaeda-std-xcode-26.3"])
+        self.assertEqual(result["glaeda-std-xcode-26.3"]["declared"], ["build-mini-1"])
+        self.assertEqual(result["glaeda-std-xcode-26.3"]["conforming_count"], 1)
+
+    def test_pools_need_an_exact_real_xcode_to_conform(self) -> None:
+        for text in (probe_text().replace("|dir|26.3|17C529", "|symlink:/x|26.3|17C529"),
+                     probe_text().replace("|dir|26.3|17C529", "|dir|26.3|17C528")):
+            result = mf.pools(self.manifest, observed(**{"build-mini-1": text}), ["build-mini-1"])
+            self.assertEqual(result["glaeda-std-xcode-26.3"]["conforming"], [])
+        self.assertEqual(mf.pools(self.manifest, None, ["build-mini-1"])["glaeda-std-xcode-26.3"]["conforming_count"], 0)
+
+    def test_opportunistic_and_dev_members_are_not_pooled(self) -> None:
+        data = copy.deepcopy(self.manifest)
+        data["hosts"]["build-mini-1"]["availability"] = "opportunistic"
+        self.assertEqual(mf.pools(data, None, ["build-mini-1"]), {})
+        data["hosts"]["build-mini-1"].update(availability="dedicated", **{"class": "dev"})
+        self.assertEqual(mf.pools(data, None, ["build-mini-1"]), {})
+
+    def test_classed_host_must_state_availability(self) -> None:
+        data = json.loads(EXAMPLE.read_text())
+        del data["hosts"]["build-mini-1"]["availability"]
+        with self.assertRaisesRegex(mf.Failure, "class but no availability"):
+            mf.load_manifest(self.write(data))
+
+    def test_host_xcode_override_sets_its_pool(self) -> None:
+        data = copy.deepcopy(self.manifest)
+        data["hosts"]["build-mini-1"]["overrides"] = {"xcode": {"apps": [
+            {"path": "/Applications/Xcode_26.6.app", "version": "26.6", "build": "17F113"}]}}
+        text = probe_text() + "xcode_app\t/Applications/Xcode_26.6.app|dir|26.6|17F113\n"
+        result = mf.pools(data, observed(**{"build-mini-1": text}), ["build-mini-1"])
+        self.assertEqual(list(result), ["glaeda-std-xcode-26.6"])
+        self.assertEqual(result["glaeda-std-xcode-26.6"]["conforming"], ["build-mini-1"])
+
+    def test_unreachable_host_is_declared_not_conforming(self) -> None:
+        obs = {"hosts": {"build-mini-1": {"host": "build-mini-1", "reachable": False, "error": "timeout"}}}
+        result = mf.pools(self.manifest, obs, ["build-mini-1"])
+        self.assertEqual((result["glaeda-std-xcode-26.3"]["declared_count"],
+                          result["glaeda-std-xcode-26.3"]["conforming_count"]), (1, 0))
+
+    def test_pool_label_matches_the_runner_rule(self) -> None:
+        self.assertEqual(mf.pool_label("std", "26.6"), "glaeda-std-xcode-26.6")
+
+
 class CheckTests(unittest.TestCase):
     def setUp(self) -> None:
         self.manifest = mf.load_manifest(EXAMPLE)
@@ -1291,7 +1378,7 @@ class OnboardTests(unittest.TestCase):
         self.assertEqual(mf.onboard_hosts(self.manifest, None), (["build-mini-1", "build-mini-2"], {}))
         targets, skipped = mf.onboard_hosts(self.manifest, ["small-mini"])
         self.assertEqual((targets, skipped), ([], {"small-mini": "no node_id in the manifest"}))
-        self.manifest["hosts"]["build-mini-2"]["class"] = "m4-16"  # a 16 GB class never takes the app compile
+        self.manifest["hosts"]["build-mini-2"]["hardware"] = "m4-16"  # 16 GB hardware never takes the app compile
         targets, skipped = mf.onboard_hosts(self.manifest, ["build-mini-1", "build-mini-2"])
         self.assertEqual(targets, ["build-mini-1"])
         self.assertIn("compile_lane: false", skipped["build-mini-2"])
@@ -1392,8 +1479,8 @@ class OnboardTests(unittest.TestCase):
     def test_onboarding_fields_are_validated(self) -> None:
         cases = ((("lan",), {"auth": "password"}, "lan.auth"),
                  (("runner",), {"org": "a b"}, "runner.org"),
-                 (("classes", "m4-16", "compile_lane"), "no", "compile_lane"),
-                 (("classes", "m4pro-48", "acceptance"), {"xcode_build": "17C529", "candidate": "x", "node": "cmux-mac-001"},
+                 (("hardware", "m4-16", "compile_lane"), "no", "compile_lane"),
+                 (("hardware", "m4pro-48", "acceptance"), {"xcode_build": "17C529", "candidate": "x", "node": "cmux-mac-001"},
                   "acceptance needs"),
                  (("hosts", "build-mini-1", "lan_ip"), "mini-1.lan", "lan_ip"))
         for keys, value, error in cases:
