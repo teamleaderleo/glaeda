@@ -114,10 +114,10 @@ fleet="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet"
 [ -f "$fleet/acceptance/cmux_macos_native_build.json" ] && \
   e pf_acceptance "$(plutil -extract result raw "$fleet/acceptance/cmux_macos_native_build.json" 2>/dev/null)"
 
-# Homebrew's owner decides whether an install needs sudo -u <owner>.
-for mark in /opt/homebrew/Cellar /opt/homebrew/bin; do
-  [ -e "$mark" ] && { e pf_brew_owner "$(stat -f %Su "$mark")"; break; }
-done
+# Homebrew's owner decides whether an install needs sudo -u <owner>. Only a runnable brew counts: an
+# installer that stops early leaves an empty prefix (bin, Cellar) behind, and that is still no Homebrew.
+brew_prefix="${GLAEDA_PREFLIGHT_BREW_PREFIX:-/opt/homebrew}"  # override only for tests
+[ -x "$brew_prefix/bin/brew" ] && e pf_brew_owner "$(stat -f %Su "$brew_prefix/bin/brew")"
 
 # A running or prepared macOS update means a restart is coming.
 # Only an install or download; softwareupdate -l or --history from a monitoring job is not an update.

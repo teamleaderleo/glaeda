@@ -11,6 +11,7 @@ import io
 import json
 import re
 import os
+import pwd
 import shutil
 import subprocess
 import sys
@@ -823,6 +824,26 @@ class PreflightScriptTests(unittest.TestCase):
         self.assertEqual(pf["runners"], [{"dir": "actions-runner-cmux-persistent-compile", "name": "mini-1"}])
         self.assertNotIn("secret.example", out)
         self.assertEqual(pf["python"], {"path": None, "version": None})
+
+    def test_empty_homebrew_prefix_is_no_homebrew(self) -> None:
+        # A brew.sh run that stops early leaves bin and Cellar behind. Counting those as Homebrew hid the missing
+        # brew from preflight, and fix then ran /opt/homebrew/bin/brew on four minis (2026-09-24).
+        def owner(prefix: Path) -> str | None:
+            script = mf.PROBE.read_text() + "\nCMUX_ROOT='~/cmux'\nXCODE_PIN=''\nWORKLOAD_PATH=''\n" \
+                "WORKLOAD_TOOLS=''\nPYTHONS=''\nCANDIDATE_FALLBACK=''\n" + mf.PREFLIGHT_PROBE.read_text()
+            out = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True, timeout=60,
+                                 env={"HOME": os.fspath(prefix.parent), "PATH": "/usr/bin:/bin",
+                                      "GLAEDA_PREFLIGHT_BREW_PREFIX": os.fspath(prefix)}).stdout
+            return mf.parse_probe(out)["preflight"]["brew_owner"]
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "homebrew"
+            for name in ("bin", "Cellar", "lib"):
+                (prefix / name).mkdir(parents=True)
+            self.assertIsNone(owner(prefix))
+            (prefix / "bin/brew").write_text("#!/bin/sh\n")
+            self.assertIsNone(owner(prefix))  # present but not runnable
+            (prefix / "bin/brew").chmod(0o755)
+            self.assertEqual(owner(prefix), pwd.getpwuid(os.getuid()).pw_name)
 
 
 def morning_text() -> str:
