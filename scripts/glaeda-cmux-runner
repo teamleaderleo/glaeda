@@ -189,6 +189,7 @@ class Context:
         self.hook_dir = self.runner_dir / HOOK_DIR
         self.gh = args.gh or which("gh", ("/opt/homebrew/bin/gh", "/usr/local/bin/gh"))
         self.gh_state = "missing" if self.gh is None else "logged in"
+        self.xcode_app = args.xcode_app
         self.python = args.python or which("python3", ("/opt/homebrew/bin/python3", "/usr/bin/python3"))
         self.agents = self.home / "Library/LaunchAgents"
         self.logs = self.home / "Library/Logs"
@@ -705,6 +706,14 @@ def preflight(ctx: Context) -> dict[str, Any]:
     else:
         check("gh", False, ctx.gh_state, "gh auth login as an admin, or pipe a token to --token-stdin")
     check("python", ctx.python is not None, ctx.python or "missing", "hooks need python3", True)
+    if ctx.xcode_app:
+        # cmux jobs pick Xcode by path (CMUX_CI_XCODE_APP*), not by xcode-select, so the path must exist
+        # as a real directory: a symlinked Xcode breaks compilation-cache replay (swift#92545).
+        app = Path(ctx.xcode_app)
+        version = run(["/usr/bin/xcodebuild", "-version"], env={**os.environ, "DEVELOPER_DIR": os.fspath(
+            app / "Contents/Developer")})[1].replace("\n", " ") if app.is_dir() and not app.is_symlink() else ""
+        check("xcodeApp", bool(version) and "Build version" in version, version or f"{app} missing or a symlink",
+              "cmux jobs routed here will fail; install that Xcode at exactly this path")
     disk = which("glaeda-disk", (os.fspath(ctx.home / ".local/bin/glaeda-disk"),))
     check("glaedaDisk", disk is not None or None, disk or "not installed",
           "optional: glaeda-mini-setup --apply installs it; hooks skip disk pressure without it")
@@ -762,6 +771,8 @@ def parser() -> argparse.ArgumentParser:
                    help="with --apply, read the registration (or, with --uninstall, removal) token from stdin; "
                         "without --apply, plan that path")
     p.add_argument("--python", help="interpreter the job hooks run (default: python3 on PATH)")
+    p.add_argument("--xcode-app", help="check the Xcode that routed jobs select (the value of the repo's "
+                   "CMUX_CI_XCODE_APP_PR variable, such as /Applications/Xcode_26.6.app); a warning, never a block")
     p.add_argument("--skip-launchctl", action="store_true", help="write the plist but do not load or unload it")
     return p
 

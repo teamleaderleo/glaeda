@@ -616,6 +616,17 @@ class RunnerTest(unittest.TestCase):
             self.assertFalse((self.home / "actions-runner-glaeda").exists())
             self.assertNotIn(REMOVE_TOKEN, self.last_output)
 
+    def test_xcode_app_check_warns_and_never_blocks(self) -> None:
+        missing = self.invoke("--xcode-app", os.fspath(self.home / "Xcode_26.6.app"))
+        self.assertEqual(missing["preflight"]["checks"]["xcodeApp"]["level"], "warn")
+        self.assertNotIn("xcodeApp", missing["blocking"])
+        real = self.home / "Real.app"
+        real.mkdir()
+        (self.home / "Link.app").symlink_to(real)
+        linked = self.invoke("--xcode-app", os.fspath(self.home / "Link.app"))
+        self.assertIn("symlink", linked["preflight"]["checks"]["xcodeApp"]["value"])
+        self.assertNotIn("xcodeApp", self.invoke()["preflight"]["checks"])
+
     def test_token_stdin_apply_needs_a_token(self) -> None:
         for args, stdin in ((("--apply", "--token-stdin"), ""),
                             (("--apply", "--token-stdin"), "not a token; rm -rf /\n")):

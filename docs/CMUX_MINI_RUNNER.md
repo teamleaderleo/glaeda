@@ -21,7 +21,14 @@ them back to Blacksmith.
   second keeps admin credentials off a shared build host.
 - A glaeda checkout: `git clone https://github.com/teamleaderleo/glaeda ~/Projects/glaeda`.
 - The cmux Xcode pin and `pmset` settings from `glaeda-mini-setup` operator steps, so
-  jobs can build once routed.
+  jobs can build once routed. cmux jobs select Xcode by path from repository
+  variables (`CMUX_CI_XCODE_APP_PR`, `..._MACOS_15`, `..._MACOS_26`), not through
+  `xcode-select`, so that exact path must exist as a real directory (not a symlink).
+  Pass it as `--xcode-app /Applications/Xcode_26.6.app` and the plan warns when it
+  is missing. `gh variable list --repo manaflow-ai/cmux | grep XCODE` shows the pins.
+- Automatic login for the build user (`sysadminctl -autologin status`). The runner is
+  a LaunchAgent in that user's GUI session, so it starts again after a reboot only
+  when the user logs in automatically.
 
 ## 2. One command
 
