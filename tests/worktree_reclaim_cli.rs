@@ -252,6 +252,23 @@ fn work_state_picks_the_window_and_a_working_process_vetoes() {
     );
     fixture.age_by("landed", 2 * 60 * 60);
 
+    // Created from main and never committed to: it did nothing yet, so it is not finished.
+    fixture.add("fresh");
+    fixture.age_by("fresh", 2 * 60 * 60);
+
+    // Renamed tracked.txt to renamed.txt; main gained renamed.txt but kept tracked.txt.
+    let renamed = fixture.add("renamed");
+    git(&renamed, &["mv", "tracked.txt", "renamed.txt"]);
+    commit(&renamed, "rename");
+    fs::write(fixture.main.join("renamed.txt"), "initial\n").expect("write renamed copy");
+    git(&fixture.main, &["add", "renamed.txt"]);
+    commit(&fixture.main, "copy, not rename");
+    git(
+        &fixture.main,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    fixture.age_by("renamed", 2 * 60 * 60);
+
     let unfinished = fixture.add("unfinished");
     fs::write(unfinished.join("wip.txt"), "wip\n").expect("write wip");
     git(&unfinished, &["add", "wip.txt"]);
@@ -299,6 +316,16 @@ fn work_state_picks_the_window_and_a_working_process_vetoes() {
         unfinished["decision"]["vetoes"],
         serde_json::json!(["recently_active"])
     );
+
+    for name in ["fresh", "renamed"] {
+        let worktree = by_name(name);
+        assert_eq!(worktree["facts"]["work_state"], "in_progress", "{name}");
+        assert_eq!(
+            worktree["decision"]["vetoes"],
+            serde_json::json!(["recently_active"]),
+            "{name}"
+        );
+    }
 
     let busy = by_name("busy");
     assert_eq!(busy["facts"]["in_use"], true);

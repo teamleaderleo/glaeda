@@ -100,8 +100,8 @@ const PER_WORKTREE_REF_PATTERNS: [&str; 3] = ["refs/worktree/", "refs/bisect/", 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkState {
-    /// HEAD is in a remote's default branch, every file the branch changed is already identical
-    /// there (a squash merge), or the branch's upstream was deleted.
+    /// HEAD moved since the worktree was created, and the result is in a remote's default branch
+    /// or every file it changed is already identical there (a squash merge).
     Finished,
     /// Anything else, including every case the checks could not settle.
     InProgress,
@@ -301,7 +301,8 @@ impl LinkedWorktreeReclaimDecision {
 pub struct LinkedWorktreeReclaimPlan {
     schema_version: u8,
     decision: LinkedWorktreeReclaimDecision,
-    minimum_idle_seconds: i64,
+    /// The idle window that applied to this worktree's work state.
+    idle_window_seconds: i64,
 }
 
 impl LinkedWorktreeReclaimPlan {
@@ -316,8 +317,8 @@ impl LinkedWorktreeReclaimPlan {
     }
 
     #[must_use]
-    pub const fn minimum_idle_seconds(&self) -> i64 {
-        self.minimum_idle_seconds
+    pub const fn idle_window_seconds(&self) -> i64 {
+        self.idle_window_seconds
     }
 }
 
@@ -401,7 +402,7 @@ pub fn plan_linked_worktree_reclaim(
     Ok(LinkedWorktreeReclaimPlan {
         schema_version: LINKED_WORKTREE_RECLAIM_SCHEMA_VERSION,
         decision,
-        minimum_idle_seconds: window,
+        idle_window_seconds: window,
     })
 }
 
@@ -464,6 +465,10 @@ impl ProcessUseEvidence {
             let record = executor
                 .execute_with_timeout(&spec, LSOF_TIMEOUT)
                 .map_err(|_| process_evidence_unavailable())?;
+            // lsof exits 1 when some process could not be fully read; anything else is a failure.
+            if !matches!(record.status, Some(0 | 1)) {
+                return Err(process_evidence_unavailable());
+            }
             parse_lsof_names(&record.stdout)
         };
         if paths.is_empty() {
@@ -520,38 +525,25 @@ fn parse_lsof_names(output: &str) -> Vec<PathBuf> {
 /// Most changed paths compared against a default branch; a larger branch counts as unfinished.
 const MAX_FINISHED_COMPARE_PATHS: usize = 512;
 
-/// Decide whether `commit` (checked out on `branch`, if attached) has landed.
+/// Decide whether `commit` has landed.
 ///
-/// Every question is asked from the main worktree. Any failure answers "in progress", which only
-/// keeps the worktree longer.
+/// A worktree whose HEAD is still where it was created did nothing yet, however recently that
+/// commit reached a default branch, so it stays in progress. An upstream marked `[gone]` is not
+/// used: follow-up commits after the remote branch was deleted are common. Every question is asked
+/// from the main worktree, and any failure answers "in progress", which only keeps the worktree
+/// longer.
 fn observe_work_state(
     observer: &ProjectCheckoutObserver,
     repository: &Path,
     commit: &str,
-    branch: Option<&str>,
+    created_at: Option<&str>,
     executor: &impl TimedCommandExecutor,
 ) -> WorkState {
-    let run = |arguments: &[&str]| observer.git(repository, arguments, executor).ok();
-
-    if let Some(branch) = branch {
-        let reference = format!("refs/heads/{branch}");
-        let track = run(&[
-            "for-each-ref",
-            "--format=%(upstream)%09%(upstream:track)",
-            &reference,
-        ]);
-        if let Some(record) = track.filter(|record| record.success) {
-            let line = record.stdout.trim_end();
-            if let Some((upstream, state)) = line.split_once('\t')
-                && !upstream.is_empty()
-                && state == "[gone]"
-            {
-                return WorkState::Finished;
-            }
-        }
+    if created_at.is_none_or(|created| created == commit) {
+        return WorkState::InProgress;
     }
-
-    let Some(heads) = run(&["for-each-ref", "--format=%(symref)", "refs/remotes/"])
+    let run = |arguments: &[&str]| observer.git(repository, arguments, executor).ok();
+    let Some(heads) = run(&["for-each-ref", "--format=%(symref)", "refs/remotes/*/HEAD"])
         .filter(|record| record.success)
     else {
         return WorkState::InProgress;
@@ -571,8 +563,10 @@ fn observe_work_state(
             continue;
         };
         let base = base.stdout.trim().to_owned();
-        let Some(changed) =
-            run(&["diff", "--name-only", "-z", &base, commit]).filter(|record| record.success)
+        // --no-renames: a rename must list both names, or a branch that renamed `a` to `a2`
+        // would compare only `a2` and miss that the default branch still has `a`.
+        let Some(changed) = run(&["diff", "--no-renames", "--name-only", "-z", &base, commit])
+            .filter(|record| record.success)
         else {
             continue;
         };
@@ -583,17 +577,27 @@ fn observe_work_state(
             .map(|path| format!(":(literal){path}"))
             .collect();
         if paths.is_empty() || paths.len() > MAX_FINISHED_COMPARE_PATHS {
-            // Nothing changed means the commit is already on the branch's history; the ancestor
-            // check above answered that. Too many paths is not worth proving.
             continue;
         }
-        let mut arguments = vec!["diff", "--quiet", commit, target, "--"];
+        let mut arguments = vec!["diff", "--no-renames", "--quiet", commit, target, "--"];
         arguments.extend(paths.iter().map(String::as_str));
         if run(&arguments).and_then(|record| record.status) == Some(0) {
             return WorkState::Finished;
         }
     }
     WorkState::InProgress
+}
+
+/// The commit a worktree was created at: the new id of the oldest entry in its HEAD reflog.
+/// `None` when the reflog is absent, empty or unreadable.
+fn creation_commit(git_dir: &Path) -> Option<String> {
+    let text = std::fs::read(git_dir.join(HEAD_REFLOG)).ok()?;
+    let first = text
+        .split(|byte| *byte == b'\n')
+        .find(|line| !line.is_empty())?;
+    let new = first.split(|byte| *byte == b' ').nth(1)?;
+    let new = std::str::from_utf8(new).ok()?;
+    (new.len() >= 40 && new.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| new.to_owned())
 }
 
 // --- Observation -----------------------------------------------------------
@@ -874,7 +878,7 @@ fn observe_detailed(
         observer,
         &inventory.repository,
         &head,
-        branch.as_deref(),
+        creation_commit(&git_dir).as_deref(),
         executor,
     );
 
@@ -1969,14 +1973,14 @@ mod tests {
             unfinished.decision().vetoes(),
             [LinkedWorktreeReclaimVeto::RecentlyActive]
         );
-        assert_eq!(unfinished.minimum_idle_seconds(), 3 * DAY);
+        assert_eq!(unfinished.idle_window_seconds(), 3 * DAY);
         let finished = LinkedWorktreeFacts {
             work_state: WorkState::Finished,
             ..two_hours
         };
         let plan = plan_linked_worktree_reclaim(&finished, policy, NOW).expect("plan");
         assert!(plan.decision().is_eligible());
-        assert_eq!(plan.minimum_idle_seconds(), 3_600);
+        assert_eq!(plan.idle_window_seconds(), 3_600);
         assert_eq!(
             LinkedWorktreeReclaimPolicy::with_finished_window(DAY, 60)
                 .unwrap_err()
