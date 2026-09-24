@@ -283,6 +283,19 @@ class ReviewTests(unittest.TestCase):
             self.assertIsNone(fs.as_command(fix), fix)
         self.assertEqual(fs.as_command("cd ~/cmux && ./scripts/setup.sh"), "cd ~/cmux && ./scripts/setup.sh")
 
+    def test_no_command_built_from_fix_text_is_ever_safe(self):
+        # as_command allows PATH=... and git -c ...: acceptable only because of this invariant.
+        fixes = ["PATH=~/evil brew install x", "git -c core.sshCommand=x fetch", "sudo pmset -c sleep 0",
+                 "cd ~/cmux && git submodule update --init"]
+        doc = build(check=src({"issues": [{"host": "mini-a", "area": f"a{i}", "detail": "d", "fix": f}
+                                          for i, f in enumerate(fixes)], "observed_at": {}}),
+                    preflight=src({"hosts": {"mini-b": {"ready": False, "checks": {
+                        f"c{i}": {"state": "fail", "detail": "d", "fix": f, "group": "self"}
+                        for i, f in enumerate(fixes)}}}, "observed_at": {}}))
+        derived = [f for f in doc["findings"] if f["source"] in ("check", "preflight") and f["action"]["command"]]
+        self.assertEqual(len(derived), 8)
+        self.assertFalse(any(f["action"]["safe_to_apply"] for f in derived))
+
     def test_a_source_without_an_observation_time_is_not_fresh(self):
         for stamp in (None, "yesterday"):
             doc = build(runners=src({"runners": []}, at=stamp), queue=src({"jobs": [{"labels": ["self-hosted"]}]}))
