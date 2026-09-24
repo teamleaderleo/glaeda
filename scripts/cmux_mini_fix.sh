@@ -208,7 +208,7 @@ homebrew_fetch() {  # UPSTREAM [PEER_URL [IDENTITY]]
     # The newest release tag, as the brew.sh installer checks out; HEAD only when there is none.
     tag=$(git ls-remote --tags --refs "$upstream" | sed -n 's#.*refs/tags/\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$#\1#p' \
       | sort -t. -k1,1n -k2,2n -k3,3n | tail -1 || true)
-    ref=HEAD; [ -z "$tag" ] || ref="refs/tags/$tag"
+    ref=HEAD; [ -z "$tag" ] || ref="+refs/tags/$tag:refs/tags/$tag"
     git -C "$dir" fetch --quiet --depth 1 "$upstream" "$ref"
   fi
   git -C "$dir" checkout --quiet --detach FETCH_HEAD
