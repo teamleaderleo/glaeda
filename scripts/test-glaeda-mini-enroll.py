@@ -64,6 +64,38 @@ class Plan(unittest.TestCase):
             me.plan(me.State(True, enrollment("retired"), False), None, False, False)
 
 
+class CandidatePlan(unittest.TestCase):
+    """A reviewed candidate replaces the source build; nothing compiles Rust on the node."""
+
+    def test_fresh_mini_stages_instead_of_building(self) -> None:
+        steps = me.plan(me.State(False, None, False), "cmux-mac-001", False, False, candidate=True)
+        self.assertEqual(steps, ["stage", "bootstrap", "enroll", "accept-local", "eligible", "status"])
+
+    def test_a_staged_generation_is_reinspected_not_restaged(self) -> None:
+        steps = me.plan(me.State(True, enrollment("eligible"), True), None, False, False, candidate=True)
+        self.assertEqual(steps, ["inspect", "status"])
+
+    def test_candidate_steps_run_the_generation_tools_and_binary(self) -> None:
+        generation = Path("/Users/op/Projects/glaeda-generations/36e07e36ea7b")
+        runner = me.Runner("/py", me.Paths(Path("/Users/op")), Path("/cmux"), generation)
+        self.assertEqual(runner.fleet_py, "/Users/op/Projects/glaeda-generations/36e07e36ea7b/scripts/cmux_fleet.py")
+        self.assertEqual(runner.glaeda_bin, generation / "bin/glaeda")
+        self.assertEqual(me.Paths(Path("/Users/op")).generation("36e07e36ea7b9bc9e04c366547a5312dd348024d"),
+                         generation)
+
+    def test_fleet_tools_run_without_writing_bytecode(self) -> None:
+        runner = me.Runner("/py", me.Paths(Path("/Users/op")), Path("/cmux"), Path("/g"))
+        with mock.patch.object(me.subprocess, "run") as run:
+            runner.fleet("status", "e")
+        self.assertEqual(run.call_args.args[0][:3], ["/py", "-B", "/g/scripts/cmux_fleet.py"])
+
+    def test_candidate_flags_go_together(self) -> None:
+        with mock.patch.object(me, "DARWIN_REQUIRED", False), \
+             mock.patch.object(me, "pick_python", return_value="/py"), \
+             mock.patch("builtins.print"):
+            self.assertEqual(me.main(["--cmux-root", "/c", "--candidate", "/a.tar.gz"]), 2)
+
+
 class Python(unittest.TestCase):
     def test_picks_the_first_313_or_newer(self) -> None:
         versions = {"/a": (3, 12), "/b": (3, 13), "/c": (3, 14)}
