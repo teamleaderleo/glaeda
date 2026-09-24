@@ -13,7 +13,7 @@
     glaeda-mini-fleet pools    [HOST ...] [--observed FILE]                     runner capacity per pool label (JSON)
 
 The manifest names every host, its fleet node id (node_id, so every enrollment rerun asks for the
-same one), its hardware class, the toolchain it must carry, the SSH keys that must, may, and must
+same one), its hardware and scheduling class, the toolchain it must carry, the SSH keys that must, may, and must
 not be in the login user's authorized_keys, and the launchd jobs that must be running. `check` diffs fresh observation against it and exits 1 on drift.
 
 observe, check, and plan are read-only. The probe (scripts/cmux_mini_probe.sh) runs as the SSH
@@ -93,7 +93,7 @@ from typing import Any
 
 SCHEMA = "glaeda-mini-fleet/v1"
 # What a host is for; the target end state can give one host several.
-ROLES = ("dev-builds", "ci-runner", "nightly", "ios-simulators", "cache-host")
+ROLES = ("dev-builds", "ci-runner", "nightly", "ios-simulators", "cache-host", "chromium-builds")
 # Scheduling class (cmuxterm-hq build-fleet/FLEET-MEMBERSHIP.md). `hardware` names the machine
 # shape the check verifies; `class` says what work the member takes.
 CLASSES = ("xl", "std", "light", "dev", "borrowed")
@@ -172,7 +172,10 @@ def load_manifest(path: Path) -> dict[str, Any]:
             raise Failure(f"{path}: host {name} has unknown hardware {host.get('hardware')!r}")
         if "class" in host and host["class"] not in CLASSES:
             raise Failure(f"{path}: host {name} has unknown class {host['class']!r}; known: {', '.join(CLASSES)}")
-        if host.get("availability", "dedicated") not in AVAILABILITY:
+        # glaeda-cmux-runner refuses a member without availability, so a classed host must say.
+        if "class" in host and "availability" not in host:
+            raise Failure(f"{path}: host {name} has a class but no availability ({', '.join(AVAILABILITY)})")
+        if "availability" in host and host["availability"] not in AVAILABILITY:
             raise Failure(f"{path}: host {name} has unknown availability {host['availability']!r}; "
                           f"known: {', '.join(AVAILABILITY)}")
         if "owner" in host and not isinstance(host["owner"], str):
@@ -298,6 +301,8 @@ def upgrade_legacy_classes(data: dict[str, Any]) -> None:
     """
     if "hardware" in data or "classes" not in data:
         return
+    if not isinstance(data.get("hosts"), dict):
+        raise Failure("hosts must be an object keyed by host name")
     data["hardware"] = data.pop("classes")
     for host in data.get("hosts", {}).values():
         if isinstance(host, dict) and "class" in host and "hardware" not in host:
@@ -641,8 +646,10 @@ def pools(manifest: dict[str, Any], observed: dict[str, Any] | None, hosts: list
 
     A member is declared for a pool when it is dedicated, has the ci-runner role, takes a runner
     class, and its policy pins that Xcode. It conforms when the latest observation shows that
-    exact Xcode (path, version, build) as a real directory, which is also when glaeda-cmux-runner
-    issues the label. Without an observation nothing conforms.
+    exact Xcode (path, version, build) as a real directory: the host meets the pool, so a runner
+    installed or relabelled from this manifest would carry the label. It does not prove the
+    registered runner carries it today; GitHub fixes labels at registration. Without an
+    observation nothing conforms.
     """
     out: dict[str, dict[str, list[str]]] = {}
     for name in hosts:

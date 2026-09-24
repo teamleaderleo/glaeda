@@ -216,6 +216,27 @@ class ClassAndPoolTests(unittest.TestCase):
         data["hosts"]["build-mini-1"].update(availability="dedicated", **{"class": "dev"})
         self.assertEqual(mf.pools(data, None, ["build-mini-1"]), {})
 
+    def test_classed_host_must_state_availability(self) -> None:
+        data = json.loads(EXAMPLE.read_text())
+        del data["hosts"]["build-mini-1"]["availability"]
+        with self.assertRaisesRegex(mf.Failure, "class but no availability"):
+            mf.load_manifest(self.write(data))
+
+    def test_host_xcode_override_sets_its_pool(self) -> None:
+        data = copy.deepcopy(self.manifest)
+        data["hosts"]["build-mini-1"]["overrides"] = {"xcode": {"apps": [
+            {"path": "/Applications/Xcode_26.6.app", "version": "26.6", "build": "17F113"}]}}
+        text = probe_text() + "xcode_app\t/Applications/Xcode_26.6.app|dir|26.6|17F113\n"
+        result = mf.pools(data, observed(**{"build-mini-1": text}), ["build-mini-1"])
+        self.assertEqual(list(result), ["glaeda-std-xcode-26.6"])
+        self.assertEqual(result["glaeda-std-xcode-26.6"]["conforming"], ["build-mini-1"])
+
+    def test_unreachable_host_is_declared_not_conforming(self) -> None:
+        obs = {"hosts": {"build-mini-1": {"host": "build-mini-1", "reachable": False, "error": "timeout"}}}
+        result = mf.pools(self.manifest, obs, ["build-mini-1"])
+        self.assertEqual((result["glaeda-std-xcode-26.3"]["declared_count"],
+                          result["glaeda-std-xcode-26.3"]["conforming_count"]), (1, 0))
+
     def test_pool_label_matches_the_runner_rule(self) -> None:
         self.assertEqual(mf.pool_label("std", "26.6"), "glaeda-std-xcode-26.6")
 
