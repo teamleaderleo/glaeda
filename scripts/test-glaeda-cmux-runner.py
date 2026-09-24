@@ -735,6 +735,27 @@ class RunnerTest(unittest.TestCase):
         verbs = [e["argv"][0] for e in self.log() if e["tool"] == "launchctl"]
         self.assertEqual(verbs.count("bootstrap"), 2, verbs)  # install, then relabel; never a third
 
+    def test_relabel_with_a_plist_change_restarts_on_the_new_plist(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--labels", "ram48")
+            plist = self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist"
+            receipt_path = self.home / ".local/state/glaeda/cmux-runner/receipt.json"
+            doc = json.loads(receipt_path.read_text())
+            data = plist.read_bytes().replace(b"</dict>\n</plist>", b"<key>X</key><string>old</string></dict>\n</plist>")
+            plist.write_bytes(data)  # an older plist this install wrote
+            for act in doc["actions"]:
+                if act.get("kind") == "agent":
+                    act["ownedSha256"] = cr.sha256_bytes(data)
+            receipt_path.write_text(json.dumps(doc))
+            with mock.patch.object(cr, "xcode_present", return_value=True):
+                receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                      "--name", "mini-test-glaeda")
+        self.assertEqual(self.by_kind(receipt)["agent"]["state"], "update")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        verbs = [e["argv"][0] for e in self.log() if e["tool"] == "launchctl" and e["argv"][0] != "print"]
+        self.assertEqual(verbs[-3:], ["bootstrap", "bootout", "bootstrap"], verbs)
+
     def test_relabel_without_a_token_blocks_and_changes_nothing(self) -> None:
         self.invoke("--apply", "--labels", "ram48")
         before = self.tree()

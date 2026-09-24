@@ -735,9 +735,9 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                 act["note"] = "adopted the registration an interrupted --apply finished in this directory"
         elif kind in {"hook", "agent"} and state in {"create", "update"}:
             data, mode = desired_files(ctx)[Path(act["path"])]
-            if kind == "agent" and act.get("loaded"):
-                bootout(ctx)
-                act["loaded"] = False
+            if kind == "agent" and (act.get("loaded") or getattr(ctx, "agent_started", False)):
+                bootout(ctx)  # loaded at plan time, or started since by a relabel
+                act["loaded"] = ctx.agent_started = False
             write_atomic(Path(act["path"]), data, mode)
             act["applied"] = act["owned"] = True
             act["ownedSha256"] = act["sha256"]
