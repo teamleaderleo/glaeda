@@ -81,6 +81,10 @@ parallel; one that differs is left quarantined with the differing fields named. 
 a class that already records a receipt for the candidate is not seeded again, and a host already
 on it is left alone. Dry run by default.
 
+fix, share, sudo-plan --run, onboard, repair and upgrade skip a host another build holds (the fleet
+host lock /Users/Shared/cmux-build-fleet/host.lock) or a glaeda-reservation/v1 marker reserves, and
+exit 1; --wait waits up to 4 hours instead. Every changing step on a host checks again first.
+
 The manifest's `candidate` pins the reviewed Glaeda candidate the fleet runs (source, sha256, run,
 artifact, repo, expires). upgrade writes it; preflight, fix, onboard and repair read it.
 
@@ -1313,7 +1317,7 @@ FIX_NEEDS = {"metal": ("licence", "launch"), "setup": ("cmux", "licence", "launc
              "glaeda": ("python", "rust")}
 # Remote functions that only read; every other one takes the host's step lock.
 # share_send only reads, and stays lock-free so one source can feed several peers at once.
-READ_ONLY_FUNCTIONS = {"candidate_check", "share_have", "share_source", "share_send"}
+READ_ONLY_FUNCTIONS = {"candidate_check", "share_have", "share_source", "share_send", "host_check"}
 SUDO_ORDER = ("select", "licence", "first_launch", "power", "homebrew", "brew")
 HOMEBREW_INSTALLER = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
 FIX_TIMEOUTS = {"cmux_clone": 1800, "submodules": 1800, "brew": 5400, "rust_channel": 1800, "glaeda": 1800,
@@ -1446,6 +1450,58 @@ def library_command(func: str, args: list[str], keep_stdin: bool = False) -> str
 def fix_call(name: str, user: str, func: str, args: list[str], log: Any, timeout: float | None) -> int:
     """Run one function of cmux_mini_fix.sh on the host."""
     return ssh_stream(name, user, library_command(func, args), log, timeout=timeout)
+
+
+HELD_EXIT = 20  # cmux_mini_fix.sh: the host is held by the fleet host lock or a reservation
+HOLD_WAIT_SECONDS = 4 * 3600
+HOLD_POLL_SECONDS = 60
+
+
+def host_check(manifest: dict[str, Any], name: str) -> str | None:
+    """Why the host is held (another build holds the fleet host lock, or it is reserved), or None when free.
+
+    Read-only on the host. A host whose state cannot be read counts as held: never change a host blind."""
+    try:
+        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", manifest["ssh_user"], name,
+                               library_command("host_check", [])], capture_output=True, text=True, timeout=120,
+                              check=False)
+    except subprocess.TimeoutExpired:
+        return "could not read its host lock and reservation (timed out)"
+    if proc.returncode == 0:
+        return None
+    said = [line.split("held: ", 1)[1] for line in proc.stdout.splitlines() if "held: " in line]
+    if proc.returncode == HELD_EXIT and said:
+        return said[-1]
+    return f"could not read its host lock and reservation (ssh exit {proc.returncode})"
+
+
+def gate_hosts(manifest: dict[str, Any], names: list[str], wait: bool = False,
+               poll: float = HOLD_POLL_SECONDS, limit: float = HOLD_WAIT_SECONDS) -> dict[str, str]:
+    """The hosts a changing command must skip, and why: held by the fleet host lock or a reservation.
+
+    With wait, poll the held ones until they are free or `limit` seconds pass, then skip what is still held."""
+    def check(names: list[str]) -> dict[str, str]:
+        if not names:
+            return {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            found = dict(zip(names, pool.map(lambda h: host_check(manifest, h), names)))
+        return {h: why for h, why in found.items() if why}
+
+    held = check(names)
+    deadline = time.monotonic() + limit
+    while wait and held and time.monotonic() < deadline:
+        say("waiting: " + "; ".join(f"{h} held: {why}" for h, why in sorted(held.items())))
+        time.sleep(poll)
+        held = check(sorted(held))
+    for name, why in sorted(held.items()):
+        say(f"{name}: held: {why}, skipped" + (" (waited the limit)" if wait else " (--wait waits for it)"))
+    return held
+
+
+def host_gate_block() -> str:
+    """cmux_mini_fix.sh's host gate, for scripts that run without the library (sudo-plan)."""
+    text = FIX_LIBRARY.read_text()
+    return text[text.index("# >>> host gate"):text.index("# <<< host gate")]
 
 
 def brew_commands(owner: str, formulas: list[str], as_owner: bool) -> list[str]:
@@ -1722,10 +1778,14 @@ def eligible_hosts(manifest: dict[str, Any], hosts: list[str]) -> tuple[list[str
     return [h for h in hosts if h not in skipped], skipped
 
 
-def cmd_fix(manifest: dict[str, Any], hosts: list[str], yes: bool, log_dir: Path | None, seed: str | None = None) -> int:
+def cmd_fix(manifest: dict[str, Any], hosts: list[str], yes: bool, log_dir: Path | None, seed: str | None = None,
+            wait: bool = False) -> int:
     if seed:
         select_hosts(manifest, [seed])
     targets, skipped = eligible_hosts(manifest, [h for h in hosts if h != seed])
+    held = gate_hosts(manifest, targets, wait and yes)
+    skipped.update({h: f"held: {why}" for h, why in held.items()})
+    targets = [h for h in targets if h not in held]
     results = {r["host"]: r for r in preflight(manifest, observe(manifest, targets, preflight=True), targets)}
     directory = run_log_dir("fix", log_dir) if yes else None
     reachable = [h for h in targets if "reach" not in results[h]["checks"]]
@@ -1740,7 +1800,7 @@ def cmd_fix(manifest: dict[str, Any], hosts: list[str], yes: bool, log_dir: Path
         else:
             outcomes.append(done[name])
     print(render_fix(outcomes, yes))
-    failed = any(o.get("failed") for o in outcomes) or len(reachable) < len(targets)
+    failed = any(o.get("failed") for o in outcomes) or len(reachable) < len(targets) or bool(held)
     if yes and reachable:
         print(f"\nlogs: {directory}\n\nfresh preflight:")
         print(render_preflight(preflight(manifest, observe(manifest, reachable, preflight=True), reachable)))
@@ -1777,6 +1837,9 @@ def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any]
              "set -euo pipefail",
              "cd /",
              "step() { printf '\\n== %s\\n' \"$*\"; }",
+             "# Nothing runs while another build holds the fleet host lock or the host is reserved.",
+             host_gate_block().rstrip("\n"),
+             f'if why=$(host_held); then echo "held: $why, skipped"; exit {HELD_EXIT}; fi',
              "sudo -v",
              "# Keep sudo's timestamp fresh while Homebrew works; the loop ends with this script.",
              "( while sleep 60; do sudo -n -v 2>/dev/null || exit 0; done ) &",
@@ -1831,10 +1894,14 @@ def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any]
     return "\n".join(lines) + "\n"
 
 
-def cmd_sudo_plan(manifest: dict[str, Any], hosts: list[str], run: bool, sudoers: bool, log_dir: Path | None) -> int:
+def cmd_sudo_plan(manifest: dict[str, Any], hosts: list[str], run: bool, sudoers: bool, log_dir: Path | None,
+                  wait: bool = False) -> int:
     targets, skipped = eligible_hosts(manifest, hosts)
     if run and not sys.stdin.isatty():
         raise Failure("sudo-plan --run asks for each host's password; run it from a terminal")
+    held = gate_hosts(manifest, targets, wait) if run else {}
+    skipped.update({h: f"held: {why}" for h, why in held.items()})
+    targets = [h for h in targets if h not in held]
     results = preflight(manifest, observe(manifest, targets, preflight=True), targets)
     directory = run_log_dir("sudo-plan", log_dir)
     plans: dict[str, str] = {}
@@ -1855,7 +1922,7 @@ def cmd_sudo_plan(manifest: dict[str, Any], hosts: list[str], run: bool, sudoers
     for name, why in skipped.items():
         print(f"# {name}: skipped ({why})")
     if not plans:
-        return 0
+        return 1 if held else 0
     if not run:
         print(f"# Review, then: glaeda-mini-fleet sudo-plan {' '.join(plans)} --run{' --sudoers' if sudoers else ''}")
         return 0
@@ -1866,10 +1933,10 @@ def cmd_sudo_plan(manifest: dict[str, Any], hosts: list[str], run: bool, sudoers
                                "/bin/bash -c " + shlex.quote(script)], check=False).returncode
         if code:
             failed.append(name)
-            print(f"==== {name}: exit {code}")
+            print(f"==== {name}: exit {code}" + (" (held, skipped)" if code == HELD_EXIT else ""))
     print("\nfresh preflight:")
     print(render_preflight(preflight(manifest, observe(manifest, list(plans), preflight=True), list(plans))))
-    return 1 if failed else 0
+    return 1 if failed or held else 0
 
 
 # ---------------------------------------------------------------- share (LAN seeding)
@@ -1966,7 +2033,7 @@ def share_one(manifest: dict[str, Any], thing: str, source: str, name: str, args
 
 
 def cmd_share(manifest: dict[str, Any], thing: str, source: str | None, hosts: list[str], yes: bool, jobs: int,
-              log_dir: Path | None) -> int:
+              log_dir: Path | None, wait: bool = False) -> int:
     if thing not in SHARE_THINGS:
         raise Failure(f"share what? one of {', '.join(SHARE_THINGS)}")
     if not source:
@@ -1975,6 +2042,11 @@ def cmd_share(manifest: dict[str, Any], thing: str, source: str | None, hosts: l
     targets, skipped = eligible_hosts(manifest, [h for h in hosts if h != source])
     if not targets:
         raise Failure("share needs at least one destination host besides --from")
+    held = gate_hosts(manifest, [source, *targets], wait) if yes else {}
+    if source in held:
+        raise Failure(f"{source} is held ({held[source]}); nothing was copied")
+    skipped.update({h: f"held: {why}" for h, why in held.items()})
+    targets = [h for h in targets if h not in held]
     directory = run_log_dir(f"share-{thing}", log_dir)
     args = {h: share_args(manifest, h, thing) for h in [source, *targets]}
     with open(directory / f"{source}.source.log", "ab") as log:
@@ -1995,7 +2067,7 @@ def cmd_share(manifest: dict[str, Any], thing: str, source: str | None, hosts: l
     print(f"logs: {directory}")
     if not yes:
         print("dry run; pass --yes to copy")
-    return 1 if any(not ok for _, ok, _ in outcomes) else 0
+    return 1 if any(not ok for _, ok, _ in outcomes) or held else 0
 
 
 SEED_LOCK = threading.Lock()
@@ -2238,6 +2310,13 @@ def resolve_glaeda_main(repo: str) -> str:
     return sha
 
 
+def held_or(code: int, log_path: Path, what: str) -> str:
+    """A step's refusal for a row: held (the fleet host lock or a reservation) or what failed."""
+    if code == HELD_EXIT:
+        return "held: " + last_line(log_path).split("held: ", 1)[-1]
+    return f"{what}: {last_line(log_path)}"
+
+
 def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str], glaeda_ref: str,
               receipt: tuple[str, str, bytes] | None, log_path: Path, seed: str | None = None) -> tuple[bool, str, str]:
     """Move one enrolled host onto the pinned candidate; (ok, step reached, detail).
@@ -2253,15 +2332,17 @@ def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candi
             note(log, f"== {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {label}")
 
         step(f"sync ~/glaeda to {glaeda_ref[:12]}")
-        if fix_call(name, user, "glaeda_sync", [glaeda_ref], log, 900):
-            return False, "sync", f"could not move ~/glaeda: {last_line(log_path)}"
+        code = fix_call(name, user, "glaeda_sync", [glaeda_ref], log, 900)
+        if code:
+            return False, "sync", held_or(code, log_path, "could not move ~/glaeda")
         step(f"stage candidate {candidate['source'][:12]}")
         ok, detail = run_repair(manifest, name, {"kind": "candidate", "source12": candidate["source"][:12]}, log, seed)
         if not ok:
             return False, "stage", detail
         step("drain: stop the runners once their current job ends")
-        if fix_call(name, user, "runner_hold", [str(RUNNER_DRAIN_SECONDS)], log, RUNNER_DRAIN_SECONDS + 600):
-            return False, "drain", last_line(log_path)
+        code = fix_call(name, user, "runner_hold", [str(RUNNER_DRAIN_SECONDS)], log, RUNNER_DRAIN_SECONDS + 600)
+        if code:
+            return False, "drain", held_or(code, log_path, "could not stop the runners")
         command = enroll_command(manifest, name, result, candidate, False, receipt[:2] if receipt else None, renew=True)
         step(f"renew ({command})")
         code = ssh_stream(name, user, command, log, stdin=receipt[2] if receipt else b"", timeout=ENROLL_TIMEOUT)
@@ -2287,6 +2368,9 @@ def _enroll_one(manifest: dict[str, Any], name: str, result: dict[str, Any], can
     command = enroll_command(manifest, name, result, candidate, no_accept,
                              class_receipt[:2] if class_receipt else None)
     with open(log_path, "ab") as log:
+        # glaeda-mini-enroll takes no step lock, so the host gate is asked right before it.
+        if fix_call(name, manifest["ssh_user"], "host_check", [], log, 120):
+            return HELD_EXIT
         note(log, f"== enroll ({command})")
         return ssh_stream(name, manifest["ssh_user"], command, log, stdin=class_receipt[2] if class_receipt else b"",
                           timeout=ENROLL_TIMEOUT)
@@ -2301,7 +2385,8 @@ def runner_actions(result: dict[str, Any]) -> tuple[list[str], list[str]]:
 
 
 def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, sudo: str, acceptance: str,
-                seed: str | None, log_dir: Path | None, heartbeat: float = HEARTBEAT_SECONDS, mode: str = "onboard") -> int:
+                seed: str | None, log_dir: Path | None, heartbeat: float = HEARTBEAT_SECONDS, mode: str = "onboard",
+                wait: bool = False) -> int:
     """onboard and repair: one pipeline. preflight, fix, sudo-plans, fix again, then the enrollment and runners.
 
     onboard enrolls a host that has no enrollment yet; repair leaves it (onboard's job). Both renew an
@@ -2311,6 +2396,10 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         raise Failure(f"{mode} --sudo run asks for each host's password; run it from a terminal")
     targets, skipped = onboard_hosts(manifest, wanted)
     rows = {h: new_row(manifest, h, f"skipped: {why}") for h, why in skipped.items()}
+    # A held host (another build's fleet host lock, or a reservation) is skipped, and the run exits 1.
+    held = gate_hosts(manifest, targets, wait and yes)
+    rows.update({h: new_row(manifest, h, f"held: {why}, skipped", step="gate") for h, why in held.items()})
+    targets = [h for h in targets if h not in held]
     for name in targets:
         rows[name] = new_row(manifest, name, step="preflight")
     if seed:
@@ -2465,7 +2554,9 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
             if ok:
                 rows[name].update(step="renew", result="eligible")
             else:
-                settle(name, step, f"failed: {detail}")
+                settle(name, step, detail if detail.startswith("held:") else f"failed: {detail}")
+        elif outcome == HELD_EXIT:
+            settle(name, "enroll", f"held: {last_line(logs[name]).split('held: ', 1)[-1]}")
         elif outcome:
             settle(name, "enroll", f"failed: exit {outcome}")
         elif acceptance == "class" and name not in receipts:
@@ -2734,7 +2825,7 @@ def export_class_receipt(manifest: dict[str, Any], name: str, result: dict[str, 
 
 def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str] | None, run: str, repo: str,
                 sha256: str | None, seeds: list[str], yes: bool, share_from: str | None, log_dir: Path | None,
-                heartbeat: float = HEARTBEAT_SECONDS) -> int:
+                heartbeat: float = HEARTBEAT_SECONDS, wait: bool = False) -> int:
     """Roll a new candidate over the fleet: one accept-local per class on a seed, then class adoption on the rest."""
     global PINNED_CANDIDATE
     candidate = resolve_candidate_run(run, repo, sha256)
@@ -2760,6 +2851,12 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
         f"{candidate.get('sha256') or 'read from the run receipt at download (--yes)'}, expires {candidate.get('expires', '?')}")
 
     rows = {h: new_row(manifest, h, f"skipped: {why}") for h, why in skipped.items()}
+    held = gate_hosts(manifest, targets, wait and yes)
+    for name, why in held.items():
+        if name in chosen.values():
+            raise Failure(f"--seed-per-class {name} is held ({why}); pick another or pass --wait")
+        rows[name] = new_row(manifest, name, f"held: {why}, skipped", step="gate")
+    targets = [h for h in targets if h not in held]
     results = {r["host"]: r for r in preflight(manifest, observe(manifest, targets, preflight=True), targets)} \
         if targets else {}
     ready: list[str] = []  # enrolled, reachable, ready hosts that need the new candidate or already run it
@@ -2880,7 +2977,7 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
         say(f"seeding {len(seeds_now)} class(es): {', '.join(seeds_now)} (accept-local is a cold cmux build on each)")
         logs = {h: directory / f"{h}.log" for h in seeds_now}
         for name, (ok, step, detail) in run_with_heartbeat(seeds_now, logs, "seed", heartbeat).items():
-            rows[name].update(step=step, result=detail if ok else f"failed: {detail}")
+            rows[name].update(step=step, result=detail if ok or detail.startswith("held:") else f"failed: {detail}")
     peers = []
     for klass, members in classes.items():
         if klass not in plan:
@@ -2903,7 +3000,7 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
                                            receipts[manifest["hosts"][h]["hardware"]], logs[h], share_from))
                  for h in peers}
         for name, (ok, step, detail) in run_with_heartbeat(tasks, logs, "adopt", heartbeat).items():
-            rows[name].update(step=step, result=detail if ok else f"failed: {detail}")
+            rows[name].update(step=step, result=detail if ok or detail.startswith("held:") else f"failed: {detail}")
     touched = [h for h in ready if rows[h]["step"] not in {"preflight", "-"}]
     for result in preflight(manifest, observe(manifest, touched, preflight=True), touched) if touched else []:
         new = (result.get("enrollment") or {}).get("generation")
@@ -2942,6 +3039,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--yes", action="store_true",
                         help="apply, fix, share, onboard, repair, upgrade: make the changes instead of printing them")
     parser.add_argument("--run", action="store_true", help="sudo-plan: run each host's plan over ssh -t")
+    parser.add_argument("--wait", action="store_true",
+                        help="fix, share, sudo-plan --run, onboard, repair, upgrade: wait (up to 4 hours) for a host "
+                             "held by the fleet host lock or a reservation instead of skipping it")
     parser.add_argument("--sudoers", action="store_true",
                         help="sudo-plan: also install a narrow NOPASSWD rule (printed in the plan for review)")
     parser.add_argument("--log-dir", type=Path, help="fix, sudo-plan, share, onboard: where per-host logs and plans go")
@@ -2980,20 +3080,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in {"onboard", "repair"}:
             sudo = args.sudo or ("wait" if args.command == "onboard" else "stop")
             return cmd_onboard(manifest, args.hosts, args.yes, sudo, args.acceptance, args.seed, args.log_dir,
-                               mode=args.command)
+                               mode=args.command, wait=args.wait)
         if args.command == "upgrade":
             if not args.candidate_run:
                 raise Failure("upgrade needs --candidate-run RUN (a fleet-candidate.yml run)")
             return cmd_upgrade(manifest, args.manifest, args.hosts, args.candidate_run, args.candidate_repo,
-                               args.candidate_sha256, args.seeds, args.yes, args.seed, args.log_dir)
+                               args.candidate_sha256, args.seeds, args.yes, args.seed, args.log_dir, wait=args.wait)
         if args.command == "share":
             if not args.hosts:
                 raise Failure("share needs explicit destination hosts")
-            return cmd_share(manifest, thing, args.seed, hosts, args.yes, args.jobs, args.log_dir)
+            return cmd_share(manifest, thing, args.seed, hosts, args.yes, args.jobs, args.log_dir, args.wait)
         if args.command == "fix":
-            return cmd_fix(manifest, hosts, args.yes, args.log_dir, args.seed)
+            return cmd_fix(manifest, hosts, args.yes, args.log_dir, args.seed, args.wait)
         if args.command == "sudo-plan":
-            return cmd_sudo_plan(manifest, hosts, args.run, args.sudoers, args.log_dir)
+            return cmd_sudo_plan(manifest, hosts, args.run, args.sudoers, args.log_dir, args.wait)
         if args.command == "preflight":
             observed = read_observed(args.observed) if args.observed else observe(manifest, hosts, preflight=True)
             try:

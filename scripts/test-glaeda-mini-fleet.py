@@ -1012,7 +1012,7 @@ class FixPlanTests(unittest.TestCase):
     def test_fix_command_skips_record_only_hosts_and_probes_once(self) -> None:
         obs = observed(**{"build-mini-1": morning_text()})
         with mock.patch.object(mf, "observe", return_value=obs) as probe, mock.patch.object(mf, "run_repair") as run, \
-                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stdout(io.StringIO()) as out, mock.patch.object(mf, "host_check", return_value=None), \
                 mock.patch.object(mf, "operator_zig_minimum", return_value="0.16.0"):
             code = mf.main(["fix", "build-mini-1", "small-mini", "--manifest", os.fspath(EXAMPLE)])
         self.assertEqual(code, 0)
@@ -1100,7 +1100,8 @@ class FixLibraryTests(unittest.TestCase):
         command = ssh.call_args.args[2]
         self.assertTrue(command.startswith("/bin/bash -c "))
         return subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=60,
-                              env={"HOME": os.fspath(home), "PATH": "/usr/bin:/bin"})
+                              env={"HOME": os.fspath(home), "PATH": "/usr/bin:/bin",
+                                   "GLAEDA_FLEET_DIR": os.fspath(home / "fleet")})
 
     def test_parses_as_bash_and_never_escalates(self) -> None:
         subprocess.run(["bash", "-n", os.fspath(mf.FIX_LIBRARY)], check=True)
@@ -1219,6 +1220,41 @@ class FixLibraryTests(unittest.TestCase):
             self.assertEqual(predates.returncode, 3)
             self.assertIn("predates glaeda-mini-enroll --renew", predates.stderr)
             self.assertEqual(git("rev-parse", "HEAD", cwd=home / "glaeda"), later)
+
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_a_held_host_refuses_every_changing_step(self) -> None:
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            fleet = home / "fleet"
+            fleet.mkdir()
+            self.assertEqual(self.call(home, "host_check").returncode, 0)
+            marker = {"schema": "glaeda-reservation/v1", "owner": "cache-bench", "purpose": "measurement",
+                      "since": 1, "until": 4102444800}
+            (fleet / "reservation.json").write_text(json.dumps(marker))
+            checked = self.call(home, "host_check")
+            self.assertEqual(checked.returncode, 20)
+            self.assertIn("held: reserved by cache-bench for measurement until 2100-01-01T00:00:00Z", checked.stdout)
+            refused = self.call(home, "candidate_dir", "abc")  # a changing step: lock() asks first
+            self.assertEqual(refused.returncode, 20)
+            self.assertIn("reserved by cache-bench", refused.stderr)
+            self.assertFalse((home / "Library").exists())
+            for bad in ({**marker, "until": "4102444800"}, {**marker, "until": 4102444800.5},
+                        {**marker, "schema": "v2"}, "not json"):
+                (fleet / "reservation.json").write_text(bad if isinstance(bad, str) else json.dumps(bad))
+                self.assertEqual(self.call(home, "host_check").returncode, 20, bad)  # invalid counts as held
+            (fleet / "reservation.json").write_text(json.dumps({**marker, "until": 2}))  # expired
+            (fleet / "host.lock").write_text("")
+            self.assertEqual(self.call(home, "host_check").returncode, 0)
+            fd = os.open(fleet / "host.lock", os.O_RDONLY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                locked = self.call(home, "host_check")
+                self.assertEqual(locked.returncode, 20)
+                self.assertIn("held by another build (fleet host lock", locked.stdout)
+            finally:
+                os.close(fd)
+            self.assertEqual(self.call(home, "candidate_dir", "abc").returncode, 0)
 
     def test_runner_hold_release_and_kick(self) -> None:
         # launchctl and pgrep are shims ahead of the real ones on the workload PATH, so this runs anywhere.
@@ -1486,7 +1522,7 @@ class ShareTests(unittest.TestCase):
 def run_command(texts: dict[str, str], *extra: str, tokens: list[str] | None = None,
                 manifest: Path = EXAMPLE, command: str = "onboard", after: dict[str, str] | None = None,
                 ssh_codes: dict[str, int] | None = None, ssh_output: dict[str, bytes] | None = None,
-                ) -> tuple[int, str, list]:
+                held: dict[str, str] | None = None) -> tuple[int, str, list]:
     """Run a command with SSH stubbed. Probes return `texts` until something enrolls, then `after`
     (default: each host eligible, no runner). ssh_codes and ssh_output: the exit code and log output
     for commands containing a needle."""
@@ -1513,6 +1549,7 @@ def run_command(texts: dict[str, str], *extra: str, tokens: list[str] | None = N
             mock.patch.object(mf, "observe", side_effect=probe), mock.patch.object(mf, "ssh_stream", side_effect=ssh), \
             mock.patch.object(mf, "mint_runner_token", return_value="AAAATOKENTOKENTOKENTOKEN") as mint, \
             mock.patch.object(mf, "resolve_glaeda_main", return_value="d" * 40), \
+            mock.patch.object(mf, "host_check", side_effect=lambda m, h: (held or {}).get(h)), \
             mock.patch.object(mf, "operator_zig_minimum", return_value="0.16.0"):
         code = mf.main([command, *texts, "--manifest", os.fspath(manifest), "--log-dir", tmp, *extra])
     if tokens is not None:
@@ -1728,6 +1765,55 @@ class PinnedRustTests(unittest.TestCase):
             self.assertEqual(result["checks"]["rust"]["state"], state, result["checks"]["rust"])
         mine, _ = mf.planned_actions(result)
         self.assertEqual([(a["kind"], a.get("toolchain")) for a in mine], [("rust_default", "1.98.1")])
+
+
+class HostGateTests(unittest.TestCase):
+    def test_held_hosts_are_skipped_and_the_run_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = pinned_manifest(tmp)
+            texts = {"build-mini-1": on_candidate(), "build-mini-2": on_candidate(node_id="cmux-mac-002")}
+            why = "reserved by cache-bench for measurement until 2100-01-01T00:00:00Z"
+            code, out, calls = run_command(texts, "--yes", command="repair", manifest=manifest,
+                                           after={h: on_candidate(generation=NEW_GEN) for h in texts},
+                                           held={"build-mini-2": why})
+        self.assertEqual(code, 1)
+        self.assertIn(f"held: {why}, skipped", out)
+        self.assertEqual({c[0] for c in calls}, {"build-mini-1"})
+
+    def test_wait_polls_until_the_host_is_free(self) -> None:
+        answers = iter(["held by another build", "held by another build", None])
+        with mock.patch.object(mf, "host_check", side_effect=lambda m, h: next(answers)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(mf.gate_hosts({}, ["a"], wait=True, poll=0), {})
+        self.assertEqual(out.getvalue().count("waiting: a held"), 2)
+        with mock.patch.object(mf, "host_check", return_value="held by another build"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(mf.gate_hosts({}, ["a"], wait=True, poll=0, limit=0), {"a": "held by another build"})
+            self.assertEqual(mf.gate_hosts({}, ["a"]), {"a": "held by another build"})
+        self.assertIn("a: held: held by another build, skipped (--wait waits for it)", out.getvalue())
+
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_a_sudo_plan_checks_the_host_before_it_asks_for_a_password(self) -> None:
+        manifest = mf.load_manifest(EXAMPLE)
+        text = preflight_text().replace("xcode_select\t/Applications/Xcode.app/Contents/Developer",
+                                        "xcode_select\t/Library/Developer/CommandLineTools")
+        script = mf.sudo_plan_script(manifest, "build-mini-1",
+                                     mf.preflight_host(manifest, "build-mini-1", observed(h=text)["hosts"]["h"], "0.16.0"))
+        self.assertLess(script.index("host_held"), script.index("sudo -v"))
+        with tempfile.TemporaryDirectory() as tmp:
+            fleet = Path(tmp) / "fleet"
+            fleet.mkdir()
+            (fleet / "reservation.json").write_text(json.dumps(
+                {"schema": "glaeda-reservation/v1", "owner": "o", "purpose": "p", "since": 1, "until": 4102444800}))
+            shims = Path(tmp) / "bin"
+            shims.mkdir()
+            (shims / "sudo").write_text(f"#!/bin/sh\ntouch {tmp}/sudo-ran\n")
+            (shims / "sudo").chmod(0o755)
+            run = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                                 env={"PATH": f"{shims}:/usr/bin:/bin", "GLAEDA_FLEET_DIR": os.fspath(fleet)})
+            self.assertEqual(run.returncode, 20, run.stderr)
+            self.assertIn("held: reserved by o for p", run.stdout)
+            self.assertFalse((Path(tmp) / "sudo-ran").exists())
 
 
 class RepairTests(unittest.TestCase):

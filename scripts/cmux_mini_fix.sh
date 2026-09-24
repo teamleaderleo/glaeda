@@ -15,10 +15,58 @@ say() { printf 'glaeda-mini-fleet: %s\n' "$*"; }
 refuse() { say "refused: $*" >&2; exit 3; }
 home() { printf '%s' "${1/#\~/$HOME}"; }
 
+# >>> host gate (sudo-plan scripts inline this block too)
+# The host is held while another build holds the fleet host lock (the flock with-host-lock, the build
+# worker and the runner hook take) or an active glaeda-reservation/v1 marker names it; an unreadable or
+# invalid marker counts as held (glaeda_reservation.py's rule). host_held prints why and succeeds when
+# held. perl, because a fresh mini has no Python and macOS has no flock(1).
+GLAEDA_FLEET_DIR="${GLAEDA_FLEET_DIR:-/Users/Shared/cmux-build-fleet}"
+host_held() {
+  perl -MFcntl=:flock -MJSON::PP -MB -MPOSIX=strftime -e '
+    my $dir = shift;
+    sub flags { my $v = shift; return ref($v) ? 0 : B::svref_2object(\$v)->FLAGS }
+    sub is_int { my $f = flags($_[0]); defined $_[0] && ($f & B::SVp_IOK) && !($f & (B::SVp_POK | B::SVp_NOK)) }
+    sub is_str { my $f = flags($_[0]); defined $_[0] && ($f & B::SVp_POK) && !($f & (B::SVp_IOK | B::SVp_NOK)) }
+    my $res = "$dir/reservation.json";
+    if (-e $res) {
+      open(my $fh, "<", $res) or do { print "reservation $res is unreadable\n"; exit 0 };
+      my $text = do { local $/; <$fh> };
+      my $doc = eval { JSON::PP->new->decode($text) };
+      my $why = ref($doc) ne "HASH" ? "not a JSON object"
+        : (($doc->{schema} // "") ne "glaeda-reservation/v1") ? "schema is not glaeda-reservation/v1"
+        : !(is_str($doc->{owner}) && is_str($doc->{purpose})) ? "owner or purpose is not a string"
+        : !(is_int($doc->{since}) && is_int($doc->{until})) ? "since or until is not integer Unix seconds" : "";
+      if ($why ne "") { print "reservation $res is not a valid glaeda-reservation/v1 marker ($why)\n"; exit 0 }
+      if (time() < $doc->{until}) {
+        printf "reserved by %s for %s until %s\n", $doc->{owner} || "?", $doc->{purpose} || "?",
+          strftime("%Y-%m-%dT%H:%M:%SZ", gmtime($doc->{until}));
+        exit 0;
+      }
+    }
+    my $lock = "$dir/host.lock";
+    if (-e $lock) {
+      open(my $fh, "<", $lock) or do { print "cannot open the fleet host lock $lock\n"; exit 0 };
+      flock($fh, LOCK_SH | LOCK_NB) or do { print "held by another build (fleet host lock $lock)\n"; exit 0 };
+    }
+    exit 1;
+  ' "$GLAEDA_FLEET_DIR"
+}
+# <<< host gate
+
+held_refuse() { say "held: $*, skipped" >&2; exit 20; }
+
+host_check() {  # exit 0 when the host is free, 20 (and why on stdout) when it is held
+  local why
+  if why=$(host_held); then say "held: $why"; exit 20; fi
+  say "free"
+}
+
 # One changing step at a time per host: an SSH timeout on the operator side does not stop the remote
 # step, so a rerun must not start the same work beside it. A lock whose process is gone is taken over.
+# No step starts while the host is held (see host_held).
 lock() {
-  local dir="$HOME/.local/state/glaeda/mini-fleet/step.lock" pid
+  local dir="$HOME/.local/state/glaeda/mini-fleet/step.lock" pid why
+  if why=$(host_held); then held_refuse "$why"; fi
   mkdir -p "$(dirname "$dir")"
   if ! mkdir "$dir" 2>/dev/null; then
     pid=$(cat "$dir/pid" 2>/dev/null || true)
