@@ -1,12 +1,14 @@
 #!/bin/bash
 # Read-only probe for one cmux build mini. Emits "key<TAB>value" lines; repeated keys form lists.
-# Runs as the login user with no sudo and no Python (a mini without an accepted Xcode licence
+# Runs as the login user with no privileged command and no Python (a mini without an accepted Xcode licence
 # has only stub /usr/bin/python3). Never prints key material, tokens, or log contents.
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 e() { printf '%s\t%s\n' "$1" "$2"; }
 e user "$(id -un)"
 e uid "$(id -u)"
 id -Gn | tr ' ' '\n' | grep -qx admin && e admin_group yes || e admin_group no
+# -n -l lists privileges without running anything; it succeeds only when no password is needed.
+if sudo -n -l >/dev/null 2>&1; then e sudo nopasswd; else e sudo password; fi
 e hostname "$(scutil --get LocalHostName 2>/dev/null)"
 e computer_name "$(scutil --get ComputerName 2>/dev/null)"
 e model "$(sysctl -n hw.model)"
@@ -17,7 +19,7 @@ e macos "$(sw_vers -productVersion)"
 e macos_build "$(sw_vers -buildVersion)"
 e uptime_boot "$(sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+).*/\1/')"
 for app in /Applications/Xcode*.app; do
-  [ -e "$app" ] || continue
+  [ -e "$app" ] || [ -L "$app" ] || continue
   kind=dir; [ -L "$app" ] && kind="symlink:$(readlink "$app")"
   v=$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist" 2>/dev/null)
   b=$(plutil -extract ProductBuildVersion raw "$app/Contents/version.plist" 2>/dev/null)
@@ -54,6 +56,8 @@ done
 F=/Users/Shared/cmux-build-fleet
 if [ -d "$F" ]; then
   e fleet_root present
+  # Existence only; the token is never read.
+  [ -f "$F/secrets/controller.token" ] && e controller_token present || e controller_token missing
   e fleet_labels "$(plutil -extract EnvironmentVariables.CMUX_CI_LABELS raw /Library/LaunchDaemons/ai.manaflow.cmux-build-worker.plist 2>/dev/null)"
   for f in logs/worker.log worker.log job-history.jsonl; do
     [ -f "$F/$f" ] && e fleet_mtime "$f|$(stat -f %m "$F/$f")"
