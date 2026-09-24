@@ -91,7 +91,7 @@ gh api -X POST repos/manaflow-ai/cmux/actions/runners/registration-token --jq .t
 ```
 
 Only `glaeda-cmux-runner` and `glaeda-cmux-runner-hook` need to be on the mini, side
-by side. Without `gh`, the release metadata comes from the public API through curl,
+by side, plus `glaeda_fleet_labels.py` when you pass `--manifest` (section 2c). Without `gh`, the release metadata comes from the public API through curl,
 a name that is already registered is refused by `config.sh` itself, and step 5 is
 confirmed from the runner's own log (`Listening for Jobs`) and `.runner` instead of
 the API. Check the labels from the operator's machine (section 3).
@@ -114,7 +114,9 @@ For a fleet member, pass the manifest instead of `--labels` (the two are exclusi
 glaeda-cmux-runner --apply --token-stdin --manifest ~/glaeda-runner/mini-fleet.json --member cmux10s-mac-mini
 ```
 
-The manifest is cmuxterm-hq `build-fleet/mini-fleet.json`; see that repository's
+The label rule lives in `scripts/glaeda_fleet_labels.py`, shared with
+`glaeda-mini-fleet`, and must sit next to `glaeda-cmux-runner` on the mini. The
+manifest is cmuxterm-hq `build-fleet/mini-fleet.json`; see that repository's
 `build-fleet/FLEET-MEMBERSHIP.md`. The member's entry decides everything, and the
 runner is named `<member>-glaeda` unless `--name` says otherwise:
 

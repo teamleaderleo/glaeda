@@ -43,6 +43,8 @@ The receipt lands in ~/.local/state/glaeda/cmux-runner/receipt.json.
 from __future__ import annotations
 
 import argparse
+import importlib.machinery
+import importlib.util
 import contextlib
 import datetime
 import hashlib
@@ -71,12 +73,9 @@ LABEL = "com.teamleaderleo.glaeda.cmux-runner"
 DEFAULT_REPO = "manaflow-ai/cmux"
 BASE_LABELS = ("self-hosted", "macOS", "ARM64")
 MINI_LABEL = "glaeda-mini"
-# Fleet membership (cmuxterm-hq build-fleet/FLEET-MEMBERSHIP.md): a runner's labels come only from its
-# manifest entry. dev machines take no jobs; borrowed machines run jobs only inside a VM, not here.
-RUNNER_CLASSES = ("xl", "std", "light")
-MEMBER_CLASSES = RUNNER_CLASSES + ("dev", "borrowed")
-AVAILABILITY = ("dedicated", "opportunistic")
-RUNNER_ROLE = "ci-runner"
+# Fleet membership labels (cmuxterm-hq build-fleet/FLEET-MEMBERSHIP.md) live in glaeda_fleet_labels.py
+# next to this script, shared with glaeda-mini-fleet. Only --manifest needs that file on the mini.
+LABELS_MODULE = "glaeda_fleet_labels.py"
 ROUTE_VARIABLES = ("MACOS_RUNNER_15", "MACOS_RUNNER_26", "MACOS_RUNNER_PR", "MACOS_RUNNER_DUAL_XCODE")
 RUNNER_RELEASE_API = "repos/actions/runner/releases"
 PLATFORM_ASSET = "osx-arm64"
@@ -244,14 +243,6 @@ class Context:
         return "~" + text[len(home):] if text == home or text.startswith(home + "/") else text
 
 
-def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
-    """Same deep merge glaeda-mini-fleet uses for a host's overrides over the manifest defaults."""
-    out = dict(base)
-    for key, value in over.items():
-        out[key] = merge(out[key], value) if isinstance(value, dict) and isinstance(out.get(key), dict) else value
-    return out
-
-
 def xcode_present(app: dict[str, Any]) -> bool:
     """The manifest's Xcode is really here: a real directory whose xcodebuild reports that exact build."""
     path, build = Path(str(app.get("path") or "")), str(app.get("build") or "")
@@ -264,38 +255,23 @@ def xcode_present(app: dict[str, Any]) -> bool:
             and re.search(rf"^Xcode {re.escape(version)}$", out, re.M) is not None)
 
 
+def fleet_labels() -> Any:
+    """The shared label rule, loaded from beside this script only when --manifest asks for it."""
+    path = SCRIPT_DIR / LABELS_MODULE
+    loader = importlib.machinery.SourceFileLoader("glaeda_fleet_labels", os.fspath(path))
+    spec = importlib.util.spec_from_loader("glaeda_fleet_labels", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
 def member_labels(manifest: Any, member: str) -> tuple[dict[str, Any] | None, str | None]:
     """(member summary with labels, None) or (None, why this member cannot be a runner). Reads only."""
-    if not isinstance(manifest, dict) or not isinstance(manifest.get("hosts"), dict):
-        return None, "manifest has no hosts table"
-    host = manifest["hosts"].get(member)
-    if not isinstance(host, dict):
-        return None, f"{member} is not a member in the manifest"
-    klass, availability = host.get("class"), host.get("availability")
-    roles = host.get("roles") if isinstance(host.get("roles"), list) else []
-    if klass not in MEMBER_CLASSES:
-        return None, f"{member} class {klass!r} is not one of {', '.join(MEMBER_CLASSES)}"
-    if klass not in RUNNER_CLASSES:
-        return None, f"{member} is class {klass}, which never runs a GitHub runner on the host"
-    if availability not in AVAILABILITY:
-        return None, f"{member} availability {availability!r} is not one of {', '.join(AVAILABILITY)}"
-    if RUNNER_ROLE not in roles:
-        return None, f"{member} roles do not include {RUNNER_ROLE}"
-    defaults, overrides = manifest.get("defaults") or {}, host.get("overrides") or {}
-    if not isinstance(defaults, dict) or not isinstance(overrides, dict):
-        return None, f"manifest defaults or {member} overrides is not an object"
-    xcode = merge(defaults, overrides).get("xcode") or {}
-    apps = xcode.get("apps") if isinstance(xcode, dict) else None
-    if not isinstance(apps, list):
-        apps = []
-    versions = [str(a["version"]) for a in apps
-                if isinstance(a, dict) and re.fullmatch(r"[0-9][0-9.]*", str(a.get("version") or "")) and xcode_present(a)]
-    # One label a pool picker can route a whole run to: this class, this verified Xcode, and counted
-    # capacity. Opportunistic members never carry it, so they never receive a required job.
-    pools = [f"glaeda-{klass}-xcode-{v}" for v in versions] if availability == "dedicated" else []
-    labels = [MINI_LABEL, f"glaeda-class-{klass}", f"glaeda-{availability}", *[f"xcode-{v}" for v in versions], *pools]
-    return {"member": member, "class": klass, "availability": availability, "roles": roles,
-            "labels": list(dict.fromkeys(labels))}, None
+    try:
+        rule = fleet_labels()
+    except (OSError, SyntaxError) as error:
+        return None, f"{LABELS_MODULE} must sit next to this script for --manifest ({type(error).__name__})"
+    return rule.member_labels(manifest, member, lambda app: xcode_present(app))
 
 
 def load_receipt(ctx: Context) -> dict[str, Any] | None:

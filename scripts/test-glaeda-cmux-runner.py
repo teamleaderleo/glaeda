@@ -933,9 +933,41 @@ class ManifestLabelsTest(unittest.TestCase):
                     self.assertTrue(why)
 
 
+fleet_labels = load("glaeda_fleet_labels_under_test", ROOT / "scripts" / "glaeda_fleet_labels.py")
+
+
+class FleetLabelsModuleTest(unittest.TestCase):
+    """The shared rule glaeda-mini-fleet imports: pin its strings and its declared/conforming views."""
+
+    def test_pool_label_string(self) -> None:
+        self.assertEqual(fleet_labels.pool_label("std", "26.6"), "glaeda-std-xcode-26.6")
+        self.assertEqual(fleet_labels.pool_label("light", "26.6"), "glaeda-light-xcode-26.6")
+
+    def test_runner_and_module_agree(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            for member in MANIFEST["hosts"]:
+                with self.subTest(member):
+                    self.assertEqual(cr.member_labels(MANIFEST, member),
+                                     fleet_labels.member_labels(MANIFEST, member, lambda app: True))
+
+    def test_declared_and_conforming_pools(self) -> None:
+        declared = fleet_labels.declared_pools(MANIFEST)
+        self.assertEqual(declared, {"glaeda-std-xcode-26.3": ["override"], "glaeda-std-xcode-26.6": ["mini-std"]})
+        conforming = fleet_labels.declared_pools(MANIFEST, lambda member, app: member != "mini-std")
+        self.assertEqual(conforming, {"glaeda-std-xcode-26.3": ["override"]})
+        self.assertEqual(fleet_labels.declared_pools({"hosts": []}), {})
+
+    def test_runner_without_the_module_explains(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(cr, "SCRIPT_DIR", Path(tmp)):
+            member, why = cr.member_labels(MANIFEST, "mini-std")
+        self.assertIsNone(member)
+        self.assertIn("glaeda_fleet_labels.py must sit next to this script", why)
+
+
 class NoEmDashTest(unittest.TestCase):
     def test_no_em_dashes(self) -> None:
-        for path in (ROOT / "scripts/glaeda-cmux-runner", HOOK, Path(__file__), ROOT / "docs/CMUX_MINI_RUNNER.md"):
+        for path in (ROOT / "scripts/glaeda-cmux-runner", HOOK, Path(__file__), ROOT / "docs/CMUX_MINI_RUNNER.md",
+                     ROOT / "scripts/glaeda_fleet_labels.py"):
             self.assertNotIn(chr(0x2014), path.read_text(encoding="utf-8"), path)
 
 
