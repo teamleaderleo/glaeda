@@ -394,12 +394,13 @@ class HookTest(unittest.TestCase):
         self.fleet()
         state = self.dir / "state"
         state.mkdir()
-        (state / "host-lock-holder.pid").write_text(f"{os.getpid()}\n")  # a live pid, but not a holder
+        stale = hook.holder_file(state)  # keyed by RUNNER_NAME, which CI's own runner sets
+        stale.write_text(f"{os.getpid()}\n")  # a live pid, but not a holder
         with mock.patch.object(hook.os, "fork", side_effect=OSError("no fork")):
             held, note = hook.take_host_lock(os.fspath(self.dir / "fleet/host.lock"), os.getpid(), state)
         self.assertFalse(held)
         self.assertIn("cannot start the host lock holder", note)
-        self.assertFalse((state / "host-lock-holder.pid").exists())
+        self.assertFalse(stale.exists())
         self.assertTrue(self.lock_free())
 
     def test_huge_until_is_described_not_raised(self) -> None:
