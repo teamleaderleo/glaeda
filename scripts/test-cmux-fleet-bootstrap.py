@@ -407,6 +407,17 @@ class Tests(unittest.TestCase):
         self.assertTrue(observed["checks"]["workloadToolPath"])
         self.assertEqual(observed["observed"]["toolsMissingFromWorkloadPath"], [])
 
+    def test_free_disk_floor_follows_build_slots(self):
+        self.assertEqual(b.default_min_free_gib("macos"), 50)
+        self.assertEqual(b.default_min_free_gib("macos", 4), 125)
+        self.assertEqual(b.default_min_free_gib("linux", 4), 40)
+        with self.assertRaises(ValueError):
+            b.default_min_free_gib("macos", 0)
+        args = b.parser().parse_args(
+            ["--platform", "macos", "--cmux-root", ".", "--glaeda", ".",
+             "--hardware-class", "x", "--role", "r"])
+        self.assertEqual(args.build_slots, 1)
+
     def test_power_posture_parser(self):
         raw = (
             "Battery Power:\n"

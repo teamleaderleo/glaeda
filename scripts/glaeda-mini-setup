@@ -57,7 +57,7 @@ import cmux_fleet_bootstrap as fleet  # noqa: E402  (read-only helpers; importin
 # The machines this was written for. A different host still works; preflight says how it differs.
 TARGET = {"machine": "Mac mini", "chip": "Apple M4 Pro", "cpus": 14, "memoryGiB": 48}
 CMUX_XCODE_APP = "/Applications/Xcode_26.3.app"  # vars.CMUX_CI_XCODE_APP_MACOS_15, cmux docs/ci/mac-fleet.md 3.3
-MIN_FREE_GIB = 120  # same default as the fleet bootstrap
+MIN_FREE_GIB = fleet.default_min_free_gib("macos")  # one build slot, as the fleet bootstrap
 SUPPORTED_MACOS = {15, 26}
 LABEL_PREFIX = "com.teamleaderleo.glaeda."
 GIT_DEFAULTS = (
