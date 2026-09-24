@@ -82,6 +82,38 @@ class ManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(mf.Failure, "also in never_touch"):
                 mf.load_manifest(path)
 
+    def test_never_touch_matches_case_and_local_suffix(self) -> None:
+        for name in ("Coordinator-Mini", "coordinator-mini.local"):
+            with self.assertRaisesRegex(mf.Failure, "never_touch"):
+                mf.select_hosts(self.manifest, [name])
+        data = copy.deepcopy(self.manifest)
+        data["hosts"]["alias"] = {"hostname": "Coordinator-Mini.local", "class": "m4-16"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "m.json"
+            path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(mf.Failure, "also in never_touch"):
+                mf.load_manifest(path)
+
+    def test_public_key_must_be_one_bare_line(self) -> None:
+        for bad in ("ssh-ed25519 AAAA a\nssh-ed25519 BBBB b", 'command="x" ssh-ed25519 AAAA a'):
+            data = copy.deepcopy(self.manifest)
+            data["keys"]["coordinator"]["public_key"] = bad
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "m.json"
+                path.write_text(json.dumps(data))
+                with self.assertRaisesRegex(mf.Failure, "one bare key line"):
+                    mf.load_manifest(path)
+
+    def test_bad_observation_exits_2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            obs = Path(tmp) / "obs.json"
+            for text in ("not json", "{}", json.dumps({"hosts": {"build-mini-1": {"reachable": True}}})):
+                obs.write_text(text)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    code = mf.main(["check", "--manifest", os.fspath(EXAMPLE), "--host", "build-mini-1",
+                                    "--observed", os.fspath(obs)])
+                self.assertEqual(code, 2, text)
+
     def test_unknown_key_reference_is_refused(self) -> None:
         data = copy.deepcopy(self.manifest)
         data["defaults"]["authorized_keys"]["allow"].append("ghost")
@@ -138,6 +170,25 @@ class CheckTests(unittest.TestCase):
         self.assertTrue(any(i["area"] == "identity" for i in issues))
         self.assertTrue(any(i["area"] == "launchd" and "not-loaded" in i["detail"] for i in issues))
 
+    def test_key_in_authorized_keys2_is_live(self) -> None:
+        text = probe_text() + f"ak_key\tauthorized_keys2|no|256 {STRAY} hidden (ED25519)\n"
+        details = [i["detail"] for i in self.issues(text)]
+        self.assertTrue(any("not allowed" in d for d in details))
+        self.assertTrue(any("authorized_keys2" in d for d in details))
+
+    def test_backup_copies_are_not_live(self) -> None:
+        text = probe_text() + f"ak_key\tauthorized_keys.bak|no|256 {STRAY} old (ED25519)\n"
+        self.assertFalse([i for i in self.issues(text) if "not allowed" in i["detail"]])
+
+    def test_symlinked_xcode_is_drift(self) -> None:
+        text = probe_text(clone=False) + "xcode_app\t/Applications/Xcode_26.3.app|symlink:Xcode.app|26.3|17C529\n"
+        self.assertTrue([i for i in self.issues(text) if "real directory" in i["detail"]])
+
+    def test_versions_compare_padded(self) -> None:
+        self.assertEqual(mf.version_tuple("26.3"), mf.version_tuple("26.3.0"))
+        self.assertLess(mf.version_tuple("26.4"), mf.version_tuple("26.5"))
+        self.assertEqual(mf.version_tuple(""), (0, 0, 0))
+
     def test_unreachable_host_is_one_finding(self) -> None:
         issues = mf.check(self.manifest, {"hosts": {"build-mini-1": {"reachable": False, "error": "timeout"}}},
                           ["build-mini-1"])
@@ -192,6 +243,19 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("no public_key", out)
 
+    def test_unreachable_host_fails_apply(self) -> None:
+        with mock.patch.object(mf, "observe", lambda m, n: {"hosts": {x: {"reachable": False, "error": "down"} for x in n}}), \
+                mock.patch.object(mf, "remote") as remote, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mf.apply(self.manifest, ["build-mini-1"], True), 1)
+        remote.assert_not_called()
+
+    def test_unverified_effect_fails_apply(self) -> None:
+        texts = iter([observed(**{"build-mini-1": probe_text(keys=("operator",))}),
+                      {"hosts": {"build-mini-1": {"reachable": False, "error": "gone"}}}])
+        with mock.patch.object(mf, "observe", lambda m, n: next(texts)), \
+                mock.patch.object(mf, "remote", return_value=(0, "added")), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mf.apply(self.manifest, ["build-mini-1"], True), 1)
+
     def test_stray_keys_are_never_removed(self) -> None:
         _code, _out, calls = self.run_apply(["build-mini-1"], True, {"build-mini-1": probe_text(extra_keys=(STRAY,))})
         self.assertEqual(calls, [])
@@ -222,10 +286,74 @@ class AddKeyScriptTests(unittest.TestCase):
             self.assertIn("unchanged", run(fp).stdout)
             self.assertEqual(len(ak.read_text().splitlines()), 2)
             self.assertEqual(ak.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(len(list((home / ".ssh").glob("authorized_keys.glaeda-*"))), 1)
+            self.assertEqual(sorted(p.name for p in (home / ".ssh").iterdir()), ["authorized_keys"])
+            self.assertEqual(len(list((home / ".local/state/glaeda/mini-fleet").glob("authorized_keys.*"))), 1)
+
+    def test_missing_file_is_created_private(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "new", "-f", os.fspath(home / "new")], check=True)
+            fp = subprocess.run(["ssh-keygen", "-lf", os.fspath(home / "new.pub")], capture_output=True, text=True).stdout.split()[1]
+            proc = subprocess.run(["bash", "-c", mf.ADD_KEY, "glaeda", fp], input=(home / "new.pub").read_text(), text=True,
+                                  capture_output=True, env={"HOME": tmp, "PATH": os.environ["PATH"]})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            ak = home / ".ssh" / "authorized_keys"
+            self.assertEqual(len(ak.read_text().splitlines()), 1)
+            self.assertEqual((ak.stat().st_mode & 0o777, (home / ".ssh").stat().st_mode & 0o777), (0o600, 0o700))
+
+
+@unittest.skipUnless(sys.platform == "darwin", "cp -c, plutil and stat -f are macOS")
+class CloneScriptTests(unittest.TestCase):
+    def fake_app(self, root: Path, version: str, build: str) -> Path:
+        app = root / "X.app" / "Contents"
+        app.mkdir(parents=True)
+        subprocess.run(["plutil", "-create", "xml1", os.fspath(app / "Info.plist")], check=True)
+        subprocess.run(["plutil", "-insert", "CFBundleShortVersionString", "-string", version, os.fspath(app / "Info.plist")], check=True)
+        subprocess.run(["plutil", "-create", "xml1", os.fspath(app / "version.plist")], check=True)
+        subprocess.run(["plutil", "-insert", "ProductBuildVersion", "-string", build, os.fspath(app / "version.plist")], check=True)
+        return root / "X.app"
+
+    def run_clone(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", "-c", mf.CLONE_XCODE, "glaeda", *args], capture_output=True, text=True)
+
+    def test_clone_matches_identity_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self.fake_app(Path(tmp), "26.3", "17C529")
+            dst = os.fspath(Path(tmp) / "Y.app")
+            self.assertEqual(self.run_clone(os.fspath(src), dst, "26.6", "17F113").returncode, 3)
+            first = self.run_clone(os.fspath(src), dst, "26.3", "17C529")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertTrue(Path(dst).is_dir() and not Path(dst).is_symlink())
+            self.assertIn("unchanged", self.run_clone(os.fspath(src), dst, "26.3", "17C529").stdout)
+
+    def test_dangling_symlink_destination_is_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self.fake_app(Path(tmp), "26.3", "17C529")
+            dst = Path(tmp) / "Y.app"
+            dst.symlink_to(Path(tmp) / "gone")
+            self.assertIn("unchanged", self.run_clone(os.fspath(src), os.fspath(dst), "26.3", "17C529").stdout)
+            self.assertFalse((Path(tmp) / "Y.app.glaeda-partial").exists())
 
 
 class ProbeScriptTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("ssh-keygen"), "needs ssh-keygen")
+    def test_probe_reports_every_live_key_including_an_unterminated_last_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".ssh").mkdir()
+            pubs = []
+            for name in ("a", "b", "c"):
+                subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", name, "-f", os.fspath(home / name)], check=True)
+                pubs.append((home / f"{name}.pub").read_text().strip())
+            (home / ".ssh" / "authorized_keys").write_text(pubs[0] + "\n" + pubs[1])  # no trailing newline
+            (home / ".ssh" / "authorized_keys2").write_text(pubs[2] + "\n")
+            out = subprocess.run(["bash", os.fspath(ROOT / "scripts" / "cmux_mini_probe.sh")], capture_output=True,
+                                 text=True, env={"HOME": tmp, "PATH": "/usr/bin:/bin"}).stdout
+            parsed = mf.parse_probe(out)
+            self.assertEqual(sorted((k["file"], k["comment"]) for k in parsed["authorized_keys"]),
+                             [("authorized_keys", "a"), ("authorized_keys", "b"), ("authorized_keys2", "c")])
+            self.assertNotIn("AAAA", out)  # fingerprints only, never key material
+
     def test_probe_parses_as_bash(self) -> None:
         subprocess.run(["bash", "-n", os.fspath(ROOT / "scripts" / "cmux_mini_probe.sh")], check=True)
 

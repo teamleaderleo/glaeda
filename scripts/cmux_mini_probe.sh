@@ -68,7 +68,8 @@ for ak in "$HOME"/.ssh/authorized_keys*; do
   [ -f "$ak" ] || continue
   e ak_file "$(basename "$ak")|$(stat -f '%Lp' "$ak")"
   # Options (from=, command=, restrict) are reported as a flag, never their values.
-  while IFS= read -r line; do
+  # "|| [ -n ]" keeps a final line that has no trailing newline; sshd still honours it.
+  while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue;; esac
     opts=no
     case "$line" in ssh-*|ecdsa-*|sk-*) ;; *) opts=yes;; esac
