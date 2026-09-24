@@ -5,10 +5,10 @@ a fresh build whose only warm source is a fleet store on the other mini, across 
 **132 s** against **756 s** cold (5.7x), with 4,191 of 4,191 cacheable tasks hitting and every
 compiler output byte-identical to the build that filled the store. Getting there took two
 cache-key fixes that apply to any machine sharing entries: a fixed DerivedData path and a fixed
-local CAS path. One limit: for the full app, the filling build and the reading build ran on the
-same mini (the other one was busy), so full-app portability *between* machines rests on the
-chain, where writer and reader were different minis. A cross-machine full-app read is the
-first measurement of the next step. Follow-up to
+local CAS path. The main runs had the filling and reading builds on the same mini (the other
+was busy); a later cross-machine read (cmux7s reading from a store cmux8s filled) also hit
+4,191 of 4,191, in 127 s, with every Xcode-cached output byte-identical across the two
+machines (see Cross-machine read). Follow-up to
 [the 2026-09-23 Air Blue measurement](fleet-compilation-cache-2026-09-23.md); design and plan
 in #1134.
 
@@ -104,6 +104,29 @@ per fresh machine.
   (end state, not arrival order; see the [prefetch follow-up](fleet-compilation-cache-prefetch-2026-09-24.md)).
   An earlier version of this doc cited the `kv_put_dangling` counter; it only looked at
   top-level values and saw no IDs, so its zero proved nothing.
+
+### Cross-machine read
+
+Run after the Chromium job released cmux7s, both minis pinned to Xcode 26.3 with
+`DEVELOPER_DIR=/Applications/Xcode.app` (provisioning had switched `xcode-select` to 26.6
+between 15:16 and 15:31 UTC; one unpinned attempt compiled everything, since the store's keys
+were 26.3's). cmux8s filled the store and served it; cmux7s read with an empty node.
+
+| Run | Machine | Wall | Xcode hits / cacheable |
+| --- | --- | ---: | ---: |
+| fresh reader, store on the other mini | cmux7s | 127.4 s | 4,191 / 4,191 |
+| warm node | cmux7s | 77.3 s | 4,191 / 4,191 |
+| fresh reader, same-host reference | cmux8s | 107.8 s | 4,191 / 4,191 |
+
+cmux7s started the fresh run at load 27, still settling from the Chromium job, so its wall
+time is an upper bound. Outputs: 7,631 of 7,634 `.o`, `.swiftmodule`, `.pcm`, `.a` and
+debug-dylib files identical between the two machines. The three that differ are the
+script-built Go WireGuard library (two copies) and the app's debug dylib, which links it;
+none of them goes through the compilation cache.
+
+A related rule for the fleet: cache keys include the compiler, so members share entries only
+when they build with the same Xcode build number. The store should be segmented or keyed by
+it, and the fleet check should treat the selected Xcode as part of the cache contract.
 
 ## Findings
 
