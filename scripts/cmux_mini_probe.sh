@@ -24,6 +24,14 @@ for app in /Applications/Xcode*.app; do
   v=$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist" 2>/dev/null)
   b=$(plutil -extract ProductBuildVersion raw "$app/Contents/version.plist" 2>/dev/null)
   e xcode_app "$app|$kind|$v|$b"
+  # </dev/null: this probe arrives on stdin (bash -s), so a child that reads stdin would eat it.
+  # Ask the app itself: the licence agreement is shared across releases, so the plist's version
+  # string is not what xcodebuild checks. Both queries run nothing privileged.
+  if [ -x "$app/Contents/Developer/usr/bin/xcodebuild" ]; then
+    DEVELOPER_DIR="$app/Contents/Developer" xcodebuild -license check </dev/null >/dev/null 2>&1 && l=accepted || l=needed
+    DEVELOPER_DIR="$app/Contents/Developer" xcodebuild -checkFirstLaunchStatus </dev/null >/dev/null 2>&1 && f=done || f=needed
+    e xcode_ready "$app|$l|$f"
+  fi
 done
 e xcode_select "$(xcode-select -p 2>/dev/null)"
 if [ -e /Library/Preferences/com.apple.dt.Xcode.plist ]; then
