@@ -519,18 +519,6 @@ impl Store {
         refs: Vec<cas::CasDataId>,
         data: Vec<u8>,
     ) -> Result<Vec<u8>, Status> {
-        let r = self.put_through_inner(refs, data).await;
-        if r.is_err() {
-            self.stats.write_failed.fetch_add(1, Relaxed);
-        }
-        r
-    }
-
-    async fn put_through_inner(
-        &self,
-        refs: Vec<cas::CasDataId>,
-        data: Vec<u8>,
-    ) -> Result<Vec<u8>, Status> {
         let forward = match &self.upstream {
             Some(up) if !self.read_only_kv => Some((up, data_object(refs.clone(), data.clone()))),
             _ => None,
@@ -660,15 +648,23 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         &self,
         r: Request<cas::CasPutRequest>,
     ) -> Result<Response<cas::CasPutResponse>, Status> {
-        self.0.check_writer(&r)?;
-        let obj = r.into_inner().data.unwrap_or_default();
-        let data = self.0.bytes_of(obj.blob)?;
-        let id = self.0.put_through(obj.references, data).await?;
-        Ok(Response::new(cas::CasPutResponse {
-            contents: Some(cas::cas_put_response::Contents::CasId(cas::CasDataId {
-                id,
-            })),
-        }))
+        let s = &self.0;
+        let resp = async {
+            self.0.check_writer(&r)?;
+            let obj = r.into_inner().data.unwrap_or_default();
+            let data = self.0.bytes_of(obj.blob)?;
+            let id = self.0.put_through(obj.references, data).await?;
+            Ok(Response::new(cas::CasPutResponse {
+                contents: Some(cas::cas_put_response::Contents::CasId(cas::CasDataId {
+                    id,
+                })),
+            }))
+        }
+        .await;
+        if resp.is_err() {
+            s.stats.write_failed.fetch_add(1, Relaxed);
+        }
+        resp
     }
 
     async fn get(
@@ -692,15 +688,23 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         &self,
         r: Request<cas::CasSaveRequest>,
     ) -> Result<Response<cas::CasSaveResponse>, Status> {
-        self.0.check_writer(&r)?;
-        let blob = r.into_inner().data.unwrap_or_default();
-        let data = self.0.bytes_of(blob.blob)?;
-        let id = self.0.put_through(Vec::new(), data).await?;
-        Ok(Response::new(cas::CasSaveResponse {
-            contents: Some(cas::cas_save_response::Contents::CasId(cas::CasDataId {
-                id,
-            })),
-        }))
+        let s = &self.0;
+        let resp = async {
+            self.0.check_writer(&r)?;
+            let blob = r.into_inner().data.unwrap_or_default();
+            let data = self.0.bytes_of(blob.blob)?;
+            let id = self.0.put_through(Vec::new(), data).await?;
+            Ok(Response::new(cas::CasSaveResponse {
+                contents: Some(cas::cas_save_response::Contents::CasId(cas::CasDataId {
+                    id,
+                })),
+            }))
+        }
+        .await;
+        if resp.is_err() {
+            s.stats.write_failed.fetch_add(1, Relaxed);
+        }
+        resp
     }
 
     async fn load(

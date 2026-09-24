@@ -15,10 +15,11 @@
 # is down (nothing is built); 4 if the build passed but no marker was written.
 # The writer node keeps its own copy of what it wrote, so a fleet store that is
 # emptied needs the writer's node store emptied too, or later markers can
-# claim entries the store lost. Writer builds should start from an empty
-# local CAS (COMPILATION_CACHE_CAS_PATH): an entry whose upload failed may
-# otherwise be answered from it and never uploaded again (not observed; how
-# Xcode orders the local and remote lookups is unverified).
+# claim entries the store lost. The build must use the fixed local CAS
+# ($ROOT/cas), which this script empties first: an entry whose upload failed
+# could otherwise be answered from it and never uploaded again (not observed;
+# how Xcode orders local and remote lookups is unverified). The writer's node
+# store keeps the writer's own builds fast.
 set -u
 repo=${1:?usage: fleet-cas-writer-build.sh REPO COMMIT -- CMD...}
 commit=${2:?usage: fleet-cas-writer-build.sh REPO COMMIT -- CMD...}
@@ -47,11 +48,18 @@ activity() { count kv_get_hit kv_get_miss kv_put; }
 xcode=$(xcodebuild -version | awk '/Build version/ {print $3}')
 [ -n "$xcode" ] || { echo "no Xcode build version" >&2; exit 2; }
 "$ROOT/bin/fleet-cas-settings.sh" "$ROOT/fleet-cas.sock" >/dev/null || exit 3
+rm -rf "$ROOT/cas"
 i0=$(instance) f0=$(failures) a0=$(activity)
 [ -n "$i0" ] && [ -n "$f0" ] && [ -n "$a0" ] || { echo "cannot read $stats" >&2; exit 3; }
 "$@"
 rc=$?
 [ "$rc" -eq 0 ] || exit "$rc"
+# A node that died late in the build and is not back yet left its last stats
+# behind: calls to the dead socket fail without being counted anywhere.
+"$ROOT/bin/fleet-cas-settings.sh" "$ROOT/fleet-cas.sock" >/dev/null || {
+  echo "fleet-cas: the node is down after the build; no marker for $repo/$commit" >&2
+  exit 4
+}
 sleep 1  # the node rewrites stats.json every 500 ms
 i1=$(instance) f1=$(failures) a1=$(activity)
 if [ "$i1" != "$i0" ]; then

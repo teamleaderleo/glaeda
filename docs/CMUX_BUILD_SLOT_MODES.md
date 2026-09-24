@@ -72,8 +72,8 @@ Catch-up DerivedData lifecycle, since one directory serves every slot on the hos
   451 s whole-target rebuild, and it is not where anyone iterates);
 - the job copies its products out before releasing the host lock, because the next catch-up
   build on the host empties the directory;
-- the local CAS is kept between builds (the 102 s result depends on a filled one). It is
-  Xcode's own on-disk CAS, which the node daemon does not manage, so its size budget comes
+- the local CAS is kept between builds (the 102 s result depends on a filled one), except on
+  the writer, whose builds start from an empty one (Writer, below). It is Xcode's own on-disk CAS, which the node daemon does not manage, so its size budget comes
   from a separate pruner; the daemon's `node-store` gets its own eviction (both not built yet).
 
 Contract. The host check (`glaeda-mini-fleet check`) can verify:
@@ -106,8 +106,8 @@ CI's main build is the only writer (#1134 M3; tested in
 - The main build runs under `xcode/bin/fleet-cas-writer-build.sh cmux <sha> -- <build>`. It
   publishes the signed marker `cmux/<sha>/<Xcode build>` only after a successful build that
   used the node, with no write error, no failed or skipped fleet-store call and no node
-  restart; otherwise it exits 4 and later main builds fill the rest. Writer builds start
-  from an empty local CAS, so every lookup reaches the node (an entry answered from the
+  restart, and with the node still up afterwards; otherwise it exits 4 and later main builds
+  fill the rest. It empties the local CAS (`xcode/cas`) first, so every lookup reaches the node (an entry answered from the
   local CAS would never be uploaded again; whether Xcode does that is unverified).
 - The writer mini runs no PR or other untrusted job. Any process running as the build user
   there can read the key, so a PR job on that host could sign a poisoned entry. It leaves the
