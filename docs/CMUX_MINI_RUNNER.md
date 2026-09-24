@@ -84,10 +84,13 @@ What `--apply` does:
      baked in from the member's `hardware` and first verified Xcode). It refuses with
      `refused: node not eligible (...)` unless the node status from the staged
      generation's `cmux_fleet.py status` (the command `glaeda-mini-enroll` uses) says
-     `eligible` with `routingCandidateEligible` true, the enrollment references
-     `~/.config/glaeda/cmux-fleet/class-acceptance/<hardware>.json`, and `rustc`,
-     `cargo`, `zig`, `xcodebuild` and `xcrun --show-sdk-version`, run from `$HOME`,
-     print exactly the class receipt's strings. The check takes about a second and runs
+     `eligible` with `routingCandidateEligible` true and the build role eligible, the
+     enrollment references `~/.config/glaeda/cmux-fleet/class-acceptance/<hardware>.json`,
+     that receipt validates (its digest recomputed by the generation's
+     `validate_class_acceptance`) and records all six toolchain strings, and `rustc`,
+     `cargo`, `zig`, `xcodebuild` and `xcrun --show-sdk-version`, run from `$HOME` on the
+     runner's own PATH (the job's PATH), print exactly those strings, all within one
+     20 s budget. The check takes about a second and runs
      on every job, so a mini that drifts or loses eligibility stops taking PR jobs at
      once, and refusal recovery re-runs the job elsewhere.
    - job-completed releases the host lock, runs the same disk pressure pass and always exits 0.

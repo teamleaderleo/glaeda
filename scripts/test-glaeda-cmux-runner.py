@@ -276,11 +276,11 @@ class HookTest(unittest.TestCase):
         (fleet / "host.lock").touch()
         return fleet
 
-    def started(self, *extra: str, watch: int | None = None) -> subprocess.CompletedProcess:
+    def started(self, *extra: str, watch: int | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
         push = event(self.dir, "push", {"repository": CMUX})
         args = ["--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
                 "--watch-pid", str(watch or os.getpid()), *extra]
-        return self.run_hook("job-started", "push", push, *args, repo="manaflow-ai/cmux")
+        return self.run_hook("job-started", "push", push, *args, repo="manaflow-ai/cmux", env=env)
 
     def lock_free(self) -> bool:
         import fcntl
@@ -420,7 +420,9 @@ class HookTest(unittest.TestCase):
                  "zigVersion": "0.16.0", "xcodeVersion": "26.6", "xcodeBuild": "17F113", "macosSdkVersion": "26.5"}
 
     def node(self, state: str = "eligible", routing: bool = True, receipt_sha: str = "sha256:aa",
-             enrolled_sha: str = "sha256:aa", tools: dict | None = None, generation: bool = True) -> None:
+             enrolled_sha: str = "sha256:aa", tools: dict | None = None, generation: bool = True,
+             valid: bool = True, role: str = "cmux_macos_native_build", receipt_toolchain: dict | None = None,
+             hang: str | None = None) -> None:
         """A fake Glaeda node under HOME (self.dir): enrollment, class receipt, staged CLI, toolchain."""
         config = self.dir / ".config/glaeda/cmux-fleet"
         (config / "class-acceptance").mkdir(parents=True, exist_ok=True)
@@ -428,15 +430,20 @@ class HookTest(unittest.TestCase):
         (config / "enrollment.json").write_text(json.dumps({"state": state, "classAcceptanceSha256": enrolled_sha}))
         (config / "acceptance/cmux_macos_native_build.json").write_text("{}")
         (config / "class-acceptance/m4pro-48.json").write_text(json.dumps(
-            {"receiptSha256": receipt_sha, "glaedaCandidate": {"commit": self.COMMIT}, "toolchain": self.TOOLCHAIN}))
+            {"receiptSha256": receipt_sha, "glaedaCandidate": {"commit": self.COMMIT},
+             "toolchain": self.TOOLCHAIN if receipt_toolchain is None else receipt_toolchain}))
         gen = self.dir / "Projects/glaeda-generations" / self.COMMIT[:12] / "scripts"
         if generation:
             gen.mkdir(parents=True, exist_ok=True)
-            (gen / "cmux_fleet.py").write_text("import json\nprint(json.dumps(" + repr({
-                "schema": "glaeda-cmux-fleet-node-status/v1", "state": state, "routingCandidateEligible": routing,
-                "roles": [{"role": "cmux_macos_native_build", "eligible": routing,
-                           "reason": "ok" if routing else "acceptance_missing_or_rejected"}]}) + "))\n")
-        cargo = self.dir / ".cargo/bin"
+            status = {"schema": "glaeda-cmux-fleet-node-status/v1", "state": state, "routingCandidateEligible": routing,
+                      "roles": [{"role": role, "eligible": routing,
+                                 "reason": "ok" if routing else "acceptance_missing_or_rejected"}]}
+            (gen / "cmux_fleet.py").write_text(
+                "import json\n"
+                f"def validate_class_acceptance(doc):\n    if not {valid!r}:\n        raise ValueError('digest')\n"
+                "    return doc\n"
+                f"if __name__ == '__main__':\n    print(json.dumps({status!r}))\n")
+        cargo = self.dir / "jobpath"
         cargo.mkdir(parents=True, exist_ok=True)
         have = {**self.TOOLCHAIN, **(tools or {})}
         outputs = {"rustc": have["rustcVersion"], "cargo": have["cargoVersion"], "zig": have["zigVersion"],
@@ -446,10 +453,13 @@ class HookTest(unittest.TestCase):
             if text is None:
                 (cargo / name).unlink(missing_ok=True)
                 continue
-            make_executable(cargo / name, f"#!/bin/sh\ncat <<'OUT'\n{text}\nOUT\n")
+            body = "sleep 60\n" if name == hang else f"cat <<'OUT'\n{text}\nOUT\n"
+            make_executable(cargo / name, f"#!/bin/sh\n{body}")
 
     def eligible_start(self) -> subprocess.CompletedProcess:
-        return self.started("--require-eligible", "--fleet-class", "m4pro-48", "--toolchain-xcode", "/Applications/Xcode_26.6.app")
+        # The fake toolchain is on the job's PATH, which is the runner's PATH the hook inherits.
+        return self.started("--require-eligible", "--fleet-class", "m4pro-48", "--toolchain-xcode",
+                            "/Applications/Xcode_26.6.app", env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin"})
 
     def done(self) -> None:
         self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"))
@@ -471,6 +481,11 @@ class HookTest(unittest.TestCase):
             "xcode-drift": (dict(tools={"xcodeBuild": "17F999"}), "xcodeBuild '17F999' != '17F113'"),
             "zig-missing": (dict(tools={"zigVersion": None}), "zigVersion '' != '0.16.0'"),
             "no-generation": (dict(generation=False), "no node status from generation 3809eed51fdd"),
+            "receipt-invalid": (dict(valid=False), "class receipt does not validate"),
+            "wrong-role": (dict(role="some_other_role"), "some_other_role: ok"),
+            "receipt-without-toolchain": (dict(receipt_toolchain={}), "records no rustcVersion"),
+            "receipt-unknown-zig": (dict(receipt_toolchain={**self.TOOLCHAIN, "zigVersion": "unknown"}),
+                                    "records no zigVersion"),
         }
         for name, (kwargs, text) in cases.items():
             with self.subTest(name):
@@ -482,6 +497,17 @@ class HookTest(unittest.TestCase):
                 self.assertIn("refused: node not eligible", result.stdout)
                 self.assertIn(text, result.stdout)
                 self.assertTrue(self.lock_free(), "a refused job never takes the host lock")
+
+    def test_hung_tool_refuses_within_the_budget(self) -> None:
+        self.fleet()
+        self.node(hang="xcodebuild")
+        with mock.patch.dict(os.environ, {}):
+            start = time.monotonic()
+            result = self.started("--require-eligible", "--fleet-class", "m4pro-48",
+                                  env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("xcodeVersion '' != '26.6'", result.stdout)
+        self.assertLess(time.monotonic() - start, 30)
 
     def test_no_enrollment_refuses(self) -> None:
         self.fleet()

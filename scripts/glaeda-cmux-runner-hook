@@ -143,10 +143,14 @@ def reservation_refusal(path: str, now: float) -> str | None:
 
 FLEET_ROLE = "cmux_macos_native_build"
 NODE_STATUS_SCHEMA = "glaeda-cmux-fleet-node-status/v1"
-# (class receipt toolchain field, command) run from $HOME, so no checkout's rust-toolchain.toml applies.
+# (class receipt toolchain field, command) run from $HOME on the runner's own PATH (the job's PATH), so
+# no checkout's rust-toolchain.toml applies. Every field must be in the receipt: a receipt without them
+# proves nothing.
 TOOLCHAIN_PROBES = (("rustcVersion", ["rustc", "--version"]), ("cargoVersion", ["cargo", "--version"]),
                     ("zigVersion", ["zig", "version"]),
                     ("macosSdkVersion", ["xcrun", "--sdk", "macosx", "--show-sdk-version"]))
+REQUIRED_TOOLCHAIN = ("rustcVersion", "cargoVersion", "zigVersion", "xcodeVersion", "xcodeBuild", "macosSdkVersion")
+ELIGIBILITY_BUDGET_S = 20.0  # one deadline for every probe: a hung xcodebuild refuses, it does not stall
 
 
 def _json_file(path: Path) -> Any:
@@ -156,10 +160,13 @@ def _json_file(path: Path) -> Any:
         return None
 
 
-def _probe(argv: list[str], env: dict[str, str], cwd: Path) -> str:
+def _probe(argv: list[str], env: dict[str, str], cwd: Path, deadline: float) -> str:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return ""
     try:
         out = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env,
-                             cwd=cwd, timeout=60, check=False)
+                             cwd=cwd, timeout=remaining, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return out.stdout.strip() if out.returncode == 0 else ""
@@ -168,6 +175,7 @@ def _probe(argv: list[str], env: dict[str, str], cwd: Path) -> str:
 def eligibility_refusal(fleet_class: str | None, xcode_app: str | None) -> str | None:
     """Why this node may not run a PR job now (not eligible, or toolchain drift), or None."""
     home = Path.home()
+    deadline = time.monotonic() + ELIGIBILITY_BUDGET_S
     config = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "glaeda" / "cmux-fleet"
     if not fleet_class:
         return "node not eligible (no fleet class configured for this runner)"
@@ -184,34 +192,46 @@ def eligibility_refusal(fleet_class: str | None, xcode_app: str | None) -> str |
     if not re.fullmatch(r"[0-9a-f]{12,40}", commit):
         return "node not eligible (the class receipt names no Glaeda candidate)"
     generation = home / "Projects" / "glaeda-generations" / commit[:12]
+    if not generation.is_dir():
+        return f"node not eligible (no node status from generation {commit[:12]})"
+    # The receipt's own sha is a claim; the generation's validator recomputes it from the content.
+    valid = _probe([sys.executable, "-B", "-c",
+                    "import json, sys; sys.path.insert(0, 'scripts'); import cmux_fleet; "
+                    "cmux_fleet.validate_class_acceptance(json.load(open(sys.argv[1]))); print('valid')",
+                    os.fspath(config / "class-acceptance" / f"{fleet_class}.json")], dict(os.environ), generation, deadline)
+    if valid != "valid":
+        return f"node not eligible (the {fleet_class} class receipt does not validate)"
     status_out = _probe([sys.executable, "-B", os.fspath(generation / "scripts" / "cmux_fleet.py"), "status",
                          os.fspath(config / "enrollment.json"), "--acceptance",
-                         os.fspath(config / "acceptance" / f"{FLEET_ROLE}.json")], dict(os.environ), generation
-                        if generation.is_dir() else home)
+                         os.fspath(config / "acceptance" / f"{FLEET_ROLE}.json")], dict(os.environ), generation,
+                        deadline)
     try:
         status = json.loads(status_out)
     except ValueError:
         status = None
     if not isinstance(status, dict) or status.get("schema") != NODE_STATUS_SCHEMA:
         return f"node not eligible (no node status from generation {commit[:12]})"
-    if status.get("state") != "eligible" or status.get("routingCandidateEligible") is not True:
-        roles = status.get("roles") if isinstance(status.get("roles"), list) else []
-        why = ", ".join(str(r.get("reason")) for r in roles if isinstance(r, dict) and r.get("reason")) or "?"
+    roles = status.get("roles") if isinstance(status.get("roles"), list) else []
+    build_role = [r for r in roles if isinstance(r, dict) and r.get("role") == FLEET_ROLE]
+    if (status.get("state") != "eligible" or status.get("routingCandidateEligible") is not True
+            or not build_role or build_role[0].get("eligible") is not True):
+        why = ", ".join(f"{r.get('role')}: {r.get('reason')}" for r in roles if isinstance(r, dict)) or "no roles"
         return f"node not eligible (state {status.get('state')}, {why})"
     want = receipt.get("toolchain") if isinstance(receipt.get("toolchain"), dict) else {}
-    env = dict(os.environ)
-    env["PATH"] = ":".join([os.fspath(home / ".cargo/bin"), os.fspath(home / ".local/bin"), env.get("PATH", "")])
+    missing = [f for f in REQUIRED_TOOLCHAIN if not str(want.get(f) or "").strip() or str(want.get(f)) == "unknown"]
+    if missing:
+        return f"node not eligible (the {fleet_class} class receipt records no {', '.join(missing)})"
+    env = dict(os.environ)  # the runner's PATH, which is the job's PATH
     if xcode_app:
         env["DEVELOPER_DIR"] = os.fspath(Path(xcode_app) / "Contents" / "Developer")
     have: dict[str, str] = {}
     for field, argv in TOOLCHAIN_PROBES:
-        if field in want:
-            have[field] = _probe(argv, env, home)
-    if "xcodeVersion" in want or "xcodeBuild" in want:
-        lines = _probe(["xcodebuild", "-version"], env, home).splitlines()
-        have["xcodeVersion"] = lines[0].removeprefix("Xcode ").strip() if lines else ""
-        have["xcodeBuild"] = lines[1].removeprefix("Build version ").strip() if len(lines) > 1 else ""
-    drift = [f"{field} {have[field]!r} != {want[field]!r}" for field in have if field in want and have[field] != str(want[field])]
+        have[field] = _probe(argv, env, home, deadline)
+    lines = _probe(["xcodebuild", "-version"], env, home, deadline).splitlines()
+    have["xcodeVersion"] = lines[0].removeprefix("Xcode ").strip() if lines else ""
+    have["xcodeBuild"] = lines[1].removeprefix("Build version ").strip() if len(lines) > 1 else ""
+    drift = [f"{field} {have[field]!r} != {str(want[field])!r}" for field in REQUIRED_TOOLCHAIN
+             if have.get(field) != str(want[field])]
     if drift:
         return f"node not eligible (toolchain drifted from the {fleet_class} class receipt: {'; '.join(drift)})"
     return None
