@@ -263,6 +263,9 @@ class GlaedaDiskTest(unittest.TestCase):
                              min_bytes=0, git_disposable=True)
         self.fam.root.mkdir()
         origin = self.root / "origin"
+        # these stand in for a network server; any other local remote vouches for nothing
+        gd.TRUSTED_LOCAL_REMOTES = (str(origin), str(self.root / "subsrc"))
+        self.addCleanup(setattr, gd, "TRUSTED_LOCAL_REMOTES", ())
         self._git("init", "-q", "-b", "main", str(origin))
         (origin / "f").write_text("x")
         self._git("-C", str(origin), "add", "f")
@@ -515,6 +518,28 @@ class GlaedaDiskTest(unittest.TestCase):
             "embedded": ("git-checkout", confirm),
             "sub-worktree": ("git-checkout", ["submodule sm: has worktrees of its own"]),
             "local-fetch": ("git-checkout", confirm)})
+
+    def test_local_remotes_never_vouch_for_commits(self) -> None:
+        root, origin = self._tmp_repos()
+        a, b = root / "a", root / "b"
+        self._git("clone", "-q", str(origin), str(a))
+        self._git("-C", str(a), "commit", "-q", "--allow-empty", "-m", "only here")
+        self._git("clone", "-q", str(a), str(b))  # b's origin is a
+        self._git("-C", str(a), "remote", "add", "b", str(b))
+        self._git("-C", str(a), "fetch", "-q", "b")
+        for c in (a, b):
+            self._age(c)
+        v = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
+        self.assertEqual(v, {"a": ("git-checkout", ["commits no remote confirms"]),
+                             "b": ("git-checkout", ["commits no remote confirms"])})
+        self.assertEqual(gd.network_remotes(a / ".git"), ["origin"])  # not the sibling b
+
+    def test_network_remote_urls(self) -> None:
+        for url in ("https://github.com/o/r.git", "ssh://git@h/o/r", "git@github.com:o/r.git",
+                    "big-red:Projects/x", "git://h/r"):
+            self.assertTrue(gd.NETWORK_URL.match(url), url)
+        for url in ("/tmp/x", "../b", "./b", "file:///tmp/x", "b", "/c/x"):
+            self.assertFalse(gd.NETWORK_URL.match(url) and not url.startswith("file:"), url)
 
     def test_worktree_reflog_only_commit_is_kept(self) -> None:
         root, origin = self._tmp_repos()

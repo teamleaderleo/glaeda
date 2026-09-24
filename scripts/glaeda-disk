@@ -435,17 +435,43 @@ def local_tips(gitdir: Path, worktree_only: bool = False) -> list[str] | None:
     return sorted(t for t in tips if t and not ZERO.match(t))
 
 
+NETWORK_URL = re.compile(r"(https?|ssh|git|git\+ssh|ssh\+git)://|[^/.][^/:]*:(?!//)")
+
+
+TRUSTED_LOCAL_REMOTES: tuple[str, ...] = ()  # tests: local repos standing in for a server
+
+
+def network_remotes(gitdir: Path) -> list[str] | None:
+    """Remotes on another machine. A local path or file:// remote can be one more scratch repo
+    about to be deleted too (two clones fetching from each other vouch for commits that exist
+    nowhere else), so it never counts as a copy. None when the config cannot be read."""
+    out = _git_dir_run(gitdir, "config", "--get-regexp", r"^remote\..*\.url$")
+    if out is None:
+        return [] if _git_dir_run(gitdir, "rev-parse", "--git-dir") is not None else None
+    names = set()
+    for line in out.splitlines():
+        key, _, url = line.partition(" ")
+        name = key[len("remote."):-len(".url")]
+        trusted = any(url == t or url.startswith(t + "/") for t in TRUSTED_LOCAL_REMOTES)
+        if trusted or (NETWORK_URL.match(url) and not url.startswith("file:")):
+            names.add(name)
+        else:
+            names.discard(name)  # a remote with any local URL is not trusted
+            names.add(f"\0{name}")
+    return sorted(n for n in names if not n.startswith("\0") and f"\0{n}" not in names)
+
+
 def remote_has(gitdir: Path, commits: list[str]) -> bool:
     """True when some remote of this repository confirms it holds every one of `commits`.
 
     `fetch --negotiate-only` asks the server which of these it has in common and transfers no
     objects and writes no refs. An unreachable server, a refusal or a partial answer is False.
     """
-    remotes = _git_dir_run(gitdir, "remote")
+    remotes = network_remotes(gitdir)
     if not remotes:
         return False
     missing = set(commits)
-    for remote in remotes.split():
+    for remote in remotes:
         acked = _git_dir_run(gitdir, "-c", "protocol.version=2", "fetch", "--negotiate-only",
                              *[f"--negotiation-tip={c}" for c in sorted(missing)], remote,
                              network=True)
@@ -469,9 +495,13 @@ def repo_loss(gitdir: Path) -> str:
         return "unreadable refs"
     if not tips:
         return ""
+    remotes = network_remotes(gitdir)
+    if remotes is None:
+        return "unreadable remotes"
     try:
         r = subprocess.run(["git", "--git-dir", str(gitdir), "rev-list", "--max-count=5001",
-                            "--stdin", "--not", "--remotes"], input="\n".join(tips) + "\n",
+                            "--stdin", "--not", *[f"--remotes={n}/*" for n in remotes]],
+                           input="\n".join(tips) + "\n",
                            capture_output=True, text=True, timeout=60,
                            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
     except (OSError, subprocess.TimeoutExpired):
