@@ -618,8 +618,9 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("waits for brew (sudo-plan)", out["waiting"][0])
         self.assertIn("waits for rust", out["waiting"][1])
         script = mf.sudo_plan_script(self.manifest, "build-mini-1", result)
-        self.assertIn(f'[ -x /opt/homebrew/bin/brew ] || NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL {mf.HOMEBREW_INSTALLER})"',
+        self.assertIn(f'  curl -fsSL -o "$installer" {mf.HOMEBREW_INSTALLER}\n  NONINTERACTIVE=1 /bin/bash "$installer"\n',
                       script)
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
         self.assertNotIn("brew install", script)
         # Once Homebrew exists and the login user owns it, fix installs the formulas without root.
         checks["brew"] = {"state": "info", "detail": "cmux", "fix": "", "group": ""}
@@ -806,6 +807,9 @@ class ToolchainTests(unittest.TestCase):
         self.assertEqual(checks["rust"]["action"], {"kind": "rust_default", "toolchain": "stable"})
         ok = preflight_text() + "pf_rust_default\tstable-aarch64-apple-darwin (default)\n"
         self.assertEqual(self.result(ok)["checks"]["rust"]["state"], "ok")
+        self.manifest["defaults"]["toolchain"]["rustup_default"] = "1.8"
+        near = preflight_text() + "pf_rust_default\t1.80.0-aarch64-apple-darwin (default)\n"
+        self.assertEqual(self.result(near)["checks"]["rust"]["state"], "fail")
 
     def test_cmux_checkout_comes_from_the_toolchain(self) -> None:
         self.manifest["defaults"]["toolchain"]["cmux"] = {"repo": "example/cmux", "ref": "release", "root": "~/src/cmux",
@@ -877,6 +881,19 @@ class FixPlanTests(unittest.TestCase):
         self.assertIn("waits for metal (fix)", out["waiting"][0])
         self.assertIn("FAILED boom", log)
 
+    def test_one_host_raising_is_a_failure_not_a_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(mf, "run_repair", side_effect=OSError("disk full")):
+            out = mf.fix_host(self.manifest, "build-mini-1", self.result, True, Path(tmp))
+        self.assertTrue(out["failed"])
+        self.assertIn("OSError: disk full", out["failed"][0])
+
+    def test_unknown_prerequisites_name_their_cause(self) -> None:
+        self.result["checks"]["licence"] = {"state": "unknown", "detail": "no runnable xcodebuild in the pinned Xcode",
+                                            "fix": "", "group": ""}
+        waiting = mf.fix_host(self.manifest, "build-mini-1", self.result, False, None)["waiting"]
+        self.assertIn("waits for licence (unknown: no runnable xcodebuild in the pinned Xcode)", waiting[0])
+
     def test_glaeda_runs_with_the_python_enroll_will_use_and_waits_for_cargo(self) -> None:
         self.result["checks"]["glaeda"] = {"state": "fail", "detail": "", "fix": "", "group": "self", "action": {"kind": "glaeda"}}
         waiting = mf.fix_host(self.manifest, "build-mini-1", self.result, False, None)["waiting"]
@@ -938,9 +955,10 @@ class SudoPlanTests(unittest.TestCase):
     def test_sudoers_rule_is_narrow_and_checked_before_install(self) -> None:
         script = self.plan(preflight_text(), sudoers=True)
         rule = next(line for line in script.splitlines() if line.startswith("builder ALL="))
-        self.assertEqual(rule, "builder ALL=(root) NOPASSWD: /usr/bin/xcode-select -s /Applications/Xcode.app, "
-                               "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -runFirstLaunch, "
-                               "/bin/launchctl kickstart -k system/com.example.build-worker")
+        # Never a path rule for Xcode tools: /Applications is admin-writable, so that would be root.
+        self.assertEqual(rule, "builder ALL=(root) NOPASSWD: /bin/launchctl kickstart -k system/com.example.build-worker")
+        del self.manifest["defaults"]["launchd"]
+        self.assertIn("no rule to install", self.plan(preflight_text(), sudoers=True))
         self.assertLess(script.index('sudo visudo -cf "$rule"'), script.index(f"sudo install -m 0440"))
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
@@ -984,8 +1002,11 @@ class FixLibraryTests(unittest.TestCase):
     def test_parses_as_bash_and_never_escalates(self) -> None:
         subprocess.run(["bash", "-n", os.fspath(mf.FIX_LIBRARY)], check=True)
         body = [line for line in mf.FIX_LIBRARY.read_text().splitlines() if not line.lstrip().startswith("#")]
-        for word in ("sudo", "rm ", "curl"):
+        for word in ("sudo", "rm -r", "curl", "--force"):
             self.assertFalse([line for line in body if word in line], word)
+        # The only removal is the step lock's own pid file and directory.
+        self.assertEqual([line.strip() for line in body if "rm " in line],
+                         ["""trap 'rm -f "$HOME/.local/state/glaeda/mini-fleet/step.lock/pid"; rmdir "$HOME/.local/state/glaeda/mini-fleet/step.lock" 2>/dev/null || true' EXIT"""])
 
     @unittest.skipUnless(shutil.which("shasum") or shutil.which("sha256sum"), "needs shasum")
     def test_candidate_is_placed_only_when_its_digest_matches(self) -> None:
@@ -997,7 +1018,7 @@ class FixLibraryTests(unittest.TestCase):
                 (bin_dir / "shasum").write_text('#!/bin/sh\nshift 2\nexec sha256sum "$@"\n')
                 (bin_dir / "shasum").chmod(0o755)
             with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{bin_dir}:/usr/bin:/bin"):
-                self.assertEqual(self.call(home, "candidate_check", "abc", "a.tar.gz", "0" * 64).returncode, 1)
+                self.assertEqual(self.call(home, "candidate_check", "abc", "a.tar.gz", "0" * 64).returncode, 10)
                 self.assertEqual(self.call(home, "candidate_dir", "abc").returncode, 0)
                 directory = home / "Library/Caches/cmux-fleet/glaeda-candidate-abc"
                 (directory / "a.tar.gz.partial").write_bytes(b"candidate")
@@ -1027,6 +1048,30 @@ class FixLibraryTests(unittest.TestCase):
             self.assertEqual(os.readlink(home / ".local/bin/python3"), f"{dist}/python3")
             # Idempotent: its own link is replaced, not refused.
             self.assertEqual(self.call(home, "python_link", "~/.local/python-3.14", "3.13").returncode, 0)
+
+    def test_a_running_step_holds_the_host_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            lock = home / ".local/state/glaeda/mini-fleet/step.lock"
+            lock.mkdir(parents=True)
+            (lock / "pid").write_text(str(os.getpid()))  # a live process holds it
+            held = self.call(home, "candidate_dir", "abc")
+            self.assertEqual(held.returncode, 3)
+            self.assertIn("still running", held.stderr)
+            finished = subprocess.Popen(["true"])
+            finished.wait()
+            (lock / "pid").write_text(str(finished.pid))  # its process is gone: taken over, then released
+            self.assertEqual(self.call(home, "candidate_dir", "abc").returncode, 0)
+            self.assertFalse(lock.exists())
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_an_unfinished_clone_is_not_built_on(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            subprocess.run(["git", "init", "-q", os.fspath(home / "cmux")], check=True)
+            out = self.call(home, "cmux_clone", "example/cmux", "main", "~/cmux", "1")
+            self.assertEqual(out.returncode, 3)
+            self.assertIn("unfinished clone", out.stderr)
 
     def test_clone_refuses_a_directory_that_is_not_a_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1086,7 +1131,7 @@ class OperatorSideTests(unittest.TestCase):
                 (base / name / "bin/python3").write_text("")
             with mock.patch.dict(os.environ, {"HOME": tmp}):
                 os.environ.pop("GLAEDA_MINI_FLEET_PYTHON", None)
-                self.assertEqual(mf.operator_python_dist("3.13")[1], "3.14")
+                self.assertEqual(mf.operator_python_dist("3.13")[1], "3.14.0")
                 self.assertIsNone(mf.operator_python_dist("3.15"))
 
 

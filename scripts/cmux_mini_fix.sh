@@ -14,10 +14,27 @@ say() { printf 'glaeda-mini-fleet: %s\n' "$*"; }
 refuse() { say "refused: $*" >&2; exit 3; }
 home() { printf '%s' "${1/#\~/$HOME}"; }
 
+# One changing step at a time per host: an SSH timeout on the operator side does not stop the remote
+# step, so a rerun must not start the same work beside it. A lock whose process is gone is taken over.
+lock() {
+  local dir="$HOME/.local/state/glaeda/mini-fleet/step.lock" pid
+  mkdir -p "$(dirname "$dir")"
+  if ! mkdir "$dir" 2>/dev/null; then
+    pid=$(cat "$dir/pid" 2>/dev/null || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then refuse "another glaeda-mini-fleet step (pid $pid) is still running here"; fi
+  fi
+  echo $$ > "$dir/pid"
+  trap 'rm -f "$HOME/.local/state/glaeda/mini-fleet/step.lock/pid"; rmdir "$HOME/.local/state/glaeda/mini-fleet/step.lock" 2>/dev/null || true' EXIT
+}
+
 # The cmux checkout: a shallow clone of REF with submodules, as the fleet bootstrap reads them.
 cmux_clone() {  # REPO REF ROOT DEPTH
   local root; root=$(home "$3")
-  if [ -e "$root/.git" ]; then say "unchanged: $root is a checkout"; submodules "$3" "$4"; return; fi
+  if [ -e "$root/.git" ]; then
+    # An interrupted clone leaves a .git with no HEAD; building on it would fail later and obscurely.
+    git -C "$root" rev-parse --verify -q HEAD >/dev/null || refuse "$root is an unfinished clone (no HEAD); move it aside"
+    say "unchanged: $root is a checkout"; submodules "$3" "$4"; return
+  fi
   [ ! -e "$root" ] || refuse "$root exists and is not a git checkout"
   git clone --depth 1 --branch "$2" --progress "https://github.com/$1.git" "$root"
   submodules "$3" "$4"
@@ -88,9 +105,9 @@ candidate_dir() {  # SOURCE12
   mkdir -p "$HOME/Library/Caches/cmux-fleet/glaeda-candidate-$1"
 }
 
-candidate_check() {  # SOURCE12 NAME SHA256: exit 0 when the archive is already in place
+candidate_check() {  # SOURCE12 NAME SHA256: exit 0 when the archive is in place, 10 when it is absent
   local file="$HOME/Library/Caches/cmux-fleet/glaeda-candidate-$1/$2"
-  [ -f "$file" ] || exit 1
+  [ -f "$file" ] || exit 10
   local got; got=$(shasum -a 256 "$file" | cut -d' ' -f1)
   [ "$got" = "$3" ] || refuse "$file has sha256 $got, want $3; move it aside"
   say "unchanged: $file matches"

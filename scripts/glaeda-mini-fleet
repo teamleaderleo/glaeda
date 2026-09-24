@@ -36,8 +36,9 @@ host to its own file and ends with a fresh preflight. A rerun resumes: finished 
 `sudo-plan` prints one script per host with every root step preflight found (xcode-select,
 licence, first launch, Homebrew installs as the Homebrew owner and the rustup links, pmset). With
 --run it runs each over `ssh -t`, so the operator types each host's password once. --sudoers adds
-a narrow NOPASSWD rule (the pinned xcode-select and first launch, launchctl kickstart of the
-manifest's jobs) to the script, printed there for review.
+a narrow NOPASSWD rule, printed in the script for review: launchctl kickstart of the manifest's
+jobs only. xcode-select and first launch stay password steps, because /Applications is writable by
+the admin group and a path rule for an Xcode tool there would be passwordless root.
 
 The manifest's `toolchain` (in defaults, overridable per host) declares what every build host
 must carry: the Xcode app and build and whether it is selected, the Metal toolchain, the minimum
@@ -848,7 +849,8 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
         put("rust", "fail", f"not on the workload PATH: {', '.join(missing_rust)}",
             f"{as_owner}brew install rustup; link its cargo, rustc and rustup proxies into /opt/homebrew/bin", brew_group,
             brew("rustup"))
-    elif default_wanted and default_got is not None and not default_got.startswith(default_wanted):
+    elif default_wanted and default_got is not None and default_got != default_wanted and \
+            not default_got.startswith((f"{default_wanted}-", f"{default_wanted} ")):
         put("rust", "fail", f"rustup default is {default_got or 'unset'}, the manifest wants {default_wanted}",
             f"rustup default {default_wanted}", "self", {"kind": "rust_default", "toolchain": default_wanted})
     elif broken_rust:
@@ -1075,8 +1077,11 @@ def render_preflight(results: list[dict[str, Any]]) -> str:
 FIX_ORDER = ("xcode_clone", "python", "cmux_clone", "submodules", "brew", "rust_default", "rust_channel",
              "glaeda", "metal", "setup", "candidate")
 # What each repair needs to pass first (checks, or repairs made earlier in the same run).
-FIX_NEEDS = {"metal": ("licence",), "setup": ("cmux", "licence", "launch", "metal", "zig"), "brew": ("brew",),
-             "glaeda": ("rust",)}  # glaeda-mini-setup builds glaeda-worktree-reclaim with cargo
+# glaeda-mini-setup builds glaeda-worktree-reclaim with cargo, under the Python enroll will use.
+FIX_NEEDS = {"metal": ("licence", "launch"), "setup": ("cmux", "licence", "launch", "metal", "zig"), "brew": ("brew",),
+             "glaeda": ("python", "rust")}
+# Remote functions that only read; every other one takes the host's step lock.
+READ_ONLY_FUNCTIONS = {"candidate_check"}
 SUDO_ORDER = ("select", "licence", "first_launch", "power", "homebrew", "brew")
 HOMEBREW_INSTALLER = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
 FIX_TIMEOUTS = {"cmux_clone": 1800, "submodules": 1800, "brew": 5400, "rust_channel": 1800, "glaeda": 1800,
@@ -1128,6 +1133,8 @@ def waiting_on(action: dict[str, Any], checks: dict[str, Any], fixed: set[str]) 
         got = checks.get(need)
         if got is None or got["state"] in {"ok", "info"} or need in fixed:
             continue
+        if got["state"] == "unknown":
+            return f"{need} (unknown: {got['detail']})"
         who = {"password": "sudo-plan", "person": "a person", "self": "fix"}.get(got["group"], "a person")
         return f"{need} ({who})"
     return None
@@ -1193,8 +1200,8 @@ def ssh_stream(name: str, user: str, command: str, log: Any, stdin: bytes = b"",
 
 def fix_call(name: str, user: str, func: str, args: list[str], log: Any, timeout: float | None) -> int:
     """Run one function of cmux_mini_fix.sh on the host."""
-    script = (f"WORKLOAD_PATH={shlex.quote(bootstrap.CMUX_WORKLOAD_TOOL_PATH)}\n" + FIX_LIBRARY.read_text()
-              + "\n" + shlex.join([func, *args]) + "\n")
+    call = shlex.join([func, *args]) if func in READ_ONLY_FUNCTIONS else "lock; " + shlex.join([func, *args])
+    script = f"WORKLOAD_PATH={shlex.quote(bootstrap.CMUX_WORKLOAD_TOOL_PATH)}\n" + FIX_LIBRARY.read_text() + "\n" + call + "\n"
     return ssh_stream(name, user, "/bin/bash -c " + shlex.quote(script), log, timeout=timeout)
 
 
@@ -1216,16 +1223,17 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool) -> list[str]:
 
 
 def operator_python_dist(minimum: str) -> tuple[Path, str] | None:
-    """The newest relocatable CPython on this Mac that is at least `minimum`: (directory, major.minor)."""
+    """The newest relocatable CPython on this Mac that is at least `minimum`: (directory, full version)."""
     explicit = os.environ.get("GLAEDA_MINI_FLEET_PYTHON")
     found = [Path(explicit).expanduser()] if explicit else \
         sorted(Path("~/.local/share/uv/python").expanduser().glob("cpython-3.*-macos-aarch64-none"))
     best: tuple[Path, str] | None = None
     for directory in found:
-        match = re.match(r"cpython-(\d+)\.(\d+)", directory.resolve().name)
+        match = re.match(r"cpython-(\d+\.\d+(?:\.\d+)?)", directory.resolve().name)
         if not match or not (directory / "bin" / "python3").exists():
             continue
-        version = f"{match[1]}.{match[2]}"
+        # The directory name carries the full version, so a patch upgrade lands beside the old one.
+        version = match[1]
         if version_tuple(version) >= version_tuple(minimum) and \
                 (best is None or version_tuple(version) > version_tuple(best[1])):
             best = (directory.resolve(), version)
@@ -1334,8 +1342,8 @@ def stage_candidate(name: str, user: str, action: dict[str, Any], log: Any) -> t
     code = fix_call(name, user, "candidate_check", [source12, archive_name, candidate["sha256"]], log, 120)
     if code == 0:
         return True, "already in place"
-    if code != 1:
-        return False, "the archive on the host does not match; see the log"
+    if code != 10:
+        return False, f"cannot check the archive on the host (exit {code}); see the log"
     try:
         archive = fetch_candidate(candidate, log)
     except Failure as error:
@@ -1411,7 +1419,10 @@ def fix_host(manifest: dict[str, Any], name: str, result: dict[str, Any], yes: b
                 continue
             say(f"{name}: {label}")
             note(log, f"== {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {label}")
-            ok, detail = run_repair(manifest, name, action, log)
+            try:
+                ok, detail = run_repair(manifest, name, action, log)
+            except (Failure, OSError, subprocess.SubprocessError) as error:
+                ok, detail = False, f"{type(error).__name__}: {error}"
             note(log, f"== {'done' if ok else 'FAILED'} {detail}")
             if ok:
                 fixed.update(action["checks"])
@@ -1481,17 +1492,20 @@ def cmd_fix(manifest: dict[str, Any], hosts: list[str], yes: bool, log_dir: Path
     return 1 if failed else 0
 
 
-def sudoers_rule(manifest: dict[str, Any], name: str) -> str:
-    """A NOPASSWD rule for exactly the root commands later fleet runs repeat. Every word is validated."""
+def sudoers_rule(manifest: dict[str, Any], name: str) -> str | None:
+    """A NOPASSWD rule for restarting the manifest's launchd jobs, or None when it declares none.
+
+    It leaves out xcode-select and xcodebuild -runFirstLaunch on purpose: the pinned Xcode lives in
+    /Applications, which the admin group (the login user) can rename entries in, so a path-based rule
+    for either would give passwordless root to any process running as that user."""
     user = manifest["ssh_user"]
-    pin = xcode_pin(manifest, name)
-    if not re.fullmatch(r"[a-z_][a-z0-9_-]*", user) or not pin or not SAFE_PATH_RE.fullmatch(pin):
-        raise Failure(f"{name}: cannot write a sudoers rule for user {user!r} and Xcode {pin!r}")
-    commands = [f"/usr/bin/xcode-select -s {pin}", f"{pin}/Contents/Developer/usr/bin/xcodebuild -runFirstLaunch"]
-    for label in host_policy(manifest, name).get("launchd", {}).get("running", []):
-        if re.fullmatch(r"[A-Za-z0-9._-]+", label):
-            commands.append(f"/bin/launchctl kickstart -k system/{label}")
-    return f"{user} ALL=(root) NOPASSWD: " + ", ".join(commands)
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]*", user):
+        raise Failure(f"{name}: cannot write a sudoers rule for user {user!r}")
+    labels = [label for label in host_policy(manifest, name).get("launchd", {}).get("running", [])
+              if re.fullmatch(r"[A-Za-z0-9._-]+", label)]
+    if not labels:
+        return None
+    return f"{user} ALL=(root) NOPASSWD: " + ", ".join(f"/bin/launchctl kickstart -k system/{label}" for label in labels)
 
 
 def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any], sudoers: bool = False) -> str | None:
@@ -1529,14 +1543,24 @@ def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any]
             lines += ["sudo pmset -a autorestart 1"] if action["autorestart"] else []
         elif kind == "homebrew":
             # The installer refuses root; as the login user it asks sudo, which this script already primed.
+            # Download first: a failed curl inside "$(...)" would run an empty script and pass.
             lines += [f"step 'install Homebrew in /opt/homebrew for {action['user']} ({HOMEBREW_INSTALLER})'",
-                      f'[ -x /opt/homebrew/bin/brew ] || NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL {HOMEBREW_INSTALLER})"']
+                      "if [ ! -x /opt/homebrew/bin/brew ]; then",
+                      '  installer=$(mktemp)',
+                      f'  curl -fsSL -o "$installer" {HOMEBREW_INSTALLER}',
+                      '  NONINTERACTIVE=1 /bin/bash "$installer"',
+                      '  rm -f "$installer"',
+                      "fi"]
         elif kind == "brew":
             lines.append(f"step 'Homebrew as {action['owner']}: {' '.join(action['formulas'])}'")
             lines += brew_commands(action["owner"], action["formulas"], True)
-    if sudoers:
-        rule = sudoers_rule(manifest, name)
-        lines += [f"step 'sudoers rule {SUDOERS_FILE}'",
+    rule = sudoers_rule(manifest, name) if sudoers else None
+    if sudoers and rule is None:
+        lines.append("# --sudoers: the manifest declares no launchd jobs, so there is no rule to install.")
+    if rule:
+        lines += ["# xcode-select and xcodebuild -runFirstLaunch stay password steps: /Applications is writable by the",
+                  "# admin group, so a NOPASSWD path rule for either would be passwordless root for this user.",
+                  f"step 'sudoers rule {SUDOERS_FILE}'",
                   'rule=$(mktemp)',
                   "cat > \"$rule\" <<'SUDOERS'",
                   f"# glaeda-mini-fleet: {user} may run exactly these as root without a password.",
