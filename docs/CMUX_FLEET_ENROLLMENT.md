@@ -145,6 +145,23 @@ scripts/glaeda-mini-fleet preflight --output json     # machine-readable, with t
 
 It prints one host-by-check table (`ok`, `FAIL`, `todo` for a step onboarding itself performs, `?` when unknown), then each host's fixes in three groups: what the login user can do itself, what needs a password, and what needs a person. `todo` does not block; anything `FAIL` does. rustup runs with `RUSTUP_AUTO_INSTALL=0` and git with `GIT_OPTIONAL_LOCKS=0`, so the probe installs and writes nothing.
 
+### Declare the toolchain
+
+`defaults.toolchain` (overridable per host under `overrides.toolchain`) pins what every build host must carry, in one place: `xcode` (`app`, `version`, `build`, and `select`, default true), `metal` (default true), `zig_min`, `rustup_default`, `python_min` (at least 3.13), and `cmux` (`repo`, `ref`, `root`, `submodule_depth`, where 0 means full history). `preflight` and `fix` read it; the host's own Ghostty `minimum_zig_version` still applies when it is higher. When a toolchain is declared, `check` probes the preflight section too and reports toolchain drift (on hosts without a `node_id`, the cmux checkout checks are skipped).
+
+### Repair what needs no root, then batch what does
+
+```bash
+scripts/glaeda-mini-fleet fix cmux7s-mac-mini cmux8s-mac-mini          # dry run: what it would run, what waits
+scripts/glaeda-mini-fleet fix cmux7s-mac-mini cmux8s-mac-mini --yes    # run it; one log per host
+scripts/glaeda-mini-fleet sudo-plan cmux7s-mac-mini cmux8s-mac-mini    # one reviewed root script per host
+scripts/glaeda-mini-fleet sudo-plan cmux7s-mac-mini cmux8s-mac-mini --run   # ssh -t, one password per host
+```
+
+`fix` probes like `preflight`, then runs every repair the login user can make, per host in parallel and in dependency order: a shallow cmux clone at the declared ref with submodules, an APFS clone of the pinned Xcode, a relocatable CPython copied from this Mac into `~/.local` (`$GLAEDA_MINI_FLEET_PYTHON`, else the newest `uv` CPython under `~/.local/share/uv/python`), `brew install rustup zig` and the rustup proxy links when the login user owns Homebrew, `rustup default`, Glaeda and `glaeda-mini-setup --apply`, the Metal toolchain, cmux `./scripts/setup.sh`, and the reviewed candidate, downloaded once on this Mac with `gh`, checked against `CANDIDATE_SHA256`, and copied to where `persistent-compile up` looks. A repair whose prerequisite needs root (setup needs zig, which needs Homebrew) is listed as waiting. Each remote step is a function in `scripts/cmux_mini_fix.sh` that looks before it acts, so a rerun resumes, and none uses sudo or overwrites what it did not create. Logs go to `~/.local/state/glaeda/mini-fleet/fix-<time>/<host>.log`; a run ends with a fresh preflight.
+
+`sudo-plan` writes one script per host with every root step preflight found: `xcode-select -s`, licence, first launch, `pmset` (no sleep on AC, `autorestart 1`), Homebrew installs as its owner via `sudo -H -u <owner>` plus the rustup links, or, on a host with no Homebrew, the brew.sh installer run as the login user so it owns `/opt/homebrew` and later installs need no root. A prepared macOS update is noted, never restarted. `--run` runs each plan over `ssh -t`, one host after another, so the operator types each password once; the script keeps sudo's timestamp fresh while it runs. `--sudoers` adds `/etc/sudoers.d/glaeda-mini-fleet`, checked with `visudo -cf` first, allowing only `launchctl kickstart -k system/<job>` for the manifest's launchd jobs. It deliberately leaves out `xcode-select` and `xcodebuild -runFirstLaunch`: `/Applications` is writable by the admin group, so the login user could swap the app behind a path rule, which would make that rule passwordless root. Those stay one-password steps, needed once per Xcode. Run `fix` again afterwards.
+
 Each host may also carry `roles` (`dev-builds`, `ci-runner`, `nightly`, `ios-simulators`, `cache-host`) and the `sudo` mode it is expected to have (`nopasswd` or `password`, observed with `sudo -n -l`, which runs nothing). `controller_token: "present"` requires the fleet worker's controller token file to exist; the probe tests existence only and never reads it.
 
 ## Enroll a Mac in one command

@@ -66,6 +66,8 @@ if [ -n "$channel" ] && [ -n "$rustup" ]; then
 elif [ -n "$channel" ]; then
   e pf_rust_channel "$channel|"
 fi
+# The toolchain plain cargo and rustc resolve to outside the checkout (the manifest's rustup_default).
+[ -n "$rustup" ] && e pf_rust_default "$(cd "$HOME" && PATH="$WORKLOAD_PATH" "$rustup" default 2>&1 | grep -v '^info:' | first)"
 
 # glaeda-mini-enroll's interpreter search, in its order.
 py=""
