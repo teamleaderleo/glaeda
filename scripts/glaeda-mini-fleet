@@ -46,7 +46,7 @@ PROBE = SCRIPT_DIR / "cmux_mini_probe.sh"
 DEFAULT_MANIFEST = Path(os.environ.get("GLAEDA_MINI_FLEET_MANIFEST", "~/.config/glaeda/mini-fleet.json")).expanduser()
 SSH = "/usr/bin/ssh"
 PROBE_TIMEOUT = 90
-LIST_KEYS = {"xcode_app", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key"}
+LIST_KEYS = {"xcode_app", "xcode_ready", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key"}
 # Files sshd reads by default (OpenSSH AuthorizedKeysFile); every other authorized_keys* is a copy.
 LIVE_KEY_FILES = ("authorized_keys", "authorized_keys2")
 
@@ -150,6 +150,8 @@ def parse_probe(text: str) -> dict[str, Any]:
         "macos": out.get("macos"),
         "macos_build": out.get("macos_build"),
         "xcode_apps": [dict(zip(("path", "kind", "version", "build"), v.split("|", 3))) for v in out["xcode_app"]],
+        "xcode_ready": {path: {"licence": lic, "first_launch": first}
+                        for path, lic, first in (v.split("|", 2) for v in out["xcode_ready"])},
         "xcode_select": out.get("xcode_select"),
         "xcode_license_accepted": out.get("xcode_license_accepted"),
         "disk": {p: {"total_gib": int(t), "free_gib": int(f)}
@@ -248,10 +250,20 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
             drift("xcode", f"{want['path']} is a {got['kind']}, want a real directory (symlinked paths break cache replay)")
         elif (got["version"], got["build"]) != (want["version"], want["build"]):
             drift("xcode", f"{want['path']} is {got['version']} ({got['build']}), want {want['version']} ({want['build']})")
+        else:
+            ready = obs.get("xcode_ready", {}).get(want["path"])
+            developer = f"{want['path']}/Contents/Developer"
+            if ready and ready["licence"] != "accepted":
+                drift("xcode", f"{want['path']} licence not accepted",
+                      f"sudo env DEVELOPER_DIR={developer} xcodebuild -license accept")
+            if ready and ready["first_launch"] != "done":
+                drift("xcode", f"{want['path']} first launch not run",
+                      f"sudo env DEVELOPER_DIR={developer} xcodebuild -runFirstLaunch")
     if xcode.get("select") and obs["xcode_select"] != xcode["select"]:
         drift("xcode", f"xcode-select {obs['xcode_select']!r}, want {xcode['select']!r}", f"sudo xcode-select -s {xcode['select']}")
     # Xcode treats a licence accepted for a newer version as covering older ones.
-    if xcode.get("license") and version_tuple(obs["xcode_license_accepted"]) < version_tuple(xcode["license"]):
+    if xcode.get("license") and not obs.get("xcode_ready") and \
+            version_tuple(obs["xcode_license_accepted"]) < version_tuple(xcode["license"]):
         drift("xcode", f"licence accepted for {obs['xcode_license_accepted'] or 'nothing'}, want {xcode['license']}",
               "sudo xcodebuild -license accept && sudo xcodebuild -runFirstLaunch")
 
