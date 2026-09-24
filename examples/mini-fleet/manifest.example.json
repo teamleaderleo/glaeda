@@ -88,7 +88,25 @@
     "disk": {
       "min_free_gib": 100
     },
-    "controller_token": "present"
+    "controller_token": "present",
+    "toolchain": {
+      "xcode": {
+        "app": "/Applications/Xcode.app",
+        "version": "26.3",
+        "build": "17C529",
+        "select": true
+      },
+      "metal": true,
+      "zig_min": "0.16.0",
+      "rustup_default": "stable",
+      "python_min": "3.13",
+      "cmux": {
+        "repo": "manaflow-ai/cmux",
+        "ref": "main",
+        "root": "~/cmux",
+        "submodule_depth": 1
+      }
+    }
   },
   "hosts": {
     "build-mini-1": {
