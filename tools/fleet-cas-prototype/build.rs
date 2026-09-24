@@ -3,6 +3,7 @@ fn main() {
         [
             "compilation_caching_cas.proto",
             "compilation_caching_kv.proto",
+            "fleet_cas.proto",
         ],
         ["proto"],
     )

@@ -48,6 +48,14 @@ PKG=... SCHEME=... WORK=... DD=... scripts/reader-runs.sh http://<lan-ip>:7450 3
 ```
 
 Keep the socket path short; macOS limits unix socket paths to 104 bytes.
+`scripts/fleet-cas-settings.sh <socket>` prints the two plugin settings only
+when the node answers; with a dead socket Xcode 26.3 crawls instead of
+failing, so wrappers should add the settings only from its output.
+
+The node prefetches: after fetching an index entry it asks the fleet store for
+the entry's whole object closure in one streamed call (`GetClosure` in
+`proto/fleet_cas.proto`, a glaeda extension, not part of Xcode's protocol).
+`--no-prefetch` turns it off.
 Build under `$HOME` (never `/tmp`, see swiftlang/swift#92545). On Xcode 26.3,
 pass `DD=<fixed path>` (the same on every machine) instead of mapping
 DerivedData; see the 2026-09-24 experiment. On a cmux build fleet mini,

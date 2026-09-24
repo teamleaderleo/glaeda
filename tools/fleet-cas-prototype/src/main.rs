@@ -15,9 +15,10 @@
 //!   acknowledged, so an index entry never reaches the fleet store ahead of
 //!   the objects it names. With `--read-only-kv` nothing is forwarded.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 use prost::Message;
@@ -32,6 +33,9 @@ pub mod cas {
 }
 pub mod kv {
     tonic::include_proto!("compilation_cache_service.keyvalue.v1");
+}
+pub mod fleet {
+    tonic::include_proto!("glaeda.fleetcas.v1");
 }
 
 #[derive(Default)]
@@ -65,6 +69,10 @@ struct Stats {
     up_skipped: AtomicU64,
     /// Fetched objects whose recomputed ID did not match (answered as misses).
     up_cas_verify_fail: AtomicU64,
+    /// Closure prefetches: calls, objects kept, bytes kept.
+    up_prefetch_calls: AtomicU64,
+    up_prefetched: AtomicU64,
+    up_prefetch_bytes: AtomicU64,
 }
 
 impl Stats {
@@ -94,6 +102,9 @@ impl Stats {
             ("up_errors", &self.up_errors),
             ("up_skipped", &self.up_skipped),
             ("up_cas_verify_fail", &self.up_cas_verify_fail),
+            ("up_prefetch_calls", &self.up_prefetch_calls),
+            ("up_prefetched", &self.up_prefetched),
+            ("up_prefetch_bytes", &self.up_prefetch_bytes),
         ];
         let body: Vec<String> = fields
             .iter()
@@ -113,10 +124,12 @@ impl Stats {
     }
 }
 
-#[derive(Clone)]
 struct Upstream {
     cas: cas::casdb_service_client::CasdbServiceClient<Channel>,
     kv: kv::key_value_db_client::KeyValueDbClient<Channel>,
+    fleet: fleet::fleet_cas_client::FleetCasClient<Channel>,
+    /// Cleared if the fleet store does not serve GetClosure.
+    closure: AtomicBool,
 }
 
 struct Store {
@@ -154,6 +167,78 @@ fn data_object(refs: Vec<cas::CasDataId>, data: Vec<u8>) -> cas::CasObject {
         }),
         references: refs,
     }
+}
+
+/// The store IDs an index entry names. Xcode's value is its own nested
+/// protobuf record in which each output appears as a pair: the plugin's
+/// 65-byte ID and this store's 32-byte ID. Walk the wire format and collect
+/// every 32-byte length-delimited field; a false positive only costs a lookup
+/// of an absent ID.
+fn embedded_ids(value: &kv::Value) -> Vec<Vec<u8>> {
+    fn varint(b: &[u8], i: &mut usize) -> Option<u64> {
+        let mut r = 0u64;
+        for shift in (0..64).step_by(7) {
+            let c = *b.get(*i)?;
+            *i += 1;
+            r |= u64::from(c & 0x7f) << shift;
+            if c < 0x80 {
+                return Some(r);
+            }
+        }
+        None
+    }
+    // Returns false if `b` is not a well-formed message, so a string that
+    // happens to start like one is not mined for IDs.
+    fn walk(b: &[u8], depth: u32, out: &mut Vec<Vec<u8>>) -> bool {
+        let mut i = 0;
+        let mut found = Vec::new();
+        while i < b.len() {
+            let Some(key) = varint(b, &mut i) else {
+                return false;
+            };
+            match key & 7 {
+                0 => {
+                    if varint(b, &mut i).is_none() {
+                        return false;
+                    }
+                }
+                1 => i += 8,
+                5 => i += 4,
+                2 => {
+                    let Some(len) = varint(b, &mut i) else {
+                        return false;
+                    };
+                    let Some(end) = i.checked_add(len as usize).filter(|&e| e <= b.len()) else {
+                        return false;
+                    };
+                    let field = &b[i..end];
+                    if field.len() == 32 {
+                        found.push(field.to_vec());
+                    } else if depth < 8 {
+                        walk(field, depth + 1, &mut found);
+                    }
+                    i = end;
+                }
+                _ => return false,
+            }
+        }
+        if i != b.len() {
+            return false;
+        }
+        out.extend(found);
+        true
+    }
+    let mut out = Vec::new();
+    for v in value.entries.values() {
+        if v.len() == 32 {
+            out.push(v.clone());
+        } else {
+            walk(v, 0, &mut out);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn upstream_err(e: Status) -> Status {
@@ -391,14 +476,91 @@ impl Store {
         Ok(id)
     }
 
-    /// Count entries that name absent objects. Xcode's values map names to
-    /// 32-byte object IDs here; this measures the M3 publication rule
-    /// without enforcing it yet.
+    /// After fetching an index entry, pull every object it reaches in one
+    /// streamed call, so Xcode's per-object loads that follow are local hits
+    /// instead of one fleet round trip each. Best effort: anything missed
+    /// here is still fetched object by object.
+    async fn prefetch(&self, value: &kv::Value) {
+        // The channel's per-call timeout covers only the response headers,
+        // not a streamed body: bound the whole prefetch, so a store that
+        // stalls mid-stream costs one timeout, then the backoff.
+        let limit = std::time::Duration::from_secs(30);
+        if tokio::time::timeout(limit, self.prefetch_inner(value))
+            .await
+            .is_err()
+        {
+            self.upstream_failed();
+        }
+    }
+
+    async fn prefetch_inner(&self, value: &kv::Value) {
+        let Some(up) = &self.upstream else { return };
+        if !up.closure.load(Relaxed) {
+            return;
+        }
+        let roots: Vec<Vec<u8>> = embedded_ids(value)
+            .into_iter()
+            .filter(|id| !self.cas_path(id).exists())
+            .collect();
+        if roots.is_empty() {
+            return;
+        }
+        let t = Instant::now();
+        let mut client = up.fleet.clone();
+        let mut stream = match client.get_closure(fleet::ClosureRequest { roots }).await {
+            Ok(r) => r.into_inner(),
+            Err(e) if e.code() == tonic::Code::Unimplemented => {
+                up.closure.store(false, Relaxed);
+                return;
+            }
+            // A busy or refusing store: skip this prefetch only; the objects
+            // still come one by one.
+            Err(e)
+                if matches!(
+                    e.code(),
+                    tonic::Code::ResourceExhausted | tonic::Code::InvalidArgument
+                ) =>
+            {
+                return;
+            }
+            Err(_) => {
+                self.upstream_failed();
+                return;
+            }
+        };
+        self.stats.up_prefetch_calls.fetch_add(1, Relaxed);
+        while let Ok(Some(m)) = stream.message().await {
+            let Ok(obj) = cas::CasObject::decode(m.object.as_slice()) else {
+                self.stats.up_cas_verify_fail.fetch_add(1, Relaxed);
+                continue;
+            };
+            let data = blob_data(&obj).to_vec();
+            if object_id(&obj.references, &data) != m.id {
+                self.stats.up_cas_verify_fail.fetch_add(1, Relaxed);
+                continue;
+            }
+            if self.cas_path(&m.id).exists() {
+                continue;
+            }
+            let len = data.len() as u64;
+            if self.put(obj.references, data).is_ok() {
+                self.stats.up_prefetched.fetch_add(1, Relaxed);
+                self.stats.up_prefetch_bytes.fetch_add(len, Relaxed);
+            }
+        }
+        self.stats.up_calls.fetch_add(1, Relaxed);
+        self.stats
+            .up_micros
+            .fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+    }
+
+    /// Count entries that name absent objects (the M3 publication rule,
+    /// measured here, not enforced yet). Any 32-byte field in the record
+    /// counts as an ID, so this can over-count, never under-count.
     fn count_dangling(&self, value: &kv::Value) {
-        let dangling = value
-            .entries
-            .values()
-            .any(|v| v.len() == 32 && !self.cas_path(v).exists());
+        let dangling = embedded_ids(value)
+            .iter()
+            .any(|id| !self.cas_path(id).exists());
         if dangling {
             self.stats.kv_put_dangling.fetch_add(1, Relaxed);
         }
@@ -524,6 +686,7 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
             return Ok(kv_response(None));
         };
         s.stats.up_kv_fetch.fetch_add(1, Relaxed);
+        s.prefetch(&value).await;
         // Keep it: the next lookup on this node is local.
         let _ = std::fs::create_dir_all(path.parent().unwrap())
             .and_then(|_| publish_new(&path, &value.encode_to_vec()));
@@ -584,8 +747,64 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
     }
 }
 
-const USAGE: &str =
-    "usage: fleet-cas <socket | tcp:ADDR> <store> [--read-only-kv] [--upstream http://HOST:PORT]";
+struct FleetSvc(Arc<Store>);
+
+/// Bounds on the unauthenticated closure RPC: roots per call, and walks in
+/// flight (each holds a blocking-pool thread while it streams).
+const MAX_CLOSURE_ROOTS: usize = 4096;
+static CLOSURE_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(64)));
+
+#[tonic::async_trait]
+impl fleet::fleet_cas_server::FleetCas for FleetSvc {
+    type GetClosureStream =
+        tokio_stream::wrappers::ReceiverStream<Result<fleet::ClosureObject, Status>>;
+
+    async fn get_closure(
+        &self,
+        r: Request<fleet::ClosureRequest>,
+    ) -> Result<Response<Self::GetClosureStream>, Status> {
+        let mut queue = r.into_inner().roots;
+        queue.sort();
+        queue.dedup();
+        if queue.len() > MAX_CLOSURE_ROOTS {
+            return Err(Status::invalid_argument("too many closure roots"));
+        }
+        let permit = CLOSURE_SLOTS
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("closure walks busy"))?;
+        let store = self.0.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut seen: HashSet<Vec<u8>> = queue.iter().cloned().collect();
+            while let Some(id) = queue.pop() {
+                // `get` verifies the object and treats damage as absence.
+                let Ok(Some(obj)) = store.get(&id) else {
+                    continue;
+                };
+                for r in &obj.references {
+                    if seen.insert(r.id.clone()) {
+                        queue.push(r.id.clone());
+                    }
+                }
+                let msg = fleet::ClosureObject {
+                    id,
+                    object: obj.encode_to_vec(),
+                };
+                if tx.blocking_send(Ok(msg)).is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+}
+
+const USAGE: &str = "usage: fleet-cas <socket | tcp:ADDR> <store> [--read-only-kv] [--upstream http://HOST:PORT] [--no-prefetch]";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -596,10 +815,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(root);
     let mut read_only_kv = false;
     let mut upstream_url = None;
+    let mut prefetch = true;
     let mut rest = args[2..].iter();
     while let Some(a) = rest.next() {
         match a.as_str() {
             "--read-only-kv" => read_only_kv = true,
+            "--no-prefetch" => prefetch = false,
             "--upstream" => upstream_url = Some(rest.next().ok_or(USAGE)?.clone()),
             _ => return Err(USAGE.into()),
         }
@@ -616,12 +837,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .tcp_nodelay(true)
                 .connect_timeout(std::time::Duration::from_secs(2))
                 .timeout(std::time::Duration::from_secs(30))
+                .http2_keep_alive_interval(std::time::Duration::from_secs(10))
+                .keep_alive_timeout(std::time::Duration::from_secs(5))
+                .keep_alive_while_idle(true)
                 .connect_lazy();
             Some(Upstream {
                 cas: cas::casdb_service_client::CasdbServiceClient::new(ch.clone())
                     .max_decoding_message_size(512 << 20)
                     .max_encoding_message_size(512 << 20),
-                kv: kv::key_value_db_client::KeyValueDbClient::new(ch),
+                kv: kv::key_value_db_client::KeyValueDbClient::new(ch.clone()),
+                fleet: fleet::fleet_cas_client::FleetCasClient::new(ch)
+                    .max_decoding_message_size(512 << 20),
+                closure: AtomicBool::new(prefetch),
             })
         }
         None => None,
@@ -657,12 +884,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let final_store = store.clone();
     let router = tonic::transport::Server::builder()
         .tcp_nodelay(true)
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(10)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
         .add_service(
             cas::casdb_service_server::CasdbServiceServer::new(CasSvc(store.clone()))
                 .max_decoding_message_size(512 << 20)
                 .max_encoding_message_size(512 << 20),
         )
-        .add_service(kv::key_value_db_server::KeyValueDbServer::new(KvSvc(store)));
+        .add_service(kv::key_value_db_server::KeyValueDbServer::new(KvSvc(
+            store.clone(),
+        )))
+        .add_service(
+            fleet::fleet_cas_server::FleetCasServer::new(FleetSvc(store))
+                .max_encoding_message_size(512 << 20),
+        );
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
     };
