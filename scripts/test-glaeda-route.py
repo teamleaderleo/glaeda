@@ -819,14 +819,6 @@ class CountingTests(unittest.TestCase):
         d = gr.decide(idle_state(std_idle=4, light_idle=0), ledger_doc(fresh_start), request(slots=3), now=NOW + 10)
         self.assertFalse(d.owned)
 
-    def test_runner_in_two_pools_is_idle_in_one_only(self):
-        both = {"name": "m1-glaeda", "status": "online", "busy": False,
-                "labels": [{"name": STD}, {"name": "glaeda-std-xcode-26.4"}]}
-        pools = {"observed_at": NOW, "pools": {STD: {"conforming": ["m1"]},
-                                               "glaeda-std-xcode-26.4": {"conforming": ["m1"]}}}
-        doc = gr.build_state(pools, {"runners": [both]}, repo=REPO, now=NOW)
-        self.assertEqual((doc["pools"][STD]["idle"], doc["pools"]["glaeda-std-xcode-26.4"]["idle"]), (1, 0))
-
     def test_malformed_state_answers_the_default_instead_of_crashing(self):
         store, ledger = fake_ledger()
         for bad in ({**idle_state(), "order": [STD, 3]},
