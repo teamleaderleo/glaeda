@@ -1318,6 +1318,9 @@ FIX_NEEDS = {"metal": ("licence", "launch"), "setup": ("cmux", "licence", "launc
 # Remote functions that only read; every other one takes the host's step lock.
 # share_send only reads, and stays lock-free so one source can feed several peers at once.
 READ_ONLY_FUNCTIONS = {"candidate_check", "share_have", "share_source", "share_send", "host_check"}
+# Steps that honor less of the host gate than the default (both the fleet host lock and reservations):
+# a drain waits out the job holding the lock, and restoring runners never builds anything.
+LOCK_GATE = {"runner_hold": "reservation", "runner_release": "none", "runner_kick": "none"}
 SUDO_ORDER = ("select", "licence", "first_launch", "power", "homebrew", "brew")
 HOMEBREW_INSTALLER = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
 FIX_TIMEOUTS = {"cmux_clone": 1800, "submodules": 1800, "brew": 5400, "rust_channel": 1800, "glaeda": 1800,
@@ -1441,7 +1444,9 @@ def library_command(func: str, args: list[str], keep_stdin: bool = False) -> str
     """`/bin/bash -c` running one cmux_mini_fix.sh function, ready to hand to ssh as its command.
 
     Every function that changes the host first takes its step lock."""
-    call = shlex.join([func, *args]) if func in READ_ONLY_FUNCTIONS else "lock; " + shlex.join([func, *args])
+    gate = LOCK_GATE.get(func, "")
+    call = shlex.join([func, *args]) if func in READ_ONLY_FUNCTIONS else \
+        f"lock{' ' + gate if gate else ''}; " + shlex.join([func, *args])
     script = (f"WORKLOAD_PATH={shlex.quote(bootstrap.CMUX_WORKLOAD_TOOL_PATH)}\n" + ("KEEP_STDIN=1\n" if keep_stdin else "")
               + FIX_LIBRARY.read_text() + "\n" + call + "\n")
     return "/bin/bash -c " + shlex.quote(script)
@@ -1665,6 +1670,10 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
             return False, f"{seed} cannot seed {thing} ({problem})"
         # Python, the candidate and Metal also have a path without a seed: this Mac, or the internet.
         note(log, f"{seed} cannot seed {thing} ({problem}); using the path without a seed")
+    if kind in {"xcode_clone", "brew"}:  # neither goes through the fix library's lock(), so ask first
+        code = fix_call(name, user, "host_check", [], log, 120)
+        if code:
+            return False, held_or(code, None, "could not check the host lock and reservation")
     if kind == "xcode_clone":
         code, text = remote(name, user, CLONE_XCODE, [action["source"], action["path"], action["version"], action["build"]])
         note(log, text)
@@ -2310,11 +2319,12 @@ def resolve_glaeda_main(repo: str) -> str:
     return sha
 
 
-def held_or(code: int, log_path: Path, what: str) -> str:
+def held_or(code: int, log_path: Path | None, what: str) -> str:
     """A step's refusal for a row: held (the fleet host lock or a reservation) or what failed."""
+    line = last_line(log_path) if log_path else ""
     if code == HELD_EXIT:
-        return "held: " + last_line(log_path).split("held: ", 1)[-1]
-    return f"{what}: {last_line(log_path)}"
+        return "held: " + (line.split("held: ", 1)[-1] or "the fleet host lock or a reservation")
+    return f"{what}: {line or f'exit {code}'}"
 
 
 def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str], glaeda_ref: str,
@@ -2344,6 +2354,10 @@ def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candi
         if code:
             return False, "drain", held_or(code, log_path, "could not stop the runners")
         command = enroll_command(manifest, name, result, candidate, False, receipt[:2] if receipt else None, renew=True)
+        code = fix_call(name, user, "host_check", [], log, 120)  # the drain may have waited long; ask again
+        if code:
+            fix_call(name, user, "runner_release", ["if-eligible"], log, 300)
+            return False, "renew", held_or(code, log_path, "could not check the host lock and reservation")
         step(f"renew ({command})")
         code = ssh_stream(name, user, command, log, stdin=receipt[2] if receipt else b"", timeout=ENROLL_TIMEOUT)
     if code:
@@ -2369,8 +2383,9 @@ def _enroll_one(manifest: dict[str, Any], name: str, result: dict[str, Any], can
                              class_receipt[:2] if class_receipt else None)
     with open(log_path, "ab") as log:
         # glaeda-mini-enroll takes no step lock, so the host gate is asked right before it.
-        if fix_call(name, manifest["ssh_user"], "host_check", [], log, 120):
-            return HELD_EXIT
+        code = fix_call(name, manifest["ssh_user"], "host_check", [], log, 120)
+        if code:
+            return code
         note(log, f"== enroll ({command})")
         return ssh_stream(name, manifest["ssh_user"], command, log, stdin=class_receipt[2] if class_receipt else b"",
                           timeout=ENROLL_TIMEOUT)
@@ -2507,7 +2522,8 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
                 code = subprocess.run([SSH, "-t", "-o", "ConnectTimeout=10", "-l", manifest["ssh_user"], name,
                                        "/bin/bash -c " + shlex.quote(script)], check=False).returncode
                 if code:
-                    settle(name, "sudo-plan", f"failed: exit {code}")
+                    settle(name, "sudo-plan", "held, skipped (see the plan's output)" if code == HELD_EXIT
+                           else f"failed: exit {code}")
         elif sudo == "wait" and sys.stdin.isatty():
             print(f"\nRoot steps are needed on {', '.join(plans)}. Review the plans in {directory}, then run:\n"
                   f"  glaeda-mini-fleet sudo-plan {' '.join(plans)} --run\nPress Enter here when they are done.", flush=True)

@@ -1243,6 +1243,11 @@ class FixLibraryTests(unittest.TestCase):
                         {**marker, "schema": "v2"}, "not json"):
                 (fleet / "reservation.json").write_text(bad if isinstance(bad, str) else json.dumps(bad))
                 self.assertEqual(self.call(home, "host_check").returncode, 20, bad)  # invalid counts as held
+            # A far-future until overflowed gmtime and crashed perl, which once read as free.
+            (fleet / "reservation.json").write_text(json.dumps({**marker, "until": 9223372036854775807}))
+            self.assertEqual(self.call(home, "host_check").returncode, 20)
+            (fleet / "reservation.json").write_text(json.dumps(marker).replace("4102444800", "2e3"))  # Python: a float
+            self.assertEqual(self.call(home, "host_check").returncode, 20)
             (fleet / "reservation.json").write_text(json.dumps({**marker, "until": 2}))  # expired
             (fleet / "host.lock").write_text("")
             self.assertEqual(self.call(home, "host_check").returncode, 0)
@@ -1252,6 +1257,12 @@ class FixLibraryTests(unittest.TestCase):
                 locked = self.call(home, "host_check")
                 self.assertEqual(locked.returncode, 20)
                 self.assertIn("held by another build (fleet host lock", locked.stdout)
+                # A drain honors only reservations: it waits out the job that holds the lock.
+                gate = subprocess.run(["bash", "-c", 'say() { :; }; eval "$(sed -n "/^# >>> host gate/,/^# <<< host gate/p" '
+                                       f'{mf.FIX_LIBRARY})"; host_held reservation || echo free'],
+                                      capture_output=True, text=True, env={"PATH": "/usr/bin:/bin",
+                                                                           "GLAEDA_FLEET_DIR": os.fspath(fleet)})
+                self.assertEqual(gate.stdout.strip(), "free")
             finally:
                 os.close(fd)
             self.assertEqual(self.call(home, "candidate_dir", "abc").returncode, 0)
@@ -1855,8 +1866,8 @@ class RepairTests(unittest.TestCase):
         code, out, calls = run_command({"build-mini-1": on_candidate()}, "--yes", command="repair",
                                        manifest=self.manifest, after=after)
         self.assertEqual(code, 0, out)
-        order = ("lock; glaeda_sync " + "d" * 40, "candidate_check", "lock; runner_hold 2400", ENROLL,
-                 "lock; runner_release")
+        order = ("lock; glaeda_sync " + "d" * 40, "candidate_check", "lock reservation; runner_hold 2400", "host_check",
+                 ENROLL, "lock none; runner_release")
         self.assertEqual([next(k for k in order if k in remote_call(c[1])) for c in calls], list(order))
         enroll = calls_to(calls, ENROLL)[0]
         self.assertIn(f"--renew --class-receipt - --class-receipt-sha256 {RECEIPT_SHA} --fleet-class m4pro-48",
@@ -1877,7 +1888,7 @@ class RepairTests(unittest.TestCase):
         self.assertIn("quarantined: differs from class m4pro-48 in toolchain.rustc, hardware.memoryGiB", out)
         self.assertIn("glaeda-mini-fleet repair build-mini-1 --acceptance node --yes", out)
         # After a failed renewal the runners come back only if the node still serves; the host decides.
-        self.assertEqual([remote_call(c[1]) for c in calls_to(calls, "runner_release")], ["lock; runner_release if-eligible"])
+        self.assertEqual([remote_call(c[1]) for c in calls_to(calls, "runner_release")], ["lock none; runner_release if-eligible"])
 
     def test_no_receipt_for_the_candidate_blocks_before_anything_runs(self) -> None:
         manifest = pinned_manifest(self.tmp.name, recorded_for="59ca9c9bd1bb")
@@ -1904,8 +1915,8 @@ class RepairTests(unittest.TestCase):
                                               node_id="cmux-mac-002")}
         code, out, calls = run_command(texts, "--yes", command="repair", manifest=self.manifest, after=texts)
         self.assertEqual(code, 0, out)
-        self.assertEqual([c[0] for c in calls_to(calls, "lock; runner_kick")], ["build-mini-1"])
-        self.assertEqual([c[0] for c in calls_to(calls, "lock; runner_release")], ["build-mini-2"])
+        self.assertEqual([c[0] for c in calls_to(calls, "lock none; runner_kick")], ["build-mini-1"])
+        self.assertEqual([c[0] for c in calls_to(calls, "lock none; runner_release")], ["build-mini-2"])
         self.assertEqual(calls_to(calls, ENROLL), [])
         draining = {"build-mini-1": on_candidate(state="draining")}
         code, out, calls = run_command(draining, "--yes", command="repair", manifest=self.manifest, after=draining)
