@@ -39,7 +39,9 @@ So a slot keeps two DerivedData directories and picks per job:
 | iteration DerivedData | `/Users/Shared/cmux-build-fleet/xcode/slot-<n>/iter/DerivedData` | no: never touches the cache |
 
 The catch-up DerivedData is one path per host, not per slot, because its path is in every key
-(mapping it crashes swift-frontend on Xcode 26.3 and 26.6).
+(mapping it crashes swift-frontend on Xcode 26.3 and 26.6). The host lock already serializes
+builds, so one catch-up build per host at a time is not a new limit. Iteration directories can
+be per slot because nothing is shared from them.
 
 Both path rules hold on the fleet pin, Xcode 26.6 (17F113), measured on cmux8s:
 
@@ -47,9 +49,7 @@ Both path rules hold on the fleet pin, Xcode 26.6 (17F113), measured on cmux8s:
   `bad_optional_access`;
 - a fresh full-app build against a filled local CAS at the same path hit 4,192 of 4,192 in
   102 s, while the same CAS cloned to a different path hit 1,535 of 4,192 and took 600 s (the
-  whole app target missed). The host lock already serializes
-builds, so one catch-up build per host at a time is not a new limit. Iteration directories can
-be per slot because nothing is shared from them.
+  whole app target missed).
 
 Contract, checked by `glaeda-mini-fleet check`:
 
