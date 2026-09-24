@@ -40,17 +40,21 @@ const DEFAULT_MAX_RECLAIMS: usize = 32;
 /// Default number of local branches one run may delete across all repositories.
 const DEFAULT_MAX_BRANCH_DELETIONS: usize = 64;
 
-/// Where `gh` is looked for when `--gh` is not given; scheduled jobs run with a minimal PATH.
+/// Where `gh` is looked for when `--gh` is not given, after `~/.local/bin/gh`; scheduled jobs
+/// run with a minimal PATH.
 const GH_CANDIDATES: [&str; 3] = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"];
 
 /// Environment passed to `gh` so it finds its configuration and stored credentials.
-const GH_ENVIRONMENT: [&str; 6] = [
+const GH_ENVIRONMENT: [&str; 8] = [
     "HOME",
     "XDG_CONFIG_HOME",
     "GH_CONFIG_DIR",
     "GH_TOKEN",
     "GITHUB_TOKEN",
     "USER",
+    // Linux: gh reads a keyring-stored token through the session bus.
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
 ];
 
 // Ignored files are gone for good; everything else comes back with `git worktree add` at the
@@ -257,9 +261,10 @@ fn main() -> ExitCode {
     let github = (!cli.no_github)
         .then(|| {
             cli.gh.clone().or_else(|| {
-                GH_CANDIDATES
-                    .iter()
-                    .map(PathBuf::from)
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".local/bin/gh"))
+                    .into_iter()
+                    .chain(GH_CANDIDATES.iter().map(PathBuf::from))
                     .find(|path| path.is_file())
             })
         })
