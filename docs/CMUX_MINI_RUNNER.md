@@ -107,7 +107,27 @@ What `--apply` does:
      rustup change). The check takes about a second and runs
      on every job, so a mini that drifts or loses eligibility stops taking PR jobs at
      once, and refusal recovery re-runs the job elsewhere.
-   - job-completed releases the host lock, runs the same disk pressure pass and always exits 0.
+   - With weighted capacity (`--capacity-units N`, baked in from the manifest class for
+     every member, see 2d), the job takes a share of the mini instead of the whole host
+     lock. It holds a shared `flock` on `host.lock` (so `with-host-lock`'s `LOCK_EX`,
+     the build worker, waits for every PR job, and a held worker lock refuses them),
+     plus units and tokens under `/Users/Shared/cmux-build-fleet/capacity`, all as
+     `flock`s held by the job's detached holder, so a crash frees them. The cost comes
+     from `GITHUB_JOB`: `macos-compile-admission` 2 units plus the `persistent-dd`
+     token (one writer of the kept DerivedData at a time), `app-host-unit-tests` and
+     `tests-build-and-lag` 1 unit plus the `gui` token (one console session),
+     `cli-product-tests` and `swift-package-tests` 1 unit, and any other job counts
+     as a compile. When units or a token are taken it refuses at once with
+     `refused: capacity: ...`, which the refusal rescue re-runs elsewhere; it never
+     waits. Because `flock` gives no preference to the exclusive waiter, it also
+     refuses while another process (the build worker in `with-host-lock`) is waiting
+     for `host.lock`, so the worker gets the host as soon as the running PR jobs end.
+     Admissions on one mini are serialized for a moment (`capacity/admission.lock`),
+     so two jobs never split the free units between them.
+   - The toolchain check also requires `gh` on the job PATH: cmux's CI scripts call
+     `gh api`, and a mini without it fails jobs midway instead of refusing them.
+   - job-completed releases the host lock (or the capacity share), runs the same disk
+     pressure pass and always exits 0.
 4. Writes and loads `~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist`
    (runs `run.sh`, restarts on crash, logs to `~/Library/Logs/glaeda-cmux-runner.log`).
 5. Confirms through the GitHub API that the runner is listed with every label and
@@ -196,6 +216,29 @@ Relabelling keeps the runner's name. Moving an existing `<hostname>-glaeda` runn
 to a member whose name `<member>-glaeda` differs is a different install: the
 command refuses it as a conflict until `--uninstall --apply` removes the old one,
 or pass `--name` with the existing name to relabel it in place.
+
+## 2d. Several runners per mini
+
+A manifest class carries a runner count and the capacity units they share
+(defaults: `std` 4 runners and 4 units, `light` 2 and 2, `xl` 8 and 8). Override
+them with `defaults.runner.classes.<class>` `{"runners": N, "capacityUnits": U}`,
+or per host under `overrides.runner.classes.<class>`. Each runner is one
+`--instance K`:
+
+    for k in 0 1 2 3; do
+      gh api -X POST repos/manaflow-ai/cmux/actions/runners/registration-token --jq .token |
+        ssh MINI "~/glaeda-runner/scripts/glaeda-cmux-runner --apply --token-stdin \
+          --manifest ~/glaeda-runner/mini-fleet.json --member MEMBER --instance $k"
+    done
+
+Instance 0 keeps the original paths. Instance K gets `~/actions-runner-glaeda-K`,
+the LaunchAgent `com.teamleaderleo.glaeda.cmux-runner.K`, its log
+`~/Library/Logs/glaeda-cmux-runner-K.log`, its receipt under
+`~/.local/state/glaeda/cmux-runner/instance-K/` and the name `<member>-glaeda-K`,
+with the same labels, so the pool grows by K runners. An instance past the class's
+count is refused. Every instance bakes the same `--capacity-units`, so the mini
+never runs more than its units, however many runners pick up jobs. Uninstall one
+with `--uninstall --apply --instance K`.
 
 ## 3. Verify
 

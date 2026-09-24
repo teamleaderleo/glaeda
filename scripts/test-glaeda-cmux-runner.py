@@ -399,7 +399,7 @@ class HookTest(unittest.TestCase):
         with mock.patch.object(hook.os, "fork", side_effect=OSError("no fork")):
             held, note = hook.take_host_lock(os.fspath(self.dir / "fleet/host.lock"), os.getpid(), state)
         self.assertFalse(held)
-        self.assertIn("cannot start the host lock holder", note)
+        self.assertIn("cannot start the lock holder", note)
         self.assertFalse(stale.exists())
         self.assertTrue(self.lock_free())
 
@@ -407,6 +407,106 @@ class HookTest(unittest.TestCase):
         reservation = load("glaeda_reservation_under_test", ROOT / "scripts" / "glaeda_reservation.py")
         text = reservation.describe({"owner": "o", "purpose": "p", "since": 0, "until": 10**30})
         self.assertIn("not a representable time", text)
+
+    # ------------------------------------------------------------ weighted capacity
+
+    def job(self, name: str, runner: str, units: int = 4, watch: int | None = None) -> subprocess.CompletedProcess:
+        return self.started("--capacity-units", str(units), "--capacity-dir", os.fspath(self.dir / "capacity"),
+                            watch=watch, env={"GITHUB_JOB": name, "RUNNER_NAME": runner})
+
+    def finish(self, runner: str) -> str:
+        return self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
+                             env={"RUNNER_NAME": runner}).stdout
+
+    def shared_lock_blocks_exclusive(self) -> bool:
+        return not self.lock_free()
+
+    def test_capacity_admits_by_weight_and_refuses_fast_when_full(self) -> None:
+        self.fleet()
+        try:
+            first = self.job("macos-compile-admission", "r0")
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertIn("holding 2/4 units+persistent-dd for macos-compile-admission (compile", first.stdout)
+            second = self.job("macos-compile-admission", "r1")
+            self.assertEqual(second.returncode, 1)
+            self.assertIn("refused: capacity: the persistent-dd token is taken", second.stdout)
+            self.assertEqual(self.job("cli-product-tests", "r2").returncode, 0)
+            gui = self.job("app-host-unit-tests", "r3")
+            self.assertIn("1/4 units+gui", gui.stdout)
+            start = time.monotonic()
+            full = self.job("swift-package-tests", "r4")
+            self.assertLess(time.monotonic() - start, 10, "a full mini refuses, it never waits")
+            self.assertEqual(full.returncode, 1)
+            self.assertIn("refused: capacity: 0 of 4 units free", full.stdout)
+            self.assertTrue(self.shared_lock_blocks_exclusive(), "with-host-lock's LOCK_EX must wait for our jobs")
+            self.assertIn("released", self.finish("r0"))
+            self.assertIn("persistent-dd", self.job("macos-compile-admission", "r5").stdout)
+        finally:
+            for runner in ("r0", "r2", "r3", "r5"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free(), "every holder let go")
+
+    def test_capacity_gui_token_and_unknown_jobs(self) -> None:
+        self.fleet()
+        try:
+            self.assertEqual(self.job("tests-build-and-lag", "g0").returncode, 0)
+            other = self.job("app-host-unit-tests", "g1")
+            self.assertIn("refused: capacity: the gui token is taken", other.stdout)
+            unknown = self.job("release-build", "u0")
+            self.assertIn("persistent-dd for release-build (compile", unknown.stdout)
+        finally:
+            for runner in ("g0", "u0"):
+                self.finish(runner)
+
+    def test_capacity_refuses_while_a_fleet_build_holds_the_host(self) -> None:
+        fleet = self.fleet()
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,time\n"
+                                   f"fd=os.open({os.fspath(fleet / 'host.lock')!r},os.O_RDWR)\n"
+                                   "fcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(30)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            result = self.job("cli-product-tests", "w0")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("refused: capacity: a fleet build holds the host lock", result.stdout)
+        finally:
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
+
+    @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
+    def test_capacity_stops_admitting_while_a_fleet_build_waits(self) -> None:
+        fleet = self.fleet()
+        try:
+            self.assertEqual(self.job("cli-product-tests", "l0").returncode, 0)
+            waiter = subprocess.Popen([sys.executable, "-c",
+                                       "import fcntl,os\n"
+                                       f"fd=os.open({os.fspath(fleet / 'host.lock')!r},os.O_RDWR)\n"
+                                       "print('waiting',flush=True)\nfcntl.flock(fd,fcntl.LOCK_EX)\n"],
+                                      stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(waiter.stdout.readline().strip(), "waiting")
+                time.sleep(0.5)
+                result = self.job("cli-product-tests", "l1")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("refused: capacity: a fleet build is waiting for the host", result.stdout)
+                self.finish("l0")
+                self.assertEqual(waiter.wait(timeout=10), 0, "the build worker gets the host once our job ends")
+            finally:
+                waiter.kill()
+                waiter.wait()
+                waiter.stdout.close()
+        finally:
+            self.finish("l0")
+
+    def test_capacity_toolchain_gate_requires_gh(self) -> None:
+        self.fleet()
+        self.node(gh=False)
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("gh is not on the job PATH", result.stdout)
+        self.assertTrue(self.lock_free())
 
     def test_no_fleet_lock_file_admits(self) -> None:
         result = self.started()
@@ -424,7 +524,7 @@ class HookTest(unittest.TestCase):
              valid: bool = True, role: str = "cmux_macos_native_build", receipt_toolchain: dict | None = None,
              hang: str | None = None, default: str = "1.98.1-aarch64-apple-darwin",
              installed: tuple = ("1.88.0-aarch64-apple-darwin", "1.98.1-aarch64-apple-darwin"),
-             python: str = "3.13") -> None:
+             python: str = "3.13", gh: bool = True) -> None:
         """A fake Glaeda node under HOME (self.dir): enrollment, class receipt, staged CLI, toolchain."""
         config = self.dir / ".config/glaeda/cmux-fleet"
         (config / "class-acceptance").mkdir(parents=True, exist_ok=True)
@@ -481,6 +581,10 @@ else:
                            f"import os\nprint(json.load(open({state!r} + '/rustc-by-toolchain.json'))"
                            f"[os.environ.get('RUSTUP_TOOLCHAIN') or open({state!r} + '/rustup-default').read().strip()])\n"))
         make_executable(cargo / "python3", f"#!/bin/sh\necho {python}\n")
+        if gh:
+            make_executable(cargo / "gh", "#!/bin/sh\necho 'gh version 2.101.0 (2026-09-15)'\n")
+        else:
+            (cargo / "gh").unlink(missing_ok=True)
         outputs = {"cargo": have["cargoVersion"], "zig": have["zigVersion"],
                    "xcrun": have["macosSdkVersion"],
                    "xcodebuild": f"Xcode {have['xcodeVersion']}\nBuild version {have['xcodeBuild']}"}
@@ -1078,6 +1182,26 @@ class RunnerTest(unittest.TestCase):
                       (hooks / "job-started.sh").read_text())
         self.assertTrue((hooks / "glaeda_reservation.py").is_file())
 
+    def test_instances_get_their_own_paths_and_share_the_capacity(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            first = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            third = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std", "--instance", "3")
+        names = [argv[argv.index("--name") + 1] for argv in self.config_argvs()]
+        self.assertEqual(names, ["mini-std-glaeda", "mini-std-glaeda-3"])
+        self.assertEqual(third["runnerDir"], os.fspath(self.home / "actions-runner-glaeda-3"))
+        self.assertEqual(first["runnerDir"], os.fspath(self.home / "actions-runner-glaeda"))
+        plist = self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.3.plist"
+        self.assertEqual(plistlib.loads(plist.read_bytes())["Label"], "com.teamleaderleo.glaeda.cmux-runner.3")
+        self.assertTrue((self.home / ".local/state/glaeda/cmux-runner/instance-3/receipt.json").is_file())
+        self.assertTrue((self.home / ".local/state/glaeda/cmux-runner/receipt.json").is_file())
+        for runner in ("actions-runner-glaeda", "actions-runner-glaeda-3"):
+            self.assertIn("--capacity-units 4", (self.home / runner / "glaeda-hooks/job-started.sh").read_text())
+        err = io.StringIO()
+        with mock.patch.object(cr, "xcode_present", return_value=True), contextlib.redirect_stderr(err):
+            self.assertEqual(cr.main(["--gh", os.fspath(self.gh), "--manifest", self.manifest(), "--member",
+                                      "mini-std", "--instance", "4"]), 2)
+        self.assertIn("instance 4 is beyond that", err.getvalue())
+
     def test_manifest_refusals_and_exclusive_flags(self) -> None:
         for args in (("--manifest", self.manifest(), "--member", "laptop"),
                      ("--manifest", self.manifest(), "--member", "mini-std", "--labels", "x"),
@@ -1280,6 +1404,25 @@ MANIFEST = {
 
 
 class ManifestLabelsTest(unittest.TestCase):
+    def test_runner_capacity_per_class(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            std, _ = cr.member_labels(MANIFEST, "mini-std")
+            light, _ = cr.member_labels(MANIFEST, "mini-light")
+            self.assertEqual((std["runners"], std["capacityUnits"]), (4, 4))
+            self.assertEqual((light["runners"], light["capacityUnits"]), (2, 2))
+            manifest = json.loads(json.dumps(MANIFEST))
+            manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 3, "capacityUnits": 6}}}
+            manifest["hosts"]["override"]["overrides"]["runner"] = {"classes": {"std": {"runners": 1}}}
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["runners"], 3)
+            self.assertEqual(cr.member_labels(manifest, "override")[0]["runners"], 1)
+            self.assertEqual(cr.member_labels(manifest, "override")[0]["capacityUnits"], 6)
+            for bad in ({"runners": 0}, {"runners": True}, {"capacityUnits": 1}, "four"):
+                with self.subTest(bad=bad):
+                    manifest["defaults"]["runner"] = {"classes": {"std": bad}}
+                    member, why = cr.member_labels(manifest, "mini-std")
+                    self.assertIsNone(member)
+                    self.assertIn("runner.classes.std", why)
+
     def test_member_labels_table(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
             std, _ = cr.member_labels(MANIFEST, "mini-std")

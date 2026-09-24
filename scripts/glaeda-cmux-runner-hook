@@ -27,12 +27,15 @@ re-runs it elsewhere) when:
   * another build holds the fleet host lock (/Users/Shared/cmux-build-fleet/host.lock, the flock that
     with-host-lock and the build worker take)
   * with --require-eligible (every fleet member): the local Glaeda node is not eligible, or its toolchain
-    drifted from its class receipt. Eligibility is the node status that glaeda-mini-enroll reads, from the
+    drifted from its class receipt, or gh is not on the job PATH. Eligibility is the node status that glaeda-mini-enroll reads, from the
     staged generation's cmux_fleet.py (state eligible, routingCandidateEligible true), and the enrollment
     must reference ~/.config/glaeda/cmux-fleet/class-acceptance/<class>.json. The toolchain check runs
     rustc, cargo, zig, xcodebuild and xcrun and compares them with that receipt's strings, exactly.
 Otherwise it takes that lock for the job: a small detached holder keeps it until job-completed releases
 it or the job's Runner.Worker exits, so fleet builds wait for the PR job and a crash cannot strand it.
+With --capacity-units N (several runners on one mini, docs/CMUX_MINI_RUNNER.md 2d) it takes a weighted
+share instead: a shared lock on host.lock plus units and tokens under FLEET_DIR/capacity, and refuses
+with "refused: capacity: ..." rather than wait when they are taken (take_capacity).
 Only then does it run glaeda-disk --pressure --apply --top 0, bounded and never able to fail the job.
 
 job-completed only runs the same disk pressure pass and always exits 0.
@@ -41,6 +44,7 @@ job-completed only runs the same disk pressure pass and always exits 0.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import importlib.machinery
 import importlib.util
@@ -63,6 +67,18 @@ RESERVATION = f"{FLEET_DIR}/reservation.json"
 HOLDER_FILE = "host-lock-holder"
 HOLDER_POLL_S = 2.0
 HOLDER_MAX_S = 5 * 24 * 3600  # GitHub's limit for a self-hosted job; the job's own exit releases it sooner
+# Weighted capacity (--capacity-units > 0, several runners per mini). Each job's class, from GITHUB_JOB
+# (the job id in cmux's ci-macos.yml; matrix shards share it), costs units plus exclusive tokens.
+# Compile admission's persistent DerivedData (/Users/Shared/cmux-build-fleet/ci, owned_build_state.py)
+# takes one writer at a time, so a compile holds the persistent-dd token; GUI jobs share one console
+# session (and tests-build-and-lag runs pkill -x "cmux DEV"), so they hold the gui token. An unknown
+# job is treated as a compile: the safe side of both.
+JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui", "tests-build-and-lag": "gui",
+               "cli-product-tests": "light", "swift-package-tests": "light"}
+CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
+    "compile": (2, ("persistent-dd",)), "gui": (1, ("gui",)), "light": (1, ())}
+ADMISSION_WAIT_S = 10.0  # admissions are serialized briefly so two jobs never split the free units
+LSOF = shutil.which("lsof") or "/usr/sbin/lsof"
 # Events whose code is the repository's own, or a same-repo pull request checked below. Comment,
 # check and review-comment events can run with secrets on behalf of a fork PR, so they are left out.
 ADMITTED_EVENTS = ("push", "pull_request", "merge_group", "workflow_dispatch", "schedule", "workflow_run")
@@ -262,6 +278,8 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
     if not re.fullmatch(r"\d+\.\d+", python) or tuple(map(int, python.split("."))) < MIN_WORKLOAD_PYTHON:
         return (f"node not eligible (python3 on the job PATH is {python or 'missing'}; cmux's profile runner "
                 f"needs {'.'.join(map(str, MIN_WORKLOAD_PYTHON))}+)"), note
+    if not _probe(["gh", "--version"], env, home, deadline):
+        return "node not eligible (gh is not on the job PATH; cmux's CI scripts call gh api)", note
     if xcode_app:
         env["DEVELOPER_DIR"] = os.fspath(Path(xcode_app) / "Contents" / "Developer")
     have: dict[str, str] = {}
@@ -308,6 +326,12 @@ def holder_file(state_dir: Path) -> Path:
     return state_dir / (f"{HOLDER_FILE}-{name}.pid" if name else f"{HOLDER_FILE}.pid")
 
 
+def close_all(fds: list[int]) -> None:
+    for fd in fds:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
 def take_host_lock(path: str, watch_pid: int, state_dir: Path) -> tuple[bool, str]:
     """Take the fleet host lock without waiting and leave it with a detached holder for this job.
     Admitted only once the holder itself reports its pid, so a holder that died never counts."""
@@ -322,27 +346,126 @@ def take_host_lock(path: str, watch_pid: int, state_dir: Path) -> tuple[bool, st
     except OSError:
         os.close(fd)
         return False, "another build holds the fleet host lock"
+    held, note = hold([fd], watch_pid, state_dir)
+    return held, (f"holding the fleet host lock for this job ({note})" if held else note)
+
+
+def lock_file(path: Path, mode: int) -> int | None:
+    """An fd holding flock `mode` (with LOCK_NB) on path, created if missing, or None when it is taken."""
+    fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    try:
+        fcntl.flock(fd, mode | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def lock_waiters(path: str, ours: set[int]) -> list[int]:
+    """Processes with the host lock open that are not this runner fleet's holders: with-host-lock
+    blocked in LOCK_EX (the fleet build worker, a reload). Empty when lsof cannot tell."""
+    try:
+        out = subprocess.run([LSOF, "-t", "--", path], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, timeout=5, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return [int(p) for p in out.split() if p.isdigit() and int(p) not in ours]
+
+
+def holder_pids(state_dir: Path) -> set[int]:
+    pids = {os.getpid()}
+    for pid_file in state_dir.glob(f"{HOLDER_FILE}*.pid") if state_dir.is_dir() else []:
+        with contextlib.suppress(OSError, ValueError):
+            pids.add(int(pid_file.read_text().strip()))
+    return pids
+
+
+def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watch_pid: int,
+                  state_dir: Path) -> tuple[bool, str]:
+    """Weighted admission for one of several runners on this mini, without ever waiting on a job.
+    One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
+    takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
+    the job class's tokens. Everything is a flock, so a holder that dies releases all of it."""
+    klass = JOB_CLASSES.get(job, "compile")
+    units, tokens = CLASS_COST[klass]
+    units = min(units, total)
+    try:
+        capacity_dir.mkdir(parents=True, exist_ok=True)
+        admission = os.open(capacity_dir / "admission.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    except OSError as error:
+        return False, f"cannot open the capacity ledger ({type(error).__name__})"
+    fds: list[int] = []
+    try:
+        deadline = time.monotonic() + ADMISSION_WAIT_S
+        while True:
+            try:
+                fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return False, "capacity: another admission on this mini is stuck"
+                time.sleep(0.1)
+        if os.path.exists(host_lock):
+            fd = os.open(host_lock, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                return False, "capacity: a fleet build holds the host lock"
+            fds.append(fd)
+            waiting = lock_waiters(host_lock, holder_pids(state_dir))
+            if waiting:  # flock has no writer preference: stop admitting so the build worker gets in
+                return False, f"capacity: a fleet build is waiting for the host (pid {waiting[0]})"
+        for token in tokens:
+            fd = lock_file(capacity_dir / f"{token}.token", fcntl.LOCK_EX)
+            if fd is None:
+                return False, f"capacity: the {token} token is taken ({job or 'unknown job'} is {klass})"
+            fds.append(fd)
+        got = 0
+        for slot in range(total):
+            if got == units:
+                break
+            fd = lock_file(capacity_dir / f"unit-{slot}", fcntl.LOCK_EX)
+            if fd is not None:
+                fds.append(fd)
+                got += 1
+        if got < units:
+            return False, (f"capacity: {got} of {total} units free, {job or 'an unknown job'} ({klass}) needs {units}")
+        held, note = hold(fds, watch_pid, state_dir, drop=(admission,))
+        fds = []  # the holder has them now, or hold closed them
+        what = "+".join([f"{units}/{total} units", *tokens])
+        return held, (f"holding {what} for {job or 'an unknown job'} ({klass}; {note})" if held else note)
+    except OSError as error:
+        return False, f"capacity: cannot take the ledger ({type(error).__name__})"
+    finally:
+        close_all(fds)
+        os.close(admission)
+
+
+def hold(fds: list[int], watch_pid: int, state_dir: Path, drop: tuple[int, ...] = ()) -> tuple[bool, str]:
+    """Hand the locked fds to a detached holder that keeps them until job-completed or watch_pid exits.
+    Closes this process's copies either way. The holder closes `drop` (locks that must not outlive the
+    admission). Succeeds only once the holder reports its own pid."""
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         pid_file = holder_file(state_dir)
         pid_file.unlink(missing_ok=True)  # a stale file from a crashed holder must not look like success
     except OSError as error:
-        os.close(fd)
-        return False, f"cannot prepare the host lock holder ({type(error).__name__})"
+        close_all(fds)
+        return False, f"cannot prepare the lock holder ({type(error).__name__})"
     try:
         ready_r, ready_w = os.pipe()
     except OSError as error:
-        os.close(fd)
-        return False, f"cannot start the host lock holder ({type(error).__name__})"
+        close_all(fds)
+        return False, f"cannot start the lock holder ({type(error).__name__})"
     try:
         child = os.fork()
     except OSError as error:
-        for leftover in (fd, ready_r, ready_w):
-            os.close(leftover)
-        return False, f"cannot start the host lock holder ({type(error).__name__})"
+        close_all([*fds, ready_r, ready_w])
+        return False, f"cannot start the lock holder ({type(error).__name__})"
     if child == 0:  # detach twice so the runner never waits on the holder
         try:
-            os.close(ready_r)
+            close_all([ready_r, *drop])
             os.setsid()
             if os.fork():
                 os._exit(0)
@@ -362,16 +485,16 @@ def take_host_lock(path: str, watch_pid: int, state_dir: Path) -> tuple[bool, st
                     break
                 time.sleep(HOLDER_POLL_S)
         finally:
-            os._exit(0)  # the lock goes with this process
+            os._exit(0)  # the locks go with this process
     os.close(ready_w)
     os.waitpid(child, 0)
-    os.close(fd)  # the holder keeps the same open file, so the lock stays held while it lives
+    close_all(fds)  # the holder keeps the same open files, so the locks stay held while it lives
     ready, _, _ = select.select([ready_r], [], [], 10)
     reported = os.read(ready_r, 32).decode().strip() if ready else ""
     os.close(ready_r)
     if not reported.isdigit() or not pid_alive(int(reported)):
-        return False, "the host lock holder did not start; refusing rather than run unlocked"
-    return True, f"holding the fleet host lock for this job (holder {reported}, watching pid {watch_pid})"
+        return False, "the lock holder did not start; refusing rather than run unlocked"
+    return True, f"holder {reported}, watching pid {watch_pid}"
 
 
 def release_host_lock(state_dir: Path) -> str:
@@ -448,6 +571,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="refuse unless this is an eligible Glaeda node on its class receipt's toolchain")
     p.add_argument("--fleet-class", help="hardware class naming class-acceptance/<class>.json (with --require-eligible)")
     p.add_argument("--toolchain-xcode", help="the Xcode app the class receipt's xcodeVersion and SDK refer to")
+    p.add_argument("--capacity-units", type=int, default=0,
+                   help="weighted capacity shared by this mini's runners (0: one job holds the host lock alone)")
+    p.add_argument("--capacity-dir", type=Path, default=Path(FLEET_DIR) / "capacity", help=argparse.SUPPRESS)
     p.add_argument("--host-lock", default=HOST_LOCK, help=argparse.SUPPRESS)
     p.add_argument("--reservation", default=RESERVATION, help=argparse.SUPPRESS)
     p.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/glaeda/cmux-runner",
@@ -477,11 +603,17 @@ def main(argv: list[str] | None = None) -> int:
         if why:
             return refuse(why)
         # The wrapper execs this script, so the parent is the job's Runner.Worker.
-        held, note = take_host_lock(args.host_lock, args.watch_pid or os.getppid(), args.state_dir)
+        if args.capacity_units > 0:
+            held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
+                                       os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
+                                       args.state_dir)
+        else:
+            held, note = take_host_lock(args.host_lock, args.watch_pid or os.getppid(), args.state_dir)
         if not held:
             return refuse(note)
         if args.require_eligible:
-            # Under the lock no other fleet job runs here, so the default set now holds for this job.
+            # Under the lock no fleet build runs here, and every runner here aligns to the same receipt,
+            # so the default set now holds for this job.
             why, aligned = toolchain_refusal(args.fleet_class, want, args.toolchain_xcode)
             if why:
                 release_host_lock(args.state_dir)

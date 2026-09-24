@@ -20,6 +20,11 @@ MEMBER_CLASSES = RUNNER_CLASSES + ("dev", "borrowed")
 AVAILABILITY = ("dedicated", "opportunistic")
 RUNNER_ROLE = "ci-runner"
 VERSION_RE = r"[0-9][0-9.]*"
+# Runners per member and the weighted capacity units they share (glaeda-cmux-runner-hook): a compile is
+# 2 units, a light or GUI job 1. The manifest's defaults.runner.classes.<class> {runners, capacityUnits}
+# overrides these, and a host's overrides.runner.classes likewise.
+CLASS_CAPACITY = {"xl": (8, 8), "std": (4, 4), "light": (2, 2)}
+MAX_RUNNERS = 16
 
 
 def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
@@ -75,12 +80,26 @@ def member_labels(manifest: Any, member: str,
     # Opportunistic members never carry a pool label, so they never receive a required job.
     pools = [pool_label(klass, v) for v in versions] if availability == "dedicated" else []
     labels = [MINI_LABEL, f"glaeda-class-{klass}", f"glaeda-{availability}", *[f"xcode-{v}" for v in versions], *pools]
-    disk = merge(manifest.get("defaults") or {}, host.get("overrides") or {}).get("disk")
+    merged = merge(manifest.get("defaults") or {}, host.get("overrides") or {})
+    disk = merged.get("disk")
     floor = disk.get("min_free_gib") if isinstance(disk, dict) else None
+    runners, units = CLASS_CAPACITY[klass]
+    runner = merged.get("runner")
+    declared = ((runner.get("classes") or {}).get(klass) if isinstance(runner, dict)
+                and isinstance(runner.get("classes"), dict) else None)
+    if declared is not None:
+        if not isinstance(declared, dict):
+            return None, f"runner.classes.{klass} is not an object"
+        runners, units = declared.get("runners", runners), declared.get("capacityUnits", units)
+    if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
+        return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
+    if not (isinstance(units, int) and not isinstance(units, bool) and 2 <= units <= 4 * MAX_RUNNERS):
+        return None, f"runner.classes.{klass}.capacityUnits must be 2 to {4 * MAX_RUNNERS} (a compile is 2)"
     return {"member": member, "class": klass, "availability": availability, "roles": roles,
             "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
-            "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready]}, None
+            "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready],
+            "runners": runners, "capacityUnits": units}, None
 
 
 def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool] | None = None) -> dict[str, list[str]]:
