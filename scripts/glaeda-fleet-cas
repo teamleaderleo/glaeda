@@ -51,8 +51,7 @@ say() { printf '%s %s\n' "$([ -n "$apply" ] && echo apply || echo plan)" "$*"; }
 do_() { say "$*"; [ -z "$apply" ] || "$@"; }
 
 label_for() { echo "com.teamleaderleo.glaeda.fleet-cas-$1"; }
-xml() { local v=${1//&/&amp;}; v=${v//</&lt;}; printf '%s' "${v//>/&gt;}"; }
-changed=  # set when a binary or plist changed, so the agent restarts
+xml() { local v=${1//&/"&amp;"}; v=${v//</"&lt;"}; v=${v//>/"&gt;"}; printf '%s' "$v"; }
 
 check_owner() {
   if [ -e "$ROOT" ] && [ "$(stat -f %u "$ROOT")" != "$(id -u)" ]; then
@@ -88,6 +87,7 @@ write_plist() {  # role, args...
   cat >"$plist.tmp" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- fleet-cas binary sha256 $(shasum -a 256 "$BIN/fleet-cas" | cut -c1-64): a new binary changes this plist, so every role restarts -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -111,7 +111,7 @@ $args    </array>
 </plist>
 PLIST
   plutil -lint -s "$plist.tmp"
-  if cmp -s "$plist.tmp" "$plist" && [ -z "$changed" ] \
+  if cmp -s "$plist.tmp" "$plist" \
     && launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
     rm -f "$plist.tmp"; echo "unchanged $label"; return 0
   fi
@@ -123,15 +123,18 @@ install_binaries() {
   say "build $proto (cargo build --release --locked)"
   if [ -n "$apply" ]; then
     check_owner
-    # cargo competes with builds for the mini, so it takes the fleet host lock.
-    (cd "$proto" && scripts/with-fleet-lock.pl cargo build --release --locked -q)
+    # cargo competes with builds for the mini, so it takes the fleet host lock where one exists.
+    if [ -e /Users/Shared/cmux-build-fleet/host.lock ]; then
+      (cd "$proto" && scripts/with-fleet-lock.pl cargo build --release --locked -q)
+    else
+      (cd "$proto" && cargo build --release --locked -q)
+    fi
     mkdir -p "$BIN"
     local f src
     for f in fleet-cas fleet-cas-settings.sh; do
       src=$proto/target/release/$f; [ "$f" = fleet-cas ] || src=$proto/scripts/$f
       if ! cmp -s "$src" "$BIN/$f"; then
         install -m 0755 "$src" "$BIN/$f.new" && mv "$BIN/$f.new" "$BIN/$f"
-        changed=1
       fi
     done
   fi

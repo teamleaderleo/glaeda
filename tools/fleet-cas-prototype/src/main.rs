@@ -418,7 +418,11 @@ impl Store {
             // A store that refuses this node's writes is healthy: fail the
             // write, keep reading.
             if e.code() == tonic::Code::PermissionDenied {
-                eprintln!("fleet store refused a write: {}", e.message());
+                // Log the first; the rest only count, so a misconfigured
+                // writer does not flood the log.
+                if self.stats.write_refused.fetch_add(1, Relaxed) == 0 {
+                    eprintln!("fleet store refused a write: {}", e.message());
+                }
                 return upstream_err(e);
             }
             self.upstream_failed();
