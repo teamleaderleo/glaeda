@@ -645,11 +645,11 @@ def pending(entry: dict[str, Any], now: float, observed_at: float | None = None)
     if entry["state"] == "rescuing":
         return entry["slots"]
     if entry["state"] == "held":
-        if not live(entry, now):
-            return 0
         started_at = parse_utc(entry.get("started_at"))
         if started_at is not None and started_at >= seen:
             return entry["slots"]
+        if not live(entry, now):
+            return 0
         return max(0, entry["slots"] - entry["started"])
     ended_at = parse_utc(entry.get("ended_at"))
     return entry["slots"] if ended_at is not None and ended_at >= seen else 0
@@ -835,7 +835,8 @@ def stuck_reason(entry: dict[str, Any], stuck: list[dict[str, Any]], refused: li
 
 
 def watch_one(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str, float],
-              rescue_seconds: int = RESCUE_SECONDS) -> dict[str, Any] | None:
+              rescue_seconds: int = RESCUE_SECONDS,
+              persist: Callable[[], None] = lambda: None) -> dict[str, Any] | None:
     """One look at one live reservation. Returns field updates, or None when nothing changed.
 
     held: count the pool jobs that started (their slots stop counting once the pool state is newer
@@ -871,6 +872,7 @@ def watch_one(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str,
                     return {"state": "released", "note": f"not rescued: {moved}"}
                 api.ok("POST", f"/repos/{repo}/actions/runs/{run_id}/cancel")
                 seen[key] = now
+                persist()  # the re-run depends on this record; keep it even if the tick dies next
                 return {"cancel_at": utc(now)}
             waited = now - mine
             if waited >= CANCEL_GIVE_UP_SECONDS:
@@ -927,7 +929,7 @@ def apply_updates(doc: dict[str, Any], updates: dict[str, tuple[str, dict[str, A
 
 def agent_tick(api: GitHub, ledger: Ledger, *, repo: str, now: float, seen: dict[str, float],
                log: Callable[[str], None], sleep: Callable[[float], None] = time.sleep,
-               rescue_seconds: int = RESCUE_SECONDS) -> dict[str, Any]:
+               rescue_seconds: int = RESCUE_SECONDS, persist: Callable[[], None] = lambda: None) -> dict[str, Any]:
     """Watch every live reservation for `repo` once, and record what changed in the ledger.
 
     A reservation that becomes `rescuing` is written first and cancelled second, in the same tick,
@@ -939,7 +941,7 @@ def agent_tick(api: GitHub, ledger: Ledger, *, repo: str, now: float, seen: dict
         updates: dict[str, tuple[str, dict[str, Any]]] = {}
         for entry in entries:
             try:
-                update = watch_one(api, entry, now=now, seen=seen, rescue_seconds=rescue_seconds)
+                update = watch_one(api, entry, now=now, seen=seen, rescue_seconds=rescue_seconds, persist=persist)
             except (Failure, urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as error:
                 log(f"{entry['id']}: watch failed ({type(error).__name__}: {str(error)[:160]})")
                 continue
@@ -1131,15 +1133,18 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None,
                     repo_client().set_variable(args.repo, args.variable, text)
                     print(f"published {args.variable}: "
                           + (", ".join(f"{k} {v['idle']} idle" for k, v in doc["pools"].items()) or "no owned pools"))
-                except Failure as error:
+                except (Failure, urllib.error.URLError, OSError) as error:
                     # The watch still runs: a stale state only means new runs go to Blacksmith.
                     print(f"glaeda-route: publish failed: {error}", file=sys.stderr)
                     code = 2
             seen = load_seen(args.seen_file)
-            summary = agent_tick(repo_client(), ledger_client(), repo=args.repo, now=now(), seen=seen,
-                                 log=lambda line: print(line, flush=True), sleep=sleep,
-                                 rescue_seconds=args.rescue_seconds)
-            save_seen(args.seen_file, seen)
+            try:
+                summary = agent_tick(repo_client(), ledger_client(), repo=args.repo, now=now(), seen=seen,
+                                     log=lambda line: print(line, flush=True), sleep=sleep,
+                                     rescue_seconds=args.rescue_seconds,
+                                     persist=lambda: save_seen(args.seen_file, seen))
+            finally:
+                save_seen(args.seen_file, seen)
             print(f"watched {summary['watched']} reservation(s), updated {summary['updated']}")
             return code
 

@@ -683,6 +683,25 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(entry["state"], "rescued")
         self.assertIn("overflow", entry["note"])
 
+    def test_cancel_record_is_saved_before_a_failing_second_write(self):
+        self.cmux.add_run(jobs=[job(1, created=NOW - 600)])
+        store, ledger = fake_ledger(ledger_doc(reservation(created=NOW - 600)))
+        saved = []
+        seen = {"job:1": NOW - 200}
+        orig = store.__call__
+
+        def fail_second_pass(request, timeout=None):
+            if self.cmux.effects and request.get_method() == "GET":
+                raise urllib.error.URLError("ledger down")
+            return orig(request, timeout)
+
+        ledger.api._open = fail_second_pass
+        with self.assertRaises(urllib.error.URLError):
+            gr.agent_tick(self.api, ledger, repo=REPO, now=NOW, seen=seen, log=self.logs.append,
+                          sleep=lambda s: None, persist=lambda: saved.append(dict(seen)))
+        self.assertEqual(self.cmux.effects, [("cancel", 7)])
+        self.assertIn(f"cancel:{REPO}#7.1", saved[-1])
+
     def test_lost_write_means_no_cancel(self):
         self.cmux.add_run(jobs=[job(1, created=NOW - 600)])
         store, ledger = fake_ledger(ledger_doc(reservation(created=NOW - 600)))
@@ -816,6 +835,8 @@ class CountingTests(unittest.TestCase):
         self.assertEqual(gr.pending(ended, NOW + 10, NOW), 2)
         self.assertEqual(gr.pending(ended, NOW + 30, NOW + 25), 0)
         self.assertEqual(gr.pending(reservation(slots=2, state="rescuing"), NOW, NOW), 2)
+        lapsed_start = reservation(slots=2, started=2, started_at=gr.utc(NOW + 5), hold=NOW)
+        self.assertEqual(gr.pending(lapsed_start, NOW + 10, NOW), 2)
         d = gr.decide(idle_state(std_idle=4, light_idle=0), ledger_doc(fresh_start), request(slots=3), now=NOW + 10)
         self.assertFalse(d.owned)
 
