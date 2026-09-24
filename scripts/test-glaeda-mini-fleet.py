@@ -1439,7 +1439,7 @@ class OnboardTests(unittest.TestCase):
             receipt_path = Path(tmp) / "m4pro-48.json"
             receipt_path.write_text(json.dumps(receipt))
             data = copy.deepcopy(self.manifest)
-            data["classes"]["m4pro-48"]["acceptance"].update(receipt=os.fspath(receipt_path),
+            data["hardware"]["m4pro-48"]["acceptance"].update(receipt=os.fspath(receipt_path),
                                                              receipt_sha256=receipt["receiptSha256"])
             path = write_manifest(tmp, data)
             code, out, calls = self.run_onboard({"build-mini-1": self.fresh()}, "--yes", manifest=path)
@@ -1452,7 +1452,7 @@ class OnboardTests(unittest.TestCase):
             self.assertEqual(enroll[0][2], receipt_path.read_bytes())
             self.assertTrue([c for c in calls if "persistent-compile up" in c[1]])
             # A receipt that is not the recorded one blocks the host before anything runs on it.
-            data["classes"]["m4pro-48"]["acceptance"]["receipt_sha256"] = "sha256:" + "d" * 64
+            data["hardware"]["m4pro-48"]["acceptance"]["receipt_sha256"] = "sha256:" + "d" * 64
             path = write_manifest(tmp, data)
             code, out, calls = self.run_onboard({"build-mini-1": self.fresh()}, "--yes", manifest=path)
         self.assertEqual(code, 1)

@@ -55,7 +55,7 @@ the named ones): preflight, fix, the sudo-plans (--sudo run over ssh -t, wait fo
 or stop), fix again, a fresh preflight, enrollment in parallel with a heartbeat line every 30
 seconds, and runner registration with one org token minted here and passed over stdin. It ends
 with one table: host, node id, step reached, result, log. Acceptance is proved once per class and
-Xcode build: by default a host joins on the class's recorded acceptance (classes.<c>.acceptance)
+Xcode build: by default a host joins on the class's recorded acceptance (hardware.<h>.acceptance)
 and enrolls without accept-local; --acceptance node runs accept-local on the host instead. Dry
 run by default; never_touch hosts are refused.
 
@@ -2115,7 +2115,7 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
                 settle(name, "preflight", f"blocked: {why}; accept one host of the class first "
                                           f"(onboard {name} --acceptance node --yes)")
             elif recorded is not None and "receipt" in recorded:
-                klass = manifest["hosts"][name]["class"]
+                klass = manifest["hosts"][name]["hardware"]  # the key the acceptance is recorded under
                 data, why = class_receipt_bytes(recorded, klass)
                 if data is None:
                     settle(name, "preflight", f"blocked: {why}")

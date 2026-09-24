@@ -124,7 +124,7 @@ every node and class acceptance. Roll one out like this:
    bootstrap into a private file, `renew-enrollment` and `renew-enrollment-apply`,
    then `glaeda-mini-enroll ... --apply` runs the one `accept-local`. Then
    `export-class-acceptance` ([Class acceptance](CMUX_FLEET_ENROLLMENT.md#class-acceptance))
-   and record the receipt and its `receiptSha256` in the manifest class.
+   and record the receipt and its `receiptSha256` under the manifest's `hardware.<key>.acceptance`.
 4. `glaeda-mini-fleet onboard --acceptance class --yes` joins the rest of the class.
 Repository-side automation should build on this same bundle, without requiring
 the CMUX team to design a second distribution system.
