@@ -87,7 +87,8 @@ if [ -L "$R" ] || { [ -e "$R" ] && { [ ! -f "$R" ] || [ ! -r "$R" ]; }; }; then
 elif [ -f "$R" ]; then
   e reservation_raw "$(head -c 4097 "$R" | base64 | tr -d '\n')"
 fi
-# Whether a build holds the fleet host lock right now. A shared, non-blocking flock on a read-only
+# Whether a build holds the fleet host lock right now, shared (PR jobs on a mini with several runners)
+# or exclusive (with-host-lock). An exclusive, non-blocking flock on a read-only
 # descriptor cannot wait and is dropped at once, so the probe never blocks and holds the lock for
 # microseconds. with-host-lock and the worker retry; a one-shot LOCK_NB taker (recipe-release,
 # disk-pressure) that lands in that window fails or skips that one attempt. lsof would miss a
@@ -98,7 +99,7 @@ if [ -e "$L" ] || [ -L "$L" ]; then
   hl=$(/usr/bin/perl -MFcntl=:DEFAULT,:flock -e '
     my $f;
     sysopen($f, $ARGV[0], O_RDONLY | O_NOFOLLOW | O_NONBLOCK) && -f $f or do { print "unknown"; exit 0 };
-    if (flock($f, LOCK_SH | LOCK_NB)) { flock($f, LOCK_UN); print "free" }
+    if (flock($f, LOCK_EX | LOCK_NB)) { flock($f, LOCK_UN); print "free" }
     else { print $!{EWOULDBLOCK} ? "held" : "unknown" }' "$L" </dev/null 2>/dev/null)
   e host_lock "${hl:-unknown}"
 else

@@ -52,7 +52,9 @@ host_held() {
       my $lock = "$dir/host.lock";
       if (($mode // "") ne "reservation" && -e $lock) {
         open(my $fh, "<", $lock) or do { print "cannot open the fleet host lock $lock\n"; exit 0 };
-        flock($fh, LOCK_SH | LOCK_NB) or do { print "held by another build (fleet host lock $lock)\n"; exit 0 };
+        # Exclusive: PR jobs on a mini with several runners hold it shared (glaeda-cmux-runner-hook).
+        flock($fh, LOCK_EX | LOCK_NB) or do { print "held by another build (fleet host lock $lock)\n"; exit 0 };
+        flock($fh, LOCK_UN);
       }
       print "free\n";
       exit 3;
@@ -230,8 +232,11 @@ held_dir() { printf '%s' "$HOME/.local/state/glaeda/mini-fleet/runner-held"; }
 
 runner_plist() {  # DIR: the runner's LaunchAgent (svc.sh records it in .service; glaeda-cmux-runner's is fixed), or fail
   local plist; plist=$(cat "$1/.service" 2>/dev/null || true)
-  if [ -z "$plist" ] && [ "$(basename "$1")" = actions-runner-glaeda ]; then
+  local base; base=$(basename "$1")
+  if [ -z "$plist" ] && [ "$base" = actions-runner-glaeda ]; then
     plist="$HOME/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist"
+  elif [ -z "$plist" ] && [[ "$base" =~ ^actions-runner-glaeda-([0-9]+)$ ]]; then  # --instance K
+    plist="$HOME/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.${BASH_REMATCH[1]}.plist"
   fi
   [ -n "$plist" ] && [ -f "$plist" ] || return 1
   printf '%s' "$plist"

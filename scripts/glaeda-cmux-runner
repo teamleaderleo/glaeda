@@ -198,7 +198,11 @@ class Context:
         self.apply = args.apply
         self.org = args.org
         self.repo = None if args.org else (args.repo or DEFAULT_REPO)
-        self.name = args.name or default_name()
+        self.instance = args.instance or 0
+        # Instance 0 keeps the original paths; instance K adds -K (dirs, logs, name) or .K (launchd label).
+        self.suffix = f"-{self.instance}" if self.instance else ""
+        self.label = f"{LABEL}.{self.instance}" if self.instance else LABEL
+        self.name = args.name or default_name() + self.suffix
         extra = [label.strip() for label in (args.labels or "").split(",") if label.strip()]
         self.labels = list(dict.fromkeys([*BASE_LABELS, MINI_LABEL, *extra]))
         # True when this run says what the labels must be (--labels or --manifest); otherwise a
@@ -206,12 +210,13 @@ class Context:
         self.labels_requested = bool(extra)
         self.member: dict[str, Any] | None = None
         self.min_free_gib: float = args.min_free_gib or 0
+        self.capacity_units: int = args.capacity_units or 0
         self.group = args.group
         self.replace = args.replace
         self.version = args.runner_version
         self.pinned_sha = args.runner_sha256
         self.route_repo = args.route_repo
-        self.runner_dir = (args.runner_dir or self.home / "actions-runner-glaeda").expanduser().absolute()
+        self.runner_dir = (args.runner_dir or self.home / f"actions-runner-glaeda{self.suffix}").expanduser().absolute()
         self.hook_dir = self.runner_dir / HOOK_DIR
         self.gh = args.gh or which("gh", ("/opt/homebrew/bin/gh", "/usr/local/bin/gh"))
         self.gh_state = "missing" if self.gh is None else "logged in"
@@ -220,9 +225,11 @@ class Context:
         self.agents = self.home / "Library/LaunchAgents"
         self.logs = self.home / "Library/Logs"
         self.state = self.home / ".local/state/glaeda/cmux-runner"
+        if self.instance:
+            self.state = self.state / f"instance-{self.instance}"
         self.receipt_path = self.state / "receipt.json"
-        self.plist_path = self.agents / f"{LABEL}.plist"
-        self.log_path = self.logs / "glaeda-cmux-runner.log"
+        self.plist_path = self.agents / f"{self.label}.plist"
+        self.log_path = self.logs / f"glaeda-cmux-runner{self.suffix}.log"
         self.token_stdin = args.token_stdin
         self.stdin_token: str | None = None  # set by main() from stdin; used once, never stored
 
@@ -363,6 +370,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         scope += f" --require-eligible --fleet-class {shlex.quote(ctx.member['hardware'])}"
         if ctx.member.get("xcodeApps"):
             scope += f" --toolchain-xcode {shlex.quote(ctx.member['xcodeApps'][0])}"
+    if ctx.capacity_units:  # every runner on this mini shares these units (the hook's capacity ledger)
+        scope += f" --capacity-units {int(ctx.capacity_units)}"
     started = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"
@@ -383,7 +392,7 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
     # user's home, such as an old ~/.local/bin/zig, must never shadow the one the class accepted.
     path = WORKLOAD_PATH
     return {
-        "Label": LABEL,
+        "Label": ctx.label,
         "ProgramArguments": [os.fspath(ctx.runner_dir / "run.sh")],
         "WorkingDirectory": os.fspath(ctx.runner_dir),
         "RunAtLoad": True,
@@ -395,8 +404,8 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
             "ACTIONS_RUNNER_HOOK_JOB_COMPLETED": os.fspath(ctx.hook_dir / "job-completed.sh"),
             "PATH": path,
         },
-        "StandardOutPath": os.fspath(ctx.logs / "glaeda-cmux-runner.log"),
-        "StandardErrorPath": os.fspath(ctx.logs / "glaeda-cmux-runner.err"),
+        "StandardOutPath": os.fspath(ctx.log_path),
+        "StandardErrorPath": os.fspath(ctx.logs / f"glaeda-cmux-runner{ctx.suffix}.err"),
     }
 
 
@@ -422,7 +431,7 @@ def owned_dir(ctx: Context, receipt: dict[str, Any] | None) -> bool:
 def launchctl_loaded(ctx: Context) -> bool | None:
     if ctx.skip_launchctl:
         return None
-    return run([LAUNCHCTL, "print", f"gui/{ctx.uid}/{LABEL}"])[0] == 0
+    return run([LAUNCHCTL, "print", f"gui/{ctx.uid}/{ctx.label}"])[0] == 0
 
 
 def routing(ctx: Context) -> dict[str, list[str]]:
@@ -540,7 +549,7 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
         if state == "blocked" and not blocked_dir:
             act["note"] = "exists and was not written by this command"
         if kind == "agent":
-            act["label"] = LABEL
+            act["label"] = ctx.label
             act["loaded"] = launchctl_loaded(ctx)
             act["launchctl"] = "skipped (sandbox HOME)" if ctx.sandbox else ("skipped" if ctx.skip_launchctl else "managed")
         actions.append(act)
@@ -563,7 +572,7 @@ def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[st
         state, note = "remove", ""
     else:
         state, note = "kept", "not installed by this command, or changed since"
-    actions.append({"kind": "agent", "label": LABEL, "path": plist, "state": state, "note": note,
+    actions.append({"kind": "agent", "label": ctx.label, "path": plist, "state": state, "note": note,
                     "loaded": launchctl_loaded(ctx)})
 
     ours = owned_dir(ctx, receipt)
@@ -678,9 +687,9 @@ def relabel(ctx: Context, act: dict[str, Any]) -> None:
 
 
 def bootout(ctx: Context, wait_s: float = 5.0) -> None:
-    run([LAUNCHCTL, "bootout", f"gui/{ctx.uid}/{LABEL}"])
+    run([LAUNCHCTL, "bootout", f"gui/{ctx.uid}/{ctx.label}"])
     deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline and run([LAUNCHCTL, "print", f"gui/{ctx.uid}/{LABEL}"])[0] == 0:
+    while time.monotonic() < deadline and run([LAUNCHCTL, "print", f"gui/{ctx.uid}/{ctx.label}"])[0] == 0:
         time.sleep(0.25)
 
 
@@ -942,7 +951,13 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--min-free-gib", type=float, help="job-started refuses a job below this much free disk "
                    "(default: the manifest's disk.min_free_gib with --manifest, else no floor)")
     p.add_argument("--member", help="this machine's key in the manifest's hosts table (default name <member>-glaeda)")
-    p.add_argument("--name", help="runner name (default: <short hostname>-glaeda)")
+    p.add_argument("--name", help="runner name (default: <short hostname>-glaeda, plus -K for --instance K)")
+    p.add_argument("--instance", type=int, default=0,
+                   help="which of this mini's runners (0 keeps the original paths; K > 0 gets its own "
+                        "~/actions-runner-glaeda-K, LaunchAgent, receipt and name <member>-glaeda-K)")
+    p.add_argument("--capacity-units", type=int,
+                   help="weighted capacity the job-started hook shares across this mini's runners "
+                        "(default: the manifest class's capacityUnits with --manifest, else one job at a time)")
     p.add_argument("--replace", action="store_true", help="replace an existing runner with the same name")
     p.add_argument("--runner-dir", type=Path, help="install directory (default ~/actions-runner-glaeda)")
     p.add_argument("--runner-version", help="pin a runner version such as 2.328.0 (default latest)")
@@ -963,6 +978,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if DARWIN_REQUIRED and platform.system() != "Darwin":
         print("glaeda-cmux-runner: macOS only", file=sys.stderr)
+        return 2
+    if args.instance < 0 or args.instance > 63:
+        print("glaeda-cmux-runner: --instance must be 0 to 63", file=sys.stderr)
         return 2
     if args.org and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", args.org):
         print("glaeda-cmux-runner: --org must be an organization login", file=sys.stderr)
@@ -990,10 +1008,16 @@ def main(argv: list[str] | None = None) -> int:
         ctx.member = member
         if not args.min_free_gib:
             ctx.min_free_gib = float(member.get("minFreeGib") or 0)
+        if ctx.instance >= int(member.get("runners") or 1):
+            print(f"glaeda-cmux-runner: {args.member} is class {member['class']} with {member.get('runners')} "
+                  f"runner(s); instance {ctx.instance} is beyond that", file=sys.stderr)
+            return 2
+        if not args.capacity_units:
+            ctx.capacity_units = int(member.get("capacityUnits") or 0)
         ctx.labels = list(dict.fromkeys([*BASE_LABELS, *member["labels"]]))
         ctx.labels_requested = True
         if not args.name:
-            ctx.name = f"{args.member}-glaeda"
+            ctx.name = f"{args.member}-glaeda{ctx.suffix}"
     if args.token_stdin and args.apply:  # a plan previews the stdin path but never reads a token
         token = sys.stdin.readline(4096).strip()
         if not re.fullmatch(TOKEN_RE, token):
@@ -1026,6 +1050,14 @@ def main(argv: list[str] | None = None) -> int:
                 ctx.unreadable_registration = True
     if not args.uninstall and owned_dir(ctx, prior):
         registered = (prior or {}).get("registration") or {}
+        kept = (prior or {}).get("member")
+        if ctx.member is None and isinstance(kept, dict) and kept.get("hardware"):
+            # a plain re-run keeps the member's gate, capacity and disk floor, not just its labels
+            ctx.member = kept
+            if not args.capacity_units:
+                ctx.capacity_units = int(kept.get("capacityUnits") or 0)
+            if not args.min_free_gib:
+                ctx.min_free_gib = float(kept.get("minFreeGib") or 0)
         # a re-run that names nothing keeps what this install registered, not the hostname default
         if not ctx.labels_requested and isinstance(registered.get("labels"), list) and registered["labels"]:
             ctx.labels = registered["labels"]
