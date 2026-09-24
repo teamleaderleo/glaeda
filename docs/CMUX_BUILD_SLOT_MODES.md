@@ -85,7 +85,9 @@ The worker recipe must enforce, since a host check cannot see a job's settings:
 - the two plugin settings come only from `fleet-cas-settings.sh <socket>`, which prints them
   only when the node answers (a dead socket makes a build crawl instead of failing; the script
   exists, the recipe change is planned);
-- the fleet store is segmented by Xcode build (planned; the prototype has one namespace).
+- entries from different Xcode builds are kept apart. One store serves every build: a 26.6
+  build against a 26.3 store compiled everything, consistent with the compiler being in the
+  key (the key inputs were not inspected). A per-build segment is planned only for eviction.
 
 Writer: CI's main build is the trusted writer, filling the store for every main commit it
 builds (planned; the prototype has no signed writes yet, see #1134 M3). Nothing else writes.
@@ -103,8 +105,10 @@ which builds the prototype and installs user LaunchAgents:
 - `com.teamleaderleo.glaeda.fleet-cas-node` on every build host: the node daemon on the socket
   above, read-only (`--read-only-kv`) until then, and `xcode/bin/fleet-cas-settings.sh`.
 
-Cache keys include the compiler, so entries from different Xcode builds never collide in one
-store; a per-build segment would only help eviction and accounting. `glaeda-fleet-cas uninstall
+A writer host must not run untrusted jobs: the allowlist trusts every process on an allowed
+address until signed writes (M3) exist. The store listens on a DHCP address, so the store host
+needs a DHCP reservation. The agents need the build user's GUI session; the fleet minis log in
+automatically. `glaeda-fleet-cas uninstall
 --apply` removes both agents and keeps the stores. Deployed on cmux7s (store and node) and
 cmux8s (node) on 2026-09-24.
 

@@ -51,6 +51,8 @@ struct Stats {
     kv_put_conflict: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    /// Writes refused because the TCP peer is not an allowed writer.
+    write_refused: AtomicU64,
     /// KV entries whose 32-byte values name objects this store lacks.
     kv_put_dangling: AtomicU64,
     // Node daemon only: traffic to the fleet store.
@@ -88,6 +90,7 @@ impl Stats {
             ("kv_put_refused", &self.kv_put_refused),
             ("kv_put_conflict", &self.kv_put_conflict),
             ("kv_put_dangling", &self.kv_put_dangling),
+            ("write_refused", &self.write_refused),
             ("bytes_in", &self.bytes_in),
             ("bytes_out", &self.bytes_out),
             ("up_cas_fetch", &self.up_cas_fetch),
@@ -300,7 +303,7 @@ impl Store {
         match r.remote_addr() {
             Some(peer) if allowed.contains(&peer.ip()) => Ok(()),
             _ => {
-                self.stats.kv_put_refused.fetch_add(1, Relaxed);
+                self.stats.write_refused.fetch_add(1, Relaxed);
                 Err(Status::permission_denied("not a fleet-cas writer"))
             }
         }
@@ -412,6 +415,12 @@ impl Store {
     /// compiles on), and nothing is published half-way.
     fn write_unavailable(&self, e: Option<Status>) -> Status {
         if let Some(e) = e {
+            // A store that refuses this node's writes is healthy: fail the
+            // write, keep reading.
+            if e.code() == tonic::Code::PermissionDenied {
+                eprintln!("fleet store refused a write: {}", e.message());
+                return upstream_err(e);
+            }
             self.upstream_failed();
             return upstream_err(e);
         }
@@ -936,7 +945,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = tokio::signal::ctrl_c().await;
     };
     if let Some(addr) = listen.strip_prefix("tcp:") {
-        router.serve_with_shutdown(addr.parse()?, shutdown).await?;
+        let addr: std::net::SocketAddr = addr.parse()?;
+        if addr.ip().is_unspecified() {
+            return Err("refusing a wildcard listen address: bind the LAN address".into());
+        }
+        router.serve_with_shutdown(addr, shutdown).await?;
     } else {
         let socket = PathBuf::from(listen);
         let _ = std::fs::remove_file(&socket);

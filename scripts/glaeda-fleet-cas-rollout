@@ -7,7 +7,8 @@
 # HOST names are ssh aliases (User cmux). The store listens on the store host's LAN address
 # (en0) port 7450; every NODE_HOST gets a read-only node daemon pointed at it. Each host
 # receives scripts/glaeda-fleet-cas and tools/fleet-cas-prototype under
-# ~/.cache/glaeda-fleet-cas and runs `glaeda-fleet-cas` there (docs/CMUX_BUILD_SLOT_MODES.md).
+# ~/.cache/glaeda-fleet-cas (also when planning) and runs `glaeda-fleet-cas` there
+# (docs/CMUX_BUILD_SLOT_MODES.md).
 # Minis on another LAN cannot reach the store until the tailnet grants the port.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -25,13 +26,14 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$store" ] || { sed -n '2,5p' "$0" >&2; exit 2; }
 for h in "$store" ${nodes[@]+"${nodes[@]}"}; do
-  case $h in *lawrence*) echo "refusing $h: cmux-lawrence is the fleet coordinator" >&2; exit 2 ;; esac
+  target=$(ssh -G "$h" | awk '/^hostname /{print $2}')
+  case "$h $target" in *lawrence*) echo "refusing $h ($target): cmux-lawrence is the fleet coordinator" >&2; exit 2 ;; esac
 done
 
 ship() {  # host
   ssh -o BatchMode=yes "$1" 'mkdir -p ~/.cache/glaeda-fleet-cas/glaeda/scripts ~/.cache/glaeda-fleet-cas/glaeda/tools'
-  rsync -a "$here/scripts/glaeda-fleet-cas" "$1:.cache/glaeda-fleet-cas/glaeda/scripts/"
-  rsync -a --delete --exclude target "$here/tools/fleet-cas-prototype" "$1:.cache/glaeda-fleet-cas/glaeda/tools/"
+  rsync -a -e 'ssh -o BatchMode=yes' "$here/scripts/glaeda-fleet-cas" "$1:.cache/glaeda-fleet-cas/glaeda/scripts/"
+  rsync -a -e 'ssh -o BatchMode=yes' --delete --exclude target "$here/tools/fleet-cas-prototype" "$1:.cache/glaeda-fleet-cas/glaeda/tools/"
 }
 run() {  # host, args...
   local h=$1; shift
