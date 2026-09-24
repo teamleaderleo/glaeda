@@ -16,7 +16,8 @@ Xcode's compilation cache and incremental builds do not mix for the cmux app tar
 | flip caching on / off in the same DerivedData | 606 s (full rebuild) | 755 s (full rebuild) |
 
 The caching-off column and the flip row are from cmux8s at the fleet pin, Xcode 26.6
-(17F113); the caching-on column is from the minis on Xcode 26.3. The edit was a new
+(17F113); the caching-on column is from the minis on Xcode 26.3, with a different edit, so the
+two edit cells are not a strict pair. The edit was a new
 file-scope declaration in one app file (`WorkspaceTodoState.swift`), which recompiled 646
 dependent compile steps; its revert took 125 s. An edit inside a function body likely
 recompiles less (the Air Blue campaign saw 40 to 48 s on Xcode 27) and has not been measured
@@ -119,7 +120,7 @@ cmux8s (node) on 2026-09-24.
 ## When to switch
 
 Catch-up is only fast when the store already holds the target commit; on a store miss it
-is a cold build (about 750 to 800 s), slower than an incremental caching-off rebuild. So the
+is a cold build (756 s on Xcode 26.3 minis; a full caching-on rebuild took 606 s on 26.6), slower than an incremental caching-off rebuild. So the
 worker asks first: the writer records a marker per commit it has filled (planned), and
 catch-up is chosen only when the marker for the target commit exists. The rows below are read
 top to bottom, first match wins, and the writer is exempt: CI's main build always runs catch-up
@@ -139,7 +140,7 @@ merge base with main has a marker (its own changes are few, and they miss either
 started once the catch-up product is delivered. It takes the host lock like any job, and a
 `flock` does not preempt, so a foreground job must be able to cancel it: the warmer registers
 its xcodebuild process, the foreground job stops it and requeues the warm (planned). An
-interrupted incremental build leaves DerivedData usable: on the pin, a build stopped after 25 s
+build stopped during planning left DerivedData usable: on the pin, a build stopped after 25 s
 was followed by an ordinary incremental one (143 s, the same 646 steps as the uncancelled
 edit). That stop landed during planning; a stop in the middle of compiling is still
 unmeasured. Because every slot shares the
@@ -160,7 +161,7 @@ DerivedData is therefore warmed by its own caching-off builds:
   36 s for a new tag into a warm pair and 620 s when a low-level package changed. How often a
   main commit touches a low-level package has not been counted, so the warmer's average cost
   is unknown;
-- warming a slot from nothing is a cold caching-off build (about 750 s on a mini), so a host
+- warming a slot from nothing is a cold caching-off build (710 s on a mini at the pin), so a host
   warms its slots one at a time, idle only, and a new slot is usable in catch-up mode before
   its iteration DerivedData is ready;
 - the source checkout per slot stays at a fixed path, so incremental state stays valid.
