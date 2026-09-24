@@ -1,0 +1,159 @@
+# RFC #1134 M2 gate: does Xcode's remote compilation-cache socket mode hold up on the full
+# cmux app graph, or stall on deep module graphs as Tuist reported?
+#
+# Three full cmux app builds on one GitHub-hosted Xcode 27 runner, each with its own new
+# DerivedData and local CAS:
+#   local  compilation caching on, local CAS only (the baseline socket mode is compared to)
+#   fill   plus the prototype service on a unix socket, empty store
+#   fresh  a "new machine": its only warm source is the store `fill` left behind
+# Every build has a watchdog, so a stall is a recorded result, not a hung job.
+# Measurement only: nothing here gates merges or publishes anything.
+name: fleet-cas full-app gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      cmux_ref:
+        description: manaflow-ai/cmux commit to build
+        required: true
+      build_timeout_minutes:
+        description: per-build watchdog
+        default: "75"
+  push:
+    branches: [experiment/fleet-cas-fullapp]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-cas-fullapp-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    runs-on: xcode-27
+    timeout-minutes: 300
+    env:
+      CMUX_REF: ${{ inputs.cmux_ref || 'cdcdea125fde224f8c1998053a7d1d72e4243465' }}
+      BUILD_TIMEOUT_MINUTES: ${{ inputs.build_timeout_minutes || '75' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: glaeda
+
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          sysctl -n hw.ncpu hw.memsize machdep.cpu.brand_string
+          df -h "$HOME"
+
+      - name: Build the prototype service
+        working-directory: glaeda/tools/fleet-cas-prototype
+        run: |
+          command -v cargo || { curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; }
+          . "$HOME/.cargo/env" 2>/dev/null || true
+          cargo build --release --locked
+
+      # $HOME, never /tmp or $TMPDIR: Xcode 27 replay crashes under symlinked build paths
+      # (swiftlang/swift#92545).
+      - name: Check out cmux
+        run: |
+          mkdir -p "$HOME/w" && cd "$HOME/w"
+          git init -q cmux && cd cmux
+          git remote add origin https://github.com/manaflow-ai/cmux.git
+          git fetch -q --depth 1 origin "$CMUX_REF"
+          git checkout -q FETCH_HEAD
+          # every submodule except ghostty, whose prebuilt xcframework is downloaded below
+          git -c submodule.ghostty.update=none submodule update --init --recursive --depth 1
+          GHOSTTY_SHA="$(git ls-tree HEAD ghostty | awk '{print $3}')" ./scripts/download-prebuilt-ghosttykit.sh
+          git log -1 --format='cmux %H %cI'
+
+      - name: Resolve packages once
+        working-directory: /Users/runner/w/cmux
+        run: |
+          xcodebuild -resolvePackageDependencies -project cmux.xcodeproj -scheme cmux \
+            -clonedSourcePackagesDirPath "$HOME/w/spm" 2>&1 | tail -5
+
+      - name: Measure
+        working-directory: /Users/runner/w/cmux
+        run: |
+          set -u
+          W="$HOME/w/runs"; mkdir -p "$W"
+          SOCK="$HOME/w/fcas.sock"; STORE="$HOME/w/store"
+          SERVER="$GITHUB_WORKSPACE/glaeda/tools/fleet-cas-prototype/target/release/fleet-cas"
+
+          build() {  # label, extra settings...
+            local label=$1; shift
+            local dd="$W/dd-$label" log="$W/log-$label.txt"
+            local start end rc
+            start=$(date +%s)
+            xcodebuild build -project cmux.xcodeproj -scheme cmux -configuration Debug \
+              -destination 'platform=macOS' -derivedDataPath "$dd" \
+              -clonedSourcePackagesDirPath "$HOME/w/spm" -disableAutomaticPackageResolution \
+              COMPILATION_CACHE_ENABLE_CACHING=YES \
+              COMPILATION_CACHE_CAS_PATH="$W/localcas-$label" \
+              COMPILATION_CACHE_ENABLE_DIAGNOSTIC_REMARKS=YES \
+              SWIFT_ENABLE_PREFIX_MAPPING=YES CLANG_ENABLE_PREFIX_MAPPING=YES \
+              SWIFT_ENABLE_PROJECT_PREFIX_MAPPING=YES CLANG_ENABLE_PROJECT_PREFIX_MAPPING=YES \
+              SWIFT_OTHER_PREFIX_MAPPINGS="$dd=/^derived" CLANG_OTHER_PREFIX_MAPPINGS="$dd=/^derived" \
+              -showBuildTimingSummary "$@" >"$log" 2>&1 &
+            local pid=$! waited=0 stalled=0 last_size=-1 same=0
+            while kill -0 "$pid" 2>/dev/null; do
+              sleep 30; waited=$((waited + 30))
+              # a stall: the build log has not grown for 10 minutes
+              size=$(stat -f %z "$log")
+              if [ "$size" = "$last_size" ]; then same=$((same + 30)); else same=0; fi
+              last_size=$size
+              if [ "$same" -ge 600 ] || [ "$waited" -ge $((BUILD_TIMEOUT_MINUTES * 60)) ]; then
+                stalled=1
+                sample "$pid" 5 -file "$W/sample-$label.txt" >/dev/null 2>&1 || true
+                pkill -TERM -P "$pid" 2>/dev/null; kill -TERM "$pid" 2>/dev/null
+                break
+              fi
+            done
+            wait "$pid"; rc=$?
+            end=$(date +%s)
+            printf '| %s | %s | %s | %ss | %s | %s | %s |\n' "$label" "$rc" \
+              "$([ $stalled = 1 ] && echo "stalled (log silent ${same}s)" || echo no)" \
+              "$((end - start))" "$(grep -c 'cache hit' "$log")" "$(grep -c 'cache miss' "$log")" \
+              "$(grep -c 'cache poisoned' "$log")" | tee -a "$W/results.md"
+          }
+
+          echo '| run | rc | stalled | wall | hits | misses | poisoned |' > "$W/results.md"
+          echo '| --- | --- | --- | ---: | ---: | ---: | ---: |' >> "$W/results.md"
+          build local
+
+          mkdir -p "$STORE"; rm -f "$SOCK"
+          "$SERVER" "$SOCK" "$STORE" >"$W/server.log" 2>&1 &
+          for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.2; done
+          plugin=(COMPILATION_CACHE_ENABLE_PLUGIN=YES "COMPILATION_CACHE_REMOTE_SERVICE_PATH=$SOCK")
+          build fill "${plugin[@]}"
+          cp "$STORE/stats.json" "$W/stats-after-fill.json" 2>/dev/null || true
+          build fresh "${plugin[@]}"
+          cp "$STORE/stats.json" "$W/stats-after-fresh.json" 2>/dev/null || true
+          du -sh "$STORE" | tee -a "$W/results.md"
+          find "$STORE" -type f | wc -l | xargs echo "store files:" | tee -a "$W/results.md"
+
+          {
+            echo "## fleet-cas full-app gate"
+            echo "cmux \`$CMUX_REF\`, $(xcodebuild -version | tr '\n' ' '), $(sysctl -n hw.ncpu) CPUs"
+            echo; cat "$W/results.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for l in local fill fresh; do
+            echo "== $l: timing summary"; grep -A25 'Build Timing Summary' "$W/log-$l.txt" | head -30
+            echo "== $l: errors"; grep -E 'error:|BUILD FAILED|crash|Segmentation' "$W/log-$l.txt" | head -20
+          done
+
+      - name: Keep logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: fleet-cas-fullapp-logs
+          path: |
+            ~/w/runs/log-*.txt
+            ~/w/runs/results.md
+            ~/w/runs/stats-*.json
+            ~/w/runs/sample-*.txt
+            ~/w/runs/server.log
+          retention-days: 14
