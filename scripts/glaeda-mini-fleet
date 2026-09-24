@@ -532,7 +532,7 @@ def probe_reservation(flag: str | None, raw_b64: str | None) -> dict[str, Any] |
             return {"valid": False, "why": "the probe sent unreadable content"}
         return marker_from_bytes(raw)
     if flag is not None:
-        return {"valid": False, "why": "a symlink or not a regular file"}
+        return {"valid": False, "why": "a symlink, not a regular file, or unreadable"}
     return None
 
 
@@ -546,7 +546,10 @@ def reservation_state(reservation: dict[str, Any] | None, now: float) -> str | N
 
 
 def utc(epoch: float) -> str:
-    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(epoch))
+    try:
+        return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(epoch))
+    except (ValueError, OverflowError, OSError):
+        return f"epoch {epoch}"  # a hand-written marker can carry a time no calendar holds
 
 
 def printable(text: str) -> str:
@@ -555,7 +558,10 @@ def printable(text: str) -> str:
 
 
 def describe_reservation(reservation: dict[str, Any]) -> str:
-    return printable(reservation_rules.describe(reservation))
+    try:
+        return printable(reservation_rules.describe(reservation))
+    except (ValueError, OverflowError, OSError):
+        return printable(f"{reservation['owner'] or '?'} for {reservation['purpose'] or '?'} until epoch {reservation['until']}")
 
 
 def parse_key(value: str) -> dict[str, Any]:

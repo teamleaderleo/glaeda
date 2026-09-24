@@ -82,7 +82,7 @@ fi
 # Reservation marker written by glaeda-mini-fleet reserve. Shipped raw (bounded, base64 on one line)
 # so glaeda_reservation.py parses it on the operator side, as the runner hook does on the host.
 R="$F/reservation.json"
-if [ -L "$R" ] || { [ -e "$R" ] && [ ! -f "$R" ]; }; then
+if [ -L "$R" ] || { [ -e "$R" ] && { [ ! -f "$R" ] || [ ! -r "$R" ]; }; }; then
   e reservation invalid
 elif [ -f "$R" ]; then
   e reservation_raw "$(head -c 4097 "$R" | base64 | tr -d '\n')"

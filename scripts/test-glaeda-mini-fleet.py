@@ -2216,6 +2216,11 @@ class ReservationCheckAndPoolTests(unittest.TestCase):
         self.assertEqual(invalid[0]["fix"].split(", then ")[1], "glaeda-mini-fleet release build-mini-1 --force --yes")
         self.assertIn("schema", invalid[0]["detail"])
 
+    def test_a_time_no_calendar_holds_does_not_crash_check(self) -> None:
+        for until in (10**12, 10**20):
+            issues = self.issues(reservation_line(until=until))
+            self.assertIn(f"epoch {until}", [i for i in issues if i["area"] == "reserved"][0]["detail"])
+
     def test_reservation_beyond_the_cap_is_also_drift(self) -> None:
         now = int(time.time())
         areas = [i["area"] for i in self.issues(reservation_line(until=now + 100 * 3600))]
