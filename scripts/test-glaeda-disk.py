@@ -188,6 +188,14 @@ class GlaedaDiskTest(unittest.TestCase):
 
     def test_thresholds_take_gib_or_percent(self) -> None:
         self.assertEqual(gd.space("60", 10**15), 60 * 1024**3)
+        gib = 1024**3
+        # one default across a 256 GB laptop, a 1 TB mini and an 8 TB studio
+        self.assertEqual(gd.space("15%:40-150", 238 * gib), 40 * gib)
+        self.assertEqual(gd.space("15%:40-150", 931 * gib), int(931 * gib * 0.15))
+        self.assertEqual(gd.space("15%:40-150", 7450 * gib), 150 * gib)
+        for bad in ("60:1-2", "15%:9", "15%:50-40", "15%:a-b"):
+            with self.assertRaises(ValueError):
+                gd.space(bad, 1000)
         self.assertEqual(gd.space("15%", 1000), 150)
         self.assertEqual(gd.space("2.5", 0), int(2.5 * 1024**3))
         with self.assertRaises(ValueError):
@@ -354,6 +362,10 @@ class GlaedaDiskTest(unittest.TestCase):
         self._git("clone", "-q", str(origin), str(root / "super"))
         self._git("-C", str(root / "super"), "-c", "protocol.file.allow=always", "submodule",
                   "add", "-q", str(sub), "sm")
+        (root / "super/sm/local").write_text("only here")
+        self._git("-C", str(root / "super/sm"), "add", "local")
+        self._git("-C", str(root / "super/sm"), "commit", "-qm", "local")
+        self._git("-C", str(root / "super"), "add", "sm")
         self._git("-C", str(root / "super"), "commit", "-qm", "sm")
         self._git("-C", str(root / "super"), "push", "-q", "origin", "HEAD:refs/heads/super")
         self._git("-C", str(root / "super"), "fetch", "-q")
@@ -374,10 +386,71 @@ class GlaedaDiskTest(unittest.TestCase):
         why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
         self.assertEqual(why, {
             "main": ("git-checkout", ["other worktrees use this repository"]),
-            "super": ("git-checkout", ["submodules"]),
+            "super": ("git-checkout", ["submodule sm: commits made here and not on any remote"]),
             "skipped": ("git-checkout", ["files hidden from status"]),
             "bisect": ("git-checkout", ["HEAD on no ref"]),
             "locked": ("git-checkout", ["locked worktree"])})
+
+    def test_submodules_are_judged_not_vetoed(self) -> None:
+        root, origin = self._tmp_repos()
+        sub = self.root / "subsrc"
+        self._git("clone", "-q", str(origin), str(sub))
+        add = ("-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "sm")
+
+        def superproject(name: str, worktree: bool = False) -> Path:
+            d = root / name
+            if worktree:
+                self._git("-C", str(origin), "worktree", "add", "-q", "-b", name, str(d))
+            else:
+                self._git("clone", "-q", str(origin), str(d))
+            self._git("-C", str(d), *add)
+            self._git("-C", str(d), "commit", "-qm", "sm")
+            if not worktree:
+                self._git("-C", str(d), "push", "-q", "origin", f"HEAD:refs/heads/{name}")
+                self._git("-C", str(d), "fetch", "-q")
+            return d
+
+        superproject("pushed")  # submodule at a commit its remote has
+        # pinned at a commit fetched by id: on the remote, but no remote-tracking ref has it
+        extra = self.root / "extra"
+        self._git("clone", "-q", str(sub), str(extra))
+        (extra / "e").write_text("e")
+        self._git("-C", str(extra), "add", "e")
+        self._git("-C", str(extra), "commit", "-qm", "e")
+        pinned = self._git("-C", str(extra), "rev-parse", "HEAD").strip()
+        self._git("-C", str(extra), "push", "-q", "origin", "HEAD:refs/pinned/e")  # no branch
+        d = superproject("fetched")
+        self._git("-C", str(d / "sm"), "-c", "uploadpack.allowAnySHA1InWant=true", "fetch", "-q",
+                  "origin", pinned)
+        self._git("-C", str(d / "sm"), "checkout", "-q", pinned)
+        self.assertTrue(self._git("-C", str(d / "sm"), "rev-list", "HEAD", "--not", "--remotes"))
+        self._git("-C", str(d), "add", "sm")
+        self._git("-C", str(d), "commit", "-qm", "pin")
+        self._git("-C", str(d), "push", "-q", "origin", "HEAD:refs/heads/fetched")
+        self._git("-C", str(d), "fetch", "-q")
+        superproject("wt-pushed", worktree=True)
+        d = superproject("dirty")
+        (d / "sm/untracked").write_text("u")
+        d = superproject("stashed")
+        (d / "sm/f").write_text("changed")
+        self._git("-C", str(d / "sm"), "stash", "-q")
+        d = superproject("wt-local", worktree=True)  # modules live in the worktree's git dir
+        (d / "sm/g").write_text("g")
+        self._git("-C", str(d / "sm"), "add", "g")
+        self._git("-C", str(d / "sm"), "commit", "-qm", "g")
+        self._git("-C", str(d), "add", "sm")
+        self._git("-C", str(d), "commit", "-qm", "bump")
+        for c in root.iterdir():
+            self._age(c)
+        why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
+        self.assertEqual(why, {
+            "pushed": ("reclaimable", []),
+            "fetched": ("reclaimable", []),
+            "wt-pushed": ("reclaimable", []),
+            "dirty": ("git-checkout", ["uncommitted or untracked changes"]),
+            "stashed": ("git-checkout", ["submodule sm: stash entries"]),
+            "wt-local": ("git-checkout",
+                         ["submodule sm: commits made here and not on any remote"])})
 
     def test_apply_rechecks_a_checkout_that_gained_work(self) -> None:
         root, origin = self._tmp_repos()
@@ -446,6 +519,8 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertIn("botany-sim-worktrees", projects.skip)
         tmp = next(f for f in fams if f.id == "tmp")
         self.assertIn(f"claude-{os.getuid()}", tmp.skip)
+        # scratch clones and leaked files are judged on any filesystem, not only a tmpfs
+        self.assertTrue(tmp.files and tmp.git_disposable)
 
     def test_claude_session_seen_in_alternate_config_dir(self) -> None:
         t = self.home / ".claude-outlook/projects/-home-leo-Projects/abc-123.jsonl"

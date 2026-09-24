@@ -27,13 +27,17 @@ Every deletion is appended to a JSONL receipt.
 
 Free space is judged per filesystem. On Linux /tmp is often its own tmpfs, so pressure there
 reclaims only /tmp items, and pressure on the home filesystem never deletes from /tmp.
+Thresholds scale with the disk: "15%:40-150" is 15% of it, at least 40 and at most 150 GiB,
+so the same default fits a 256 GB laptop, a Mac mini and a multi-terabyte Mac Studio.
 
 A tmpfs holds its files in RAM and swap, so its free space says nothing about pressure: a
 16 GiB /tmp at 80% had filled swap while still "2.3G free". A tmpfs is judged by
---tmpfs-low/--tmpfs-target instead (default: pressure once a quarter of it is in use).
-There the temp dir also counts top-level files (leaked extracted libraries, logs) and small
-items (1 MiB floor), and a scratch checkout is reclaimable when deleting it loses nothing
-git holds: clean, no stash, every local commit on a remote, no submodules and no other
+--tmpfs-low/--tmpfs-target instead (default: pressure once a quarter of it is in use), and
+its items count from 1 MiB.
+
+The temp dir also counts top-level files (leaked extracted libraries, logs), and a scratch
+checkout there is reclaimable when deleting it loses nothing
+git holds: clean, no stash, every local commit on a remote (submodules too) and no other
 worktrees (a linked worktree: unlocked, HEAD on a branch, tag or remote ref of its
 repository, which survives). Ignored files go with it: in a temp-dir checkout they are
 build output or copies. Nested or unverifiable checkouts stay protected.
@@ -120,8 +124,8 @@ def default_families() -> list[Family]:
                "session scratch space; the session is idle", depth=2,
                skip=("bundled-skills", "bash-edit-diff")),
         Family("tmp", tmp, True, "agent scratch under the temp dir",
-               skip=(f"claude-{uid}",), files=tmpfs,
-               min_bytes=1024**2 if tmpfs else None, git_disposable=tmpfs),
+               skip=(f"claude-{uid}",), files=True,
+               min_bytes=1024**2 if tmpfs else None, git_disposable=True),
         Family("user-cache", HOME / ".cache", False, "tool caches (report only)"),
         Family("library-caches", HOME / "Library/Caches", False, "app caches (report only)"),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
@@ -336,18 +340,22 @@ def git_loss(path: Path) -> str:
     top = git("rev-parse", "--show-toplevel")
     if top is None or os.path.realpath(top.strip()) != os.path.realpath(path):
         return "not a readable checkout"
-    status = git("status", "--porcelain", "--untracked-files=all")
+    # --ignore-submodules=none overrides submodule.*.ignore, so dirty submodules count
+    status = git("status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
     if status is None or status.strip():
         return "uncommitted or untracked changes"
     # status hides edits to files flagged assume-unchanged (lowercase tag) or skip-worktree (S)
     flags = git("ls-files", "-v")
     if flags is None or any(ln[:1].islower() or ln[:1] == "S" for ln in flags.splitlines()):
         return "files hidden from status"
-    if (path / ".gitmodules").exists():
-        return "submodules"  # their commits live only in this checkout's .git/modules
+    own = git("rev-parse", "--path-format=absolute", "--git-dir")
+    if own is None:
+        return "not a readable checkout"
+    # submodule repositories live in this checkout's git dir (a linked worktree's own one),
+    # so they are deleted with it
+    if (loss := module_loss(Path(own.strip()) / "modules")):
+        return loss
     if dotgit.is_dir():
-        if (dotgit / "modules").exists():
-            return "submodules"
         wts = git("worktree", "list", "--porcelain")
         if wts is None or sum(ln.startswith("worktree ") for ln in wts.splitlines()) != 1:
             return "other worktrees use this repository"
@@ -361,14 +369,73 @@ def git_loss(path: Path) -> str:
         common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
         if common is None or os.path.realpath(common.strip()).startswith(os.path.realpath(path) + "/"):
             return "repository inside the worktree"
-        own = git("rev-parse", "--path-format=absolute", "--git-dir")
-        if own is None or os.path.lexists(os.path.join(own.strip(), "locked")):
+        if os.path.lexists(os.path.join(own.strip(), "locked")):
             return "locked worktree"
         # refs/bisect and refs/worktree belong to the worktree and go with it
         refs = git("for-each-ref", "--count=1", "--contains", "HEAD", "--format=%(refname)",
                    "refs/heads", "refs/tags", "refs/remotes")
         if refs is None or not refs.strip():
             return "HEAD on no ref"
+    return ""
+
+
+# reflog subjects that move a ref to a commit without creating one
+FETCHED_ONLY = re.compile(r"(checkout: |clone: |reset: moving to |branch: Created from |"
+                          r"pull: Fast-forward|merge [^:]*: Fast-forward|update by push|fetch)")
+
+
+def module_loss(modules: Path, budget: int = 200) -> str:
+    """"" when every submodule repository under `modules` (nested ones too) has no stash and
+    no commit made here that its remotes lack, else what deleting them would lose.
+
+    `submodule update` fetches the pinned commit by id, so no remote-tracking ref contains it.
+    Such commits are fine; one the module's reflog shows being created here (commit, merge,
+    rebase, ...) is not. A module with commits outside its remotes and no reflog is kept."""
+    if not modules.exists():
+        return ""
+    if modules.is_symlink() or not modules.is_dir():
+        return "unreadable submodule store"
+    frontier = [modules]
+    while frontier:
+        d = frontier.pop()
+        for c in _children(d):
+            budget -= 1
+            if budget < 0:
+                return "too many submodules to check"
+            if c.is_symlink() or not c.is_dir():
+                continue
+            if not ((c / "HEAD").is_file() and (c / "objects").is_dir()):
+                frontier.append(c)  # a path component of a nested submodule name
+                continue
+
+            def git(*args: str) -> str | None:
+                try:
+                    r = subprocess.run(["git", "--git-dir", str(c), *args], capture_output=True,
+                                       text=True, timeout=60,
+                                       env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+                except (OSError, subprocess.TimeoutExpired):
+                    return None
+                return r.stdout if r.returncode == 0 else None
+
+            name = os.path.relpath(c, modules)
+            if git("for-each-ref", "--count=1", "refs/stash") != "":
+                return f"submodule {name}: stash entries"
+            local = git("rev-list", "--max-count=5001", "HEAD", "--branches", "--tags",
+                        "--not", "--remotes")
+            if local is None or len(local.split()) > 5000:
+                return f"submodule {name}: commits not on any remote"
+            if local.strip():
+                made = git("log", "-g", "--all", "--format=%H%x09%gs") if (
+                    c / "logs/HEAD").is_file() else None
+                if made is None:
+                    return f"submodule {name}: commits not on any remote"
+                outside = set(local.split())
+                for line in made.splitlines():
+                    sha, _, subject = line.partition("\t")
+                    if sha in outside and not FETCHED_ONLY.match(subject):
+                        return f"submodule {name}: commits made here and not on any remote"
+            if (c / "modules").exists():
+                frontier.append(c / "modules")
     return ""
 
 
@@ -558,11 +625,24 @@ def free_bytes(path: Path) -> tuple[int, int]:
 
 
 def space(spec: str, total: int) -> int:
-    """A threshold as bytes: "60" is 60 GiB, "15%" is 15% of this filesystem's size."""
+    """A threshold as bytes: "60" is 60 GiB, "15%" is 15% of this filesystem's size, and
+    "15%:40-150" is that share held between 40 and 150 GiB."""
     spec = str(spec).strip()
-    if spec.endswith("%"):
-        return int(total * float(spec[:-1]) / 100)
-    return int(float(spec) * GIB)
+    share, _, bounds = spec.partition(":")
+    if not share.endswith("%"):
+        if bounds:
+            raise ValueError(f"bounds need a percentage: {spec!r}")
+        return int(float(share) * GIB)
+    n = int(total * float(share[:-1]) / 100)
+    if bounds:
+        lo, sep, hi = bounds.partition("-")
+        if not sep:
+            raise ValueError(f"bounds are LOW-HIGH GiB: {spec!r}")
+        lo_b, hi_b = int(float(lo) * GIB), int(float(hi) * GIB)
+        if lo_b > hi_b:
+            raise ValueError(f"bounds are LOW-HIGH GiB: {spec!r}")
+        n = min(max(n, lo_b), hi_b)
+    return n
 
 
 def mount_point(path: Path) -> Path:
@@ -836,12 +916,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--apply", action="store_true", help="delete reclaimable items")
     ap.add_argument("--pressure", action="store_true",
                     help="only act when free space is below --low; stop at --target")
-    low, target = ("60", "100") if DARWIN else ("10%", "20%")
-    ap.add_argument("--low", default=low,
-                    help="pressure threshold per filesystem, GiB free or N%% of its size "
-                         "(default %(default)s)")
-    ap.add_argument("--target", default=target,
-                    help="stop freeing at this much free, GiB or N%% (default %(default)s)")
+    ap.add_argument("--low", default="15%:40-150",
+                    help="pressure threshold per filesystem: GiB free, N%% of its size, or "
+                         "N%%:LO-HI to hold that share between LO and HI GiB (default %(default)s)")
+    ap.add_argument("--target", default="25%:80-300",
+                    help="stop freeing at this much free, same forms (default %(default)s)")
     ap.add_argument("--tmpfs-low", default="75%",
                     help="pressure threshold for a tmpfs, whose files live in RAM and swap "
                          "(default %(default)s free)")
