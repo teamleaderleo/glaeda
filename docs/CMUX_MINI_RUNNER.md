@@ -227,7 +227,9 @@ them with `defaults.runner.classes.<class>` `{"runners": N, "capacityUnits": U,
 `compileSlots` (default 1, at most U/2) is how many compiles run at once, one
 `persistent-dd` token each (`persistent-dd.token`, `persistent-dd-1.token`, ...).
 Raise it only once cmux's compile admission keeps its canonical root and kept
-state per runner; with shared paths two compiles would clobber each other. Each runner is one
+state per runner; with shared paths two compiles would clobber each other. Re-apply
+every instance on the mini together: runners that disagree on the count run as many
+compiles as the highest one allows. Each runner is one
 `--instance K`:
 
     for k in 0 1 2 3; do

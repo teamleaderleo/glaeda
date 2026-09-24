@@ -429,7 +429,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         taken: list[str] = []
         for token in tokens:
             # persistent-dd comes in compile_slots copies once compile admission keeps its state per
-            # runner; copy 0 keeps the original file name, so older hooks on the same mini still agree.
+            # runner; copy 0 keeps the original file name. A mini whose runners disagree on the count runs
+            # as many compiles as the highest one allows, so re-apply every instance on a mini together.
             copies = max(1, compile_slots) if token == "persistent-dd" else 1
             for copy in range(copies):
                 name = token if copy == 0 else f"{token}-{copy}"
