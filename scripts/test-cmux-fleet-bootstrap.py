@@ -335,6 +335,29 @@ class Tests(unittest.TestCase):
         ):
             return b.collect_macos(root, root / "glaeda", 1, "cmux-mac-build-large", cache_root)
 
+    def test_xcode_pin_accepts_the_major_cmux_pins(self):
+        # cmux#14050 changed .xcode-version from "26.0" to "26".
+        for pin in ("26", "26.0", "26\n".strip()):
+            self.assertTrue(b.xcode_pin_ready(pin, "26.6", "26.5"), pin)
+        self.assertFalse(b.xcode_pin_ready("27", "27.0", "27.0"))
+        self.assertFalse(b.xcode_pin_ready("26", "25.4", "26.5"))
+        self.assertFalse(b.xcode_pin_ready("26", "260.1", "26.5"))
+        self.assertFalse(b.xcode_pin_ready("26", "26.6", "15.5"))
+        self.assertFalse(b.xcode_pin_ready("26", None, "26.5"))
+        self.assertFalse(b.xcode_pin_ready("", "26.6", "26.5"))
+
+    def test_macos_observation_accepts_a_major_only_xcode_version_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._macos_checkout(root)
+            (root / ".xcode-version").write_text("26\n", encoding="utf-8")
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+            cache_root = root / "cache"
+            cache_root.mkdir()
+            self.assertTrue(self._collect_macos(root, cache_root, visible=True)["checks"]["xcodePin"])
+
     def test_macos_observation_reports_workload_tool_visibility(self):
         # collect_macos cannot run on the host that runs this suite, so its
         # wiring is the half most likely to be left behind by a later edit.

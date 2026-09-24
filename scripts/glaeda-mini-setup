@@ -68,7 +68,7 @@ import cmux_fleet_bootstrap as fleet  # noqa: E402  (read-only helpers; importin
 
 # The machines this was written for. A different host still works; preflight says how it differs.
 TARGET = {"machine": "Mac mini", "chip": "Apple M4 Pro", "cpus": 14, "memoryGiB": 48}
-CMUX_XCODE_APP = "/Applications/Xcode_26.3.app"  # vars.CMUX_CI_XCODE_APP_MACOS_15, cmux docs/ci/mac-fleet.md 3.3
+CMUX_XCODE_APP = "/Applications/Xcode_26.6.app"  # vars.CMUX_CI_XCODE_APP_PR, which the persistent producer reads first
 MIN_FREE_GIB = fleet.default_min_free_gib("macos")  # one build slot, as the fleet bootstrap
 SUPPORTED_MACOS = {15, 26}
 LABEL_PREFIX = "com.teamleaderleo.glaeda."
@@ -162,15 +162,16 @@ class Context:
 def pick_python() -> str | None:
     """The interpreter the glaeda-disk LaunchAgents run.
 
-    /usr/bin/python3 is a stub that opens an install dialog until the Command Line Tools exist,
-    so it only counts once they do.
+    /usr/bin/python3 is a stub that opens an install dialog until the Command Line Tools or
+    an Xcode exist, so it only counts once one does. The fleet's Xcode is a versioned app
+    such as Xcode_26.6.app, not only Xcode.app.
     """
     for candidate in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
         if os.access(candidate, os.X_OK):
             return candidate
-    if Path("/Library/Developer/CommandLineTools/usr/bin/python3").exists() or Path(
-        "/Applications/Xcode.app"
-    ).exists():
+    if Path("/Library/Developer/CommandLineTools/usr/bin/python3").exists() or any(
+        Path("/Applications").glob("Xcode*.app")
+    ):
         return "/usr/bin/python3"
     return None
 
@@ -181,6 +182,16 @@ def pick_python() -> str | None:
 def check(ok: bool | None, value: object, note: str = "", blocking: bool = False) -> dict[str, Any]:
     level = "ok" if ok else ("info" if ok is None else ("block" if blocking else "warn"))
     return {"level": level, "value": value, "note": note}
+
+
+def command_line_tools_check(present: bool, version: str | None, xcode_selected_and_usable: bool) -> dict[str, Any]:
+    """A selected, licensed Xcode already backs /usr/bin/git, python3 and xcrun, so the
+    Command Line Tools block only a Mac that has neither."""
+    if present:
+        return check(True, version or "present")
+    if xcode_selected_and_usable:
+        return check(None, "missing", "not needed: the selected Xcode provides git and xcrun")
+    return check(False, "missing", "xcode-select --install", True)
 
 
 def xcode_apps() -> list[dict[str, str]]:
@@ -275,14 +286,15 @@ def preflight(ctx: Context) -> dict[str, Any]:
     clt = Path("/Library/Developer/CommandLineTools")
     _, clt_pkg = run(["/usr/sbin/pkgutil", "--pkg-info=com.apple.pkg.CLTools_Executables"])
     clt_version = re.search(r"^version:\s*(\S+)", clt_pkg, re.MULTILINE)
-    checks["commandLineTools"] = check(clt.is_dir(), clt_version.group(1) if clt_version else ("present" if clt.is_dir() else "missing"),
-                                       "" if clt.is_dir() else "xcode-select --install", True)
     apps = xcode_apps()
     code, selected = run(["/usr/bin/xcode-select", "-p"])
     selected = selected if code == 0 else "none"
     xcode_code, xcode_version = run(["/usr/bin/xcrun", "xcodebuild", "-version"]) if apps else (1, "")
     licence_needed = "license" in xcode_version.lower()
     version_match = re.search(r"^Xcode\s+(\S+)", xcode_version, re.MULTILINE)
+    checks["commandLineTools"] = command_line_tools_check(
+        clt.is_dir(), clt_version.group(1) if clt_version else None,
+        selected.startswith("/Applications/Xcode") and xcode_code == 0 and not licence_needed)
     checks["xcode"] = check(bool(apps), ", ".join(f'{Path(a["path"]).name} {a["version"]}' for a in apps) or "none",
                             "" if apps else "install Xcode (operator)", True)
     checks["xcodeSelected"] = check(selected.startswith("/Applications/Xcode"), selected,
@@ -693,7 +705,7 @@ def operator_steps(ctx: Context, pre: dict[str, Any], fleet_result: dict[str, An
         steps.append({"why": why, "command": command, "needs": needs})
 
     c = pre["checks"]
-    if c["commandLineTools"]["level"] != "ok":
+    if c["commandLineTools"]["level"] not in {"ok", "info"}:
         add("Command Line Tools missing", "xcode-select --install", "human (GUI dialog)")
     if c["xcode"]["level"] != "ok" or c["cmuxXcodePin"]["level"] != "ok":
         add(f"cmux CI pins {ctx.xcode_app}", f"install Xcode at {ctx.xcode_app} (xcodes or the Apple developer site)", "human")

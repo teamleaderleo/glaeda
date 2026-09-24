@@ -104,6 +104,32 @@ class MiniSetupTest(unittest.TestCase):
     def states(self, receipt: dict) -> set[str]:
         return {a["state"] for a in receipt["actions"]}
 
+    def test_command_line_tools_block_only_without_a_usable_selected_xcode(self) -> None:
+        self.assertEqual(ms.command_line_tools_check(True, "26.6", False)["level"], "ok")
+        # The selected, licensed Xcode backs git and xcrun: nothing to install.
+        self.assertEqual(ms.command_line_tools_check(False, None, True)["level"], "info")
+        self.assertEqual(ms.command_line_tools_check(False, None, False)["level"], "block")
+        for level, wanted in (("info", False), ("block", True)):
+            pre = fake_preflight()(None)
+            pre["checks"]["commandLineTools"] = {"level": level, "value": "missing", "note": ""}
+            steps = ms.operator_steps(mock.Mock(xcode_app=ms.CMUX_XCODE_APP), pre, None)
+            self.assertEqual(any(s["command"] == "xcode-select --install" for s in steps), wanted, level)
+
+    def test_pick_python_trusts_the_shim_beside_a_versioned_xcode(self) -> None:
+        def fake_glob(self, pattern):
+            return iter([Path("/Applications/Xcode_26.6.app")]) if pattern == "Xcode*.app" else iter([])
+        with mock.patch.object(ms.os, "access", return_value=False), \
+             mock.patch.object(ms.Path, "exists", return_value=False), \
+             mock.patch.object(ms.Path, "glob", fake_glob):
+            self.assertEqual(ms.pick_python(), "/usr/bin/python3")
+        with mock.patch.object(ms.os, "access", return_value=False), \
+             mock.patch.object(ms.Path, "exists", return_value=False), \
+             mock.patch.object(ms.Path, "glob", lambda self, pattern: iter([])):
+            self.assertIsNone(ms.pick_python())
+
+    def test_default_xcode_pin_matches_the_cmux_pull_request_lane(self) -> None:
+        self.assertEqual(ms.CMUX_XCODE_APP, "/Applications/Xcode_26.6.app")
+
     def test_plan_is_default_and_writes_nothing(self) -> None:
         receipt = self.invoke()
         self.assertFalse(receipt["applied"])
