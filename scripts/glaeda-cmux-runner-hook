@@ -409,11 +409,15 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         if os.path.isdir(os.path.dirname(host_lock)):
             # created if missing, so a worker that starts later still has to wait for this job
             fd = os.open(host_lock, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            except OSError:
-                os.close(fd)
-                return False, "capacity: a fleet build holds the host lock"
+            for attempt in range(6):  # a fleet probe takes it exclusively for microseconds; a build keeps it
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if attempt == 5:
+                        os.close(fd)
+                        return False, "capacity: a fleet build holds the host lock"
+                    time.sleep(0.1)
             fds.append(fd)
             waiting = lock_waiters(host_lock, holder_pids(state_dir))
             # lsof sees only this user's processes, which is how the fleet worker runs today.
@@ -489,9 +493,11 @@ def hold(fds: list[int], watch_pid: int, state_dir: Path, drop: tuple[int, ...] 
                     break
                 time.sleep(HOLDER_POLL_S)
         finally:
-            with contextlib.suppress(Exception):  # still ours: job-completed renamed it and waits for us
-                if releasing.read_text().strip() == me:
-                    releasing.unlink()
+            for leftover in ("releasing", "pid_file"):  # still ours: released, or the job died first
+                with contextlib.suppress(Exception):
+                    path = releasing if leftover == "releasing" else pid_file
+                    if path.read_text().strip() == me:
+                        path.unlink()
             os._exit(0)  # the locks go with this process
     os.close(ready_w)
     os.waitpid(child, 0)
