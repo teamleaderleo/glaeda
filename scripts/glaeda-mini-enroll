@@ -149,8 +149,13 @@ class State:
     acceptance_current: bool
 
 
-def plan(state: State, node_id: str | None, reaccept: bool, rebuild: bool, candidate: bool = False) -> list[str]:
-    """The steps still needed, in order. Pure, so it is tested without a Mac."""
+def plan(state: State, node_id: str | None, reaccept: bool, rebuild: bool, candidate: bool = False,
+         no_accept: bool = False) -> list[str]:
+    """The steps still needed, in order. Pure, so it is tested without a Mac.
+
+    no_accept stops at a bootstrapped, enrolled (enrolling) node without running accept-local: for a
+    host whose class and Xcode build already hold an acceptance, until cmux_fleet.py can take a class
+    receipt for the eligible transition (a node receipt is bound to its nodeId and generation)."""
     steps = []
     if candidate:
         # A staged generation is re-inspected before anything runs, outside the plan.
@@ -172,6 +177,13 @@ def plan(state: State, node_id: str | None, reaccept: bool, rebuild: bool, candi
                    "move it to enrolling with cmux_fleet.py transition-apply, then re-run")
     elif enrollment_state == "retired":
         raise Stop("node is retired; remove the enrollment to enroll this machine again")
+    if no_accept:
+        if reaccept:
+            raise Stop("--reaccept and --no-accept contradict each other")
+        if enrollment_state != "eligible" and state.acceptance_current:
+            steps.append("eligible")
+        steps.append("status")
+        return steps
     if reaccept or state.enrollment is None or not state.acceptance_current:
         # cmux_fleet.py accepts only an enrolling node; re-acceptance of an
         # eligible or draining one goes through quarantine, which advances the
@@ -369,6 +381,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--node-id", help="opaque node id for a first enrollment, such as cmux-mac-001")
     p.add_argument("--apply", action="store_true", help="run the steps (default is plan only)")
     p.add_argument("--reaccept", action="store_true", help="run accept-local even if the receipt is current")
+    p.add_argument("--no-accept", action="store_true",
+                   help="bootstrap and enroll only; skip accept-local (its class already holds an acceptance)")
     p.add_argument("--rebuild", action="store_true", help="rebuild and reinstall the glaeda binary")
     p.add_argument("--python", help="Python 3.13+ interpreter (default: found automatically)")
     p.add_argument("--candidate", type=Path, help="downloaded candidate archive (docs/FLEET_DISTRIBUTION.md)")
@@ -409,7 +423,8 @@ def main(argv: list[str] | None = None) -> int:
             runner.inspect(args.sha256, args.source)
         if generation is None or staged:
             state.acceptance_current = runner.acceptance_current(enrollment)
-        steps = plan(state, args.node_id, args.reaccept, args.rebuild, candidate=generation is not None)
+        steps = plan(state, args.node_id, args.reaccept, args.rebuild, candidate=generation is not None,
+                     no_accept=args.no_accept)
         print(f"glaeda-mini-enroll ({python})")
         for step in steps:
             print(f"  - {DESCRIPTIONS[step]}")
@@ -435,11 +450,17 @@ def main(argv: list[str] | None = None) -> int:
             elif step == "status":
                 status = runner.status()
                 print(json.dumps(status, indent=2, sort_keys=True))
-                if not status.get("routingCandidateEligible"):
+                if not status.get("routingCandidateEligible") and not args.no_accept:
                     raise Stop("status does not report this node as a routing candidate")
     except Stop as stop:
         print(f"\nglaeda-mini-enroll: {stop}", file=sys.stderr)
         return 1
+    enrolled = read_json(paths.enrollment) or {}
+    if args.no_accept and enrolled.get("state") != "eligible":
+        print(f"\n{enrolled.get('nodeId')} is enrolled ({enrolled.get('state')}) without a node acceptance "
+              "(--no-accept). It becomes eligible after accept-local, or from a class acceptance once "
+              "cmux_fleet.py accepts one.")
+        return 0
     # Accepted: the transient bootstrap and the one-step rollback are no longer needed.
     for leftover in (paths.fleet / "bootstrap.json", paths.install / "glaeda.rollback"):
         leftover.unlink(missing_ok=True)

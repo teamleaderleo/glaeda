@@ -58,6 +58,17 @@ class Plan(unittest.TestCase):
             with self.subTest(state=state), self.assertRaisesRegex(me.Stop, "--to enrolling"):
                 me.plan(me.State(True, enrollment(state), current), None, reaccept, False)
 
+    def test_no_accept_enrolls_without_acceptance(self) -> None:
+        steps = me.plan(me.State(False, None, False), "cmux-mac-003", False, False, candidate=True, no_accept=True)
+        self.assertEqual(steps, ["stage", "bootstrap", "enroll", "status"])
+        # An enrolling node with a current receipt still transitions; one without stays enrolling.
+        self.assertEqual(me.plan(me.State(True, enrollment("enrolling"), True), None, False, False, no_accept=True),
+                         ["eligible", "status"])
+        self.assertEqual(me.plan(me.State(True, enrollment("enrolling"), False), None, False, False, no_accept=True),
+                         ["status"])
+        with self.assertRaises(me.Stop):
+            me.plan(me.State(True, enrollment("enrolling"), False), None, True, False, no_accept=True)
+
     def test_rebuild_does_not_force_acceptance(self) -> None:
         steps = me.plan(me.State(True, enrollment("eligible"), True), None, False, True)
         self.assertEqual(steps, ["install-glaeda", "status"])

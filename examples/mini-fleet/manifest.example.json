@@ -5,6 +5,14 @@
   "never_touch": [
     "coordinator-mini"
   ],
+  "lan": {
+    "subnet": "10.0.8.",
+    "auth": "agent",
+    "note": "the minis reach each other's port 22 on this LAN; ssh -A from the operator lends the source its key"
+  },
+  "runner": {
+    "org": "example-org"
+  },
   "keys": {
     "coordinator": {
       "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -31,12 +39,18 @@
       "model": "Mac16,11",
       "chip": "Apple M4 Pro",
       "cpus": 14,
-      "memory_gib": 48
+      "memory_gib": 48,
+      "acceptance": {
+        "xcode_build": "17C529",
+        "candidate": "59ca9c9bd1bb",
+        "node": "cmux-mac-001"
+      }
     },
     "m4-16": {
       "model": "Mac16,10",
       "chip": "Apple M4",
-      "memory_gib": 16
+      "memory_gib": 16,
+      "compile_lane": false
     }
   },
   "defaults": {
