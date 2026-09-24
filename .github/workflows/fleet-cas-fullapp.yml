@@ -69,6 +69,18 @@ jobs:
           GHOSTTY_SHA="$(git ls-tree HEAD ghostty | awk '{print $3}')" ./scripts/download-prebuilt-ghosttykit.sh
           git log -1 --format='cmux %H %cI'
 
+      # The app's Diff Sidecar phase runs `rustup run <pinned> cargo`. Installing that toolchain
+      # and building the crate once here keeps Rust setup out of the measured builds (run 1
+      # failed with E0463 while the toolchain was being installed inside the Xcode phase).
+      - name: Prepare the Rust sidecar toolchain
+        working-directory: /Users/runner/w/cmux
+        run: |
+          . "$HOME/.cargo/env" 2>/dev/null || true
+          channel=$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/{print $2; exit}' Native/DiffSidecar/rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --target aarch64-apple-darwin
+          rustup run "$channel" cargo build --release --locked --target aarch64-apple-darwin \
+            --manifest-path Native/DiffSidecar/Cargo.toml --target-dir "$HOME/w/sidecar-warm" 2>&1 | tail -3
+
       - name: Resolve packages once
         working-directory: /Users/runner/w/cmux
         run: |
@@ -112,7 +124,7 @@ jobs:
                 break
               fi
             done
-            wait "$pid"; rc=$?
+            rc=0; wait "$pid" || rc=$?  # a failed build is a result, not a reason to stop
             end=$(date +%s)
             printf '| %s | %s | %s | %ss | %s | %s | %s |\n' "$label" "$rc" \
               "$([ $stalled = 1 ] && echo "stalled (log silent ${same}s)" || echo no)" \
@@ -141,8 +153,8 @@ jobs:
             echo; cat "$W/results.md"
           } >> "$GITHUB_STEP_SUMMARY"
           for l in local fill fresh; do
-            echo "== $l: timing summary"; grep -A25 'Build Timing Summary' "$W/log-$l.txt" | head -30
-            echo "== $l: errors"; grep -E 'error:|BUILD FAILED|crash|Segmentation' "$W/log-$l.txt" | head -20
+            echo "== $l: timing summary"; grep -A25 'Build Timing Summary' "$W/log-$l.txt" | head -30 || true
+            echo "== $l: errors"; grep -E 'error:|BUILD FAILED|crash|Segmentation' "$W/log-$l.txt" | head -20 || true
           done
 
       - name: Keep logs
