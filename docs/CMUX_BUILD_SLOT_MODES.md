@@ -11,15 +11,16 @@ Xcode's compilation cache and incremental builds do not mix for the cmux app tar
 | Build (full `cmux` app, M4 Pro) | Caching on | Caching off |
 | --- | ---: | ---: |
 | fresh DerivedData, fleet store warm | 90 to 130 s | 710 s (cold) |
-| one-line app-target edit, warm DerivedData | 451 s (whole target recompiles) | 125 to 156 s (646 compile steps) |
+| one-line app-target edit, warm DerivedData | 451 s (whole target recompiles) | 125 to 156 s (323 files recompiled) |
 | no-op, warm DerivedData | | 13 to 14 s |
 | flip caching on / off in the same DerivedData | 606 s (full rebuild) | 755 s (full rebuild) |
 
 The caching-off column and the flip row are from cmux8s at the fleet pin, Xcode 26.6
 (17F113); the caching-on column is from the minis on Xcode 26.3, with a different edit, so the
 two edit cells are not a strict pair. The edit was a new
-file-scope declaration in one app file (`WorkspaceTodoState.swift`), which recompiled 646
-dependent compile steps; its revert took 125 s. An edit inside a function body likely
+file-scope declaration (`private let`) in one app file (`WorkspaceTodoState.swift`), which
+recompiled 323 of the app target's 2,655 Swift files (Xcode 26.6 logs each compile twice, 646
+lines); its revert took 125 s. An edit inside a function body likely
 recompiles less (the Air Blue campaign saw 40 to 48 s on Xcode 27) and has not been measured
 on the pin. The fresh-build row assumes the fleet store already holds that commit. With caching on, every
 compile job's key covers the whole module, so any edit misses every job in the app target.
@@ -187,7 +188,7 @@ started once the catch-up product is delivered. It takes the host lock like any 
 `flock` does not preempt, so a foreground job must be able to cancel it: the warmer registers
 its xcodebuild process, the foreground job stops it and requeues the warm (planned). An
 build stopped during planning left DerivedData usable: on the pin, a build stopped after 25 s
-was followed by an ordinary incremental one (143 s, the same 646 steps as the uncancelled
+was followed by an ordinary incremental one (143 s, the same 323 files as the uncancelled
 edit). That stop landed during planning; a stop in the middle of compiling is still
 unmeasured. Because every slot shares the
 host lock, an iteration edit can also wait behind another slot's foreground build, about 100 s
