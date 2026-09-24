@@ -78,6 +78,82 @@ class BootstrapError(RuntimeError):
     pass
 
 
+# How to install each workload tool the build looks up on CMUX_WORKLOAD_TOOL_PATH.
+# Homebrew belongs to one account on a shared mini; installing as anyone else
+# leaves its owner with files it cannot update, so the fix names the owner.
+TOOL_FIXES = {
+    "cargo": "brew install rustup as the Homebrew owner, then link its cargo, rustc and rustup proxies into /opt/homebrew/bin",
+    "rustc": "brew install rustup as the Homebrew owner, then link its cargo, rustc and rustup proxies into /opt/homebrew/bin",
+    "rustup": "brew install rustup as the Homebrew owner, then link its cargo, rustc and rustup proxies into /opt/homebrew/bin",
+    "zig": "brew install zig as the Homebrew owner (Ghostty needs the version in ghostty/build.zig.zon)",
+    "git": "xcode-select --install, or select an Xcode with sudo xcode-select -s",
+    "xcodebuild": "install the pinned Xcode and select it with sudo xcode-select -s",
+    "xcrun": "install the pinned Xcode and select it with sudo xcode-select -s",
+    "python3": "install python3 3.13 or newer",
+}
+METAL_FIX = "Metal Toolchain missing; run xcodebuild -downloadComponent MetalToolchain"
+SUBMODULE_FIX = "submodules not initialized; run git submodule update --init --recursive --depth 1 in the cmux checkout"
+FIRST_LAUNCH_FIX = "Xcode first launch not done (plugins fail to load); run sudo xcodebuild -runFirstLaunch"
+LICENSE_FIX = "Xcode licence not accepted; run sudo xcodebuild -license accept"
+# The fix for each check `evaluate` can list in blockingChecks, so a refusal says what to do.
+BLOCKING_FIXES = {
+    "supportedOs": "use macOS 15 or 26 (Linux: Ubuntu 24.04 or Debian 12 on kernel 6+)",
+    "hardwareCapability": "use a host that meets the hardware class minimum (8 CPUs, 16 GiB on macOS)",
+    "cmuxCheckout": "clone manaflow-ai/cmux (git clone --depth 1) and pass it as --cmux-root",
+    "canonicalCheckoutClean": "commit, stash or remove local changes in the cmux checkout (git status)",
+    "submodulesReady": SUBMODULE_FIX,
+    "cmuxSetupArtifacts": "run ./scripts/setup.sh in the cmux checkout (it needs the Metal toolchain and zig first)",
+    "xcodePin": "select an Xcode of the pinned major: sudo xcode-select -s /Applications/Xcode_<pin>.app",
+    "git": TOOL_FIXES["git"],
+    "profileRunnerInterpreter": "run the bootstrap with Python 3.13 or newer (os.waitid)",
+    "workloadToolPath": "put every build tool in /opt/homebrew/bin or /usr/local/bin (see toolsMissingFromWorkloadPath)",
+    "zig": "install the zig Ghostty needs: " + TOOL_FIXES["zig"],
+    "rust": "rustup, cargo and rustc must run in the cmux checkout: rustup toolchain install <channel in Native/DiffSidecar/rust-toolchain.toml>",
+    "metalToolchain": METAL_FIX,
+    "glaedaExecutable": "install or stage the glaeda binary (glaeda-mini-enroll does this)",
+    "diskAdmission": "free disk space (glaeda-disk shows where it went)",
+    "nativeCacheRoot": "create the native cache root (glaeda-mini-setup --apply)",
+    "nativeCacheDiskAdmission": "free disk space on the native cache volume (glaeda-disk)",
+    "unattendedPower": "turn off sleep on AC power: sudo pmset -c sleep 0",
+    "systemd": "run on a systemd host",
+    "bubblewrap": "install bubblewrap",
+    "cgroupV2": "boot with the unified cgroup v2 hierarchy",
+    "pressureSignals": "enable PSI (/proc/pressure)",
+    "memoryAdmission": "free memory: 8 GiB must be available",
+    "actionsPrerequisites": "install curl, tar, gzip and ldd",
+}
+
+
+def diagnose_command(argv: list[str], output: str) -> str | None:
+    """Name the missing thing behind a failed probe command, and its fix."""
+    text = output.lower()
+    if "dvtplugin" in text or "runfirstlaunch" in text or "dvtdownloads" in text:
+        return FIRST_LAUNCH_FIX
+    if "license" in text and ("agree" in text or "accept" in text):
+        return LICENSE_FIX
+    if "command line tools instance" in text or "xcode-select: error" in text:
+        return TOOL_FIXES["xcodebuild"]
+    if Path(argv[0]).name == "xcrun" and "metal" in argv[1:]:
+        return METAL_FIX
+    match = re.search(r"toolchain '([^']+)' is not installed", output)
+    if match:
+        return f"Rust toolchain {match.group(1)} is not installed; run rustup toolchain install {match.group(1)}"
+    return None
+
+
+def explain_error(message: str) -> str:
+    """Turn a bootstrap error, including one from an older candidate, into what to fix."""
+    if "build.zig.zon" in message and ("Errno 2" in message or "No such file" in message):
+        return SUBMODULE_FIX
+    if message == "required command failed: xcrun":
+        return ("xcrun failed: usually " + METAL_FIX + " (check with xcrun metal --version); "
+                "otherwise the selected Xcode is missing or needs first launch")
+    missing = re.fullmatch(r"required command is missing: (\S+)", message)
+    if missing and missing.group(1) in TOOL_FIXES:
+        return f"{missing.group(1)} is not installed: {TOOL_FIXES[missing.group(1)]}"
+    return message
+
+
 def canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
 
@@ -123,7 +199,11 @@ def run(
             f"required command output is too large: {Path(argv[0]).name}"
         )
     if result.returncode != 0:
-        raise BootstrapError(f"required command failed: {Path(argv[0]).name}")
+        command = " ".join([Path(argv[0]).name, *argv[1:3]])
+        tail = result.stdout.strip().splitlines()
+        hint = diagnose_command(argv, result.stdout)
+        detail = hint or (f"exit {result.returncode}: {tail[-1][:200]}" if tail else f"exit {result.returncode}")
+        raise BootstrapError(f"{command} failed: {detail}")
     # Column zero carries meaning for callers such as `git submodule status`,
     # whose leading space marks a checked-out submodule. Trim the trailing
     # newline and nothing else: callers that fullmatch this output are matching
@@ -134,7 +214,8 @@ def run(
 def executable(name: str) -> str:
     value = shutil.which(name)
     if value is None:
-        raise BootstrapError(f"required command is missing: {name}")
+        fix = TOOL_FIXES.get(name)
+        raise BootstrapError(f"required command is missing: {name}" + (f"; {fix}" if fix else ""))
     return os.path.abspath(value)
 
 
@@ -270,6 +351,12 @@ def cmux_submodules_ready(root: Path) -> bool:
         [executable("git"), "submodule", "status", "--recursive"],
         cwd=root,
     )
+    return submodule_status_ready(output)
+
+
+def submodule_status_ready(output: str) -> bool:
+    """`git submodule status` marks a checked-out submodule with a leading space;
+    -, + and U mean uninitialized, off its recorded commit, or conflicted."""
     lines = [line for line in output.splitlines() if line]
     return bool(lines) and all(line[0] == " " for line in lines)
 
@@ -307,14 +394,23 @@ def xcode_pin_ready(pin: str, xcode_version: str | None, sdk_version: str) -> bo
 
 def cmux_required_zig_version(root: Path) -> str:
     manifest = root / "ghostty/build.zig.zon"
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise BootstrapError(f"ghostty/build.zig.zon is missing: {SUBMODULE_FIX}") from None
+    required = minimum_zig_version(text)
+    if required is None:
+        raise BootstrapError("Ghostty minimum Zig version is unavailable")
+    return required
+
+
+def minimum_zig_version(build_zig_zon: str) -> str | None:
     match = re.search(
         r'^\s*\.minimum_zig_version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"',
-        manifest.read_text(encoding="utf-8"),
+        build_zig_zon,
         re.MULTILINE,
     )
-    if match is None:
-        raise BootstrapError("Ghostty minimum Zig version is unavailable")
-    return match.group(1)
+    return match.group(1) if match else None
 
 
 def zig_version_compatible(actual: str, required: str) -> bool:
@@ -336,9 +432,14 @@ def zig_version_compatible(actual: str, required: str) -> bool:
 
 
 def cmux_diff_rust_toolchain(root: Path) -> str:
-    content = (root / "Native/DiffSidecar/rust-toolchain.toml").read_text(
-        encoding="utf-8"
-    )
+    try:
+        content = (root / "Native/DiffSidecar/rust-toolchain.toml").read_text(
+            encoding="utf-8"
+        )
+    except FileNotFoundError:
+        raise BootstrapError(
+            "Native/DiffSidecar/rust-toolchain.toml is missing; update the cmux checkout"
+        ) from None
     match = re.search(
         r'^\s*channel\s*=\s*"([^"]+)"',
         content,
@@ -363,7 +464,13 @@ def collect_macos(
     if match is None:
         raise BootstrapError("macOS version is unavailable")
     major = int(match.group(1))
-    pin = (cmux_root / ".xcode-version").read_text(encoding="utf-8").strip()
+    try:
+        pin = (cmux_root / ".xcode-version").read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        raise BootstrapError(
+            f"{cmux_root} has no .xcode-version, so it is not a cmux checkout; "
+            + BLOCKING_FIXES["cmuxCheckout"]
+        ) from None
     xcode = run([executable("xcodebuild"), "-version"])
     xcrun = executable("xcrun")
     sdk = run([xcrun, "--sdk", "macosx", "--show-sdk-version"])
@@ -746,7 +853,7 @@ def main() -> int:
         subprocess.TimeoutExpired,
     ) as error:
         print(
-            json.dumps({"error": str(error)}, sort_keys=True, separators=(",", ":")),
+            json.dumps({"error": explain_error(str(error))}, sort_keys=True, separators=(",", ":")),
             file=sys.stderr,
         )
         return 1

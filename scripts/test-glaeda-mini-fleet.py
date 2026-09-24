@@ -429,5 +429,258 @@ class ProbeScriptTests(unittest.TestCase):
         self.assertEqual(sudo_lines, ["if sudo -n -l >/dev/null 2>&1; then e sudo nopasswd; else e sudo password; fi"])
 
 
+
+READY_XCODE = ("xcode_ready\t/Applications/Xcode.app|accepted|done\n"
+               "xcode_ready\t/Applications/Xcode_26.3.app|accepted|done\n")
+
+
+def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zig: str = "0.16.0",
+                   zig_path: str = "/opt/homebrew/bin/zig", rust: bool = True, metal: bool = True,
+                   sdks: str = "ok", python: str = "/opt/homebrew/bin/python3.13|3.13",
+                   submodules: tuple[str, ...] = (" a1 ghostty (heads/main)",), artifacts: bool = True,
+                   dirty: int = 0, candidate: str | None = "59ca9c9bd1bb|yes|yes", enroll_state: str | None = "eligible",
+                   acceptance: str | None = "accepted", update_running: str | None = None, prepared: bool = False,
+                   sleep: int = 0, runners: tuple[str, ...] = ("actions-runner-cmux-persistent-compile|mini-1",),
+                   **probe: object) -> str:
+    """A probe plus preflight section for a host that is ready unless told otherwise."""
+    lines = [probe_text(**probe).rstrip("\n").replace("user\tbuilder", f"user\t{user}"), READY_XCODE.rstrip("\n")]
+    lines.append(f"pf_sdks\t{sdks}")
+    lines.append("pf_metal\t" + ("ok|Apple metal version 32023.883" if metal else
+                                 "fail|error: cannot execute tool 'metal' due to missing Metal Toolchain"))
+    tools = {"git": ("/usr/bin/git", "git version 2.50.1 (Apple Git-155)"),
+             "xcodebuild": ("/usr/bin/xcodebuild", "Xcode 26.3"), "xcrun": ("/usr/bin/xcrun", "xcrun version 72."),
+             "zig": (zig_path, zig)}
+    if rust:
+        tools.update({"cargo": ("/opt/homebrew/bin/cargo", "cargo 1.88.0 (abc 2025-06-23)"),
+                      "rustc": ("/opt/homebrew/bin/rustc", "rustc 1.88.0 (abc 2025-06-23)"),
+                      "rustup": ("/opt/homebrew/bin/rustup", "rustup 1.29.1 (2026-08-13)")})
+    for tool in mf.bootstrap.MACOS_WORKLOAD_TOOLS:
+        path, version = tools.get(tool, ("", ""))
+        lines.append(f"pf_tool\t{tool}|{path}|{version if path else ''}")
+    if rust:
+        lines.append("pf_rust_channel\t1.88.0|rustc 1.88.0 (abc 2025-06-23)")
+    lines.append(f"pf_python\t{python}")
+    lines += ["pf_cmux\tpresent", "pf_cmux_pin\t26", "pf_zig_min\t0.16.0" if submodules[0][0] == " " else "pf_zig_min\t"]
+    lines += [f"pf_submodule\t{s}" for s in submodules]
+    lines += [f"pf_setup_artifacts\t{'yes' if artifacts else 'no'}", f"pf_cmux_dirty\t{dirty}"]
+    if candidate:
+        lines.append(f"pf_candidate\t{candidate}")
+    lines += ["pf_glaeda\tpresent", "pf_cache_root\tpresent"]
+    if enroll_state:
+        lines.append(f"pf_enroll_state\t{enroll_state}")
+    if acceptance:
+        lines.append(f"pf_acceptance\t{acceptance}")
+    if brew_owner:
+        lines.append(f"pf_brew_owner\t{brew_owner}")
+    if update_running:
+        lines.append(f"pf_update_running\t{update_running}")
+    if prepared:
+        lines.append("pf_update_prepared\tyes")
+    lines += ["pf_pmset\tAC Power:", f"pf_pmset\t sleep                {sleep}"]
+    lines += [f"pf_runner\t{r}" for r in runners]
+    return "\n".join(lines) + "\n"
+
+
+class PreflightTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest = mf.load_manifest(EXAMPLE)
+
+    def result(self, text: str, host: str = "build-mini-1", zig_fallback: str | None = None) -> dict:
+        obs = observed(**{host: text})["hosts"][host]
+        return mf.preflight_host(self.manifest, host, obs, zig_fallback)
+
+    def states(self, text: str, **kwargs: object) -> dict[str, str]:
+        return {k: v["state"] for k, v in self.result(text, **kwargs)["checks"].items()}
+
+    def test_ready_host_passes_every_check(self) -> None:
+        result = self.result(preflight_text())
+        self.assertTrue(result["ready"], result)
+        self.assertEqual({k for k, v in result["checks"].items() if v["state"] not in {"ok", "info"}}, set())
+        self.assertEqual(list(result["checks"]), list(mf.PREFLIGHT_CHECKS))
+
+    def test_the_austin_mini_morning_is_found_in_one_pass(self) -> None:
+        # 2026-09-24, cmux-austin-mini-1: every one of these showed up only after the previous fix.
+        text = preflight_text(user="cmux", brew_owner="admin", zig="0.15.2", zig_path="/usr/local/bin/zig",
+                              rust=False, metal=False, python="|3.9", submodules=("-a1 ghostty",),
+                              artifacts=False, candidate="59ca9c9bd1bb|no|no", enroll_state=None,
+                              acceptance=None, node_id=None)
+        text = text.replace("xcode_select\t/Applications/Xcode.app/Contents/Developer",
+                            "xcode_select\t/Applications/Xcode_26.3.app/Contents/Developer")
+        result = self.result(text, zig_fallback="0.16.0")
+        checks = result["checks"]
+        self.assertFalse(result["ready"])
+        self.assertEqual({k for k, v in checks.items() if v["state"] == "fail"},
+                         {"select", "metal", "rust", "zig", "python", "cmux", "setup"})
+        self.assertEqual({k for k, v in checks.items() if v["state"] == "todo"}, {"candidate", "enroll"})
+        fixes = mf.grouped_fixes(result)
+        self.assertIn("select: sudo xcode-select -s /Applications/Xcode.app", fixes["password"])
+        self.assertTrue(any(f.startswith("zig: sudo -u admin brew install zig") for f in fixes["password"]))
+        self.assertTrue(any(f.startswith("rust: sudo -u admin brew install rustup") for f in fixes["password"]))
+        self.assertTrue(any("-downloadComponent MetalToolchain" in f for f in fixes["self"]))
+        self.assertTrue(any("git submodule update --init" in f for f in fixes["self"]))
+        self.assertTrue(any("~/.local/bin/python3" in f for f in fixes["self"]))
+        self.assertIn("0.15.2 at /usr/local/bin/zig, Ghostty needs 0.16.0", checks["zig"]["detail"])
+        self.assertIn("admin", checks["brew"]["detail"])
+        # Blockers come before the steps onboarding performs itself.
+        self.assertTrue(fixes["self"][-1].startswith("enroll: glaeda-mini-enroll"))
+        self.assertIn("--node-id cmux-mac-001", fixes["self"][-1])
+
+    def test_first_launch_is_caught_from_plugin_errors_too(self) -> None:
+        checks = self.result(preflight_text(sdks="plugin_error|DVTPlugInLoading: symbol not found"))["checks"]
+        self.assertEqual(checks["launch"]["state"], "fail")
+        self.assertIn("-runFirstLaunch", checks["launch"]["fix"])
+        self.assertEqual(checks["launch"]["group"], "password")
+        text = preflight_text().replace("Xcode.app|accepted|done", "Xcode.app|needed|needed")
+        checks = self.result(text)["checks"]
+        self.assertEqual((checks["licence"]["state"], checks["launch"]["state"]), ("fail", "fail"))
+
+    def test_pending_macos_update_blocks(self) -> None:
+        running = self.result(preflight_text(update_running="softwareupdate --install macOS 26.7 --restart"))
+        self.assertFalse(running["ready"])
+        self.assertEqual(running["checks"]["update"]["group"], "person")
+        prepared = self.result(preflight_text(prepared=True))
+        self.assertEqual(prepared["checks"]["update"]["state"], "fail")
+        self.assertIn("restart", prepared["checks"]["update"]["detail"])
+
+    def test_onboarding_steps_left_do_not_block(self) -> None:
+        text = preflight_text(candidate="59ca9c9bd1bb|no|yes", enroll_state=None, acceptance=None, runners=(),
+                              node_id=None)
+        result = self.result(text)
+        self.assertTrue(result["ready"], result)
+        self.assertEqual({k for k, v in result["checks"].items() if v["state"] == "todo"},
+                         {"candidate", "enroll", "runner"})
+        self.assertIn("archive downloaded, not staged", result["checks"]["candidate"]["detail"])
+
+    def test_node_id_is_required_before_enrollment(self) -> None:
+        checks = self.result(preflight_text(enroll_state=None, acceptance=None, node_id=None), host="small-mini")["checks"]
+        self.assertEqual(checks["node"]["state"], "fail")
+        self.assertIn("hosts.small-mini.node_id", checks["node"]["fix"])
+        checks = self.result(preflight_text(node_id="cmux-mac-009"))["checks"]
+        self.assertIn("enrolled as cmux-mac-009", checks["node"]["detail"])
+
+    def test_power_disk_and_dirty_checkout(self) -> None:
+        states = self.states(preflight_text(sleep=10, dirty=3))
+        self.assertEqual((states["power"], states["cmux"]), ("fail", "fail"))
+        low = preflight_text().replace("disk\t/System/Volumes/Data|460|220", "disk\t/System/Volumes/Data|460|20")
+        self.assertEqual(self.states(low)["disk"], "fail")
+
+    def test_zig_minimum_falls_back_to_the_operator_checkout(self) -> None:
+        text = preflight_text(zig="0.15.2", submodules=("-a1 ghostty",))
+        self.assertEqual(self.states(text)["zig"], "unknown")
+        self.assertEqual(self.states(text, zig_fallback="0.16.0")["zig"], "fail")
+        self.assertEqual(self.states(preflight_text(zig="0.16.1"))["zig"], "ok")
+
+    def test_missing_homebrew_makes_brew_fixes_a_person_step(self) -> None:
+        checks = self.result(preflight_text(brew_owner=None, rust=False))["checks"]
+        self.assertEqual((checks["rust"]["group"], checks["brew"]["state"]), ("person", "fail"))
+        self.assertIn("install Homebrew", checks["rust"]["fix"])
+
+    def test_unreachable_and_unprobed_hosts_are_not_ready(self) -> None:
+        result = mf.preflight_host(self.manifest, "build-mini-1", {"reachable": False, "error": "timeout"})
+        self.assertEqual((result["ready"], result["checks"]["reach"]["detail"]), (False, "timeout"))
+        plain = observed(**{"build-mini-1": probe_text()})["hosts"]["build-mini-1"]
+        self.assertFalse(mf.preflight_host(self.manifest, "build-mini-1", plain)["ready"])
+
+    def run_main(self, texts: dict[str, str], *extra: str) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            obs = Path(tmp) / "obs.json"
+            obs.write_text(json.dumps(observed(**texts)))
+            with contextlib.redirect_stdout(io.StringIO()) as out, \
+                    mock.patch.object(mf, "operator_zig_minimum", return_value=None):
+                code = mf.main(["preflight", *texts, "--manifest", os.fspath(EXAMPLE), "--observed", os.fspath(obs), *extra])
+        return code, out.getvalue()
+
+    def test_table_groups_fixes_and_exits_nonzero(self) -> None:
+        code, out = self.run_main({"build-mini-1": preflight_text(),
+                                   "build-mini-2": preflight_text(hostname="Build-Mini-2", metal=False, sleep=1,
+                                                                  node_id="cmux-mac-002")})
+        self.assertEqual(code, 1, out)
+        header, first, second = out.splitlines()[:3]
+        self.assertEqual(header.split()[1:], [*mf.PREFLIGHT_CHECKS, "ready"])
+        self.assertTrue(first.startswith("build-mini-1") and first.endswith("yes"))
+        self.assertTrue(second.endswith("NO"))
+        self.assertIn("can do itself (no root):", out)
+        self.assertIn("needs a password:\n    power: sudo pmset -c sleep 0", out)
+        self.assertIn("2 hosts, 1 ready, 1 not ready", out)
+        self.assertNotIn("\u2014", out)  # no em dashes in operator output
+
+    def test_json_output_and_ready_exit(self) -> None:
+        code, out = self.run_main({"build-mini-1": preflight_text()}, "--output", "json")
+        self.assertEqual(code, 0, out)
+        doc = json.loads(out)
+        self.assertEqual(doc["schema"], "glaeda-mini-fleet/v1/preflight")
+        host = doc["hosts"]["build-mini-1"]
+        self.assertTrue(host["ready"])
+        self.assertEqual(set(host["fixes"]), {"self", "password", "person"})
+
+    def test_never_touch_host_is_refused_before_any_connection(self) -> None:
+        with mock.patch.object(mf, "observe_host") as probe, contextlib.redirect_stderr(io.StringIO()) as err:
+            code = mf.main(["preflight", "coordinator-mini", "--manifest", os.fspath(EXAMPLE)])
+        self.assertEqual(code, 2)
+        self.assertIn("never_touch", err.getvalue())
+        probe.assert_not_called()
+
+    def test_preflight_ships_the_owning_scripts_rules(self) -> None:
+        script = mf.preflight_script(self.manifest, "build-mini-1").decode()
+        self.assertTrue(script.startswith(mf.PROBE.read_text()))
+        self.assertIn(f"WORKLOAD_PATH={mf.bootstrap.CMUX_WORKLOAD_TOOL_PATH}\n", script)
+        self.assertIn("WORKLOAD_TOOLS='" + " ".join(mf.bootstrap.MACOS_WORKLOAD_TOOLS) + "'", script)
+        self.assertIn("XCODE_PIN=/Applications/Xcode.app\n", script)
+        self.assertIn(mf.enroll.PYTHON_CANDIDATES[0], script)
+        self.assertIn("~/.local/bin/python3", script)
+        self.assertEqual(mf.xcode_pin(self.manifest, "build-mini-1"), "/Applications/Xcode.app")
+
+
+class PreflightScriptTests(unittest.TestCase):
+    def test_parses_as_bash(self) -> None:
+        subprocess.run(["bash", "-n", os.fspath(mf.PREFLIGHT_PROBE)], check=True)
+
+    def test_never_installs_writes_or_escalates(self) -> None:
+        body = [line.strip() for line in mf.PREFLIGHT_PROBE.read_text().splitlines()
+                if line.strip() and not line.strip().startswith("#")]
+        # The update check reports the softwareupdate command line, not the sudo wrapper around it.
+        body = [line.replace("grep -v '^[0-9]* sudo '", "") for line in body]
+        for word in ("sudo", "rm ", "mv ", "cp ", "brew ", "install", "downloadComponent", "curl", "> ", ">>"):
+            self.assertFalse([line for line in body if word in line.replace("2>", "").replace(">/dev/null", "")],
+                             word)
+        self.assertIn("export RUSTUP_AUTO_INSTALL=0 GIT_OPTIONAL_LOCKS=0", body)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_runs_against_a_sandbox_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            tools = home / "workload-bin"
+            tools.mkdir()
+            for name, text in (("zig", "0.15.2"), ("cargo", "cargo 1.88.0 (x)"), ("git", None)):
+                if text is None:
+                    (tools / name).symlink_to(shutil.which("git"))
+                    continue
+                (tools / name).write_text(f"#!/bin/sh\necho '{text}'\n")
+                (tools / name).chmod(0o755)
+            cmux = home / "cmux"
+            subprocess.run(["git", "init", "-q", os.fspath(cmux)], check=True)
+            (cmux / "scripts/ci").mkdir(parents=True)
+            (cmux / "scripts/ci/persistent_compile_fleet.py").write_text(f'CANDIDATE_SOURCE = "{"ab" * 20}"\n')
+            generation = home / "Projects/glaeda-generations" / ("ab" * 6)
+            generation.mkdir(parents=True)
+            (generation / "stage-receipt.json").write_text("{}")
+            runner = home / "actions-runner-cmux-persistent-compile"
+            runner.mkdir()
+            (runner / ".runner").write_text('﻿{\n  "agentName": "mini-1",\n  "serverUrl": "https://secret.example/"\n}\n')
+            header = (f"CMUX_ROOT='~/cmux'\nXCODE_PIN=''\nWORKLOAD_PATH={tools}\n"
+                      "WORKLOAD_TOOLS='cargo git zig rustup'\nPYTHONS=''\nCANDIDATE_FALLBACK=''\n")
+            out = subprocess.run(["bash", "-s"], input=header + mf.PREFLIGHT_PROBE.read_text(), capture_output=True,
+                                 text=True, env={"HOME": tmp, "PATH": "/usr/bin:/bin"}, timeout=60).stdout
+            pf = mf.parse_probe(out)["preflight"]
+        self.assertEqual(pf["tools"]["zig"], {"path": f"{tools}/zig", "version": "0.15.2"})
+        self.assertEqual(pf["tools"]["cargo"]["version"], "cargo 1.88.0 (x)")
+        self.assertIsNone(pf["tools"]["rustup"]["path"])
+        self.assertTrue(pf["cmux"])
+        self.assertEqual(pf["candidate"], {"source12": "ab" * 6, "staged": True, "archive": False})
+        self.assertEqual(pf["runners"], [{"dir": "actions-runner-cmux-persistent-compile", "name": "mini-1"}])
+        self.assertNotIn("secret.example", out)
+        self.assertEqual(pf["python"], {"path": None, "version": None})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -125,6 +125,26 @@ Observation runs `scripts/cmux_mini_probe.sh` over SSH as the login user, with n
 
 A real manifest names hosts, people, and keys, so it does not belong in this repository. The default path is `~/.config/glaeda/mini-fleet.json` (or `--manifest`, or `$GLAEDA_MINI_FLEET_MANIFEST`); `examples/mini-fleet/manifest.example.json` shows the shape. Keys that nobody has ruled on carry `"status": "review"` and sit in `allow`, so `check` stays quiet about them but flags any key the manifest does not name. Xcode apps listed under `pending` are reported without counting as drift. A host's `node_id` assigns its opaque fleet node id (`cmux-mac-NNN`, unique across the manifest), so enrollment reruns always ask for the same one. `check` reads the enrolled id from `~/.config/glaeda/cmux-fleet/enrollment.json`: a host not enrolled yet is pending, with the `--node-id` to use, and a host enrolled under a different id is drift.
 
+### Find every onboarding blocker in one pass
+
+```bash
+scripts/glaeda-mini-fleet preflight                   # every host, in parallel; exit 1 if any is not ready
+scripts/glaeda-mini-fleet preflight cmux14 cmux15     # named hosts
+scripts/glaeda-mini-fleet preflight --output json     # machine-readable, with the fixes grouped
+```
+
+`preflight` checks, read-only and over the same SSH session as `observe`, everything the bootstrap, `glaeda-mini-enroll`, local acceptance and cmux `./scripts/setup.sh` will later require, so a host no longer fails one step at a time:
+
+- the pinned Xcode (the manifest's `xcode.select`, else its first `xcode.apps` entry): present, selected with `xcode-select`, licence accepted, first launch done (`xcodebuild -checkFirstLaunchStatus`, plus plugin-load errors from `xcodebuild -showsdks`), and its Metal toolchain (`xcrun metal --version`)
+- `cargo`, `rustc`, `rustup`, `zig`, `git`, `xcodebuild` and `xcrun` on the workload's fixed PATH (`CMUX_WORKLOAD_TOOL_PATH`), with versions: zig against Ghostty's `minimum_zig_version` (the host's checkout, else the operator's `$GLAEDA_CMUX_ROOT`, default `~/Projects/cmux`), and the DiffSidecar Rust toolchain installed
+- Python 3.13+ where `glaeda-mini-enroll` looks for it
+- the cmux checkout (`cmux_root` in the manifest, default `~/cmux`): submodules initialized, no local changes, setup artifacts present
+- AC sleep off, free disk against the manifest floor, and a macOS update that is installing or prepared and waiting for a restart
+- progress: the candidate cmux names staged, a node id (manifest or enrolled), the enrollment and acceptance state, a registered runner
+- who owns Homebrew, which decides whether a `brew install` needs `sudo -u <owner>`
+
+It prints one host-by-check table (`ok`, `FAIL`, `todo` for a step onboarding itself performs, `?` when unknown), then each host's fixes in three groups: what the login user can do itself, what needs a password, and what needs a person. `todo` does not block; anything `FAIL` does. rustup runs with `RUSTUP_AUTO_INSTALL=0` and git with `GIT_OPTIONAL_LOCKS=0`, so the probe installs and writes nothing.
+
 Each host may also carry `roles` (`dev-builds`, `ci-runner`, `nightly`, `ios-simulators`, `cache-host`) and the `sudo` mode it is expected to have (`nopasswd` or `password`, observed with `sudo -n -l`, which runs nothing). `controller_token: "present"` requires the fleet worker's controller token file to exist; the probe tests existence only and never reads it.
 
 ## Enroll a Mac in one command
