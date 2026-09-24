@@ -423,7 +423,8 @@ class HookTest(unittest.TestCase):
              enrolled_sha: str = "sha256:aa", tools: dict | None = None, generation: bool = True,
              valid: bool = True, role: str = "cmux_macos_native_build", receipt_toolchain: dict | None = None,
              hang: str | None = None, default: str = "1.98.1-aarch64-apple-darwin",
-             installed: tuple = ("1.88.0-aarch64-apple-darwin", "1.98.1-aarch64-apple-darwin")) -> None:
+             installed: tuple = ("1.88.0-aarch64-apple-darwin", "1.98.1-aarch64-apple-darwin"),
+             python: str = "3.13") -> None:
         """A fake Glaeda node under HOME (self.dir): enrollment, class receipt, staged CLI, toolchain."""
         config = self.dir / ".config/glaeda/cmux-fleet"
         (config / "class-acceptance").mkdir(parents=True, exist_ok=True)
@@ -464,6 +465,8 @@ if args[:2] == ["toolchain", "list"]:
         print(name + (" (active, default)" if name == default else ""))
 elif args == ["default"]:
     print(default + " (default)")
+elif args == ["show"]:
+    print("Default host: aarch64-apple-darwin")
 elif args[:1] == ["default"] and args[1] in installed:
     open(state + "/rustup-default", "w").write(args[1])
     print("info: default toolchain set to " + args[1])
@@ -475,8 +478,9 @@ else:
         rustc = have["rustcVersion"] if (tools or {}).get("rustcVersion") else None
         make_executable(cargo / "rustc", f"#!{sys.executable}\nimport json\n"
                         + (f"print({rustc!r})\n" if rustc else
-                           f"print(json.load(open({state!r} + '/rustc-by-toolchain.json'))"
-                           f"[open({state!r} + '/rustup-default').read().strip()])\n"))
+                           f"import os\nprint(json.load(open({state!r} + '/rustc-by-toolchain.json'))"
+                           f"[os.environ.get('RUSTUP_TOOLCHAIN') or open({state!r} + '/rustup-default').read().strip()])\n"))
+        make_executable(cargo / "python3", f"#!/bin/sh\necho {python}\n")
         outputs = {"cargo": have["cargoVersion"], "zig": have["zigVersion"],
                    "xcrun": have["macosSdkVersion"],
                    "xcodebuild": f"Xcode {have['xcodeVersion']}\nBuild version {have['xcodeBuild']}"}
@@ -538,6 +542,37 @@ else:
                       result.stdout)
         self.assertEqual((self.dir / "rustup-default").read_text(), "1.98.1-aarch64-apple-darwin")
         self.assertFalse(self.lock_free())
+        self.done()
+
+    def test_check_is_read_only_and_predicts_the_alignment(self) -> None:
+        self.node(default="1.88.0-aarch64-apple-darwin")
+        push = event(self.dir, "push", {"repository": CMUX})
+        result = self.run_hook("check", "push", push, "--fleet-class", "m4pro-48", "--toolchain-xcode",
+                               "/Applications/Xcode_26.6.app", env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin"})
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("eligible (would set the rustup default to 1.98.1-aarch64-apple-darwin)", result.stdout)
+        self.assertEqual((self.dir / "rustup-default").read_text(), "1.88.0-aarch64-apple-darwin")
+        self.assertFalse((self.dir / "state").exists())
+
+    def test_old_python_on_the_job_path_refuses(self) -> None:
+        self.fleet()
+        self.node(python="3.9")
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("python3 on the job PATH is 3.9", result.stdout)
+        self.assertTrue(self.lock_free())
+
+    def test_matching_stable_default_is_left_alone(self) -> None:
+        self.fleet()
+        self.node(default="stable-aarch64-apple-darwin", installed=("stable-aarch64-apple-darwin",))
+        json_path = self.dir / "rustc-by-toolchain.json"
+        versions = json.loads(json_path.read_text())
+        versions["stable-aarch64-apple-darwin"] = self.TOOLCHAIN["rustcVersion"]
+        json_path.write_text(json.dumps(versions))
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("set the rustup default", result.stdout)
+        self.assertEqual((self.dir / "rustup-default").read_text(), "stable-aarch64-apple-darwin")
         self.done()
 
     def test_toolchain_refusal_after_the_lock_releases_it(self) -> None:

@@ -99,7 +99,12 @@ What `--apply` does:
      1.91.0). The DiffSidecar pin itself is checked with `rustup run`. A refusal after
      the lock is taken releases it. The runner's PATH is exactly cmux's workload PATH
      (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`), so a tool under
-     the user's home never shadows the accepted one. The check takes about a second and runs
+     the user's home never shadows the accepted one. The default is only changed when
+     `rustc --version` differs from the receipt, and `python3` on that PATH must be 3.13
+     or newer (cmux's profile runner needs it). To see what a job would get without
+     touching anything: `glaeda-cmux-runner-hook check --fleet-class <hardware>
+     --toolchain-xcode <app>`, run with the workload PATH, is read-only (no lock, no
+     rustup change). The check takes about a second and runs
      on every job, so a mini that drifts or loses eligibility stops taking PR jobs at
      once, and refusal recovery re-runs the job elsewhere.
    - job-completed releases the host lock, runs the same disk pressure pass and always exits 0.

@@ -150,6 +150,7 @@ TOOLCHAIN_PROBES = (("rustcVersion", ["rustc", "--version"]), ("cargoVersion", [
                     ("zigVersion", ["zig", "version"]),
                     ("macosSdkVersion", ["xcrun", "--sdk", "macosx", "--show-sdk-version"]))
 REQUIRED_TOOLCHAIN = ("rustcVersion", "cargoVersion", "zigVersion", "xcodeVersion", "xcodeBuild", "macosSdkVersion")
+MIN_WORKLOAD_PYTHON = (3, 13)  # cmux_fleet_bootstrap profile_runner_interpreter_ready: os.waitid on macOS
 ELIGIBILITY_BUDGET_S = 20.0  # one deadline for every probe: a hung xcodebuild refuses, it does not stall
 
 
@@ -224,27 +225,43 @@ def node_refusal(fleet_class: str | None) -> tuple[str | None, dict[str, Any]]:
     return None, want
 
 
-def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: str | None) -> tuple[str | None, str]:
-    """Run under the host lock: point rustup's default at the receipt's toolchain (other fleet jobs on this
-    mini flip it), then require every probed string to equal the receipt's. Returns (refusal, note)."""
+def receipt_toolchain_name(want: dict[str, Any], env: dict[str, str], home: Path, deadline: float) -> str | None:
+    """'1.98.1-<host triple>' for the receipt's rustc, the triple taken from rustup itself."""
+    match = re.fullmatch(r"rustc (\d+\.\d+\.\d+)(?: .*)?", str(want.get("rustcVersion") or ""))
+    host = re.search(r"^Default host: (\S+)$", _probe(["rustup", "show"], env, home, deadline), re.M)
+    return f"{match.group(1)}-{host.group(1)}" if match and host else None
+
+
+def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: str | None,
+                      align: bool = True) -> tuple[str | None, str]:
+    """Require every probed string to equal the class receipt's. With align (under the host lock), first
+    point rustup's default at the receipt's toolchain when rustc differs: other fleet jobs on this mini
+    flip it. Without align (the read-only check), probe as if aligned. Returns (refusal, note)."""
     home = Path.home()
     deadline = time.monotonic() + ELIGIBILITY_BUDGET_S
     env = dict(os.environ)  # the runner's PATH, which is the job's (workload) PATH
     note = ""
-    match = re.fullmatch(r"rustc (\d+\.\d+\.\d+)(?: .*)?", str(want.get("rustcVersion") or ""))
-    if not match:
-        return f"node not eligible (cannot read a toolchain from rustcVersion {want.get('rustcVersion')!r})", note
-    toolchain = f"{match.group(1)}-aarch64-apple-darwin"
-    installed = _probe(["rustup", "toolchain", "list"], env, home, deadline).splitlines()
-    names = [line.split()[0] for line in installed if line.strip()]
-    if toolchain not in names:
-        return f"node not eligible (rust toolchain {toolchain} is not installed)", note
-    current = next((line.split()[0] for line in installed if "(default)" in line or "default)" in line), "")
-    if current != toolchain:
-        _probe(["rustup", "default", toolchain], env, home, deadline)
-        if _probe(["rustup", "default"], env, home, deadline).split()[:1] != [toolchain]:
-            return f"node not eligible (could not set the rustup default to {toolchain})", note
-        note = f"set the rustup default to {toolchain} (was {current or 'none'})"
+    if _probe(["rustc", "--version"], env, home, deadline) != str(want.get("rustcVersion")):
+        toolchain = receipt_toolchain_name(want, env, home, deadline)
+        if toolchain is None:
+            return f"node not eligible (cannot name a toolchain for {want.get('rustcVersion')!r})", note
+        names = [line.split()[0] for line in _probe(["rustup", "toolchain", "list"], env, home, deadline).splitlines()
+                 if line.strip()]
+        if toolchain not in names:
+            return f"node not eligible (rust toolchain {toolchain} is not installed)", note
+        if align:
+            current = _probe(["rustup", "default"], env, home, deadline).split()[:1]
+            _probe(["rustup", "default", toolchain], env, home, deadline)
+            if _probe(["rustup", "default"], env, home, deadline).split()[:1] != [toolchain]:
+                return f"node not eligible (could not set the rustup default to {toolchain})", note
+            note = f"set the rustup default to {toolchain} (was {current[0] if current else 'none'})"
+        else:
+            env["RUSTUP_TOOLCHAIN"] = toolchain  # probe only: what the job would see once aligned
+            note = f"would set the rustup default to {toolchain}"
+    python = _probe(["python3", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"], env, home, deadline)
+    if not re.fullmatch(r"\d+\.\d+", python) or tuple(map(int, python.split("."))) < MIN_WORKLOAD_PYTHON:
+        return (f"node not eligible (python3 on the job PATH is {python or 'missing'}; cmux's profile runner "
+                f"needs {'.'.join(map(str, MIN_WORKLOAD_PYTHON))}+)"), note
     if xcode_app:
         env["DEVELOPER_DIR"] = os.fspath(Path(xcode_app) / "Contents" / "Developer")
     have: dict[str, str] = {}
@@ -418,7 +435,8 @@ def disk_pressure(explicit: str | None) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog=PREFIX)
-    p.add_argument("phase", choices=("job-started", "job-completed"))
+    p.add_argument("phase", choices=("job-started", "job-completed", "check"),
+                   help="check: the eligibility gate only, read-only (no lock, no rustup change)")
     p.add_argument("--allowed-repo", action="append", default=[])
     p.add_argument("--allowed-owner")
     p.add_argument("--allow-event", action="append", default=[],
@@ -437,6 +455,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--watch-pid", type=int, default=0, help=argparse.SUPPRESS)
     args = p.parse_args(argv)
 
+    if args.phase == "check":
+        why, want = node_refusal(args.fleet_class)
+        if not why:
+            why, note = toolchain_refusal(args.fleet_class, want, args.toolchain_xcode, align=False)
+        print(f"{PREFIX}: {'refused: ' + why if why else 'eligible' + (f' ({note})' if note else '')}", flush=True)
+        return 1 if why else 0
     if args.phase == "job-started":
         admit, reason = decide(os.environ.get("GITHUB_EVENT_NAME"), load_event(os.environ.get("GITHUB_EVENT_PATH")),
                                os.environ.get("GITHUB_REPOSITORY"), args.allowed_repo, args.allowed_owner,
