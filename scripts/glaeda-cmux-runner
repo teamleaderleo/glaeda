@@ -371,7 +371,25 @@ def routing(ctx: Context) -> dict[str, list[str]]:
 # ---------------------------------------------------------------- plan
 
 
+def receipt_conflict(ctx: Context, receipt: dict[str, Any] | None) -> str | None:
+    """A live receipt for another directory, name or scope: this run must not touch or replace it."""
+    if not receipt:
+        return None
+    reg = receipt.get("registration") or {}
+    theirs = (receipt.get("runnerDir"), reg.get("name"), reg.get("scope"))
+    if not receipt.get("runnerDirOwned") and not reg:
+        return None
+    mine = (os.fspath(ctx.runner_dir), ctx.name if reg else None, (ctx.org or ctx.repo) if reg else None)
+    if theirs == mine:
+        return None
+    return (f"this Mac already has a runner install ({theirs[1] or 'unregistered'} on {theirs[2] or '?'} in "
+            f"{ctx.show(theirs[0] or '?')}); run --uninstall --apply first")
+
+
 def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str, Any]]:
+    conflict = receipt_conflict(ctx, receipt)
+    if conflict:
+        return [{"kind": "receipt", "path": os.fspath(ctx.receipt_path), "state": "blocked", "note": conflict}]
     actions: list[dict[str, Any]] = []
     ours = owned_dir(ctx, receipt)
     configured = (ctx.runner_dir / ".runner").is_file()
@@ -497,7 +515,7 @@ def download_and_unpack(ctx: Context, act: dict[str, Any], install_id: str) -> N
         stage.unlink(missing_ok=True)
         act["state"], act["note"] = "failed", f"SHA-256 mismatch: got {got}, want sha256:{act['sha256']}"
         return
-    ctx.runner_dir.mkdir(parents=True, mode=0o755)
+    ctx.runner_dir.mkdir(parents=True, exist_ok=True, mode=0o755)  # a rerun after a failed unpack
     # The marker lands first, so a failed unpack still leaves a directory this command owns.
     (ctx.runner_dir / MARKER).write_text(install_id + "\n")
     tar = which("tar", ("/usr/bin/tar",)) or "tar"
@@ -528,6 +546,7 @@ def register(ctx: Context, act: dict[str, Any]) -> None:
         act["state"], act["note"] = "failed", f"config.sh failed: {out[-400:]}"
         return
     act["applied"] = True
+    act["runnerId"] = (local_runner(ctx) or {}).get("agentId")
 
 
 def bootout(ctx: Context, wait_s: float = 5.0) -> None:
@@ -560,7 +579,8 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             register(ctx, act)
             if act["state"] != "failed":
                 receipt_doc["registration"] = {"owned": True, "scope": ctx.org or ctx.repo, "org": bool(ctx.org),
-                                               "name": ctx.name, "labels": ctx.labels}
+                                               "name": ctx.name, "labels": ctx.labels,
+                                               "runnerId": act.get("runnerId")}
         elif kind in {"hook", "agent"} and state in {"create", "update"}:
             data, mode = desired_files(ctx)[Path(act["path"])]
             if kind == "agent" and act.get("loaded"):
@@ -581,8 +601,8 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
         if kind == "verify":
             verify(ctx, act, wait=not ctx.skip_launchctl)
             registration = receipt_doc.get("registration")
-            if registration and act.get("runner"):
-                registration["runnerId"] = act["runner"].get("id")
+            if registration and registration.get("runnerId") is None:  # receipts from before .runner ids
+                registration["runnerId"] = (local_runner(ctx) or {}).get("agentId")
 
 
 def local_runner(ctx: Context) -> dict[str, Any] | None:
@@ -667,12 +687,16 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
                 act["state"], act["note"] = "failed", f"deregistration failed: {out[-300:]}"
                 continue
             listed, runner = lookup_runner(ctx)
-            if runner and runner.get("id") is not None and ctx.gh:
+            owned_id = act.get("runnerId")
+            if runner and owned_id is not None and runner.get("id") == owned_id:
                 code2, out2 = run([ctx.gh, "api", "-X", "DELETE", f"{ctx.scope_api}/actions/runners/{int(runner['id'])}"])
                 if code2 == 0:
                     act["applied"], act["note"] = True, "config.sh remove failed; deleted by id through the API"
                     continue
                 out = out2
+            elif runner:
+                out = (f"GitHub lists {ctx.name} as id {runner.get('id')}, not this install's id {owned_id}; "
+                       "another machine may own that name now, so it is not deleted")
             elif listed and runner is None:
                 act["applied"], act["note"] = True, "GitHub no longer lists this runner"
                 continue
@@ -831,10 +855,6 @@ def main(argv: list[str] | None = None) -> int:
                 if act["state"] == "remove":
                     act["state"], act["note"] = "blocked", "deregistering needs gh as an admin, or --token-stdin"
         if args.apply:
-            if pre["blocking"] and any(a["kind"] == "deregister" and a["state"] == "remove" for a in actions):
-                for act in actions:
-                    if act["state"] == "remove":
-                        act["state"], act["note"] = "blocked", "preflight blocks: " + ", ".join(pre["blocking"])
             apply_uninstall(ctx, actions)
     else:
         actions = plan_install(ctx, prior)
@@ -846,7 +866,7 @@ def main(argv: list[str] | None = None) -> int:
             apply_install(ctx, actions, doc)
         doc["routing"] = routing(ctx)
     doc["actions"] = actions
-    doc["blocking"] = pre["blocking"] + [f"{a['kind']}:{a.get('path') or a.get('name') or ''}".rstrip(":")
+    doc["blocking"] = ([] if args.uninstall else pre["blocking"]) + [f"{a['kind']}:{a.get('path') or a.get('name') or ''}".rstrip(":")
                                          for a in actions if a.get("state") in {"blocked", "failed"}]
     doc["ready"] = not doc["blocking"]
     failed = any(a.get("state") == "failed" for a in actions)
@@ -857,13 +877,13 @@ def main(argv: list[str] | None = None) -> int:
             write_atomic(ctx.state / "uninstall-receipt.json", data, 0o600)
             if prior is not None and doc["ready"]:  # a blocked or failed uninstall keeps the receipt for a re-run
                 os.replace(ctx.receipt_path, ctx.state / "receipt.uninstalled.json")
-        elif doc["runnerDirOwned"] or any(a.get("owned") for a in actions):
+        elif receipt_conflict(ctx, prior) is None and (doc["runnerDirOwned"] or any(a.get("owned") for a in actions)):
             write_atomic(ctx.receipt_path, data, 0o600)
     if args.output == "json":
         print(json.dumps(doc, indent=2, sort_keys=True))
     else:
         print(render(ctx, doc))
-    return 1 if failed else 0
+    return 1 if failed or (args.apply and not doc["ready"]) else 0
 
 
 if __name__ == "__main__":

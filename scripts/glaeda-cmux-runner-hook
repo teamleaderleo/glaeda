@@ -8,6 +8,8 @@ The runner calls these through ACTIONS_RUNNER_HOOK_JOB_STARTED and
 ACTIONS_RUNNER_HOOK_JOB_COMPLETED (small .sh wrappers written by scripts/glaeda-cmux-runner).
 
 job-started refuses (exits 1, so the runner fails the job before any step runs) when:
+  * the event is not one of ADMITTED_EVENTS (so issue_comment, check_run, check_suite,
+    pull_request_target and anything new are refused; --allow-event adds more)
   * the event is pull_request_target
   * the event carries a pull_request whose head repository is a fork, is missing, or differs
     from the base repository (covers pull_request, pull_request_review, and friends)
@@ -33,6 +35,9 @@ from pathlib import Path
 from typing import Any
 
 DISK_TIMEOUT_S = 120
+# Events whose code is the repository's own, or a same-repo pull request checked below. Comment,
+# check and review-comment events can run with secrets on behalf of a fork PR, so they are left out.
+ADMITTED_EVENTS = ("push", "pull_request", "merge_group", "workflow_dispatch", "schedule", "workflow_run")
 PREFIX = "glaeda-cmux-runner-hook"
 
 
@@ -44,7 +49,8 @@ def _repo_name(repo: Any) -> str | None:
 
 
 def decide(event_name: str | None, event: Any, repository: str | None,
-           allowed_repos: list[str], allowed_owner: str | None) -> tuple[bool, str]:
+           allowed_repos: list[str], allowed_owner: str | None,
+           extra_events: tuple[str, ...] = ()) -> tuple[bool, str]:
     """Return (admit, reason). Pure: no I/O, so tests can table-drive it."""
     if not event_name:
         return False, "GITHUB_EVENT_NAME is not set"
@@ -52,6 +58,8 @@ def decide(event_name: str | None, event: Any, repository: str | None,
         return False, "event payload is missing or not a JSON object"
     if event_name == "pull_request_target":
         return False, "pull_request_target runs untrusted PR context with base-repo secrets"
+    if event_name not in ADMITTED_EVENTS + tuple(extra_events):
+        return False, f"{event_name} is not an admitted event on this runner"
     repo = (repository or _repo_name(event.get("repository")) or "").lower()
     if allowed_repos and repo not in {r.lower() for r in allowed_repos}:
         return False, f"repository {repo or '(unknown)'} is not allowed on this runner"
@@ -125,13 +133,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("phase", choices=("job-started", "job-completed"))
     p.add_argument("--allowed-repo", action="append", default=[])
     p.add_argument("--allowed-owner")
+    p.add_argument("--allow-event", action="append", default=[],
+                   help="admit another event name (pull_request_target is always refused)")
     p.add_argument("--disk", help="glaeda-disk path (default: PATH, then ~/.local/bin)")
     p.add_argument("--no-disk", action="store_true")
     args = p.parse_args(argv)
 
     if args.phase == "job-started":
         admit, reason = decide(os.environ.get("GITHUB_EVENT_NAME"), load_event(os.environ.get("GITHUB_EVENT_PATH")),
-                               os.environ.get("GITHUB_REPOSITORY"), args.allowed_repo, args.allowed_owner)
+                               os.environ.get("GITHUB_REPOSITORY"), args.allowed_repo, args.allowed_owner,
+                               tuple(args.allow_event))
         if not admit:
             message = f"{PREFIX}: refused: {reason}"
             print(message, flush=True)

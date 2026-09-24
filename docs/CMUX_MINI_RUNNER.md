@@ -57,7 +57,10 @@ What `--apply` does:
    only as `ACTIONS_RUNNER_INPUT_TOKEN` in that child's environment, which the runner
    reads and clears. It is never in an argv, a file, a log, or the output.
 3. Writes the job hooks into `~/actions-runner-glaeda/glaeda-hooks/`:
-   - job-started refuses the job (exits 1 before any step runs) for
+   - job-started admits only `push`, `pull_request`, `merge_group`,
+     `workflow_dispatch`, `schedule` and `workflow_run` (so `issue_comment`,
+     `check_run` and the like, which can act for a fork PR with secrets, are refused).
+     It refuses the job (exits 1 before any step runs) for
      `pull_request_target`, for any pull request whose head repository is a fork, is
      missing, or differs from the base repository, for a `workflow_run` from another
      repository, for any repository other than `manaflow-ai/cmux`, and whenever the
@@ -71,7 +74,10 @@ What `--apply` does:
    waits up to 90 s for it to report online.
 
 The receipt is `~/.local/state/glaeda/cmux-runner/receipt.json`. A second `--apply`
-reports every step as unchanged. A plan with any blocked step applies nothing.
+reports every step as unchanged. A plan with any blocked step applies nothing, and
+a blocked `--apply` exits 1. One install per user: an `--apply` with a different
+`--runner-dir`, `--name`, `--repo` or `--org` than the receipt is blocked until the
+first one is uninstalled.
 
 ## 2b. No gh on the mini: pipe the token over SSH
 
@@ -124,9 +130,10 @@ gh variable set MACOS_RUNNER_DUAL_XCODE --body glaeda-mini --repo manaflow-ai/cm
 ```
 
 cmux workflows read these as `runs-on: ${{ vars.MACOS_RUNNER_15 || 'blacksmith-6vcpu-macos-15' }}`.
-Fork pull requests are meant to stay on Blacksmith (a separate cmux change makes
-these expressions fall back for forks); the job-started hook refuses them anyway if
-one ever lands here. One mini runs one job at a time, so routing every variable to
+Until cmux's `runs-on` expressions fall back to Blacksmith for fork pull
+requests, routing `MACOS_RUNNER_PR` sends fork PR jobs here, where the job-started
+hook refuses them: they fail instead of running on Blacksmith. Route
+`MACOS_RUNNER_PR` only after that fallback lands. One mini runs one job at a time, so routing every variable to
 it queues work behind it.
 
 ## 5. Rollback
@@ -149,7 +156,8 @@ scripts/glaeda-mini-setup --runner --uninstall --apply    # deregister and remov
 
 Uninstall acts on the directory, name and scope in the receipt; flags cannot redirect it. It unloads and removes the LaunchAgent
 only if it still has the bytes this tool wrote, deregisters with a one-time removal
-token (falling back to `DELETE .../actions/runners/<id>` when `gh` is present), and removes
+token (falling back to `DELETE .../actions/runners/<id>` when `gh` is present, and only for
+the id this install registered), and removes
 `~/actions-runner-glaeda` (including `_work`) only if the receipt created it and
 the directory's marker still matches. If deregistration fails, the directory and
 receipt stay so the command can be re-run. Nothing outside those paths is touched.

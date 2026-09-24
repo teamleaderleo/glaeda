@@ -172,6 +172,9 @@ SAMPLE_EVENTS = {
     "workflow-run-same-repo": ("workflow_run", {"repository": CMUX, "workflow_run": {
         "head_repository": CMUX, "event": "push"}}, True),
     "other-repository": ("push", {"repository": {"full_name": "evil/cmux"}}, False),
+    "issue-comment-on-pr": ("issue_comment", {"repository": CMUX, "issue": {"pull_request": {"url": "x"}}}, False),
+    "check-run": ("check_run", {"repository": CMUX, "check_run": {}}, False),
+    "schedule": ("schedule", {"repository": CMUX}, True),
 }
 
 
@@ -465,7 +468,7 @@ class RunnerTest(unittest.TestCase):
     def test_existing_runner_name_blocks_without_replace(self) -> None:
         (self.state / "runners.json").write_text(json.dumps({"runners": [
             {"id": 7, "name": "mini-test-glaeda", "status": "offline", "labels": []}]}))
-        receipt = self.invoke("--apply")
+        receipt = self.invoke("--apply", expect=1)
         self.assertEqual(self.by_kind(receipt)["register"]["state"], "blocked")
         self.assertFalse(receipt["ready"])
         self.assertFalse((self.home / "actions-runner-glaeda").exists())
@@ -517,7 +520,7 @@ class RunnerTest(unittest.TestCase):
         runner = self.home / "actions-runner-glaeda"
         runner.mkdir()
         (runner / "keep.txt").write_text("operator data")
-        receipt = self.invoke("--apply")
+        receipt = self.invoke("--apply", expect=1)
         self.assertEqual(self.by_kind(receipt)["dir"]["state"], "blocked")
         self.assertEqual(sorted(p.name for p in runner.iterdir()), ["keep.txt"])
         self.assertFalse(any(e["tool"] in {"curl", "config.sh"} for e in self.log()))
@@ -559,6 +562,47 @@ class RunnerTest(unittest.TestCase):
         retry = self.invoke("--uninstall", "--apply")
         self.assertEqual({a["kind"]: a["state"] for a in retry["actions"]}["dir"], "remove")
         self.assertFalse((self.home / "actions-runner-glaeda").exists())
+
+    def test_api_fallback_never_deletes_another_machines_runner(self) -> None:
+        self.invoke("--apply")
+        # the name was re-registered elsewhere with --replace: same name, new id
+        (self.state / "runners.json").write_text(json.dumps({"runners": [
+            {"id": 9999, "name": "mini-test-glaeda", "status": "online", "labels": []}]}))
+        (self.state / "fail-config-remove").touch()
+        receipt = self.invoke("--uninstall", "--apply", expect=1)
+        dereg = next(a for a in receipt["actions"] if a["kind"] == "deregister")
+        self.assertEqual(dereg["state"], "failed")
+        self.assertIn("not deleted", dereg["note"])
+        self.assertFalse(any(e["tool"] == "gh" and "DELETE" in e["argv"] for e in self.log()))
+        self.assertTrue((self.home / "actions-runner-glaeda").is_dir())
+        self.assertTrue((self.home / ".local/state/glaeda/cmux-runner/receipt.json").is_file())
+
+    def test_a_second_install_elsewhere_is_blocked_and_keeps_the_receipt(self) -> None:
+        self.invoke("--apply")
+        receipt_path = self.home / ".local/state/glaeda/cmux-runner/receipt.json"
+        before = receipt_path.read_bytes()
+        (self.home / "elsewhere").mkdir()
+        for args in (("--runner-dir", os.fspath(self.home / "elsewhere")),
+                     ("--runner-dir", os.fspath(self.home / "fresh")),
+                     ("--name", "other-glaeda"), ("--repo", "teamleaderleo/cmux")):
+            with self.subTest(args=args):
+                blocked = self.invoke("--apply", *args, expect=1)
+                self.assertEqual([a["state"] for a in blocked["actions"]], ["blocked"])
+                self.assertEqual(receipt_path.read_bytes(), before)
+                self.assertFalse((self.home / "fresh").exists())
+        removed = self.invoke("--uninstall", "--apply")
+        self.assertTrue(all(a["applied"] for a in removed["actions"] if a["state"] == "remove"))
+        self.assertFalse((self.home / "actions-runner-glaeda").exists())
+
+    def test_rerun_after_failed_unpack_recovers(self) -> None:
+        self.invoke("--apply")
+        runner = self.home / "actions-runner-glaeda"
+        for name in ("config.sh", ".runner"):
+            (runner / name).unlink()
+        (self.state / "runners.json").write_text(json.dumps({"runners": []}))
+        receipt = self.invoke("--apply")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        self.assertTrue((runner / ".runner").is_file())
 
     def test_config_remove_failure_falls_back_to_api_delete(self) -> None:
         self.invoke("--apply")
@@ -604,7 +648,7 @@ class RunnerTest(unittest.TestCase):
             self.assertEqual({a["state"] for a in again["actions"] if a["kind"] != "verify"}, {"unchanged"})
 
             before = self.tree()
-            stuck = self.invoke("--uninstall", "--apply", gh=False)  # no way to deregister: touch nothing
+            stuck = self.invoke("--uninstall", "--apply", gh=False, expect=1)  # no way to deregister: touch nothing
             self.assertFalse(stuck["ready"])
             self.assertTrue(all(a["state"] == "blocked" for a in stuck["actions"]), stuck["actions"])
             after = self.tree()
