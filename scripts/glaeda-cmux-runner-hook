@@ -134,6 +134,12 @@ DEFAULT_HOME_REPO = "manaflow-ai/cmux"
 
 GUEST_WAIT_S = 600.0  # guests have no rescue workflow: a full mini holds their job this long before refusing
 GUEST_POLL_S = 5.0
+# A cmux GUI job (app-host shard, tests-build-and-lag) refused only because another GUI job holds this mini's one
+# gui token waits this long for it instead. Two root runners share one gui token, so a full suite's shards often
+# meet on a mini, and a GUI job there runs about 90 s, while a refusal's rescue round trip took 71 s to 18 min
+# (median 126 s, 16 refusals, cmux PR CI 2026-09-25 07:00-09:00Z) and sent the re-run shards to Blacksmith.
+GUI_WAIT_S = 180.0
+GUI_TOKEN_TAKEN = "capacity: the gui token is taken"
 
 
 def is_guest(repo: str | None, home_repo: str = DEFAULT_HOME_REPO) -> bool:
@@ -1642,6 +1648,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="the repository whose job ids JOB_CLASSES names; other repos are guests (see job_class)")
     p.add_argument("--guest-wait", type=float, default=GUEST_WAIT_S,
                    help="seconds a guest job waits for room on a full mini before it is refused")
+    p.add_argument("--gui-wait", type=float, default=GUI_WAIT_S,
+                   help="seconds a home-repository job refused only for the gui token waits for it")
     p.add_argument("--allow-event", action="append", default=[],
                    help="admit another event name (pull_request_target is always refused)")
     p.add_argument("--trusted-ref", help="admit only push and schedule jobs on this ref (needs --trusted-repo)")
@@ -1721,15 +1729,22 @@ def main(argv: list[str] | None = None) -> int:
             # the repository decide() admitted: the runner's variable, else the event payload's
             repo = os.environ.get("GITHUB_REPOSITORY") or _repo_name((event or {}).get("repository")
                                                                      if isinstance(event, dict) else None)
-            deadline = time.monotonic() + (args.guest_wait if is_guest(repo, args.home_repo) else 0)
+            guest = is_guest(repo, args.home_repo)
+            start = time.monotonic()
+            deadline = start + (args.guest_wait if guest else 0)
             while True:
                 held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
                                            os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
                                            args.state_dir, args.compile_slots, args.canonical_roots,
                                            repo, args.home_repo, instance=args.instance,
                                            workflow=workflow_file(os.environ.get("GITHUB_WORKFLOW_REF")))
-                # cmux refuses fast (its rescue workflow reroutes); a guest has none, so it waits for room
-                if held or not note.startswith("capacity:") or time.monotonic() >= deadline:
+                # cmux refuses fast (its rescue workflow reroutes); a guest has none, so it waits for room.
+                # A cmux job refused only for the gui token waits for it too: the holder is a short GUI job.
+                if held or not note.startswith("capacity:"):
+                    break
+                if not guest and note.startswith(GUI_TOKEN_TAKEN):
+                    deadline = max(deadline, start + args.gui_wait)
+                if time.monotonic() >= deadline:
                     break
                 time.sleep(GUEST_POLL_S)
         else:

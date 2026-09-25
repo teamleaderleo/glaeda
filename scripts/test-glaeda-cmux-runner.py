@@ -734,7 +734,7 @@ class HookTest(unittest.TestCase):
         self.fleet()
         try:
             self.assertEqual(self.job("tests-build-and-lag", "g0").returncode, 0)
-            other = self.job("app-host-unit-tests", "g1")
+            other = self.job("app-host-unit-tests", "g1", 4, None, "--gui-wait", "0")
             self.assertIn("refused: capacity: the gui token is taken", other.stdout)
             for n, lane in enumerate(("cli-pipe-regressions", "remote-daemon-macos-tests", "claude-wrapper")):
                 side = self.job(lane, f"s{n}", units=8)
@@ -746,6 +746,36 @@ class HookTest(unittest.TestCase):
             self.assertIn("persistent-dd+root-1 for future-unlisted-job (compile", unknown.stdout)
         finally:
             for runner in ("g0", "u0"):
+                self.finish(runner)
+
+    def test_capacity_gui_job_waits_for_the_gui_token(self) -> None:
+        self.fleet()
+        try:
+            self.assertEqual(self.job("app-host-unit-tests", "w0").returncode, 0)
+            waited = time.monotonic()
+            busy = self.job("tests-build-and-lag", "w1", 4, None, "--gui-wait", "3")
+            self.assertEqual(busy.returncode, 1, busy.stdout)
+            self.assertIn("refused: capacity: the gui token is taken", busy.stdout)
+            self.assertGreaterEqual(time.monotonic() - waited, 3, "a gui job waits for the token before refusal")
+            # the holder finishes while the next one waits: it is admitted, not refused
+            release = threading.Timer(2.0, self.finish, args=("w0",))
+            release.start()
+            try:
+                admitted = self.job("app-host-unit-tests", "w2", 4, None, "--gui-wait", "30")
+            finally:
+                release.join()
+            self.assertEqual(admitted.returncode, 0, admitted.stdout)
+            self.assertIn("+gui", admitted.stdout)
+            # only the gui token is waited for: any other refusal is still immediate
+            self.finish("w2")
+            self.assertEqual(self.job("macos-compile-admission", "w3", 4).returncode, 0)
+            waited = time.monotonic()
+            full = self.job("cli-product-tests", "w4", 4, None, "--gui-wait", "30")
+            self.assertIn("refused: capacity:", full.stdout)
+            self.assertNotIn("gui token", full.stdout)
+            self.assertLess(time.monotonic() - waited, 20, "a units refusal does not wait")
+        finally:
+            for runner in ("w0", "w1", "w2", "w3", "w4"):
                 self.finish(runner)
 
     def test_job_class_keys_on_workflow_file_and_job_id(self) -> None:
