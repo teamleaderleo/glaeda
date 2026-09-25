@@ -83,6 +83,7 @@ RUNNER_RELEASE_API = "repos/actions/runner/releases"
 PLATFORM_ASSET = "osx-arm64"
 MARKER = ".glaeda-cmux-runner"
 HOOK_DIR = "glaeda-hooks"
+HELD_DIR = ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh held_dir
 DARWIN_REQUIRED = True
 RUN_TIMEOUT = 60
 CURL = "/usr/bin/curl"
@@ -532,6 +533,39 @@ def launchctl_loaded(ctx: Context) -> bool | None:
     return run([LAUNCHCTL, "print", f"gui/{ctx.uid}/{ctx.label}"])[0] == 0
 
 
+def held_marker(ctx: Context) -> Path:
+    """cmux_mini_fix.sh runner_hold's mark: this runner was stopped on purpose, and runner_release starts it."""
+    return ctx.home / HELD_DIR / ctx.runner_dir.name
+
+
+def launchctl_disabled(ctx: Context) -> bool | None:
+    """launchd's disabled override for this label (bootstrap refuses a disabled service with error 5)."""
+    if ctx.skip_launchctl:
+        return None
+    code, out = run([LAUNCHCTL, "print-disabled", f"gui/{ctx.uid}"])
+    if code != 0:
+        return None
+    found = re.search(r'"' + re.escape(ctx.label) + r'"\s*=>\s*(\w+)', out)
+    return bool(found) and found.group(1) in {"disabled", "true"}
+
+
+def start_agent(ctx: Context, act: dict[str, Any], plist: str) -> str | None:
+    """Enable the label if launchd has it disabled, then bootstrap it. The reason on failure, else None.
+
+    Callers never start a runner that runner_hold marked held, so a disabled label here is one nothing
+    means to keep stopped (a hand `launchctl disable`, or a hold whose mark is gone)."""
+    ctx.log_offset = ctx.log_path.stat().st_size if ctx.log_path.is_file() else 0
+    if launchctl_disabled(ctx):
+        code, out = run([LAUNCHCTL, "enable", f"gui/{ctx.uid}/{ctx.label}"])
+        act["wasDisabled"], act["enabled"] = True, code == 0
+        if code != 0:
+            act["bootstrapped"] = False
+            return "launchctl enable failed: " + out
+    code, out = run([LAUNCHCTL, "bootstrap", f"gui/{ctx.uid}", plist])
+    act["bootstrapped"] = code == 0
+    return None if code == 0 else "launchctl bootstrap failed: " + out
+
+
 def routing(ctx: Context) -> dict[str, list[str]]:
     repo = shlex.quote(ctx.route_repo)
     return {
@@ -650,6 +684,10 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
             act["label"] = ctx.label
             act["loaded"] = launchctl_loaded(ctx)
             act["launchctl"] = "skipped (sandbox HOME)" if ctx.sandbox else ("skipped" if ctx.skip_launchctl else "managed")
+            act["held"] = held_marker(ctx).is_file()
+            act["disabled"] = launchctl_disabled(ctx)
+            if act["disabled"] and not act["held"] and not act.get("note"):
+                act["note"] = "launchd has this label disabled with no hold mark; --apply enables it before bootstrap"
         actions.append(act)
     actions.append({"kind": "verify", "state": "pending", "note": f"GET {ctx.scope_api}/actions/runners, name {ctx.name}"})
     return actions
@@ -775,29 +813,11 @@ def relabel(ctx: Context, act: dict[str, Any]) -> None:
         act["note"] += ("; the old registration is still on GitHub and this runner is stopped: re-run with a "
                         "fresh token (it re-registers the same name with --replace)")
         return
-    if not ctx.skip_launchctl:
-        ctx.log_offset = ctx.log_path.stat().st_size if ctx.log_path.is_file() else 0
-        enable(ctx)
-        code, out = run([LAUNCHCTL, "bootstrap", f"gui/{ctx.uid}", os.fspath(ctx.plist_path)])
-        act["bootstrapped"] = code == 0
-        ctx.agent_started = code == 0  # the agent step must not bootstrap it a second time
-        if code != 0:
-            act["state"], act["note"] = "failed", ("re-registered, but launchctl bootstrap failed: " + out)[:400]
-
-
-def enable(ctx: Context) -> None:
-    """Clear a launchd disable before a bootstrap, which a disabled label refuses.
-
-    cmux_mini_fix.sh runner_hold disables the agent for a repair; when its
-    hold mark is lost, runner_release skips it and every later --apply failed
-    at bootstrap (cmux7s, 2026-09-25). An --apply is the operator asking for
-    the runner, so it re-enables its own agent, unless a hold mark says a
-    repair is still running (runner_release clears that one).
-    """
-    if (ctx.home / ".local/state/glaeda/mini-fleet/runner-held" / ctx.runner_dir.name).exists():
-        print(f"glaeda-cmux-runner: {ctx.label} is held for a repair; leaving it disabled", file=sys.stderr)
-        return
-    run([LAUNCHCTL, "enable", f"gui/{ctx.uid}/{ctx.label}"])
+    if not ctx.skip_launchctl and not held_marker(ctx).is_file():  # a held runner stays stopped
+        why = start_agent(ctx, act, os.fspath(ctx.plist_path))
+        ctx.agent_started = why is None  # the agent step must not bootstrap it a second time
+        if why:
+            act["state"], act["note"] = "failed", ("re-registered, but " + why)[:400]
 
 
 def bootout(ctx: Context, wait_s: float = 5.0) -> None:
@@ -858,16 +878,21 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             act["loaded"] = True  # relabel already started this exact, unchanged plist
         if kind == "agent" and act["state"] in {"create", "update", "unchanged"} and not ctx.skip_launchctl \
                 and not act.get("loaded"):
-            ctx.log_offset = ctx.log_path.stat().st_size if ctx.log_path.is_file() else 0
-            enable(ctx)
-            code, out = run([LAUNCHCTL, "bootstrap", f"gui/{ctx.uid}", act["path"]])
-            act["bootstrapped"] = code == 0
-            if code != 0:
-                act["state"], act["note"] = "failed", ("launchctl bootstrap failed: " + out)[:400]
+            if act.get("held"):
+                ctx.held = True
+                act["note"] = (f"held by runner_hold ({ctx.show(held_marker(ctx))}); not started. "
+                               "cmux_mini_fix.sh runner_release starts it")
+            else:
+                why = start_agent(ctx, act, act["path"])
+                if why:
+                    act["state"], act["note"] = "failed", why[:400]
         if act["state"] == "failed":
             failed = True
         if kind == "verify":
-            verify(ctx, act, wait=not ctx.skip_launchctl)
+            held = getattr(ctx, "held", False)
+            verify(ctx, act, wait=not ctx.skip_launchctl and not held)
+            if held and act["state"] == "ok":
+                act["note"] = "; ".join(filter(None, [act.get("note"), "held: registered but not started"]))
             registration = receipt_doc.get("registration")
             if registration and registration.get("runnerId") is None:  # receipts from before .runner ids
                 registration["runnerId"] = (local_runner(ctx) or {}).get("agentId")
