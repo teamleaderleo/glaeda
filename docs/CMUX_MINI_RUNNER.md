@@ -368,6 +368,16 @@ in at the producer's root. So one root job per root per mini:
 - Jobs the hook does not know (app-host-test-rerun, seed-swiftpm-manifests, anything new) are pinned to
   root 1, because they use /private/tmp/cmux-ci themselves.
 
+## 2g. iOS simulator runners
+
+A host with `"ios_sim": true` in the manifest carries `glaeda-ios-sim` when the installer also finds an
+available iOS 26.x runtime (`xcrun simctl list runtimes -j` against the member's Xcode). iOS jobs use
+`runs-on: [glaeda-std-xcode-26.6, glaeda-ios-sim]` through the owned-pool picker, so a job never lands on
+a mini without a runtime (cmux14 has none). Hook classes: `mobile-core-package` and `ios-simulator-build`
+are `isolated` (2 units, own DerivedData or SwiftPM `.build`, no canonical root), `ios-simulator`,
+`validate` and `screenshots` are `simulator` (2 units, a booted simulator, no gui token), and
+`resolve-ref` is light.
+
 ## 3. Verify
 
 ```bash

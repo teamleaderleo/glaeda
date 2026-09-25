@@ -266,6 +266,21 @@ def xcode_present(app: dict[str, Any]) -> bool:
             and re.search(rf"^Xcode {re.escape(version)}$", out, re.M) is not None)
 
 
+def ios_sim_present(apps: list[dict[str, Any]], major: str) -> bool:
+    """An available iOS <major>.x simulator runtime for the member's first verified Xcode (simctl, read-only)."""
+    developer = Path(str(apps[0].get("path") or "")) / "Contents/Developer"
+    code, out = run(["/usr/bin/xcrun", "simctl", "list", "runtimes", "-j"],
+                    env={**os.environ, "DEVELOPER_DIR": os.fspath(developer)})
+    if code != 0:
+        return False
+    try:
+        runtimes = json.loads(out[out.find("{"):]).get("runtimes") or []  # stderr is merged in; skip any warning
+    except (ValueError, AttributeError):
+        return False
+    return any(isinstance(r, dict) and r.get("isAvailable") and r.get("platform") == "iOS"
+               and str(r.get("version") or "").split(".")[0] == major for r in runtimes)
+
+
 def fleet_labels() -> Any:
     """The shared label rule, loaded from beside this script only when --manifest asks for it."""
     path = SCRIPT_DIR / LABELS_MODULE
@@ -282,7 +297,8 @@ def member_labels(manifest: Any, member: str) -> tuple[dict[str, Any] | None, st
         rule = fleet_labels()
     except Exception as error:  # noqa: BLE001  (missing, broken or stale module: explain, never a traceback)
         return None, f"{LABELS_MODULE} must sit next to this script for --manifest ({type(error).__name__})"
-    return rule.member_labels(manifest, member, lambda app: xcode_present(app))
+    return rule.member_labels(manifest, member, lambda app: xcode_present(app),
+                              lambda apps: ios_sim_present(apps, getattr(rule, "IOS_SIM_MAJOR", "26")))
 
 
 def load_receipt(ctx: Context) -> dict[str, Any] | None:
