@@ -334,17 +334,21 @@ def validate_ios_simulator(path: Path, where: str, ios: Any) -> None:
 
 def ios_simulator_drift(ios: dict[str, Any], obs: dict[str, Any]) -> list[tuple[str, str]]:
     """(message, fix) for each way the observed iOS simulators differ from the declared ones."""
-    have = {r["build"]: r for r in obs.get("ios_runtimes", [])}
+    runtimes = obs.get("ios_runtimes", [])
+    have = {r["build"]: r for r in runtimes if r.get("available", True)}
     out = []
     for build in ios.get("runtimes", []):
         if build not in have:
+            # -buildVersion only takes what Apple lists for this Xcode, so name the build to confirm instead.
             out.append((f"iOS simulator runtime {build} missing",
-                        "xcodebuild -downloadPlatform iOS, or xcrun simctl runtime add <dmg>"))
+                        f"xcodebuild -downloadPlatform iOS with the pinned Xcode (must yield {build}), "
+                        "or xcrun simctl runtime add <dmg>"))
     if ios.get("exclusive"):
-        for build, r in sorted(have.items()):
+        # An unavailable runtime is still extra: deleting it is the fix.
+        for build, r in sorted((r["build"], r) for r in runtimes):
             if build not in ios.get("runtimes", []):
                 out.append((f"extra iOS simulator runtime {r['full']} ({build})",
-                            f"xcrun simctl runtime delete {r['identifier']}"))
+                            f"xcrun simctl runtime delete {build}"))
     names = {(d["runtime"], d["name"]) for d in obs.get("ios_devices", [])}
     for build in ios.get("runtimes", []):
         short = have.get(build, {}).get("short")
@@ -559,13 +563,28 @@ def parse_probe(text: str) -> dict[str, Any]:
         "enrolled_node_id": out.get("fleet_node_id"),
         "reservation": probe_reservation(out.get("reservation"), out.get("reservation_raw")),
         "host_lock": out.get("host_lock"),
-        "ios_runtimes": [dict(zip(("short", "full", "build", "identifier"), v.split("|", 3)))
-                         for v in out["ios_runtime"] if v.count("|") == 3],
+        "ios_runtimes": ios_runtimes(out["ios_runtime"]),
         "ios_devices": [dict(zip(("runtime", "name"), v.split("|", 1))) for v in out["ios_device"] if "|" in v],
         "authorized_keys_files": [v.split("|")[0] for v in out["ak_file"]],
         "authorized_keys": [parse_key(v) for v in out["ak_key"] if v.split("|", 1)[0] in LIVE_KEY_FILES],
         **({"preflight": parse_preflight(out)} if "pf_python" in out else {}),
     }
+
+
+def ios_runtimes(lines: list[str]) -> list[dict[str, Any]]:
+    """Probe ios_runtime lines, keeping only well-formed ones: their fields go into operator fix text."""
+    runtimes = []
+    for line in lines:
+        fields = line.split("|")
+        if len(fields) not in (4, 5):
+            continue
+        short, full, build, identifier = fields[:4]
+        if not (VERSION_RE.fullmatch(short) and VERSION_RE.fullmatch(full) and IOS_BUILD_RE.fullmatch(build)
+                and re.fullmatch(r"com\.apple\.[A-Za-z0-9.-]+", identifier)):
+            continue
+        runtimes.append({"short": short, "full": full, "build": build, "identifier": identifier,
+                         "available": fields[4:] != ["unavailable"]})
+    return runtimes
 
 
 def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:

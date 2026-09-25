@@ -420,7 +420,18 @@ class IosSimulatorTests(unittest.TestCase):
                 "ios_runtime\t27.0|27.0|24A5390f|com.apple.CoreSimulator.SimRuntime.iOS-27-0\n")
         obs = observed(**{"build-mini-1": probe_text() + text})
         fixes = [i["fix"] for i in mf.check(self.manifest, obs, ["build-mini-1"]) if i["area"] == "ios"]
-        self.assertEqual(fixes, ["xcrun simctl runtime delete com.apple.CoreSimulator.SimRuntime.iOS-27-0"])
+        self.assertEqual(fixes, ["xcrun simctl runtime delete 24A5390f"])
+
+    def test_unavailable_and_malformed_runtimes(self) -> None:
+        text = ("ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5|unavailable\n"
+                "ios_device\t26.5|iPhone 17 Pro Max\n"
+                "ios_runtime\t26.0|26.0|x;rm -rf|com.apple.CoreSimulator.SimRuntime.iOS-26-0\n")
+        # An unusable declared runtime counts as missing; a malformed line is dropped, never shown.
+        self.assertEqual(self.ios(text), ["iOS simulator runtime 23F77 missing"])
+        stale = ("ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5\n"
+                 "ios_device\t26.5|iPhone 17 Pro Max\n"
+                 "ios_runtime\t17.0|17.0|21A328|com.apple.CoreSimulator.SimRuntime.iOS-17-0|unavailable\n")
+        self.assertEqual(self.ios(stale), ["extra iOS simulator runtime 17.0 (21A328)"])
 
     def test_declaration_is_validated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

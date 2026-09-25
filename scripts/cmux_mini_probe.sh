@@ -42,7 +42,8 @@ done
 if [ -n "$sim_dev" ]; then
   # "iOS 26.3 (26.3.1 - 23D8133) - com.apple.CoreSimulator.SimRuntime.iOS-26-3" -> short|full|build|identifier
   DEVELOPER_DIR="$sim_dev" xcrun simctl list runtimes </dev/null 2>/dev/null |
-    sed -nE 's/^iOS ([0-9.]+) \(([0-9.]+) - ([A-Za-z0-9]+)\) - (com\.apple\.[A-Za-z0-9.-]+).*/ios_runtime	\1|\2|\3|\4/p'
+    sed -nE -e 's/^iOS ([0-9.]+) \(([0-9.]+) - ([A-Za-z0-9]+)\) - (com\.apple\.[A-Za-z0-9.-]+) \(unavailable.*/ios_runtime	\1|\2|\3|\4|unavailable/p' \
+      -e 's/^iOS ([0-9.]+) \(([0-9.]+) - ([A-Za-z0-9]+)\) - (com\.apple\.[A-Za-z0-9.-]+) *$/ios_runtime	\1|\2|\3|\4/p'
   # Devices under "-- iOS 26.3 --" -> short|name, without the UDID and state.
   DEVELOPER_DIR="$sim_dev" xcrun simctl list devices available </dev/null 2>/dev/null |
     awk '/^-- iOS /{v=$3; next} /^-- /{v=""; next} v!="" && /^    /{sub(/^ +/,""); sub(/ \([0-9A-F-]+\) \([^)]*\) *$/,""); print "ios_device\t" v "|" $0}'
