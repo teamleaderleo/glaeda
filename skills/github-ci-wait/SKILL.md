@@ -10,6 +10,10 @@ hour. Sessions polling on their own used it all up. `glaeda-gh` is a local daemo
 only process polling: one batched GraphQL query for every watched PR, ETag requests for runs
 (an unchanged run costs nothing), and one batched query every 15 s for comment waits. Its
 commands read the daemon's cache and make no API calls.
+Runs come first from the cmux build controller, which receives GitHub's run webhooks
+(cmuxterm-hq#675): a finished run shows up within a few seconds and costs no quota at all. That
+needs the tailnet and `~/.config/cmux/build-fleet/controller.token`; without them the daemon falls
+back to the ETag reads.
 
 ## Wait and check
 

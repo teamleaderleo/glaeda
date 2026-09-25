@@ -144,7 +144,7 @@ class Base(unittest.TestCase):
         gg.WAIT_POLL = 0.05
         gg.DOWN_GRACE = 0.3
         self.gh = FakeGitHub()
-        self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN)
+        self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
 
     def tearDown(self) -> None:
         gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE = self.saved
@@ -153,6 +153,195 @@ class Base(unittest.TestCase):
     def age_watch(self, key: str, seconds: float) -> None:
         path = gg.watch_dir() / gg.file_name(key)
         os.utime(path, (NOW - seconds, NOW - seconds))
+
+
+class FakeController:
+    """Stands in for the cmux build controller's /v1/github/runs/<id> endpoint."""
+
+    def __init__(self) -> None:
+        self.runs: dict[int, dict] = {}
+        self.calls: list[int] = []
+        self.down = False
+
+    def run(self, run_id: int) -> dict | None:
+        self.calls.append(run_id)
+        if self.down:
+            raise self.down if isinstance(self.down, gg.WatchError) else gg.WatchError("controller: URLError")
+        return self.runs.get(run_id)
+
+
+def ctl_run(run_id: int, status: str, conclusion: str = "", updated: str = "2026-09-25T10:00:00Z", repo: str = "o/r") -> dict:
+    return {"id": run_id, "repo": repo, "name": "seed", "event": "workflow_dispatch", "head_sha": "a" * 40,
+            "attempt": 1, "status": status, "conclusion": conclusion, "url": f"https://x/{run_id}", "updated_at": updated}
+
+
+class ControllerTest(Base):
+    def setUp(self) -> None:
+        super().setUp()
+        self.ctl = FakeController()
+        self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=self.ctl)
+
+    def test_tracked_run_costs_no_quota(self) -> None:
+        self.ctl.runs[21] = ctl_run(21, "in_progress")
+        key = gg.parse_key("run", "o/r/21")
+        gg.register(key)
+        for i in range(5):
+            self.daemon.tick(NOW + i * gg.CYCLE)
+        self.assertEqual(self.gh.rest_calls(), [])
+        self.ctl.runs[21] = ctl_run(21, "completed", "failure", "2026-09-25T10:05:00Z")
+        self.gh.runs[21] = {"id": 21, "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                            "updated_at": "2026-09-25T10:05:00Z"}
+        self.gh.jobs[21] = [job("build", end=NOW)]
+        self.daemon.tick(NOW + 5 * gg.CYCLE + gg.TICK)
+        entry = gg.read_cache(key)
+        self.assertEqual((entry["source"], entry["data"]["conclusion"]), ("controller", "failure"))
+        self.assertEqual(gg.verdict("run", entry["data"], jobs=entry["jobs"]), gg.EXIT_FAIL)
+        # the failed attempt's job list is read once, for its failed steps; nothing after that
+        self.assertEqual((len(self.gh.run_calls()), len(self.gh.job_calls())), (1, 1))
+        self.assertEqual(entry["jobs"][0]["failedSteps"], ["Run selected tests"])
+        for i in range(1, 4):
+            self.daemon.tick(NOW + 5 * gg.CYCLE + gg.TICK + i * gg.CYCLE)
+        self.assertEqual(len(self.gh.rest_calls()), 2)
+
+    def test_refusal_reported_by_the_controller_is_held_until_the_rescue_attempt(self) -> None:
+        now = time.time()
+        self.ctl.runs[31] = ctl_run(31, "completed", "failure", iso(now))
+        self.gh.runs[31] = {"id": 31, "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                            "updated_at": iso(now)}
+        self.gh.jobs[31] = [refused(end=now)]
+        key = "run:o/r/31"
+        gg.register(key)
+        self.age_watch(key, 1)  # the reader came before the first fetch; a later one would get a REST confirmation
+        self.daemon.tick(NOW)
+        entry = gg.read_cache(key)
+        self.assertIsNone(gg.verdict("run", entry["data"], jobs=entry["jobs"]))  # held for the rescue
+        self.ctl.runs[31] = {**ctl_run(31, "in_progress", "", iso(now + 50)), "attempt": 2}
+        self.daemon.tick(NOW + gg.TICK)
+        entry = gg.read_cache(key)
+        self.assertEqual((entry["data"]["run_attempt"], entry["data"]["status"]), (2, "in_progress"))
+        self.ctl.runs[31] = {**ctl_run(31, "completed", "success", iso(now + 600)), "attempt": 2}
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        entry = gg.read_cache(key)
+        self.assertEqual(gg.verdict("run", entry["data"], jobs=entry.get("jobs")), gg.EXIT_OK)
+        self.assertEqual(len(self.gh.rest_calls()), 2)  # only attempt 1's run and job list
+
+    def test_safety_net_reads_rest_every_15_minutes(self) -> None:
+        self.ctl.runs[22] = ctl_run(22, "in_progress")
+        self.gh.runs[22] = {"id": 22, "status": "in_progress", "updated_at": "2026-09-25T10:00:00Z"}
+        gg.register("run:o/r/22")
+        self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.REST_SAFETY - gg.CYCLE)
+        self.assertEqual(len(self.gh.rest_calls()), 0)
+        self.daemon.tick(NOW + gg.REST_SAFETY + 1)
+        self.assertEqual(len(self.gh.rest_calls()), 1)
+
+    def test_lost_delivery_is_not_undone(self) -> None:
+        self.ctl.runs[23] = ctl_run(23, "in_progress")
+        self.gh.runs[23] = {"id": 23, "status": "completed", "conclusion": "success", "updated_at": "2026-09-25T10:09:00Z"}
+        key = gg.parse_key("run", "o/r/23")
+        gg.register(key)
+        self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.REST_SAFETY + 1)
+        self.daemon.tick(NOW + gg.REST_SAFETY + 1 + gg.TICK)
+        self.assertEqual(gg.read_cache(key)["data"]["conclusion"], "success")
+
+    def test_unknown_run_uses_rest(self) -> None:
+        self.gh.runs[24] = {"id": 24, "status": "completed", "conclusion": "success"}
+        gg.register("run:o/r/24")
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.gh.rest_calls()), 1)
+        self.assertEqual(gg.read_cache("run:o/r/24")["source"], "rest")
+
+    def test_controller_down_backs_off(self) -> None:
+        self.ctl.down = True
+        self.gh.runs[25] = {"id": 25, "status": "in_progress"}
+        gg.register("run:o/r/25")
+        self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(len(self.ctl.calls), 1)
+        self.assertEqual(len(self.gh.rest_calls()), 1)
+        self.ctl.down = False
+        self.daemon.tick(NOW + gg.CONTROLLER_RETRY + 1)
+        self.assertEqual(len(self.ctl.calls), 2)
+
+    def test_job_lists_and_other_repos_stay_on_rest(self) -> None:
+        self.ctl.runs[26] = ctl_run(26, "in_progress", repo="other/repo")
+        self.gh.runs[26] = {"id": 26, "status": "in_progress"}
+        gg.register("run:o/r/26")
+        self.gh.runs[27] = {"id": 27, "status": "in_progress"}
+        self.ctl.runs[27] = ctl_run(27, "in_progress")
+        gg.register("run:o/r/27", jobs=True)
+        self.daemon.tick(NOW)
+        self.assertEqual(self.ctl.calls, [26])
+        self.assertEqual(gg.read_cache("run:o/r/26")["source"], "rest")
+        self.assertEqual(gg.read_cache("run:o/r/27")["source"], "rest")
+
+    def test_new_reader_of_a_finished_run_gets_one_rest_confirmation(self) -> None:
+        self.ctl.runs[28] = ctl_run(28, "completed", "success")
+        self.gh.runs[28] = {"id": 28, "status": "completed", "conclusion": "success", "updated_at": "2026-09-25T10:00:00Z"}
+        key = "run:o/r/28"
+        gg.register(key)
+        self.age_watch(key, 200)
+        self.daemon.tick(NOW - 100)
+        self.assertEqual(self.gh.rest_calls(), [])
+        stale = gg.read_cache(key)["dataAt"]
+        self.daemon.tick(NOW - 98)
+        self.assertEqual(gg.read_cache(key)["dataAt"], stale, "unchanged controller data keeps its time")
+        self.age_watch(key, 0)  # a new reader
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.gh.rest_calls()), 1)
+        self.assertEqual(gg.read_cache(key)["dataAt"], NOW)
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual(len(self.gh.rest_calls()), 1, "confirmed once, not every cycle")
+
+    def test_rerun_before_its_webhook_is_not_answered_with_the_old_attempt(self) -> None:
+        self.ctl.runs[29] = ctl_run(29, "completed", "failure")
+        self.gh.runs[29] = {"id": 29, "status": "queued", "conclusion": None, "run_attempt": 2,
+                            "updated_at": "2026-09-25T10:30:00Z"}
+        key = "run:o/r/29"
+        gg.register(key)
+        self.age_watch(key, 200)
+        self.daemon.tick(NOW - 100)
+        self.age_watch(key, 0)
+        self.daemon.tick(NOW)
+        entry = gg.read_cache(key)
+        self.assertEqual((entry["source"], entry["data"]["status"]), ("rest", "queued"))
+        self.daemon.tick(NOW + gg.TICK)  # the controller has not heard of the rerun yet
+        self.assertEqual(gg.read_cache(key)["data"]["status"], "queued")
+        self.ctl.runs[29] = {**ctl_run(29, "completed", "success", "2026-09-25T10:40:00Z"), "attempt": 2}
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        entry = gg.read_cache(key)
+        self.assertEqual((entry["source"], entry["data"]["conclusion"], entry["data"]["run_attempt"]), ("controller", "success", 2))
+
+    def test_controller_down_after_tracking_resumes_rest(self) -> None:
+        self.ctl.runs[30] = ctl_run(30, "in_progress")
+        self.gh.runs[30] = {"id": 30, "status": "in_progress"}
+        gg.register("run:o/r/30")
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.rest_calls(), [])
+        self.ctl.down = True
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual(len(self.gh.rest_calls()), 1, "no 15-minute blackout while the controller is down")
+
+    def test_controller_without_the_receiver_is_quiet(self) -> None:
+        self.ctl.down = gg.NoReceiver("controller HTTP 404")
+        self.gh.runs[32] = {"id": 32, "status": "in_progress"}
+        gg.register("run:o/r/32")
+        status = self.daemon.tick(NOW)
+        self.assertEqual(status["errors"], [])
+        self.assertEqual(len(self.gh.rest_calls()), 1)
+        self.daemon.tick(NOW + gg.CONTROLLER_RETRY + 1)
+        self.assertEqual(len(self.ctl.calls), 1)  # not asked again for 15 minutes
+        self.daemon.tick(NOW + gg.CONTROLLER_ABSENT + 1)
+        self.assertEqual(len(self.ctl.calls), 2)
+
+    def test_controller_config_needs_a_token(self) -> None:
+        old = os.environ.get("CMUX_CI_TOKEN_FILE")
+        os.environ["CMUX_CI_TOKEN_FILE"] = "/nonexistent/token"
+        try:
+            self.assertIsNone(gg.Controller.from_env())
+        finally:
+            os.environ.pop("CMUX_CI_TOKEN_FILE") if old is None else os.environ.__setitem__("CMUX_CI_TOKEN_FILE", old)
 
 
 class DaemonTest(Base):
