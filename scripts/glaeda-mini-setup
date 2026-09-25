@@ -28,9 +28,10 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-worktree-reclaim       built from src/bin/glaeda-worktree-reclaim.rs
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
     ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
+    ~/.local/bin/glaeda-seed-prefetch          from scripts/glaeda-seed-prefetch (a no-op off an owned cmux runner)
     ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
     ~/.config/glaeda/update.json               its release ring, written once (--ota-ring canary|stable)
-    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,update}.plist
+    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,update}.plist
     build-host directories and three git defaults, each set only when unset
     python@3.13 from Homebrew, only when no Python 3.13+ exists and this user owns Homebrew
 
@@ -613,6 +614,18 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-fleet-cas-prune.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-fleet-cas-prune.err"),
         },
+        # Fetches main's newest DerivedData seed into each canonical root's local seed cache while an owned
+        # cmux runner is idle (cmuxterm-hq#658); it exits at once where no owned job has run.
+        LABEL_PREFIX + "seed-prefetch": {
+            "Label": LABEL_PREFIX + "seed-prefetch",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-seed-prefetch"), "--apply"],
+            "StartInterval": 300,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-seed-prefetch.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-seed-prefetch.err"),
+        },
     }
 
 
@@ -756,7 +769,8 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     for path, mode in directories(ctx):
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
-    for name in ("glaeda-disk", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-update"):
+    for name in ("glaeda-disk", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
+                 "glaeda-update"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
@@ -883,7 +897,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
     for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
-                 "glaeda-update"):
+                 "glaeda-seed-prefetch", "glaeda-update"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     for act in actions:
         if act["kind"] == "note":

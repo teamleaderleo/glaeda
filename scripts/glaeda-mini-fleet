@@ -251,7 +251,7 @@ RESERVATION_MAX_BYTES = 4096  # the probe ships at most one byte more, so a larg
 OWNER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}\Z")
 PURPOSE_MAX = 200
 # Check areas that inform without counting as drift.
-INFO_AREAS = ("pending", "reserved")
+INFO_AREAS = ("pending", "reserved", "disabled")
 
 
 class Failure(Exception):
@@ -616,6 +616,7 @@ def parse_probe(text: str) -> dict[str, Any]:
         "fleet_cas": {
             "paths": dict(v.split("|", 1) for v in out["fleet_cas_path"] if "|" in v),
             "node_mode": out.get("fleet_cas_node_mode"),
+            "catch_up": out.get("fleet_catch_up") or None,  # "0" when bin/worker exports CMUX_CI_CATCH_UP=0
             "node": out.get("fleet_cas_node"),
             "recipe": out.get("fleet_recipe_released"),
             "build_mode": out.get("fleet_recipe_build_mode"),
@@ -1069,6 +1070,10 @@ def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, 
     if cas.get("node") != "answers":
         out.append(("fleet-cas", "fleet-cas node does not answer on xcode/fleet-cas.sock (the fleet-cas-settings.sh "
                     "check); builds fall back to the local cache", rollout))
+    if role == "reader" and cas.get("catch_up") == "0":
+        # On purpose: remote-hit catch-up measured 1631 s against 383 s, so the wrapper keeps it off until the
+        # bulk `fleet-cas warm` lands (cmuxterm-hq makes catch-up opt-in by default). Informational, not drift.
+        out.append(("disabled", f"catch-up disabled (CMUX_CI_CATCH_UP=0 in {FLEET_ROOT}/bin/worker)", ""))
     # Readers build in catch-up mode from it; the writer's fill runs the same recipe's fill path.
     release = "cmuxterm-hq build-fleet/recipe-release.py (operator)"
     if cas.get("recipe") in (None, "none"):

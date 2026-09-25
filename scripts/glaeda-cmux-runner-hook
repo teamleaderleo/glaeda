@@ -50,9 +50,10 @@ job-completed stops the sampler (it writes the record), runs the same disk press
     glaeda-cmux-runner-hook listen --runner-dir DIR [--no-waiters]
 
 runs under the runner LaunchAgent's listen.sh: it runs DIR/run.sh, and while the fleet has the host (an exclusive
-host lock, a reservation, or a fleet build waiting for the lock) or every capacity unit on the mini is taken, it
-stops the idle runner's listener so GitHub routes the job to another runner instead of here to be refused (Gate).
-Full means every unit this runner's own --capacity-units scans, read from its job-started hook.
+host lock, a reservation, or a fleet build waiting for the lock), every capacity unit on the mini is
+taken, or the mini is saturated (its 1-minute load at least GATE_LOAD_PAUSE per core), it stops the idle
+runner's listener so GitHub routes the job to another runner instead of here to be refused or slowed
+down (Gate). Full means every unit this runner's own --capacity-units scans, read from its job-started hook.
 """
 
 from __future__ import annotations
@@ -216,10 +217,35 @@ PREFIX = "glaeda-cmux-runner-hook"
 GATE = "glaeda-cmux-runner-gate"
 GATE_POLL_S = float(os.environ.get("GLAEDA_RUNNER_GATE_POLL_S") or 2.0)
 GATE_CONFIRM = 2  # consecutive idle polls, so a hook's or a probe's momentary hold never stops a listener
+# A mini whose 1-minute load reaches GATE_LOAD_PAUSE per core stops its idle listeners; they listen again once it
+# falls below GATE_LOAD_RESUME per core. Load, not ps CPU, because a compile's short-lived swift-frontend processes
+# saturate a mini while ps's decaying %cpu shows 6 of 14 cores used. Measured over 229 cmux jobs on the PR minis
+# (glaeda-cmux-jobs.jsonl, 2026-09-25 07:54-10:37Z): claude-wrapper, which itself uses 0.1 core, took 46-95 s at a
+# mean load under 25 on 14 cores and 120-527 s at 36-100 (5 of 6 runs; its lane times out at 10 min), and every
+# job window with a mean load of 40 or more had a compile admission on that mini.
+GATE_LOAD_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_PAUSE") or 2.0)
+GATE_LOAD_RESUME = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_RESUME") or 1.5)
+SATURATED = "the mini is saturated"
+# A load hold longer than this is not a compile (their p99 is about 33 min): something outside CI (a leaked process,
+# Spotlight, a software update) is loading the mini. The gate then listens anyway, logs it, and only pauses for
+# load again once the load has fallen below the resume mark, so one stuck process cannot keep a mini dark.
+GATE_LOAD_MAX_HOLD_S = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_MAX_HOLD_S") or 45 * 60)
 GATE_STOP_WAIT_S = 60.0  # a graceful listener exit, before it is killed
 GATE_WAITER_EVERY_S = 30.0
 GATE_MAX_FAILURES = 5  # consecutive failed polls before the gate hands the runner back
 GATE_FALLBACK = 70  # listen.sh runs run.sh itself: the gate broke before any runner started
+# A throttled mini (macOS thermal pressure, notifyutil's com.apple.system.thermalpressurelevel: 0 nominal,
+# 1 moderate, 2 heavy, 3 trapping, 4 sleeping) compiles 3 to 14x slower per task (cmuxterm-hq#663), which
+# pmset -g therm never reports. At GATE_THERMAL_HOLD or above an idle listener stops, so GitHub routes to a
+# cool mini while this one cools; it listens again once the level is back at GATE_THERMAL_RELEASE or below.
+# GLAEDA_RUNNER_THERMAL_HOLD=0 turns this off.
+THERMAL_HOT = 3  # also what job telemetry calls thermal_limited, whatever the gate's setting
+_hold = os.environ.get("GLAEDA_RUNNER_THERMAL_HOLD", "")
+GATE_THERMAL_HOLD = int(_hold) if _hold.strip().isdigit() else THERMAL_HOT  # never crash a hook on a typo
+GATE_THERMAL_RELEASE = 1
+GATE_THERMAL_EVERY_S = 30.0
+NOTIFYUTIL = "/usr/bin/notifyutil"
+THERMAL_PRESSURE_KEY = "com.apple.system.thermalpressurelevel"
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -971,6 +997,35 @@ def mini_full(capacity_dir: Path | None, total: int) -> str | None:
         os.close(admission)
 
 
+def thermal_pressure_level() -> int | None:
+    """macOS thermal pressure (0 nominal to 4 sleeping), or None when it cannot be read."""
+    try:
+        out = subprocess.run([NOTIFYUTIL, "-g", THERMAL_PRESSURE_KEY], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=5, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    found = re.search(re.escape(THERMAL_PRESSURE_KEY) + r"\s+(\d+)", out)
+    return int(found.group(1)) if found else None
+
+
+def mini_saturated(paused: bool, load: float | None = None, cores: int | None = None) -> str | None:
+    """Why this mini is too loaded to take another job, or None: its 1-minute load is at least GATE_LOAD_PAUSE per
+    core, or, once `paused` for that, still at least GATE_LOAD_RESUME per core (the gap keeps a listener from
+    flapping). The text is stable, so a held gate logs it once. An unreadable load never saturates."""
+    try:
+        load = os.getloadavg()[0] if load is None else load
+    except OSError:
+        return None
+    cores = (os.cpu_count() or 0) if cores is None else cores
+    if cores <= 0:
+        return None
+    limit = GATE_LOAD_RESUME if paused else GATE_LOAD_PAUSE
+    if load < limit * cores:
+        return None
+    return (f"{SATURATED} (1-minute load at least {GATE_LOAD_PAUSE:g} per core on {cores} cores; "
+            f"listening resumes below {GATE_LOAD_RESUME:g})")
+
+
 def host_held(host_lock: str, reservation: str, now: float) -> str | None:
     """Why the fleet, not a PR job, holds this host right now, or None. Our own jobs hold the host lock
     shared, so only an exclusive holder or a reservation counts. Microseconds: one non-blocking flock."""
@@ -1077,6 +1132,10 @@ class Gate:
         self.waiting_at = -GATE_WAITER_EVERY_S
         self.worker_noted = False
         self.source = source_identity()
+        self.thermal: int | None = None  # the level while the gate holds for heat, else None
+        self.thermal_at = -GATE_THERMAL_EVERY_S
+        self.load_since: float | None = None  # when the current load hold began
+        self.load_waived = False  # a hold ran past GATE_LOAD_MAX_HOLD_S; ignored until the load falls
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -1120,7 +1179,46 @@ class Gate:
             self.waiting, self.waiting_at = host_waiters(self.host_lock, self.state_dir), time.monotonic()
         if why is None and self.waiting:
             why = f"a fleet build is waiting for the host (pid {min(self.waiting)})"
-        return why or self.full()
+        if why:
+            self.load_since = None  # the fleet's claim, not load, is holding this gate
+        return why or self.saturated() or self.full() or self.hot()
+
+    def saturated(self) -> str | None:
+        """mini_saturated with this gate's hysteresis and hold limit. Checked before mini_full, so a mini both
+        full and saturated holds for load and resumes only below GATE_LOAD_RESUME."""
+        why = mini_saturated(paused=self.load_since is not None or self.load_waived)
+        now = time.monotonic()
+        if why is None:
+            if self.load_waived:
+                gate_log("the load fell below the resume mark; load holds apply again")
+            self.load_since, self.load_waived = None, False
+            return None
+        if self.load_waived:
+            return None
+        if self.load_since is None:
+            self.load_since = now
+        elif now - self.load_since >= GATE_LOAD_MAX_HOLD_S:
+            gate_log(f"{SATURATED} for over {GATE_LOAD_MAX_HOLD_S / 60:g} min, longer than any compile: listening "
+                     "anyway until the load falls (look for a process outside CI jobs)")
+            self.load_since, self.load_waived = None, True
+            return None
+        return why
+
+    def hot(self, fresh: bool = False) -> str | None:
+        """Why this mini is too hot to take a job, read at most every GATE_THERMAL_EVERY_S. Holds from
+        GATE_THERMAL_HOLD until the level is back at GATE_THERMAL_RELEASE, so a mini at the edge does not
+        flap. An unreadable level changes nothing."""
+        if GATE_THERMAL_HOLD <= 0:
+            return None
+        if fresh or time.monotonic() - self.thermal_at >= GATE_THERMAL_EVERY_S:
+            level, self.thermal_at = thermal_pressure_level(), time.monotonic()
+            if level is not None:
+                release = min(GATE_THERMAL_RELEASE, GATE_THERMAL_HOLD - 1)  # below the hold, or it flaps
+                limit = release if self.thermal is not None else GATE_THERMAL_HOLD - 1
+                self.thermal = level if level > limit else None
+        if self.thermal is None:
+            return None
+        return f"the mini is throttled (thermal pressure level {self.thermal})"
 
     def confirmed(self) -> str | None:
         """A fresh reading right before a stop: the holder still holds, or a waiter seen at least one poll ago
@@ -1131,7 +1229,9 @@ class Gate:
             self.waiting, self.waiting_at = again, time.monotonic()
             if again:
                 why = f"a fleet build is waiting for the host (pid {min(again)})"
-        return why or self.full(fresh=True)
+        if why:
+            self.load_since = None
+        return why or self.saturated() or self.full(fresh=True) or self.hot(fresh=True)
 
     def full(self, fresh: bool = False) -> str | None:
         """Every unit this runner's jobs could take is held. A look an admission blocked keeps the previous
@@ -1211,6 +1311,7 @@ class Gate:
             self.reload()
             if self.busy():
                 self.streak = 0  # a claim must hold for two idle polls, not carry over from the job
+                self.load_since = None  # the hold limit times a pause, never a job
                 return None
             why = self.claimed()
             self.streak = self.streak + 1 if why else 0
@@ -1456,14 +1557,18 @@ def host_io() -> tuple[float | None, float | None]:
 
 
 def thermal_limited() -> bool | None:
-    """True when pmset reports a CPU speed limit under 100 or a recorded thermal/performance warning."""
+    """True when macOS reports high thermal pressure, or pmset a CPU speed limit under 100 or a recorded
+    thermal/performance warning."""
+    level = thermal_pressure_level()
     try:
         out = subprocess.run([PMSET, "-g", "therm"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
                              timeout=5, check=False).stdout
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        out = ""
+    if level is not None and level >= THERMAL_HOT:
+        return True  # pmset stays silent at thermal pressure (cmuxterm-hq#663)
     if not out:
-        return None
+        return None if level is None else False
     limit = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", out)
     if limit and int(limit.group(1)) < 100:
         return True

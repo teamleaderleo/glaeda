@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""glaeda-seed-prefetch: keep an owned cmux mini's local DerivedData seeds on current main between jobs.
+
+    glaeda-seed-prefetch               plan: which roots would fetch for main's head
+    glaeda-seed-prefetch --apply       fetch (the 5-minute LaunchAgent from glaeda-mini-setup)
+
+cmux compile admission on an owned mini starts from a seed: a DerivedData built on main, keyed by
+commit. A seed the mini already keeps clones in 14 to 42 s; one it has to download takes 180 to 280 s
+at the minis' ~60 Mbps (cmux#14433), and the newest seed moves with every main push, so jobs rarely
+found theirs kept. This agent fetches ahead while the mini is idle (cmuxterm-hq#658 step 1).
+
+Each canonical root keeps its own state store: /Users/Shared/cmux-build-fleet/ci for root 1 and
+ci/cmux-ci-<n> for the others. The last owned job on a root records there which seeds that root
+adopts (seed-source.json, cmux owned_build_state.py `check`); a root no job has recorded is skipped.
+For main's head, cmux's own `seed_derived_data.py prefetch STORE REVISION` finds the nearest seed of
+this mini's width and downloads it into STORE/seeds unless it is kept already. The script comes from
+main itself (git archive of scripts/ci), so the fetch always matches what jobs adopt.
+
+Nothing here needs a credential: github.com/manaflow-ai/cmux and the seed bucket are public, and
+history comes from a blobless, shallow git mirror under ci/.prefetch instead of the GitHub API. It
+never takes the host lock and never touches a job's tree: a run is deferred while any job or build is
+running, and cmux's prune spares seeds a job touched in the last 10 minutes. A job that starts during
+a download only shares the uplink with it. One run at a time (flock on ci/.prefetch/lock). Once every
+root has main's head's own seed kept, later runs stop after one `git fetch` until main moves. Prints one
+JSON line.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE = Path(os.environ.get("GLAEDA_SEED_STATE", "/Users/Shared/cmux-build-fleet/ci"))
+REPO_URL = os.environ.get("GLAEDA_SEED_REPO", "https://github.com/manaflow-ai/cmux.git")
+# Pinned here rather than read from seed-source.json, which any job on the mini can write.
+BUCKET_URL = os.environ.get("GLAEDA_SEED_BUCKET_URL", "https://ci-cache.cmux.com")
+# launchd's PATH lacks Homebrew, and without zstd cmux's r2-cache.sh cannot read a .tar.zst seed.
+TOOL_PATH = "/opt/homebrew/bin:/usr/local/bin"
+SOURCE = "seed-source.json"
+DEPTH = 60  # seed_derived_data.ANCESTOR_LIMIT (50) commits of history, plus margin
+# A job or build that may be using the uplink or the seed cache right now.
+BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
+                  r"|/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
+FETCH_TIMEOUT = 180
+PREFETCH_TIMEOUT = 900
+KEEP_SCRIPTS = 2  # extracted scripts/ci trees, by main commit
+
+
+def running_commands() -> list[str] | None:
+    try:
+        out = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.splitlines() if out.returncode == 0 else None
+
+
+def busy() -> str:
+    """The first running job or build, or '' when idle. Unknown counts as busy."""
+    commands = running_commands()
+    if commands is None:
+        return "cannot list processes"
+    for command in commands:
+        if BUSY.search(command):
+            return command.strip()[:160]
+    return ""
+
+
+def stores(state: Path) -> list[Path]:
+    """Root 1's store, then the other roots', that an owned job has recorded a seed prefix in."""
+    candidates = [state, *sorted(p for p in state.glob("cmux-ci-*") if p.is_dir())]
+    return [store for store in candidates if (store / SOURCE).is_file()]
+
+
+def git(mirror: Path, *args: str, timeout: int = FETCH_TIMEOUT) -> str:
+    return subprocess.run(["git", "-C", os.fspath(mirror), *args], check=True, capture_output=True,
+                          text=True, timeout=timeout).stdout
+
+
+def main_head(work: Path) -> tuple[Path, str]:
+    """A blobless shallow mirror of main, fetched now; returns (mirror, head sha)."""
+    mirror = work / "cmux.git"
+    if not (mirror / "HEAD").is_file():
+        shutil.rmtree(mirror, ignore_errors=True)
+        mirror.mkdir(parents=True)
+        git(mirror, "init", "--bare", "-q")
+        git(mirror, "remote", "add", "origin", REPO_URL)
+    git(mirror, "fetch", "-q", "--filter=blob:none", f"--depth={DEPTH}", "origin",
+        "+refs/heads/main:refs/remotes/origin/main")
+    return mirror, git(mirror, "rev-parse", "refs/remotes/origin/main").strip()
+
+
+def scripts_for(work: Path, mirror: Path, head: str) -> Path:
+    """cmux's scripts/ci at HEAD, extracted once per commit; older extractions are removed."""
+    target = work / f"scripts-{head[:12]}"
+    if not (target / "scripts/ci/seed_derived_data.py").is_file():
+        shutil.rmtree(target, ignore_errors=True)
+        incoming = work / f".scripts-{head[:12]}.{os.getpid()}"
+        shutil.rmtree(incoming, ignore_errors=True)
+        incoming.mkdir(parents=True)
+        archive = subprocess.run(["git", "-C", os.fspath(mirror), "archive", head, "scripts/ci"],
+                                 check=True, capture_output=True, timeout=FETCH_TIMEOUT).stdout
+        subprocess.run(["tar", "-x", "-C", os.fspath(incoming)], input=archive, check=True, timeout=60)
+        incoming.rename(target)
+    for leftover in work.glob(".scripts-*"):  # an extraction that failed part way
+        if not leftover.name.endswith(f".{os.getpid()}"):
+            shutil.rmtree(leftover, ignore_errors=True)
+    old = sorted((p for p in work.glob("scripts-*") if p != target), key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in old[KEEP_SCRIPTS - 1:]:
+        shutil.rmtree(stale, ignore_errors=True)
+    os.utime(target)
+    return target
+
+
+def prefetch(scripts: Path, store: Path, head: str, mirror: Path) -> dict:
+    env = {key: value for key, value in os.environ.items() if key not in ("GITHUB_REPOSITORY", "GITHUB_OUTPUT")}
+    env["CMUX_SEED_GIT_DIR"] = os.fspath(mirror)
+    env["CI_CACHE_R2_PUBLIC_URL"] = BUCKET_URL
+    # r2-cache.sh stages each archive under TMPDIR; kept under .prefetch, a killed download's partial
+    # archive is wiped by the next run instead of waiting for macOS temp cleanup.
+    env["TMPDIR"] = os.fspath(mirror.parent / "tmp")
+    env["PATH"] = f"{TOOL_PATH}:{env.get('PATH', '/usr/bin:/bin')}"
+    # Its own process group, so a timeout also stops the downloads r2-cache.sh started.
+    child = subprocess.Popen([sys.executable, os.fspath(scripts / "scripts/ci/seed_derived_data.py"), "prefetch",
+                              os.fspath(store), head], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             env=env, start_new_session=True)
+
+    def stop_child() -> None:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    # launchd's bootout (an OTA update, an uninstall) signals only this job's own process group, so
+    # without this the download would outlive us with no timeout and no lock.
+    def on_signal(signum, _frame) -> None:
+        stop_child()
+        sys.exit(128 + signum)
+
+    previous = {signum: signal.signal(signum, on_signal) for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    try:
+        stdout, stderr = child.communicate(timeout=PREFETCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        stop_child()
+        child.communicate()
+        return {"fetched": "false", "reason": f"timed out after {PREFETCH_TIMEOUT} s"}
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+    out = subprocess.CompletedProcess(child.args, child.returncode, stdout, stderr)
+    lines = [line for line in out.stdout.splitlines() if line.startswith("{")]
+    if out.returncode != 0 or not lines:
+        return {"fetched": "false", "reason": f"exit {out.returncode}: {(out.stderr or out.stdout).strip()[-200:]}"}
+    try:
+        return json.loads(lines[-1])
+    except ValueError:
+        return {"fetched": "false", "reason": "unreadable result"}
+
+
+def run(apply: bool, state: Path = STATE) -> dict:
+    record: dict = {"tool": "glaeda-seed-prefetch", "time": int(time.time()), "apply": apply}
+    roots = stores(state)
+    if not roots:
+        return {**record, "state": "skip", "reason": "no owned job has recorded a seed prefix on this mini"}
+    work = state / ".prefetch"
+    work.mkdir(parents=True, exist_ok=True)
+    lock = os.open(work / "lock", os.O_RDONLY | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lock)
+        return {**record, "state": "skip", "reason": "another prefetch is running"}
+    try:
+        why = busy()
+        if why:
+            return {**record, "state": "deferred", "reason": f"busy: {why}"}
+        try:
+            mirror, head = main_head(work)
+        except (OSError, subprocess.SubprocessError) as error:
+            # A git killed by the timeout can leave shallow.lock or a ref lock behind, and every later
+            # fetch would then fail. The mirror is small and cheap to rebuild: start over next run.
+            shutil.rmtree(work / "cmux.git", ignore_errors=True)
+            detail = getattr(error, "stderr", "") or ""
+            if isinstance(detail, bytes):
+                detail = detail.decode(errors="replace")
+            return {**record, "state": "error", "reason": f"git fetch: {type(error).__name__} {detail.strip()[-200:]}"}
+        record["head"] = head
+        done_path = work / "done.json"
+        try:
+            done = json.loads(done_path.read_text())
+        except (OSError, ValueError):
+            done = {}
+        pending = [store for store in roots if done.get(os.fspath(store)) != head]
+        if not pending:
+            return {**record, "state": "current", "roots": len(roots)}
+        if not apply:
+            return {**record, "state": "plan", "would_fetch": [os.fspath(store) for store in pending]}
+        shutil.rmtree(work / "tmp", ignore_errors=True)
+        (work / "tmp").mkdir()
+        try:
+            scripts = scripts_for(work, mirror, head)
+        except (OSError, subprocess.SubprocessError) as error:
+            return {**record, "state": "error", "reason": f"scripts: {type(error).__name__}"}
+        results = {}
+        for store in pending:
+            why = busy()
+            if why:
+                results[os.fspath(store)] = {"fetched": "false", "reason": f"deferred, busy: {why}"}
+                break
+            result = prefetch(scripts, store, head, mirror)
+            results[os.fspath(store)] = result
+            # Current only once HEAD's own seed is kept: seeds land a build behind main, so a nearer
+            # one may still come. Any other outcome retries next run, which costs a git fetch and one
+            # HEAD request per commit of history when nothing new is there.
+            kept = result.get("fetched") == "true" or result.get("reason") == "already kept"
+            if kept and result.get("distance") == 0:
+                done[os.fspath(store)] = head
+        incoming = work / f".done.{os.getpid()}"
+        incoming.write_text(json.dumps(done) + "\n")
+        incoming.rename(done_path)
+        return {**record, "state": "applied", "results": results}
+    finally:
+        os.close(lock)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--apply", action="store_true")
+    args = parser.parse_args(argv)
+    print(json.dumps(run(args.apply)), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
