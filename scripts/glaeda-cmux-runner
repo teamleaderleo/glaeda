@@ -267,9 +267,10 @@ def xcode_present(app: dict[str, Any]) -> bool:
             and re.search(rf"^Xcode {re.escape(version)}$", out, re.M) is not None)
 
 
-def ios_sim_present(apps: list[dict[str, Any]], major: str) -> bool | None:
-    """An available iOS <major>.x simulator runtime (simctl, read-only). Runtimes are shared by every Xcode on
-    the machine, so the member's first verified Xcode answers for all. None when simctl gives no usable answer."""
+def ios_sim_present(apps: list[dict[str, Any]], builds: list[str]) -> bool | None:
+    """Every iOS simulator runtime build in builds (23F77) is available (simctl, read-only). Runtimes are shared by
+    every Xcode on the machine, so the member's first verified Xcode answers for all. None when simctl gives no
+    usable answer."""
     developer = Path(str(apps[0].get("path") or "")) / "Contents/Developer"
     code, out = run(["/usr/bin/xcrun", "simctl", "list", "runtimes", "-j"],
                     env={**os.environ, "DEVELOPER_DIR": os.fspath(developer)})
@@ -281,8 +282,9 @@ def ios_sim_present(apps: list[dict[str, Any]], major: str) -> bool | None:
         return None
     if not isinstance(runtimes, list):
         return None
-    return any(isinstance(r, dict) and r.get("isAvailable") and r.get("platform") == "iOS"
-               and str(r.get("version") or "").split(".")[0] == major for r in runtimes)
+    have = {str(r.get("buildversion")) for r in runtimes
+            if isinstance(r, dict) and r.get("isAvailable") and r.get("platform") == "iOS"}
+    return all(b in have for b in builds)
 
 
 def fleet_labels() -> Any:
@@ -304,8 +306,8 @@ def member_labels(manifest: Any, member: str, prior_labels: list[str] | None = N
         rule = fleet_labels()
     except Exception as error:  # noqa: BLE001  (missing, broken or stale module: explain, never a traceback)
         return None, f"{LABELS_MODULE} must sit next to this script for --manifest ({type(error).__name__})"
-    def ios_sim_ok(apps: list[dict[str, Any]]) -> bool:
-        found = ios_sim_present(apps, getattr(rule, "IOS_SIM_MAJOR", "26"))
+    def ios_sim_ok(apps: list[dict[str, Any]], builds: list[str]) -> bool:
+        found = ios_sim_present(apps, builds)
         return found if found is not None else getattr(rule, "IOS_SIM_LABEL", "glaeda-ios-sim") in (prior_labels or [])
     return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok)
 

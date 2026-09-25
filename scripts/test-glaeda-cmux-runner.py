@@ -2221,21 +2221,31 @@ class ManifestLabelsTest(unittest.TestCase):
                     self.assertIn("trustedRef", cr.member_labels(manifest, "mini-std")[1])
 
     def test_ios_sim_label_needs_the_manifest_and_a_runtime(self) -> None:
+        def rt(build: str, available: bool = True, platform: str = "iOS") -> dict:
+            return {"platform": platform, "version": "26.5", "buildversion": build, "isAvailable": available}
         with mock.patch.object(cr, "xcode_present", return_value=True):
             manifest = json.loads(json.dumps(MANIFEST))
             self.assertNotIn("glaeda-ios-sim", cr.member_labels(manifest, "mini-std")[0]["labels"])
             manifest["hosts"]["mini-std"]["roles"] = [*manifest["hosts"]["mini-std"]["roles"], "ios-simulators"]
-            runtimes = {"runtimes": [{"platform": "iOS", "version": "26.3.1", "isAvailable": True}]}
+            runtimes = {"runtimes": [rt("23F77")]}
             with mock.patch.object(cr, "run", return_value=(0, "warning: noise\n" + json.dumps(runtimes))):
+                self.assertNotIn("glaeda-ios-sim", cr.member_labels(manifest, "mini-std")[0]["labels"],
+                                 "no declared runtime, no label")
+                manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"], "exclusive": True}
                 member, _ = cr.member_labels(manifest, "mini-std")
                 self.assertIn("glaeda-ios-sim", member["labels"])
                 self.assertTrue(member["iosSim"])
             for label, found in (("none", {"runtimes": []}),
-                                 ("27 only", {"runtimes": [{"platform": "iOS", "version": "27.0", "isAvailable": True}]}),
-                                 ("unavailable", {"runtimes": [{"platform": "iOS", "version": "26.3.1", "isAvailable": False}]}),
-                                 ("watchOS", {"runtimes": [{"platform": "watchOS", "version": "26.0", "isAvailable": True}]})):
+                                 ("26.3.1 only", {"runtimes": [rt("23D8133")]}),
+                                 ("unavailable", {"runtimes": [rt("23F77", available=False)]}),
+                                 ("watchOS", {"runtimes": [rt("23F77", platform="watchOS")]})):
                 with self.subTest(label), mock.patch.object(cr, "run", return_value=(0, json.dumps(found))):
                     self.assertNotIn("glaeda-ios-sim", cr.member_labels(manifest, "mini-std")[0]["labels"])
+            manifest["defaults"]["ios_simulator"]["runtimes"] = ["23F77", "24A5390f"]
+            with mock.patch.object(cr, "run", return_value=(0, json.dumps(runtimes))):
+                self.assertNotIn("glaeda-ios-sim", cr.member_labels(manifest, "mini-std")[0]["labels"],
+                                 "every declared runtime must be present")
+            manifest["defaults"]["ios_simulator"]["runtimes"] = ["23F77"]
             with mock.patch.object(cr, "run", return_value=(72, "xcrun: error")) as run:
                 self.assertNotIn("glaeda-ios-sim", cr.member_labels(manifest, "mini-std")[0]["labels"])
                 self.assertIn("glaeda-ios-sim", cr.member_labels(manifest, "mini-std", ["glaeda-ios-sim"])[0]["labels"],

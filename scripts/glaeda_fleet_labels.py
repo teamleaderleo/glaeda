@@ -14,10 +14,11 @@ import re
 from typing import Any, Callable
 
 MINI_LABEL = "glaeda-mini"
-# A host with the ios-simulators role, verified on the mini: an available iOS runtime of IOS_SIM_MAJOR.
+# A host with the ios-simulators role, verified on the mini: every runtime build the manifest's ios_simulator.runtimes
+# declares (23F77) is available, because the pinned Xcode refuses any other iOS SDK's simulators. With nothing
+# declared, the member carries no label.
 IOS_SIM_LABEL = "glaeda-ios-sim"
 IOS_SIM_ROLE = "ios-simulators"
-IOS_SIM_MAJOR = "26"
 # dev machines take no jobs; borrowed machines run jobs only inside a VM, never as a host runner.
 RUNNER_CLASSES = ("xl", "std", "light")
 MEMBER_CLASSES = RUNNER_CLASSES + ("dev", "borrowed")
@@ -80,7 +81,7 @@ def xcode_apps(manifest: dict[str, Any], member: str) -> list[dict[str, Any]] | 
 
 
 def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]], bool],
-                  ios_sim_ok: Callable[[list[dict[str, Any]]], bool] | None = None
+                  ios_sim_ok: Callable[[list[dict[str, Any]], list[str]], bool] | None = None
                   ) -> tuple[dict[str, Any] | None, str | None]:
     """(member summary with labels, None) or (None, why this member cannot be a runner)."""
     if not isinstance(manifest, dict) or not isinstance(manifest.get("hosts"), dict):
@@ -120,7 +121,11 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     # Declared (the ios-simulators role) and, when the caller can look (the installer on the mini), a simulator
     # runtime actually present: an iOS job routed here must be able to boot one. Without a check (the fleet
     # plan) this is the declared view.
-    ios_sim = IOS_SIM_ROLE in roles and bool(ready) and (ios_sim_ok is None or ios_sim_ok(ready))
+    ios = merged.get("ios_simulator")
+    builds = ios.get("runtimes") if isinstance(ios, dict) else None
+    builds = [b for b in builds if isinstance(b, str) and b] if isinstance(builds, list) else []
+    ios_sim = (IOS_SIM_ROLE in roles and bool(ready) and bool(builds)
+               and (ios_sim_ok is None or ios_sim_ok(ready, builds)))
     labels = [MINI_LABEL, f"glaeda-class-{klass}", f"glaeda-{availability}",
               *(["glaeda-trusted"] if trusted_ref else []), *[f"xcode-{v}" for v in versions], *pools,
               *([IOS_SIM_LABEL] if ios_sim else [])]
