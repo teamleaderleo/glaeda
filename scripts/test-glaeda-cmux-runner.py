@@ -740,10 +740,10 @@ class HookTest(unittest.TestCase):
                 side = self.job(lane, f"s{n}", units=8)
                 self.assertIn(f"1/8 units for {lane} (light", side.stdout)
                 self.finish(f"s{n}")
-            self.assertIn("canonical root token is taken", self.job("release-build", "u0").stdout)
+            self.assertIn("canonical root token is taken", self.job("future-unlisted-job", "u0").stdout)
             self.finish("g0")
-            unknown = self.job("release-build", "u0")
-            self.assertIn("persistent-dd+root-1 for release-build (compile", unknown.stdout)
+            unknown = self.job("future-unlisted-job", "u0")
+            self.assertIn("persistent-dd+root-1 for future-unlisted-job (compile", unknown.stdout)
         finally:
             for runner in ("g0", "u0"):
                 self.finish(runner)
@@ -760,8 +760,9 @@ class HookTest(unittest.TestCase):
             # the same id elsewhere (test-e2e's root jobs) keeps the unknown-job default: compile, pinned
             self.assertEqual(hook.job_class(job, home, home, "test-e2e.yml"), ("compile", True))
             self.assertEqual(hook.job_class(job, home, home), ("compile", True))
-        self.assertEqual(hook.job_class("rerun", home, home, "app-host-test-rerun.yml"), ("compile", True),
-                         "rerun hard-codes root 1 and wipes compile DerivedData: the pinned default")
+        self.assertEqual(hook.job_class("rerun", home, home, "app-host-test-rerun.yml"), ("gui", False))
+        self.assertEqual(hook.job_class("rerun", home, home, "other.yml"), ("compile", True))
+        self.assertEqual(hook.job_class("release-build", home, home, "ci.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("macos-compile-admission", home, home, "ci.yml"), ("compile", False))
         self.assertEqual(hook.job_class("lint", "someone/else", home, "cmux-tui.yml"), ("isolated", False),
                          "a guest keeps the guest rule")
