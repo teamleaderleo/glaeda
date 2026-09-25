@@ -19,7 +19,9 @@ the controller tracks the run. It never loops faster.
 
 Prints `<status> <conclusion> <url>` (or JSON with --json) and exits 0 for success,
 skipped or neutral, 1 for any other conclusion, 3 on --timeout, 2 on usage errors and
-4 when neither the controller nor GitHub can answer.
+4 when nothing can answer (no tokens, GitHub says the run or commit does not exist in
+that repo, or an internal error). While the controller is down but has a token,
+gh-wait keeps retrying it until the timeout.
 
 Run it in the background from an agent; the harness wakes the agent when it exits.
 
@@ -30,7 +32,9 @@ GitHub token for the fallback: $GH_TOKEN, $GITHUB_TOKEN, else `gh auth token`.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
+import math
 import os
 import re
 import subprocess
@@ -50,8 +54,9 @@ LONG_POLL = 300          # the controller caps a single wait at 300 s
 REST_UNTRACKED = 300     # fallback cadence when the controller cannot answer
 REST_TRACKED = 900       # safety net for a lost delivery while the controller tracks the run
 CONTROLLER_RETRY = 30    # tailnet only, costs no GitHub budget
+MIN_PASS = 5             # a controller that answers early still gets at most one request per 5 s
 OK_CONCLUSIONS = {"success", "skipped", "neutral"}
-RUN_URL = re.compile(r"^https://github\.com/([^/]+/[^/]+)/actions/runs/(\d+)")
+RUN_URL = re.compile(r"^https://github\.com/([^/]+/[^/]+)/actions/runs/(\d+)(?:/attempts/(\d+))?")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SHA = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
@@ -92,6 +97,10 @@ class Unavailable(Exception):
     pass
 
 
+class NotFound(Exception):
+    """GitHub has no such run or commit in that repo: waiting longer cannot help."""
+
+
 class Controller:
     def __init__(self) -> None:
         self.base = controller_base()
@@ -103,18 +112,21 @@ class Controller:
         if not self.token:
             raise Unavailable("no controller token")
         sep = "&" if "?" in path else "?"
-        req = urllib.request.Request(f"{self.base}{path}{sep}wait={int(wait)}",
+        req = urllib.request.Request(f"{self.base}{path}{sep}wait={math.ceil(wait)}",
                                      headers={"Authorization": "Bearer " + self.token})
         try:
             with urllib.request.urlopen(req, timeout=wait + 30) as res:
-                return json.load(res)
+                body = json.load(res)
         except urllib.error.HTTPError as err:
             if err.code == 401:
                 self.token = None
                 log("controller rejected the token (401); using the REST fallback only")
             raise Unavailable(f"controller HTTP {err.code}") from err
-        except (OSError, ValueError) as err:
+        except (OSError, ValueError, http.client.HTTPException) as err:
             raise Unavailable(f"controller unreachable: {err}") from err
+        if not isinstance(body, dict):
+            raise Unavailable("controller answered with something other than a JSON object")
+        return body
 
 
 class GitHub:
@@ -149,15 +161,17 @@ class GitHub:
         except urllib.error.HTTPError as err:
             if err.code == 304 and cached:
                 return cached[1]
+            if err.code in (404, 422):
+                raise NotFound(f"GitHub HTTP {err.code} for {path}") from err
             raise Unavailable(f"GitHub HTTP {err.code} for {path}") from err
-        except (OSError, ValueError) as err:
+        except (OSError, ValueError, http.client.HTTPException) as err:
             raise Unavailable(f"GitHub unreachable: {err}") from err
 
 
 def newest_per_name(runs: list[dict]) -> list[dict]:
-    newest: dict[str, dict] = {}
+    newest: dict[tuple[str, str], dict] = {}
     for r in runs:
-        key = (r.get("name") or "").lower()
+        key = ((r.get("name") or "").lower(), r.get("event") or "")
         if key not in newest or r["id"] > newest[key]["id"]:
             newest[key] = r
     return sorted(newest.values(), key=lambda r: r["id"])
@@ -182,6 +196,8 @@ class RunTarget:
         match = RUN_URL.match(ref)
         if match:
             repo, ref = repo or match.group(1), match.group(2)
+            if match.group(3):
+                attempt = max(attempt, int(match.group(3)))
         if not ref.isdigit():
             raise ValueError("run wants a numeric run id or a run URL")
         self.id, self.repo, self.attempt = int(ref), repo, attempt
@@ -197,6 +213,8 @@ class RunTarget:
 
     def from_rest(self, gh: GitHub) -> tuple[bool, dict]:
         r = gh.get(f"/repos/{self.repo or DEFAULT_REPO}/actions/runs/{self.id}")
+        if not isinstance(r, dict):
+            raise Unavailable("unexpected GitHub response")
         run = {"id": r["id"], "repo": (self.repo or DEFAULT_REPO).lower(), "name": r.get("name"), "status": r.get("status"),
                "conclusion": r.get("conclusion") or "", "attempt": r.get("run_attempt", 1), "url": r.get("html_url")}
         return run["status"] == "completed" and run["attempt"] >= self.attempt, run
@@ -222,34 +240,44 @@ class ShaTarget:
         known = bool(view.get("runs") or view.get("suites"))
         return known, view.get("terminal", False), view
 
-    def full_sha(self) -> str | None:
+    def full_sha(self, gh: GitHub) -> str:
+        """The 40-character SHA: local git first, else one GitHub read, remembered."""
         if len(self.sha) == 40:
             return self.sha
         try:
             out = subprocess.run(["git", "rev-parse", "--verify", "--quiet", self.sha + "^{commit}"],
                                  capture_output=True, text=True, timeout=10).stdout.strip()
-            return out if len(out) == 40 else None
         except (OSError, subprocess.SubprocessError):
-            return None
+            out = ""
+        if len(out) != 40:
+            commit = gh.get(f"/repos/{self.repo}/commits/{self.sha}")
+            out = commit.get("sha", "") if isinstance(commit, dict) else ""
+        if len(out) != 40:
+            raise Unavailable(f"cannot resolve {self.sha} in {self.repo}")
+        self.sha = out.lower()
+        return self.sha
 
     def from_rest(self, gh: GitHub) -> tuple[bool, dict]:
-        full = self.full_sha()
-        if not full:
-            raise Unavailable("the REST fallback needs the full 40-character SHA")
+        full = self.full_sha(gh)
         body = gh.get(f"/repos/{self.repo}/actions/runs?head_sha={full}&per_page=100")
-        runs = [{"id": r["id"], "name": r.get("name"), "status": r.get("status"), "conclusion": r.get("conclusion") or "",
-                 "url": r.get("html_url")} for r in body.get("workflow_runs", [])]
+        if not isinstance(body, dict):
+            raise Unavailable("unexpected GitHub response")
+        runs = [{"id": r["id"], "name": r.get("name"), "event": r.get("event"), "status": r.get("status"),
+                 "conclusion": r.get("conclusion") or "", "url": r.get("html_url")} for r in body.get("workflow_runs", [])]
         if self.check:
             runs = [r for r in runs if (r["name"] or "").lower() == self.check.lower()]
         runs = newest_per_name(runs)
         suites: list[dict] = []
         if self.check and not runs:
+            # Only when no workflow matches, so a pass stays one read (two at most, both conditional).
             body = gh.get(f"/repos/{self.repo}/commits/{full}/check-suites?per_page=100")
+            if not isinstance(body, dict):
+                raise Unavailable("unexpected GitHub response")
             suites = [{"id": s["id"], "app": (s.get("app") or {}).get("slug"), "status": s.get("status"),
                        "conclusion": s.get("conclusion") or ""} for s in body.get("check_suites", [])
                       if self.check.lower() in {((s.get("app") or {}).get("slug") or "").lower(),
                                                 ((s.get("app") or {}).get("name") or "").lower()}]
-            suites = sorted(suites, key=lambda s: s["id"])[-1:]
+            suites = sorted(suites, key=lambda s: s["id"])
         terminal, conclusion = summarize(runs + suites)
         return terminal, {"repo": self.repo, "sha": self.sha, "check": self.check, "terminal": terminal,
                           "conclusion": conclusion, "runs": runs, "suites": suites}
@@ -276,8 +304,10 @@ def wait(target, timeout: float, as_json: bool) -> int:
     deadline = time.monotonic() + timeout
     last_rest = None
     first = True
+    was_reachable = True
     while True:
-        remaining = deadline - time.monotonic()
+        started = time.monotonic()
+        remaining = deadline - started
         if remaining <= 0:
             log("timed out")
             return 3
@@ -290,8 +320,11 @@ def wait(target, timeout: float, as_json: bool) -> int:
                 return finish(target, state, as_json, "controller")
         except Unavailable as err:
             reachable = False
-            if first or controller.token:
+            if was_reachable:
                 log(f"{err}; falling back to one conditional GitHub read per {REST_UNTRACKED // 60} min")
+        if reachable and not was_reachable:
+            log("controller reachable again")
+        was_reachable = reachable
         now = time.monotonic()
         if first and known:
             last_rest = now  # tracked from the start: the webhook answers, REST is only a safety net
@@ -306,13 +339,19 @@ def wait(target, timeout: float, as_json: bool) -> int:
                 terminal, state = target.from_rest(gh)
                 if terminal:
                     return finish(target, state, as_json, "github")
+            except NotFound as err:
+                log(f"{err}; check --repo (default {DEFAULT_REPO})")
+                return 4
             except Unavailable as err:
                 log(str(err))
-        first = False
         if not reachable:
             # Retrying the controller is free (tailnet); without a token only the REST cadence is left.
             pause = CONTROLLER_RETRY if controller.token else last_rest + REST_UNTRACKED - time.monotonic()
-            time.sleep(max(0.0, min(pause, deadline - time.monotonic())))
+        else:
+            # A controller that answers early (peek, proxy, restart) must not make this spin.
+            pause = 0 if first else MIN_PASS - (time.monotonic() - started)
+        first = False
+        time.sleep(max(0.0, min(pause, deadline - time.monotonic())))
 
 
 def status() -> int:
@@ -353,6 +392,9 @@ def main(argv: list[str]) -> int:
         return wait(target, args.timeout, args.json)
     except KeyboardInterrupt:
         return 130
+    except Exception as err:  # exit 1 means "the run failed"; a crash must not look like that
+        log(f"internal error: {err!r}")
+        return 4
 
 
 if __name__ == "__main__":

@@ -71,7 +71,7 @@ class GhWaitTest(unittest.TestCase):
             os.environ[k] = v
             self.addCleanup(lambda k=k, old=old: os.environ.pop(k, None) if old is None else os.environ.__setitem__(k, old))
         for name, value in {"GITHUB_API": self.fake.url + "/gh", "REST_UNTRACKED": 0.3, "REST_TRACKED": 0.6,
-                            "CONTROLLER_RETRY": 0.05, "LONG_POLL": 1}.items():
+                            "CONTROLLER_RETRY": 0.05, "LONG_POLL": 1, "MIN_PASS": 0.05}.items():
             old = getattr(gw, name)
             setattr(gw, name, value)
             self.addCleanup(setattr, gw, name, old)
@@ -190,6 +190,26 @@ class GhWaitTest(unittest.TestCase):
         os.environ["PATH"], old = "/nonexistent", os.environ["PATH"]
         self.addCleanup(os.environ.__setitem__, "PATH", old)
         self.assertEqual(self.run_main("run", "11")[0], 4)
+
+    def test_unknown_repo_is_final(self) -> None:
+        self.fake.respond = lambda p, h: (404, {}, {}) if p.startswith("/gh/") else (200, {}, {"known": False})
+        code, _, err = self.run_main("run", "12")
+        self.assertEqual(code, 4)
+        self.assertIn("--repo", err)
+        self.assertEqual(len(self.fake.paths("/gh")), 1)
+
+    def test_early_answers_do_not_spin(self) -> None:
+        gw.MIN_PASS = 0.2
+        self.fake.respond = lambda p, h: (200, {}, {"known": True, "terminal": False, "run": {}})
+        self.run_main("run", "13", "--timeout", "1")
+        self.assertLessEqual(len(self.fake.paths("/v1/")), 7)
+
+    def test_garbage_is_not_a_failure_verdict(self) -> None:
+        self.fake.respond = lambda p, h: (200, {}, ["not", "an", "object"]) if p.startswith("/v1/") else (500, {}, {})
+        self.assertEqual(self.run_main("run", "14", "--timeout", "0.5")[0], 3)
+
+    def test_attempt_from_url(self) -> None:
+        self.assertEqual(gw.RunTarget("https://github.com/a/b/actions/runs/5/attempts/3", None, 1).attempt, 3)
 
     def test_usage(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()):
