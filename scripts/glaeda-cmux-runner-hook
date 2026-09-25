@@ -116,17 +116,29 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
                # xcode-select -s host-wide, harmless while every job on the mini uses the pinned Xcode.
                "release-build": "isolated"}
 # Job ids other workflows reuse, keyed by (workflow file, job id) and checked before JOB_CLASSES, since a bare
-# id such as `build` or `test` also names test-e2e's root jobs. cmux-tui's macOS jobs are cargo lint, test and
-# its reusable build-artifacts `build` (GITHUB_WORKFLOW_REF names the caller), into the workspace target dir: no
-# GUI or canonical root. app-host-test-rerun's `rerun` claims the product's root itself (cmux#14417:
-# glaeda-canonical-root take <root> --wait) before touching its DerivedData and runs its tests in the console
-# session, so it is gui like app-host-unit-tests.
+# id such as `build`, `test` or `lint` means different work in different workflows. cmux-tui's macOS jobs are
+# cargo lint, test and its reusable build-artifacts `build` (GITHUB_WORKFLOW_REF names the caller), into the
+# workspace target dir: no GUI or canonical root. app-host-test-rerun's `rerun` claims the product's root itself
+# (cmux#14417: glaeda-canonical-root take <root> --wait) before touching its DerivedData and runs its tests in
+# the console session, so it is gui like app-host-unit-tests.
+# test-e2e's `build` compiles into $CMUX_CI_CANONICAL_ROOT/derived-data-compile-admission (the root its token
+# picks) and then runs the selected cmuxTests through run-in-console-session.sh, or cmuxUITests in the console
+# user's GUI bootstrap, on the same runner (cmux "ci: run E2E tests on the runner that built them"), so it is
+# compile-gui. It never touches compile admission's persistent DerivedData: no owned_build_state.py and no
+# CMUX_SEED_LOCAL_CACHE, so it takes no persistent-dd token. Its `test` runs only when `build` did not test, and
+# restores that product into the producer's root (restore-app-host-test-product.sh takes it) for the same
+# console-session tests, so it is gui like `rerun`.
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
-                        ("cmux-tui.yml", "build"): "isolated", ("app-host-test-rerun.yml", "rerun"): "gui"}
+                        ("cmux-tui.yml", "build"): "isolated", ("app-host-test-rerun.yml", "rerun"): "gui",
+                        ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
 # restore a product into with rm -rf of its src, so one root job per root per mini (cmux#14338 adds a second).
+# compile-gui holds the gui token for its whole job, compile included: the tests it runs afterwards start from
+# a step the hook never sees, so the token has to be taken at job start. gui comes before root, so a refusal
+# for the gui token is the one GUI_WAIT_S waits for.
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("root",)),
+    "compile-gui": (2, ("gui", "root")),
     "isolated": (2, ()), "simulator": (2, ("simulator",)), "light": (1, ())}
 # Guest repositories (any repo other than --home-repo, admitted by an org-scoped runner's --allowed-owner)
 # never touch cmux's canonical roots or persistent DerivedData, so they are costed by job-id suffix alone:
@@ -136,10 +148,12 @@ DEFAULT_HOME_REPO = "manaflow-ai/cmux"
 
 GUEST_WAIT_S = 600.0  # guests have no rescue workflow: a full mini holds their job this long before refusing
 GUEST_POLL_S = 5.0
-# A cmux GUI job (app-host shard, tests-build-and-lag) refused only because another GUI job holds this mini's one
-# gui token waits this long for it instead. Two root runners share one gui token, so a full suite's shards often
-# meet on a mini, and a GUI job there runs about 90 s, while a refusal's rescue round trip took 71 s to 18 min
-# (median 126 s, 16 refusals, cmux PR CI 2026-09-25 07:00-09:00Z) and sent the re-run shards to Blacksmith.
+# A cmux GUI job (app-host shard, tests-build-and-lag, test-e2e's build and test) refused only because another
+# GUI job holds this mini's one gui token waits this long for it instead. Two root runners share one gui token,
+# so a full suite's shards often meet on a mini, and a GUI job there runs about 90 s, while a refusal's rescue
+# round trip took 71 s to 18 min (median 126 s, 16 refusals, cmux PR CI 2026-09-25 07:00-09:00Z) and sent the
+# re-run shards to Blacksmith. test-e2e's build holds the token for its compile too, so a job that meets it
+# usually waits out GUI_WAIT_S and is refused: the rescue then moves it, as before this wait existed.
 # It must fit inside cmux's owned_pool_rescue.REFUSAL_SECONDS (120) with room to spare: a job that fails later
 # than that after starting no longer counts as refused, so the rescue would not re-run it. Around the wait go
 # about 5 s of runner setup before the hook, the last try (normally under a second, but up to tens of seconds

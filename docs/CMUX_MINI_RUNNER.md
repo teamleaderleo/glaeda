@@ -119,6 +119,8 @@ What `--apply` does:
      from `GITHUB_JOB`: `macos-compile-admission` 2 units plus the `persistent-dd`
      token (one writer of the kept DerivedData at a time), `app-host-unit-tests` and
      `tests-build-and-lag` 1 unit plus the `gui` token (one console session),
+     test-e2e's `build` (compile, then the selected tests in the console session) 2 units
+     plus the `gui` token, test-e2e's `test` 1 unit plus the `gui` token,
      `cli-product-tests`, `swift-package-tests` and the side lanes `cli-pipe-regressions`,
      `remote-daemon-macos-tests` and `claude-wrapper` 1 unit, and any other job counts
      as a compile. When units or a token are taken it refuses at once with
@@ -398,9 +400,10 @@ Compiles build in a canonical root (/private/tmp/cmux-ci; cmux#14338 adds /priva
 and app-host test consumers restore a product there with `rm -rf <root>/src`, because `#filePath` is baked
 in at the producer's root. So one root job per root per mini:
 
-- Root jobs are compile (macos-compile-admission and any unknown job id), gui (app-host-unit-tests,
-  tests-build-and-lag) and product (cli-product-tests). Each also takes an exclusive `capacity/root-k.token`
-  (k = 1 to `canonicalRoots`), and the hook writes `CMUX_CI_CANONICAL_ROOT=<root k>` to `$GITHUB_ENV` and
+- Root jobs are compile (macos-compile-admission and any unknown job id), compile-gui (test-e2e's `build`:
+  a producer that holds the gui token as well, and no persistent-dd), gui (app-host-unit-tests,
+  tests-build-and-lag, app-host-test-rerun's `rerun`, test-e2e's `test`) and product (cli-product-tests).
+  Each also takes an exclusive `capacity/root-k.token` (k = 1 to `canonicalRoots`), and the hook writes `CMUX_CI_CANONICAL_ROOT=<root k>` to `$GITHUB_ENV` and
   `$RUNNER_TEMP/glaeda-canonical-root`. The root follows the token, never the runner instance.
 - Light jobs take no root.
 - `defaults.runner.classes.<class>.canonicalRoots` (default 1, at most `runners`) runners per mini
@@ -421,8 +424,10 @@ in at the producer's root. So one root job per root per mini:
   detached holder tied to the job's Runner.Worker and released by job-completed. A re-take of a root the
   same job already holds (a compile restoring its own product) is a no-op. It exits 1 when the root is
   still busy after the wait, and 2 for a bad root or outside a runner job.
-- Jobs the hook does not know (app-host-test-rerun, seed-swiftpm-manifests, anything new) are pinned to
-  root 1, because they use /private/tmp/cmux-ci themselves.
+- Jobs the hook does not know (seed-swiftpm-manifests, anything new) are pinned to root 1, because they use
+  /private/tmp/cmux-ci themselves. Ids that other workflows reuse (`build`, `test`, `lint`) are classed by
+  (workflow file, job id) from `GITHUB_WORKFLOW_REF`, so test-e2e's jobs are not pinned: `build` takes the
+  root its token picks and reads it from `CMUX_CI_CANONICAL_ROOT`, and `test` takes the producer's root.
 
 ## 2g. iOS simulator runners
 

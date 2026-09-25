@@ -828,6 +828,42 @@ class HookTest(unittest.TestCase):
             for runner in ("w0", "w1", "w2", "w3", "w4", "w5"):
                 self.finish(runner)
 
+    def test_capacity_e2e_jobs_hold_the_gui_token(self) -> None:
+        # test-e2e's build compiles and then runs its tests in the console session; its test job is the fallback
+        self.fleet()
+        e2e = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/test-e2e.yml@refs/heads/main"}
+        two = ("--canonical-roots", "2", "--compile-slots", "2")
+        env_file = self.dir / "github_env"
+        try:
+            build = self.job("build", "e0", 8, None, *two, env={**e2e, "GITHUB_ENV": os.fspath(env_file)})
+            self.assertEqual(build.returncode, 0, build.stdout)
+            self.assertIn("holding 2/8 units+gui+root-1 for build (compile-gui", build.stdout)
+            self.assertNotIn("persistent-dd", build.stdout)
+            self.assertEqual(env_file.read_text(), "CMUX_CI_CANONICAL_ROOT=/private/tmp/cmux-ci\n")
+            # its own restore step re-takes the root it holds: a no-op
+            self.assertEqual(self.take("/private/tmp/cmux-ci", "e0").returncode, 0)
+            # a compile admission still runs beside it, in the other root
+            self.assertIn("persistent-dd+root-2", self.job("macos-compile-admission", "e1", 8, None, *two).stdout)
+            for n, (job, ref) in enumerate((("app-host-unit-tests", {}), ("test", e2e), ("build", e2e))):
+                waited = time.monotonic()
+                refused = self.job(job, f"g{n}", 8, None, *two, "--gui-wait", "1", env=ref)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn("refused: capacity: the gui token is taken", refused.stdout)
+                self.assertGreaterEqual(time.monotonic() - waited, 1, f"{job} waits for the gui token")
+            self.finish("e0")
+            # the fallback test job is a consumer: no root at job start, the producer's root from its restore step
+            test = self.job("test", "e2", 8, None, *two, env=e2e)
+            self.assertEqual(test.returncode, 0, test.stdout)
+            self.assertIn("for test (gui", test.stdout)
+            self.assertNotIn("root-", test.stdout.split("holding", 1)[1])
+            self.assertEqual(self.take("/private/tmp/cmux-ci-2", "e2", "--wait", "0").returncode, 1,
+                             "the compile admission still holds root 2")
+            self.assertEqual(self.take("/private/tmp/cmux-ci", "e2").returncode, 0)
+        finally:
+            for runner in ("e0", "e1", "e2", "g0", "g1", "g2"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
     def test_capacity_gui_wait_stops_once_the_refusal_is_not_the_gui_token(self) -> None:
         self.fleet()
         release = None
@@ -863,9 +899,19 @@ class HookTest(unittest.TestCase):
         home = "manaflow-ai/cmux"
         for job in ("lint", "test", "build"):
             self.assertEqual(hook.job_class(job, home, home, "cmux-tui.yml"), ("isolated", False))
-            # the same id elsewhere (test-e2e's root jobs) keeps the unknown-job default: compile, pinned
-            self.assertEqual(hook.job_class(job, home, home, "test-e2e.yml"), ("compile", True))
+            # the same id in a workflow the table does not name keeps the unknown-job default: compile, pinned
+            self.assertEqual(hook.job_class(job, home, home, "other.yml"), ("compile", True))
             self.assertEqual(hook.job_class(job, home, home), ("compile", True))
+        # test-e2e runs its tests in the console session: build compiles and tests, test is the fallback
+        self.assertEqual(hook.job_class("build", home, home, "test-e2e.yml"), ("compile-gui", False))
+        self.assertEqual(hook.job_class("test", home, home, "test-e2e.yml"), ("gui", False))
+        self.assertEqual(hook.job_class("lint", home, home, "test-e2e.yml"), ("compile", True))
+        self.assertEqual(hook.job_class("build", "someone/else", home, "test-e2e.yml"), ("isolated", False))
+        self.assertEqual(hook.CLASS_COST["compile-gui"], (2, ("gui", "root")),
+                         "no persistent-dd: the E2E build never writes compile admission's kept DerivedData")
+        self.assertNotIn("compile-gui", hook.ROOT_CONSUMERS, "a producer takes a token-chosen root")
+        for klass in {*hook.JOB_CLASSES.values(), *hook.WORKFLOW_JOB_CLASSES.values()}:
+            self.assertIn(klass, hook.CLASS_COST)
         self.assertEqual(hook.job_class("rerun", home, home, "app-host-test-rerun.yml"), ("gui", False))
         self.assertEqual(hook.job_class("rerun", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("release-build", home, home, "ci.yml"), ("isolated", False))
