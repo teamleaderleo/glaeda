@@ -204,6 +204,53 @@ class ControllerTest(Base):
         self.assertEqual(gg.read_cache("run:o/r/26")["source"], "rest")
         self.assertEqual(gg.read_cache("run:o/r/27")["source"], "rest")
 
+    def test_new_reader_of_a_finished_run_gets_one_rest_confirmation(self) -> None:
+        self.ctl.runs[28] = ctl_run(28, "completed", "success")
+        self.gh.runs[28] = {"id": 28, "status": "completed", "conclusion": "success", "updated_at": "2026-09-25T10:00:00Z"}
+        key = "run:o/r/28"
+        gg.register(key)
+        self.age_watch(key, 200)
+        self.daemon.tick(NOW - 100)
+        self.assertEqual(self.gh.rest_calls(), [])
+        stale = gg.read_cache(key)["dataAt"]
+        self.daemon.tick(NOW - 98)
+        self.assertEqual(gg.read_cache(key)["dataAt"], stale, "unchanged controller data keeps its time")
+        self.age_watch(key, 0)  # a new reader
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.gh.rest_calls()), 1)
+        self.assertEqual(gg.read_cache(key)["dataAt"], NOW)
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual(len(self.gh.rest_calls()), 1, "confirmed once, not every cycle")
+
+    def test_rerun_before_its_webhook_is_not_answered_with_the_old_attempt(self) -> None:
+        self.ctl.runs[29] = ctl_run(29, "completed", "failure")
+        self.gh.runs[29] = {"id": 29, "status": "queued", "conclusion": None, "run_attempt": 2,
+                            "updated_at": "2026-09-25T10:30:00Z"}
+        key = "run:o/r/29"
+        gg.register(key)
+        self.age_watch(key, 200)
+        self.daemon.tick(NOW - 100)
+        self.age_watch(key, 0)
+        self.daemon.tick(NOW)
+        entry = gg.read_cache(key)
+        self.assertEqual((entry["source"], entry["data"]["status"]), ("rest", "queued"))
+        self.daemon.tick(NOW + gg.TICK)  # the controller has not heard of the rerun yet
+        self.assertEqual(gg.read_cache(key)["data"]["status"], "queued")
+        self.ctl.runs[29] = {**ctl_run(29, "completed", "success", "2026-09-25T10:40:00Z"), "attempt": 2}
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        entry = gg.read_cache(key)
+        self.assertEqual((entry["source"], entry["data"]["conclusion"], entry["data"]["run_attempt"]), ("controller", "success", 2))
+
+    def test_controller_down_after_tracking_resumes_rest(self) -> None:
+        self.ctl.runs[30] = ctl_run(30, "in_progress")
+        self.gh.runs[30] = {"id": 30, "status": "in_progress"}
+        gg.register("run:o/r/30")
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.rest_calls(), [])
+        self.ctl.down = True
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual(len(self.gh.rest_calls()), 1, "no 15-minute blackout while the controller is down")
+
     def test_controller_config_needs_a_token(self) -> None:
         old = os.environ.get("CMUX_CI_TOKEN_FILE")
         os.environ["CMUX_CI_TOKEN_FILE"] = "/nonexistent/token"

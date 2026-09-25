@@ -247,6 +247,8 @@ class Controller:
         if not base:
             doc = read_json(CONTROLLER_CONFIG)
             base = (doc.get("controller") if isinstance(doc, dict) else None) or CONTROLLER_DEFAULT
+        if not isinstance(base, str):
+            return None
         path = os.environ.get("CMUX_CI_TOKEN_FILE") or os.fspath(CONTROLLER_TOKEN)
         try:
             token = Path(path).read_text().strip()
@@ -351,6 +353,7 @@ class Daemon:
         self.transport = transport
         self.controller = Controller.from_env() if controller == "env" else controller
         self.controller_down_until = 0.0
+        self.controller_filled: set[str] = set()  # runs the controller answered on this tick
         self.token_source = token
         self.token: str | None = None
         doc = read_json(BASE / "budget.json")
@@ -458,9 +461,16 @@ class Daemon:
             c = e["cache"]
             if self.now - self.attempted.get(e["key"], float("-inf")) < CYCLE:
                 continue
-            if kind == "run" and c is not None and c.get("source") == "controller" and \
-                    self.now - (c.get("restAt") or 0) < REST_SAFETY:
-                continue  # the controller answers this run every tick; REST only as the safety net
+            if kind == "run" and e["key"] in self.controller_filled:
+                # A finished run with a reader newer than both its data and the last REST read: that
+                # reader's wait will not rule on older data, so REST confirms it once (it may have
+                # been rerun before the webhook said so).
+                if terminal(kind, c.get("data")) and e["touched"] > max(c.get("dataAt") or 0, c.get("restAt") or 0):
+                    out.append(e)
+                # Otherwise the controller answered on this tick: REST only as the safety net.
+                elif self.now - (c.get("restAt") or 0) >= REST_SAFETY:
+                    out.append(e)
+                continue
             if c is None:
                 out.append(e)
             elif full and (not terminal(kind, c.get("data")) or self.now - c.get("fetchedAt", 0) >= TERMINAL_REFRESH
@@ -564,7 +574,8 @@ class Daemon:
         if state == "fresh":
             fields["data"] = slim_run(doc)
             # a run the controller tracks keeps that source; REST was only the safety-net check
-            if prior.get("source") != "controller" or (doc.get("updated_at") or "") > ((prior.get("data") or {}).get("updated_at") or ""):
+            if prior.get("source") != "controller" or \
+                    (iso_epoch(doc.get("updated_at")) or 0) > (iso_epoch((prior.get("data") or {}).get("updated_at")) or 0):
                 fields["source"] = "rest"
         if e["jobs"] and self.mode("rest") == "normal":
             jstate, jdoc, jetag = self.get(base + "/jobs?per_page=100", prior.get("jobsEtag") if "jobs" in prior else None)
@@ -578,11 +589,15 @@ class Daemon:
 
     def from_controller(self, entries: list[dict]) -> None:
         """Fill watched runs from the controller: free, every tick. Job lists still come from REST."""
+        self.controller_filled = set()
         if self.controller is None or self.now < self.controller_down_until:
             return
+        deadline = time.monotonic() + TICK  # a slow controller must not stall the tick
         for e in entries:
             if not e["key"].startswith("run:") or e["jobs"]:
                 continue
+            if time.monotonic() > deadline:
+                return  # the rest wait for the next tick; REST covers them meanwhile
             _, owner, repo, run_id = split_key(e["key"])
             try:
                 run = self.controller.run(run_id)
@@ -593,11 +608,19 @@ class Daemon:
             if run is None or (run.get("repo") or "").lower() != f"{owner}/{repo}".lower():
                 continue
             prior = e["cache"] or {}
+            before = prior.get("data") or {}
             older = iso_epoch(run.get("updated_at")) or 0
-            known = iso_epoch((prior.get("data") or {}).get("updated_at")) or 0
-            if prior.get("source") == "rest" and known > older:
+            if prior.get("source") == "rest" and (iso_epoch(before.get("updated_at")) or 0) > older:
                 continue  # a lost delivery: REST has seen a newer state than the controller
-            fields: dict[str, Any] = {"error": None, "dataAt": self.now, "data": controller_run(run), "source": "controller"}
+            data = controller_run(run)
+            for k in ("display_title", "created_at"):  # the webhook record lacks these; keep REST's
+                data[k] = before.get(k)
+            self.controller_filled.add(e["key"])
+            same = prior.get("source") == "controller" and all(
+                before.get(k) == data.get(k) for k in ("status", "conclusion", "run_attempt", "updated_at"))
+            fields: dict[str, Any] = {"error": None, "data": data, "source": "controller"}
+            if not same:
+                fields["dataAt"] = self.now  # unchanged data keeps its time, so wait cannot rule on it anew
             if prior.get("source") != "controller":
                 fields["restAt"] = self.now  # the safety-net clock starts when the controller takes over
             self.store(e["key"], e["cache"], **fields)
