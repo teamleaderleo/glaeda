@@ -27,7 +27,8 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-disk                   from scripts/glaeda-disk
     ~/.local/bin/glaeda-worktree-reclaim       built from src/bin/glaeda-worktree-reclaim.rs
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
-    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim}.plist
+    ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
+    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune}.plist
     build-host directories and three git defaults, each set only when unset
     python@3.13 from Homebrew, only when no Python 3.13+ exists and this user owns Homebrew
 
@@ -486,7 +487,7 @@ def preflight_macos(ctx: Context) -> dict[str, Any]:
 
 
 def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
-    """The three LaunchAgents, matching the ones hand-installed on Air Blue, for this user."""
+    """The LaunchAgents for this user: disk hygiene as hand-installed on Air Blue, plus the fleet-cas pruner."""
     disk = os.fspath(ctx.bin / "glaeda-disk")
     python = ctx.python or "/usr/bin/python3"
     return {
@@ -525,6 +526,18 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "Nice": 10,
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-worktree-reclaim.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-worktree-reclaim.err"),
+        },
+        # Keeps the fleet compilation-cache node store and local Xcode CAS within budget; it exits at
+        # once on a host without fleet-cas and defers while any build runs or holds the host lock.
+        LABEL_PREFIX + "fleet-cas-prune": {
+            "Label": LABEL_PREFIX + "fleet-cas-prune",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-fleet-cas-prune"), "--apply"],
+            "StartInterval": 3600,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-fleet-cas-prune.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-fleet-cas-prune.err"),
         },
     }
 
@@ -637,7 +650,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     for path, mode in directories(ctx):
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
-    for name in ("glaeda-disk", "glaeda-worktree-reclaim-all"):
+    for name in ("glaeda-disk", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
@@ -760,7 +773,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         path = agent_path(ctx, label)
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
-    for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
+    for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     for act in actions:
         if act["kind"] == "note":
