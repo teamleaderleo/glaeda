@@ -109,6 +109,31 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("root",)),
     "isolated": (2, ()), "simulator": (2, ("simulator",)), "light": (1, ())}
+# Guest repositories (any repo other than --home-repo, admitted by an org-scoped runner's --allowed-owner)
+# never touch cmux's canonical roots or persistent DerivedData, so they are costed by job-id suffix alone:
+# "-sim" or "simulator" uses the one CoreSimulator service, "-light" is small, anything else is isolated.
+DEFAULT_HOME_REPO = "manaflow-ai/cmux"
+
+
+GUEST_WAIT_S = 600.0  # guests have no rescue workflow: a full mini holds their job this long before refusing
+GUEST_POLL_S = 5.0
+
+
+def is_guest(repo: str | None, home_repo: str = DEFAULT_HOME_REPO) -> bool:
+    """An unknown repository is a guest: the safe side, since a guest never takes cmux's roots."""
+    return not repo or repo.lower() != home_repo.lower()
+
+
+def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO) -> tuple[str, bool]:
+    """The job's class and whether it is pinned to /private/tmp/cmux-ci (an unknown job of the home repo)."""
+    if is_guest(repo, home_repo):
+        name = job.lower()
+        if name.endswith("-sim") or name.endswith("simulator"):
+            return "simulator", False
+        return ("light" if name.endswith("-light") else "isolated"), False
+    return JOB_CLASSES.get(job, "compile"), job not in JOB_CLASSES
+
+
 CANONICAL_ROOT_ENV = "CMUX_CI_CANONICAL_ROOT"
 # With more than one root, these restore a producer's product into the producer's root (#filePath is baked
 # in there), so they take that root from their restore step, not a token-chosen one at job start.
@@ -616,19 +641,20 @@ def holder_pids(state_dir: Path) -> set[int]:
 
 
 def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watch_pid: int,
-                  state_dir: Path, compile_slots: int = 1, roots: int = 1) -> tuple[bool, str]:
+                  state_dir: Path, compile_slots: int = 1, roots: int = 1,
+                  repo: str | None = DEFAULT_HOME_REPO, home_repo: str = DEFAULT_HOME_REPO) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
     takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
     the job class's tokens. Everything is a flock, so a holder that dies releases all of it."""
-    klass = JOB_CLASSES.get(job, "compile")
+    klass, pinned = job_class(job, repo, home_repo)
     units, tokens = CLASS_COST[klass]
     units = min(units, total)
     if roots > 1 and klass in ROOT_CONSUMERS:
         # a consumer must use the producer's root, which only its restore step knows: it takes that root
         # itself with glaeda-canonical-root take (take-root below) instead of a token-chosen one here
         tokens = tuple(t for t in tokens if t != "root")
-    pinned = job not in JOB_CLASSES  # workflows the hook does not know use /private/tmp/cmux-ci itself
+    # pinned: home-repo workflows the hook does not know use /private/tmp/cmux-ci itself
     try:
         capacity_dir.mkdir(parents=True, exist_ok=True)
         admission = os.open(capacity_dir / "admission.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
@@ -1170,6 +1196,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--parse-only", action="store_true", help=argparse.SUPPRESS)  # the gate's reload check
     p.add_argument("--allowed-repo", action="append", default=[])
     p.add_argument("--allowed-owner")
+    p.add_argument("--home-repo", default=DEFAULT_HOME_REPO,
+                   help="the repository whose job ids JOB_CLASSES names; other repos are guests (see job_class)")
+    p.add_argument("--guest-wait", type=float, default=GUEST_WAIT_S,
+                   help="seconds a guest job waits for room on a full mini before it is refused")
     p.add_argument("--allow-event", action="append", default=[],
                    help="admit another event name (pull_request_target is always refused)")
     p.add_argument("--trusted-ref", help="admit only push and schedule jobs on this ref (needs --trusted-repo)")
@@ -1238,9 +1268,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.capacity_units > 0:
             roots_file(args.state_dir).unlink(missing_ok=True)  # a crashed job's record must not look held
             ensure_root_shim(Path(FLEET_DIR) / "bin")
-            held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
-                                       os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
-                                       args.state_dir, args.compile_slots, args.canonical_roots)
+            # the repository decide() admitted: the runner's variable, else the event payload's
+            repo = os.environ.get("GITHUB_REPOSITORY") or _repo_name((event or {}).get("repository")
+                                                                     if isinstance(event, dict) else None)
+            deadline = time.monotonic() + (args.guest_wait if is_guest(repo, args.home_repo) else 0)
+            while True:
+                held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
+                                           os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
+                                           args.state_dir, args.compile_slots, args.canonical_roots,
+                                           repo, args.home_repo)
+                # cmux refuses fast (its rescue workflow reroutes); a guest has none, so it waits for room
+                if held or not note.startswith("capacity:") or time.monotonic() >= deadline:
+                    break
+                time.sleep(GUEST_POLL_S)
         else:
             held, note = take_host_lock(args.host_lock, args.watch_pid or os.getppid(), args.state_dir)
         if not held:

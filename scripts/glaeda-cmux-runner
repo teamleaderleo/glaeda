@@ -62,6 +62,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -368,7 +369,8 @@ def resolve_release(ctx: Context) -> dict[str, Any]:
 
 def lookup_runner(ctx: Context) -> tuple[bool, dict[str, Any] | None]:
     """(query succeeded, runner with ctx.name or None). A failed query is not "absent"."""
-    doc = gh_json(ctx, f"{ctx.scope_api}/actions/runners?per_page=100")
+    # filtered by name: an org's list (hosted scale sets included) runs far past one page
+    doc = gh_json(ctx, f"{ctx.scope_api}/actions/runners?name={urllib.parse.quote(ctx.name)}&per_page=100")
     if not isinstance(doc, dict) or not isinstance(doc.get("runners"), list):
         return False, None
     for runner in doc["runners"]:
