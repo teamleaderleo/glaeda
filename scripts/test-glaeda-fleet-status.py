@@ -566,12 +566,19 @@ class DiskTests(unittest.TestCase):
         self.assertEqual((row["installed"], row["error"]), (False, None))
         self.assertNotIn("prune", row)
         self.assertNotIn("reclaimed_24h", row)
-        doc = build(disk=disk(mini_a=row, mini_b={"reachable": False, "error": "timeout", "observed_at": AT}))
-        [f] = by_id(doc, "disk.")
-        self.assertEqual((f["id"], f["severity"]), ("disk.no_glaeda_disk@mini-a", "info"))
+        doc = build(disk=disk(mini_a=row, mini_b={"reachable": False, "error": "TimeoutExpired", "observed_at": AT}))
+        self.assertEqual({(f["id"], f["severity"]) for f in by_id(doc, "disk.")},
+                         {("disk.no_glaeda_disk@mini-a", "info"), ("disk.probe_failed@mini-b", "info")})
+        [timed_out] = by_id(doc, "disk.probe_failed")
+        self.assertIn("TimeoutExpired", timed_out["summary"])
         self.assertEqual(self.member(doc, "mini-b")["disk"], {"reachable": False})
         self.assertIn("unreachable", fs.render_text(doc))
         self.assertEqual(fs.parse_disk("", AT)["error"], "glaeda-disk printed no JSON")
+        # no snapshot: glaeda-disk would du everything first, so the probe does not run it
+        row = fs.parse_disk('@disk\n{"no_snapshot":true}\n@now\n1\n', AT)
+        self.assertEqual(row["error"], "glaeda-disk has no size snapshot yet")
+        [f] = by_id(build(disk=disk(mini_a=row)), "disk.")
+        self.assertEqual((f["code"], f["severity"]), ("unreadable", "info"))
 
     def test_parse_reduces_the_probe_to_numbers_without_paths(self):
         report = {"free": 100 * GIB, "total": 460 * GIB, "idle_hours": 24,
@@ -585,7 +592,8 @@ class DiskTests(unittest.TestCase):
                     {"at": "2027-01-15T07:00:00+0000", "outcome": "changed:in-use", "bytes": 9 * GIB},
                     {"at": "2027-01-10T00:00:00+0000", "outcome": "reclaimed", "bytes": 9 * GIB}]
         now = 1_800_000_000  # 2027-01-15T08:00:00Z
-        prune = [{"at": "2027-01-14T08:00:00+0000", "gc": "ran", "result": "ok"},
+        prune = [{"at": "2027-01-14T08:00:00+0000", "gc": "ran", "result": "ok",
+                  "gc_dry_run": "dry run: in /Users/cmux/store; kept entries naming no stored object: 0"},
                  {"at": "2027-01-15T07:00:00+0000", "gc": "not due", "result": "ok", "role": "reader",
                   "node_store_bytes": 5, "local_cas_bytes": 6}]
         stdout = ("@disk\n" + json.dumps(report, indent=2) + "\n@sizes_at\n1799999000\n@prune_job_at\n1799000000\n"
@@ -601,6 +609,7 @@ class DiskTests(unittest.TestCase):
         self.assertEqual((row["prune"]["result"], row["prune"]["node_store_bytes"]), ("ok", 5))
         self.assertEqual(row["prune"]["at"], now - 3600 + 100)  # moved onto this machine's clock
         self.assertEqual(row["gc"]["result"], "ran")  # "not due" is not a gc outcome
+        self.assertEqual(row["gc"]["suspect_entries"], 0)  # the count, never the tool's text
         self.assertEqual(row["sizes_at"], 1799999100)
 
     def test_disk_output_stays_bounded(self):
@@ -608,14 +617,14 @@ class DiskTests(unittest.TestCase):
                     for i in range(5000)]
         huge = disk_row(families=families, error=None,
                         prune={"at": AT, "result": "failed " + "y" * 10_000}, fleet_cas=True,
-                        gc={"at": AT, "result": "failed", "dry_run": "z" * 100_000})
+                        gc={"at": AT, "result": "failed", "suspect_entries": "z" * 100_000})
         doc = build(disk=src({"hosts": {"mini-a": huge, "mini-b": huge, "not-in-manifest": huge,
                                         "coordinator": huge}}))
         self.assertLessEqual(len(fs.canonical(doc)), fs.MAX_DOCUMENT_BYTES)
         d = self.member(doc)["disk"]
         self.assertEqual(len(d["families"]), fs.MAX_DISK_FAMILIES)
         self.assertTrue(all(len(f["family"]) <= 60 and len(f["owner"]) <= 80 for f in d["families"]))
-        self.assertLessEqual(len(d["gc"]["dry_run"]), 160)
+        self.assertIsNone(d["gc"]["suspect_entries"])
         self.assertLessEqual(len(fs.disk_line(d, AT)), fs.MAX_TEXT)
         self.assertTrue(all(len(f["summary"]) <= fs.MAX_TEXT for f in doc["findings"]))
         # never_touch members get findings but no command
@@ -633,6 +642,67 @@ class DiskTests(unittest.TestCase):
         with mock.patch.object(fs.subprocess, "run",
                                return_value=subprocess.CompletedProcess([], 255, "", "ssh: timed out")):
             self.assertFalse(fs.disk_host("mini-a", "builder")["reachable"])
+
+
+    def test_cargo_target_is_listed_but_not_counted_twice(self):
+        families = [{"family": "projects", "bytes": 40 * GIB, "owner": "", "retired": False},
+                    {"family": "cargo-target", "bytes": 30 * GIB, "owner": "", "retired": False}]
+        d = self.member(build(disk=disk(mini_a=disk_row(families=families))))["disk"]
+        self.assertEqual(d["cache_bytes"], 40 * GIB)
+        self.assertEqual(len(d["families"]), 2)
+
+    def test_a_prune_line_without_a_readable_time_is_silent_not_new(self):
+        doc = build(disk=disk(mini_a=disk_row(fleet_cas=True, prune_job_at=AT - 60,
+                                              prune={"at": None, "result": "ok"})))
+        [f] = by_id(doc, "disk.prune_silent@mini-a")
+        self.assertIn("no readable time", f["summary"])
+
+    def test_the_probe_script_runs_against_a_fake_home(self):
+        report = {"free": 50 * GIB, "total": 460 * GIB, "filesystems": [
+            {"free": 50 * GIB, "total": 460 * GIB, "low": 69 * GIB}],
+            "owners": {"hq": {"owner": "worker", "retired": True}},
+            "items": [{"family": "hq", "path": "/x", "bytes": 6 * GIB}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            tool = home / ".local/bin/glaeda-disk"
+            tool.parent.mkdir(parents=True)
+            tool.write_text("#!/bin/sh\ncat <<'JSON'\n" + json.dumps(report, indent=2) + "\nJSON\n")
+            tool.chmod(0o755)
+            (home / ".cache/glaeda-disk").mkdir(parents=True)
+            (home / ".cache/glaeda-disk/sizes.json").write_text("{}")
+            (home / "Library/Logs").mkdir(parents=True)
+            (home / "Library/Logs/glaeda-fleet-cas-prune.jsonl").write_text(
+                json.dumps({"at": "2027-01-15T07:00:00+0000", "result": "failed", "role": "reader"}) + "\n")
+            (home / "Projects/recovery/disk-reclaim").mkdir(parents=True)
+            (home / "Projects/recovery/disk-reclaim/receipts.jsonl").write_text("not json\n")
+            proc = subprocess.run(["/bin/sh", "-c", fs.DISK_SCRIPT], capture_output=True, text=True, timeout=30,
+                                  env={"HOME": str(home), "PATH": "/usr/bin:/bin"}, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        row = fs.parse_disk(proc.stdout, AT)
+        self.assertEqual((row["free"], row["low"], row["error"]), (50 * GIB, 69 * GIB, None))
+        self.assertEqual(row["prune"]["result"], "failed")
+        self.assertEqual(row["reclaimed_24h"], {"bytes": 0, "count": 0})
+        doc = build(disk=disk(mini_a=row))
+        self.assertTrue(by_id(doc, "disk.pressure@mini-a"))
+        self.assertTrue(by_id(doc, "disk.retired_owner:hq@mini-a"))
+        self.assertTrue(by_id(doc, "disk.prune_failed@mini-a"))
+
+    def test_real_glaeda_disk_json_parses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "tmp"
+            (root / "big").mkdir(parents=True)
+            (root / "big" / "blob").write_bytes(b"x" * (2 * 1024 * 1024))
+            proc = subprocess.run([sys.executable, str(SCRIPT.parent / "glaeda-disk"), "--json", "--top", "0",
+                                   "--no-snapshot", "--min-mib", "0", "--family", "tmp",
+                                   "--root-override", f"tmp={root}"],
+                                  capture_output=True, text=True, timeout=120, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        row = fs.parse_disk("@disk\n" + proc.stdout + "\n@now\n1800000000\n", AT)
+        self.assertIsNone(row["error"])
+        self.assertGreater(row["total"], 0)
+        self.assertIsNotNone(row["low"])
+        self.assertEqual([f["family"] for f in row["families"]], ["tmp"])
+        self.assertGreaterEqual(row["families"][0]["bytes"], 2 * 1024 * 1024)
 
     def test_html_has_a_disk_column(self):
         page = fs.render_html(build(disk=disk(mini_a=disk_row(free=30 * GIB))))

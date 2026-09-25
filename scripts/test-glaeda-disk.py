@@ -169,6 +169,13 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertGreater(sizes["new"], 0)
         self.assertIn(str(new), known)  # measured size is kept for the next snapshot
 
+    def test_saving_new_paths_keeps_the_snapshot_stamp(self) -> None:
+        snap = self.root / "keep.json"
+        gd.save_snapshot({"/a": 1, "/b": 2}, snap, at=1000.0)
+        self.assertEqual(gd.load_snapshot(snap), (1000.0, {"/a": 1, "/b": 2}))
+        gd.save_snapshot({"/a": 1}, snap)
+        self.assertGreater(gd.load_snapshot(snap)[0], 1000.0)  # a full measurement is now
+
     def test_snapshot_round_trip_and_corrupt_snapshot_is_empty(self) -> None:
         snap = self.root / "sizes.json"
         gd.save_snapshot({"/a": 1}, snap)

@@ -766,10 +766,11 @@ def load_snapshot(path: Path = SNAPSHOT) -> tuple[float, dict[str, int]]:
         return 0.0, {}
 
 
-def save_snapshot(sizes: dict[str, int], path: Path = SNAPSHOT) -> None:
+def save_snapshot(sizes: dict[str, int], path: Path = SNAPSHOT, at: float | None = None) -> None:
+    """`at` is when the oldest size was measured; only a full measurement moves it to now."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps({"at": time.time(), "sizes": sizes}))
+    tmp.write_text(json.dumps({"at": time.time() if at is None else at, "sizes": sizes}))
     os.replace(tmp, path)
 
 
@@ -1278,7 +1279,9 @@ def main(argv: list[str] | None = None) -> int:
             save_snapshot({**load_snapshot()[1], **known})
             lock.unlink(missing_ok=True)
         elif not at or len(known) != before or a.apply:
-            save_snapshot(known)
+            # adding a few new paths does not make the old sizes fresh: keep their stamp, so the
+            # background refresh still comes due (a status probe that runs often must not defer it)
+            save_snapshot(known, at=at or None)
         if at and age_min > a.max_age and not a.apply and not _fresh(lock, 600):
             lock.touch()
             subprocess.Popen([sys.executable, os.path.abspath(__file__), "--refresh", "--top", "0",

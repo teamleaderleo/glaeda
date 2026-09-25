@@ -106,13 +106,16 @@ The `disk` probe reads, per member:
 
 - `~/.local/bin/glaeda-disk --json --top 0`: free and total bytes of the data
   volume, its pressure threshold (`low`), and cache bytes per glaeda-disk family
-  with its owner and whether that owner is retired. It runs with a max age far
-  past any snapshot, so a status probe never starts glaeda-disk's background
-  re-measure; `sizes_at` says how old the sizes are. Item paths never leave the
-  member: only family totals do.
+  with its owner and whether that owner is retired. It runs only over an existing
+  size snapshot (without one it would measure every family first) and with a max
+  age far past any snapshot, so a status probe never starts glaeda-disk's
+  background re-measure; `sizes_at` says how old the sizes are. Item paths never
+  leave the member: only family totals do. `cache_bytes` leaves out
+  `cargo-target`, which is also counted inside its checkout.
 - the last 48 lines of `~/Library/Logs/glaeda-fleet-cas-prune.jsonl`: the newest
   line (result, role, node store and local CAS bytes) and the newest line with a
-  gc outcome (gc runs once a day; `not due` is not an outcome).
+  gc outcome (gc runs once a day; `not due` is not an outcome) with the dry run's
+  count of kept entries naming no stored object, never its text.
 - the prune LaunchAgent's install time, and whether the host has fleet-cas
   (`/Users/Shared/cmux-build-fleet/xcode/fleet-cas.env`).
 - bytes and deletions with outcome `reclaimed` in the last 24 h, from
@@ -128,7 +131,7 @@ Findings, all `warn` unless noted:
 | `prune_failed`, `gc_failed`, `gc_skipped` | the last prune or gc result starts with `failed` or `skipped: kept entries` | person: read the prune log |
 | `prune_silent` | fleet-cas host, no prune line in 3 h (or none 3 h after the job was installed) | `launchctl list com.teamleaderleo.glaeda.fleet-cas-prune` (safe) |
 | `prune_missing` | fleet-cas host without the prune LaunchAgent | person: `glaeda-mini-setup --apply` |
-| `summary`, `no_glaeda_disk`, `unreadable` (info) | otherwise | `glaeda-disk` report, or a person to install it |
+| `summary`, `no_glaeda_disk`, `unreadable`, `probe_failed` (info) | otherwise, a missing tool or snapshot, or a probe that timed out | `glaeda-disk` report, a person to install it, or a refresh |
 
 No disk action ever deletes. The text output adds one `disk:` line per member and
 the page a `disk` column, for example:

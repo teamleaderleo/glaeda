@@ -78,6 +78,9 @@ RETIRED_WARN_BYTES = 5 * GIB
 # fleet-cas-prune runs hourly; three missed runs is a stopped LaunchAgent, not a busy host.
 PRUNE_SILENT_SECONDS = 3 * 3600
 PRUNE_LABEL = "com.teamleaderleo.glaeda.fleet-cas-prune"
+# glaeda-disk families whose bytes are also counted in another family (cargo-target sits inside checkouts).
+DOUBLE_COUNTED = frozenset({"cargo-target"})
+GC_SUSPECT = re.compile(r"kept entries naming no stored object: (\d+)")
 
 # Only these reach child processes; the document never carries any of them.
 CHILD_ENV = ("HOME", "PATH", "LANG", "LC_ALL", "USER", "LOGNAME", "SSH_AUTH_SOCK", "TMPDIR",
@@ -374,14 +377,16 @@ def collect_lima(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
     return source({"hosts": results})
 
 
-# Read-only: prints, tails and a stat. glaeda-disk gets a max age far past any snapshot so a status probe
-# never starts its background re-measure; sizes_at says how old its sizes are instead. tail -c keeps the
-# newest bytes; a line cut at the front fails to parse and is skipped.
+# Read-only: prints, tails and a stat. glaeda-disk runs only over an existing size snapshot (without one it
+# would du every family first) and with a max age far past any snapshot, so a status probe never starts its
+# background re-measure; sizes_at says how old its sizes are instead. Its JSON lists every item with its
+# path, so it is capped in transport and reduced here to family totals. tail -c keeps the newest bytes; a
+# line cut at the front fails to parse and is skipped.
 DISK_SCRIPT = (
     "export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin; "
-    "echo @disk; if [ -x ~/.local/bin/glaeda-disk ]; then "
-    "~/.local/bin/glaeda-disk --json --top 0 --max-age 1000000 2>/dev/null | head -c 1048576; "
-    "else echo '{\"no_glaeda_disk\":true}'; fi; echo; "
+    "echo @disk; if [ ! -x ~/.local/bin/glaeda-disk ]; then echo '{\"no_glaeda_disk\":true}'; "
+    "elif [ ! -e ~/.cache/glaeda-disk/sizes.json ]; then echo '{\"no_snapshot\":true}'; else "
+    "~/.local/bin/glaeda-disk --json --top 0 --max-age 1000000 2>/dev/null | head -c 4194304; fi; echo; "
     "echo @sizes_at; stat -f %m ~/.cache/glaeda-disk/sizes.json 2>/dev/null; "
     "echo @prune; tail -n 48 ~/Library/Logs/glaeda-fleet-cas-prune.jsonl 2>/dev/null | tail -c 131072; echo; "
     "echo @prune_job_at; stat -f %m ~/Library/LaunchAgents/" + PRUNE_LABEL + ".plist 2>/dev/null; "
@@ -434,6 +439,8 @@ def parse_disk(stdout: str, at: int) -> dict[str, Any]:
         row["error"] = "glaeda-disk printed no JSON"
     elif report.get("no_glaeda_disk"):
         row["installed"] = False
+    elif report.get("no_snapshot"):
+        row["error"] = "glaeda-disk has no size snapshot yet"
     else:
         free, total = num(report.get("free")), num(report.get("total"))
         systems = [f for f in report.get("filesystems") or [] if isinstance(f, dict)]
@@ -466,8 +473,11 @@ def parse_disk(stdout: str, at: int) -> dict[str, Any]:
         gc_lines = [x for x in prune_lines if x.get("gc") not in (None, "not due")]
         if gc_lines:
             stamp = log_time(gc_lines[-1].get("at"))
+            # Only the count: the dry run's text is tool output and can carry store paths.
+            suspect = GC_SUSPECT.search(str(gc_lines[-1].get("gc_dry_run") or ""))
             row["gc"] = {"at": stamp + skew if stamp is not None else None,
-                         "result": clean(gc_lines[-1].get("gc"), 160), "dry_run": clean(gc_lines[-1].get("gc_dry_run"))}
+                         "result": clean(gc_lines[-1].get("gc"), 160),
+                         "suspect_entries": int(suspect.group(1)) if suspect else None}
     receipts = sections.get("receipts", [])
     if receipts[:1] == ["present"]:
         since = (remote_now if remote_now is not None else at) - 86400
@@ -906,6 +916,10 @@ class Builder:
             m["observed"]["disk"] = at
             if not row.get("reachable"):
                 m["disk"] = {"reachable": False}
+                # A host that answers ssh but whose probe timed out is not the same as a host that is down.
+                self.finding("disk", "probe_failed", "info", f"disk probe failed: {clean(row.get('error'), 160)}",
+                             member, at, self.action(member, "retry_probe", "agent", "glaeda-fleet-status",
+                                                     safe=True, on_member=False))
                 continue
             report = self.action(member, "report_disk", "agent", "~/.local/bin/glaeda-disk",
                                  note="reports where the space went and what is reclaimable; it may refresh "
@@ -931,7 +945,8 @@ class Builder:
                 "error": clean(row.get("error"), 160) if row.get("error") else None,
                 "free_bytes": free, "total_bytes": total, "low_bytes": low,
                 "under_pressure": free is not None and low is not None and free < low,
-                "cache_bytes": sum(f["bytes"] for f in families), "families": families,
+                "cache_bytes": sum(f["bytes"] for f in families if f["family"] not in DOUBLE_COUNTED),
+                "families": families,
                 "sizes_at": stamp_of(row.get("sizes_at")), "fleet_cas": row.get("fleet_cas") is True,
                 "prune_job_at": stamp_of(row.get("prune_job_at")),
                 "prune": None if prune is None else {
@@ -940,7 +955,7 @@ class Builder:
                     "node_store_bytes": num(prune.get("node_store_bytes")),
                     "local_cas_bytes": num(prune.get("local_cas_bytes"))},
                 "gc": None if gc is None else {"at": stamp_of(gc.get("at")), "result": clean(gc.get("result"), 120),
-                                               "dry_run": clean(gc.get("dry_run"), 160)},
+                                               "suspect_entries": stamp_of(gc.get("suspect_entries"))},
                 "reclaimed_24h": None if reclaimed is None else {
                     "bytes": num(reclaimed.get("bytes")) or 0, "count": num(reclaimed.get("count")) or 0},
             }
@@ -979,9 +994,10 @@ class Builder:
                                  note="glaeda-mini-setup --apply installs it with the disk jobs"))
             elif d["fleet_cas"]:
                 # No line yet: judge from when the job was installed, so a new install is not silent.
-                since = last if last is not None else d["prune_job_at"]
+                since = last if last is not None else None if d["prune"] else d["prune_job_at"]
                 if since is None or self.at - since > PRUNE_SILENT_SECONDS:
                     what = (f"last fleet-cas-prune line {when(last, self.at)}" if last is not None else
+                            "last fleet-cas-prune line carries no readable time" if d["prune"] else
                             f"no fleet-cas-prune line since the job was installed {when(since, self.at)}")
                     warn("prune_silent", f"{what} on a fleet-cas host",
                          self.action(member, "inspect_prune_job", "agent", f"launchctl list {PRUNE_LABEL}",
