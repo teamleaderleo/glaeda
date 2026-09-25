@@ -1132,8 +1132,8 @@ class RunnerScope(NamedTuple):
 
 
 def runner_scope(runner_dir: Path) -> RunnerScope:
-    """RunnerScope from the hook script glaeda-cmux-runner wrote. The hook passes --instance only with more
-    than one root; otherwise the instance is the runner directory's -K suffix (actions-runner-glaeda-K)."""
+    """RunnerScope from the hook script glaeda-cmux-runner wrote. The hook passes --instance; the directory's
+    -K suffix (actions-runner-glaeda-K) is the fallback for hooks written before it always did."""
     try:
         text = (runner_dir / RUNNER_HOOK_SCRIPT).read_text()
     except (OSError, UnicodeDecodeError):
