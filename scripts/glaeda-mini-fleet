@@ -176,7 +176,8 @@ SSH = "/usr/bin/ssh"
 PROBE_TIMEOUT = 90
 PREFLIGHT_TIMEOUT = 180
 LIST_KEYS = {"xcode_app", "xcode_ready", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key",
-             "pf_tool", "pf_submodule", "pf_pmset", "pf_runner", "pf_brew_formula", "pf_secret"}
+             "pf_tool", "pf_submodule", "pf_pmset", "pf_runner", "pf_brew_formula", "pf_secret",
+             "ios_runtime", "ios_device"}
 # Same rule as scripts/cmux_fleet.py NODE_RE: an opaque cmux-* fleet node id.
 NODE_ID_RE = re.compile(r"cmux-[a-z0-9][a-z0-9-]{2,59}\Z")
 VERSION_RE = re.compile(r"\d+(\.\d+){0,2}\Z")
@@ -184,6 +185,9 @@ VERSION_RE = re.compile(r"\d+(\.\d+){0,2}\Z")
 SAFE_PATH_RE = re.compile(r"/[A-Za-z0-9._/-]+\Z")
 SAFE_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
 TOOLCHAIN_KEYS = {"xcode", "metal", "zig_min", "rustup_default", "python_min", "cmux"}
+# iOS simulator runtime builds (23F77) and device type names (iPhone 17 Pro Max).
+IOS_BUILD_RE = re.compile(r"[0-9]{2}[A-Z][0-9]{1,5}[a-z]?\Z")
+IOS_DEVICE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ().-]{0,63}\Z")
 # glaeda-mini-enroll's accept-local needs os.waitid, which CPython on macOS has from 3.13.
 ENROLL_PYTHON_MIN = "3.13"
 # The glaeda-mini-enroll options onboard, repair and upgrade pass; a ~/glaeda without them fails with
@@ -290,8 +294,10 @@ def load_manifest(path: Path) -> dict[str, Any]:
         node_ids[node_id] = name
     validate_onboarding(path, data)
     validate_toolchain(path, "defaults", data["defaults"].get("toolchain"))
+    validate_ios_simulator(path, "defaults", data["defaults"].get("ios_simulator"))
     for name, host in data["hosts"].items():
         validate_toolchain(path, f"host {name}", host.get("overrides", {}).get("toolchain"))
+        validate_ios_simulator(path, f"host {name}", host.get("overrides", {}).get("ios_simulator"))
     for key_id, key in data["keys"].items():
         public = key.get("public_key")
         if public is not None and (not isinstance(public, str) or "\n" in public.strip()
@@ -303,6 +309,50 @@ def load_manifest(path: Path) -> dict[str, Any]:
                                     or not options_well_formed(options)):
             raise Failure(f"{path}: key {key_id} options must be one printable authorized_keys options field")
     return data
+
+
+def validate_ios_simulator(path: Path, where: str, ios: Any) -> None:
+    """ios_simulator: {"runtimes": ["23F77"], "exclusive": true, "devices": ["iPhone 17 Pro Max"]}.
+
+    runtimes are iOS simulator runtime builds every such host must have; exclusive means no others;
+    devices are device types that must exist, available, on each declared runtime.
+    """
+    if ios is None:
+        return
+    if not isinstance(ios, dict) or set(ios) - {"runtimes", "exclusive", "devices"}:
+        raise Failure(f"{path}: {where} ios_simulator takes runtimes, exclusive and devices")
+    runtimes, devices = ios.get("runtimes", []), ios.get("devices", [])
+    if not isinstance(runtimes, list) or not all(isinstance(b, str) and IOS_BUILD_RE.fullmatch(b) for b in runtimes):
+        raise Failure(f"{path}: {where} ios_simulator.runtimes must be runtime builds such as 23F77")
+    if not isinstance(devices, list) or not all(isinstance(d, str) and IOS_DEVICE_RE.fullmatch(d) for d in devices):
+        raise Failure(f"{path}: {where} ios_simulator.devices must be device type names such as iPhone 17 Pro Max")
+    if not isinstance(ios.get("exclusive", False), bool):
+        raise Failure(f"{path}: {where} ios_simulator.exclusive must be true or false")
+    if ios.get("exclusive") and not runtimes:
+        raise Failure(f"{path}: {where} ios_simulator.exclusive needs at least one runtime")
+
+
+def ios_simulator_drift(ios: dict[str, Any], obs: dict[str, Any]) -> list[tuple[str, str]]:
+    """(message, fix) for each way the observed iOS simulators differ from the declared ones."""
+    have = {r["build"]: r for r in obs.get("ios_runtimes", [])}
+    out = []
+    for build in ios.get("runtimes", []):
+        if build not in have:
+            out.append((f"iOS simulator runtime {build} missing",
+                        "xcodebuild -downloadPlatform iOS, or xcrun simctl runtime add <dmg>"))
+    if ios.get("exclusive"):
+        for build, r in sorted(have.items()):
+            if build not in ios.get("runtimes", []):
+                out.append((f"extra iOS simulator runtime {r['full']} ({build})",
+                            f"xcrun simctl runtime delete {r['identifier']}"))
+    names = {(d["runtime"], d["name"]) for d in obs.get("ios_devices", [])}
+    for build in ios.get("runtimes", []):
+        short = have.get(build, {}).get("short")
+        for device in ios.get("devices", []) if short else []:
+            if (short, device) not in names:
+                out.append((f"no available {device} simulator on iOS {short}",
+                            f"xcrun simctl create '{device}' '{device}' {have[build]['identifier']}"))
+    return out
 
 
 def options_well_formed(options: str) -> bool:
@@ -509,6 +559,9 @@ def parse_probe(text: str) -> dict[str, Any]:
         "enrolled_node_id": out.get("fleet_node_id"),
         "reservation": probe_reservation(out.get("reservation"), out.get("reservation_raw")),
         "host_lock": out.get("host_lock"),
+        "ios_runtimes": [dict(zip(("short", "full", "build", "identifier"), v.split("|", 3)))
+                         for v in out["ios_runtime"] if v.count("|") == 3],
+        "ios_devices": [dict(zip(("runtime", "name"), v.split("|", 1))) for v in out["ios_device"] if "|" in v],
         "authorized_keys_files": [v.split("|")[0] for v in out["ak_file"]],
         "authorized_keys": [parse_key(v) for v in out["ak_key"] if v.split("|", 1)[0] in LIVE_KEY_FILES],
         **({"preflight": parse_preflight(out)} if "pf_python" in out else {}),
@@ -830,6 +883,11 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
     data = obs["disk"].get("/System/Volumes/Data") or obs["disk"].get("/")
     if floor and data and data["free_gib"] < floor:
         drift("disk", f"{data['free_gib']} GiB free, floor {floor}", "glaeda-disk")
+
+    ios = policy.get("ios_simulator")
+    if ios:
+        for message, fix in ios_simulator_drift(ios, obs):
+            drift("ios", message, fix)
 
     # The declared toolchain: Xcode from the plain probe, the rest from a preflight section when observed.
     declared = policy.get("toolchain") or {}

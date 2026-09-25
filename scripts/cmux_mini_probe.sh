@@ -34,6 +34,19 @@ for app in /Applications/Xcode*.app; do
   fi
 done
 e xcode_select "$(xcode-select -p 2>/dev/null)"
+# iOS simulator runtimes and devices, from the newest Xcode that has simctl (they are system-wide).
+sim_dev=
+for app in /Applications/Xcode*.app; do
+  [ -x "$app/Contents/Developer/usr/bin/simctl" ] && sim_dev="$app/Contents/Developer"
+done
+if [ -n "$sim_dev" ]; then
+  # "iOS 26.3 (26.3.1 - 23D8133) - com.apple.CoreSimulator.SimRuntime.iOS-26-3" -> short|full|build|identifier
+  DEVELOPER_DIR="$sim_dev" xcrun simctl list runtimes </dev/null 2>/dev/null |
+    sed -nE 's/^iOS ([0-9.]+) \(([0-9.]+) - ([A-Za-z0-9]+)\) - (com\.apple\.[A-Za-z0-9.-]+).*/ios_runtime	\1|\2|\3|\4/p'
+  # Devices under "-- iOS 26.3 --" -> short|name, without the UDID and state.
+  DEVELOPER_DIR="$sim_dev" xcrun simctl list devices available </dev/null 2>/dev/null |
+    awk '/^-- iOS /{v=$3; next} /^-- /{v=""; next} v!="" && /^    /{sub(/^ +/,""); sub(/ \([0-9A-F-]+\) \([^)]*\) *$/,""); print "ios_device\t" v "|" $0}'
+fi
 if [ -e /Library/Preferences/com.apple.dt.Xcode.plist ]; then
   e xcode_license_accepted "$(defaults read /Library/Preferences/com.apple.dt.Xcode IDEXcodeVersionForAgreedToGMLicense 2>/dev/null)"
 fi
