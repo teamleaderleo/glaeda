@@ -375,8 +375,10 @@ in at the producer's root. So one root job per root per mini:
 
 ## 2g. iOS simulator runners
 
-A host with the `ios-simulators` role carries `glaeda-ios-sim` when the installer also finds an available
-iOS 26.x runtime (`xcrun simctl list runtimes -j`). If simctl gives no usable answer, the runner keeps
+A host with the `ios-simulators` role carries `glaeda-ios-sim` when the installer also finds every runtime
+build the manifest's `ios_simulator.runtimes` declares available (`xcrun simctl list runtimes -j`, matched on
+`buildversion`). The build is pinned, not any 26.x: Xcode 26.6 refuses simulators that are not its iOS 26.5
+SDK's runtime (23F77), so a 26.3.1-only mini fails every iOS job. No declared runtime means no label. If simctl gives no usable answer, the runner keeps
 the label it registered with, so a CoreSimulator hiccup never re-registers it. iOS jobs use
 `runs-on: [glaeda-std-xcode-26.6, glaeda-ios-sim]` through the owned-pool picker, so a job never lands on a
 mini without a runtime (cmux14 has none). The picker must count ios-sim capacity before workflows depend
