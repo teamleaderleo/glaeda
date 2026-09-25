@@ -636,6 +636,7 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
         "update_running": out.get("pf_update_running"),
         "update_prepared": None if prepared is None else {"state": prepared[0], "version": prepared[1]},
         "pmset": "\n".join(out["pf_pmset"]),
+        "autoupdate": out.get("pf_autoupdate"),  # install|download; None from an older probe
         # dir|name|loaded|listening|held; an older probe sends only dir|name, which reads as unknown.
         "runners": [dict(zip(("dir", "name", "loaded", "listening", "held"),
                              (v.split("|", 4) + ["", "unknown", "", ""])[:5])) for v in out["pf_runner"]],
@@ -1339,7 +1340,7 @@ def cmd_release(manifest: dict[str, Any], hosts: list[str], owner: str | None, f
 DEFAULT_CMUX_ROOT = "~/cmux"  # where fix clones cmux on a mini
 # Columns of the preflight table, in the order onboarding meets them.
 PREFLIGHT_CHECKS = ("os", "xcode", "select", "licence", "launch", "metal", "rust", "zig", "tools", "python", "python3",
-                    "gh", "cmux", "setup", "glaeda", "power", "disk", "update", "candidate", "node", "enroll", "runner",
+                    "gh", "cmux", "setup", "glaeda", "power", "disk", "update", "autoupdate", "candidate", "node", "enroll", "runner",
                     "brew", "pins", "secrets")
 # An unknown here means the bootstrap would refuse or cannot be predicted, so it blocks like a failure.
 UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "power", "disk"})
@@ -1693,6 +1694,18 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
         put("update", "ok", f"macOS {pf['update_prepared']['version']} was prepared before the last boot and did not apply")
     else:
         put("update", "ok")
+    if pf.get("autoupdate") is not None:
+        install, _, download = pf["autoupdate"].partition("|")
+        on = [name for name, value in (("install", install), ("download", download)) if value.strip() != "0"]
+        if on:
+            # Not blocking: the host works, but an update can land mid-day (a CLT update resets xcode-select)
+            # or wait for a restart. Update checks and security data stay on; glaeda-mini-fleet upgrades on purpose.
+            put("autoupdate", "todo", f"macOS updates {' and '.join(on)} automatically",
+                "sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates "
+                "-bool false && sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload "
+                "-bool false", "password", {"kind": "autoupdate"})
+        else:
+            put("autoupdate", "ok")
 
     # Onboarding progress: candidate, node id, enrollment, runner.
     enrolled = obs.get("enrolled_node_id")
@@ -1908,7 +1921,7 @@ READ_ONLY_FUNCTIONS = {"candidate_check", "share_have", "share_source", "share_s
 # Steps that honor less of the host gate than the default (both the fleet host lock and reservations):
 # a drain waits out the job holding the lock, and restoring runners never builds anything.
 LOCK_GATE = {"runner_hold": "reservation", "runner_release": "none", "runner_kick": "none"}
-SUDO_ORDER = ("select", "licence", "first_launch", "power", "homebrew", "brew", "python_link")
+SUDO_ORDER = ("select", "licence", "first_launch", "power", "autoupdate", "homebrew", "brew", "python_link")
 # Homebrew itself comes from a git fetch, never the brew.sh installer: that stalls on the Command Line Tools
 # softwareupdate the fleet does not need (the pinned Xcode is selected) and leaves an empty /opt/homebrew.
 HOMEBREW_REPO = "https://github.com/Homebrew/brew"
@@ -2554,6 +2567,10 @@ def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any]
             lines.append("step 'power: no sleep on AC, restart after a power failure'")
             lines += [f"{su}pmset -c sleep 0"] if action["sleep"] else []
             lines += [f"{su}pmset -a autorestart 1"] if action["autorestart"] else []
+        elif kind == "autoupdate":
+            lines.append("step 'macOS updates: no automatic download or install (checks and security data stay on)'")
+            lines += [f"{su}defaults write /Library/Preferences/com.apple.SoftwareUpdate {key} -bool false"
+                      for key in ("AutomaticallyInstallMacOSUpdates", "AutomaticDownload")]
         elif kind == "homebrew":
             # Only the directory needs root. fix then git-fetches Homebrew into it as the login user; the brew.sh
             # installer is not used because it stalls on a Command Line Tools install the pinned Xcode makes moot.

@@ -700,7 +700,7 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
         lines.append(f"pf_update_running\t{update_running}")
     if prepared:
         lines.append(f"pf_update_prepared\t{prepared}")
-    lines += ["pf_pmset\tAC Power:", f"pf_pmset\t sleep                {sleep}"]
+    lines += ["pf_pmset\tAC Power:", f"pf_pmset\t sleep                {sleep}", "pf_autoupdate\t0|0"]
     lines += [f"pf_runner\t{r}" for r in runners]
     lines += [f"pf_secret\t{p}" for p in secrets]
     return "\n".join(lines) + "\n"
@@ -839,6 +839,14 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("hosts.small-mini.node_id", checks["node"]["fix"])
         checks = self.result(preflight_text(node_id="cmux-mac-009"))["checks"]
         self.assertIn("enrolled as cmux-mac-009", checks["node"]["detail"])
+
+    def test_automatic_updates_are_a_nonblocking_password_todo(self) -> None:
+        on = self.result(preflight_text().replace("pf_autoupdate\t0|0", "pf_autoupdate\t1|"))["checks"]["autoupdate"]
+        self.assertEqual((on["state"], on["group"]), ("todo", "password"))
+        self.assertIn("install and download", on["detail"])  # unset download means on
+        self.assertEqual(self.states(preflight_text())["autoupdate"], "ok")
+        older = preflight_text().replace("pf_autoupdate\t0|0\n", "")
+        self.assertNotIn("autoupdate", self.states(older))  # an older probe says nothing
 
     def test_power_disk_and_dirty_checkout(self) -> None:
         states = self.states(preflight_text(sleep=10, dirty=3))
@@ -1442,6 +1450,15 @@ class SudoPlanTests(unittest.TestCase):
         script = self.plan(morning_text() + "pf_update_prepared\tpending|26.7\n")
         self.assertIn("# Not run here: macOS 26.7 is prepared", script)
         self.assertNotIn("shutdown", script.replace("# Not run here", ""))
+
+    def test_automatic_updates_are_planned_off(self) -> None:
+        for value in ("1|1", "|", "0|1"):
+            script = self.plan(preflight_text().replace("pf_autoupdate\t0|0", f"pf_autoupdate\t{value}"))
+            self.assertIn("defaults write /Library/Preferences/com.apple.SoftwareUpdate "
+                          "AutomaticallyInstallMacOSUpdates -bool false", script)
+            self.assertIn("AutomaticDownload -bool false", script)
+            subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        self.assertNotIn("SoftwareUpdate", self.plan(preflight_text()) or "")  # already off: nothing to do
 
     def test_homebrew_owner_is_validated(self) -> None:
         with self.assertRaises(mf.Failure):
