@@ -88,6 +88,9 @@ class Family:
     files: bool = False  # top-level regular files are candidates too
     min_bytes: int | None = None  # size floor for this family instead of --min-mib
     git_disposable: bool = False  # a checkout that loses nothing when deleted is reclaimable
+    owner: str = ""  # who writes it, so a cache nobody owns any more is visible
+    owner_job: str = ""  # launchd service of that owner (e.g. system/ai.x.worker); unloaded = retired
+    rebuild_minutes: float = 10.0  # rough cost of losing it; cheaper items go first under pressure
 
 
 WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
@@ -124,19 +127,21 @@ def default_families() -> list[Family]:
     wt_roots = worktree_roots(projects)
     fams = [
         Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
-               "next xcodebuild rebuilds it"),
+               "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15),
         Family("claude-scratchpad", tmp / f"claude-{uid}", True,
                "session scratch space; the session is idle", depth=2,
-               skip=("bundled-skills", "bash-edit-diff")),
+               skip=("bundled-skills", "bash-edit-diff"), owner="Claude sessions", rebuild_minutes=0.5),
         Family("tmp", tmp, True, "agent scratch under the temp dir",
                skip=(f"claude-{uid}",), files=True,
-               min_bytes=1024**2 if tmpfs else None, git_disposable=True),
+               min_bytes=1024**2 if tmpfs else None, git_disposable=True, owner="agents and tools",
+               rebuild_minutes=0.5),
         # cmux's cloud reload and CI jobs keep warm trees per unit (reload-cloud/{cmux-base,work},
         # reload-cloud-ios/{DerivedData,work}); a build mini grew 36 GiB here within hours. Depth 2
         # so a unit's DerivedData can go (see derived_data) while the clones below cmux-base and work
         # stay protected; hq's cleanup-host.sh ages those out.
         Family("cmux-job-cache", HOME / ".cache/cmux-job", True,
-               "next cmux reload or CI job rebuilds it (cold)", depth=2, git_disposable=True),
+               "next cmux reload or CI job rebuilds it (cold)", depth=2, git_disposable=True,
+               owner="cmuxterm-hq reload-cloud scripts", rebuild_minutes=30),
         Family("user-cache", HOME / ".cache", False, "tool caches (report only)", skip=("cmux-job",)),
         Family("library-caches", HOME / "Library/Caches", False, "app caches (report only)"),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
@@ -144,6 +149,11 @@ def default_families() -> list[Family]:
         Family("projects", projects, False, "checkouts (report only)",
                skip=tuple(r.name for r in wt_roots)),
     ]
+    # The retiring hq build worker's shared cache: visible with its owner, never deleted here. When the
+    # worker is unloaded the report says so, since other tools may still read parts of it (2026-09-24).
+    fams.append(Family("hq-build-fleet-cache", Path("/Users/Shared/cmux-build-fleet/cache"), False,
+                       "report only: the hq build worker's shared cache", owner="cmux build worker (hq)",
+                       owner_job="system/ai.manaflow.cmux-build-worker"))
     for root in wt_roots:
         fams.append(Family("worktrees", root, False,
                            "run glaeda-worktree-reclaim-all (report only)"))
@@ -610,6 +620,53 @@ def _children(path: Path) -> list[Path]:
         return []
 
 
+def owner_retired(fam: Family) -> bool:
+    """True when the family names its owner's launchd service and that service is not loaded."""
+    if not fam.owner_job or not DARWIN:
+        return False
+    try:
+        return subprocess.run(["launchctl", "print", fam.owner_job], capture_output=True,
+                              timeout=10).returncode != 0
+    except (OSError, subprocess.SubprocessError):
+        return False  # unknown: say nothing rather than call a live owner retired
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # someone else's live process
+    return True
+
+
+def cmux_active(path: Path, levels: int = 2) -> bool:
+    """cmuxterm-hq's reload-cloud marks a slot in use with <slot>/.cmux-active/pid while a job runs
+    (lib/cloud-slot-runtime.sh). A live pid there, at or up to `levels` below path, means in use.
+    An unreadable marker counts as live (fail closed)."""
+    level = [path]
+    for _ in range(levels + 1):
+        nxt: list[Path] = []
+        for d in level:
+            marker = d / ".cmux-active" / "pid"
+            if marker.exists():
+                try:
+                    if _pid_alive(int(marker.read_text().split()[0])):
+                        return True
+                except (OSError, ValueError, IndexError):
+                    return True
+            nxt += [c for c in _children(d) if c.is_dir() and not c.is_symlink() and c.name != ".cmux-active"]
+        level = nxt[:500]
+    return False
+
+
+def value(item: "Item", fam: Family) -> float:
+    """Deletion order under pressure: space freed per minute of rebuild, favouring what has sat idle
+    longest (a tree untouched for days is less likely to be read again)."""
+    return item.bytes * (1 + item.idle_hours / 24) / max(fam.rebuild_minutes, 0.1)
+
+
 def holds_socket(path: Path, levels: int = 2, budget: int = 3000) -> bool:
     """True when a Unix socket sits up to `levels` below path (tmux, ssh-agent, X11, IDE servers).
 
@@ -747,6 +804,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence) -> list[Item]:
             reasons.append("claude session active")
         if fam.reclaimable and holds_socket(path):
             reasons.append("holds a socket")
+        if fam.reclaimable and cmux_active(path):
+            reasons.append("a cmux reload job holds it (.cmux-active)")
         if not fam.reclaimable:
             verdict = "report-only"
         elif reasons:
@@ -862,7 +921,7 @@ def gib(n: int) -> str:
 
 
 def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
-           notes: dict[str, str] | None = None) -> None:
+           notes: dict[str, str] | None = None, fams: dict[str, Family] | None = None) -> None:
     for fs in fss:
         print(f"free {gib(fs.free).strip()} of {gib(fs.total).strip()} "
               f"({100 * fs.free / max(fs.total, 1):.0f}%) on {fs.mount}, pressure below "
@@ -876,6 +935,9 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
     for fam, n in sorted(by_fam.items(), key=lambda kv: -kv[1]):
         r = sum(i.bytes for i in items if i.family == fam and i.verdict == "reclaimable")
         note = f"  ({notes[fam]})" if notes and fam in notes else ""
+        f = (fams or {}).get(fam)
+        if f and f.owner:
+            note += f"  owner: {f.owner}" + (" (RETIRED: its service is not loaded)" if owner_retired(f) else "")
         print(f"  {gib(n)}  {fam:20s}  reclaimable {gib(r).strip()}{note}")
     print(f"\ntop {limit}")
     for i in items[:limit]:
@@ -925,7 +987,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     except NoEvidence as e:
         print(f"refusing to delete anything: {e}", file=sys.stderr)
         return 0
-    for i in items:
+    # cheapest loss per byte first, not simply largest first
+    for i in sorted(items, key=lambda i: value(i, families[i.family]), reverse=True):
         if i.verdict != "reclaimable":
             continue
         p = Path(i.path)
@@ -937,7 +1000,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             if dev not in targets or free_bytes(p.parent)[0] >= targets[dev]:
                 continue
         # fresh re-observation right before the destructive step
-        if in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p):
+        if in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or cmux_active(p):
             outcome = "changed:in-use"
         elif (time.time() - newest_mtime(p)) / 3600 < idle_hours:
             outcome = "changed:modified"
@@ -1212,10 +1275,12 @@ def main(argv: list[str] | None = None) -> int:
     if a.json:
         print(json.dumps({"free": shown[0].free, "total": shown[0].total, "idle_hours": idle,
                           "filesystems": [asdict(fs) for fs in shown],
+                          "owners": {f.id: {"owner": f.owner, "retired": owner_retired(f)}
+                                     for f in fams if f.owner},
                           "items": [asdict(i) for i in items]}, indent=2))
     else:
         report(items, shown, a.top, idle,
-               {f.id: f.rebuild for f in fams if f.id == "cargo-target"})
+               {f.id: f.rebuild for f in fams if f.id == "cargo-target"}, {f.id: f for f in fams})
     if a.apply:
         print()
         apply(items, {f.id: f for f in fams}, a.receipt,

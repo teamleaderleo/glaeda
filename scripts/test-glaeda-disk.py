@@ -205,6 +205,34 @@ class GlaedaDiskTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             gd.space("lots", 1000)
 
+    def test_cmux_active_marker_holds_a_slot(self) -> None:
+        slot = self.root / "work/slot-1"
+        (slot / ".cmux-active").mkdir(parents=True)
+        self.assertFalse(gd.cmux_active(self.root / "work"))  # marker dir, no pid yet
+        (slot / ".cmux-active/pid").write_text(f"{os.getpid()}\n")
+        self.assertTrue(gd.cmux_active(self.root / "work"))  # live pid one level down
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        (slot / ".cmux-active/pid").write_text(str(dead.pid))
+        self.assertFalse(gd.cmux_active(self.root / "work"))
+        (slot / ".cmux-active/pid").write_text("garbage")
+        self.assertTrue(gd.cmux_active(self.root / "work"))  # unreadable: fail closed
+
+    def test_pressure_deletes_cheapest_loss_first(self) -> None:
+        dd = gd.Family("xcode-derived-data", self.root, True, "x", rebuild_minutes=15)
+        scratch = gd.Family("claude-scratchpad", self.root, True, "x", rebuild_minutes=0.5)
+        big = gd.Item("xcode-derived-data", "/a", 20 * gd.GIB, 30.0, "reclaimable")
+        small = gd.Item("claude-scratchpad", "/b", 2 * gd.GIB, 7.0, "reclaimable")
+        self.assertGreater(gd.value(small, scratch), gd.value(big, dd))
+        stale = gd.replace(big, idle_hours=24 * 7)
+        self.assertGreater(gd.value(stale, dd), gd.value(big, dd))  # long idle ranks higher
+
+    @unittest.skipUnless(sys.platform == "darwin", "launchd")
+    def test_owner_retired_needs_a_named_unloaded_service(self) -> None:
+        self.assertFalse(gd.owner_retired(gd.Family("x", self.root, False, "", owner="someone")))
+        gone = gd.Family("x", self.root, False, "", owner="someone", owner_job="system/com.example.glaeda-none")
+        self.assertTrue(gd.owner_retired(gone))
+
     def test_pressure_waits_for_a_ci_job_until_the_emergency_floor(self) -> None:
         job = "/Users/cmux/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 148 151"
         self.assertTrue(gd.CI_WORKER.search(job))
