@@ -369,7 +369,7 @@ def resolve_release(ctx: Context) -> dict[str, Any]:
 
 def lookup_runner(ctx: Context) -> tuple[bool, dict[str, Any] | None]:
     """(query succeeded, runner with ctx.name or None). A failed query is not "absent"."""
-    # filtered by name: an org lists every repo's and hosted scale set's runners, far past one page
+    # filtered by name: an org's list (hosted scale sets included) runs far past one page
     doc = gh_json(ctx, f"{ctx.scope_api}/actions/runners?name={urllib.parse.quote(ctx.name)}&per_page=100")
     if not isinstance(doc, dict) or not isinstance(doc.get("runners"), list):
         return False, None

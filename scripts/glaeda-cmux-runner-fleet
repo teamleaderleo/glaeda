@@ -137,6 +137,34 @@ def mint(scope: str, kind: str = "registration-token") -> str | None:
     return token if code == 0 and TOKEN_RE.fullmatch(token) else None
 
 
+def group_refusal(org: str, group: str, repo: str | None) -> str | None:
+    """Why the org runner group cannot take the migration, or None. Checked before any member is touched."""
+    code, out, _ = run(["gh", "api", f"orgs/{org}/actions/runner-groups?per_page=100"], 60)
+    try:
+        groups = [g for g in json.loads(out).get("runner_groups", []) if g.get("name") == group]
+    except (ValueError, AttributeError):
+        return f"cannot list {org}'s runner groups (gh exit {code}; org admin needed)"
+    if not groups:
+        return f"{org} has no runner group named {group!r}"
+    found = groups[0]
+    if not repo:
+        return None
+    code, out, _ = run(["gh", "api", f"repos/{repo}", "--jq", ".private"], 60)
+    if out.strip() == "false" and not found.get("allows_public_repositories"):
+        return f"runner group {group!r} does not allow public repositories, and {repo} is public"
+    if found.get("visibility") == "all":
+        return None
+    if found.get("visibility") == "private" and out.strip() == "true":
+        return None
+    code, out, _ = run(["gh", "api", "--paginate", f"orgs/{org}/actions/runner-groups/{found.get('id')}/repositories"
+                        "?per_page=100", "--jq", ".repositories[].full_name"], 60)
+    if code != 0:
+        return f"cannot list the repositories of runner group {group!r}"
+    if repo.lower() not in {line.strip().lower() for line in out.splitlines()}:
+        return f"runner group {group!r} does not allow {repo}; add it before moving its runners"
+    return None
+
+
 def stage(member: str, manifest: dict[str, Any], scratch: Path) -> str | None:
     """Copy the scripts and the member's trimmed manifest. Returns why it failed, or None."""
     local = scratch / f"{member}.manifest.json"
@@ -151,28 +179,67 @@ def stage(member: str, manifest: dict[str, Any], scratch: Path) -> str | None:
     return None if code == 0 else f"scp: {err.strip()[-200:]}"
 
 
+def _uninstall_cmd(member: str, instance: int, apply: bool) -> str:
+    return (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --uninstall {'--apply --token-stdin ' if apply else ''}"
+            f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --instance {instance} --output json")
+
+
+def _failed_note(out: str, err: str, code: int) -> str:
+    try:
+        notes = [f"{a.get('kind')}: {a.get('note') or a.get('state')}" for a in json.loads(out).get("actions", [])
+                 if isinstance(a, dict) and a.get("state") in ("failed", "blocked")]
+    except (ValueError, AttributeError):
+        notes = []
+    return "; ".join(notes)[-200:] or f"exit {code}: {(err or out).strip()[-200:]}"
+
+
+def registered_scope(member: str, instance: int) -> tuple[str | None, str | None]:
+    """(scope the instance is registered to, "" when none; or None and why it could not be read). Read-only:
+    the single-mini uninstall plan, which follows the instance's receipt."""
+    code, out, err = run(["ssh", *SSH_OPTIONS, member, _uninstall_cmd(member, instance, False)], CHECK_TIMEOUT_S)
+    try:
+        acts = [a for a in json.loads(out).get("actions", []) if isinstance(a, dict) and a.get("kind") == "deregister"]
+    except (ValueError, AttributeError):
+        return None, f"cannot read its registration: {_failed_note(out, err, code)}"
+    act = acts[0] if acts else {"state": "kept"}
+    if act.get("state") == "kept":
+        return "", None
+    if act.get("state") == "remove" and isinstance(act.get("scope"), str) and act["scope"]:
+        return act["scope"], None
+    return None, f"registration not recorded clearly ({act.get('note') or act.get('state')}); fix it by hand"
+
+
 def uninstall_instance(member: str, instance: int, repo: str) -> str | None:
     """Deregister one instance's repo-scoped runner. Returns why it failed, or None."""
     token = mint(scope_api(repo, None), "remove-token")
     if token is None:
         return f"no remove token for {repo} (gh admin on the repo?)"
-    remote = (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --uninstall --apply --token-stdin "
-              f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --instance {instance} --output json")
-    code, out, err = run(["ssh", *SSH_OPTIONS, member, remote], APPLY_TIMEOUT_S, stdin=token + "\n")
+    code, out, err = run(["ssh", *SSH_OPTIONS, member, _uninstall_cmd(member, instance, True)], APPLY_TIMEOUT_S,
+                         stdin=token + "\n")
     del token
-    return None if code == 0 else f"uninstall exit {code}: {(err or out).strip()[-200:]}"
+    return None if code == 0 else f"uninstall failed ({_failed_note(out, err, code)})"
 
 
 def apply_instance(member: str, instance: int, repo: str | None, extra: list[str], org: str | None = None,
                    group: str | None = None, migrate_from: str | None = None) -> dict[str, Any]:
-    if migrate_from:
-        failed = uninstall_instance(member, instance, migrate_from)
-        if failed:
-            return {"instance": instance, "exit": None, "state": failed}
+    # The registration token comes first, so a missing permission never strips a runner it cannot replace.
     token = mint(scope_api(repo, org))
     if token is None:
         return {"instance": instance, "exit": None,
-                "state": f"no registration token (gh admin on {org or repo}?)"}
+                "state": f"no registration token (gh admin on {org or repo}?); nothing changed"}
+    deregistered = None
+    if migrate_from:
+        scope, why = registered_scope(member, instance)
+        if scope is None:
+            return {"instance": instance, "exit": None, "state": f"{why}; nothing changed"}
+        if scope.lower() == migrate_from.lower():
+            failed = uninstall_instance(member, instance, migrate_from)
+            if failed:
+                return {"instance": instance, "exit": None, "state": f"{failed}; check the runner by hand"}
+            deregistered = migrate_from
+        elif scope and scope.lower() != (org or "").lower():
+            return {"instance": instance, "exit": None,
+                    "state": f"registered to {scope}, not {migrate_from} or {org}; nothing changed"}
     scope = f"--org {_quote(org)}" + (f" --group {_quote(group)}" if group else "") if org else f"--repo {_quote(repo)}"
     remote = (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --apply --token-stdin {scope} "
               f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --instance {instance} "
@@ -186,7 +253,12 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
         name = acts.get("register", {}).get("name")
     except (ValueError, TypeError, AttributeError):
         state, name = f"no receipt: {(err or out).strip()[-200:]}", None
-    return {"instance": instance, "exit": code, "state": state, "name": name}
+    result = {"instance": instance, "exit": code, "state": state, "name": name}
+    if deregistered:
+        result["deregistered"] = deregistered
+        if code != 0:  # the old runner is gone and the new one did not come up: say so loudly
+            result["state"] = f"NO RUNNER: deregistered from {deregistered}, then {state}; re-run to register"
+    return result
 
 
 def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, manifest: dict[str, Any],
@@ -226,6 +298,8 @@ def render(rows: list[dict[str, Any]], skipped: dict[str, str], applied: bool) -
     for row in rows:
         units = f"{row['runners']} runners/{row['capacityUnits']} units"
         lines.append(f"  {row['member']:<22} {row['class']:<5} {units:<20} {row['action']:<24} {row['gate']}")
+        if any(str(i.get("state", "")).startswith("NO RUNNER") for i in row.get("instances", [])):
+            lines.append(f"      {row['member']} has instances with no runner: re-run for this member")
         for inst in row.get("instances", []):
             lines.append(f"      {inst['instance']}: exit={inst['exit']} {inst['state']}  {inst.get('name') or ''}")
     for member, why in sorted(skipped.items()):
@@ -276,8 +350,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.migrate_from_repo and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+", args.migrate_from_repo):
         print("glaeda-cmux-runner-fleet: --migrate-from-repo must be OWNER/REPO", file=sys.stderr)
         return 2
+    if args.migrate_from_repo and not args.group:
+        print("glaeda-cmux-runner-fleet: --migrate-from-repo needs --group (the Default group admits every repo)",
+              file=sys.stderr)
+        return 2
     if args.migrate_from_repo:
         args.jobs = 1  # one member at a time, so the rest keep serving the old scope
+    if args.org and args.group and args.apply:
+        why = group_refusal(args.org, args.group, args.migrate_from_repo)
+        if why:
+            print(f"glaeda-cmux-runner-fleet: {why}; nothing changed", file=sys.stderr)
+            return 2
     only = [h for h in (args.hosts or "").split(",") if h] or None
     unknown = [h for h in only or [] if h not in (manifest.get("hosts") or {})]
     if unknown:

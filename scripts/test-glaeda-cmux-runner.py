@@ -702,7 +702,11 @@ class HookTest(unittest.TestCase):
             self.assertNotIn("root-", same.stdout)
             self.assertIn("1/12 units for lint-light (light", guest("lint-light", "n2").stdout)
             self.assertIn("+simulator for ui-tests-sim (simulator", guest("ui-tests-sim", "n3").stdout)
-            self.assertIn("simulator token is taken", guest("ios-simulator", "n4").stdout)
+            waited = time.monotonic()
+            busy = self.job("ios-simulator", "n4", 12, None, "--allowed-repo", "manaflow-ai/newapp",
+                            "--guest-wait", "3", env=env)
+            self.assertIn("simulator token is taken", busy.stdout)
+            self.assertGreaterEqual(time.monotonic() - waited, 3, "a guest waits for room before it is refused")
         finally:
             for runner in ("h0", "n0", "n1", "n2", "n3", "n4"):
                 self.finish(runner)

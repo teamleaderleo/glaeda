@@ -353,7 +353,13 @@ the pools, register them at org scope into a runner group and allow that reposit
 2. `glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis --migrate-from-repo manaflow-ai/cmux`
    deregisters each member's repo runners and registers them in the group, one member at a time, so
    the other members keep taking cmux jobs. Members with a trusted-only runner (2e) are skipped and
-   stay on their repository.
+   stay on their repository. Before touching any member it checks that the group exists and allows
+   the repository, and it mints each registration token before deregistering, so a missing
+   permission changes nothing. Each instance's receipt decides what happens: already in the org, it
+   is only re-applied; registered elsewhere, it is left alone. Re-running after a partial migration is
+   safe, and an instance deregistered but not re-registered reports `NO RUNNER`. Run it when the pool
+   is quiet: deregistering stops a job that is running on that member, and the runner directory
+   (with `_work`) is recreated, so each instance's first jobs afterwards are cold.
 3. Adding a later repository is only a group edit:
    `gh api -X PUT orgs/manaflow-ai/actions/runner-groups/GROUP_ID/repositories/REPO_ID`.
 
@@ -361,9 +367,12 @@ At org scope the hook admits any repository of the org (`--allowed-owner`) under
 and disk rules. Job ids in the hook's table are cmux's (`--home-repo`, default `manaflow-ai/cmux`); a
 guest repository's job never takes a canonical root or the persistent-DerivedData token, whatever its
 id. It costs 2 units (isolated), or 1 unit when its id ends in `-light`, or 2 units plus the one
-simulator token when its id ends in `-sim` or `simulator`. Guests share the runner user's `$HOME` and
-`/Users/Shared/cmux-build-fleet`, so they get the same trust as cmux PRs: members of the org only, no
-secrets on these hosts.
+simulator token when its id ends in `-sim` or `simulator`. A repository the hook cannot identify is a
+guest. cmux jobs are refused at once when a mini is full (its rescue workflow reroutes them); a guest
+has no rescue, so it waits up to `--guest-wait` (600 s) for room before it is refused. Guests share
+the runner user's `$HOME` and `/Users/Shared/cmux-build-fleet`, so the trust boundary is anyone who
+can push a branch to any repository in the group (outside collaborators and bots such as Dependabot
+included), and these hosts hold no secrets.
 
 ## 2f. Canonical roots
 

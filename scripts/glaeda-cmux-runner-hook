@@ -115,9 +115,18 @@ CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
 DEFAULT_HOME_REPO = "manaflow-ai/cmux"
 
 
-def job_class(job: str, repo: str | None = None, home_repo: str = DEFAULT_HOME_REPO) -> tuple[str, bool]:
+GUEST_WAIT_S = 600.0  # guests have no rescue workflow: a full mini holds their job this long before refusing
+GUEST_POLL_S = 5.0
+
+
+def is_guest(repo: str | None, home_repo: str = DEFAULT_HOME_REPO) -> bool:
+    """An unknown repository is a guest: the safe side, since a guest never takes cmux's roots."""
+    return not repo or repo.lower() != home_repo.lower()
+
+
+def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO) -> tuple[str, bool]:
     """The job's class and whether it is pinned to /private/tmp/cmux-ci (an unknown job of the home repo)."""
-    if repo and repo.lower() != home_repo.lower():
+    if is_guest(repo, home_repo):
         name = job.lower()
         if name.endswith("-sim") or name.endswith("simulator"):
             return "simulator", False
@@ -632,8 +641,8 @@ def holder_pids(state_dir: Path) -> set[int]:
 
 
 def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watch_pid: int,
-                  state_dir: Path, compile_slots: int = 1, roots: int = 1, repo: str | None = None,
-                  home_repo: str = DEFAULT_HOME_REPO) -> tuple[bool, str]:
+                  state_dir: Path, compile_slots: int = 1, roots: int = 1,
+                  repo: str | None = DEFAULT_HOME_REPO, home_repo: str = DEFAULT_HOME_REPO) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
     takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
@@ -1189,6 +1198,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--allowed-owner")
     p.add_argument("--home-repo", default=DEFAULT_HOME_REPO,
                    help="the repository whose job ids JOB_CLASSES names; other repos are guests (see job_class)")
+    p.add_argument("--guest-wait", type=float, default=GUEST_WAIT_S,
+                   help="seconds a guest job waits for room on a full mini before it is refused")
     p.add_argument("--allow-event", action="append", default=[],
                    help="admit another event name (pull_request_target is always refused)")
     p.add_argument("--trusted-ref", help="admit only push and schedule jobs on this ref (needs --trusted-repo)")
@@ -1257,10 +1268,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.capacity_units > 0:
             roots_file(args.state_dir).unlink(missing_ok=True)  # a crashed job's record must not look held
             ensure_root_shim(Path(FLEET_DIR) / "bin")
-            held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
-                                       os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
-                                       args.state_dir, args.compile_slots, args.canonical_roots,
-                                       os.environ.get("GITHUB_REPOSITORY"), args.home_repo)
+            # the repository decide() admitted: the runner's variable, else the event payload's
+            repo = os.environ.get("GITHUB_REPOSITORY") or _repo_name((event or {}).get("repository")
+                                                                     if isinstance(event, dict) else None)
+            deadline = time.monotonic() + (args.guest_wait if is_guest(repo, args.home_repo) else 0)
+            while True:
+                held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
+                                           os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
+                                           args.state_dir, args.compile_slots, args.canonical_roots,
+                                           repo, args.home_repo)
+                # cmux refuses fast (its rescue workflow reroutes); a guest has none, so it waits for room
+                if held or not note.startswith("capacity:") or time.monotonic() >= deadline:
+                    break
+                time.sleep(GUEST_POLL_S)
         else:
             held, note = take_host_lock(args.host_lock, args.watch_pid or os.getppid(), args.state_dir)
         if not held:

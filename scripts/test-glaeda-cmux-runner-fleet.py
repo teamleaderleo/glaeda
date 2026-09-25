@@ -42,6 +42,15 @@ if " check " in remote:
     if host in os.environ.get("FAKE_ELIGIBLE", "").split(","):
         print("glaeda-cmux-runner-hook: eligible"); sys.exit(0)
     print("glaeda-cmux-runner-hook: refused: node not eligible (no Glaeda enrollment on this mini)"); sys.exit(1)
+if "--uninstall" in remote and "--apply" not in remote:
+    k = remote.split("--instance ")[1].split()[0]
+    scopes = dict(x.split("=") for x in os.environ.get("FAKE_SCOPES", "").split(",") if x)
+    scope = scopes.get(host + ":" + k, scopes.get(host, "manaflow-ai/cmux"))
+    print(json.dumps({{"actions": [{{"kind": "deregister", "state": "remove" if scope else "kept", "scope": scope}}]}}))
+    sys.exit(0)
+if "--apply" in remote and "--uninstall" not in remote and host in os.environ.get("FAKE_REGISTER_FAILS", "").split(","):
+    print(json.dumps({{"actions": [{{"kind": "register", "state": "failed"}}, {{"kind": "verify", "state": "skipped"}}]}}))
+    sys.exit(1)
 if "--apply" in remote:
     time.sleep(float(os.environ.get("FAKE_APPLY_S", "0")))
     k = remote.split("--instance ")[1].split()[0]
@@ -63,8 +72,20 @@ if dest.endswith("mini-fleet.json"):
 FAKE_GH = """#!{python}
 import json, os, sys
 open(os.environ["FAKE_LOG"], "a").write(json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n")
-print("{token}")
+path = next((a for a in sys.argv[2:] if "/" in a and not a.startswith("-")), "")
+if path.startswith("orgs/") and path.endswith("runner-groups?per_page=100"):
+    groups = json.loads(os.environ.get("FAKE_GROUPS", "[]"))
+    print(json.dumps({{"runner_groups": groups}}))
+elif "/repositories" in path:
+    print(os.environ.get("FAKE_GROUP_REPOS", "manaflow-ai/cmux").replace(",", "\\n"))
+elif path.startswith("repos/") and path.count("/") == 2:
+    print("false")
+elif path.startswith("orgs/") and path.endswith("registration-token") and os.environ.get("FAKE_NO_ORG_TOKEN"):
+    sys.exit(1)
+else:
+    print("{token}")
 """
+GROUP = json.dumps([{"id": 7, "name": "glaeda-minis", "visibility": "selected", "allows_public_repositories": True}])
 
 
 class FleetTest(unittest.TestCase):
@@ -138,22 +159,49 @@ class FleetTest(unittest.TestCase):
                                            "trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"}}}
         self.manifest.write_text(json.dumps(manifest))
         result = self.fleet("--apply", "--org", "manaflow-ai", "--group", "glaeda-minis",
-                            "--migrate-from-repo", "manaflow-ai/cmux", FAKE_ELIGIBLE="mini-a,mini-b,mini-t")
+                            "--migrate-from-repo", "manaflow-ai/cmux", FAKE_ELIGIBLE="mini-a,mini-b,mini-t",
+                            FAKE_GROUPS=GROUP, FAKE_SCOPES="mini-b:1=manaflow-ai,mini-b:2=")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = {r["member"]: r for r in json.loads(result.stdout)["members"]}
         self.assertIn("trusted-only runner stays on manaflow-ai/cmux", rows["mini-t"]["action"])
         calls = self.calls()
-        gh = [c["argv"][3] for c in calls if c["tool"] == "gh"]
-        self.assertEqual(gh.count("repos/manaflow-ai/cmux/actions/runners/remove-token"), 8)
+        gh = [c["argv"][3] for c in calls if c["tool"] == "gh" and len(c["argv"]) > 3]
+        # mini-b instance 1 already moved and instance 2 has no registration: only 6 deregistrations
+        self.assertEqual(gh.count("repos/manaflow-ai/cmux/actions/runners/remove-token"), 6)
         self.assertEqual(gh.count("orgs/manaflow-ai/actions/runners/registration-token"), 8)
         ssh = [c for c in calls if c["tool"] == "ssh" and "--apply" in c["remote"]]
         self.assertNotIn("mini-t", {c["host"] for c in ssh})
         registers = [c for c in ssh if "--uninstall" not in c["remote"]]
+        self.assertEqual(len(registers), 8)
         self.assertTrue(all("--org manaflow-ai --group glaeda-minis" in c["remote"] for c in registers))
         # one member at a time: every mini-a call happens before any mini-b call
         hosts = [c["host"] for c in ssh]
         self.assertEqual(hosts, sorted(hosts), "members migrate one after another")
         self.assertNotIn(TOKEN, json.dumps([c.get("argv", c.get("remote")) for c in calls]), "token only on stdin")
+
+    def test_migration_touches_nothing_without_a_usable_group_or_token(self) -> None:
+        args = ("--apply", "--org", "manaflow-ai", "--group", "glaeda-minis", "--migrate-from-repo", "manaflow-ai/cmux")
+        missing = self.fleet(*args, FAKE_GROUPS="[]")
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("no runner group named", missing.stderr)
+        closed = self.fleet(*args, FAKE_GROUPS=GROUP, FAKE_GROUP_REPOS="manaflow-ai/other")
+        self.assertEqual(closed.returncode, 2)
+        self.assertIn("does not allow manaflow-ai/cmux", closed.stderr)
+        self.assertEqual(self.fleet("--apply", "--org", "manaflow-ai", "--migrate-from-repo",
+                                    "manaflow-ai/cmux").returncode, 2, "migration needs a group")
+        self.assertFalse(any(c["tool"] == "ssh" and "--apply" in c["remote"] for c in self.calls()))
+        notoken = self.fleet(*args, FAKE_GROUPS=GROUP, FAKE_NO_ORG_TOKEN="1")
+        self.assertEqual(notoken.returncode, 1)
+        self.assertIn("nothing changed", notoken.stdout)
+        self.assertFalse(any(c["tool"] == "ssh" and "--uninstall" in c["remote"] for c in self.calls()))
+
+    def test_failed_registration_after_deregistering_says_no_runner(self) -> None:
+        result = self.fleet("--apply", "--org", "manaflow-ai", "--group", "glaeda-minis", "--hosts", "mini-a",
+                            "--migrate-from-repo", "manaflow-ai/cmux", FAKE_GROUPS=GROUP, FAKE_REGISTER_FAILS="mini-a")
+        self.assertEqual(result.returncode, 1)
+        rows = {r["member"]: r for r in json.loads(result.stdout)["members"]}
+        self.assertTrue(all(i["state"].startswith("NO RUNNER: deregistered from manaflow-ai/cmux")
+                            for i in rows["mini-a"]["instances"]))
 
     def test_group_needs_org(self) -> None:
         result = self.fleet("--group", "glaeda-minis")
