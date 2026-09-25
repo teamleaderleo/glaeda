@@ -52,9 +52,10 @@ pr --until green|done` therefore stops with exit 4 as soon as the daemon's cache
 --until merged keeps waiting. UNKNOWN mergeability (GitHub computes it lazily) counts as pending.
 
 A job a glaeda runner refused (its "Set up runner" step, the runner's job-started hook, failed
-within two minutes) is usually re-run elsewhere by the repository's own rescue. `wait` holds such
-a failure as pending for --rescue-grace seconds (default 360) and follows the next attempt; a
-failure with any other cause decides at once.
+within six minutes; a GUI job may wait up to four for the gui token first) is usually re-run
+elsewhere by the repository's own rescue. `wait` holds such a failure as pending for
+--rescue-grace seconds (default 360) and follows the next attempt; a failure with any other
+cause decides at once.
 
 State lives in ~/.cache/glaeda/gh (GLAEDA_GH_DIR overrides): watch/, cache/, budget.json,
 daemon.json (a heartbeat and the last hour's request counts) and daemon.lock, which the daemon
@@ -106,7 +107,8 @@ RUN_OK = {"success", "neutral", "skipped"}
 # The runner's job-started hook shows as this step. glaeda's hook fails it when the host refuses the
 # job (busy, draining); the repository's rescue (cmux: owned_pool_rescue.py) then re-runs the job.
 HOOK_STEP = "Set up runner"
-REFUSAL_SECONDS = 120  # a refusal fails at job start; a job that ran longer failed for real
+# a refusal fails at job start, after up to 240 s waiting for the gui token (cmux owned_pool_rescue's window)
+REFUSAL_SECONDS = 360
 RESCUE_GRACE = 360  # how long a refused attempt stays pending while a rescue re-run may follow
 GLAEDA_RUNNER = re.compile(r"(?:^|-)glaeda(?:-|$)")
 COMMENTS_LAST = 50  # comments per issue per read: more than this within one 15 s cycle are missed
