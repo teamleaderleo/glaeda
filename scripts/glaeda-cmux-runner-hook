@@ -194,7 +194,7 @@ CANONICAL_ROOT_ENV = "CMUX_CI_CANONICAL_ROOT"
 ROOT_CONSUMERS = ("gui", "product")
 # Producers whose admission root sits in a holder of its own (root_holder_file), so a step can swap it for the
 # root of a product the job reuses instead of compiling (glaeda-canonical-root take ROOT --switch): the old
-# root is let go before the new one is waited for, so the job never holds two roots.
+# root is let go once the new one is held, so a switch that times out leaves the job on its old root.
 ROOT_SWITCHERS = ("compile-gui",)
 TAKE_ROOT_POLL_S = 1.0
 # glaeda-canonical-root take-gui: a job takes the gui token only for the steps that use the console session.
@@ -699,11 +699,11 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
     if not ok:
         print(f"{PREFIX}: take-root: {note}", file=sys.stderr)
         return 1
-    if held:  # a switch: ROOT is held, so the old roots can go
-        for old in held:
-            release_holder(root_holder_file(state_dir, old))
+    if held:  # a switch: ROOT is held, so the old roots can go, after the record stops naming them
         with contextlib.suppress(OSError):
             roots_file(state_dir).write_text(name + "\n")
+        for old in held:
+            release_holder(root_holder_file(state_dir, old))
         print(f"{PREFIX}: take-root: let go of {', '.join(held)}; {export_root(name)}", file=sys.stderr)
     else:
         with contextlib.suppress(OSError), open(roots_file(state_dir), "a", encoding="utf-8") as record:
