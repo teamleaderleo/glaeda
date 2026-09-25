@@ -1,7 +1,8 @@
 name: Promote
 
-# Moves stable to the canary release once it has soaked and canary hosts reported healthy
-# (commit statuses glaeda-ota/<host> on its source commit). stable.json has this one writer.
+# Moves stable to the newest release that has soaked, that canary hosts reported healthy on
+# (commit statuses glaeda-ota/<host>) and that descends from stable. stable.json has this one
+# writer. Canary hosts also dispatch this after each run, since GitHub's cron can lag for hours.
 # docs/GLAEDA_OTA.md
 
 on:
@@ -30,27 +31,51 @@ jobs:
         with:
           persist-credentials: false
           show-progress: false
-      - name: Promote if healthy
+          fetch-depth: 0  # stable only moves forward: the ancestry check needs history
+      - name: Promote the newest healthy soaked release
+        env:
+          SOAK_HOURS: "6"
         run: |
           mkdir -p channels
-          if ! gh release download ota-channels --pattern canary.json --dir channels 2>channels/err; then
-            if grep -q -e "no assets match" -e "release not found" channels/err; then
-              echo "no canary yet" >> "$GITHUB_STEP_SUMMARY"; exit 0
-            fi
-            cat channels/err; exit 1
-          fi
           stable=()
+          stable_tag=""
+          stable_source=""
           if gh release download ota-channels --pattern stable.json --dir channels 2>channels/err; then
             stable=(--stable channels/stable.json)
-          elif ! grep -q "no assets match" channels/err; then
+            stable_tag=$(python3 -c 'import json;print(json.load(open("channels/stable.json"))["tag"])')
+            stable_source=$(python3 -c 'import json;print(json.load(open("channels/stable.json"))["source"])')
+          elif ! grep -q -e "no assets match" -e "release not found" channels/err; then
             cat channels/err; exit 1
           fi
-          source=$(python3 -c 'import json;print(json.load(open("channels/canary.json"))["source"])')
-          # newest first; one page holds every canary host's latest status
-          gh api "repos/$GH_REPO/commits/$source/statuses?per_page=100" > channels/statuses.json
+          # releases newest first; only those past the soak can be promoted, so only they cost API calls
+          cutoff=$(( $(date +%s) - SOAK_HOURS * 3600 ))
+          gh release list --limit 40 --json tagName,createdAt \
+            --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | "\(.tagName) \(.createdAt)"' \
+            > channels/releases.txt
+          : > channels/candidates.jsonl
+          considered=0
+          while read -r tag created; do
+            [ "$(date -d "$created" +%s)" -le "$cutoff" ] || continue
+            gh release download "$tag" --pattern release.json --output channels/release.json --clobber
+            source=$(python3 -c 'import json;print(json.load(open("channels/release.json"))["source"])')
+            # newest first; one page holds every canary host's latest status
+            gh api "repos/$GH_REPO/commits/$source/statuses?per_page=100" > channels/statuses.json
+            descends=true
+            if [ -n "$stable_source" ]; then
+              set +e
+              git merge-base --is-ancestor "$stable_source" "$source"
+              code=$?
+              set -e
+              case "$code" in 0) ;; 1) descends=false ;; *) echo "stable $stable_source is not in main's history" >&2; exit 1 ;; esac
+            fi
+            python3 scripts/glaeda_release.py candidate --release channels/release.json --published "$created" \
+              --statuses channels/statuses.json --descends "$descends" >> channels/candidates.jsonl
+            considered=$((considered + 1))
+            if [ "$tag" = "$stable_tag" ] || [ "$considered" -ge 10 ]; then break; fi
+          done < channels/releases.txt
           set +e
-          python3 scripts/glaeda_release.py promote --canary channels/canary.json "${stable[@]}" \
-            --statuses channels/statuses.json > channels/next.json 2> channels/why.txt
+          python3 scripts/glaeda_release.py promote --candidates channels/candidates.jsonl "${stable[@]}" \
+            --soak-hours "$SOAK_HOURS" > channels/next.json 2> channels/why.txt
           code=$?
           set -e
           cat channels/why.txt >> "$GITHUB_STEP_SUMMARY"

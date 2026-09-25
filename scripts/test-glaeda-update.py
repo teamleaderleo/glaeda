@@ -290,21 +290,47 @@ class ReleaseTest(unittest.TestCase):
         self.assertFalse(gr.promotion(self.canary(), {**self.canary(), "ring": "stable"}, ok, self.NOW)[0])
         self.assertEqual(gr.promotion(None, None, ok, self.NOW), (False, "no canary release"))
 
-    def test_cli_promote_writes_stable_or_exits_3(self) -> None:
+    def entry(self, letter: str, published: str) -> dict:
+        return {**self.canary(published), "tag": "r-20260925-" + letter * 12, "source": letter * 40}
+
+    def test_choose_takes_the_newest_soaked_healthy_release_not_only_the_canary(self) -> None:
+        ok = [self.status("air-blue", "success", "2026-09-25T01:00:00Z")]
+        bad = [self.status("big-red", "failure", "2026-09-25T01:00:00Z")]
+        old = {"entry": self.entry("a", "2026-09-25T01:00:00Z"), "statuses": ok, "descendsFromStable": True}
+        mid = {"entry": self.entry("b", "2026-09-25T04:00:00Z"), "statuses": bad, "descendsFromStable": True}
+        new = {"entry": self.entry("c", "2026-09-25T10:00:00Z"), "statuses": ok, "descendsFromStable": True}
+        # c is still soaking and b failed on a canary: a, the newest that passes, is promoted
+        chosen, why = gr.choose([new, mid, old], None, self.NOW)
+        self.assertEqual(chosen["tag"], old["entry"]["tag"], why)
+        # nothing older than stable is considered, and never a release off stable's line
+        stable = {**old["entry"], "ring": "stable"}
+        self.assertIsNone(gr.choose([new, mid, old], stable, self.NOW)[0])
+        side = {**mid, "statuses": ok, "descendsFromStable": False}
+        self.assertIsNone(gr.choose([side, old], stable, self.NOW)[0])
+        self.assertEqual(gr.choose([], None, self.NOW), (None, "no releases"))
+
+    def test_cli_candidate_then_promote(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            canary, statuses = Path(tmp) / "canary.json", Path(tmp) / "statuses.json"
-            canary.write_bytes(gr.canonical(self.canary()))
-            statuses.write_text(json.dumps([]))
-            args = ["promote", "--canary", str(canary), "--statuses", str(statuses), "--soak-hours", "0"]
+            tmp = Path(tmp)
+            release_raw = gr.canonical(gr.release_manifest("a" * 40, "r-20260925-" + "a" * 12, {"x.tar.gz": b"x"}))
+            (tmp / "release.json").write_bytes(release_raw)
+            (tmp / "statuses.json").write_text(json.dumps([self.status("air-blue", "success", "2026-09-25T01:00:00Z")]))
+            out = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(gr.main(["candidate", "--release", str(tmp / "release.json"), "--published",
+                                          "2026-09-25T00:00:00Z", "--statuses", str(tmp / "statuses.json"),
+                                          "--descends", "true"]), 0)
+            out.flush()
+            (tmp / "candidates.jsonl").write_bytes(out.buffer.getvalue())
             out = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
             with open(os.devnull, "w") as null, contextlib.redirect_stderr(null), contextlib.redirect_stdout(out):
-                self.assertEqual(gr.main(args), 3)
-                statuses.write_text(json.dumps([self.status("air-blue", "success", "2026-09-25T01:00:00Z")]))
-                self.assertEqual(gr.main(args), 0)
+                self.assertEqual(gr.main(["promote", "--candidates", str(tmp / "candidates.jsonl"),
+                                          "--soak-hours", "0"]), 0)
+                (tmp / "empty.jsonl").write_text("")
+                self.assertEqual(gr.main(["promote", "--candidates", str(tmp / "empty.jsonl")]), 3)
             out.flush()
             stable = gr.parse_channel(out.buffer.getvalue(), "stable")
-            self.assertEqual(stable["tag"], self.canary()["tag"])
-            self.assertIn("promoted", stable)
+            self.assertEqual((stable["tag"], stable["releaseSha256"]), ("r-20260925-" + "a" * 12, gr.sha256(release_raw)))
 
     def test_manifest_and_channel_round_trip(self) -> None:
         release_raw = gr.canonical(gr.release_manifest("a" * 40, "r-20260925-" + "a" * 12, {"x.tar.gz": b"data"}))
