@@ -105,7 +105,8 @@ struct Cli {
     #[arg(long)]
     gh: Option<PathBuf>,
 
-    /// Decide branches from Git alone, without asking GitHub.
+    /// Decide from Git alone, without asking GitHub whether a pull request merged: applies to
+    /// worktree work state and to --branches.
     #[arg(long, conflicts_with = "gh")]
     no_github: bool,
 

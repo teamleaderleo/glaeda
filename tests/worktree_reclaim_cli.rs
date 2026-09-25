@@ -1169,6 +1169,9 @@ fn a_merged_pull_request_finishes_a_worktree_git_alone_cannot() {
             .trim()
             .to_owned()
     };
+    // A fresh branch whose name and start point match an old merged pull request: no work yet.
+    fixture.add("reused");
+    let reused_tip = tip("reused");
     let squashed_tip = tip("squashed");
     let moved_on_merged = tip("moved-on");
     // moved-on kept working after its pull request merged: its new tip is not in the PR head.
@@ -1176,7 +1179,7 @@ fn a_merged_pull_request_finishes_a_worktree_git_alone_cannot() {
     fs::write(moved_on.join("after.txt"), "after\n").expect("write follow-up");
     git(&moved_on, &["add", "after.txt"]);
     commit(&moved_on, "follow-up after merge");
-    for name in ["squashed", "moved-on", "unmerged"] {
+    for name in ["squashed", "moved-on", "unmerged", "reused"] {
         fixture.age_by(name, 2 * 60 * 60);
     }
 
@@ -1195,6 +1198,7 @@ for arg in "$@"; do
       case "$name" in
         squashed) nodes='{{"number":1,"headRefOid":"{squashed_tip}","baseRefName":"main"}}' ;;
         moved-on) nodes='{{"number":2,"headRefOid":"{moved_on_merged}","baseRefName":"main"}}' ;;
+        reused) nodes='{{"number":3,"headRefOid":"{reused_tip}","baseRefName":"main"}}' ;;
         *) nodes='' ;;
       esac
       fields="$fields,\"$key\":{{\"nodes\":[$nodes]}}" ;;
@@ -1223,7 +1227,7 @@ printf '{{"data":{{"repository":{{"defaultBranchRef":{{"name":"main"}}%s}}}}}}' 
         entry_by_name(&fixture, &with_github, "squashed")["decision"]["decision"],
         "eligible"
     );
-    for name in ["moved-on", "unmerged"] {
+    for name in ["moved-on", "unmerged", "reused"] {
         let entry = entry_by_name(&fixture, &with_github, name);
         assert_eq!(entry["facts"]["work_state"], "in_progress", "{name}");
         assert_eq!(

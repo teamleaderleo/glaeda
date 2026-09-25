@@ -908,19 +908,17 @@ fn observe_detailed(
         ProjectBranchState::Detached => None,
     };
     let head = observation.commit().as_str().to_owned();
-    let landed = branch
-        .as_ref()
-        .is_some_and(|name| inventory.landed_tips.get(name) == Some(&head));
+    // Like the git-only test, only a worktree that made a commit of its own can be finished: a
+    // fresh branch whose name and start point match an old merged pull request did nothing yet.
+    let authored = authored_work(&git_dir);
+    let landed = authored
+        && branch
+            .as_ref()
+            .is_some_and(|name| inventory.landed_tips.get(name) == Some(&head));
     let work_state = if landed {
         WorkState::Finished
     } else {
-        observe_work_state(
-            observer,
-            &inventory.repository,
-            &head,
-            authored_work(&git_dir),
-            executor,
-        )
+        observe_work_state(observer, &inventory.repository, &head, authored, executor)
     };
 
     let facts = LinkedWorktreeFacts {
