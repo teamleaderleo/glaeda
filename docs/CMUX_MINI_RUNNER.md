@@ -133,9 +133,16 @@ What `--apply` does:
    - Every admitted job also gets a detached host sampler (`--no-telemetry`, or
      `GLAEDA_RUNNER_TELEMETRY=0` in the LaunchAgent's environment, turns it off). Every
      10 s it reads `ps` and the load average and splits the CPU between this job's
-     process tree, the other runner slots' jobs, and everything outside them. When the
+     process tree, the other runner slots' jobs, and everything outside them. It also
+     takes one second of `iostat` (host CPU busy %, the ground truth that `ps`'s decaying
+     %cpu misses for short-lived compiler processes, and disk MB/s) and counts processes
+     running and in uninterruptible wait (disk or memory). Disk MB/s sums every disk
+     iostat lists, mounted images included. Two more reasons mark a job contended: the
+     host CPU averaged 90% busy while other runner jobs and outside work held a quarter
+     of the cores, or uninterruptible waits averaged at least 4 and 30% of the cores. When the
      job ends it appends one line to `~/Library/Logs/glaeda-cmux-jobs.jsonl`
-     (`glaeda-cmux-job/v1`): load mean and max, mean cores per bucket, the top five
+     (`glaeda-cmux-job/v1`): load mean and max, host CPU busy %, disk MB/s, the run queue,
+     mean cores per bucket, the top five
      outside processes by estimated core-seconds, the other runner jobs seen, and a
      `contended` or `clear` verdict with its reasons. Processes are named by the kernel's
      executable name (`ucomm`, never argv) and user only. The log keeps its newest half past 2 MiB.

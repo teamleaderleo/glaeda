@@ -2545,6 +2545,52 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertEqual(len(log.read_text().splitlines()), 1)
         self.assertEqual(self.hook.finish_sampler(state), "no job telemetry sampler")
 
+    def test_host_io_reads_the_second_report(self) -> None:
+        out = ("              disk0              disk4       cpu\n"
+               "    KB/t  tps  MB/s     KB/t  tps  MB/s  us sy id\n"
+               "   17.34 1233 20.88    49.77    0  0.00  19  9 72\n"
+               "    9.36 7391 67.59     8.00   10  1.41  46 43 12\n")
+        done = subprocess.CompletedProcess([], 0, stdout=out, stderr="")
+        with mock.patch.object(self.hook.subprocess, "run", return_value=done):
+            self.assertEqual(self.hook.host_io(), (69.0, 88.0))
+        with mock.patch.object(self.hook.subprocess, "run", side_effect=FileNotFoundError):
+            self.assertEqual(self.hook.host_io(), (None, None), "Linux has no BSD iostat")
+        garbled = subprocess.CompletedProcess([], 0, stdout="usage: iostat\n", stderr="")
+        with mock.patch.object(self.hook.subprocess, "run", return_value=garbled):
+            self.assertEqual(self.hook.host_io(), (None, None))
+
+    def test_run_queue_counts_running_and_blocked(self) -> None:
+        done = subprocess.CompletedProcess([], 0, stdout="R+\nS\nSs\nU\nU+\nD\nZ\n", stderr="")
+        with mock.patch.object(self.hook.subprocess, "run", return_value=done):
+            self.assertEqual(self.hook.run_queue(), (1, 3))
+
+    def test_saturation_is_contention_only_when_shared(self) -> None:
+        shared = self.hook.JobSamples({}, 14, 0.0)
+        shared.add(40.0, (0.3, 6.6, 1.1, {}, {}), 10.0, (20, 0), 120.0, 98.0)
+        record = shared.summary(10.0)
+        self.assertEqual(record["verdict"], "contended")
+        self.assertIn("98% busy", record["reasons"][0])
+        self.assertEqual(record["cpu_busy_pct"], 98.0)
+        self.assertEqual(record["disk_mb_s"], {"mean": 120.0, "max": 120.0})
+
+        alone = self.hook.JobSamples({}, 14, 0.0)
+        alone.add(40.0, (12.0, 0.5, 0.5, {}, {}), 10.0, (20, 0), 120.0, 99.0)
+        self.assertEqual(alone.summary(10.0)["verdict"], "clear", "a job saturating the host by itself is clear")
+
+        waiting = self.hook.JobSamples({}, 14, 0.0)
+        waiting.add(9.0, (4.0, 0.0, 0.2, {}, {}), 10.0, (2, 6), 900.0, 40.0)
+        quiet = self.hook.JobSamples({}, 14, 0.0)
+        quiet.add(3.0, (1.0, 0.0, 0.2, {}, {}), 10.0, (2, 3), 5.0, 20.0)
+        self.assertEqual(quiet.summary(10.0)["verdict"], "clear", "an idle Mac shows a few U processes")
+        record = waiting.summary(10.0)
+        self.assertEqual(record["verdict"], "contended")
+        self.assertIn("uninterruptible wait (disk or memory), disks 900 MB/s", record["reasons"][0])
+
+        unknown = self.hook.JobSamples({}, 14, 0.0)
+        unknown.add(9.0, (4.0, 0.0, 0.2, {}, {}), 10.0)
+        record = unknown.summary(10.0)
+        self.assertEqual((record["queue"], record["disk_mb_s"], record["cpu_busy_pct"]), (None, None, None))
+
     def test_sampler_file_never_looks_like_a_lock_holder(self) -> None:
         name = self.hook.sampler_file(self.dir).name
         self.assertFalse(name.startswith(self.hook.HOLDER_FILE))
