@@ -516,6 +516,14 @@ class CatchUpTests(unittest.TestCase):
         (issue,) = self.reader(fleet_cas_text(src_cmux="missing"), pending=True)
         self.assertEqual(issue["fix"], "the next catch-up build creates it")
 
+    def test_reader_catch_up_disabled_is_info_not_drift(self) -> None:
+        text = fleet_cas_text() + "fleet_catch_up\t0\n"
+        (issue,) = self.reader(text)
+        self.assertEqual(issue["area"], "disabled")
+        self.assertIn("disabled", mf.INFO_AREAS)  # so it never counts as drift
+        self.assertIn("catch-up disabled (CMUX_CI_CATCH_UP=0", issue["detail"])
+        self.assertEqual(self.reader(fleet_cas_text() + "fleet_catch_up\t1\n"), [])
+
     def test_reader_node_not_read_only_is_drift(self) -> None:
         for mode, got in (("signing", "the node signs (--sign-key)"), ("other", "the node has neither flag"),
                           ("missing", "no xcode/run/node.args"), ("unreadable", "xcode/run/node.args is unreadable")):
