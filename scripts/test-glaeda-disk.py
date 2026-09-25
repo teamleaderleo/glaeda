@@ -664,6 +664,21 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertFalse((job / "reload-cloud-ios/DerivedData").exists())
         self.assertEqual([c.name for c in (job / "reload-cloud-ios").iterdir()], [])  # no half-deleted leftover
         self.assertTrue((base / ".git").is_dir())
+        # a delete interrupted after its rename leaves a tree nothing else will ever clean up
+        left = job / "reload-cloud-ios/.glaeda-disk-deleting-DerivedData-123"
+        (left / "slot-1/SourcePackages/checkouts/dep/.git").mkdir(parents=True)
+        (left / "slot-1/x.o").write_bytes(b"\0" * 4096)
+        for dirpath, dirnames, filenames in os.walk(left):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (old, old), follow_symlinks=False)
+        os.utime(left, (old, old))
+        saved = gd.process_evidence
+        gd.process_evidence = lambda: ([], "")
+        try:
+            again = {i.path: i.verdict for i in gd.survey(fams, 24, 0)}
+        finally:
+            gd.process_evidence = saved
+        self.assertEqual(again[str(left)], "reclaimable")
 
     def test_claude_session_seen_in_alternate_config_dir(self) -> None:
         t = self.home / ".claude-outlook/projects/-home-leo-Projects/abc-123.jsonl"

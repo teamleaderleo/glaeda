@@ -290,9 +290,14 @@ def claude_session_active(session_id: str, idle_s: float) -> bool:
     return False
 
 
+DELETING_PREFIX = ".glaeda-disk-deleting-"  # remove() renames a tree to this before deleting it
+
+
 def derived_data(fam: Family, path: Path) -> bool:
-    """Xcode DerivedData is build output even though SourcePackages inside it holds git clones."""
-    return fam.id == "xcode-derived-data" or (fam.id == "cmux-job-cache" and path.name == "DerivedData")
+    """Build output despite git inside: Xcode DerivedData (SourcePackages holds clones), and a tree
+    remove() had already renamed aside when it was interrupted, which is only ever reclaimed."""
+    return (fam.id == "xcode-derived-data" or path.name.startswith(DELETING_PREFIX)
+            or (fam.id == "cmux-job-cache" and path.name == "DerivedData"))
 
 
 REPRODUCIBLE_DIRS = frozenset({"node_modules", ".build", "DerivedData", "target", ".venv",
@@ -867,7 +872,8 @@ def remove(path: Path) -> None:
         return
     # Move it out of the way first (same directory, so one atomic rename): a job that starts during a
     # minutes-long delete then finds nothing at the path instead of a half-deleted tree it might reuse.
-    doomed = path.with_name(f".glaeda-disk-deleting-{path.name}-{os.getpid()}")
+    # A read-only parent makes the rename fail and apply records the item incomplete: nothing is lost.
+    doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
     os.rename(path, doomed)
     shutil.rmtree(doomed, ignore_errors=False, onerror=_chmod_retry)
 
