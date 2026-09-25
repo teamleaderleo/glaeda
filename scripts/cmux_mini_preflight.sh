@@ -180,6 +180,11 @@ for f in /System/Volumes/Update/Preflight.plist /System/Volumes/Update/Update.pl
   break
 done
 pmset -g custom 2>/dev/null | while IFS= read -r line; do e pf_pmset "$line"; done
+# Automatic install and download of macOS updates, as install|download (empty means unset, which is on).
+# A build host should take macOS updates on purpose (glaeda-mini-fleet upgrade), not mid-day or as a
+# prepared update that waits for a restart.
+sw=/Library/Preferences/com.apple.SoftwareUpdate
+e pf_autoupdate "$(defaults read $sw AutomaticallyInstallMacOSUpdates 2>/dev/null)|$(defaults read $sw AutomaticDownload 2>/dev/null)"
 
 # Runners registered for this user: the directory and agent name, whether its launchd agent is
 # loaded in the GUI domain, whether its listener runs, and whether glaeda-mini-fleet holds it stopped.
