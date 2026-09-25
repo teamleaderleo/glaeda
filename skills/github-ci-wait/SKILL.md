@@ -10,10 +10,11 @@ hour. Sessions polling on their own used it all up. `glaeda-gh` is a local daemo
 only process polling: one batched GraphQL query for every watched PR, ETag requests for runs
 (an unchanged run costs nothing), and one batched query every 15 s for comment waits. Its
 commands read the daemon's cache and make no API calls.
-Runs come first from the cmux build controller, which receives GitHub's run webhooks
-(cmuxterm-hq#675): a finished run shows up within a few seconds and costs no quota at all. That
-needs the tailnet and `~/.config/cmux/build-fleet/controller.token`; without them the daemon falls
-back to the ETag reads.
+On the tailnet the daemon also follows the cmux build controller, which receives GitHub's run,
+check and comment webhooks (cmuxterm-hq#675). A finished run, a PR check change or a bot's
+reply then reaches `wait` within a few seconds at no quota cost. Public repos need no token;
+private ones (cmuxterm-hq) need `~/.config/cmux/build-fleet/controller.token`. Without the
+controller everything still works by polling, only slower; `glaeda-gh budget` says which.
 
 ## Wait and check
 
@@ -87,8 +88,9 @@ glaeda-gh wait comment teamleaderleo/stensibly#454 --author 'github-actions[bot]
   before you started waiting is missed. Pass your own comment's URL.
 - `--author` accepts `github-actions[bot]` or `github-actions`. `--match` is a regular expression
   searched in the body.
-- It prints the first matching comment (URL and body) and exits 0. The daemon reads the latest
-  50 comments every 15 s while someone waits.
+- It prints the first matching comment (URL and body) and exits 0. A reply on a repo the
+  controller receives webhooks for (teamleaderleo/stensibly among them) arrives within seconds;
+  otherwise the daemon reads the latest 50 comments every 15 s while someone waits.
 
 ## When the daemon is down or hung
 

@@ -30,13 +30,15 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   left) it stops that API until the quota resets. The quota is shared, so this also protects
   every other tool on the account.
 - The token comes from `gh auth token` and stays in memory; it is never written or logged.
-- Runs are first asked of the cmux build controller on the tailnet (cmuxterm-hq#675), which
-  receives GitHub's workflow_run webhooks: a free read every tick, so a finished run shows up
-  within about TICK seconds and costs no quota. While the controller tracks a run, REST reads it
-  only as a safety net every 15 minutes; when the controller is unreachable, has no token here,
-  or has never seen the run, the REST path above applies unchanged. Controller: $CMUX_CI_CONTROLLER,
-  else the cmux-ci client config, else the fleet default; token: $CMUX_CI_TOKEN_FILE, else
-  ~/.config/cmux/build-fleet/controller.token.
+- The cmux build controller on the tailnet (cmuxterm-hq#675) receives GitHub's workflow_run,
+  check_suite and issue_comment webhooks. Each tick the daemon reads its change feed once: free,
+  so a finished run shows up within about TICK seconds and costs no quota, a check event on a
+  watched PR's head commit or branch re-reads that PR at once (at most every NUDGE_MIN seconds),
+  and a new comment reaches comment waits. While the controller tracks a run, REST reads it only
+  as a safety net every 15 minutes; when the controller is unreachable or has never seen the run,
+  the REST path above applies unchanged. Public repositories need no token; private ones need the
+  controller token. Controller: $CMUX_CI_CONTROLLER, else the cmux-ci client config, else the
+  fleet default; token: $CMUX_CI_TOKEN_FILE, else ~/.config/cmux/build-fleet/controller.token.
 
 Clients make no API calls. When the daemon is not running they say so and exit 3 rather than
 fall back to polling. `wait` exits 0 on success (or a matching comment), 1 on failure (a failed
@@ -115,9 +117,11 @@ CONTROLLER_DEFAULT = "http://100.71.114.64:18765"
 CONTROLLER_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
 CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
 CONTROLLER_TIMEOUT = 3  # a tick must not stall on an unreachable controller
-CONTROLLER_RETRY = 60  # after a failure, the controller is left alone this long
+CONTROLLER_RETRY = 60  # after a failure, the controller is left alone this long, doubling up to CONTROLLER_ABSENT
 REST_SAFETY = 900  # a run the controller tracks is still read over REST this often (a lost delivery)
 CONTROLLER_ABSENT = 900  # a controller without the run-events receiver (404, 503) is asked again this rarely
+FEED_PAGES = 5  # feed pages read per tick at most; a longer backlog continues on the next tick
+NUDGE_MIN = 20  # a PR a check event nudged is re-read at most this often (GraphQL points)
 
 NAME = r"[A-Za-z0-9_.-]+"
 PR_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pull/)(\d+)(?:[/?#].*)?")
@@ -129,7 +133,7 @@ BUCKETS = {"pr": "graphql", "run": "rest", "comment": "graphql"}
 
 # NUM is the alias's PR-number variable: isRequired needs it
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeStateStatus headRefOid
-reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
+headRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
   requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { statusCheckRollup { state
 contexts(first: 100) { totalCount pageInfo { hasNextPage } nodes { __typename
@@ -295,9 +299,10 @@ class NoReceiver(WatchError):
 
 
 class Controller:
-    """The build controller's run events (cmuxterm-hq#675): webhook state over the tailnet, no GitHub quota."""
+    """The build controller's GitHub events (cmuxterm-hq#675) over the tailnet: no GitHub quota.
+    Without a token it answers for public repositories only."""
 
-    def __init__(self, base: str, token: str) -> None:
+    def __init__(self, base: str, token: str | None) -> None:
         self.base, self.token = base.rstrip("/"), token
 
     @classmethod
@@ -306,19 +311,19 @@ class Controller:
         if not base:
             doc = read_json(CONTROLLER_CONFIG)
             base = (doc.get("controller") if isinstance(doc, dict) else None) or CONTROLLER_DEFAULT
-        if not isinstance(base, str):
+        if not isinstance(base, str) or not base.startswith(("http://", "https://")):
             return None
         path = os.environ.get("CMUX_CI_TOKEN_FILE") or os.fspath(CONTROLLER_TOKEN)
         try:
-            token = Path(path).read_text().strip()
+            token = Path(path).read_text().strip() or None
         except OSError:
-            return None
-        return cls(base, token) if token and base.startswith(("http://", "https://")) else None
+            token = None
+        return cls(base, token)
 
-    def run(self, run_id: int) -> dict | None:
-        """The controller's view of a run, or None when it has never seen it. Raises WatchError."""
-        request = urllib.request.Request(f"{self.base}/v1/github/runs/{run_id}?wait=0",
-                                         headers={"Authorization": f"Bearer {self.token}"})
+    def get(self, path: str) -> dict:
+        """One JSON answer. Raises NoReceiver (404, 503) or WatchError."""
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        request = urllib.request.Request(self.base + path, headers=headers)
         try:
             with OPENER.open(request, timeout=CONTROLLER_TIMEOUT) as response:
                 doc = json.loads(response.read(MAX_BODY))
@@ -330,8 +335,20 @@ class Controller:
             raise WatchError(f"controller: {type(error).__name__}") from None
         if not isinstance(doc, dict):
             raise WatchError("controller: not a JSON object")
+        return doc
+
+    def run(self, run_id: int) -> dict | None:
+        """The controller's view of a run, or None when it has never seen it. Raises WatchError."""
+        doc = self.get(f"/v1/github/runs/{int(run_id)}?wait=0")
         run = doc.get("run")
         return run if doc.get("known") and isinstance(run, dict) else None
+
+    def events(self, since: int | None) -> dict:
+        """The change feed after cursor `since`, or only the current cursor when since is None."""
+        doc = self.get("/v1/github/events?since=" + ("latest" if since is None else str(int(since))))
+        if not isinstance(doc.get("cursor"), int) or doc["cursor"] < 0:
+            raise WatchError("controller: feed without a cursor")
+        return doc
 
 
 def controller_run(run: dict) -> dict:
@@ -442,6 +459,7 @@ def parse_pr(node: dict) -> dict:
         "state": node.get("state"), "isDraft": node.get("isDraft"), "merged": node.get("merged"),
         "mergedAt": node.get("mergedAt"), "mergeable": node.get("mergeable"),
         "mergeStateStatus": node.get("mergeStateStatus"), "headRefOid": node.get("headRefOid"),
+        "headRefName": node.get("headRefName"),
         "reviewDecision": node.get("reviewDecision"), "updatedAt": node.get("updatedAt"),
         "checkState": rollup.get("state"), "checks": checks, "superseded": superseded,
         "checksTotal": contexts.get("totalCount", len(checks)),
@@ -482,7 +500,12 @@ class Daemon:
         self.transport = transport
         self.controller = Controller.from_env() if controller == "env" else controller
         self.controller_down_until = 0.0
-        self.controller_filled: set[str] = set()  # runs the controller answered on this tick
+        self.controller_failures = 0
+        self.controller_filled: set[str] = set()  # watched runs the controller tracks, while its feed answers
+        self.controller_cursor: int | None = None
+        self.controller_seen: dict[str, bool] = {}  # watched run key -> the controller knows the run
+        self.controller_status: dict[str, Any] = {"state": "off" if self.controller is None else "starting"}
+        self.nudged: set[str] = set()  # PRs a check event touched since their last fetch
         self.token_source = token
         self.token: str | None = None
         doc = read_json(BASE / "budget.json")
@@ -592,6 +615,11 @@ class Daemon:
         out = []
         for e in mine:
             c = e["cache"]
+            if (kind == "pr" and c is not None and e["key"] in self.nudged
+                    and self.now - self.attempted.get(e["key"], float("-inf")) >= NUDGE_MIN):
+                self.nudged.discard(e["key"])  # a check event on its head: re-read now, not at the cycle
+                out.append(e)
+                continue
             if kind == "run" and c is not None and e["key"] in self.controller_filled:
                 data = c.get("data") or {}
                 # A failed attempt whose job list is not this attempt's: REST reads it once (per cycle
@@ -648,7 +676,7 @@ class Daemon:
         hour = {what: sum(1 for _, w in self.sent if w == what) for what in ("rest", "rest304", "graphql")}
         status = {"pid": os.getpid(), "at": self.now, "watching": len(entries),
                   "fetched": {"pr": len(prs), "run": len(runs), "comment": len(comments)},
-                  "controller": len(self.controller_filled),
+                  "controller": {**self.controller_status, "runs": len(self.controller_filled)},
                   "modes": {b: self.mode(b) for b in ("rest", "graphql")}, "errors": self.errors[:10],
                   "lastHour": hour, "heartbeat": HEARTBEAT_EVERY}
         # the heartbeat lets clients tell a hung daemon (lock held, nothing written) from an idle one
@@ -793,47 +821,141 @@ class Daemon:
                 self.errors.append(f"{e['key']} jobs: {jdoc}")
         self.store(e["key"], e["cache"], **fields)
 
+    def controller_down(self, error: WatchError) -> None:
+        """Leave the controller alone for a while; REST serves meanwhile. The cursor is kept, so the
+        feed catches up on what happened in between when it answers again."""
+        if isinstance(error, NoReceiver):
+            wait, state = CONTROLLER_ABSENT, "absent"  # not an error: that controller has no receiver
+        else:
+            self.controller_failures += 1
+            wait, state = min(CONTROLLER_ABSENT, CONTROLLER_RETRY * 2 ** (self.controller_failures - 1)), "down"
+            self.errors.append(describe(error))
+        self.controller_down_until = self.now + wait
+        self.controller_status = {"state": state, "error": describe(error), "retryAt": self.now + wait,
+                                  "token": bool(self.controller.token)}
+
+    def read_feed(self) -> list[dict]:
+        """The feed pages after the cursor. The first call only learns the cursor; a reset (the
+        controller lost its state) starts over, so every watched run gets a fresh baseline."""
+        if self.controller_cursor is None:
+            doc = self.controller.events(None)
+            self.controller_cursor, self.controller_seen = doc["cursor"], {}
+            return [doc]
+        pages = []
+        for _ in range(FEED_PAGES):
+            doc = self.controller.events(self.controller_cursor)
+            if doc.get("reset"):
+                self.controller_cursor, self.controller_seen = doc["cursor"], {}
+                return [doc]
+            pages.append(doc)
+            self.controller_cursor = doc["cursor"]
+            if not doc.get("more"):
+                break
+        return pages
+
     def from_controller(self, entries: list[dict]) -> None:
-        """Fill watched runs from the controller: free, every tick. Job lists still come from REST."""
+        """Follow the controller's change feed: free, one request a tick, plus one baseline read for
+        each run newly watched. Job lists still come from REST."""
         self.controller_filled = set()
         if self.controller is None or self.now < self.controller_down_until:
             return
         deadline = time.monotonic() + TICK  # a slow controller must not stall the tick
-        for e in entries:
-            if not e["key"].startswith("run:") or e["jobs"]:
+        try:
+            pages = self.read_feed()
+        except WatchError as error:
+            return self.controller_down(error)
+        self.controller_failures = 0
+        runs = {e["key"]: e for e in entries if e["key"].startswith("run:") and not e["jobs"]}
+        self.controller_seen = {k: v for k, v in self.controller_seen.items() if k in runs}
+        for key, e in runs.items():
+            if key in self.controller_seen:
                 continue
             if time.monotonic() > deadline:
-                return  # the rest wait for the next tick; REST covers them meanwhile
-            _, owner, repo, run_id = split_key(e["key"])
+                break  # the rest get their baseline on the next tick; REST covers them meanwhile
+            _, owner, repo, run_id = split_key(key)
             try:
                 run = self.controller.run(run_id)
-            except NoReceiver:
-                self.controller_down_until = self.now + CONTROLLER_ABSENT  # not an error: REST as before
-                return
             except WatchError as error:
-                self.controller_down_until = self.now + CONTROLLER_RETRY
-                self.errors.append(describe(error))
-                return
-            if run is None or (run.get("repo") or "").lower() != f"{owner}/{repo}".lower():
+                return self.controller_down(error)
+            known = run is not None and (run.get("repo") or "").lower() == f"{owner}/{repo}"
+            self.controller_seen[key] = known
+            if known:
+                self.apply_run(e, run)
+        for page in pages:
+            for run in page.get("runs") or []:
+                key = f"run:{str(run.get('repo') or '').lower()}/{run.get('id')}"
+                if key in runs:
+                    self.controller_seen[key] = True  # newer than any baseline
+                    self.apply_run(runs[key], run)
+            self.nudge(entries, page)
+            self.merge_comments(entries, page)
+        self.controller_filled = {k for k, known in self.controller_seen.items() if known}
+        self.controller_status = {"state": "ok", "lastDelivery": pages[-1].get("receiver_last_delivery"),
+                                  "token": bool(self.controller.token)}
+
+    def apply_run(self, e: dict, run: dict) -> None:
+        prior = e["cache"] or {}
+        before = prior.get("data") or {}
+        older = iso_epoch(run.get("updated_at")) or 0
+        if prior.get("source") == "rest" and (iso_epoch(before.get("updated_at")) or 0) > older:
+            return  # a lost delivery: REST has seen a newer state than the controller
+        data = controller_run(run)
+        for k in ("display_title", "created_at"):  # the webhook record lacks these; keep REST's
+            data[k] = before.get(k)
+        same = prior.get("source") == "controller" and all(
+            before.get(k) == data.get(k) for k in ("status", "conclusion", "run_attempt", "updated_at"))
+        fields: dict[str, Any] = {"error": None, "data": data, "source": "controller"}
+        if not same:
+            fields["dataAt"] = self.now  # unchanged data keeps its time, so wait cannot rule on it anew
+        if prior.get("source") != "controller":
+            fields["restAt"] = self.now  # the safety-net clock starts when the controller takes over
+        self.store(e["key"], e["cache"], **fields)
+        e["cache"] = read_cache(e["key"])
+
+    def nudge(self, entries: list[dict], page: dict) -> None:
+        """Mark watched PRs whose head commit or branch had a run or check suite event."""
+        touched: set[tuple[str, str]] = set()
+        for item in (page.get("runs") or []) + (page.get("suites") or []):
+            repo = str(item.get("repo") or "").lower()
+            touched.add((repo, "sha:" + str(item.get("head_sha") or "").lower()))
+            if item.get("head_branch"):
+                touched.add((repo, "branch:" + str(item["head_branch"])))
+        if not touched:
+            return
+        for e in entries:
+            data = (e["cache"] or {}).get("data") or {}
+            if not e["key"].startswith("pr:") or not data:
+                continue
+            _, owner, repo, _ = split_key(e["key"])
+            marks = {"sha:" + str(data.get("headRefOid") or "").lower()}
+            if data.get("headRefName"):
+                marks.add("branch:" + str(data["headRefName"]))  # a push: runs for a head GitHub has not shown yet
+            if any((f"{owner}/{repo}", m) in touched for m in marks):
+                self.nudged.add(e["key"])
+
+    def merge_comments(self, entries: list[dict], page: dict) -> None:
+        """Add new, edited and deleted comments on watched issues to their cached comment list. The
+        next GraphQL read (every COMMENT_CYCLE) replaces the list with GitHub's latest 50."""
+        watched = {e["key"]: e for e in entries if e["key"].startswith("comment:")}
+        for c in page.get("comments") or []:
+            try:
+                key = f"comment:{str(c.get('repo') or '').lower()}#{int(c.get('number') or 0)}"
+            except (TypeError, ValueError):
+                continue
+            e = watched.get(key)
+            if e is None:
                 continue
             prior = e["cache"] or {}
-            before = prior.get("data") or {}
-            older = iso_epoch(run.get("updated_at")) or 0
-            if prior.get("source") == "rest" and (iso_epoch(before.get("updated_at")) or 0) > older:
-                continue  # a lost delivery: REST has seen a newer state than the controller
-            data = controller_run(run)
-            for k in ("display_title", "created_at"):  # the webhook record lacks these; keep REST's
-                data[k] = before.get(k)
-            self.controller_filled.add(e["key"])
-            same = prior.get("source") == "controller" and all(
-                before.get(k) == data.get(k) for k in ("status", "conclusion", "run_attempt", "updated_at"))
-            fields: dict[str, Any] = {"error": None, "data": data, "source": "controller"}
-            if not same:
-                fields["dataAt"] = self.now  # unchanged data keeps its time, so wait cannot rule on it anew
-            if prior.get("source") != "controller":
-                fields["restAt"] = self.now  # the safety-net clock starts when the controller takes over
-            self.store(e["key"], e["cache"], **fields)
-            e["cache"] = read_cache(e["key"])
+            data = dict(prior.get("data") or {"url": None, "state": None, "type": None, "total": None, "comments": []})
+            by_id = {x.get("id"): x for x in data.get("comments") or []}
+            if c.get("deleted"):
+                by_id.pop(c.get("id"), None)
+            else:
+                by_id[c.get("id")] = {"id": c.get("id"), "url": c.get("url"), "createdAt": c.get("created_at"),
+                                      "author": c.get("author"), "body": str(c.get("body") or "")[:COMMENT_BODY_MAX]}
+            data["comments"] = sorted(by_id.values(), key=lambda x: x.get("id") or 0)[-2 * COMMENTS_LAST:]
+            self.store(key, e["cache"], data=data, dataAt=self.now, error=None)
+            e["cache"] = read_cache(key)
 
     def prune(self, live: set[str]) -> None:
         if not cache_dir().is_dir():
@@ -1383,6 +1505,20 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
         time.sleep(min(WAIT_POLL, max(0.1, timeout - (now - start))))
 
 
+def controller_line(ctl: dict) -> str:
+    state = ctl.get("state")
+    scope = "" if ctl.get("token") else ", public repos only (no token)"
+    if state == "ok":
+        return (f"controller: webhook events ok, {ctl.get('runs', 0)} watched runs from it, last delivery "
+                f"{age(iso_epoch(ctl.get('lastDelivery')))}{scope}")
+    if state in {"down", "absent"}:
+        why = "no run-events receiver there" if state == "absent" else f"unreachable ({ctl.get('error')})"
+        return f"controller: {why}; polling GitHub meanwhile, next try in {max(0, int((ctl.get('retryAt') or 0) - time.time()))}s"
+    if state == "off":
+        return "controller: none configured; polling GitHub"
+    return "controller: starting"
+
+
 def cmd_budget(as_json: bool) -> int:
     running = daemon_running(grace=DOWN_GRACE)
     budget = read_json(BASE / "budget.json") or {}
@@ -1403,6 +1539,9 @@ def cmd_budget(as_json: bool) -> int:
             reset = b.get("reset")
             when = dt.datetime.fromtimestamp(reset, dt.timezone.utc).strftime("%H:%M:%SZ") if reset else "?"
             print(f"{bucket:<8} {b.get('remaining')}/{b.get('limit')} left, resets {when}, seen {age(b.get('seenAt'))}")
+        ctl = status.get("controller")
+        if isinstance(ctl, dict):
+            print(controller_line(ctl))
         hour = status.get("lastHour")
         if isinstance(hour, dict):
             print(f"daemon requests in the last hour: {hour.get('rest', 0)} REST, {hour.get('rest304', 0)} more "
