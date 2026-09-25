@@ -220,6 +220,18 @@ GATE_STOP_WAIT_S = 60.0  # a graceful listener exit, before it is killed
 GATE_WAITER_EVERY_S = 30.0
 GATE_MAX_FAILURES = 5  # consecutive failed polls before the gate hands the runner back
 GATE_FALLBACK = 70  # listen.sh runs run.sh itself: the gate broke before any runner started
+# A throttled mini (macOS thermal pressure, notifyutil's com.apple.system.thermalpressurelevel: 0 nominal,
+# 1 moderate, 2 heavy, 3 trapping, 4 sleeping) compiles 3 to 14x slower per task (cmuxterm-hq#663), which
+# pmset -g therm never reports. At GATE_THERMAL_HOLD or above an idle listener stops, so GitHub routes to a
+# cool mini while this one cools; it listens again once the level is back at GATE_THERMAL_RELEASE or below.
+# GLAEDA_RUNNER_THERMAL_HOLD=0 turns this off.
+THERMAL_HOT = 3  # also what job telemetry calls thermal_limited, whatever the gate's setting
+_hold = os.environ.get("GLAEDA_RUNNER_THERMAL_HOLD", "")
+GATE_THERMAL_HOLD = int(_hold) if _hold.strip().isdigit() else THERMAL_HOT  # never crash a hook on a typo
+GATE_THERMAL_RELEASE = 1
+GATE_THERMAL_EVERY_S = 30.0
+NOTIFYUTIL = "/usr/bin/notifyutil"
+THERMAL_PRESSURE_KEY = "com.apple.system.thermalpressurelevel"
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -971,6 +983,17 @@ def mini_full(capacity_dir: Path | None, total: int) -> str | None:
         os.close(admission)
 
 
+def thermal_pressure_level() -> int | None:
+    """macOS thermal pressure (0 nominal to 4 sleeping), or None when it cannot be read."""
+    try:
+        out = subprocess.run([NOTIFYUTIL, "-g", THERMAL_PRESSURE_KEY], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=5, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    found = re.search(re.escape(THERMAL_PRESSURE_KEY) + r"\s+(\d+)", out)
+    return int(found.group(1)) if found else None
+
+
 def host_held(host_lock: str, reservation: str, now: float) -> str | None:
     """Why the fleet, not a PR job, holds this host right now, or None. Our own jobs hold the host lock
     shared, so only an exclusive holder or a reservation counts. Microseconds: one non-blocking flock."""
@@ -1077,6 +1100,8 @@ class Gate:
         self.waiting_at = -GATE_WAITER_EVERY_S
         self.worker_noted = False
         self.source = source_identity()
+        self.thermal: int | None = None  # the level while the gate holds for heat, else None
+        self.thermal_at = -GATE_THERMAL_EVERY_S
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -1120,7 +1145,23 @@ class Gate:
             self.waiting, self.waiting_at = host_waiters(self.host_lock, self.state_dir), time.monotonic()
         if why is None and self.waiting:
             why = f"a fleet build is waiting for the host (pid {min(self.waiting)})"
-        return why or self.full()
+        return why or self.full() or self.hot()
+
+    def hot(self, fresh: bool = False) -> str | None:
+        """Why this mini is too hot to take a job, read at most every GATE_THERMAL_EVERY_S. Holds from
+        GATE_THERMAL_HOLD until the level is back at GATE_THERMAL_RELEASE, so a mini at the edge does not
+        flap. An unreadable level changes nothing."""
+        if GATE_THERMAL_HOLD <= 0:
+            return None
+        if fresh or time.monotonic() - self.thermal_at >= GATE_THERMAL_EVERY_S:
+            level, self.thermal_at = thermal_pressure_level(), time.monotonic()
+            if level is not None:
+                release = min(GATE_THERMAL_RELEASE, GATE_THERMAL_HOLD - 1)  # below the hold, or it flaps
+                limit = release if self.thermal is not None else GATE_THERMAL_HOLD - 1
+                self.thermal = level if level > limit else None
+        if self.thermal is None:
+            return None
+        return f"the mini is throttled (thermal pressure level {self.thermal})"
 
     def confirmed(self) -> str | None:
         """A fresh reading right before a stop: the holder still holds, or a waiter seen at least one poll ago
@@ -1131,7 +1172,7 @@ class Gate:
             self.waiting, self.waiting_at = again, time.monotonic()
             if again:
                 why = f"a fleet build is waiting for the host (pid {min(again)})"
-        return why or self.full(fresh=True)
+        return why or self.full(fresh=True) or self.hot(fresh=True)
 
     def full(self, fresh: bool = False) -> str | None:
         """Every unit this runner's jobs could take is held. A look an admission blocked keeps the previous
@@ -1456,14 +1497,18 @@ def host_io() -> tuple[float | None, float | None]:
 
 
 def thermal_limited() -> bool | None:
-    """True when pmset reports a CPU speed limit under 100 or a recorded thermal/performance warning."""
+    """True when macOS reports high thermal pressure, or pmset a CPU speed limit under 100 or a recorded
+    thermal/performance warning."""
+    level = thermal_pressure_level()
     try:
         out = subprocess.run([PMSET, "-g", "therm"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
                              timeout=5, check=False).stdout
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        out = ""
+    if level is not None and level >= THERMAL_HOT:
+        return True  # pmset stays silent at thermal pressure (cmuxterm-hq#663)
     if not out:
-        return None
+        return None if level is None else False
     limit = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", out)
     if limit and int(limit.group(1)) < 100:
         return True

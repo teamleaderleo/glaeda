@@ -47,6 +47,7 @@ cr = load("glaeda_cmux_runner", ROOT / "scripts" / "glaeda-cmux-runner")
 cr.DARWIN_REQUIRED = False
 cr.ONLINE_WAIT_S = 0
 hook = load("glaeda_cmux_runner_hook", HOOK)
+REAL_LEVEL = hook.thermal_pressure_level  # GateTest patches the module attribute
 setup = load("glaeda_mini_setup_for_runner", ROOT / "scripts" / "glaeda-mini-setup")
 setup.DARWIN_REQUIRED = False
 
@@ -1223,6 +1224,11 @@ class GateTest(unittest.TestCase):
         run_sh.write_text(f"#!/bin/bash\n{helper}\nexit 0\n")
         run_sh.chmod(0o755)
         self.addCleanup(self.reap)
+        # A cool mini unless a test says otherwise (the real reading depends on the machine running the test).
+        self.level: int | None = 0
+        patcher = mock.patch.object(hook, "thermal_pressure_level", side_effect=lambda: self.level)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def reap(self) -> None:
         with contextlib.suppress(Exception):
@@ -1418,6 +1424,67 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook, "host_waiters", return_value={77, 88}):
             self.assertEqual(gate.confirmed(), "a fleet build is waiting for the host (pid 77)")
 
+    def test_a_throttled_mini_holds_until_it_has_cooled(self) -> None:
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        self.level = 2
+        self.assertIsNone(gate.claimed())  # heavy under load is normal
+        self.level = 4
+        gate.thermal_at -= hook.GATE_THERMAL_EVERY_S
+        self.assertEqual(gate.claimed(), "the mini is throttled (thermal pressure level 4)")
+        self.assertEqual(gate.confirmed(), "the mini is throttled (thermal pressure level 4)")
+        self.level = 2
+        gate.thermal_at -= hook.GATE_THERMAL_EVERY_S
+        self.assertEqual(gate.claimed(), "the mini is throttled (thermal pressure level 2)")  # not cool yet
+        self.level = 1
+        self.assertIsNotNone(gate.claimed())  # read at most every thirty seconds
+        gate.thermal_at -= hook.GATE_THERMAL_EVERY_S
+        self.assertIsNone(gate.claimed())
+
+    def test_an_unreadable_level_or_the_switch_off_never_holds(self) -> None:
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        self.level = None
+        self.assertIsNone(gate.claimed())
+        self.level = 4
+        with mock.patch.object(hook, "GATE_THERMAL_HOLD", 0):
+            self.assertIsNone(gate.confirmed())
+
+    def test_a_hold_at_level_one_does_not_flap_at_a_steady_level(self) -> None:
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        self.level = 1
+        with mock.patch.object(hook, "GATE_THERMAL_HOLD", 1):
+            self.assertIsNotNone(gate.claimed())
+            gate.thermal_at -= hook.GATE_THERMAL_EVERY_S
+            self.assertIsNotNone(gate.claimed())  # still held at the same level
+            self.level = 0
+            gate.thermal_at -= hook.GATE_THERMAL_EVERY_S
+            self.assertIsNone(gate.claimed())
+
+    def test_a_bad_hold_setting_falls_back_instead_of_breaking_the_hook(self) -> None:
+        out = subprocess.run([sys.executable, "-c", f"import runpy; m = runpy.run_path({os.fspath(HOOK)!r}, "
+                              "run_name='x'); print(m['GATE_THERMAL_HOLD'])"],
+                             env={**os.environ, "GLAEDA_RUNNER_THERMAL_HOLD": "hot"}, capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(), "3", out.stderr)
+
+    def test_a_hot_idle_listener_stops_and_a_busy_one_keeps_its_job(self) -> None:
+        self.level = 3
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        stops: list[str] = []
+        gate.stop = stops.append  # type: ignore[method-assign]
+        gate.child = mock.Mock(poll=mock.Mock(return_value=None))
+        gate.busy = lambda: True  # type: ignore[method-assign]
+        gate.step(); gate.step(); gate.step()
+        self.assertEqual(stops, [])
+        gate.busy = lambda: False  # type: ignore[method-assign]
+        gate.step(); gate.step()
+        self.assertEqual(stops, ["the mini is throttled (thermal pressure level 3)"])
+
+    def test_the_level_parser_reads_notifyutil(self) -> None:
+        run = mock.Mock(return_value=mock.Mock(stdout="com.apple.system.thermalpressurelevel 4\n"))
+        with mock.patch.object(hook.subprocess, "run", run):
+            self.assertEqual(REAL_LEVEL(), 4)
+            run.return_value = mock.Mock(stdout="")
+            self.assertIsNone(REAL_LEVEL())
+
     def test_the_gate_asks_lsof_at_most_every_thirty_seconds(self) -> None:
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
         with mock.patch.object(hook, "host_waiters", return_value={77}) as lsof:
@@ -1546,7 +1613,8 @@ class GateTest(unittest.TestCase):
         self.assertEqual(subprocess.run([sys.executable, os.fspath(old), *argv], capture_output=True).returncode, 2)
 
     def run_listen(self, *extra: str) -> tuple[subprocess.Popen, Path]:
-        env = {**os.environ, "GLAEDA_RUNNER_GATE_POLL_S": "0.1"}
+        # The hook runs in its own process, so the setUp patch of the thermal level does not reach it.
+        env = {**os.environ, "GLAEDA_RUNNER_GATE_POLL_S": "0.1", "GLAEDA_RUNNER_THERMAL_HOLD": "0"}
         log = self.tmp / "runner.log"
         with log.open("wb") as out:
             proc = subprocess.Popen([*extra] if extra else
