@@ -23,13 +23,6 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   left) it stops that API until the quota resets. The quota is shared, so this also protects
   every other tool on the account.
 - The token comes from `gh auth token` and stays in memory; it is never written or logged.
-- Runs are first asked of the cmux build controller on the tailnet (cmuxterm-hq#675), which
-  receives GitHub's workflow_run webhooks: a free read every tick, so a finished run shows up
-  within about TICK seconds and costs no quota. While the controller tracks a run, REST reads it
-  only as a safety net every 15 minutes; when the controller is unreachable, has no token here,
-  or has never seen the run, the REST path above applies unchanged. Controller: $CMUX_CI_CONTROLLER,
-  else the cmux-ci client config, else the fleet default; token: $CMUX_CI_TOKEN_FILE, else
-  ~/.config/cmux/build-fleet/controller.token.
 
 Clients make no API calls. When the daemon is not running they say so and exit 3 rather than
 fall back to polling. `wait` exits 0 on success, 1 on failure (a failed check, a failed run, a PR
@@ -78,12 +71,6 @@ DOWN_GRACE = 5.0  # clients look this long for the daemon before calling it down
 FAILED = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR", "STALE"}
 RUN_OK = {"success", "neutral", "skipped"}
 EXIT_OK, EXIT_FAIL, EXIT_TIMEOUT, EXIT_DOWN = 0, 1, 2, 3
-CONTROLLER_DEFAULT = "http://100.71.114.64:18765"
-CONTROLLER_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
-CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
-CONTROLLER_TIMEOUT = 3  # a tick must not stall on an unreachable controller
-CONTROLLER_RETRY = 60  # after a failure, the controller is left alone this long
-REST_SAFETY = 900  # a run the controller tracks is still read over REST this often (a lost delivery)
 
 NAME = r"[A-Za-z0-9_.-]+"
 PR_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pull/)(\d+)(?:[/?#].*)?")
@@ -232,55 +219,6 @@ def gh_token() -> str:
     return token
 
 
-# ---------------------------------------------------------------- cmux build controller
-
-
-class Controller:
-    """The build controller's run events (cmuxterm-hq#675): webhook state over the tailnet, no GitHub quota."""
-
-    def __init__(self, base: str, token: str) -> None:
-        self.base, self.token = base.rstrip("/"), token
-
-    @classmethod
-    def from_env(cls) -> "Controller | None":
-        base = os.environ.get("CMUX_CI_CONTROLLER", "").strip()
-        if not base:
-            doc = read_json(CONTROLLER_CONFIG)
-            base = (doc.get("controller") if isinstance(doc, dict) else None) or CONTROLLER_DEFAULT
-        if not isinstance(base, str):
-            return None
-        path = os.environ.get("CMUX_CI_TOKEN_FILE") or os.fspath(CONTROLLER_TOKEN)
-        try:
-            token = Path(path).read_text().strip()
-        except OSError:
-            return None
-        return cls(base, token) if token and base.startswith(("http://", "https://")) else None
-
-    def run(self, run_id: int) -> dict | None:
-        """The controller's view of a run, or None when it has never seen it. Raises WatchError."""
-        request = urllib.request.Request(f"{self.base}/v1/github/runs/{run_id}?wait=0",
-                                         headers={"Authorization": f"Bearer {self.token}"})
-        try:
-            with OPENER.open(request, timeout=CONTROLLER_TIMEOUT) as response:
-                doc = json.loads(response.read(MAX_BODY))
-        except urllib.error.HTTPError as error:
-            raise WatchError(f"controller HTTP {error.code}") from None
-        except (OSError, http.client.HTTPException, ValueError) as error:
-            raise WatchError(f"controller: {type(error).__name__}") from None
-        if not isinstance(doc, dict):
-            raise WatchError("controller: not a JSON object")
-        run = doc.get("run")
-        return run if doc.get("known") and isinstance(run, dict) else None
-
-
-def controller_run(run: dict) -> dict:
-    """The controller's run record in slim_run's shape."""
-    return {"id": run.get("id"), "name": run.get("name"), "display_title": None, "status": run.get("status"),
-            "conclusion": run.get("conclusion") or None, "html_url": run.get("url"), "head_sha": run.get("head_sha"),
-            "head_branch": run.get("head_branch") or "", "event": run.get("event"), "run_attempt": run.get("attempt"),
-            "created_at": None, "updated_at": run.get("updated_at")}
-
-
 # ---------------------------------------------------------------- GraphQL for PRs
 
 
@@ -348,12 +286,8 @@ def slim_jobs(doc: dict) -> list[dict]:
 
 
 class Daemon:
-    def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
-                 controller: Any = "env") -> None:
+    def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token) -> None:
         self.transport = transport
-        self.controller = Controller.from_env() if controller == "env" else controller
-        self.controller_down_until = 0.0
-        self.controller_filled: set[str] = set()  # runs the controller answered on this tick
         self.token_source = token
         self.token: str | None = None
         doc = read_json(BASE / "budget.json")
@@ -461,16 +395,6 @@ class Daemon:
             c = e["cache"]
             if self.now - self.attempted.get(e["key"], float("-inf")) < CYCLE:
                 continue
-            if kind == "run" and e["key"] in self.controller_filled:
-                # A finished run with a reader newer than both its data and the last REST read: that
-                # reader's wait will not rule on older data, so REST confirms it once (it may have
-                # been rerun before the webhook said so).
-                if terminal(kind, c.get("data")) and e["touched"] > max(c.get("dataAt") or 0, c.get("restAt") or 0):
-                    out.append(e)
-                # Otherwise the controller answered on this tick: REST only as the safety net.
-                elif self.now - (c.get("restAt") or 0) >= REST_SAFETY:
-                    out.append(e)
-                continue
             if c is None:
                 out.append(e)
             elif full and (not terminal(kind, c.get("data")) or self.now - c.get("fetchedAt", 0) >= TERMINAL_REFRESH
@@ -485,7 +409,6 @@ class Daemon:
         self.now = time.time() if now is None else now
         self.errors = []
         entries = self.watches()
-        self.from_controller(entries)
         prs, runs = self.due("pr", entries), self.due("run", entries)
         for i in range(0, len(prs), GQL_BATCH):
             try:
@@ -513,8 +436,7 @@ class Daemon:
     def store(self, key: str, prior: dict | None, **fields: Any) -> None:
         entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
         if prior:
-            entry.update({k: prior[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "restAt", "source")
-                          if k in prior})
+            entry.update({k: prior[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt") if k in prior})
         entry.update(fields)
         write_json(cache_dir() / file_name(key), entry)
 
@@ -570,13 +492,9 @@ class Daemon:
         if state == "error":
             self.errors.append(f"{e['key']}: {doc}")
             return self.store(e["key"], e["cache"], error=doc)
-        fields: dict[str, Any] = {"error": None, "etag": etag, "dataAt": self.now, "restAt": self.now}
+        fields: dict[str, Any] = {"error": None, "etag": etag, "dataAt": self.now}
         if state == "fresh":
             fields["data"] = slim_run(doc)
-            # a run the controller tracks keeps that source; REST was only the safety-net check
-            if prior.get("source") != "controller" or \
-                    (iso_epoch(doc.get("updated_at")) or 0) > (iso_epoch((prior.get("data") or {}).get("updated_at")) or 0):
-                fields["source"] = "rest"
         if e["jobs"] and self.mode("rest") == "normal":
             jstate, jdoc, jetag = self.get(base + "/jobs?per_page=100", prior.get("jobsEtag") if "jobs" in prior else None)
             if jstate == "fresh":
@@ -586,45 +504,6 @@ class Daemon:
             else:
                 self.errors.append(f"{e['key']} jobs: {jdoc}")
         self.store(e["key"], e["cache"], **fields)
-
-    def from_controller(self, entries: list[dict]) -> None:
-        """Fill watched runs from the controller: free, every tick. Job lists still come from REST."""
-        self.controller_filled = set()
-        if self.controller is None or self.now < self.controller_down_until:
-            return
-        deadline = time.monotonic() + TICK  # a slow controller must not stall the tick
-        for e in entries:
-            if not e["key"].startswith("run:") or e["jobs"]:
-                continue
-            if time.monotonic() > deadline:
-                return  # the rest wait for the next tick; REST covers them meanwhile
-            _, owner, repo, run_id = split_key(e["key"])
-            try:
-                run = self.controller.run(run_id)
-            except WatchError as error:
-                self.controller_down_until = self.now + CONTROLLER_RETRY
-                self.errors.append(describe(error))
-                return
-            if run is None or (run.get("repo") or "").lower() != f"{owner}/{repo}".lower():
-                continue
-            prior = e["cache"] or {}
-            before = prior.get("data") or {}
-            older = iso_epoch(run.get("updated_at")) or 0
-            if prior.get("source") == "rest" and (iso_epoch(before.get("updated_at")) or 0) > older:
-                continue  # a lost delivery: REST has seen a newer state than the controller
-            data = controller_run(run)
-            for k in ("display_title", "created_at"):  # the webhook record lacks these; keep REST's
-                data[k] = before.get(k)
-            self.controller_filled.add(e["key"])
-            same = prior.get("source") == "controller" and all(
-                before.get(k) == data.get(k) for k in ("status", "conclusion", "run_attempt", "updated_at"))
-            fields: dict[str, Any] = {"error": None, "data": data, "source": "controller"}
-            if not same:
-                fields["dataAt"] = self.now  # unchanged data keeps its time, so wait cannot rule on it anew
-            if prior.get("source") != "controller":
-                fields["restAt"] = self.now  # the safety-net clock starts when the controller takes over
-            self.store(e["key"], e["cache"], **fields)
-            e["cache"] = read_cache(e["key"])
 
     def prune(self, live: set[str]) -> None:
         if not cache_dir().is_dir():
