@@ -116,6 +116,29 @@ open(dest, "wb").write(open(os.path.join(state, "runner.tar.gz"), "rb").read())
 FAKE_LAUNCHCTL = FAKE_LOG_HEADER + r'''
 argv = sys.argv[1:]
 log("launchctl", argv)
+# launchd's disabled overrides live in disabled.json (labels); bootstrap refuses a disabled one, as launchd does.
+path = os.path.join(state, "disabled.json")
+disabled = json.load(open(path)) if os.path.exists(path) else []
+if argv[0] == "print-disabled":
+    extra = open(os.path.join(state, "print-disabled-extra")).read() if os.path.exists(os.path.join(state, "print-disabled-extra")) else ""
+    print("disabled services = {\n" + extra + "".join(f'\t"{l}" => disabled\n' for l in disabled) + "}"); sys.exit(0)
+if argv[0] in ("enable", "disable"):
+    label = argv[1].rsplit("/", 1)[1]
+    disabled = [l for l in disabled if l != label] + ([label] if argv[0] == "disable" else [])
+    json.dump(disabled, open(path, "w")); sys.exit(0)
+if argv[0] == "bootstrap" and os.path.basename(argv[2])[:-len(".plist")] in disabled:
+    print("Bootstrap failed: 5: Input/output error"); sys.exit(5)
+# With loaded.json present, the fake tracks which labels are loaded; otherwise print always says not loaded.
+lpath = os.path.join(state, "loaded.json")
+if os.path.exists(lpath):
+    loaded = json.load(open(lpath))
+    if argv[0] == "print":
+        sys.exit(0 if argv[1].rsplit("/", 1)[1] in loaded else 1)
+    if argv[0] == "bootstrap":
+        loaded.append(os.path.basename(argv[2])[:-len(".plist")])
+    if argv[0] == "bootout":
+        loaded = [l for l in loaded if l != argv[1].rsplit("/", 1)[1]]
+    json.dump(loaded, open(lpath, "w"))
 sys.exit(1 if argv[0] == "print" else 0)
 '''
 
@@ -2067,13 +2090,6 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("bootstrap", verbs)
         self.assertIn("bootout", verbs)
         self.assertLess(verbs.index("bootstrap"), verbs.index("bootout"))
-        # A disabled label refuses bootstrap, so every bootstrap is preceded by an enable of the same label.
-        calls = [e["argv"] for e in self.log() if e["tool"] == "launchctl"]
-        for i, argv in enumerate(calls):
-            if argv[0] == "bootstrap":
-                self.assertGreater(i, 0, calls)
-                self.assertEqual(calls[i - 1][0], "enable", calls)
-                self.assertTrue(calls[i - 1][1].endswith("/com.teamleaderleo.glaeda.cmux-runner"), calls[i - 1])
 
     def test_a_runner_held_for_a_repair_stays_disabled(self) -> None:
         held = self.home / ".local/state/glaeda/mini-fleet/runner-held"
@@ -2084,6 +2100,145 @@ class RunnerTest(unittest.TestCase):
             self.invoke("--apply")
         verbs = [e["argv"][0] for e in self.log() if e["tool"] == "launchctl"]
         self.assertNotIn("enable", verbs)
+
+    def test_a_disabled_label_is_enabled_before_bootstrap(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        label = "com.teamleaderleo.glaeda.cmux-runner"
+        (self.state / "disabled.json").write_text(json.dumps([label]))  # a hand `launchctl disable`, no hold mark
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            plan = self.invoke()
+            self.assertTrue(self.by_kind(plan)["agent"]["disabled"])
+            self.assertIn("enables it before bootstrap", self.by_kind(plan)["agent"]["note"])
+            receipt = self.invoke("--apply")
+        agent = self.by_kind(receipt)["agent"]
+        self.assertTrue(agent["bootstrapped"] and agent["wasDisabled"] and agent["enabled"], agent)
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        verbs = [e["argv"][0] for e in self.log() if e["tool"] == "launchctl" and e["argv"][0] != "print"]
+        self.assertLess(verbs.index("enable"), verbs.index("bootstrap"), verbs)
+        self.assertIn(["enable", f"gui/{os.getuid()}/{label}"], [e["argv"] for e in self.log() if e["tool"] == "launchctl"])
+        on_disk = json.loads((self.home / ".local/state/glaeda/cmux-runner/receipt.json").read_text())
+        self.assertTrue(self.by_kind(on_disk)["agent"]["wasDisabled"])
+
+    def test_an_enabled_label_is_bootstrapped_without_enable(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            receipt = self.invoke("--apply")
+        self.assertNotIn("wasDisabled", self.by_kind(receipt)["agent"])
+        self.assertNotIn("enable", [e["argv"][0] for e in self.log() if e["tool"] == "launchctl"])
+
+    def test_a_held_runner_stays_stopped_until_released(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        label = "com.teamleaderleo.glaeda.cmux-runner"
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply")
+            held = self.home / ".local/state/glaeda/mini-fleet/runner-held/actions-runner-glaeda"
+            held.parent.mkdir(parents=True)
+            held.write_text("")  # runner_hold: mark, disable, bootout
+            (self.state / "disabled.json").write_text(json.dumps([label]))
+            (self.state / "log.jsonl").unlink()
+            receipt = self.invoke("--apply")
+            agent = self.by_kind(receipt)["agent"]
+            self.assertTrue(agent["held"], agent)
+            self.assertIn("runner_release", agent["note"])
+            self.assertNotIn("bootstrapped", agent)
+            self.assertTrue(receipt["ready"], receipt["blocking"])
+            self.assertIn("held", self.by_kind(receipt)["verify"]["note"])
+            verbs = [e["argv"][0] for e in self.log() if e["tool"] == "launchctl"]
+            self.assertNotIn("enable", verbs)
+            self.assertNotIn("bootstrap", verbs)
+            self.assertEqual(json.loads((self.state / "disabled.json").read_text()), [label])
+            held.unlink()  # runner_release: enable, bootstrap, drop the mark; or a later --apply once released
+            receipt = self.invoke("--apply")
+        self.assertTrue(self.by_kind(receipt)["agent"]["bootstrapped"])
+
+    def test_relabel_never_starts_a_held_runner(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--labels", "ram48")
+            held = self.home / ".local/state/glaeda/mini-fleet/runner-held/actions-runner-glaeda"
+            held.parent.mkdir(parents=True)
+            held.write_text("")
+            (self.state / "log.jsonl").unlink()
+            with mock.patch.object(cr, "xcode_present", return_value=True):
+                receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                      "--name", "mini-test-glaeda")
+        self.assertEqual(self.by_kind(receipt)["register"]["state"], "updated")
+        self.assertNotIn("bootstrap", [e["argv"][0] for e in self.log() if e["tool"] == "launchctl"])
+
+    def test_print_disabled_is_read_per_exact_label(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        (self.state / "disabled.json").write_text(json.dumps(["com.teamleaderleo.glaeda.cmux-runner.1"]))
+        (self.state / "print-disabled-extra").write_text(
+            '\t"com.teamleaderleo.glaeda.cmux-runner" => enabled\n\t"com.teamleaderleo.glaeda.cmux-runner.2" => true\n')
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            receipt = self.invoke("--apply")  # instance 0: its own entry says enabled; .1 is only a prefix match
+            self.assertFalse(self.by_kind(receipt)["agent"]["disabled"])
+            self.assertNotIn("enable", [e["argv"][0] for e in self.log() if e["tool"] == "launchctl"])
+            ctx = cr.Context(cr.parser().parse_args(["--instance", "2"]))
+            self.assertTrue(cr.launchctl_disabled(ctx), "older macOS prints => true")
+            ctx = cr.Context(cr.parser().parse_args(["--instance", "1"]))
+            self.assertTrue(cr.launchctl_disabled(ctx))
+            self.assertEqual(cr.held_marker(ctx).name, "actions-runner-glaeda-1")  # runner_hold's basename
+
+    def test_relabel_of_a_loaded_held_runner_leaves_it_stopped_and_says_so(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        label = "com.teamleaderleo.glaeda.cmux-runner"
+        (self.state / "loaded.json").write_text("[]")
+        (self.state / "disabled.json").write_text(json.dumps([label]))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            first = self.invoke("--apply", "--labels", "ram48")  # a hand disable: enabled, then started
+            self.assertTrue(self.by_kind(first)["agent"]["wasDisabled"])
+            self.assertEqual(json.loads((self.state / "loaded.json").read_text()), [label])
+            held = self.home / ".local/state/glaeda/mini-fleet/runner-held/actions-runner-glaeda"
+            held.parent.mkdir(parents=True)
+            held.write_text("")  # marked held, but still loaded (a hold whose bootout did not take)
+            (self.state / "log.jsonl").unlink()
+            with mock.patch.object(cr, "xcode_present", return_value=True):
+                receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                      "--name", "mini-test-glaeda")
+        agent = self.by_kind(receipt)["agent"]
+        self.assertEqual(self.by_kind(receipt)["register"]["state"], "updated")
+        self.assertFalse(agent["loaded"], agent)
+        self.assertIn("runner_release", agent["note"])
+        self.assertIn("held", self.by_kind(receipt)["verify"]["note"])
+        self.assertEqual(json.loads((self.state / "loaded.json").read_text()), [])
+        verbs = [e["argv"][0] for e in self.log() if e["tool"] == "launchctl"]
+        self.assertNotIn("bootstrap", verbs)
+        self.assertNotIn("enable", verbs)
+
+    def test_relabel_records_the_enable_on_the_agent_step(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        label = "com.teamleaderleo.glaeda.cmux-runner"
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--labels", "ram48")
+            (self.state / "disabled.json").write_text(json.dumps([label]))
+            with mock.patch.object(cr, "xcode_present", return_value=True):
+                receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                      "--name", "mini-test-glaeda")
+        agent = self.by_kind(receipt)["agent"]
+        self.assertTrue(agent["wasDisabled"] and agent["enabled"], agent)
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+
+    def test_a_failed_enable_fails_the_agent_step(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        (self.state / "disabled.json").write_text(json.dumps(["com.teamleaderleo.glaeda.cmux-runner"]))
+        make_executable(self.launchctl, FAKE_LAUNCHCTL.replace(
+            'if argv[0] in ("enable", "disable"):', 'if argv[0] == "enable":\n    print("denied"); sys.exit(1)\nif argv[0] in ("enable", "disable"):'))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            receipt = self.invoke("--apply", expect=1)
+        agent = self.by_kind(receipt)["agent"]
+        self.assertEqual(agent["state"], "failed")
+        self.assertIn("launchctl enable failed: denied", agent["note"])
+        self.assertNotIn("bootstrap", [e["argv"][0] for e in self.log() if e["tool"] == "launchctl"])
+
+    def test_uninstall_drops_the_hold_mark(self) -> None:
+        self.invoke("--apply")
+        held = self.home / ".local/state/glaeda/mini-fleet/runner-held/actions-runner-glaeda"
+        held.parent.mkdir(parents=True)
+        held.write_text("")
+        receipt = self.invoke("--uninstall", "--apply")
+        self.assertTrue(self.by_kind(receipt)["agent"]["heldMarkRemoved"])
+        self.assertFalse(held.exists())
 
     # ------------------------------------------------------------ uninstall
 
@@ -2468,7 +2623,8 @@ class RunnerTest(unittest.TestCase):
                                       "--name", "mini-test-glaeda")
         self.assertEqual(self.by_kind(receipt)["agent"]["state"], "update")
         self.assertTrue(receipt["ready"], receipt["blocking"])
-        verbs = [e["argv"][0] for e in self.log() if e["tool"] == "launchctl" and e["argv"][0] not in ("print", "enable")]
+        verbs = [e["argv"][0] for e in self.log() if e["tool"] == "launchctl"
+                 and e["argv"][0] not in {"print", "print-disabled", "enable"}]
         self.assertEqual(verbs[-3:], ["bootstrap", "bootout", "bootstrap"], verbs)
 
     def test_a_plist_change_never_boots_out_a_runner_with_a_job(self) -> None:

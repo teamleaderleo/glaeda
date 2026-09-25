@@ -512,3 +512,11 @@ the id this install registered), and removes
 `~/actions-runner-glaeda` (including `_work`) only if the receipt created it and
 the directory's marker still matches. If deregistration fails, the directory and
 receipt stay so the command can be re-run. Nothing outside those paths is touched.
+
+To stop a runner without removing it, use `cmux_mini_fix.sh runner_hold` (what
+`glaeda-mini-fleet` drains with): it writes a mark under
+`~/.local/state/glaeda/mini-fleet/runner-held/`, and `--apply` leaves a marked runner
+stopped until `runner_release` starts it (uninstall drops the mark). A bare `launchctl disable` leaves no mark,
+so the next `--apply` enables the label before its bootstrap and records `wasDisabled`
+in the agent step of the receipt. To take a host out of the pools for good, drop its
+`ci-runner` role and uninstall its runners.
