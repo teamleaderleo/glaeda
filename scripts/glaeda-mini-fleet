@@ -121,7 +121,9 @@ submodule depth). check, preflight and fix read it from there.
 
 `apply` only adds, and only what the manifest can prove: it appends a required key whose
 `public_key` the manifest carries and whose fingerprint matches, after copying authorized_keys
-aside; and it APFS-clones an Xcode (`cp -c`, a real directory sharing blocks, never a symlink)
+aside, prefixed by the key's `options` when it declares them (from=, command=, no-pty; check then
+requires exactly those options on that key, compared by a digest the probe reports instead of
+their text); and it APFS-clones an Xcode (`cp -c`, a real directory sharing blocks, never a symlink)
 when the source's version and build match the target. It never removes keys, never uses sudo,
 and skips hosts marked `"apply": false`. Without --yes it prints what it would run. Every run
 ends with a fresh observation and check of the hosts it touched.
@@ -285,7 +287,11 @@ def load_manifest(path: Path) -> dict[str, Any]:
         public = key.get("public_key")
         if public is not None and (not isinstance(public, str) or "\n" in public.strip()
                                    or not public.startswith(("ssh-", "ecdsa-", "sk-"))):
-            raise Failure(f"{path}: key {key_id} public_key must be one bare key line, no options")
+            raise Failure(f"{path}: key {key_id} public_key must be one bare key line; restrictions go in options")
+        options = key.get("options")
+        if options is not None and (not isinstance(options, str) or not options or options != options.strip()
+                                    or any(c in options for c in "\n\r\t") or not options.isprintable()):
+            raise Failure(f"{path}: key {key_id} options must be one printable authorized_keys options field")
     return data
 
 
@@ -597,12 +603,24 @@ def describe_reservation(reservation: dict[str, Any]) -> str:
 
 
 def parse_key(value: str) -> dict[str, Any]:
-    file, options, fp = value.split("|", 2)
+    """One probe ak_key line. options is False, True (present, digest unknown) or "h:<16 hex>"."""
+    file, flag, fp = value.split("|", 2)
+    options: bool | str = flag if flag.startswith("h:") else flag == "yes"
     parts = fp.split(" ", 2)
     if len(parts) < 3 or not parts[1].startswith("SHA256:"):
-        return {"file": file, "fingerprint": None, "comment": fp, "options": options == "yes"}
+        return {"file": file, "fingerprint": None, "comment": fp, "options": options}
     comment, _, kind = parts[2].rpartition(" (")
-    return {"file": file, "fingerprint": parts[1], "comment": comment, "type": kind.rstrip(")"), "options": options == "yes"}
+    return {"file": file, "fingerprint": parts[1], "comment": comment, "type": kind.rstrip(")"), "options": options}
+
+
+def options_digest(options: str) -> str:
+    """How the probe reports a key's options: never their text, only this digest."""
+    return "h:" + hashlib.sha256(options.encode()).hexdigest()[:16]
+
+
+def key_line(key: dict[str, Any]) -> str:
+    """The authorized_keys line apply writes: declared options, then the bare public key."""
+    return f"{key['options']} {key['public_key']}" if key.get("options") else key["public_key"]
 
 
 def observe_host(name: str, user: str, script: bytes | None = None, timeout: int = PROBE_TIMEOUT) -> dict[str, Any]:
@@ -750,8 +768,14 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
     for k in obs["authorized_keys"]:
         if not k.get("fingerprint"):
             drift("ssh", "authorized_keys has an unparseable line")
-        elif k["options"]:
-            drift("ssh", f"key {k['fingerprint'][7:19]} carries options; review them")
+        else:
+            want = manifest["keys"].get(known.get(k["fingerprint"], ""), {}).get("options")
+            if want and k["options"] != options_digest(want):
+                drift("ssh", f"key {known[k['fingerprint']]} lacks its declared options "
+                             f"({'none' if not k['options'] else 'different ones'}); replace its line",
+                      f"remove key {k['fingerprint']}, then add key {known[k['fingerprint']]}")
+            elif not want and k["options"]:
+                drift("ssh", f"key {k['fingerprint'][7:19]} carries options; review them")
     for k in obs["authorized_keys"]:
         if k.get("file") != "authorized_keys":
             drift("ssh", f"key {(k['fingerprint'] or '?')[7:19]} ({k['comment']}) is in {k['file']}, which sshd also reads")
@@ -975,7 +999,7 @@ def apply(manifest: dict[str, Any], hosts: list[str], yes: bool) -> int:
                     print(f"{name}: cannot add {action['key']}: manifest has no public_key")
                     failed += 1
                     continue
-                label, script, args, stdin = f"add key {action['key']}", ADD_KEY, [key["fingerprint"]], key["public_key"] + "\n"
+                label, script, args, stdin = f"add key {action['key']}", ADD_KEY, [key["fingerprint"]], key_line(key) + "\n"
             else:
                 label, script = f"clone {action['source']} -> {action['path']}", CLONE_XCODE
                 args, stdin = [action["source"], action["path"], action["version"], action["build"]], ""

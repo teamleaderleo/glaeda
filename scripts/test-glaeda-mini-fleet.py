@@ -284,6 +284,35 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(len(stray), 1)
         self.assertNotIn("action", stray[0])
 
+    def restricted(self, options: str = 'from="10.0.0.0/8",no-pty') -> None:
+        self.manifest["keys"]["coordinator"]["options"] = options
+
+    def test_declared_options_that_match_are_not_drift(self) -> None:
+        self.restricted()
+        digest = mf.options_digest('from="10.0.0.0/8",no-pty')
+        text = probe_text(keys=("operator",)) + \
+            f"ak_key\tauthorized_keys|{digest}|256 {FP['coordinator']} coordinator comment (ED25519)\n"
+        self.assertFalse([i for i in self.issues(text) if i["area"] == "ssh"])
+
+    def test_restricted_key_without_its_options_is_drift(self) -> None:
+        self.restricted()
+        for flag in ("no", mf.options_digest("no-pty")):
+            text = probe_text(keys=("operator",)) + \
+                f"ak_key\tauthorized_keys|{flag}|256 {FP['coordinator']} coordinator comment (ED25519)\n"
+            ssh = [i for i in self.issues(text) if i["area"] == "ssh"]
+            self.assertEqual(len(ssh), 1, ssh)
+            self.assertIn("lacks its declared options", ssh[0]["detail"])
+
+    def test_options_must_be_one_printable_field(self) -> None:
+        for bad in ("", " no-pty", "no-pty\nssh-ed25519 AAAA x", 7):
+            data = copy.deepcopy(self.manifest)
+            data["keys"]["coordinator"]["options"] = bad
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "m.json"
+                path.write_text(json.dumps(data))
+                with self.assertRaisesRegex(mf.Failure, "options must be"):
+                    mf.load_manifest(path)
+
     def test_allowed_review_key_is_not_drift(self) -> None:
         issues = self.issues(probe_text(keys=("coordinator", "operator", "service-cache")))
         self.assertFalse([i for i in issues if i["area"] == "ssh"])
@@ -390,6 +419,12 @@ class ApplyTests(unittest.TestCase):
         self.assertIs(script, mf.ADD_KEY)
         self.assertEqual(args, [FP["coordinator"]])
         self.assertTrue(stdin.startswith("ssh-ed25519 "))
+
+    def test_add_key_writes_declared_options_first(self) -> None:
+        self.manifest["keys"]["coordinator"]["options"] = 'from="10.0.0.0/8",no-pty'
+        _code, _out, calls = self.run_apply(["build-mini-1"], True, {"build-mini-1": probe_text(keys=("operator",))})
+        (_name, _user, _script, _args, stdin), = calls
+        self.assertTrue(stdin.startswith('from="10.0.0.0/8",no-pty ssh-ed25519 '))
 
     def test_key_without_public_key_is_not_added(self) -> None:
         self.manifest["keys"]["coordinator"].pop("public_key")
@@ -508,6 +543,20 @@ class ProbeScriptTests(unittest.TestCase):
             self.assertEqual(sorted((k["file"], k["comment"]) for k in parsed["authorized_keys"]),
                              [("authorized_keys", "a"), ("authorized_keys", "b"), ("authorized_keys2", "c")])
             self.assertNotIn("AAAA", out)  # fingerprints only, never key material
+
+    def test_probe_reports_an_options_digest_never_the_options(self) -> None:
+        options = 'from="172.20.21.0/24",command="/usr/local/bin/probe",no-pty,no-port-forwarding'
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".ssh").mkdir()
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "agent", "-f", os.fspath(home / "a")], check=True)
+            (home / ".ssh" / "authorized_keys").write_text(f"{options} {(home / 'a.pub').read_text().strip()}\n")
+            out = subprocess.run(["bash", os.fspath(ROOT / "scripts" / "cmux_mini_probe.sh")], capture_output=True,
+                                 text=True, env={"HOME": tmp, "PATH": "/usr/bin:/bin"}).stdout
+            (key,) = mf.parse_probe(out)["authorized_keys"]
+            self.assertEqual(key["options"], mf.options_digest(options))
+            self.assertNotIn("172.20.21", out)
+            self.assertNotIn("AAAA", out)
 
     def test_probe_parses_as_bash(self) -> None:
         subprocess.run(["bash", "-n", os.fspath(ROOT / "scripts" / "cmux_mini_probe.sh")], check=True)
