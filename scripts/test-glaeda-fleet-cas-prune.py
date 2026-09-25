@@ -137,6 +137,41 @@ class PruneTest(unittest.TestCase):
         finally:
             os.close(held)
 
+    def fake_store(self, no_roots: int) -> Path:
+        for sub in ("kv", "cas"):
+            (self.root / "fleet-store" / sub).mkdir(parents=True)
+        (self.root / "bin").mkdir()
+        log = self.root / "gc.calls"
+        binary = self.root / "bin/fleet-cas"
+        binary.write_text("#!/bin/sh\n"
+                          f"echo \"$*\" >> {log}\n"
+                          "case \"$*\" in *--dry-run*) p='dry run: ';; *) p='';; esac\n"
+                          f"echo \"${{p}}kv kept 5 deleted 1; cas kept 9 deleted 2 (4096 bytes); "
+                          f"kept entries naming no stored object: {no_roots}\"\n")
+        binary.chmod(0o755)
+        return log
+
+    def test_store_gc_dry_runs_first_and_runs_daily(self) -> None:
+        log = self.fake_store(0)
+        rec = fp.store_gc(self.root, 14)
+        self.assertEqual(rec["gc"], "ran")
+        calls = log.read_text().splitlines()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--dry-run", calls[0])
+        self.assertNotIn("--dry-run", calls[1])
+        self.assertIn("--keep-days 14", calls[1])
+        self.assertEqual(fp.store_gc(self.root, 14), {"gc": "not due"})
+        self.assertEqual(fp.store_gc(self.root, 14, now=time.time() + fp.GC_EVERY + 1)["gc"], "ran")
+
+    def test_store_gc_refuses_when_entries_name_no_object(self) -> None:
+        log = self.fake_store(3)
+        rec = fp.store_gc(self.root, 14)
+        self.assertTrue(rec["gc"].startswith("skipped: kept entries name no stored object"))
+        self.assertEqual(len(log.read_text().splitlines()), 1)  # only the dry run
+
+    def test_no_store_no_gc(self) -> None:
+        self.assertEqual(fp.store_gc(self.root, 14), {})
+
     def test_defers_while_a_build_runs_or_holds_the_lock(self) -> None:
         self.env()
         paths = self.node(10)
