@@ -561,6 +561,45 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(commands, [["--user", "daemon-reload"],
                                     ["--user", "enable", "--now", "glaeda-disk-pressure.timer"]])
 
+    def test_linux_activation_failure_fails_the_run(self) -> None:
+        self.linux()
+        ctx = ms.Context(self.home, True, "/usr/bin/python3", False, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 1, True, "linux")
+        ctx.skip_launchctl = False
+
+        def refusing_run(argv, *args, **kwargs):
+            return (1, "Failed to enable unit") if "enable" in argv else (0, "")
+
+        blocked = {"kind": "agent", "label": "glaeda-worktree-reclaim.timer", "state": "blocked",
+                   "applied": False, "loaded": False, "note": "glaeda-worktree-reclaim could not be installed"}
+        timer = {"kind": "agent", "label": "glaeda-disk-pressure.timer", "state": "create",
+                 "applied": True, "loaded": False}
+        with mock.patch.object(ms, "run", refusing_run):
+            ms.activate_systemd(ctx, [timer, blocked])
+        self.assertEqual(timer["state"], "failed")
+        self.assertIn("enable --now failed", timer["note"])
+        self.assertEqual(blocked["note"], "glaeda-worktree-reclaim could not be installed")
+
+    def test_linux_uninstall_disables_timers_whatever_their_state(self) -> None:
+        self.linux()
+        self.invoke("--apply")
+        ctx = ms.Context(self.home, True, "/usr/bin/python3", False, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 1, True, "linux")
+        ctx.skip_launchctl = False
+        commands: list[list[str]] = []
+
+        def systemctl_run(argv, *args, **kwargs):
+            commands.append(argv[1:])
+            return 1, ""  # is-enabled/is-active: neither; removal must still disable and stop
+
+        with mock.patch.object(ms, "run", systemctl_run), mock.patch.object(ms, "systemctl", lambda: "systemctl"):
+            actions = ms.plan_uninstall(ctx)
+            commands.clear()
+            ms.apply_uninstall(ctx, actions)
+        self.assertIn(["--user", "disable", "--now", "glaeda-worktree-reclaim.timer"], commands)
+        self.assertIn(["--user", "stop", "glaeda-worktree-reclaim.service"], commands)
+        self.assertEqual(commands[-1], ["--user", "daemon-reload"])
+
     def test_no_em_dashes(self) -> None:
         for name in ("glaeda-mini-setup", "glaeda-worktree-reclaim-all", "test-glaeda-mini-setup.py"):
             self.assertNotIn(chr(0x2014), (ROOT / "scripts" / name).read_text(), name)

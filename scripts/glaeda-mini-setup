@@ -196,8 +196,13 @@ def pick_python() -> str | None:
     an Xcode exist, so it only counts once one does. The fleet's Xcode is a versioned app
     such as Xcode_26.6.app, not only Xcode.app.
     """
-    if platform.system() == "Linux":  # the units run glaeda-disk through its python3 shebang
-        return which("python3", ("/usr/bin/python3",))
+    if HOST_PLATFORM == "linux":
+        # The units run glaeda-disk through its `env python3` shebang with systemd's default PATH,
+        # so only interpreters there count; a pyenv shim on the login PATH would not be found.
+        for candidate in ("/usr/local/bin/python3", "/usr/bin/python3"):
+            if os.access(candidate, os.X_OK):
+                return candidate
+        return None
     for candidate in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
         if os.access(candidate, os.X_OK):
             return candidate
@@ -377,16 +382,21 @@ def preflight_linux(ctx: Context) -> dict[str, Any]:
     """The hygiene profile's needs on Linux: a systemd user manager, python3, and cargo."""
     checks: dict[str, dict[str, Any]] = {}
     checks["linux"] = check(True, f"{os_release_name()} ({platform.machine()})")
-    code, _ = run([systemctl(), "--user", "show-environment"])
-    checks["systemdUser"] = check(code == 0, "available" if code == 0 else "unavailable",
-                                  "" if code == 0 else "the timers need a systemd user manager (systemctl --user)", True)
+    if ctx.skip_launchctl:  # sandbox HOME or --skip-systemctl: systemctl is never called
+        checks["systemdUser"] = check(None, "not checked (systemctl skipped)")
+    else:
+        code, _ = run([systemctl(), "--user", "show-environment"])
+        checks["systemdUser"] = check(
+            code == 0, "available" if code == 0 else "unavailable",
+            "" if code == 0 else "the timers need a systemd user manager: systemctl --user must work "
+            "(log in directly, or set XDG_RUNTIME_DIR when using su or sudo -u)", True)
     user = pwd.getpwuid(ctx.uid).pw_name
     code, out = run(["loginctl", "show-user", user, "--property", "Linger", "--value"])
     linger = code == 0 and out.strip() == "yes"
     checks["linger"] = check(linger, "yes" if linger else (out.strip() or "unknown"),
                              "" if linger else f"timers stop when {user} logs out until: sudo loginctl enable-linger {user}")
     checks["python"] = check(ctx.python is not None, ctx.python or "missing",
-                             "" if ctx.python else "glaeda-disk needs python3", True)
+                             "" if ctx.python else "glaeda-disk needs python3 on systemd's PATH (/usr/bin)", True)
     cargo = find_cargo(ctx)
     checks["cargo"] = check(cargo is not None or ctx.reclaim_binary is not None,
                             cargo or ("--reclaim-binary" if ctx.reclaim_binary else "missing"),
@@ -585,9 +595,11 @@ def agent_loaded(ctx: Context, label: str) -> bool | None:
         return launchctl_loaded(ctx, label)
     if ctx.skip_launchctl or not label.endswith(".timer"):
         return None
-    enabled = run([systemctl(), "--user", "is-enabled", label])
-    active = run([systemctl(), "--user", "is-active", label])
-    return enabled == (0, "enabled") and active == (0, "active")
+    # run() merges stderr, so a warning can sit beside the answer: look for the answer's line.
+    code, out = run([systemctl(), "--user", "is-enabled", label])
+    enabled = code == 0 and "enabled" in out.splitlines()
+    code, out = run([systemctl(), "--user", "is-active", label])
+    return enabled and code == 0 and "active" in out.splitlines()
 
 
 def git_get(ctx: Context, key: str) -> str | None:
@@ -877,32 +889,33 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
 
 
 def activate_systemd(ctx: Context, actions: list[dict[str, Any]]) -> None:
-    """Reload the user manager after unit changes and start every timer that is not running.
+    """Reload the user manager, then start every timer that is not running.
 
     A timer whose own file or whose service changed is restarted so the new definition applies.
+    Any failure marks that action failed, so the receipt is not ready and the run exits 1.
     """
     agents = [a for a in actions if a["kind"] == "agent"]
-    if any(a.get("applied") for a in agents):
-        code, out = run([systemctl(), "--user", "daemon-reload"])
-        if code != 0:
-            for act in agents:
-                act["note"] = ("systemctl --user daemon-reload failed: " + out)[:400]
-            return
+    timers = [a for a in agents if a["label"].endswith(".timer") and a["state"] in {"create", "update", "unchanged"}]
     changed = {a["label"] for a in agents if a.get("applied")}
-    for act in agents:
-        label = act["label"]
-        if not label.endswith(".timer") or act["state"] not in {"create", "update", "unchanged"}:
-            continue
-        service = label.removesuffix(".timer") + ".service"
-        if act.get("loaded") and not ({label, service} & changed):
-            continue
-        verb = ["enable", "--now"] if not act.get("loaded") else ["restart"]
-        code, out = run([systemctl(), "--user", *verb, label])
-        if code == 0 and verb == ["restart"]:
-            code, out = run([systemctl(), "--user", "enable", label])
-        act["enabled"] = code == 0
-        if code != 0:
-            act["note"] = (f"systemctl --user {' '.join(verb)} failed: " + out)[:400]
+    pending = [a for a in timers if not a.get("loaded")
+               or {a["label"], a["label"].removesuffix(".timer") + ".service"} & changed]
+    if not changed and not pending:
+        return
+    # Reload before any enable: a hand-copied unit systemd has not read yet is "not found".
+    code, out = run([systemctl(), "--user", "daemon-reload"])
+    if code != 0:
+        for act in pending or timers:
+            act["state"], act["note"] = "failed", ("systemctl --user daemon-reload failed: " + out)[:400]
+        return
+    for act in pending:
+        steps = [["enable", "--now"]] if not act.get("loaded") else [["restart"], ["enable"]]
+        for verb in steps:
+            code, out = run([systemctl(), "--user", *verb, act["label"]])
+            if code != 0:
+                act["state"] = "failed"
+                act["note"] = (f"systemctl --user {' '.join(verb)} failed: " + out)[:400]
+                break
+        act["enabled"] = act["state"] != "failed"
 
 
 def find_cargo(ctx: Context) -> str | None:
@@ -926,11 +939,13 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
     for act in actions:
         act["applied"] = False
         if act["kind"] == "agent":
-            if act.get("loaded") and act["state"] == "remove":
-                if ctx.platform == "linux":
-                    run([systemctl(), "--user", "disable", "--now", act["label"]])
-                else:
-                    bootout(ctx, act["label"])
+            if act["state"] == "remove" and ctx.platform == "linux" and not ctx.skip_launchctl:
+                # Whatever is_enabled/is_active said: a stopped-but-enabled timer leaves a wants
+                # link, and an active-but-disabled one keeps firing after its file is gone.
+                verb = ["disable", "--now"] if act["label"].endswith(".timer") else ["stop"]
+                run([systemctl(), "--user", *verb, act["label"]])
+            elif act.get("loaded") and act["state"] == "remove" and ctx.platform != "linux":
+                bootout(ctx, act["label"])
             if act["state"] == "remove":
                 Path(act["path"]).unlink()
                 act["applied"] = True
