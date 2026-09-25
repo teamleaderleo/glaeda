@@ -208,7 +208,7 @@ def node_refusal(fleet_class: str | None) -> tuple[str | None, dict[str, Any]]:
         return f"node not eligible (no {fleet_class} class receipt)", {}
     acceptance = _json_file(config / "acceptance" / f"{FLEET_ROLE}.json")
     if not receipt.get("receiptSha256") or (enrollment.get("classAcceptanceSha256") != receipt.get("receiptSha256")
-                                            and not receipt_source(enrollment, acceptance, receipt)):
+                                            and not receipt_source(enrollment, acceptance, receipt, fleet_class)):
         return f"node not eligible (the enrollment does not reference the {fleet_class} class receipt)", {}
     commit = str(((receipt.get("glaedaCandidate") or {}) if isinstance(receipt.get("glaedaCandidate"), dict) else {})
                  .get("commit") or "")
@@ -257,13 +257,15 @@ SOURCE_BINDING = (("enrollment", "nodeId", "acceptingNodeId"), ("enrollment", "e
                   ("acceptance", "cmuxSemanticResultSha256", "cmuxSemanticResultSha256"))
 
 
-def receipt_source(enrollment: dict[str, Any], acceptance: Any, receipt: dict[str, Any]) -> bool:
+def receipt_source(enrollment: dict[str, Any], acceptance: Any, receipt: dict[str, Any], fleet_class: str) -> bool:
     """This node is the one the class receipt was exported from: an enrollment that references no class
     receipt, and every binding field equal and present. Eligibility itself is still the node status."""
     if enrollment.get("classAcceptanceSha256") is not None or not isinstance(acceptance, dict):
         return False
     docs = {"enrollment": enrollment, "acceptance": acceptance}
-    if receipt.get("toolchainGeneration") not in (enrollment.get("supportedToolchainGenerations") or []):
+    generations = enrollment.get("supportedToolchainGenerations")
+    if receipt.get("fleetClass") != fleet_class or not isinstance(generations, list) \
+            or receipt.get("toolchainGeneration") not in generations:
         return False
     return all(docs[doc].get(field) not in (None, "") and docs[doc].get(field) == receipt.get(key)
                for doc, field, key in SOURCE_BINDING)

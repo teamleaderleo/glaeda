@@ -649,7 +649,7 @@ else:
         self.node()
         config = self.dir / ".config/glaeda/cmux-fleet"
         receipt = json.loads((config / "class-acceptance/m4pro-48.json").read_text())
-        receipt.update(acceptingNodeId="cmux-mac-001", acceptingEnrollmentGeneration=2, glaedaGeneration="sha256:g",
+        receipt.update(fleetClass="m4pro-48", acceptingNodeId="cmux-mac-001", acceptingEnrollmentGeneration=2, glaedaGeneration="sha256:g",
                        toolchainGeneration="sha256:t", cmuxToolchainIdentity="sha256:i", cmuxSemanticResultSha256="sha256:s")
         (config / "class-acceptance/m4pro-48.json").write_text(json.dumps(receipt))
         enrollment = {"state": "eligible", "nodeId": "cmux-mac-001", "enrollmentGeneration": 2,
@@ -660,7 +660,8 @@ else:
                  "stale-generation": ({"enrollmentGeneration": 1}, {}, 1),
                  "other-toolchain": ({"supportedToolchainGenerations": ["sha256:x"]}, {}, 1),
                  "other-result": ({}, {"cmuxSemanticResultSha256": "sha256:z"}, 1),
-                 "references-another-receipt": ({"classAcceptanceSha256": "sha256:bb"}, {}, 1)}
+                 "references-another-receipt": ({"classAcceptanceSha256": "sha256:bb"}, {}, 1),
+                 "generations-not-a-list": ({"supportedToolchainGenerations": "sha256:t"}, {}, 1)}
         for name, (enroll_over, accept_over, code) in cases.items():
             with self.subTest(name):
                 (config / "enrollment.json").write_text(json.dumps({**enrollment, **enroll_over}))
@@ -670,6 +671,11 @@ else:
                 self.assertEqual(result.returncode, code, result.stdout)
                 if code:
                     self.assertIn("does not reference the m4pro-48 class receipt", result.stdout)
+        (config / "enrollment.json").write_text(json.dumps(enrollment))
+        (config / "acceptance/cmux_macos_native_build.json").write_text(json.dumps(acceptance))
+        (config / "class-acceptance/m4pro-48.json").write_text(json.dumps({**receipt, "fleetClass": "m4-16"}))
+        self.assertEqual(self.eligible_start().returncode, 1, "a receipt for another class never admits")
+        self.done()
 
     def test_eligible_node_on_its_toolchain_is_admitted(self) -> None:
         self.fleet()
