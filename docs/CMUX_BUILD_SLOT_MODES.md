@@ -22,8 +22,9 @@ file-scope declaration (`private let`) in one app file (`WorkspaceTodoState.swif
 recompiled 323 of the app target's 2,655 Swift files (Xcode 26.6 logs each compile twice, 646
 lines); its revert took 125 s. An edit inside a function body likely
 recompiles less (the Air Blue campaign saw 40 to 48 s on Xcode 27) and has not been measured
-on the pin. The fresh-build row assumes the fleet store already holds that commit. With caching on, every
-compile job's key covers the whole module, so any edit misses every job in the app target.
+on the pin. The fresh-build row assumes the fleet store already holds that commit. With caching on (Xcode 26.3),
+every compile job's key covered the whole module, so any edit missed every job in the app
+target (but see the 26.6 evidence below).
 
 Turning caching off for the app target alone (a per-target macro) while packages stay cached
 is not adopted for now: one fresh build that way (Xcode 26.3, against a 26.3 store) lost the
@@ -31,17 +32,21 @@ package hits (76 against about 1,535) and took 802 s. The cause was not diagnose
 may reach package compiles), and the warm edit and no-op runs that would decide the question
 were invalidated by an Xcode switch mid-run, so this stays open (Next, item 1).
 
-Later evidence reopens both conclusions above; treat them as one early data point, not a
-rule. cmux CI now uses a per-target macro,
-`COMPILATION_CACHE_ENABLE_CACHING=$(CMUX_CI_COMPILATION_CACHE_$(TARGET_NAME):default=YES)`, to
-turn the cache off for `cmuxTests` only (manaflow-ai/cmux#14349). Under the cache the
-`cmuxTests` driver rewrites its chained bridging header on every build, which invalidated all
-~1,100 test inputs. On Xcode 26.6 (canary run 36081880621, 12vcpu), a one-test-file edit
-went from 139 s to 31 s, and with the cache on, a function-body app edit compiled 2 app tasks
-rather than the whole target. The 451 s whole-target rebuild and the 802 s trial were both on
-Xcode 26.3, and 26.3 also recompiled all 5,218 app files on a body-only edit in CI (run
-36035657899). So the whole-module cache key may be a 26.3 behaviour rather than a property of
-the cache. Re-measure on the pin before relying on the two-mode split.
+Later evidence reopens the first conclusion for function-body edits; treat both as early data
+points, not rules. cmux CI now turns the cache off for `cmuxTests` only (not the app target)
+with a per-target macro,
+`COMPILATION_CACHE_ENABLE_CACHING=$(CMUX_CI_COMPILATION_CACHE_$(TARGET_NAME):default=YES)`
+(manaflow-ai/cmux#14349). Under the cache the `cmuxTests` driver rewrote its chained bridging
+header on every build, which invalidated all 1,073 test inputs. On Xcode 26.6 (canary run
+36081880621, 12vcpu), a one-test-file edit spent 139 s in `cmuxTests` with the cache on and
+31 s with it off (44 s for the whole rebuild). A function-body app edit compiled 2 app tasks
+with the cache on, so on 26.6 the app target stayed incremental for that edit. The 451 s cell
+(a new file-scope declaration) and the 802 s trial were both on Xcode 26.3, and 26.3 also
+recompiled the whole app target on a body-only edit in CI (5,218 compile lines, run
+36035657899). The first admission with the macro (cmux#14349's own, job 107918674068)
+recompiled only `cmuxTests` (1 driver, 43 batched compiles) and no package or app files, but
+that was a seeded incremental build. Package hits on a fresh cache-fed build with the macro are
+still unmeasured, so the second conclusion stays open.
 
 So a slot keeps two DerivedData directories and picks per job:
 
@@ -229,7 +234,9 @@ DerivedData is therefore warmed by its own caching-off builds:
 
 1. On the pin: a function-body app edit, a cancellation in the middle of compiling, and the
    mixed-mode edit and no-op runs (with the fresh-build hit loss diagnosed). Start from the
-   cmux#14349 per-target macro, and check whether caching on alone stays incremental on 26.6.
+   cmux#14349 per-target macro. Check whether caching on alone stays incremental on 26.6 for a
+   new top-level declaration (the 451 s cell's edit), and whether the macro applied to the app
+   target keeps package hits on a fresh build.
 2. Cut the non-compiler work a catch-up build still does. Summed task time, not wall time:
    SwiftDriver planning and scanning 163 s, script phases 18 s (Rust diff sidecar, nucleo FFI,
    wireguard-go), App Intents extraction 16 s over 89 tasks. Script phases can be cached by
