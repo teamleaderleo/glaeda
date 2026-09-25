@@ -62,7 +62,7 @@ HEX64 = re.compile(r"[0-9a-f]{64}")
 MAX_EXTRACTED = 1024 * 1024 * 1024
 # what setup installs and a first update snapshots, so it can roll back without a previous release
 TOOLS = ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
-         "glaeda-seed-prefetch", "glaeda-update")
+         "glaeda-seed-prefetch", "glaeda-update", "glaeda-gh")
 RELEASE_SCHEMA = "glaeda-release/v1"
 STATUS_PREFIX = "glaeda-ota/"
 MAX_ASSET = 200 * 1024 * 1024
@@ -262,6 +262,7 @@ def health(bin_dir: Path, channel_dir: Path) -> tuple[bool, str]:
     checks = [
         [sys.executable, str(bin_dir / "glaeda-disk"), "--help"],
         [str(bin_dir / "glaeda-worktree-reclaim"), "--help"],
+        [sys.executable, str(bin_dir / "glaeda-gh"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-update"), "--channel-dir", str(channel_dir)],
     ]
     for argv in checks:

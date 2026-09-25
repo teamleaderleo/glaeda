@@ -30,8 +30,10 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
     ~/.local/bin/glaeda-seed-prefetch          from scripts/glaeda-seed-prefetch (a no-op off an owned cmux runner)
     ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
+    ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
+    ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
     ~/.config/glaeda/update.json               its release ring, written once (--ota-ring canary|stable)
-    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,update}.plist
+    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,update,gh-watch}.plist
     build-host directories and three git defaults, each set only when unset
     python@3.13 from Homebrew, only when no Python 3.13+ exists and this user owns Homebrew
 
@@ -50,8 +52,8 @@ the newest release on the ring, then rolls back if the new tools do not run.
 Linux (Big Red, owned Linux machines, Linux VMs on the fleet) gets the hygiene profile, the
 only one written for it so far, with or without the flag. It installs the same tools and
 the systemd user units in ops/systemd (glaeda-disk-pressure, glaeda-worktree-reclaim and
-glaeda-update, each a service and a timer) into ~/.config/systemd/user, reloads the user manager and enables the
-timers. There is no disk-dedupe unit (it watches Xcode DerivedData). A missing systemd user
+glaeda-update, each a service and a timer, and the long-running glaeda-gh service) into
+~/.config/systemd/user, reloads the user manager and enables the timers and glaeda-gh. There is no disk-dedupe unit (it watches Xcode DerivedData). A missing systemd user
 manager blocks; lingering off is reported, since timers then stop at logout.
 
 Machine enrollment stays with scripts/glaeda-mini-enroll, which drives
@@ -62,6 +64,7 @@ This command only runs that bootstrap read-only and records its verdict. The rec
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import json
@@ -106,7 +109,12 @@ LINUX_UNITS = (
     "glaeda-worktree-reclaim.timer",
     "glaeda-update.service",
     "glaeda-update.timer",
+    "glaeda-gh.service",
 )
+# long-running Linux services with no timer: enabled and started themselves
+DAEMON_UNITS = frozenset({"glaeda-gh.service"})
+# the Claude Code skill installed beside the tools
+SKILL_SOURCE = REPO / "skills/github-ci-wait/SKILL.md"
 # glaeda-update runs this command from a release; it sets this so setup never unloads the job running it
 UPDATE_ENV = "GLAEDA_UPDATE_RUNNING"
 OTA_RINGS = ("canary", "stable")
@@ -626,6 +634,20 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-seed-prefetch.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-seed-prefetch.err"),
         },
+        # The shared GitHub CI watcher (scripts/glaeda-gh): the one process that polls GitHub for every
+        # session on this host. It idles without API calls while nothing is watched and re-executes
+        # itself when the tool is updated.
+        LABEL_PREFIX + "gh-watch": {
+            "Label": LABEL_PREFIX + "gh-watch",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-gh"), "serve"],
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "ThrottleInterval": 30,
+            # gh (for the token) is in Homebrew, which a LaunchAgent's PATH leaves out
+            "EnvironmentVariables": {"PATH": f"{ctx.bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"},
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-gh.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-gh.err"),
+        },
     }
 
 
@@ -646,6 +668,14 @@ def agent_bytes(ctx: Context, label: str) -> bytes:
 
 def is_disk_agent(label: str) -> bool:
     return label.startswith((LABEL_PREFIX + "disk", "glaeda-disk"))
+
+
+def is_gh_agent(label: str) -> bool:
+    return label == LABEL_PREFIX + "gh-watch" or label.startswith("glaeda-gh.")
+
+
+def skill_path(ctx: Context) -> Path:
+    return ctx.home / ".claude/skills/github-ci-wait/SKILL.md"
 
 
 def is_update_agent(label: str) -> bool:
@@ -729,7 +759,7 @@ def agent_loaded(ctx: Context, label: str) -> bool | None:
     """Loaded in launchd, or on Linux a timer that is enabled and active. Services start from their timer."""
     if ctx.platform != "linux":
         return launchctl_loaded(ctx, label)
-    if ctx.skip_launchctl or not label.endswith(".timer"):
+    if ctx.skip_launchctl or not (label.endswith(".timer") or label in DAEMON_UNITS):
         return None
     # run() merges stderr, so a warning can sit beside the answer: look for the answer's line.
     code, out = run([systemctl(), "--user", "is-enabled", label])
@@ -770,10 +800,14 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
     for name in ("glaeda-disk", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
-                 "glaeda-update"):
+                 "glaeda-update", "glaeda-gh"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
+    # a copy, not a link: the release tree it came from is replaced by the next update
+    act = file_action(ctx, "tool", skill_path(ctx), SKILL_SOURCE.read_bytes(), 0o644)
+    act["source"] = os.fspath(SKILL_SOURCE)
+    actions.append(act)
     mode, source, note = reclaim_source(ctx)
     dest = ctx.bin / "glaeda-worktree-reclaim"
     if mode == "blocked":
@@ -812,7 +846,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
                         act["sha256"] = act["previousSha256"]
             except (OSError, plistlib.InvalidFileException, ValueError):
                 pass
-        if ctx.python is None and (is_disk_agent(label) or is_update_agent(label)):
+        if ctx.python is None and (is_disk_agent(label) or is_update_agent(label) or is_gh_agent(label)):
             act["state"], act["note"] = "blocked", "no usable python3 yet"
         if is_reclaim_agent(label) and reclaim_act["state"] == "blocked":
             act["state"], act["note"] = "blocked", "glaeda-worktree-reclaim could not be installed"
@@ -897,8 +931,9 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
     for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
-                 "glaeda-seed-prefetch", "glaeda-update"):
+                 "glaeda-seed-prefetch", "glaeda-update", "glaeda-gh"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
+    actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
     for act in actions:
         if act["kind"] == "note":
             continue
@@ -999,6 +1034,7 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
                 data = agent_bytes(ctx, act["label"])
             if state == "update":
                 act["backup"] = backup(ctx, dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)  # the skill's directory may not exist yet
             if kind == "agent" and act.get("loaded") and ctx.platform != "linux":
                 if is_update_agent(act["label"]) and os.environ.get(UPDATE_ENV):
                     # unloading would kill the glaeda-update that is running this setup; launchd
@@ -1063,7 +1099,8 @@ def activate_systemd(ctx: Context, actions: list[dict[str, Any]]) -> None:
     Any failure marks that action failed, so the receipt is not ready and the run exits 1.
     """
     agents = [a for a in actions if a["kind"] == "agent"]
-    timers = [a for a in agents if a["label"].endswith(".timer") and a["state"] in {"create", "update", "unchanged"}]
+    timers = [a for a in agents if (a["label"].endswith(".timer") or a["label"] in DAEMON_UNITS)
+              and a["state"] in {"create", "update", "unchanged"}]
     changed = {a["label"] for a in agents if a.get("applied")}
     pending = [a for a in timers if not a.get("loaded")
                or {a["label"], a["label"].removesuffix(".timer") + ".service"} & changed]
@@ -1110,7 +1147,7 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
             if act["state"] == "remove" and ctx.platform == "linux" and not ctx.skip_launchctl:
                 # Whatever is_enabled/is_active said: a stopped-but-enabled timer leaves a wants
                 # link, and an active-but-disabled one keeps firing after its file is gone.
-                verb = ["disable", "--now"] if act["label"].endswith(".timer") else ["stop"]
+                verb = ["disable", "--now"] if act["label"].endswith(".timer") or act["label"] in DAEMON_UNITS else ["stop"]
                 run([systemctl(), "--user", *verb, act["label"]])
             elif act.get("loaded") and act["state"] == "remove" and ctx.platform != "linux":
                 bootout(ctx, act["label"])
@@ -1120,6 +1157,9 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
         elif act["kind"] == "tool" and act["state"] == "remove":
             Path(act["path"]).unlink()
             act["applied"] = True
+            if Path(act["path"]) == skill_path(ctx):
+                with contextlib.suppress(OSError):  # only when empty
+                    skill_path(ctx).parent.rmdir()
         elif act["kind"] == "git" and act["state"] == "remove":
             code, _ = run([which("git") or "git", "config", "--global", "--unset", act["key"]], env=ctx.git_env())
             act["applied"] = code == 0
