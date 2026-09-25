@@ -17,7 +17,8 @@ TOOL = ROOT / "scripts" / "glaeda-cmux-runner-fleet"
 TOKEN = "AAAREGTOKEN123"
 MANIFEST = {
     "defaults": {"xcode": {"apps": [{"path": "/Applications/Xcode_26.6.app", "version": "26.6", "build": "17F113"}]},
-                 "disk": {"min_free_gib": 100}, "people": {"secret": "never copied"}},
+                 "disk": {"min_free_gib": 100}, "ios_simulator": {"runtimes": ["23F77"]},
+                 "people": {"secret": "never copied"}},
     "hosts": {
         "mini-a": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"], "hardware": "m4pro-48"},
         "mini-b": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"], "hardware": "m4pro-48"},
@@ -151,7 +152,8 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 8, "one token per instance")
         staged = json.loads((self.dir / "calls.jsonl.mini-a.manifest").read_text())
         self.assertEqual(set(staged["hosts"]), {"mini-a"})
-        self.assertEqual(set(staged["defaults"]), {"xcode", "disk"}, "no other hosts, keys or people")
+        self.assertEqual(set(staged["defaults"]), {"xcode", "disk", "ios_simulator"},
+                         "no other hosts, keys or people; ios_simulator gates glaeda-ios-sim on the mini")
 
     def test_org_migration_goes_one_member_at_a_time_and_skips_trusted(self) -> None:
         manifest = json.loads(json.dumps(MANIFEST))
