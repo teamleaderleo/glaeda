@@ -1061,9 +1061,8 @@ def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None 
 
 def conflicting(data: dict) -> bool:
     """An open PR GitHub says conflicts with its base. UNKNOWN is still being computed: not a conflict."""
-    if data.get("state") != "OPEN" or data.get("mergeable") == "UNKNOWN":
-        return False
-    return data.get("mergeable") == "CONFLICTING" or data.get("mergeStateStatus") == "DIRTY"
+    # mergeStateStatus can lag mergeable (or read DRAFT), so mergeable alone decides.
+    return data.get("state") == "OPEN" and data.get("mergeable") == "CONFLICTING"
 
 
 def age(seconds: float | None) -> str:

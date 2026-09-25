@@ -787,7 +787,11 @@ class ClientTest(Base):
         self.assertEqual(gg.verdict("pr", {**data, "mergeStateStatus": "CLEAN"}, "green"), 0)
         # A conflicted PR runs no workflows until the next push, and a merged one never will: no wait.
         self.assertEqual(gg.check_verdict({**data, "mergeStateStatus": "DIRTY"}, "done"), 1)
-        self.assertEqual(gg.verdict("pr", {**data, "mergeStateStatus": "DIRTY"}, "done"), gg.EXIT_CONFLICT)
+        self.assertEqual(gg.verdict("pr", {**data, "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"}, "done"),
+                         gg.EXIT_CONFLICT)
+        # A lagging DIRTY without CONFLICTING is not called a conflict.
+        self.assertNotEqual(gg.verdict("pr", {**data, "mergeable": "MERGEABLE", "mergeStateStatus": "DIRTY"}, "done"),
+                            gg.EXIT_CONFLICT)
         self.assertIn("merge conflicts", gg.summary("pr:o/r#1", {"data": {**data, "mergeStateStatus": "DIRTY"}}))
         self.assertEqual(gg.verdict("pr", {**data, "state": "MERGED", "mergeStateStatus": "UNKNOWN"}, "green"), 0)
         # Classic branch protection lists its contexts too.
