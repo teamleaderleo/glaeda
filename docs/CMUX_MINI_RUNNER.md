@@ -358,9 +358,15 @@ in at the producer's root. So one root job per root per mini:
   runner whose mini is already busy in its root (a "canonical root token is taken" refusal).
 - `compileSlots` may not exceed `canonicalRoots`: every compile holds a root.
 - `declared_pools` and glaeda-route count only the pool labels; the root labels are a per-mini subset of them.
-- Before `canonicalRoots` goes above 1, consumers need `glaeda-canonical-root take <root>` to hold
-  the producer's root (not shipped yet). Workflows that use /private/tmp/cmux-ci directly (app-host-test-rerun,
-  seed-swiftpm-manifests) must hold root 1.
+- With `canonicalRoots` above 1, consumers (gui and product jobs) take no root at job start. Their restore
+  step runs `/Users/Shared/cmux-build-fleet/bin/glaeda-canonical-root take <root> --wait 1800` for the
+  producer's root (the path from the product receipt, or N). The job-started hook links that path to its
+  runner's generated shim, which runs the hook's `take-root`: an exclusive `root-N.token` held by a second
+  detached holder tied to the job's Runner.Worker and released by job-completed. A re-take of a root the
+  same job already holds (a compile restoring its own product) is a no-op. It exits 1 when the root is
+  still busy after the wait, and 2 for a bad root or outside a runner job.
+- Jobs the hook does not know (app-host-test-rerun, seed-swiftpm-manifests, anything new) are pinned to
+  root 1, because they use /private/tmp/cmux-ci themselves.
 
 ## 3. Verify
 

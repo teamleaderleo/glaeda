@@ -17,6 +17,7 @@ import io
 import json
 import os
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -495,6 +496,98 @@ class HookTest(unittest.TestCase):
             for runner in ("r0", "r2", "r3", "r5"):
                 self.finish(runner)
         self.assertTrue(self.lock_free(), "every holder let go")
+
+    def take(self, root: str, runner: str, *extra: str) -> subprocess.CompletedProcess:
+        """Run take-root as a restore step would: under a process named Runner.Worker (its ancestor)."""
+        worker = self.dir / "Runner.Worker"
+        if not worker.exists():  # a real parent process named Runner.Worker (a copied /bin/sh is killed on macOS)
+            source = self.dir / "worker.c"
+            source.write_text("#include <sys/wait.h>\n#include <unistd.h>\nint main(int c, char **v) {\n"
+                              "  pid_t p = fork(); if (p == 0) { execv(\"/bin/sh\", v); _exit(127); }\n"
+                              "  int s = 0; waitpid(p, &s, 0); return WIFEXITED(s) ? WEXITSTATUS(s) : 1; }\n")
+            cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+            if cc is None or subprocess.run([cc, "-o", os.fspath(worker), os.fspath(source)],
+                                            capture_output=True).returncode != 0:
+                self.skipTest("no C compiler to build a Runner.Worker stand-in")
+        cmd = " ".join(shlex.quote(a) for a in [sys.executable, os.fspath(HOOK), "take-root", "--root", root,
+                                                "--capacity-dir", os.fspath(self.dir / "capacity"),
+                                                "--state-dir", os.fspath(self.dir / "state"), *extra])
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "RUNNER_NAME": runner,
+                   "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet")}
+        return subprocess.run([os.fspath(worker), "-c", cmd], env=environ, capture_output=True, text=True,
+                              timeout=60, check=False)
+
+    def test_two_roots_consumers_take_the_producers_root_in_their_step(self) -> None:
+        self.fleet()
+        two = ("--canonical-roots", "2", "--compile-slots", "2")
+        try:
+            compile_ = self.job("macos-compile-admission", "p0", 8, None, *two)
+            self.assertIn("persistent-dd+root-1", compile_.stdout)
+            consumer = self.job("cli-product-tests", "c0", 8, None, *two)
+            self.assertEqual(consumer.returncode, 0, consumer.stdout)
+            self.assertNotIn("root-", consumer.stdout.split("holding", 1)[1], "a consumer takes no root at job start")
+            busy = self.take("/private/tmp/cmux-ci", "c0", "--wait", "1")
+            self.assertEqual(busy.returncode, 1, busy.stderr)
+            self.assertIn("still in use", busy.stderr)
+            got = self.take("/private/tmp/cmux-ci-2", "c0")
+            self.assertEqual((got.returncode, got.stdout.strip()), (0, "/private/tmp/cmux-ci-2"), got.stderr)
+            self.assertEqual(self.take("2", "c0").returncode, 0, "a re-take of a root this job holds is a no-op")
+            other = self.take("/private/tmp/cmux-ci-2", "c1", "--wait", "1")
+            self.assertEqual(other.returncode, 1, "another job cannot take a held root")
+            self.assertIn("canonical root holder(s) released", self.finish("c0"))
+            self.assertEqual(self.take("/private/tmp/cmux-ci-2", "c1").returncode, 0, "released with the job")
+            self.finish("c1")
+            again = self.take("1", "p0")
+            self.assertEqual(again.returncode, 0, "the producer re-taking its own root is a no-op")
+            self.assertFalse((self.dir / "state" / "host-lock-holder-p0-root-1.pid").exists())
+        finally:
+            for runner in ("p0", "c0", "c1"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
+    def test_two_roots_unknown_jobs_are_pinned_to_root_one(self) -> None:
+        self.fleet()
+        two = ("--canonical-roots", "2", "--compile-slots", "2")
+        try:
+            self.assertIn("root-1", self.job("macos-compile-admission", "u0", 8, None, *two).stdout)
+            pinned = self.job("app-host-test-rerun", "u1", 8, None, *two)
+            self.assertEqual(pinned.returncode, 1, "an unknown job uses /private/tmp/cmux-ci itself")
+            self.assertIn("canonical root token is taken", pinned.stdout)
+            self.assertIn("root-2", self.job("macos-compile-admission", "u2", 8, None, *two).stdout)
+        finally:
+            for runner in ("u0", "u1", "u2"):
+                self.finish(runner)
+
+    def test_take_root_refuses_bad_roots_and_non_jobs(self) -> None:
+        for bad in ("/tmp/elsewhere", "/private/tmp/cmux-ci-1", "0", "cmux-ci-2x"):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.take(bad, "x0").returncode, 2)
+        outside = self.run_hook("take-root", None, None, "--root", "2", "--capacity-dir",
+                                os.fspath(self.dir / "capacity"), "--state-dir", os.fspath(self.dir / "state"))
+        self.assertEqual(outside.returncode, 2)
+        self.assertIn("not inside a runner job", outside.stderr)
+
+    def test_job_started_links_the_root_shim_into_the_fleet_bin(self) -> None:
+        fleet = self.fleet()
+        (fleet / "bin").mkdir()
+        hooks = self.dir / "hooks"
+        hooks.mkdir()
+        shutil.copy(HOOK, hooks / "glaeda-cmux-runner-hook")
+        (hooks / "glaeda-canonical-root").write_text("#!/bin/sh\n")
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_FLEET_DIR": os.fspath(fleet),
+                   "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(event(self.dir, "push", {"repository": CMUX})),
+                   "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_JOB": "swift-package-tests", "RUNNER_NAME": "s0"}
+        run = subprocess.run([sys.executable, os.fspath(hooks / "glaeda-cmux-runner-hook"), "job-started",
+                              "--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--capacity-units", "4",
+                              "--capacity-dir", os.fspath(self.dir / "capacity"), "--state-dir", os.fspath(self.dir / "state"),
+                              "--watch-pid", str(os.getpid())], env=environ, capture_output=True, text=True, timeout=30)
+        try:
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            link = fleet / "bin" / "glaeda-canonical-root"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(os.readlink(link), os.fspath((hooks / "glaeda-canonical-root").resolve()))
+        finally:
+            self.finish("s0")
 
     def test_capacity_one_root_job_per_canonical_root(self) -> None:
         # a consumer's rm -rf of <root>/src must never meet a compile or another consumer in that root
@@ -1705,6 +1798,9 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--require-eligible --fleet-class m4pro-48 --toolchain-xcode /Applications/Xcode_26.6.app",
                       (hooks / "job-started.sh").read_text())
         self.assertTrue((hooks / "glaeda_reservation.py").is_file())
+        shim = (hooks / "glaeda-canonical-root").read_text()
+        self.assertIn("take-root --root", shim)
+        self.assertTrue(os.access(hooks / "glaeda-canonical-root", os.X_OK))
         self.assertNotIn("--compile-slots", (hooks / "job-started.sh").read_text())  # 1 is the hook's default
         manifest["defaults"]["runner"] = {"classes": {"std": {"compileSlots": 2, "canonicalRoots": 2}}}
         path.write_text(json.dumps(manifest))
