@@ -114,6 +114,12 @@ OTA_RINGS = ("canary", "stable")
 HYGIENE_BLOCKING = frozenset({"python", "systemdUser"})
 RUN_TIMEOUT = 20
 ENROLL_PYTHON_FORMULA = "python@3.13"
+# git before 2.55 has a `git maintenance` bug that eats memory; hosts ran with maintenance.auto off
+# because of it, which let duplicate packs pile up (14 GiB in one cmux checkout on 2026-09-25)
+MIN_GIT = (2, 55)
+GIT_CANDIDATES = ("/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git")
+# glaeda-update waits 30 minutes for this whole command; the git step must fit well inside that
+GIT_BREW_TIMEOUT = 600
 BREW_TIMEOUT = 1800
 
 
@@ -273,11 +279,57 @@ def brew_allowed(ctx: Context) -> bool:
     return not ctx.sandbox
 
 
-def brew_install(brew: str, formula: str) -> tuple[int, str]:
+def git_version(git: str) -> tuple[int, ...] | None:
+    code, out = run([git, "--version"])
+    found = re.search(r"git version (\d+)\.(\d+)(?:\.(\d+))?", out) if code == 0 else None
+    return tuple(int(x) for x in found.groups() if x is not None) if found else None
+
+
+def newest_git() -> tuple[str | None, tuple[int, ...] | None]:
+    """The newest git among PATH and the usual install locations."""
+    best: tuple[str | None, tuple[int, ...] | None] = (None, None)
+    for git in dict.fromkeys(g for g in (shutil.which("git"), *GIT_CANDIDATES) if g and os.access(g, os.X_OK)):
+        version = git_version(git)
+        if version and (best[1] is None or version > best[1]):
+            best = (git, version)
+    return best
+
+
+def plan_git(ctx: Context) -> dict[str, Any]:
+    """git >= 2.55 on every host; Homebrew installs it when this user owns Homebrew."""
+    need = ".".join(map(str, MIN_GIT))
+    act: dict[str, Any] = {"kind": "gitpkg", "key": f"git>={need}", "formula": "git"}
+    git, version = newest_git()
+    shown = f"{git} {'.'.join(map(str, version))}" if version else "none"
+    if version and version >= MIN_GIT:
+        on_path = shutil.which("git")
+        path_version = git_version(on_path) if on_path else None
+        note = "" if not path_version or path_version >= MIN_GIT else (
+            f"PATH resolves {on_path} {'.'.join(map(str, path_version))}: put {Path(git).parent} first")
+        return {**act, "state": "unchanged", "value": shown, "note": note}
+    if ctx.platform == "linux":
+        return {**act, "state": "blocked", "value": shown,
+                "note": f"git {need}+ fixes a git maintenance memory bug: sudo add-apt-repository ppa:git-core/ppa "
+                        "&& sudo apt install git"}
+    brew = owned_brew()
+    if brew and not brew_allowed(ctx):
+        return {**act, "state": "blocked", "value": shown, "note": "brew install git is not run with a sandbox HOME"}
+    if brew:
+        return {**act, "state": "create", "value": shown, "brew": brew,
+                "note": f"brew install git: git {need}+ fixes a git maintenance memory bug"}
+    return {**act, "state": "blocked", "value": shown,
+            "note": f"git {need}+ fixes a git maintenance memory bug: the Homebrew owner runs brew install git"}
+
+
+def brew_install(brew: str, formula: str, verb: str = "install", timeout: int = BREW_TIMEOUT,
+                 no_auto_update: bool = False) -> tuple[int, str]:
+    env = {**os.environ, "HOMEBREW_NO_AUTO_UPDATE": "1"} if no_auto_update else None
     try:
-        result = subprocess.run([brew, "install", formula], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, timeout=BREW_TIMEOUT, check=False)
-    except (OSError, subprocess.TimeoutExpired) as error:
+        result = subprocess.run([brew, verb, formula], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=timeout, check=False, env=env)
+    except subprocess.TimeoutExpired:
+        return 1, f"brew {verb} {formula} timed out after {timeout} s"
+    except OSError as error:
         return 1, str(error)
     return result.returncode, result.stdout
 
@@ -788,6 +840,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
                         "note": note, "owned": state == "unchanged" and key in owned_before})
     if not ctx.hygiene_only:
         actions.append(plan_enroll_python(ctx))
+    actions.append(plan_git(ctx))
     return actions
 
 
@@ -957,6 +1010,20 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             write_atomic(path, (json.dumps(act["value"], indent=1, sort_keys=True) + "\n").encode(), 0o644)
             act["applied"] = True
+        if kind == "gitpkg" and state == "create":
+            # bottles only, no self-update: both calls fit well inside glaeda-update's wait for setup
+            code, out = brew_install(act["brew"], "git", timeout=GIT_BREW_TIMEOUT, no_auto_update=True)
+            _, version = newest_git()
+            if code == 0 and not (version and version >= MIN_GIT):
+                # `brew install` leaves an outdated keg alone; upgrade it
+                code, more = brew_install(act["brew"], "git", verb="upgrade", timeout=GIT_BREW_TIMEOUT,
+                                          no_auto_update=True)
+                out += more
+                _, version = newest_git()
+            act["applied"] = bool(version and version >= MIN_GIT)
+            act["value"] = ".".join(map(str, version)) if version else None
+            if not act["applied"]:
+                act["state"], act["note"] = "failed", f"brew install git exited {code}: {out.strip()[-300:]}"[:400]
         if kind == "python" and state == "create":
             code, out = brew_install(act["brew"], act["formula"])
             found = enroll_python(ctx)
@@ -1079,6 +1146,9 @@ def operator_steps(ctx: Context, pre: dict[str, Any], fleet_result: dict[str, An
         add("remote access", "install Tailscale and log in to the tailnet", "human")
     elif not pre["tailscale"].get("running"):
         add("remote access", "open Tailscale and log in", "human")
+    for a in actions:
+        if a["kind"] == "gitpkg" and a["state"] in {"blocked", "failed"}:
+            add(f"git {'.'.join(map(str, MIN_GIT))}+ (git maintenance memory bug)", a["note"], "Homebrew owner or operator")
     if any(a["kind"] == "python" and a["state"] in {"blocked", "failed"} for a in actions):
         add("glaeda-mini-enroll needs Python 3.13+ (os.waitid)", enroll_module().PYTHON_FIX,
             "Homebrew owner or operator")
@@ -1249,7 +1319,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.apply:
             apply_install(ctx, actions)
     fleet_result = None if args.uninstall or ctx.hygiene_only else run_fleet_bootstrap(ctx)
-    failed = [a for a in actions if a.get("state") == "failed"]
+    # a failed git install is reported (receipt, operator step) but does not fail the run: glaeda-update
+    # rolls a release back when setup fails, and a transient brew error is not the release's fault
+    failed = [a for a in actions if a.get("state") == "failed" and a.get("kind") != "gitpkg"]
     receipt = {
         "schema": SCHEMA,
         "mode": "uninstall" if args.uninstall else "install",

@@ -642,6 +642,48 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(path.read_bytes(), ms.agent_bytes(ctx, label))
         self.assertIn("deferred", act["note"])
 
+    def test_git_below_2_55_is_installed_with_our_brew_or_handed_to_the_operator(self) -> None:
+        ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 50, hygiene_only=True)
+        with mock.patch.object(ms, "newest_git", lambda: ("/usr/bin/git", (2, 55, 0))):
+            self.assertEqual(ms.plan_git(ctx)["state"], "unchanged")
+        old = lambda: ("/usr/bin/git", (2, 50, 1))
+        with mock.patch.object(ms, "newest_git", old), mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"):
+            self.assertEqual(ms.plan_git(ctx)["state"], "blocked")  # sandbox HOME never runs brew
+            ctx.sandbox = False
+            act = ms.plan_git(ctx)
+            self.assertEqual((act["state"], act["brew"]), ("create", "/opt/homebrew/bin/brew"))
+        with mock.patch.object(ms, "newest_git", old), mock.patch.object(ms, "owned_brew", lambda: None):
+            self.assertIn("Homebrew owner", ms.plan_git(ctx)["note"])
+            linux = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
+                               ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name="linux")
+            self.assertIn("ppa:git-core/ppa", ms.plan_git(linux)["note"])
+
+    def test_brew_git_apply_upgrades_an_outdated_keg(self) -> None:
+        ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 50, hygiene_only=True)
+        versions = iter([(2, 50, 1), (2, 55, 0)])  # install leaves the old keg; upgrade fixes it
+        act = {"kind": "gitpkg", "state": "create", "brew": "/opt/homebrew/bin/brew", "note": ""}
+        calls = []
+
+        def fake_brew(brew, formula, verb="install", timeout=0, no_auto_update=False):
+            calls.append((verb, timeout, no_auto_update))
+            return 0, "already installed"
+
+        with mock.patch.object(ms, "brew_install", fake_brew), \
+                mock.patch.object(ms, "newest_git", lambda: ("/opt/homebrew/bin/git", next(versions))):
+            ms.apply_install(ctx, [act])
+        self.assertTrue(act["applied"])
+        self.assertEqual(calls, [("install", ms.GIT_BREW_TIMEOUT, True), ("upgrade", ms.GIT_BREW_TIMEOUT, True)])
+        self.assertLess(2 * ms.GIT_BREW_TIMEOUT, 1800)  # inside glaeda-update's wait for setup
+        self.assertEqual(act["value"], "2.55.0")
+
+    def test_failed_git_install_does_not_fail_the_run(self) -> None:
+        failing = {"kind": "gitpkg", "key": "git>=2.55", "state": "failed", "note": "brew exited 1"}
+        with mock.patch.object(ms, "plan_git", lambda ctx: dict(failing)):
+            receipt = self.invoke("--hygiene-only", "--apply")  # invoke asserts exit 0
+        self.assertIn("action:git>=2.55", receipt["blocking"])
+
     def test_no_em_dashes(self) -> None:
         for name in ("glaeda-mini-setup", "glaeda-worktree-reclaim-all", "test-glaeda-mini-setup.py"):
             self.assertNotIn(chr(0x2014), (ROOT / "scripts" / name).read_text(), name)
