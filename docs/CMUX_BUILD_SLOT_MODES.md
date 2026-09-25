@@ -31,6 +31,18 @@ package hits (76 against about 1,535) and took 802 s. The cause was not diagnose
 may reach package compiles), and the warm edit and no-op runs that would decide the question
 were invalidated by an Xcode switch mid-run, so this stays open (Next, item 1).
 
+Later evidence reopens both conclusions above; treat them as one early data point, not a
+rule. cmux CI now uses a per-target macro,
+`COMPILATION_CACHE_ENABLE_CACHING=$(CMUX_CI_COMPILATION_CACHE_$(TARGET_NAME):default=YES)`, to
+turn the cache off for `cmuxTests` only (manaflow-ai/cmux#14349). Under the cache the
+`cmuxTests` driver rewrites its chained bridging header on every build, which invalidated all
+~1,100 test inputs. On Xcode 26.6 (canary run 36081880621, 12vcpu), a one-test-file edit
+went from 139 s to 31 s, and with the cache on, a function-body app edit compiled 2 app tasks
+rather than the whole target. The 451 s whole-target rebuild and the 802 s trial were both on
+Xcode 26.3, and 26.3 also recompiled all 5,218 app files on a body-only edit in CI (run
+36035657899). So the whole-module cache key may be a 26.3 behaviour rather than a property of
+the cache. Re-measure on the pin before relying on the two-mode split.
+
 So a slot keeps two DerivedData directories and picks per job:
 
 - **Catch-up mode (caching on):** a fresh machine, a slot far behind main, or a one-shot build
@@ -216,7 +228,8 @@ DerivedData is therefore warmed by its own caching-off builds:
 ## Next
 
 1. On the pin: a function-body app edit, a cancellation in the middle of compiling, and the
-   mixed-mode edit and no-op runs (with the fresh-build hit loss diagnosed).
+   mixed-mode edit and no-op runs (with the fresh-build hit loss diagnosed). Start from the
+   cmux#14349 per-target macro, and check whether caching on alone stays incremental on 26.6.
 2. Cut the non-compiler work a catch-up build still does. Summed task time, not wall time:
    SwiftDriver planning and scanning 163 s, script phases 18 s (Rust diff sidecar, nucleo FFI,
    wireguard-go), App Intents extraction 16 s over 89 tasks. Script phases can be cached by
