@@ -18,11 +18,23 @@ main itself (git archive of scripts/ci), so the fetch always matches what jobs a
 
 Nothing here needs a credential: github.com/manaflow-ai/cmux and the seed bucket are public, and
 history comes from a blobless, shallow git mirror under ci/.prefetch instead of the GitHub API. It
-never takes the host lock and never touches a job's tree: a run is deferred while any job or build is
-running, and cmux's prune spares seeds a job touched in the last 10 minutes. A job that starts during
-a download only shares the uplink with it. One run at a time (flock on ci/.prefetch/lock). Once every
-root has main's head's own seed kept, later runs stop after one `git fetch` until main moves. Prints one
-JSON line.
+never takes the host lock and never touches a job's tree, and cmux's prune spares seeds a job touched
+in the last 10 minutes. One run at a time (flock on ci/.prefetch/lock). Once every root has main's
+head's own seed kept, later runs stop after one `git fetch` until main moves. Prints one JSON line.
+
+It fetches while jobs run, at BUSY_RATE. It used to wait for an idle mini, but a PR mini is almost
+never idle: on 2026-09-25 about 90% of runs were deferred, every mini kept 2 to 8 seeds, and compile
+admission's kept seeds sat 12 to 20 commits behind main (cmuxterm-hq#661, workstream 6). A seed is
+about 1.9 GB. At BUSY_RATE, 3 of the minis' ~8 MB/s, it takes about 11 minutes and leaves a job most
+of the link; on an idle mini it runs at full speed.
+
+It fetches only when it pays. A start at most NEAR_APP_SWIFT_FILES app Swift files from the build
+never recompiled the `cmux` module (0 of 21 admissions, 2026-09-25), while 6 or more did in 26 of 40,
+as did any package source change (every `cmux` file imports those modules). So a root that keeps a
+seed within NEAR_APP_SWIFT_FILES app Swift files of main's head, with no package source between them,
+skips the download. Main takes 2 to 9 merges an hour at every hour of the day, so a clock or a commit
+count cannot say when main is quiet; its content can. Measured on the same day, this fetches 15
+seeds per root instead of 34 for the same distance from main.
 """
 
 from __future__ import annotations
@@ -52,6 +64,17 @@ BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
                   r"|/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
 FETCH_TIMEOUT = 180
 PREFETCH_TIMEOUT = 900
+# While a job runs: curl's --limit-rate for the download (r2-cache.sh's curl reads CURL_HOME/.curlrc),
+# and a longer timeout for the slower download. r2-cache.sh stops a download after 900 s, so this rate
+# fetches up to 2.7 GB.
+BUSY_RATE = "3M"
+BUSY_PREFETCH_TIMEOUT = 1500
+# A kept seed this near main's head is a start that does not recompile the app: skip the download.
+NEAR_APP_SWIFT_FILES = 5
+# Local Swift packages (cmux owned_build_state.PACKAGE_SOURCES). Packages/iOS counts too: the macOS
+# app and its packages import several of them (CmuxMobileRPC, CmuxMobileTransport, ...).
+PACKAGE_SOURCES = ("Packages/", "vendor/", "Examples/")
+NOT_APP_SOURCES = ("cmuxTests/", "cmuxUITests/")
 KEEP_SCRIPTS = 2  # extracted scripts/ci trees, by main commit
 
 
@@ -74,6 +97,58 @@ def busy() -> str:
     return ""
 
 
+def app_swift_changes(mirror: Path, base: str, head: str) -> tuple[int, bool] | None:
+    """App Swift files that differ between two commits, and whether a package source or submodule does.
+
+    None when the mirror cannot compare them (a commit past its depth). Trees only: no blob fetch.
+    """
+    try:
+        raw = git(mirror, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", base, head)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    files, package = 0, False
+    fields = raw.split("\0")
+    # -z: ":<mode> <mode> <sha> <sha> <status>" NUL "<path>" NUL, paths unquoted.
+    for meta, path in zip(fields[0::2], fields[1::2]):
+        modes = meta.split()[:2]
+        if "160000" in (mode.lstrip(":") for mode in modes):
+            package = True  # a submodule bump (vendor/bonsplit): its sources changed
+            continue
+        if not path.endswith(".swift") or "/Tests/" in path or path.startswith(NOT_APP_SOURCES):
+            continue
+        files += 1
+        package = package or path.startswith(PACKAGE_SOURCES)
+    return files, package
+
+
+def near_seed(mirror: Path, store: Path, head: str) -> dict | None:
+    """The kept seed of this mini's width that is nearest HEAD, if it is near enough to skip a download."""
+    try:
+        prefix = json.loads((store / SOURCE).read_text()).get("prefix", "")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(prefix, str) or not prefix:
+        return None
+    scoped = f"{prefix}j{os.sysconf('SC_NPROCESSORS_ONLN')}-"
+    try:
+        # Only the commits the shallow mirror holds: an older seed counts as far.
+        history = set(git(mirror, "rev-list", head).split())
+    except (OSError, subprocess.SubprocessError):
+        return None
+    best = None
+    for entry in (store / "seeds").glob(scoped + "*"):
+        commit = entry.name[len(scoped):]
+        if commit not in history or not entry.is_dir():
+            continue
+        changes = app_swift_changes(mirror, commit, head)
+        if changes is None:
+            continue
+        files, package = changes
+        if not package and files <= NEAR_APP_SWIFT_FILES and (best is None or files < best["app_swift_files"]):
+            best = {"key": entry.name, "app_swift_files": files}
+    return best
+
+
 def stores(state: Path) -> list[Path]:
     """Root 1's store, then the other roots', that an owned job has recorded a seed prefix in."""
     candidates = [state, *sorted(p for p in state.glob("cmux-ci-*") if p.is_dir())]
@@ -81,8 +156,11 @@ def stores(state: Path) -> list[Path]:
 
 
 def git(mirror: Path, *args: str, timeout: int = FETCH_TIMEOUT) -> str:
+    # The mirror is shallow and blobless: a commit past its depth must fail, not make git lazily fetch
+    # that commit's whole history from the promisor remote.
+    env = {**os.environ, "GIT_NO_LAZY_FETCH": "1"}
     return subprocess.run(["git", "-C", os.fspath(mirror), *args], check=True, capture_output=True,
-                          text=True, timeout=timeout).stdout
+                          text=True, timeout=timeout, env=env).stdout
 
 
 def main_head(work: Path) -> tuple[Path, str]:
@@ -120,8 +198,17 @@ def scripts_for(work: Path, mirror: Path, head: str) -> Path:
     return target
 
 
-def prefetch(scripts: Path, store: Path, head: str, mirror: Path) -> dict:
+def prefetch(scripts: Path, store: Path, head: str, mirror: Path, throttled: bool = False) -> dict:
     env = {key: value for key, value in os.environ.items() if key not in ("GITHUB_REPOSITORY", "GITHUB_OUTPUT")}
+    timeout = PREFETCH_TIMEOUT
+    if throttled:
+        curl_home = mirror.parent / "curl-busy"
+        curl_home.mkdir(exist_ok=True)
+        (curl_home / ".curlrc").write_text(f"limit-rate = {BUSY_RATE}\n")
+        env["CURL_HOME"] = os.fspath(curl_home)
+        timeout = BUSY_PREFETCH_TIMEOUT
+    else:
+        env.pop("CURL_HOME", None)
     env["CMUX_SEED_GIT_DIR"] = os.fspath(mirror)
     env["CI_CACHE_R2_PUBLIC_URL"] = BUCKET_URL
     # r2-cache.sh stages each archive under TMPDIR; kept under .prefetch, a killed download's partial
@@ -147,11 +234,11 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path) -> dict:
 
     previous = {signum: signal.signal(signum, on_signal) for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
     try:
-        stdout, stderr = child.communicate(timeout=PREFETCH_TIMEOUT)
+        stdout, stderr = child.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         stop_child()
         child.communicate()
-        return {"fetched": "false", "reason": f"timed out after {PREFETCH_TIMEOUT} s"}
+        return {"fetched": "false", "reason": f"timed out after {timeout} s"}
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
@@ -179,9 +266,6 @@ def run(apply: bool, state: Path = STATE) -> dict:
         os.close(lock)
         return {**record, "state": "skip", "reason": "another prefetch is running"}
     try:
-        why = busy()
-        if why:
-            return {**record, "state": "deferred", "reason": f"busy: {why}"}
         try:
             mirror, head = main_head(work)
         except (OSError, subprocess.SubprocessError) as error:
@@ -211,11 +295,14 @@ def run(apply: bool, state: Path = STATE) -> dict:
             return {**record, "state": "error", "reason": f"scripts: {type(error).__name__}"}
         results = {}
         for store in pending:
+            near = near_seed(mirror, store, head)
+            if near is not None:
+                results[os.fspath(store)] = {"fetched": "false", "reason": "a kept seed is near main's head", **near}
+                continue
             why = busy()
+            result = prefetch(scripts, store, head, mirror, throttled=bool(why))
             if why:
-                results[os.fspath(store)] = {"fetched": "false", "reason": f"deferred, busy: {why}"}
-                break
-            result = prefetch(scripts, store, head, mirror)
+                result["throttled"] = f"{BUSY_RATE}B/s, busy: {why}"
             results[os.fspath(store)] = result
             # Current only once HEAD's own seed is kept: seeds land a build behind main, so a nearer
             # one may still come. Any other outcome retries next run, which costs a git fetch and one
