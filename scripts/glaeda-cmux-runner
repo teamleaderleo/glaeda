@@ -91,6 +91,7 @@ WORKLOAD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 PUBLIC_API = "https://api.github.com/"
 TOKEN_RE = r"[A-Za-z0-9_.\-]+"
 LISTENING = "Listening for Jobs"
+GATE_HELD = "glaeda-cmux-runner-gate: holding the listener off"  # the gate's line while the fleet has the host
 
 
 # ---------------------------------------------------------------- small helpers
@@ -402,7 +403,10 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
     path = WORKLOAD_PATH
     return {
         "Label": ctx.label,
-        "ProgramArguments": [os.fspath(ctx.runner_dir / "run.sh")],
+        # run.sh under the hook's listener gate: an idle runner stops listening while a fleet build holds
+        # or waits for the host, so GitHub routes its jobs elsewhere instead of here to be refused.
+        "ProgramArguments": [ctx.python or "/usr/bin/python3", os.fspath(ctx.hook_dir / "glaeda-cmux-runner-hook"),
+                             "listen", "--runner-dir", os.fspath(ctx.runner_dir), "--label", ctx.label],
         "WorkingDirectory": os.fspath(ctx.runner_dir),
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
@@ -793,18 +797,25 @@ def verify_local(ctx: Context, act: dict[str, Any], wait: bool) -> None:
         return
     offset = getattr(ctx, "log_offset", None)
     deadline = time.monotonic() + (ONLINE_WAIT_S if wait else 0)
-    online = False
+    online = held = False
     while offset is not None:
         try:
             with ctx.log_path.open("rb") as log:
                 log.seek(offset)
-                online = LISTENING.encode() in log.read()
+                text = log.read()
+                online, held = LISTENING.encode() in text, GATE_HELD.encode() in text
         except OSError:
             pass
-        if online or time.monotonic() >= deadline:
+        if online or held or time.monotonic() >= deadline:
             break
         time.sleep(3)
-    act["runner"] = {"id": local.get("agentId"), "status": "online" if online else "unknown", "source": "local"}
+    status = "online" if online else "held off by the listener gate" if held else "unknown"
+    act["runner"] = {"id": local.get("agentId"), "status": status, "source": "local"}
+    if held and not online:
+        act["state"] = "ok"
+        act["note"] = ("registered; the listener gate is holding it off while a fleet build has the host, "
+                       f"and it starts listening once the host is free (see {ctx.show(ctx.log_path)})")
+        return
     if offset is not None and not online:
         act["state"], act["note"] = "failed", f"runner did not log '{LISTENING}' within {ONLINE_WAIT_S}s; see {ctx.show(ctx.log_path)}"
         return

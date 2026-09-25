@@ -41,6 +41,12 @@ with "refused: capacity: ..." rather than wait when they are taken (take_capacit
 Only then does it run glaeda-disk --pressure --apply --top 0, bounded and never able to fail the job.
 
 job-completed only runs the same disk pressure pass and always exits 0.
+
+    glaeda-cmux-runner-hook listen --runner-dir DIR --label LABEL
+
+is the runner LaunchAgent's program: it runs DIR/run.sh, and while the fleet has the host (an exclusive
+host lock, a reservation, or a fleet build waiting for the lock) it stops the idle runner's listener so
+GitHub routes the job to another runner instead of here to be refused (Gate).
 """
 
 from __future__ import annotations
@@ -55,6 +61,7 @@ import os
 import re
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -118,6 +125,15 @@ LSOF = shutil.which("lsof") or "/usr/sbin/lsof"
 # check and review-comment events can run with secrets on behalf of a fork PR, so they are left out.
 ADMITTED_EVENTS = ("push", "pull_request", "merge_group", "workflow_dispatch", "schedule", "workflow_run")
 PREFIX = "glaeda-cmux-runner-hook"
+# listen: the runner LaunchAgent runs run.sh under this gate. While the fleet holds or wants the host
+# (an exclusive host lock, a process waiting for it, or a reservation), an idle runner stops listening,
+# so GitHub hands its jobs to another runner instead of here, where job-started would refuse them.
+GATE = "glaeda-cmux-runner-gate"
+GATE_FILE = "listener-gate"  # listener-gate-<launchd label>.pid: the gate's own probes are not a waiter
+GATE_POLL_S = float(os.environ.get("GLAEDA_RUNNER_GATE_POLL_S") or 2.0)
+GATE_CONFIRM = 2  # consecutive polls, so a hook's or a probe's momentary hold never stops a listener
+GATE_STOP_WAIT_S = 60.0  # a graceful listener exit, before it is killed
+GATE_WAITER_EVERY_S = 30.0
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -464,9 +480,10 @@ def lock_waiters(path: str, ours: set[int]) -> list[int]:
 
 def holder_pids(state_dir: Path) -> set[int]:
     pids = {os.getpid()}
-    for pid_file in state_dir.glob(f"{HOLDER_FILE}*.pid*") if state_dir.is_dir() else []:
-        with contextlib.suppress(OSError, ValueError):
-            pids.add(int(pid_file.read_text().strip()))
+    for pattern in (f"{HOLDER_FILE}*.pid*", f"{GATE_FILE}-*.pid"):
+        for pid_file in state_dir.glob(pattern) if state_dir.is_dir() else []:
+            with contextlib.suppress(OSError, ValueError):
+                pids.add(int(pid_file.read_text().strip()))
     return pids
 
 
@@ -632,6 +649,163 @@ def release_host_lock(state_dir: Path) -> str:
     return "released the fleet host lock" if not pid_alive(pid) else f"holder {pid} still exiting"
 
 
+# ---------------------------------------------------------------- listener gate
+
+
+def host_held(host_lock: str, reservation: str, now: float) -> str | None:
+    """Why the fleet, not a PR job, holds this host right now, or None. Our own jobs hold the host lock
+    shared, so only an exclusive holder or a reservation counts. Microseconds: one non-blocking flock."""
+    why = reservation_refusal(reservation, now)
+    if why or not os.path.exists(host_lock):
+        return why
+    try:
+        fd = os.open(host_lock, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None  # job-started decides what an unreadable lock means
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        return "a fleet build holds the host lock"
+    finally:
+        os.close(fd)  # drops the probe's shared lock too
+    return None
+
+
+def host_waiter(host_lock: str, state_dir: Path) -> str | None:
+    """A fleet build waiting for the host lock (not one of our holders or gates). lsof costs about 0.3 s
+    of CPU on a mini, so the gate asks at most every GATE_WAITER_EVERY_S."""
+    if not os.path.exists(host_lock):
+        return None
+    waiting = lock_waiters(host_lock, holder_pids(state_dir))
+    return f"a fleet build is waiting for the host (pid {waiting[0]})" if waiting else None
+
+
+def runner_pids(runner_dir: Path, program: str) -> list[int]:
+    out = subprocess.run(["/usr/bin/pgrep", "-f", os.fspath(runner_dir / "bin" / program)],
+                         stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False).stdout
+    return [int(p) for p in out.split() if p.isdigit()]
+
+
+def gate_log(message: str) -> None:
+    print(f"{GATE}: {message}", flush=True)
+
+
+class Gate:
+    """run.sh under the listener gate. A runner with a job (a Runner.Worker) is never stopped; job-started
+    still refuses a job handed over in the moment before a stop."""
+
+    def __init__(self, runner_dir: Path, host_lock: str, reservation: str, state_dir: Path) -> None:
+        self.runner_dir, self.host_lock, self.reservation, self.state_dir = \
+            runner_dir, host_lock, reservation, state_dir
+        self.child: subprocess.Popen[bytes] | None = None
+        self.stop_deadline: float | None = None  # set while a stop the gate asked for is under way
+        self.streak = 0
+        self.held: str | None = None
+        self.terminating = False
+        self.waiter: str | None = None
+        self.waiter_at = -GATE_WAITER_EVERY_S
+
+    def claimed(self) -> str | None:
+        try:
+            why = host_held(self.host_lock, self.reservation, time.time())
+            if why is None and time.monotonic() - self.waiter_at >= GATE_WAITER_EVERY_S:
+                self.waiter, self.waiter_at = host_waiter(self.host_lock, self.state_dir), time.monotonic()
+            return why or self.waiter
+        except Exception as error:  # noqa: BLE001  (a gate that cannot tell keeps listening; job-started decides)
+            gate_log(f"cannot read the host state ({type(error).__name__}); listening")
+            return None
+
+    def start(self) -> None:
+        gate_log("starting the listener")
+        self.child = subprocess.Popen([os.fspath(self.runner_dir / "run.sh")], cwd=self.runner_dir,
+                                      stdin=subprocess.DEVNULL)
+        self.streak = 0
+
+    def stop(self, why: str) -> None:
+        gate_log(f"stopping the idle listener: {why}")
+        self.held, self.stop_deadline = why, time.monotonic() + GATE_STOP_WAIT_S
+        listeners = runner_pids(self.runner_dir, "Runner.Listener")
+        for pid in listeners:  # the listener's own graceful exit ends its session, so GitHub stops routing here
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGINT)
+        if not listeners and self.child is not None:
+            self.child.terminate()
+
+    def kill(self) -> None:
+        for pid in runner_pids(self.runner_dir, "Runner.Listener"):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        if self.child is not None:
+            self.child.kill()
+
+    def step(self) -> int | None:
+        """One poll. Returns an exit code when the gate itself should exit."""
+        if self.child is not None:
+            code = self.child.poll()
+            if code is not None:
+                self.child = None
+                if self.stop_deadline is None or self.terminating:
+                    return code  # the runner exited on its own: launchd's KeepAlive decides, as before
+                self.stop_deadline = None
+                gate_log(f"holding the listener off: {self.held}")
+                return None
+            elif self.stop_deadline is not None:
+                if time.monotonic() > self.stop_deadline:
+                    gate_log("the listener did not exit; killing it")
+                    self.kill()
+                return None
+            else:
+                why = self.claimed()
+                self.streak = self.streak + 1 if why else 0
+                if why and self.streak >= GATE_CONFIRM and not runner_pids(self.runner_dir, "Runner.Worker"):
+                    self.stop(why)
+                return None
+        if self.terminating:
+            return 0
+        why = self.claimed()
+        if why:
+            if why != self.held:
+                gate_log(f"holding the listener off: {why}")
+            self.held, self.streak = why, 0
+            return None
+        if self.held is not None:
+            self.streak += 1
+            if self.streak < GATE_CONFIRM:
+                return None
+            gate_log("the host is free again")
+            self.held = None
+        self.start()
+        return None
+
+    def terminate(self, *_: Any) -> None:
+        self.terminating = True
+        if self.child is not None and self.child.poll() is None:
+            if self.stop_deadline is None:
+                self.stop("the runner agent is stopping")
+
+
+def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, label: str) -> int:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    name = "".join(c for c in label if c.isalnum() or c in "-_.") or "runner"
+    pid_file = state_dir / f"{GATE_FILE}-{name}.pid"
+    pid_file.write_text(f"{os.getpid()}\n")
+    gate = Gate(runner_dir, host_lock, reservation, state_dir)
+    signal.signal(signal.SIGTERM, gate.terminate)
+    signal.signal(signal.SIGINT, gate.terminate)
+    try:
+        while True:
+            code = gate.step()
+            if code is not None:
+                return code
+            time.sleep(GATE_POLL_S if not gate.terminating else 0.5)
+    finally:
+        if gate.child is not None and gate.child.poll() is None:
+            gate.kill()
+        with contextlib.suppress(OSError):
+            if pid_file.read_text().strip() == str(os.getpid()):
+                pid_file.unlink()
+
+
 def refuse(reason: str) -> int:
     message = f"{PREFIX}: refused: {reason}"
     print(message, flush=True)
@@ -679,8 +853,11 @@ def disk_pressure(explicit: str | None) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog=PREFIX)
-    p.add_argument("phase", choices=("job-started", "job-completed", "check"),
-                   help="check: the eligibility gate only, read-only (no lock, no rustup change)")
+    p.add_argument("phase", choices=("job-started", "job-completed", "check", "listen"),
+                   help="check: the eligibility gate only, read-only (no lock, no rustup change); "
+                        "listen: run the runner's run.sh under the listener gate (the LaunchAgent's program)")
+    p.add_argument("--runner-dir", type=Path, help="listen: the runner directory whose run.sh the gate runs")
+    p.add_argument("--label", default="", help="listen: the runner's launchd label (names the gate's pid file)")
     p.add_argument("--allowed-repo", action="append", default=[])
     p.add_argument("--allowed-owner")
     p.add_argument("--allow-event", action="append", default=[],
@@ -708,6 +885,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--watch-pid", type=int, default=0, help=argparse.SUPPRESS)
     args = p.parse_args(argv)
 
+    if args.phase == "listen":
+        if args.runner_dir is None:
+            p.error("listen needs --runner-dir")
+        return listen(args.runner_dir, args.host_lock, args.reservation, args.state_dir, args.label)
     if args.phase == "check":
         why, want = node_refusal(args.fleet_class)
         if not why:

@@ -133,7 +133,30 @@ What `--apply` does:
    - job-completed releases the host lock (or the capacity share), runs the same disk
      pressure pass and always exits 0.
 4. Writes and loads `~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist`
-   (runs `run.sh`, restarts on crash, logs to `~/Library/Logs/glaeda-cmux-runner.log`).
+   (runs `run.sh` under the listener gate, restarts on crash, logs to
+   `~/Library/Logs/glaeda-cmux-runner.log`).
+   - The listener gate (`glaeda-cmux-runner-hook listen`) keeps an idle runner off
+     GitHub while the fleet has the host, so jobs go to another runner and never
+     reach job-started here just to be refused. Each refusal made cmux's rescue cancel
+     and re-run the whole PR run. On 2026-09-25, 7 of 14 refusals in two hours were
+     "a fleet build holds the host lock": the fleet-cas reader held cmux8s for 47
+     minutes, and hq worker builds hold a mini for about 20.
+   - The fleet has the host when:
+     - a process holds `host.lock` exclusively (every 2 s, one non-blocking shared
+       `flock`, which only an exclusive holder blocks);
+     - a reservation is active; or
+     - a process that is not our holder or gate is waiting for the lock (`lsof`,
+       at most every 30 s because it costs about 0.3 s of CPU on a mini).
+   - After two polls in a row it sends `SIGINT` to the runner's `Runner.Listener`.
+     The listener's graceful exit ends its session, and GitHub shows the runner as
+     offline. A runner with a job (a `Runner.Worker` from its directory) is never
+     stopped.
+   - The gate starts `run.sh` again after two free polls. It logs
+     `glaeda-cmux-runner-gate: holding the listener off: <why>` while it waits, and
+     `--apply`'s verify accepts that line in place of `Listening for Jobs`.
+   - A runner exit the gate didn't ask for passes through, so launchd's KeepAlive
+     behaves as before.
+   - job-started still refuses a job handed over in the moment before a stop.
 5. Confirms through the GitHub API that the runner is listed with every label and
    waits up to 90 s for it to report online.
 

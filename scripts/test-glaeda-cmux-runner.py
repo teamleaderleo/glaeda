@@ -9,6 +9,7 @@ reaches an argv, a file, or the output.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -16,6 +17,7 @@ import io
 import json
 import os
 import plistlib
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -878,6 +880,174 @@ else:
                 self.assertEqual(ok, admitted)
 
 
+FAKE_LISTENER = """#!/usr/bin/env python3
+import signal, sys, time
+signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+print("Listening for Jobs", flush=True)
+while True:
+    time.sleep(0.05)
+"""
+
+
+class GateTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.lock = self.tmp / "host.lock"
+        self.lock.touch()
+        self.state = self.tmp / "state"
+        self.runner = self.tmp / "actions-runner-glaeda"
+        (self.runner / "bin").mkdir(parents=True)
+        listener = self.runner / "bin/Runner.Listener"
+        listener.write_text(FAKE_LISTENER)
+        listener.chmod(0o755)
+        run_sh = self.runner / "run.sh"  # the runner's own run loop: exit when the listener does
+        run_sh.write_text(f"#!/bin/bash\n{sys.executable} {listener}\nexit $?\n")
+        run_sh.chmod(0o755)
+
+    def held(self) -> str | None:
+        return hook.host_held(os.fspath(self.lock), os.fspath(self.tmp / "none.json"), time.time())
+
+    def hold(self, mode: int) -> int:
+        fd = os.open(self.lock, os.O_RDONLY)
+        fcntl.flock(fd, mode | fcntl.LOCK_NB)
+        self.addCleanup(os.close, fd)
+        return fd
+
+    def test_a_free_host_or_our_shared_jobs_leave_the_listener_on(self) -> None:
+        self.assertIsNone(self.held())
+        self.hold(fcntl.LOCK_SH)  # a PR job's holder
+        self.assertIsNone(self.held())
+
+    def test_an_exclusive_holder_claims_the_host(self) -> None:
+        self.hold(fcntl.LOCK_EX)
+        self.assertEqual(self.held(), "a fleet build holds the host lock")
+
+    def test_a_reservation_claims_the_host(self) -> None:
+        with mock.patch.object(hook, "reservation_refusal", return_value="host reserved by leo"):
+            self.assertEqual(self.held(), "host reserved by leo")
+
+    def test_a_waiter_claims_the_host_but_a_gate_pid_does_not(self) -> None:
+        waiter = lambda: hook.host_waiter(os.fspath(self.lock), self.state)
+        with mock.patch.object(hook, "lock_waiters", side_effect=lambda path, ours: sorted({4242, 77} - ours)):
+            self.assertEqual(waiter(), "a fleet build is waiting for the host (pid 77)")
+            self.state.mkdir()
+            (self.state / "listener-gate-com.teamleaderleo.glaeda.cmux-runner.2.pid").write_text("77\n")
+            self.assertEqual(waiter(), "a fleet build is waiting for the host (pid 4242)")
+            (self.state / "listener-gate-other.pid").write_text("4242\n")
+            self.assertIsNone(waiter())
+
+    def test_the_gate_asks_lsof_at_most_every_thirty_seconds(self) -> None:
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        with mock.patch.object(hook, "lock_waiters", return_value=[77]) as lsof:
+            self.assertEqual(gate.claimed(), "a fleet build is waiting for the host (pid 77)")
+            self.assertEqual(gate.claimed(), "a fleet build is waiting for the host (pid 77)")
+            self.assertEqual(lsof.call_count, 1)
+            gate.waiter_at -= hook.GATE_WAITER_EVERY_S
+            lsof.return_value = []
+            self.assertIsNone(gate.claimed())
+            self.assertEqual(lsof.call_count, 2)
+
+    def gate(self, claims: list[str | None], busy: bool = False):
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock()
+        gate.child.poll.return_value = None
+        seq = iter(claims)
+        gate.claimed = lambda: next(seq)
+        stops: list[str] = []
+        gate.stop = lambda why: (stops.append(why), setattr(gate, "stop_deadline", time.monotonic() + 60))
+        pids = mock.patch.object(hook, "runner_pids", side_effect=lambda d, prog: [9] if busy and prog == "Runner.Worker" else [])
+        pids.start()
+        self.addCleanup(pids.stop)
+        return gate, stops
+
+    def test_an_idle_listener_stops_only_after_the_claim_holds_for_two_polls(self) -> None:
+        gate, stops = self.gate(["held", None, "held", "held"])
+        for _ in range(3):
+            self.assertIsNone(gate.step())
+        self.assertEqual(stops, [])
+        gate.step()
+        self.assertEqual(stops, ["held"])
+
+    def test_a_busy_runner_is_never_stopped(self) -> None:
+        gate, stops = self.gate(["held"] * 5, busy=True)
+        for _ in range(5):
+            gate.step()
+        self.assertEqual(stops, [])
+
+    def test_a_stopped_listener_restarts_after_two_free_polls_and_a_runner_exit_still_exits(self) -> None:
+        gate, stops = self.gate(["held", "held", "held", None, None])
+        gate.step(); gate.step()
+        self.assertEqual(stops, ["held"])
+        gate.held = "held"
+        gate.child.poll.return_value = 0  # the listener exited because the gate asked
+        with mock.patch.object(hook.subprocess, "Popen") as popen:
+            self.assertIsNone(gate.step())  # the listener is gone
+            self.assertIsNone(gate.child)
+            gate.step()  # still held
+            gate.step()  # free once
+            popen.assert_not_called()
+            gate.step()  # free twice
+            popen.assert_called_once()
+        gate.child = mock.Mock()
+        gate.child.poll.return_value = 3  # the runner exited on its own: launchd decides
+        self.assertEqual(gate.step(), 3)
+
+    def test_listen_stops_and_restarts_a_real_listener(self) -> None:
+        env = {**os.environ, "GLAEDA_RUNNER_GATE_POLL_S": "0.1"}
+        log = self.tmp / "runner.log"
+        with log.open("wb") as out:
+            proc = subprocess.Popen([sys.executable, os.fspath(HOOK), "listen", "--runner-dir", os.fspath(self.runner),
+                                     "--label", "t", "--host-lock", os.fspath(self.lock), "--reservation",
+                                     os.fspath(self.tmp / "none.json"), "--state-dir", os.fspath(self.state)],
+                                    stdout=out, stderr=subprocess.STDOUT, env=env)
+        self.addCleanup(lambda: [os.kill(pid, 9) for pid in hook.runner_pids(self.runner, "Runner.Listener")])
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+
+        def wait_for(text: str, count: int = 1) -> None:
+            deadline = time.monotonic() + 15
+            while log.read_text().count(text) < count:
+                self.assertLess(time.monotonic(), deadline, log.read_text())
+                time.sleep(0.05)
+
+        def listeners() -> list[int]:
+            return hook.runner_pids(self.runner, "Runner.Listener")
+
+        wait_for("Listening for Jobs")
+        self.assertEqual(len(listeners()), 1)
+        fd = os.open(self.lock, os.O_RDONLY)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        wait_for("holding the listener off: a fleet build holds the host lock")
+        self.assertEqual(listeners(), [])
+        self.assertIn("stopping the idle listener: a fleet build holds the host lock", log.read_text())
+        self.assertIsNone(proc.poll())
+        os.close(fd)
+        wait_for("the host is free again")
+        wait_for("Listening for Jobs", 2)
+        proc.terminate()
+        self.assertEqual(proc.wait(timeout=15), 0)
+        self.assertEqual(listeners(), [])
+        self.assertEqual(list(self.state.glob("listener-gate-*.pid")), [])
+
+    def test_listen_leaves_a_runner_with_a_job_alone(self) -> None:
+        worker = self.runner / "bin/Runner.Worker"
+        worker.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n")
+        worker.chmod(0o755)
+        job = subprocess.Popen([sys.executable, os.fspath(worker)])
+        self.addCleanup(job.kill)
+        self.hold(fcntl.LOCK_EX)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        gate.child = mock.Mock()
+        gate.child.poll.return_value = None
+        with mock.patch.object(gate, "stop") as stop:
+            for _ in range(4):
+                gate.step()
+            stop.assert_not_called()
+            job.kill(); job.wait()
+            gate.step()
+            stop.assert_called_once_with("a fleet build holds the host lock")
+
+
 class RunnerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -989,7 +1159,9 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(config["argv"][config["argv"].index("--labels") + 1], "glaeda-mini,cmux-extra")
         self.assertEqual(config["argv"][config["argv"].index("--url") + 1], "https://github.com/manaflow-ai/cmux")
         plist = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist").read_bytes())
-        self.assertEqual(plist["ProgramArguments"], [os.fspath(runner / "run.sh")])
+        self.assertEqual(plist["ProgramArguments"][1:], [
+            os.fspath(runner / "glaeda-hooks/glaeda-cmux-runner-hook"), "listen", "--runner-dir", os.fspath(runner),
+            "--label", "com.teamleaderleo.glaeda.cmux-runner"])
         env = plist["EnvironmentVariables"]
         started = Path(env["ACTIONS_RUNNER_HOOK_JOB_STARTED"])
         self.assertTrue(os.access(started, os.X_OK))
