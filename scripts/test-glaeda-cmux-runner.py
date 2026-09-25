@@ -1409,6 +1409,14 @@ class GateTest(unittest.TestCase):
             self.assertIsNone(gate.claimed())
             load[0] = 40.0
             self.assertIsNotNone(gate.claimed(), "a fresh overload holds again")
+            # A fleet claim in between restarts the clock: the limit times a load pause, not the fleet's.
+            clock[0] += 50
+            fd = self.hold(fcntl.LOCK_EX)
+            self.assertEqual(gate.claimed(), "a fleet build holds the host lock")
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            clock[0] += 50
+            self.assertIsNotNone(gate.claimed(), "the 100 s since the first look are not all load hold")
+            self.assertIsNotNone(gate.claimed())
 
     def test_a_saturated_mini_stops_an_idle_listener_through_step(self) -> None:
         for name, value in (("GATE_LOAD_PAUSE", 2.0), ("GATE_LOAD_RESUME", 1.5)):
