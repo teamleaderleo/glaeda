@@ -121,10 +121,10 @@ whose host lock was held (`busy`) without removing them.
 The fleet compile-cache catch-up roles (cmuxterm-hq build-fleet README, "Filling the store"): the host
 with role `catch-up-writer` must have the LaunchDaemon ai.manaflow.cmux-build-catch-up-fill loaded (it
 runs every 15 minutes, so "not running" between ticks conforms and a non-zero last exit shows as
-pending), must not run the hq worker (bin/worker; a drained wrapper that execs /bin/sleep conforms),
+pending), must not run the dev-build worker (bin/worker; a drained wrapper that execs /bin/sleep conforms),
 its fleet-cas node must sign (--sign-key), and it needs xcode/bin/fleet-cas-writer-build.sh. The
 manifest allows one writer, never also dev-builds, and a ci-runner writer only with
-overrides.runner.trustedRef. The hq builders (`dev-builds`) are readers: their node must be read-only
+overrides.runner.trustedRef. The dev-build workers (`dev-builds`) are readers: their node must be read-only
 (--read-only-kv). On both, the released recipe (the target of recipes) must carry cmux-build-mode.py,
 the fixed paths under xcode/ (src/cmux, DerivedData, fleet-cas.sock, fleet-cas.env,
 bin/fleet-cas-marker.sh, bin/fleet-cas-settings.sh and their parents) must be real directories, a
@@ -179,9 +179,9 @@ SCHEMA = "glaeda-mini-fleet/v1"
 # What a host is for; the target end state can give one host several.
 ROLES = ("dev-builds", "ci-runner", "nightly", "ios-simulators", "cache-host", "chromium-builds", "catch-up-writer")
 # Fleet compile-cache catch-up (cmuxterm-hq build-fleet README, "Filling the store"). The one writer host fills
-# the store from its own LaunchDaemon and runs no hq worker, so no team-submitted build runs next to its signing
-# key. The hq builders (dev-builds) are the readers: a read-only fleet-cas node and the released recipe's
-# cmux-build-mode.py. check only reports here: the cache keys include xcode/src/cmux and xcode/DerivedData,
+# the store from its own LaunchDaemon and runs no dev-build worker, so no team-submitted build runs next to its
+# signing key. The dev-build workers (dev-builds) are the readers: a read-only fleet-cas node and the released
+# recipe's cmux-build-mode.py. check only reports here: the cache keys include xcode/src/cmux and xcode/DerivedData,
 # so nothing in this tool deletes, moves or re-clones them.
 CATCH_UP_WRITER = "catch-up-writer"
 CATCH_UP_READER_ROLES = ("dev-builds",)
@@ -304,7 +304,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
             clash = sorted(set(host["roles"]) & set(CATCH_UP_READER_ROLES))
             if clash:
                 raise Failure(f"{path}: host {name} is the {CATCH_UP_WRITER} and also {', '.join(clash)}; "
-                              "the writer runs no hq worker")
+                              "the writer runs no dev-build worker")
             # PR code must never run next to the signing key: a writer's runners take trusted refs only.
             if "ci-runner" in host["roles"] and not (host_policy(data, name).get("runner") or {}).get("trustedRef"):
                 raise Failure(f"{path}: host {name} is the {CATCH_UP_WRITER} and a ci-runner without "
@@ -1003,7 +1003,7 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
 
 
 def catch_up_role(host: dict[str, Any]) -> str | None:
-    """CATCH_UP_WRITER, "reader" for an hq builder, or None for a host outside the catch-up path."""
+    """CATCH_UP_WRITER, "reader" for a dev-build worker, or None for a host outside the catch-up path."""
     roles = host.get("roles") or []
     if CATCH_UP_WRITER in roles:
         return CATCH_UP_WRITER
@@ -1032,7 +1032,7 @@ def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, 
                 out.append(("pending", f"{CATCH_UP_FILL_LABEL} last exited {code.group(1)}; loaded, runs on its timer",
                             "read its receipts (cmux-build-fleet logs/catch-up-fill.log)"))
         if obs["fleet_worker"].get("process") == "running":
-            out.append(("catch-up", f"the hq worker ({FLEET_ROOT}/bin/worker) runs on the {CATCH_UP_WRITER}; "
+            out.append(("catch-up", f"the dev-build worker ({FLEET_ROOT}/bin/worker) runs on the {CATCH_UP_WRITER}; "
                         "team-submitted builds would run next to the signing key",
                         f"drain it: exclude the host in fleet.json and make its {HQ_WORKER_LABEL} wrapper idle"))
     cas = obs.get("fleet_cas") or {}
@@ -1942,8 +1942,8 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
                 f"{as_owner}brew pin {' '.join(unpinned)}", brew_group)
         else:
             put("pins", "ok", " ".join(pf.get("brew_formulas") or {}) or "none installed")
-    # PR jobs run as the login user, so on a runner host every secret it can read is theirs. An hq builder
-    # (no runners) legitimately reads its own tokens as that user, which is only worth showing.
+    # PR jobs run as the login user, so on a runner host every secret it can read is theirs. A host with no
+    # runners (a dev-build worker) legitimately reads its own tokens as that user, which is only worth showing.
     # The manifest's accepted_secrets are risks the operator accepted (reviewed in cmuxterm-hq
     # build-fleet/mini-fleet.json); they show as info, and only the rest fail.
     secrets = pf.get("secrets") or []

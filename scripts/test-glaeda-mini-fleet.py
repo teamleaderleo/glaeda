@@ -428,7 +428,7 @@ FILL = "ai.manaflow.cmux-build-catch-up-fill"
 
 
 class CatchUpTests(unittest.TestCase):
-    """The fleet compile-cache catch-up roles: one writer that fills, hq builders that read."""
+    """The fleet compile-cache catch-up roles: one writer that fills, dev-build workers that read."""
 
     def setUp(self) -> None:
         self.manifest = mf.load_manifest(EXAMPLE)
@@ -459,7 +459,7 @@ class CatchUpTests(unittest.TestCase):
     def test_writer_running_the_hq_worker_is_drift(self) -> None:
         (issue,) = self.writer(worker_proc="running")
         self.assertEqual(issue[0], "catch-up")
-        self.assertIn("hq worker", issue[1])
+        self.assertIn("dev-build worker", issue[1])
 
     def test_writer_without_its_fill_daemon_is_drift(self) -> None:
         self.assertEqual(self.writer(fill=None), [("launchd", f"{FILL} not installed")])
@@ -986,7 +986,8 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(self.result(text, host="build-mini-2")["checks"]["secrets"]["state"], "fail")
 
     def test_readable_secrets_on_a_builder_are_info(self) -> None:
-        # An hq builder (cmux15): no runner, no ci-runner role; its worker reads its own tokens as the login user.
+        # A dev-build worker host (cmux15 then): no runner, no ci-runner role; its worker reads its own
+        # tokens as the login user.
         text = preflight_text(secrets=("/Users/Shared/cmux-build-fleet/secrets/r2.token",), runners=(),
                               hostname="build-mini-2", node_id="cmux-mac-002")
         result = self.result(text, host="build-mini-2")

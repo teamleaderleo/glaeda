@@ -173,10 +173,12 @@ def default_families() -> list[Family]:
         fams.append(Family("user-tmp", user_tmp, True, "agent scratch under the per-user $TMPDIR",
                            skip_prefixes=("com.apple.",), git_disposable=True, bulk_sizes=True,
                            owner="agents and tools", rebuild_minutes=0.5))
-    # The retiring hq build worker's shared cache: visible with its owner, never deleted here. When the
-    # worker is unloaded the report says so, since other tools may still read parts of it (2026-09-24).
+    # The dev-build worker's shared cache (the cmuxterm-hq controller's worker, live only on the dev-build worker
+    # host since cmuxterm-hq#661): visible with its owner, never deleted here. When the worker is unloaded the
+    # report says so, since other tools may still read parts of it (2026-09-24).
     fams.append(Family("hq-build-fleet-cache", Path("/Users/Shared/cmux-build-fleet/cache"), False,
-                       "report only: the hq build worker's shared cache", owner="cmux build worker (hq)",
+                       "report only: the dev-build worker's shared cache",
+                       owner="cmux dev-build worker (hq controller)",
                        owner_job="system/ai.manaflow.cmux-build-worker"))
     for root in wt_roots:
         fams.append(Family("worktrees", root, False,
