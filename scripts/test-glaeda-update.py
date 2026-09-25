@@ -193,6 +193,31 @@ class UpdateTest(unittest.TestCase):
         with self.assertRaisesRegex(gu.UpdateError, "malformed"):
             self.run_update()
 
+    def test_health_plans_offline_from_the_fetched_channel(self) -> None:
+        self.server.publish(SOURCES[0])
+        self.run_update()
+        channel_dir = self.state / "health-channel"
+        self.assertEqual(json.loads((channel_dir / "control.json").read_bytes()), gr.control(False))
+        self.assertEqual(json.loads((channel_dir / "canary.json").read_bytes())["tag"],
+                         self.server.rings["canary"]["tag"])
+        self.assertFalse((self.state / "pre-ota").exists())  # snapshot dropped after the first success
+
+    def test_real_updater_plans_from_a_channel_dir_without_network(self) -> None:
+        entry = self.server.publish(SOURCES[0])
+        channel_dir = self.root / "channel"
+        channel_dir.mkdir()
+        control_raw, ring_raw = self.server.channel("stable")
+        (channel_dir / "control.json").write_bytes(control_raw)
+        (channel_dir / "stable.json").write_bytes(ring_raw)
+        home = self.root / "home"
+        home.mkdir()
+        env = {**os.environ, "HOME": str(home), "http_proxy": "http://127.0.0.1:9", "https_proxy": "http://127.0.0.1:9"}
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/glaeda-update"), "--channel-dir", str(channel_dir)],
+                                capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertEqual((plan["result"], plan["target"]), ("plan", entry["tag"]))
+
     def test_bad_state_stops_the_run(self) -> None:
         self.server.publish(SOURCES[0])
         self.state.mkdir()

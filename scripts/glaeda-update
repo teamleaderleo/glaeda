@@ -256,12 +256,13 @@ def run_setup(gen: Path, args: list[str]) -> tuple[bool, str]:
     return result.returncode == 0, (result.stdout + result.stderr)[-2000:]
 
 
-def health(bin_dir: Path = BIN, home: Path | None = None) -> tuple[bool, str]:
-    """The installed tools run, and the installed glaeda-update plans against the live channel."""
+def health(bin_dir: Path, channel_dir: Path) -> tuple[bool, str]:
+    """The installed tools run, and the installed glaeda-update plans from the channel files this
+    run already fetched, so a network blip cannot fail (and quarantine) a good release."""
     checks = [
         [sys.executable, str(bin_dir / "glaeda-disk"), "--help"],
         [str(bin_dir / "glaeda-worktree-reclaim"), "--help"],
-        [sys.executable, str(bin_dir / "glaeda-update")],
+        [sys.executable, str(bin_dir / "glaeda-update"), "--channel-dir", str(channel_dir)],
     ]
     for argv in checks:
         name = Path(argv[1] if argv[0] == sys.executable else argv[0]).name
@@ -281,15 +282,17 @@ def health(bin_dir: Path = BIN, home: Path | None = None) -> tuple[bool, str]:
     return True, "tools run"
 
 
-def snapshot(state_dir: Path, bin_dir: Path) -> dict[str, bytes]:
-    """The installed tools before a first update, kept so it can be undone without a release."""
-    saved = {name: (bin_dir / name).read_bytes() for name in TOOLS if (bin_dir / name).is_file()}
-    root = state_dir / "pre-ota"
-    if saved and not root.exists():
-        root.mkdir(parents=True, mode=0o700)
-        for name, data in saved.items():
-            (root / name).write_bytes(data)
-    return saved
+def snapshot(state_dir: Path, bin_dir: Path) -> None:
+    """The installed tools (not agents or config) before a first update, so a failed first update
+    can be undone without a previous release. Rewritten each first attempt, removed on success."""
+    root, tmp = state_dir / "pre-ota", state_dir / "pre-ota.partial"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True, mode=0o700)
+    for name in TOOLS:
+        if (bin_dir / name).is_file():
+            (tmp / name).write_bytes((bin_dir / name).read_bytes())
+    shutil.rmtree(root, ignore_errors=True)
+    os.replace(tmp, root)
 
 
 def restore(state_dir: Path, bin_dir: Path) -> bool:
@@ -378,10 +381,15 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
     ok, log = run_setup(gen, config["setupArgs"])
     detail = "installed" if ok else "setup failed"
     if ok:
-        ok, detail = health(bin_dir)
+        channel_dir = state_dir / "health-channel"
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        (channel_dir / "control.json").write_bytes(control_raw)
+        (channel_dir / f"{config['ring']}.json").write_bytes(ring_raw or b"")
+        ok, detail = health(bin_dir, channel_dir)
     if ok:
         state.update(previous=state["current"], current=entry["tag"])
         save_state(state, state_dir)
+        shutil.rmtree(state_dir / "pre-ota", ignore_errors=True)
         prune(state_dir, {t for t in (state["current"], state["previous"]) if t})
         return {**out, "result": "updated", "detail": detail, "status": report(config, entry, True, detail)}
     state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
@@ -402,6 +410,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="install the ring's release if it is new")
     ap.add_argument("--status", action="store_true", help="print config and state, contact nothing")
+    ap.add_argument("--channel-dir", type=Path, help=argparse.SUPPRESS)  # health check: plan offline
     a = ap.parse_args(argv)
     try:
         config = load_config()
@@ -409,7 +418,12 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"config": config, "state": load_state()}, indent=1, sort_keys=True))
             return 0
         if not a.apply:  # planning reads only, so it needs no lock (health checks plan mid-update)
-            result = update(False, config)
+            channel = None
+            if a.channel_dir:
+                ring_file = a.channel_dir / f"{config['ring']}.json"
+                ring_raw = ring_file.read_bytes() or None
+                channel = ((a.channel_dir / "control.json").read_bytes(), ring_raw)
+            result = update(False, config, channel=channel)
         else:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             with open(STATE_DIR / "lock", "w") as lock:

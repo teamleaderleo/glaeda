@@ -39,7 +39,9 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
      live channel.
 
    If that fails, it re-runs the previous release's setup, or on a host's first update restores
-   the tools it replaced, and quarantines the failed release on that host.
+   the tools it replaced (tools only; agents and config stay as the failed setup left them), and
+   quarantines the failed release on that host. The health check plans from the channel files
+   the run already fetched, so a network blip cannot fail a good release.
 4. **Canary health.** A canary host with an authenticated `gh` posts the commit status
    `glaeda-ota/<host>` (success or failure) on the release commit.
 5. **Stable.** `.github/workflows/promote.yml` runs hourly. It moves `stable` to the canary
@@ -86,6 +88,9 @@ canary. Dispatching `promote` only runs the same check early; it never skips the
   file cannot point a host at another repository's download.
 - The attestation must name `release.yml` on `refs/heads/main` as its signer. A dispatch on
   another branch neither publishes nor attests.
+- Stable hosts without a signed-in `gh` do not check the attestation. That does not widen trust:
+  whoever can write this repository can already change what minis run, since
+  `glaeda-mini-fleet` syncs their `~/glaeda` to `main`.
 - The updater runs only what a release's `glaeda-mini-setup` installs. That command is
   idempotent, never uses sudo, and owns every file it writes (its receipt records them).
 - A release comes only from a push to `main` of this repository by someone with write access.

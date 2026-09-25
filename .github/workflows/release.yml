@@ -108,9 +108,16 @@ jobs:
           fi
           if gh release download ota-channels --pattern canary.json --dir channels 2>channels/err; then
             previous=$(python3 -c 'import json;print(json.load(open("channels/canary.json"))["source"])')
-            if ! git merge-base --is-ancestor "$previous" "$GITHUB_SHA"; then
+            set +e
+            git merge-base --is-ancestor "$previous" "$GITHUB_SHA"
+            descends=$?
+            set -e
+            if [ "$descends" = 1 ]; then
               echo "canary stays at $previous: $GITHUB_SHA does not descend from it" >> "$GITHUB_STEP_SUMMARY"
               exit 0
+            elif [ "$descends" != 0 ]; then
+              echo "canary commit $previous is not in main's history (rewritten?); fix canary.json by hand" >&2
+              exit 1
             fi
           elif ! grep -q "no assets match" channels/err; then
             cat channels/err; exit 1
