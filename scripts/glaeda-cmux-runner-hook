@@ -1248,17 +1248,18 @@ SYSCTL = "/usr/sbin/sysctl"
 PMSET = "/usr/bin/pmset"
 IOSTAT = "/usr/sbin/iostat"
 TOP_OUTSIDE = 5
-# Contended: work outside this mini's runner jobs averaged at least this many cores (or this share of the
-# cores), or the load average stayed well above the core count. Either one slows a compile's every file.
+# Contended, any of: work outside this mini's runner jobs averaged at least this many cores and this share of
+# the cores; the host CPU was saturated while other runner jobs and outside work held a real share of it (so
+# co-tenant jobs the capacity ledger admitted count here, deliberately: they slow this job all the same); or
+# many processes sat in uninterruptible wait. The load average is recorded but is never a reason by itself.
 CONTENDED_OUTSIDE_CORES = 2.0
 CONTENDED_OUTSIDE_SHARE = 0.15
-# Processes in uninterruptible wait (ps state U, nearly always disk) count toward the load average but use no
-# CPU; this many on average means the job was waiting on I/O, which the CPU buckets cannot show.
-CONTENDED_BLOCKED = 2.0
-# A saturated host is contention only when someone besides this job holds a real share of it.
 CONTENDED_BUSY_PCT = 90.0
 CONTENDED_SHARED_SHARE = 0.25
-CONTENDED_BLOCKED_SHARE = 0.25
+# ps state U on macOS means some thread waits uninterruptibly: disk, but also VM faults and memory-compressor
+# stalls. An idle Mac shows 1 to 3, so the floor sits well above that noise.
+CONTENDED_BLOCKED = 4.0
+CONTENDED_BLOCKED_SHARE = 0.3
 RUNNER_DIR_RE = re.compile(r"/(actions-runner[A-Za-z0-9_.-]*)/")
 
 
@@ -1460,7 +1461,7 @@ class JobSamples:
         blocked_mean = self.blocked / self.queues if self.queues else None
         if blocked_mean is not None and blocked_mean >= max(CONTENDED_BLOCKED, CONTENDED_BLOCKED_SHARE * self.ncpu):
             disk = f", disks {self.disk_sum / self.disks:.0f} MB/s" if self.disks else ""
-            reasons.append(f"{blocked_mean:.1f} processes on average waited on I/O{disk}")
+            reasons.append(f"{blocked_mean:.1f} processes on average in uninterruptible wait (disk or memory){disk}")
         if self.thermal:
             reasons.append("thermal or performance limit reported")
         top_outside = sorted(self.outside_by.items(), key=lambda kv: -kv[1])[:TOP_OUTSIDE]
@@ -1542,6 +1543,7 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         deadline = time.monotonic() + HOLDER_MAX_S
         tick = 0
         while True:
+            sampled_at = time.monotonic()
             try:
                 rows = ps_rows()
                 skip = {os.getpid()} | {pid for pid, ppid, _, _, _ in rows if ppid == os.getpid()}
@@ -1553,18 +1555,22 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
             except Exception:  # noqa: BLE001  (a bad sample is skipped, not fatal)
                 pass
             tick += 1
-            stop_at = time.monotonic() + interval
-            while time.monotonic() < stop_at:
+            stop_at = sampled_at + interval  # a sample takes about a second; keep the period at interval
+            finished = False
+            while True:  # check at least once, even when the sample outlasted the interval
                 try:
                     ours = pid_file.read_text().strip() == me
                 except OSError:
                     ours = False
                 if not ours or not pid_alive(watch_pid) or time.monotonic() >= deadline:
+                    finished = True
                     break
-                time.sleep(min(1.0, interval))
-            else:
-                continue
-            break
+                left = stop_at - time.monotonic()
+                if left <= 0:
+                    break
+                time.sleep(min(1.0, left))
+            if finished:
+                break
         append_job_record(samples.summary(time.time()), log)
     except Exception:  # noqa: BLE001
         pass

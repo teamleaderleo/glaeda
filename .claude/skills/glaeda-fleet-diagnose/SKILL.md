@@ -35,7 +35,8 @@ Fields (`glaeda-cmux-job/v1`): `cores.job` / `cores.other_runner_jobs` / `cores.
 - `contended` with high `cores.outside`: something outside every runner job used the CPU. `top_outside` names it.
 - `cores.*` come from `ps` %cpu, a decaying average that undercounts short-lived compiler processes. When
   `load.mean` is far above the cores listed, trust `cpu_busy_pct`: near 100 means the host was saturated.
-- High `queue.blocked` with high `disk_mb_s`: the job waited on disk, not CPU.
+- High `queue.blocked` with high `disk_mb_s`: the job waited on disk, not CPU. High `queue.blocked` with low
+  `disk_mb_s`: memory pressure (VM faults, compressor), check `memory_pressure` / swap on the host.
 - High `other_runner_jobs`: co-tenant jobs on the same mini (capacity ledger admitted them; see step 4).
 - `clear` but still slow: the work itself grew. Go to step 3.
 - No record: the job predates the sampler, the hook ran with `--no-telemetry` / `GLAEDA_RUNNER_TELEMETRY=0`,

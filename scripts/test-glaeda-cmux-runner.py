@@ -2579,9 +2579,12 @@ class JobTelemetryTest(unittest.TestCase):
 
         waiting = self.hook.JobSamples({}, 14, 0.0)
         waiting.add(9.0, (4.0, 0.0, 0.2, {}, {}), 10.0, (2, 6), 900.0, 40.0)
+        quiet = self.hook.JobSamples({}, 14, 0.0)
+        quiet.add(3.0, (1.0, 0.0, 0.2, {}, {}), 10.0, (2, 3), 5.0, 20.0)
+        self.assertEqual(quiet.summary(10.0)["verdict"], "clear", "an idle Mac shows a few U processes")
         record = waiting.summary(10.0)
         self.assertEqual(record["verdict"], "contended")
-        self.assertIn("waited on I/O, disks 900 MB/s", record["reasons"][0])
+        self.assertIn("uninterruptible wait (disk or memory), disks 900 MB/s", record["reasons"][0])
 
         unknown = self.hook.JobSamples({}, 14, 0.0)
         unknown.add(9.0, (4.0, 0.0, 0.2, {}, {}), 10.0)

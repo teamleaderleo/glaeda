@@ -151,8 +151,8 @@ the reasons for the newest five contended ones. A job is contended when work
 outside the mini's runner jobs averaged at least 2 cores and at least 15% of
 them; when the host CPU (iostat) averaged 90% busy or more while other runner
 jobs and outside work together held a quarter of the cores; when processes in
-uninterruptible wait (ps state U, nearly always disk) averaged at least 2 and a
-quarter of the cores; or when pmset reported a thermal limit. The load average
+uninterruptible wait (ps state U: disk, VM faults or memory-compressor stalls)
+averaged at least 4 and 30% of the cores; or when pmset reported a thermal limit. The load average
 is recorded but is not a reason on its own: a compile alone pushes it past the
 core count. That is the question a slow CI job raises first: was it the change,
 or the host?
