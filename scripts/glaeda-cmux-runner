@@ -409,7 +409,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
             scope += f" --compile-slots {slots}"
         roots = int((ctx.member or {}).get("canonicalRoots") or 1)
         if roots > 1:
-            scope += f" --canonical-roots {roots}"
+            # instance i prefers root i+1, so a root runner keeps compiling in the tree its warm labels name
+            scope += f" --canonical-roots {roots} --instance {ctx.instance}"
     started = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"
