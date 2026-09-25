@@ -42,6 +42,13 @@ blocks it; build-host checks (free disk, Xcode pin, hardware) are reported, not 
 so a nearly full laptop can still install the tool that frees it. Re-running it from a fresh
 checkout is how such a machine picks up newer tools.
 
+Linux (Big Red, owned Linux machines, Linux VMs on the fleet) gets the hygiene profile, the
+only one written for it so far, with or without the flag. It installs the same three tools and
+the systemd user units in ops/systemd (glaeda-disk-pressure and glaeda-worktree-reclaim, each a
+service and a timer) into ~/.config/systemd/user, reloads the user manager and enables the
+timers. There is no disk-dedupe unit (it watches Xcode DerivedData). A missing systemd user
+manager blocks; lingering off is reported, since timers then stop at logout.
+
 Machine enrollment stays with scripts/glaeda-mini-enroll, which drives
 scripts/cmux-fleet-bootstrap-macos and scripts/cmux_fleet.py (docs/CMUX_FLEET_ENROLLMENT.md).
 This command only runs that bootstrap read-only and records its verdict. The receipt lands in ~/.local/state/glaeda/mini-setup/receipt.json.
@@ -83,8 +90,19 @@ GIT_DEFAULTS = (
     ("submodule.fetchJobs", "0"),  # cmux has submodules; fetch them in parallel
 )
 DARWIN_REQUIRED = True
-# with --hygiene-only, only these preflight failures block: the agents run python3
-HYGIENE_BLOCKING = frozenset({"python"})
+# The platform this run sets up. Linux supports the hygiene profile only.
+HOST_PLATFORM = "linux" if platform.system() == "Linux" else "macos"
+# Linux: the systemd user units installed verbatim from ops/systemd, which stay their one definition.
+SYSTEMD_UNITS_DIR = REPO / "ops/systemd"
+LINUX_UNITS = (
+    "glaeda-disk-pressure.service",
+    "glaeda-disk-pressure.timer",
+    "glaeda-worktree-reclaim.service",
+    "glaeda-worktree-reclaim.timer",
+)
+# with --hygiene-only, only these preflight failures block: the agents run python3, and on
+# Linux the timers need a systemd user manager
+HYGIENE_BLOCKING = frozenset({"python", "systemdUser"})
 RUN_TIMEOUT = 20
 ENROLL_PYTHON_FORMULA = "python@3.13"
 BREW_TIMEOUT = 1800
@@ -129,8 +147,10 @@ def which(name: str, extra: tuple[str, ...] = ()) -> str | None:
 class Context:
     def __init__(self, home: Path, apply: bool, python: str | None, skip_launchctl: bool,
                  reclaim_binary: Path | None, cmux_root: Path | None, glaeda_bin: Path | None,
-                 xcode_app: str, min_free_gib: int, hygiene_only: bool = False) -> None:
+                 xcode_app: str, min_free_gib: int, hygiene_only: bool = False,
+                 platform_name: str | None = None) -> None:
         self.home = home
+        self.platform = platform_name or HOST_PLATFORM
         self.hygiene_only = hygiene_only
         self.apply = apply
         self.uid = os.getuid()
@@ -145,8 +165,11 @@ class Context:
         self.xcode_app = xcode_app
         self.min_free_gib = min_free_gib
         self.bin = home / ".local/bin"
-        self.agents = home / "Library/LaunchAgents"
-        self.logs = home / "Library/Logs"
+        linux = self.platform == "linux"
+        # LaunchAgents on macOS; systemd user units on Linux
+        self.agents = home / (".config/systemd/user" if linux else "Library/LaunchAgents")
+        # the reclaim unit appends to ~/.local/state/glaeda-worktree-reclaim.jsonl
+        self.logs = home / (".local/state" if linux else "Library/Logs")
         self.derived_data = home / "Library/Developer/Xcode/DerivedData"
         self.cache_root = home / ".cache/glaeda/cmux-native-cache"
         self.state = home / ".local/state/glaeda/mini-setup"
@@ -173,6 +196,8 @@ def pick_python() -> str | None:
     an Xcode exist, so it only counts once one does. The fleet's Xcode is a versioned app
     such as Xcode_26.6.app, not only Xcode.app.
     """
+    if platform.system() == "Linux":  # the units run glaeda-disk through its python3 shebang
+        return which("python3", ("/usr/bin/python3",))
     for candidate in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
         if os.access(candidate, os.X_OK):
             return candidate
@@ -331,6 +356,57 @@ def power() -> dict[str, Any]:
 
 
 def preflight(ctx: Context) -> dict[str, Any]:
+    return preflight_linux(ctx) if ctx.platform == "linux" else preflight_macos(ctx)
+
+
+def systemctl() -> str:
+    return which("systemctl", ("/usr/bin/systemctl", "/bin/systemctl")) or "/usr/bin/systemctl"
+
+
+def os_release_name() -> str:
+    try:
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if line.startswith("PRETTY_NAME="):
+                return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return "Linux"
+
+
+def preflight_linux(ctx: Context) -> dict[str, Any]:
+    """The hygiene profile's needs on Linux: a systemd user manager, python3, and cargo."""
+    checks: dict[str, dict[str, Any]] = {}
+    checks["linux"] = check(True, f"{os_release_name()} ({platform.machine()})")
+    code, _ = run([systemctl(), "--user", "show-environment"])
+    checks["systemdUser"] = check(code == 0, "available" if code == 0 else "unavailable",
+                                  "" if code == 0 else "the timers need a systemd user manager (systemctl --user)", True)
+    user = pwd.getpwuid(ctx.uid).pw_name
+    code, out = run(["loginctl", "show-user", user, "--property", "Linger", "--value"])
+    linger = code == 0 and out.strip() == "yes"
+    checks["linger"] = check(linger, "yes" if linger else (out.strip() or "unknown"),
+                             "" if linger else f"timers stop when {user} logs out until: sudo loginctl enable-linger {user}")
+    checks["python"] = check(ctx.python is not None, ctx.python or "missing",
+                             "" if ctx.python else "glaeda-disk needs python3", True)
+    cargo = find_cargo(ctx)
+    checks["cargo"] = check(cargo is not None or ctx.reclaim_binary is not None,
+                            cargo or ("--reclaim-binary" if ctx.reclaim_binary else "missing"),
+                            "" if cargo or ctx.reclaim_binary else "glaeda-worktree-reclaim is built with cargo (rustup)")
+    free = fleet.disk_free_gib(ctx.home)
+    checks["diskFree"] = check(free >= ctx.min_free_gib, f"{free} GiB", f"need {ctx.min_free_gib} GiB", True)
+    ts = tailscale()
+    checks["tailscale"] = check(ts.get("running", False),
+                                ts.get("dnsName") or ts.get("hostname") or ("not installed" if not ts["installed"] else ts.get("backendState") or "not running"))
+    return {
+        "checks": checks,
+        "hardware": {"arch": platform.machine(), "cpus": os.cpu_count() or 0},
+        "tailscale": ts,
+        "power": {"readable": False},
+        "xcode": {"apps": [], "selected": "none", "licenceNeeded": False},
+        "blocking": sorted(name for name, c in checks.items() if c["level"] == "block"),
+    }
+
+
+def preflight_macos(ctx: Context) -> dict[str, Any]:
     checks: dict[str, dict[str, Any]] = {}
     version = platform.mac_ver()[0]
     major = int(version.split(".")[0]) if version else 0
@@ -439,7 +515,38 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
     }
 
 
+def agent_names(ctx: Context) -> list[str]:
+    """LaunchAgent labels on macOS; systemd unit file names on Linux."""
+    return list(LINUX_UNITS) if ctx.platform == "linux" else list(agent_plists(ctx))
+
+
+def agent_path(ctx: Context, label: str) -> Path:
+    return ctx.agents / (label if ctx.platform == "linux" else f"{label}.plist")
+
+
+def agent_bytes(ctx: Context, label: str) -> bytes:
+    if ctx.platform == "linux":
+        return (SYSTEMD_UNITS_DIR / label).read_bytes()
+    return plistlib.dumps(agent_plists(ctx)[label], sort_keys=True)
+
+
+def is_disk_agent(label: str) -> bool:
+    return label.startswith((LABEL_PREFIX + "disk", "glaeda-disk"))
+
+
+def is_reclaim_agent(label: str) -> bool:
+    return label == LABEL_PREFIX + "worktree-reclaim" or label.startswith("glaeda-worktree-reclaim.")
+
+
 def directories(ctx: Context) -> list[tuple[Path, int]]:
+    if ctx.platform == "linux":
+        return [
+            (ctx.bin, 0o755),
+            (ctx.agents, 0o755),
+            (ctx.logs, 0o755),
+            (ctx.home / "Projects", 0o755),  # glaeda-worktree-reclaim-all scans here
+            (ctx.state, 0o700),
+        ]
     dirs = [
         (ctx.bin, 0o755),
         (ctx.agents, 0o755),
@@ -470,6 +577,17 @@ def launchctl_loaded(ctx: Context, label: str) -> bool | None:
         return None
     code, _ = run(["/bin/launchctl", "print", f"gui/{ctx.uid}/{label}"])
     return code == 0
+
+
+def agent_loaded(ctx: Context, label: str) -> bool | None:
+    """Loaded in launchd, or on Linux a timer that is enabled and active. Services start from their timer."""
+    if ctx.platform != "linux":
+        return launchctl_loaded(ctx, label)
+    if ctx.skip_launchctl or not label.endswith(".timer"):
+        return None
+    enabled = run([systemctl(), "--user", "is-enabled", label])
+    active = run([systemctl(), "--user", "is-active", label])
+    return enabled == (0, "enabled") and active == (0, "active")
 
 
 def git_get(ctx: Context, key: str) -> str | None:
@@ -533,11 +651,11 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     prior_receipt = load_receipt(ctx) or {}
     owned_files = {a.get("path"): a.get("ownedSha256") or a.get("sha256") for a in prior_receipt.get("actions", [])
                    if a.get("kind") in {"tool", "agent"} and a.get("owned")}
-    for label, doc in agent_plists(ctx).items():
-        dest = ctx.agents / f"{label}.plist"
-        data = plistlib.dumps(doc, sort_keys=True)
-        act = file_action(ctx, "agent", dest, data, 0o644)
-        if act["state"] == "update":
+    for label in agent_names(ctx):
+        dest = agent_path(ctx, label)
+        act = file_action(ctx, "agent", dest, agent_bytes(ctx, label), 0o644)
+        if ctx.platform != "linux" and act["state"] == "update":
+            doc = agent_plists(ctx)[label]
             try:  # a hand-written plist with the same content is not a change
                 with dest.open("rb") as stream:
                     if plistlib.load(stream) == doc:
@@ -545,13 +663,14 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
                         act["sha256"] = act["previousSha256"]
             except (OSError, plistlib.InvalidFileException, ValueError):
                 pass
-        if ctx.python is None and label.startswith(LABEL_PREFIX + "disk"):
+        if ctx.python is None and is_disk_agent(label):
             act["state"], act["note"] = "blocked", "no usable python3 yet"
-        if label == LABEL_PREFIX + "worktree-reclaim" and reclaim_act["state"] == "blocked":
+        if is_reclaim_agent(label) and reclaim_act["state"] == "blocked":
             act["state"], act["note"] = "blocked", "glaeda-worktree-reclaim could not be installed"
         act["label"] = label
-        act["loaded"] = launchctl_loaded(ctx, label)
-        act["launchctl"] = "skipped (sandbox HOME)" if ctx.sandbox else ("skipped" if ctx.skip_launchctl else "managed")
+        act["loaded"] = agent_loaded(ctx, label)
+        scheduler = "systemctl" if ctx.platform == "linux" else "launchctl"
+        act[scheduler] = "skipped (sandbox HOME)" if ctx.sandbox else ("skipped" if ctx.skip_launchctl else "managed")
         actions.append(act)
 
     # owned: this command wrote the file (now or on an earlier run) and it is still those bytes.
@@ -566,7 +685,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
 
     # /usr/bin/git is an install-dialog stub until the Command Line Tools (or Xcode) exist.
     git_ok = which("git") is not None and (
-        not DARWIN_REQUIRED or Path("/Library/Developer/CommandLineTools").exists() or bool(xcode_apps()))
+        ctx.platform == "linux" or not DARWIN_REQUIRED or Path("/Library/Developer/CommandLineTools").exists() or bool(xcode_apps()))
     prior = load_receipt(ctx) or {}
     owned_before = {a.get("key") for a in prior.get("actions", []) if a.get("kind") == "git" and a.get("owned")}
     for key, value in () if ctx.hygiene_only else GIT_DEFAULTS:
@@ -621,10 +740,10 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
     if receipt is None:
         actions.append({"kind": "note", "state": "kept",
                         "note": f"no install receipt at {ctx.show(ctx.receipt_path)}; nothing is removed"})
-    for label in agent_plists(ctx):
-        path = ctx.agents / f"{label}.plist"
+    for label in agent_names(ctx):
+        path = agent_path(ctx, label)
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
-                        "loaded": launchctl_loaded(ctx, label)})
+                        "loaded": agent_loaded(ctx, label)})
     for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     for act in actions:
@@ -706,7 +825,7 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
                 path.mkdir(parents=True, exist_ok=True, mode=int(act["mode"], 8))
                 act["applied"] = True
             continue
-        if kind == "agent" and act["label"] == LABEL_PREFIX + "worktree-reclaim" and reclaim_failed:
+        if kind == "agent" and is_reclaim_agent(act["label"]) and reclaim_failed:
             act["state"], act["note"] = "blocked", "glaeda-worktree-reclaim could not be installed"
             continue
         if kind == "tool" and act.get("build"):
@@ -724,16 +843,17 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             if kind == "tool":
                 data = Path(act["source"]).read_bytes()
             else:
-                data = plistlib.dumps(agent_plists(ctx)[act["label"]], sort_keys=True)
+                data = agent_bytes(ctx, act["label"])
             if state == "update":
                 act["backup"] = backup(ctx, dest)
-            if kind == "agent" and act.get("loaded"):
+            if kind == "agent" and act.get("loaded") and ctx.platform != "linux":
                 bootout(ctx, act["label"])
                 act["loaded"] = False
             write_atomic(dest, data, int(act["mode"], 8))
             act["applied"] = act["owned"] = True
             act["ownedSha256"] = act["sha256"]
-        if kind == "agent" and state in {"create", "update", "unchanged"} and not ctx.skip_launchctl and not act.get("loaded"):
+        if (kind == "agent" and ctx.platform != "linux" and state in {"create", "update", "unchanged"}
+                and not ctx.skip_launchctl and not act.get("loaded")):
             code, out = bootstrap(ctx, act["path"])
             act["bootstrapped"] = code == 0
             if code != 0:
@@ -752,6 +872,37 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             act["applied"] = act["owned"] = code == 0
             if code != 0:
                 act["state"], act["note"] = "failed", out[:400]
+    if ctx.platform == "linux" and not ctx.skip_launchctl:
+        activate_systemd(ctx, actions)
+
+
+def activate_systemd(ctx: Context, actions: list[dict[str, Any]]) -> None:
+    """Reload the user manager after unit changes and start every timer that is not running.
+
+    A timer whose own file or whose service changed is restarted so the new definition applies.
+    """
+    agents = [a for a in actions if a["kind"] == "agent"]
+    if any(a.get("applied") for a in agents):
+        code, out = run([systemctl(), "--user", "daemon-reload"])
+        if code != 0:
+            for act in agents:
+                act["note"] = ("systemctl --user daemon-reload failed: " + out)[:400]
+            return
+    changed = {a["label"] for a in agents if a.get("applied")}
+    for act in agents:
+        label = act["label"]
+        if not label.endswith(".timer") or act["state"] not in {"create", "update", "unchanged"}:
+            continue
+        service = label.removesuffix(".timer") + ".service"
+        if act.get("loaded") and not ({label, service} & changed):
+            continue
+        verb = ["enable", "--now"] if not act.get("loaded") else ["restart"]
+        code, out = run([systemctl(), "--user", *verb, label])
+        if code == 0 and verb == ["restart"]:
+            code, out = run([systemctl(), "--user", "enable", label])
+        act["enabled"] = code == 0
+        if code != 0:
+            act["note"] = (f"systemctl --user {' '.join(verb)} failed: " + out)[:400]
 
 
 def find_cargo(ctx: Context) -> str | None:
@@ -776,7 +927,10 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
         act["applied"] = False
         if act["kind"] == "agent":
             if act.get("loaded") and act["state"] == "remove":
-                bootout(ctx, act["label"])
+                if ctx.platform == "linux":
+                    run([systemctl(), "--user", "disable", "--now", act["label"]])
+                else:
+                    bootout(ctx, act["label"])
             if act["state"] == "remove":
                 Path(act["path"]).unlink()
                 act["applied"] = True
@@ -786,6 +940,9 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
         elif act["kind"] == "git" and act["state"] == "remove":
             code, _ = run([which("git") or "git", "config", "--global", "--unset", act["key"]], env=ctx.git_env())
             act["applied"] = code == 0
+    if (ctx.platform == "linux" and not ctx.skip_launchctl
+            and any(a["kind"] == "agent" and a.get("applied") for a in actions)):
+        run([systemctl(), "--user", "daemon-reload"])
 
 
 # ---------------------------------------------------------------- operator steps and reserved slots
@@ -895,7 +1052,7 @@ def render(ctx: Context, receipt: dict[str, Any]) -> str:
     mode = receipt["mode"]
     lines = [f"glaeda-mini-setup: {mode.upper()}" + ("" if receipt["applied"] else " (nothing changed; add --apply to act)")]
     if ctx.sandbox:
-        lines.append(f"  sandbox HOME {ctx.home}: launchctl is never called")
+        lines.append(f"  sandbox HOME {ctx.home}: {'systemctl' if ctx.platform == 'linux' else 'launchctl'} is never called")
     pre = receipt["preflight"]
     lines.append("preflight")
     for name, c in pre["checks"].items():
@@ -937,10 +1094,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--reclaim-binary", type=Path, help="prebuilt glaeda-worktree-reclaim instead of cargo build")
     p.add_argument("--python", help="interpreter the glaeda-disk agents run (default: Homebrew python3)")
     p.add_argument("--xcode-app", default=CMUX_XCODE_APP, help=f"pinned Xcode (default {CMUX_XCODE_APP})")
-    p.add_argument("--min-free-gib", type=int, default=MIN_FREE_GIB)
-    p.add_argument("--skip-launchctl", action="store_true", help="write plists but do not load or unload them")
+    p.add_argument("--min-free-gib", type=int, default=None,
+                   help=f"default: one build slot ({MIN_FREE_GIB} GiB on macOS)")
+    p.add_argument("--skip-launchctl", "--skip-systemctl", dest="skip_launchctl", action="store_true",
+                   help="write plists or units but do not load, enable or unload them")
     p.add_argument("--hygiene-only", action="store_true",
-                   help="only the disk and worktree hygiene tools and agents, for any Mac")
+                   help="only the disk and worktree hygiene tools and agents, for any Mac or Linux host")
     return p
 
 
@@ -963,14 +1122,15 @@ def main(argv: list[str] | None = None) -> int:
         argv.remove("--runner")
         return run_runner_mode(argv)
     args = parser().parse_args(argv)
-    if DARWIN_REQUIRED and platform.system() != "Darwin":
-        print("glaeda-mini-setup: macOS only", file=sys.stderr)
+    if DARWIN_REQUIRED and platform.system() not in {"Darwin", "Linux"}:
+        print("glaeda-mini-setup: macOS or Linux only", file=sys.stderr)
         return 2
+    min_free_gib = args.min_free_gib if args.min_free_gib is not None else fleet.default_min_free_gib(HOST_PLATFORM)
     ctx = Context(Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir), args.apply, args.python,
                   args.skip_launchctl, args.reclaim_binary,
                   args.cmux_root.expanduser().resolve() if args.cmux_root else None,
-                  args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, args.min_free_gib,
-                  args.hygiene_only)
+                  args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, min_free_gib,
+                  args.hygiene_only or HOST_PLATFORM == "linux")
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
         checks = {n: ({**c, "level": "warn"} if c["level"] == "block" and n not in HYGIENE_BLOCKING else c)
@@ -990,6 +1150,7 @@ def main(argv: list[str] | None = None) -> int:
         "schema": SCHEMA,
         "mode": "uninstall" if args.uninstall else "install",
         "profile": "hygiene" if ctx.hygiene_only else "build-host",
+        "platform": ctx.platform,
         "applied": args.apply,
         "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "sourceRevision": git_revision(),
