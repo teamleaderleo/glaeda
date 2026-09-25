@@ -296,7 +296,7 @@ DELETING_PREFIX = ".glaeda-disk-deleting-"  # remove() renames a tree to this be
 def derived_data(fam: Family, path: Path) -> bool:
     """Build output despite git inside: Xcode DerivedData (SourcePackages holds clones), and a tree
     remove() had already renamed aside when it was interrupted, which is only ever reclaimed."""
-    return (fam.id == "xcode-derived-data" or path.name.startswith(DELETING_PREFIX)
+    return bool(fam.id == "xcode-derived-data" or re.fullmatch(re.escape(DELETING_PREFIX) + r".+-[0-9]+", path.name)
             or (fam.id == "cmux-job-cache" and path.name == "DerivedData"))
 
 
