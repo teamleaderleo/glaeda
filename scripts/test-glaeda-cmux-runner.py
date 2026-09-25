@@ -526,13 +526,13 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free(), "every holder let go")
 
-    def take(self, root: str, runner: str, *extra: str) -> subprocess.CompletedProcess:
-        return self.step(["take-root", "--root", root, "--canonical-roots", "2", *extra], runner)
+    def take(self, root: str, runner: str, *extra: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return self.step(["take-root", "--root", root, "--canonical-roots", "2", *extra], runner, env)
 
     def take_gui(self, runner: str, *extra: str) -> subprocess.CompletedProcess:
         return self.step(["take-gui", *extra], runner)
 
-    def step(self, argv: list[str], runner: str) -> subprocess.CompletedProcess:
+    def step(self, argv: list[str], runner: str, env: dict | None = None) -> subprocess.CompletedProcess:
         """Run a hook phase as a job step would: under a process named Runner.Worker (its ancestor).
         A real Runner.Worker outlives the step and the root holder watches it, so the stand-in reports
         the step's exit status and then stays up until the test ends; one that exited with the step
@@ -557,7 +557,7 @@ class HookTest(unittest.TestCase):
                                                 "--capacity-dir", os.fspath(self.dir / "capacity"),
                                                 "--state-dir", os.fspath(self.dir / "state")])
         environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0", "RUNNER_NAME": runner,
-                   "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet")}
+                   "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"), **(env or {})}
         proc = subprocess.Popen([os.fspath(worker), "-c", cmd], env=environ, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(self.end_worker, proc)
@@ -641,10 +641,19 @@ class HookTest(unittest.TestCase):
             refused = self.take("2", "e0", "--wait", "0")
             self.assertEqual(refused.returncode, 2, "without --switch a second root is still refused")
             self.assertIn("--switch", refused.stderr)
-            switched = self.take("/private/tmp/cmux-ci-2", "e0", "--switch")
+            # root 2 busy: a switch that times out keeps the old root, never leaving the job without one
+            self.assertEqual(self.take("2", "b0").returncode, 0)
+            late = self.take("2", "e0", "--switch", "--wait", "1")
+            self.assertEqual(late.returncode, 1, late.stderr)
+            self.assertEqual(self.take("1", "x0", "--wait", "0").returncode, 1, "e0 still holds root 1")
+            self.assertEqual((state / "host-lock-holder-e0.roots").read_text().split(), ["root-1"])
+            self.finish("b0")
+            env_file = self.dir / "switch_env"
+            switched = self.take("/private/tmp/cmux-ci-2", "e0", "--switch", env={"GITHUB_ENV": os.fspath(env_file)})
             self.assertEqual((switched.returncode, switched.stdout.strip()), (0, "/private/tmp/cmux-ci-2"),
                              switched.stderr)
             self.assertIn("let go of root-1", switched.stderr)
+            self.assertEqual(env_file.read_text(), "CMUX_CI_CANONICAL_ROOT=/private/tmp/cmux-ci-2\n")
             self.assertEqual((state / "host-lock-holder-e0.roots").read_text().split(), ["root-2"])
             self.assertEqual(self.take("1", "c0", "--wait", "5").returncode, 0, "root 1 is free again")
             gui = self.job("app-host-unit-tests", "g0", 8, None, *two, "--gui-wait", "0")
@@ -658,8 +667,10 @@ class HookTest(unittest.TestCase):
             self.assertIn("persistent-dd+root-1", compile_.stdout)
             self.assertEqual(self.take("2", "p0", "--switch").returncode, 2,
                              "a root in the admission holder cannot be let go")
+            (state / "host-lock-holder-p0-root-1.pid").write_text("999999\n")  # a killed holder's leftover
+            self.assertEqual(self.take("2", "p0", "--switch").returncode, 2, "a dead holder lets nothing go")
         finally:
-            for runner in ("e0", "c0", "c1", "g0", "p0"):
+            for runner in ("e0", "c0", "c1", "g0", "p0", "b0", "x0"):
                 self.finish(runner)
         self.assertFalse(list((self.dir / "capacity").glob("*.want-*")), "no waiter marker outlives its wait")
         self.assertTrue(self.lock_free())
@@ -719,6 +730,12 @@ class HookTest(unittest.TestCase):
             # a gui holder not waiting for this job's root is no cycle: take-gui keeps waiting for the token
             self.assertIn("root-2", self.job("macos-compile-admission", "c1", 8, None, *two).stdout)
             self.assertEqual(self.take_gui("c1", "--wait", "1").returncode, 1)
+            # a marker its waiter stopped refreshing is stale, even if its pid is alive (recycled or foreign)
+            stale = self.dir / "capacity" / f"root-2.want-{os.getpid()}"
+            stale.write_text("gui\n")
+            os.utime(stale, (time.time() - 60, time.time() - 60))
+            self.assertEqual(self.take_gui("c1", "--wait", "1").returncode, 1, "no give-way to a stale marker")
+            self.assertFalse(stale.exists(), "and it is swept")
         finally:
             for runner in ("c0", "g0", "c1"):
                 self.finish(runner)

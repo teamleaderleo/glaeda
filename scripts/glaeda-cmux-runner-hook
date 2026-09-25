@@ -202,6 +202,7 @@ TAKE_ROOT_POLL_S = 1.0
 # the lock orders are opposite. So a take-root waiter leaves a marker, capacity/root-k.want-<pid> ("gui" when
 # its job holds the gui token), and take-gui gives way (TAKE_GUI_GAVE_WAY) when a gui holder wants its root.
 TAKE_GUI_GAVE_WAY = 3
+WANT_FRESH_S = 10.0  # a waiter rewrites its marker every TAKE_ROOT_POLL_S; an older one is stale
 
 
 def canonical_root(k: int) -> str:
@@ -648,8 +649,11 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
     """glaeda-canonical-root take ROOT: hold canonical root ROOT for the rest of this job (cmux#14338), waiting
     up to wait_s for it. A root this job already holds is a no-op; a second, different root is refused (two
     jobs taking two roots in opposite orders would deadlock), unless `switch` and every root the job holds
-    has a holder of its own (ROOT_SWITCHERS, or an earlier take-root): those are let go first, so the job
-    never holds two. The caller must be done with the old root. Prints the root's path."""
+    has a live holder of its own (ROOT_SWITCHERS, or an earlier take-root). A switch waits for ROOT while
+    still holding the old roots and lets them go only once ROOT is held, so a timeout leaves the job where
+    it was (exit 1) and never without a root; two switchers after each other's root both time out, so
+    callers keep --wait short. On success it points $GITHUB_ENV's CMUX_CI_CANONICAL_ROOT at ROOT. Prints
+    the root's path."""
     k = root_number(spec, roots)
     if k is None:
         print(f"{PREFIX}: take-root: {spec!r} is not one of this mini's {roots} canonical root(s) "
@@ -665,7 +669,7 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
     if name in held:
         print(path)
         return 0
-    if held and not (switch and all(root_holder_file(state_dir, old).exists() for old in held)):
+    if held and not (switch and all(holder_alive(root_holder_file(state_dir, old)) for old in held)):
         print(f"{PREFIX}: take-root: this job already holds {', '.join(held)}; one root per job"
               + ("" if switch else " (--switch lets go of a root with its own holder first)"), file=sys.stderr)
         return 2
@@ -673,12 +677,6 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
     if worker is None:
         print(f"{PREFIX}: take-root: not inside a runner job (no Runner.Worker above this step)", file=sys.stderr)
         return 2
-    if held:
-        for old in held:
-            release_holder(root_holder_file(state_dir, old))
-        with contextlib.suppress(OSError):
-            roots_file(state_dir).unlink()
-        print(f"{PREFIX}: take-root: let go of {', '.join(held)}", file=sys.stderr)
     deadline = time.monotonic() + max(0.0, wait_s)
     want = capacity_dir / f"{name}.want-{os.getpid()}"
     try:
@@ -689,21 +687,37 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
             if time.monotonic() >= deadline:
                 print(f"{PREFIX}: take-root: {path} is still in use after {wait_s:g} s", file=sys.stderr)
                 return 1
-            if not want.exists():  # take-gui reads it: a gui holder waiting for a root must not be waited on
-                with contextlib.suppress(OSError):
-                    want.write_text("gui\n" if gui_file(state_dir).exists() else "\n")
+            # take-gui reads it: a gui holder waiting for a root must not be waited on. Rewritten every poll,
+            # so a marker a killed waiter left goes stale (WANT_FRESH_S) even if its pid comes back.
+            with contextlib.suppress(OSError):
+                want.write_text("gui\n" if gui_file(state_dir).exists() else "\n")
             time.sleep(TAKE_ROOT_POLL_S)
     finally:
         with contextlib.suppress(OSError):
             want.unlink()
-    held, note = hold([fd], worker, state_dir, pid_file=root_holder_file(state_dir, name))
-    if not held:
+    ok, note = hold([fd], worker, state_dir, pid_file=root_holder_file(state_dir, name))
+    if not ok:
         print(f"{PREFIX}: take-root: {note}", file=sys.stderr)
         return 1
-    with contextlib.suppress(OSError), open(roots_file(state_dir), "a", encoding="utf-8") as record:
-        record.write(name + "\n")
+    if held:  # a switch: ROOT is held, so the old roots can go
+        for old in held:
+            release_holder(root_holder_file(state_dir, old))
+        with contextlib.suppress(OSError):
+            roots_file(state_dir).write_text(name + "\n")
+        print(f"{PREFIX}: take-root: let go of {', '.join(held)}; {export_root(name)}", file=sys.stderr)
+    else:
+        with contextlib.suppress(OSError), open(roots_file(state_dir), "a", encoding="utf-8") as record:
+            record.write(name + "\n")
     print(path)
     return 0
+
+
+def holder_alive(pid_file: Path) -> bool:
+    """A holder pid file whose holder is still running (a killed one leaves its file behind)."""
+    try:
+        return pid_alive(int(pid_file.read_text().strip()))
+    except (OSError, ValueError):
+        return False
 
 
 def gui_holder_wants(capacity_dir: Path, roots: list[str]) -> str | None:
@@ -714,7 +728,11 @@ def gui_holder_wants(capacity_dir: Path, roots: list[str]) -> str | None:
                 pid, mark = int(marker.name.rsplit("-", 1)[1]), marker.read_text()
             except (OSError, ValueError):
                 continue
-            if not pid_alive(pid):
+            try:
+                fresh = time.time() - marker.stat().st_mtime < WANT_FRESH_S
+            except OSError:
+                continue
+            if not fresh or not pid_alive(pid):
                 with contextlib.suppress(OSError):
                     marker.unlink()  # a waiter that was killed
             elif mark.strip() == "gui":
@@ -758,8 +776,12 @@ def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path) -> int:
     if not ok:
         print(f"{PREFIX}: take-gui: {note}", file=sys.stderr)
         return 1
-    with contextlib.suppress(OSError):
+    try:
         gui_file(state_dir).write_text("gui\n")
+    except OSError as error:  # unrecorded, a re-take would wait on itself and markers would miss it
+        release_holder(main.with_name(f"{main.stem}-gui.pid"))
+        print(f"{PREFIX}: take-gui: cannot record the gui token ({type(error).__name__})", file=sys.stderr)
+        return 1
     return 0
 
 
