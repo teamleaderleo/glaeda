@@ -1131,15 +1131,17 @@ class Gate:
             self.waiting, self.waiting_at = again, time.monotonic()
             if again:
                 why = f"a fleet build is waiting for the host (pid {min(again)})"
-        return why or self.full()
+        return why or self.full(fresh=True)
 
-    def full(self) -> str | None:
+    def full(self, fresh: bool = False) -> str | None:
         """Every unit this runner's jobs could take is held. A look an admission blocked keeps the previous
-        answer, so a full mini's retrying admissions never read as free and restart a listener."""
+        answer, so a full mini's retrying admissions never read as free and restart a listener; the fresh
+        look right before a stop (confirmed()) stops only on a reading of its own."""
         why = mini_full(self.capacity_dir, runner_units(self.runner_dir))
-        if not isinstance(why, Unknown):
-            self.full_why = why
-        return self.full_why
+        if isinstance(why, Unknown):
+            return None if fresh else self.full_why
+        self.full_why = why
+        return why
 
     def tree(self) -> tuple[list[int], dict[int, tuple[int, str]]]:
         table = processes()

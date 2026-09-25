@@ -1363,6 +1363,7 @@ class GateTest(unittest.TestCase):
         # a full mini's admissions keep retrying: a blocked look must not read as free and restart a listener
         with mock.patch.object(hook, "mini_full", return_value=hook.UNKNOWN):
             self.assertEqual(gate.claimed(), "all 2 capacity units on this mini are taken")
+            self.assertIsNone(gate.confirmed(), "the look right before a stop needs a reading of its own")
         with mock.patch.object(hook, "mini_full", return_value=None):
             self.assertIsNone(gate.claimed())
         with mock.patch.object(hook, "mini_full", return_value=hook.UNKNOWN):
