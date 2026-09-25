@@ -642,6 +642,37 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(path.read_bytes(), ms.agent_bytes(ctx, label))
         self.assertIn("deferred", act["note"])
 
+    def test_git_below_2_55_is_installed_with_our_brew_or_handed_to_the_operator(self) -> None:
+        ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 50, hygiene_only=True)
+        with mock.patch.object(ms, "newest_git", lambda: ("/usr/bin/git", (2, 55, 0))):
+            self.assertEqual(ms.plan_git(ctx)["state"], "unchanged")
+        old = lambda: ("/usr/bin/git", (2, 50, 1))
+        with mock.patch.object(ms, "newest_git", old), mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"):
+            self.assertEqual(ms.plan_git(ctx)["state"], "blocked")  # sandbox HOME never runs brew
+            ctx.sandbox = False
+            act = ms.plan_git(ctx)
+            self.assertEqual((act["state"], act["brew"]), ("create", "/opt/homebrew/bin/brew"))
+        with mock.patch.object(ms, "newest_git", old), mock.patch.object(ms, "owned_brew", lambda: None):
+            self.assertIn("Homebrew owner", ms.plan_git(ctx)["note"])
+            linux = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
+                               ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name="linux")
+            self.assertIn("ppa:git-core/ppa", ms.plan_git(linux)["note"])
+
+    def test_brew_git_apply_upgrades_an_outdated_keg(self) -> None:
+        ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 50, hygiene_only=True)
+        versions = iter([(2, 50, 1), (2, 55, 0)])  # install leaves the old keg; upgrade fixes it
+        act = {"kind": "gitpkg", "state": "create", "brew": "/opt/homebrew/bin/brew", "note": ""}
+        calls = []
+        with mock.patch.object(ms, "brew_install", lambda brew, formula: (0, "already installed")), \
+                mock.patch.object(ms, "newest_git", lambda: ("/opt/homebrew/bin/git", next(versions))), \
+                mock.patch.object(ms, "run", lambda argv, **kw: (calls.append(argv), (0, ""))[1]):
+            ms.apply_install(ctx, [act])
+        self.assertTrue(act["applied"])
+        self.assertEqual(calls, [["/opt/homebrew/bin/brew", "upgrade", "git"]])
+        self.assertEqual(act["value"], "2.55.0")
+
     def test_no_em_dashes(self) -> None:
         for name in ("glaeda-mini-setup", "glaeda-worktree-reclaim-all", "test-glaeda-mini-setup.py"):
             self.assertNotIn(chr(0x2014), (ROOT / "scripts" / name).read_text(), name)
