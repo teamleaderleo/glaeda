@@ -1979,6 +1979,24 @@ class GateTest(unittest.TestCase):
         self.assertEqual(check.call_args[0][0][1:], [os.fspath(HOOK), "listen", "--no-waiters", "--adopt=4321",
                                                      "--parse-only"])
 
+    def test_an_ios_sim_side_runner_listens_only_with_room_for_a_2_unit_job(self) -> None:
+        self.assertNotIn("--fit-units", self.listen_sh(sys.executable).read_text())
+        script = self.listen_sh(sys.executable, ["glaeda-mini", "glaeda-side-std-xcode-26.6", "glaeda-ios-sim"])
+        self.assertIn(f"listen --runner-dir {self.runner} --fit-units 2 &", script.read_text())
+        argv = ["listen", "--runner-dir", os.fspath(self.runner), "--fit-units", "2", "--parse-only"]
+        self.assertEqual(subprocess.run([sys.executable, os.fspath(HOOK), *argv], capture_output=True).returncode, 0)
+        side = hook.RunnerScope(4, 2, 2, False)
+        self.assertEqual(hook.mini_full(self.units(3), 4, side, 2),
+                         "only 1 of 4 capacity units on this mini are free; its next job needs 2")
+        self.assertIsNone(hook.mini_full(self.units(3), 4, side), "a light-only side runner still fits a light job")
+        self.assertIsNone(hook.mini_full(self.units(2), 4, side, 2))
+        self.runner_hook(4)
+        (self.runner / hook.RUNNER_HOOK_SCRIPT).write_text(
+            "exec python3 /hook job-started --capacity-units 4 --canonical-roots 2 --instance 3\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                         capacity_dir=self.units(3), fit_units=2)
+        self.assertEqual(gate.claimed(), "only 1 of 4 capacity units on this mini are free; its next job needs 2")
+
     def test_parse_only_accepts_the_gate_argv_and_an_old_hook_would_not(self) -> None:
         argv = ["listen", "--runner-dir", os.fspath(self.runner), "--no-waiters", "--adopt=1", "--parse-only"]
         self.assertEqual(subprocess.run([sys.executable, os.fspath(HOOK), *argv], capture_output=True).returncode, 0)
@@ -2047,9 +2065,9 @@ class GateTest(unittest.TestCase):
             gate.step(); gate.step()
             stop.assert_called_once_with("a fleet build holds the host lock")
 
-    def listen_sh(self, python: str) -> Path:
+    def listen_sh(self, python: str, labels: list[str] | None = None) -> Path:
         ctx = mock.Mock(python=python, hook_dir=HOOK.parent, runner_dir=self.runner, org=None, repo="manaflow-ai/cmux",
-                        min_free_gib=0, member=None, capacity_units=4)
+                        min_free_gib=0, member=None, capacity_units=4, labels=labels or ["glaeda-mini"])
         script = self.tmp / "listen.sh"
         script.write_bytes(cr.hook_wrappers(ctx)["listen.sh"])
         script.chmod(0o755)
@@ -2709,7 +2727,9 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--state-dir", shim)
         self.assertTrue(os.access(hooks / "glaeda-canonical-root", os.X_OK))
         self.assertNotIn("--compile-slots", (hooks / "job-started.sh").read_text())  # 1 is the hook's default
-        self.assertNotIn("--instance", (hooks / "job-started.sh").read_text())  # one root: nothing to prefer
+        # one root: no --canonical-roots, but --instance still tells the gate a root runner from a side one
+        self.assertNotIn("--canonical-roots", (hooks / "job-started.sh").read_text())
+        self.assertIn("--capacity-units 4 --instance 0\n", (hooks / "job-started.sh").read_text())
         manifest["defaults"]["runner"] = {"classes": {"std": {"compileSlots": 2, "canonicalRoots": 2}}}
         path.write_text(json.dumps(manifest))
         with mock.patch.object(cr, "xcode_present", return_value=True):
