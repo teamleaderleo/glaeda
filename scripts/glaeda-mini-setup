@@ -30,6 +30,7 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
     ~/.local/bin/glaeda-seed-prefetch          from scripts/glaeda-seed-prefetch (a no-op off an owned cmux runner)
     ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
+    ~/.local/bin/gh-wait                       from scripts/gh-wait (wait on a GitHub run without polling)
     ~/.config/glaeda/update.json               its release ring, written once (--ota-ring canary|stable)
     ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,update}.plist
     build-host directories and three git defaults, each set only when unset
@@ -770,7 +771,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
     for name in ("glaeda-disk", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
-                 "glaeda-update"):
+                 "glaeda-update", "gh-wait"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
@@ -897,7 +898,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
     for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
-                 "glaeda-seed-prefetch", "glaeda-update"):
+                 "glaeda-seed-prefetch", "glaeda-update", "gh-wait"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     for act in actions:
         if act["kind"] == "note":

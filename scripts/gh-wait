@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Block until a GitHub Actions run or a commit's checks finish, without polling GitHub.
+
+    gh-wait run <run id | run URL> [--repo owner/name] [--attempt N]
+    gh-wait sha <sha> [--repo owner/name] [--check NAME]
+    gh-wait status
+
+The cmux build controller receives GitHub's workflow_run and check_suite webhooks
+(manaflow-ai/cmuxterm-hq#675) and holds this request open on the tailnet until the
+state is terminal, so a wait costs no GitHub API budget. `--check` names a workflow
+(for example "CI") or a check suite's app (for example "vercel"); without it, `sha`
+waits for every workflow run it has seen for the commit, so name the check when the
+workflows may not have started yet.
+
+When the controller is unreachable or has never seen the run (it started before the
+receiver, or the delivery was lost), gh-wait makes one conditional REST read with the
+last ETag (a 304 is free), then at most one every 5 minutes, or every 15 minutes while
+the controller tracks the run. It never loops faster.
+
+Prints `<status> <conclusion> <url>` (or JSON with --json) and exits 0 for success,
+skipped or neutral, 1 for any other conclusion, 3 on --timeout, 2 on usage errors and
+4 when neither the controller nor GitHub can answer.
+
+Run it in the background from an agent; the harness wakes the agent when it exits.
+
+Controller: $CMUX_CI_CONTROLLER, else the cmux-ci client config, else the fleet default.
+Token: $CMUX_CI_TOKEN_FILE, $CMUX_CI_TOKEN, else ~/.config/cmux/build-fleet/controller.token.
+GitHub token for the fallback: $GH_TOKEN, $GITHUB_TOKEN, else `gh auth token`.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+DEFAULT_CONTROLLER = "http://100.71.114.64:18765"
+DEFAULT_REPO = "manaflow-ai/cmux"
+CLIENT_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
+TOKEN_FILE = Path.home() / ".config/cmux/build-fleet/controller.token"
+GITHUB_API = "https://api.github.com"
+LONG_POLL = 300          # the controller caps a single wait at 300 s
+REST_UNTRACKED = 300     # fallback cadence when the controller cannot answer
+REST_TRACKED = 900       # safety net for a lost delivery while the controller tracks the run
+CONTROLLER_RETRY = 30    # tailnet only, costs no GitHub budget
+OK_CONCLUSIONS = {"success", "skipped", "neutral"}
+RUN_URL = re.compile(r"^https://github\.com/([^/]+/[^/]+)/actions/runs/(\d+)")
+REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+SHA = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+
+def log(msg: str) -> None:
+    print(f"gh-wait: {msg}", file=sys.stderr, flush=True)
+
+
+def controller_base() -> str:
+    env = os.environ.get("CMUX_CI_CONTROLLER", "").strip()
+    if env:
+        return env.rstrip("/")
+    try:
+        configured = json.loads(CLIENT_CONFIG.read_text()).get("controller", "")
+        if configured:
+            return configured.rstrip("/")
+    except (OSError, ValueError):
+        pass
+    return DEFAULT_CONTROLLER
+
+
+def controller_token() -> str | None:
+    path = os.environ.get("CMUX_CI_TOKEN_FILE")
+    if path:
+        try:
+            return Path(path).read_text().strip() or None
+        except OSError:
+            return None
+    if os.environ.get("CMUX_CI_TOKEN", "").strip():
+        return os.environ["CMUX_CI_TOKEN"].strip()
+    try:
+        return TOKEN_FILE.read_text().strip() or None
+    except OSError:
+        return None
+
+
+class Unavailable(Exception):
+    pass
+
+
+class Controller:
+    def __init__(self) -> None:
+        self.base = controller_base()
+        self.token = controller_token()
+        if not self.token:
+            log(f"no controller token ({TOKEN_FILE}); using the REST fallback only")
+
+    def get(self, path: str, wait: float) -> dict:
+        if not self.token:
+            raise Unavailable("no controller token")
+        sep = "&" if "?" in path else "?"
+        req = urllib.request.Request(f"{self.base}{path}{sep}wait={int(wait)}",
+                                     headers={"Authorization": "Bearer " + self.token})
+        try:
+            with urllib.request.urlopen(req, timeout=wait + 30) as res:
+                return json.load(res)
+        except urllib.error.HTTPError as err:
+            if err.code == 401:
+                self.token = None
+                log("controller rejected the token (401); using the REST fallback only")
+            raise Unavailable(f"controller HTTP {err.code}") from err
+        except (OSError, ValueError) as err:
+            raise Unavailable(f"controller unreachable: {err}") from err
+
+
+class GitHub:
+    """Conditional REST reads. Every call is one request; a 304 does not count against the limit."""
+
+    def __init__(self) -> None:
+        self.token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if not self.token:
+            try:
+                self.token = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True,
+                                            timeout=15).stdout.strip() or None
+            except (OSError, subprocess.SubprocessError):
+                self.token = None
+        self.cache: dict[str, tuple[str, object]] = {}
+
+    def get(self, path: str) -> object:
+        if not self.token:
+            raise Unavailable("no GitHub token for the REST fallback")
+        url = GITHUB_API + path
+        headers = {"Authorization": "Bearer " + self.token, "Accept": "application/vnd.github+json",
+                   "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "gh-wait"}
+        cached = self.cache.get(url)
+        if cached:
+            headers["If-None-Match"] = cached[0]
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as res:
+                body = json.load(res)
+                etag = res.headers.get("ETag")
+                if etag:
+                    self.cache[url] = (etag, body)
+                return body
+        except urllib.error.HTTPError as err:
+            if err.code == 304 and cached:
+                return cached[1]
+            raise Unavailable(f"GitHub HTTP {err.code} for {path}") from err
+        except (OSError, ValueError) as err:
+            raise Unavailable(f"GitHub unreachable: {err}") from err
+
+
+def newest_per_name(runs: list[dict]) -> list[dict]:
+    newest: dict[str, dict] = {}
+    for r in runs:
+        key = (r.get("name") or "").lower()
+        if key not in newest or r["id"] > newest[key]["id"]:
+            newest[key] = r
+    return sorted(newest.values(), key=lambda r: r["id"])
+
+
+def summarize(items: list[dict]) -> tuple[bool, str]:
+    """(terminal, conclusion) over runs or suites, the same rule as the controller."""
+    if not items:
+        return False, ""
+    conclusion = "success"
+    for item in items:
+        if item.get("status") != "completed":
+            return False, ""
+        c = item.get("conclusion") or ""
+        if c not in OK_CONCLUSIONS and conclusion in OK_CONCLUSIONS:
+            conclusion = c
+    return True, conclusion
+
+
+class RunTarget:
+    def __init__(self, ref: str, repo: str | None, attempt: int) -> None:
+        match = RUN_URL.match(ref)
+        if match:
+            repo, ref = repo or match.group(1), match.group(2)
+        if not ref.isdigit():
+            raise ValueError("run wants a numeric run id or a run URL")
+        self.id, self.repo, self.attempt = int(ref), repo, attempt
+
+    def controller_path(self) -> str:
+        return f"/v1/github/runs/{self.id}?attempt={self.attempt}"
+
+    def from_controller(self, view: dict) -> tuple[bool, bool, dict]:
+        run = view.get("run") or {}
+        if run.get("repo") and not self.repo:
+            self.repo = run["repo"]
+        return view.get("known", False), view.get("terminal", False), run
+
+    def from_rest(self, gh: GitHub) -> tuple[bool, dict]:
+        r = gh.get(f"/repos/{self.repo or DEFAULT_REPO}/actions/runs/{self.id}")
+        run = {"id": r["id"], "repo": (self.repo or DEFAULT_REPO).lower(), "name": r.get("name"), "status": r.get("status"),
+               "conclusion": r.get("conclusion") or "", "attempt": r.get("run_attempt", 1), "url": r.get("html_url")}
+        return run["status"] == "completed" and run["attempt"] >= self.attempt, run
+
+    @staticmethod
+    def result(run: dict) -> tuple[str, str, str]:
+        return run.get("status", ""), run.get("conclusion", ""), run.get("url", "")
+
+
+class ShaTarget:
+    def __init__(self, sha: str, repo: str | None, check: str | None) -> None:
+        if not SHA.match(sha):
+            raise ValueError("sha wants 7 to 40 hex characters")
+        self.sha, self.repo, self.check = sha.lower(), repo or DEFAULT_REPO, check or ""
+
+    def controller_path(self) -> str:
+        q = {"repo": self.repo}
+        if self.check:
+            q["check"] = self.check
+        return f"/v1/github/commits/{self.sha}?{urllib.parse.urlencode(q)}"
+
+    def from_controller(self, view: dict) -> tuple[bool, bool, dict]:
+        known = bool(view.get("runs") or view.get("suites"))
+        return known, view.get("terminal", False), view
+
+    def full_sha(self) -> str | None:
+        if len(self.sha) == 40:
+            return self.sha
+        try:
+            out = subprocess.run(["git", "rev-parse", "--verify", "--quiet", self.sha + "^{commit}"],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+            return out if len(out) == 40 else None
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def from_rest(self, gh: GitHub) -> tuple[bool, dict]:
+        full = self.full_sha()
+        if not full:
+            raise Unavailable("the REST fallback needs the full 40-character SHA")
+        body = gh.get(f"/repos/{self.repo}/actions/runs?head_sha={full}&per_page=100")
+        runs = [{"id": r["id"], "name": r.get("name"), "status": r.get("status"), "conclusion": r.get("conclusion") or "",
+                 "url": r.get("html_url")} for r in body.get("workflow_runs", [])]
+        if self.check:
+            runs = [r for r in runs if (r["name"] or "").lower() == self.check.lower()]
+        runs = newest_per_name(runs)
+        suites: list[dict] = []
+        if self.check and not runs:
+            body = gh.get(f"/repos/{self.repo}/commits/{full}/check-suites?per_page=100")
+            suites = [{"id": s["id"], "app": (s.get("app") or {}).get("slug"), "status": s.get("status"),
+                       "conclusion": s.get("conclusion") or ""} for s in body.get("check_suites", [])
+                      if self.check.lower() in {((s.get("app") or {}).get("slug") or "").lower(),
+                                                ((s.get("app") or {}).get("name") or "").lower()}]
+            suites = sorted(suites, key=lambda s: s["id"])[-1:]
+        terminal, conclusion = summarize(runs + suites)
+        return terminal, {"repo": self.repo, "sha": self.sha, "check": self.check, "terminal": terminal,
+                          "conclusion": conclusion, "runs": runs, "suites": suites}
+
+    def result(self, view: dict) -> tuple[str, str, str]:
+        url = f"https://github.com/{self.repo}/commit/{self.sha}"
+        runs = view.get("runs") or []
+        if len(runs) == 1 and runs[0].get("url"):
+            url = runs[0]["url"]
+        return ("completed" if view.get("terminal") else "pending"), view.get("conclusion", ""), url
+
+
+def finish(target, state: dict, as_json: bool, source: str) -> int:
+    status, conclusion, url = target.result(state)
+    if as_json:
+        print(json.dumps({"source": source, **state}))
+    else:
+        print(f"{status} {conclusion} {url}".strip())
+    return 0 if conclusion in OK_CONCLUSIONS else 1
+
+
+def wait(target, timeout: float, as_json: bool) -> int:
+    controller, gh = Controller(), None
+    deadline = time.monotonic() + timeout
+    last_rest = None
+    first = True
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log("timed out")
+            return 3
+        known, reachable = False, True
+        try:
+            # Peek first, so a run the controller never saw gets its REST read right away.
+            view = controller.get(target.controller_path(), 0 if first else min(LONG_POLL, remaining))
+            known, terminal, state = target.from_controller(view)
+            if terminal:
+                return finish(target, state, as_json, "controller")
+        except Unavailable as err:
+            reachable = False
+            if first or controller.token:
+                log(f"{err}; falling back to one conditional GitHub read per {REST_UNTRACKED // 60} min")
+        now = time.monotonic()
+        if first and known:
+            last_rest = now  # tracked from the start: the webhook answers, REST is only a safety net
+        interval = REST_TRACKED if known else REST_UNTRACKED
+        if last_rest is None or now - last_rest >= interval:
+            last_rest = now
+            gh = gh or GitHub()
+            if not gh.token and not reachable and not controller.token:
+                log("no controller token and no GitHub token; nothing can answer")
+                return 4
+            try:
+                terminal, state = target.from_rest(gh)
+                if terminal:
+                    return finish(target, state, as_json, "github")
+            except Unavailable as err:
+                log(str(err))
+        first = False
+        if not reachable:
+            # Retrying the controller is free (tailnet); without a token only the REST cadence is left.
+            pause = CONTROLLER_RETRY if controller.token else last_rest + REST_UNTRACKED - time.monotonic()
+            time.sleep(max(0.0, min(pause, deadline - time.monotonic())))
+
+
+def status() -> int:
+    controller = Controller()
+    try:
+        view = controller.get("/v1/github/runs/1", 0)
+    except Unavailable as err:
+        log(str(err))
+        return 4
+    print(json.dumps({"controller": controller.base, "receiver_last_delivery": view.get("receiver_last_delivery")}))
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="gh-wait", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    run = sub.add_parser("run", help="wait for one workflow run")
+    run.add_argument("id", help="run id or https://github.com/OWNER/REPO/actions/runs/ID URL")
+    run.add_argument("--attempt", type=int, default=1, help="wait for this attempt or later (after a rerun)")
+    sha = sub.add_parser("sha", help="wait for a commit's workflow runs or one named check")
+    sha.add_argument("sha")
+    sha.add_argument("--check", help="workflow name or check suite app (slug or name)")
+    for p in (run, sha):
+        p.add_argument("--repo", help=f"owner/name (default {DEFAULT_REPO}, or the run URL's repo)")
+        p.add_argument("--timeout", type=float, default=6 * 3600, help="seconds (default 6 h)")
+        p.add_argument("--json", action="store_true", help="print the final state as JSON")
+    sub.add_parser("status", help="show the receiver's last webhook delivery")
+    args = parser.parse_args(argv)
+    if args.cmd == "status":
+        return status()
+    if args.repo and not REPO.match(args.repo):
+        parser.error("--repo wants owner/name")
+    try:
+        target = RunTarget(args.id, args.repo, args.attempt) if args.cmd == "run" else ShaTarget(args.sha, args.repo, args.check)
+    except ValueError as err:
+        parser.error(str(err))
+    try:
+        return wait(target, args.timeout, args.json)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
