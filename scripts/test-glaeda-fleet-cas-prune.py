@@ -67,6 +67,8 @@ class PruneTest(unittest.TestCase):
         self.assertTrue(fp.busy(["/Applications/Xcode_26.6.app/Contents/Developer/usr/bin/xcodebuild -scheme cmux"]))
         self.assertTrue(fp.busy(["/Users/cmux/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2"]))
         self.assertTrue(fp.busy(["/Users/cmux/actions-runner-x/bin.2.337.0/Runner.Worker spawnclient 1 2"]))
+        self.assertTrue(fp.busy(["/Applications/Xcode_26.6.app/Contents/SharedFrameworks/SwiftBuild.framework/"
+                                 "Versions/A/PlugIns/SWBBuildService.bundle/Contents/MacOS/SWBBuildService"]))
         self.assertFalse(fp.busy(["/Users/cmux/actions-runner-glaeda/bin/Runner.Listener run",
                                   "python3 xcodebuild-log-parser.py"]))
 
@@ -115,6 +117,25 @@ class PruneTest(unittest.TestCase):
         self.assertEqual(self.run_main("--apply", "--local-cas-gib", "0")["local_cas"], "removed")
         self.assertFalse((self.root / "cas").exists())
         self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith(".cas")], [])
+
+    def test_leftover_renamed_cas_is_swept(self) -> None:
+        self.env()
+        left = self.root / ".cas.pruning-4242/v1"
+        left.mkdir(parents=True)
+        (left / "blob").write_bytes(b"\0" * 8192)
+        rec = self.run_main("--apply")
+        self.assertGreater(rec["swept_bytes"], 0)
+        self.assertFalse((self.root / ".cas.pruning-4242").exists())
+
+    def test_nothing_to_delete_never_takes_the_lock(self) -> None:
+        self.env()
+        self.node(3)
+        held = os.open(self.lock, os.O_RDONLY)
+        try:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.assertEqual(self.run_main("--apply", "--node-gib", "1")["result"], "ok")
+        finally:
+            os.close(held)
 
     def test_defers_while_a_build_runs_or_holds_the_lock(self) -> None:
         self.env()

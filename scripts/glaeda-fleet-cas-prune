@@ -18,9 +18,12 @@ Two stores under /Users/Shared/cmux-build-fleet/xcode (docs/CMUX_BUILD_SLOT_MODE
               pruned here.
 
 A missing index entry in the middle of a build means a compile, so nothing is deleted while a
-build can be running: the run is skipped (exit 0, "deferred") while any xcodebuild or GitHub
-Actions Runner.Worker runs, and otherwise holds the fleet host lock (host.lock, the same flock
-with-host-lock and the runner hook take) without waiting for it, for the whole run.
+build can be running: the run is skipped (exit 0, "deferred") while any xcodebuild, Xcode build
+service or GitHub Actions Runner.Worker runs. Sizes and the plan are worked out without any lock;
+only the deletes run under the fleet host lock (host.lock, the same flock with-host-lock and the
+runner hook take), taken without waiting, after checking for a build once more. Holding it
+refuses new jobs and takes idle listeners offline (#1206), so it is held only for a rename and
+the unlinks; the renamed local CAS is removed after the lock is released.
 
 The fleet store itself (xcode/fleet-store, on the store host) is pruned by `fleet-cas gc`, which
 knows which entries are still read; this never touches it. Prints one JSON line per run.
@@ -44,7 +47,10 @@ ROOT = Path(os.environ.get("GLAEDA_FLEET_CAS_ROOT", "/Users/Shared/cmux-build-fl
 HOST_LOCK = Path(os.environ.get("FLEET_HOST_LOCK", "/Users/Shared/cmux-build-fleet/host.lock"))
 GIB = 1024**3
 # A build that can read the node: any xcodebuild, or a CI job (any runner dir, versioned bin too).
-BUSY = re.compile(r"(^|/)xcodebuild(\s|$)|/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
+# Xcode's build service can outlive xcodebuild with the CAS plugin still open.
+BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
+                  r"|/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
+PRUNING = ".cas.pruning-"  # a local CAS renamed aside for deletion
 
 
 def busy(commands: list[str]) -> str:
@@ -115,17 +121,19 @@ def plan_node(files: list[tuple[float, int, str]], budget: int) -> list[tuple[fl
     return doomed
 
 
-def remove_tree(path: Path) -> None:
-    """Rename aside first, so nothing ever sees a half-deleted Xcode CAS at the real path."""
-    doomed = path.with_name(f".{path.name}.pruning-{os.getpid()}")
-    os.rename(path, doomed)
-    shutil.rmtree(doomed, ignore_errors=True)
+def sweep(root: Path) -> int:
+    """Delete local CAS copies a previous run renamed aside but did not finish removing."""
+    freed = 0
+    for leftover in root.glob(PRUNING + "*"):
+        freed += tree_bytes(leftover)
+        shutil.rmtree(leftover, ignore_errors=True)
+    return freed
 
 
 def take_lock(path: Path):
     """The host lock without waiting, or None when a build holds it. No lock file: no lock."""
     try:
-        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)  # flock needs no write access
     except FileNotFoundError:
         return -1
     try:
@@ -161,43 +169,57 @@ def main(argv: list[str] | None = None) -> int:
         rec["result"] = f"deferred: a build is running ({why})"
         print(json.dumps(rec))
         return 0
-    lock = take_lock(HOST_LOCK) if a.apply else -1
+    if a.apply:
+        rec["swept_bytes"] = sweep(ROOT)
+    # Measure and plan with no lock held: these walks are the slow part.
+    local = ROOT / "cas"
+    local_bytes = tree_bytes(local) if local.is_dir() else 0
+    rec["local_cas_bytes"] = local_bytes
+    drop_local = not writer and local_bytes > a.local_cas_gib * GIB
+    store = ROOT / "node-store"
+    files = node_files(store) if store.is_dir() else []
+    rec["node_store_bytes"] = sum(b for _, b, _ in files)
+    doomed = [] if writer else plan_node(files, int(a.node_gib * GIB))
+    rec["local_cas"] = ("kept: the writer empties it before every writer build" if writer
+                        else ("would remove" if drop_local else "within budget"))
+    rec["node_store"] = ("kept: the writer's node store must match the fleet store" if writer
+                         else f"would remove {len(doomed)} oldest files, "
+                              f"{sum(b for _, b, _ in doomed) / GIB:.1f} GiB")
+    if not a.apply or not (drop_local or doomed):
+        rec["result"] = "ok"
+        print(json.dumps(rec))
+        return 0
+    lock = take_lock(HOST_LOCK)
     if lock is None:
         rec["result"] = "deferred: a build holds the host lock"
         print(json.dumps(rec))
         return 0
+    renamed = None
     try:
-        local = ROOT / "cas"
-        local_bytes = tree_bytes(local) if local.is_dir() else 0
-        rec["local_cas_bytes"] = local_bytes
-        if writer:
-            rec["local_cas"] = "kept: the writer empties it before every writer build"
-        elif local_bytes > a.local_cas_gib * GIB:
-            rec["local_cas"] = "removed" if a.apply else "would remove"
-            if a.apply:
-                remove_tree(local)
-        else:
-            rec["local_cas"] = "within budget"
-        store = ROOT / "node-store"
-        files = node_files(store) if store.is_dir() else []
-        rec["node_store_bytes"] = sum(b for _, b, _ in files)
-        if writer:
-            rec["node_store"] = "kept: the writer's node store must match the fleet store"
-        else:
-            doomed = plan_node(files, int(a.node_gib * GIB))
-            freed = 0
-            for _, b, p in doomed if a.apply else []:
-                try:
-                    os.unlink(p)
-                    freed += b
-                except FileNotFoundError:
-                    pass
-            rec["node_store"] = (f"{'removed' if a.apply else 'would remove'} {len(doomed)} oldest files, "
-                                 f"{(freed if a.apply else sum(b for _, b, _ in doomed)) / GIB:.1f} GiB")
-        rec["result"] = "ok"
+        again = running_commands()
+        if again is None or (why := busy(again)):
+            rec["result"] = f"deferred: a build started ({why if again else 'ps failed'})"
+            print(json.dumps(rec))
+            return 0
+        if drop_local and local.is_dir():
+            renamed = ROOT / f"{PRUNING}{os.getpid()}"
+            os.rename(local, renamed)
+            rec["local_cas"] = "removed"
+        freed = 0
+        for _, b, p in doomed:
+            try:
+                os.unlink(p)
+                freed += b
+            except FileNotFoundError:
+                pass
+        if doomed:
+            rec["node_store"] = f"removed {len(doomed)} oldest files, {freed / GIB:.1f} GiB"
     finally:
-        if lock not in (None, -1):
+        if lock != -1:
             os.close(lock)
+    if renamed is not None:  # the slow part, with the lock released: nothing reads this path
+        shutil.rmtree(renamed, ignore_errors=True)
+    rec["result"] = "ok"
     print(json.dumps(rec))
     return 0
 

@@ -148,7 +148,7 @@ class MiniSetupTest(unittest.TestCase):
         for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
             self.assertTrue(os.access(bin_dir / name, os.X_OK), name)
         self.assertEqual((bin_dir / "glaeda-disk").read_bytes(), (ROOT / "scripts/glaeda-disk").read_bytes())
-        for label in ("disk-pressure", "disk-dedupe", "worktree-reclaim"):
+        for label in ("disk-pressure", "disk-dedupe", "worktree-reclaim", "fleet-cas-prune"):
             path = self.home / f"Library/LaunchAgents/com.teamleaderleo.glaeda.{label}.plist"
             raw = path.read_bytes()
             self.assertNotIn(b"/Users/leoli", raw)
@@ -158,7 +158,8 @@ class MiniSetupTest(unittest.TestCase):
                 self.assertTrue(arg.startswith(os.fspath(bin_dir)), arg)
             self.assertTrue(doc["StandardOutPath"].startswith(os.fspath(self.home / "Library/Logs")))
             # dedupe is never urgent; pressure must still free space while a build fills the disk
-            self.assertEqual(doc.get("ProcessType"), "Background" if label == "disk-dedupe" else None)
+            self.assertEqual(doc.get("ProcessType"),
+                             "Background" if label in ("disk-dedupe", "fleet-cas-prune") else None)
         dedupe = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.disk-dedupe.plist").read_bytes())
         self.assertEqual(dedupe["WatchPaths"], [os.fspath(self.home / "Library/Developer/Xcode/DerivedData")])
         self.assertTrue((self.home / "Library/Developer/Xcode/DerivedData").is_dir())
