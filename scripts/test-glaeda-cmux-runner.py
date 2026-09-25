@@ -760,7 +760,8 @@ class HookTest(unittest.TestCase):
             # the same id elsewhere (test-e2e's root jobs) keeps the unknown-job default: compile, pinned
             self.assertEqual(hook.job_class(job, home, home, "test-e2e.yml"), ("compile", True))
             self.assertEqual(hook.job_class(job, home, home), ("compile", True))
-        self.assertEqual(hook.job_class("rerun", home, home, "app-host-test-rerun.yml"), ("product", False))
+        self.assertEqual(hook.job_class("rerun", home, home, "app-host-test-rerun.yml"), ("compile", True),
+                         "rerun hard-codes root 1 and wipes compile DerivedData: the pinned default")
         self.assertEqual(hook.job_class("macos-compile-admission", home, home, "ci.yml"), ("compile", False))
         self.assertEqual(hook.job_class("lint", "someone/else", home, "cmux-tui.yml"), ("isolated", False),
                          "a guest keeps the guest rule")
