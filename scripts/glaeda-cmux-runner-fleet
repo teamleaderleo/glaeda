@@ -180,7 +180,9 @@ def stage(member: str, manifest: dict[str, Any], scratch: Path) -> str | None:
 
 
 def _uninstall_cmd(member: str, instance: int, apply: bool) -> str:
-    return (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --uninstall {'--apply --token-stdin ' if apply else ''}"
+    # --token-stdin even for the plan: without gh on the mini, a plan lacking it reads "blocked", and a plan
+    # never reads stdin
+    return (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --uninstall {'--apply ' if apply else ''}--token-stdin "
             f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --instance {instance} --output json")
 
 

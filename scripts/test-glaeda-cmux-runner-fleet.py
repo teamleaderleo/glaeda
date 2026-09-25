@@ -46,7 +46,8 @@ if "--uninstall" in remote and "--apply" not in remote:
     k = remote.split("--instance ")[1].split()[0]
     scopes = dict(x.split("=") for x in os.environ.get("FAKE_SCOPES", "").split(",") if x)
     scope = scopes.get(host + ":" + k, scopes.get(host, "manaflow-ai/cmux"))
-    print(json.dumps({{"actions": [{{"kind": "deregister", "state": "remove" if scope else "kept", "scope": scope}}]}}))
+    state = ("remove" if "--token-stdin" in remote else "blocked") if scope else "kept"  # no gh on a mini
+    print(json.dumps({{"actions": [{{"kind": "deregister", "state": state, "scope": scope}}]}}))
     sys.exit(0)
 if "--apply" in remote and "--uninstall" not in remote and host in os.environ.get("FAKE_REGISTER_FAILS", "").split(","):
     print(json.dumps({{"actions": [{{"kind": "register", "state": "failed"}}, {{"kind": "verify", "state": "skipped"}}]}}))
