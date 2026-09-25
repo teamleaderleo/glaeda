@@ -526,6 +526,52 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free(), "every holder let go")
 
+    def test_job_log_records_started_refused_and_completed(self) -> None:
+        self.fleet()
+        log = self.dir / "Library/Logs/glaeda-cmux-jobs.jsonl"
+        gh = {"GLAEDA_RUNNER_TELEMETRY": "1", "GITHUB_RUN_ID": "987", "GITHUB_RUN_ATTEMPT": "2",
+              "GITHUB_WORKFLOW": "CI", "GITHUB_REF": "refs/pull/5/merge", "GITHUB_HEAD_REF": "feat-x",
+              "GITHUB_SHA": "a" * 40}
+        try:
+            first = self.job("macos-compile-admission", "e0", 4, None, "--instance", "1", env=gh)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            second = self.job("macos-compile-admission", "e1", 4, None, env=gh)
+            self.assertEqual(second.returncode, 1, second.stdout)
+        finally:
+            self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
+                          env={"RUNNER_NAME": "e0", "GLAEDA_RUNNER_TELEMETRY": "1"})
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        by_event = {r["event"]: r for r in records}
+        self.assertEqual(sorted(by_event), ["completed", "refused", "started"])
+        started, refused, completed = by_event["started"], by_event["refused"], by_event["completed"]
+        for record in records:
+            self.assertEqual(record["schema"], "glaeda-cmux-job/v1")
+            self.assertEqual((record["run_id"], record["run_attempt"], record["workflow"], record["ref"],
+                              record["head_ref"], record["sha"], record["repository"], record["job"]),
+                             ("987", "2", "CI", "refs/pull/5/merge", "feat-x", "a" * 40, "manaflow-ai/cmux",
+                              "macos-compile-admission"))
+            self.assertIsInstance(record["at"], int)
+            self.assertIn("decision", record)
+        self.assertEqual((started["runner"], started["units"], started["roots"], started["gui"],
+                          started["instance"]), ("e0", 2, ["root-1"], False, 1))
+        self.assertIn("holding 2/4 units+persistent-dd+root-1", started["decision"])
+        self.assertIsInstance(started["wait_s"], float)
+        self.assertEqual((refused["runner"], refused["units"], refused["roots"], refused["gui"]), ("e1", 0, [], False))
+        self.assertIn("capacity: the persistent-dd token is taken", refused["decision"])
+        self.assertIsInstance(refused["wait_s"], float)
+        self.assertEqual((completed["runner"], completed["roots"], completed["units"]), ("e0", ["root-1"], 2))
+        self.assertNotIn("roots_admitted", completed)
+        self.assertIn("verdict", completed)
+
+    def test_early_refusal_logs_without_a_wait(self) -> None:
+        pr = event(self.dir, "pr", {"repository": {"full_name": "someone/fork"}})
+        result = self.run_hook("job-started", "pull_request_target", pr, "--allowed-repo", "manaflow-ai/cmux",
+                               "--no-disk", env={"GLAEDA_RUNNER_TELEMETRY": "1", "RUNNER_NAME": "e2"})
+        self.assertEqual(result.returncode, 1)
+        [record] = [json.loads(line) for line in
+                    (self.dir / "Library/Logs/glaeda-cmux-jobs.jsonl").read_text().splitlines()]
+        self.assertEqual((record["event"], record["wait_s"], record["repository"]), ("refused", None, "someone/fork"))
+
     def take(self, root: str, runner: str, *extra: str, env: dict | None = None) -> subprocess.CompletedProcess:
         return self.step(["take-root", "--root", root, "--canonical-roots", "2", *extra], runner, env)
 
@@ -3388,6 +3434,116 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertLessEqual(log.stat().st_size, 4096 + 200)
         self.assertEqual(json.loads(lines[-1])["n"], 199)
         self.assertTrue(all(json.loads(line) for line in lines), "every kept line is whole JSON")
+
+    def test_job_log_cap_is_16_mib_and_trims_under_concurrent_writers(self) -> None:
+        self.assertEqual(self.hook.JOB_LOG_MAX_BYTES, 16 * 1024 * 1024)
+        log = self.dir / "Logs" / "jobs.jsonl"
+        with mock.patch.object(self.hook, "JOB_LOG_MAX_BYTES", 8192):
+            def write(w: int) -> None:
+                for n in range(150):
+                    self.hook.append_job_record({"w": w, "n": n, "pad": "x" * 40}, log)
+            threads = [threading.Thread(target=write, args=(w,)) for w in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        lines = log.read_text().splitlines()
+        self.assertLessEqual(log.stat().st_size, 8192 + 200)
+        records = [json.loads(line) for line in lines]  # every kept line is whole JSON
+        self.assertEqual({r["n"] for r in records if r["n"] == 149}, {149}, "the newest lines survive a trim")
+
+    def test_trim_renames_and_leaves_no_temp_file(self) -> None:
+        log = self.dir / "Logs" / "jobs.jsonl"
+        self.hook.append_job_record({"n": 0}, log)
+        before = log.stat().st_ino
+        with mock.patch.object(self.hook, "JOB_LOG_MAX_BYTES", 2048):
+            for n in range(1, 80):
+                self.hook.append_job_record({"n": n, "pad": "x" * 40}, log)
+        self.assertNotEqual(log.stat().st_ino, before, "the trim replaces the file, never truncates it")
+        self.assertEqual([p.name for p in log.parent.iterdir()], [log.name])
+        self.assertEqual(json.loads(log.read_text().splitlines()[-1])["n"], 79)
+
+    def test_job_started_line_skips_a_held_log_lock(self) -> None:
+        log = self.dir / "jobs.jsonl"
+        log.write_text("")
+        with open(log, "a+b") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            start = time.monotonic()
+            self.assertFalse(self.hook.append_job_record({"n": 1}, log, wait=False))
+            self.assertLess(time.monotonic() - start, 1.0, "the log never delays a job")
+            self.hook.job_event("started", {"job": "x"}, log)  # swallowed, not raised
+        self.assertEqual(log.read_text(), "")
+        self.assertTrue(self.hook.append_job_record({"n": 2}, log, wait=False))
+
+    def test_oversized_record_stays_whole_json(self) -> None:
+        log = self.dir / "jobs.jsonl"
+        self.hook.append_job_record({"event": "completed", "decision": "d" * 9000, "job": "x"}, log)
+        record = json.loads(log.read_text())
+        self.assertEqual((record["job"], "decision" in record), ("x", False))
+
+    def test_broken_roots_file_reads_as_none(self) -> None:
+        self.hook.roots_file(self.dir).write_bytes(b"\xff\xfe root-1")
+        self.assertEqual(self.hook.held_roots(self.dir), [])
+
+    def test_completed_roots_come_from_while_the_worker_lived(self) -> None:
+        watched = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(lambda: (watched.kill(), watched.wait()))
+        state = self.dir / "state"
+        log = self.dir / "jobs.jsonl"
+        state.mkdir()
+        self.hook.roots_file(state).write_text("root-1\n")
+        self.hook.start_sampler(watched.pid, state, {"job": "x", "roots": ["root-1"]}, log, interval=0.2)
+        deadline = time.monotonic() + 10
+        while not self.hook.sampler_file(state).exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        watched.kill()
+        watched.wait()
+        self.hook.roots_file(state).write_text("root-2\n")  # the next job on this runner, after the worker died
+        self.hook.gui_file(state).write_text("gui\n")
+        while (not log.exists() or not log.read_text()) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        [record] = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual((record["roots"], record["gui"], "roots_admitted" in record), (["root-1"], False, False))
+
+    def test_roots_released_after_the_pid_file_goes_are_not_read_as_empty(self) -> None:
+        # finish_sampler removes the pid file, then job-completed removes .roots while the worker still lives
+        watched = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(lambda: (watched.kill(), watched.wait()))
+        state = self.dir / "state"
+        log = self.dir / "jobs.jsonl"
+        state.mkdir()
+        self.hook.roots_file(state).write_text("root-1\n")
+        self.hook.start_sampler(watched.pid, state, {"job": "x", "roots": ["root-1"]}, log, interval=0.2)
+        deadline = time.monotonic() + 10
+        while not self.hook.sampler_file(state).exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.3)
+        self.hook.sampler_file(state).unlink()
+        self.hook.roots_file(state).unlink()
+        while (not log.exists() or not log.read_text()) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        [record] = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual((record["roots"], "roots_admitted" in record), (["root-1"], False))
+
+    def test_completed_line_has_event_and_final_roots(self) -> None:
+        watched = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(lambda: (watched.kill(), watched.wait()))
+        state = self.dir / "state"
+        log = self.dir / "jobs.jsonl"
+        state.mkdir()
+        self.hook.roots_file(state).write_text("root-1\n")
+        self.hook.start_sampler(watched.pid, state, {"job": "x", "roots": ["root-1"], "decision": "d"}, log,
+                                interval=0.2)
+        deadline = time.monotonic() + 10
+        while not self.hook.sampler_file(state).exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.hook.roots_file(state).write_text("root-2\n")  # take-root --switch mid-job
+        time.sleep(2.5)  # a sample takes about a second; the switch is read on the next pass while the job is ours
+        self.assertEqual(self.hook.finish_sampler(state), "job telemetry recorded")
+        [record] = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual((record["event"], record["roots"], record["roots_admitted"], record["decision"]),
+                         ("completed", ["root-2"], ["root-1"], "d"))
+        self.assertIsInstance(record["at"], int)
 
     def test_sampler_writes_one_record_when_finished(self) -> None:
         watched = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])

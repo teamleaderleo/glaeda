@@ -511,10 +511,13 @@ def collect_disk(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
     return source({"hosts": results})
 
 
-# Read-only: the tail of the runner hook's per-job log (glaeda-cmux-job/v1, one line per admitted job). A line cut
+# Read-only: the tail of the runner hook's per-job log (glaeda-cmux-job/v1; only "completed" lines, or lines with no
+# event from older hooks, carry the host record; "started" and "refused" lines are dropped on the host, so the
+# 400-line tail still holds about 400 completed records). A line cut
 # at the front by tail -c fails to parse and is skipped.
 JOBS_SCRIPT = (
-    "echo @jobs; tail -n 400 ~/Library/Logs/glaeda-cmux-jobs.jsonl 2>/dev/null | tail -c 1048576; echo; "
+    "echo @jobs; tail -c 8388608 ~/Library/Logs/glaeda-cmux-jobs.jsonl 2>/dev/null "
+    "| grep -v -e '\"event\":\"started\"' -e '\"event\":\"refused\"' | tail -n 400 | tail -c 1048576; echo; "
     "echo @now; date +%s"
 )
 
@@ -533,7 +536,8 @@ def parse_jobs(stdout: str, at: int) -> dict[str, Any]:
     skew = at - remote_now if remote_now is not None else 0
     since = (remote_now if remote_now is not None else at) - JOBS_WINDOW_S
     records = [r for r in json_lines(sections.get("jobs", []))
-               if r.get("schema") == "glaeda-cmux-job/v1" and (num(r.get("ended_at")) or 0) >= since]
+               if r.get("schema") == "glaeda-cmux-job/v1" and r.get("event", "completed") == "completed"
+               and (num(r.get("ended_at")) or 0) >= since]
     contended = [r for r in records if r.get("verdict") == "contended"]
     newest = sorted(contended, key=lambda r: -(num(r.get("ended_at")) or 0))[:MAX_CONTENDED_JOBS]
     return {"reachable": True, "observed_at": at, "count": len(records), "contended": len(contended),

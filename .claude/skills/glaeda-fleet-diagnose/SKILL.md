@@ -21,7 +21,9 @@ gh api repos/OWNER/REPO/actions/jobs/JOB_ID --jq '.runner_name, (.steps[] | "\(.
 
 ## 2. Is it the host or the work? Read the job's host record
 
-The runner hook samples the host during every admitted job and writes one line per job:
+The runner hook writes a `started` line at admission, a `refused` line when job-started refuses, and a
+`completed` line (the host record) when the job ends; `event` says which, and a line without it is `completed`.
+`decision`, `wait_s`, `units`, `roots` and `gui` say what admission decided and held:
 
 ```bash
 ssh MEMBER 'tail -n 50 ~/Library/Logs/glaeda-cmux-jobs.jsonl' | grep '"run_id":"RUN_ID"'
