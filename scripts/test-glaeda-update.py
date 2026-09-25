@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import importlib.machinery
 import importlib.util
@@ -38,7 +39,7 @@ bin_dir.mkdir(parents=True, exist_ok=True)
 code = int(Path(__file__).with_name("health-code").read_text())
 for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-update"):
     tool = bin_dir / name
-    tool.write_text("#!/usr/bin/env python3\\nimport sys\\nsys.exit(%d)\\n" % code)
+    tool.write_text("#!/usr/bin/env python3\\nimport sys\\nprint('{\\\"result\\\": \\\"plan\\\"}')\\nsys.exit(%d)\\n" % code)
     tool.chmod(0o755)
 with open(bin_dir / "setup-runs", "a") as log:
     log.write(Path(__file__).parents[2].name + " " + " ".join(sys.argv[1:]) + " " + os.environ.get("GLAEDA_UPDATE_RUNNING", "") + "\\n")
@@ -60,7 +61,8 @@ class Server:
 
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}
-        self.channels = gr.empty_channels()
+        self.paused = False
+        self.rings: dict[str, dict] = {}
 
     def publish(self, source: str, health_code: int = 0, archive: bytes | None = None) -> dict:
         tag = gr.release_tag(source, dt.datetime(2026, 9, 25))
@@ -73,12 +75,14 @@ class Server:
         release_raw = gr.canonical(gr.release_manifest(source, tag, {name: archive}))
         self.files[gu.DOWNLOAD.format(tag=tag, name=name)] = archive
         self.files[gu.DOWNLOAD.format(tag=tag, name="release.json")] = release_raw
-        entry = gr.channel_entry(json.loads(release_raw), release_raw, "2026-09-25T00:00:00Z")
-        self.channels["canary"] = entry
+        entry = gr.channel_entry("canary", json.loads(release_raw), release_raw, "2026-09-25T00:00:00Z")
+        self.rings["canary"] = entry
+        self.rings["stable"] = {**entry, "ring": "stable"}
         return entry
 
-    def raw_channels(self) -> bytes:
-        return gr.canonical(self.channels)
+    def channel(self, ring: str) -> tuple[bytes, bytes | None]:
+        entry = self.rings.get(ring)
+        return gr.canonical(gr.control(self.paused)), gr.canonical(entry) if entry else None
 
     def fetch(self, url: str, limit: int) -> bytes:
         return self.files[url]
@@ -93,7 +97,7 @@ class UpdateTest(unittest.TestCase):
         self.server = Server()
         self.saved = (gu.fetch, gu.attestation_ok, gu.local_target, os.environ.get("GLAEDA_TEST_BIN"))
         gu.fetch = self.server.fetch
-        gu.attestation_ok = lambda path: None
+        gu.attestation_ok = lambda path: True
         gu.local_target = lambda: TARGET
         os.environ["GLAEDA_TEST_BIN"] = str(self.bin)
         self.config = {"ring": "canary", "setupArgs": ["--hygiene-only"], "host": "test", "reportStatus": False}
@@ -105,7 +109,7 @@ class UpdateTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_update(self, apply: bool = True) -> dict:
-        return gu.update(apply, self.config, self.state, self.server.raw_channels(), self.bin)
+        return gu.update(apply, self.config, self.state, self.server.channel(self.config["ring"]), self.bin)
 
     def test_plan_changes_nothing_then_apply_installs_and_is_idempotent(self) -> None:
         entry = self.server.publish(SOURCES[0])
@@ -133,7 +137,8 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(state["current"], good["tag"])
         self.assertIn(bad["tag"], state["quarantined"])
         # the restored tools are the good release's again
-        self.assertEqual(subprocess.run([sys.executable, str(self.bin / "glaeda-disk")]).returncode, 0)
+        self.assertEqual(subprocess.run([sys.executable, str(self.bin / "glaeda-disk")],
+                                        capture_output=True).returncode, 0)
         self.assertEqual(self.run_update()["result"], "quarantined")
         # a newer release is still tried
         newer = self.server.publish(SOURCES[2])
@@ -150,7 +155,7 @@ class UpdateTest(unittest.TestCase):
         with self.assertRaisesRegex(gu.UpdateError, "does not match release.json"):
             self.run_update()
         self.server.publish(SOURCES[0])
-        self.server.channels["canary"]["releaseSha256"] = "0" * 64
+        self.server.rings["canary"]["releaseSha256"] = "0" * 64
         with self.assertRaisesRegex(gu.UpdateError, "does not match the channel"):
             self.run_update()
         self.assertFalse(self.bin.exists())
@@ -158,9 +163,43 @@ class UpdateTest(unittest.TestCase):
     def test_failed_attestation_is_refused(self) -> None:
         self.server.publish(SOURCES[0])
         gu.attestation_ok = lambda path: False
-        with self.assertRaisesRegex(gu.UpdateError, "attestation"):
+        with self.assertRaisesRegex(gu.UpdateError, "did not verify"):
+            self.run_update()
+        # a canary that cannot check refuses; stable, which only names canary-verified releases, installs
+        gu.attestation_ok = lambda path: None
+        with self.assertRaisesRegex(gu.UpdateError, "canary must verify"):
             self.run_update()
         self.assertFalse(self.bin.exists())
+        self.config["ring"] = "stable"
+        self.assertEqual(self.run_update()["result"], "updated")
+
+    def test_first_update_rolls_back_to_the_tools_it_replaced(self) -> None:
+        self.bin.mkdir()
+        (self.bin / "glaeda-disk").write_text("hand-installed\n")
+        self.server.publish(SOURCES[0], health_code=1)
+        result = self.run_update()
+        self.assertEqual(result["result"], "rolled-back")
+        self.assertEqual(result["rollback"], "restored the tools installed before the first update")
+        self.assertEqual((self.bin / "glaeda-disk").read_text(), "hand-installed\n")
+
+    def test_malformed_channel_names_are_refused(self) -> None:
+        entry = self.server.publish(SOURCES[0])
+        for tag in ("../../../../cli/cli/releases/download/v2.0.0", "r-20260925-ABC", "latest"):
+            with self.subTest(tag=tag):
+                self.server.rings["canary"] = {**entry, "tag": tag}
+                with self.assertRaisesRegex(gu.UpdateError, "malformed"):
+                    self.run_update()
+        self.server.rings["canary"] = {**entry, "ring": "stable"}
+        with self.assertRaisesRegex(gu.UpdateError, "malformed"):
+            self.run_update()
+
+    def test_bad_state_stops_the_run(self) -> None:
+        self.server.publish(SOURCES[0])
+        self.state.mkdir()
+        for text in ("{not json", json.dumps({"current": "../x", "previous": None, "quarantined": []}), "[]"):
+            (self.state / "state.json").write_text(text)
+            with self.assertRaises(gu.UpdateError):
+                self.run_update()
 
     def test_unsafe_archive_entries_are_refused(self) -> None:
         for name in ("../escape", "/abs/path"):
@@ -179,9 +218,10 @@ class UpdateTest(unittest.TestCase):
 
     def test_paused_and_empty_rings_do_nothing(self) -> None:
         self.server.publish(SOURCES[0])
-        self.server.channels["paused"] = True
+        self.server.paused = True
         self.assertEqual(self.run_update()["result"], "idle")
-        self.server.channels["paused"] = False
+        self.server.paused = False
+        del self.server.rings["stable"]
         self.config["ring"] = "stable"
         self.assertEqual(self.run_update()["result"], "idle")
         self.assertFalse(self.bin.exists())
@@ -202,40 +242,52 @@ class UpdateTest(unittest.TestCase):
 class ReleaseTest(unittest.TestCase):
     NOW = dt.datetime(2026, 9, 25, 12, tzinfo=dt.timezone.utc)
 
-    def channels(self, published: str = "2026-09-25T00:00:00Z") -> dict:
-        channels = gr.empty_channels()
-        channels["canary"] = {"tag": "r-20260925-" + "a" * 12, "source": "a" * 40,
-                              "releaseSha256": "0" * 64, "published": published}
-        return channels
+    def canary(self, published: str = "2026-09-25T00:00:00Z") -> dict:
+        return {"schema": gr.CHANNEL_SCHEMA, "ring": "canary", "tag": "r-20260925-" + "a" * 12,
+                "source": "a" * 40, "releaseSha256": "0" * 64, "published": published}
 
     def status(self, host: str, state: str, at: str) -> dict:
         return {"context": gr.STATUS_PREFIX + host, "state": state, "updated_at": at}
 
     def test_promotion_needs_soak_success_and_no_failure(self) -> None:
         ok = [self.status("air-blue", "success", "2026-09-25T01:00:00Z")]
-        self.assertEqual(gr.promotion(self.channels("2026-09-25T10:00:00Z"), ok, self.NOW)[0], False)
-        self.assertEqual(gr.promotion(self.channels(), [], self.NOW),
+        self.assertFalse(gr.promotion(self.canary("2026-09-25T10:00:00Z"), None, ok, self.NOW)[0])
+        self.assertEqual(gr.promotion(self.canary(), None, [], self.NOW),
                          (False, "no canary host reported success"))
         failed = ok + [self.status("big-red", "failure", "2026-09-25T02:00:00Z")]
-        self.assertFalse(gr.promotion(self.channels(), failed, self.NOW)[0])
+        self.assertFalse(gr.promotion(self.canary(), None, failed, self.NOW)[0])
         # a host's newest status counts: a later success clears its earlier failure
         recovered = failed + [self.status("big-red", "success", "2026-09-25T03:00:00Z")]
-        self.assertTrue(gr.promotion(self.channels(), recovered, self.NOW)[0])
+        self.assertTrue(gr.promotion(self.canary(), None, recovered, self.NOW)[0])
         # unrelated contexts are ignored
         noise = ok + [{"context": "ci/verify", "state": "failure", "updated_at": "2026-09-25T04:00:00Z"}]
-        self.assertTrue(gr.promotion(self.channels(), noise, self.NOW)[0])
-        paused = {**self.channels(), "paused": True}
-        self.assertEqual(gr.promotion(paused, ok, self.NOW), (False, "paused"))
-        same = {**self.channels(), "stable": self.channels()["canary"]}
-        self.assertFalse(gr.promotion(same, ok, self.NOW)[0])
+        self.assertTrue(gr.promotion(self.canary(), None, noise, self.NOW)[0])
+        self.assertFalse(gr.promotion(self.canary(), {**self.canary(), "ring": "stable"}, ok, self.NOW)[0])
+        self.assertEqual(gr.promotion(None, None, ok, self.NOW), (False, "no canary release"))
+
+    def test_cli_promote_writes_stable_or_exits_3(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            canary, statuses = Path(tmp) / "canary.json", Path(tmp) / "statuses.json"
+            canary.write_bytes(gr.canonical(self.canary()))
+            statuses.write_text(json.dumps([]))
+            args = ["promote", "--canary", str(canary), "--statuses", str(statuses), "--soak-hours", "0"]
+            out = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+            with open(os.devnull, "w") as null, contextlib.redirect_stderr(null), contextlib.redirect_stdout(out):
+                self.assertEqual(gr.main(args), 3)
+                statuses.write_text(json.dumps([self.status("air-blue", "success", "2026-09-25T01:00:00Z")]))
+                self.assertEqual(gr.main(args), 0)
+            out.flush()
+            stable = gr.parse_channel(out.buffer.getvalue(), "stable")
+            self.assertEqual(stable["tag"], self.canary()["tag"])
+            self.assertIn("promoted", stable)
 
     def test_manifest_and_channel_round_trip(self) -> None:
         release_raw = gr.canonical(gr.release_manifest("a" * 40, "r-20260925-" + "a" * 12, {"x.tar.gz": b"data"}))
         doc = gr.parse_release(release_raw, gr.sha256(release_raw))
-        entry = gr.channel_entry(doc, release_raw, "2026-09-25T00:00:00Z")
-        channels = {**gr.empty_channels(), "canary": entry}
-        self.assertEqual(gr.parse_channels(gr.canonical(channels)), channels)
-        self.assertEqual(gu.resolve(gr.canonical(channels), "canary"), entry)
+        entry = gr.channel_entry("canary", doc, release_raw, "2026-09-25T00:00:00Z")
+        self.assertEqual(gr.parse_channel(gr.canonical(entry), "canary"), entry)
+        self.assertEqual(gu.resolve(gr.canonical(gr.control(False)), gr.canonical(entry), "canary"), entry)
+        self.assertIsNone(gu.resolve(gr.canonical(gr.control(True)), gr.canonical(entry), "canary"))
         self.assertEqual(gu.check_release(release_raw, entry)["tag"], entry["tag"])
         with self.assertRaises(gr.ReleaseError):
             gr.parse_release(release_raw, "0" * 64)

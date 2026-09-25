@@ -13,16 +13,20 @@ it. Configuration is ~/.config/glaeda/update.json, written once by setup and nev
 
 What one run does, and what it refuses:
 
-1. Reads channels.json from the `ota-channels` release (scripts/glaeda_release.py). `paused` stops
-   every host. The ring names one release by tag and by the SHA-256 of its release.json.
+1. Reads control.json and <ring>.json from the `ota-channels` release (scripts/glaeda_release.py).
+   `paused` stops every host. The ring names one release by tag and by the SHA-256 of its
+   release.json; malformed names are refused.
 2. Downloads release.json and requires that digest, then this platform's glaeda-hygiene archive and
-   requires the size and SHA-256 release.json lists. With `gh` on PATH the archive's build-provenance
-   attestation must also verify. Extraction refuses absolute paths, `..`, links and devices.
+   requires the size and SHA-256 release.json lists. The archive's build-provenance attestation
+   must come from release.yml on main. A canary refuses to install when it cannot check that (no
+   gh, or gh not signed in); a stable host then relies on the hash chain, since stable only ever
+   names a release canaries verified. Extraction refuses absolute paths, `..`, links and devices.
 3. Installs by running that release's own scripts/glaeda-mini-setup --apply with the configured
    arguments and its prebuilt reclaim binary. Setup is idempotent and owns every installed file.
-4. Health: the installed glaeda-disk, glaeda-worktree-reclaim and glaeda-update must each run.
-   On failure the previous release's setup runs again (rollback) and the failed tag is quarantined
-   on this host, so it is never retried; a newer release is.
+4. Health: the installed glaeda-disk and glaeda-worktree-reclaim must run, and the installed
+   glaeda-update must plan against the live channel. On failure the previous release's setup runs
+   again, or on a first update the snapshot of the tools taken before it is restored, and the failed
+   tag is quarantined on this host, so it is never retried; a newer release is.
 5. On a canary host with reportStatus and an authenticated `gh`, the outcome is posted as the commit
    status `glaeda-ota/<host>` on the release's source commit. Promotion to stable waits for those.
 
@@ -37,18 +41,28 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 REPOSITORY = "teamleaderleo/glaeda"
-CHANNELS_URL = f"https://github.com/{REPOSITORY}/releases/download/ota-channels/channels.json"
 DOWNLOAD = f"https://github.com/{REPOSITORY}/releases/download/{{tag}}/{{name}}"
-CHANNELS_SCHEMA = "glaeda-ota-channels/v1"
+CHANNEL_SCHEMA = "glaeda-ota-channel/v1"
+CONTROL_SCHEMA = "glaeda-ota-control/v1"
+SIGNER_WORKFLOW = f"{REPOSITORY}/.github/workflows/release.yml"
+TAG_RE = re.compile(r"r-\d{8}-[0-9a-f]{12}")
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+HEX64 = re.compile(r"[0-9a-f]{64}")
+MAX_EXTRACTED = 1024 * 1024 * 1024
+# what setup installs and a first update snapshots, so it can roll back without a previous release
+TOOLS = ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
+         "glaeda-update")
 RELEASE_SCHEMA = "glaeda-release/v1"
 STATUS_PREFIX = "glaeda-ota/"
 MAX_ASSET = 200 * 1024 * 1024
@@ -105,10 +119,19 @@ def load_config(path: Path = CONFIG) -> dict:
 
 
 def load_state(state_dir: Path = STATE_DIR) -> dict:
+    empty = {"current": None, "previous": None, "quarantined": []}
     try:
-        return json.loads((state_dir / "state.json").read_text())
-    except (FileNotFoundError, ValueError):
-        return {"current": None, "previous": None, "quarantined": []}
+        doc = json.loads((state_dir / "state.json").read_text())
+    except FileNotFoundError:
+        return empty
+    except ValueError as e:
+        raise UpdateError(f"state.json is unreadable ({e}); fix or remove it") from e
+    ok = (isinstance(doc, dict) and isinstance(doc.get("quarantined"), list)
+          and all(doc.get(k) is None or (isinstance(doc.get(k), str) and TAG_RE.fullmatch(doc[k]))
+                  for k in ("current", "previous")))
+    if not ok:
+        raise UpdateError("state.json has the wrong shape; fix or remove it")
+    return doc
 
 
 def save_state(state: dict, state_dir: Path = STATE_DIR) -> None:
@@ -118,19 +141,34 @@ def save_state(state: dict, state_dir: Path = STATE_DIR) -> None:
     os.replace(tmp, state_dir / "state.json")
 
 
-def resolve(channels_raw: bytes, ring: str) -> dict | None:
-    doc = json.loads(channels_raw)
-    if doc.get("schema") != CHANNELS_SCHEMA:
-        raise UpdateError("channels.json has an unknown schema")
-    if doc.get("paused"):
+def channel_url(name: str) -> str:
+    return DOWNLOAD.format(tag="ota-channels", name=name)
+
+
+def resolve(control_raw: bytes, ring_raw: bytes | None, ring: str) -> dict | None:
+    """The ring's release entry, or None when paused or the ring names nothing yet."""
+    control = json.loads(control_raw)
+    if control.get("schema") != CONTROL_SCHEMA or not isinstance(control.get("paused"), bool):
+        raise UpdateError("control.json is malformed")
+    if control["paused"] or ring_raw is None:
         return None
-    entry = doc.get(ring)
-    if not entry:
-        return None
-    for key in ("tag", "source", "releaseSha256"):
-        if not isinstance(entry.get(key), str):
-            raise UpdateError(f"channels.json {ring}.{key} is missing")
+    entry = json.loads(ring_raw)
+    if (entry.get("schema") != CHANNEL_SCHEMA or entry.get("ring") != ring
+            or not TAG_RE.fullmatch(str(entry.get("tag"))) or not SHA_RE.fullmatch(str(entry.get("source")))
+            or not HEX64.fullmatch(str(entry.get("releaseSha256")))):
+        raise UpdateError(f"{ring}.json is malformed")
     return entry
+
+
+def fetch_channel(ring: str) -> tuple[bytes, bytes | None]:
+    control = fetch(channel_url("control.json"), MAX_META)
+    try:
+        ring_raw = fetch(channel_url(f"{ring}.json"), MAX_META)
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        ring_raw = None  # stable before the first promotion
+    return control, ring_raw
 
 
 def check_release(raw: bytes, entry: dict) -> dict:
@@ -155,6 +193,8 @@ def safe_extract(archive: Path, destination: Path) -> None:
     root = destination.resolve()
     with tarfile.open(archive, "r:gz") as tar:
         members = tar.getmembers()
+        if sum(m.size for m in members if m.isfile()) > MAX_EXTRACTED:
+            raise UpdateError("archive expands past the size limit")
         for member in members:
             name = member.name
             if name.startswith("/") or ".." in Path(name).parts or not (member.isfile() or member.isdir()):
@@ -172,19 +212,29 @@ def safe_extract(archive: Path, destination: Path) -> None:
             os.chmod(target, 0o755 if member.mode & 0o111 else 0o644)
 
 
+def find_gh() -> str | None:
+    """gh on PATH, else where Homebrew and distributions put it: a LaunchAgent's PATH is only
+    /usr/bin:/bin:/usr/sbin:/sbin, and a canary that cannot find gh never reports its health."""
+    for candidate in (shutil.which("gh"), str(HOME / ".local/bin/gh"), "/opt/homebrew/bin/gh",
+                      "/usr/local/bin/gh", "/usr/bin/gh"):
+        if candidate and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def attestation_ok(path: Path) -> bool | None:
-    """True/False from `gh attestation verify`; None when gh is absent (hash pinning still holds)."""
-    gh = shutil.which("gh")
+    """True/False from `gh attestation verify` pinned to release.yml on main; None when it cannot be
+    asked (no gh, or gh not signed in)."""
+    gh = find_gh()
     if not gh:
         return None
-    result = subprocess.run([gh, "attestation", "verify", str(path), "--repo", REPOSITORY],
-                            capture_output=True, text=True, timeout=120)
-    if result.returncode == 0:
-        return True
-    # an unauthenticated gh cannot ask; that is the same as no gh, not a forgery
-    if "gh auth login" in result.stderr or "authentication" in result.stderr.lower():
+    signed_in = subprocess.run([gh, "auth", "status"], capture_output=True, text=True, timeout=60)
+    if signed_in.returncode != 0:
         return None
-    return False
+    result = subprocess.run([gh, "attestation", "verify", str(path), "--repo", REPOSITORY,
+                             "--signer-workflow", SIGNER_WORKFLOW, "--source-ref", "refs/heads/main"],
+                            capture_output=True, text=True, timeout=120)
+    return result.returncode == 0
 
 
 def generation(state_dir: Path, tag: str) -> Path:
@@ -206,26 +256,58 @@ def run_setup(gen: Path, args: list[str]) -> tuple[bool, str]:
     return result.returncode == 0, (result.stdout + result.stderr)[-2000:]
 
 
-def health(bin_dir: Path = BIN) -> tuple[bool, str]:
+def health(bin_dir: Path = BIN, home: Path | None = None) -> tuple[bool, str]:
+    """The installed tools run, and the installed glaeda-update plans against the live channel."""
     checks = [
         [sys.executable, str(bin_dir / "glaeda-disk"), "--help"],
         [str(bin_dir / "glaeda-worktree-reclaim"), "--help"],
-        [sys.executable, str(bin_dir / "glaeda-update"), "--status"],
+        [sys.executable, str(bin_dir / "glaeda-update")],
     ]
     for argv in checks:
+        name = Path(argv[1] if argv[0] == sys.executable else argv[0]).name
         try:
-            result = subprocess.run(argv, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
         except (OSError, subprocess.TimeoutExpired) as e:
-            return False, f"{Path(argv[1] if argv[0] == sys.executable else argv[0]).name}: {e}"
+            return False, f"{name}: {e}"
         if result.returncode != 0:
-            return False, f"{Path(argv[1] if argv[0] == sys.executable else argv[0]).name} exited {result.returncode}"
+            return False, f"{name} exited {result.returncode}"
+        if name == "glaeda-update":
+            try:
+                planned = json.loads(result.stdout.strip().splitlines()[-1])["result"]
+            except (ValueError, KeyError, IndexError):
+                return False, "glaeda-update printed no plan"
+            if planned not in ("plan", "current", "idle", "quarantined"):
+                return False, f"glaeda-update planned {planned}"
     return True, "tools run"
+
+
+def snapshot(state_dir: Path, bin_dir: Path) -> dict[str, bytes]:
+    """The installed tools before a first update, kept so it can be undone without a release."""
+    saved = {name: (bin_dir / name).read_bytes() for name in TOOLS if (bin_dir / name).is_file()}
+    root = state_dir / "pre-ota"
+    if saved and not root.exists():
+        root.mkdir(parents=True, mode=0o700)
+        for name, data in saved.items():
+            (root / name).write_bytes(data)
+    return saved
+
+
+def restore(state_dir: Path, bin_dir: Path) -> bool:
+    root = state_dir / "pre-ota"
+    if not root.is_dir():
+        return False
+    for path in root.iterdir():
+        tmp = bin_dir / f".{path.name}.restore"
+        tmp.write_bytes(path.read_bytes())
+        tmp.chmod(0o755)
+        os.replace(tmp, bin_dir / path.name)
+    return True
 
 
 def report(config: dict, entry: dict, ok: bool, detail: str) -> str:
     if config["ring"] != "canary" or not config["reportStatus"]:
         return "not reported (not a reporting canary)"
-    gh = shutil.which("gh")
+    gh = find_gh()
     if not gh:
         return "not reported (no gh)"
     result = subprocess.run(
@@ -245,7 +327,7 @@ def prune(state_dir: Path, keep: set[str]) -> None:
             shutil.rmtree(child, ignore_errors=True)
 
 
-def download(state_dir: Path, entry: dict, target: str) -> Path:
+def download(state_dir: Path, entry: dict, target: str, ring: str) -> Path:
     """Fetch and verify the release into its generation directory; reuse a complete one."""
     gen = generation(state_dir, entry["tag"])
     if (gen / ".complete").is_file():
@@ -261,9 +343,11 @@ def download(state_dir: Path, entry: dict, target: str) -> Path:
     partial.mkdir(parents=True, mode=0o700)
     archive = partial / name
     archive.write_bytes(raw)
-    if attestation_ok(archive) is False:
+    attested = attestation_ok(archive)
+    if attested is False or (attested is None and ring == "canary"):
         shutil.rmtree(partial, ignore_errors=True)
-        raise UpdateError("build-provenance attestation did not verify")
+        raise UpdateError("build-provenance attestation did not verify" if attested is False else
+                          "a canary must verify the attestation: install gh and sign in")
     safe_extract(archive, partial)
     archive.unlink()
     (partial / "release.json").write_bytes(release_raw)
@@ -273,11 +357,11 @@ def download(state_dir: Path, entry: dict, target: str) -> Path:
     return gen
 
 
-def update(apply: bool, config: dict, state_dir: Path = STATE_DIR, channels_raw: bytes | None = None,
-           bin_dir: Path = BIN) -> dict:
+def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
+           channel: tuple[bytes, bytes | None] | None = None, bin_dir: Path = BIN) -> dict:
     state = load_state(state_dir)
-    raw = channels_raw if channels_raw is not None else fetch(CHANNELS_URL, MAX_META)
-    entry = resolve(raw, config["ring"])
+    control_raw, ring_raw = channel if channel is not None else fetch_channel(config["ring"])
+    entry = resolve(control_raw, ring_raw, config["ring"])
     out = {"ring": config["ring"], "current": state["current"]}
     if entry is None:
         return {**out, "result": "idle", "why": "paused or nothing on this ring"}
@@ -288,7 +372,9 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR, channels_raw:
         return {**out, "result": "quarantined", "why": "this release failed here before"}
     if not apply:
         return {**out, "result": "plan", "why": f"would install {entry['tag']}"}
-    gen = download(state_dir, entry, local_target())
+    gen = download(state_dir, entry, local_target(), config["ring"])
+    if state["current"] is None:
+        snapshot(state_dir, bin_dir)
     ok, log = run_setup(gen, config["setupArgs"])
     detail = "installed" if ok else "setup failed"
     if ok:
@@ -299,11 +385,14 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR, channels_raw:
         prune(state_dir, {t for t in (state["current"], state["previous"]) if t})
         return {**out, "result": "updated", "detail": detail, "status": report(config, entry, True, detail)}
     state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
-    rolled = "no previous release to restore"
     previous = state["current"]
     if previous and (generation(state_dir, previous) / ".complete").is_file():
         back, _ = run_setup(generation(state_dir, previous), config["setupArgs"])
         rolled = f"restored {previous}" if back else f"restoring {previous} failed too"
+    elif restore(state_dir, bin_dir):
+        rolled = "restored the tools installed before the first update"
+    else:
+        rolled = "nothing to restore"
     save_state(state, state_dir)
     return {**out, "result": "rolled-back", "detail": detail, "rollback": rolled, "log": log[-600:],
             "status": report(config, entry, False, detail)}
@@ -319,19 +408,22 @@ def main(argv: list[str] | None = None) -> int:
         if a.status:
             print(json.dumps({"config": config, "state": load_state()}, indent=1, sort_keys=True))
             return 0
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with open(STATE_DIR / "lock", "w") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                print(json.dumps({"result": "busy", "why": "another glaeda-update is running"}))
-                return 0
-            result = update(a.apply, config)
+        if not a.apply:  # planning reads only, so it needs no lock (health checks plan mid-update)
+            result = update(False, config)
+        else:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            with open(STATE_DIR / "lock", "w") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    print(json.dumps({"result": "busy", "why": "another glaeda-update is running"}))
+                    return 0
+                result = update(True, config)
         result["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         print(json.dumps(result, sort_keys=True))
         return 1 if result["result"] == "rolled-back" else 0
-    except (UpdateError, OSError, ValueError, subprocess.SubprocessError) as e:
-        print(json.dumps({"result": "error", "why": str(e)}))
+    except Exception as e:  # one JSON line per run, whatever failed
+        print(json.dumps({"result": "error", "why": f"{type(e).__name__}: {e}"[:500]}))
         return 1
 
 

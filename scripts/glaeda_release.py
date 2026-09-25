@@ -11,17 +11,18 @@ Every push to main builds one release in CI (.github/workflows/release.yml):
     release.json                     source commit and the SHA-256 and size of every asset
 
 The release is tagged r-<UTC date>-<source[:12]> and each asset carries a build-provenance
-attestation. One more release, tag `ota-channels`, holds channels.json, the only mutable file:
+attestation from release.yml on main. One more release, tag `ota-channels`, holds the only mutable
+files, each with exactly one writer so concurrent workflow runs never overwrite each other:
 
-    {"schema": "glaeda-ota-channels/v1", "paused": false,
-     "canary": {"tag": ..., "source": ..., "releaseSha256": ..., "published": ...},
-     "stable": {... the same fields ..., "promoted": ...}}
+    canary.json   {"schema": "glaeda-ota-channel/v1", "ring": "canary", "tag", "source",
+                   "releaseSha256", "published"}                      written by release.yml
+    stable.json   the same, ring "stable", plus "promoted"            written by promote.yml
+    control.json  {"schema": "glaeda-ota-control/v1", "paused": false} written by control.yml
 
-Hosts read it anonymously (the repository is public) and trust nothing else by name: release.json
-must match `releaseSha256`, and every asset must match release.json. The release workflow moves
-`canary` to each new release. The promote workflow moves `stable` to the canary once it has soaked
-(`SOAK_HOURS`) and canary hosts have reported success and none failure, as commit statuses
-`glaeda-ota/<host>` on its source commit.
+Hosts read them anonymously (the repository is public) and trust nothing by name: release.json
+must match `releaseSha256`, and every asset must match release.json. Canary only moves forward
+(release.yml checks ancestry). Stable moves to the canary once it has soaked (`SOAK_HOURS`) and
+canary hosts have reported success and none failure, as commit statuses `glaeda-ota/<host>`.
 """
 from __future__ import annotations
 
@@ -40,7 +41,8 @@ from pathlib import Path
 
 REPOSITORY = "teamleaderleo/glaeda"
 CHANNELS_TAG = "ota-channels"
-CHANNELS_SCHEMA = "glaeda-ota-channels/v1"
+CHANNEL_SCHEMA = "glaeda-ota-channel/v1"
+CONTROL_SCHEMA = "glaeda-ota-control/v1"
 RELEASE_SCHEMA = "glaeda-release/v1"
 TARGETS = ("aarch64-apple-darwin", "x86_64-unknown-linux-gnu")
 STATUS_PREFIX = "glaeda-ota/"
@@ -123,27 +125,29 @@ def parse_release(raw: bytes, expected_sha256: str) -> dict:
     return doc
 
 
-def channel_entry(doc: dict, release_raw: bytes, published: str) -> dict:
-    return {"tag": doc["tag"], "source": doc["source"], "releaseSha256": sha256(release_raw),
-            "published": published}
+def channel_entry(ring: str, doc: dict, release_raw: bytes, published: str) -> dict:
+    return {"schema": CHANNEL_SCHEMA, "ring": ring, "tag": doc["tag"], "source": doc["source"],
+            "releaseSha256": sha256(release_raw), "published": published}
 
 
-def parse_channels(raw: bytes) -> dict:
+def parse_channel(raw: bytes, ring: str) -> dict:
     doc = json.loads(raw)
-    if doc.get("schema") != CHANNELS_SCHEMA or not isinstance(doc.get("paused"), bool):
-        raise ReleaseError("channels.json is malformed")
-    for ring in ("canary", "stable"):
-        entry = doc.get(ring)
-        if entry is None:
-            continue
-        if (not TAG_RE.fullmatch(str(entry.get("tag"))) or not SHA_RE.fullmatch(str(entry.get("source")))
-                or not HEX64.fullmatch(str(entry.get("releaseSha256")))):
-            raise ReleaseError(f"channels.json {ring} entry is malformed")
+    if (doc.get("schema") != CHANNEL_SCHEMA or doc.get("ring") != ring
+            or not TAG_RE.fullmatch(str(doc.get("tag"))) or not SHA_RE.fullmatch(str(doc.get("source")))
+            or not HEX64.fullmatch(str(doc.get("releaseSha256")))):
+        raise ReleaseError(f"{ring}.json is malformed")
     return doc
 
 
-def empty_channels() -> dict:
-    return {"schema": CHANNELS_SCHEMA, "paused": False, "canary": None, "stable": None}
+def control(paused: bool) -> dict:
+    return {"schema": CONTROL_SCHEMA, "paused": paused}
+
+
+def parse_control(raw: bytes) -> dict:
+    doc = json.loads(raw)
+    if doc.get("schema") != CONTROL_SCHEMA or not isinstance(doc.get("paused"), bool):
+        raise ReleaseError("control.json is malformed")
+    return doc
 
 
 def canary_verdict(statuses: list[dict]) -> tuple[int, int]:
@@ -160,11 +164,9 @@ def canary_verdict(statuses: list[dict]) -> tuple[int, int]:
     return states.count("success"), sum(state in ("failure", "error") for state in states)
 
 
-def promotion(channels: dict, statuses: list[dict], now: dt.datetime, soak_hours: float = SOAK_HOURS) -> tuple[bool, str]:
-    """Whether `canary` may become `stable` now, and why."""
-    canary, stable = channels.get("canary"), channels.get("stable")
-    if channels.get("paused"):
-        return False, "paused"
+def promotion(canary: dict | None, stable: dict | None, statuses: list[dict], now: dt.datetime,
+              soak_hours: float = SOAK_HOURS) -> tuple[bool, str]:
+    """Whether `canary` may become `stable` now, and why. Pausing stops hosts, not this."""
     if canary is None:
         return False, "no canary release"
     if stable is not None and stable["tag"] == canary["tag"]:
@@ -203,16 +205,15 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--source", required=True)
     m.add_argument("--tag", required=True)
     m.add_argument("--assets", type=Path, required=True)
-    c = sub.add_parser("set-canary", help="print channels.json with canary moved to a release")
-    c.add_argument("--channels", type=Path, help="current channels.json; absent starts empty")
+    c = sub.add_parser("canary", help="print canary.json for a release")
     c.add_argument("--release", type=Path, required=True)
-    p = sub.add_parser("promote", help="print channels.json with stable moved to canary, if allowed")
-    p.add_argument("--channels", type=Path, required=True)
-    p.add_argument("--statuses", type=Path, required=True, help="the source commit's statuses (API JSON)")
+    p = sub.add_parser("promote", help="print stable.json moved to the canary, if allowed (exit 3 if not)")
+    p.add_argument("--canary", type=Path, required=True)
+    p.add_argument("--stable", type=Path, help="current stable.json; absent means none yet")
+    p.add_argument("--statuses", type=Path, required=True, help="the canary commit's statuses (API JSON)")
     p.add_argument("--soak-hours", type=float, default=SOAK_HOURS)
-    s = sub.add_parser("set-paused", help="print channels.json with paused set")
-    s.add_argument("--channels", type=Path, required=True)
-    s.add_argument("--paused", choices=("true", "false"), required=True)
+    k = sub.add_parser("control", help="print control.json")
+    k.add_argument("--paused", choices=("true", "false"), required=True)
     a = ap.parse_args(argv)
     try:
         if a.command == "hygiene":
@@ -228,24 +229,23 @@ def main(argv: list[str] | None = None) -> int:
             if not assets:
                 raise ReleaseError("no assets")
             (a.assets / "release.json").write_bytes(canonical(release_manifest(a.source, a.tag, assets)))
-        elif a.command == "set-canary":
-            channels = parse_channels(a.channels.read_bytes()) if a.channels else empty_channels()
+        elif a.command == "canary":
             release_raw = a.release.read_bytes()
             doc = parse_release(release_raw, sha256(release_raw))
-            channels["canary"] = channel_entry(doc, release_raw, iso(now_utc()))
-            sys.stdout.buffer.write(canonical(channels))
+            sys.stdout.buffer.write(canonical(channel_entry("canary", doc, release_raw, iso(now_utc()))))
         elif a.command == "promote":
-            channels = parse_channels(a.channels.read_bytes())
-            ok, why = promotion(channels, json.loads(a.statuses.read_bytes()), now_utc(), a.soak_hours)
+            canary = parse_channel(a.canary.read_bytes(), "canary")
+            stable = parse_channel(a.stable.read_bytes(), "stable") if a.stable else None
+            statuses = json.loads(a.statuses.read_bytes())
+            if not isinstance(statuses, list):
+                raise ReleaseError("statuses must be the API's JSON list")
+            ok, why = promotion(canary, stable, statuses, now_utc(), a.soak_hours)
             print(why, file=sys.stderr)
             if not ok:
                 return 3
-            channels["stable"] = {**channels["canary"], "promoted": iso(now_utc())}
-            sys.stdout.buffer.write(canonical(channels))
-        elif a.command == "set-paused":
-            channels = parse_channels(a.channels.read_bytes())
-            channels["paused"] = a.paused == "true"
-            sys.stdout.buffer.write(canonical(channels))
+            sys.stdout.buffer.write(canonical({**canary, "ring": "stable", "promoted": iso(now_utc())}))
+        elif a.command == "control":
+            sys.stdout.buffer.write(canonical(control(a.paused == "true")))
         return 0
     except (ReleaseError, OSError, ValueError, subprocess.CalledProcessError) as e:
         print(f"glaeda_release: {e}", file=sys.stderr)

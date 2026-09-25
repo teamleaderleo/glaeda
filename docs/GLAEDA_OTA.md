@@ -17,20 +17,29 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
 
    Every asset gets a build-provenance attestation. Releases are prereleases, so none is marked
    "latest".
-2. **Canary.** The same workflow points `canary` in `channels.json` at the new release. The
-   file is the one asset of the `ota-channels` release, and it is the only mutable file.
+2. **Canary.** The same workflow points `canary.json` at the new release, but only if the new
+   commit descends from the current canary, so a slow build never moves canary backwards.
+   The `ota-channels` release holds the only mutable files, each with one writer:
+   - `canary.json`, written by `release.yml`;
+   - `stable.json`, written by `promote.yml`;
+   - `control.json` (`paused`), written by `control.yml`.
+
+   Only runs on `main` publish or write anything.
 3. **Hosts pull.** `glaeda-update` runs hourly on every host: a LaunchAgent
    `com.teamleaderleo.glaeda.update` on macOS, the systemd user timer `glaeda-update.timer` on
    Linux, with up to 15 minutes of random delay. It reads its ring from
    `~/.config/glaeda/update.json`, then:
    - downloads by hash;
-   - checks the attestation when `gh` can;
+   - checks the build-provenance attestation, which must come from `release.yml` on `main`. A
+     canary refuses to install without that check (it needs `gh`, signed in). A stable host
+     without `gh` relies on the hash chain, since stable only names releases a canary verified;
    - runs the release's own `scripts/glaeda-mini-setup --apply` with the host's setup flags and
      the prebuilt reclaim binary;
-   - checks that the installed tools run.
+   - checks that the installed tools run and that the new `glaeda-update` can plan against the
+     live channel.
 
-   If the new tools do not run, it re-runs the previous release's setup and quarantines the failed
-   release on that host.
+   If that fails, it re-runs the previous release's setup, or on a host's first update restores
+   the tools it replaced, and quarantines the failed release on that host.
 4. **Canary health.** A canary host with an authenticated `gh` posts the commit status
    `glaeda-ota/<host>` (success or failure) on the release commit.
 5. **Stable.** `.github/workflows/promote.yml` runs hourly. It moves `stable` to the canary
@@ -59,10 +68,10 @@ names another ring.
 ## Operator controls
 
 ```bash
-gh workflow run promote.yml --repo teamleaderleo/glaeda -f action=pause    # every host stops updating
-gh workflow run promote.yml --repo teamleaderleo/glaeda -f action=resume
-gh workflow run promote.yml --repo teamleaderleo/glaeda -f action=promote  # check promotion now
-gh release download ota-channels --repo teamleaderleo/glaeda -p channels.json -O -   # what each ring runs
+gh workflow run control.yml --repo teamleaderleo/glaeda -f paused=true    # every host stops updating
+gh workflow run control.yml --repo teamleaderleo/glaeda -f paused=false   # resume
+gh workflow run promote.yml --repo teamleaderleo/glaeda                   # check promotion now
+gh release download ota-channels --repo teamleaderleo/glaeda -p '*.json' -D /tmp/ota   # what each ring runs
 glaeda-update --status                     # on a host: ring, current, previous, quarantined
 tail ~/Library/Logs/glaeda-update.jsonl    # macOS; ~/.local/state/glaeda-update.jsonl on Linux
 ```
@@ -72,9 +81,11 @@ canary. Dispatching `promote` only runs the same check early; it never skips the
 
 ## Trust
 
-- Hosts trust GitHub over TLS and nothing by name. `channels.json` pins release.json by
-  SHA-256, and release.json pins every asset.
-- With `gh` present the attestation must verify. Without it, hash pinning is the check.
+- Hosts trust GitHub over TLS and nothing by name. The ring file pins release.json by SHA-256,
+  and release.json pins every asset. Tags and commits must have the release format, so a ring
+  file cannot point a host at another repository's download.
+- The attestation must name `release.yml` on `refs/heads/main` as its signer. A dispatch on
+  another branch neither publishes nor attests.
 - The updater runs only what a release's `glaeda-mini-setup` installs. That command is
   idempotent, never uses sudo, and owns every file it writes (its receipt records them).
 - A release comes only from a push to `main` of this repository by someone with write access.

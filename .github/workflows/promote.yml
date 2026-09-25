@@ -1,66 +1,61 @@
 name: Promote
 
 # Moves stable to the canary release once it has soaked and canary hosts reported healthy
-# (commit statuses glaeda-ota/<host> on its source commit), or pauses and resumes every host.
+# (commit statuses glaeda-ota/<host> on its source commit). stable.json has this one writer.
 # docs/GLAEDA_OTA.md
 
 on:
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
-    inputs:
-      action:
-        description: promote (if healthy), pause, or resume
-        type: choice
-        options: [promote, pause, resume]
-        default: promote
 
 permissions:
   contents: write
   statuses: read
 
 concurrency:
-  group: ota-channels
+  group: ota-stable
   cancel-in-progress: false
 
 jobs:
-  channels:
+  promote:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      ACTION: ${{ inputs.action || 'promote' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           show-progress: false
-      - name: Update channels.json
+      - name: Promote if healthy
         run: |
           mkdir -p channels
-          if ! gh release download ota-channels --pattern channels.json --dir channels 2>/dev/null; then
-            echo "no ota-channels release yet" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          if ! gh release download ota-channels --pattern canary.json --dir channels 2>channels/err; then
+            if grep -q -e "no assets match" -e "release not found" channels/err; then
+              echo "no canary yet" >> "$GITHUB_STEP_SUMMARY"; exit 0
+            fi
+            cat channels/err; exit 1
           fi
-          case "$ACTION" in
-            pause|resume)
-              python3 scripts/glaeda_release.py set-paused --channels channels/channels.json \
-                --paused "$([ "$ACTION" = pause ] && echo true || echo false)" > channels/next.json ;;
-            *)
-              source=$(python3 -c 'import json;d=json.load(open("channels/channels.json"));print((d.get("canary") or {}).get("source",""))')
-              if [ -z "$source" ]; then echo "no canary" >> "$GITHUB_STEP_SUMMARY"; exit 0; fi
-              # newest first; one page holds every canary host's latest status
-              gh api "repos/$GH_REPO/commits/$source/statuses?per_page=100" > channels/statuses.json
-              set +e
-              python3 scripts/glaeda_release.py promote --channels channels/channels.json \
-                --statuses channels/statuses.json > channels/next.json 2> channels/why.txt
-              code=$?
-              set -e
-              cat channels/why.txt >> "$GITHUB_STEP_SUMMARY"
-              if [ "$code" = 3 ]; then exit 0; fi
-              [ "$code" = 0 ] || exit "$code" ;;
-          esac
-          mv channels/next.json channels/channels.json
-          gh release upload ota-channels channels/channels.json --clobber
-          cat channels/channels.json >> "$GITHUB_STEP_SUMMARY"
+          stable=()
+          if gh release download ota-channels --pattern stable.json --dir channels 2>channels/err; then
+            stable=(--stable channels/stable.json)
+          elif ! grep -q "no assets match" channels/err; then
+            cat channels/err; exit 1
+          fi
+          source=$(python3 -c 'import json;print(json.load(open("channels/canary.json"))["source"])')
+          # newest first; one page holds every canary host's latest status
+          gh api "repos/$GH_REPO/commits/$source/statuses?per_page=100" > channels/statuses.json
+          set +e
+          python3 scripts/glaeda_release.py promote --canary channels/canary.json "${stable[@]}" \
+            --statuses channels/statuses.json > channels/next.json 2> channels/why.txt
+          code=$?
+          set -e
+          cat channels/why.txt >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" = 3 ]; then exit 0; fi
+          [ "$code" = 0 ] || exit "$code"
+          mv channels/next.json channels/stable.json
+          gh release upload ota-channels channels/stable.json --clobber
+          cat channels/stable.json >> "$GITHUB_STEP_SUMMARY"

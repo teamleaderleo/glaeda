@@ -13,6 +13,8 @@ permissions:
 
 jobs:
   build:
+    # only main publishes; a dispatch on another ref must never reach a host
+    if: github.ref == 'refs/heads/main'
     strategy:
       fail-fast: true
       matrix:
@@ -52,9 +54,10 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # channels.json has one writer at a time; promote.yml shares this group
+    if: github.ref == 'refs/heads/main'
+    # canary.json has this one writer; a newer push waiting here supersedes an older pending one
     concurrency:
-      group: ota-channels
+      group: ota-canary
       cancel-in-progress: false
     permissions:
       contents: write
@@ -68,6 +71,7 @@ jobs:
         with:
           persist-credentials: false
           show-progress: false
+          fetch-depth: 0  # canary only moves forward: the ancestry check needs history
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: release-*
@@ -87,20 +91,31 @@ jobs:
         env:
           TAG: ${{ steps.manifest.outputs.tag }}
         run: |
-          gh release create "$TAG" release-assets/* --target "$GITHUB_SHA" --prerelease --latest=false \
-            --title "$TAG" --notes "glaeda $GITHUB_SHA. Installed by glaeda-update on the canary ring first (docs/GLAEDA_OTA.md)."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # a re-run of the same commit: same tag, replace the assets
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" release-assets/* --target "$GITHUB_SHA" --prerelease --latest=false \
+              --title "$TAG" --notes "glaeda $GITHUB_SHA. Installed by glaeda-update on the canary ring first (docs/GLAEDA_OTA.md)."
+          fi
       - name: Move canary to it
         run: |
           mkdir -p channels
-          if gh release view ota-channels >/dev/null 2>&1; then
-            gh release download ota-channels --pattern channels.json --dir channels
-            current=(--channels channels/channels.json)
-          else
-            gh release create ota-channels --target "$GITHUB_SHA" --prerelease --latest=false \
-              --title "OTA channels" --notes "channels.json: the release each glaeda-update ring installs (docs/GLAEDA_OTA.md)."
-            current=()
+          if ! gh release view ota-channels >/dev/null 2>&1; then
+            python3 scripts/glaeda_release.py control --paused false > channels/control.json
+            gh release create ota-channels channels/control.json --target "$GITHUB_SHA" --prerelease --latest=false \
+              --title "OTA channels" --notes "canary.json, stable.json, control.json: what each glaeda-update ring installs (docs/GLAEDA_OTA.md)."
           fi
-          python3 scripts/glaeda_release.py set-canary "${current[@]}" --release release-assets/release.json > channels/next.json
-          mv channels/next.json channels/channels.json
-          gh release upload ota-channels channels/channels.json --clobber
-          cat channels/channels.json >> "$GITHUB_STEP_SUMMARY"
+          if gh release download ota-channels --pattern canary.json --dir channels 2>channels/err; then
+            previous=$(python3 -c 'import json;print(json.load(open("channels/canary.json"))["source"])')
+            if ! git merge-base --is-ancestor "$previous" "$GITHUB_SHA"; then
+              echo "canary stays at $previous: $GITHUB_SHA does not descend from it" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          elif ! grep -q "no assets match" channels/err; then
+            cat channels/err; exit 1
+          fi
+          python3 scripts/glaeda_release.py canary --release release-assets/release.json > channels/next.json
+          mv channels/next.json channels/canary.json
+          gh release upload ota-channels channels/canary.json --clobber
+          cat channels/canary.json >> "$GITHUB_STEP_SUMMARY"
