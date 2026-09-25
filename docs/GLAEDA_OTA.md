@@ -44,11 +44,18 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    the run already fetched, so a network blip cannot fail a good release.
 4. **Canary health.** A canary host with an authenticated `gh` posts the commit status
    `glaeda-ota/<host>` (success or failure) on the release commit.
-5. **Stable.** `.github/workflows/promote.yml` runs hourly. It moves `stable` to the canary
-   release once all of these hold:
+5. **Stable.** `.github/workflows/promote.yml` runs hourly, and each canary run also dispatches it,
+   since GitHub's cron can lag for hours. It moves `stable` to the newest release for which all of
+   these hold:
    - the release is at least 6 hours old;
    - at least one canary host reported success;
-   - no canary host's newest status is a failure.
+   - no canary host's newest status is a failure;
+   - it descends from the current stable;
+   - no newer release has a canary failure. A release's own updater installs its successor, so a
+     failure there can be the older release's fault; promotion waits until a newer one is healthy.
+
+   It looks past the current canary on purpose: with several merges a day the newest release is
+   never 6 hours old, and stable would never move.
 
    Stable hosts pick it up within the hour.
 

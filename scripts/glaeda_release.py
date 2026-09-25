@@ -21,8 +21,10 @@ files, each with exactly one writer so concurrent workflow runs never overwrite 
 
 Hosts read them anonymously (the repository is public) and trust nothing by name: release.json
 must match `releaseSha256`, and every asset must match release.json. Canary only moves forward
-(release.yml checks ancestry). Stable moves to the canary once it has soaked (`SOAK_HOURS`) and
-canary hosts have reported success and none failure, as commit statuses `glaeda-ota/<host>`.
+(release.yml checks ancestry). Stable moves to the newest release that has soaked (`SOAK_HOURS`),
+that canary hosts reported success on and none failure (commit statuses `glaeda-ota/<host>`), and
+that descends from the current stable. Not only the current canary: with several merges a day
+the newest release never finishes soaking, and stable would starve.
 """
 from __future__ import annotations
 
@@ -183,6 +185,34 @@ def promotion(canary: dict | None, stable: dict | None, statuses: list[dict], no
     return True, f"{ok} canary host(s) healthy after {age:.1f} h"
 
 
+def choose(candidates: list[dict], stable: dict | None, now: dt.datetime,
+           soak_hours: float = SOAK_HOURS) -> tuple[dict | None, str]:
+    """The newest candidate that may become stable, and why (or why none).
+
+    Each candidate is {"entry": <canary-shaped entry>, "statuses": [...], "descendsFromStable": bool}.
+    Candidates include releases still soaking: their failures block older releases.
+    """
+    reasons = []
+    for candidate in sorted(candidates, key=lambda c: c["entry"]["published"], reverse=True):
+        entry = candidate["entry"]
+        if stable is not None and entry["tag"] == stable["tag"]:
+            reasons.append(f"{entry['tag']}: already stable")
+            break  # everything older is older than stable too
+        if canary_verdict(candidate["statuses"])[1]:
+            # A release's own updater installs its successor, so a canary failure on a newer release can
+            # be an older release's fault: nothing older is promoted until a newer one is healthy.
+            reasons.append(f"{entry['tag']}: a canary reported failure; nothing older is promoted")
+            break
+        if stable is not None and not candidate.get("descendsFromStable"):
+            reasons.append(f"{entry['tag']}: does not descend from stable")
+            continue
+        ok, why = promotion(entry, stable, candidate["statuses"], now, soak_hours)
+        if ok:
+            return entry, f"{entry['tag']}: {why}"
+        reasons.append(f"{entry['tag']}: {why}")
+    return None, "; ".join(reasons) or "no releases"
+
+
 def now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
@@ -207,10 +237,14 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--assets", type=Path, required=True)
     c = sub.add_parser("canary", help="print canary.json for a release")
     c.add_argument("--release", type=Path, required=True)
-    p = sub.add_parser("promote", help="print stable.json moved to the canary, if allowed (exit 3 if not)")
-    p.add_argument("--canary", type=Path, required=True)
+    d = sub.add_parser("candidate", help="print one promotion candidate as a JSON line")
+    d.add_argument("--release", type=Path, required=True, help="the release's release.json")
+    d.add_argument("--published", required=True, help="the release's creation time (ISO 8601)")
+    d.add_argument("--statuses", type=Path, required=True, help="its source commit's statuses (API JSON)")
+    d.add_argument("--descends", choices=("true", "false"), required=True, help="descends from stable")
+    p = sub.add_parser("promote", help="print stable.json for the best candidate (exit 3 if none)")
+    p.add_argument("--candidates", type=Path, required=True, help="JSON lines from `candidate`")
     p.add_argument("--stable", type=Path, help="current stable.json; absent means none yet")
-    p.add_argument("--statuses", type=Path, required=True, help="the canary commit's statuses (API JSON)")
     p.add_argument("--soak-hours", type=float, default=SOAK_HOURS)
     k = sub.add_parser("control", help="print control.json")
     k.add_argument("--paused", choices=("true", "false"), required=True)
@@ -233,17 +267,25 @@ def main(argv: list[str] | None = None) -> int:
             release_raw = a.release.read_bytes()
             doc = parse_release(release_raw, sha256(release_raw))
             sys.stdout.buffer.write(canonical(channel_entry("canary", doc, release_raw, iso(now_utc()))))
-        elif a.command == "promote":
-            canary = parse_channel(a.canary.read_bytes(), "canary")
-            stable = parse_channel(a.stable.read_bytes(), "stable") if a.stable else None
+        elif a.command == "candidate":
+            release_raw = a.release.read_bytes()
+            doc = parse_release(release_raw, sha256(release_raw))
             statuses = json.loads(a.statuses.read_bytes())
             if not isinstance(statuses, list):
                 raise ReleaseError("statuses must be the API's JSON list")
-            ok, why = promotion(canary, stable, statuses, now_utc(), a.soak_hours)
+            entry = channel_entry("canary", doc, release_raw, a.published)
+            print(json.dumps({"entry": entry, "statuses": statuses, "descendsFromStable": a.descends == "true"},
+                             sort_keys=True))
+        elif a.command == "promote":
+            stable = parse_channel(a.stable.read_bytes(), "stable") if a.stable else None
+            candidates = [json.loads(line) for line in a.candidates.read_text().splitlines() if line.strip()]
+            for candidate in candidates:
+                parse_channel(canonical(candidate["entry"]), "canary")
+            chosen, why = choose(candidates, stable, now_utc(), a.soak_hours)
             print(why, file=sys.stderr)
-            if not ok:
+            if chosen is None:
                 return 3
-            sys.stdout.buffer.write(canonical({**canary, "ring": "stable", "promoted": iso(now_utc())}))
+            sys.stdout.buffer.write(canonical({**chosen, "ring": "stable", "promoted": iso(now_utc())}))
         elif a.command == "control":
             sys.stdout.buffer.write(canonical(control(a.paused == "true")))
         return 0

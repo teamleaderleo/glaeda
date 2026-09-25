@@ -321,6 +321,22 @@ def report(config: dict, entry: dict, ok: bool, detail: str) -> str:
     return "reported" if result.returncode == 0 else f"not reported (gh exited {result.returncode})"
 
 
+def nudge_promotion(config: dict) -> str:
+    """Ask promote.yml to check now. Its hourly cron can lag for hours, and without a run nothing
+    ever reaches stable; the workflow itself decides, so an extra dispatch is harmless."""
+    if config["ring"] != "canary" or not config["reportStatus"]:
+        return "not a reporting canary"
+    gh = find_gh()
+    if not gh:
+        return "no gh"
+    try:
+        result = subprocess.run([gh, "workflow", "run", "promote.yml", "--repo", REPOSITORY],
+                                capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"not dispatched ({e})"
+    return "dispatched" if result.returncode == 0 else f"not dispatched (gh exited {result.returncode})"
+
+
 def prune(state_dir: Path, keep: set[str]) -> None:
     root = state_dir / "generations"
     if not root.is_dir():
@@ -375,7 +391,15 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         return {**out, "result": "quarantined", "why": "this release failed here before"}
     if not apply:
         return {**out, "result": "plan", "why": f"would install {entry['tag']}"}
-    gen = download(state_dir, entry, local_target(), config["ring"])
+    try:
+        gen = download(state_dir, entry, local_target(), config["ring"])
+    except UpdateError as e:
+        # The release failed verification (digest, attestation, archive): that is the release's fault
+        # or a real attack, never a blip, so it counts against it. Network errors are not UpdateError
+        # and stay inconclusive: no status, try again next hour.
+        state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
+        save_state(state, state_dir)
+        return {**out, "result": "refused", "detail": str(e), "status": report(config, entry, False, str(e))}
     if state["current"] is None:
         snapshot(state_dir, bin_dir)
     ok, log = run_setup(gen, config["setupArgs"])
@@ -433,9 +457,11 @@ def main(argv: list[str] | None = None) -> int:
                     print(json.dumps({"result": "busy", "why": "another glaeda-update is running"}))
                     return 0
                 result = update(True, config)
+                if result["result"] in ("updated", "current", "idle"):
+                    result["promotion"] = nudge_promotion(config)
         result["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         print(json.dumps(result, sort_keys=True))
-        return 1 if result["result"] == "rolled-back" else 0
+        return 1 if result["result"] in ("rolled-back", "refused") else 0
     except Exception as e:  # one JSON line per run, whatever failed
         print(json.dumps({"result": "error", "why": f"{type(e).__name__}: {e}"[:500]}))
         return 1

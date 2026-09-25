@@ -152,25 +152,26 @@ class UpdateTest(unittest.TestCase):
         entry = self.server.publish(SOURCES[0])
         url = gu.DOWNLOAD.format(tag=entry["tag"], name=gr.hygiene_asset(TARGET))
         self.server.files[url] += b"x"
-        with self.assertRaisesRegex(gu.UpdateError, "does not match release.json"):
-            self.run_update()
-        self.server.publish(SOURCES[0])
+        result = self.run_update()
+        self.assertEqual((result["result"], result["detail"]), ("refused", "archive does not match release.json"))
+        self.assertIn(entry["tag"], gu.load_state(self.state)["quarantined"])
+        self.assertEqual(self.run_update()["result"], "quarantined")
+        entry = self.server.publish(SOURCES[1])
         self.server.rings["canary"]["releaseSha256"] = "0" * 64
-        with self.assertRaisesRegex(gu.UpdateError, "does not match the channel"):
-            self.run_update()
+        self.assertEqual(self.run_update()["detail"], "release.json does not match the channel")
         self.assertFalse(self.bin.exists())
 
     def test_failed_attestation_is_refused(self) -> None:
         self.server.publish(SOURCES[0])
         gu.attestation_ok = lambda path: False
-        with self.assertRaisesRegex(gu.UpdateError, "did not verify"):
-            self.run_update()
+        self.assertIn("did not verify", self.run_update()["detail"])
         # a canary that cannot check refuses; stable, which only names canary-verified releases, installs
+        self.server.publish(SOURCES[1])
         gu.attestation_ok = lambda path: None
-        with self.assertRaisesRegex(gu.UpdateError, "canary must verify"):
-            self.run_update()
+        self.assertIn("canary must verify", self.run_update()["detail"])
         self.assertFalse(self.bin.exists())
         self.config["ring"] = "stable"
+        self.state = self.root / "stable-host-state"  # another host, which has quarantined nothing
         self.assertEqual(self.run_update()["result"], "updated")
 
     def test_first_update_rolls_back_to_the_tools_it_replaced(self) -> None:
@@ -229,17 +230,15 @@ class UpdateTest(unittest.TestCase):
     def test_unsafe_archive_entries_are_refused(self) -> None:
         for name in ("../escape", "/abs/path"):
             with self.subTest(name=name):
-                self.server.publish(SOURCES[0], archive=tar_gz({name: (b"x", 0o644)}))
-                with self.assertRaisesRegex(gu.UpdateError, "refused"):
-                    self.run_update()
+                self.server.publish(SOURCES[0 if name.startswith("..") else 1], archive=tar_gz({name: (b"x", 0o644)}))
+                self.assertIn("refused", self.run_update()["detail"])
         out = io.BytesIO()
         with tarfile.open(fileobj=out, mode="w:gz") as tar:
             link = tarfile.TarInfo("glaeda/link")
             link.type, link.linkname = tarfile.SYMTYPE, "/etc/passwd"
             tar.addfile(link)
-        self.server.publish(SOURCES[0], archive=out.getvalue())
-        with self.assertRaisesRegex(gu.UpdateError, "refused"):
-            self.run_update()
+        self.server.publish(SOURCES[2], archive=out.getvalue())
+        self.assertIn("refused", self.run_update()["detail"])
 
     def test_paused_and_empty_rings_do_nothing(self) -> None:
         self.server.publish(SOURCES[0])
@@ -290,21 +289,52 @@ class ReleaseTest(unittest.TestCase):
         self.assertFalse(gr.promotion(self.canary(), {**self.canary(), "ring": "stable"}, ok, self.NOW)[0])
         self.assertEqual(gr.promotion(None, None, ok, self.NOW), (False, "no canary release"))
 
-    def test_cli_promote_writes_stable_or_exits_3(self) -> None:
+    def entry(self, letter: str, published: str) -> dict:
+        return {**self.canary(published), "tag": "r-20260925-" + letter * 12, "source": letter * 40}
+
+    def test_choose_takes_the_newest_soaked_healthy_release_not_only_the_canary(self) -> None:
+        ok = [self.status("air-blue", "success", "2026-09-25T01:00:00Z")]
+        bad = [self.status("big-red", "failure", "2026-09-25T01:00:00Z")]
+        old = {"entry": self.entry("a", "2026-09-25T01:00:00Z"), "statuses": ok, "descendsFromStable": True}
+        mid = {"entry": self.entry("b", "2026-09-25T04:00:00Z"), "statuses": bad, "descendsFromStable": True}
+        new = {"entry": self.entry("c", "2026-09-25T10:00:00Z"), "statuses": ok, "descendsFromStable": True}
+        # c is still soaking: a, the newest soaked healthy release, is promoted
+        chosen, why = gr.choose([new, old], None, self.NOW)
+        self.assertEqual(chosen["tag"], old["entry"]["tag"], why)
+        # a canary failure on b, newer than a, may be a's updater failing to install b: nothing older goes
+        self.assertIsNone(gr.choose([new, mid, old], None, self.NOW)[0])
+        # a failure on a newer release that is still soaking blocks too
+        soaking_bad = {**new, "statuses": bad}
+        self.assertIsNone(gr.choose([soaking_bad, old], None, self.NOW)[0])
+        # nothing older than stable is considered, and never a release off stable's line
+        stable = {**old["entry"], "ring": "stable"}
+        self.assertIsNone(gr.choose([new, mid, old], stable, self.NOW)[0])
+        side = {**mid, "statuses": ok, "descendsFromStable": False}
+        self.assertIsNone(gr.choose([side, old], stable, self.NOW)[0])
+        self.assertEqual(gr.choose([], None, self.NOW), (None, "no releases"))
+
+    def test_cli_candidate_then_promote(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            canary, statuses = Path(tmp) / "canary.json", Path(tmp) / "statuses.json"
-            canary.write_bytes(gr.canonical(self.canary()))
-            statuses.write_text(json.dumps([]))
-            args = ["promote", "--canary", str(canary), "--statuses", str(statuses), "--soak-hours", "0"]
+            tmp = Path(tmp)
+            release_raw = gr.canonical(gr.release_manifest("a" * 40, "r-20260925-" + "a" * 12, {"x.tar.gz": b"x"}))
+            (tmp / "release.json").write_bytes(release_raw)
+            (tmp / "statuses.json").write_text(json.dumps([self.status("air-blue", "success", "2026-09-25T01:00:00Z")]))
+            out = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(gr.main(["candidate", "--release", str(tmp / "release.json"), "--published",
+                                          "2026-09-25T00:00:00Z", "--statuses", str(tmp / "statuses.json"),
+                                          "--descends", "true"]), 0)
+            out.flush()
+            (tmp / "candidates.jsonl").write_bytes(out.buffer.getvalue())
             out = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
             with open(os.devnull, "w") as null, contextlib.redirect_stderr(null), contextlib.redirect_stdout(out):
-                self.assertEqual(gr.main(args), 3)
-                statuses.write_text(json.dumps([self.status("air-blue", "success", "2026-09-25T01:00:00Z")]))
-                self.assertEqual(gr.main(args), 0)
+                self.assertEqual(gr.main(["promote", "--candidates", str(tmp / "candidates.jsonl"),
+                                          "--soak-hours", "0"]), 0)
+                (tmp / "empty.jsonl").write_text("")
+                self.assertEqual(gr.main(["promote", "--candidates", str(tmp / "empty.jsonl")]), 3)
             out.flush()
             stable = gr.parse_channel(out.buffer.getvalue(), "stable")
-            self.assertEqual(stable["tag"], self.canary()["tag"])
-            self.assertIn("promoted", stable)
+            self.assertEqual((stable["tag"], stable["releaseSha256"]), ("r-20260925-" + "a" * 12, gr.sha256(release_raw)))
 
     def test_manifest_and_channel_round_trip(self) -> None:
         release_raw = gr.canonical(gr.release_manifest("a" * 40, "r-20260925-" + "a" * 12, {"x.tar.gz": b"data"}))
