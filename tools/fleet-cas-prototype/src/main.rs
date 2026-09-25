@@ -39,6 +39,7 @@ pub mod kv {
 pub mod fleet {
     tonic::include_proto!("glaeda.fleetcas.v1");
 }
+mod gc;
 mod sign;
 
 #[derive(Default)]
@@ -767,6 +768,10 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
                 // A damaged entry is a miss, like a damaged object.
                 if let Ok(value) = kv::Value::decode(bytes.as_slice()) {
                     if s.trusts(&key, &value) {
+                        // A fleet store records the use, for `fleet-cas gc`.
+                        if !s.strip_signatures {
+                            gc::touch_if_stale(&path);
+                        }
                         s.stats.kv_get_hit.fetch_add(1, Relaxed);
                         return Ok(answer(value));
                     }
@@ -967,6 +972,9 @@ impl fleet::fleet_cas_server::FleetCas for FleetSvc {
 const USAGE: &str = "usage: fleet-cas <socket | tcp:ADDR> <store> [--read-only-kv] [--upstream http://HOST:PORT] [--no-prefetch] [--writers IP,IP] [--trusted-keys HEX,HEX] [--sign-key PATH]
        fleet-cas keygen PATH        create a writer signing key (mode 0600), print its public key
        fleet-cas pubkey PATH        print a signing key's public key
+       fleet-cas gc STORE --keep-days N [--dry-run]
+                                    on a fleet store: delete index entries unused for N days
+                                    and objects no kept entry reaches (objects under a day old stay)
        fleet-cas marker put http://HOST:PORT NAME --sign-key PATH [--entry K=V]...
        fleet-cas marker get http://HOST:PORT NAME --trusted-keys HEX,HEX
                                     exit 0 and print the entries if the marker exists and verifies,
@@ -1053,6 +1061,33 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
             let path = args.get(1).ok_or(USAGE)?;
             let sk = sign::load_signing_key(Path::new(path))?;
             println!("{}", hex::encode(sk.verifying_key().as_bytes()));
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+        Some("gc") => {
+            let root = PathBuf::from(args.get(1).ok_or(USAGE)?);
+            let mut days = None;
+            let mut dry_run = false;
+            let mut rest = args[2..].iter();
+            while let Some(a) = rest.next() {
+                match a.as_str() {
+                    "--keep-days" => days = Some(rest.next().ok_or(USAGE)?.parse::<u64>()?),
+                    "--dry-run" => dry_run = true,
+                    _ => return Err(USAGE.into()),
+                }
+            }
+            let days = days.ok_or("gc needs --keep-days N")?;
+            if days == 0 {
+                return Err("--keep-days must be at least 1".into());
+            }
+            if !root.join("kv").is_dir() || !root.join("cas").is_dir() {
+                return Err(format!("{}: not a fleet-cas store (no kv/ and cas/)", root.display()).into());
+            }
+            let r = gc::run(&root, std::time::Duration::from_secs(days * 86_400), dry_run)?;
+            println!(
+                "{}kv kept {} deleted {}; cas kept {} deleted {} ({} bytes)",
+                if dry_run { "dry run: " } else { "" },
+                r.kv_kept, r.kv_deleted, r.cas_kept, r.cas_deleted, r.bytes_deleted
+            );
             return Ok(std::process::ExitCode::SUCCESS);
         }
         Some("marker") => {

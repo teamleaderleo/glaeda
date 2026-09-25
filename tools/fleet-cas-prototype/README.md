@@ -81,6 +81,11 @@ Signed index entries (#1134 M3, `src/sign.rs`):
   (`instance`);
   `scripts/fleet-cas-marker.sh REPO COMMIT` tells a worker whether the store holds a
   commit for its Xcode build.
+
+Garbage collection (`src/gc.rs`): a fleet store bumps an index entry's mtime when a read
+uses it (at most hourly), and `fleet-cas gc STORE --keep-days N [--dry-run]` keeps the
+entries used within N days plus every object they reach, keeps objects written in the last
+day, and deletes the rest. Run it on the store host; a concurrent read at worst misses.
 Build under `$HOME` (never `/tmp`, see swiftlang/swift#92545). On Xcode 26.3,
 pass `DD=<fixed path>` (the same on every machine) instead of mapping
 DerivedData; see the 2026-09-24 experiment. On a cmux build fleet mini,
