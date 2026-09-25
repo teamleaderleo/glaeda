@@ -154,7 +154,8 @@ write_service() {  # role, args...
   local r=$1; shift
   local label; label=$(label_for "$r")
   local agent=$AGENTS/$label.plist daemon=/Library/LaunchDaemons/$label.plist
-  say "run $label: $BIN/fleet-cas $*"
+  local prog=$BIN/fleet-cas; [ "$r" = relay ] && prog=/usr/bin/ssh
+  say "run $label: $prog $*"
   [ -n "$apply" ] || return 0
   mkdir -p "$AGENTS" "$LOGS" "$ROOT/run" "$ROOT/launchd"
   local changed=$bin_changed
