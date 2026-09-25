@@ -26,6 +26,7 @@ ms = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_mini_setup"] = ms
 loader.exec_module(ms)
 ms.DARWIN_REQUIRED = False
+ms.HOST_PLATFORM = "macos"  # CI runs these on Linux; the Linux profile has its own tests below
 REAL_ENROLL_PYTHON = ms.enroll_python
 
 PMSET_SLEEPY = """Battery Power:
@@ -71,8 +72,8 @@ class MiniSetupTest(unittest.TestCase):
 
         def recording_run(argv, *args, **kwargs):
             self.calls.append(list(argv))
-            if argv[0] == "/bin/launchctl":
-                raise AssertionError("launchctl must never run with a sandbox HOME")
+            if argv[0] == "/bin/launchctl" or os.path.basename(argv[0]) == "systemctl":
+                raise AssertionError("launchctl and systemctl must never run with a sandbox HOME")
             return real_run(argv, *args, **kwargs)
 
         self.patches = [
@@ -476,6 +477,128 @@ class MiniSetupTest(unittest.TestCase):
         with mock.patch.object(enroll, "pick_python", return_value="/x/python3.13") as pick:
             self.assertEqual(REAL_ENROLL_PYTHON(mock.Mock(home=self.home)), "/x/python3.13")
         pick.assert_called_once_with(None, self.home)
+
+    def linux(self) -> None:
+        """Run the rest of the test as a Linux host with a stub preflight."""
+        platform_patch = mock.patch.object(ms, "HOST_PLATFORM", "linux")
+        platform_patch.start()
+        self.patches.append(platform_patch)
+
+    def test_linux_installs_the_ops_systemd_units_verbatim_then_is_idempotent(self) -> None:
+        self.linux()
+        receipt = self.invoke("--apply")  # Linux gets the hygiene profile without the flag
+        self.assertEqual((receipt["platform"], receipt["profile"]), ("linux", "hygiene"))
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        units = self.home / ".config/systemd/user"
+        self.assertEqual(sorted(p.name for p in units.iterdir()), sorted(ms.LINUX_UNITS))
+        for name in ms.LINUX_UNITS:
+            self.assertEqual((units / name).read_bytes(), (ROOT / "ops/systemd" / name).read_bytes(), name)
+        for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
+            self.assertTrue(os.access(self.home / ".local/bin" / name, os.X_OK), name)
+        self.assertTrue((self.home / ".local/state").is_dir())
+        self.assertFalse((self.home / "Library").exists())
+        kinds = {a["kind"] for a in receipt["actions"]}
+        self.assertNotIn("git", kinds)
+        self.assertNotIn("python", kinds)
+        self.assertEqual(receipt["operatorSteps"], [])
+        again = self.invoke("--apply")
+        self.assertEqual(self.states(again), {"unchanged"})
+        self.assertFalse(any("systemctl" in os.path.basename(c[0]) for c in self.calls))
+
+    def test_linux_uninstall_removes_only_our_units(self) -> None:
+        self.linux()
+        self.invoke("--apply")
+        units = self.home / ".config/systemd/user"
+        (units / "glaeda-disk-pressure.timer").write_text("[Timer]\nOnCalendar=daily\n")
+        receipt = self.invoke("--uninstall", "--apply")
+        by_path = {Path(a["path"]).name: a["state"] for a in receipt["actions"] if a["kind"] == "agent"}
+        self.assertEqual(by_path["glaeda-disk-pressure.timer"], "kept")
+        self.assertEqual(by_path["glaeda-worktree-reclaim.timer"], "remove")
+        self.assertEqual([p.name for p in units.iterdir()], ["glaeda-disk-pressure.timer"])
+
+    def test_linux_reclaim_units_block_without_a_reclaim_binary(self) -> None:
+        self.linux()
+        out = io.StringIO()
+        with mock.patch.object(ms, "find_cargo", lambda ctx: None), contextlib.redirect_stdout(out):
+            ms.main(["--output", "json", "--python", "/usr/bin/python3", "--apply"])
+        receipt = json.loads(out.getvalue())
+        states = {a.get("label"): a["state"] for a in receipt["actions"] if a["kind"] == "agent"}
+        self.assertEqual(states["glaeda-worktree-reclaim.timer"], "blocked")
+        self.assertEqual(states["glaeda-disk-pressure.timer"], "create")
+
+    def test_linux_activation_reloads_then_enables_or_restarts_timers(self) -> None:
+        self.linux()
+        ctx = ms.Context(self.home, True, "/usr/bin/python3", False, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 1, True, "linux")
+        ctx.skip_launchctl = False  # the real path, with systemctl stubbed below
+        commands: list[list[str]] = []
+
+        def systemctl_run(argv, *args, **kwargs):
+            commands.append(argv[1:])
+            return 0, ""
+
+        def agent(label, state, applied, loaded):
+            return {"kind": "agent", "label": label, "state": state, "applied": applied, "loaded": loaded}
+
+        actions = [
+            agent("glaeda-disk-pressure.service", "unchanged", False, None),
+            agent("glaeda-disk-pressure.timer", "unchanged", False, True),  # running, untouched: left alone
+            agent("glaeda-worktree-reclaim.service", "update", True, None),
+            agent("glaeda-worktree-reclaim.timer", "unchanged", False, True),  # its service changed
+        ]
+        with mock.patch.object(ms, "run", systemctl_run), mock.patch.object(ms, "systemctl", lambda: "systemctl"):
+            ms.activate_systemd(ctx, actions)
+        self.assertEqual(commands, [
+            ["--user", "daemon-reload"],
+            ["--user", "restart", "glaeda-worktree-reclaim.timer"],
+            ["--user", "enable", "glaeda-worktree-reclaim.timer"],
+        ])
+        commands.clear()
+        fresh = [agent("glaeda-disk-pressure.timer", "create", True, False),
+                 agent("glaeda-worktree-reclaim.timer", "blocked", False, False)]
+        with mock.patch.object(ms, "run", systemctl_run), mock.patch.object(ms, "systemctl", lambda: "systemctl"):
+            ms.activate_systemd(ctx, fresh)
+        self.assertEqual(commands, [["--user", "daemon-reload"],
+                                    ["--user", "enable", "--now", "glaeda-disk-pressure.timer"]])
+
+    def test_linux_activation_failure_fails_the_run(self) -> None:
+        self.linux()
+        ctx = ms.Context(self.home, True, "/usr/bin/python3", False, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 1, True, "linux")
+        ctx.skip_launchctl = False
+
+        def refusing_run(argv, *args, **kwargs):
+            return (1, "Failed to enable unit") if "enable" in argv else (0, "")
+
+        blocked = {"kind": "agent", "label": "glaeda-worktree-reclaim.timer", "state": "blocked",
+                   "applied": False, "loaded": False, "note": "glaeda-worktree-reclaim could not be installed"}
+        timer = {"kind": "agent", "label": "glaeda-disk-pressure.timer", "state": "create",
+                 "applied": True, "loaded": False}
+        with mock.patch.object(ms, "run", refusing_run):
+            ms.activate_systemd(ctx, [timer, blocked])
+        self.assertEqual(timer["state"], "failed")
+        self.assertIn("enable --now failed", timer["note"])
+        self.assertEqual(blocked["note"], "glaeda-worktree-reclaim could not be installed")
+
+    def test_linux_uninstall_disables_timers_whatever_their_state(self) -> None:
+        self.linux()
+        self.invoke("--apply")
+        ctx = ms.Context(self.home, True, "/usr/bin/python3", False, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 1, True, "linux")
+        ctx.skip_launchctl = False
+        commands: list[list[str]] = []
+
+        def systemctl_run(argv, *args, **kwargs):
+            commands.append(argv[1:])
+            return 1, ""  # is-enabled/is-active: neither; removal must still disable and stop
+
+        with mock.patch.object(ms, "run", systemctl_run), mock.patch.object(ms, "systemctl", lambda: "systemctl"):
+            actions = ms.plan_uninstall(ctx)
+            commands.clear()
+            ms.apply_uninstall(ctx, actions)
+        self.assertIn(["--user", "disable", "--now", "glaeda-worktree-reclaim.timer"], commands)
+        self.assertIn(["--user", "stop", "glaeda-worktree-reclaim.service"], commands)
+        self.assertEqual(commands[-1], ["--user", "daemon-reload"])
 
     def test_no_em_dashes(self) -> None:
         for name in ("glaeda-mini-setup", "glaeda-worktree-reclaim-all", "test-glaeda-mini-setup.py"):
