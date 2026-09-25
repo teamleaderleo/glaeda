@@ -738,6 +738,34 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("r2.token", result["checks"]["secrets"]["detail"])
         self.assertTrue(result["ready"], result)
 
+    def test_accepted_secrets_are_info_and_only_the_rest_fail(self) -> None:
+        key, token = "/Users/builder/.ssh/id_ed25519", "/Users/Shared/cmux-build-fleet/secrets/r2.token"
+        self.manifest["hosts"]["build-mini-1"]["accepted_secrets"] = ["~/.ssh/id_ed25519"]
+        text = preflight_text(secrets=(key,)) + "pf_home\t/Users/builder\n"
+        result = self.result(text)
+        self.assertEqual(result["checks"]["secrets"]["state"], "info")
+        self.assertEqual(result["checks"]["secrets"]["detail"], f"accepted: {key}")
+        self.assertTrue(result["ready"], result)
+        # Both: fail, naming only the path nobody accepted.
+        checks = self.result(preflight_text(secrets=(key, token)) + "pf_home\t/Users/builder\n")["checks"]
+        self.assertEqual((checks["secrets"]["state"], checks["secrets"]["group"]), ("fail", "person"))
+        self.assertTrue(checks["secrets"]["detail"].endswith(f"PR jobs run as: {token}"), checks["secrets"]["detail"])
+        self.assertNotIn(key, checks["secrets"]["detail"])
+        # An absolute path matches as written; without pf_home, ~ is the login user's /Users home.
+        self.manifest["hosts"]["build-mini-1"]["accepted_secrets"] = [token, "~/.ssh/id_ed25519"]
+        self.assertEqual(self.result(preflight_text(secrets=(key, token)))["checks"]["secrets"]["state"], "info")
+
+    def test_accepted_secrets_are_validated(self) -> None:
+        for bad in ("~/.ssh/id_ed25519", ["relative/key"], ["~root/.ssh/id_rsa"], [3], ["/a\nb"]):
+            data = json.loads(EXAMPLE.read_text())
+            data["hosts"]["build-mini-1"]["accepted_secrets"] = bad
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(mf.Failure, "accepted_secrets"):
+                mf.load_manifest(write_manifest(tmp, data))
+        data = json.loads(EXAMPLE.read_text())
+        data["hosts"]["build-mini-1"]["accepted_secrets"] = ["~/.ssh/id_ed25519", "/Users/Shared/x.token"]
+        with tempfile.TemporaryDirectory() as tmp:
+            mf.load_manifest(write_manifest(tmp, data))
+
     def test_no_readable_secrets_is_ok(self) -> None:
         checks = self.result(preflight_text())["checks"]
         self.assertEqual(checks["secrets"], {"state": "ok", "detail": "none readable by builder", "fix": "", "group": ""})
@@ -1079,7 +1107,15 @@ class PreflightSecretsScriptTests(unittest.TestCase):
                      ".config/glaeda/empty.key": "",
                      ".config/gh/hosts.yml": "github.com:\n    oauth_token: gho_sekritgh\n",
                      "Library/Application Support/cmux-build-fleet/secrets/runner.token": "sekrit-runner-token\n",
-                     ".secrets/locked.env": "sekrit-locked\n"}
+                     ".secrets/locked.env": "sekrit-locked\n",
+                     ".secrets/nested/deep/.hidden.token": "sekrit-nested\n",
+                     ".secrets/bad\nname": "sekrit-newline\n",
+                     ".secrets/bad\tname": "sekrit-tab\n",
+                     ".netrc": "machine x password sekrit-netrc\n",
+                     ".git-credentials": "https://u:sekrit-gitcred@example.com\n",
+                     ".docker/config.json": '{"auths": {"x": {"auth": "sekrit-docker"}}}\n',
+                     ".aws/credentials": "aws_secret_access_key = sekrit-aws\n",
+                     ".config/rclone/rclone.conf": "secret_access_key = sekrit-rclone\n"}
             for rel, text in files.items():
                 (home / rel).parent.mkdir(parents=True, exist_ok=True)
                 (home / rel).write_text(text)
@@ -1091,18 +1127,25 @@ class PreflightSecretsScriptTests(unittest.TestCase):
             out = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True,
                                  env={"HOME": tmp, "PATH": "/usr/bin:/bin"}, timeout=60).stdout
             found = [p for p in mf.parse_probe(out)["preflight"]["secrets"] if p.startswith(tmp)]
-            # A token-less gh config is not a secret.
+            # A token-less gh config, or a docker config with no auth, is not a secret.
             (home / ".config/gh/hosts.yml").write_text("github.com:\n    user: someone\n")
+            (home / ".docker/config.json").write_text('{"credsStore": "osxkeychain"}\n')
             again = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True,
                                    env={"HOME": tmp, "PATH": "/usr/bin:/bin"}, timeout=60).stdout
             (home / ".secrets/locked.env").chmod(0o600)
-        want = [f"{tmp}/.config/glaeda/fleet.key", f"{tmp}/.secrets/r2.env",
+        want = [f"{tmp}/.config/glaeda/fleet.key", f"{tmp}/.secrets/r2.env", f"{tmp}/.secrets/nested/deep/.hidden.token",
                 f"{tmp}/Library/Application Support/cmux-build-fleet/secrets/runner.token",
-                f"{tmp}/.config/gh/hosts.yml", f"{tmp}/.ssh/id_ed25519"]
+                f"{tmp}/.config/gh/hosts.yml", f"{tmp}/.ssh/id_ed25519", f"{tmp}/.netrc", f"{tmp}/.git-credentials",
+                f"{tmp}/.docker/config.json", f"{tmp}/.aws/credentials", f"{tmp}/.config/rclone/rclone.conf"]
         if os.geteuid() == 0:  # root reads a mode-0 file
-            want.insert(2, f"{tmp}/.secrets/locked.env")
-        self.assertEqual(found, want)
-        self.assertNotIn(f"{tmp}/.config/gh/hosts.yml", [p for p in mf.parse_probe(again)["preflight"]["secrets"]])
+            want.append(f"{tmp}/.secrets/locked.env")
+        self.assertEqual(sorted(found), sorted(want))
+        self.assertEqual(mf.parse_probe(out)["preflight"]["home"], tmp)
+        # A newline or tab in a name could forge probe lines, so those paths are skipped whole.
+        self.assertNotIn("bad", out)
+        later = mf.parse_probe(again)["preflight"]["secrets"]
+        self.assertNotIn(f"{tmp}/.config/gh/hosts.yml", later)
+        self.assertNotIn(f"{tmp}/.docker/config.json", later)
         self.assertNotIn("sekrit", out + again)
 
 
@@ -1358,7 +1401,8 @@ class SudoPlanTests(unittest.TestCase):
         for step in ("xcode-select -s /Applications/Xcode.app", "env DEVELOPER_DIR=", "pmset -c sleep 0",
                      "sudo -H -u admin env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew",
                      'sudo -H -u admin ln -s "/opt/homebrew/opt/rustup/bin/$t"',
-                     'chown -h admin "$cache"/*', 'visudo -cf "$rule"', "install -m 0440 -o root"):
+                     'cp -nP "$staged"/* "$cache"/', 'chown -h admin "$cache"/*', 'visudo -cf "$rule"',
+                     "install -m 0440 -o root"):
             self.assertIn(step, script)
         # Bottles fix staged are in the login user's home, not root's.
         self.assertIn("login_home=~builder", body)
@@ -1444,6 +1488,7 @@ class SudoPlanAskOnceTests(unittest.TestCase):
             self.assertNotIn("sudo -v", call["argv"][-1])
         for call in calls:
             self.assertNotIn("-t", call["argv"])
+            self.assertEqual(call["argv"][0], "-T")  # no tty even under a RequestTTY config
             self.assertEqual(call["stdin"], self.PASSWORD + "\n")
             self.assertFalse(any(self.PASSWORD in a for a in call["argv"]))
         self.assertNotIn(self.PASSWORD, text)

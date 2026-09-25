@@ -198,19 +198,28 @@ for r in "$HOME"/actions-runner*/.runner; do
 done
 
 # Secrets this user can read. PR jobs run as the login user on a runner host, so whatever it can read,
-# a PR can read (cmuxterm-hq#595). Paths only, never contents. nullglob drops a pattern with no match;
-# a literal path (hosts.yml) still comes through, so every entry must be a readable, non-empty file.
-shopt -s nullglob
-for f in /Users/Shared/cmux-build-fleet/secrets/* "$HOME"/.config/glaeda/*.key "$HOME"/.secrets/* \
-    "$HOME/Library/Application Support/cmux-build-fleet/secrets/"* \
-    "/Library/Application Support/cmux-build-controller/secrets/"* \
-    "$HOME/.config/gh/hosts.yml" "$HOME"/.ssh/id_*; do
+# a PR can read (cmuxterm-hq#595). Paths only, never contents. The secrets directories are walked whole
+# (subdirectories and dotfiles count); nullglob drops a pattern with no match, dotglob keeps .files, and a
+# literal path still comes through, so every entry must be a readable, non-empty file. A path with a
+# newline or tab is skipped: it could forge probe lines.
+# The home the paths below expand, for the manifest's ~-prefixed accepted_secrets.
+e pf_home "$HOME"
+shopt -s nullglob dotglob
+while IFS= read -r -d '' f; do
+  case "$f" in *$'\n'*|*$'\t'*) continue ;; esac
   [ -f "$f" ] && [ -r "$f" ] && [ -s "$f" ] || continue
   case "$f" in
     *.pub) continue ;;
     "$HOME/.config/gh/hosts.yml") grep -q oauth_token "$f" 2>/dev/null || continue ;;
+    "$HOME/.docker/config.json") grep -q auth "$f" 2>/dev/null || continue ;;
   esac
   e pf_secret "$f"
-done
-shopt -u nullglob
+done < <(
+  find /Users/Shared/cmux-build-fleet/secrets "$HOME/.secrets" \
+    "$HOME/Library/Application Support/cmux-build-fleet/secrets" \
+    "/Library/Application Support/cmux-build-controller/secrets" \( -type f -o -type l \) -print0 2>/dev/null
+  printf '%s\0' "$HOME"/.config/glaeda/*.key "$HOME"/.ssh/id_* "$HOME/.config/gh/hosts.yml" "$HOME/.netrc" \
+    "$HOME/.git-credentials" "$HOME/.docker/config.json" "$HOME/.aws/credentials" "$HOME/.config/rclone/rclone.conf"
+)
+shopt -u nullglob dotglob
 } </dev/null
