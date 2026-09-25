@@ -710,5 +710,60 @@ class DiskTests(unittest.TestCase):
         self.assertIn("UNDER PRESSURE", page)
 
 
+def job_record(job="macos-compile-admission", verdict="clear", ended=AT - 600, reasons=None, **extra):
+    return {"schema": "glaeda-cmux-job/v1", "job": job, "run_id": "123", "runner": "mini-a-glaeda",
+            "seconds": 2200.0, "ended_at": ended, "cores": {"job": 9.0, "other_runner_jobs": 0.5, "outside": 5.1},
+            "load": {"mean": 30.5, "max": 36.4}, "verdict": verdict, "reasons": reasons or [], **extra}
+
+
+def jobs_stdout(*records, now=AT):
+    return "@jobs\n" + "\n".join(json.dumps(r) for r in records) + "\n@now\n" + str(now) + "\n"
+
+
+class JobsTests(unittest.TestCase):
+    def member(self, doc, name="mini-a"):
+        return next(m for m in doc["members"] if m["name"] == name)
+
+    def test_contended_jobs_warn_with_the_reason_and_a_read_only_command(self):
+        row = fs.parse_jobs(jobs_stdout(
+            job_record(),
+            job_record(verdict="contended", reasons=["outside processes averaged 5.1 cores (top: zig (cmux))",
+                                                     "load averaged 30.5 on 14 cores"]),
+            job_record(verdict="contended", ended=AT - 3 * 86400, reasons=["old"])), AT)
+        self.assertEqual((row["count"], row["contended"]), (2, 1))
+        doc = build(jobs=src({"hosts": {"mini-a": row}}))
+        [f] = by_id(doc, "jobs.contended@mini-a")
+        self.assertEqual(f["severity"], "warn")
+        self.assertIn("1 of 2 runner jobs in 24 h ran contended", f["summary"])
+        self.assertIn("macos-compile-admission (run 123)", f["summary"])
+        self.assertIn("zig (cmux)", f["summary"])
+        self.assertEqual(f["action"]["command"], "ssh -- mini-a 'tail -n 20 ~/Library/Logs/glaeda-cmux-jobs.jsonl'")
+        self.assertTrue(f["action"]["safe_to_apply"])
+        self.assertIn("1 contended", fs.render_text(doc))
+        self.assertIn("<th>jobs (24 h)</th>", fs.render_html(doc))
+        self.assertEqual(self.member(doc)["jobs"]["contended_jobs"][0]["outside_cores"], 5.1)
+
+    def test_clear_jobs_and_missing_logs_are_quiet(self):
+        clear = fs.parse_jobs(jobs_stdout(job_record(), job_record()), AT)
+        empty = fs.parse_jobs("@jobs\n\n@now\n" + str(AT) + "\n", AT)
+        doc = build(jobs=src({"hosts": {"mini-a": clear, "mini-b": empty}}))
+        self.assertFalse(by_id(doc, "jobs.contended"))
+        self.assertEqual(fs.jobs_line(self.member(doc)["jobs"]), "2 jobs, 0 contended")
+        self.assertEqual(fs.jobs_line(self.member(doc, "mini-b")["jobs"]), "no job records")
+
+    def test_foreign_or_cut_lines_are_skipped(self):
+        stdout = "@jobs\n" + '{"schema":"something-else"}\n' + 'ma","verdict":"contended"}\n' + \
+                 json.dumps(job_record()) + "\n@now\n" + str(AT) + "\n"
+        self.assertEqual(fs.parse_jobs(stdout, AT)["count"], 1)
+
+    def test_jobs_probe_is_read_only_and_skips_never_touch(self):
+        seen = []
+        with mock.patch.object(fs, "jobs_host", side_effect=lambda h, u: seen.append(h) or {"reachable": True}):
+            fs.collect_jobs({"ssh_user": "builder", "never_touch": ["coordinator"]}, ["mini-a", "coordinator"])
+        self.assertEqual(seen, ["mini-a"])
+        for word in (" rm ", "unlink", "delete", ">", "--apply"):
+            self.assertNotIn(word, fs.JOBS_SCRIPT.replace("2>/dev/null", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

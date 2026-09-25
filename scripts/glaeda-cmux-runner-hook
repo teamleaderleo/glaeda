@@ -40,7 +40,12 @@ share instead: a shared lock on host.lock plus units and tokens under FLEET_DIR/
 with "refused: capacity: ..." rather than wait when they are taken (take_capacity).
 Only then does it run glaeda-disk --pressure --apply --top 0, bounded and never able to fail the job.
 
-job-completed only runs the same disk pressure pass and always exits 0.
+An admitted job also gets a detached host sampler (unless --no-telemetry): it records load, the cores used by
+this job, by the other runner slots' jobs and by everything outside them, and the top outside processes, and
+writes one JSON line per job to ~/Library/Logs/glaeda-cmux-jobs.jsonl (glaeda-cmux-job/v1, "contended" or
+"clear"). glaeda-fleet-status reads it (source "jobs").
+
+job-completed stops the sampler (it writes the record), runs the same disk pressure pass and always exits 0.
 
     glaeda-cmux-runner-hook listen --runner-dir DIR [--no-waiters]
 
@@ -1160,6 +1165,279 @@ def load_event(path: str | None) -> Any:
         return None
 
 
+# ---------------------------------------------------------------- per-job host telemetry
+#
+# A detached sampler watches the host while each admitted job runs, so a slow job can be explained after
+# the fact: how loaded the mini was, how much CPU went to this job, to the other runner slots' jobs, and to
+# processes outside any runner job, and which of those used the most. On job-completed (or when the job's
+# Runner.Worker exits) it appends one bounded JSON line to JOB_LOG. Observation only: it never refuses,
+# delays or fails a job, and every failure is swallowed.
+#
+# Privacy: processes are recorded by executable basename and user only, never arguments or paths; runner
+# slots by their directory name (actions-runner-glaeda-2). ps's %cpu is the kernel's decaying recent
+# average, so core-seconds are an estimate: good for "who used the CPU", not for billing.
+JOB_LOG = Path.home() / "Library/Logs/glaeda-cmux-jobs.jsonl"
+JOB_LOG_MAX_BYTES = 2 * 1024 * 1024  # past this the log keeps its newest half
+JOB_SCHEMA = "glaeda-cmux-job/v1"
+SAMPLER_FILE = "job-sampler"
+SAMPLE_S = 10.0
+THERMAL_EVERY = 6  # pmset -g therm every Nth sample
+PS = "/bin/ps"
+SYSCTL = "/usr/sbin/sysctl"
+PMSET = "/usr/bin/pmset"
+TOP_OUTSIDE = 5
+# Contended: work outside this mini's runner jobs averaged at least this many cores (or this share of the
+# cores), or the load average stayed well above the core count. Either one slows a compile's every file.
+CONTENDED_OUTSIDE_CORES = 2.0
+CONTENDED_OUTSIDE_SHARE = 0.15
+CONTENDED_LOAD_PER_CORE = 1.5
+RUNNER_DIR_RE = re.compile(r"/(actions-runner[A-Za-z0-9_.-]*)/")
+
+
+def sampler_file(state_dir: Path) -> Path:
+    main = holder_file(state_dir)
+    return state_dir / main.name.replace(HOLDER_FILE, SAMPLER_FILE, 1)
+
+
+def ps_rows() -> list[tuple[int, int, float, str, str]]:
+    """(pid, ppid, %cpu, user, executable basename) for every process."""
+    out = subprocess.run([PS, "-Ao", "pid=,ppid=,pcpu=,user=,comm="], stdin=subprocess.DEVNULL,
+                         capture_output=True, text=True, timeout=10, check=False, env={"LC_ALL": "C"}).stdout
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 5:
+            continue
+        try:
+            rows.append((int(parts[0]), int(parts[1]), float(parts[2]), parts[3], parts[4].strip()))
+        except ValueError:
+            continue
+    return rows
+
+
+def classify(rows: list[tuple[int, int, float, str, str]], job_root: int,
+             skip: set[int]) -> tuple[float, float, float, dict[str, float], dict[str, float]]:
+    """Cores used right now by this job's tree, other runner jobs, and everything else, plus the outside
+    cores by "basename (user)" and the other jobs' cores by runner directory."""
+    parent = {pid: ppid for pid, ppid, _, _, _ in rows}
+    workers = {pid: (m.group(1) if (m := RUNNER_DIR_RE.search(comm)) else "runner")
+               for pid, _, _, _, comm in rows if comm.endswith("Runner.Worker")}
+    workers.setdefault(job_root, "this job")
+
+    def owner(pid: int) -> int | None:
+        seen = 0
+        while pid > 1 and seen < 256:
+            if pid in workers:
+                return pid
+            pid = parent.get(pid, 0)
+            seen += 1
+        return None
+
+    job = others = outside = 0.0
+    by_outside: dict[str, float] = {}
+    by_runner: dict[str, float] = {}
+    for pid, _, pcpu, user, comm in rows:
+        if pid in skip or pcpu <= 0:
+            continue
+        cores = pcpu / 100.0
+        root = owner(pid)
+        if root == job_root:
+            job += cores
+        elif root is not None:
+            others += cores
+            by_runner[workers[root]] = by_runner.get(workers[root], 0.0) + cores
+        else:
+            outside += cores
+            key = f"{os.path.basename(comm)[:60]} ({user[:24]})"
+            by_outside[key] = by_outside.get(key, 0.0) + cores
+    return job, others, outside, by_outside, by_runner
+
+
+def load_average() -> float | None:
+    try:
+        out = subprocess.run([SYSCTL, "-n", "vm.loadavg"], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, timeout=5, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    nums = re.findall(r"\d+(?:\.\d+)?", out)
+    return float(nums[0]) if nums else None
+
+
+def thermal_limited() -> bool | None:
+    """True when pmset reports a CPU speed limit under 100 or a recorded thermal/performance warning."""
+    try:
+        out = subprocess.run([PMSET, "-g", "therm"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                             timeout=5, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if not out:
+        return None
+    limit = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", out)
+    if limit and int(limit.group(1)) < 100:
+        return True
+    warned = [l for l in out.splitlines() if "warning level" in l.lower() and not l.strip().startswith("Note: No")]
+    return bool(warned)
+
+
+class JobSamples:
+    """Running totals for one job; summary() is the JSON line."""
+
+    def __init__(self, meta: dict[str, Any], ncpu: int, started: float, interval: float = SAMPLE_S):
+        self.meta, self.ncpu, self.started, self.interval = meta, max(1, ncpu), started, interval
+        self.samples = 0
+        self.load_sum = self.load_max = 0.0
+        self.loads = 0
+        self.job = self.others = self.outside = 0.0
+        self.outside_by: dict[str, float] = {}
+        self.runners_by: dict[str, float] = {}
+        self.thermal: bool | None = None
+
+    def add(self, load: float | None, split: tuple[float, float, float, dict[str, float], dict[str, float]],
+            interval: float) -> None:
+        job, others, outside, by_outside, by_runner = split
+        self.samples += 1
+        if load is not None:
+            self.loads += 1
+            self.load_sum += load
+            self.load_max = max(self.load_max, load)
+        self.job += job
+        self.others += others
+        self.outside += outside
+        for key, cores in by_outside.items():
+            self.outside_by[key] = self.outside_by.get(key, 0.0) + cores * interval
+        for key, cores in by_runner.items():
+            self.runners_by[key] = self.runners_by.get(key, 0.0) + cores * interval
+
+    def summary(self, ended: float) -> dict[str, Any]:
+        n = max(1, self.samples)
+        load_mean = self.load_sum / self.loads if self.loads else None
+        outside_mean = self.outside / n
+        reasons = []
+        if self.samples and outside_mean >= max(CONTENDED_OUTSIDE_CORES, CONTENDED_OUTSIDE_SHARE * self.ncpu):
+            top = max(self.outside_by, key=self.outside_by.get) if self.outside_by else "unknown"
+            reasons.append(f"outside processes averaged {outside_mean:.1f} cores (top: {top})")
+        if load_mean is not None and load_mean >= CONTENDED_LOAD_PER_CORE * self.ncpu:
+            reasons.append(f"load averaged {load_mean:.1f} on {self.ncpu} cores")
+        if self.thermal:
+            reasons.append("thermal or performance limit reported")
+        top_outside = sorted(self.outside_by.items(), key=lambda kv: -kv[1])[:TOP_OUTSIDE]
+        return {
+            "schema": JOB_SCHEMA, **self.meta,
+            "started_at": int(self.started), "ended_at": int(ended), "seconds": round(ended - self.started, 1),
+            "ncpu": self.ncpu, "samples": self.samples, "sample_seconds": self.interval,
+            "load": {"mean": None if load_mean is None else round(load_mean, 2), "max": round(self.load_max, 2)},
+            "cores": {"job": round(self.job / n, 2), "other_runner_jobs": round(self.others / n, 2),
+                      "outside": round(outside_mean, 2)},
+            "top_outside": [{"process": k, "core_seconds": round(v)} for k, v in top_outside],
+            "other_runner_jobs": [{"runner": k, "core_seconds": round(v)}
+                                  for k, v in sorted(self.runners_by.items(), key=lambda kv: -kv[1])[:8]],
+            "thermal_limited": self.thermal,
+            "verdict": "contended" if reasons else "clear", "reasons": reasons,
+        }
+
+
+def append_job_record(record: dict[str, Any], log: Path = JOB_LOG) -> None:
+    """One line per job; past JOB_LOG_MAX_BYTES keep the newest half, cut at a line boundary."""
+    log.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, separators=(",", ":"), sort_keys=True)[:8192] + "\n"
+    with open(log, "a", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.write(line)
+        handle.flush()
+        if handle.tell() > JOB_LOG_MAX_BYTES:
+            data = log.read_bytes()
+            keep = data[len(data) // 2:]
+            keep = keep[keep.find(b"\n") + 1:]
+            tmp = log.with_name(log.name + ".tmp")
+            tmp.write_bytes(keep)
+            tmp.replace(log)
+
+
+def job_meta(repo: str | None, home_repo: str) -> dict[str, Any]:
+    def env(name: str, limit: int = 120) -> str | None:
+        value = os.environ.get(name)
+        return value[:limit] if value else None
+    job = env("GITHUB_JOB") or ""
+    klass, _ = job_class(job, repo, home_repo) if job else ("unknown", False)
+    return {"host": os.uname().nodename.split(".")[0][:64], "runner": env("RUNNER_NAME", 80), "job": job or None,
+            "class": klass, "workflow": env("GITHUB_WORKFLOW"), "repository": repo,
+            "run_id": env("GITHUB_RUN_ID", 32), "run_attempt": env("GITHUB_RUN_ATTEMPT", 8)}
+
+
+def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Path = JOB_LOG,
+                  interval: float = SAMPLE_S) -> str:
+    """Fork the detached sampler. Best effort: returns a note, never raises, never fails the job."""
+    try:
+        pid_file = sampler_file(state_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        pid_file.unlink(missing_ok=True)
+        child = os.fork()
+    except Exception as error:  # noqa: BLE001  (observation must not refuse a job)
+        return f"job telemetry off ({type(error).__name__})"
+    if child:
+        os.waitpid(child, 0)
+        return "job telemetry sampling"
+    try:
+        os.setsid()
+        if os.fork():
+            os._exit(0)
+        null = os.open(os.devnull, os.O_RDWR)
+        for std in (0, 1, 2):  # the runner reads the hook's output until EOF
+            os.dup2(null, std)
+        me = str(os.getpid())
+        pid_file.write_text(me + "\n")
+        started = time.time()
+        samples = JobSamples(meta, os.cpu_count() or 1, started, interval)
+        deadline = time.monotonic() + HOLDER_MAX_S
+        tick = 0
+        while True:
+            try:
+                rows = ps_rows()
+                skip = {os.getpid()} | {pid for pid, ppid, _, _, _ in rows if ppid == os.getpid()}
+                samples.add(load_average(), classify(rows, watch_pid, skip), interval)
+                if tick % THERMAL_EVERY == 0:
+                    limited = thermal_limited()
+                    if limited is not None:
+                        samples.thermal = bool(samples.thermal) or limited
+            except Exception:  # noqa: BLE001  (a bad sample is skipped, not fatal)
+                pass
+            tick += 1
+            stop_at = time.monotonic() + interval
+            while time.monotonic() < stop_at:
+                try:
+                    ours = pid_file.read_text().strip() == me
+                except OSError:
+                    ours = False
+                if not ours or not pid_alive(watch_pid) or time.monotonic() >= deadline:
+                    break
+                time.sleep(min(1.0, interval))
+            else:
+                continue
+            break
+        append_job_record(samples.summary(time.time()), log)
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            if pid_file.read_text().strip() == str(os.getpid()):
+                pid_file.unlink()
+        os._exit(0)
+
+
+def finish_sampler(state_dir: Path, wait_s: float = 5.0) -> str:
+    """job-completed: tell the sampler to write its record, and give it a moment to do so."""
+    pid_file = sampler_file(state_dir)
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        return "no job telemetry sampler"
+    pid_file.unlink(missing_ok=True)
+    deadline = time.monotonic() + wait_s
+    while pid_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    return "job telemetry recorded" if not pid_alive(pid) else f"job telemetry sampler {pid} still writing"
+
+
 def find_disk(explicit: str | None) -> str | None:
     if explicit:
         return explicit if os.path.isfile(explicit) else None
@@ -1213,6 +1491,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--trusted-repo", help="the one repository --trusted-ref admits")
     p.add_argument("--disk", help="glaeda-disk path (default: PATH, then ~/.local/bin)")
     p.add_argument("--no-disk", action="store_true")
+    p.add_argument("--no-telemetry", action="store_true", help="do not sample the host while the job runs")
+    p.add_argument("--job-log", type=Path, default=JOB_LOG, help=argparse.SUPPRESS)
     p.add_argument("--min-free-gib", type=float, default=0, help="refuse a job below this much free disk")
     p.add_argument("--require-eligible", action="store_true",
                    help="refuse unless this is an eligible Glaeda node on its class receipt's toolchain")
@@ -1235,6 +1515,8 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     if args.parse_only:
         return 0
+    # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
+    telemetry = not args.no_telemetry and os.environ.get("GLAEDA_RUNNER_TELEMETRY", "1") != "0"
 
     if args.phase == "listen":
         if args.runner_dir is None:
@@ -1304,7 +1586,15 @@ def main(argv: list[str] | None = None) -> int:
             if aligned:
                 note += f"; {aligned}"
         print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
+        if telemetry:
+            repo = os.environ.get("GITHUB_REPOSITORY") or _repo_name((event or {}).get("repository")
+                                                                     if isinstance(event, dict) else None)
+            meta = job_meta(repo, args.home_repo)
+            note = start_sampler(args.watch_pid or os.getppid(), args.state_dir, meta, args.job_log)
+            print(f"{PREFIX}: {note}", flush=True)
     else:
+        if telemetry:
+            print(f"{PREFIX}: {finish_sampler(args.state_dir)}", flush=True)
         print(f"{PREFIX}: {release_host_lock(args.state_dir)}", flush=True)
     if not args.no_disk:
         print(f"{PREFIX}: {disk_pressure(args.disk)}", flush=True)

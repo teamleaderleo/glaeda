@@ -17,6 +17,8 @@ Collection joins what exists today, each source optional and read-only:
   (default on)               Lima instance counts and orphans per member (--no-lima to skip)
   (default on)               disk per member: free space, cache families and owners (glaeda-disk --json),
                              the last fleet-cas-prune and gc lines, bytes reclaimed in 24 h (--no-disk to skip)
+  (default on)               runner jobs per member over 24 h: how many ran contended (the runner hook's
+                             ~/Library/Logs/glaeda-cmux-jobs.jsonl), and what used the CPU (--no-jobs to skip)
 
 Every finding carries a typed action {id, who: agent|password|person, safe_to_apply, command, note}:
 `command` runs from the operator machine, `safe_to_apply` is true only for read-only commands, and
@@ -52,7 +54,7 @@ SSH = "/usr/bin/ssh"
 
 WHO = ("agent", "password", "person")
 SEVERITIES = ("error", "warn", "info")
-SOURCE_NAMES = ("manifest", "check", "preflight", "controller", "runners", "queue", "cache", "lima", "disk")
+SOURCE_NAMES = ("manifest", "check", "preflight", "controller", "runners", "queue", "cache", "lima", "disk", "jobs")
 # A source older than this at build time is itself a finding.
 DEFAULT_MAX_AGE = 900
 MAX_MEMBERS = 128
@@ -73,6 +75,9 @@ CONTROLLER_TIMEOUT = 60
 CACHE_TIMEOUT = 5
 # glaeda-disk judges live verdicts (open files, running commands) on top of its size snapshot: ~15 s.
 DISK_TIMEOUT = 90
+JOBS_TIMEOUT = 30
+JOBS_WINDOW_S = 24 * 3600
+MAX_CONTENDED_JOBS = 5  # per member, newest first
 # A retired owner's family above this is worth a person's decision.
 RETIRED_WARN_BYTES = 5 * GIB
 # fleet-cas-prune runs hourly; three missed runs is a stopped LaunchAgent, not a busy host.
@@ -506,6 +511,60 @@ def collect_disk(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
     return source({"hosts": results})
 
 
+# Read-only: the tail of the runner hook's per-job log (glaeda-cmux-job/v1, one line per admitted job). A line cut
+# at the front by tail -c fails to parse and is skipped.
+JOBS_SCRIPT = (
+    "echo @jobs; tail -n 400 ~/Library/Logs/glaeda-cmux-jobs.jsonl 2>/dev/null | tail -c 1048576; echo; "
+    "echo @now; date +%s"
+)
+
+
+def parse_jobs(stdout: str, at: int) -> dict[str, Any]:
+    """The last 24 h of job records, reduced to counts and the newest contended jobs' reasons."""
+    sections: dict[str, list[str]] = {}
+    current = None
+    for line in stdout.splitlines():
+        if re.fullmatch(r"@[a-z_]+", line.strip()):
+            current = line.strip()[1:]
+            sections[current] = []
+        elif current is not None and line.strip():
+            sections[current].append(line)
+    remote_now = next((int(x) for x in sections.get("now", []) if x.strip().isdigit()), None)
+    skew = at - remote_now if remote_now is not None else 0
+    since = (remote_now if remote_now is not None else at) - JOBS_WINDOW_S
+    records = [r for r in json_lines(sections.get("jobs", []))
+               if r.get("schema") == "glaeda-cmux-job/v1" and (num(r.get("ended_at")) or 0) >= since]
+    contended = [r for r in records if r.get("verdict") == "contended"]
+    newest = sorted(contended, key=lambda r: -(num(r.get("ended_at")) or 0))[:MAX_CONTENDED_JOBS]
+    return {"reachable": True, "observed_at": at, "count": len(records), "contended": len(contended),
+            "jobs": [{"job": clean(r.get("job") or "?", 60), "run_id": clean(r.get("run_id"), 32) or None,
+                      "runner": clean(r.get("runner"), 60) or None, "seconds": num(r.get("seconds")),
+                      "ended_at": (int(r["ended_at"]) + skew) if num(r.get("ended_at")) is not None else None,
+                      "outside_cores": num((r.get("cores") or {}).get("outside")) if isinstance(r.get("cores"), dict) else None,
+                      "load_mean": num((r.get("load") or {}).get("mean")) if isinstance(r.get("load"), dict) else None,
+                      "reasons": [clean(x, 160) for x in (r.get("reasons") or [])[:3]]}
+                     for r in newest]}
+
+
+def jobs_host(host: str, user: str) -> dict[str, Any]:
+    try:
+        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, JOBS_SCRIPT],
+                              capture_output=True, text=True, timeout=JOBS_TIMEOUT, env=child_env(), check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"reachable": False, "error": type(error).__name__, "observed_at": now()}
+    if proc.returncode != 0 and "@now" not in proc.stdout:
+        return {"reachable": False, "error": clean(proc.stderr, 160) or f"exit {proc.returncode}", "observed_at": now()}
+    return parse_jobs(proc.stdout, now())
+
+
+def collect_jobs(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
+    never = set(manifest.get("never_touch") or [])
+    targets = [h for h in hosts if h not in never]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = dict(zip(targets, pool.map(lambda h: jobs_host(h, manifest["ssh_user"]), targets)))
+    return source({"hosts": results})
+
+
 def collect(args: argparse.Namespace) -> dict[str, Any]:
     fleet = mini_fleet()
     try:
@@ -527,6 +586,8 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         sources["lima"] = collect_lima(manifest, hosts)
     if not args.no_disk:
         sources["disk"] = collect_disk(manifest, hosts)
+    if not args.no_jobs:
+        sources["jobs"] = collect_jobs(manifest, hosts)
     return {"schema": SOURCES_SCHEMA, "collected_at": now(), "sources": sources}
 
 
@@ -1008,6 +1069,47 @@ class Builder:
 
     # ---- document
 
+    def fold_jobs(self) -> None:
+        """A runner job that ran contended is slow for a reason that is not the change under test: say which."""
+        data = self.data("jobs")
+        if not data:
+            return
+        for host, row in sorted((data.get("hosts") or {}).items()):
+            member = self.member_of(host)
+            if member is None or not isinstance(row, dict):
+                continue
+            at = stamp_of(row.get("observed_at"))
+            m = self.members[member]
+            m["observed"]["jobs"] = at
+            if not row.get("reachable"):
+                m["jobs"] = {"reachable": False}
+                self.finding("jobs", "probe_failed", "info", f"jobs probe failed: {clean(row.get('error'), 160)}",
+                             member, at, self.action(member, "retry_probe", "agent", "glaeda-fleet-status",
+                                                     safe=True, on_member=False))
+                continue
+            jobs = [j for j in (row.get("jobs") or [])[:MAX_CONTENDED_JOBS] if isinstance(j, dict)]
+            count, contended = int(num(row.get("count")) or 0), int(num(row.get("contended")) or 0)
+            m["jobs"] = {"reachable": True, "window_seconds": JOBS_WINDOW_S, "count": count,
+                         "contended": contended,
+                         "contended_jobs": [{"job": clean(j.get("job"), 60), "run_id": clean(j.get("run_id"), 32) or None,
+                                             "runner": clean(j.get("runner"), 60) or None,
+                                             "seconds": num(j.get("seconds")), "ended_at": stamp_of(j.get("ended_at")),
+                                             "outside_cores": num(j.get("outside_cores")),
+                                             "load_mean": num(j.get("load_mean")),
+                                             "reasons": [clean(x, 160) for x in (j.get("reasons") or [])[:3]]}
+                                            for j in jobs]}
+            if contended:
+                latest = m["jobs"]["contended_jobs"][0] if m["jobs"]["contended_jobs"] else {}
+                why = "; ".join(latest.get("reasons") or []) or "no reason recorded"
+                run = f" (run {latest['run_id']})" if latest.get("run_id") else ""
+                self.finding("jobs", "contended", "warn",
+                             f"{contended} of {count} runner jobs in 24 h ran contended; latest "
+                             f"{latest.get('job') or '?'}{run}: {why}", member, at,
+                             self.action(member, "show_job_records", "agent",
+                                         "tail -n 20 ~/Library/Logs/glaeda-cmux-jobs.jsonl", safe=True,
+                                         note="each line names this job's cores, the other runner jobs' and the "
+                                              "top processes outside them"))
+
     def build(self) -> dict[str, Any]:
         self.state = self.freshness()
         self.fold_check()
@@ -1018,6 +1120,7 @@ class Builder:
         cache = self.fold_cache()
         self.fold_lima()
         self.fold_disk()
+        self.fold_jobs()
         findings = dedupe(self.findings)
         rank = {s: i for i, s in enumerate(SEVERITIES)}
         findings.sort(key=lambda f: (rank[f["severity"]], f["member"] or "", f["id"]))
@@ -1147,6 +1250,21 @@ def disk_line(d: dict[str, Any] | None, at: int) -> str:
     return clean("; ".join(parts), MAX_TEXT)
 
 
+def jobs_line(j: dict[str, Any] | None) -> str:
+    """One compact line per member: job count, contended count, and the newest contended job's first reason."""
+    if not j:
+        return ""
+    if not j.get("reachable"):
+        return "unreachable"
+    if not j.get("count"):
+        return "no job records"
+    line = f"{j['count']} jobs, {j.get('contended') or 0} contended"
+    latest = (j.get("contended_jobs") or [{}])[0]
+    if j.get("contended") and latest:
+        line += f"; latest {latest.get('job') or '?'}: {(latest.get('reasons') or ['?'])[0]}"
+    return clean(line, MAX_TEXT)
+
+
 def when(stamp: Any, at: int) -> str:
     if stamp is None:
         return "never"
@@ -1168,6 +1286,11 @@ def render_text(doc: dict[str, Any]) -> str:
         lines.append("")
         lines.append("disk:")
         lines.extend(f"  {name:<{width}}  {line}" for name, line in disk)
+    jobs = [(m["name"], jobs_line(m.get("jobs"))) for m in doc["members"] if m.get("jobs")]
+    if jobs:
+        lines.append("")
+        lines.append("jobs (24 h):")
+        lines.extend(f"  {name:<{width}}  {line}" for name, line in jobs)
     stale = [f"{n} {s['state']}" for n, s in doc["sources"].items() if s["state"] in ("stale", "unavailable")]
     if stale:
         lines.append("")
@@ -1240,7 +1363,7 @@ def render_html(doc: dict[str, Any]) -> str:
         out.append(f"<tr><td>{e(name)}</td><td class=\"s-{e(s['state'])}\">{e(s['state'])}</td>"
                    f"<td>{e(when(s['observed_at'], at))}</td><td>{e(s['error'] or '')}</td></tr>")
     out.append("</table></div><h2>Members</h2><div class=\"scroll\"><table><tr><th>member</th><th>class</th>"
-               "<th>status</th><th>controller</th><th>runners</th><th>lima</th><th>disk</th><th>errors</th>"
+               "<th>status</th><th>controller</th><th>runners</th><th>lima</th><th>disk</th><th>jobs (24 h)</th><th>errors</th>"
                "<th>warnings</th>"
                "<th>observed</th></tr>")
     for m in doc["members"]:
@@ -1254,6 +1377,7 @@ def render_html(doc: dict[str, Any]) -> str:
         out.append(f"<tr><td>{e(m['name'])}{tag}</td><td>{e(str(m['class'] or ''))}</td>"
                    f"<td class=\"s-{e(m['status'])}\">{e(m['status'])}</td><td>{e(str(ctl.get('state', '')))}</td>"
                    f"<td>{e(runners)}</td><td>{e(lima_text)}</td><td>{e(disk_line(m.get('disk'), at))}</td>"
+                   f"<td>{e(jobs_line(m.get('jobs')))}</td>"
                    f"<td>{m['counts']['error']}</td>"
                    f"<td>{m['counts']['warn']}</td><td>{e(when(m['observed_at'], at))}</td></tr>")
     out.append("</table></div>")
@@ -1319,6 +1443,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--no-fleet-probe", action="store_true", help="skip glaeda-mini-fleet check and preflight")
     p.add_argument("--no-lima", action="store_true", help="skip the Lima instance listing")
     p.add_argument("--no-disk", action="store_true", help="skip the per-member disk and cache probe")
+    p.add_argument("--no-jobs", action="store_true", help="skip the per-member runner job records")
     p.add_argument("--controller-status", type=Path, help="path to cmuxterm-hq build-fleet/status.py")
     p.add_argument("--controller-json", type=Path, help="a saved status.py --json output instead")
     p.add_argument("--github-runners", metavar="SCOPE", help="orgs/OWNER or repos/OWNER/REPO")
