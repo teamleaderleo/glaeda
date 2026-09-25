@@ -45,6 +45,33 @@ def check_run(name: str, status: str = "COMPLETED", conclusion: str | None = "SU
             "detailsUrl": f"https://ci/{name}"}
 
 
+def iso(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def job(name: str, conclusion: str = "failure", run_attempt: int = 1, runner: str = "cmuxs-mac-mini-3-glaeda-1",
+        labels: tuple = ("glaeda-root-std-xcode-26.6",), failed_step: str = "Run selected tests",
+        seconds: int = 300, end: float | None = None) -> dict:
+    """A REST job; a failed one fails at `failed_step`, `seconds` after it started."""
+    end = time.time() if end is None else end
+    steps = [{"name": "Set up job", "conclusion": "success"}]
+    if conclusion == "failure":
+        steps.append({"name": failed_step, "conclusion": "failure"})
+    return {"id": abs(hash(name)) % 1000, "name": name, "status": "completed", "conclusion": conclusion,
+            "html_url": f"https://ci/job/{name}", "run_attempt": run_attempt, "runner_name": runner,
+            "labels": list(labels), "started_at": iso(end - seconds), "completed_at": iso(end), "steps": steps}
+
+
+def cached(*jobs: dict) -> dict:
+    """Jobs as the daemon caches them."""
+    return {"jobs": gg.slim_jobs({"jobs": list(jobs)})}
+
+
+def refused(name: str = "build", **kw) -> dict:
+    """What glaeda's runner hook leaves when it refuses a job: Set up runner failed within seconds."""
+    return job(name, failed_step="Set up runner", seconds=7, **kw)
+
+
 class FakeGitHub:
     """Answers GraphQL and REST like api.github.com; records every request."""
 
@@ -53,6 +80,9 @@ class FakeGitHub:
         self.prs: dict[tuple[str, str, int], dict] = {}
         self.runs: dict[int, dict] = {}
         self.jobs: dict[int, list] = {}
+        self.issues: dict[tuple[str, str, int], dict] = {}
+        self.steps: dict[str, list] = {}  # check run node id -> steps
+        self.step_queries: list[list[str]] = []
         self.rest_remaining = 4000
         self.graphql_remaining = 4000
 
@@ -68,12 +98,18 @@ class FakeGitHub:
             v, data, errors = doc["variables"], {}, []
             self.graphql_remaining -= 1
             data["rateLimit"] = {"limit": 5000, "remaining": self.graphql_remaining, "resetAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 1800)), "cost": 1}
+            if "nodes(ids:" in doc["query"]:
+                self.step_queries.append(list(v["ids"]))
+                data["nodes"] = [{"id": i, "steps": {"nodes": self.steps[i]}} if i in self.steps else None
+                                 for i in v["ids"]]
+            comments = "issueOrPullRequest" in doc["query"]
+            alias, field, table = ("c", "issueOrPullRequest", self.issues) if comments else ("p", "pullRequest", self.prs)
             i = 0
             while f"o{i}" in v:
-                node = self.prs.get((v[f"o{i}"], v[f"r{i}"], v[f"n{i}"]))
-                data[f"p{i}"] = {"pullRequest": node}
+                node = table.get((v[f"o{i}"], v[f"r{i}"], v[f"n{i}"]))
+                data[f"{alias}{i}"] = {field: node}
                 if node is None:
-                    errors.append({"type": "NOT_FOUND", "path": [f"p{i}", "pullRequest"], "message": "Could not resolve"})
+                    errors.append({"type": "NOT_FOUND", "path": [f"{alias}{i}", field], "message": "Could not resolve"})
                 i += 1
             out = {"data": data, **({"errors": errors} if errors else {})}
             return 200, self.rate("graphql", self.graphql_remaining), json.dumps(out).encode()
@@ -92,6 +128,12 @@ class FakeGitHub:
 
     def gql_calls(self) -> list:
         return [c for c in self.calls if c[1].endswith("/graphql")]
+
+    def run_calls(self) -> list:
+        return [c for c in self.rest_calls() if "/jobs" not in c[1]]
+
+    def job_calls(self) -> list:
+        return [c for c in self.rest_calls() if "/jobs" in c[1]]
 
 
 class Base(unittest.TestCase):
@@ -215,18 +257,20 @@ class DaemonTest(Base):
         self.assertEqual(len(self.gh.gql_calls()), 1)
 
     def test_rerun_of_a_completed_run_is_seen_on_the_next_cycle(self) -> None:
-        self.gh.runs[3] = {"id": 3, "status": "completed", "conclusion": "failure"}
+        self.gh.runs[3] = {"id": 3, "status": "completed", "conclusion": "failure", "run_attempt": 1}
+        self.gh.jobs[3] = [job("build", run_attempt=1)]
         gg.register("run:o/r/3")
         self.age_watch("run:o/r/3", 1)  # registered before the first fetch
         self.daemon.tick(NOW)
         self.daemon.tick(NOW + gg.CYCLE)  # nobody new is reading: a completed run is not re-read
-        self.assertEqual(len(self.gh.rest_calls()), 1)
-        self.gh.runs[3] = {"id": 3, "status": "queued", "conclusion": None}  # gh run rerun 3
+        self.assertEqual(len(self.gh.run_calls()), 1)
+        self.assertEqual(len(self.gh.job_calls()), 1)  # the failed attempt's steps, read once
+        self.gh.runs[3] = {"id": 3, "status": "queued", "conclusion": None, "run_attempt": 2}  # gh run rerun 3
         path = gg.watch_dir() / gg.file_name("run:o/r/3")
         gg.register("run:o/r/3")  # a new wait
         os.utime(path, (NOW + gg.CYCLE + 1,) * 2)
         self.daemon.tick(NOW + 2 * gg.CYCLE)
-        self.assertEqual(len(self.gh.rest_calls()), 2)
+        self.assertEqual(len(self.gh.run_calls()), 2)
         self.assertEqual(gg.read_cache("run:o/r/3")["data"]["status"], "queued")
 
     def test_budget_floor_goes_lean_then_stops(self) -> None:
@@ -328,6 +372,96 @@ class DaemonTest(Base):
                 gg.parse_key(kind, text)
         self.assertEqual(gg.parse_key("pr", "Manaflow-AI/cmux#14542"), "pr:manaflow-ai/cmux#14542")
         self.assertEqual(gg.parse_key("run", "o/r/actions/runs/12/attempts/2"), "run:o/r/12")
+        self.assertEqual(gg.parse_key("comment", "https://github.com/T/S/issues/454#issuecomment-5"), "comment:t/s#454")
+        self.assertEqual(gg.parse_key("comment", "t/s#454"), "comment:t/s#454")
+        with self.assertRaises(gg.WatchError):
+            gg.parse_key("pr", "t/s/issues/454")  # an issue is not a pull request
+
+    def test_failed_run_reads_its_jobs_once_per_attempt(self) -> None:
+        key = "run:o/r/4"
+        self.gh.runs[4] = {"id": 4, "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                           "updated_at": iso(NOW)}
+        self.gh.jobs[4] = [job("build", end=NOW), job("lint", "success", end=NOW)]
+        gg.register(key)  # no --jobs
+        self.daemon.tick(NOW)
+        entry = gg.read_cache(key)
+        self.assertEqual([j["failedSteps"] for j in entry["jobs"]], [["Run selected tests"], []])
+        self.assertIn("failed: build (step: Run selected tests)", gg.summary(key, entry))
+        path = gg.watch_dir() / gg.file_name(key)
+        os.utime(path, (NOW + gg.CYCLE - 1,) * 2)  # a waiter is still reading
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual((len(self.gh.run_calls()), len(self.gh.job_calls())), (2, 1))  # the run answered 304
+        self.assertEqual(self.gh.rest_remaining, 3998)
+        # attempt 2 fails too: its own job list is read
+        self.gh.runs[4] = {**self.gh.runs[4], "run_attempt": 2}
+        self.gh.jobs[4] = [job("build", run_attempt=2, end=NOW), job("lint", "success", end=NOW)]
+        os.utime(path, (NOW + 2 * gg.CYCLE - 1,) * 2)
+        self.daemon.tick(NOW + 2 * gg.CYCLE)
+        self.assertEqual(len(self.gh.job_calls()), 2)
+        self.assertEqual(gg.jobs_attempt(gg.read_cache(key)["jobs"]), 2)
+
+    def test_failed_check_steps_are_read_once(self) -> None:
+        failed = {**check_run("build", conclusion="FAILURE"), "id": "CR_1"}
+        self.gh.prs[("o", "r", 1)] = pr_node(1, rollup="FAILURE", checks=[failed, {**check_run("lint"), "id": "CR_2"}])
+        self.gh.steps["CR_1"] = [{"name": "Set up job", "conclusion": "SUCCESS"},
+                                 {"name": "Run selected tests", "conclusion": "FAILURE"},
+                                 {"name": "Upload logs", "conclusion": "CANCELLED"}]
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.step_queries, [["CR_1"]])  # only the failed check
+        data = gg.read_cache("pr:o/r#1")["data"]
+        self.assertEqual(data["checks"][0]["failedSteps"], ["Run selected tests"])
+        self.assertIn("failed: build (step: Run selected tests)", gg.summary("pr:o/r#1", {"data": data}))
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual(len(self.gh.gql_calls()), 3)  # PR, steps, PR: the steps were kept
+        self.assertEqual(gg.read_cache("pr:o/r#1")["data"]["checks"][0]["failedSteps"], ["Run selected tests"])
+
+    def test_comment_watch_polls_fast_and_ends_with_its_waiter(self) -> None:
+        self.gh.issues[("t", "s", 454)] = {"__typename": "Issue", "url": "https://github.com/t/s/issues/454",
+                                           "state": "OPEN", "comments": {"totalCount": 1, "nodes": [
+                                               {"databaseId": 9, "url": "u9", "createdAt": iso(NOW),
+                                                "author": {"login": "github-actions"}, "body": "x" * 9000}]}}
+        gg.register("comment:t/s#454")
+        gg.register("comment:t/s#455")
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.gh.gql_calls()), 1)  # both issues in one query
+        data = gg.read_cache("comment:t/s#454")["data"]
+        self.assertEqual(data["comments"][0]["author"], "github-actions")
+        self.assertEqual(len(data["comments"][0]["body"]), gg.COMMENT_BODY_MAX)
+        self.assertTrue(gg.read_cache("comment:t/s#455")["missing"])
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        self.daemon.tick(NOW + gg.COMMENT_CYCLE)
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+        self.age_watch("comment:t/s#454", gg.TERMINAL_GRACE + 1)  # the wait ended
+        self.age_watch("comment:t/s#455", 1)
+        self.assertEqual(self.daemon.tick(NOW + gg.COMMENT_CYCLE + 1)["watching"], 1)
+
+    def test_an_entry_filled_between_cycles_is_refreshed_on_the_next_one(self) -> None:
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        self.daemon.tick(NOW)  # a cycle with nothing watched still starts the cycle clock
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW + 40)  # filled at once
+        self.daemon.tick(NOW + gg.CYCLE)  # the next cycle, 20 s later, refreshes it
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+        self.assertEqual(gg.read_cache("pr:o/r#1")["fetchedAt"], NOW + gg.CYCLE)
+
+    def test_heartbeat_and_request_counts(self) -> None:
+        self.daemon.tick(NOW)  # nothing watched: the heartbeat is still written
+        self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["at"], NOW)
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["at"], NOW)  # not every tick
+        self.daemon.tick(NOW + gg.HEARTBEAT_EVERY)
+        self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["at"], NOW + gg.HEARTBEAT_EVERY)
+        self.gh.runs[7] = {"id": 7, "status": "in_progress"}
+        gg.register("run:o/r/7")
+        self.daemon.tick(NOW + 100)
+        self.daemon.tick(NOW + 100 + gg.CYCLE)
+        hour = gg.read_json(gg.BASE / "daemon.json")["lastHour"]
+        self.assertEqual(hour, {"rest": 1, "rest304": 1, "graphql": 0})
+        self.gh.runs[7] = {"id": 7, "status": "queued"}
+        self.daemon.tick(NOW + 100 + 3700)
+        self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["lastHour"]["rest304"], 0)  # an hour later
 
 
 class ClientTest(Base):
@@ -347,7 +481,7 @@ class ClientTest(Base):
                                                           "dataAt": at if data else None, "data": data, "error": None, **extra})
 
     def wait(self, kind: str, target: str, until: str = "green", timeout: float = 0.5, fill: tuple | None = None,
-             sha: str | None = None) -> tuple[int, str]:
+             sha: str | None = None, grace: float = gg.RESCUE_GRACE) -> tuple[int, str]:
         """Wait while a stand-in daemon writes `fill` (data, extra) shortly after the wait begins."""
         key = gg.parse_key(kind, target)
         timer = threading.Timer(0.1, lambda: self.put(key, fill[0], **fill[1])) if fill else None
@@ -355,7 +489,7 @@ class ClientTest(Base):
             timer.start()
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-            code = gg.cmd_wait(kind, target, until, timeout, False, False, sha)
+            code = gg.cmd_wait(kind, target, until, timeout, False, False, sha, grace)
         if timer:
             timer.join()
         return code, out.getvalue()
@@ -524,7 +658,194 @@ class ClientTest(Base):
             self.assertEqual(gg.cmd_status("pr", "o/r#1", False, False), 3)
             self.assertEqual(gg.cmd_budget(False), 3)
         self.assertIn("daemon is not running", err.getvalue())
+        self.assertIn("Start it: ", err.getvalue())
         self.assertFalse(gg.watch_dir().exists())  # no interest registered, nothing polled
+
+    def test_hung_daemon_is_reported(self) -> None:
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time() - gg.STALE_HEARTBEAT - 60, "heartbeat": 30})
+        code, text = self.wait("run", "o/r/1", timeout=0.1)
+        self.assertEqual(code, 2)
+        self.assertIn("looks hung", text)
+        self.assertEqual(text.count("looks hung"), 1)  # said once, not every poll
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gg.cmd_budget(False), 3)
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30})
+        self.assertNotIn("looks hung", self.wait("run", "o/r/1", timeout=0.1)[1])
+        # an older daemon, idle, wrote daemon.json only when it last fetched something
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time() - 3 * gg.STALE_HEARTBEAT})
+        self.assertNotIn("looks hung", self.wait("run", "o/r/1", timeout=0.1)[1])
+
+    # -- a glaeda runner refusing a job at setup, then the rescue re-running it
+
+    def run_doc(self, attempt: int, conclusion: str | None, finished: float | None = None) -> dict:
+        finished = time.time() if finished is None else finished
+        return {"status": "completed" if conclusion else "in_progress", "conclusion": conclusion,
+                "run_attempt": attempt, "head_sha": "c" * 40, "updated_at": iso(finished), "html_url": "u"}
+
+    def test_refused_attempt_is_held_then_the_rescue_attempt_decides(self) -> None:
+        refusal = (self.run_doc(1, "failure"), cached(refused(), job("lint", "cancelled", seconds=5)))
+        code, text = self.wait("run", "o/r/1", fill=refusal, timeout=0.4)
+        self.assertEqual(code, 2)  # held, not failed
+        self.assertIn("held: attempt 1 failed only because a glaeda runner refused build at setup", text)
+        self.assertIn("failed: build (step: Set up runner) (refused by cmuxs-mac-mini-3-glaeda-1)", text)
+        # the rescue's attempt 2 lands on Blacksmith and passes
+        self.assertEqual(self.wait("run", "o/r/1", fill=(self.run_doc(2, "success"), {}))[0], 0)
+        # no rescue came within the grace: the failure stands, and says why it waited
+        late = (self.run_doc(1, "failure", time.time() - gg.RESCUE_GRACE - 1), cached(refused()))
+        code, text = self.wait("run", "o/r/1", fill=late)
+        self.assertEqual(code, 1)
+        self.assertIn("no rescue attempt followed within 360s", text)
+        # --rescue-grace 0 rules on each attempt
+        self.assertEqual(self.wait("run", "o/r/1", fill=refusal, grace=0)[0], 1)
+
+    def test_only_a_refusal_on_a_glaeda_runner_is_held(self) -> None:
+        cases = {
+            "a real failure": [job("build")],
+            "a refusal and a real failure": [refused(), job("test")],
+            "setup failed on another runner": [refused(runner="GitHub Actions 12", labels=("ubuntu-latest",))],
+            "setup failed after running a while": [job("build", failed_step="Set up runner", seconds=600)],
+            "an older attempt's jobs": [refused(run_attempt=1)],
+        }
+        for why, jobs in cases.items():
+            attempt = 2 if why == "an older attempt's jobs" else 1
+            code, _ = self.wait("run", "o/r/1", fill=(self.run_doc(attempt, "failure"), cached(*jobs)))
+            self.assertEqual(code, 1, why)
+        self.assertEqual(self.wait("run", "o/r/1", fill=(self.run_doc(1, "failure"), {}))[0], 1)  # jobs unknown
+        # a run the rescue cancelled after the refusal is held as well
+        cancelled = (self.run_doc(1, "cancelled"), cached(refused(), job("test", "cancelled")))
+        self.assertEqual(self.wait("run", "o/r/1", fill=cancelled, timeout=0.3)[0], 2)
+
+    def test_refused_pr_check_holds_its_run(self) -> None:
+        now = time.time()
+
+        def in_run(check: dict, run: int, seconds: int, required: bool = True) -> dict:
+            return {**check, "id": f"CR_{check['name']}", "databaseId": run * 10, "isRequired": required,
+                    "startedAt": iso(now - seconds), "completedAt": iso(now),
+                    "checkSuite": {"conclusion": "FAILURE", "workflowRun": {"databaseId": run, "workflow": {"name": "CI"}}}}
+        build = in_run(check_run("build", conclusion="FAILURE"), 5, 7)
+        status = in_run(check_run("ci-status", conclusion="FAILURE"), 5, 3)
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[build, status]))
+        data["checks"][0]["failedSteps"], data["checks"][1]["failedSteps"] = ["Set up runner"], ["Check results"]
+        self.assertIsNone(gg.verdict("pr", data, "green"))
+        text = gg.summary("pr:o/r#1", {"data": data}, "green")
+        self.assertIn("checks PENDING: 0 passed, 0 failed, 0 pending, 2 held", text)
+        self.assertIn("held: CI / build (step: Set up runner)", text)
+        self.assertEqual(gg.verdict("pr", data, "green", grace=0), 1)
+        self.assertEqual(gg.verdict("pr", data, "green", now=now + gg.RESCUE_GRACE + 1), 1)
+        # a real failure in the same run is not held
+        data["checks"][0]["failedSteps"] = ["Run selected tests"]
+        self.assertEqual(gg.verdict("pr", data, "green"), 1)
+
+    def test_headline_agrees_with_the_verdict(self) -> None:
+        """manaflow-ai/cmux#14667: GitHub's rollup was FAILURE for a Web complexity run cancelled
+        between two passing ones, and the headline printed that next to result: success."""
+        def web(run: int, conclusion: str) -> dict:
+            return {**check_run("Web complexity", conclusion=conclusion), "databaseId": run, "isRequired": True,
+                    "checkSuite": {"conclusion": conclusion, "workflowRun": {"databaseId": run, "workflow": {
+                        "name": "Web complexity", "databaseId": 77}}}}
+        lint = {**check_run("lint", conclusion="CANCELLED"), "isRequired": False}
+        node = pr_node(1, rollup="FAILURE", checks=[web(1, "SUCCESS"), web(2, "CANCELLED"), web(3, "SUCCESS"),
+                                                     {**check_run("build"), "isRequired": True}, lint])
+        node["mergeStateStatus"] = "CLEAN"
+        data = gg.parse_pr(node)
+        self.assertEqual(gg.verdict("pr", data, "done"), 0)
+        text = gg.summary("pr:o/r#1", {"data": data}, "done")
+        self.assertIn("checks SUCCESS: 2 passed, 1 failed, 0 pending (of 3, 2 required); GitHub's rollup says FAILURE", text)
+        self.assertIn("cancelled: lint (not required)", text)
+        self.assertIn("superseded: Web complexity / Web complexity cancelled, replaced by a newer attempt or run", text)
+        self.assertNotIn("checks FAILURE", text)
+        # the headline follows the mode the wait used: green ignores optional checks still running
+        running = gg.parse_pr(pr_node(2, rollup="PENDING", checks=[{**check_run("build"), "isRequired": True},
+                                                                    {**check_run("slow", "IN_PROGRESS", None)}]))
+        self.assertIn("checks SUCCESS", gg.summary("pr:o/r#2", {"data": running}, "green"))
+        self.assertIn("checks PENDING", gg.summary("pr:o/r#2", {"data": running}, "done"))
+
+    # -- comments
+
+    def comments(self, *items: tuple[int, str, str, float]) -> dict:
+        return {"url": "https://github.com/t/s/issues/454", "state": "OPEN", "type": "Issue", "total": len(items),
+                "comments": [{"id": i, "author": a, "body": b, "createdAt": iso(t), "url": f"u{i}"}
+                             for i, a, b, t in items]}
+
+    def wait_comment(self, fill: dict | None = None, timeout: float = 0.5, **kw) -> tuple[int, str]:
+        key = "comment:t/s#454"
+        timer = threading.Timer(0.1, lambda: self.put(key, fill)) if fill else None
+        if timer:
+            timer.start()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            code = gg.cmd_wait_comment("t/s#454", timeout, False, **kw)
+        if timer:
+            timer.join()
+        return code, out.getvalue()
+
+    def test_wait_comment(self) -> None:
+        now = time.time()
+        receipt = "callsign-receipt/v0\nstatus: accepted\nrequest-comment: https://github.com/t/s/issues/454#issuecomment-100"
+        old = (100, "someone", "/callsign reserve Quill", now - 600)
+        old_receipt = (101, "github-actions", receipt, now - 590)
+        # by default only comments after the wait began count
+        self.put("comment:t/s#454", self.comments(old, old_receipt))
+        code, text = self.wait_comment(timeout=0.3, author="github-actions[bot]")
+        self.assertEqual(code, 2)
+        self.assertIn("0 comments since the wait began, none matched; to include a reply posted before", text)
+        # --since the request comment's URL finds the receipt that came before the wait
+        code, text = self.wait_comment(timeout=0.3, author="github-actions[bot]", match=r"issuecomment-100\b",
+                                       since="https://github.com/t/s/issues/454#issuecomment-100")
+        self.assertEqual(code, 0)
+        self.assertIn("comment 101 by github-actions", text)
+        self.assertIn("  status: accepted", text)
+        self.assertEqual(self.wait_comment(timeout=0.3, since="10m", author="github-actions")[0], 0)
+        self.assertEqual(self.wait_comment(timeout=0.3, since="101")[0], 2)
+        self.assertEqual(self.wait_comment(timeout=0.3, since="5m", author="github-actions")[0], 2)
+        # a reply that arrives while waiting
+        reply = (102, "github-actions", receipt.replace("100", "102"), time.time() + 1)
+        code, _ = self.wait_comment(self.comments(old, old_receipt, reply), author="github-actions[bot]",
+                                    match="issuecomment-102")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.wait_comment(self.comments(reply), timeout=0.3, author="someone")[0], 2)
+        with self.assertRaises(gg.WatchError):
+            self.wait_comment(match="(")
+        with self.assertRaises(gg.WatchError):
+            gg.parse_since("yesterday", now)
+        self.assertEqual(gg.parse_since("2026-09-25T18:00:00Z", now), (None, gg.iso_epoch("2026-09-25T18:00:00Z")))
+        self.assertEqual(gg.parse_since(None, now), (None, now))
+
+    def test_wait_comment_on_a_missing_issue_fails(self) -> None:
+        key = "comment:t/s#454"
+        timer = threading.Timer(0.1, lambda: self.put(key, None, error="Could not resolve", missing=True))
+        timer.start()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.cmd_wait_comment("t/s#454", 0.5, False), 1)
+        timer.join()
+
+    # -- --sha
+
+    def test_sha_is_validated_and_resolved(self) -> None:
+        green = gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")]))  # head is aaaa...
+        for bad in ("xyz1234", "abc", "a" * 41):
+            with self.assertRaises(gg.WatchError):
+                gg.resolve_sha(bad)
+        saved = gg.git_rev_parse
+        try:
+            gg.git_rev_parse = lambda prefix: None  # not a commit in this checkout
+            with self.assertRaisesRegex(gg.WatchError, "not the head GitHub shows \\(aaaaaaaaaaaa\\)"):
+                self.wait("pr", "o/r#1", fill=(green, {}), sha="abcdef1")
+            self.assertEqual(self.wait("pr", "o/r#1", fill=(green, {}), sha="AAAAAAA")[0], 0)
+            gg.git_rev_parse = lambda prefix: prefix + "0" * (40 - len(prefix))  # a local commit not pushed yet
+            self.assertEqual(self.wait("pr", "o/r#1", fill=(green, {}), sha="bbbbbbb", timeout=0.3)[0], 2)
+        finally:
+            gg.git_rev_parse = saved
+        self.assertEqual(self.wait("pr", "o/r#1", fill=(green, {}), sha="b" * 40, timeout=0.3)[0], 2)  # pending
+        with self.assertRaisesRegex(gg.WatchError, "a run's commit never changes"):
+            self.wait("run", "o/r/2", fill=(self.run_doc(1, "success"), {}), sha="d" * 40)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.main(["wait", "pr", "o/r#1", "--sha", "HEAD"]), 64)
+            self.assertEqual(gg.main(["wait", "comment", "o/r#1", "--sha", "a" * 40]), 64)
+            self.assertEqual(gg.main(["wait", "pr", "o/r#1", "--author", "x"]), 64)
+            self.assertEqual(gg.main(["wait", "run", "o/r/1", "--rescue-grace", "-1"]), 64)
+        self.assertIn("--sha must be a commit id", err.getvalue())
 
 
 if __name__ == "__main__":
