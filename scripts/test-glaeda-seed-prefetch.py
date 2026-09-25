@@ -124,6 +124,17 @@ class SeedPrefetchTest(unittest.TestCase):
         self.assertEqual(sp.run(True, self.state)["state"], "current")
         self.assertEqual(len(self.call_lines()), 3)
 
+    def test_a_broken_mirror_is_rebuilt_on_the_next_run(self):
+        self.record(self.state)
+        sp.run(True, self.state)
+        # A fetch killed mid-way leaves a lock that makes every later fetch fail.
+        (self.state / ".prefetch/cmux.git/shallow.lock").write_text("")
+        self.commit()
+        failed = sp.run(True, self.state)
+        self.assertEqual(failed["state"], "error")
+        self.assertIn("shallow.lock", failed["reason"])
+        self.assertEqual(sp.run(True, self.state)["state"], "applied")
+
     def test_a_failed_prefetch_is_reported_and_retried(self):
         self.record(self.state)
         (self.repo / "scripts/ci/seed_derived_data.py").write_text("import sys\nsys.exit('boom')\n")

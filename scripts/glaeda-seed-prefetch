@@ -33,6 +33,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -109,6 +110,9 @@ def scripts_for(work: Path, mirror: Path, head: str) -> Path:
                                  check=True, capture_output=True, timeout=FETCH_TIMEOUT).stdout
         subprocess.run(["tar", "-x", "-C", os.fspath(incoming)], input=archive, check=True, timeout=60)
         incoming.rename(target)
+    for leftover in work.glob(".scripts-*"):  # an extraction that failed part way
+        if not leftover.name.endswith(f".{os.getpid()}"):
+            shutil.rmtree(leftover, ignore_errors=True)
     old = sorted((p for p in work.glob("scripts-*") if p != target), key=lambda p: p.stat().st_mtime, reverse=True)
     for stale in old[KEEP_SCRIPTS - 1:]:
         shutil.rmtree(stale, ignore_errors=True)
@@ -121,12 +125,20 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path) -> dict:
     env["CMUX_SEED_GIT_DIR"] = os.fspath(mirror)
     env["CI_CACHE_R2_PUBLIC_URL"] = BUCKET_URL
     env["PATH"] = f"{TOOL_PATH}:{env.get('PATH', '/usr/bin:/bin')}"
+    # Its own process group, so a timeout also stops the downloads r2-cache.sh started.
+    child = subprocess.Popen([sys.executable, os.fspath(scripts / "scripts/ci/seed_derived_data.py"), "prefetch",
+                              os.fspath(store), head], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             env=env, start_new_session=True)
     try:
-        out = subprocess.run([sys.executable, os.fspath(scripts / "scripts/ci/seed_derived_data.py"), "prefetch",
-                              os.fspath(store), head], capture_output=True, text=True, timeout=PREFETCH_TIMEOUT,
-                             env=env)
+        stdout, stderr = child.communicate(timeout=PREFETCH_TIMEOUT)
     except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        child.communicate()
         return {"fetched": "false", "reason": f"timed out after {PREFETCH_TIMEOUT} s"}
+    out = subprocess.CompletedProcess(child.args, child.returncode, stdout, stderr)
     lines = [line for line in out.stdout.splitlines() if line.startswith("{")]
     if out.returncode != 0 or not lines:
         return {"fetched": "false", "reason": f"exit {out.returncode}: {(out.stderr or out.stdout).strip()[-200:]}"}
@@ -156,7 +168,13 @@ def run(apply: bool, state: Path = STATE) -> dict:
         try:
             mirror, head = main_head(work)
         except (OSError, subprocess.SubprocessError) as error:
-            return {**record, "state": "error", "reason": f"git fetch: {type(error).__name__}"}
+            # A git killed by the timeout can leave shallow.lock or a ref lock behind, and every later
+            # fetch would then fail. The mirror is small and cheap to rebuild: start over next run.
+            shutil.rmtree(work / "cmux.git", ignore_errors=True)
+            detail = getattr(error, "stderr", "") or ""
+            if isinstance(detail, bytes):
+                detail = detail.decode(errors="replace")
+            return {**record, "state": "error", "reason": f"git fetch: {type(error).__name__} {detail.strip()[-200:]}"}
         record["head"] = head
         done_path = work / "done.json"
         try:
