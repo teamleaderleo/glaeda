@@ -81,6 +81,22 @@ Signed index entries (#1134 M3, `src/sign.rs`):
   (`instance`);
   `scripts/fleet-cas-marker.sh REPO COMMIT` tells a worker whether the store holds a
   commit for its Xcode build.
+- `fleet-cas warm URL NAME --trusted-keys HEX --store DIR` copies a whole fill into a
+  node's store before a build (`src/warm.rs`). The writer node appends every index key its
+  builds look up or write to `fill-keys.log` in its store; the writer script stores the keys
+  its build added as a CAS object (the manifest) and names it in the signed marker. `warm`
+  fetches the listed entries with 32 calls in flight and the objects they reach in two
+  closure streams at a time, checking every signature and ID. Without it, a remote-hit catch-up build
+  pays two fleet-store round trips per lookup, mostly one at a time: the 09-25 pair test
+  (7837 lookups, 100% hits) took 1631 s at about 336 ms per lookup against a loaded store.
+  Entries are written only after the objects they reach, so a warm that stops early never
+  leaves the node slower than no warm (a node answers a local entry without prefetching).
+  One deadline covers the whole warm (`--timeout`, 150 s).
+  `scripts/fleet-cas-warm.sh REPO COMMIT` runs it with the node's settings, as the node's
+  user: exit 0 warmed, 1 no marker or a marker without a manifest, 2 something did not
+  verify, 3 incomplete (store unreachable, busy, failing or too slow).
+  `up_prefetch_micros` and `up_slow_calls` (calls over 100 ms) in a node's stats separate
+  a slow store from serial round trips.
 
 Garbage collection (`src/gc.rs`): a fleet store bumps an index entry's mtime when a read
 uses it (at most hourly), and `fleet-cas gc STORE --keep-days N [--dry-run]` keeps the

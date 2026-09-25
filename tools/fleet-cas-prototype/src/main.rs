@@ -41,6 +41,7 @@ pub mod fleet {
 }
 mod gc;
 mod sign;
+mod warm;
 
 #[derive(Default)]
 struct Stats {
@@ -91,6 +92,10 @@ struct Stats {
     up_prefetch_calls: AtomicU64,
     up_prefetched: AtomicU64,
     up_prefetch_bytes: AtomicU64,
+    /// Time spent in closure prefetches (also in up_micros), and fleet-store
+    /// calls slower than 100 ms, to tell a slow store from serial round trips.
+    up_prefetch_micros: AtomicU64,
+    up_slow_calls: AtomicU64,
 }
 
 impl Stats {
@@ -128,6 +133,8 @@ impl Stats {
             ("up_prefetch_calls", &self.up_prefetch_calls),
             ("up_prefetched", &self.up_prefetched),
             ("up_prefetch_bytes", &self.up_prefetch_bytes),
+            ("up_prefetch_micros", &self.up_prefetch_micros),
+            ("up_slow_calls", &self.up_slow_calls),
         ];
         let body: Vec<String> = fields
             .iter()
@@ -140,10 +147,17 @@ impl Stats {
     async fn upstream<T>(&self, f: impl std::future::Future<Output = T>) -> T {
         let t = Instant::now();
         let r = f.await;
-        self.up_calls.fetch_add(1, Relaxed);
-        self.up_micros
-            .fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+        self.record_call(t);
         r
+    }
+
+    fn record_call(&self, t: Instant) {
+        let micros = t.elapsed().as_micros() as u64;
+        self.up_calls.fetch_add(1, Relaxed);
+        self.up_micros.fetch_add(micros, Relaxed);
+        if micros > 100_000 {
+            self.up_slow_calls.fetch_add(1, Relaxed);
+        }
     }
 }
 
@@ -179,6 +193,23 @@ struct Store {
     /// Unix millis until which fleet-store calls are skipped after a failure.
     upstream_down_until: AtomicU64,
     stats: Stats,
+    /// The writer's node only: every index key its builds look up or write,
+    /// one hex key per line. `fleet-cas-writer-build.sh` turns the lines a
+    /// fill added into the marker's manifest, which `fleet-cas warm` reads.
+    key_log: Option<std::sync::Mutex<std::fs::File>>,
+}
+
+/// The writer node's key log, in its store directory.
+const KEY_LOG: &str = "fill-keys.log";
+
+/// Open the key log for appending, starting it over past 64 MiB (a fill adds
+/// about 1 MiB; the writer script reads only what its build appended).
+fn open_key_log(root: &Path) -> std::io::Result<std::fs::File> {
+    let path = root.join(KEY_LOG);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 64 << 20) {
+        std::fs::remove_file(&path)?;
+    }
+    std::fs::File::options().create(true).append(true).open(path)
 }
 
 const UPSTREAM_BACKOFF_MS: u64 = 30_000;
@@ -324,6 +355,18 @@ fn publish_new(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
 }
 
 impl Store {
+    /// Record a key a build used (writer node only). One write per line, so
+    /// concurrent lookups never interleave within a line.
+    fn log_key(&self, key: &[u8]) {
+        if let Some(log) = &self.key_log {
+            use std::io::Write;
+            let line = format!("{}\n", hex::encode(key));
+            if let Ok(mut f) = log.lock() {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+    }
+
     /// Refuse a write from a TCP peer that is not an allowed writer.
     fn check_writer<T>(&self, r: &Request<T>) -> Result<(), Status> {
         let Some(allowed) = &self.writers else {
@@ -633,9 +676,9 @@ impl Store {
                 self.stats.up_prefetch_bytes.fetch_add(len, Relaxed);
             }
         }
-        self.stats.up_calls.fetch_add(1, Relaxed);
+        self.stats.record_call(t);
         self.stats
-            .up_micros
+            .up_prefetch_micros
             .fetch_add(t.elapsed().as_micros() as u64, Relaxed);
     }
 
@@ -779,6 +822,7 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
                             gc::touch_if_stale(&path);
                         }
                         s.stats.kv_get_hit.fetch_add(1, Relaxed);
+                        s.log_key(&key);
                         return Ok(answer(value));
                     }
                     replace = true;
@@ -812,6 +856,7 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
             return Ok(kv_response(None));
         }
         s.stats.up_kv_fetch.fetch_add(1, Relaxed);
+        s.log_key(&key);
         s.prefetch(&value).await;
         // Keep it: the next lookup on this node is local.
         let bytes = value.encode_to_vec();
@@ -914,6 +959,7 @@ impl Store {
                 }
             }
         }
+        s.log_key(&req.key);
         Ok(Response::new(kv::PutValueResponse { error: None }))
     }
 }
@@ -981,10 +1027,18 @@ const USAGE: &str = "usage: fleet-cas <socket | tcp:ADDR> <store> [--read-only-k
        fleet-cas gc STORE --keep-days N [--dry-run]
                                     on a fleet store: delete index entries unused for N days
                                     and objects no kept entry reaches (objects under a day old stay)
-       fleet-cas marker put http://HOST:PORT NAME --sign-key PATH [--entry K=V]...
+       fleet-cas marker put http://HOST:PORT NAME --sign-key PATH [--entry K=V]... [--manifest FILE]
        fleet-cas marker get http://HOST:PORT NAME --trusted-keys HEX,HEX
                                     exit 0 and print the entries if the marker exists and verifies,
-                                    1 if it is absent, 2 if it does not verify or on error";
+                                    1 if it is absent, 2 if it does not verify or on error
+       fleet-cas warm http://HOST:PORT NAME --trusted-keys HEX,HEX --store DIR [--jobs N] [--timeout S]
+                                    copy every index entry the marker's manifest lists, and the
+                                    objects they reach, into a node store (DIR) before a build:
+                                    exit 0 when warmed, 1 if the marker is absent or has no
+                                    manifest, 2 if something does not verify, 3 if incomplete";
+
+/// The marker entry naming the fill's manifest (see `warm.rs`).
+const MANIFEST_ENTRY: &str = "manifest";
 
 /// Per-commit markers: small signed index entries under their own key prefix,
 /// written by the trusted writer after a complete fill and checked by workers
@@ -996,6 +1050,7 @@ async fn marker(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std::
     let mut sign_key = None;
     let mut trusted = None;
     let mut value = kv::Value::default();
+    let mut manifest = None;
     let mut rest = args[3..].iter();
     while let Some(a) = rest.next() {
         let v = rest.next().ok_or(USAGE)?;
@@ -1007,8 +1062,12 @@ async fn marker(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std::
                 if k == sign::SIG_ENTRY {
                     return Err("reserved entry name".into());
                 }
+                if k == MANIFEST_ENTRY {
+                    return Err("use --manifest FILE for the manifest entry".into());
+                }
                 value.entries.insert(k.into(), val.as_bytes().to_vec());
             }
+            "--manifest" => manifest = Some(PathBuf::from(v)),
             _ => return Err(USAGE.into()),
         }
     }
@@ -1017,11 +1076,29 @@ async fn marker(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std::
         .timeout(std::time::Duration::from_secs(10))
         .connect()
         .await?;
-    let mut client = kv::key_value_db_client::KeyValueDbClient::new(ch);
+    let mut client = kv::key_value_db_client::KeyValueDbClient::new(ch.clone());
     let key = sign::marker_key(name);
     match op.as_str() {
         "put" => {
             let sk = sign_key.ok_or("marker put needs --sign-key")?;
+            if let Some(path) = manifest {
+                // The manifest is a CAS object, named in the signed marker by
+                // its raw 32-byte ID: the signature covers it, and gc keeps it
+                // as long as the marker (an embedded ID of a kept entry).
+                let data = std::fs::read(&path)?;
+                warm::parse_manifest(&data)?;
+                let id = object_id(&[], &data);
+                let resp = cas::casdb_service_client::CasdbServiceClient::new(ch.clone())
+                    .max_encoding_message_size(512 << 20)
+                    .put(cas::CasPutRequest { data: Some(data_object(Vec::new(), data)) })
+                    .await?
+                    .into_inner();
+                match resp.contents {
+                    Some(cas::cas_put_response::Contents::CasId(c)) if c.id == id => {}
+                    _ => return Err("the store did not keep the manifest".into()),
+                }
+                value.entries.insert(MANIFEST_ENTRY.into(), id);
+            }
             sign::sign(&sk, &key, &mut value);
             let resp = client
                 .put_value(kv::PutValueRequest { key, value: Some(value) })
@@ -1046,7 +1123,11 @@ async fn marker(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std::
             let mut entries: Vec<_> = sign::strip(v).entries.into_iter().collect();
             entries.sort();
             for (k, val) in entries {
-                println!("{k}={}", String::from_utf8_lossy(&val));
+                if k == MANIFEST_ENTRY {
+                    println!("{k}={}", hex::encode(&val));
+                } else {
+                    println!("{k}={}", String::from_utf8_lossy(&val));
+                }
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
@@ -1097,6 +1178,12 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
                 r.kv_kept, r.kv_deleted, r.cas_kept, r.cas_deleted, r.bytes_deleted, r.kv_no_roots
             );
             return Ok(std::process::ExitCode::SUCCESS);
+        }
+        Some("warm") => {
+            return Ok(warm::run(&args[1..]).await.unwrap_or_else(|e| {
+                eprintln!("fleet-cas warm: {e}");
+                std::process::ExitCode::from(2)
+            }));
         }
         Some("marker") => {
             // Errors are exit 2, so a caller can tell them from "absent" (1).
@@ -1157,6 +1244,10 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
         }
     }
     std::fs::create_dir_all(&root)?;
+    let key_log = match &sign_key {
+        Some(_) => Some(std::sync::Mutex::new(open_key_log(&root)?)),
+        None => None,
+    };
 
     let upstream = match &upstream_url {
         Some(url) => {
@@ -1198,6 +1289,7 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
             instance: AtomicU64::new(now_ms() ^ u64::from(std::process::id()) << 44),
             ..Stats::default()
         },
+        key_log,
     });
 
     let stats_store = store.clone();

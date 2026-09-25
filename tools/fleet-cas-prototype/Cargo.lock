@@ -264,6 +264,7 @@ version = "0.0.1"
 dependencies = [
  "ed25519-dalek",
  "hex",
+ "hyper-util",
  "prost",
  "protox",
  "sha2",
@@ -272,6 +273,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower",
 ]
 
 [[package]]

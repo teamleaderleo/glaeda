@@ -20,6 +20,10 @@
 # could otherwise be answered from it and never uploaded again (not observed;
 # how Xcode orders local and remote lookups is unverified). The writer's node
 # store keeps the writer's own builds fast.
+# The marker also names the fill's manifest: every index key the build looked
+# up or wrote, from the lines the writer node appended to its key log during
+# the build. Readers pass it to `fleet-cas warm` (fleet-cas-warm.sh) to copy
+# the whole commit into their node before building.
 set -u
 repo=${1:?usage: fleet-cas-writer-build.sh REPO COMMIT -- CMD...}
 commit=${2:?usage: fleet-cas-writer-build.sh REPO COMMIT -- CMD...}
@@ -49,6 +53,8 @@ xcode=$(xcodebuild -version | awk '/Build version/ {print $3}')
 [ -n "$xcode" ] || { echo "no Xcode build version" >&2; exit 2; }
 "$ROOT/bin/fleet-cas-settings.sh" "$ROOT/fleet-cas.sock" >/dev/null || exit 3
 rm -rf "$ROOT/cas"
+keylog=$ROOT/node-store/fill-keys.log
+k0=$( { wc -c <"$keylog"; } 2>/dev/null | tr -d ' ')
 i0=$(instance) f0=$(failures) a0=$(activity)
 [ -n "$i0" ] && [ -n "$f0" ] && [ -n "$a0" ] || { echo "cannot read $stats" >&2; exit 3; }
 "$@"
@@ -74,7 +80,20 @@ if [ "$a1" = "$a0" ]; then
   echo "fleet-cas: the build never used the node (plugin settings missing?); no marker for $repo/$commit" >&2
   exit 4
 fi
+# The keys this build used. A node without a key log (older than warm) gives
+# a marker without a manifest: readers can still check it, not warm from it.
+manifest=()
+if [ -n "$k0" ]; then
+  list=$ROOT/fill-manifest.$$
+  tail -c +"$((k0 + 1))" "$keylog" | sort -u >"$list" || exit 4
+  trap 'rm -f "$list"' EXIT
+  [ -s "$list" ] || { echo "fleet-cas: the key log gained nothing during the build; no marker for $repo/$commit" >&2; exit 4; }
+  manifest=(--manifest "$list")
+  echo "fleet-cas: manifest of $(wc -l <"$list" | tr -d ' ') keys"
+else
+  echo "fleet-cas: no key log at $keylog (node predates warm); marker without a manifest" >&2
+fi
 "$ROOT/bin/fleet-cas" marker put "http://$store" "$repo/$commit/$xcode" --sign-key "$key" \
   --entry "repo=$repo" --entry "commit=$commit" --entry "xcode=$xcode" \
-  --entry "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" || exit 4
+  --entry "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" ${manifest[@]+"${manifest[@]}"} || exit 4
 echo "fleet-cas: marker $repo/$commit/$xcode"
