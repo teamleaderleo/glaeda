@@ -1246,11 +1246,19 @@ THERMAL_EVERY = 6  # pmset -g therm every Nth sample
 PS = "/bin/ps"
 SYSCTL = "/usr/sbin/sysctl"
 PMSET = "/usr/bin/pmset"
+IOSTAT = "/usr/sbin/iostat"
 TOP_OUTSIDE = 5
 # Contended: work outside this mini's runner jobs averaged at least this many cores (or this share of the
 # cores), or the load average stayed well above the core count. Either one slows a compile's every file.
 CONTENDED_OUTSIDE_CORES = 2.0
 CONTENDED_OUTSIDE_SHARE = 0.15
+# Processes in uninterruptible wait (ps state U, nearly always disk) count toward the load average but use no
+# CPU; this many on average means the job was waiting on I/O, which the CPU buckets cannot show.
+CONTENDED_BLOCKED = 2.0
+# A saturated host is contention only when someone besides this job holds a real share of it.
+CONTENDED_BUSY_PCT = 90.0
+CONTENDED_SHARED_SHARE = 0.25
+CONTENDED_BLOCKED_SHARE = 0.25
 RUNNER_DIR_RE = re.compile(r"/(actions-runner[A-Za-z0-9_.-]*)/")
 
 
@@ -1333,6 +1341,43 @@ def load_average() -> float | None:
     return float(nums[0]) if nums else None
 
 
+def run_queue() -> tuple[int, int] | None:
+    """(running, blocked): processes in ps state R and in uninterruptible wait (U, or D on Linux)."""
+    try:
+        out = subprocess.run([PS, "-Ao", "stat="], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                             timeout=10, check=False, env={"LC_ALL": "C"}).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    states = [line.strip()[:1] for line in out.splitlines() if line.strip()]
+    if not states:
+        return None
+    return sum(s == "R" for s in states), sum(s in ("U", "D") for s in states)
+
+
+def host_io() -> tuple[float | None, float | None]:
+    """(disk MB/s summed over every disk, host CPU busy %) over one second: the second iostat report, since
+    the first counts from boot. Busy % is the ground truth for saturation: ps %cpu is a decaying average that
+    misses the short-lived compiler processes a build is made of."""
+    try:
+        out = subprocess.run([IOSTAT, "-d", "-C", "-K", "-n", "16", "-c", "2", "-w", "1"],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10, check=False,
+                             env={"LC_ALL": "C"}).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    lines = [l.split() for l in out.splitlines() if l.strip()]
+    if len(lines) < 4 or "MB/s" not in lines[1]:
+        return None, None
+    header, last = lines[1], lines[-1]
+    if len(last) != len(header):
+        return None, None
+    try:
+        disk = round(sum(float(last[i]) for i, name in enumerate(header) if name == "MB/s"), 2)
+        busy = float(100 - int(last[header.index("id")])) if "id" in header else None
+    except (ValueError, IndexError):
+        return None, None
+    return disk, busy
+
+
 def thermal_limited() -> bool | None:
     """True when pmset reports a CPU speed limit under 100 or a recorded thermal/performance warning."""
     try:
@@ -1361,10 +1406,30 @@ class JobSamples:
         self.outside_by: dict[str, float] = {}
         self.runners_by: dict[str, float] = {}
         self.thermal: bool | None = None
+        self.queues = 0
+        self.running = self.blocked = 0.0
+        self.blocked_max = 0
+        self.disks = 0
+        self.disk_sum = self.disk_max = 0.0
+        self.busies = 0
+        self.busy_sum = 0.0
 
     def add(self, load: float | None, split: tuple[float, float, float, dict[str, float], dict[str, float]],
-            interval: float) -> None:
+            interval: float, queue: tuple[int, int] | None = None, disk: float | None = None,
+            busy: float | None = None) -> None:
         job, others, outside, by_outside, by_runner = split
+        if queue is not None:
+            self.queues += 1
+            self.running += queue[0]
+            self.blocked += queue[1]
+            self.blocked_max = max(self.blocked_max, queue[1])
+        if disk is not None:
+            self.disks += 1
+            self.disk_sum += disk
+            self.disk_max = max(self.disk_max, disk)
+        if busy is not None:
+            self.busies += 1
+            self.busy_sum += busy
         self.samples += 1
         if load is not None:
             self.loads += 1
@@ -1386,6 +1451,16 @@ class JobSamples:
         if self.samples and outside_mean >= max(CONTENDED_OUTSIDE_CORES, CONTENDED_OUTSIDE_SHARE * self.ncpu):
             top = max(self.outside_by, key=self.outside_by.get) if self.outside_by else "unknown"
             reasons.append(f"outside processes averaged {outside_mean:.1f} cores (top: {top})")
+        busy_mean = self.busy_sum / self.busies if self.busies else None
+        shared = self.others / n + outside_mean
+        if (busy_mean is not None and busy_mean >= CONTENDED_BUSY_PCT
+                and shared >= CONTENDED_SHARED_SHARE * self.ncpu):
+            reasons.append(f"host CPU {busy_mean:.0f}% busy while other runner jobs and outside processes "
+                           f"used {shared:.1f} of {self.ncpu} cores")
+        blocked_mean = self.blocked / self.queues if self.queues else None
+        if blocked_mean is not None and blocked_mean >= max(CONTENDED_BLOCKED, CONTENDED_BLOCKED_SHARE * self.ncpu):
+            disk = f", disks {self.disk_sum / self.disks:.0f} MB/s" if self.disks else ""
+            reasons.append(f"{blocked_mean:.1f} processes on average waited on I/O{disk}")
         if self.thermal:
             reasons.append("thermal or performance limit reported")
         top_outside = sorted(self.outside_by.items(), key=lambda kv: -kv[1])[:TOP_OUTSIDE]
@@ -1396,6 +1471,12 @@ class JobSamples:
             "load": {"mean": None if load_mean is None else round(load_mean, 2), "max": round(self.load_max, 2)},
             "cores": {"job": round(self.job / n, 2), "other_runner_jobs": round(self.others / n, 2),
                       "outside": round(outside_mean, 2)},
+            "queue": None if not self.queues else {
+                "running": round(self.running / self.queues, 1),
+                "blocked": round(self.blocked / self.queues, 1), "blocked_max": self.blocked_max},
+            "cpu_busy_pct": None if busy_mean is None else round(busy_mean, 1),
+            "disk_mb_s": None if not self.disks else {
+                "mean": round(self.disk_sum / self.disks, 1), "max": round(self.disk_max, 1)},
             "top_outside": [{"process": k, "core_seconds": round(v)} for k, v in top_outside],
             "other_runner_jobs": [{"runner": k, "core_seconds": round(v)}
                                   for k, v in sorted(self.runners_by.items(), key=lambda kv: -kv[1])[:8]],
@@ -1464,7 +1545,7 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
             try:
                 rows = ps_rows()
                 skip = {os.getpid()} | {pid for pid, ppid, _, _, _ in rows if ppid == os.getpid()}
-                samples.add(load_average(), classify(rows, watch_pid, skip), interval)
+                samples.add(load_average(), classify(rows, watch_pid, skip), interval, run_queue(), *host_io())
                 if tick % THERMAL_EVERY == 0:
                     limited = thermal_limited()
                     if limited is not None:
