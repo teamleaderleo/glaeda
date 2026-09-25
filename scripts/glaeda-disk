@@ -295,7 +295,13 @@ def process_evidence() -> tuple[list[str], str]:
         raise NoEvidence(f"ps: {e}") from e
     if ps.returncode != 0 or not ps.stdout.strip():
         raise NoEvidence(f"ps failed (exit {ps.returncode})")
-    return opened, ps.stdout
+    return opened, command_text(ps.stdout)
+
+
+def command_text(ps_output: str) -> str:
+    """Command lines with repeated slashes collapsed: $TMPDIR ends in a slash, so a script's
+    "$TMPDIR/x" reads .../T//x, which would not match the path it names."""
+    return re.sub(r"/{2,}", "/", ps_output)
 
 
 def spellings(path: str) -> list[str]:
@@ -789,15 +795,6 @@ def _search(fam: Family, budget: int = 20000) -> list[Path]:
     return found
 
 
-def private_to(path: Path, uid: int) -> bool:
-    """A directory only uid can write or list (a macOS $TMPDIR is 0700)."""
-    try:
-        st = path.lstat()
-    except OSError:
-        return False
-    return stat.S_ISDIR(st.st_mode) and st.st_uid == uid and not st.st_mode & 0o077
-
-
 def candidates(fam: Family) -> list[Path]:
     if fam.match:
         level = _search(fam)
@@ -810,8 +807,6 @@ def candidates(fam: Family) -> list[Path]:
                      and (e.is_dir(follow_symlinks=False)
                           or (fam.files and e.is_file(follow_symlinks=False)))]
     uid = os.getuid()
-    if fam.depth == 1 and not fam.match and private_to(fam.root, uid):
-        return level  # nobody else can create entries in it, so skip one lstat per entry
     owned = []
     for p in level:
         try:

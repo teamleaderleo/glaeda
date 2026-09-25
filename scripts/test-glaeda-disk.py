@@ -54,6 +54,11 @@ class GlaedaDiskTest(unittest.TestCase):
         make(self.root / "new", age_hours=1)
         self.assertEqual(self.verdicts(), {"old": "reclaimable", "new": "recent"})
 
+    def test_tmpdir_double_slash_still_names_the_path(self) -> None:
+        cmds = gd.command_text("bash /var/folders/px/abc/T//work/build.sh\n")
+        self.assertTrue(gd.named_by("/private/var/folders/px/abc/T/work", cmds))
+        self.assertFalse(gd.named_by("/private/var/folders/px/abc/T/wor", cmds))
+
     def test_process_cwd_and_command_line_veto(self) -> None:
         a, b = make(self.root / "a"), make(self.root / "b")
         make(self.root / "a-sibling")
