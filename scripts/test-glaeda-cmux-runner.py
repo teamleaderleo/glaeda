@@ -3311,6 +3311,26 @@ class JobTelemetryTest(unittest.TestCase):
         [record] = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual((record["roots"], record["gui"], "roots_admitted" in record), (["root-1"], False, False))
 
+    def test_roots_released_after_the_pid_file_goes_are_not_read_as_empty(self) -> None:
+        # finish_sampler removes the pid file, then job-completed removes .roots while the worker still lives
+        watched = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(lambda: (watched.kill(), watched.wait()))
+        state = self.dir / "state"
+        log = self.dir / "jobs.jsonl"
+        state.mkdir()
+        self.hook.roots_file(state).write_text("root-1\n")
+        self.hook.start_sampler(watched.pid, state, {"job": "x", "roots": ["root-1"]}, log, interval=0.2)
+        deadline = time.monotonic() + 10
+        while not self.hook.sampler_file(state).exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.3)
+        self.hook.sampler_file(state).unlink()
+        self.hook.roots_file(state).unlink()
+        while (not log.exists() or not log.read_text()) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        [record] = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual((record["roots"], "roots_admitted" in record), (["root-1"], False))
+
     def test_completed_line_has_event_and_final_roots(self) -> None:
         watched = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         self.addCleanup(lambda: (watched.kill(), watched.wait()))
@@ -3324,7 +3344,7 @@ class JobTelemetryTest(unittest.TestCase):
         while not self.hook.sampler_file(state).exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         self.hook.roots_file(state).write_text("root-2\n")  # take-root --switch mid-job
-        time.sleep(0.4)
+        time.sleep(2.5)  # a sample takes about a second; the switch is read on the next pass while the job is ours
         self.assertEqual(self.hook.finish_sampler(state), "job telemetry recorded")
         [record] = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual((record["event"], record["roots"], record["roots_admitted"], record["decision"]),

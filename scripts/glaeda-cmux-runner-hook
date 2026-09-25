@@ -1949,17 +1949,22 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
             tick += 1
             stop_at = sampled_at + interval  # a sample takes about a second; keep the period at interval
             finished = False
+            def still_ours():
+                try:
+                    return pid_file.read_text().strip() == me
+                except OSError:
+                    return False
             while True:  # check at least once, even when the sample outlasted the interval
+                ours = still_ours()
                 try:  # take-root/--switch and take-gui change these mid-job
+                    # a reading counts only if our pid file is still in place on both sides of it: finish_sampler
+                    # removes that file before job-completed removes .roots and .gui, which a slow sample can
+                    # otherwise read as empty while the Runner.Worker is still alive
                     seen = (held_roots(state_dir), gui_file(state_dir).exists())
-                    if pid_alive(watch_pid):
+                    if ours and still_ours() and pid_alive(watch_pid):
                         holdings = seen
                 except Exception:  # noqa: BLE001
                     pass
-                try:
-                    ours = pid_file.read_text().strip() == me
-                except OSError:
-                    ours = False
                 if not ours or not pid_alive(watch_pid) or time.monotonic() >= deadline:
                     finished = True
                     break
