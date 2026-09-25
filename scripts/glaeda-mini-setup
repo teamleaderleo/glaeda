@@ -28,7 +28,9 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-worktree-reclaim       built from src/bin/glaeda-worktree-reclaim.rs
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
     ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
-    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune}.plist
+    ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
+    ~/.config/glaeda/update.json               its release ring, written once (--ota-ring canary|stable)
+    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,update}.plist
     build-host directories and three git defaults, each set only when unset
     python@3.13 from Homebrew, only when no Python 3.13+ exists and this user owns Homebrew
 
@@ -37,16 +39,17 @@ enroll does and is not ready without it, so a missing interpreter shows up here,
 into enrollment. When Homebrew belongs to another account, the fix is printed instead.
 
 --hygiene-only is for machines that are not fleet build hosts, such as personal MacBooks.
-It installs the three tools and three LaunchAgents above and nothing else: no build-host
+It installs the tools and LaunchAgents above and nothing else: no build-host
 directories, no git defaults, no operator steps, no fleet bootstrap. Only a missing python3
 blocks it; build-host checks (free disk, Xcode pin, hardware) are reported, not enforced,
-so a nearly full laptop can still install the tool that frees it. Re-running it from a fresh
-checkout is how such a machine picks up newer tools.
+so a nearly full laptop can still install the tool that frees it. After that, glaeda-update
+keeps every host on its release ring (docs/GLAEDA_OTA.md): each hour it runs this command from
+the newest release on the ring, then rolls back if the new tools do not run.
 
 Linux (Big Red, owned Linux machines, Linux VMs on the fleet) gets the hygiene profile, the
-only one written for it so far, with or without the flag. It installs the same three tools and
-the systemd user units in ops/systemd (glaeda-disk-pressure and glaeda-worktree-reclaim, each a
-service and a timer) into ~/.config/systemd/user, reloads the user manager and enables the
+only one written for it so far, with or without the flag. It installs the same tools and
+the systemd user units in ops/systemd (glaeda-disk-pressure, glaeda-worktree-reclaim and
+glaeda-update, each a service and a timer) into ~/.config/systemd/user, reloads the user manager and enables the
 timers. There is no disk-dedupe unit (it watches Xcode DerivedData). A missing systemd user
 manager blocks; lingering off is reported, since timers then stop at logout.
 
@@ -100,7 +103,12 @@ LINUX_UNITS = (
     "glaeda-disk-pressure.timer",
     "glaeda-worktree-reclaim.service",
     "glaeda-worktree-reclaim.timer",
+    "glaeda-update.service",
+    "glaeda-update.timer",
 )
+# glaeda-update runs this command from a release; it sets this so setup never unloads the job running it
+UPDATE_ENV = "GLAEDA_UPDATE_RUNNING"
+OTA_RINGS = ("canary", "stable")
 # with --hygiene-only, only these preflight failures block: the agents run python3, and on
 # Linux the timers need a systemd user manager
 HYGIENE_BLOCKING = frozenset({"python", "systemdUser"})
@@ -149,7 +157,7 @@ class Context:
     def __init__(self, home: Path, apply: bool, python: str | None, skip_launchctl: bool,
                  reclaim_binary: Path | None, cmux_root: Path | None, glaeda_bin: Path | None,
                  xcode_app: str, min_free_gib: int, hygiene_only: bool = False,
-                 platform_name: str | None = None) -> None:
+                 platform_name: str | None = None, ota_ring: str | None = None) -> None:
         self.home = home
         self.platform = platform_name or HOST_PLATFORM
         self.hygiene_only = hygiene_only
@@ -175,6 +183,8 @@ class Context:
         self.cache_root = home / ".cache/glaeda/cmux-native-cache"
         self.state = home / ".local/state/glaeda/mini-setup"
         self.receipt_path = self.state / "receipt.json"
+        self.ota_ring = ota_ring
+        self.update_config = home / ".config/glaeda/update.json"
 
     def show(self, path: Path | str) -> str:
         text = os.fspath(path)
@@ -527,6 +537,18 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-worktree-reclaim.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-worktree-reclaim.err"),
         },
+        # Over-the-air updates (scripts/glaeda-update): hourly, installs this host's release ring and
+        # rolls back when the new tools do not run.
+        LABEL_PREFIX + "update": {
+            "Label": LABEL_PREFIX + "update",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-update"), "--apply"],
+            "StartInterval": 3600,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-update.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-update.err"),
+        },
         # Keeps the fleet compilation-cache node store and local Xcode CAS within budget; it exits at
         # once on a host without fleet-cas and defers while any build runs or holds the host lock.
         LABEL_PREFIX + "fleet-cas-prune": {
@@ -559,6 +581,38 @@ def agent_bytes(ctx: Context, label: str) -> bytes:
 
 def is_disk_agent(label: str) -> bool:
     return label.startswith((LABEL_PREFIX + "disk", "glaeda-disk"))
+
+
+def is_update_agent(label: str) -> bool:
+    return label == LABEL_PREFIX + "update" or label.startswith("glaeda-update.")
+
+
+def update_config(ctx: Context) -> dict[str, Any]:
+    """What glaeda-update reads: this host's ring and the setup flags it re-runs releases with."""
+    return {
+        "ring": ctx.ota_ring or "stable",
+        "setupArgs": ["--hygiene-only"] if ctx.hygiene_only else [],
+        "host": platform.node().split(".")[0].lower(),
+        "reportStatus": (ctx.ota_ring or "stable") == "canary",
+    }
+
+
+def update_config_action(ctx: Context) -> dict[str, Any]:
+    """Written once. A later run changes it only when --ota-ring names a different ring."""
+    path = ctx.update_config
+    act: dict[str, Any] = {"kind": "config", "path": os.fspath(path), "mode": "0o644"}
+    try:
+        current = json.loads(path.read_text())
+    except FileNotFoundError:
+        current = None
+    except (OSError, ValueError):
+        return {**act, "state": "blocked", "note": "unreadable; fix or remove it"}
+    if current is None:
+        return {**act, "state": "create", "value": update_config(ctx)}
+    if ctx.ota_ring and current.get("ring") != ctx.ota_ring:
+        value = {**current, "ring": ctx.ota_ring, "reportStatus": ctx.ota_ring == "canary"}
+        return {**act, "state": "update", "value": value, "previous": current.get("ring")}
+    return {**act, "state": "unchanged", "value": current}
 
 
 def is_reclaim_agent(label: str) -> bool:
@@ -650,7 +704,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     for path, mode in directories(ctx):
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
-    for name in ("glaeda-disk", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune"):
+    for name in ("glaeda-disk", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-update"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
@@ -692,7 +746,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
                         act["sha256"] = act["previousSha256"]
             except (OSError, plistlib.InvalidFileException, ValueError):
                 pass
-        if ctx.python is None and is_disk_agent(label):
+        if ctx.python is None and (is_disk_agent(label) or is_update_agent(label)):
             act["state"], act["note"] = "blocked", "no usable python3 yet"
         if is_reclaim_agent(label) and reclaim_act["state"] == "blocked":
             act["state"], act["note"] = "blocked", "glaeda-worktree-reclaim could not be installed"
@@ -701,6 +755,8 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         scheduler = "systemctl" if ctx.platform == "linux" else "launchctl"
         act[scheduler] = "skipped (sandbox HOME)" if ctx.sandbox else ("skipped" if ctx.skip_launchctl else "managed")
         actions.append(act)
+
+    actions.append(update_config_action(ctx))
 
     # owned: this command wrote the file (now or on an earlier run) and it is still those bytes.
     # A file that was already identical before the first install is never owned, so never removed.
@@ -773,7 +829,8 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         path = agent_path(ctx, label)
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
-    for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune"):
+    for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
+                 "glaeda-update"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     for act in actions:
         if act["kind"] == "note":
@@ -876,6 +933,14 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             if state == "update":
                 act["backup"] = backup(ctx, dest)
             if kind == "agent" and act.get("loaded") and ctx.platform != "linux":
+                if is_update_agent(act["label"]) and os.environ.get(UPDATE_ENV):
+                    # unloading would kill the glaeda-update that is running this setup; launchd
+                    # reads the new plist at the next login, or when setup runs by hand
+                    write_atomic(Path(act["path"]), data, int(act["mode"], 8))
+                    act["applied"] = act["owned"] = True
+                    act["ownedSha256"] = act["sha256"]
+                    act["note"] = "written; reload deferred while glaeda-update runs"
+                    continue
                 bootout(ctx, act["label"])
                 act["loaded"] = False
             write_atomic(dest, data, int(act["mode"], 8))
@@ -887,6 +952,11 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             act["bootstrapped"] = code == 0
             if code != 0:
                 act["note"] = ("launchctl bootstrap failed: " + out)[:400]
+        if kind == "config" and state in {"create", "update"}:
+            path = Path(act["path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_atomic(path, (json.dumps(act["value"], indent=1, sort_keys=True) + "\n").encode(), 0o644)
+            act["applied"] = True
         if kind == "python" and state == "create":
             code, out = brew_install(act["brew"], act["formula"])
             found = enroll_python(ctx)
@@ -1130,6 +1200,8 @@ def parser() -> argparse.ArgumentParser:
                    help=f"default: one build slot ({MIN_FREE_GIB} GiB on macOS)")
     p.add_argument("--skip-launchctl", "--skip-systemctl", dest="skip_launchctl", action="store_true",
                    help="write plists or units but do not load, enable or unload them")
+    p.add_argument("--ota-ring", choices=OTA_RINGS,
+                   help="release ring glaeda-update follows (default stable; set once in ~/.config/glaeda/update.json)")
     p.add_argument("--hygiene-only", action="store_true",
                    help="only the disk and worktree hygiene tools and agents, for any Mac or Linux host")
     return p
@@ -1162,7 +1234,7 @@ def main(argv: list[str] | None = None) -> int:
                   args.skip_launchctl, args.reclaim_binary,
                   args.cmux_root.expanduser().resolve() if args.cmux_root else None,
                   args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, min_free_gib,
-                  args.hygiene_only or HOST_PLATFORM == "linux")
+                  args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring)
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
         checks = {n: ({**c, "level": "warn"} if c["level"] == "block" and n not in HYGIENE_BLOCKING else c)

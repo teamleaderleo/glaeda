@@ -603,6 +603,45 @@ class MiniSetupTest(unittest.TestCase):
         self.assertIn(["--user", "stop", "glaeda-worktree-reclaim.service"], commands)
         self.assertEqual(commands[-1], ["--user", "daemon-reload"])
 
+    def test_ota_updater_installed_and_ring_written_once(self) -> None:
+        receipt = self.invoke("--hygiene-only", "--apply")
+        self.assertTrue(os.access(self.home / ".local/bin/glaeda-update", os.X_OK))
+        plist = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.update.plist").read_bytes())
+        self.assertEqual(plist["ProgramArguments"][1:], [os.fspath(self.home / ".local/bin/glaeda-update"), "--apply"])
+        self.assertEqual(plist["ProcessType"], "Background")
+        path = self.home / ".config/glaeda/update.json"
+        config = json.loads(path.read_text())
+        self.assertEqual((config["ring"], config["setupArgs"], config["reportStatus"]),
+                         ("stable", ["--hygiene-only"], False))
+        self.assertEqual(next(a for a in receipt["actions"] if a["kind"] == "config")["state"], "create")
+        # a later run leaves a hand-edited config alone, unless --ota-ring names another ring
+        path.write_text(json.dumps({**config, "host": "renamed"}))
+        self.assertEqual(self.states(self.invoke("--hygiene-only", "--apply")), {"unchanged"})
+        self.invoke("--hygiene-only", "--apply", "--ota-ring", "canary")
+        config = json.loads(path.read_text())
+        self.assertEqual((config["ring"], config["host"], config["reportStatus"]), ("canary", "renamed", True))
+        # uninstall removes the updater it installed
+        self.invoke("--uninstall", "--apply")
+        self.assertFalse((self.home / ".local/bin/glaeda-update").exists())
+
+    def test_update_agent_is_not_unloaded_under_glaeda_update(self) -> None:
+        ctx = ms.Context(self.home, True, "/usr/bin/python3", False, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 50, hygiene_only=True)
+        ctx.sandbox = False
+        ctx.skip_launchctl = False
+        label = ms.LABEL_PREFIX + "update"
+        path = ms.agent_path(ctx, label)
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"old")
+        act = {"kind": "agent", "label": label, "path": os.fspath(path), "state": "update", "loaded": True,
+               "mode": "0o644", "sha256": "x", "owned": False}
+        with mock.patch.object(ms, "bootout", mock.Mock(side_effect=AssertionError("must not unload"))), \
+                mock.patch.object(ms, "bootstrap", mock.Mock(side_effect=AssertionError("must not reload"))), \
+                mock.patch.dict(os.environ, {ms.UPDATE_ENV: "1"}):
+            ms.apply_install(ctx, [act])
+        self.assertEqual(path.read_bytes(), ms.agent_bytes(ctx, label))
+        self.assertIn("deferred", act["note"])
+
     def test_no_em_dashes(self) -> None:
         for name in ("glaeda-mini-setup", "glaeda-worktree-reclaim-all", "test-glaeda-mini-setup.py"):
             self.assertNotIn(chr(0x2014), (ROOT / "scripts" / name).read_text(), name)

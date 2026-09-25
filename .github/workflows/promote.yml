@@ -1,0 +1,61 @@
+name: Promote
+
+# Moves stable to the canary release once it has soaked and canary hosts reported healthy
+# (commit statuses glaeda-ota/<host> on its source commit). stable.json has this one writer.
+# docs/GLAEDA_OTA.md
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  statuses: read
+
+concurrency:
+  group: ota-stable
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+      - name: Promote if healthy
+        run: |
+          mkdir -p channels
+          if ! gh release download ota-channels --pattern canary.json --dir channels 2>channels/err; then
+            if grep -q -e "no assets match" -e "release not found" channels/err; then
+              echo "no canary yet" >> "$GITHUB_STEP_SUMMARY"; exit 0
+            fi
+            cat channels/err; exit 1
+          fi
+          stable=()
+          if gh release download ota-channels --pattern stable.json --dir channels 2>channels/err; then
+            stable=(--stable channels/stable.json)
+          elif ! grep -q "no assets match" channels/err; then
+            cat channels/err; exit 1
+          fi
+          source=$(python3 -c 'import json;print(json.load(open("channels/canary.json"))["source"])')
+          # newest first; one page holds every canary host's latest status
+          gh api "repos/$GH_REPO/commits/$source/statuses?per_page=100" > channels/statuses.json
+          set +e
+          python3 scripts/glaeda_release.py promote --canary channels/canary.json "${stable[@]}" \
+            --statuses channels/statuses.json > channels/next.json 2> channels/why.txt
+          code=$?
+          set -e
+          cat channels/why.txt >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" = 3 ]; then exit 0; fi
+          [ "$code" = 0 ] || exit "$code"
+          mv channels/next.json channels/stable.json
+          gh release upload ota-channels channels/stable.json --clobber
+          cat channels/stable.json >> "$GITHUB_STEP_SUMMARY"
