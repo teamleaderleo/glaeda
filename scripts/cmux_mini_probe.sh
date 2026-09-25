@@ -92,6 +92,8 @@ if [ -d "$F" ]; then
   e fleet_recipe "$(ls "$F/recipe-releases" 2>/dev/null | tail -1 | cut -c1-12)"
   e fleet_worker_sha "$(shasum -a 256 "$F/bin/worker" 2>/dev/null | cut -c1-12)"
   pgrep -f "$F/bin/worker" >/dev/null && e fleet_worker_proc running || e fleet_worker_proc absent
+  # 0 when the wrapper turns catch-up off on purpose (remote-hit catch-up was slower until bulk warm lands).
+  e fleet_catch_up "$(grep -oE '^export CMUX_CI_CATCH_UP=[0-9]+' "$F/bin/worker" 2>/dev/null | tail -1 | cut -d= -f2)"
   # Fleet compile cache (glaeda-fleet-cas): the fixed paths catch-up builds key on, by kind only.
   # A symlink counts as a symlink whatever it points at: the cache keys include the literal path.
   for p in xcode xcode/src xcode/src/cmux xcode/DerivedData xcode/bin xcode/fleet-cas.sock \
