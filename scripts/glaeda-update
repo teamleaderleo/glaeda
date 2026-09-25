@@ -262,6 +262,7 @@ def health(bin_dir: Path, channel_dir: Path) -> tuple[bool, str]:
     checks = [
         [sys.executable, str(bin_dir / "glaeda-disk"), "--help"],
         [str(bin_dir / "glaeda-worktree-reclaim"), "--help"],
+        [sys.executable, str(bin_dir / "glaeda-gh"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-update"), "--channel-dir", str(channel_dir)],
     ]
     for argv in checks:

@@ -40,6 +40,7 @@ import argparse
 import datetime as dt
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -66,6 +67,7 @@ GQL_BATCH = 25  # PRs per GraphQL query
 MAX_BODY = 8 * 1024 * 1024
 WAIT_POLL = 3  # clients re-read the cache this often
 TOUCH_EVERY = 30  # clients refresh their interest this often
+DOWN_GRACE = 5.0  # clients look this long for the daemon before calling it down (it re-executes on update)
 FAILED = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR", "STALE"}
 RUN_OK = {"success", "neutral", "skipped"}
 EXIT_OK, EXIT_FAIL, EXIT_TIMEOUT, EXIT_DOWN = 0, 1, 2, 3
@@ -74,11 +76,13 @@ NAME = r"[A-Za-z0-9_.-]+"
 PR_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pull/)(\d+)(?:[/?#].*)?")
 RUN_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})/(?:actions/runs/)?(\d+)(?:[/?#].*)?")
 
+# NUM is the alias's PR-number variable: isRequired needs it
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeStateStatus headRefOid
 reviewDecision updatedAt commits(last: 1) { nodes { commit { statusCheckRollup { state
 contexts(first: 100) { totalCount pageInfo { hasNextPage } nodes { __typename
-... on CheckRun { name status conclusion detailsUrl }
-... on StatusContext { context state targetUrl } } } } } } }"""
+... on CheckRun { name status conclusion detailsUrl databaseId startedAt isRequired(pullRequestNumber: NUM) }
+... on StatusContext { context state targetUrl createdAt isRequired(pullRequestNumber: NUM) } } } } } } }"""
+TOKEN_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9_]{20,251}|github_pat_[A-Za-z0-9_]{20,251}|[0-9a-f]{40})")
 
 
 class WatchError(RuntimeError):
@@ -160,13 +164,32 @@ def iso_epoch(text: str | None) -> float | None:
 # ---------------------------------------------------------------- GitHub transport
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib would copy the Authorization header to wherever a redirect points; refuse them all."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
+def describe(error: BaseException) -> str:
+    """Our own messages are safe to show; anything else is reduced to its type name."""
+    return str(error) if isinstance(error, WatchError) else type(error).__name__
+
+
 def http(method: str, url: str, headers: dict[str, str], body: bytes | None = None) -> tuple[int, dict, bytes]:
+    if not url.startswith(API + "/"):
+        raise WatchError("refusing a request outside api.github.com")
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with OPENER.open(request, timeout=30) as response:
             return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read(MAX_BODY)
-    except urllib.error.HTTPError as error:  # 304 and every 4xx/5xx land here, with headers
-        return error.code, {k.lower(): v for k, v in error.headers.items()}, error.read(MAX_BODY)
+    except urllib.error.HTTPError as error:  # 304, refused redirects and every 4xx/5xx land here
+        return error.code, {k.lower(): v for k, v in (error.headers or {}).items()}, error.read(MAX_BODY)
+    except (OSError, http.client.HTTPException, ValueError) as error:
+        raise WatchError(f"request failed: {type(error).__name__}") from None
 
 
 def find_gh() -> str | None:
@@ -190,6 +213,8 @@ def gh_token() -> str:
     token = result.stdout.strip()
     if result.returncode != 0 or not token:  # neither stream is repeated: stdout may be a token
         raise WatchError(f"gh auth token exited {result.returncode}; is gh signed in?")
+    if not TOKEN_RE.fullmatch(token):
+        raise WatchError("gh auth token printed something that is not a GitHub token")
     return token
 
 
@@ -202,7 +227,8 @@ def pr_query(keys: list[str]) -> tuple[str, dict]:
     for i, key in enumerate(keys):
         _, owner, repo, number = split_key(key)
         decls.append(f"$o{i}: String!, $r{i}: String!, $n{i}: Int!")
-        parts.append(f"p{i}: repository(owner: $o{i}, name: $r{i}) {{ pullRequest(number: $n{i}) {{ {PR_FIELDS} }} }}")
+        fields = PR_FIELDS.replace("NUM", f"$n{i}")
+        parts.append(f"p{i}: repository(owner: $o{i}, name: $r{i}) {{ pullRequest(number: $n{i}) {{ {fields} }} }}")
         variables.update({f"o{i}": owner, f"r{i}": repo, f"n{i}": number})
     query = f"query({', '.join(decls)}) {{ rateLimit {{ limit remaining resetAt cost }} {' '.join(parts)} }}"
     return query, variables
@@ -212,16 +238,24 @@ def parse_pr(node: dict) -> dict:
     commits = ((node.get("commits") or {}).get("nodes") or [{}])
     rollup = ((commits[0] or {}).get("commit") or {}).get("statusCheckRollup") or {}
     contexts = rollup.get("contexts") or {}
-    checks = []
+    latest: dict[str, tuple[tuple, dict]] = {}
     for c in contexts.get("nodes") or []:
         if c.get("__typename") == "StatusContext":
             state = c.get("state")
             done = state in {"SUCCESS", "FAILURE", "ERROR"}
-            checks.append({"name": c.get("context"), "status": "COMPLETED" if done else "PENDING",
-                           "conclusion": state if done else None, "url": c.get("targetUrl")})
+            check = {"name": c.get("context"), "status": "COMPLETED" if done else "PENDING",
+                     "conclusion": state if done else None, "url": c.get("targetUrl")}
+            order = (c.get("createdAt") or "", 0)
         else:
-            checks.append({"name": c.get("name"), "status": c.get("status"), "conclusion": c.get("conclusion"),
-                           "url": c.get("detailsUrl")})
+            check = {"name": c.get("name"), "status": c.get("status"), "conclusion": c.get("conclusion"),
+                     "url": c.get("detailsUrl")}
+            order = (c.get("startedAt") or "", c.get("databaseId") or 0)
+        check["required"] = bool(c.get("isRequired"))
+        # a rerun leaves the old attempt in the list (cancelled, then passed): keep the newest per name
+        name = str(check["name"])
+        if name not in latest or order >= latest[name][0]:
+            latest[name] = (order, check)
+    checks = [check for _, check in latest.values()]
     return {
         "number": node.get("number"), "url": node.get("url"), "title": node.get("title"),
         "state": node.get("state"), "isDraft": node.get("isDraft"), "merged": node.get("merged"),
@@ -259,6 +293,7 @@ class Daemon:
         self.last_cycle: dict[str, float] = {"pr": 0.0, "run": 0.0}
         self.now = time.time()
         self.errors: list[str] = []
+        self.attempted: dict[str, float] = {}  # at most one attempt per key per CYCLE, whatever fails
 
     # -- budget
 
@@ -354,10 +389,14 @@ class Daemon:
         out = []
         for e in mine:
             c = e["cache"]
+            if self.now - self.attempted.get(e["key"], float("-inf")) < CYCLE:
+                continue
             if c is None:
                 out.append(e)
             elif full and (not terminal(kind, c.get("data")) or self.now - c.get("fetchedAt", 0) >= TERMINAL_REFRESH):
                 out.append(e)
+        for e in out:
+            self.attempted[e["key"]] = self.now
         return out
 
     def tick(self, now: float | None = None) -> dict:
@@ -366,11 +405,18 @@ class Daemon:
         entries = self.watches()
         prs, runs = self.due("pr", entries), self.due("run", entries)
         for i in range(0, len(prs), GQL_BATCH):
-            self.fetch_prs(prs[i:i + GQL_BATCH])
+            try:
+                self.fetch_prs(prs[i:i + GQL_BATCH])
+            except Exception as error:  # noqa: BLE001  one bad batch must not stop the rest
+                self.errors.append(f"graphql: {describe(error)}")
         for e in runs:
             if self.mode("rest") == "stop":
                 break
-            self.fetch_run(e)
+            try:
+                self.fetch_run(e)
+            except Exception as error:  # noqa: BLE001
+                self.errors.append(f"{e['key']}: {describe(error)}")
+        self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
         self.prune({e["key"] for e in entries})
         if self.budget != self.saved_budget:
             write_json(BASE / "budget.json", self.budget)
@@ -398,7 +444,7 @@ class Daemon:
         try:
             status, _, doc = self.request("POST", "/graphql", {"query": query, "variables": variables})
         except (WatchError, OSError) as error:
-            return self.fail(entries, f"graphql: {error}")
+            return self.fail(entries, f"graphql: {describe(error)}")
         if status != 200 or not isinstance(doc, dict):
             return self.fail(entries, f"graphql: HTTP {status}")
         data = doc.get("data") or {}
@@ -421,7 +467,7 @@ class Daemon:
         try:
             status, h, doc = self.request("GET", path, etag=etag)
         except (WatchError, OSError) as error:
-            return "error", f"rest: {error}", None
+            return "error", f"rest: {describe(error)}", None
         if status == 304:
             return "same", None, etag
         if status == 200 and isinstance(doc, dict):
@@ -484,8 +530,8 @@ def serve() -> int:
             if summary != last and (status["errors"] or last is not None):
                 log({"event": "state", "modes": status["modes"], "errors": status["errors"]})
             last = summary
-        except Exception as error:  # noqa: BLE001  keep serving; the message never carries the token
-            log({"event": "error", "error": f"{type(error).__name__}: {error}"[:300]})
+        except Exception as error:  # noqa: BLE001  keep serving; only the type name is logged
+            log({"event": "error", "error": describe(error)})
         time.sleep(TICK)
         try:
             if me.stat().st_mtime != stamp:
@@ -498,7 +544,19 @@ def serve() -> int:
 # ---------------------------------------------------------------- clients
 
 
-def daemon_running() -> bool:
+def daemon_running(grace: float = 0.0) -> bool:
+    """True while some process holds the daemon lock. With grace, keep looking that long: the lock is
+    released for a moment while the daemon re-executes itself after an update."""
+    deadline = time.monotonic() + grace
+    while True:
+        if lock_held():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def lock_held() -> bool:
     try:
         with open(BASE / "daemon.lock", "r") as lock:
             try:
@@ -516,15 +574,23 @@ DOWN = ("glaeda-gh: the daemon is not running, so nothing is polling GitHub. Sta
         "Linux: systemctl --user start glaeda-gh) or install it with glaeda-mini-setup --hygiene-only --apply.")
 
 
-def failing(data: dict) -> list[dict]:
-    return [c for c in data.get("checks") or [] if (c.get("conclusion") or "").upper() in FAILED]
+def failing(checks: list[dict]) -> list[dict]:
+    return [c for c in checks if (c.get("conclusion") or "").upper() in FAILED]
 
 
-def verdict(kind: str, data: dict | None, until: str = "green") -> int | None:
+def judged(data: dict) -> list[dict]:
+    """The checks that decide: the required ones when GitHub marks any, else all of them."""
+    checks = data.get("checks") or []
+    return [c for c in checks if c.get("required")] or checks
+
+
+def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None = None) -> int | None:
     """EXIT_OK, EXIT_FAIL, or None while still pending."""
     if not data:
         return None
     if kind == "run":
+        if sha and not str(data.get("head_sha") or "").startswith(sha):
+            return None
         if data.get("status") != "completed":
             return None
         return EXIT_OK if data.get("conclusion") in RUN_OK else EXIT_FAIL
@@ -532,16 +598,19 @@ def verdict(kind: str, data: dict | None, until: str = "green") -> int | None:
         return EXIT_FAIL
     if until == "merged":
         return EXIT_OK if data.get("state") == "MERGED" else None
-    bad = failing(data)
-    if until == "green":
-        if bad:
-            return EXIT_FAIL
-        return EXIT_OK if data.get("checkState") == "SUCCESS" else None
-    checks = data.get("checks") or []
-    if data.get("checksTruncated") or not checks:
+    if sha and not str(data.get("headRefOid") or "").startswith(sha):
+        return None  # the push has not reached GitHub yet, or these are an older commit's checks
+    if data.get("checksTruncated"):  # more than 100 checks: GitHub's own rollup decides
         state = data.get("checkState")
         return EXIT_OK if state == "SUCCESS" else EXIT_FAIL if state in {"FAILURE", "ERROR"} else None
-    if any(c.get("status") != "COMPLETED" for c in checks):
+    checks, decide = data.get("checks") or [], judged(data)
+    if not decide:
+        return None  # nothing has reported yet
+    bad = failing(decide)
+    unfinished = [c for c in (decide if until == "green" else checks) if c.get("status") != "COMPLETED"]
+    if until == "green" and bad:
+        return EXIT_FAIL
+    if unfinished:
         return None
     return EXIT_FAIL if bad else EXIT_OK
 
@@ -569,13 +638,18 @@ def summary(key: str, entry: dict | None) -> str:
         lines.append(f"{name} {data.get('state')}{draft}  mergeable={data.get('mergeable')} "
                      f"({data.get('mergeStateStatus')})  review={data.get('reviewDecision')}  head {head}")
         checks = data.get("checks") or []
-        bad = failing(data)
+        bad = failing(checks)
         pending = [c for c in checks if c.get("status") != "COMPLETED"]
+        required = sum(1 for c in checks if c.get("required"))
         more = "+" if data.get("checksTruncated") else ""
-        lines.append(f"checks {data.get('checkState')}: {len(checks) - len(bad) - len(pending)} passed, "
-                     f"{len(bad)} failed, {len(pending)} pending (of {data.get('checksTotal', len(checks))}{more})")
+        if checks:
+            lines.append(f"checks {data.get('checkState')}: {len(checks) - len(bad) - len(pending)} passed, "
+                         f"{len(bad)} failed, {len(pending)} pending (of {len(checks)}{more}, {required} required)")
+        else:
+            lines.append("checks: none reported yet for this head commit")
         for c in bad[:20]:
-            lines.append(f"  failed: {c.get('name')}  {c.get('url') or ''}".rstrip())
+            optional = " (not required)" if required and not c.get("required") else ""
+            lines.append(f"  failed: {c.get('name')}{optional}  {c.get('url') or ''}".rstrip())
         if len(bad) > 20:
             lines.append(f"  ... {len(bad) - 20} more failed")
         lines.append(str(data.get("url") or ""))
@@ -607,7 +681,7 @@ def emit(key: str, entry: dict | None, as_json: bool, extra: dict | None = None)
 
 def cmd_status(kind: str, target: str, jobs: bool, as_json: bool, first_wait: float = CYCLE + 10) -> int:
     key = parse_key(kind, target)
-    if not daemon_running():
+    if not daemon_running(grace=DOWN_GRACE):
         print(DOWN, file=sys.stderr)
         return EXIT_DOWN
     register(key, jobs)
@@ -620,12 +694,17 @@ def cmd_status(kind: str, target: str, jobs: bool, as_json: bool, first_wait: fl
     return EXIT_OK if entry and entry.get("data") else EXIT_FAIL
 
 
-def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool) -> int:
+def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
+             sha: str | None = None) -> int:
+    """Rules only on data the daemon fetched after this wait began, never on an older cache."""
     key = parse_key(kind, target)
-    start = time.monotonic()
+    if sha and not re.fullmatch(r"[0-9a-fA-F]{7,40}", sha):
+        raise WatchError("--sha must be a commit id (7 to 40 hex digits)")
+    sha = sha.lower() if sha else None
+    began, start = time.time(), time.monotonic()
     touched = -TOUCH_EVERY
     while True:
-        if not daemon_running():
+        if not daemon_running(grace=DOWN_GRACE):
             print(DOWN, file=sys.stderr)
             return EXIT_DOWN
         now = time.monotonic()
@@ -633,19 +712,28 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
             register(key, jobs)
             touched = now
         entry = read_cache(key)
-        result = verdict(kind, (entry or {}).get("data"), until)
+        fresh = entry is not None and (entry.get("fetchedAt") or 0) >= began
         waited = int(now - start)
+        if fresh and not entry.get("data") and entry.get("error"):
+            emit(key, entry, as_json, {"result": "failure", "waited_s": waited})
+            return EXIT_FAIL  # not found, or no access
+        result = verdict(kind, entry.get("data"), until, sha) if fresh and (entry.get("dataAt") or 0) >= began else None
         if result is not None:
             emit(key, entry, as_json, {"result": "success" if result == EXIT_OK else "failure", "waited_s": waited})
             return result
         if now - start >= timeout:
-            emit(key, entry, as_json, {"result": "timeout", "waited_s": waited})
+            extra = {"result": "timeout", "waited_s": waited}
+            if sha and entry and entry.get("data"):
+                head = entry["data"].get("headRefOid") or entry["data"].get("head_sha") or ""
+                if not str(head).startswith(sha):
+                    extra["note"] = f"GitHub still shows head {str(head)[:10]}, not {sha[:10]}"
+            emit(key, entry, as_json, extra)
             return EXIT_TIMEOUT
         time.sleep(min(WAIT_POLL, max(0.1, timeout - (now - start))))
 
 
 def cmd_budget(as_json: bool) -> int:
-    running = daemon_running()
+    running = daemon_running(grace=DOWN_GRACE)
     budget = read_json(BASE / "budget.json") or {}
     status = read_json(BASE / "daemon.json") or {}
     watching = len(list(watch_dir().glob("*.json"))) if watch_dir().is_dir() else 0
@@ -683,6 +771,7 @@ def parser() -> argparse.ArgumentParser:
             s.add_argument("--until", choices=("green", "done", "merged"), default="green",
                            help="PRs: green (fail fast), done (every check finished) or merged")
             s.add_argument("--timeout", type=float, default=3600, help="seconds (default 3600); exit 2 after")
+            s.add_argument("--sha", help="the commit you pushed (git rev-parse HEAD): other heads count as pending")
     b = sub.add_parser("budget", help="REST and GraphQL quota as the daemon last saw it")
     b.add_argument("--json", action="store_true")
     return p
@@ -697,7 +786,7 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_budget(args.json)
         if args.command == "status":
             return cmd_status(args.kind, args.target, args.jobs, args.json)
-        return cmd_wait(args.kind, args.target, args.until, args.timeout, args.jobs, args.json)
+        return cmd_wait(args.kind, args.target, args.until, args.timeout, args.jobs, args.json, args.sha)
     except WatchError as error:
         print(f"glaeda-gh: {error}", file=sys.stderr)
         return 64

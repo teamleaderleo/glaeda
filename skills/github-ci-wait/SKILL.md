@@ -13,7 +13,7 @@ only process polling: one batched GraphQL query for every watched PR, and ETag r
 ## Wait and check
 
 ```bash
-glaeda-gh wait pr OWNER/REPO#N                   # until green; exits 1 at the first failed check
+glaeda-gh wait pr OWNER/REPO#N --sha "$(git rev-parse HEAD)"   # until green; 1 at the first failed check
 glaeda-gh wait pr OWNER/REPO#N --until done      # until every check finishes (0 green, 1 red)
 glaeda-gh wait pr OWNER/REPO#N --until merged
 glaeda-gh wait run OWNER/REPO/RUN_ID [--jobs]    # 0 success, 1 failure
@@ -24,6 +24,9 @@ glaeda-gh budget                                 # REST and GraphQL left, and re
 
 - `wait` exits 0 on success, 1 on failure, 2 on timeout (`--timeout S`, default 3600), 3 when the
   daemon is down. It ends with a summary that names failing checks and links them.
+- After a push, pass `--sha` with the commit you pushed: checks of an older head then count as pending.
+- `wait` only rules on data fetched after it started, so it answers within about a minute at the earliest.
+- Checks GitHub marks required decide the verdict; a rerun replaces the cancelled attempt it follows.
 - URLs work too: `glaeda-gh wait pr https://github.com/o/r/pull/12`.
 - Run a long `wait` in the background (Bash `run_in_background`) and carry on; you are told when it exits.
 - Add `--json` for machine-readable output.

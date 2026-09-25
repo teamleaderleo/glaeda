@@ -37,7 +37,7 @@ from pathlib import Path
 bin_dir = Path(os.environ["GLAEDA_TEST_BIN"])
 bin_dir.mkdir(parents=True, exist_ok=True)
 code = int(Path(__file__).with_name("health-code").read_text())
-for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-update"):
+for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-update", "glaeda-gh"):
     tool = bin_dir / name
     tool.write_text("#!/usr/bin/env python3\\nimport sys\\nprint('{\\\"result\\\": \\\"plan\\\"}')\\nsys.exit(%d)\\n" % code)
     tool.chmod(0o755)

@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -96,14 +97,15 @@ class FakeGitHub:
 class Base(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.saved = (gg.BASE, gg.WAIT_POLL)
+        self.saved = (gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE)
         gg.BASE = Path(self.tmp.name) / "gh"
         gg.WAIT_POLL = 0.05
+        gg.DOWN_GRACE = 0.3
         self.gh = FakeGitHub()
         self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN)
 
     def tearDown(self) -> None:
-        gg.BASE, gg.WAIT_POLL = self.saved
+        gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE = self.saved
         self.tmp.cleanup()
 
     def age_watch(self, key: str, seconds: float) -> None:
@@ -162,7 +164,9 @@ class DaemonTest(Base):
         self.daemon.tick(NOW)
         self.assertEqual(len(self.gh.gql_calls()), 1)  # one query for all three
         one = gg.read_cache(keys[0])["data"]
-        self.assertEqual([c["name"] for c in gg.failing(one)], ["b", "legacy"])
+        self.assertEqual([c["name"] for c in gg.failing(one["checks"])], ["b", "legacy"])
+        query_vars = json.loads(self.gh.gql_calls()[0][3])["query"]
+        self.assertIn("isRequired(pullRequestNumber: $n2)", query_vars)
         self.assertEqual(one["checksTotal"], 3)
         self.assertEqual(gg.read_cache(keys[1])["data"]["state"], "MERGED")
         missing = gg.read_cache(keys[2])
@@ -268,6 +272,39 @@ class DaemonTest(Base):
         self.daemon.tick(NOW)
         self.assertIn("gh signed in", gg.read_cache("pr:o/r#1")["error"])
 
+    def test_failures_are_retried_once_per_cycle(self) -> None:
+        def broken(method, url, headers, body):
+            raise gg.WatchError("request failed: RemoteDisconnected")
+
+        self.daemon.transport = broken
+        gg.register("pr:o/r#1")
+        gg.register("run:o/r/2")
+        attempts = []
+        self.daemon.transport = lambda *a: (attempts.append(a[1]), broken(*a))[1]
+        for i in range(20):  # 40 s of ticks
+            self.daemon.tick(NOW + i * gg.TICK)
+        self.assertEqual(len(attempts), 2)
+        self.assertIn("RemoteDisconnected", gg.read_cache("run:o/r/2")["error"])
+
+        def explodes(method, url, headers, body):
+            raise KeyError("boom")  # an unexpected bug still costs one attempt per cycle
+
+        self.daemon.transport = lambda *a: (attempts.append(a[1]), explodes(*a))[1]
+        for i in range(20):
+            self.daemon.tick(NOW + gg.CYCLE + i * gg.TICK)
+        self.assertEqual(len(attempts), 4)
+
+    def test_redirects_and_foreign_hosts_are_refused(self) -> None:
+        with self.assertRaises(gg.WatchError):
+            gg.http("GET", "https://example.com/x", {"Authorization": "Bearer x"})
+        handler = gg.NoRedirect()
+        self.assertIsNone(handler.redirect_request(None, None, 301, "Moved", {}, "https://evil.example/"))
+
+    def test_token_format_is_checked(self) -> None:
+        self.assertTrue(gg.TOKEN_RE.fullmatch("gho_" + "a" * 36))
+        self.assertTrue(gg.TOKEN_RE.fullmatch("github_pat_" + "A1_" * 20))
+        self.assertFalse(gg.TOKEN_RE.fullmatch("To get started with GitHub CLI, please run: gh auth login"))
+
     def test_bad_keys_are_refused(self) -> None:
         for kind, text in (("pr", "o/r"), ("pr", "o/r#x"), ("run", "o/r"), ("pr", "o/r#1) { x }")):
             with self.assertRaises(gg.WatchError):
@@ -287,44 +324,92 @@ class ClientTest(Base):
         self.lock.close()
         super().tearDown()
 
-    def put(self, key: str, data: dict | None, **extra) -> None:
-        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": time.time(),
-                                                          "dataAt": time.time(), "data": data, "error": None, **extra})
+    def put(self, key: str, data: dict | None, at: float | None = None, **extra) -> None:
+        at = time.time() if at is None else at
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": at,
+                                                          "dataAt": at if data else None, "data": data, "error": None, **extra})
 
-    def wait(self, kind: str, target: str, until: str = "green", timeout: float = 0.3) -> tuple[int, str]:
+    def wait(self, kind: str, target: str, until: str = "green", timeout: float = 0.5, fill: tuple | None = None,
+             sha: str | None = None) -> tuple[int, str]:
+        """Wait while a stand-in daemon writes `fill` (data, extra) shortly after the wait begins."""
+        key = gg.parse_key(kind, target)
+        timer = threading.Timer(0.1, lambda: self.put(key, fill[0], **fill[1])) if fill else None
+        if timer:
+            timer.start()
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-            code = gg.cmd_wait(kind, target, until, timeout, False, False)
+            code = gg.cmd_wait(kind, target, until, timeout, False, False, sha)
+        if timer:
+            timer.join()
         return code, out.getvalue()
 
     def test_wait_exit_codes(self) -> None:
         green = gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")]))
-        self.put("pr:o/r#1", green)
-        self.assertEqual(self.wait("pr", "o/r#1")[0], 0)
+        self.assertEqual(self.wait("pr", "o/r#1", fill=(green, {}))[0], 0)
 
         red = gg.parse_pr(pr_node(2, rollup="PENDING", checks=[check_run("a", conclusion="FAILURE"),
                                                                 check_run("b", "IN_PROGRESS", None)]))
-        self.put("pr:o/r#2", red)
-        code, text = self.wait("pr", "o/r#2")
+        code, text = self.wait("pr", "o/r#2", fill=(red, {}))
         self.assertEqual(code, 1)  # green fails fast
         self.assertIn("failed: a  https://ci/a", text)
-        self.assertEqual(self.wait("pr", "o/r#2", until="done")[0], 2)  # done waits for b
+        self.assertEqual(self.wait("pr", "o/r#2", until="done", fill=(red, {}))[0], 2)  # done waits for b
 
         closed = gg.parse_pr(pr_node(3, state="CLOSED", rollup="SUCCESS"))
-        self.put("pr:o/r#3", closed)
-        self.assertEqual(self.wait("pr", "o/r#3", until="merged")[0], 1)
-        self.put("pr:o/r#4", gg.parse_pr(pr_node(4, state="MERGED", rollup=None)))
-        self.assertEqual(self.wait("pr", "o/r#4", until="merged")[0], 0)
+        self.assertEqual(self.wait("pr", "o/r#3", until="merged", fill=(closed, {}))[0], 1)
+        merged = gg.parse_pr(pr_node(4, state="MERGED", rollup=None))
+        self.assertEqual(self.wait("pr", "o/r#4", until="merged", fill=(merged, {}))[0], 0)
 
-        self.put("run:o/r/5", {"status": "completed", "conclusion": "failure"})
-        self.assertEqual(self.wait("run", "o/r/5")[0], 1)
-        self.put("run:o/r/6", {"status": "completed", "conclusion": "success"})
-        self.assertEqual(self.wait("run", "o/r/6")[0], 0)
+        self.assertEqual(self.wait("run", "o/r/5", fill=({"status": "completed", "conclusion": "failure"}, {}))[0], 1)
+        self.assertEqual(self.wait("run", "o/r/6", fill=({"status": "completed", "conclusion": "success"}, {}))[0], 0)
         code, text = self.wait("run", "o/r/7", timeout=0.1)  # nothing cached yet
         self.assertEqual(code, 2)
         self.assertIn("result: timeout", text)
         # waiting registered interest for the daemon to pick up
         self.assertIsNotNone(gg.read_json(gg.watch_dir() / gg.file_name("run:o/r/7")))
+
+    def test_wait_ignores_cache_from_before_it_began(self) -> None:
+        old_green = gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")]))
+        self.put("pr:o/r#1", old_green, at=time.time() - 30)
+        self.assertEqual(self.wait("pr", "o/r#1", timeout=0.3)[0], 2)
+
+    def test_wait_sha_mismatch_is_pending(self) -> None:
+        green = gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")]))  # head is aaaa...
+        code, text = self.wait("pr", "o/r#1", fill=(green, {}), sha="b" * 40, timeout=0.4)
+        self.assertEqual(code, 2)
+        self.assertIn("GitHub still shows head aaaaaaaaaa", text)
+        self.assertEqual(self.wait("pr", "o/r#1", fill=(green, {}), sha="aaaaaaa")[0], 0)
+
+    def test_missing_pr_fails(self) -> None:
+        code, text = self.wait("pr", "o/r#404", fill=(None, {"error": "Could not resolve"}))
+        self.assertEqual(code, 1)
+        self.assertIn("Could not resolve", text)
+
+    def test_rerun_after_cancel_counts_the_latest_attempt(self) -> None:
+        old = {**check_run("Web complexity", conclusion="CANCELLED"), "databaseId": 1, "startedAt": "2026-09-25T10:00:00Z"}
+        new = {**check_run("Web complexity"), "databaseId": 2, "startedAt": "2026-09-25T11:00:00Z"}
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[new, old]))
+        self.assertEqual([c["conclusion"] for c in data["checks"]], ["SUCCESS"])
+        self.assertEqual(gg.verdict("pr", data), 0)
+
+    def test_only_required_checks_decide_when_marked(self) -> None:
+        req = {**check_run("build"), "isRequired": True}
+        optional = {**check_run("lint", conclusion="FAILURE"), "isRequired": False}
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[req, optional]))
+        self.assertEqual(gg.verdict("pr", data, "green"), 0)
+        self.assertEqual(gg.verdict("pr", data, "done"), 0)
+        self.assertIn("lint (not required)", gg.summary("pr:o/r#1", {"data": data}))
+        many = {**data, "checksTruncated": True, "checkState": "PENDING"}
+        self.assertIsNone(gg.verdict("pr", many))  # over 100 checks: the rollup decides
+        self.assertIn("none reported yet", gg.summary("pr:o/r#2", {"data": gg.parse_pr(pr_node(2, rollup=None))}))
+
+    def test_daemon_down_waits_out_a_reexec(self) -> None:
+        self.lock.close()
+        holder = open(gg.BASE / "daemon.lock", "a+")
+        relock = threading.Timer(0.1, lambda: fcntl.flock(holder, fcntl.LOCK_EX))
+        relock.start()
+        self.assertTrue(gg.daemon_running(grace=0.5))
+        relock.join()
+        holder.close()
 
     def test_done_uses_every_check(self) -> None:
         both = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[check_run("a"), check_run("b", conclusion="CANCELLED")]))

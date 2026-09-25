@@ -64,6 +64,7 @@ This command only runs that bootstrap read-only and records its verdict. The rec
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import json
@@ -1156,6 +1157,9 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
         elif act["kind"] == "tool" and act["state"] == "remove":
             Path(act["path"]).unlink()
             act["applied"] = True
+            if Path(act["path"]) == skill_path(ctx):
+                with contextlib.suppress(OSError):  # only when empty
+                    skill_path(ctx).parent.rmdir()
         elif act["kind"] == "git" and act["state"] == "remove":
             code, _ = run([which("git") or "git", "config", "--global", "--unset", act["key"]], env=ctx.git_env())
             act["applied"] = code == 0
