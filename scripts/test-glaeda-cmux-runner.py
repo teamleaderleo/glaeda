@@ -748,6 +748,23 @@ class HookTest(unittest.TestCase):
             for runner in ("g0", "u0"):
                 self.finish(runner)
 
+    def test_job_class_keys_on_workflow_file_and_job_id(self) -> None:
+        wf = hook.workflow_file
+        self.assertEqual(wf("manaflow-ai/cmux/.github/workflows/cmux-tui.yml@refs/pull/1/merge"), "cmux-tui.yml")
+        self.assertEqual(wf("manaflow-ai/cmux/.github/workflows/test-e2e.yml@refs/heads/main"), "test-e2e.yml")
+        for bad in (None, "", "cmux-tui.yml", "manaflow-ai/cmux/cmux-tui.yml@main"):
+            self.assertEqual(wf(bad), "")
+        home = "manaflow-ai/cmux"
+        for job in ("lint", "test", "build"):
+            self.assertEqual(hook.job_class(job, home, home, "cmux-tui.yml"), ("isolated", False))
+            # the same id elsewhere (test-e2e's root jobs) keeps the unknown-job default: compile, pinned
+            self.assertEqual(hook.job_class(job, home, home, "test-e2e.yml"), ("compile", True))
+            self.assertEqual(hook.job_class(job, home, home), ("compile", True))
+        self.assertEqual(hook.job_class("rerun", home, home, "app-host-test-rerun.yml"), ("product", False))
+        self.assertEqual(hook.job_class("macos-compile-admission", home, home, "ci.yml"), ("compile", False))
+        self.assertEqual(hook.job_class("lint", "someone/else", home, "cmux-tui.yml"), ("isolated", False),
+                         "a guest keeps the guest rule")
+
     def test_capacity_guest_repo_jobs_never_take_cmux_roots(self) -> None:
         self.fleet()
         env = {"GITHUB_REPOSITORY": "manaflow-ai/newapp"}
