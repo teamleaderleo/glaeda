@@ -14,8 +14,9 @@ import re
 from typing import Any, Callable
 
 MINI_LABEL = "glaeda-mini"
-# A host's ios_sim: true, verified on the mini: an available iOS runtime of IOS_SIM_MAJOR in its Xcode.
+# A host with the ios-simulators role, verified on the mini: an available iOS runtime of IOS_SIM_MAJOR.
 IOS_SIM_LABEL = "glaeda-ios-sim"
+IOS_SIM_ROLE = "ios-simulators"
 IOS_SIM_MAJOR = "26"
 # dev machines take no jobs; borrowed machines run jobs only inside a VM, never as a host runner.
 RUNNER_CLASSES = ("xl", "std", "light")
@@ -108,12 +109,10 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     versions = [str(a["version"]) for a in ready]
     # Opportunistic members never carry a pool label, so they never receive a required job.
     pools = [pool_label(klass, v, bool(trusted_ref)) for v in versions] if availability == "dedicated" else []
-    ios_declared = host.get("ios_sim", False)
-    if not isinstance(ios_declared, bool):
-        return None, f"{member} ios_sim must be true or false"
-    # Declared in the manifest and, when the caller can look (the installer on the mini), a simulator runtime
-    # actually present: an iOS job routed here must be able to boot one.
-    ios_sim = ios_declared and bool(ready) and (ios_sim_ok is None or ios_sim_ok(ready))
+    # Declared (the ios-simulators role) and, when the caller can look (the installer on the mini), a simulator
+    # runtime actually present: an iOS job routed here must be able to boot one. Without a check (the fleet
+    # plan) this is the declared view.
+    ios_sim = IOS_SIM_ROLE in roles and bool(ready) and (ios_sim_ok is None or ios_sim_ok(ready))
     labels = [MINI_LABEL, f"glaeda-class-{klass}", f"glaeda-{availability}",
               *(["glaeda-trusted"] if trusted_ref else []), *[f"xcode-{v}" for v in versions], *pools,
               *([IOS_SIM_LABEL] if ios_sim else [])]
