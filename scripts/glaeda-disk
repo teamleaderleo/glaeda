@@ -644,13 +644,13 @@ def _pid_alive(pid: int) -> bool:
 
 def cmux_active(path: Path, levels: int = 3, budget: int = 5000) -> bool:
     """cmuxterm-hq's reload-cloud marks a slot busy while a job runs: <slot>/.cmux-active/pid with a
-    live pid, or a <slot>/.lock (lib/cloud-slot-runtime.sh). Either, at or up to `levels` below path,
+    live pid, or work/<slot>/.lock (lib/cloud-slot-runtime.sh). Either, at or up to `levels` below path,
     means in use. An unreadable pid, or a tree too big to search within `budget`, counts as busy."""
     level = [path]
     for depth in range(levels + 1):
         nxt: list[Path] = []
         for d in level:
-            if (d / ".lock").exists():
+            if d.parent.name == "work" and (d / ".lock").exists():  # hq's slot lock, not any tool's .lock
                 return True
             marker = d / ".cmux-active" / "pid"
             if marker.exists():

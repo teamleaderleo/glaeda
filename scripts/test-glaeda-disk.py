@@ -221,6 +221,9 @@ class GlaedaDiskTest(unittest.TestCase):
         (slot / ".lock").write_text("")
         self.assertTrue(gd.cmux_active(self.root / "work"))  # hq's slot lock also means busy
         (slot / ".lock").unlink()
+        (self.root / "work/slot-1/SourcePackages").mkdir()
+        (self.root / "work/slot-1/SourcePackages/.lock").write_text("")
+        self.assertFalse(gd.cmux_active(self.root / "work"))  # a SwiftPM lock is not a slot lock
         # the marker lives in work/<slot>; the DerivedData beside it is what glaeda-disk deletes
         (slot / ".cmux-active/pid").write_text(str(os.getpid()))
         fam = gd.Family("cmux-job-cache", self.root, True, "x", depth=2)
