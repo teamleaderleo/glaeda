@@ -146,6 +146,46 @@ async fn writer_manifest_then_warm() {
     let (rc, _, _) = run(&["warm", &url, "r/c/none", "--trusted-keys", &pubkey, "--store", &p("reader2")]);
     assert_eq!(rc, 1);
 
+    // Prewarm (needs Xcode for the build version, as on the minis): the latest marker
+    // names a commit, and prewarm warms it into the node store.
+    let xcode = Command::new("xcodebuild").arg("-version").output().ok().and_then(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("Build version ").map(str::to_string))
+    });
+    if let Some(xcode) = xcode {
+        let commit = "ab".repeat(20);
+        let (rc, _, err) = run(&["marker", "put", &url, &format!("r/{commit}/{xcode}"), "--sign-key", &p("writer.key"), "--entry", "commit=x", "--manifest", &p("manifest")]);
+        assert_eq!(rc, 0, "{err}");
+        // The latest marker moves: a newer signed put replaces it.
+        for c in ["cd".repeat(20), commit.clone()] {
+            let (rc, _, err) = run(&["marker", "put", &url, &format!("r/latest/{xcode}"), "--sign-key", &p("writer.key"), "--entry", &format!("commit={c}")]);
+            assert_eq!(rc, 0, "{err}");
+        }
+        let (_, out, _) = run(&["marker", "get", &url, &format!("r/latest/{xcode}"), "--trusted-keys", &pubkey]);
+        assert!(out.contains(&format!("commit={commit}")), "{out}");
+        let pw = root.join("pw");
+        std::fs::create_dir_all(pw.join("bin")).unwrap();
+        std::os::unix::fs::symlink(BIN, pw.join("bin/fleet-cas")).unwrap();
+        std::fs::write(pw.join("fleet-cas.env"), format!("FLEET_CAS_STORE=127.0.0.1:{port}\nFLEET_CAS_TRUSTED_KEYS={pubkey}\nFLEET_CAS_SIGN_KEY=\n")).unwrap();
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fleet-cas-prewarm.sh");
+        let prewarm = || {
+            let o = Command::new(script)
+                .arg("r")
+                .env("FLEET_CAS_ROOT", &pw)
+                .env("FLEET_HOST_LOCK", root.join("no-such-lock"))
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+        let out = prewarm();
+        assert!(out.contains("2 fetched"), "{out}");
+        assert_eq!(count_files(&pw.join("node-store/kv")), 2);
+        // Everything local now: the next tick checks and logs nothing.
+        assert_eq!(prewarm(), "");
+    }
+
     drop(_guard);
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -1,7 +1,7 @@
 #!/bin/bash
 # glaeda-fleet-cas: install the fleet compilation-cache services on this cmux mini.
 #
-#   glaeda-fleet-cas node --store HOST:PORT [--trusted-keys HEX] [--apply]
+#   glaeda-fleet-cas node --store HOST:PORT [--trusted-keys HEX] [--prewarm REPO] [--apply]
 #   glaeda-fleet-cas writer --store HOST:PORT --sign-key PATH --trusted-keys HEX [--apply]
 #   glaeda-fleet-cas store --listen IP:PORT [--writers IP,IP] [--trusted-keys HEX] [--apply]
 #   glaeda-fleet-cas uninstall [--apply]               remove the services, keep the stores
@@ -17,7 +17,8 @@
 #         read-only (--read-only-kv). With --trusted-keys it uses only index entries signed
 #         by the writer. Builds add the plugin settings only from
 #         `xcode/bin/fleet-cas-settings.sh <socket>`; `xcode/bin/fleet-cas-marker.sh` says
-#         whether the store holds a commit.
+#         whether the store holds a commit. --prewarm REPO adds a 5-minute LaunchAgent
+#         (fleet-cas-prewarm.sh) that keeps the node warm with the writer's newest fill.
 # writer: the node daemon on the one trusted writer host (#1134 M3): it signs every index
 #         entry with --sign-key (a 0600 key file made by `fleet-cas keygen`, which stays on
 #         this host) and writes through to the store. Its main builds run under
@@ -43,7 +44,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 proto=$here/tools/fleet-cas-prototype
 
 role=${1:-}; shift || true
-apply= store= listen= writers= trusted= sign_key=
+apply= store= listen= writers= trusted= sign_key= prewarm=
 while [ $# -gt 0 ]; do
   case $1 in
     --apply) apply=1 ;;
@@ -52,6 +53,7 @@ while [ $# -gt 0 ]; do
     --writers) writers=${2:?--writers IP,IP}; shift ;;
     --trusted-keys) trusted=${2:?--trusted-keys HEX,HEX}; shift ;;
     --sign-key) sign_key=${2:?--sign-key PATH}; shift ;;
+    --prewarm) prewarm=${2:?--prewarm REPO}; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -115,6 +117,46 @@ plist_for() {  # role, label, daemon (1 or empty)
     '    <key>ProcessType</key>' '    <string>Interactive</string>'
   printf '%s\n' '    <key>StandardOutPath</key>' "    <string>$log</string>"
   printf '%s\n' '    <key>StandardErrorPath</key>' "    <string>$log</string>" '</dict>' '</plist>'
+}
+
+# A reader node's prewarm (fleet-cas-prewarm.sh REPO): a LaunchAgent every 5 minutes that
+# copies the writer's newest fill into the node store between builds. An agent is enough: it
+# reaches the store on its tailnet address, and it skips while any job holds the host lock.
+PREWARM_LABEL=com.teamleaderleo.glaeda.fleet-cas-prewarm
+prewarm_plist() {  # repo
+  local log=$LOGS/glaeda-fleet-cas-prewarm.log
+  printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+    '<plist version="1.0">' '<dict>' \
+    '    <key>Label</key>' "    <string>$PREWARM_LABEL</string>" \
+    '    <key>ProgramArguments</key>' '    <array>' \
+    "        <string>$BIN/fleet-cas-prewarm.sh</string>" "        <string>$(xml "$1")</string>" '    </array>' \
+    '    <key>StartInterval</key>' '    <integer>300</integer>' \
+    '    <key>RunAtLoad</key>' '    <true/>' \
+    '    <key>ProcessType</key>' '    <string>Background</string>' \
+    '    <key>LowPriorityIO</key>' '    <true/>' \
+    '    <key>StandardOutPath</key>' "    <string>$log</string>" \
+    '    <key>StandardErrorPath</key>' "    <string>$log</string>" '</dict>' '</plist>'
+}
+write_prewarm() {  # repo, or empty to remove
+  local agent=$AGENTS/$PREWARM_LABEL.plist
+  if [ -z "$1" ]; then
+    [ -e "$agent" ] || return 0
+    say "remove $PREWARM_LABEL"
+    [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$PREWARM_LABEL" 2>/dev/null || true; rm -f "$agent"; }
+    return 0
+  fi
+  say "prewarm $PREWARM_LABEL: every 5 min, $BIN/fleet-cas-prewarm.sh $1"
+  [ -n "$apply" ] || return 0
+  mkdir -p "$AGENTS" "$LOGS"
+  prewarm_plist "$1" >"$agent.tmp"
+  plutil -lint -s "$agent.tmp"
+  if cmp -s "$agent.tmp" "$agent" && launchctl print "gui/$(id -u)/$PREWARM_LABEL" >/dev/null 2>&1; then
+    rm -f "$agent.tmp"
+  else
+    mv "$agent.tmp" "$agent"
+    bootstrap "gui/$(id -u)" "$PREWARM_LABEL" "$agent"
+  fi
 }
 
 # Stop the role's process so launchd starts it again with the current args and binary. The
@@ -193,7 +235,7 @@ install_binaries() {
     (cd "$proto" && nice -n 15 cargo build --release --locked -q)
     mkdir -p "$BIN"
     local f src
-    for f in fleet-cas fleet-cas-run fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-writer-build.sh; do
+    for f in fleet-cas fleet-cas-run fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-prewarm.sh fleet-cas-writer-build.sh; do
       src=$proto/target/release/$f; [ "$f" = fleet-cas ] || src=$proto/scripts/$f
       if ! cmp -s "$src" "$BIN/$f"; then
         install -m 0755 "$src" "$BIN/$f.new" && mv "$BIN/$f.new" "$BIN/$f"
@@ -231,6 +273,8 @@ case $role in
     elif [ -n "$sign_key" ]; then
       echo "--sign-key is for the writer role" >&2; exit 2
     fi
+    # The writer fills; it has nothing to prewarm.
+    [ "$role" = node ] || [ -z "$prewarm" ] || { echo "--prewarm is for the node role" >&2; exit 2; }
     install_binaries
     if [ -n "$apply" ] && [ "$role" = writer ]; then
       pub=$("$BIN/fleet-cas" pubkey "$sign_key")
@@ -245,6 +289,7 @@ case $role in
       "$BIN/fleet-cas-settings.sh" "$SOCK" >/dev/null 2>&1 || health_failed node
       echo "ok $role answering on $SOCK (upstream $store)"
     fi
+    write_prewarm "$prewarm"
     ;;
   store)
     [ -n "$listen" ] || { echo "store needs --listen IP:PORT (a LAN address, never 0.0.0.0)" >&2; exit 2; }
@@ -261,6 +306,7 @@ case $role in
     fi
     ;;
   uninstall)
+    write_prewarm ""
     for r in node store; do
       label=$(label_for "$r")
       say "stop and remove $label (stores kept)"

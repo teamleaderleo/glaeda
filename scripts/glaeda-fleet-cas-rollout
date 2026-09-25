@@ -2,7 +2,7 @@
 # glaeda-fleet-cas-rollout: deploy the fleet compilation cache from an operator Mac.
 #
 #   glaeda-fleet-cas-rollout --store HOST [--trusted-keys HEX] [--writer HOST --sign-key PATH]
-#                            NODE_HOST... [--apply]
+#                            [--prewarm REPO] NODE_HOST... [--apply]
 #
 # Plans by default; --apply deploys. HOST names are ssh aliases (User cmux). The store
 # listens on the store host's tailnet address port 7450; every NODE_HOST gets a read-only
@@ -14,17 +14,20 @@
 # node's socket. Each host
 # receives scripts/glaeda-fleet-cas and tools/fleet-cas-prototype under
 # ~/.cache/glaeda-fleet-cas (also when planning) and runs `glaeda-fleet-cas` there
-# (docs/CMUX_BUILD_SLOT_MODES.md). Every host needs the tailnet grant for the store port.
+# (docs/CMUX_BUILD_SLOT_MODES.md). With --prewarm REPO (cmux@catchup-v1), every node also gets
+# the prewarm agent (fleet-cas-prewarm.sh), which keeps it warm with the writer's newest fill.
+# Every host needs the tailnet grant for the store port.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 PORT=7450
-store= apply= trusted= writer= sign_key= nodes=()
+store= apply= trusted= writer= sign_key= prewarm= nodes=()
 while [ $# -gt 0 ]; do
   case $1 in
     --store) store=${2:?}; shift ;;
     --trusted-keys) trusted=${2:?}; shift ;;
     --writer) writer=${2:?}; shift ;;
     --sign-key) sign_key=${2:?}; shift ;;
+    --prewarm) prewarm=${2:?}; shift ;;
     --apply) apply=--apply ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *) nodes+=("$1") ;;
@@ -75,5 +78,5 @@ run "$store" store --listen "$ip:$PORT" ${writer_ip:+--writers "$writer_ip"} ${t
 [ -z "$writer" ] || run "$writer" writer --store "$ip:$PORT" --sign-key "$sign_key" --trusted-keys "$trusted" $apply
 for n in ${nodes[@]+"${nodes[@]}"}; do
   [ "$n" = "$writer" ] && continue
-  run "$n" node --store "$ip:$PORT" ${trusted:+--trusted-keys "$trusted"} $apply
+  run "$n" node --store "$ip:$PORT" ${trusted:+--trusted-keys "$trusted"} ${prewarm:+--prewarm "$prewarm"} $apply
 done

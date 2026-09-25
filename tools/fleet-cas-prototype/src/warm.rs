@@ -208,6 +208,8 @@ async fn warm(
             if let Ok(bytes) = std::fs::read(&path) {
                 if let Ok(v) = kv::Value::decode(bytes.as_slice()) {
                     if store.trusts(&key, &v) {
+                        // A use, so the node store's gc keeps it (fleet-cas-prewarm.sh).
+                        crate::gc::touch_if_stale(&path);
                         return Ok(Entry::Local);
                     }
                 }

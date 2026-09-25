@@ -97,3 +97,8 @@ fi
   --entry "repo=$repo" --entry "commit=$commit" --entry "xcode=$xcode" \
   --entry "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" ${manifest[@]+"${manifest[@]}"} || exit 4
 echo "fleet-cas: marker $repo/$commit/$xcode"
+# The newest fill, for readers' prewarm (fleet-cas-prewarm.sh). Only after the commit's own
+# marker, so it never names a commit without one. Best effort: the fill itself succeeded.
+"$ROOT/bin/fleet-cas" marker put "http://$store" "$repo/latest/$xcode" --sign-key "$key" \
+  --entry "repo=$repo" --entry "commit=$commit" --entry "xcode=$xcode" \
+  --entry "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "fleet-cas: could not update $repo/latest/$xcode" >&2
