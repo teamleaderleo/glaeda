@@ -146,7 +146,8 @@ cmux7s-mac-mini  free 158.6/460.4 GiB (low 69.1); caches 218.8 GiB [user-cache 1
 The runner hook samples the host while every admitted job runs and writes one
 `glaeda-cmux-job/v1` line per job to `~/Library/Logs/glaeda-cmux-jobs.jsonl`
 ([CMUX_MINI_RUNNER.md](CMUX_MINI_RUNNER.md), section 2, step 3). The `jobs` probe tails that
-file and keeps the last 24 h: how many jobs ran, how many ran `contended`, and
+file, reads only its `completed` lines (or lines with no `event`) and skips `started` and
+`refused` ones, and keeps the last 24 h: how many jobs ran, how many ran `contended`, and
 the reasons for the newest five contended ones. A job is contended when work
 outside the mini's runner jobs averaged at least 2 cores and at least 15% of
 them; when the host CPU (iostat) averaged 90% busy or more while other runner

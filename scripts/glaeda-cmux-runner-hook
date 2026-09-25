@@ -42,8 +42,9 @@ Only then does it run glaeda-disk --pressure --apply --top 0, bounded and never 
 
 An admitted job also gets a detached host sampler (unless --no-telemetry): it records load, the cores used by
 this job, by the other runner slots' jobs and by everything outside them, and the top outside processes, and
-writes one JSON line per job to ~/Library/Logs/glaeda-cmux-jobs.jsonl (glaeda-cmux-job/v1, "contended" or
-"clear"). glaeda-fleet-status reads it (source "jobs").
+writes one "completed" JSON line per job to ~/Library/Logs/glaeda-cmux-jobs.jsonl (glaeda-cmux-job/v1,
+"contended" or "clear"); job-started also writes a "started" line at admission and a "refused" line when it
+refuses. glaeda-fleet-status reads the completed lines (source "jobs").
 
 job-completed stops the sampler (it writes the record), runs the same disk pressure pass and always exits 0.
 
@@ -871,8 +872,9 @@ def holder_pids(state_dir: Path) -> set[int]:
 def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watch_pid: int,
                   state_dir: Path, compile_slots: int = 1, roots: int = 1,
                   repo: str | None = DEFAULT_HOME_REPO, home_repo: str = DEFAULT_HOME_REPO,
-                  instance: int = 0, workflow: str = "") -> tuple[bool, str]:
+                  instance: int = 0, workflow: str = "", taken_out: dict[str, Any] | None = None) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
+    When held, taken_out (if given) receives the units and tokens taken, for the job log.
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
     takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
     the job class's tokens. Everything is a flock, so a holder that dies releases all of it."""
@@ -968,6 +970,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 release_holder(holder_file(state_dir))
                 note = why
         what = "+".join([f"{units}/{total} units", *taken])
+        if held and taken_out is not None:
+            taken_out.update(units=units, units_total=total, tokens=list(taken))
         if held and "gui" in taken:
             with contextlib.suppress(OSError):
                 gui_file(state_dir).write_text("gui\n")
@@ -1562,7 +1566,7 @@ def load_event(path: str | None) -> Any:
 # slots by their directory name (actions-runner-glaeda-2). ps's %cpu is the kernel's decaying recent
 # average, so core-seconds are an estimate: good for "who used the CPU", not for billing.
 JOB_LOG = Path.home() / "Library/Logs/glaeda-cmux-jobs.jsonl"
-JOB_LOG_MAX_BYTES = 2 * 1024 * 1024  # past this the log keeps its newest half
+JOB_LOG_MAX_BYTES = 16 * 1024 * 1024  # past this the log keeps its newest half (weeks of started/completed lines)
 JOB_SCHEMA = "glaeda-cmux-job/v1"
 SAMPLER_FILE = "job-sampler"
 SAMPLE_S = 10.0
@@ -1794,7 +1798,7 @@ class JobSamples:
             reasons.append("thermal or performance limit reported")
         top_outside = sorted(self.outside_by.items(), key=lambda kv: -kv[1])[:TOP_OUTSIDE]
         return {
-            "schema": JOB_SCHEMA, **self.meta,
+            "schema": JOB_SCHEMA, **self.meta, "event": "completed", "at": int(ended),
             "started_at": int(self.started), "ended_at": int(ended), "seconds": round(ended - self.started, 1),
             "ncpu": self.ncpu, "samples": self.samples, "sample_seconds": self.interval,
             "load": {"mean": None if load_mean is None else round(load_mean, 2), "max": round(self.load_max, 2)},
@@ -1841,7 +1845,26 @@ def job_meta(repo: str | None, home_repo: str) -> dict[str, Any]:
     klass, _ = job_class(job, repo, home_repo) if job else ("unknown", False)
     return {"host": os.uname().nodename.split(".")[0][:64], "runner": env("RUNNER_NAME", 80), "job": job or None,
             "class": klass, "workflow": env("GITHUB_WORKFLOW"), "repository": repo,
-            "run_id": env("GITHUB_RUN_ID", 32), "run_attempt": env("GITHUB_RUN_ATTEMPT", 8)}
+            "run_id": env("GITHUB_RUN_ID", 32), "run_attempt": env("GITHUB_RUN_ATTEMPT", 8),
+            "event_name": env("GITHUB_EVENT_NAME", 40), "ref": env("GITHUB_REF", 160),
+            "head_ref": env("GITHUB_HEAD_REF", 160), "sha": env("GITHUB_SHA", 40)}
+
+
+def held_roots(state_dir: Path) -> list[str]:
+    """The canonical roots (root-k) the runner's .roots file names now; take-root --switch rewrites it mid-job."""
+    try:
+        return [name for name in roots_file(state_dir).read_text().split() if name.startswith("root-")][:8]
+    except OSError:
+        return []
+
+
+def job_event(event: str, meta: dict[str, Any], log: Path = JOB_LOG, **fields: Any) -> None:
+    """Append a started or refused line (the sampler writes the completed one). Observation only: every
+    failure is swallowed, so the log can never refuse or fail a job."""
+    try:
+        append_job_record({"schema": JOB_SCHEMA, **meta, "event": event, "at": int(time.time()), **fields}, log)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Path = JOB_LOG,
@@ -1899,7 +1922,14 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                 time.sleep(min(1.0, left))
             if finished:
                 break
-        append_job_record(samples.summary(time.time()), log)
+        record = samples.summary(time.time())
+        with contextlib.suppress(Exception):  # take-root/--switch and take-gui change these mid-job
+            final = held_roots(state_dir)
+            if final != record.get("roots", []):
+                record["roots_admitted"] = record.get("roots", [])
+            record["roots"] = final
+            record["gui"] = bool(record.get("gui")) or gui_file(state_dir).exists()
+        append_job_record(record, log)
     except Exception:  # noqa: BLE001
         pass
     finally:
@@ -2028,34 +2058,45 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if why else 0
     if args.phase == "job-started":
         event = load_event(os.environ.get("GITHUB_EVENT_PATH"))
+        # the repository decide() admits: the runner's variable, else the event payload's
+        repo = os.environ.get("GITHUB_REPOSITORY") or _repo_name((event or {}).get("repository")
+                                                                 if isinstance(event, dict) else None)
+        admit_start: float | None = None
+
+        def refused(why: str) -> int:
+            if telemetry:
+                job_event("refused", job_meta(repo, args.home_repo), args.job_log, decision=why[:400],
+                          wait_s=None if admit_start is None else round(time.monotonic() - admit_start, 1),
+                          units=0, roots=[], gui=False, instance=args.instance)
+            return refuse(why)
+
         admit, reason = decide(os.environ.get("GITHUB_EVENT_NAME"), event,
                                os.environ.get("GITHUB_REPOSITORY"), args.allowed_repo, args.allowed_owner,
                                tuple(args.allow_event))
         if not admit:
-            return refuse(reason)
+            return refused(reason)
         if args.trusted_ref or args.trusted_repo:
             why = trusted_refusal(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                                   os.environ.get("GITHUB_REPOSITORY"), event, args.trusted_ref or "(unset)",
                                   args.trusted_repo or "(unset)")
             if why:
-                return refuse(why)
+                return refused(why)
         want: dict[str, Any] = {}
         if args.require_eligible:
             why, want = node_refusal(args.fleet_class)
             if why:
-                return refuse(why)
+                return refused(why)
         why = reservation_refusal(args.reservation, time.time()) \
             or disk_refusal(os.path.dirname(args.host_lock), args.min_free_gib)
         if why:
-            return refuse(why)
+            return refused(why)
         # The wrapper execs this script, so the parent is the job's Runner.Worker.
+        admit_start = time.monotonic()
+        taken: dict[str, Any] = {}
         if args.capacity_units > 0:
             roots_file(args.state_dir).unlink(missing_ok=True)  # a crashed job's record must not look held
             gui_file(args.state_dir).unlink(missing_ok=True)
             ensure_root_shim(Path(FLEET_DIR) / "bin")
-            # the repository decide() admitted: the runner's variable, else the event payload's
-            repo = os.environ.get("GITHUB_REPOSITORY") or _repo_name((event or {}).get("repository")
-                                                                     if isinstance(event, dict) else None)
             guest = is_guest(repo, args.home_repo)
             start = time.monotonic()
             while True:
@@ -2063,7 +2104,8 @@ def main(argv: list[str] | None = None) -> int:
                                            os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
                                            args.state_dir, args.compile_slots, args.canonical_roots,
                                            repo, args.home_repo, instance=args.instance,
-                                           workflow=workflow_file(os.environ.get("GITHUB_WORKFLOW_REF")))
+                                           workflow=workflow_file(os.environ.get("GITHUB_WORKFLOW_REF")),
+                                           taken_out=taken)
                 # cmux refuses fast (its rescue workflow reroutes); a guest has none, so it waits for room.
                 # A cmux job refused only for the gui token waits for it too: the holder is a short GUI job.
                 if held or not note.startswith("capacity:"):
@@ -2077,23 +2119,25 @@ def main(argv: list[str] | None = None) -> int:
         else:
             held, note = take_host_lock(args.host_lock, args.watch_pid or os.getppid(), args.state_dir)
         if not held:
-            return refuse(note)
+            return refused(note)
         if args.require_eligible:
             # Under the lock no fleet build runs here, and every runner here aligns to the same receipt,
             # so the default set now holds for this job.
             why, aligned = toolchain_refusal(args.fleet_class, want, args.toolchain_xcode)
             if why:
                 release_host_lock(args.state_dir)
-                return refuse(why)
+                return refused(why)
             if aligned:
                 note += f"; {aligned}"
         print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
         if args.test_keychain:
             print(f"{PREFIX}: {ensure_test_keychain(Path.home())}", flush=True)
         if telemetry:
-            repo = os.environ.get("GITHUB_REPOSITORY") or _repo_name((event or {}).get("repository")
-                                                                     if isinstance(event, dict) else None)
             meta = job_meta(repo, args.home_repo)
+            meta.update(decision=f"{reason}; {note}"[:400], wait_s=round(time.monotonic() - admit_start, 1),
+                        units=taken.get("units"), roots=held_roots(args.state_dir),
+                        gui=gui_file(args.state_dir).exists(), instance=args.instance)
+            job_event("started", meta, args.job_log)
             note = start_sampler(args.watch_pid or os.getppid(), args.state_dir, meta, args.job_log)
             print(f"{PREFIX}: {note}", flush=True)
     else:

@@ -147,9 +147,22 @@ What `--apply` does:
      mean cores per bucket, the top five
      outside processes by estimated core-seconds, the other runner jobs seen, and a
      `contended` or `clear` verdict with its reasons. Processes are named by the kernel's
-     executable name (`ucomm`, never argv) and user only. The log keeps its newest half past 2 MiB.
+     executable name (`ucomm`, never argv) and user only. The log keeps its newest half past 16 MiB
+     (the trim rewrites the file in place under the append flock, so concurrent writers stay safe).
      `glaeda-fleet-status` reports it (source `jobs`). The sampler never refuses, delays
      or fails a job.
+   - Job log schema. Every line has `schema` (`glaeda-cmux-job/v1`), `event`, `at` (unix
+     seconds) and the job's identity: `host`, `runner`, `instance`, `job`, `class`,
+     `workflow`, `repository`, `run_id`, `run_attempt`, `event_name`, `ref`, `head_ref` (the
+     PR branch), `sha`. `event` is `started` (written at admission), `refused` (written by
+     job-started's refusal path) or `completed` (the sampler's host record); a line without
+     `event` comes from an older hook and is a `completed` one. Started and refused lines add
+     `decision` (the admitted or refused text), `wait_s` (seconds in admission and capacity
+     waits; null for a refusal before admission began), `units`, `roots` (root-k names) and
+     `gui`. The completed line carries the same fields plus the host record; its `roots` is
+     re-read from the runner's `.roots` file at job end, and `roots_admitted` names the
+     admission set when take-root `--switch` changed it. With telemetry off
+     (`--no-telemetry`, `GLAEDA_RUNNER_TELEMETRY=0`) no lines are written.
    - job-completed stops the sampler (it writes the job's line), releases the host lock
      (or the capacity share), runs the same disk pressure pass and always exits 0.
 4. Writes and loads `~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist`
