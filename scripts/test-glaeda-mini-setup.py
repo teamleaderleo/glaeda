@@ -665,12 +665,17 @@ class MiniSetupTest(unittest.TestCase):
         versions = iter([(2, 50, 1), (2, 55, 0)])  # install leaves the old keg; upgrade fixes it
         act = {"kind": "gitpkg", "state": "create", "brew": "/opt/homebrew/bin/brew", "note": ""}
         calls = []
-        with mock.patch.object(ms, "brew_install", lambda brew, formula: (0, "already installed")), \
-                mock.patch.object(ms, "newest_git", lambda: ("/opt/homebrew/bin/git", next(versions))), \
-                mock.patch.object(ms, "run", lambda argv, **kw: (calls.append(argv), (0, ""))[1]):
+
+        def fake_brew(brew, formula, verb="install", timeout=0, no_auto_update=False):
+            calls.append((verb, timeout, no_auto_update))
+            return 0, "already installed"
+
+        with mock.patch.object(ms, "brew_install", fake_brew), \
+                mock.patch.object(ms, "newest_git", lambda: ("/opt/homebrew/bin/git", next(versions))):
             ms.apply_install(ctx, [act])
         self.assertTrue(act["applied"])
-        self.assertEqual(calls, [["/opt/homebrew/bin/brew", "upgrade", "git"]])
+        self.assertEqual(calls, [("install", ms.GIT_BREW_TIMEOUT, True), ("upgrade", ms.GIT_BREW_TIMEOUT, True)])
+        self.assertLess(2 * ms.GIT_BREW_TIMEOUT, 1800)  # inside glaeda-update's wait for setup
         self.assertEqual(act["value"], "2.55.0")
 
     def test_failed_git_install_does_not_fail_the_run(self) -> None:

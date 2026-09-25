@@ -118,6 +118,8 @@ ENROLL_PYTHON_FORMULA = "python@3.13"
 # because of it, which let duplicate packs pile up (14 GiB in one cmux checkout on 2026-09-25)
 MIN_GIT = (2, 55)
 GIT_CANDIDATES = ("/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git")
+# glaeda-update waits 30 minutes for this whole command; the git step must fit well inside that
+GIT_BREW_TIMEOUT = 600
 BREW_TIMEOUT = 1800
 
 
@@ -300,7 +302,11 @@ def plan_git(ctx: Context) -> dict[str, Any]:
     git, version = newest_git()
     shown = f"{git} {'.'.join(map(str, version))}" if version else "none"
     if version and version >= MIN_GIT:
-        return {**act, "state": "unchanged", "value": shown, "note": ""}
+        on_path = shutil.which("git")
+        path_version = git_version(on_path) if on_path else None
+        note = "" if not path_version or path_version >= MIN_GIT else (
+            f"PATH resolves {on_path} {'.'.join(map(str, path_version))}: put {Path(git).parent} first")
+        return {**act, "state": "unchanged", "value": shown, "note": note}
     if ctx.platform == "linux":
         return {**act, "state": "blocked", "value": shown,
                 "note": f"git {need}+ fixes a git maintenance memory bug: sudo add-apt-repository ppa:git-core/ppa "
@@ -315,11 +321,15 @@ def plan_git(ctx: Context) -> dict[str, Any]:
             "note": f"git {need}+ fixes a git maintenance memory bug: the Homebrew owner runs brew install git"}
 
 
-def brew_install(brew: str, formula: str) -> tuple[int, str]:
+def brew_install(brew: str, formula: str, verb: str = "install", timeout: int = BREW_TIMEOUT,
+                 no_auto_update: bool = False) -> tuple[int, str]:
+    env = {**os.environ, "HOMEBREW_NO_AUTO_UPDATE": "1"} if no_auto_update else None
     try:
-        result = subprocess.run([brew, "install", formula], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, timeout=BREW_TIMEOUT, check=False)
-    except (OSError, subprocess.TimeoutExpired) as error:
+        result = subprocess.run([brew, verb, formula], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=timeout, check=False, env=env)
+    except subprocess.TimeoutExpired:
+        return 1, f"brew {verb} {formula} timed out after {timeout} s"
+    except OSError as error:
         return 1, str(error)
     return result.returncode, result.stdout
 
@@ -1001,11 +1011,13 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             write_atomic(path, (json.dumps(act["value"], indent=1, sort_keys=True) + "\n").encode(), 0o644)
             act["applied"] = True
         if kind == "gitpkg" and state == "create":
-            code, out = brew_install(act["brew"], "git")
+            # bottles only, no self-update: both calls fit well inside glaeda-update's wait for setup
+            code, out = brew_install(act["brew"], "git", timeout=GIT_BREW_TIMEOUT, no_auto_update=True)
             _, version = newest_git()
-            if not (version and version >= MIN_GIT):
+            if code == 0 and not (version and version >= MIN_GIT):
                 # `brew install` leaves an outdated keg alone; upgrade it
-                code, more = run([act["brew"], "upgrade", "git"], timeout=BREW_TIMEOUT)
+                code, more = brew_install(act["brew"], "git", verb="upgrade", timeout=GIT_BREW_TIMEOUT,
+                                          no_auto_update=True)
                 out += more
                 _, version = newest_git()
             act["applied"] = bool(version and version >= MIN_GIT)
