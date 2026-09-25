@@ -138,7 +138,9 @@ GUEST_POLL_S = 5.0
 # gui token waits this long for it instead. Two root runners share one gui token, so a full suite's shards often
 # meet on a mini, and a GUI job there runs about 90 s, while a refusal's rescue round trip took 71 s to 18 min
 # (median 126 s, 16 refusals, cmux PR CI 2026-09-25 07:00-09:00Z) and sent the re-run shards to Blacksmith.
-GUI_WAIT_S = 180.0
+# Keep it well under cmux's owned_pool_rescue.REFUSAL_SECONDS (120): a job that fails later than that after
+# starting no longer counts as refused, so the rescue would not re-run it.
+GUI_WAIT_S = 90.0
 GUI_TOKEN_TAKEN = "capacity: the gui token is taken"
 
 
