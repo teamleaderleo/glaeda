@@ -401,7 +401,8 @@ and app-host test consumers restore a product there with `rm -rf <root>/src`, be
 in at the producer's root. So one root job per root per mini:
 
 - Root jobs are compile (macos-compile-admission and any unknown job id), compile-gui (test-e2e's `build`:
-  a producer that holds the gui token as well, and no persistent-dd), gui (app-host-unit-tests,
+  a producer that holds the gui token as well, and no persistent-dd: it only clones its root's kept state,
+  which the root token already guards), gui (app-host-unit-tests,
   tests-build-and-lag, app-host-test-rerun's `rerun`, test-e2e's `test`) and product (cli-product-tests).
   Each also takes an exclusive `capacity/root-k.token` (k = 1 to `canonicalRoots`), and the hook writes `CMUX_CI_CANONICAL_ROOT=<root k>` to `$GITHUB_ENV` and
   `$RUNNER_TEMP/glaeda-canonical-root`. The root follows the token, never the runner instance.

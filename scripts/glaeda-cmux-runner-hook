@@ -124,8 +124,10 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # test-e2e's `build` compiles into $CMUX_CI_CANONICAL_ROOT/derived-data-compile-admission (the root its token
 # picks) and then runs the selected cmuxTests through run-in-console-session.sh, or cmuxUITests in the console
 # user's GUI bootstrap, on the same runner (cmux "ci: run E2E tests on the runner that built them"), so it is
-# compile-gui. It never touches compile admission's persistent DerivedData: no owned_build_state.py and no
-# CMUX_SEED_LOCAL_CACHE, so it takes no persistent-dd token. Its `test` runs only when `build` did not test, and
+# compile-gui. It never writes compile admission's persistent DerivedData: on an owned Mac it only clones this
+# root's kept state (owned_build_state.py check/prefer/adopt, cmux#14692), never keep/save/record, and only a
+# job holding root-k writes root-k's store, so the root token covers it and it takes no persistent-dd token.
+# Its `test` runs only when `build` did not test, and
 # restores that product into the producer's root (restore-app-host-test-product.sh takes it) for the same
 # console-session tests, so it is gui like `rerun`.
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
