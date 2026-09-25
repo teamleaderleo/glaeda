@@ -481,5 +481,164 @@ class CollectTests(unittest.TestCase):
             fs.collect_cache(["t5"])
 
 
+GIB = 1024**3
+
+
+def disk_row(**extra):
+    row = {"reachable": True, "installed": True, "error": None, "observed_at": AT - 5, "free": 200 * GIB,
+           "total": 460 * GIB, "low": 69 * GIB, "sizes_at": AT - 600, "fleet_cas": False, "prune_job_at": None,
+           "families": [{"family": "tmp", "bytes": 12 * GIB, "owner": "agents and tools", "retired": False}]}
+    row.update(extra)
+    return row
+
+
+def disk(**rows):
+    return src({"hosts": {name.replace("_", "-"): row for name, row in rows.items()}})
+
+
+class DiskTests(unittest.TestCase):
+    def member(self, doc, name="mini-a"):
+        return next(m for m in doc["members"] if m["name"] == name)
+
+    def test_a_healthy_member_is_one_info_summary(self):
+        doc = build(disk=disk(mini_a=disk_row()))
+        [f] = by_id(doc, "disk.")
+        self.assertEqual((f["id"], f["severity"]), ("disk.summary@mini-a", "info"))
+        self.assertEqual(f["action"]["command"], "ssh -- mini-a '~/.local/bin/glaeda-disk'")
+        self.assertFalse(f["action"]["safe_to_apply"])  # glaeda-disk may rewrite its snapshot
+        d = self.member(doc)["disk"]
+        self.assertEqual((d["free_bytes"], d["cache_bytes"], d["under_pressure"]), (200 * GIB, 12 * GIB, False))
+        self.assertEqual(self.member(doc)["status"], "ok")
+
+    def test_a_member_under_pressure_warns_with_a_report_command(self):
+        doc = build(disk=disk(mini_a=disk_row(free=30 * GIB)))
+        [f] = by_id(doc, "disk.pressure@mini-a")
+        self.assertEqual(f["severity"], "warn")
+        self.assertIn("30.0 GiB free of 460.0, below the pressure threshold 69.0 GiB", f["summary"])
+        self.assertEqual((f["action"]["who"], f["action"]["safe_to_apply"]), ("agent", False))
+        self.assertNotIn("rm ", f["action"]["command"])
+        self.assertFalse(by_id(doc, "disk.summary"))
+        self.assertEqual(self.member(doc)["status"], "attention")
+        self.assertIn("UNDER PRESSURE", fs.render_text(doc))
+
+    def test_a_retired_owner_holding_more_than_5_gib_needs_a_person(self):
+        families = [{"family": "hq-build-fleet-cache", "bytes": 21 * GIB, "owner": "cmux build worker (hq)",
+                     "retired": True},
+                    {"family": "old-small", "bytes": 4 * GIB, "owner": "gone", "retired": True},
+                    {"family": "user-cache", "bytes": 170 * GIB, "owner": "", "retired": False}]
+        doc = build(disk=disk(mini_a=disk_row(families=families)))
+        [f] = by_id(doc, "disk.retired_owner")
+        self.assertEqual(f["id"], "disk.retired_owner:hq-build-fleet-cache@mini-a")
+        self.assertEqual((f["action"]["who"], f["action"]["command"]), ("person", None))
+        self.assertIn("RETIRED 25.0 GiB", fs.disk_line(self.member(doc)["disk"], AT))
+
+    def test_gc_skip_and_failed_prune_warn_but_other_skips_do_not(self):
+        doc = build(disk=disk(
+            mini_a=disk_row(fleet_cas=True, prune={"at": AT - 600, "result": "ok", "role": "writer"},
+                            gc={"at": AT - 7200, "result": "skipped: kept entries name no stored object, so the "
+                                                           "ID heuristic is suspect", "dry_run": "kept ...: 3"}),
+            mini_b=disk_row(fleet_cas=True, prune={"at": AT - 600, "result": "failed"},
+                            gc={"at": AT - 60, "result": "skipped: the dry run failed or fleet-cas predates gc"})))
+        [skip] = by_id(doc, "disk.gc_skipped@mini-a")
+        self.assertEqual((skip["severity"], skip["action"]["who"]), ("warn", "person"))
+        self.assertTrue(by_id(doc, "disk.prune_failed@mini-b"))
+        self.assertFalse(by_id(doc, "disk.gc_skipped@mini-b"))
+
+    def test_a_silent_prune_job_warns_only_after_three_hours(self):
+        doc = build(disk=disk(
+            mini_a=disk_row(fleet_cas=True, prune={"at": AT - 4 * 3600, "result": "ok"}),
+            mini_b=disk_row(fleet_cas=True, prune_job_at=AT - 3600)))
+        [f] = by_id(doc, "disk.prune_silent")
+        self.assertEqual(f["member"], "mini-a")
+        self.assertEqual(f["action"]["command"],
+                         "ssh -- mini-a 'launchctl list com.teamleaderleo.glaeda.fleet-cas-prune'")
+        self.assertTrue(f["action"]["safe_to_apply"])  # literal read-only listing
+        doc = build(disk=disk(mini_a=disk_row(fleet_cas=True, prune_job_at=AT - 4 * 3600),
+                              mini_b=disk_row(fleet_cas=True)))
+        self.assertTrue(by_id(doc, "disk.prune_silent@mini-a"))
+        self.assertTrue(by_id(doc, "disk.prune_missing@mini-b"))
+        # no fleet-cas: no prune expectations at all
+        self.assertFalse(by_id(build(disk=disk(mini_a=disk_row())), "disk.prune"))
+
+    def test_missing_logs_and_tool_are_graceful(self):
+        row = fs.parse_disk('@disk\n{"no_glaeda_disk":true}\n@sizes_at\n@prune_job_at\n@prune\n\n@fleet_cas\n'
+                            '@receipts\n\n@now\n1800000000\n', AT)
+        self.assertEqual((row["installed"], row["error"]), (False, None))
+        self.assertNotIn("prune", row)
+        self.assertNotIn("reclaimed_24h", row)
+        doc = build(disk=disk(mini_a=row, mini_b={"reachable": False, "error": "timeout", "observed_at": AT}))
+        [f] = by_id(doc, "disk.")
+        self.assertEqual((f["id"], f["severity"]), ("disk.no_glaeda_disk@mini-a", "info"))
+        self.assertEqual(self.member(doc, "mini-b")["disk"], {"reachable": False})
+        self.assertIn("unreachable", fs.render_text(doc))
+        self.assertEqual(fs.parse_disk("", AT)["error"], "glaeda-disk printed no JSON")
+
+    def test_parse_reduces_the_probe_to_numbers_without_paths(self):
+        report = {"free": 100 * GIB, "total": 460 * GIB, "idle_hours": 24,
+                  "filesystems": [{"dev": 1, "mount": "/", "free": 100 * GIB, "total": 460 * GIB, "low": 69 * GIB,
+                                   "target": 115 * GIB, "tmpfs": False}],
+                  "owners": {"hq": {"owner": "worker", "retired": True}, "empty": {"owner": "x", "retired": False}},
+                  "items": [{"family": "hq", "path": "/Users/cmux/secret/a", "bytes": 3 * GIB},
+                            {"family": "hq", "path": "/Users/cmux/secret/b", "bytes": 4 * GIB},
+                            {"family": "tmp", "path": "/private/tmp/x", "bytes": GIB}]}
+        receipts = [{"at": "2027-01-15T08:00:00+0000", "outcome": "reclaimed", "bytes": 2 * GIB},
+                    {"at": "2027-01-15T07:00:00+0000", "outcome": "changed:in-use", "bytes": 9 * GIB},
+                    {"at": "2027-01-10T00:00:00+0000", "outcome": "reclaimed", "bytes": 9 * GIB}]
+        now = 1_800_000_000  # 2027-01-15T08:00:00Z
+        prune = [{"at": "2027-01-14T08:00:00+0000", "gc": "ran", "result": "ok"},
+                 {"at": "2027-01-15T07:00:00+0000", "gc": "not due", "result": "ok", "role": "reader",
+                  "node_store_bytes": 5, "local_cas_bytes": 6}]
+        stdout = ("@disk\n" + json.dumps(report, indent=2) + "\n@sizes_at\n1799999000\n@prune_job_at\n1799000000\n"
+                  "@prune\n{\"cut off at the front\n" + "\n".join(map(json.dumps, prune)) +
+                  "\n@fleet_cas\nyes\n@receipts\npresent\n" + "\n".join(map(json.dumps, receipts)) +
+                  f"\n@now\n{now - 100}\n")
+        row = fs.parse_disk(stdout, now)
+        self.assertNotIn("/Users/", json.dumps(row))
+        self.assertEqual((row["free"], row["low"], row["fleet_cas"]), (100 * GIB, 69 * GIB, True))
+        self.assertEqual(row["families"][0], {"family": "hq", "bytes": 7 * GIB, "owner": "worker", "retired": True})
+        self.assertEqual([f["family"] for f in row["families"]], ["hq", "tmp", "empty"])
+        self.assertEqual(row["reclaimed_24h"], {"bytes": 2 * GIB, "count": 1})
+        self.assertEqual((row["prune"]["result"], row["prune"]["node_store_bytes"]), ("ok", 5))
+        self.assertEqual(row["prune"]["at"], now - 3600 + 100)  # moved onto this machine's clock
+        self.assertEqual(row["gc"]["result"], "ran")  # "not due" is not a gc outcome
+        self.assertEqual(row["sizes_at"], 1799999100)
+
+    def test_disk_output_stays_bounded(self):
+        families = [{"family": f"f{i}" + "x" * 500, "bytes": i * GIB, "owner": "o" * 5000, "retired": True}
+                    for i in range(5000)]
+        huge = disk_row(families=families, error=None,
+                        prune={"at": AT, "result": "failed " + "y" * 10_000}, fleet_cas=True,
+                        gc={"at": AT, "result": "failed", "dry_run": "z" * 100_000})
+        doc = build(disk=src({"hosts": {"mini-a": huge, "mini-b": huge, "not-in-manifest": huge,
+                                        "coordinator": huge}}))
+        self.assertLessEqual(len(fs.canonical(doc)), fs.MAX_DOCUMENT_BYTES)
+        d = self.member(doc)["disk"]
+        self.assertEqual(len(d["families"]), fs.MAX_DISK_FAMILIES)
+        self.assertTrue(all(len(f["family"]) <= 60 and len(f["owner"]) <= 80 for f in d["families"]))
+        self.assertLessEqual(len(d["gc"]["dry_run"]), 160)
+        self.assertLessEqual(len(fs.disk_line(d, AT)), fs.MAX_TEXT)
+        self.assertTrue(all(len(f["summary"]) <= fs.MAX_TEXT for f in doc["findings"]))
+        # never_touch members get findings but no command
+        mine = [f for f in doc["findings"] if f["member"] == "coordinator"]
+        self.assertTrue(mine)
+        self.assertFalse([f for f in mine if f["action"]["command"] or f["action"]["who"] == "agent"])
+
+    def test_disk_probe_skips_never_touch_and_is_read_only(self):
+        seen = []
+        with mock.patch.object(fs, "disk_host", side_effect=lambda h, u: seen.append(h) or {"reachable": True}):
+            fs.collect_disk({"ssh_user": "builder", "never_touch": ["coordinator"]}, ["mini-a", "coordinator"])
+        self.assertEqual(seen, ["mini-a"])
+        for word in (" rm ", "--apply", "--refresh", "--pressure", "unlink", "delete", ">"):
+            self.assertNotIn(word, fs.DISK_SCRIPT.replace("2>/dev/null", ""))
+        with mock.patch.object(fs.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 255, "", "ssh: timed out")):
+            self.assertFalse(fs.disk_host("mini-a", "builder")["reachable"])
+
+    def test_html_has_a_disk_column(self):
+        page = fs.render_html(build(disk=disk(mini_a=disk_row(free=30 * GIB))))
+        self.assertIn("<th>disk</th>", page)
+        self.assertIn("UNDER PRESSURE", page)
+
+
 if __name__ == "__main__":
     unittest.main()
