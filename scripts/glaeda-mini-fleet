@@ -188,7 +188,8 @@ CATCH_UP_READER_ROLES = ("dev-builds",)
 CATCH_UP_FILL_LABEL = "ai.manaflow.cmux-build-catch-up-fill"
 HQ_WORKER_LABEL = "ai.manaflow.cmux-build-worker"
 # launchd jobs that start on a timer (StartInterval): loaded but "not running" between ticks is their normal state.
-INTERVAL_LABELS = (CATCH_UP_FILL_LABEL,)
+# glaeda-disk agents: timer driven (900 s and 21600 s), so "not running" between runs is healthy.
+INTERVAL_LABELS = (CATCH_UP_FILL_LABEL, "com.teamleaderleo.glaeda.disk-pressure", "com.teamleaderleo.glaeda.disk-dedupe")
 # Paths under FLEET_ROOT that catch-up builds key on, and the kind each must be. A symlink anywhere here is drift.
 FLEET_CAS_PATHS = {
     "xcode": "dir", "xcode/src": "dir", "xcode/src/cmux": "dir", "xcode/DerivedData": "dir", "xcode/bin": "dir",
@@ -948,7 +949,8 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
             exit_code = re.search(r"last_exit=(-?[0-9]+)\b", state)
             if exit_code and exit_code.group(1) != "0":
                 drift("pending", f"{label} last exited {exit_code.group(1)}; loaded, runs on its timer",
-                      "read its receipts (cmux-build-fleet logs/catch-up-fill.log)")
+                      "read its receipts (cmux-build-fleet logs/catch-up-fill.log)" if label == CATCH_UP_FILL_LABEL
+                      else f"launchctl print gui/$(id -u)/{label}")
         elif not state.startswith("running"):
             drift("launchd", f"{label} is {state}")
     for label in policy.get("launchd", {}).get("absent", []):
