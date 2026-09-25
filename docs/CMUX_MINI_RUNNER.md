@@ -261,6 +261,39 @@ count is refused. Every instance bakes the same `--capacity-units`, so the mini
 never runs more than its units, however many runners pick up jobs. Uninstall one
 with `--uninstall --apply --instance K`.
 
+## 2e. Trusted-only runners on a mini that holds a secret
+
+A mini that holds a secret, such as the fleet-cas signing key on the writer mini, must never run PR
+code as the user that can read it. Set the host's runner overrides in the manifest:
+
+```json
+"cmux7s-mac-mini": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"],
+                    "overrides": {"runner": {"trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"}}}
+```
+
+Its runners then:
+
+- carry `glaeda-trusted` and the pool label `glaeda-trusted-<class>-xcode-<version>` instead of
+  `glaeda-<class>-xcode-<version>`, so a PR run's picker never counts or routes to them;
+- bake `--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux` into the job-started hook. It
+  refuses (`refused: untrusted: ...`) every job that is not a push or schedule of exactly that repository
+  on that ref: `GITHUB_REPOSITORY` and the payload's repository, `GITHUB_REF`, a push payload's `ref`
+  and a schedule's default branch must all match, and a payload with `pull_request`, `workflow_run` or
+  `merge_group` is refused. The hook lives on the host, so this holds even when a PR's workflow names
+  the trusted label, and the exact repository keeps another repository in the org off the runner.
+
+workflow_dispatch is refused: a dispatched workflow on main can check out any ref from its inputs (cmux's
+app-host-test-rerun takes `refs/pull/N/merge`). pull_request, merge_group and workflow_run are refused too.
+
+What the gate cannot see, and the operator must keep true:
+
+- The trust boundary is whoever can push to main: main's ruleset must block direct pushes, with no
+  bypass list, so every commit there is a reviewed merge.
+- Trusted jobs must pin every action and reusable workflow by commit SHA, and must restore only caches
+  that trusted runs wrote. A cache namespace that PR runs also write (build seeds, sccache, SwiftPM
+  manifest caches) brings PR-produced bytes next to the secret.
+- Also limit the org runner group to the one repository (an admin setting).
+
 ## 3. Verify
 
 ```bash

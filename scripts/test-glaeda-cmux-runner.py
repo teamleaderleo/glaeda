@@ -237,6 +237,54 @@ class HookTest(unittest.TestCase):
         self.assertEqual(self.run_hook("job-started", "push", path, "--allowed-owner", "manaflow-ai",
                                        "--no-disk", repo="other/cmux").returncode, 1)
 
+    def test_trusted_ref_admits_only_that_branchs_own_jobs(self) -> None:
+        repo = {**CMUX, "default_branch": "main"}
+        other = {"full_name": "manaflow-ai/scratch", "fork": False, "default_branch": "main"}
+        main = {"ref": "refs/heads/main", "repository": repo}
+        pr = {"number": 1, "head": {"repo": {**CMUX, "fork": False}}, "base": {"repo": CMUX}}
+        cases = {
+            "push to main": ("push", "refs/heads/main", main, "manaflow-ai/cmux", True),
+            "schedule": ("schedule", "refs/heads/main", {"repository": repo}, "manaflow-ai/cmux", True),
+            "dispatch on main (inputs can name any ref)": (
+                "workflow_dispatch", "refs/heads/main", {"ref": "refs/heads/main", "repository": repo,
+                                                         "inputs": {"ref": "refs/pull/1/merge"}}, "manaflow-ai/cmux", False),
+            "push to a branch": ("push", "refs/heads/pr-branch", {**main, "ref": "refs/heads/pr-branch"},
+                                 "manaflow-ai/cmux", False),
+            "push, ref env and payload differ": ("push", "refs/heads/main", {**main, "ref": "refs/heads/x"},
+                                                 "manaflow-ai/cmux", False),
+            "another org repo's main": ("push", "refs/heads/main", {**main, "repository": other},
+                                        "manaflow-ai/scratch", False),
+            "repo env and payload differ": ("push", "refs/heads/main", {**main, "repository": other},
+                                            "manaflow-ai/cmux", False),
+            "schedule on another default branch": ("schedule", "refs/heads/main",
+                                                   {"repository": {**repo, "default_branch": "dev"}},
+                                                   "manaflow-ai/cmux", False),
+            "push carrying a pull_request": ("push", "refs/heads/main", {**main, "pull_request": pr},
+                                             "manaflow-ai/cmux", False),
+            "same-repo pull request": ("pull_request", "refs/pull/1/merge", {"pull_request": pr, "repository": repo},
+                                       "manaflow-ai/cmux", False),
+            "merge queue": ("merge_group", "refs/heads/gh-readonly-queue/main/pr-1", {"repository": repo},
+                            "manaflow-ai/cmux", False),
+            "no ref": ("push", None, main, "manaflow-ai/cmux", False),
+        }
+        for name, (event_name, ref, payload, repository, admitted) in cases.items():
+            with self.subTest(name):
+                path = event(self.dir, "".join(c if c.isalnum() else "-" for c in name), payload)
+                result = self.run_hook("job-started", event_name, path, "--allowed-owner", "manaflow-ai",
+                                       "--trusted-ref", "refs/heads/main", "--trusted-repo", "manaflow-ai/cmux",
+                                       "--no-disk", repo=repository, env={"GITHUB_REF": ref} if ref else None)
+                self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
+                if not admitted:
+                    self.assertIn("refused: ", result.stdout)
+        path = event(self.dir, "trusted-ref-alone", main)
+        self.assertEqual(self.run_hook("job-started", "push", path, "--trusted-ref", "refs/heads/main", "--no-disk",
+                                       repo="manaflow-ai/cmux", env={"GITHUB_REF": "refs/heads/main"}).returncode, 1,
+                         "--trusted-ref without --trusted-repo fails closed")
+        path = event(self.dir, "plain-pr", {"pull_request": pr, "repository": CMUX})
+        self.assertEqual(self.run_hook("job-started", "pull_request", path, "--allowed-owner", "manaflow-ai",
+                                       "--no-disk", repo="manaflow-ai/cmux").returncode, 0,
+                         "without --trusted-ref a same-repo PR is admitted as before")
+
     def test_disk_pressure_never_fails_and_is_bounded(self) -> None:
         marker = self.dir / "disk-ran"
         slow = make_executable(self.dir / "glaeda-disk-slow", "import time, pathlib, sys\n"
@@ -1261,6 +1309,13 @@ class RunnerTest(unittest.TestCase):
         with mock.patch.object(cr, "xcode_present", return_value=True):
             self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
         self.assertIn("--capacity-units 4 --compile-slots 2", (hooks / "job-started.sh").read_text())
+        self.assertNotIn("--trusted-ref", (hooks / "job-started.sh").read_text())
+        manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {
+            "trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"}
+        path.write_text(json.dumps(manifest))
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
+        self.assertIn("--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux", (hooks / "job-started.sh").read_text())
 
     def test_instances_get_their_own_paths_and_share_the_capacity(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
@@ -1512,6 +1567,26 @@ class ManifestLabelsTest(unittest.TestCase):
                     member, why = cr.member_labels(manifest, "mini-std")
                     self.assertIsNone(member)
                     self.assertIn("runner.classes.std", why)
+
+    def test_trusted_ref_moves_the_member_to_its_own_pool(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            manifest = json.loads(json.dumps(MANIFEST))
+            trusted = {"trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"}
+            manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = dict(trusted)
+            member, why = cr.member_labels(manifest, "mini-std")
+            self.assertIsNone(why)
+            self.assertEqual(member["pools"], ["glaeda-trusted-std-xcode-26.6"])
+            self.assertIn("glaeda-trusted", member["labels"])
+            self.assertNotIn("glaeda-std-xcode-26.6", member["labels"], "a PR run must never route here")
+            self.assertEqual(member["trustedRef"], "refs/heads/main")
+            self.assertIsNone(cr.member_labels(MANIFEST, "mini-std")[0]["trustedRef"])
+            for bad in ({**trusted, "trustedRef": "main"}, {**trusted, "trustedRef": "refs/pull/1/merge"},
+                        {**trusted, "trustedRef": "refs/heads/a b"}, {**trusted, "trustedRef": 7},
+                        {"trustedRef": "refs/heads/main"}, {"trustedRepo": "manaflow-ai/cmux"},
+                        {**trusted, "trustedRepo": "cmux"}):
+                with self.subTest(bad=bad):
+                    manifest["hosts"]["mini-std"]["overrides"]["runner"] = bad
+                    self.assertIn("trustedRef", cr.member_labels(manifest, "mini-std")[1])
 
     def test_member_labels_table(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
