@@ -636,7 +636,7 @@ class HookTest(unittest.TestCase):
         state = self.dir / "state"
         try:
             build = self.job("build", "e0", 8, None, *two, env=e2e)
-            self.assertIn("+gui+root-1 for build (compile-gui", build.stdout)
+            self.assertIn("units+root-1 for build (compile-gui", build.stdout)
             self.assertTrue((state / "host-lock-holder-e0-root-1.pid").exists(), "the root has a holder of its own")
             refused = self.take("2", "e0", "--wait", "0")
             self.assertEqual(refused.returncode, 2, "without --switch a second root is still refused")
@@ -656,8 +656,8 @@ class HookTest(unittest.TestCase):
             self.assertEqual(env_file.read_text(), "CMUX_CI_CANONICAL_ROOT=/private/tmp/cmux-ci-2\n")
             self.assertEqual((state / "host-lock-holder-e0.roots").read_text().split(), ["root-2"])
             self.assertEqual(self.take("1", "c0", "--wait", "5").returncode, 0, "root 1 is free again")
-            gui = self.job("app-host-unit-tests", "g0", 8, None, *two, "--gui-wait", "0")
-            self.assertIn("the gui token is taken", gui.stdout, "the admission holder keeps units and gui")
+            full = self.job("swift-package-tests", "g0", 2, None, *two)  # e0 still holds unit-0 and unit-1
+            self.assertIn("0 of 2 units free", full.stdout, "the admission holder keeps its units")
             self.assertEqual(self.take("2", "e0").returncode, 0, "a re-take of the new root is a no-op")
             self.assertIn("canonical root holder(s) released", self.finish("e0"))
             self.assertEqual(self.take("2", "c1", "--wait", "5").returncode, 0, "released with the job")
@@ -947,44 +947,49 @@ class HookTest(unittest.TestCase):
             for runner in ("w0", "w1", "w2", "w3", "w4", "w5"):
                 self.finish(runner)
 
-    def test_capacity_e2e_jobs_hold_the_gui_token(self) -> None:
-        # test-e2e's build compiles and then runs its tests in the console session; its test job is the fallback
+    def test_capacity_e2e_build_takes_the_gui_token_for_its_tests_only(self) -> None:
+        # test-e2e's build compiles, then takes the gui token itself (take-gui) before its console-session tests
         self.fleet()
         e2e = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/test-e2e.yml@refs/heads/main"}
         two = ("--canonical-roots", "2", "--compile-slots", "2")
         env_file = self.dir / "github_env"
+        state = self.dir / "state"
         try:
             build = self.job("build", "e0", 8, None, *two, env={**e2e, "GITHUB_ENV": os.fspath(env_file)})
             self.assertEqual(build.returncode, 0, build.stdout)
-            self.assertIn("holding 2/8 units+gui+root-1 for build (compile-gui", build.stdout)
+            self.assertIn("holding 2/8 units+root-1 for build (compile-gui", build.stdout)
+            self.assertNotIn("gui+", build.stdout)
             self.assertNotIn("persistent-dd", build.stdout)
+            self.assertFalse((state / "host-lock-holder-e0.gui").exists())
             self.assertEqual(env_file.read_text(), "CMUX_CI_CANONICAL_ROOT=/private/tmp/cmux-ci\n")
             # its own restore step re-takes the root it holds: a no-op
             self.assertEqual(self.take("/private/tmp/cmux-ci", "e0").returncode, 0)
-            # a compile admission still runs beside it, in the other root
+            # while it compiles, a GUI job runs beside it, and so does a compile admission in the other root
+            shard = self.job("app-host-unit-tests", "g0", 8, None, *two, "--gui-wait", "0")
+            self.assertIn("+gui for app-host-unit-tests (gui", shard.stdout)
             self.assertIn("persistent-dd+root-2", self.job("macos-compile-admission", "e1", 8, None, *two).stdout)
-            for n, (job, ref) in enumerate((("app-host-unit-tests", {}), ("test", e2e), ("build", e2e))):
-                waited = time.monotonic()
-                refused = self.job(job, f"g{n}", 8, None, *two, "--gui-wait", "1", env=ref)
-                self.assertEqual(refused.returncode, 1, refused.stdout)
-                self.assertIn("refused: capacity: the gui token is taken", refused.stdout)
-                self.assertGreaterEqual(time.monotonic() - waited, 1, f"{job} waits for the gui token")
-            self.finish("e0")
-            # the fallback test job is a consumer: no root at job start, the producer's root from its restore step
+            # the build's tests wait for that shard's token, then take it
+            self.assertEqual(self.take_gui("e0", "--wait", "1").returncode, 1, "the shard still holds it")
+            self.finish("g0")
+            self.assertEqual(self.take_gui("e0", "--wait", "5").returncode, 0)
+            refused = self.job("tests-build-and-lag", "g1", 8, None, *two, "--gui-wait", "0")
+            self.assertIn("refused: capacity: the gui token is taken", refused.stdout)
+            self.assertIn("the gui token holder released", self.finish("e0"))
             # with root 1 free, a build on the second root runner still takes it: root 1's seeds and caches
             # are the ones main publishes, and it keeps no per-root state to prefer its own root for
             first = self.job("build", "e3", 8, None, *two, "--instance", "1", env=e2e)
-            self.assertIn("+gui+root-1 for build (compile-gui", first.stdout)
+            self.assertIn("units+root-1 for build (compile-gui", first.stdout)
             self.finish("e3")
+            # the fallback test job is a consumer: gui at job start, the producer's root from its restore step
             test = self.job("test", "e2", 8, None, *two, env=e2e)
             self.assertEqual(test.returncode, 0, test.stdout)
-            self.assertIn("for test (gui", test.stdout)
+            self.assertIn("+gui for test (gui", test.stdout)
             self.assertNotIn("root-", test.stdout.split("holding", 1)[1])
             self.assertEqual(self.take("/private/tmp/cmux-ci-2", "e2", "--wait", "0").returncode, 1,
                              "the compile admission still holds root 2")
             self.assertEqual(self.take("/private/tmp/cmux-ci", "e2").returncode, 0)
         finally:
-            for runner in ("e0", "e1", "e2", "e3", "g0", "g1", "g2"):
+            for runner in ("e0", "e1", "e2", "e3", "g0", "g1"):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
@@ -1031,7 +1036,7 @@ class HookTest(unittest.TestCase):
         self.assertEqual(hook.job_class("test", home, home, "test-e2e.yml"), ("gui", False))
         self.assertEqual(hook.job_class("lint", home, home, "test-e2e.yml"), ("compile", True))
         self.assertEqual(hook.job_class("build", "someone/else", home, "test-e2e.yml"), ("isolated", False))
-        self.assertEqual(hook.CLASS_COST["compile-gui"], (2, ("gui", "root")),
+        self.assertEqual(hook.CLASS_COST["compile-gui"], (2, ("root",)),
                          "no persistent-dd: the E2E build never writes compile admission's kept DerivedData")
         self.assertNotIn("compile-gui", hook.ROOT_CONSUMERS, "a producer takes a token-chosen root")
         for klass in {*hook.JOB_CLASSES.values(), *hook.WORKFLOW_JOB_CLASSES.values()}:
