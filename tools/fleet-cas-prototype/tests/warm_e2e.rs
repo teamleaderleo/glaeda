@@ -124,7 +124,7 @@ async fn writer_manifest_then_warm() {
 
     let (rc, out, err) = run(&["warm", &url, "r/c/x", "--trusted-keys", &pubkey, "--store", &p("reader")]);
     assert_eq!(rc, 0, "{out}{err}");
-    assert!(out.contains("2 keys (0 local, 2 fetched, 0 missing, 0 unverified), 2 objects"), "{out}");
+    assert!(out.contains("2 keys (0 local, 2 fetched, 0 missing), 2 objects"), "{out}");
     assert_eq!(count_files(&root.join("reader/kv")), 2);
     assert_eq!(count_files(&root.join("reader/cas")), 2);
     // Again: everything is local now.
@@ -137,6 +137,11 @@ async fn writer_manifest_then_warm() {
     let (rc, _, _) = run(&["warm", &url, "r/c/x", "--trusted-keys", &other, "--store", &p("reader2")]);
     assert_ne!(rc, 0);
     assert_eq!(count_files(&root.join("reader2/kv")), 0);
+    // A store that is gone: incomplete (3), nothing written.
+    let dead = format!("http://127.0.0.1:{}", std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port());
+    let (rc, _, _) = run(&["warm", &dead, "r/c/x", "--trusted-keys", &pubkey, "--store", &p("reader3")]);
+    assert_eq!(rc, 3);
+    assert_eq!(count_files(&root.join("reader3/kv")), 0);
     // No marker: exit 1.
     let (rc, _, _) = run(&["warm", &url, "r/c/none", "--trusted-keys", &pubkey, "--store", &p("reader2")]);
     assert_eq!(rc, 1);

@@ -220,8 +220,8 @@ worker asks first: the writer records a marker per commit it has filled, and cat
 chosen only when `xcode/bin/fleet-cas-marker.sh cmux <sha>` exits 0 (the signed marker for
 that commit and this host's Xcode build exists). Before building, the worker then runs
 `xcode/bin/fleet-cas-warm.sh cmux <sha>` under a timeout: it copies the whole fill into the
-node, so the build's lookups are local hits. On exit 1 (a marker without a manifest) the build
-may run unwarmed; on 2 or a timeout, fall back to a slot build. Unwarmed, each lookup is two
+node, so the build's lookups are local hits. On any other exit (1: no manifest, 2: something
+did not verify, 3: incomplete) or a timeout, fall back to a slot build. Unwarmed, each lookup is two
 serial fleet-store round trips, and a full catch-up read took 1631 s on 09-25. The rows below are read
 top to bottom, first match wins, and the writer is exempt: CI's main build always runs catch-up
 with write-through, since filling the store is its job. A PR commit counts as held when its

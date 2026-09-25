@@ -15,10 +15,9 @@
 //! entry must carry a trusted signature, the manifest and every object are
 //! checked against their content IDs.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 use prost::Message;
@@ -44,10 +43,27 @@ pub fn parse_manifest(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
 }
 
 enum Entry {
-    Local(Vec<Vec<u8>>),
-    Fetched(Vec<Vec<u8>>),
+    Local,
+    /// Fetched and verified, not written yet: (path, encoded value, replace
+    /// an unservable local copy, IDs it names).
+    Fetched(PathBuf, Vec<u8>, bool, Vec<Vec<u8>>),
     Missing,
     Unverified,
+}
+
+/// Why a warm did not finish. Exit codes: 2 for `Untrusted`, 3 for `Incomplete`.
+enum Failure {
+    /// Something did not verify: a marker, an entry, the manifest or an object.
+    Untrusted(String),
+    /// The store was unreachable, busy, slow or failed a call. Nothing that
+    /// would slow the build down was written (see the order in `warm`).
+    Incomplete(String),
+}
+
+impl<E: std::fmt::Display> From<E> for Failure {
+    fn from(e: E) -> Self {
+        Failure::Incomplete(e.to_string())
+    }
 }
 
 pub async fn run(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
@@ -57,6 +73,7 @@ pub async fn run(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std:
     let mut trusted = None;
     let mut dir = None;
     let mut jobs = 32usize;
+    let mut timeout = 150u64;
     let mut rest = args[2..].iter();
     while let Some(a) = rest.next() {
         let v = rest.next().ok_or(USAGE)?;
@@ -64,17 +81,60 @@ pub async fn run(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std:
             "--trusted-keys" => trusted = Some(sign::parse_trusted(v)?),
             "--store" => dir = Some(PathBuf::from(v)),
             "--jobs" => jobs = v.parse::<usize>()?.clamp(1, 256),
+            "--timeout" => timeout = v.parse::<u64>()?.max(1),
             _ => return Err(USAGE.into()),
         }
     }
     let keys = trusted.ok_or("warm needs --trusted-keys")?;
     let dir = dir.ok_or("warm needs --store DIR (the node's store)")?;
     let t0 = Instant::now();
+    // One deadline for the whole warm: a stalled stream or a store that
+    // accepts connections and never answers must not hold the build up.
+    let limit = std::time::Duration::from_secs(timeout);
+    let result = match tokio::time::timeout(limit, warm(url, name, keys, dir, jobs)).await {
+        Ok(r) => r,
+        Err(_) => Err(Failure::Incomplete(format!("not done after {timeout} s"))),
+    };
+    match result {
+        Ok(Some(line)) => {
+            println!("warm {name}: {line} in {:.1} s", t0.elapsed().as_secs_f64());
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Ok(None) => Ok(std::process::ExitCode::from(1)),
+        Err(Failure::Untrusted(e)) => {
+            eprintln!("fleet-cas warm: {e}");
+            Ok(std::process::ExitCode::from(2))
+        }
+        Err(Failure::Incomplete(e)) => {
+            eprintln!("fleet-cas warm: incomplete after {:.1} s: {e}", t0.elapsed().as_secs_f64());
+            Ok(std::process::ExitCode::from(3))
+        }
+    }
+}
 
-    let ch = tonic::transport::Endpoint::from_shared(url.clone())?
+/// Upper bound on what one warm writes: a full cmux fill is about 1.2 GB, and
+/// a store (or anyone on the plain-HTTP path) could stream objects nobody asked for.
+const MAX_WARM_BYTES: u64 = 16 << 30;
+
+/// Warm in an order that never leaves the node slower than no warm: entries
+/// are fetched into memory, then everything they reach is stored, and only
+/// then are the entries written. A node answers a local entry without a
+/// prefetch, so an entry written ahead of its objects would cost one fetch per
+/// object; an entry left out still gets the node's fetch plus closure prefetch.
+async fn warm(
+    url: &str,
+    name: &str,
+    keys: Vec<ed25519_dalek::VerifyingKey>,
+    dir: PathBuf,
+    jobs: usize,
+) -> Result<Option<String>, Failure> {
+    let ch = tonic::transport::Endpoint::from_shared(url.to_string())?
         .tcp_nodelay(true)
         .connect_timeout(std::time::Duration::from_secs(2))
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(30))
+        .http2_keep_alive_interval(std::time::Duration::from_secs(10))
+        .keep_alive_timeout(std::time::Duration::from_secs(5))
+        .keep_alive_while_idle(true)
         .connect()
         .await?;
     let kv_client = kv::key_value_db_client::KeyValueDbClient::new(ch.clone());
@@ -91,15 +151,14 @@ pub async fn run(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std:
         .await?;
     let Some(kv::get_value_response::Contents::Value(marker)) = resp.into_inner().contents else {
         eprintln!("fleet-cas warm: no marker {name}");
-        return Ok(std::process::ExitCode::from(1));
+        return Ok(None);
     };
     if !sign::verify(&keys, &mkey, &marker) {
-        eprintln!("fleet-cas warm: marker {name} is not signed by a trusted key");
-        return Ok(std::process::ExitCode::from(2));
+        return Err(Failure::Untrusted(format!("marker {name} is not signed by a trusted key")));
     }
     let Some(mid) = marker.entries.get(MANIFEST_ENTRY).cloned() else {
         eprintln!("fleet-cas warm: marker {name} has no manifest (written before warm existed)");
-        return Ok(std::process::ExitCode::from(1));
+        return Ok(None);
     };
     let resp = cas_client
         .get(cas::CasGetRequest {
@@ -109,12 +168,12 @@ pub async fn run(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std:
         .await?
         .into_inner();
     let Some(cas::cas_get_response::Contents::Data(obj)) = resp.contents else {
-        return Err(format!("the store lacks manifest {}", hex::encode(&mid)).into());
+        return Err(Failure::Incomplete(format!("the store lacks manifest {}", hex::encode(&mid))));
     };
     if object_id(&obj.references, blob_data(&obj)) != mid {
-        return Err("the manifest does not match its ID".into());
+        return Err(Failure::Untrusted("the manifest does not match its ID".into()));
     }
-    let wanted = parse_manifest(blob_data(&obj))?;
+    let wanted = parse_manifest(blob_data(&obj)).map_err(Failure::Untrusted)?;
 
     // The node's store, written the way the node writes it.
     std::fs::create_dir_all(&dir)?;
@@ -132,9 +191,12 @@ pub async fn run(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std:
         key_log: None,
     });
 
-    // 2. Index entries, many in flight.
+    // 2. Index entries, many in flight, kept in memory. The first failed call
+    // stops the warm: a store that fails one call is likely failing them all.
     let slots = Arc::new(Semaphore::new(jobs));
+    // Dropping the set (an early return) aborts the calls still in flight.
     let mut set = JoinSet::new();
+    let mut done = Vec::with_capacity(wanted.len());
     for key in wanted.iter().cloned() {
         let store = store.clone();
         let mut client = kv_client.clone();
@@ -146,7 +208,7 @@ pub async fn run(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std:
             if let Ok(bytes) = std::fs::read(&path) {
                 if let Ok(v) = kv::Value::decode(bytes.as_slice()) {
                     if store.trusts(&key, &v) {
-                        return Ok(Entry::Local(embedded_ids(&v)));
+                        return Ok(Entry::Local);
                     }
                 }
                 replace = true;
@@ -161,48 +223,42 @@ pub async fn run(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std:
             if !store.trusts(&key, &v) {
                 return Ok(Entry::Unverified);
             }
-            let bytes = v.encode_to_vec();
-            std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
-            if replace {
-                write_atomic(&path, &bytes).map_err(|e| e.to_string())?;
-            } else {
-                // Lost a race with the node: its copy is as good.
-                publish_new(&path, &bytes).map_err(|e| e.to_string())?;
-            }
-            Ok::<_, String>(Entry::Fetched(embedded_ids(&v)))
+            let ids = embedded_ids(&v);
+            Ok::<_, String>(Entry::Fetched(path, v.encode_to_vec(), replace, ids))
         });
-    }
-    let (mut local, mut fetched, mut missing, mut unverified, mut errors) = (0, 0, 0, 0, 0);
-    let mut roots: HashSet<Vec<u8>> = HashSet::new();
-    let mut first_error = None;
-    while let Some(r) = set.join_next().await {
-        match r? {
-            Ok(Entry::Local(ids)) => {
-                local += 1;
-                roots.extend(ids);
-            }
-            Ok(Entry::Fetched(ids)) => {
-                fetched += 1;
-                roots.extend(ids);
-            }
-            Ok(Entry::Missing) => missing += 1,
-            Ok(Entry::Unverified) => unverified += 1,
-            Err(e) => {
-                errors += 1;
-                first_error.get_or_insert(e);
-            }
+        // Collect as we go, so a failure stops new calls early.
+        while let Some(r) = set.try_join_next() {
+            done.push(r??);
         }
     }
+    while let Some(r) = set.join_next().await {
+        done.push(r??);
+    }
+    let (mut local, mut missing, mut unverified) = (0, 0, 0);
+    let mut fetched = Vec::new();
+    for entry in done {
+        match entry {
+            Entry::Local => local += 1,
+            Entry::Fetched(path, bytes, replace, ids) => fetched.push((path, bytes, replace, ids)),
+            Entry::Missing => missing += 1,
+            Entry::Unverified => unverified += 1,
+        }
+    }
+    if unverified > 0 {
+        return Err(Failure::Untrusted(format!("{unverified} entries without a trusted signature")));
+    }
 
-    // 3. Everything those entries reach, in a few streamed closure calls.
-    let mut roots: Vec<Vec<u8>> = roots
-        .into_iter()
-        .filter(|id| !store.cas_path(id).exists())
-        .collect();
+    // 3. Everything the fetched entries reach, in closure streams. Roots are not
+    // filtered by what is on disk: an object can be present without its
+    // references (an earlier interrupted prefetch), and the stream fills them in.
+    let mut roots: Vec<Vec<u8>> = fetched.iter().flat_map(|f| f.3.iter().cloned()).collect();
     roots.sort();
+    roots.dedup();
     let objects = Arc::new(AtomicU64::new(0));
     let bytes = Arc::new(AtomicU64::new(0));
-    let streams = Arc::new(Semaphore::new(4));
+    // Two streams per warm: the store serves 64 walks at once, shared with
+    // every node's prefetches and the other hosts' warms.
+    let streams = Arc::new(Semaphore::new(2));
     let mut set = JoinSet::new();
     for chunk in roots.chunks(MAX_CLOSURE_ROOTS) {
         let chunk = chunk.to_vec();
@@ -212,65 +268,68 @@ pub async fn run(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std:
         let permit = streams.clone().acquire_owned().await?;
         set.spawn(async move {
             let _permit = permit;
-            // The store bounds closure walks in flight; a busy store is retried.
-            let mut tries = 0;
+            // A busy store is retried with backoff, within the warm's deadline.
+            let mut wait = std::time::Duration::from_millis(500);
             let mut stream = loop {
                 match client
                     .get_closure(fleet::ClosureRequest { roots: chunk.clone() })
                     .await
                 {
                     Ok(r) => break r.into_inner(),
-                    Err(e) if e.code() == tonic::Code::ResourceExhausted && tries < 10 => {
-                        tries += 1;
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    Err(e) if e.code() == tonic::Code::ResourceExhausted => {
+                        tokio::time::sleep(wait).await;
+                        wait = (wait * 2).min(std::time::Duration::from_secs(8));
                     }
-                    Err(e) => return Err(e.to_string()),
+                    Err(e) => return Err(Failure::Incomplete(e.to_string())),
                 }
             };
-            while let Some(m) = stream.message().await.map_err(|e| e.to_string())? {
+            while let Some(m) = stream.message().await? {
                 let Ok(obj) = cas::CasObject::decode(m.object.as_slice()) else {
-                    return Err("undecodable object in a closure".into());
+                    return Err(Failure::Untrusted("undecodable object in a closure".into()));
                 };
                 let data = blob_data(&obj).to_vec();
                 if object_id(&obj.references, &data) != m.id {
-                    return Err("closure object does not match its ID".into());
+                    return Err(Failure::Untrusted("closure object does not match its ID".into()));
                 }
                 if store.cas_path(&m.id).exists() {
                     continue;
                 }
                 let len = data.len() as u64;
+                if bytes.fetch_add(len, Relaxed) + len > MAX_WARM_BYTES {
+                    return Err(Failure::Untrusted(format!(
+                        "the store sent more than {MAX_WARM_BYTES} bytes"
+                    )));
+                }
                 store.put(obj.references, data).map_err(|e| e.message().to_string())?;
-                objects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                bytes.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+                objects.fetch_add(1, Relaxed);
             }
-            Ok::<_, String>(())
+            Ok(())
         });
     }
     while let Some(r) = set.join_next().await {
         if let Err(e) = r? {
-            errors += 1;
-            first_error.get_or_insert(e);
+            set.abort_all();
+            return Err(e);
         }
     }
 
-    let load = std::sync::atomic::Ordering::Relaxed;
-    println!(
-        "warm {name}: {} keys ({local} local, {fetched} fetched, {missing} missing, \
-         {unverified} unverified), {} objects ({} bytes) in {:.1} s",
+    // 4. Only now the entries: their objects are in place.
+    let written = fetched.len();
+    for (path, value, replace, _) in fetched {
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        if replace {
+            write_atomic(&path, &value)?;
+        } else {
+            // Lost a race with the node: its copy is as good.
+            publish_new(&path, &value)?;
+        }
+    }
+    Ok(Some(format!(
+        "{} keys ({local} local, {written} fetched, {missing} missing), {} objects ({} bytes)",
         wanted.len(),
-        objects.load(load),
-        bytes.load(load),
-        t0.elapsed().as_secs_f64()
-    );
-    if let Some(e) = first_error {
-        eprintln!("fleet-cas warm: {errors} failed calls, first: {e}");
-        return Ok(std::process::ExitCode::from(2));
-    }
-    if unverified > 0 {
-        eprintln!("fleet-cas warm: {unverified} entries without a trusted signature");
-        return Ok(std::process::ExitCode::from(2));
-    }
-    Ok(std::process::ExitCode::SUCCESS)
+        objects.load(Relaxed),
+        bytes.load(Relaxed)
+    )))
 }
 
 #[cfg(test)]

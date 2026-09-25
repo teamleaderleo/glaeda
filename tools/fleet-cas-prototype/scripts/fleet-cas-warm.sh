@@ -4,9 +4,12 @@
 # trip each (fleet-cas warm, src/warm.rs).
 #
 # usage: fleet-cas-warm.sh REPO COMMIT
-# exit 0: warmed; 1: no marker, or a marker without a manifest (build without
-# warming, or as a slot build); 2: unverified or error. Run it after
-# fleet-cas-marker.sh returns 0, under a timeout of a few minutes.
+# exit 0: warmed; 1: no marker, or a marker without a manifest; 2: something
+# did not verify (a marker, entry, manifest or object); 3: incomplete (store
+# unreachable, busy or failing, or not done within --timeout, 150 s). On 3
+# nothing was written that would slow a build: entries are written only after
+# their objects. Run it after fleet-cas-marker.sh returns 0, as the node's user
+# (it writes into the node's store).
 set -u
 repo=${1:?usage: fleet-cas-warm.sh REPO COMMIT}
 commit=${2:?usage: fleet-cas-warm.sh REPO COMMIT}

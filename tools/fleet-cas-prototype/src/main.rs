@@ -1031,11 +1031,11 @@ const USAGE: &str = "usage: fleet-cas <socket | tcp:ADDR> <store> [--read-only-k
        fleet-cas marker get http://HOST:PORT NAME --trusted-keys HEX,HEX
                                     exit 0 and print the entries if the marker exists and verifies,
                                     1 if it is absent, 2 if it does not verify or on error
-       fleet-cas warm http://HOST:PORT NAME --trusted-keys HEX,HEX --store DIR [--jobs N]
+       fleet-cas warm http://HOST:PORT NAME --trusted-keys HEX,HEX --store DIR [--jobs N] [--timeout S]
                                     copy every index entry the marker's manifest lists, and the
                                     objects they reach, into a node store (DIR) before a build:
                                     exit 0 when warmed, 1 if the marker is absent or has no
-                                    manifest, 2 if it does not verify or on error";
+                                    manifest, 2 if something does not verify, 3 if incomplete";
 
 /// The marker entry naming the fill's manifest (see `warm.rs`).
 const MANIFEST_ENTRY: &str = "manifest";

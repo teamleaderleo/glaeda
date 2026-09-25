@@ -54,7 +54,7 @@ xcode=$(xcodebuild -version | awk '/Build version/ {print $3}')
 "$ROOT/bin/fleet-cas-settings.sh" "$ROOT/fleet-cas.sock" >/dev/null || exit 3
 rm -rf "$ROOT/cas"
 keylog=$ROOT/node-store/fill-keys.log
-k0=$(wc -c <"$keylog" 2>/dev/null | tr -d ' ')
+k0=$( { wc -c <"$keylog"; } 2>/dev/null | tr -d ' ')
 i0=$(instance) f0=$(failures) a0=$(activity)
 [ -n "$i0" ] && [ -n "$f0" ] && [ -n "$a0" ] || { echo "cannot read $stats" >&2; exit 3; }
 "$@"
