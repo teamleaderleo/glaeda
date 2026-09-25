@@ -1190,7 +1190,6 @@ TOP_OUTSIDE = 5
 # cores), or the load average stayed well above the core count. Either one slows a compile's every file.
 CONTENDED_OUTSIDE_CORES = 2.0
 CONTENDED_OUTSIDE_SHARE = 0.15
-CONTENDED_LOAD_PER_CORE = 1.5
 RUNNER_DIR_RE = re.compile(r"/(actions-runner[A-Za-z0-9_.-]*)/")
 
 
@@ -1200,16 +1199,26 @@ def sampler_file(state_dir: Path) -> Path:
 
 
 def ps_rows() -> list[tuple[int, int, float, str, str]]:
-    """(pid, ppid, %cpu, user, executable basename) for every process."""
-    out = subprocess.run([PS, "-Ao", "pid=,ppid=,pcpu=,user=,comm="], stdin=subprocess.DEVNULL,
-                         capture_output=True, text=True, timeout=10, check=False, env={"LC_ALL": "C"}).stdout
+    """(pid, ppid, %cpu, user, name) for every process. The name is the kernel's executable name (ucomm), not
+    argv[0], so a process title can never carry arguments into the record; Runner.Worker keeps its argv[0]
+    because its runner directory is the only thing read from it."""
+    def run(fields: str) -> str:
+        return subprocess.run([PS, "-Ao", fields], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              timeout=10, check=False, env={"LC_ALL": "C"}).stdout
+    names: dict[int, str] = {}
+    for line in run("pid=,ucomm=").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            names[int(parts[0])] = parts[1].strip()
     rows = []
-    for line in out.splitlines():
+    for line in run("pid=,ppid=,pcpu=,user=,comm=").splitlines():
         parts = line.split(None, 4)
         if len(parts) < 5:
             continue
         try:
-            rows.append((int(parts[0]), int(parts[1]), float(parts[2]), parts[3], parts[4].strip()))
+            pid, comm = int(parts[0]), parts[4].strip()
+            name = comm if comm.endswith("Runner.Worker") else names.get(pid, "?")
+            rows.append((pid, int(parts[1]), float(parts[2]), parts[3], name))
         except ValueError:
             continue
     return rows
@@ -1316,8 +1325,6 @@ class JobSamples:
         if self.samples and outside_mean >= max(CONTENDED_OUTSIDE_CORES, CONTENDED_OUTSIDE_SHARE * self.ncpu):
             top = max(self.outside_by, key=self.outside_by.get) if self.outside_by else "unknown"
             reasons.append(f"outside processes averaged {outside_mean:.1f} cores (top: {top})")
-        if load_mean is not None and load_mean >= CONTENDED_LOAD_PER_CORE * self.ncpu:
-            reasons.append(f"load averaged {load_mean:.1f} on {self.ncpu} cores")
         if self.thermal:
             reasons.append("thermal or performance limit reported")
         top_outside = sorted(self.outside_by.items(), key=lambda kv: -kv[1])[:TOP_OUTSIDE]
@@ -1337,20 +1344,22 @@ class JobSamples:
 
 
 def append_job_record(record: dict[str, Any], log: Path = JOB_LOG) -> None:
-    """One line per job; past JOB_LOG_MAX_BYTES keep the newest half, cut at a line boundary."""
+    """One line per job; past JOB_LOG_MAX_BYTES keep the newest half, cut at a line boundary. The trim
+    rewrites the file in place under the lock, so a writer waiting on the lock never holds a replaced inode."""
     log.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(record, separators=(",", ":"), sort_keys=True)[:8192] + "\n"
-    with open(log, "a", encoding="utf-8") as handle:
+    line = (json.dumps(record, separators=(",", ":"), sort_keys=True)[:8192] + "\n").encode()
+    with open(log, "a+b") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         handle.write(line)
         handle.flush()
-        if handle.tell() > JOB_LOG_MAX_BYTES:
-            data = log.read_bytes()
+        if os.fstat(handle.fileno()).st_size > JOB_LOG_MAX_BYTES:
+            handle.seek(0)
+            data = handle.read()
             keep = data[len(data) // 2:]
             keep = keep[keep.find(b"\n") + 1:]
-            tmp = log.with_name(log.name + ".tmp")
-            tmp.write_bytes(keep)
-            tmp.replace(log)
+            handle.truncate(0)
+            handle.write(keep)
+            handle.flush()
 
 
 def job_meta(repo: str | None, home_repo: str) -> dict[str, Any]:

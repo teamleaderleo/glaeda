@@ -2402,7 +2402,7 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertEqual(set(by_outside), {"zig (cmux)", "mds_stores (root)"})
         self.assertFalse(any("/" in key for key in by_outside), "no paths leave the host")
 
-    def test_summary_flags_outside_cpu_and_overload(self) -> None:
+    def test_summary_flags_outside_cpu_not_its_own_load(self) -> None:
         samples = self.hook.JobSamples({"job": "macos-compile-admission"}, 14, 1000.0)
         for _ in range(6):
             samples.add(30.0, (8.0, 0.0, 5.0, {"zig (cmux)": 5.0}, {}), 10.0)
@@ -2411,8 +2411,13 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertEqual(record["verdict"], "contended")
         self.assertEqual(record["cores"], {"job": 8.0, "other_runner_jobs": 0.0, "outside": 5.0})
         self.assertEqual(record["top_outside"], [{"process": "zig (cmux)", "core_seconds": 300}])
-        self.assertEqual(len(record["reasons"]), 2)
+        self.assertEqual(len(record["reasons"]), 1)
         self.assertIn("zig (cmux)", record["reasons"][0])
+
+        busy = self.hook.JobSamples({}, 14, 0.0)
+        busy.add(40.0, (13.0, 0.0, 0.5, {}, {}), 10.0)
+        self.assertEqual(busy.summary(10.0)["verdict"], "clear", "a compile's own load is not contention")
+        self.assertEqual(busy.summary(10.0)["load"]["mean"], 40.0)
 
         quiet = self.hook.JobSamples({}, 14, 0.0)
         quiet.add(9.0, (12.0, 1.0, 0.5, {"WindowServer (_windowserver)": 0.5}, {}), 10.0)
@@ -2455,7 +2460,8 @@ class JobTelemetryTest(unittest.TestCase):
         self.hook.start_sampler(watched.pid, state, {"job": "x"}, log, interval=0.2)
         watched.wait()
         deadline = time.monotonic() + 10
-        while not log.exists() and time.monotonic() < deadline:
+        while (not log.exists() or not log.read_text() or self.hook.sampler_file(state).exists()) \
+                and time.monotonic() < deadline:
             time.sleep(0.1)
         self.assertEqual(len(log.read_text().splitlines()), 1)
         self.assertEqual(self.hook.finish_sampler(state), "no job telemetry sampler")

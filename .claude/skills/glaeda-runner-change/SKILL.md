@@ -57,7 +57,7 @@ scripts/glaeda-cmux-runner-fleet --apply --hosts ONE # canary one member first
 scripts/glaeda-cmux-runner-fleet --apply             # then the rest
 ```
 
-The listener gate reloads when the hook file changes, so a staged hook takes effect for the next job without a
+job-started.sh runs the hook file fresh for every job, so a staged hook takes effect for the next job without a
 restart. After the canary, run a job there and check the new behavior on the host (for telemetry:
 `ssh MEMBER 'tail -n 1 ~/Library/Logs/glaeda-cmux-jobs.jsonl'`), then `scripts/glaeda-fleet-status --host MEMBER`.
 Kill switch for telemetry without a redeploy: `GLAEDA_RUNNER_TELEMETRY=0` in the runner LaunchAgent environment.

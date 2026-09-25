@@ -137,8 +137,8 @@ What `--apply` does:
      job ends it appends one line to `~/Library/Logs/glaeda-cmux-jobs.jsonl`
      (`glaeda-cmux-job/v1`): load mean and max, mean cores per bucket, the top five
      outside processes by estimated core-seconds, the other runner jobs seen, and a
-     `contended` or `clear` verdict with its reasons. Processes are named by executable
-     basename and user only. The log keeps its newest half past 2 MiB.
+     `contended` or `clear` verdict with its reasons. Processes are named by the kernel's
+     executable name (`ucomm`, never argv) and user only. The log keeps its newest half past 2 MiB.
      `glaeda-fleet-status` reports it (source `jobs`). The sampler never refuses, delays
      or fails a job.
    - job-completed stops the sampler (it writes the job's line), releases the host lock

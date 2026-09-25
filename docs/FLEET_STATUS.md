@@ -148,9 +148,9 @@ The runner hook samples the host while every admitted job runs and writes one
 ([CMUX_MINI_RUNNER.md](CMUX_MINI_RUNNER.md), section 2, step 3). The `jobs` probe tails that
 file and keeps the last 24 h: how many jobs ran, how many ran `contended`, and
 the reasons for the newest five contended ones. A job is contended when work
-outside the mini's runner jobs averaged at least 2 cores (or 15% of them), when
-the load average stayed at 1.5 times the core count or more, or when pmset
-reported a thermal limit. That is the question a slow CI job raises first: was it
+outside the mini's runner jobs averaged at least 2 cores and at least 15% of
+them, or when pmset reported a thermal limit. The load average is recorded but
+is not a reason on its own: a compile alone pushes it past the core count. That is the question a slow CI job raises first: was it
 the change, or the host?
 
 | Code | When | Action |

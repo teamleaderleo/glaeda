@@ -542,7 +542,7 @@ def parse_jobs(stdout: str, at: int) -> dict[str, Any]:
                       "ended_at": (int(r["ended_at"]) + skew) if num(r.get("ended_at")) is not None else None,
                       "outside_cores": num((r.get("cores") or {}).get("outside")) if isinstance(r.get("cores"), dict) else None,
                       "load_mean": num((r.get("load") or {}).get("mean")) if isinstance(r.get("load"), dict) else None,
-                      "reasons": [clean(x, 160) for x in (r.get("reasons") or [])[:3]]}
+                      "reasons": [clean(x, 160) for x in (r.get("reasons") if isinstance(r.get("reasons"), list) else [])[:3]]}
                      for r in newest]}
 
 
@@ -1096,7 +1096,7 @@ class Builder:
                                              "seconds": num(j.get("seconds")), "ended_at": stamp_of(j.get("ended_at")),
                                              "outside_cores": num(j.get("outside_cores")),
                                              "load_mean": num(j.get("load_mean")),
-                                             "reasons": [clean(x, 160) for x in (j.get("reasons") or [])[:3]]}
+                                             "reasons": [clean(x, 160) for x in (j.get("reasons") if isinstance(j.get("reasons"), list) else [])[:3]]}
                                             for j in jobs]}
             if contended:
                 latest = m["jobs"]["contended_jobs"][0] if m["jobs"]["contended_jobs"] else {}

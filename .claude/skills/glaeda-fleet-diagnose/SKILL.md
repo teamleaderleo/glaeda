@@ -16,7 +16,7 @@ gh api repos/OWNER/REPO/actions/jobs/JOB_ID --jq '.runner_name, (.steps[] | "\(.
 ```
 
 - `runner_name` is `<member>-glaeda[-K]`: member host plus runner slot K (directory `~/actions-runner-glaeda[-K]`).
-- Get the job log with `curl -sL -H "Authorization: Bearer $(gh auth token)" https://api.github.com/repos/OWNER/REPO/actions/jobs/JOB_ID/logs`
+- Get the job log with `gh api repos/OWNER/REPO/actions/jobs/JOB_ID/logs`
   (works before the whole run finishes; `gh run view --log` waits for the run).
 
 ## 2. Is it the host or the work? Read the job's host record
@@ -28,7 +28,7 @@ ssh MEMBER 'tail -n 50 ~/Library/Logs/glaeda-cmux-jobs.jsonl' | grep '"run_id":"
 ```
 
 Fields (`glaeda-cmux-job/v1`): `cores.job` / `cores.other_runner_jobs` / `cores.outside` (mean cores),
-`load.mean` / `load.max`, `top_outside` (executable basename and user, estimated core-seconds),
+`load.mean` / `load.max`, `top_outside` (kernel executable name and user, estimated core-seconds),
 `other_runner_jobs` (co-tenant runner slots), `thermal_limited`, `verdict` (`contended` or `clear`) and `reasons`.
 
 - `contended` with high `cores.outside`: something outside every runner job used the CPU. `top_outside` names it.
