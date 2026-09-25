@@ -157,6 +157,8 @@ class MiniSetupTest(unittest.TestCase):
             for arg in doc["ProgramArguments"][1:2]:
                 self.assertTrue(arg.startswith(os.fspath(bin_dir)), arg)
             self.assertTrue(doc["StandardOutPath"].startswith(os.fspath(self.home / "Library/Logs")))
+            # dedupe is never urgent; pressure must still free space while a build fills the disk
+            self.assertEqual(doc.get("ProcessType"), "Background" if label == "disk-dedupe" else None)
         dedupe = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.disk-dedupe.plist").read_bytes())
         self.assertEqual(dedupe["WatchPaths"], [os.fspath(self.home / "Library/Developer/Xcode/DerivedData")])
         self.assertTrue((self.home / "Library/Developer/Xcode/DerivedData").is_dir())

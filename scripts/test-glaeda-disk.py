@@ -623,6 +623,63 @@ class LinuxLayoutTest(unittest.TestCase):
         # scratch clones and leaked files are judged on any filesystem, not only a tmpfs
         self.assertTrue(tmp.files and tmp.git_disposable)
 
+    def test_cmux_job_units_go_but_unpushed_checkouts_stay(self) -> None:
+        job = self.home / ".cache/cmux-job"
+        # as on cmux13s: SwiftPM clones inside DerivedData, and each slot's clone one level below cmux-base
+        (job / "reload-cloud-ios/DerivedData/slot-1/Build").mkdir(parents=True)
+        (job / "reload-cloud-ios/DerivedData/slot-1/Build/x.o").write_bytes(b"\0" * 4096)
+        (job / "reload-cloud-ios/DerivedData/slot-1/SourcePackages/checkouts/dep/.git").mkdir(parents=True)
+        base = job / "reload-cloud/cmux-base/slot-1"
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "init", "-q", str(base)], check=True, env=env)
+        (base / "f").write_text("x")
+        subprocess.run(["git", "-C", str(base), "add", "f"], check=True, env=env)
+        subprocess.run(["git", "-C", str(base), "commit", "-qm", "local only"], check=True, env=env)
+        old = time.time() - 48 * 3600
+        for dirpath, dirnames, filenames in os.walk(job):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (old, old), follow_symlinks=False)
+        saved = gd.process_evidence
+        gd.process_evidence = lambda: ([], "")
+        try:
+            fams = [f for f in gd.default_families() if f.id in ("cmux-job-cache", "user-cache")]
+            items = gd.survey(fams, 24, 0)
+        finally:
+            gd.process_evidence = saved
+        verdicts = {Path(i.path).relative_to(self.home).as_posix(): (i.family, i.verdict) for i in items}
+        self.assertEqual(verdicts[".cache/cmux-job/reload-cloud-ios/DerivedData"], ("cmux-job-cache", "reclaimable"))
+        # a commit no remote holds keeps its checkout
+        self.assertEqual(verdicts[".cache/cmux-job/reload-cloud/cmux-base"], ("cmux-job-cache", "git-checkout"))
+        self.assertNotIn(".cache/cmux-job", verdicts)  # not listed again as a report-only tool cache
+        receipt = self.home / "receipt.jsonl"
+        fams_by_id = {f.id: f for f in fams}
+        with contextlib.redirect_stdout(io.StringIO()):
+            saved = gd.process_evidence
+            gd.process_evidence = lambda: ([], "")
+            try:
+                gd.apply(items, fams_by_id, receipt, None, 24)
+            finally:
+                gd.process_evidence = saved
+        self.assertFalse((job / "reload-cloud-ios/DerivedData").exists())
+        self.assertEqual([c.name for c in (job / "reload-cloud-ios").iterdir()], [])  # no half-deleted leftover
+        self.assertTrue((base / ".git").is_dir())
+        # a delete interrupted after its rename leaves a tree nothing else will ever clean up
+        left = job / "reload-cloud-ios/.glaeda-disk-deleting-DerivedData-123"
+        (left / "slot-1/SourcePackages/checkouts/dep/.git").mkdir(parents=True)
+        (left / "slot-1/x.o").write_bytes(b"\0" * 4096)
+        for dirpath, dirnames, filenames in os.walk(left):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (old, old), follow_symlinks=False)
+        os.utime(left, (old, old))
+        saved = gd.process_evidence
+        gd.process_evidence = lambda: ([], "")
+        try:
+            again = {i.path: i.verdict for i in gd.survey(fams, 24, 0)}
+        finally:
+            gd.process_evidence = saved
+        self.assertEqual(again[str(left)], "reclaimable")
+
     def test_claude_session_seen_in_alternate_config_dir(self) -> None:
         t = self.home / ".claude-outlook/projects/-home-leo-Projects/abc-123.jsonl"
         t.parent.mkdir(parents=True)
