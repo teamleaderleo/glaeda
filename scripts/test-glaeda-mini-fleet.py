@@ -403,6 +403,27 @@ class CheckTests(unittest.TestCase):
         self.assertIn("ok (1 pending)", out.getvalue())
 
 
+class DiskAgentTests(unittest.TestCase):
+    """The glaeda-disk agents run on timers: loaded and idle is healthy, a failed run is pending, unloaded is drift."""
+
+    def launchd_issues(self, state: str) -> list[tuple[str, str]]:
+        manifest = mf.load_manifest(EXAMPLE)
+        label = "com.teamleaderleo.glaeda.disk-pressure"
+        manifest["defaults"]["launchd"]["running"] = [label]
+        text = probe_text() + f"launchd\t~/Library/LaunchAgents|{label}|{state}\n"
+        return [(i["area"], i["detail"]) for i in mf.check(manifest, observed(**{"build-mini-1": text}), ["build-mini-1"])
+                if label in i["detail"]]
+
+    def test_idle_between_runs_is_ok(self) -> None:
+        self.assertEqual(self.launchd_issues("not running last_exit=0"), [])
+
+    def test_failed_run_is_pending_and_unloaded_is_drift(self) -> None:
+        self.assertEqual(self.launchd_issues("not running last_exit=2"),
+                         [("pending", "com.teamleaderleo.glaeda.disk-pressure last exited 2; loaded, runs on its timer")])
+        self.assertEqual(self.launchd_issues("not-loaded"),
+                         [("launchd", "com.teamleaderleo.glaeda.disk-pressure is not-loaded")])
+
+
 FILL = "ai.manaflow.cmux-build-catch-up-fill"
 
 
