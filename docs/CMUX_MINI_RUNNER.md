@@ -428,6 +428,27 @@ in at the producer's root. So one root job per root per mini:
   detached holder tied to the job's Runner.Worker and released by job-completed. A re-take of a root the
   same job already holds (a compile restoring its own product) is a no-op. It exits 1 when the root is
   still busy after the wait, and 2 for a bad root or outside a runner job.
+- A second, different root is refused (exit 2): two jobs taking two roots in opposite orders would deadlock.
+  `take ROOT --switch` swaps instead.
+  - It waits for ROOT while still holding the old root, and lets the old one go only once ROOT is held.
+    A timeout (exit 1) leaves the job on its old root, never without one.
+  - Two switchers after each other's root both time out, so callers keep `--wait` short.
+  - On success it writes the new `CMUX_CI_CANONICAL_ROOT` to `$GITHUB_ENV`.
+  - It only works when each held root has a live holder of its own: one taken with `take`, or the
+    admission root of a `ROOT_SWITCHERS` class (compile-gui, test-e2e's `build`), which the hook hands to
+    a separate holder at admission.
+  - A build that finds a product to reuse at another root switches to it. The caller must be done with
+    the old root.
+- `glaeda-canonical-root take-gui [--wait S]` holds the mini's gui token from that step to the end of the
+  job, with a third holder (`<holder>-gui.pid`) that job-completed releases. It is a no-op when the job
+  already holds gui from admission. It exits 0 when held, 1 when still taken after the wait, and 2
+  outside a job.
+  - A job in take-gui holds a root, while a gui job waiting in take-root holds gui: opposite lock orders.
+    So every take-root waiter writes `capacity/root-k.want-<pid>`, containing `gui` when its job holds
+    the gui token. take-gui exits 3 at once when a gui holder is waiting for a root this job holds. The
+    caller then leaves its console-session work to another job and finishes, which frees the root.
+    Waiters rewrite their markers every second. take-gui removes a marker older than 10 s or with a dead
+    pid, so a killed waiter's leftover cannot make it give way.
 - Jobs the hook does not know (seed-swiftpm-manifests, anything new) are pinned to root 1, because they use
   /private/tmp/cmux-ci themselves. Ids that other workflows reuse (`build`, `test`, `lint`) are classed by
   (workflow file, job id) from `GITHUB_WORKFLOW_REF`, so with `canonicalRoots` above 1 test-e2e's jobs are

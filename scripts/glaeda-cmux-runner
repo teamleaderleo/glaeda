@@ -478,15 +478,21 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     capacity = shlex.quote(os.fspath(Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet") / "capacity"))
     home = ctx.home if isinstance(getattr(ctx, "home", None), Path) else Path.home()
     state = shlex.quote(os.fspath(home / ".local/state/glaeda/cmux-runner"))
+    dirs = f" --capacity-dir {capacity} --state-dir {state}"
     root = (
         "#!/bin/sh\n"
-        "# glaeda-canonical-root take ROOT [--wait SECONDS] (generated, receipt-owned): hold canonical root ROOT\n"
-        "# (/private/tmp/cmux-ci[-N]) for the rest of this job; the job-started hook links it into the fleet bin.\n"
-        "[ \"${1:-}\" = take ] && [ -n \"${2:-}\" ] || "
-        "{ echo 'usage: glaeda-canonical-root take ROOT [--wait SECONDS]' >&2; exit 2; }\n"
-        "root=$2; shift 2\n"
-        f"exec {python} {hook} take-root --root \"$root\" --canonical-roots {roots_n}"
-        f" --capacity-dir {capacity} --state-dir {state} \"$@\"\n"
+        "# glaeda-canonical-root take ROOT [--wait SECONDS] [--switch] (generated, receipt-owned): hold canonical\n"
+        "# root ROOT (/private/tmp/cmux-ci[-N]) for the rest of this job; take-gui [--wait SECONDS] holds the\n"
+        "# mini's gui token (exit 3: gave way to a gui job waiting for this job's root). The job-started hook links\n"
+        "# it into the fleet bin.\n"
+        "usage() { echo 'usage: glaeda-canonical-root take ROOT [--wait SECONDS] [--switch]"
+        " | take-gui [--wait SECONDS]' >&2; exit 2; }\n"
+        "case \"${1:-}\" in\n"
+        "take) [ -n \"${2:-}\" ] || usage; root=$2; shift 2\n"
+        f"    exec {python} {hook} take-root --root \"$root\" --canonical-roots {roots_n}{dirs} \"$@\" ;;\n"
+        f"take-gui) shift; exec {python} {hook} take-gui{dirs} \"$@\" ;;\n"
+        "*) usage ;;\n"
+        "esac\n"
     )
     return {"job-started.sh": started.encode(), "job-completed.sh": completed.encode(), "listen.sh": listen.encode(),
             "glaeda-canonical-root": root.encode()}
