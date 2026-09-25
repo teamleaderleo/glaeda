@@ -130,7 +130,12 @@ def default_families() -> list[Family]:
         Family("tmp", tmp, True, "agent scratch under the temp dir",
                skip=(f"claude-{uid}",), files=True,
                min_bytes=1024**2 if tmpfs else None, git_disposable=True),
-        Family("user-cache", HOME / ".cache", False, "tool caches (report only)"),
+        # cmux's cloud reload and CI jobs keep warm trees per unit (reload-cloud/{cmux-base,work},
+        # reload-cloud-ios/{DerivedData,work}); a build mini grew 36 GiB here within hours. Depth 2
+        # so a unit's DerivedData can go while its checkout stays, unless that checkout loses nothing.
+        Family("cmux-job-cache", HOME / ".cache/cmux-job", True,
+               "next cmux reload or CI job rebuilds it (cold)", depth=2, git_disposable=True),
+        Family("user-cache", HOME / ".cache", False, "tool caches (report only)", skip=("cmux-job",)),
         Family("library-caches", HOME / "Library/Caches", False, "app caches (report only)"),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
                "use `xcrun simctl delete unavailable` (report only)"),

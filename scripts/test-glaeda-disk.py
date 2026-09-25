@@ -623,6 +623,34 @@ class LinuxLayoutTest(unittest.TestCase):
         # scratch clones and leaked files are judged on any filesystem, not only a tmpfs
         self.assertTrue(tmp.files and tmp.git_disposable)
 
+    def test_cmux_job_units_go_but_unpushed_checkouts_stay(self) -> None:
+        job = self.home / ".cache/cmux-job"
+        (job / "reload-cloud-ios/DerivedData/Build").mkdir(parents=True)
+        (job / "reload-cloud-ios/DerivedData/Build/x.o").write_bytes(b"\0" * 4096)
+        base = job / "reload-cloud/cmux-base"
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "init", "-q", str(base)], check=True, env=env)
+        (base / "f").write_text("x")
+        subprocess.run(["git", "-C", str(base), "add", "f"], check=True, env=env)
+        subprocess.run(["git", "-C", str(base), "commit", "-qm", "local only"], check=True, env=env)
+        old = time.time() - 48 * 3600
+        for dirpath, dirnames, filenames in os.walk(job):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (old, old), follow_symlinks=False)
+        saved = gd.process_evidence
+        gd.process_evidence = lambda: ([], "")
+        try:
+            fams = [f for f in gd.default_families() if f.id in ("cmux-job-cache", "user-cache")]
+            items = gd.survey(fams, 24, 0)
+        finally:
+            gd.process_evidence = saved
+        verdicts = {Path(i.path).relative_to(self.home).as_posix(): (i.family, i.verdict) for i in items}
+        self.assertEqual(verdicts[".cache/cmux-job/reload-cloud-ios/DerivedData"], ("cmux-job-cache", "reclaimable"))
+        # a commit no remote holds keeps its checkout
+        self.assertEqual(verdicts[".cache/cmux-job/reload-cloud/cmux-base"], ("cmux-job-cache", "git-checkout"))
+        self.assertNotIn(".cache/cmux-job", verdicts)  # not listed again as a report-only tool cache
+
     def test_claude_session_seen_in_alternate_config_dir(self) -> None:
         t = self.home / ".claude-outlook/projects/-home-leo-Projects/abc-123.jsonl"
         t.parent.mkdir(parents=True)
