@@ -266,6 +266,24 @@ def xcode_present(app: dict[str, Any]) -> bool:
             and re.search(rf"^Xcode {re.escape(version)}$", out, re.M) is not None)
 
 
+def ios_sim_present(apps: list[dict[str, Any]], major: str) -> bool | None:
+    """An available iOS <major>.x simulator runtime (simctl, read-only). Runtimes are shared by every Xcode on
+    the machine, so the member's first verified Xcode answers for all. None when simctl gives no usable answer."""
+    developer = Path(str(apps[0].get("path") or "")) / "Contents/Developer"
+    code, out = run(["/usr/bin/xcrun", "simctl", "list", "runtimes", "-j"],
+                    env={**os.environ, "DEVELOPER_DIR": os.fspath(developer)})
+    if code != 0:
+        return None
+    try:
+        runtimes = json.loads(out[out.find("{"):]).get("runtimes")  # stderr is merged in; skip any warning
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(runtimes, list):
+        return None
+    return any(isinstance(r, dict) and r.get("isAvailable") and r.get("platform") == "iOS"
+               and str(r.get("version") or "").split(".")[0] == major for r in runtimes)
+
+
 def fleet_labels() -> Any:
     """The shared label rule, loaded from beside this script only when --manifest asks for it."""
     path = SCRIPT_DIR / LABELS_MODULE
@@ -276,13 +294,19 @@ def fleet_labels() -> Any:
     return module
 
 
-def member_labels(manifest: Any, member: str) -> tuple[dict[str, Any] | None, str | None]:
-    """(member summary with labels, None) or (None, why this member cannot be a runner). Reads only."""
+def member_labels(manifest: Any, member: str, prior_labels: list[str] | None = None
+                  ) -> tuple[dict[str, Any] | None, str | None]:
+    """(member summary with labels, None) or (None, why this member cannot be a runner). Reads only.
+    prior_labels: what this runner registered with, so a simctl hiccup keeps the iOS label instead of
+    re-registering the runner without it."""
     try:
         rule = fleet_labels()
     except Exception as error:  # noqa: BLE001  (missing, broken or stale module: explain, never a traceback)
         return None, f"{LABELS_MODULE} must sit next to this script for --manifest ({type(error).__name__})"
-    return rule.member_labels(manifest, member, lambda app: xcode_present(app))
+    def ios_sim_ok(apps: list[dict[str, Any]]) -> bool:
+        found = ios_sim_present(apps, getattr(rule, "IOS_SIM_MAJOR", "26"))
+        return found if found is not None else getattr(rule, "IOS_SIM_LABEL", "glaeda-ios-sim") in (prior_labels or [])
+    return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok)
 
 
 def load_receipt(ctx: Context) -> dict[str, Any] | None:
@@ -1092,7 +1116,9 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as error:
             print(f"glaeda-cmux-runner: cannot read manifest: {type(error).__name__}", file=sys.stderr)
             return 2
-        member, why = member_labels(manifest, args.member)
+        early = load_receipt(ctx)
+        member, why = member_labels(manifest, args.member,
+                                    ((early or {}).get("registration") or {}).get("labels") or [])
         if member is None:
             print(f"glaeda-cmux-runner: {why}", file=sys.stderr)
             return 2

@@ -14,6 +14,10 @@ import re
 from typing import Any, Callable
 
 MINI_LABEL = "glaeda-mini"
+# A host with the ios-simulators role, verified on the mini: an available iOS runtime of IOS_SIM_MAJOR.
+IOS_SIM_LABEL = "glaeda-ios-sim"
+IOS_SIM_ROLE = "ios-simulators"
+IOS_SIM_MAJOR = "26"
 # dev machines take no jobs; borrowed machines run jobs only inside a VM, never as a host runner.
 RUNNER_CLASSES = ("xl", "std", "light")
 MEMBER_CLASSES = RUNNER_CLASSES + ("dev", "borrowed")
@@ -67,8 +71,9 @@ def xcode_apps(manifest: dict[str, Any], member: str) -> list[dict[str, Any]] | 
     return [a for a in apps if isinstance(a, dict)] if isinstance(apps, list) else []
 
 
-def member_labels(manifest: Any, member: str,
-                  xcode_ok: Callable[[dict[str, Any]], bool]) -> tuple[dict[str, Any] | None, str | None]:
+def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]], bool],
+                  ios_sim_ok: Callable[[list[dict[str, Any]]], bool] | None = None
+                  ) -> tuple[dict[str, Any] | None, str | None]:
     """(member summary with labels, None) or (None, why this member cannot be a runner)."""
     if not isinstance(manifest, dict) or not isinstance(manifest.get("hosts"), dict):
         return None, "manifest has no hosts table"
@@ -104,8 +109,13 @@ def member_labels(manifest: Any, member: str,
     versions = [str(a["version"]) for a in ready]
     # Opportunistic members never carry a pool label, so they never receive a required job.
     pools = [pool_label(klass, v, bool(trusted_ref)) for v in versions] if availability == "dedicated" else []
+    # Declared (the ios-simulators role) and, when the caller can look (the installer on the mini), a simulator
+    # runtime actually present: an iOS job routed here must be able to boot one. Without a check (the fleet
+    # plan) this is the declared view.
+    ios_sim = IOS_SIM_ROLE in roles and bool(ready) and (ios_sim_ok is None or ios_sim_ok(ready))
     labels = [MINI_LABEL, f"glaeda-class-{klass}", f"glaeda-{availability}",
-              *(["glaeda-trusted"] if trusted_ref else []), *[f"xcode-{v}" for v in versions], *pools]
+              *(["glaeda-trusted"] if trusted_ref else []), *[f"xcode-{v}" for v in versions], *pools,
+              *([IOS_SIM_LABEL] if ios_sim else [])]
     disk = merged.get("disk")
     floor = disk.get("min_free_gib") if isinstance(disk, dict) else None
     runners, units = CLASS_CAPACITY[klass]
@@ -134,7 +144,7 @@ def member_labels(manifest: Any, member: str,
     return {"member": member, "class": klass, "availability": availability, "roles": roles,
             "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
-            "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready],
+            "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
             "trustedRef": trusted_ref, "trustedRepo": trusted_repo,
             "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)]}, None

@@ -87,12 +87,19 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
                "cli-product-tests": "product", "swift-package-tests": "light",
                # side lanes: no GUI, no persistent state. cli-pipe-regressions builds only cmux-cli, into
                # its own $RUNNER_TEMP DerivedData; remote-daemon-macos-tests is go test; claude-wrapper is node.
-               "cli-pipe-regressions": "light", "remote-daemon-macos-tests": "light", "claude-wrapper": "light"}
+               "cli-pipe-regressions": "light", "remote-daemon-macos-tests": "light", "claude-wrapper": "light",
+               # iOS (test-ios, ios-screenshots; runs-on glaeda-ios-sim): builds into their own DerivedData or
+               # SwiftPM .build, never /private/tmp/cmux-ci, so no canonical root. Simulator jobs reuse, erase and
+               # boot named devices in the user's one CoreSimulator service, so one per mini (the simulator token).
+               # ios-streamed-validate's `validate` is not listed: fixed ports, GUI session changes and secrets in
+               # $HOME keep it on Blacksmith (docs/CMUX_MINI_RUNNER.md 2g).
+               "mobile-core-package": "isolated", "ios-simulator-build": "isolated",
+               "ios-simulator": "simulator", "screenshots": "simulator"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
 # restore a product into with rm -rf of its src, so one root job per root per mini (cmux#14338 adds a second).
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("root",)),
-    "light": (1, ())}
+    "isolated": (2, ()), "simulator": (2, ("simulator",)), "light": (1, ())}
 CANONICAL_ROOT_ENV = "CMUX_CI_CANONICAL_ROOT"
 # With more than one root, these restore a producer's product into the producer's root (#filePath is baked
 # in there), so they take that root from their restore step, not a token-chosen one at job start.

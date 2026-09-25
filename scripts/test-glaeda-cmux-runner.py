@@ -630,6 +630,25 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
+    def test_capacity_ios_jobs_take_no_root_or_gui_token(self) -> None:
+        self.fleet()
+        try:
+            self.assertIn("persistent-dd+root-1", self.job("macos-compile-admission", "i0", 8).stdout)
+            for n, job in enumerate(("ios-simulator-build", "mobile-core-package")):
+                result = self.job(job, f"i{n + 1}", 12)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"holding 2/12 units for {job} (isolated", result.stdout)
+            sim = self.job("ios-simulator", "i3", 12)
+            self.assertIn("2/12 units+simulator for ios-simulator (simulator", sim.stdout)
+            second = self.job("screenshots", "i4", 12)
+            self.assertEqual(second.returncode, 1, "one simulator job per mini")
+            self.assertIn("the simulator token is taken", second.stdout)
+            self.assertIn("(validate is compile)", self.job("validate", "i5", 12).stdout,
+                          "validate is unknown to the hook (compile class): it stays on Blacksmith")
+        finally:
+            for runner in ("i0", "i1", "i2", "i3", "i4", "i5"):
+                self.finish(runner)
+
     def test_capacity_compile_slots(self) -> None:
         self.fleet()
         slots = ("--compile-slots", "2", "--canonical-roots", "2")
@@ -2136,6 +2155,31 @@ class ManifestLabelsTest(unittest.TestCase):
                 with self.subTest(bad=bad):
                     manifest["hosts"]["mini-std"]["overrides"]["runner"] = bad
                     self.assertIn("trustedRef", cr.member_labels(manifest, "mini-std")[1])
+
+    def test_ios_sim_label_needs_the_manifest_and_a_runtime(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            manifest = json.loads(json.dumps(MANIFEST))
+            self.assertNotIn("glaeda-ios-sim", cr.member_labels(manifest, "mini-std")[0]["labels"])
+            manifest["hosts"]["mini-std"]["roles"] = [*manifest["hosts"]["mini-std"]["roles"], "ios-simulators"]
+            runtimes = {"runtimes": [{"platform": "iOS", "version": "26.3.1", "isAvailable": True}]}
+            with mock.patch.object(cr, "run", return_value=(0, "warning: noise\n" + json.dumps(runtimes))):
+                member, _ = cr.member_labels(manifest, "mini-std")
+                self.assertIn("glaeda-ios-sim", member["labels"])
+                self.assertTrue(member["iosSim"])
+            for label, found in (("none", {"runtimes": []}),
+                                 ("27 only", {"runtimes": [{"platform": "iOS", "version": "27.0", "isAvailable": True}]}),
+                                 ("unavailable", {"runtimes": [{"platform": "iOS", "version": "26.3.1", "isAvailable": False}]}),
+                                 ("watchOS", {"runtimes": [{"platform": "watchOS", "version": "26.0", "isAvailable": True}]})):
+                with self.subTest(label), mock.patch.object(cr, "run", return_value=(0, json.dumps(found))):
+                    self.assertNotIn("glaeda-ios-sim", cr.member_labels(manifest, "mini-std")[0]["labels"])
+            with mock.patch.object(cr, "run", return_value=(72, "xcrun: error")) as run:
+                self.assertNotIn("glaeda-ios-sim", cr.member_labels(manifest, "mini-std")[0]["labels"])
+                self.assertIn("glaeda-ios-sim", cr.member_labels(manifest, "mini-std", ["glaeda-ios-sim"])[0]["labels"],
+                              "a simctl hiccup keeps the label the runner registered with")
+                self.assertTrue(run.call_args.kwargs["env"]["DEVELOPER_DIR"].endswith("/Contents/Developer"))
+            with mock.patch.object(cr, "run", return_value=(0, json.dumps({"runtimes": []}))):
+                self.assertNotIn("glaeda-ios-sim", cr.member_labels(manifest, "mini-std", ["glaeda-ios-sim"])[0]["labels"],
+                                 "a clean answer with no runtime drops it")
 
     def test_member_labels_table(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
