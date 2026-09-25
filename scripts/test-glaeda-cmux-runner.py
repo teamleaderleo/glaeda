@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -30,6 +31,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "scripts" / "glaeda-cmux-runner-hook"
+WORKER_STEP_EXIT = "runner-worker-step-exit "  # the Runner.Worker stand-in's last stdout line (HookTest.take)
 
 
 def load(name: str, path: Path):
@@ -498,13 +500,22 @@ class HookTest(unittest.TestCase):
         self.assertTrue(self.lock_free(), "every holder let go")
 
     def take(self, root: str, runner: str, *extra: str) -> subprocess.CompletedProcess:
-        """Run take-root as a restore step would: under a process named Runner.Worker (its ancestor)."""
+        """Run take-root as a restore step would: under a process named Runner.Worker (its ancestor).
+        A real Runner.Worker outlives the step and the root holder watches it, so the stand-in reports
+        the step's exit status and then stays up until the test ends; one that exited with the step
+        would let the holder release the root within HOLDER_POLL_S."""
         worker = self.dir / "Runner.Worker"
         if not worker.exists():  # a real parent process named Runner.Worker (a copied /bin/sh is killed on macOS)
             source = self.dir / "worker.c"
-            source.write_text("#include <sys/wait.h>\n#include <unistd.h>\nint main(int c, char **v) {\n"
-                              "  pid_t p = fork(); if (p == 0) { execv(\"/bin/sh\", v); _exit(127); }\n"
-                              "  int s = 0; waitpid(p, &s, 0); return WIFEXITED(s) ? WEXITSTATUS(s) : 1; }\n")
+            source.write_text("#include <fcntl.h>\n#include <stdio.h>\n#include <sys/wait.h>\n#include <unistd.h>\n"
+                              "int main(int c, char **v) {\n"
+                              "  pid_t p = fork();\n"
+                              "  if (p == 0) { dup2(open(\"/dev/null\", O_RDONLY), 0); execv(\"/bin/sh\", v); _exit(127); }\n"
+                              "  int s = 0; waitpid(p, &s, 0);\n"
+                              f"  printf(\"{WORKER_STEP_EXIT}%d\\n\", WIFEXITED(s) ? WEXITSTATUS(s) : 1);\n"
+                              "  fflush(stdout); close(1); close(2);\n"
+                              "  char b; while (read(0, &b, 1) > 0) {}\n"  # up until the test closes stdin
+                              "  return 0; }\n")
             cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
             if cc is None or subprocess.run([cc, "-o", os.fspath(worker), os.fspath(source)],
                                             capture_output=True).returncode != 0:
@@ -515,8 +526,31 @@ class HookTest(unittest.TestCase):
                                                 "--canonical-roots", "2", *extra])
         environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "RUNNER_NAME": runner,
                    "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet")}
-        return subprocess.run([os.fspath(worker), "-c", cmd], env=environ, capture_output=True, text=True,
-                              timeout=60, check=False)
+        proc = subprocess.Popen([os.fspath(worker), "-c", cmd], env=environ, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.end_worker, proc)
+        timer = threading.Timer(60, proc.kill)
+        timer.start()
+        try:
+            stdout, stderr = proc.stdout.read(), proc.stderr.read()  # EOF once the step is done
+        finally:
+            timer.cancel()
+        stdout, marker, status = stdout.rpartition(WORKER_STEP_EXIT)
+        self.assertTrue(marker, f"the Runner.Worker stand-in did not report the step: {stderr}")
+        return subprocess.CompletedProcess(proc.args, int(status), stdout, stderr)
+
+    @staticmethod
+    def end_worker(proc: subprocess.Popen) -> None:
+        """End a Runner.Worker stand-in, as the job ending would."""
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+        proc.stderr.close()
 
     def test_two_roots_consumers_take_the_producers_root_in_their_step(self) -> None:
         self.fleet()
