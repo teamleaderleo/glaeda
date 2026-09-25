@@ -209,13 +209,14 @@ class GlaedaDiskTest(unittest.TestCase):
         job = "/Users/cmux/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 148 151"
         self.assertTrue(gd.CI_WORKER.search(job))
         self.assertTrue(gd.CI_WORKER.search("/Users/cmux/actions-runner/bin/Runner.Worker"))
+        self.assertTrue(gd.CI_WORKER.search("/Users/cmux/actions-runner-cmux-nightly-mini/bin.2.337.0/Runner.Worker spawnclient 1 2"))
         self.assertFalse(gd.CI_WORKER.search("/Users/cmux/actions-runner-glaeda/bin/Runner.Listener run"))
-        total = 460 * gd.GIB  # a build mini: emergency 5%:15-40 is 23 GiB
+        total = 460 * gd.GIB  # a build mini: emergency 10%:30-60 is 46 GiB
         low = gd.Fs(1, "/", 60 * gd.GIB, total, 69 * gd.GIB, 115 * gd.GIB)
-        self.assertIn("deferred", gd.ci_defer({1: low}, [job], "5%:15-40"))
-        self.assertEqual(gd.ci_defer({1: low}, [], "5%:15-40"), "")  # no job: go ahead
-        critical = gd.replace(low, free=20 * gd.GIB)
-        self.assertEqual(gd.ci_defer({1: critical}, [job], "5%:15-40"), "")  # the job would fail anyway
+        self.assertIn("deferred", gd.ci_defer({1: low}, [job], "10%:30-60"))
+        self.assertEqual(gd.ci_defer({1: low}, [], "10%:30-60"), "")  # no job: go ahead
+        critical = gd.replace(low, free=40 * gd.GIB)
+        self.assertEqual(gd.ci_defer({1: critical}, [job], "10%:30-60"), "")  # the job would fail anyway
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             gd.main(["--pressure", "--emergency", "lots"])
 

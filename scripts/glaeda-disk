@@ -795,8 +795,9 @@ def space(spec: str, total: int) -> int:
     return n
 
 
-# A GitHub Actions job in progress (any runner dir: actions-runner, actions-runner-glaeda-2, ...).
-CI_WORKER = re.compile(r"/actions-runner[^/\s]*/bin/Runner\.Worker(?:\s|$)")
+# A GitHub Actions job in progress (any runner dir: actions-runner, actions-runner-glaeda-2, ...). An
+# auto-updated runner's bin is a symlink to bin.<version>, which ps shows resolved.
+CI_WORKER = re.compile(r"/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
 
 
 def ci_jobs() -> list[str]:
@@ -1105,7 +1106,8 @@ def main(argv: list[str] | None = None) -> int:
                          "(default %(default)s free)")
     ap.add_argument("--tmpfs-target", default="90%",
                     help="stop freeing a tmpfs at this much free (default %(default)s)")
-    ap.add_argument("--emergency", default="5%:15-40",
+    # One cold cmux job can write 10-36 GiB between two 15-minute runs, so the floor sits well above empty.
+    ap.add_argument("--emergency", default="10%:30-60",
                     help="with --pressure --apply: delete even while a CI job runs once free space is "
                          "below this, same forms as --low (default %(default)s)")
     ap.add_argument("--idle-hours", type=float, default=None,
