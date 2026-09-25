@@ -237,6 +237,34 @@ class HookTest(unittest.TestCase):
         self.assertEqual(self.run_hook("job-started", "push", path, "--allowed-owner", "manaflow-ai",
                                        "--no-disk", repo="other/cmux").returncode, 1)
 
+    def test_trusted_ref_admits_only_that_branchs_own_jobs(self) -> None:
+        main = {"ref": "refs/heads/main", "repository": CMUX}
+        pr = {"number": 1, "head": {"repo": {**CMUX, "fork": False}}, "base": {"repo": CMUX}}
+        cases = {
+            "push to main": ("push", "refs/heads/main", main, True),
+            "schedule": ("schedule", "refs/heads/main", {"repository": CMUX}, True),
+            "dispatch on main": ("workflow_dispatch", "refs/heads/main", {"repository": CMUX}, True),
+            "dispatch on a branch": ("workflow_dispatch", "refs/heads/pr-branch", {"repository": CMUX}, False),
+            "push to a branch": ("push", "refs/heads/pr-branch", {**main, "ref": "refs/heads/pr-branch"}, False),
+            "push, ref env and payload differ": ("push", "refs/heads/main", {**main, "ref": "refs/heads/x"}, False),
+            "same-repo pull request": ("pull_request", "refs/pull/1/merge", {"pull_request": pr, "repository": CMUX}, False),
+            "merge queue": ("merge_group", "refs/heads/gh-readonly-queue/main/pr-1", {"repository": CMUX}, False),
+            "no ref": ("push", None, main, False),
+        }
+        for name, (event_name, ref, payload, admitted) in cases.items():
+            with self.subTest(name):
+                path = event(self.dir, name.replace(" ", "-").replace(",", ""), payload)
+                result = self.run_hook("job-started", event_name, path, "--allowed-owner", "manaflow-ai",
+                                       "--trusted-ref", "refs/heads/main", "--no-disk", repo="manaflow-ai/cmux",
+                                       env={"GITHUB_REF": ref} if ref else None)
+                self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
+                if not admitted:
+                    self.assertIn("refused: ", result.stdout)
+        path = event(self.dir, "plain-pr", {"pull_request": pr, "repository": CMUX})
+        self.assertEqual(self.run_hook("job-started", "pull_request", path, "--allowed-owner", "manaflow-ai",
+                                       "--no-disk", repo="manaflow-ai/cmux").returncode, 0,
+                         "without --trusted-ref a same-repo PR is admitted as before")
+
     def test_disk_pressure_never_fails_and_is_bounded(self) -> None:
         marker = self.dir / "disk-ran"
         slow = make_executable(self.dir / "glaeda-disk-slow", "import time, pathlib, sys\n"
@@ -1261,6 +1289,12 @@ class RunnerTest(unittest.TestCase):
         with mock.patch.object(cr, "xcode_present", return_value=True):
             self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
         self.assertIn("--capacity-units 4 --compile-slots 2", (hooks / "job-started.sh").read_text())
+        self.assertNotIn("--trusted-ref", (hooks / "job-started.sh").read_text())
+        manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"trustedRef": "refs/heads/main"}
+        path.write_text(json.dumps(manifest))
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
+        self.assertIn("--trusted-ref refs/heads/main", (hooks / "job-started.sh").read_text())
 
     def test_instances_get_their_own_paths_and_share_the_capacity(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
@@ -1512,6 +1546,22 @@ class ManifestLabelsTest(unittest.TestCase):
                     member, why = cr.member_labels(manifest, "mini-std")
                     self.assertIsNone(member)
                     self.assertIn("runner.classes.std", why)
+
+    def test_trusted_ref_moves_the_member_to_its_own_pool(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            manifest = json.loads(json.dumps(MANIFEST))
+            manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"trustedRef": "refs/heads/main"}
+            member, why = cr.member_labels(manifest, "mini-std")
+            self.assertIsNone(why)
+            self.assertEqual(member["pools"], ["glaeda-trusted-std-xcode-26.6"])
+            self.assertIn("glaeda-trusted", member["labels"])
+            self.assertNotIn("glaeda-std-xcode-26.6", member["labels"], "a PR run must never route here")
+            self.assertEqual(member["trustedRef"], "refs/heads/main")
+            self.assertIsNone(cr.member_labels(MANIFEST, "mini-std")[0]["trustedRef"])
+            for bad in ("main", "refs/pull/1/merge", "refs/heads/a b", 7):
+                with self.subTest(bad=bad):
+                    manifest["hosts"]["mini-std"]["overrides"]["runner"] = {"trustedRef": bad}
+                    self.assertIn("trustedRef", cr.member_labels(manifest, "mini-std")[1])
 
     def test_member_labels_table(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):

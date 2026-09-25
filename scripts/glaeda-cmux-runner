@@ -370,6 +370,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         scope += f" --require-eligible --fleet-class {shlex.quote(ctx.member['hardware'])}"
         if ctx.member.get("xcodeApps"):
             scope += f" --toolchain-xcode {shlex.quote(ctx.member['xcodeApps'][0])}"
+        if ctx.member.get("trustedRef"):  # this mini holds a secret: only jobs on that branch, never PR code
+            scope += f" --trusted-ref {shlex.quote(ctx.member['trustedRef'])}"
     if ctx.capacity_units:  # every runner on this mini shares these units (the hook's capacity ledger)
         scope += f" --capacity-units {int(ctx.capacity_units)}"
         slots = int((ctx.member or {}).get("compileSlots") or 1)

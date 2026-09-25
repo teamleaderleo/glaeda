@@ -261,6 +261,29 @@ count is refused. Every instance bakes the same `--capacity-units`, so the mini
 never runs more than its units, however many runners pick up jobs. Uninstall one
 with `--uninstall --apply --instance K`.
 
+## 2e. Trusted-only runners on a mini that holds a secret
+
+A mini that holds a secret, such as the fleet-cas signing key on the writer mini, must never run PR
+code as the user that can read it. Set the host's `overrides.runner.trustedRef` in the manifest:
+
+```json
+"cmux7s-mac-mini": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"],
+                    "overrides": {"runner": {"trustedRef": "refs/heads/main"}}}
+```
+
+Its runners then:
+
+- carry `glaeda-trusted` and the pool label `glaeda-trusted-<class>-xcode-<version>` instead of
+  `glaeda-<class>-xcode-<version>`, so a PR run's picker never counts or routes to them;
+- bake `--trusted-ref refs/heads/main` into the job-started hook, which refuses (`refused: untrusted:
+  ...`) every job whose event is not push, schedule or workflow_dispatch, or whose `GITHUB_REF` (and a
+  push payload's `ref`) is not that ref. For those events the workflow file and the checkout both come
+  from the ref, and pushing to it takes a merge, so PR code never runs there even if a PR's workflow
+  names the trusted label.
+
+pull_request, merge_group and workflow_run are refused: they run code that has not merged. Route only
+main and nightly runs to the trusted pool.
+
 ## 3. Verify
 
 ```bash

@@ -17,6 +17,8 @@ job-started refuses (exits 1, so the runner fails the job before any step runs) 
   * a workflow_run was triggered from a different head repository
   * the repository is not in the allowlist baked in at install time
   * GITHUB_EVENT_NAME or GITHUB_EVENT_PATH is missing or unreadable (fail closed)
+  * with --trusted-ref REF (a mini that holds a secret): the event is not push, schedule or
+    workflow_dispatch, or GITHUB_REF (and a push payload's ref) is not REF, so no PR code runs there
 Any crash also exits non-zero, which refuses the job. An admitted job is then held to the fleet host,
 so a PR job never lands on a mini that is busy with other work. It is refused fast (the pool picker
 re-runs it elsewhere) when:
@@ -136,6 +138,21 @@ def decide(event_name: str | None, event: Any, repository: str | None,
         if head_name is None or head_name != (repo or _repo_name(event.get("repository"))):
             return False, f"workflow_run triggered from another repository ({head_name})"
     return True, f"{event_name} on {repo or '(unknown)'}"
+
+
+TRUSTED_EVENTS = ("push", "schedule", "workflow_dispatch")
+
+
+def trusted_refusal(event_name: str | None, ref: str | None, event: Any, trusted_ref: str) -> str | None:
+    """Why a job is not trusted code on trusted_ref, or None. Pure. The workflow and its checkout both come
+    from that ref for these events, and pushing to it takes a merge, so PR code never runs here."""
+    if event_name not in TRUSTED_EVENTS:
+        return f"untrusted: {event_name} is not one of {', '.join(TRUSTED_EVENTS)} (this runner takes only {trusted_ref})"
+    if ref != trusted_ref:
+        return f"untrusted: ref {ref or '(unset)'} is not {trusted_ref}"
+    if event_name == "push" and (not isinstance(event, dict) or event.get("ref") != trusted_ref):
+        return f"untrusted: push payload ref is not {trusted_ref}"
+    return None
 
 
 def reservation_refusal(path: str, now: float) -> str | None:
@@ -620,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--allowed-owner")
     p.add_argument("--allow-event", action="append", default=[],
                    help="admit another event name (pull_request_target is always refused)")
+    p.add_argument("--trusted-ref", help="admit only push, schedule and workflow_dispatch jobs on this ref")
     p.add_argument("--disk", help="glaeda-disk path (default: PATH, then ~/.local/bin)")
     p.add_argument("--no-disk", action="store_true")
     p.add_argument("--min-free-gib", type=float, default=0, help="refuse a job below this much free disk")
@@ -646,11 +664,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{PREFIX}: {'refused: ' + why if why else 'eligible' + (f' ({note})' if note else '')}", flush=True)
         return 1 if why else 0
     if args.phase == "job-started":
-        admit, reason = decide(os.environ.get("GITHUB_EVENT_NAME"), load_event(os.environ.get("GITHUB_EVENT_PATH")),
+        event = load_event(os.environ.get("GITHUB_EVENT_PATH"))
+        admit, reason = decide(os.environ.get("GITHUB_EVENT_NAME"), event,
                                os.environ.get("GITHUB_REPOSITORY"), args.allowed_repo, args.allowed_owner,
                                tuple(args.allow_event))
         if not admit:
             return refuse(reason)
+        if args.trusted_ref:
+            why = trusted_refusal(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"), event,
+                                  args.trusted_ref)
+            if why:
+                return refuse(why)
         want: dict[str, Any] = {}
         if args.require_eligible:
             why, want = node_refusal(args.fleet_class)
