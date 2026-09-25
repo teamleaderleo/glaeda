@@ -184,6 +184,14 @@ def write_atomic(path: Path, data: bytes, mode: int) -> None:
     os.replace(stage, path)
 
 
+RUNNER_LABEL_PREFIX = "glaeda-runner-"
+
+
+def runner_label(name: str) -> str:
+    """The label only the runner registered as `name` carries (glaeda-runner-<name>, lowercase)."""
+    return RUNNER_LABEL_PREFIX + re.sub(r"[^a-z0-9._-]+", "-", name.lower())
+
+
 def default_name() -> str:
     host = socket.gethostname().split(".")[0].lower()
     host = re.sub(r"[^a-z0-9-]+", "-", host).strip("-") or "mac"
@@ -1193,6 +1201,10 @@ def main(argv: list[str] | None = None) -> int:
         ctx.labels_requested = True
         if not args.name:
             ctx.name = f"{args.member}-glaeda{ctx.suffix}"
+        if is_root:
+            # A static handle on this one root runner (cmux's warm affinity): the picker reads which runner
+            # kept a warm build and names it in runs-on, so no job ever writes a runner label.
+            ctx.labels.append(runner_label(ctx.name))
     if args.token_stdin and args.apply:  # a plan previews the stdin path but never reads a token
         token = sys.stdin.readline(4096).strip()
         if not re.fullmatch(TOKEN_RE, token):
