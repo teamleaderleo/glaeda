@@ -118,6 +118,18 @@ Both are dry runs without --yes. The probe reports the marker and whether a buil
 reserved members (active or invalid marker) out of `conforming`; it lists them, and lists members
 whose host lock was held (`busy`) without removing them.
 
+The fleet compile-cache catch-up roles (cmuxterm-hq build-fleet README, "Filling the store"): the host
+with role `catch-up-writer` must have the LaunchDaemon ai.manaflow.cmux-build-catch-up-fill loaded (it
+runs every 15 minutes, so "not running" between ticks conforms), must not run the hq worker
+(bin/worker; a drained wrapper that execs /bin/sleep conforms), and its fleet-cas node must sign
+(--sign-key). The hq builders (`dev-builds`) are readers: their node must be read-only
+(--read-only-kv) and the released recipe (the target of recipes) must carry cmux-build-mode.py. On
+both, the fixed paths under xcode/ (src/cmux, DerivedData, fleet-cas.sock, fleet-cas.env,
+bin/fleet-cas-marker.sh and their parents) must be real directories, a socket and files, never
+symlinks, and the node must answer xcode/bin/fleet-cas-settings.sh on its socket. check only reports
+these: the cache keys include xcode/src/cmux and xcode/DerivedData, so nothing here deletes or
+re-clones them.
+
 The manifest's `toolchain` (in defaults, overridable per host) declares what every build host
 must carry: the Xcode app and build and whether it is selected, the Metal toolchain, the minimum
 Zig, rustup's default toolchain, the minimum Python, and the cmux checkout (repo, ref, root,
@@ -161,7 +173,26 @@ from typing import Any
 
 SCHEMA = "glaeda-mini-fleet/v1"
 # What a host is for; the target end state can give one host several.
-ROLES = ("dev-builds", "ci-runner", "nightly", "ios-simulators", "cache-host", "chromium-builds")
+ROLES = ("dev-builds", "ci-runner", "nightly", "ios-simulators", "cache-host", "chromium-builds", "catch-up-writer")
+# Fleet compile-cache catch-up (cmuxterm-hq build-fleet README, "Filling the store"). The one writer host fills
+# the store from its own LaunchDaemon and runs no hq worker, so no team-submitted build runs next to its signing
+# key. The hq builders (dev-builds) are the readers: a read-only fleet-cas node and the released recipe's
+# cmux-build-mode.py. check only reports here: the cache keys include xcode/src/cmux and xcode/DerivedData,
+# so nothing in this tool deletes, moves or re-clones them.
+CATCH_UP_WRITER = "catch-up-writer"
+CATCH_UP_READER_ROLES = ("dev-builds",)
+CATCH_UP_FILL_LABEL = "ai.manaflow.cmux-build-catch-up-fill"
+HQ_WORKER_LABEL = "ai.manaflow.cmux-build-worker"
+# launchd jobs that start on a timer (StartInterval): loaded but "not running" between ticks is their normal state.
+INTERVAL_LABELS = (CATCH_UP_FILL_LABEL,)
+# Paths under FLEET_ROOT that catch-up builds key on, and the kind each must be. A symlink anywhere here is drift.
+FLEET_CAS_PATHS = {
+    "xcode": "dir", "xcode/src": "dir", "xcode/src/cmux": "dir", "xcode/DerivedData": "dir", "xcode/bin": "dir",
+    "xcode/fleet-cas.sock": "socket", "xcode/fleet-cas.env": "file", "xcode/bin/fleet-cas-marker.sh": "file",
+}
+# Made by the first catch-up build rather than by glaeda-fleet-cas, so only their shape can be wrong.
+FLEET_CAS_BUILD_PATHS = ("xcode/src", "xcode/src/cmux", "xcode/DerivedData")
+FLEET_CAS_NODE_MODES = {CATCH_UP_WRITER: "signing", "reader": "read-only"}
 # Scheduling class (cmuxterm-hq build-fleet/FLEET-MEMBERSHIP.md). `hardware` names the machine
 # shape the check verifies; `class` says what work the member takes.
 CLASSES = ("xl", "std", "light", "dev", "borrowed")
@@ -177,7 +208,7 @@ PROBE_TIMEOUT = 90
 PREFLIGHT_TIMEOUT = 180
 LIST_KEYS = {"xcode_app", "xcode_ready", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key",
              "pf_tool", "pf_submodule", "pf_pmset", "pf_runner", "pf_brew_formula", "pf_secret",
-             "ios_runtime", "ios_device"}
+             "ios_runtime", "ios_device", "fleet_cas_path"}
 # Same rule as scripts/cmux_fleet.py NODE_RE: an opaque cmux-* fleet node id.
 NODE_ID_RE = re.compile(r"cmux-[a-z0-9][a-z0-9-]{2,59}\Z")
 VERSION_RE = re.compile(r"\d+(\.\d+){0,2}\Z")
@@ -261,6 +292,13 @@ def load_manifest(path: Path) -> dict[str, Any]:
         unknown = set(host.get("roles", [])) - set(ROLES)
         if unknown:
             raise Failure(f"{path}: host {name} has unknown roles {sorted(unknown)}; known: {', '.join(ROLES)}")
+        if CATCH_UP_WRITER in host.get("roles", []):
+            clash = sorted(set(host["roles"]) & set(CATCH_UP_READER_ROLES))
+            if clash:
+                raise Failure(f"{path}: host {name} is the {CATCH_UP_WRITER} and also {', '.join(clash)}; "
+                              "the writer runs no hq worker")
+            if HQ_WORKER_LABEL in host_policy(data, name).get("launchd", {}).get("running", []):
+                raise Failure(f"{path}: host {name} is the {CATCH_UP_WRITER} but launchd.running lists {HQ_WORKER_LABEL}")
         if host.get("hardware") not in data["hardware"]:
             raise Failure(f"{path}: host {name} has unknown hardware {host.get('hardware')!r}")
         if "class" in host and host["class"] not in CLASSES:
@@ -559,6 +597,13 @@ def parse_probe(text: str) -> dict[str, Any]:
             "recipe": out.get("fleet_recipe"),
             "worker_sha256_12": out.get("fleet_worker_sha"),
             "controller_token": out.get("controller_token"),
+        },
+        "fleet_cas": {
+            "paths": dict(v.split("|", 1) for v in out["fleet_cas_path"] if "|" in v),
+            "node_mode": out.get("fleet_cas_node_mode"),
+            "node": out.get("fleet_cas_node"),
+            "recipe": out.get("fleet_recipe_released"),
+            "build_mode": out.get("fleet_recipe_build_mode"),
         },
         "enrolled_node_id": out.get("fleet_node_id"),
         "reservation": probe_reservation(out.get("reservation"), out.get("reservation_raw")),
@@ -884,6 +929,8 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
         state = running.get(label)
         if state is None:
             drift("launchd", f"{label} not installed")
+        elif label in INTERVAL_LABELS and state != "not-loaded":
+            continue
         elif not state.startswith("running"):
             drift("launchd", f"{label} is {state}")
     for label in policy.get("launchd", {}).get("absent", []):
@@ -908,6 +955,9 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
         for message, fix in ios_simulator_drift(ios, obs):
             drift("ios", message, fix)
 
+    for area, message, fix in catch_up_drift(host, policy, obs):
+        drift(area, message, fix)
+
     # The declared toolchain: Xcode from the plain probe, the rest from a preflight section when observed.
     declared = policy.get("toolchain") or {}
     pinned = declared.get("xcode")
@@ -930,6 +980,78 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
             if got_check and got_check["state"] == "fail":
                 drift("toolchain", f"{check_id}: {got_check['detail']}", got_check["fix"])
     return issues
+
+
+def catch_up_role(host: dict[str, Any]) -> str | None:
+    """CATCH_UP_WRITER, "reader" for an hq builder, or None for a host outside the catch-up path."""
+    roles = host.get("roles") or []
+    if CATCH_UP_WRITER in roles:
+        return CATCH_UP_WRITER
+    return "reader" if set(roles) & set(CATCH_UP_READER_ROLES) else None
+
+
+def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """Drift for the fleet compile-cache catch-up roles, as (area, detail, fix). Reports only."""
+    role = catch_up_role(host)
+    if role is None:
+        return []
+    out: list[tuple[str, str, str]] = []
+    keep = "never delete or re-clone it: the catch-up cache keys include this path"
+    if role == CATCH_UP_WRITER:
+        states = {j["label"]: j["state"] for j in obs["launchd"]}
+        fill = states.get(CATCH_UP_FILL_LABEL)
+        # A fill listed in launchd.running is already checked there.
+        if CATCH_UP_FILL_LABEL not in policy.get("launchd", {}).get("running", []):
+            if fill is None:
+                out.append(("launchd", f"{CATCH_UP_FILL_LABEL} not installed",
+                            "cmuxterm-hq build-fleet/catch-up/install-catch-up-fill.sh (operator, sudo)"))
+            elif fill == "not-loaded":
+                out.append(("launchd", f"{CATCH_UP_FILL_LABEL} is not-loaded", ""))
+        if obs["fleet_worker"].get("process") == "running":
+            out.append(("catch-up", f"the hq worker ({FLEET_ROOT}/bin/worker) runs on the {CATCH_UP_WRITER}; "
+                        "team-submitted builds would run next to the signing key",
+                        f"drain it: exclude the host in fleet.json and make its {HQ_WORKER_LABEL} wrapper idle"))
+    cas = obs.get("fleet_cas") or {}
+    paths = cas.get("paths") or {}
+    if not paths:
+        out.append(("fleet-cas", f"no fleet-cas observation ({FLEET_ROOT} missing)", ""))
+        return out
+    for rel, want in FLEET_CAS_PATHS.items():
+        got = paths.get(rel, "missing")
+        where = f"{FLEET_ROOT}/{rel}"
+        if got == want:
+            continue
+        if got == "symlink":
+            out.append(("fleet-cas", f"{where} is a symlink, want a real {want}",
+                        f"operator: put the real {want} at this path; {keep}"))
+        elif got == "missing" and rel in FLEET_CAS_BUILD_PATHS:
+            out.append(("fleet-cas", f"{where} missing", "the next catch-up build creates it"))
+        elif got == "missing":
+            out.append(("fleet-cas", f"{where} missing", "scripts/glaeda-fleet-cas-rollout"))
+        else:
+            out.append(("fleet-cas", f"{where} is a {got}, want a {want}",
+                        f"operator: inspect it{'; ' + keep if rel in FLEET_CAS_BUILD_PATHS else ''}"))
+    want_mode = FLEET_CAS_NODE_MODES[role]
+    mode = cas.get("node_mode") or "missing"
+    if mode != want_mode:
+        flag = "--read-only-kv" if want_mode == "read-only" else "--sign-key"
+        got = {"missing": "no xcode/run/node.args", "signing": "the node signs (--sign-key)",
+               "read-only": "the node is read-only (--read-only-kv)"}.get(mode, "the node has neither flag")
+        out.append(("fleet-cas", f"{got}; a {role} node runs {flag}",
+                    f"scripts/glaeda-fleet-cas {'node' if role == 'reader' else 'writer'} (via glaeda-fleet-cas-rollout)"))
+    if cas.get("node") != "answers":
+        detail = "has no xcode/bin/fleet-cas-settings.sh" if cas.get("node") == "no-script" else \
+            "node does not answer xcode/bin/fleet-cas-settings.sh on its socket"
+        out.append(("fleet-cas", f"fleet-cas {detail}; builds fall back to the local cache",
+                    "scripts/glaeda-fleet-cas-rollout"))
+    if role == "reader":
+        release = "cmuxterm-hq build-fleet/recipe-release.py (operator)"
+        if cas.get("recipe") in (None, "none"):
+            out.append(("recipe", f"no released recipe at {FLEET_ROOT}/recipes", release))
+        elif cas.get("build_mode") != "present":
+            out.append(("recipe", f"released recipe {cas['recipe']} has no cmux-build-mode.py, so no catch-up mode",
+                        release))
+    return out
 
 
 def version_tuple(value: str | None) -> tuple[int, ...]:
