@@ -415,6 +415,42 @@ class ClientTest(Base):
         self.assertEqual([c["status"] for c in data["checks"]], ["QUEUED"])
         self.assertIsNone(gg.verdict("pr", data))
 
+    def test_a_required_check_that_has_not_reported_is_pending(self) -> None:
+        node = pr_node(1, rollup="SUCCESS", checks=[{**check_run("Web complexity"), "isRequired": True},
+                                                     {**check_run("lint"), "isRequired": False}])
+        node["baseRef"] = {"branchProtectionRule": None, "rules": {"nodes": [
+            {"type": "REQUIRED_STATUS_CHECKS", "parameters": {"requiredStatusChecks": [
+                {"context": "Web complexity"}, {"context": "ci-status"}]}},
+            {"type": "DELETION", "parameters": None}]}}
+        data = gg.parse_pr(node)
+        self.assertEqual(data["requiredMissing"], ["ci-status"])
+        self.assertIsNone(gg.verdict("pr", data, "green"))
+        self.assertIsNone(gg.verdict("pr", data, "done"))
+        self.assertIn("required, not reported yet: ci-status", gg.summary("pr:o/r#1", {"data": data}))
+        # GitHub's merge state already counts it: CLEAN means nothing required is outstanding.
+        self.assertEqual(gg.verdict("pr", {**data, "mergeStateStatus": "CLEAN"}, "green"), 0)
+        # A conflicted PR runs no workflows until the next push, and a merged one never will: no wait.
+        self.assertEqual(gg.verdict("pr", {**data, "mergeStateStatus": "DIRTY"}, "done"), 1)
+        self.assertIn("merge conflicts", gg.summary("pr:o/r#1", {"data": {**data, "mergeStateStatus": "DIRTY"}}))
+        self.assertEqual(gg.verdict("pr", {**data, "state": "MERGED", "mergeStateStatus": "UNKNOWN"}, "green"), 0)
+        # Classic branch protection lists its contexts too.
+        node["baseRef"] = {"branchProtectionRule": {"requiredStatusCheckContexts": ["build"]}, "rules": None}
+        self.assertEqual(gg.parse_pr(node)["requiredMissing"], ["build"])
+
+    def test_a_run_cancelled_for_a_newer_run_of_its_workflow_is_dropped(self) -> None:
+        def in_run(check: dict, run: int, conclusion: str | None) -> dict:
+            return {**check, "databaseId": run * 10, "isRequired": True, "checkSuite": {
+                "conclusion": conclusion, "workflowRun": {"databaseId": run, "workflow": {"name": "CI"}}}}
+        old = [in_run(check_run("ci-status", conclusion="FAILURE"), 1, "CANCELLED"),
+               in_run(check_run("changes", conclusion="CANCELLED"), 1, "CANCELLED")]
+        new = [in_run(check_run("changes"), 2, None), in_run(check_run("macos", "QUEUED", None), 2, None)]
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=old + new))
+        self.assertEqual(sorted(c["name"] for c in data["checks"]), ["changes", "macos"])
+        self.assertIsNone(gg.verdict("pr", data, "green"))
+        # With no newer run, a cancelled run's failure still counts.
+        alone = gg.parse_pr(pr_node(2, rollup="FAILURE", checks=old))
+        self.assertEqual(gg.verdict("pr", alone, "green"), 1)
+
     def test_same_name_in_two_workflows_stays_separate(self) -> None:
         def in_workflow(check: dict, workflow: str, db: int) -> dict:
             return {**check, "databaseId": db, "checkSuite": {"workflowRun": {"workflow": {"name": workflow}}}}
