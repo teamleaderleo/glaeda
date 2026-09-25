@@ -134,8 +134,10 @@ pub fn keygen(path: &Path) -> Result<VerifyingKey, String> {
 
 /// The cache key of a per-commit marker. The prefix keeps it apart from
 /// Xcode's keys, which are binary digests.
+pub const MARKER_PREFIX: &[u8] = b"glaeda-fleet-cas-marker-v1\0";
+
 pub fn marker_key(name: &str) -> Vec<u8> {
-    let mut k = b"glaeda-fleet-cas-marker-v1\0".to_vec();
+    let mut k = MARKER_PREFIX.to_vec();
     k.extend(name.as_bytes());
     k
 }

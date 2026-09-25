@@ -386,6 +386,10 @@ impl Store {
                 .and_then(|_| write_atomic(&path, &obj.encode_to_vec()))
                 .map_err(|e| Status::internal(e.to_string()))?;
             self.stats.cas_put_new.fetch_add(1, Relaxed);
+        } else {
+            // A deduplicated upload is a fresh use: it gets gc's grace period too,
+            // or gc could delete it between the upload and the entry naming it.
+            gc::touch_if_stale(&path);
         }
         Ok(id)
     }
@@ -768,8 +772,10 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
                 // A damaged entry is a miss, like a damaged object.
                 if let Ok(value) = kv::Value::decode(bytes.as_slice()) {
                     if s.trusts(&key, &value) {
-                        // A fleet store records the use, for `fleet-cas gc`.
-                        if !s.strip_signatures {
+                        // A fleet store records the use, for `fleet-cas gc`. Not for
+                        // markers: a marker then expires N days after its fill, and
+                        // never outlives the entries it vouches for.
+                        if !s.strip_signatures && !key.starts_with(sign::MARKER_PREFIX) {
                             gc::touch_if_stale(&path);
                         }
                         s.stats.kv_get_hit.fetch_add(1, Relaxed);
@@ -1082,11 +1088,13 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
             if !root.join("kv").is_dir() || !root.join("cas").is_dir() {
                 return Err(format!("{}: not a fleet-cas store (no kv/ and cas/)", root.display()).into());
             }
-            let r = gc::run(&root, std::time::Duration::from_secs(days * 86_400), dry_run)?;
+            let secs = days.checked_mul(86_400).ok_or("--keep-days is too large")?;
+            let r = gc::run(&root, std::time::Duration::from_secs(secs), dry_run)?;
             println!(
-                "{}kv kept {} deleted {}; cas kept {} deleted {} ({} bytes)",
+                "{}kv kept {} deleted {}; cas kept {} deleted {} ({} bytes); \
+                 kept entries naming no stored object: {}",
                 if dry_run { "dry run: " } else { "" },
-                r.kv_kept, r.kv_deleted, r.cas_kept, r.cas_deleted, r.bytes_deleted
+                r.kv_kept, r.kv_deleted, r.cas_kept, r.cas_deleted, r.bytes_deleted, r.kv_no_roots
             );
             return Ok(std::process::ExitCode::SUCCESS);
         }

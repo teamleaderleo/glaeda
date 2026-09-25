@@ -4,13 +4,18 @@
 //! hour per entry, see `touch_if_stale`), so an entry's mtime is its last use.
 //! `fleet-cas gc STORE --keep-days N` keeps every entry used within N days and
 //! every object reachable from a kept entry, and deletes the rest. Objects
-//! written within the last day are always kept, so a fill in progress (objects
-//! land before the entry that names them) is never cut short. Markers are
-//! index entries like any other: one that nobody reads ages out.
+//! written or re-uploaded within the last day are always kept (a deduplicated
+//! upload bumps the object's mtime too), so a fill in progress, whose objects
+//! land before the entry that names them, keeps its objects. Marker reads do
+//! not count as uses, so a marker expires N days after its fill and never
+//! outlives the entries it vouches for.
 //!
-//! Races with a running store degrade to misses, never wrong answers: an entry
-//! read while gc deletes it may name objects gc also deleted, and the reader
-//! then compiles instead.
+//! Which objects an entry names comes from `embedded_ids`, a heuristic over
+//! Xcode's value format. A kept entry that cannot be read or decoded aborts the
+//! run before anything is deleted, and the report counts kept entries that
+//! name no stored object: check that with `--dry-run` on a real store first.
+//! Races with a running store (an entry read while gc deletes it) degrade to
+//! misses, never wrong answers.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -44,6 +49,15 @@ pub struct Report {
     pub cas_kept: u64,
     pub cas_deleted: u64,
     pub bytes_deleted: u64,
+    /// Kept entries none of whose embedded IDs is a stored object.
+    pub kv_no_roots: u64,
+}
+
+fn remove(p: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        r => r,
+    }
 }
 
 fn files(dir: &Path) -> Vec<PathBuf> {
@@ -74,29 +88,41 @@ fn age(path: &Path, now: SystemTime) -> Duration {
 pub fn run(root: &Path, keep: Duration, dry_run: bool) -> std::io::Result<Report> {
     let now = SystemTime::now();
     let mut r = Report::default();
-    // 1. Index entries: keep the recently used ones, collect the IDs they name.
-    let mut roots: Vec<Vec<u8>> = Vec::new();
-    for p in files(&root.join("kv")) {
-        if age(&p, now) <= keep {
-            r.kv_kept += 1;
-            if let Ok(bytes) = std::fs::read(&p) {
-                if let Ok(v) = kv::Value::decode(bytes.as_slice()) {
-                    roots.extend(embedded_ids(&v));
-                }
-            }
-        } else {
-            r.kv_deleted += 1;
-            if !dry_run {
-                std::fs::remove_file(&p)?;
-            }
-        }
-    }
-    // 2. Objects: everything reachable from kept entries is live.
     let cas_dir = root.join("cas");
     let path_of = |id: &[u8]| {
         let h = hex::encode(id);
         cas_dir.join(&h[..2]).join(h)
     };
+    // 1. Index entries: keep the recently used ones, collect the IDs they name.
+    // Nothing is deleted until every kept entry has been read: a kept entry
+    // whose objects gc cannot see would lose them.
+    let mut roots: Vec<Vec<u8>> = Vec::new();
+    let mut stale = Vec::new();
+    for p in files(&root.join("kv")) {
+        if age(&p, now) <= keep {
+            r.kv_kept += 1;
+            let bytes = std::fs::read(&p)?;
+            let v = kv::Value::decode(bytes.as_slice()).map_err(|e| {
+                std::io::Error::other(format!("{}: undecodable entry ({e}); nothing deleted", p.display()))
+            })?;
+            let ids = embedded_ids(&v);
+            // Markers name no objects by design; only Xcode entries count here.
+            let marker = v.entries.contains_key("commit") && v.entries.contains_key("xcode");
+            if !marker && !ids.iter().any(|id| path_of(id).exists()) {
+                r.kv_no_roots += 1;
+            }
+            roots.extend(ids);
+        } else {
+            stale.push(p);
+        }
+    }
+    for p in stale {
+        r.kv_deleted += 1;
+        if !dry_run {
+            remove(&p)?;
+        }
+    }
+    // 2. Objects: everything reachable from kept entries is live.
     let mut live: HashSet<Vec<u8>> = HashSet::new();
     let mut queue = roots;
     while let Some(id) = queue.pop() {
@@ -123,7 +149,7 @@ pub fn run(root: &Path, keep: Duration, dry_run: bool) -> std::io::Result<Report
             r.cas_deleted += 1;
             r.bytes_deleted += std::fs::metadata(&p).map_or(0, |m| m.len());
             if !dry_run {
-                std::fs::remove_file(&p)?;
+                remove(&p)?;
             }
         }
     }
