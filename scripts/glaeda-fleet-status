@@ -15,11 +15,14 @@ Collection joins what exists today, each source optional and read-only:
   --queue-repo OWNER/REPO    queued jobs per label in that repository (repeatable)
   --cache NAME=URL           cache health endpoint, e.g. a /healthz URL (repeatable)
   (default on)               Lima instance counts and orphans per member (--no-lima to skip)
+  (default on)               disk per member: free space, cache families and owners (glaeda-disk --json),
+                             the last fleet-cas-prune and gc lines, bytes reclaimed in 24 h (--no-disk to skip)
 
 Every finding carries a typed action {id, who: agent|password|person, safe_to_apply, command, note}:
 `command` runs from the operator machine, `safe_to_apply` is true only for read-only commands, and
 members in the manifest's never_touch list never get an agent action. Every source and finding
-carries observed_at so a stale view shows as stale. Nothing here changes any machine.
+carries observed_at so a stale view shows as stale. Nothing here changes any machine, except that
+glaeda-disk, like every report run of it, may rewrite its own size snapshot (~/.cache/glaeda-disk).
 
 Exit status: 0 no error findings, 1 at least one error finding, 2 the tool itself failed.
 """
@@ -27,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import datetime
 import html
 import json
 import os
@@ -48,7 +52,7 @@ SSH = "/usr/bin/ssh"
 
 WHO = ("agent", "password", "person")
 SEVERITIES = ("error", "warn", "info")
-SOURCE_NAMES = ("manifest", "check", "preflight", "controller", "runners", "queue", "cache", "lima")
+SOURCE_NAMES = ("manifest", "check", "preflight", "controller", "runners", "queue", "cache", "lima", "disk")
 # A source older than this at build time is itself a finding.
 DEFAULT_MAX_AGE = 900
 MAX_MEMBERS = 128
@@ -60,11 +64,23 @@ MAX_QUEUE_RUNS = 25
 # Org scopes list every ephemeral hosted runner too.
 MAX_RUNNER_PAGES = 10
 MAX_LIMA = 64
+MAX_DISK_FAMILIES = 24
+GIB = 1024**3
 MAX_DOCUMENT_BYTES = 512 * 1024
 LIMA_TIMEOUT = 30
 GH_TIMEOUT = 30
 CONTROLLER_TIMEOUT = 60
 CACHE_TIMEOUT = 5
+# glaeda-disk judges live verdicts (open files, running commands) on top of its size snapshot: ~15 s.
+DISK_TIMEOUT = 90
+# A retired owner's family above this is worth a person's decision.
+RETIRED_WARN_BYTES = 5 * GIB
+# fleet-cas-prune runs hourly; three missed runs is a stopped LaunchAgent, not a busy host.
+PRUNE_SILENT_SECONDS = 3 * 3600
+PRUNE_LABEL = "com.teamleaderleo.glaeda.fleet-cas-prune"
+# glaeda-disk families whose bytes are also counted in another family (cargo-target sits inside checkouts).
+DOUBLE_COUNTED = frozenset({"cargo-target"})
+GC_SUSPECT = re.compile(r"kept entries naming no stored object: (\d+)")
 
 # Only these reach child processes; the document never carries any of them.
 CHILD_ENV = ("HOME", "PATH", "LANG", "LC_ALL", "USER", "LOGNAME", "SSH_AUTH_SOCK", "TMPDIR",
@@ -361,6 +377,135 @@ def collect_lima(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
     return source({"hosts": results})
 
 
+# Read-only: prints, tails and a stat. glaeda-disk runs only over an existing size snapshot (without one it
+# would du every family first) and with a max age far past any snapshot, so a status probe never starts its
+# background re-measure; sizes_at says how old its sizes are instead. Its JSON lists every item with its
+# path, so it is capped in transport and reduced here to family totals. tail -c keeps the newest bytes; a
+# line cut at the front fails to parse and is skipped.
+DISK_SCRIPT = (
+    "export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin; "
+    "echo @disk; if [ ! -x ~/.local/bin/glaeda-disk ]; then echo '{\"no_glaeda_disk\":true}'; "
+    "elif [ ! -e ~/.cache/glaeda-disk/sizes.json ]; then echo '{\"no_snapshot\":true}'; else "
+    "~/.local/bin/glaeda-disk --json --top 0 --max-age 1000000 2>/dev/null | head -c 4194304; fi; echo; "
+    "echo @sizes_at; stat -f %m ~/.cache/glaeda-disk/sizes.json 2>/dev/null; "
+    "echo @prune; tail -n 48 ~/Library/Logs/glaeda-fleet-cas-prune.jsonl 2>/dev/null | tail -c 131072; echo; "
+    "echo @prune_job_at; stat -f %m ~/Library/LaunchAgents/" + PRUNE_LABEL + ".plist 2>/dev/null; "
+    "echo @fleet_cas; [ -e /Users/Shared/cmux-build-fleet/xcode/fleet-cas.env ] && echo yes; "
+    "echo @receipts; [ -e ~/Projects/recovery/disk-reclaim/receipts.jsonl ] && echo present; "
+    "tail -n 2000 ~/Projects/recovery/disk-reclaim/receipts.jsonl 2>/dev/null | tail -c 2097152; echo; "
+    "echo @now; date +%s"
+)
+
+
+def log_time(value: Any) -> int | None:
+    """The %Y-%m-%dT%H:%M:%S%z stamps glaeda-disk and fleet-cas-prune write."""
+    try:
+        return int(datetime.datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%S%z").timestamp())
+    except ValueError:
+        return None
+
+
+def json_lines(lines: list[str]) -> list[dict[str, Any]]:
+    out = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+def parse_disk(stdout: str, at: int) -> dict[str, Any]:
+    """The probe's sections, reduced to numbers and family names: no paths leave the member."""
+    sections: dict[str, list[str]] = {}
+    current = None
+    for line in stdout.splitlines():
+        if re.fullmatch(r"@[a-z_]+", line.strip()):
+            current = line.strip()[1:]
+            sections[current] = []
+        elif current is not None and line.strip():
+            sections[current].append(line)
+    remote_now = next((int(x) for x in sections.get("now", []) if x.strip().isdigit()), None)
+    skew = at - remote_now if remote_now is not None else 0  # remote stamps onto this machine's clock
+    row: dict[str, Any] = {"reachable": True, "observed_at": at, "installed": True, "error": None,
+                           "fleet_cas": "yes" in (x.strip() for x in sections.get("fleet_cas", []))}
+    try:
+        report = json.loads("\n".join(sections.get("disk", [])))
+    except json.JSONDecodeError:
+        report = None
+    if not isinstance(report, dict):
+        row["error"] = "glaeda-disk printed no JSON"
+    elif report.get("no_glaeda_disk"):
+        row["installed"] = False
+    elif report.get("no_snapshot"):
+        row["error"] = "glaeda-disk has no size snapshot yet"
+    else:
+        free, total = num(report.get("free")), num(report.get("total"))
+        systems = [f for f in report.get("filesystems") or [] if isinstance(f, dict)]
+        home = next((f for f in systems if f.get("free") == free and f.get("total") == total),
+                    systems[0] if systems else {})
+        sizes: dict[str, int] = {}
+        for item in report.get("items") or []:
+            if isinstance(item, dict) and num(item.get("bytes")) is not None:
+                fam = str(item.get("family") or "unknown")
+                sizes[fam] = sizes.get(fam, 0) + int(item["bytes"])
+        owners = report.get("owners") if isinstance(report.get("owners"), dict) else {}
+        families = []
+        for fam in set(sizes) | set(owners):
+            owner = owners.get(fam) if isinstance(owners.get(fam), dict) else {}
+            families.append({"family": clean(fam, 60), "bytes": sizes.get(fam, 0), "owner": clean(owner.get("owner"), 80),
+                             "retired": owner.get("retired") is True})
+        families.sort(key=lambda f: (-f["bytes"], f["family"]))
+        sizes_at = next((int(x) for x in sections.get("sizes_at", []) if x.strip().isdigit()), None)
+        row.update(free=free, total=total, low=num(home.get("low")), families=families[:MAX_DISK_FAMILIES],
+                   sizes_at=sizes_at + skew if sizes_at is not None else None)
+    job_at = next((int(x) for x in sections.get("prune_job_at", []) if x.strip().isdigit()), None)
+    row["prune_job_at"] = job_at + skew if job_at is not None else None
+    prune_lines = json_lines(sections.get("prune", []))
+    if prune_lines:
+        last = prune_lines[-1]
+        stamp = log_time(last.get("at"))
+        row["prune"] = {"at": stamp + skew if stamp is not None else None, "result": clean(last.get("result"), 160),
+                        "role": clean(last.get("role"), 20), "node_store_bytes": last.get("node_store_bytes"),
+                        "local_cas_bytes": last.get("local_cas_bytes")}
+        gc_lines = [x for x in prune_lines if x.get("gc") not in (None, "not due")]
+        if gc_lines:
+            stamp = log_time(gc_lines[-1].get("at"))
+            # Only the count: the dry run's text is tool output and can carry store paths.
+            suspect = GC_SUSPECT.search(str(gc_lines[-1].get("gc_dry_run") or ""))
+            row["gc"] = {"at": stamp + skew if stamp is not None else None,
+                         "result": clean(gc_lines[-1].get("gc"), 160),
+                         "suspect_entries": int(suspect.group(1)) if suspect else None}
+    receipts = sections.get("receipts", [])
+    if receipts[:1] == ["present"]:
+        since = (remote_now if remote_now is not None else at) - 86400
+        freed = [r for r in json_lines(receipts[1:]) if r.get("outcome") == "reclaimed"
+                 and num(r.get("bytes")) is not None and (log_time(r.get("at")) or 0) >= since]
+        row["reclaimed_24h"] = {"bytes": sum(int(r["bytes"]) for r in freed), "count": len(freed)}
+    return row
+
+
+def disk_host(host: str, user: str) -> dict[str, Any]:
+    try:
+        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, DISK_SCRIPT],
+                              capture_output=True, text=True, timeout=DISK_TIMEOUT, env=child_env(), check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"reachable": False, "error": type(error).__name__, "observed_at": now()}
+    if proc.returncode != 0 and "@now" not in proc.stdout:
+        return {"reachable": False, "error": clean(proc.stderr, 160) or f"exit {proc.returncode}", "observed_at": now()}
+    return parse_disk(proc.stdout, now())
+
+
+def collect_disk(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
+    never = set(manifest.get("never_touch") or [])
+    targets = [h for h in hosts if h not in never]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = dict(zip(targets, pool.map(lambda h: disk_host(h, manifest["ssh_user"]), targets)))
+    return source({"hosts": results})
+
+
 def collect(args: argparse.Namespace) -> dict[str, Any]:
     fleet = mini_fleet()
     try:
@@ -380,6 +525,8 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
             sources[name] = value
     if not args.no_lima:
         sources["lima"] = collect_lima(manifest, hosts)
+    if not args.no_disk:
+        sources["disk"] = collect_disk(manifest, hosts)
     return {"schema": SOURCES_SCHEMA, "collected_at": now(), "sources": sources}
 
 
@@ -756,6 +903,109 @@ class Builder:
                                          f"limactl delete -- {name}" if plain else None,
                                          note="deletes the VM disk; confirm nothing owns it first"))
 
+    def fold_disk(self) -> None:
+        data = self.data("disk")
+        if not data:
+            return
+        for host, row in sorted((data.get("hosts") or {}).items()):
+            member = self.member_of(host)
+            if member is None or not isinstance(row, dict):
+                continue
+            at = stamp_of(row.get("observed_at"))
+            m = self.members[member]
+            m["observed"]["disk"] = at
+            if not row.get("reachable"):
+                m["disk"] = {"reachable": False}
+                # A host that answers ssh but whose probe timed out is not the same as a host that is down.
+                self.finding("disk", "probe_failed", "info", f"disk probe failed: {clean(row.get('error'), 160)}",
+                             member, at, self.action(member, "retry_probe", "agent", "glaeda-fleet-status",
+                                                     safe=True, on_member=False))
+                continue
+            report = self.action(member, "report_disk", "agent", "~/.local/bin/glaeda-disk",
+                                 note="reports where the space went and what is reclaimable; it may refresh "
+                                      "its own size snapshot")
+            warned = False
+
+            def warn(code: str, summary: str, act: dict[str, Any]) -> None:
+                nonlocal warned
+                warned = True
+                self.finding("disk", code, "warn", summary, member, at, act)
+
+            families = []
+            for f in (row.get("families") or [])[:MAX_DISK_FAMILIES]:
+                if isinstance(f, dict) and num(f.get("bytes")) is not None:
+                    families.append({"family": clean(f.get("family"), 60), "bytes": int(f["bytes"]),
+                                     "owner": clean(f.get("owner"), 80), "retired": f.get("retired") is True})
+            free, total, low = num(row.get("free")), num(row.get("total")), num(row.get("low"))
+            prune = row.get("prune") if isinstance(row.get("prune"), dict) else None
+            gc = row.get("gc") if isinstance(row.get("gc"), dict) else None
+            reclaimed = row.get("reclaimed_24h") if isinstance(row.get("reclaimed_24h"), dict) else None
+            m["disk"] = {
+                "reachable": True, "installed": row.get("installed") is not False,
+                "error": clean(row.get("error"), 160) if row.get("error") else None,
+                "free_bytes": free, "total_bytes": total, "low_bytes": low,
+                "under_pressure": free is not None and low is not None and free < low,
+                "cache_bytes": sum(f["bytes"] for f in families if f["family"] not in DOUBLE_COUNTED),
+                "families": families,
+                "sizes_at": stamp_of(row.get("sizes_at")), "fleet_cas": row.get("fleet_cas") is True,
+                "prune_job_at": stamp_of(row.get("prune_job_at")),
+                "prune": None if prune is None else {
+                    "at": stamp_of(prune.get("at")), "result": clean(prune.get("result"), 120),
+                    "role": clean(prune.get("role"), 20) if prune.get("role") else None,
+                    "node_store_bytes": num(prune.get("node_store_bytes")),
+                    "local_cas_bytes": num(prune.get("local_cas_bytes"))},
+                "gc": None if gc is None else {"at": stamp_of(gc.get("at")), "result": clean(gc.get("result"), 120),
+                                               "suspect_entries": stamp_of(gc.get("suspect_entries"))},
+                "reclaimed_24h": None if reclaimed is None else {
+                    "bytes": num(reclaimed.get("bytes")) or 0, "count": num(reclaimed.get("count")) or 0},
+            }
+            d = m["disk"]
+            if not d["installed"]:
+                self.finding("disk", "no_glaeda_disk", "info", "glaeda-disk is not installed in ~/.local/bin",
+                             member, at, self.action(member, "install_glaeda_disk", "person", None,
+                                                     note="glaeda-mini-setup --apply installs it with its "
+                                                          "pressure job"))
+                warned = True  # nothing else to summarize
+            elif d["error"]:
+                self.finding("disk", "unreadable", "info", f"disk report unreadable: {d['error']}", member, at, report)
+                warned = True
+            if d["under_pressure"]:
+                warn("pressure", f"{gib(free)} GiB free of {gib(total)}, below the pressure threshold "
+                                 f"{gib(low)} GiB", report)
+            for f in families:
+                if f["retired"] and f["bytes"] > RETIRED_WARN_BYTES:
+                    warn(f"retired_owner:{f['family']}",
+                         f"{f['family']} holds {gib(f['bytes'])} GiB and its owner ({f['owner']}) is retired",
+                         self.action(member, "retire_cache", "person", None,
+                                     note="its owner's launchd service is not loaded; glaeda-disk only reports "
+                                          "this family, so a person decides whether it goes"))
+            for what, line in (("prune", d["prune"]), ("gc", d["gc"])):
+                result = (line or {}).get("result") or ""
+                if result.startswith(("failed", "skipped: kept entries")):
+                    warn(f"{what}_{'failed' if result.startswith('failed') else 'skipped'}",
+                         f"fleet-cas {what} {when(line['at'], self.at)}: {result}",
+                         self.action(member, f"inspect_{what}", "person", None,
+                                     note="read ~/Library/Logs/glaeda-fleet-cas-prune.jsonl and its .err; "
+                                          "nothing is deleted while gc is skipped"))
+            last = (d["prune"] or {}).get("at")
+            if d["fleet_cas"] and d["prune"] is None and d["prune_job_at"] is None:
+                warn("prune_missing", "fleet-cas host without the fleet-cas-prune LaunchAgent",
+                     self.action(member, "install_prune_job", "person", None,
+                                 note="glaeda-mini-setup --apply installs it with the disk jobs"))
+            elif d["fleet_cas"]:
+                # No line yet: judge from when the job was installed, so a new install is not silent.
+                since = last if last is not None else None if d["prune"] else d["prune_job_at"]
+                if since is None or self.at - since > PRUNE_SILENT_SECONDS:
+                    what = (f"last fleet-cas-prune line {when(last, self.at)}" if last is not None else
+                            "last fleet-cas-prune line carries no readable time" if d["prune"] else
+                            f"no fleet-cas-prune line since the job was installed {when(since, self.at)}")
+                    warn("prune_silent", f"{what} on a fleet-cas host",
+                         self.action(member, "inspect_prune_job", "agent", f"launchctl list {PRUNE_LABEL}",
+                                     safe=True, note="read-only: shows whether the hourly LaunchAgent is loaded "
+                                                     "and its last exit status"))
+            if not warned:
+                self.finding("disk", "summary", "info", f"disk: {disk_line(d, self.at)}", member, at, report)
+
     # ---- document
 
     def build(self) -> dict[str, Any]:
@@ -767,6 +1017,7 @@ class Builder:
         self.fold_queue(runners)
         cache = self.fold_cache()
         self.fold_lima()
+        self.fold_disk()
         findings = dedupe(self.findings)
         rank = {s: i for i, s in enumerate(SEVERITIES)}
         findings.sort(key=lambda f: (rank[f["severity"]], f["member"] or "", f["id"]))
@@ -860,6 +1111,42 @@ def build(bundle: dict[str, Any], at: int | None = None, max_age: int = DEFAULT_
 # ---------------------------------------------------------------- render
 
 
+def gib(value: Any) -> str:
+    return "?" if num(value) is None else f"{value / GIB:.1f}"
+
+
+def disk_line(d: dict[str, Any] | None, at: int) -> str:
+    """One compact line per member for both renderers."""
+    if not d:
+        return ""
+    if not d.get("reachable"):
+        return "unreachable"
+    if not d.get("installed"):
+        return "glaeda-disk not installed"
+    parts = []
+    if d.get("error"):
+        parts.append(d["error"])
+    else:
+        parts.append(f"free {gib(d.get('free_bytes'))}/{gib(d.get('total_bytes'))} GiB"
+                     f"{' UNDER PRESSURE' if d.get('under_pressure') else ''} (low {gib(d.get('low_bytes'))})")
+        retired = sum(f["bytes"] for f in d.get("families") or [] if f.get("retired"))
+        top = ", ".join(f"{f['family']} {gib(f['bytes'])}" for f in (d.get("families") or [])[:3] if f["bytes"])
+        parts.append(f"caches {gib(d.get('cache_bytes'))} GiB" + (f" [{top}]" if top else "")
+                     + (f", RETIRED {gib(retired)} GiB" if retired else ""))
+    prune, gc = d.get("prune"), d.get("gc")
+    if prune:
+        result = str(prune.get("result") or "?").split(" (")[0]
+        parts.append(f"prune {result} {when(prune.get('at'), at)}")
+    elif d.get("fleet_cas"):
+        parts.append("prune no run yet" if d.get("prune_job_at") else "prune job missing")
+    if gc:
+        parts.append(f"gc {str(gc.get('result') or '?').split(',')[0]} {when(gc.get('at'), at)}")
+    reclaimed = d.get("reclaimed_24h")
+    if reclaimed:
+        parts.append(f"reclaimed 24h {gib(reclaimed.get('bytes'))} GiB")
+    return clean("; ".join(parts), MAX_TEXT)
+
+
 def when(stamp: Any, at: int) -> str:
     if stamp is None:
         return "never"
@@ -876,6 +1163,11 @@ def render_text(doc: dict[str, Any]) -> str:
         mark = " (never_touch)" if m["never_touch"] else ""
         lines.append(f"{m['name']:<{width}}  {m['status']:<9}  {m['counts']['error']:>3} {m['counts']['warn']:>4}  "
                      f"{when(m['observed_at'], at)}{mark}")
+    disk = [(m["name"], disk_line(m.get("disk"), at)) for m in doc["members"] if m.get("disk")]
+    if disk:
+        lines.append("")
+        lines.append("disk:")
+        lines.extend(f"  {name:<{width}}  {line}" for name, line in disk)
     stale = [f"{n} {s['state']}" for n, s in doc["sources"].items() if s["state"] in ("stale", "unavailable")]
     if stale:
         lines.append("")
@@ -948,7 +1240,8 @@ def render_html(doc: dict[str, Any]) -> str:
         out.append(f"<tr><td>{e(name)}</td><td class=\"s-{e(s['state'])}\">{e(s['state'])}</td>"
                    f"<td>{e(when(s['observed_at'], at))}</td><td>{e(s['error'] or '')}</td></tr>")
     out.append("</table></div><h2>Members</h2><div class=\"scroll\"><table><tr><th>member</th><th>class</th>"
-               "<th>status</th><th>controller</th><th>runners</th><th>lima</th><th>errors</th><th>warnings</th>"
+               "<th>status</th><th>controller</th><th>runners</th><th>lima</th><th>disk</th><th>errors</th>"
+               "<th>warnings</th>"
                "<th>observed</th></tr>")
     for m in doc["members"]:
         ctl = m.get("controller") or {}
@@ -960,7 +1253,8 @@ def render_html(doc: dict[str, Any]) -> str:
         tag = " <span class=\"pill\">never_touch</span>" if m["never_touch"] else ""
         out.append(f"<tr><td>{e(m['name'])}{tag}</td><td>{e(str(m['class'] or ''))}</td>"
                    f"<td class=\"s-{e(m['status'])}\">{e(m['status'])}</td><td>{e(str(ctl.get('state', '')))}</td>"
-                   f"<td>{e(runners)}</td><td>{e(lima_text)}</td><td>{m['counts']['error']}</td>"
+                   f"<td>{e(runners)}</td><td>{e(lima_text)}</td><td>{e(disk_line(m.get('disk'), at))}</td>"
+                   f"<td>{m['counts']['error']}</td>"
                    f"<td>{m['counts']['warn']}</td><td>{e(when(m['observed_at'], at))}</td></tr>")
     out.append("</table></div>")
     titles = {"agent": "An agent can run", "password": "Needs a password", "person": "Needs a person"}
@@ -1024,6 +1318,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--host", action="append", dest="hosts", help="limit to these members (repeatable)")
     p.add_argument("--no-fleet-probe", action="store_true", help="skip glaeda-mini-fleet check and preflight")
     p.add_argument("--no-lima", action="store_true", help="skip the Lima instance listing")
+    p.add_argument("--no-disk", action="store_true", help="skip the per-member disk and cache probe")
     p.add_argument("--controller-status", type=Path, help="path to cmuxterm-hq build-fleet/status.py")
     p.add_argument("--controller-json", type=Path, help="a saved status.py --json output instead")
     p.add_argument("--github-runners", metavar="SCOPE", help="orgs/OWNER or repos/OWNER/REPO")

@@ -6,7 +6,8 @@ agents read the JSON. It is slice 9 of the fleet roadmap (cmuxterm-hq#573,
 "Seeing and fixing the fleet").
 
 It is read-only. Collection runs SSH probes, `gh api` reads and HTTP GETs; nothing
-on any machine changes.
+on any machine changes, except that `glaeda-disk`, like any report run of it, may
+rewrite its own size snapshot (`~/.cache/glaeda-disk/sizes.json`).
 
 ## Run it
 
@@ -30,6 +31,7 @@ Every source except the manifest is optional. Without a flag the source shows as
 | queue | queued jobs of queued and in-progress runs, 25 runs at most | `--queue-repo` |
 | cache | HTTP status of each endpoint | `--cache NAME=URL` |
 | lima | `limactl list --json` per member, never on `never_touch` hosts | on; `--no-lima` |
+| disk | one read-only SSH probe per member, never on `never_touch` hosts (below) | on; `--no-disk` |
 
 Split collection from building to reuse or replay a view:
 
@@ -98,10 +100,50 @@ queue is judged only against a fresh, complete runner list; otherwise it is a
 Findings from `check` and `preflight` that name the same command for the same
 member merge into one, keeping the more severe and listing the other in `also`.
 
+## Disk and caches
+
+The `disk` probe reads, per member:
+
+- `~/.local/bin/glaeda-disk --json --top 0`: free and total bytes of the data
+  volume, its pressure threshold (`low`), and cache bytes per glaeda-disk family
+  with its owner and whether that owner is retired. It runs only over an existing
+  size snapshot (without one it would measure every family first) and with a max
+  age far past any snapshot, so a status probe never starts glaeda-disk's
+  background re-measure; `sizes_at` says how old the sizes are. Item paths never
+  leave the member: only family totals do. `cache_bytes` leaves out
+  `cargo-target`, which is also counted inside its checkout.
+- the last 48 lines of `~/Library/Logs/glaeda-fleet-cas-prune.jsonl`: the newest
+  line (result, role, node store and local CAS bytes) and the newest line with a
+  gc outcome (gc runs once a day; `not due` is not an outcome) with the dry run's
+  count of kept entries naming no stored object, never its text.
+- the prune LaunchAgent's install time, and whether the host has fleet-cas
+  (`/Users/Shared/cmux-build-fleet/xcode/fleet-cas.env`).
+- bytes and deletions with outcome `reclaimed` in the last 24 h, from
+  `~/Projects/recovery/disk-reclaim/receipts.jsonl`.
+
+A missing log or receipts file is simply absent from the member's `disk` object.
+Findings, all `warn` unless noted:
+
+| Code | When | Action |
+| --- | --- | --- |
+| `pressure` | free is below glaeda-disk's pressure threshold | `glaeda-disk` report (agent, not safe: it may rewrite its snapshot) |
+| `retired_owner:<family>` | a family whose owner is retired holds more than 5 GiB | person: glaeda-disk only reports such families |
+| `prune_failed`, `gc_failed`, `gc_skipped` | the last prune or gc result starts with `failed` or `skipped: kept entries` | person: read the prune log |
+| `prune_silent` | fleet-cas host, no prune line in 3 h (or none 3 h after the job was installed) | `launchctl list com.teamleaderleo.glaeda.fleet-cas-prune` (safe) |
+| `prune_missing` | fleet-cas host without the prune LaunchAgent | person: `glaeda-mini-setup --apply` |
+| `summary`, `no_glaeda_disk`, `unreadable`, `probe_failed` (info) | otherwise, a missing tool or snapshot, or a probe that timed out | `glaeda-disk` report, a person to install it, or a refresh |
+
+No disk action ever deletes. The text output adds one `disk:` line per member and
+the page a `disk` column, for example:
+
+```text
+cmux7s-mac-mini  free 158.6/460.4 GiB (low 69.1); caches 218.8 GiB [user-cache 173.8, hq-build-fleet-cache 21.5, tmp 20.2], RETIRED 21.5 GiB; prune deferred: a build is running 19m ago; gc ran 19m ago
+```
+
 ## Bounds and privacy
 
-At most 128 members, 500 findings, 240 characters per text field, 400 per
-command, 512 KiB per document. Member fields are typed (numbers stay numbers,
+At most 128 members, 500 findings, 24 disk families per member, 240 characters
+per text field, 400 per command, 512 KiB per document. Member fields are typed (numbers stay numbers,
 text is cleaned and capped). Over the byte limit, info then warn findings drop
 first and `fleet.truncated_findings` counts them; counts always describe the
 findings that remain. An error is never dropped to fit: the tool fails instead.
