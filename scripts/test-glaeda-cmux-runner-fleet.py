@@ -50,6 +50,9 @@ if "--uninstall" in remote and "--apply" not in remote:
     state = ("remove" if "--token-stdin" in remote else "blocked") if scope else "kept"  # no gh on a mini
     print(json.dumps({{"actions": [{{"kind": "deregister", "state": state, "scope": scope}}]}}))
     sys.exit(0)
+if "--apply" in remote and host in os.environ.get("FAKE_LAUNCHCTL_FAILS", "").split(","):
+    print(json.dumps({{"actions": [{{"kind": "launchctl", "state": "failed", "note": "bootstrap: Input/output error"}}]}}))
+    sys.exit(1)
 if "--apply" in remote and "--uninstall" not in remote and host in os.environ.get("FAKE_REGISTER_FAILS", "").split(","):
     print(json.dumps({{"actions": [{{"kind": "register", "state": "failed"}}, {{"kind": "verify", "state": "skipped"}}]}}))
     sys.exit(1)
@@ -243,6 +246,13 @@ class FleetTest(unittest.TestCase):
         states = [i["state"] for i in json.loads(result.stdout)["members"][0]["instances"]]
         self.assertTrue(all("no registration token" in s for s in states))
         self.assertFalse(any(c["tool"] == "ssh" and "--apply" in c["remote"] for c in self.calls()))
+
+
+    def test_a_failure_before_register_names_the_step(self) -> None:
+        result = self.fleet("--apply", "--hosts", "mini-a", FAKE_LAUNCHCTL_FAILS="mini-a")
+        self.assertEqual(result.returncode, 1)
+        states = [i["state"] for i in json.loads(result.stdout)["members"][0]["instances"]]
+        self.assertTrue(states and all("launchctl: bootstrap: Input/output error" in s for s in states), states)
 
 
 if __name__ == "__main__":

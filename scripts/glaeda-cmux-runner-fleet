@@ -255,6 +255,10 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
         name = acts.get("register", {}).get("name")
     except (ValueError, TypeError, AttributeError):
         state, name = f"no receipt: {(err or out).strip()[-200:]}", None
+    if code != 0:
+        # A failure before register (staging, launchctl) leaves register/verify
+        # as "?": name the step that failed so the operator need not ssh in.
+        state = f"{state} ({_failed_note(out, err, code)})"
     result = {"instance": instance, "exit": code, "state": state, "name": name}
     if deregistered:
         result["deregistered"] = deregistered
