@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -156,18 +157,43 @@ class Base(unittest.TestCase):
 
 
 class FakeController:
-    """Stands in for the cmux build controller's /v1/github/runs/<id> endpoint."""
+    """Stands in for the cmux build controller: /v1/github/runs/<id> and the change feed. A change
+    to `runs` shows up in the feed, as a webhook delivery would; suites and comments are queued."""
 
     def __init__(self) -> None:
         self.runs: dict[int, dict] = {}
-        self.calls: list[int] = []
+        self.suites: list[dict] = []
+        self.comments: list[dict] = []
+        self.calls: list[int] = []  # run() reads
+        self.feeds: list[int | None] = []  # events() reads, by cursor
         self.down = False
+        self.token = "t"
+        self.seq = 0
+        self.sent: dict[int, dict] = {}
+
+    def fail(self) -> None:
+        if self.down:
+            raise self.down if isinstance(self.down, gg.WatchError) else gg.WatchError("controller: URLError")
 
     def run(self, run_id: int) -> dict | None:
         self.calls.append(run_id)
-        if self.down:
-            raise self.down if isinstance(self.down, gg.WatchError) else gg.WatchError("controller: URLError")
+        self.fail()
         return self.runs.get(run_id)
+
+    def events(self, since: int | None) -> dict:
+        self.feeds.append(since)
+        self.fail()
+        changed = [dict(r) for i, r in self.runs.items() if self.sent.get(i) != r]
+        self.sent = {i: dict(r) for i, r in self.runs.items()}
+        page = {"cursor": self.seq, "more": False, "runs": [], "suites": [], "comments": [],
+                "receiver_last_delivery": "2026-09-25T10:00:00Z"}
+        if since is None:  # the start: only the cursor
+            self.suites, self.comments = [], []
+            return page
+        self.seq += len(changed) + len(self.suites) + len(self.comments)
+        page.update(cursor=self.seq, runs=changed, suites=self.suites, comments=self.comments)
+        self.suites, self.comments = [], []
+        return page
 
 
 def ctl_run(run_id: int, status: str, conclusion: str = "", updated: str = "2026-09-25T10:00:00Z", repo: str = "o/r") -> dict:
@@ -258,11 +284,18 @@ class ControllerTest(Base):
         gg.register("run:o/r/25")
         self.daemon.tick(NOW)
         self.daemon.tick(NOW + gg.TICK)
-        self.assertEqual(len(self.ctl.calls), 1)
+        self.assertEqual(len(self.ctl.feeds), 1)
         self.assertEqual(len(self.gh.rest_calls()), 1)
+        self.assertEqual(self.daemon.controller_status["state"], "down")
+        self.daemon.tick(NOW + gg.CONTROLLER_RETRY + 1)  # still down: the wait doubles
+        self.assertEqual(len(self.ctl.feeds), 2)
+        self.daemon.tick(NOW + 2 * gg.CONTROLLER_RETRY + 2)
+        self.assertEqual(len(self.ctl.feeds), 2)
         self.ctl.down = False
-        self.daemon.tick(NOW + gg.CONTROLLER_RETRY + 1)
-        self.assertEqual(len(self.ctl.calls), 2)
+        self.daemon.tick(NOW + 3 * gg.CONTROLLER_RETRY + 2)
+        self.assertEqual(len(self.ctl.feeds), 3)
+        self.assertEqual(self.daemon.controller_status["state"], "ok")
+        self.assertEqual(self.daemon.controller_failures, 0)
 
     def test_job_lists_and_other_repos_stay_on_rest(self) -> None:
         self.ctl.runs[26] = ctl_run(26, "in_progress", repo="other/repo")
@@ -331,17 +364,99 @@ class ControllerTest(Base):
         self.assertEqual(status["errors"], [])
         self.assertEqual(len(self.gh.rest_calls()), 1)
         self.daemon.tick(NOW + gg.CONTROLLER_RETRY + 1)
-        self.assertEqual(len(self.ctl.calls), 1)  # not asked again for 15 minutes
+        self.assertEqual(len(self.ctl.feeds), 1)  # not asked again for 15 minutes
         self.daemon.tick(NOW + gg.CONTROLLER_ABSENT + 1)
-        self.assertEqual(len(self.ctl.calls), 2)
+        self.assertEqual(len(self.ctl.feeds), 2)
 
-    def test_controller_config_needs_a_token(self) -> None:
-        old = os.environ.get("CMUX_CI_TOKEN_FILE")
+    def test_one_feed_read_a_tick_after_the_baseline(self) -> None:
+        for i in (40, 41, 42):
+            self.ctl.runs[i] = ctl_run(i, "in_progress")
+            gg.register(f"run:o/r/{i}")
+        for t in range(10):
+            self.daemon.tick(NOW + t * gg.TICK)
+        self.assertEqual(sorted(self.ctl.calls), [40, 41, 42])  # one baseline each, then only the feed
+        self.assertEqual(len(self.ctl.feeds), 10)
+        self.ctl.runs[41] = ctl_run(41, "completed", "success", "2026-09-25T10:03:00Z")
+        self.daemon.tick(NOW + 10 * gg.TICK)
+        self.assertEqual(gg.read_cache("run:o/r/41")["data"]["conclusion"], "success")
+        self.assertEqual(len(self.ctl.calls), 3)
+        self.assertEqual(self.gh.rest_calls(), [])
+        self.assertEqual(self.daemon.tick(NOW + 11 * gg.TICK)["controller"]["runs"], 3)
+
+    def test_feed_reset_takes_a_new_baseline(self) -> None:
+        self.ctl.runs[43] = ctl_run(43, "in_progress")
+        gg.register("run:o/r/43")
+        self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(self.ctl.calls, [43])
+        real = self.ctl.events
+        self.ctl.events = lambda since: {**real(since), "reset": True, "cursor": 0}
+        self.daemon.tick(NOW + 2 * gg.TICK)  # the controller lost its state
+        self.ctl.events = real
+        self.daemon.tick(NOW + 3 * gg.TICK)
+        self.assertEqual(self.ctl.calls, [43, 43])
+
+    def test_check_events_nudge_a_watched_pr(self) -> None:
+        node = pr_node(1)
+        node["headRefName"] = "feat/x"
+        self.gh.prs[("o", "r", 1)] = node
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        self.daemon.tick(NOW + gg.NUDGE_MIN)  # nothing happened: no read before the cycle
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        self.ctl.suites.append({"id": 1, "repo": "o/r", "head_sha": "a" * 40, "status": "completed"})
+        self.daemon.tick(NOW + gg.NUDGE_MIN + gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), 2)  # re-read at once
+        # a push: runs for a new head on the PR's branch nudge it too, but not more than every NUDGE_MIN
+        self.ctl.runs[50] = {**ctl_run(50, "queued"), "head_sha": "c" * 40, "head_branch": "feat/x"}
+        self.daemon.tick(NOW + gg.NUDGE_MIN + 2 * gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+        self.daemon.tick(NOW + 2 * gg.NUDGE_MIN + gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), 3)
+        self.ctl.suites.append({"id": 2, "repo": "o/other", "head_sha": "a" * 40, "status": "completed"})
+        self.daemon.tick(NOW + 2 * gg.NUDGE_MIN + 3 * gg.TICK)  # still inside the 60 s cycle
+        self.assertEqual(len(self.gh.gql_calls()), 3)  # another repository's commit
+
+    def test_comments_from_the_feed_reach_a_comment_wait(self) -> None:
+        self.gh.issues[("t", "s", 454)] = {"__typename": "Issue", "url": "u", "state": "OPEN",
+                                           "comments": {"totalCount": 0, "nodes": []}}
+        gg.register("comment:t/s#454")
+        self.daemon.tick(NOW)
+        self.ctl.comments.append({"id": 77, "repo": "t/s", "number": 454, "author": "github-actions[bot]",
+                                  "body": "callsign-receipt/v0\nstatus: accepted", "url": "u77",
+                                  "created_at": iso(NOW + 1)})
+        self.ctl.comments.append({"id": 78, "repo": "t/other", "number": 454, "author": "x", "body": "y"})
+        self.daemon.tick(NOW + gg.TICK)  # before the next GraphQL read
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        comments = gg.read_cache("comment:t/s#454")["data"]["comments"]
+        self.assertEqual([c["id"] for c in comments], [77])
+        self.assertTrue(gg.comment_matches(comments[0], "github-actions", re.compile("accepted"), None, NOW))
+        self.ctl.comments.append({"id": 77, "repo": "t/s", "number": 454, "deleted": True})
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        self.assertEqual(gg.read_cache("comment:t/s#454")["data"]["comments"], [])
+
+    def test_budget_names_the_controller_state(self) -> None:
+        self.assertIn("webhook events ok, 2 watched runs", gg.controller_line(
+            {"state": "ok", "runs": 2, "lastDelivery": iso(time.time() - 5), "token": True}))
+        self.assertIn("public repos only", gg.controller_line({"state": "ok", "token": False}))
+        self.assertIn("unreachable (controller: URLError); polling GitHub", gg.controller_line(
+            {"state": "down", "error": "controller: URLError", "retryAt": time.time() + 60}))
+        self.assertIn("no run-events receiver", gg.controller_line({"state": "absent", "retryAt": 0}))
+        self.assertIn("none configured", gg.controller_line({"state": "off"}))
+
+    def test_controller_works_without_a_token(self) -> None:
+        saved = {k: os.environ.get(k) for k in ("CMUX_CI_TOKEN_FILE", "CMUX_CI_CONTROLLER")}
         os.environ["CMUX_CI_TOKEN_FILE"] = "/nonexistent/token"
+        os.environ["CMUX_CI_CONTROLLER"] = "http://controller.test:18765/"
         try:
+            ctl = gg.Controller.from_env()
+            self.assertEqual((ctl.base, ctl.token), ("http://controller.test:18765", None))  # public repos only
+            os.environ["CMUX_CI_CONTROLLER"] = "ftp://nope"
             self.assertIsNone(gg.Controller.from_env())
         finally:
-            os.environ.pop("CMUX_CI_TOKEN_FILE") if old is None else os.environ.__setitem__("CMUX_CI_TOKEN_FILE", old)
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 
 
 class DaemonTest(Base):
