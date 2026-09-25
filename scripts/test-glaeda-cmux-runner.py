@@ -1794,6 +1794,12 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("bootstrap", verbs)
         self.assertIn("bootout", verbs)
         self.assertLess(verbs.index("bootstrap"), verbs.index("bootout"))
+        # A disabled label refuses bootstrap, so every bootstrap is preceded by an enable of the same label.
+        calls = [e["argv"] for e in self.log() if e["tool"] == "launchctl"]
+        for i, argv in enumerate(calls):
+            if argv[0] == "bootstrap":
+                self.assertEqual(calls[i - 1][0], "enable", calls)
+                self.assertTrue(calls[i - 1][1].endswith("/com.teamleaderleo.glaeda.cmux-runner"), calls[i - 1])
 
     # ------------------------------------------------------------ uninstall
 
@@ -2178,7 +2184,7 @@ class RunnerTest(unittest.TestCase):
                                       "--name", "mini-test-glaeda")
         self.assertEqual(self.by_kind(receipt)["agent"]["state"], "update")
         self.assertTrue(receipt["ready"], receipt["blocking"])
-        verbs = [e["argv"][0] for e in self.log() if e["tool"] == "launchctl" and e["argv"][0] != "print"]
+        verbs = [e["argv"][0] for e in self.log() if e["tool"] == "launchctl" and e["argv"][0] not in ("print", "enable")]
         self.assertEqual(verbs[-3:], ["bootstrap", "bootout", "bootstrap"], verbs)
 
     def test_a_plist_change_never_boots_out_a_runner_with_a_job(self) -> None:
