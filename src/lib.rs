@@ -364,6 +364,8 @@ pub mod resident_repo_query;
 /// Pure, authority-free resident-sandbox generation/config/locator catalog and strict codec.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod resident_sandbox_catalog;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod resident_sandbox_host_observation;
 pub mod resource;
 /// Binding from the reusable-state identity contract to the hot-state path-class policy.
 pub mod reusable_state_hot_state_policy;
