@@ -95,7 +95,8 @@ if [ -d "$F" ]; then
   # Fleet compile cache (glaeda-fleet-cas): the fixed paths catch-up builds key on, by kind only.
   # A symlink counts as a symlink whatever it points at: the cache keys include the literal path.
   for p in xcode xcode/src xcode/src/cmux xcode/DerivedData xcode/bin xcode/fleet-cas.sock \
-           xcode/fleet-cas.env xcode/bin/fleet-cas-marker.sh; do
+           xcode/fleet-cas.env xcode/bin/fleet-cas-marker.sh xcode/bin/fleet-cas-settings.sh \
+           xcode/bin/fleet-cas-writer-build.sh; do
     if [ -L "$F/$p" ]; then k=symlink; elif [ -d "$F/$p" ]; then k=dir; elif [ -S "$F/$p" ]; then k=socket
     elif [ -f "$F/$p" ]; then k=file; elif [ -e "$F/$p" ]; then k=other; else k=missing; fi
     e fleet_cas_path "$p|$k"
@@ -103,14 +104,20 @@ if [ -d "$F" ]; then
   # The node's mode from the flags fleet-cas-run starts it with; never the key path or the store address.
   A="$F/xcode/run/node.args"
   if [ ! -f "$A" ]; then e fleet_cas_node_mode missing
-  elif grep -qxF -- --sign-key "$A"; then e fleet_cas_node_mode signing
-  elif grep -qxF -- --read-only-kv "$A"; then e fleet_cas_node_mode read-only
+  elif [ ! -r "$A" ]; then e fleet_cas_node_mode unreadable
+  elif grep -qxF -- --sign-key "$A" </dev/null; then e fleet_cas_node_mode signing
+  elif grep -qxF -- --read-only-kv "$A" </dev/null; then e fleet_cas_node_mode read-only
   else e fleet_cas_node_mode other; fi
-  # The health check builds use (glaeda-fleet-cas): connects to the socket, 2 s alarm, writes nothing.
-  S="$F/xcode/bin/fleet-cas-settings.sh"
-  if [ ! -f "$S" ]; then e fleet_cas_node no-script
-  elif /bin/bash "$S" "$F/xcode/fleet-cas.sock" </dev/null >/dev/null 2>&1; then e fleet_cas_node answers
-  else e fleet_cas_node down; fi
+  # Whether the node answers on its socket: the connect xcode/bin/fleet-cas-settings.sh makes, inlined so the
+  # probe runs no file the fleet user can change. 2 s alarm, nothing written.
+  K="$F/xcode/fleet-cas.sock"
+  if [ -S "$K" ] && /usr/bin/perl -MIO::Socket::UNIX -e '
+      local $SIG{ALRM} = sub { exit 1 }; alarm 2;
+      IO::Socket::UNIX->new(Type => SOCK_STREAM(), Peer => $ARGV[0]) or exit 1' "$K" </dev/null 2>/dev/null; then
+    e fleet_cas_node answers
+  else
+    e fleet_cas_node down
+  fi
   # The released recipe is whatever recipes points at (recipe-releases/<sha>); ls order is not release order.
   if [ -e "$F/recipes" ]; then
     rel=$(readlink "$F/recipes" 2>/dev/null)

@@ -42,7 +42,7 @@ def fleet_cas_text(mode: str = "read-only", node: str = "answers", build_mode: s
                    **kinds: str) -> str:
     """Probe lines for a conforming fleet-cas host; kinds overrides a path's kind (src_cmux="symlink")."""
     lines = [f"fleet_cas_path\t{rel}|{kinds.get(rel.replace('xcode/', '').replace('/', '_').replace('.', '_').replace('-', '_'), want)}"
-             for rel, want in mf.FLEET_CAS_PATHS.items()]
+             for rel, want in {**mf.FLEET_CAS_PATHS, **mf.FLEET_CAS_WRITER_PATHS}.items()]
     lines += [f"fleet_cas_node_mode\t{mode}", f"fleet_cas_node\t{node}"]
     if build_mode is None:
         lines.append("fleet_recipe_released\tnone")
@@ -418,14 +418,16 @@ class CatchUpTests(unittest.TestCase):
     def writer(self, fill: str | None = "not running last_exit=0", worker_proc: str = "absent",
                fleet_cas: str | None = None) -> list[tuple[str, str]]:
         text = probe_text(hostname="Build-Mini-2", node_id="cmux-mac-002", worker_proc=worker_proc,
-                          fleet_cas=fleet_cas_text(mode="signing", build_mode=None) if fleet_cas is None else fleet_cas)
+                          fleet_cas=fleet_cas_text(mode="signing") if fleet_cas is None else fleet_cas)
         if fill is not None:
             text += f"launchd\t/Library/LaunchDaemons|{FILL}|{fill}\n"
         issues = mf.check(self.manifest, observed(**{"build-mini-2": text}), ["build-mini-2"])
         return [(i["area"], i["detail"]) for i in issues if i["area"] != "pending"]
 
-    def reader(self, fleet_cas: str) -> list[dict]:
+    def reader(self, fleet_cas: str, pending: bool = False) -> list[dict]:
         issues = mf.check(self.manifest, observed(**{"build-mini-1": probe_text(fleet_cas=fleet_cas)}), ["build-mini-1"])
+        if pending:
+            return [i for i in issues if i["area"] == "pending" and "cmux-build-fleet" in i["detail"]]
         return [i for i in issues if i["area"] != "pending"]
 
     def test_writer_ok_between_fill_ticks_with_a_drained_worker(self) -> None:
@@ -451,6 +453,27 @@ class CatchUpTests(unittest.TestCase):
         self.assertEqual([(i["area"], i["detail"]) for i in issues], [("launchd", f"{FILL} not installed")])
         self.assertIn("install-catch-up-fill.sh", issues[0]["fix"])
 
+    def test_writer_needs_its_build_wrapper_and_the_recipe(self) -> None:
+        (issue,) = self.writer(fleet_cas=fleet_cas_text(mode="signing", bin_fleet_cas_writer_build_sh="missing"))
+        self.assertEqual(issue, ("fleet-cas", f"{mf.FLEET_ROOT}/xcode/bin/fleet-cas-writer-build.sh missing"))
+        (issue,) = self.writer(fleet_cas=fleet_cas_text(mode="signing", build_mode="missing"))
+        self.assertEqual(issue[0], "recipe")
+
+    def test_failing_fill_is_pending_not_hidden(self) -> None:
+        text = probe_text(hostname="Build-Mini-2", node_id="cmux-mac-002", worker_proc="absent",
+                          fleet_cas=fleet_cas_text(mode="signing"))
+        text += f"launchd\t/Library/LaunchDaemons|{FILL}|not running last_exit=1\n"
+        issues = mf.check(self.manifest, observed(**{"build-mini-2": text}), ["build-mini-2"])
+        self.assertIn(("pending", f"{FILL} last exited 1; loaded, runs on its timer"),
+                      [(i["area"], i["detail"]) for i in issues])
+        self.assertEqual(self.writer(fill="not running last_exit=1"), [])
+
+    def test_sudoers_rule_leaves_the_fill_timer_out(self) -> None:
+        self.manifest["hosts"]["build-mini-2"]["overrides"] = {"launchd": {"running": [FILL, "com.cmux.caffeinate"]}}
+        rule = mf.sudoers_rule(self.manifest, "build-mini-2")
+        self.assertIn("com.cmux.caffeinate", rule)
+        self.assertNotIn(FILL, rule)
+
     def test_writer_node_must_sign(self) -> None:
         self.assertEqual(self.writer(fleet_cas=fleet_cas_text(mode="read-only")),
                          [("fleet-cas", "the node is read-only (--read-only-kv); a catch-up-writer node runs --sign-key")])
@@ -467,20 +490,22 @@ class CatchUpTests(unittest.TestCase):
             self.assertIn("never delete or re-clone", issue["fix"])
         (issue,) = self.reader(fleet_cas_text(DerivedData="file"))
         self.assertEqual(issue["detail"], f"{mf.FLEET_ROOT}/xcode/DerivedData is a file, want a dir")
-        (issue,) = self.reader(fleet_cas_text(src_cmux="missing"))
+        # Missing (fresh host, install --reset) is pending until the first catch-up build, not drift.
+        self.assertEqual(self.reader(fleet_cas_text(src_cmux="missing")), [])
+        (issue,) = self.reader(fleet_cas_text(src_cmux="missing"), pending=True)
         self.assertEqual(issue["fix"], "the next catch-up build creates it")
 
     def test_reader_node_not_read_only_is_drift(self) -> None:
         for mode, got in (("signing", "the node signs (--sign-key)"), ("other", "the node has neither flag"),
-                          ("missing", "no xcode/run/node.args")):
+                          ("missing", "no xcode/run/node.args"), ("unreadable", "xcode/run/node.args is unreadable")):
             (issue,) = self.reader(fleet_cas_text(mode=mode))
             self.assertEqual((issue["area"], issue["detail"]), ("fleet-cas", f"{got}; a reader node runs --read-only-kv"))
 
     def test_reader_node_that_does_not_answer_is_drift(self) -> None:
         (issue,) = self.reader(fleet_cas_text(node="down"))
         self.assertIn("does not answer", issue["detail"])
-        (issue,) = self.reader(fleet_cas_text(node="no-script"))
-        self.assertIn("fleet-cas-settings.sh", issue["detail"])
+        (issue,) = self.reader(fleet_cas_text(**{"bin_fleet_cas_settings_sh": "missing"}))
+        self.assertIn("fleet-cas-settings.sh missing", issue["detail"])
 
     def test_reader_recipe_without_build_mode_is_drift(self) -> None:
         (issue,) = self.reader(fleet_cas_text(build_mode="missing"))
@@ -506,17 +531,31 @@ class CatchUpTests(unittest.TestCase):
                 data["hosts"]["build-mini-2"]["overrides"] = {"launchd": {"running": running}}
                 with self.assertRaisesRegex(mf.Failure, "catch-up-writer", msg=roles):
                     mf.load_manifest(write_manifest(tmp, data))
+            data["hosts"]["build-mini-2"]["roles"] = ["catch-up-writer", "nightly", "ci-runner"]
             data["hosts"]["build-mini-2"]["overrides"] = {"launchd": {"running": [FILL]}}
+            with self.assertRaisesRegex(mf.Failure, "trustedRef"):
+                mf.load_manifest(write_manifest(tmp, data))
+            # cmuxterm-hq#623's cmux15: a trusted-only runner beside the writer.
+            data["hosts"]["build-mini-2"]["overrides"]["runner"] = {"trustedRef": "refs/heads/main"}
             self.assertIn("catch-up-writer", mf.load_manifest(write_manifest(tmp, data))["hosts"]["build-mini-2"]["roles"])
+            data["hosts"]["small-mini"]["roles"] = ["catch-up-writer"]
+            with self.assertRaisesRegex(mf.Failure, "one writer"):
+                mf.load_manifest(write_manifest(tmp, data))
 
     def test_probe_reports_kinds_and_modes_only(self) -> None:
         text = mf.PROBE.read_text()
         for key in ("fleet_cas_path", "fleet_cas_node_mode", "fleet_cas_node", "fleet_recipe_build_mode"):
             self.assertIn(f"e {key}", text)
-        # Read-only: nothing under xcode/ is removed, moved, cloned or written.
-        body = [line for line in text.splitlines() if "xcode" in line and not line.strip().startswith("#")]
+        # Read-only: nothing in the fleet-cas section is removed, moved, cloned or written, no file under the
+        # fleet root is run, and every child that could read stdin gets /dev/null (the probe arrives on stdin).
+        start = text.index("# Fleet compile cache")
+        body = [line for line in text[start:text.index("# Reservation marker")].splitlines()
+                if not line.strip().startswith("#")]
         for line in body:
-            self.assertNotRegex(line, r"\b(rm|mv|git|mkdir|touch|ln|cp)\b|>[^&/]", line)
+            self.assertNotRegex(line, r"(?<![\w.$-])(rm|mv|git|mkdir|touch|ln|cp|bash|sh|source|install)(?=\s)|(^|[;&|] *)\.\s|(^|\s)\d?>>?\s*(?!/dev/null|&)\S", line)
+            self.assertNotRegex(line, r'(^|[;&|] *)"\$[A-Z]', line)
+            if re.search(r"\b(grep|perl)\b", line):
+                self.assertTrue("</dev/null" in line or "</dev/null" in body[body.index(line) + 2], line)
         parsed = mf.parse_probe(fleet_cas_text(src_cmux="symlink"))["fleet_cas"]
         self.assertEqual(parsed["paths"]["xcode/src/cmux"], "symlink")
         self.assertEqual((parsed["node_mode"], parsed["node"], parsed["build_mode"]), ("read-only", "answers", "present"))
