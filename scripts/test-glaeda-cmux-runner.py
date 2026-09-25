@@ -754,16 +754,15 @@ class HookTest(unittest.TestCase):
         runners = [f"f{n}" for n in range(5)]
         try:
             self.assertEqual(self.job("swift-package-tests", "f0", 4).returncode, 0)
-            self.assertEqual((capacity / hook.UNITS_TOTAL_FILE).read_text(), "4\n")
-            self.assertIsNone(hook.mini_full(capacity), "3 of 4 units are still free")
+            self.assertIsNone(hook.mini_full(capacity, 4), "3 of 4 units are still free")
             for runner in runners[1:4]:
                 self.assertEqual(self.job("swift-package-tests", runner, 4).returncode, 0)
-            self.assertEqual(hook.mini_full(capacity), "all 4 capacity units on this mini are taken")
+            self.assertEqual(hook.mini_full(capacity, 4), "all 4 capacity units on this mini are taken")
             # the probe took and gave back nothing: the holders keep every unit, and a job is still refused
             refused = self.job("swift-package-tests", "f4", 4)
             self.assertIn("refused: capacity: 0 of 4 units free", refused.stdout)
             self.finish("f2")
-            self.assertIsNone(hook.mini_full(capacity))
+            self.assertIsNone(hook.mini_full(capacity, 4))
         finally:
             for runner in runners:
                 self.finish(runner)
@@ -1299,46 +1298,93 @@ class GateTest(unittest.TestCase):
                                  setattr(gate, "held", why))
         return gate, stops
 
-    def units(self, total: int | None, held: int) -> Path:
-        """A capacity ledger of `total` units (None: nothing recorded) with the first `held` of them taken."""
+    def units(self, held: int) -> Path:
+        """A capacity ledger an admission has used, with its first `held` units taken."""
         capacity = Path(tempfile.mkdtemp(dir=self.tmp))
         (capacity / "admission.lock").touch()  # every admission creates it
-        if total is not None:
-            (capacity / hook.UNITS_TOTAL_FILE).write_text(f"{total}\n")
         for slot in range(held):
             fd = os.open(capacity / f"unit-{slot}", os.O_RDONLY | os.O_CREAT, 0o644)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.addCleanup(os.close, fd)
         return capacity
 
+    def runner_hook(self, units: int | None) -> None:
+        """This runner's job-started hook as glaeda-cmux-runner writes it, with or without --capacity-units."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(exist_ok=True)
+        scope = "--allowed-owner manaflow-ai" + (f" --capacity-units {units}" if units is not None else "")
+        script.write_text(f"#!/bin/bash\nexec /usr/bin/python3 /hook job-started {scope}\n")
+
+    def full_gate(self, capacity: Path):
+        return hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                         capacity_dir=capacity)
+
     def test_a_mini_with_every_unit_taken_claims_the_host(self) -> None:
-        self.assertIsNone(hook.mini_full(None))
-        self.assertIsNone(hook.mini_full(self.units(None, 2)), "no recorded total: never full")
-        self.assertIsNone(hook.mini_full(self.units(3, 2)))
-        capacity = self.units(2, 2)
-        self.assertEqual(hook.mini_full(capacity), "all 2 capacity units on this mini are taken")
-        none = os.fspath(self.tmp / "none.json")
-        gate = hook.Gate(self.runner, os.fspath(self.lock), none, self.state, capacity_dir=capacity)
+        self.assertIsNone(hook.mini_full(None, 2))
+        self.assertIsNone(hook.mini_full(self.units(2), 0), "a single-runner mini has no units")
+        self.assertIsNone(hook.mini_full(self.units(2), 3))
+        self.assertIsNone(hook.mini_full(self.tmp / "unused", 2), "no admission yet: nothing is taken")
+        capacity = self.units(2)
+        self.assertEqual(hook.mini_full(capacity, 2), "all 2 capacity units on this mini are taken")
+        gate = self.full_gate(capacity)
+        self.assertIsNone(gate.claimed(), "a runner without a hook script never counts as full")
+        self.runner_hook(None)
+        self.assertIsNone(gate.claimed(), "nor one whose hook takes no units")
+        self.runner_hook(2)
+        self.assertEqual(hook.runner_units(self.runner), 2)
         self.assertEqual(gate.claimed(), "all 2 capacity units on this mini are taken")
         self.assertEqual(gate.confirmed(), "all 2 capacity units on this mini are taken")
-        self.assertIsNone(hook.Gate(self.runner, os.fspath(self.lock), none, self.state).claimed(),
-                          "a gate without a ledger never looks")
+        # a re-apply that raised this runner's units: the new free unit counts on the next look
+        self.runner_hook(4)
+        self.assertIsNone(gate.claimed())
+        self.runner_hook(2)
         self.hold(fcntl.LOCK_EX)
         self.assertEqual(gate.claimed(), "a fleet build holds the host lock", "the fleet's claim comes first")
 
     def test_the_full_probe_never_competes_with_an_admission(self) -> None:
-        capacity = self.units(2, 1)
+        capacity = self.units(1)
         admission = os.open(capacity / "admission.lock", os.O_RDONLY)
         self.addCleanup(os.close, admission)
         fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
         with mock.patch.object(hook, "lock_file", side_effect=AssertionError("probed during an admission")):
-            self.assertIsNone(hook.mini_full(capacity))
+            self.assertIs(hook.mini_full(capacity, 2), hook.UNKNOWN)
         fcntl.flock(admission, fcntl.LOCK_UN)
-        self.assertIsNone(hook.mini_full(capacity))
+        self.assertIsNone(hook.mini_full(capacity, 2))
         # and the probe leaves the free unit free
         fd = hook.lock_file(capacity / "unit-1", fcntl.LOCK_EX)
         self.assertIsNotNone(fd)
         os.close(fd)
+
+    def test_a_look_an_admission_blocks_keeps_the_last_answer(self) -> None:
+        capacity = self.units(2)
+        self.runner_hook(2)
+        gate = self.full_gate(capacity)
+        self.assertEqual(gate.claimed(), "all 2 capacity units on this mini are taken")
+        # a full mini's admissions keep retrying: a blocked look must not read as free and restart a listener
+        with mock.patch.object(hook, "mini_full", return_value=hook.UNKNOWN):
+            self.assertEqual(gate.claimed(), "all 2 capacity units on this mini are taken")
+        with mock.patch.object(hook, "mini_full", return_value=None):
+            self.assertIsNone(gate.claimed())
+        with mock.patch.object(hook, "mini_full", return_value=hook.UNKNOWN):
+            self.assertIsNone(gate.claimed(), "and a free mini stays free")
+
+    def test_a_stopped_listener_stays_off_while_blocked_looks_hide_a_full_mini(self) -> None:
+        capacity = self.units(2)
+        self.runner_hook(2)
+        gate = self.full_gate(capacity)
+        gate.reload = lambda: None
+        gate.child, gate.held, gate.full_why = None, "all 2 capacity units on this mini are taken", \
+            "all 2 capacity units on this mini are taken"
+        starts: list[int] = []
+        gate.start = lambda: starts.append(1)
+        with mock.patch.object(hook, "mini_full", return_value=hook.UNKNOWN):
+            for _ in range(4):
+                self.assertIsNone(gate.step())
+        self.assertEqual(starts, [])
+        with mock.patch.object(hook, "mini_full", return_value=None):
+            for _ in range(2):
+                gate.step()
+        self.assertEqual(starts, [1], "two free looks restart the listener")
 
     def test_an_idle_listener_stops_only_after_the_claim_holds_for_two_polls(self) -> None:
         gate, stops = self.gate(["held", None, "held", "held"])
