@@ -152,25 +152,26 @@ class UpdateTest(unittest.TestCase):
         entry = self.server.publish(SOURCES[0])
         url = gu.DOWNLOAD.format(tag=entry["tag"], name=gr.hygiene_asset(TARGET))
         self.server.files[url] += b"x"
-        with self.assertRaisesRegex(gu.UpdateError, "does not match release.json"):
-            self.run_update()
-        self.server.publish(SOURCES[0])
+        result = self.run_update()
+        self.assertEqual((result["result"], result["detail"]), ("refused", "archive does not match release.json"))
+        self.assertIn(entry["tag"], gu.load_state(self.state)["quarantined"])
+        self.assertEqual(self.run_update()["result"], "quarantined")
+        entry = self.server.publish(SOURCES[1])
         self.server.rings["canary"]["releaseSha256"] = "0" * 64
-        with self.assertRaisesRegex(gu.UpdateError, "does not match the channel"):
-            self.run_update()
+        self.assertEqual(self.run_update()["detail"], "release.json does not match the channel")
         self.assertFalse(self.bin.exists())
 
     def test_failed_attestation_is_refused(self) -> None:
         self.server.publish(SOURCES[0])
         gu.attestation_ok = lambda path: False
-        with self.assertRaisesRegex(gu.UpdateError, "did not verify"):
-            self.run_update()
+        self.assertIn("did not verify", self.run_update()["detail"])
         # a canary that cannot check refuses; stable, which only names canary-verified releases, installs
+        self.server.publish(SOURCES[1])
         gu.attestation_ok = lambda path: None
-        with self.assertRaisesRegex(gu.UpdateError, "canary must verify"):
-            self.run_update()
+        self.assertIn("canary must verify", self.run_update()["detail"])
         self.assertFalse(self.bin.exists())
         self.config["ring"] = "stable"
+        self.state = self.root / "stable-host-state"  # another host, which has quarantined nothing
         self.assertEqual(self.run_update()["result"], "updated")
 
     def test_first_update_rolls_back_to_the_tools_it_replaced(self) -> None:
@@ -229,17 +230,15 @@ class UpdateTest(unittest.TestCase):
     def test_unsafe_archive_entries_are_refused(self) -> None:
         for name in ("../escape", "/abs/path"):
             with self.subTest(name=name):
-                self.server.publish(SOURCES[0], archive=tar_gz({name: (b"x", 0o644)}))
-                with self.assertRaisesRegex(gu.UpdateError, "refused"):
-                    self.run_update()
+                self.server.publish(SOURCES[0 if name.startswith("..") else 1], archive=tar_gz({name: (b"x", 0o644)}))
+                self.assertIn("refused", self.run_update()["detail"])
         out = io.BytesIO()
         with tarfile.open(fileobj=out, mode="w:gz") as tar:
             link = tarfile.TarInfo("glaeda/link")
             link.type, link.linkname = tarfile.SYMTYPE, "/etc/passwd"
             tar.addfile(link)
-        self.server.publish(SOURCES[0], archive=out.getvalue())
-        with self.assertRaisesRegex(gu.UpdateError, "refused"):
-            self.run_update()
+        self.server.publish(SOURCES[2], archive=out.getvalue())
+        self.assertIn("refused", self.run_update()["detail"])
 
     def test_paused_and_empty_rings_do_nothing(self) -> None:
         self.server.publish(SOURCES[0])
