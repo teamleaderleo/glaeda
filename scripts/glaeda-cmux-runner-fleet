@@ -54,7 +54,7 @@ REMOTE_DIR = "glaeda-runner"
 DEFAULT_REPO = "manaflow-ai/cmux"
 DEFAULT_MANIFEST = Path.home() / ".config/glaeda/mini-fleet.json"
 WORKLOAD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-TRIMMED_DEFAULTS = ("xcode", "disk", "runner")
+TRIMMED_DEFAULTS = ("xcode", "disk", "runner", "ios_simulator")
 SSH_OPTIONS = ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
 CHECK_TIMEOUT_S = 90
 APPLY_TIMEOUT_S = 2700  # above the remote worst case (download, unpack, config.sh), so a slow install is never raced by a re-run
