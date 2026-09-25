@@ -433,6 +433,10 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "echo \"glaeda-cmux-runner-gate: the gate exited $code; running the runner without it\"\n"
         "exec ./run.sh\n"
     )
+    # Explicit dirs, so a restore step that changes HOME or FLEET_DIR still finds this runner's roots record.
+    roots_n = int((ctx.member or {}).get("canonicalRoots") or 1)
+    capacity = shlex.quote(os.fspath(Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet") / "capacity"))
+    state = shlex.quote(os.fspath(ctx.home / ".local/state/glaeda/cmux-runner"))
     root = (
         "#!/bin/sh\n"
         "# glaeda-canonical-root take ROOT [--wait SECONDS] (generated, receipt-owned): hold canonical root ROOT\n"
@@ -440,7 +444,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "[ \"${1:-}\" = take ] && [ -n \"${2:-}\" ] || "
         "{ echo 'usage: glaeda-canonical-root take ROOT [--wait SECONDS]' >&2; exit 2; }\n"
         "root=$2; shift 2\n"
-        f"exec {python} {hook} take-root --root \"$root\" \"$@\"\n"
+        f"exec {python} {hook} take-root --root \"$root\" --canonical-roots {roots_n}"
+        f" --capacity-dir {capacity} --state-dir {state} \"$@\"\n"
     )
     return {"job-started.sh": started.encode(), "job-completed.sh": completed.encode(), "listen.sh": listen.encode(),
             "glaeda-canonical-root": root.encode()}

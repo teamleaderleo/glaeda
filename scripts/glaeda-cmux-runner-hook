@@ -421,30 +421,34 @@ def disk_refusal(path: str, min_free_gib: float) -> str | None:
     return None if free >= min_free_gib else f"{free:.1f} GiB free, {min_free_gib:g} GiB required"
 
 
-def root_number(spec: str) -> int | None:
-    """1 for /private/tmp/cmux-ci or 1, k for /private/tmp/cmux-ci-k or k (k 2 to 99), else None."""
+def root_number(spec: str, roots: int = 99) -> int | None:
+    """1 for /private/tmp/cmux-ci or 1, k for /private/tmp/cmux-ci-k or k (2 to roots), else None. No leading
+    zeros, so the path a caller uses is exactly the one held."""
     spec = spec.rstrip("/")
-    if spec == "/private/tmp/cmux-ci":
+    if spec in ("/private/tmp/cmux-ci", "1"):
         return 1
-    match = re.fullmatch(r"(?:/private/tmp/cmux-ci-)?([0-9]{1,2})", spec)
+    match = re.fullmatch(r"(?:/private/tmp/cmux-ci-)?([2-9]|[1-9][0-9])", spec)
     k = int(match.group(1)) if match else 0
-    return k if 1 <= k <= 99 and (spec.isdigit() or k >= 2) else None
+    return k if 2 <= k <= roots else None
 
 
 def runner_worker_pid() -> int | None:
-    """The Runner.Worker this step runs under, walking up from our parent."""
+    """The Runner.Worker this step runs under, walking up from our parent with /bin/ps (never the job's PATH)."""
     pid = os.getppid()
-    for _ in range(64):
-        if pid <= 1:
-            return None
-        out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True,
-                             check=False).stdout.strip()
-        if not out:
-            return None
-        ppid, _, comm = out.partition(" ")
-        if os.path.basename(comm.strip()) == "Runner.Worker":
-            return pid
-        pid = int(ppid)
+    try:
+        for _ in range(64):
+            if pid <= 1:
+                return None
+            out = subprocess.run(["/bin/ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True,
+                                 timeout=5, check=False).stdout.strip()
+            if not out:
+                return None
+            ppid, comm = out.split(None, 1)
+            if os.path.basename(comm.strip()) == "Runner.Worker":
+                return pid
+            pid = int(ppid)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
     return None
 
 
@@ -467,18 +471,28 @@ def ensure_root_shim(bin_dir: Path) -> None:
         os.replace(tmp, link)
 
 
-def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path) -> int:
+def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roots: int = 99) -> int:
     """glaeda-canonical-root take ROOT: hold canonical root ROOT for the rest of this job (cmux#14338), waiting
-    up to wait_s for it. A root this job already holds is a no-op. Prints the root's path."""
-    k = root_number(spec)
+    up to wait_s for it. A root this job already holds is a no-op; a second, different root is refused (two
+    jobs taking two roots in opposite orders would deadlock). Prints the root's path."""
+    k = root_number(spec, roots)
     if k is None:
-        print(f"{PREFIX}: take-root: {spec!r} is not a canonical root (/private/tmp/cmux-ci[-N] or N)", file=sys.stderr)
+        print(f"{PREFIX}: take-root: {spec!r} is not one of this mini's {roots} canonical root(s) "
+              "(/private/tmp/cmux-ci, /private/tmp/cmux-ci-N or N)", file=sys.stderr)
+        return 2
+    if not os.environ.get("RUNNER_NAME"):
+        print(f"{PREFIX}: take-root: RUNNER_NAME is not set (not a runner job step)", file=sys.stderr)
         return 2
     name, path = f"root-{k}", canonical_root(k)
+    held: list[str] = []
     with contextlib.suppress(OSError):
-        if name in roots_file(state_dir).read_text().split():
-            print(path)
-            return 0
+        held = roots_file(state_dir).read_text().split()
+    if name in held:
+        print(path)
+        return 0
+    if held:
+        print(f"{PREFIX}: take-root: this job already holds {', '.join(held)}; one root per job", file=sys.stderr)
+        return 2
     worker = runner_worker_pid()
     if worker is None:
         print(f"{PREFIX}: take-root: not inside a runner job (no Runner.Worker above this step)", file=sys.stderr)
@@ -1175,7 +1189,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.phase == "take-root":
         if not args.root:
             p.error("take-root needs --root")
-        return take_root(args.root, args.wait, args.capacity_dir, args.state_dir)
+        return take_root(args.root, args.wait, args.capacity_dir, args.state_dir, args.canonical_roots)
     if args.phase == "check":
         why, want = node_refusal(args.fleet_class)
         if not why:

@@ -511,7 +511,8 @@ class HookTest(unittest.TestCase):
                 self.skipTest("no C compiler to build a Runner.Worker stand-in")
         cmd = " ".join(shlex.quote(a) for a in [sys.executable, os.fspath(HOOK), "take-root", "--root", root,
                                                 "--capacity-dir", os.fspath(self.dir / "capacity"),
-                                                "--state-dir", os.fspath(self.dir / "state"), *extra])
+                                                "--state-dir", os.fspath(self.dir / "state"),
+                                                "--canonical-roots", "2", *extra])
         environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "RUNNER_NAME": runner,
                    "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet")}
         return subprocess.run([os.fspath(worker), "-c", cmd], env=environ, capture_output=True, text=True,
@@ -532,6 +533,9 @@ class HookTest(unittest.TestCase):
             got = self.take("/private/tmp/cmux-ci-2", "c0")
             self.assertEqual((got.returncode, got.stdout.strip()), (0, "/private/tmp/cmux-ci-2"), got.stderr)
             self.assertEqual(self.take("2", "c0").returncode, 0, "a re-take of a root this job holds is a no-op")
+            second = self.take("/private/tmp/cmux-ci", "c0", "--wait", "0")
+            self.assertEqual(second.returncode, 2, "a second, different root could deadlock against another job")
+            self.assertIn("already holds root-2", second.stderr)
             other = self.take("/private/tmp/cmux-ci-2", "c1", "--wait", "1")
             self.assertEqual(other.returncode, 1, "another job cannot take a held root")
             self.assertIn("canonical root holder(s) released", self.finish("c0"))
@@ -559,13 +563,19 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
 
     def test_take_root_refuses_bad_roots_and_non_jobs(self) -> None:
-        for bad in ("/tmp/elsewhere", "/private/tmp/cmux-ci-1", "0", "cmux-ci-2x"):
+        for bad in ("/tmp/elsewhere", "/private/tmp/cmux-ci-1", "0", "cmux-ci-2x", "02", "/private/tmp/cmux-ci-02"):
             with self.subTest(bad=bad):
                 self.assertEqual(self.take(bad, "x0").returncode, 2)
-        outside = self.run_hook("take-root", None, None, "--root", "2", "--capacity-dir",
-                                os.fspath(self.dir / "capacity"), "--state-dir", os.fspath(self.dir / "state"))
+        beyond = self.take("3", "x0", "--canonical-roots", "2")
+        self.assertEqual(beyond.returncode, 2, "a root this mini does not have")
+        self.assertIn("2 canonical root(s)", beyond.stderr)
+        outside = self.run_hook("take-root", None, None, "--root", "1", "--capacity-dir",
+                                os.fspath(self.dir / "capacity"), "--state-dir", os.fspath(self.dir / "state"),
+                                env={"RUNNER_NAME": "x0"})
         self.assertEqual(outside.returncode, 2)
         self.assertIn("not inside a runner job", outside.stderr)
+        nameless = self.run_hook("take-root", None, None, "--root", "1", "--state-dir", os.fspath(self.dir / "state"))
+        self.assertIn("RUNNER_NAME is not set", nameless.stderr)
 
     def test_job_started_links_the_root_shim_into_the_fleet_bin(self) -> None:
         fleet = self.fleet()
@@ -1800,6 +1810,8 @@ class RunnerTest(unittest.TestCase):
         self.assertTrue((hooks / "glaeda_reservation.py").is_file())
         shim = (hooks / "glaeda-canonical-root").read_text()
         self.assertIn("take-root --root", shim)
+        self.assertIn("--canonical-roots 1 --capacity-dir", shim)
+        self.assertIn("--state-dir", shim)
         self.assertTrue(os.access(hooks / "glaeda-canonical-root", os.X_OK))
         self.assertNotIn("--compile-slots", (hooks / "job-started.sh").read_text())  # 1 is the hook's default
         manifest["defaults"]["runner"] = {"classes": {"std": {"compileSlots": 2, "canonicalRoots": 2}}}
