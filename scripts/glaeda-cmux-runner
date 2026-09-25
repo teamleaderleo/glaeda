@@ -558,6 +558,7 @@ def start_agent(ctx: Context, act: dict[str, Any], plist: str) -> str | None:
     if launchctl_disabled(ctx):
         code, out = run([LAUNCHCTL, "enable", f"gui/{ctx.uid}/{ctx.label}"])
         act["wasDisabled"], act["enabled"] = True, code == 0
+        ctx.enabled_label = code == 0  # the agent step records it too when a relabel started the runner
         if code != 0:
             act["bootstrapped"] = False
             return "launchctl enable failed: " + out
@@ -805,6 +806,7 @@ def relabel(ctx: Context, act: dict[str, Any]) -> None:
         return
     if not ctx.skip_launchctl:
         bootout(ctx)
+        ctx.agent_started = False  # stopped now, whatever the plan saw; the agent step reads this
     for name in LOCAL_REGISTRATION:
         (ctx.runner_dir / name).unlink(missing_ok=True)
     act["replace"] = True
@@ -874,8 +876,8 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             write_atomic(Path(act["path"]), data, mode)
             act["applied"] = act["owned"] = True
             act["ownedSha256"] = act["sha256"]
-        if kind == "agent" and getattr(ctx, "agent_started", False) and not act.get("applied"):
-            act["loaded"] = True  # relabel already started this exact, unchanged plist
+        if kind == "agent" and hasattr(ctx, "agent_started") and not act.get("applied"):
+            act["loaded"] = ctx.agent_started  # relabel stopped this unchanged plist, and started it unless held
         if kind == "agent" and act["state"] in {"create", "update", "unchanged"} and not ctx.skip_launchctl \
                 and not act.get("loaded"):
             if act.get("held"):
@@ -886,6 +888,8 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                 why = start_agent(ctx, act, act["path"])
                 if why:
                     act["state"], act["note"] = "failed", why[:400]
+        if kind == "agent" and getattr(ctx, "enabled_label", False):
+            act["wasDisabled"] = act["enabled"] = True
         if act["state"] == "failed":
             failed = True
         if kind == "verify":
@@ -1000,6 +1004,9 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
                 bootout(ctx)
             Path(act["path"]).unlink()
             act["applied"] = True
+            if held_marker(ctx).is_file():  # a later install of this directory must not start out held
+                held_marker(ctx).unlink()
+                act["heldMarkRemoved"] = True
         elif act["kind"] == "deregister":
             token = ctx.take_token(f"{ctx.scope_api}/actions/runners/remove-token")
             code, out = (1, "no removal token")
