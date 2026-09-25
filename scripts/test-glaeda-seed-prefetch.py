@@ -29,7 +29,9 @@ FAKE_SEED = """#!/usr/bin/env python3
 import json, os, sys
 with open(os.environ["FAKE_CALLS"], "a") as log:
     log.write(" ".join(sys.argv[1:]) + " url=" + os.environ.get("CI_CACHE_R2_PUBLIC_URL", "")
-              + " git=" + os.environ.get("CMUX_SEED_GIT_DIR", "") + "\\n")
+              + " git=" + os.environ.get("CMUX_SEED_GIT_DIR", "")
+              + " curlrc=" + (open(os.path.join(os.environ["CURL_HOME"], ".curlrc")).read().strip().replace(" ", "")
+                              if os.environ.get("CURL_HOME") else "") + "\\n")
 distance = int(os.environ.get("FAKE_DISTANCE", "0"))
 print("some progress line")
 print(json.dumps({"fetched": "true", "key": "k", "distance": distance}))
@@ -78,13 +80,64 @@ class SeedPrefetchTest(unittest.TestCase):
         self.assertEqual(result["state"], "skip")
         self.assertFalse((self.state / ".prefetch").exists())
 
-    def test_a_busy_mini_defers(self):
+    def test_a_busy_mini_fetches_at_the_busy_rate(self):
         self.record(self.state)
         sp.running_commands = lambda: ["/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2"]
-        self.assertEqual(sp.run(True, self.state)["state"], "deferred")
-        sp.running_commands = lambda: None
-        self.assertEqual(sp.run(True, self.state)["state"], "deferred")
+        os.environ["FAKE_DISTANCE"] = "1"
+        result = sp.run(True, self.state)
+        self.assertEqual(result["state"], "applied")
+        self.assertIn("busy", result["results"][os.fspath(self.state)]["throttled"])
+        sp.running_commands = lambda: None  # unknown counts as busy
+        sp.run(True, self.state)
+        sp.running_commands = lambda: ["zsh"]
+        sp.run(True, self.state)
+        self.assertEqual([line.rsplit(" curlrc=", 1)[1] for line in self.call_lines()],
+                         [f"limit-rate={sp.BUSY_RATE}", f"limit-rate={sp.BUSY_RATE}", ""])
+
+    def keep_seed(self, store: Path, commit: str) -> None:
+        width = os.sysconf("SC_NPROCESSORS_ONLN")
+        (store / "seeds" / f"admission-derived-data-v1-macOS-ARM64-fp-j{width}-{commit}").mkdir(parents=True)
+
+    def write(self, path: str, text: str = "x") -> None:
+        (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (self.repo / path).write_text(text)
+
+    def test_a_kept_seed_near_main_skips_the_download(self):
+        self.record(self.state)
+        kept = self.commit()
+        self.keep_seed(self.state, kept)
+        for n in range(sp.NEAR_APP_SWIFT_FILES):
+            self.write(f"Sources/File{n}.swift")
+        # Not app sources: tests, the iOS packages, docs.
+        self.write("cmuxTests/ATests.swift")
+        self.write("Packages/macOS/CmuxFoundation/Tests/CmuxFoundationTests/ATests.swift")
+        self.write("Packages/iOS/CmuxMobile/Sources/CmuxMobile/A.swift")
+        self.write("docs/a.md")
+        self.commit()
+        result = sp.run(True, self.state)["results"][os.fspath(self.state)]
+        self.assertEqual((result["fetched"], result["app_swift_files"]), ("false", sp.NEAR_APP_SWIFT_FILES))
         self.assertEqual(self.call_lines(), [])
+        # One more app Swift file is past the bar: fetch.
+        self.write("Sources/OneMore.swift")
+        self.commit()
+        sp.run(True, self.state)
+        self.assertEqual(len(self.call_lines()), 1)
+
+    def test_a_package_source_change_fetches_however_small(self):
+        self.record(self.state)
+        kept = self.commit()
+        self.keep_seed(self.state, kept)
+        self.write("Packages/macOS/CmuxFoundation/Sources/CmuxFoundation/A.swift")
+        self.commit()
+        sp.run(True, self.state)
+        self.assertEqual(len(self.call_lines()), 1)
+
+    def test_a_seed_off_mains_history_does_not_count(self):
+        self.record(self.state)
+        self.keep_seed(self.state, "0" * 40)
+        self.commit()
+        sp.run(True, self.state)
+        self.assertEqual(len(self.call_lines()), 1)
 
     def test_plan_changes_nothing(self):
         self.record(self.state)
@@ -103,7 +156,7 @@ class SeedPrefetchTest(unittest.TestCase):
         self.assertEqual([line.split()[:3] for line in calls],
                          [["prefetch", os.fspath(self.state), head],
                           ["prefetch", os.fspath(self.state / "cmux-ci-2"), head]])
-        self.assertTrue(calls[0].endswith("git=" + os.fspath(self.state / ".prefetch/cmux.git")))
+        self.assertTrue(calls[0].endswith("git=" + os.fspath(self.state / ".prefetch/cmux.git") + " curlrc="))
         self.assertIn(" url=https://ci-cache.cmux.com ", calls[0])
         # Both roots have HEAD's own seed: the next run only fetches git.
         self.assertEqual(sp.run(True, self.state)["state"], "current")
