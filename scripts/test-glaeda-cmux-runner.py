@@ -958,6 +958,13 @@ class GateTest(unittest.TestCase):
         fleet = self.opener("with-host-lock.py")
         ours = self.opener("glaeda-cmux-runner-hook-job-started.py")  # another runner's admission
         self.assertEqual(hook.host_waiters(os.fspath(self.lock), self.state), {fleet.pid})
+        real = subprocess.run
+        def gone(cmd, **kw):  # the fleet pid exits between lsof and ps: ps lists only the hook's own pid
+            if cmd[0] == "/bin/ps":
+                cmd = [*cmd[:-1], str(ours.pid)]
+            return real(cmd, **kw)
+        with mock.patch.object(hook.subprocess, "run", side_effect=gone):
+            self.assertEqual(hook.host_waiters(os.fspath(self.lock), self.state), set())
         fleet.kill(); fleet.wait()
         self.assertEqual(hook.host_waiters(os.fspath(self.lock), self.state), set())
         self.assertIsNone(ours.poll())
@@ -1076,8 +1083,27 @@ class GateTest(unittest.TestCase):
         self.assertEqual(gate.unexpected(RuntimeError("boom")), 0)  # waited for the child instead
         gate.child = None
         self.assertEqual(gate.unexpected(RuntimeError("boom")), hook.GATE_FALLBACK)
-        with mock.patch.object(hook.Gate, "step", side_effect=OSError("ps failed")):
+        with mock.patch.object(hook.Gate, "step", side_effect=OSError("ps failed")) as step, \
+                mock.patch.object(hook, "GATE_POLL_S", 0):
             self.assertEqual(hook.listen(self.runner, os.fspath(self.lock), "", self.state, True), hook.GATE_FALLBACK)
+        self.assertEqual(step.call_count, hook.GATE_MAX_FAILURES)  # a transient failure keeps gating
+        flaky = iter([OSError("ps timed out"), 7])
+        def step_once(_self):
+            item = next(flaky)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        with mock.patch.object(hook.Gate, "step", step_once), mock.patch.object(hook, "GATE_POLL_S", 0):
+            self.assertEqual(hook.listen(self.runner, os.fspath(self.lock), "", self.state, True), 7)
+
+    def test_a_broken_gate_still_ends_its_runner_when_the_agent_stops(self) -> None:
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(child.kill)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = child
+        gate.terminating = True
+        with mock.patch.object(gate, "stop", side_effect=OSError("ps failed")):
+            self.assertIsNotNone(gate.unexpected(RuntimeError("boom")))  # terminated, not waited on forever
 
     def test_a_stop_with_no_listener_ends_the_whole_runner_tree(self) -> None:
         (self.runner / "run-helper.sh").write_text("#!/bin/bash\nsleep 30\n")  # between listeners
@@ -1101,10 +1127,20 @@ class GateTest(unittest.TestCase):
         args = execv.call_args[0][1]
         self.assertEqual(args[1:], [os.fspath(HOOK), "listen", "--adopt=4321"])
         gate.source = (0, 0, 0)
-        with mock.patch.object(hook.subprocess, "run", return_value=mock.Mock(returncode=1)), \
-                mock.patch.object(hook.os, "execv") as execv:
+        with mock.patch.object(hook.subprocess, "run", return_value=mock.Mock(returncode=2)) as check, \
+                mock.patch.object(hook.os, "execv") as execv, \
+                mock.patch.object(hook.sys, "argv", [os.fspath(HOOK), "listen", "--no-waiters"]):
             gate.reload()
-            execv.assert_not_called()  # a hook that does not load is never exec'd
+            execv.assert_not_called()  # a hook that rejects this exact argv is never exec'd
+        self.assertEqual(check.call_args[0][0][1:], [os.fspath(HOOK), "listen", "--no-waiters", "--adopt=4321",
+                                                     "--parse-only"])
+
+    def test_parse_only_accepts_the_gate_argv_and_an_old_hook_would_not(self) -> None:
+        argv = ["listen", "--runner-dir", os.fspath(self.runner), "--no-waiters", "--adopt=1", "--parse-only"]
+        self.assertEqual(subprocess.run([sys.executable, os.fspath(HOOK), *argv], capture_output=True).returncode, 0)
+        old = self.tmp / "old-hook"
+        old.write_text(HOOK.read_text().replace('p.add_argument("--parse-only"', 'p.add_argument("--renamed"'))
+        self.assertEqual(subprocess.run([sys.executable, os.fspath(old), *argv], capture_output=True).returncode, 2)
 
     def run_listen(self, *extra: str) -> tuple[subprocess.Popen, Path]:
         env = {**os.environ, "GLAEDA_RUNNER_GATE_POLL_S": "0.1"}
@@ -1181,6 +1217,20 @@ class GateTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("running the runner without it", result.stdout)
         self.assertEqual((self.tmp / "ran").read_text(), "plain run.sh\n")
+
+    def test_listen_sh_never_starts_a_second_runner_beside_a_live_one(self) -> None:
+        script = self.listen_sh(sys.executable)
+        proc, log = self.run_listen(os.fspath(script))
+        self.wait_for(log, "Listening for Jobs")
+        gate = [pid for pid, (_, cmd) in hook.processes().items()
+                if "listen --runner-dir" in cmd and os.fspath(self.runner) in cmd and "listen.sh" not in cmd]
+        self.assertEqual(len(gate), 1, gate)
+        os.kill(gate[0], 9)  # jetsam, or a re-exec into a hook that cannot run this gate
+        self.assertEqual(proc.wait(timeout=30), 1)  # launchd restarts a fresh gate
+        self.assertIn("with its runner running", log.read_text())
+        self.assertNotIn("running the runner without it", log.read_text())
+        self.assertEqual(log.read_text().count("Listening for Jobs"), 1)
+        self.assertEqual(self.listeners(), [])
 
     def test_listen_sh_forwards_sigterm_and_leaves_nothing_behind(self) -> None:
         script = self.listen_sh(sys.executable)

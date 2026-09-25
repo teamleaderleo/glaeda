@@ -133,6 +133,7 @@ GATE_POLL_S = float(os.environ.get("GLAEDA_RUNNER_GATE_POLL_S") or 2.0)
 GATE_CONFIRM = 2  # consecutive idle polls, so a hook's or a probe's momentary hold never stops a listener
 GATE_STOP_WAIT_S = 60.0  # a graceful listener exit, before it is killed
 GATE_WAITER_EVERY_S = 30.0
+GATE_MAX_FAILURES = 5  # consecutive failed polls before the gate hands the runner back
 GATE_FALLBACK = 70  # listen.sh runs run.sh itself: the gate broke before any runner started
 
 
@@ -486,9 +487,9 @@ def lock_waiters(path: str, ours: set[int]) -> list[int]:
                                  check=False).stdout
     except (OSError, subprocess.TimeoutExpired):
         return []  # cannot tell a fleet build from our own admission: no waiter, as when lsof cannot tell
-    ours_now = {int(line.split(None, 1)[0]) for line in listing.splitlines()
-                if line.strip() and PREFIX in line and line.split(None, 1)[0].isdigit()}
-    return [pid for pid in pids if pid not in ours_now]
+    fleet = {int(line.split(None, 1)[0]) for line in listing.splitlines()
+             if line.strip() and PREFIX not in line and line.split(None, 1)[0].isdigit()}
+    return [pid for pid in pids if pid in fleet]  # a pid gone since lsof is not waiting either
 
 
 def holder_pids(state_dir: Path) -> set[int]:
@@ -728,9 +729,9 @@ class Adopted:
         if self.returncode is None:
             try:
                 pid, status = os.waitpid(self.pid, os.WNOHANG)
-            except ChildProcessError:
-                self.returncode = 0
-                return 0
+            except ChildProcessError:  # not our child: never report a clean exit launchd would not restart
+                self.returncode = 1
+                return 1
             if pid:
                 self.returncode = os.waitstatus_to_exitcode(status)
         return self.returncode
@@ -776,17 +777,34 @@ class Gate:
         if now is None or now == self.source:
             return
         self.source = now
-        check = subprocess.run([sys.executable, __file__, "--help"], stdin=subprocess.DEVNULL,
-                               capture_output=True, timeout=30, check=False)
-        if check.returncode != 0:
-            gate_log("the hook changed but does not load; keeping this gate")
-            return
         argv = [a for a in sys.argv if not a.startswith("--adopt=")]
         if self.child is not None:
             argv.append(f"--adopt={self.child.pid}")
+        # The new hook must load and accept exactly this argv (a hook without --parse-only, such as a
+        # rollback to one before the gate, never gets the exec).
+        try:
+            check = subprocess.run([sys.executable, __file__, *argv[1:], "--parse-only"], stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=30, check=False)
+            ok = check.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        if not ok:
+            gate_log("the hook changed but cannot run this gate; keeping this gate")
+            return
+        if self.terminating:
+            return
         gate_log("the hook changed; reloading the gate")
         sys.stdout.flush()
-        os.execv(sys.executable, [sys.executable, *argv])
+        blocked = {signal.SIGTERM, signal.SIGINT}
+        signal.pthread_sigmask(signal.SIG_BLOCK, blocked)  # kept across exec; listen() unblocks it
+        if self.terminating:  # arrived just before the block
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
+            return
+        try:
+            os.execv(sys.executable, [sys.executable, *argv])
+        except OSError:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
+            gate_log("the reload failed; keeping this gate")
 
     def claimed(self) -> str | None:
         why = host_held(self.host_lock, self.reservation, time.time())
@@ -904,12 +922,22 @@ class Gate:
         return None
 
     def unexpected(self, error: BaseException) -> int:
-        """The gate broke: run the runner as plain run.sh would. A live child keeps running (a job is never
-        killed for a gate bug), otherwise GATE_FALLBACK tells listen.sh to exec run.sh itself."""
+        """The gate broke for good: run the runner as plain run.sh would. A live child keeps running (a job is
+        never killed for a gate bug) until it exits or the agent stops, otherwise GATE_FALLBACK tells listen.sh
+        to exec run.sh itself."""
         gate_log(f"the gate failed ({type(error).__name__}: {error}); running the runner without it")
-        if self.child is not None and self.child.poll() is None:
-            return self.child.wait()
-        return GATE_FALLBACK
+        if self.child is None or self.child.poll() is not None:
+            return GATE_FALLBACK
+        signalled = False
+        while (code := self.child.poll()) is None:
+            if self.terminating and not signalled:  # launchd is stopping the agent: end the runner's session
+                signalled = True
+                try:
+                    self.stop("the runner agent is stopping")
+                except Exception:  # noqa: BLE001
+                    self.child.terminate()
+            time.sleep(0.5)
+        return code
 
     def terminate(self, *_: Any) -> None:
         self.terminating = True  # step() acts on it: a signal handler must not run ps
@@ -922,14 +950,22 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
         gate.child = Adopted(adopt)  # type: ignore[assignment]
     signal.signal(signal.SIGTERM, gate.terminate)
     signal.signal(signal.SIGINT, gate.terminate)
-    try:
-        while True:
+    # reload() blocks both before its exec, so a stop that arrives across it stays pending until here.
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT})
+    failures = 0
+    while True:
+        try:
             code = gate.step()
-            if code is not None:
-                return code
-            time.sleep(GATE_POLL_S if not gate.terminating else 0.5)
-    except Exception as error:  # noqa: BLE001
-        return gate.unexpected(error)
+            failures = 0
+        except Exception as error:  # noqa: BLE001  (a ps timeout under load: log it and keep gating)
+            failures += 1
+            if failures >= GATE_MAX_FAILURES:
+                return gate.unexpected(error)
+            gate_log(f"a poll failed ({type(error).__name__}: {error}); trying again")
+            code = None
+        if code is not None:
+            return code
+        time.sleep(GATE_POLL_S if not gate.terminating else 0.5)
 
 
 def refuse(reason: str) -> int:
@@ -986,6 +1022,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-waiters", action="store_true",
                    help="listen: only an exclusive holder or a reservation stops the listener (one runner per mini)")
     p.add_argument("--adopt", type=int, default=0, help=argparse.SUPPRESS)
+    p.add_argument("--parse-only", action="store_true", help=argparse.SUPPRESS)  # the gate's reload check
     p.add_argument("--allowed-repo", action="append", default=[])
     p.add_argument("--allowed-owner")
     p.add_argument("--allow-event", action="append", default=[],
@@ -1012,6 +1049,8 @@ def main(argv: list[str] | None = None) -> int:
                    help=argparse.SUPPRESS)
     p.add_argument("--watch-pid", type=int, default=0, help=argparse.SUPPRESS)
     args = p.parse_args(argv)
+    if args.parse_only:
+        return 0
 
     if args.phase == "listen":
         if args.runner_dir is None:

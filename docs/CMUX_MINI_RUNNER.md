@@ -162,13 +162,22 @@ What `--apply` does:
    - **Restarting and logs.** The gate starts `run.sh` again after two free polls. While
      it waits it logs `glaeda-cmux-runner-gate: holding the listener off: <why>`, and
      `--apply`'s verify accepts that line with or without gh.
-   - **Failure is safe.** If the gate can't start (a broken hook or interpreter),
-     `listen.sh` runs `run.sh` itself, as before the gate. If the gate fails while
-     the runner runs, it waits for the runner instead of killing it. A runner exit the
-     gate didn't ask for passes through, so launchd's KeepAlive behaves as before.
+   - **Failure is safe.**
+     - A failed poll (a `ps` timeout under load) is logged and retried. After 5 in a
+       row, the gate hands the runner back: it waits for the runner instead of killing
+       it, and still ends it on a SIGTERM.
+     - If the gate can't start (a broken hook or interpreter), `listen.sh` runs
+       `run.sh` itself, as before the gate.
+     - If the gate dies while its runner still runs, `listen.sh` never starts a second
+       one. It stops the listener once it has no job, then exits 1 so launchd restarts
+       a fresh gate.
+     - A runner exit the gate didn't ask for passes through, so launchd's KeepAlive
+       behaves as before.
    - **Hook updates.** When `--apply` replaces the hook, the gate re-executes the new
      hook in place and keeps its `run.sh`, so a gate fix reaches every mini without a
-     runner restart. A new hook that fails to load is skipped.
+     runner restart. It does so only after the new hook accepts the exact argv it will
+     get (`--parse-only`). SIGTERM and SIGINT stay blocked across the exec, so a stop
+     is never lost.
    - **Busy runners.** An `--apply` that would change a loaded plist while the runner
      has a job fails that runner's agent step, "the runner has a job; nothing changed,
      re-run when idle", so it never boots out a running job.
