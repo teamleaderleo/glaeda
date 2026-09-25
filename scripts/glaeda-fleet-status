@@ -512,10 +512,12 @@ def collect_disk(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
 
 
 # Read-only: the tail of the runner hook's per-job log (glaeda-cmux-job/v1; only "completed" lines, or lines with no
-# event from older hooks, carry the host record; "started" and "refused" lines are skipped here). A line cut
+# event from older hooks, carry the host record; "started" and "refused" lines are dropped on the host, so the
+# 400-line tail still holds about 400 completed records). A line cut
 # at the front by tail -c fails to parse and is skipped.
 JOBS_SCRIPT = (
-    "echo @jobs; tail -n 1000 ~/Library/Logs/glaeda-cmux-jobs.jsonl 2>/dev/null | tail -c 1048576; echo; "
+    "echo @jobs; tail -c 8388608 ~/Library/Logs/glaeda-cmux-jobs.jsonl 2>/dev/null "
+    "| grep -v -e '\"event\":\"started\"' -e '\"event\":\"refused\"' | tail -n 400 | tail -c 1048576; echo; "
     "echo @now; date +%s"
 )
 

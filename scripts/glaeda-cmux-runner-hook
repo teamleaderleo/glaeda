@@ -1818,23 +1818,60 @@ class JobSamples:
         }
 
 
-def append_job_record(record: dict[str, Any], log: Path = JOB_LOG) -> None:
-    """One line per job; past JOB_LOG_MAX_BYTES keep the newest half, cut at a line boundary. The trim
-    rewrites the file in place under the lock, so a writer waiting on the lock never holds a replaced inode."""
+JOB_LINE_MAX = 8192
+JOB_LOG_LOCK_TRIES = 10  # job-started's lines: LOCK_NB tries 20 ms apart, then the line is skipped
+JOB_LOG_LOCK_PAUSE_S = 0.02
+
+
+def append_job_record(record: dict[str, Any], log: Path = JOB_LOG, wait: bool = True) -> bool:
+    """One line per job; past JOB_LOG_MAX_BYTES keep the newest half, cut at a line boundary. The trim writes
+    the kept half to a temporary file and renames it over the log while holding the old inode's lock, so a
+    crash never leaves an empty log. A writer that got the lock on a replaced inode sees it (the path's inode
+    differs) and reopens. wait=False (job-started) tries the lock for about 200 ms and then skips the line, so
+    the log never delays a job. Returns whether the line was written."""
     log.parent.mkdir(parents=True, exist_ok=True)
-    line = (json.dumps(record, separators=(",", ":"), sort_keys=True)[:8192] + "\n").encode()
-    with open(log, "a+b") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        handle.write(line)
-        handle.flush()
-        if os.fstat(handle.fileno()).st_size > JOB_LOG_MAX_BYTES:
-            handle.seek(0)
-            data = handle.read()
-            keep = data[len(data) // 2:]
-            keep = keep[keep.find(b"\n") + 1:]
-            handle.truncate(0)
-            handle.write(keep)
+    text = json.dumps(record, separators=(",", ":"), sort_keys=True)
+    if len(text) > JOB_LINE_MAX:  # drop the bulkiest optional fields rather than cut the JSON
+        slim = {k: v for k, v in record.items() if k not in ("top_outside", "other_runner_jobs", "decision")}
+        text = json.dumps(slim, separators=(",", ":"), sort_keys=True)
+    line = (text[:JOB_LINE_MAX] + "\n").encode()
+    tries = JOB_LOG_LOCK_TRIES
+    while True:
+        with open(log, "a+b") as handle:
+            if wait:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+            else:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    tries -= 1
+                    if tries <= 0:
+                        return False
+                    time.sleep(JOB_LOG_LOCK_PAUSE_S)
+                    continue
+            try:
+                current = os.stat(log).st_ino
+            except OSError:
+                current = None
+            if current != os.fstat(handle.fileno()).st_ino:
+                continue  # a trim renamed a new file over the path while this writer waited: reopen it
+            handle.write(line)
             handle.flush()
+            if os.fstat(handle.fileno()).st_size > JOB_LOG_MAX_BYTES:
+                handle.seek(0)
+                data = handle.read()
+                keep = data[len(data) // 2:]
+                keep = keep[keep.find(b"\n") + 1:]
+                tmp = log.with_name(f".{log.name}.trim-{os.getpid()}")
+                try:
+                    with open(tmp, "wb") as out:
+                        out.write(keep)
+                        out.flush()
+                        os.fsync(out.fileno())
+                    os.replace(tmp, log)  # still under the old inode's lock: waiters reopen the new file
+                finally:
+                    tmp.unlink(missing_ok=True)
+            return True
 
 
 def job_meta(repo: str | None, home_repo: str) -> dict[str, Any]:
@@ -1854,7 +1891,7 @@ def held_roots(state_dir: Path) -> list[str]:
     """The canonical roots (root-k) the runner's .roots file names now; take-root --switch rewrites it mid-job."""
     try:
         return [name for name in roots_file(state_dir).read_text().split() if name.startswith("root-")][:8]
-    except OSError:
+    except (OSError, ValueError):
         return []
 
 
@@ -1862,7 +1899,8 @@ def job_event(event: str, meta: dict[str, Any], log: Path = JOB_LOG, **fields: A
     """Append a started or refused line (the sampler writes the completed one). Observation only: every
     failure is swallowed, so the log can never refuse or fail a job."""
     try:
-        append_job_record({"schema": JOB_SCHEMA, **meta, "event": event, "at": int(time.time()), **fields}, log)
+        append_job_record({"schema": JOB_SCHEMA, **meta, "event": event, "at": int(time.time()), **fields}, log,
+                          wait=False)
     except Exception:  # noqa: BLE001
         pass
 
@@ -1893,6 +1931,9 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         samples = JobSamples(meta, os.cpu_count() or 1, started, interval)
         deadline = time.monotonic() + HOLDER_MAX_S
         tick = 0
+        # what the job holds, read only while its Runner.Worker lives: job-completed removes .roots and .gui
+        # after finish_sampler's short wait, and once the worker is gone the next job on this runner rewrites them
+        holdings = (list(meta.get("roots") or []), bool(meta.get("gui")))
         while True:
             sampled_at = time.monotonic()
             try:
@@ -1909,6 +1950,12 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
             stop_at = sampled_at + interval  # a sample takes about a second; keep the period at interval
             finished = False
             while True:  # check at least once, even when the sample outlasted the interval
+                try:  # take-root/--switch and take-gui change these mid-job
+                    seen = (held_roots(state_dir), gui_file(state_dir).exists())
+                    if pid_alive(watch_pid):
+                        holdings = seen
+                except Exception:  # noqa: BLE001
+                    pass
                 try:
                     ours = pid_file.read_text().strip() == me
                 except OSError:
@@ -1923,12 +1970,11 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
             if finished:
                 break
         record = samples.summary(time.time())
-        with contextlib.suppress(Exception):  # take-root/--switch and take-gui change these mid-job
-            final = held_roots(state_dir)
-            if final != record.get("roots", []):
-                record["roots_admitted"] = record.get("roots", [])
-            record["roots"] = final
-            record["gui"] = bool(record.get("gui")) or gui_file(state_dir).exists()
+        final, gui = holdings
+        if final != record.get("roots", []):
+            record["roots_admitted"] = record.get("roots", [])
+        record["roots"] = final
+        record["gui"] = bool(record.get("gui")) or gui
         append_job_record(record, log)
     except Exception:  # noqa: BLE001
         pass
@@ -2065,9 +2111,10 @@ def main(argv: list[str] | None = None) -> int:
 
         def refused(why: str) -> int:
             if telemetry:
-                job_event("refused", job_meta(repo, args.home_repo), args.job_log, decision=why[:400],
-                          wait_s=None if admit_start is None else round(time.monotonic() - admit_start, 1),
-                          units=0, roots=[], gui=False, instance=args.instance)
+                with contextlib.suppress(Exception):  # observation never hides or changes a refusal
+                    job_event("refused", job_meta(repo, args.home_repo), args.job_log, decision=why[:400],
+                              wait_s=None if admit_start is None else round(time.monotonic() - admit_start, 1),
+                              units=0, roots=[], gui=False, instance=args.instance)
             return refuse(why)
 
         admit, reason = decide(os.environ.get("GITHUB_EVENT_NAME"), event,
@@ -2117,6 +2164,9 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 time.sleep(min(GUEST_POLL_S, left))  # never start a try after the deadline
         else:
+            with contextlib.suppress(OSError):  # a crashed job's record must not show in this job's log lines
+                roots_file(args.state_dir).unlink(missing_ok=True)
+                gui_file(args.state_dir).unlink(missing_ok=True)
             held, note = take_host_lock(args.host_lock, args.watch_pid or os.getppid(), args.state_dir)
         if not held:
             return refused(note)
@@ -2133,11 +2183,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.test_keychain:
             print(f"{PREFIX}: {ensure_test_keychain(Path.home())}", flush=True)
         if telemetry:
-            meta = job_meta(repo, args.home_repo)
-            meta.update(decision=f"{reason}; {note}"[:400], wait_s=round(time.monotonic() - admit_start, 1),
-                        units=taken.get("units"), roots=held_roots(args.state_dir),
-                        gui=gui_file(args.state_dir).exists(), instance=args.instance)
-            job_event("started", meta, args.job_log)
+            meta: dict[str, Any] = {}
+            try:  # observation must not fail an admitted job
+                meta = job_meta(repo, args.home_repo)
+                meta.update(decision=f"{reason}; {note}"[:400], wait_s=round(time.monotonic() - admit_start, 1),
+                            units=taken.get("units"), roots=held_roots(args.state_dir),
+                            gui=gui_file(args.state_dir).exists(), instance=args.instance)
+                job_event("started", meta, args.job_log)
+            except Exception:  # noqa: BLE001
+                pass
             note = start_sampler(args.watch_pid or os.getppid(), args.state_dir, meta, args.job_log)
             print(f"{PREFIX}: {note}", flush=True)
     else:

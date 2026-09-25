@@ -762,6 +762,20 @@ class JobsTests(unittest.TestCase):
                              job_record(event="completed"), job_record())
         self.assertEqual((fs.parse_jobs(stdout, AT)["count"], fs.parse_jobs(stdout, AT)["contended"]), (2, 0))
 
+    def test_jobs_script_drops_started_and_refused_on_the_host(self):
+        with tempfile.TemporaryDirectory() as home:
+            logs = Path(home) / "Library" / "Logs"
+            logs.mkdir(parents=True)
+            lines = []
+            for n in range(500):
+                lines.append(json.dumps(job_record(event="started", run_id=str(n)), separators=(",", ":"), sort_keys=True))
+                lines.append(json.dumps(job_record(event="completed", run_id=str(n)), separators=(",", ":"), sort_keys=True))
+            (logs / "glaeda-cmux-jobs.jsonl").write_text("\n".join(lines) + "\n")
+            out = subprocess.run(["/bin/sh", "-c", fs.JOBS_SCRIPT], env={"HOME": home, "PATH": "/usr/bin:/bin"},
+                                 capture_output=True, text=True, timeout=30).stdout
+        self.assertNotIn('"event":"started"', out)
+        self.assertEqual(out.count('"event":"completed"'), 400, "the tail keeps 400 completed records")
+
     def test_jobs_probe_is_read_only_and_skips_never_touch(self):
         seen = []
         with mock.patch.object(fs, "jobs_host", side_effect=lambda h, u: seen.append(h) or {"reachable": True}):
