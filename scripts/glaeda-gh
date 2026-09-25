@@ -80,7 +80,8 @@ RUN_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})/(?:actions/run
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeStateStatus headRefOid
 reviewDecision updatedAt commits(last: 1) { nodes { commit { statusCheckRollup { state
 contexts(first: 100) { totalCount pageInfo { hasNextPage } nodes { __typename
-... on CheckRun { name status conclusion detailsUrl databaseId startedAt isRequired(pullRequestNumber: NUM) }
+... on CheckRun { name status conclusion detailsUrl databaseId startedAt isRequired(pullRequestNumber: NUM)
+  checkSuite { workflowRun { workflow { name } } } }
 ... on StatusContext { context state targetUrl createdAt isRequired(pullRequestNumber: NUM) } } } } } } }"""
 TOKEN_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9_]{20,251}|github_pat_[A-Za-z0-9_]{20,251}|[0-9a-f]{40})")
 
@@ -243,18 +244,21 @@ def parse_pr(node: dict) -> dict:
         if c.get("__typename") == "StatusContext":
             state = c.get("state")
             done = state in {"SUCCESS", "FAILURE", "ERROR"}
-            check = {"name": c.get("context"), "status": "COMPLETED" if done else "PENDING",
+            check = {"name": c.get("context"), "workflow": None, "status": "COMPLETED" if done else "PENDING",
                      "conclusion": state if done else None, "url": c.get("targetUrl")}
-            order = (c.get("createdAt") or "", 0)
+            order = (0, c.get("createdAt") or "")
         else:
-            check = {"name": c.get("name"), "status": c.get("status"), "conclusion": c.get("conclusion"),
-                     "url": c.get("detailsUrl")}
-            order = (c.get("startedAt") or "", c.get("databaseId") or 0)
+            workflow = (((c.get("checkSuite") or {}).get("workflowRun") or {}).get("workflow") or {}).get("name")
+            check = {"name": c.get("name"), "workflow": workflow, "status": c.get("status"),
+                     "conclusion": c.get("conclusion"), "url": c.get("detailsUrl")}
+            # databaseId first: a queued rerun has no startedAt yet but is still the newer attempt
+            order = (c.get("databaseId") or 0, c.get("startedAt") or "")
         check["required"] = bool(c.get("isRequired"))
-        # a rerun leaves the old attempt in the list (cancelled, then passed): keep the newest per name
-        name = str(check["name"])
-        if name not in latest or order >= latest[name][0]:
-            latest[name] = (order, check)
+        # a rerun leaves the old attempt in the list (cancelled, then passed): keep the newest per
+        # (workflow, name), so same-named jobs in different workflows stay separate
+        ident = f"{check['workflow'] or ''}\0{check['name']}"
+        if ident not in latest or order >= latest[ident][0]:
+            latest[ident] = (order, check)
     checks = [check for _, check in latest.values()]
     return {
         "number": node.get("number"), "url": node.get("url"), "title": node.get("title"),
@@ -451,16 +455,19 @@ class Daemon:
         rate = data.get("rateLimit") or {}
         if rate:
             self.note_budget("graphql", rate.get("limit"), rate.get("remaining"), iso_epoch(rate.get("resetAt")))
-        problems = {}
+        problems: dict[str, dict] = {}
         for err in doc.get("errors") or []:
             path = err.get("path") or [""]
-            problems[str(path[0])] = str(err.get("message", "error"))[:200]
+            problems[str(path[0])] = err
         for i, e in enumerate(entries):
             node = (data.get(f"p{i}") or {}).get("pullRequest")
             if node:
                 self.store(e["key"], e["cache"], dataAt=self.now, data=parse_pr(node))
-            else:
-                self.store(e["key"], e["cache"], error=problems.get(f"p{i}", "pull request not found"))
+                continue
+            err = problems.get(f"p{i}") or {}
+            # only GitHub saying NOT_FOUND for this alias means the PR does not exist (or is not visible)
+            self.store(e["key"], e["cache"], error=str(err.get("message") or "no data for this pull request")[:200],
+                       missing=err.get("type") == "NOT_FOUND")
 
     def get(self, path: str, etag: str | None) -> tuple[str, Any, str | None]:
         """("fresh", doc, etag), ("same", None, etag) on 304, or ("error", message, None)."""
@@ -649,7 +656,8 @@ def summary(key: str, entry: dict | None) -> str:
             lines.append("checks: none reported yet for this head commit")
         for c in bad[:20]:
             optional = " (not required)" if required and not c.get("required") else ""
-            lines.append(f"  failed: {c.get('name')}{optional}  {c.get('url') or ''}".rstrip())
+            label = f"{c['workflow']} / {c.get('name')}" if c.get("workflow") else c.get("name")
+            lines.append(f"  failed: {label}{optional}  {c.get('url') or ''}".rstrip())
         if len(bad) > 20:
             lines.append(f"  ... {len(bad) - 20} more failed")
         lines.append(str(data.get("url") or ""))
@@ -714,10 +722,13 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
         entry = read_cache(key)
         fresh = entry is not None and (entry.get("fetchedAt") or 0) >= began
         waited = int(now - start)
-        if fresh and not entry.get("data") and entry.get("error"):
+        if fresh and not entry.get("data") and entry.get("missing"):
             emit(key, entry, as_json, {"result": "failure", "waited_s": waited})
-            return EXIT_FAIL  # not found, or no access
-        result = verdict(kind, entry.get("data"), until, sha) if fresh and (entry.get("dataAt") or 0) >= began else None
+            return EXIT_FAIL  # GitHub says NOT_FOUND; transport errors and 5xx stay pending
+        data = (entry or {}).get("data")
+        # merged, closed and completed do not go stale, so an older fetch of them is enough
+        usable = data and ((entry.get("dataAt") or 0) >= began or terminal(kind, data))
+        result = verdict(kind, data, until, sha) if usable else None
         if result is not None:
             emit(key, entry, as_json, {"result": "success" if result == EXIT_OK else "failure", "waited_s": waited})
             return result

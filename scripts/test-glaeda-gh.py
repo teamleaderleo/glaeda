@@ -172,6 +172,7 @@ class DaemonTest(Base):
         missing = gg.read_cache(keys[2])
         self.assertIsNone(missing["data"])
         self.assertIn("Could not resolve", missing["error"])
+        self.assertTrue(missing["missing"])
         self.assertEqual(self.daemon.budget["graphql"]["remaining"], 3999)
 
     def test_new_entry_fills_at_once_then_waits_for_the_cycle(self) -> None:
@@ -380,7 +381,7 @@ class ClientTest(Base):
         self.assertEqual(self.wait("pr", "o/r#1", fill=(green, {}), sha="aaaaaaa")[0], 0)
 
     def test_missing_pr_fails(self) -> None:
-        code, text = self.wait("pr", "o/r#404", fill=(None, {"error": "Could not resolve"}))
+        code, text = self.wait("pr", "o/r#404", fill=(None, {"error": "Could not resolve", "missing": True}))
         self.assertEqual(code, 1)
         self.assertIn("Could not resolve", text)
 
@@ -390,6 +391,37 @@ class ClientTest(Base):
         data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[new, old]))
         self.assertEqual([c["conclusion"] for c in data["checks"]], ["SUCCESS"])
         self.assertEqual(gg.verdict("pr", data), 0)
+
+    def test_queued_rerun_outranks_the_cancelled_attempt(self) -> None:
+        old = {**check_run("e2e", conclusion="CANCELLED"), "databaseId": 1, "startedAt": "2026-09-25T10:00:00Z"}
+        queued = {**check_run("e2e", "QUEUED", None), "databaseId": 2, "startedAt": None}
+        data = gg.parse_pr(pr_node(1, rollup="PENDING", checks=[old, queued]))
+        self.assertEqual([c["status"] for c in data["checks"]], ["QUEUED"])
+        self.assertIsNone(gg.verdict("pr", data))
+
+    def test_same_name_in_two_workflows_stays_separate(self) -> None:
+        def in_workflow(check: dict, workflow: str, db: int) -> dict:
+            return {**check, "databaseId": db, "checkSuite": {"workflowRun": {"workflow": {"name": workflow}}}}
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[
+            in_workflow(check_run("build", conclusion="FAILURE"), "CI", 1),
+            in_workflow(check_run("build"), "Release", 2)]))
+        self.assertEqual(len(data["checks"]), 2)
+        self.assertEqual(gg.verdict("pr", data), 1)
+        self.assertIn("failed: CI / build", gg.summary("pr:o/r#1", {"data": data}))
+
+    def test_finished_things_answer_at_once_from_an_older_fetch(self) -> None:
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, state="MERGED", rollup="SUCCESS")), at=time.time() - 300)
+        self.assertEqual(self.wait("pr", "o/r#1", until="merged", timeout=0.3)[0], 0)
+        self.put("run:o/r/2", {"status": "completed", "conclusion": "failure"}, at=time.time() - 300)
+        self.assertEqual(self.wait("run", "o/r/2", timeout=0.3)[0], 1)
+        self.put("run:o/r/3", {"status": "in_progress"}, at=time.time() - 300)
+        self.assertEqual(self.wait("run", "o/r/3", timeout=0.3)[0], 2)  # live and stale: not trusted
+
+    def test_only_not_found_fails_a_missing_pr(self) -> None:
+        code, _ = self.wait("pr", "o/r#5", fill=(None, {"error": "graphql: HTTP 502", "missing": False}), timeout=0.4)
+        self.assertEqual(code, 2)  # a transport error or 5xx stays pending
+        code, _ = self.wait("pr", "o/r#6", fill=(None, {"error": "gh auth token exited 1; is gh signed in?"}), timeout=0.4)
+        self.assertEqual(code, 2)
 
     def test_only_required_checks_decide_when_marked(self) -> None:
         req = {**check_run("build"), "isRequired": True}
