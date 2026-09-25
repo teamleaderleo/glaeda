@@ -791,8 +791,12 @@ def enable(ctx: Context) -> None:
     cmux_mini_fix.sh runner_hold disables the agent for a repair; when its
     hold mark is lost, runner_release skips it and every later --apply failed
     at bootstrap (cmux7s, 2026-09-25). An --apply is the operator asking for
-    the runner, so it re-enables its own agent.
+    the runner, so it re-enables its own agent, unless a hold mark says a
+    repair is still running (runner_release clears that one).
     """
+    if (ctx.home / ".local/state/glaeda/mini-fleet/runner-held" / ctx.runner_dir.name).exists():
+        print(f"glaeda-cmux-runner: {ctx.label} is held for a repair; leaving it disabled", file=sys.stderr)
+        return
     run([LAUNCHCTL, "enable", f"gui/{ctx.uid}/{ctx.label}"])
 
 

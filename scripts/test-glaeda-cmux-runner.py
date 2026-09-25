@@ -1798,8 +1798,19 @@ class RunnerTest(unittest.TestCase):
         calls = [e["argv"] for e in self.log() if e["tool"] == "launchctl"]
         for i, argv in enumerate(calls):
             if argv[0] == "bootstrap":
+                self.assertGreater(i, 0, calls)
                 self.assertEqual(calls[i - 1][0], "enable", calls)
                 self.assertTrue(calls[i - 1][1].endswith("/com.teamleaderleo.glaeda.cmux-runner"), calls[i - 1])
+
+    def test_a_runner_held_for_a_repair_stays_disabled(self) -> None:
+        held = self.home / ".local/state/glaeda/mini-fleet/runner-held"
+        held.mkdir(parents=True)
+        (held / "actions-runner-glaeda").touch()
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply")
+        verbs = [e["argv"][0] for e in self.log() if e["tool"] == "launchctl"]
+        self.assertNotIn("enable", verbs)
 
     # ------------------------------------------------------------ uninstall
 
