@@ -142,6 +142,8 @@ jobs:
               Path("scripts/test-hot-observe.py"),
               Path("scripts/glaeda-disk"),
               Path("scripts/test-glaeda-disk.py"),
+              Path("scripts/glaeda-fleet-cas-prune"),
+              Path("scripts/test-glaeda-fleet-cas-prune.py"),
               Path("scripts/test-verify.py"),
               Path("scripts/test-verify-changed-rustfmt.py"),
               Path("scripts/test-front-door.py"),
@@ -176,6 +178,7 @@ jobs:
           python3 scripts/test-benchmark-linker-throughput.py
           python3 scripts/test-hot-observe.py
           python3 scripts/test-glaeda-disk.py
+          python3 scripts/test-glaeda-fleet-cas-prune.py
           python3 scripts/test-hot-pressure-shadow.py
           python3 scripts/test-hot-run.py
           python3 scripts/test-verify-focused.py
