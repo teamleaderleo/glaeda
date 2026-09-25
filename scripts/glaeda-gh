@@ -653,6 +653,8 @@ def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None 
         return EXIT_FAIL
     if unfinished or waiting:
         return None
+    if data.get("requiredMissing") and data.get("state") == "OPEN" and data.get("mergeStateStatus") == "DIRTY":
+        return EXIT_FAIL  # merge conflicts: the required checks will not run until the next push
     return EXIT_FAIL if bad else EXIT_OK
 
 

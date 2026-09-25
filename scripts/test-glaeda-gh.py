@@ -430,7 +430,7 @@ class ClientTest(Base):
         # GitHub's merge state already counts it: CLEAN means nothing required is outstanding.
         self.assertEqual(gg.verdict("pr", {**data, "mergeStateStatus": "CLEAN"}, "green"), 0)
         # A conflicted PR runs no workflows until the next push, and a merged one never will: no wait.
-        self.assertEqual(gg.verdict("pr", {**data, "mergeStateStatus": "DIRTY"}, "done"), 0)
+        self.assertEqual(gg.verdict("pr", {**data, "mergeStateStatus": "DIRTY"}, "done"), 1)
         self.assertIn("merge conflicts", gg.summary("pr:o/r#1", {"data": {**data, "mergeStateStatus": "DIRTY"}}))
         self.assertEqual(gg.verdict("pr", {**data, "state": "MERGED", "mergeStateStatus": "UNKNOWN"}, "green"), 0)
         # Classic branch protection lists its contexts too.
