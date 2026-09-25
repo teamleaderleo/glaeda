@@ -35,7 +35,9 @@ while args and args[0] == "-o":
     args = args[2:]
 host, remote = args[0], " ".join(args[1:])
 data = sys.stdin.read()
-json.dump({{"tool": "ssh", "host": host, "remote": remote, "stdin": data[:40]}}, open(log, "a")); open(log, "a").write("\\n")
+open(log, "a").write(json.dumps({{"tool": "ssh", "host": host, "remote": remote, "stdin": data[:40]}}) + "\\n")
+if host in os.environ.get("FAKE_DOWN", "").split(","):
+    sys.stderr.write("ssh: connect to host " + host + " port 22: Connection refused\\n"); sys.exit(255)
 if " check " in remote:
     if host in os.environ.get("FAKE_ELIGIBLE", "").split(","):
         print("glaeda-cmux-runner-hook: eligible"); sys.exit(0)
@@ -52,7 +54,7 @@ sys.exit(0)
 """
 FAKE_SCP = """#!{python}
 import json, os, sys
-json.dump({{"tool": "scp", "argv": sys.argv[1:]}}, open(os.environ["FAKE_LOG"], "a")); open(os.environ["FAKE_LOG"], "a").write("\\n")
+open(os.environ["FAKE_LOG"], "a").write(json.dumps({{"tool": "scp", "argv": sys.argv[1:]}}) + "\\n")
 dest = sys.argv[-1]
 if dest.endswith("mini-fleet.json"):
     src = sys.argv[-2]
@@ -60,7 +62,7 @@ if dest.endswith("mini-fleet.json"):
 """
 FAKE_GH = """#!{python}
 import json, os, sys
-json.dump({{"tool": "gh", "argv": sys.argv[1:]}}, open(os.environ["FAKE_LOG"], "a")); open(os.environ["FAKE_LOG"], "a").write("\\n")
+open(os.environ["FAKE_LOG"], "a").write(json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n")
 print("{token}")
 """
 
@@ -138,6 +140,20 @@ class FleetTest(unittest.TestCase):
         applies = [c for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
         self.assertTrue(applies and all("--skip-launchctl" in c["remote"] for c in applies))
         self.assertFalse(any(c.get("host") in ("mini-a", "mini-b") for c in self.calls()))
+
+    def test_an_unreachable_member_fails_the_apply_not_skips(self) -> None:
+        result = self.fleet("--apply", FAKE_DOWN="mini-b")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        rows = {r["member"]: r for r in json.loads(result.stdout)["members"]}
+        self.assertTrue(rows["mini-b"]["action"].startswith("unreachable"), rows["mini-b"])
+        self.assertIn("Connection refused", rows["mini-b"]["gate"])
+        self.assertEqual(rows["mini-a"]["action"], "applied")
+        self.assertEqual(self.fleet(FAKE_DOWN="mini-b").returncode, 0, "a plan still reports and exits 0")
+
+    def test_an_unknown_host_is_an_error(self) -> None:
+        result = self.fleet("--hosts", "mini-a,mini-typo")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("mini-typo", result.stderr)
 
     def test_a_failed_instance_fails_the_run(self) -> None:
         bad = self.dir / "bin" / "gh"

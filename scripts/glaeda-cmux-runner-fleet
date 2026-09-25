@@ -18,7 +18,9 @@ onboarded and never takes jobs only to refuse them. Then --apply copies this che
 its hook and their two modules into ~/glaeda-runner/scripts with a manifest trimmed to that member (its own
 entry and the xcode, disk and runner defaults: never other hosts, keys or people), mints one registration token
 per instance here and pipes it over SSH (never an argv or a file), and applies --instance K for every K.
-Nothing here routes a job: pool variables stay with whoever owns routing.
+The gate checks the manifest's first Xcode for the member; if that app is missing there, the member reads as
+not eligible even when a later one would do (safe side). A member that SSH cannot reach is "unreachable", which
+fails an --apply run. Nothing here routes a job: pool variables stay with whoever owns routing.
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ WORKLOAD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 TRIMMED_DEFAULTS = ("xcode", "disk", "runner")
 SSH_OPTIONS = ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
 CHECK_TIMEOUT_S = 90
-APPLY_TIMEOUT_S = 1200
+APPLY_TIMEOUT_S = 2700  # above the remote worst case (download, unpack, config.sh), so a slow install is never raced by a re-run
 TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-]+")
 HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
@@ -96,8 +98,9 @@ def trimmed(manifest: dict[str, Any], member: str) -> dict[str, Any]:
             "hosts": {member: manifest["hosts"][member]}}
 
 
-def check(member: str, summary: dict[str, Any]) -> tuple[bool, str]:
-    """The member's own gate, read-only: the hook runs from stdin with the workload PATH."""
+def check(member: str, summary: dict[str, Any]) -> tuple[bool | None, str]:
+    """The member's own gate, read-only: the hook runs from stdin with the workload PATH. (True, line) when
+    eligible, (False, line) when the hook refused, (None, why) when the member could not be asked."""
     argv = ["python3", "-", "check", "--fleet-class", summary["hardware"]]
     if summary.get("xcodeApps"):
         argv += ["--toolchain-xcode", summary["xcodeApps"][0]]
@@ -105,6 +108,8 @@ def check(member: str, summary: dict[str, Any]) -> tuple[bool, str]:
     code, out, err = run(["ssh", *SSH_OPTIONS, member, remote], CHECK_TIMEOUT_S,
                          stdin=(SCRIPT_DIR / "glaeda-cmux-runner-hook").read_text())
     line = (out.strip().splitlines() or [err.strip() or f"ssh exited {code}"])[-1]
+    if code not in (0, 1) or not line.startswith("glaeda-cmux-runner-hook: "):
+        return None, f"unreachable (exit {code}): {(err.strip() or line)[-200:]}"
     return code == 0, line.removeprefix("glaeda-cmux-runner-hook: ")
 
 
@@ -112,7 +117,7 @@ def _quote(text: str) -> str:
     return text if re.fullmatch(r"[A-Za-z0-9_./:=,+-]+", text) else "'" + text.replace("'", "'\\''") + "'"
 
 
-def mint(repo: str) -> str | None:
+def mint(repo: str) -> str | None:  # gh's stderr is dropped: it never carries the token, but keep it quiet
     code, out, _ = run(["gh", "api", "-X", "POST", f"repos/{repo}/actions/runners/registration-token",
                         "--jq", ".token"], 60)
     token = out.strip()
@@ -158,6 +163,9 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     eligible, why = check(member, summary)
     row: dict[str, Any] = {"member": member, "class": summary["class"], "runners": summary.get("runners", 1),
                            "capacityUnits": summary.get("capacityUnits"), "eligible": eligible, "gate": why}
+    if eligible is None:
+        row["eligible"], row["action"] = False, "unreachable"
+        return row
     if not args.apply:
         row["action"] = "would apply" if eligible or args.include_ineligible else "skip (not eligible)"
         return row
@@ -214,6 +222,10 @@ def main(argv: list[str] | None = None) -> int:
         print("glaeda-cmux-runner-fleet: --repo must be OWNER/REPO", file=sys.stderr)
         return 2
     only = [h for h in (args.hosts or "").split(",") if h] or None
+    unknown = [h for h in only or [] if h not in (manifest.get("hosts") or {})]
+    if unknown:
+        print(f"glaeda-cmux-runner-fleet: not in the manifest: {', '.join(unknown)}", file=sys.stderr)
+        return 2
     chosen, skipped = members(manifest, load_labels(), only, [h for h in args.exclude.split(",") if h])
     with tempfile.TemporaryDirectory(prefix="glaeda-runner-fleet-") as tmp, \
             concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
@@ -224,7 +236,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"applied": args.apply, "members": rows, "skipped": skipped}, indent=2, sort_keys=True))
     else:
         print(render(rows, skipped, args.apply))
-    failed = any(r.get("action") == "failed" or str(r.get("action", "")).startswith("stage failed") for r in rows)
+    failed = any(r.get("action") == "failed" or str(r.get("action", "")).startswith("stage failed")
+                 or (args.apply and r.get("action") == "unreachable") for r in rows)
     return 1 if failed else 0
 
 
