@@ -81,6 +81,15 @@ Signed index entries (#1134 M3, `src/sign.rs`):
   (`instance`);
   `scripts/fleet-cas-marker.sh REPO COMMIT` tells a worker whether the store holds a
   commit for its Xcode build.
+
+Garbage collection (`src/gc.rs`): a fleet store bumps an index entry's mtime when a read
+uses it (at most hourly), and `fleet-cas gc STORE --keep-days N [--dry-run]` keeps the
+entries used within N days plus every object they reach, keeps objects written in the last
+day, and deletes the rest. Marker reads do not count as uses, so a marker expires N days after its
+fill. Which objects an entry names comes from a heuristic over Xcode's value format, so run
+`--dry-run` on a real store first and check that "kept entries naming no stored object" is 0.
+Run it on the store host; a read that races it at worst misses.
+
 Build under `$HOME` (never `/tmp`, see swiftlang/swift#92545). On Xcode 26.3,
 pass `DD=<fixed path>` (the same on every machine) instead of mapping
 DerivedData; see the 2026-09-24 experiment. On a cmux build fleet mini,
@@ -96,7 +105,7 @@ can fill the disk but not poison a build once readers use `--trusted-keys`; the
 signing key is a file readable by the build user, so any process on the writer
 host can sign; a KV entry is not checked for its objects'
 presence (`kv_put_dangling` only counts entries that name absent objects);
-there is no size budget or eviction; and a node that cannot reach the fleet
+there is no size budget (eviction is by age of use, `fleet-cas gc`); and a node that cannot reach the fleet
 store answers reads as misses and fails writes (counted in `up_errors`), then
 skips the store for 30 s (`up_skipped`), so an outage costs about a cold build
 and nothing is published half-way. Reads and writes share that backoff, so one
