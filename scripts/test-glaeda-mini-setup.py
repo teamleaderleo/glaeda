@@ -673,6 +673,12 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(calls, [["/opt/homebrew/bin/brew", "upgrade", "git"]])
         self.assertEqual(act["value"], "2.55.0")
 
+    def test_failed_git_install_does_not_fail_the_run(self) -> None:
+        failing = {"kind": "gitpkg", "key": "git>=2.55", "state": "failed", "note": "brew exited 1"}
+        with mock.patch.object(ms, "plan_git", lambda ctx: dict(failing)):
+            receipt = self.invoke("--hygiene-only", "--apply")  # invoke asserts exit 0
+        self.assertIn("action:git>=2.55", receipt["blocking"])
+
     def test_no_em_dashes(self) -> None:
         for name in ("glaeda-mini-setup", "glaeda-worktree-reclaim-all", "test-glaeda-mini-setup.py"):
             self.assertNotIn(chr(0x2014), (ROOT / "scripts" / name).read_text(), name)

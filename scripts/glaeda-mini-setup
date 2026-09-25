@@ -1307,7 +1307,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.apply:
             apply_install(ctx, actions)
     fleet_result = None if args.uninstall or ctx.hygiene_only else run_fleet_bootstrap(ctx)
-    failed = [a for a in actions if a.get("state") == "failed"]
+    # a failed git install is reported (receipt, operator step) but does not fail the run: glaeda-update
+    # rolls a release back when setup fails, and a transient brew error is not the release's fault
+    failed = [a for a in actions if a.get("state") == "failed" and a.get("kind") != "gitpkg"]
     receipt = {
         "schema": SCHEMA,
         "mode": "uninstall" if args.uninstall else "install",
