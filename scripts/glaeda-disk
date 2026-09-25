@@ -5,6 +5,7 @@
     glaeda-disk --apply             delete every reclaimable item, largest first
     glaeda-disk --pressure --apply  act only under disk pressure, stop at the free target
     glaeda-disk --low 15% --target 25%  thresholds as GiB free or as a share of each filesystem
+    glaeda-disk --pressure --apply waits while a GitHub Actions job runs, unless below --emergency
     glaeda-disk --refresh           re-measure every size now instead of using the snapshot
     glaeda-disk --dedupe            store identical Xcode package/module files once (APFS clones)
 
@@ -794,6 +795,30 @@ def space(spec: str, total: int) -> int:
     return n
 
 
+# A GitHub Actions job in progress (any runner dir: actions-runner, actions-runner-glaeda-2, ...).
+CI_WORKER = re.compile(r"/actions-runner[^/\s]*/bin/Runner\.Worker(?:\s|$)")
+
+
+def ci_jobs() -> list[str]:
+    """Command lines of running CI jobs; empty when ps fails (apply's own evidence then fails closed)."""
+    try:
+        out = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.strip()[:160] for line in out.splitlines() if CI_WORKER.search(line)]
+
+
+def ci_defer(fss: dict[int, Fs], jobs: list[str], emergency: str) -> str:
+    """Why a pressure run should wait for a running CI job, or "" to go ahead. A bulk delete competes
+    with the job's compile for disk and CPU (a 30 GiB delete starved one on a build mini), so it waits
+    unless some filesystem under pressure is below the emergency floor, where the job would fail anyway."""
+    if not jobs:
+        return ""
+    if any(fs.under and fs.free < space(emergency, fs.total) for fs in fss.values()):
+        return ""
+    return f"deferred: a CI job is running ({jobs[0]}); pressure deletes wait unless free drops below {emergency}"
+
+
 def mount_point(path: Path) -> Path:
     path = Path(os.path.realpath(path))
     dev = path.stat().st_dev
@@ -1080,6 +1105,9 @@ def main(argv: list[str] | None = None) -> int:
                          "(default %(default)s free)")
     ap.add_argument("--tmpfs-target", default="90%",
                     help="stop freeing a tmpfs at this much free (default %(default)s)")
+    ap.add_argument("--emergency", default="5%:15-40",
+                    help="with --pressure --apply: delete even while a CI job runs once free space is "
+                         "below this, same forms as --low (default %(default)s)")
     ap.add_argument("--idle-hours", type=float, default=None,
                     help="idle window (default 24h, or 6h under pressure)")
     ap.add_argument("--family", action="append", help="limit to these family ids")
@@ -1128,9 +1156,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         fss = filesystems(fams or [Family("home", HOME, False, "")], a.low, a.target,
                           a.tmpfs_low, a.tmpfs_target)
+        space(a.emergency, GIB)
     except ValueError:
-        ap.error(f"--low/--target/--tmpfs-* take GiB or N%: {a.low!r}, {a.target!r}, "
-                 f"{a.tmpfs_low!r}, {a.tmpfs_target!r}")
+        ap.error(f"--low/--target/--tmpfs-*/--emergency take GiB or N%: {a.low!r}, {a.target!r}, "
+                 f"{a.tmpfs_low!r}, {a.tmpfs_target!r}, {a.emergency!r}")
     # a tmpfs is under pressure at a quarter full, so it shortens the idle window only for
     # pressure runs, which then touch nothing but that filesystem's families
     under = any(fs.under for fs in fss.values() if a.pressure or not fs.tmpfs)
@@ -1141,6 +1170,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         # only families on a filesystem under pressure are surveyed or touched
         fams = [f for f in fams if fss[f.root.stat().st_dev].under]
+        if a.apply and (why := ci_defer(fss, ci_jobs(), a.emergency)):
+            print(why)
+            return 0
     idle = a.idle_hours if a.idle_hours is not None else (6 if under else 24)
     at, known = (0.0, {}) if a.refresh or a.no_snapshot else load_snapshot()
     if a.apply:

@@ -205,6 +205,20 @@ class GlaedaDiskTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             gd.space("lots", 1000)
 
+    def test_pressure_waits_for_a_ci_job_until_the_emergency_floor(self) -> None:
+        job = "/Users/cmux/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 148 151"
+        self.assertTrue(gd.CI_WORKER.search(job))
+        self.assertTrue(gd.CI_WORKER.search("/Users/cmux/actions-runner/bin/Runner.Worker"))
+        self.assertFalse(gd.CI_WORKER.search("/Users/cmux/actions-runner-glaeda/bin/Runner.Listener run"))
+        total = 460 * gd.GIB  # a build mini: emergency 5%:15-40 is 23 GiB
+        low = gd.Fs(1, "/", 60 * gd.GIB, total, 69 * gd.GIB, 115 * gd.GIB)
+        self.assertIn("deferred", gd.ci_defer({1: low}, [job], "5%:15-40"))
+        self.assertEqual(gd.ci_defer({1: low}, [], "5%:15-40"), "")  # no job: go ahead
+        critical = gd.replace(low, free=20 * gd.GIB)
+        self.assertEqual(gd.ci_defer({1: critical}, [job], "5%:15-40"), "")  # the job would fail anyway
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            gd.main(["--pressure", "--emergency", "lots"])
+
     def test_pressure_targets_are_per_filesystem(self) -> None:
         make(self.root / "old")
         items = gd.survey([self.fam], 24, 0)
