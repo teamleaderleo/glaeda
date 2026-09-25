@@ -132,15 +132,29 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path) -> dict:
     child = subprocess.Popen([sys.executable, os.fspath(scripts / "scripts/ci/seed_derived_data.py"), "prefetch",
                               os.fspath(store), head], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                              env=env, start_new_session=True)
-    try:
-        stdout, stderr = child.communicate(timeout=PREFETCH_TIMEOUT)
-    except subprocess.TimeoutExpired:
+
+    def stop_child() -> None:
         try:
             os.killpg(child.pid, signal.SIGKILL)
         except OSError:
             pass
+
+    # launchd's bootout (an OTA update, an uninstall) signals only this job's own process group, so
+    # without this the download would outlive us with no timeout and no lock.
+    def on_signal(signum, _frame) -> None:
+        stop_child()
+        sys.exit(128 + signum)
+
+    previous = {signum: signal.signal(signum, on_signal) for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    try:
+        stdout, stderr = child.communicate(timeout=PREFETCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        stop_child()
         child.communicate()
         return {"fetched": "false", "reason": f"timed out after {PREFETCH_TIMEOUT} s"}
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
     out = subprocess.CompletedProcess(child.args, child.returncode, stdout, stderr)
     lines = [line for line in out.stdout.splitlines() if line.startswith("{")]
     if out.returncode != 0 or not lines:

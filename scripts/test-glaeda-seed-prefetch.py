@@ -7,9 +7,11 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -144,6 +146,39 @@ class SeedPrefetchTest(unittest.TestCase):
         self.assertEqual(outcome["fetched"], "false")
         self.assertIn("boom", outcome["reason"])
         self.assertNotEqual(sp.run(True, self.state)["state"], "current")
+
+
+    def test_a_killed_run_stops_its_download(self):
+        # launchd's bootout signals only the job's own process group; the download runs in another.
+        base = Path(self.tmp.name)
+        scripts = base / "fake-scripts"
+        (scripts / "scripts/ci").mkdir(parents=True)
+        pidfile = base / "download.pid"
+        (scripts / "scripts/ci/seed_derived_data.py").write_text(
+            "import os, subprocess, sys, time\n"
+            "d = subprocess.Popen(['sleep', '300'])\n"
+            f"open({os.fspath(pidfile)!r}, 'w').write(str(d.pid))\n"
+            "time.sleep(300)\n")
+        runner = subprocess.Popen([sys.executable, "-c",
+                                   "import importlib.machinery, sys; from pathlib import Path; "
+                                   f"m = importlib.machinery.SourceFileLoader('p', {os.fspath(ROOT / 'scripts/glaeda-seed-prefetch')!r}).load_module(); "
+                                   f"m.prefetch(Path({os.fspath(scripts)!r}), Path({os.fspath(base)!r}), 'x', Path({os.fspath(base / 'm')!r}))"])
+        deadline = time.time() + 20
+        while not (pidfile.exists() and pidfile.read_text()) and time.time() < deadline:
+            time.sleep(0.1)
+        download = int(pidfile.read_text())
+        runner.terminate()
+        self.assertEqual(runner.wait(timeout=20), 128 + signal.SIGTERM)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                os.kill(download, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(download, signal.SIGKILL)
+            self.fail("the download outlived the killed run")
 
 
 if __name__ == "__main__":
