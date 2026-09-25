@@ -94,6 +94,10 @@ CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("root",)),
     "light": (1, ())}
 CANONICAL_ROOT_ENV = "CMUX_CI_CANONICAL_ROOT"
+# With more than one root, these restore a producer's product into the producer's root (#filePath is baked
+# in there), so they take that root from their restore step, not a token-chosen one at job start.
+ROOT_CONSUMERS = ("gui", "product")
+TAKE_ROOT_POLL_S = 1.0
 
 
 def canonical_root(k: int) -> str:
@@ -417,6 +421,101 @@ def disk_refusal(path: str, min_free_gib: float) -> str | None:
     return None if free >= min_free_gib else f"{free:.1f} GiB free, {min_free_gib:g} GiB required"
 
 
+def root_number(spec: str, roots: int = 99) -> int | None:
+    """1 for /private/tmp/cmux-ci or 1, k for /private/tmp/cmux-ci-k or k (2 to roots), else None. No leading
+    zeros, so the path a caller uses is exactly the one held."""
+    spec = spec.rstrip("/")
+    if spec in ("/private/tmp/cmux-ci", "1"):
+        return 1
+    match = re.fullmatch(r"(?:/private/tmp/cmux-ci-)?([2-9]|[1-9][0-9])", spec)
+    k = int(match.group(1)) if match else 0
+    return k if 2 <= k <= roots else None
+
+
+def runner_worker_pid() -> int | None:
+    """The Runner.Worker this step runs under, walking up from our parent with /bin/ps (never the job's PATH)."""
+    pid = os.getppid()
+    try:
+        for _ in range(64):
+            if pid <= 1:
+                return None
+            out = subprocess.run(["/bin/ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True,
+                                 timeout=5, check=False).stdout.strip()
+            if not out:
+                return None
+            ppid, comm = out.split(None, 1)
+            if os.path.basename(comm.strip()) == "Runner.Worker":
+                return pid
+            pid = int(ppid)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    return None
+
+
+ROOT_SHIM = "glaeda-canonical-root"
+
+
+def ensure_root_shim(bin_dir: Path) -> None:
+    """Point FLEET_DIR/bin/glaeda-canonical-root at this hook's shim (the path cmux's restore step calls).
+    Best effort and atomic: a symlink written aside and renamed over the old one."""
+    shim = Path(__file__).resolve().parent / ROOT_SHIM
+    link = bin_dir / ROOT_SHIM
+    if not shim.is_file() or not bin_dir.is_dir():
+        return
+    with contextlib.suppress(OSError):
+        if link.is_symlink() and os.readlink(link) == os.fspath(shim):
+            return
+        tmp = bin_dir / f".{ROOT_SHIM}.{os.getpid()}"
+        tmp.unlink(missing_ok=True)
+        os.symlink(shim, tmp)
+        os.replace(tmp, link)
+
+
+def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roots: int = 99) -> int:
+    """glaeda-canonical-root take ROOT: hold canonical root ROOT for the rest of this job (cmux#14338), waiting
+    up to wait_s for it. A root this job already holds is a no-op; a second, different root is refused (two
+    jobs taking two roots in opposite orders would deadlock). Prints the root's path."""
+    k = root_number(spec, roots)
+    if k is None:
+        print(f"{PREFIX}: take-root: {spec!r} is not one of this mini's {roots} canonical root(s) "
+              "(/private/tmp/cmux-ci, /private/tmp/cmux-ci-N or N)", file=sys.stderr)
+        return 2
+    if not os.environ.get("RUNNER_NAME"):
+        print(f"{PREFIX}: take-root: RUNNER_NAME is not set (not a runner job step)", file=sys.stderr)
+        return 2
+    name, path = f"root-{k}", canonical_root(k)
+    held: list[str] = []
+    with contextlib.suppress(OSError):
+        held = roots_file(state_dir).read_text().split()
+    if name in held:
+        print(path)
+        return 0
+    if held:
+        print(f"{PREFIX}: take-root: this job already holds {', '.join(held)}; one root per job", file=sys.stderr)
+        return 2
+    worker = runner_worker_pid()
+    if worker is None:
+        print(f"{PREFIX}: take-root: not inside a runner job (no Runner.Worker above this step)", file=sys.stderr)
+        return 2
+    deadline = time.monotonic() + max(0.0, wait_s)
+    while True:
+        fd = lock_file(capacity_dir / f"{name}.token", fcntl.LOCK_EX)
+        if fd is not None:
+            break
+        if time.monotonic() >= deadline:
+            print(f"{PREFIX}: take-root: {path} is still in use after {wait_s:g} s", file=sys.stderr)
+            return 1
+        time.sleep(TAKE_ROOT_POLL_S)
+    held, note = hold([fd], worker, state_dir, pid_file=root_holder_file(state_dir, name))
+    if not held:
+        print(f"{PREFIX}: take-root: {note}", file=sys.stderr)
+        return 1
+    with contextlib.suppress(OSError), open(roots_file(state_dir), "a", encoding="utf-8") as record:
+        record.write(name + "\n")
+    print(path)
+    return 0
+
+
 def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -509,6 +608,11 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     klass = JOB_CLASSES.get(job, "compile")
     units, tokens = CLASS_COST[klass]
     units = min(units, total)
+    if roots > 1 and klass in ROOT_CONSUMERS:
+        # a consumer must use the producer's root, which only its restore step knows: it takes that root
+        # itself with glaeda-canonical-root take (take-root below) instead of a token-chosen one here
+        tokens = tuple(t for t in tokens if t != "root")
+    pinned = job not in JOB_CLASSES  # workflows the hook does not know use /private/tmp/cmux-ci itself
     try:
         capacity_dir.mkdir(parents=True, exist_ok=True)
         admission = os.open(capacity_dir / "admission.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
@@ -547,7 +651,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             # persistent-dd comes in compile_slots copies once compile admission keeps its state per
             # runner; copy 0 keeps the original file name. A mini whose runners disagree on the count runs
             # as many compiles as the highest one allows, so re-apply every instance on a mini together.
-            copies = {"persistent-dd": max(1, compile_slots), "root": max(1, roots)}.get(token, 1)
+            copies = {"persistent-dd": max(1, compile_slots), "root": 1 if pinned else max(1, roots)}.get(token, 1)
             for copy in range(copies):
                 # root tokens are named for the root they hold: root-1 is /private/tmp/cmux-ci
                 name = f"root-{copy + 1}" if token == "root" else token if copy == 0 else f"{token}-{copy}"
@@ -576,6 +680,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         root = next((name for name in taken if name.startswith("root-")), None)
         if held and root:
             note += f"; {export_root(root)}"
+            with contextlib.suppress(OSError):
+                roots_file(state_dir).write_text(root + "\n")
         return held, (f"holding {what} for {job or 'an unknown job'} ({klass}; {note})" if held else note)
     except OSError as error:
         return False, f"capacity: cannot take the ledger ({type(error).__name__})"
@@ -584,13 +690,15 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         os.close(admission)
 
 
-def hold(fds: list[int], watch_pid: int, state_dir: Path, drop: tuple[int, ...] = ()) -> tuple[bool, str]:
+def hold(fds: list[int], watch_pid: int, state_dir: Path, drop: tuple[int, ...] = (),
+         pid_file: Path | None = None) -> tuple[bool, str]:
     """Hand the locked fds to a detached holder that keeps them until job-completed or watch_pid exits.
     Closes this process's copies either way. The holder closes `drop` (locks that must not outlive the
-    admission). Succeeds only once the holder reports its own pid."""
+    admission). Succeeds only once the holder reports its own pid. pid_file defaults to the runner's
+    holder file; take-root passes its own so a second holder for the same job lives beside it."""
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
-        pid_file = holder_file(state_dir)
+        pid_file = pid_file or holder_file(state_dir)
         pid_file.unlink(missing_ok=True)  # a stale file from a crashed holder must not look like success
     except OSError as error:
         close_all(fds)
@@ -645,9 +753,28 @@ def hold(fds: list[int], watch_pid: int, state_dir: Path, drop: tuple[int, ...] 
     return True, f"holder {reported}, watching pid {watch_pid}"
 
 
+def roots_file(state_dir: Path) -> Path:
+    """The canonical roots this runner's job holds (root-k per line), so take-root knows a re-take is a no-op."""
+    main = holder_file(state_dir)
+    return main.with_name(main.stem + ".roots")
+
+
+def root_holder_file(state_dir: Path, name: str) -> Path:
+    main = holder_file(state_dir)
+    return main.with_name(f"{main.stem}-{name}.pid")
+
+
 def release_host_lock(state_dir: Path) -> str:
-    """job-completed: tell this job's holder to let go, and wait briefly for it."""
-    pid_file = holder_file(state_dir)
+    """job-completed: tell this job's holders to let go (the admission holder and any take-root holders),
+    and wait briefly for them."""
+    roots_file(state_dir).unlink(missing_ok=True)
+    main = holder_file(state_dir)
+    extra = [release_holder(path) for path in sorted(state_dir.glob(f"{main.stem}-root-*.pid"))]
+    note = release_holder(main)
+    return note + (f"; {len(extra)} canonical root holder(s) released" if extra else "")
+
+
+def release_holder(pid_file: Path) -> str:
     try:
         pid = int(pid_file.read_text().strip())
     except (OSError, ValueError):
@@ -1015,10 +1142,12 @@ def disk_pressure(explicit: str | None) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog=PREFIX)
-    p.add_argument("phase", choices=("job-started", "job-completed", "check", "listen"),
+    p.add_argument("phase", choices=("job-started", "job-completed", "check", "listen", "take-root"),
                    help="check: the eligibility gate only, read-only (no lock, no rustup change); "
                         "listen: run the runner's run.sh under the listener gate (the LaunchAgent's program)")
     p.add_argument("--runner-dir", type=Path, help="listen: the runner directory whose run.sh the gate runs")
+    p.add_argument("--root", help="take-root: the canonical root to hold, /private/tmp/cmux-ci[-N] or N")
+    p.add_argument("--wait", type=float, default=0, help="take-root: seconds to wait for the root")
     p.add_argument("--no-waiters", action="store_true",
                    help="listen: only an exclusive holder or a reservation stops the listener (one runner per mini)")
     p.add_argument("--adopt", type=int, default=0, help=argparse.SUPPRESS)
@@ -1057,6 +1186,10 @@ def main(argv: list[str] | None = None) -> int:
             p.error("listen needs --runner-dir")
         return listen(args.runner_dir, args.host_lock, args.reservation, args.state_dir, not args.no_waiters,
                       args.adopt)
+    if args.phase == "take-root":
+        if not args.root:
+            p.error("take-root needs --root")
+        return take_root(args.root, args.wait, args.capacity_dir, args.state_dir, args.canonical_roots)
     if args.phase == "check":
         why, want = node_refusal(args.fleet_class)
         if not why:
@@ -1087,6 +1220,8 @@ def main(argv: list[str] | None = None) -> int:
             return refuse(why)
         # The wrapper execs this script, so the parent is the job's Runner.Worker.
         if args.capacity_units > 0:
+            roots_file(args.state_dir).unlink(missing_ok=True)  # a crashed job's record must not look held
+            ensure_root_shim(Path(FLEET_DIR) / "bin")
             held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
                                        os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
                                        args.state_dir, args.compile_slots, args.canonical_roots)
