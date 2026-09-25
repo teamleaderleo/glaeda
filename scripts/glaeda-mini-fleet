@@ -7,7 +7,7 @@
     glaeda-mini-fleet apply    [--manifest M] --host H ... [--yes]              make the additive fixes
     glaeda-mini-fleet preflight [HOST ...] [--output text|json]                 every onboarding blocker, one pass
     glaeda-mini-fleet fix       [HOST ...] [--yes]                              every repair that needs no root
-    glaeda-mini-fleet sudo-plan [HOST ...] [--run] [--sudoers]                  every root step, one password per host
+    glaeda-mini-fleet sudo-plan [HOST ...] [--run [--ask-once]] [--sudoers]     every root step, one password per host
     glaeda-mini-fleet share THING --from HOST HOST ... [--yes]                  seed over the LAN from a prepared host
     glaeda-mini-fleet onboard   [HOST ...] [--yes] [--from HOST]                preflight, fix, sudo-plan, enroll
     glaeda-mini-fleet repair    [HOST ...] [--yes] [--from HOST]                preflight, fix, sudo-plan, renew, runners
@@ -30,7 +30,8 @@ Xcode, its selection, licence and first launch, the Metal toolchain, tool versio
 workload PATH, Python 3.13+ for enrollment and as the workload PATH's python3, gh on the workload
 PATH, the checkout with submodules and setup artifacts, a ~/glaeda whose glaeda-mini-enroll knows the options onboarding
 passes (and is at --glaeda-ref when given), power, disk, a pending macOS update, Homebrew formulas
-left unpinned) plus onboarding progress (candidate, node id, enrollment, runner). It
+left unpinned, secret files the login user can read, which fail on a PR runner host because PR jobs
+run as that user) plus onboarding progress (candidate, node id, enrollment, runner). It
 prints one host-by-check table, then each host's fixes split into what the login user can do,
 what needs a password, and what needs a person. It exits 1 when any host is not ready.
 
@@ -51,7 +52,10 @@ host to its own file and ends with a fresh preflight. A rerun resumes: finished 
 `sudo-plan` prints one script per host with every root step preflight found (xcode-select,
 licence, first launch, pmset, an /opt/homebrew directory for the login user that fix then fills,
 and Homebrew installs, pins and links as a Homebrew owner that is someone else). With
---run it runs each over `ssh -t`, so the operator types each host's password once. --sudoers adds
+--run it runs each over `ssh -t`, so the operator types each host's password once. --run --ask-once
+reads the password once on this Mac (the fleet shares one), checks it with `sudo -k -S true` on every
+host and stops at the first refusal before any plan runs, then runs each plan as root under one
+`sudo -k -S -p ''` with the password on ssh stdin, never in argv, a tty or a log. --sudoers adds
 a narrow NOPASSWD rule, printed in the script for review: launchctl kickstart of the manifest's
 jobs only. xcode-select and first launch stay password steps, because /Applications is writable by
 the admin group and a path rule for an Xcode tool there would be passwordless root.
@@ -172,7 +176,7 @@ SSH = "/usr/bin/ssh"
 PROBE_TIMEOUT = 90
 PREFLIGHT_TIMEOUT = 180
 LIST_KEYS = {"xcode_app", "xcode_ready", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key",
-             "pf_tool", "pf_submodule", "pf_pmset", "pf_runner", "pf_brew_formula"}
+             "pf_tool", "pf_submodule", "pf_pmset", "pf_runner", "pf_brew_formula", "pf_secret"}
 # Same rule as scripts/cmux_fleet.py NODE_RE: an opaque cmux-* fleet node id.
 NODE_ID_RE = re.compile(r"cmux-[a-z0-9][a-z0-9-]{2,59}\Z")
 VERSION_RE = re.compile(r"\d+(\.\d+){0,2}\Z")
@@ -558,6 +562,8 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
         # dir|name|loaded|listening|held; an older probe sends only dir|name, which reads as unknown.
         "runners": [dict(zip(("dir", "name", "loaded", "listening", "held"),
                              (v.split("|", 4) + ["", "unknown", "", ""])[:5])) for v in out["pf_runner"]],
+        # Paths of secret files the login user can read (never their contents); an older probe sends none.
+        "secrets": out["pf_secret"],
     }
 
 
@@ -1251,7 +1257,7 @@ DEFAULT_CMUX_ROOT = "~/cmux"  # where fix clones cmux on a mini
 # Columns of the preflight table, in the order onboarding meets them.
 PREFLIGHT_CHECKS = ("os", "xcode", "select", "licence", "launch", "metal", "rust", "zig", "tools", "python", "python3",
                     "gh", "cmux", "setup", "glaeda", "power", "disk", "update", "candidate", "node", "enroll", "runner",
-                    "brew", "pins")
+                    "brew", "pins", "secrets")
 # An unknown here means the bootstrap would refuse or cannot be predicted, so it blocks like a failure.
 UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "power", "disk"})
 # Who can apply a fix: the SSH login user alone, the login user with an admin password, or a person.
@@ -1694,6 +1700,17 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
                 f"{as_owner}brew pin {' '.join(unpinned)}", brew_group)
         else:
             put("pins", "ok", " ".join(pf.get("brew_formulas") or {}) or "none installed")
+    # PR jobs run as the login user, so on a runner host every secret it can read is theirs. An hq builder
+    # (no runners) legitimately reads its own tokens as that user, which is only worth showing.
+    secrets = pf.get("secrets") or []
+    runner_host = bool(runners) or "ci-runner" in (host.get("roles") or [])
+    if secrets and runner_host:
+        put("secrets", "fail", f"readable by {user}, the user PR jobs run as: {', '.join(secrets)}",
+            "make them root-only or move them to a host with no PR runners (cmuxterm-hq#595)", "person")
+    elif secrets:
+        put("secrets", "info", f"readable by {user} (no PR runners here): {', '.join(secrets)}")
+    else:
+        put("secrets", "ok", f"none readable by {user}")
     blocked = any(c["state"] == "fail" or (c["state"] == "unknown" and k in UNKNOWN_BLOCKS) for k, c in checks.items())
     return {"host": name, "ready": not blocked, "checks": checks,
             "enrollment": {"state": state, "generation": pf.get("enroll_generation"), "stale": stale,
@@ -1998,22 +2015,25 @@ def host_gate_block() -> str:
     return text[text.index("# >>> host gate"):text.index("# <<< host gate")]
 
 
-def brew_commands(owner: str, formulas: list[str], as_owner: bool) -> list[str]:
+def brew_commands(owner: str, formulas: list[str], as_owner: bool, as_root: bool = False) -> list[str]:
     """Install or upgrade formulas in /opt/homebrew as its owner, link rustup's proxies, python3 and an unlinked gh
-    onto the workload PATH, then pin the BREW_FORMULAS among them (never BREW_UNPINNED)."""
+    onto the workload PATH, then pin the BREW_FORMULAS among them (never BREW_UNPINNED).
+
+    as_root: the script already runs as root (sudo-plan --ask-once), so root steps drop their sudo; the owner's
+    steps still go through sudo -H -u, and the staged bottles are the login user's ($login_home, set by the plan)."""
     if not SAFE_WORD_RE.fullmatch(owner) or set(formulas) - set(BREW_FORMULAS) - set(BREW_UNPINNED):
         raise Failure(f"refusing Homebrew step for owner {owner!r}, formulas {formulas}")
     run = f"sudo -H -u {owner} " if as_owner else ""
-    root = "sudo " if as_owner else ""
+    root = "sudo " if as_owner and not as_root else ""
     # Newer Homebrew asks before installing unless told not to; sudo drops the variable, so env sets it.
     lines = [f'brew_as() {{ {run}env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew "$@"; }}',
              # Bottles glaeda-mini-fleet share brew staged from a peer; brew checks their digests before use.
-             f'staged="$HOME/{BREW_STAGE}"',
+             f'staged="${{login_home:-$HOME}}/{BREW_STAGE}"',
              'if [ -n "$(ls "$staged" 2>/dev/null)" ]; then',
              '  cache="$(brew_as --cache)/downloads"',
              f'  {run}mkdir -p "$cache"',
              f'  {root}cp -n "$staged"/* "$cache"/ || true',
-             *([f'  sudo chown -h {owner} "$cache"/*'] if as_owner else []),
+             *([f'  {root}chown -h {owner} "$cache"/*'] if as_owner else []),
              "fi",
              # A pinned formula stays as it is: upgrading it would change the toolchain its class receipt names.
              'pinned=" $({ brew_as list --pinned 2>/dev/null || true; } | tr "\\n" " ") "',
@@ -2387,42 +2407,59 @@ def sudoers_rule(manifest: dict[str, Any], name: str) -> str | None:
     return f"{user} ALL=(root) NOPASSWD: " + ", ".join(f"/bin/launchctl kickstart -k system/{label}" for label in labels)
 
 
-def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any], sudoers: bool = False) -> str | None:
-    """One bash script with every root step preflight found for the host, or None when there is none."""
+def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any], sudoers: bool = False,
+                     as_root: bool = False) -> str | None:
+    """One bash script with every root step preflight found for the host, or None when there is none.
+
+    By default it runs as the login user and sudo asks once (sudo -v, kept fresh while Homebrew works). as_root is
+    for sudo-plan --run --ask-once, which starts the whole script under one sudo: no sudo -v, no keepalive, no sudo
+    before a root step, and the Homebrew owner's steps still drop to that owner with sudo -H -u."""
     _, root = planned_actions(result)
     if not root and not sudoers:
         return None
     user = manifest["ssh_user"]
+    if as_root and not SAFE_WORD_RE.fullmatch(user):
+        raise Failure(f"refusing a root sudo-plan for login user {user!r}")
     node = manifest["hosts"][name].get("node_id") or "no node id"
     when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    su = "" if as_root else "sudo "
+    how = ("# Every step needs root. glaeda-mini-fleet sudo-plan --run --ask-once runs it as root with one sudo."
+           if as_root else f"# Every step needs root. Run it on the host as {user}; sudo asks for the password once.")
     lines = ["#!/bin/bash",
              f"# glaeda-mini-fleet sudo-plan for {name} ({node}), from preflight at {when}.",
-             f"# Every step needs root. Run it on the host as {user}; sudo asks for the password once.",
+             how,
              "set -euo pipefail",
              "cd /",
              "step() { printf '\\n== %s\\n' \"$*\"; }",
+             # Where fix staged Homebrew bottles (brew_commands): the login user's home, not root's.
+             *([f"login_home=~{user}",
+                # A NOPASSWD sudo leaves the password line unread on stdin; no step may read it.
+                "exec </dev/null"] if as_root else []),
              "# Nothing runs while another build holds the fleet host lock or the host is reserved.",
              host_gate_block().rstrip("\n"),
-             f'if why=$(host_held); then echo "held: $why, skipped"; exit {HELD_EXIT}; fi',
-             "sudo -v",
-             "# Keep sudo's timestamp fresh while Homebrew works; the loop ends with this script.",
-             "( while sleep 60; do sudo -n -v 2>/dev/null || exit 0; done ) &",
-             "keepalive=$!",
-             "trap 'kill \"$keepalive\" 2>/dev/null || true' EXIT"]
+             f'if why=$(host_held); then echo "held: $why, skipped"; exit {HELD_EXIT}; fi']
+    if as_root:
+        lines.append('[ "$(id -u)" = 0 ] || { echo "this plan runs as root (sudo-plan --run --ask-once)" >&2; exit 1; }')
+    else:
+        lines += ["sudo -v",
+                  "# Keep sudo's timestamp fresh while Homebrew works; the loop ends with this script.",
+                  "( while sleep 60; do sudo -n -v 2>/dev/null || exit 0; done ) &",
+                  "keepalive=$!",
+                  "trap 'kill \"$keepalive\" 2>/dev/null || true' EXIT"]
     for action in root:
         kind = action["kind"]
         if kind == "select":
-            lines += [f"step 'select {action['app']}'", f"sudo xcode-select -s {shlex.quote(action['app'])}"]
+            lines += [f"step 'select {action['app']}'", f"{su}xcode-select -s {shlex.quote(action['app'])}"]
         elif kind == "licence":
             lines += ["step 'accept the Xcode licence'",
-                      f"sudo env DEVELOPER_DIR={shlex.quote(action['developer'])} xcodebuild -license accept"]
+                      f"{su}env DEVELOPER_DIR={shlex.quote(action['developer'])} xcodebuild -license accept"]
         elif kind == "first_launch":
             lines += ["step 'Xcode first launch'",
-                      f"sudo env DEVELOPER_DIR={shlex.quote(action['developer'])} xcodebuild -runFirstLaunch"]
+                      f"{su}env DEVELOPER_DIR={shlex.quote(action['developer'])} xcodebuild -runFirstLaunch"]
         elif kind == "power":
             lines.append("step 'power: no sleep on AC, restart after a power failure'")
-            lines += ["sudo pmset -c sleep 0"] if action["sleep"] else []
-            lines += ["sudo pmset -a autorestart 1"] if action["autorestart"] else []
+            lines += [f"{su}pmset -c sleep 0"] if action["sleep"] else []
+            lines += [f"{su}pmset -a autorestart 1"] if action["autorestart"] else []
         elif kind == "homebrew":
             # Only the directory needs root. fix then git-fetches Homebrew into it as the login user; the brew.sh
             # installer is not used because it stalls on a Command Line Tools install the pinned Xcode makes moot.
@@ -2431,18 +2468,18 @@ def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any]
                 raise Failure(f"{name}: refusing to chown /opt/homebrew to {owner!r}")
             lines += [f"step 'create /opt/homebrew for {owner}; glaeda-mini-fleet fix fetches Homebrew into it'",
                       "if [ ! -x /opt/homebrew/bin/brew ]; then",
-                      "  [ -d /opt/homebrew ] || sudo mkdir /opt/homebrew",
+                      f"  [ -d /opt/homebrew ] || {su}mkdir /opt/homebrew",
                       # As root: the login user may not be able to read into someone else's directory.
-                      '  if [ -n "$(sudo find /opt/homebrew -mindepth 1 -not -type d | head -1)" ]; then',
+                      f'  if [ -n "$({su}find /opt/homebrew -mindepth 1 -not -type d | head -1)" ]; then',
                       "    echo '/opt/homebrew has files but no brew; move it aside first' >&2; exit 1",
                       "  fi",
-                      f"  sudo chown -R {owner}:admin /opt/homebrew",
+                      f"  {su}chown -R {owner}:admin /opt/homebrew",
                       "fi"]
         elif kind == "brew":
             pinned = [f for f in action["formulas"] if f in BREW_FORMULAS]
             pin = f", then pin {' '.join(pinned)}" if pinned else ""
             lines.append(f"step 'Homebrew as {action['owner']}: {' '.join(action['formulas'])}{pin}'")
-            lines += brew_commands(action["owner"], action["formulas"], True)
+            lines += brew_commands(action["owner"], action["formulas"], True, as_root)
         elif kind == "python_link":
             lines.append(f"step 'as {action['owner']}: link /opt/homebrew/bin/python3 to {BREW_PYTHON[1]}'")
             lines += python_link_commands(action["owner"], True)
@@ -2458,8 +2495,8 @@ def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any]
                   f"# glaeda-mini-fleet: {user} may run exactly these as root without a password.",
                   rule,
                   "SUDOERS",
-                  'sudo visudo -cf "$rule"',
-                  f'sudo install -m 0440 -o root -g wheel "$rule" {SUDOERS_FILE}',
+                  f'{su}visudo -cf "$rule"',
+                  f'{su}install -m 0440 -o root -g wheel "$rule" {SUDOERS_FILE}',
                   'rm -f "$rule"']
     update = result["checks"].get("update", {})
     if update.get("state") == "fail" and update.get("group") == "password":
@@ -2468,9 +2505,54 @@ def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any]
     return "\n".join(lines) + "\n"
 
 
+# One sudo reads the password from stdin (-S, no prompt, -k so a cached timestamp cannot skip the read).
+SUDO_STDIN = "sudo -k -S -p ''"
+
+
+def sudo_stdin_command(script: str | None = None) -> str:
+    """The remote command for sudo-plan --ask-once: `true` to check the password, else the plan as root.
+
+    The password is the only thing on stdin; the plan goes in argv, as `ssh -t` sends it, so no step that
+    reads stdin can swallow the script, and the password is never in argv or on a tty."""
+    return f"{SUDO_STDIN} " + ("true" if script is None else "/bin/bash -c " + shlex.quote(script))
+
+
+def run_ask_once(manifest: dict[str, Any], plans: dict[str, str]) -> list[str]:
+    """Read the password once, check it on every host before any plan runs, then run each plan as root.
+
+    Returns the hosts whose plan failed; a rejected password stops everything (Failure) with nothing run."""
+    user = manifest["ssh_user"]
+    password = getpass.getpass(f"sudo password for {user} on {', '.join(plans)}: ")
+    feed = (password + "\n").encode()
+    broken = "\n" in password or "\r" in password
+    del password
+    try:
+        if broken:
+            raise Failure("the password has a line break; sudo -S reads one line")
+        for name in plans:
+            check = subprocess.run([SSH, "-o", "ConnectTimeout=10", "-l", user, name, sudo_stdin_command()],
+                                   input=feed, capture_output=True, check=False)
+            if check.returncode:
+                raise Failure(f"{name}: sudo refused the password (or the host is unreachable, exit "
+                              f"{check.returncode}); no plan ran")
+        failed = []
+        for name, script in plans.items():
+            print(f"\n==== {name}: running as root with the password given once", flush=True)
+            code = subprocess.run([SSH, "-o", "ConnectTimeout=10", "-l", user, name, sudo_stdin_command(script)],
+                                  input=feed, check=False).returncode
+            if code:
+                failed.append(name)
+                print(f"==== {name}: exit {code}" + (" (held, skipped)" if code == HELD_EXIT else ""))
+        return failed
+    finally:
+        del feed
+
+
 def cmd_sudo_plan(manifest: dict[str, Any], hosts: list[str], run: bool, sudoers: bool, log_dir: Path | None,
-                  wait: bool = False) -> int:
+                  wait: bool = False, ask_once: bool = False) -> int:
     targets, skipped = eligible_hosts(manifest, hosts)
+    if ask_once and not run:
+        raise Failure("--ask-once goes with sudo-plan --run")
     if run and not sys.stdin.isatty():
         raise Failure("sudo-plan --run asks for each host's password; run it from a terminal")
     held = gate_hosts(manifest, targets, wait) if run else {}
@@ -2484,7 +2566,7 @@ def cmd_sudo_plan(manifest: dict[str, Any], hosts: list[str], run: bool, sudoers
         if "reach" in result["checks"]:
             print(f"# {name}: unreachable ({result['checks']['reach']['detail']})")
             continue
-        script = sudo_plan_script(manifest, name, result, sudoers)
+        script = sudo_plan_script(manifest, name, result, sudoers, as_root=ask_once)
         if script is None:
             print(f"# {name}: no root steps")
             continue
@@ -2500,8 +2582,8 @@ def cmd_sudo_plan(manifest: dict[str, Any], hosts: list[str], run: bool, sudoers
     if not run:
         print(f"# Review, then: glaeda-mini-fleet sudo-plan {' '.join(plans)} --run{' --sudoers' if sudoers else ''}")
         return 0
-    failed = []
-    for name, script in plans.items():
+    failed = run_ask_once(manifest, plans) if ask_once else []
+    for name, script in ({} if ask_once else plans).items():
         print(f"\n==== {name}: running over ssh -t; type the password for {manifest['ssh_user']}@{name}", flush=True)
         code = subprocess.run([SSH, "-t", "-o", "ConnectTimeout=10", "-l", manifest["ssh_user"], name,
                                "/bin/bash -c " + shlex.quote(script)], check=False).returncode
@@ -3634,6 +3716,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--yes", action="store_true",
                         help="apply, fix, share, onboard, repair, upgrade: make the changes instead of printing them")
     parser.add_argument("--run", action="store_true", help="sudo-plan: run each host's plan over ssh -t")
+    parser.add_argument("--ask-once", action="store_true",
+                        help="sudo-plan --run: read the password once here, check it on every host, then run each "
+                             "plan as root with it on ssh stdin (never argv or a tty)")
     parser.add_argument("--wait", action="store_true",
                         help="fix, share, sudo-plan --run, onboard, repair, upgrade: wait (up to 4 hours) for a host "
                              "held by the fleet host lock or a reservation instead of skipping it")
@@ -3708,7 +3793,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "fix":
             return cmd_fix(manifest, hosts, args.yes, args.log_dir, args.seed, args.wait)
         if args.command == "sudo-plan":
-            return cmd_sudo_plan(manifest, hosts, args.run, args.sudoers, args.log_dir, args.wait)
+            return cmd_sudo_plan(manifest, hosts, args.run, args.sudoers, args.log_dir, args.wait, args.ask_once)
         if args.command == "preflight":
             observed = read_observed(args.observed) if args.observed else observe(manifest, hosts, preflight=True)
             try:

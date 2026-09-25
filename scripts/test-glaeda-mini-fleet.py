@@ -585,7 +585,8 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
                    enroll_reason: str | None = None, python3: str | None = "/opt/homebrew/bin/python3|3.13",
                    brew_python3: bool = True, glaeda_lacking: str | None = "", glaeda_dirty: int = 0,
                    pins: tuple[str, ...] = ("rustup|pinned", "zig|pinned", "python@3.13|pinned"),
-                   brew_dir: str | None = None, gh: str | None = "/opt/homebrew/bin/gh", **probe: object) -> str:
+                   brew_dir: str | None = None, gh: str | None = "/opt/homebrew/bin/gh", secrets: tuple[str, ...] = (),
+                   **probe: object) -> str:
     """A probe plus preflight section for a host that is ready unless told otherwise."""
     lines = [probe_text(**probe).rstrip("\n").replace("user\tbuilder", f"user\t{user}"), READY_XCODE.rstrip("\n")]
     lines.append(f"pf_sdks\t{sdks}")
@@ -639,6 +640,7 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
         lines.append(f"pf_update_prepared\t{prepared}")
     lines += ["pf_pmset\tAC Power:", f"pf_pmset\t sleep                {sleep}"]
     lines += [f"pf_runner\t{r}" for r in runners]
+    lines += [f"pf_secret\t{p}" for p in secrets]
     return "\n".join(lines) + "\n"
 
 
@@ -714,6 +716,32 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual({k for k, v in result["checks"].items() if v["state"] == "todo"},
                          {"candidate", "enroll", "runner"})
         self.assertIn("archive downloaded, not staged", result["checks"]["candidate"]["detail"])
+
+    def test_readable_secrets_fail_where_pr_jobs_run(self) -> None:
+        paths = ("/Users/Shared/cmux-build-fleet/secrets/r2.token", "/Users/builder/.ssh/id_ed25519")
+        # build-mini-1: a registered runner and the ci-runner role.
+        checks = self.result(preflight_text(secrets=paths))["checks"]
+        self.assertEqual((checks["secrets"]["state"], checks["secrets"]["group"]), ("fail", "person"))
+        self.assertIn("readable by builder, the user PR jobs run as: " + ", ".join(paths), checks["secrets"]["detail"])
+        self.assertIn("cmuxterm-hq#595", checks["secrets"]["fix"])
+        self.assertFalse(self.result(preflight_text(secrets=paths))["ready"])
+        # A registered runner is enough, whatever the roles say (build-mini-2 has no ci-runner role).
+        text = preflight_text(secrets=paths[:1], hostname="build-mini-2", node_id="cmux-mac-002")
+        self.assertEqual(self.result(text, host="build-mini-2")["checks"]["secrets"]["state"], "fail")
+
+    def test_readable_secrets_on_a_builder_are_info(self) -> None:
+        # An hq builder (cmux15): no runner, no ci-runner role; its worker reads its own tokens as the login user.
+        text = preflight_text(secrets=("/Users/Shared/cmux-build-fleet/secrets/r2.token",), runners=(),
+                              hostname="build-mini-2", node_id="cmux-mac-002")
+        result = self.result(text, host="build-mini-2")
+        self.assertEqual(result["checks"]["secrets"]["state"], "info")
+        self.assertIn("r2.token", result["checks"]["secrets"]["detail"])
+        self.assertTrue(result["ready"], result)
+
+    def test_no_readable_secrets_is_ok(self) -> None:
+        checks = self.result(preflight_text())["checks"]
+        self.assertEqual(checks["secrets"], {"state": "ok", "detail": "none readable by builder", "fix": "", "group": ""})
+        self.assertEqual(list(checks)[-1], "secrets")
 
     def test_node_id_is_required_before_enrollment(self) -> None:
         checks = self.result(preflight_text(enroll_state=None, acceptance=None, node_id=None), host="small-mini")["checks"]
@@ -1040,6 +1068,44 @@ class PreflightScriptTests(unittest.TestCase):
         self.assertEqual(pf["gh"], f"{tools}/gh")
 
 
+class PreflightSecretsScriptTests(unittest.TestCase):
+    def test_lists_readable_secret_paths_never_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            files = {".secrets/r2.env": "R2_SECRET=sekrit-env-value\n",
+                     ".ssh/id_ed25519": "-----BEGIN sekrit-key-body\n",
+                     ".ssh/id_ed25519.pub": "ssh-ed25519 AAAA public\n",
+                     ".config/glaeda/fleet.key": "sekrit-glaeda-key\n",
+                     ".config/glaeda/empty.key": "",
+                     ".config/gh/hosts.yml": "github.com:\n    oauth_token: gho_sekritgh\n",
+                     "Library/Application Support/cmux-build-fleet/secrets/runner.token": "sekrit-runner-token\n",
+                     ".secrets/locked.env": "sekrit-locked\n"}
+            for rel, text in files.items():
+                (home / rel).parent.mkdir(parents=True, exist_ok=True)
+                (home / rel).write_text(text)
+            (home / ".secrets/locked.env").chmod(0)
+            (home / ".secrets/dir").mkdir()
+            header = ("CMUX_ROOT='~/cmux'\nXCODE_PIN=''\nWORKLOAD_PATH=/usr/bin\nWORKLOAD_TOOLS=''\nPYTHONS=''\n"
+                      "CANDIDATE_PIN=''\nENROLL_FLAGS=''\nPIN_FORMULAS=''\n")
+            script = mf.PROBE.read_text() + "\n" + header + mf.PREFLIGHT_PROBE.read_text()
+            out = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True,
+                                 env={"HOME": tmp, "PATH": "/usr/bin:/bin"}, timeout=60).stdout
+            found = [p for p in mf.parse_probe(out)["preflight"]["secrets"] if p.startswith(tmp)]
+            # A token-less gh config is not a secret.
+            (home / ".config/gh/hosts.yml").write_text("github.com:\n    user: someone\n")
+            again = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True,
+                                   env={"HOME": tmp, "PATH": "/usr/bin:/bin"}, timeout=60).stdout
+            (home / ".secrets/locked.env").chmod(0o600)
+        want = [f"{tmp}/.config/glaeda/fleet.key", f"{tmp}/.secrets/r2.env",
+                f"{tmp}/Library/Application Support/cmux-build-fleet/secrets/runner.token",
+                f"{tmp}/.config/gh/hosts.yml", f"{tmp}/.ssh/id_ed25519"]
+        if os.geteuid() == 0:  # root reads a mode-0 file
+            want.insert(2, f"{tmp}/.secrets/locked.env")
+        self.assertEqual(found, want)
+        self.assertNotIn(f"{tmp}/.config/gh/hosts.yml", [p for p in mf.parse_probe(again)["preflight"]["secrets"]])
+        self.assertNotIn("sekrit", out + again)
+
+
 def morning_text() -> str:
     """cmux-austin-mini-1 on 2026-09-24 (see PreflightTests), as a preflight probe."""
     text = preflight_text(user="cmux", brew_owner="admin", zig="0.15.2", zig_path="/usr/local/bin/zig",
@@ -1278,6 +1344,36 @@ class SudoPlanTests(unittest.TestCase):
             mf.brew_commands("admin", ["zig", "openssl"], True)
         self.assertIn("brew_as pin zig", mf.brew_commands("admin", ["zig", "gh"], True))
 
+    def test_ask_once_plan_runs_as_root_throughout(self) -> None:
+        text = morning_text().replace("Xcode.app|accepted|done", "Xcode.app|needed|needed").replace(
+            "pf_pmset\t sleep                0", "pf_pmset\t sleep                1")
+        obs = observed(**{"build-mini-1": text})["hosts"]["build-mini-1"]
+        result = mf.preflight_host(self.manifest, "build-mini-1", obs, "0.16.0")
+        script = mf.sudo_plan_script(self.manifest, "build-mini-1", result, sudoers=True, as_root=True)
+        body = [line.strip() for line in script.splitlines() if not line.lstrip().startswith("#")]
+        self.assertNotIn("sudo -v", script)
+        self.assertNotIn("keepalive", script)
+        # The only sudo left drops to the Homebrew owner.
+        self.assertEqual([line for line in body if re.search(r"(^|[\s;|&(])sudo (?!-H -u admin )", line)], [])
+        for step in ("xcode-select -s /Applications/Xcode.app", "env DEVELOPER_DIR=", "pmset -c sleep 0",
+                     "sudo -H -u admin env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew",
+                     'sudo -H -u admin ln -s "/opt/homebrew/opt/rustup/bin/$t"',
+                     'chown -h admin "$cache"/*', 'visudo -cf "$rule"', "install -m 0440 -o root"):
+            self.assertIn(step, script)
+        # Bottles fix staged are in the login user's home, not root's.
+        self.assertIn("login_home=~builder", body)
+        self.assertIn("exec </dev/null", body)
+        self.assertIn('staged="${login_home:-$HOME}/', script)
+        self.assertIn('[ "$(id -u)" = 0 ]', script)
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        self.assertNotIn("\u2014", script)
+        # The default plan is unchanged: sudo -v, the keepalive, and sudo before each root step.
+        default = mf.sudo_plan_script(self.manifest, "build-mini-1", result)
+        for step in ("sudo -v\n", "keepalive=$!", "sudo xcode-select -s", "sudo pmset -c sleep 0",
+                     'sudo chown -h admin "$cache"/*'):
+            self.assertIn(step, default)
+        self.assertNotIn("login_home=", default)
+
     def test_run_needs_a_terminal_and_plans_are_saved(self) -> None:
         obs = observed(**{"build-mini-1": morning_text()})
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(mf, "observe", return_value=obs), \
@@ -1291,6 +1387,89 @@ class SudoPlanTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
             self.assertIn("sudo-plan build-mini-1 --run", out.getvalue())
+
+
+FAKE_SSH = """#!/usr/bin/env python3
+import json, os, sys
+argv = sys.argv[1:]
+stdin = "" if "-t" in argv else sys.stdin.read()
+with open(os.environ["FAKE_SSH_LOG"], "a") as log:
+    log.write(json.dumps({"argv": argv, "stdin": stdin}) + "\\n")
+host = argv[argv.index("-l") + 2]
+if argv[-1] == "sudo -k -S -p '' true":
+    sys.exit(0 if stdin == os.environ["FAKE_PASSWORD"] + "\\n" and host != os.environ.get("FAKE_REJECT") else 1)
+sys.exit(0)
+"""
+
+
+class SudoPlanAskOnceTests(unittest.TestCase):
+    PASSWORD = "correct horse battery 42"
+
+    def run_plan(self, *flags: str, reject: str = "") -> tuple[int, list[dict], str, Path, mock.Mock]:
+        hosts = {"build-mini-1": morning_text(),
+                 "build-mini-2": morning_text().replace("hostname\tbuild-mini-1", "hostname\tbuild-mini-2")}
+        obs = observed(**hosts)
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, logs, calls = Path(tmp) / "bin", Path(tmp) / "logs", Path(tmp) / "ssh-calls.jsonl"
+            bindir.mkdir()
+            ssh = bindir / "ssh"
+            ssh.write_text(FAKE_SSH)
+            ssh.chmod(0o755)
+            env = {"PATH": f"{bindir}:{os.environ['PATH']}", "FAKE_SSH_LOG": os.fspath(calls),
+                   "FAKE_PASSWORD": self.PASSWORD, "FAKE_REJECT": reject}
+            with mock.patch.dict(os.environ, env), mock.patch.object(mf, "SSH", os.fspath(ssh)), \
+                    mock.patch.object(mf, "observe", return_value=obs), \
+                    mock.patch.object(mf, "gate_hosts", return_value={}), \
+                    mock.patch.object(mf, "operator_zig_minimum", return_value="0.16.0"), \
+                    mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                    mock.patch.object(mf.getpass, "getpass", return_value=self.PASSWORD) as asked, \
+                    contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                code = mf.main(["sudo-plan", "build-mini-1", "build-mini-2", "--run", *flags,
+                                "--manifest", os.fspath(EXAMPLE), "--log-dir", os.fspath(logs)])
+            recorded = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+            written = "".join(p.read_text() for p in logs.rglob("*") if p.is_file())
+        return code, recorded, out.getvalue() + err.getvalue() + written, logs, asked
+
+    def test_one_password_on_stdin_never_in_argv_or_logs(self) -> None:
+        code, calls, text, _, asked = self.run_plan("--ask-once")
+        self.assertEqual(code, 0, text)
+        self.assertEqual(asked.call_count, 1)
+        hosts = [c["argv"][c["argv"].index("-l") + 2] for c in calls]
+        # Every host's password is checked before any plan runs; then each plan runs once, per host.
+        self.assertEqual(hosts, ["build-mini-1", "build-mini-2", "build-mini-1", "build-mini-2"])
+        self.assertEqual([c["argv"][-1] for c in calls[:2]], ["sudo -k -S -p '' true"] * 2)
+        for call in calls[2:]:
+            self.assertTrue(call["argv"][-1].startswith("sudo -k -S -p '' /bin/bash -c "), call["argv"][-1])
+            self.assertIn("xcode-select -s /Applications/Xcode.app", call["argv"][-1])
+            self.assertNotIn("sudo -v", call["argv"][-1])
+        for call in calls:
+            self.assertNotIn("-t", call["argv"])
+            self.assertEqual(call["stdin"], self.PASSWORD + "\n")
+            self.assertFalse(any(self.PASSWORD in a for a in call["argv"]))
+        self.assertNotIn(self.PASSWORD, text)
+
+    def test_a_refused_password_stops_before_any_plan(self) -> None:
+        code, calls, text, _, _ = self.run_plan("--ask-once", reject="build-mini-2")
+        self.assertEqual(code, 2)
+        self.assertEqual([c["argv"][-1] for c in calls], ["sudo -k -S -p '' true"] * 2)
+        self.assertIn("build-mini-2: sudo refused the password", text)
+        self.assertIn("no plan ran", text)
+        self.assertNotIn(self.PASSWORD, text)
+
+    def test_default_run_still_types_each_password_over_ssh_t(self) -> None:
+        code, calls, text, _, asked = self.run_plan()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(asked.call_count, 0)
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertEqual(call["argv"][0], "-t")
+            self.assertTrue(call["argv"][-1].startswith("/bin/bash -c "))
+            self.assertIn("sudo -v", call["argv"][-1])
+
+    def test_ask_once_needs_run(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(mf.main(["sudo-plan", "build-mini-1", "--ask-once", "--manifest", os.fspath(EXAMPLE)]), 2)
+        self.assertIn("--ask-once goes with sudo-plan --run", err.getvalue())
 
 
 class FixLibraryTests(unittest.TestCase):
