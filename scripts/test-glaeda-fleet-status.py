@@ -522,7 +522,7 @@ class DiskTests(unittest.TestCase):
         self.assertIn("UNDER PRESSURE", fs.render_text(doc))
 
     def test_a_retired_owner_holding_more_than_5_gib_needs_a_person(self):
-        families = [{"family": "hq-build-fleet-cache", "bytes": 21 * GIB, "owner": "cmux build worker (hq)",
+        families = [{"family": "hq-build-fleet-cache", "bytes": 21 * GIB, "owner": "cmux dev-build worker (hq controller)",
                      "retired": True},
                     {"family": "old-small", "bytes": 4 * GIB, "owner": "gone", "retired": True},
                     {"family": "user-cache", "bytes": 170 * GIB, "owner": "", "retired": False}]
