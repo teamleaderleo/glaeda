@@ -984,6 +984,38 @@ class HookTest(unittest.TestCase):
             for runner in ("g0", "u0"):
                 self.finish(runner)
 
+    def test_capacity_a_root_runner_listens_only_while_the_mini_fits_any_root_job(self) -> None:
+        self.fleet()
+        capacity = self.dir / "capacity"
+        root = hook.RunnerScope(units=4, compile_slots=2, roots=2, root=True)
+        side = hook.RunnerScope(units=4, compile_slots=2, roots=2, root=False)
+        slots = ("--compile-slots", "2", "--canonical-roots", "2")
+        try:
+            first = self.job("macos-compile-admission", "c0", 4, None, *slots, "--instance", "0")
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertIsNone(hook.mini_full(capacity, 4, root), "2 units, the gui token, pdd-1 and root-2 are free")
+            shard = self.job("app-host-unit-tests", "g1", 4, None, *slots, "--instance", "1", "--gui-wait", "0")
+            self.assertEqual(shard.returncode, 0, shard.stdout + shard.stderr)
+            # 1 unit left: the next compile would be refused, so root runners stop; a light side job still fits
+            self.assertEqual(hook.mini_full(capacity, 4, root),
+                             "only 1 of 4 capacity units on this mini are free; a compile needs 2")
+            self.assertIsNone(hook.mini_full(capacity, 4, side))
+            self.assertIn("1 of 4 units free", self.job("macos-compile-admission", "c2", 4, None, *slots).stdout)
+            self.finish("c0")
+            # 3 units free, but the shard holds the one gui token: the next shard would be refused
+            self.assertEqual(hook.mini_full(capacity, 4, root), "the gui token is taken (an app-host shard needs it)")
+            self.assertIsNone(hook.mini_full(capacity, 4, side))
+            self.finish("g1")
+            self.assertIsNone(hook.mini_full(capacity, 4, root))
+            for n in range(2):  # both compile slots: every root and persistent-dd token is taken
+                both = self.job("macos-compile-admission", f"c{n}", 8, None, *slots, "--instance", str(n))
+                self.assertEqual(both.returncode, 0, both.stdout + both.stderr)
+            self.assertEqual(hook.mini_full(capacity, 8, root), "all 2 persistent-dd tokens on this mini are taken")
+            self.assertIsNone(hook.mini_full(capacity, 8, side))
+        finally:
+            for runner in ("c0", "c1", "c2", "g1"):
+                self.finish(runner)
+
     def test_capacity_a_full_mini_is_seen_by_the_listener_gate(self) -> None:
         self.fleet()
         capacity = self.dir / "capacity"
@@ -1732,6 +1764,53 @@ class GateTest(unittest.TestCase):
                 gate.step()
             start.assert_called_once()
 
+    def test_runner_scope_reads_the_hook_and_the_runner_directory(self) -> None:
+        self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(), "no hook script: no units, no root")
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(exist_ok=True)
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --compile-slots 2 "
+                          "--canonical-roots 2 --instance 1\n")
+        self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(5, 2, 2, True))
+        script.write_text("exec python3 /hook job-started --capacity-units 4 --canonical-roots 2 --instance 3\n")
+        self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(4, 1, 2, False))
+        # one root: the hook passes no --instance, so the directory suffix names it (actions-runner-glaeda-K)
+        script.write_text("exec python3 /hook job-started --capacity-units 4\n")
+        self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(4, 1, 1, True))
+        side = self.tmp / "actions-runner-glaeda-2"
+        (side / "glaeda-hooks").mkdir(parents=True)
+        (side / hook.RUNNER_HOOK_SCRIPT).write_text(script.read_text())
+        self.assertEqual(hook.runner_scope(side), hook.RunnerScope(4, 1, 1, False))
+        self.assertEqual(hook.runner_units(side), 4)
+
+    def test_a_root_runner_holds_while_a_token_its_jobs_need_is_taken(self) -> None:
+        root = hook.RunnerScope(4, 2, 2, True)
+        side = hook.RunnerScope(4, 2, 2, False)
+        capacity = self.units(0)
+        self.assertIsNone(hook.mini_full(capacity, 4, root))
+        cases = (("gui.token",), ("persistent-dd.token", "persistent-dd-1.token"), ("root-1.token", "root-2.token"))
+        whys = ("the gui token is taken (an app-host shard needs it)",
+                "all 2 persistent-dd tokens on this mini are taken", "all 2 canonical roots on this mini are taken")
+        for names, why in zip(cases, whys):
+            fds = [hook.lock_file(capacity / name, fcntl.LOCK_EX) for name in names]
+            self.assertEqual(hook.mini_full(capacity, 4, root), why)
+            self.assertIsNone(hook.mini_full(capacity, 4, side), "side runners take no root job")
+            fcntl.flock(fds[-1], fcntl.LOCK_UN)
+            if len(fds) > 1:
+                self.assertIsNone(hook.mini_full(capacity, 4, root), "one free copy is enough")
+            for fd in fds:
+                os.close(fd)
+        self.assertEqual(hook.mini_full(self.units(3), 4, root),
+                         "only 1 of 4 capacity units on this mini are free; a compile needs 2")
+        self.assertIsNone(hook.mini_full(self.units(3), 4, side))
+        self.assertEqual(hook.mini_full(self.units(1), 2, root),
+                         "only 1 of 2 capacity units on this mini are free; a compile needs 2")
+        self.assertEqual(hook.mini_full(self.units(1), 1, root), "all 1 capacity units on this mini are taken")
+        self.assertIsNone(hook.mini_full(self.units(0), 1, root), "a 1-unit mini needs just its unit")
+        # the gate reads the scope from the runner's own hook script
+        self.runner_hook(4)
+        gate = self.full_gate(self.units(3))
+        self.assertEqual(gate.claimed(), "only 1 of 4 capacity units on this mini are free; a compile needs 2")
+
     def test_the_full_probe_never_competes_with_an_admission(self) -> None:
         capacity = self.units(1)
         admission = os.open(capacity / "admission.lock", os.O_RDONLY)
@@ -1990,6 +2069,24 @@ class GateTest(unittest.TestCase):
         self.assertEqual(check.call_args[0][0][1:], [os.fspath(HOOK), "listen", "--no-waiters", "--adopt=4321",
                                                      "--parse-only"])
 
+    def test_an_ios_sim_side_runner_listens_only_with_room_for_a_2_unit_job(self) -> None:
+        self.assertNotIn("--fit-units", self.listen_sh(sys.executable).read_text())
+        script = self.listen_sh(sys.executable, ["glaeda-mini", "glaeda-side-std-xcode-26.6", "glaeda-ios-sim"])
+        self.assertIn(f"listen --runner-dir {self.runner} --fit-units 2 &", script.read_text())
+        argv = ["listen", "--runner-dir", os.fspath(self.runner), "--fit-units", "2", "--parse-only"]
+        self.assertEqual(subprocess.run([sys.executable, os.fspath(HOOK), *argv], capture_output=True).returncode, 0)
+        side = hook.RunnerScope(4, 2, 2, False)
+        self.assertEqual(hook.mini_full(self.units(3), 4, side, 2),
+                         "only 1 of 4 capacity units on this mini are free; its next job needs 2")
+        self.assertIsNone(hook.mini_full(self.units(3), 4, side), "a light-only side runner still fits a light job")
+        self.assertIsNone(hook.mini_full(self.units(2), 4, side, 2))
+        self.runner_hook(4)
+        (self.runner / hook.RUNNER_HOOK_SCRIPT).write_text(
+            "exec python3 /hook job-started --capacity-units 4 --canonical-roots 2 --instance 3\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                         capacity_dir=self.units(3), fit_units=2)
+        self.assertEqual(gate.claimed(), "only 1 of 4 capacity units on this mini are free; its next job needs 2")
+
     def test_parse_only_accepts_the_gate_argv_and_an_old_hook_would_not(self) -> None:
         argv = ["listen", "--runner-dir", os.fspath(self.runner), "--no-waiters", "--adopt=1", "--parse-only"]
         self.assertEqual(subprocess.run([sys.executable, os.fspath(HOOK), *argv], capture_output=True).returncode, 0)
@@ -2058,9 +2155,9 @@ class GateTest(unittest.TestCase):
             gate.step(); gate.step()
             stop.assert_called_once_with("a fleet build holds the host lock")
 
-    def listen_sh(self, python: str) -> Path:
+    def listen_sh(self, python: str, labels: list[str] | None = None) -> Path:
         ctx = mock.Mock(python=python, hook_dir=HOOK.parent, runner_dir=self.runner, org=None, repo="manaflow-ai/cmux",
-                        min_free_gib=0, member=None, capacity_units=4)
+                        min_free_gib=0, member=None, capacity_units=4, labels=labels or ["glaeda-mini"])
         script = self.tmp / "listen.sh"
         script.write_bytes(cr.hook_wrappers(ctx)["listen.sh"])
         script.chmod(0o755)
@@ -2720,7 +2817,9 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--state-dir", shim)
         self.assertTrue(os.access(hooks / "glaeda-canonical-root", os.X_OK))
         self.assertNotIn("--compile-slots", (hooks / "job-started.sh").read_text())  # 1 is the hook's default
-        self.assertNotIn("--instance", (hooks / "job-started.sh").read_text())  # one root: nothing to prefer
+        # one root: no --canonical-roots, but --instance still tells the gate a root runner from a side one
+        self.assertNotIn("--canonical-roots", (hooks / "job-started.sh").read_text())
+        self.assertIn("--capacity-units 4 --instance 0\n", (hooks / "job-started.sh").read_text())
         manifest["defaults"]["runner"] = {"classes": {"std": {"compileSlots": 2, "canonicalRoots": 2}}}
         path.write_text(json.dumps(manifest))
         with mock.patch.object(cr, "xcode_present", return_value=True):

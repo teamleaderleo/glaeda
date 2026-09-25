@@ -93,6 +93,7 @@ WORKLOAD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 PUBLIC_API = "https://api.github.com/"
 TOKEN_RE = r"[A-Za-z0-9_.\-]+"
 LISTENING = "Listening for Jobs"
+IOS_SIM_JOB_LABEL = "glaeda-ios-sim"  # glaeda_fleet_labels.IOS_SIM_LABEL
 GATE_HELD = "glaeda-cmux-runner-gate: holding the listener off"  # the gate's line while the fleet has the host
 
 
@@ -421,7 +422,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         roots = int((ctx.member or {}).get("canonicalRoots") or 1)
         if roots > 1:
             # instance i prefers root i+1, so a root runner keeps compiling in the tree its warm labels name
-            scope += f" --canonical-roots {roots} --instance {ctx.instance}"
+            scope += f" --canonical-roots {roots}"
+        # always, so the listener gate tells a root runner from a side runner (instance below the roots)
+        scope += f" --instance {ctx.instance}"
     started = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"
@@ -436,6 +439,10 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     )
     gate = (f"{python} {hook} listen --runner-dir {shlex.quote(os.fspath(ctx.runner_dir))}"
             + ("" if ctx.capacity_units else " --no-waiters"))
+    if ctx.capacity_units and IOS_SIM_JOB_LABEL in ctx.labels:
+        # the iOS picker sends 2-unit jobs (isolated builds, the simulator) to this label: listening with one
+        # free unit only takes one to refuse it (cmuxterm-hq#661 Workstream 7)
+        gate += " --fit-units 2"
     listen = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner listener gate (generated, receipt-owned): the runner LaunchAgent's program. The\n"

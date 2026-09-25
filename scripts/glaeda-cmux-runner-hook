@@ -53,7 +53,8 @@ runs under the runner LaunchAgent's listen.sh: it runs DIR/run.sh, and while the
 host lock, a reservation, or a fleet build waiting for the lock), every capacity unit on the mini is
 taken, or the mini is saturated (its 1-minute load at least GATE_LOAD_PAUSE per core), it stops the idle
 runner's listener so GitHub routes the job to another runner instead of here to be refused or slowed
-down (Gate). Full means every unit this runner's own --capacity-units scans, read from its job-started hook.
+down (Gate). Full means every unit this runner's own --capacity-units scans, read from its job-started hook;
+for a root runner it also means the mini cannot admit a compile or an app-host shard (mini_full).
 """
 
 from __future__ import annotations
@@ -74,7 +75,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 DISK_TIMEOUT_S = 120
 # The runner's own environment (its LaunchAgent), never a job's env:, which does not reach hooks.
@@ -307,7 +308,6 @@ def export_root(name: str) -> str:
 ADMISSION_WAIT_S = 30.0  # admissions are serialized briefly so two jobs never split the free units
 # The listener gate reads its runner's --capacity-units from the job-started hook glaeda-cmux-runner wrote.
 RUNNER_HOOK_SCRIPT = "glaeda-hooks/job-started.sh"
-CAPACITY_UNITS_RE = re.compile(r"\s--capacity-units\s+([0-9]+)(?:\s|$)")
 LSOF = shutil.which("lsof") or "/usr/sbin/lsof"
 # Events whose code is the repository's own, or a same-repo pull request checked below. Comment,
 # check and review-comment events can run with secrets on behalf of a fork PR, so they are left out.
@@ -758,6 +758,8 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
     try:
         while True:
             fd = lock_file(capacity_dir / f"{name}.token", fcntl.LOCK_EX)
+            if fd is None and time.monotonic() >= deadline:
+                fd = retake(capacity_dir / f"{name}.token")  # a listener gate's probe holds it for microseconds
             if fd is not None:
                 break
             if time.monotonic() >= deadline:
@@ -786,6 +788,17 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
             record.write(name + "\n")
     print(path)
     return 0
+
+
+PROBE_RETRY_S = 0.05
+
+
+def retake(path: Path) -> int | None:
+    """One more try at a token after a short pause. The listener gate's probe (mini_full) takes root and gui
+    tokens for microseconds without admission.lock, which take-root and take-gui do not hold either, so a
+    last try that meets a probe must not be the one that fails the job."""
+    time.sleep(PROBE_RETRY_S)
+    return lock_file(path, fcntl.LOCK_EX)
 
 
 def holder_alive(pid_file: Path) -> bool:
@@ -833,6 +846,8 @@ def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path) -> int:
     deadline = time.monotonic() + max(0.0, wait_s)
     while True:
         fd = lock_file(capacity_dir / "gui.token", fcntl.LOCK_EX)
+        if fd is None and time.monotonic() >= deadline:
+            fd = retake(capacity_dir / "gui.token")  # a listener gate's probe holds it for microseconds
         if fd is not None:
             break
         held: list[str] = []
@@ -1186,14 +1201,43 @@ UNKNOWN = Unknown("unknown")
 def runner_units(runner_dir: Path) -> int:
     """The --capacity-units this runner's job-started hook passes (take_capacity's total), or 0 for a
     single-runner mini or an unreadable hook. Read on every probe, so a re-apply that changes it counts at once."""
+    return runner_scope(runner_dir).units
+
+
+class RunnerScope(NamedTuple):
+    """What this runner's job-started hook admits with: its --capacity-units, --compile-slots and
+    --canonical-roots, and whether it is a root runner (instance below canonical roots, glaeda-cmux-runner)."""
+    units: int = 0
+    compile_slots: int = 1
+    roots: int = 1
+    root: bool = False
+
+
+def runner_scope(runner_dir: Path) -> RunnerScope:
+    """RunnerScope from the hook script glaeda-cmux-runner wrote. The hook passes --instance; the directory's
+    -K suffix (actions-runner-glaeda-K) is the fallback for hooks written before it always did."""
     try:
-        match = CAPACITY_UNITS_RE.search((runner_dir / RUNNER_HOOK_SCRIPT).read_text())
+        text = (runner_dir / RUNNER_HOOK_SCRIPT).read_text()
     except (OSError, UnicodeDecodeError):
-        return 0
-    return int(match.group(1)) if match else 0
+        return RunnerScope()
+
+    def flag(name: str, default: int) -> int:
+        match = re.search(rf"\s--{name}\s+([0-9]+)(?:\s|$)", text)
+        return int(match.group(1)) if match else default
+
+    suffix = re.search(r"-([0-9]+)$", runner_dir.name)
+    instance = flag("instance", int(suffix.group(1)) if suffix else 0)
+    roots = max(1, flag("canonical-roots", 1))
+    return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots, instance < roots)
 
 
-def mini_full(capacity_dir: Path | None, total: int) -> str | None:
+# A root runner's jobs (compile admission, app-host shards, cli-product, lag) cost up to this many units, and
+# the costliest takes a persistent-dd and a root token, and a shard the gui token (CLASS_COST).
+ROOT_FIT_UNITS = max(CLASS_COST[k][0] for k in ("compile", "gui", "product", "compile-gui"))
+
+
+def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None = None,
+              fit_units: int = 1) -> str | None:
     """Why none of this runner's `total` capacity units is free, or None, or UNKNOWN when it could not look.
     A job handed to a full mini is refused at once, and cmux's rescue re-runs it on Blacksmith along with the
     siblings fail-fast cancelled (cmux main full suite 36114055694: three shards refused with 0 of 4 units
@@ -1201,7 +1245,16 @@ def mini_full(capacity_dir: Path | None, total: int) -> str | None:
     listening leaves the job queued for the next free runner instead. `total` is what this runner's own
     admissions try (take_capacity scans unit-0 up to it), so full here means this runner's next job would be
     refused. The probe holds admission.lock without waiting for it, so no admission can find a unit taken by
-    the probe; while an admission holds it the answer is UNKNOWN."""
+    the probe; while an admission holds it the answer is UNKNOWN. take-root and take-gui take their tokens
+    without admission.lock, so a try that meets the probe's microsecond hold retries once (retake).
+
+    With the scope of a root runner (scope.root), full also means this mini cannot admit every job the root
+    label brings: fewer than ROOT_FIT_UNITS units free, or the gui token, every persistent-dd token or every
+    canonical root taken. GitHub hands a root label's job to any idle root runner, so a root runner listening
+    on a mini with one unit left took compiles it then refused (90 of about 400 refusals on 2026-09-25), and
+    one listening beside a running app-host shard took the next shard and refused it for the one gui token
+    (154). Each refusal costs a rescue round trip and, after two, a Blacksmith run. Held off, the job goes to
+    a mini that fits it, or waits in GitHub's queue for this one (hq#661 Workstream 7)."""
     if capacity_dir is None or total <= 0:
         return None
     try:
@@ -1213,17 +1266,49 @@ def mini_full(capacity_dir: Path | None, total: int) -> str | None:
             fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return UNKNOWN
+        root = scope is not None and scope.root
+        # fit_units: a side runner whose label brings 2-unit jobs (listen --fit-units, glaeda-ios-sim)
+        need = min(max(ROOT_FIT_UNITS if root else 1, fit_units), total)
+        free = 0
         for slot in range(total):
-            try:
-                fd = lock_file(capacity_dir / f"unit-{slot}", fcntl.LOCK_EX)
-            except OSError:
-                return None
-            if fd is not None:
-                os.close(fd)
-                return None
-        return f"all {total} capacity units on this mini are taken"
+            if not probe(capacity_dir / f"unit-{slot}"):
+                continue
+            free += 1
+            if free >= need:
+                break
+        if free == 0:
+            return f"all {total} capacity units on this mini are taken"
+        if free < need:
+            return (f"only {free} of {total} capacity units on this mini are free; "
+                    f"{'a compile' if root else 'its next job'} needs {need}")
+        if not root:
+            return None
+        assert scope is not None
+        if not probe(capacity_dir / "gui.token"):
+            return "the gui token is taken (an app-host shard needs it)"
+        dd = ["persistent-dd"] + [f"persistent-dd-{c}" for c in range(1, scope.compile_slots)]
+        if not any(probe(capacity_dir / f"{name}.token") for name in dd):
+            return ("the persistent-dd token is taken" if len(dd) == 1
+                    else f"all {len(dd)} persistent-dd tokens on this mini are taken")
+        if not any(probe(capacity_dir / f"root-{k}.token") for k in range(1, scope.roots + 1)):
+            return ("the canonical root is taken" if scope.roots == 1
+                    else f"all {scope.roots} canonical roots on this mini are taken")
+        return None
     finally:
         os.close(admission)
+
+
+def probe(path: Path) -> bool:
+    """Whether the flock at path is free right now: taken and given back at once. A file that cannot be
+    opened counts as free (the admission that needs it creates it, as lock_file does)."""
+    try:
+        fd = lock_file(path, fcntl.LOCK_EX)
+    except OSError:
+        return True
+    if fd is None:
+        return False
+    os.close(fd)
+    return True
 
 
 def thermal_pressure_level() -> int | None:
@@ -1347,10 +1432,11 @@ class Gate:
     stop. Anything unexpected hands the runner back to plain run.sh behaviour (unexpected())."""
 
     def __init__(self, runner_dir: Path, host_lock: str, reservation: str, state_dir: Path,
-                 waiters: bool = True, capacity_dir: Path | None = None) -> None:
+                 waiters: bool = True, capacity_dir: Path | None = None, fit_units: int = 1) -> None:
         self.runner_dir, self.host_lock, self.reservation, self.state_dir, self.waiters = \
             runner_dir, host_lock, reservation, state_dir, waiters
         self.capacity_dir = capacity_dir
+        self.fit_units = fit_units
         self.full_why: str | None = None  # the last known mini_full answer, kept across UNKNOWN looks
         self.child: subprocess.Popen[bytes] | None = None
         self.stop_deadline: float | None = None  # set while a stop the gate asked for is under way
@@ -1466,7 +1552,8 @@ class Gate:
         """Every unit this runner's jobs could take is held. A look an admission blocked keeps the previous
         answer, so a full mini's retrying admissions never read as free and restart a listener; the fresh
         look right before a stop (confirmed()) stops only on a reading of its own."""
-        why = mini_full(self.capacity_dir, runner_units(self.runner_dir))
+        scope = runner_scope(self.runner_dir)
+        why = mini_full(self.capacity_dir, scope.units, scope, self.fit_units)
         if isinstance(why, Unknown):
             return None if fresh else self.full_why
         self.full_why = why
@@ -1592,8 +1679,8 @@ class Gate:
 
 
 def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, waiters: bool,
-           adopt: int = 0, capacity_dir: Path | None = None) -> int:
-    gate = Gate(runner_dir, host_lock, reservation, state_dir, waiters, capacity_dir)
+           adopt: int = 0, capacity_dir: Path | None = None, fit_units: int = 1) -> int:
+    gate = Gate(runner_dir, host_lock, reservation, state_dir, waiters, capacity_dir, fit_units)
     if adopt:
         gate.child = Adopted(adopt)  # type: ignore[assignment]
     signal.signal(signal.SIGTERM, gate.terminate)
@@ -2044,6 +2131,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--wait", type=float, default=0, help="take-root, take-gui: seconds to wait for the token")
     p.add_argument("--switch", action="store_true",
                    help="take-root: let go of the root this job holds (its own holder) and take ROOT instead")
+    p.add_argument("--fit-units", type=int, default=1,
+                   help="listen: hold the listener unless this many units are free (2 for a glaeda-ios-sim side runner)")
     p.add_argument("--no-waiters", action="store_true",
                    help="listen: only an exclusive holder or a reservation stops the listener (one runner per mini)")
     p.add_argument("--adopt", type=int, default=0, help=argparse.SUPPRESS)
@@ -2095,7 +2184,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.runner_dir is None:
             p.error("listen needs --runner-dir")
         return listen(args.runner_dir, args.host_lock, args.reservation, args.state_dir, not args.no_waiters,
-                      args.adopt, args.capacity_dir)
+                      args.adopt, args.capacity_dir, args.fit_units)
     if args.phase == "take-root":
         if not args.root:
             p.error("take-root needs --root")
