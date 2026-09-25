@@ -206,7 +206,7 @@ class HookTest(unittest.TestCase):
 
     def run_hook(self, phase: str, event_name: str | None, event_path: Path | None,
                  *extra: str, repo: str | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
-        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir),
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
                    "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet")}
         if event_name is not None:
             environ["GITHUB_EVENT_NAME"] = event_name
@@ -524,7 +524,7 @@ class HookTest(unittest.TestCase):
                                                 "--capacity-dir", os.fspath(self.dir / "capacity"),
                                                 "--state-dir", os.fspath(self.dir / "state"),
                                                 "--canonical-roots", "2", *extra])
-        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "RUNNER_NAME": runner,
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0", "RUNNER_NAME": runner,
                    "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet")}
         proc = subprocess.Popen([os.fspath(worker), "-c", cmd], env=environ, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -621,7 +621,7 @@ class HookTest(unittest.TestCase):
         hooks.mkdir()
         shutil.copy(HOOK, hooks / "glaeda-cmux-runner-hook")
         (hooks / "glaeda-canonical-root").write_text("#!/bin/sh\n")
-        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_FLEET_DIR": os.fspath(fleet),
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0", "GLAEDA_FLEET_DIR": os.fspath(fleet),
                    "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(event(self.dir, "push", {"repository": CMUX})),
                    "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_JOB": "swift-package-tests", "RUNNER_NAME": "s0"}
         run = subprocess.run([sys.executable, os.fspath(hooks / "glaeda-cmux-runner-hook"), "job-started",
@@ -2389,6 +2389,104 @@ class NoEmDashTest(unittest.TestCase):
         for path in (ROOT / "scripts/glaeda-cmux-runner", HOOK, Path(__file__), ROOT / "docs/CMUX_MINI_RUNNER.md",
                      ROOT / "scripts/glaeda_fleet_labels.py", ROOT / "scripts/glaeda_reservation.py"):
             self.assertNotIn(chr(0x2014), path.read_text(encoding="utf-8"), path)
+
+
+class JobTelemetryTest(unittest.TestCase):
+    """The per-job host sampler: attribution, verdicts, the bounded log, and the fork/finish handshake."""
+
+    def setUp(self) -> None:
+        self.hook = load("glaeda_cmux_runner_hook_telemetry", HOOK)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_classify_splits_this_job_other_jobs_and_outside(self) -> None:
+        rows = [
+            (100, 1, 1.0, "cmux", "/Users/cmux/actions-runner-glaeda/bin/Runner.Worker"),
+            (101, 100, 700.0, "cmux", "/Applications/Xcode.app/usr/bin/swift-frontend"),
+            (200, 1, 0.5, "cmux", "/Users/cmux/actions-runner-glaeda-2/bin/Runner.Worker"),
+            (201, 200, 300.0, "cmux", "/usr/local/bin/node"),
+            (300, 1, 450.0, "cmux", "/opt/homebrew/bin/zig"),
+            (301, 1, 50.0, "root", "/usr/libexec/mds_stores"),
+            (400, 1, 90.0, "cmux", "/bin/ps"),
+        ]
+        job, others, outside, by_outside, by_runner = self.hook.classify(rows, 100, skip={400})
+        self.assertAlmostEqual(job, 7.01)
+        self.assertAlmostEqual(others, 3.005)
+        self.assertAlmostEqual(outside, 5.0)
+        self.assertEqual(by_runner, {"actions-runner-glaeda-2": 3.005})
+        self.assertEqual(set(by_outside), {"zig (cmux)", "mds_stores (root)"})
+        self.assertFalse(any("/" in key for key in by_outside), "no paths leave the host")
+
+    def test_summary_flags_outside_cpu_not_its_own_load(self) -> None:
+        samples = self.hook.JobSamples({"job": "macos-compile-admission"}, 14, 1000.0)
+        for _ in range(6):
+            samples.add(30.0, (8.0, 0.0, 5.0, {"zig (cmux)": 5.0}, {}), 10.0)
+        record = samples.summary(1060.0)
+        self.assertEqual(record["schema"], "glaeda-cmux-job/v1")
+        self.assertEqual(record["verdict"], "contended")
+        self.assertEqual(record["cores"], {"job": 8.0, "other_runner_jobs": 0.0, "outside": 5.0})
+        self.assertEqual(record["top_outside"], [{"process": "zig (cmux)", "core_seconds": 300}])
+        self.assertEqual(len(record["reasons"]), 1)
+        self.assertIn("zig (cmux)", record["reasons"][0])
+
+        busy = self.hook.JobSamples({}, 14, 0.0)
+        busy.add(40.0, (13.0, 0.0, 0.5, {}, {}), 10.0)
+        self.assertEqual(busy.summary(10.0)["verdict"], "clear", "a compile's own load is not contention")
+        self.assertEqual(busy.summary(10.0)["load"]["mean"], 40.0)
+
+        quiet = self.hook.JobSamples({}, 14, 0.0)
+        quiet.add(9.0, (12.0, 1.0, 0.5, {"WindowServer (_windowserver)": 0.5}, {}), 10.0)
+        self.assertEqual(quiet.summary(10.0)["verdict"], "clear")
+
+    def test_job_log_keeps_its_newest_half(self) -> None:
+        log = self.dir / "Logs" / "jobs.jsonl"
+        with mock.patch.object(self.hook, "JOB_LOG_MAX_BYTES", 4096):
+            for n in range(200):
+                self.hook.append_job_record({"n": n, "pad": "x" * 40}, log)
+        lines = log.read_text().splitlines()
+        self.assertLessEqual(log.stat().st_size, 4096 + 200)
+        self.assertEqual(json.loads(lines[-1])["n"], 199)
+        self.assertTrue(all(json.loads(line) for line in lines), "every kept line is whole JSON")
+
+    def test_sampler_writes_one_record_when_finished(self) -> None:
+        watched = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(lambda: (watched.kill(), watched.wait()))
+        state = self.dir / "state"
+        log = self.dir / "jobs.jsonl"
+        note = self.hook.start_sampler(watched.pid, state, {"job": "claude-wrapper", "class": "light"}, log,
+                                       interval=0.2)
+        self.assertEqual(note, "job telemetry sampling")
+        deadline = time.monotonic() + 10
+        while not self.hook.sampler_file(state).exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.6)
+        self.assertEqual(self.hook.finish_sampler(state), "job telemetry recorded")
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["job"], "claude-wrapper")
+        self.assertGreaterEqual(records[0]["samples"], 1)
+        self.assertIn(records[0]["verdict"], ("clear", "contended"))
+        self.assertFalse(self.hook.sampler_file(state).exists())
+
+    def test_sampler_records_when_the_job_dies_first(self) -> None:
+        watched = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1)"])
+        state = self.dir / "state"
+        log = self.dir / "jobs.jsonl"
+        self.hook.start_sampler(watched.pid, state, {"job": "x"}, log, interval=0.2)
+        watched.wait()
+        deadline = time.monotonic() + 10
+        while (not log.exists() or not log.read_text() or self.hook.sampler_file(state).exists()) \
+                and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+        self.assertEqual(self.hook.finish_sampler(state), "no job telemetry sampler")
+
+    def test_sampler_file_never_looks_like_a_lock_holder(self) -> None:
+        name = self.hook.sampler_file(self.dir).name
+        self.assertFalse(name.startswith(self.hook.HOLDER_FILE))
 
 
 if __name__ == "__main__":

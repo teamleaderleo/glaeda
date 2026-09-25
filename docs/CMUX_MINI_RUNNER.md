@@ -130,8 +130,19 @@ What `--apply` does:
      so two jobs never split the free units between them.
    - The toolchain check also requires `gh` on the job PATH: cmux's CI scripts call
      `gh api`, and a mini without it fails jobs midway instead of refusing them.
-   - job-completed releases the host lock (or the capacity share), runs the same disk
-     pressure pass and always exits 0.
+   - Every admitted job also gets a detached host sampler (`--no-telemetry`, or
+     `GLAEDA_RUNNER_TELEMETRY=0` in the LaunchAgent's environment, turns it off). Every
+     10 s it reads `ps` and the load average and splits the CPU between this job's
+     process tree, the other runner slots' jobs, and everything outside them. When the
+     job ends it appends one line to `~/Library/Logs/glaeda-cmux-jobs.jsonl`
+     (`glaeda-cmux-job/v1`): load mean and max, mean cores per bucket, the top five
+     outside processes by estimated core-seconds, the other runner jobs seen, and a
+     `contended` or `clear` verdict with its reasons. Processes are named by the kernel's
+     executable name (`ucomm`, never argv) and user only. The log keeps its newest half past 2 MiB.
+     `glaeda-fleet-status` reports it (source `jobs`). The sampler never refuses, delays
+     or fails a job.
+   - job-completed stops the sampler (it writes the job's line), releases the host lock
+     (or the capacity share), runs the same disk pressure pass and always exits 0.
 4. Writes and loads `~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist`
    (runs `glaeda-hooks/listen.sh`, restarts on crash, logs to
    `~/Library/Logs/glaeda-cmux-runner.log`). `listen.sh` runs `run.sh` under the listener

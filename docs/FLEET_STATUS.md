@@ -32,6 +32,7 @@ Every source except the manifest is optional. Without a flag the source shows as
 | cache | HTTP status of each endpoint | `--cache NAME=URL` |
 | lima | `limactl list --json` per member, never on `never_touch` hosts | on; `--no-lima` |
 | disk | one read-only SSH probe per member, never on `never_touch` hosts (below) | on; `--no-disk` |
+| jobs | the tail of each member's `~/Library/Logs/glaeda-cmux-jobs.jsonl` (below) | on; `--no-jobs` |
 
 Split collection from building to reuse or replay a view:
 
@@ -138,6 +139,29 @@ the page a `disk` column, for example:
 
 ```text
 cmux7s-mac-mini  free 158.6/460.4 GiB (low 69.1); caches 218.8 GiB [user-cache 173.8, hq-build-fleet-cache 21.5, tmp 20.2], RETIRED 21.5 GiB; prune deferred: a build is running 19m ago; gc ran 19m ago
+```
+
+## Runner jobs
+
+The runner hook samples the host while every admitted job runs and writes one
+`glaeda-cmux-job/v1` line per job to `~/Library/Logs/glaeda-cmux-jobs.jsonl`
+([CMUX_MINI_RUNNER.md](CMUX_MINI_RUNNER.md), section 2, step 3). The `jobs` probe tails that
+file and keeps the last 24 h: how many jobs ran, how many ran `contended`, and
+the reasons for the newest five contended ones. A job is contended when work
+outside the mini's runner jobs averaged at least 2 cores and at least 15% of
+them, or when pmset reported a thermal limit. The load average is recorded but
+is not a reason on its own: a compile alone pushes it past the core count. That is the question a slow CI job raises first: was it
+the change, or the host?
+
+| Code | When | Action |
+| --- | --- | --- |
+| `contended` (warn) | at least one job in 24 h ran contended | `tail -n 20 ~/Library/Logs/glaeda-cmux-jobs.jsonl` (safe) |
+| `probe_failed` (info) | the probe timed out | a refresh |
+
+The text output adds one `jobs (24 h):` line per member and the page a column:
+
+```text
+cmux13s-mac-mini  41 jobs, 1 contended; latest macos-compile-admission: outside processes averaged 5.1 cores (top: zig (cmux))
 ```
 
 ## Bounds and privacy
