@@ -1280,7 +1280,7 @@ def main(argv: list[str] | None = None) -> int:
             # the repository decide() admitted: the runner's variable, else the event payload's
             repo = os.environ.get("GITHUB_REPOSITORY") or _repo_name((event or {}).get("repository")
                                                                      if isinstance(event, dict) else None)
-            deadline = time.monotonic() + (args.guest_wait if is_guest(repo, args.home_repo, instance=args.instance) else 0)
+            deadline = time.monotonic() + (args.guest_wait if is_guest(repo, args.home_repo) else 0)
             while True:
                 held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
                                            os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),

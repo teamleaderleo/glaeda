@@ -1927,11 +1927,13 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--state-dir", shim)
         self.assertTrue(os.access(hooks / "glaeda-canonical-root", os.X_OK))
         self.assertNotIn("--compile-slots", (hooks / "job-started.sh").read_text())  # 1 is the hook's default
+        self.assertNotIn("--instance", (hooks / "job-started.sh").read_text())  # one root: nothing to prefer
         manifest["defaults"]["runner"] = {"classes": {"std": {"compileSlots": 2, "canonicalRoots": 2}}}
         path.write_text(json.dumps(manifest))
         with mock.patch.object(cr, "xcode_present", return_value=True):
             self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
-        self.assertIn("--capacity-units 4 --compile-slots 2 --canonical-roots 2", (hooks / "job-started.sh").read_text())
+        self.assertIn("--capacity-units 4 --compile-slots 2 --canonical-roots 2 --instance 0",
+                      (hooks / "job-started.sh").read_text())  # instance 0 prefers root 1
         self.assertNotIn("--trusted-ref", (hooks / "job-started.sh").read_text())
         manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {
             "trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"}
