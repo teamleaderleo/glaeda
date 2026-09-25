@@ -160,6 +160,14 @@ class MiniSetupTest(unittest.TestCase):
             # dedupe is never urgent; pressure must still free space while a build fills the disk
             self.assertEqual(doc.get("ProcessType"),
                              "Background" if label in ("disk-dedupe", "fleet-cas-prune", "seed-prefetch") else None)
+        gh = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.gh-watch.plist").read_bytes())
+        self.assertEqual(gh["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-gh"), "serve"])
+        self.assertTrue(gh["KeepAlive"])
+        self.assertIn("/opt/homebrew/bin", gh["EnvironmentVariables"]["PATH"])  # gh supplies the token
+        self.assertTrue(os.access(bin_dir / "glaeda-gh", os.X_OK))
+        skill = self.home / ".claude/skills/github-ci-wait/SKILL.md"
+        self.assertEqual(skill.read_bytes(), (ROOT / "skills/github-ci-wait/SKILL.md").read_bytes())
+        self.assertEqual(skill.stat().st_mode & 0o777, 0o644)
         dedupe = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.disk-dedupe.plist").read_bytes())
         self.assertEqual(dedupe["WatchPaths"], [os.fspath(self.home / "Library/Developer/Xcode/DerivedData")])
         self.assertTrue((self.home / "Library/Developer/Xcode/DerivedData").is_dir())
@@ -563,6 +571,11 @@ class MiniSetupTest(unittest.TestCase):
             ms.activate_systemd(ctx, fresh)
         self.assertEqual(commands, [["--user", "daemon-reload"],
                                     ["--user", "enable", "--now", "glaeda-disk-pressure.timer"]])
+        commands.clear()
+        # the long-running glaeda-gh service has no timer: it is enabled and started itself
+        with mock.patch.object(ms, "run", systemctl_run), mock.patch.object(ms, "systemctl", lambda: "systemctl"):
+            ms.activate_systemd(ctx, [agent("glaeda-gh.service", "create", True, False)])
+        self.assertEqual(commands, [["--user", "daemon-reload"], ["--user", "enable", "--now", "glaeda-gh.service"]])
 
     def test_linux_activation_failure_fails_the_run(self) -> None:
         self.linux()
@@ -601,6 +614,7 @@ class MiniSetupTest(unittest.TestCase):
             ms.apply_uninstall(ctx, actions)
         self.assertIn(["--user", "disable", "--now", "glaeda-worktree-reclaim.timer"], commands)
         self.assertIn(["--user", "stop", "glaeda-worktree-reclaim.service"], commands)
+        self.assertIn(["--user", "disable", "--now", "glaeda-gh.service"], commands)
         self.assertEqual(commands[-1], ["--user", "daemon-reload"])
 
     def test_ota_updater_installed_and_ring_written_once(self) -> None:
