@@ -166,9 +166,14 @@ and launchd starts it again.
 - `com.teamleaderleo.glaeda.fleet-cas-node` on every build host: the node daemon on the socket
   above, read-only (`--read-only-kv`) until then, and `xcode/bin/fleet-cas-settings.sh`.
 - `com.teamleaderleo.glaeda.fleet-cas-relay` on every build host other than the store host:
-  `/usr/bin/ssh -N -L 127.0.0.1:17450:<store>:7450` with the host's own key
-  (`~/.ssh/fleet-cas-relay`), which the store host authorizes for that one forward only
-  (`restrict,port-forwarding,permitopen=...`). The node's upstream is `127.0.0.1:17450`.
+  launchd listens on `127.0.0.1:17450` and starts `/usr/bin/ssh` to the store host for each
+  connection, with the host's own key (`~/.ssh/fleet-cas-relay`). The store host authorizes
+  that key as `restrict,command="/usr/bin/nc <store-ip> 7450"`: no forwarding of any kind,
+  no shell, only a pipe to the store port. The node's upstream is `127.0.0.1:17450`. (A
+  port-forward key was tried first and dropped: `permitopen` limits TCP forwards only, so
+  it still allowed Unix-socket forwards, for example to the writer's signing socket, and
+  remote forwards. Verified on cmux8s: with the pipe key, TCP and remote forwards are
+  refused and a Unix-socket forward to the writer socket returns nothing.)
 
 The relay exists because macOS Local Network privacy blocks launchd-started third-party
 binaries on these headless minis from other LAN hosts, as LaunchAgents and as LaunchDaemons
@@ -176,8 +181,10 @@ alike: the node on cmux8s got "No route to host" for the store on cmux7s while t
 binary run from ssh reached it, and Apple binaries (`/usr/bin/ssh`, `nc`) started by launchd
 got through. Tailnet addresses are not affected; once the tailnet grants the store port
 (cmuxterm-hq#589) the relay is optional. Relayed connections reach the store from the store
-host's own address, so they pass the `--writers` check: a relayed host could upload objects
-(disk use), not index entries, which still need the writer's signature.
+host's own address, so they pass the `--writers` check (glaeda#1208): a relayed host could
+upload objects (disk use), and only signatures keep it from publishing index entries, so the
+rollout refuses a relay without `--trusted-keys`. For the same reason the writer must be the
+store host.
 
 `--writer HOST --sign-key PATH --trusted-keys HEX` makes that host the writer (above) and
 its LAN address the store's only allowed writer; `--trusted-keys` alone makes every node and

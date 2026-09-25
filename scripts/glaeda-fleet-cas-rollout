@@ -39,6 +39,9 @@ fi
 # The rollout is stateless: whatever it is given replaces the deployed configuration.
 [ -n "$trusted" ] || echo "warning: no --trusted-keys: the store keeps, and nodes use, unsigned index entries" >&2
 [ -n "$writer" ] || echo "warning: no --writer: the store will accept no writes" >&2
+# The writer must be the store host: a writer elsewhere would need the relay, and relayed
+# connections reach the store from the store host's own address (glaeda#1208).
+[ -z "$writer" ] || [ "$writer" = "$store" ] || { echo "--writer must be the --store host" >&2; exit 2; }
 for h in "$store" ${writer:+"$writer"} ${nodes[@]+"${nodes[@]}"}; do
   target=$(ssh -G "$h" | awk '/^hostname /{print $2}')
   case "$h $target" in *lawrence*) echo "refusing $h ($target): cmux-lawrence is the fleet coordinator" >&2; exit 2 ;; esac
@@ -78,7 +81,12 @@ for n in ${nodes[@]+"${nodes[@]}"}; do
     run "$n" node --store "$ip:$PORT" ${trusted:+--trusted-keys "$trusted"} $apply
     continue
   fi
-  pub=$(run "$n" relay-key $apply | tee /dev/stderr | sed -n 's/^pubkey //p')
+  # Relayed connections pass the store's --writers check (glaeda#1208): only signatures
+  # keep a relayed host from publishing index entries.
+  [ -n "$trusted" ] || { echo "$n needs the relay, which needs --trusted-keys" >&2; exit 2; }
+  pubs=$(run "$n" relay-key $apply | tee /dev/stderr | sed -n 's/^pubkey //p')
+  [ "$(printf '%s\n' "$pubs" | grep -c .)" -le 1 ] || { echo "$n printed more than one relay key" >&2; exit 1; }
+  pub=$pubs
   if [ -n "$pub" ]; then
     run "$store" authorize-relay --pubkey "$pub" --target "$ip:$PORT" $apply
   else
