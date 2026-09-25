@@ -218,7 +218,11 @@ Catch-up is only fast when the store already holds the target commit; on a store
 is a cold build (756 s on Xcode 26.3 minis; a full caching-on rebuild took 606 s on 26.6), slower than an incremental caching-off rebuild. So the
 worker asks first: the writer records a marker per commit it has filled, and catch-up is
 chosen only when `xcode/bin/fleet-cas-marker.sh cmux <sha>` exits 0 (the signed marker for
-that commit and this host's Xcode build exists). The rows below are read
+that commit and this host's Xcode build exists). Before building, the worker then runs
+`xcode/bin/fleet-cas-warm.sh cmux <sha>` under a timeout: it copies the whole fill into the
+node, so the build's lookups are local hits. On exit 1 (a marker without a manifest) the build
+may run unwarmed; on 2 or a timeout, fall back to a slot build. Unwarmed, each lookup is two
+serial fleet-store round trips, and a full catch-up read took 1631 s on 09-25. The rows below are read
 top to bottom, first match wins, and the writer is exempt: CI's main build always runs catch-up
 with write-through, since filling the store is its job. A PR commit counts as held when its
 merge base with main has a marker (its own changes are few, and they miss either way).

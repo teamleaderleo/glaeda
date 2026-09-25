@@ -193,7 +193,7 @@ install_binaries() {
     (cd "$proto" && nice -n 15 cargo build --release --locked -q)
     mkdir -p "$BIN"
     local f src
-    for f in fleet-cas fleet-cas-run fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-writer-build.sh; do
+    for f in fleet-cas fleet-cas-run fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-writer-build.sh; do
       src=$proto/target/release/$f; [ "$f" = fleet-cas ] || src=$proto/scripts/$f
       if ! cmp -s "$src" "$BIN/$f"; then
         install -m 0755 "$src" "$BIN/$f.new" && mv "$BIN/$f.new" "$BIN/$f"
