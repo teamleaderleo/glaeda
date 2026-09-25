@@ -569,13 +569,16 @@ class HookTest(unittest.TestCase):
         beyond = self.take("3", "x0", "--canonical-roots", "2")
         self.assertEqual(beyond.returncode, 2, "a root this mini does not have")
         self.assertIn("2 canonical root(s)", beyond.stderr)
+        nameless = self.run_hook("take-root", None, None, "--root", "1", "--state-dir", os.fspath(self.dir / "state"))
+        self.assertIn("RUNNER_NAME is not set", nameless.stderr)
+        if os.environ.get("GITHUB_ACTIONS"):  # CI itself runs under a real Runner.Worker, so it is "inside a job"
+            return
         outside = self.run_hook("take-root", None, None, "--root", "1", "--capacity-dir",
                                 os.fspath(self.dir / "capacity"), "--state-dir", os.fspath(self.dir / "state"),
                                 env={"RUNNER_NAME": "x0"})
         self.assertEqual(outside.returncode, 2)
         self.assertIn("not inside a runner job", outside.stderr)
-        nameless = self.run_hook("take-root", None, None, "--root", "1", "--state-dir", os.fspath(self.dir / "state"))
-        self.assertIn("RUNNER_NAME is not set", nameless.stderr)
+
 
     def test_job_started_links_the_root_shim_into_the_fleet_bin(self) -> None:
         fleet = self.fleet()
