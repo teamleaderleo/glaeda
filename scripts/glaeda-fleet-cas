@@ -4,16 +4,13 @@
 #   glaeda-fleet-cas node --store HOST:PORT [--trusted-keys HEX] [--apply]
 #   glaeda-fleet-cas writer --store HOST:PORT --sign-key PATH --trusted-keys HEX [--apply]
 #   glaeda-fleet-cas store --listen IP:PORT [--writers IP,IP] [--trusted-keys HEX] [--apply]
-#   glaeda-fleet-cas relay-key [--apply]               print (create) this host's relay key
-#   glaeda-fleet-cas authorize-relay --pubkey KEY --target IP:PORT [--apply]   (on the store host)
-#   glaeda-fleet-cas relay --store IP:PORT [--apply]   pipe 127.0.0.1:17450 to the store over ssh
 #   glaeda-fleet-cas uninstall [--apply]               remove the services, keep the stores
 #
 # Run from a glaeda checkout on the mini (scripts/glaeda-fleet-cas-rollout does that from
 # an operator Mac). Planning changes nothing on this host; --apply is idempotent and restarts
 # a service only when its arguments or binary changed. Everything is owned by the current
 # user: binaries and stores under /Users/Shared/cmux-build-fleet/xcode, launchd services
-# com.teamleaderleo.glaeda.fleet-cas-{node,store,relay} (LaunchAgents, which need the user's
+# com.teamleaderleo.glaeda.fleet-cas-{node,store} (LaunchAgents, which need the user's
 # GUI session, or LaunchDaemons run as this user where root installed the plist). No sudo.
 #
 # node:   Xcode talks to /Users/Shared/cmux-build-fleet/xcode/fleet-cas.sock. The node is
@@ -46,10 +43,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 proto=$here/tools/fleet-cas-prototype
 
 role=${1:-}; shift || true
-apply= store= listen= writers= trusted= sign_key= bin_changed= pubkey= target=
-RELAY_PORT=17450
-RELAY_KEY=$HOME/.ssh/fleet-cas-relay
-RELAY_KNOWN=$HOME/.ssh/fleet-cas-relay.known_hosts
+apply= store= listen= writers= trusted= sign_key=
 while [ $# -gt 0 ]; do
   case $1 in
     --apply) apply=1 ;;
@@ -58,8 +52,6 @@ while [ $# -gt 0 ]; do
     --writers) writers=${2:?--writers IP,IP}; shift ;;
     --trusted-keys) trusted=${2:?--trusted-keys HEX,HEX}; shift ;;
     --sign-key) sign_key=${2:?--sign-key PATH}; shift ;;
-    --pubkey) pubkey=${2:?--pubkey KEY}; shift ;;
-    --target) target=${2:?--target IP:PORT}; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -98,14 +90,11 @@ health_failed() {  # role
 # no root: the installer rewrites the args file or binary and stops the process, and launchd
 # (KeepAlive) starts it again on the new ones.
 #
-# LAN access: macOS Local Network privacy blocks third-party binaries started by launchd
+# Addresses: macOS Local Network privacy blocks third-party binaries started by launchd
 # (agents and daemons alike) from other LAN hosts on these headless minis: the node on
-# cmux8s got "No route to host" for the store on cmux7s, as a LaunchAgent and as a
-# LaunchDaemon, while Apple binaries (/usr/bin/ssh, nc) started the same way got through.
-# So a node on another host reaches the store through the `relay` role: launchd listens on
-# 127.0.0.1:17450 and starts /usr/bin/ssh for each connection, and the store host runs a
-# forced `/usr/bin/nc <store>` for that key (no forwarding at all: port forwards would also
-# allow Unix-socket and remote forwards, which permitopen does not limit). A role runs as a
+# cmux8s got "No route to host" for the store on cmux7s's LAN address, while tailnet
+# addresses work. So the store listens on its tailnet address (the tailnet grants the port,
+# cmuxterm-hq#591) and every node, and the writer, connect to that. A role runs as a
 # LaunchAgent, or as a LaunchDaemon (run as this user) if root installed the plist below.
 #
 # ProcessType Interactive: builds wait on these daemons. Adaptive, with no XPC activity, ran
@@ -121,28 +110,17 @@ plist_for() {  # role, label, daemon (1 or empty)
   [ -z "${3:-}" ] || printf '%s\n' '    <key>UserName</key>' "    <string>$(xml "$(id -un)")</string>"
   printf '%s\n' '    <key>ProgramArguments</key>' '    <array>' \
     "        <string>$BIN/fleet-cas-run</string>" "        <string>$1</string>" '    </array>'
-  if [ "$1" = relay ]; then
-    # One ssh per connection; the connection is the job's stdin and stdout, so the relay
-    # has no StandardOutPath (it would take the place of the connection).
-    printf '%s\n' '    <key>Sockets</key>' '    <dict>' '        <key>Listeners</key>' '        <dict>' \
-      '            <key>SockNodeName</key>' '            <string>127.0.0.1</string>' \
-      '            <key>SockServiceName</key>' "            <string>$RELAY_PORT</string>" \
-      '        </dict>' '    </dict>' '    <key>inetdCompatibility</key>' '    <dict>' \
-      '        <key>Wait</key>' '        <false/>' '    </dict>'
-  else
-    printf '%s\n' '    <key>RunAtLoad</key>' '    <true/>' '    <key>KeepAlive</key>' '    <true/>'
-  fi
+  printf '%s\n' '    <key>RunAtLoad</key>' '    <true/>' '    <key>KeepAlive</key>' '    <true/>'
   printf '%s\n' '    <key>ThrottleInterval</key>' '    <integer>10</integer>' \
     '    <key>ProcessType</key>' '    <string>Interactive</string>'
-  [ "$1" = relay ] || printf '%s\n' '    <key>StandardOutPath</key>' "    <string>$log</string>"
+  printf '%s\n' '    <key>StandardOutPath</key>' "    <string>$log</string>"
   printf '%s\n' '    <key>StandardErrorPath</key>' "    <string>$log</string>" '</dict>' '</plist>'
 }
 
 # Stop the role's process so launchd starts it again with the current args and binary. The
 # pid must still be this role's fleet-cas (its first argument), not a reused pid.
-restart_role() {  # role
-  local pid first; pid=$(cat "$ROOT/run/$1.pid" 2>/dev/null) || return 0
-  first=$(head -1 "$ROOT/run/$1.args")
+restart_role() {  # role, first argument the running process was started with
+  local pid first=$2; pid=$(cat "$ROOT/run/$1.pid" 2>/dev/null) || return 0
   case $(ps -o command= -p "$pid" 2>/dev/null) in
     "$BIN/fleet-cas $first"*) ;;
     *) return 0 ;;
@@ -154,7 +132,6 @@ restart_role() {  # role
 
 # The binary the role's process started with (fleet-cas-run records it) differs from bin/.
 stale_binary() {  # role
-  [ "$1" != relay ] || return 1
   [ "$(cat "$ROOT/run/$1.bin" 2>/dev/null)" != "$(shasum -a 256 "$BIN/fleet-cas" | cut -c1-64)" ]
 }
 
@@ -162,12 +139,13 @@ write_service() {  # role, args...
   local r=$1; shift
   local label; label=$(label_for "$r")
   local agent=$AGENTS/$label.plist daemon=/Library/LaunchDaemons/$label.plist
-  local prog=$BIN/fleet-cas; [ "$r" = relay ] && prog=/usr/bin/ssh
-  say "run $label: $prog $*"
+  say "run $label: $BIN/fleet-cas $*"
   [ -n "$apply" ] || return 0
   mkdir -p "$AGENTS" "$LOGS" "$ROOT/run" "$ROOT/launchd"
-  local changed=
+  local changed= old_first
   stale_binary "$r" && changed=1
+  # The running process was started with the old arguments (a new store address, say).
+  old_first=$(head -1 "$ROOT/run/$r.args" 2>/dev/null || true)
   printf '%s\n' "$@" >"$ROOT/run/$r.args.tmp"
   if ! cmp -s "$ROOT/run/$r.args.tmp" "$ROOT/run/$r.args"; then
     mv "$ROOT/run/$r.args.tmp" "$ROOT/run/$r.args"; changed=1
@@ -182,7 +160,7 @@ write_service() {  # role, args...
       launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
       rm -f "$agent"
     fi
-    [ -z "$changed" ] || restart_role "$r"
+    [ -z "$changed" ] || restart_role "$r" "$old_first"
     echo "daemon $label"
     return 0
   fi
@@ -196,7 +174,7 @@ write_service() {  # role, args...
   plutil -lint -s "$agent.tmp"
   if cmp -s "$agent.tmp" "$agent" && launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
     rm -f "$agent.tmp"
-    [ -z "$changed" ] || restart_role "$r"
+    [ -z "$changed" ] || restart_role "$r" "$old_first"
     echo "agent $label"
     return 0
   fi
@@ -284,63 +262,8 @@ case $role in
       echo "ok store listening on $listen (writers: ${writers:-none}, signed entries only: $([ -n "$trusted" ] && echo yes || echo no))"
     fi
     ;;
-  relay-key)
-    if [ ! -f "$RELAY_KEY" ]; then
-      say "create $RELAY_KEY (ed25519, no passphrase: it may only forward to the store port)"
-      [ -n "$apply" ] || exit 0
-      mkdir -p -m 700 "$HOME/.ssh"
-      ssh-keygen -q -t ed25519 -N "" -C "fleet-cas-relay@$(hostname -s)" -f "$RELAY_KEY"
-    fi
-    echo "pubkey $(cut -d" " -f1,2 "$RELAY_KEY.pub")"
-    ;;
-  authorize-relay)
-    # On the store host: the key gets no forwarding and no shell; its only command pipes the
-    # session to the store port.
-    [[ $pubkey =~ ^ssh-ed25519\ [A-Za-z0-9+/]{68}$ ]] || { echo "--pubkey takes one bare ssh-ed25519 public key" >&2; exit 2; }
-    [[ $target =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}$ ]] || { echo "--target takes IP:PORT" >&2; exit 2; }
-    body=${pubkey#ssh-ed25519 }
-    ak=$HOME/.ssh/authorized_keys
-    line="restrict,command=\"/usr/bin/nc ${target%:*} ${target##*:}\" $pubkey fleet-cas-relay"
-    if grep -qxF "$line" "$ak" 2>/dev/null; then
-      echo "unchanged relay key ${body:0:16}..."
-    elif grep -qF " $body" "$ak" 2>/dev/null; then
-      echo "relay key ${body:0:16}... is in $ak with other options; not changing it" >&2; exit 1
-    else
-      say "authorize relay key ${body:0:16}... for a pipe to $target only"
-      if [ -n "$apply" ]; then
-        mkdir -p -m 700 "$HOME/.ssh"
-        # A file without a final newline would glue this key into the previous line.
-        [ ! -s "$ak" ] || [ -z "$(tail -c1 "$ak")" ] || echo >>"$ak"
-        echo "$line" >>"$ak"
-        chmod 600 "$ak"
-      fi
-    fi
-    ;;
-  relay)
-    [[ $store =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}$ ]] || { echo "relay needs --store IP:PORT" >&2; exit 2; }
-    [ -f "$RELAY_KEY" ] || [ -z "$apply" ] || { echo "no relay key; run relay-key first" >&2; exit 2; }
-    install_binaries
-    # One ssh per connection (inetd style); the store host's forced command is the pipe.
-    write_service relay -T -o BatchMode=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 \
-      -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$RELAY_KNOWN" \
-      -o IdentitiesOnly=yes -i "$RELAY_KEY" "$(id -un)@${store%:*}"
-    if [ -n "$apply" ]; then
-      # A connection starts ssh; the health check is a real gRPC round trip through it.
-      ok=
-      for _ in 1 2 3 4 5; do
-        # Any valid key (the Ed25519 base point): the probe marker never exists.
-        rc=0
-        "$BIN/fleet-cas" marker get "http://127.0.0.1:$RELAY_PORT" health-check --trusted-keys \
-          5866666666666666666666666666666666666666666666666666666666666666 >/dev/null 2>&1 || rc=$?
-        [ "$rc" -eq 1 ] && { ok=1; break; }  # 1 = reached the store, marker absent
-        sleep 1
-      done
-      [ -n "$ok" ] || health_failed relay
-      echo "ok relay 127.0.0.1:$RELAY_PORT -> $store"
-    fi
-    ;;
   uninstall)
-    for r in node store relay; do
+    for r in node store; do
       label=$(label_for "$r")
       say "stop and remove $label (stores kept)"
       [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true; rm -f "$AGENTS/$label.plist" "$ROOT/run/$r.args"; }

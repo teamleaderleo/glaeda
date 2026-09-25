@@ -1,5 +1,5 @@
 #!/bin/bash
-# launchd entry point for a fleet-cas service: exec fleet-cas (ssh for the relay) with the role's
+# launchd entry point for a fleet-cas service: exec fleet-cas with the role's
 # arguments from $ROOT/run/ROLE.args (one per line, written by glaeda-fleet-cas),
 # recording the PID so the installer can restart it without root.
 set -u
@@ -7,10 +7,6 @@ role=${1:?usage: fleet-cas-run ROLE}
 ROOT=${FLEET_CAS_ROOT:-/Users/Shared/cmux-build-fleet/xcode}
 args=()
 while IFS= read -r a; do args+=("$a"); done <"$ROOT/run/$role.args" || exit 1
-# The relay is Apple's ssh, one per connection (launchd passes the connection as stdin
-# and stdout): launchd-started third-party binaries cannot reach other LAN hosts on these
-# minis (Local Network privacy), Apple binaries can.
-[ "$role" = relay ] && exec /usr/bin/ssh "${args[@]}"
 # Record the pid and the binary it runs, so the installer can restart a stale one.
 echo $$ >"$ROOT/run/$role.pid"
 shasum -a 256 "$ROOT/bin/fleet-cas" | cut -c1-64 >"$ROOT/run/$role.bin"

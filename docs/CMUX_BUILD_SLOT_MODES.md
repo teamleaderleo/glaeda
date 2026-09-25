@@ -160,39 +160,31 @@ upgrade needs no root: the installer rewrites the arguments or binary and stops 
 and launchd starts it again.
 
 - `com.teamleaderleo.glaeda.fleet-cas-store` on the store host: the fleet store on the host's
-  LAN address, port 7450, store under `xcode/fleet-store`. Only `--writers` addresses may
+  tailnet address, port 7450, store under `xcode/fleet-store`. Only `--writers` addresses may
   write (checked per request against the TCP peer address); none by default, so a new store
-  is read-only until the trusted writer exists. Other LANs need a tailnet grant for the port.
+  is read-only until the trusted writer exists.
 - `com.teamleaderleo.glaeda.fleet-cas-node` on every build host: the node daemon on the socket
-  above, read-only (`--read-only-kv`) until then, and `xcode/bin/fleet-cas-settings.sh`.
-- `com.teamleaderleo.glaeda.fleet-cas-relay` on every build host other than the store host:
-  launchd listens on `127.0.0.1:17450` and starts `/usr/bin/ssh` to the store host for each
-  connection, with the host's own key (`~/.ssh/fleet-cas-relay`). The store host authorizes
-  that key as `restrict,command="/usr/bin/nc <store-ip> 7450"`: no forwarding of any kind,
-  no shell, only a pipe to the store port. The node's upstream is `127.0.0.1:17450`. (A
-  port-forward key was tried first and dropped: `permitopen` limits TCP forwards only, so
-  it still allowed Unix-socket forwards, for example to the writer's signing socket, and
-  remote forwards. Verified on cmux8s: with the pipe key, TCP and remote forwards are
-  refused and a Unix-socket forward to the writer socket returns nothing.)
+  above, read-only (`--read-only-kv`) unless it is the writer, and
+  `xcode/bin/fleet-cas-settings.sh`.
 
-The relay exists because macOS Local Network privacy blocks launchd-started third-party
-binaries on these headless minis from other LAN hosts, as LaunchAgents and as LaunchDaemons
-alike: the node on cmux8s got "No route to host" for the store on cmux7s while the same
-binary run from ssh reached it, and Apple binaries (`/usr/bin/ssh`, `nc`) started by launchd
-got through. Tailnet addresses are not affected; once the tailnet grants the store port
-(cmuxterm-hq#589) the relay is optional. Relayed connections reach the store from the store
-host's own address, so they pass the `--writers` check (glaeda#1208): a relayed host could
-upload objects (disk use), and only signatures keep it from publishing index entries, so the
-rollout refuses a relay without `--trusted-keys`. For the same reason the writer must be the
-store host.
+Addresses are tailnet addresses because macOS Local Network privacy blocks launchd-started
+third-party binaries on these headless minis from other hosts' LAN addresses, as
+LaunchAgents and as LaunchDaemons alike: the node on cmux8s got "No route to host" for the
+store on cmux7s's LAN address while the same binary run from ssh reached it. The same
+binary started by launchd reaches cmux7s's tailnet address (verified on cmux8s with
+`launchctl submit`), and the tailnet grants the store port to the build minis
+(cmuxterm-hq#591). Every client then connects from its own tailnet address, so the
+`--writers` check sees real peers. An ssh relay was built and dropped: a port-forward key
+also allowed Unix-socket and remote forwards (`permitopen` limits TCP forwards only), for
+example to the writer's signing socket, and the tailnet makes it unnecessary.
 
-`--writer HOST --sign-key PATH --trusted-keys HEX` makes that host the writer (above) and
-its LAN address the store's only allowed writer; `--trusted-keys` alone makes every node and
-the store use only signed entries. The store listens on a DHCP address, so the store host
-needs a DHCP reservation. A LaunchAgent needs the build user's GUI session; the fleet minis
-log in automatically. `glaeda-fleet-cas uninstall --apply` removes the services and keeps the
-stores (a LaunchDaemon's plist needs root to remove; the command prints how). Deployed on cmux7s (store and node) and
-cmux8s (node) on 2026-09-24.
+`--writer HOST --sign-key PATH --trusted-keys HEX` makes that host the writer (above); it
+must be the store host, and its tailnet address is the store's only allowed writer.
+`--trusted-keys` alone makes every node and the store use only signed entries. A
+LaunchAgent needs the build user's GUI session; the fleet minis log in automatically.
+`glaeda-fleet-cas uninstall --apply` removes the services and keeps the stores (a
+LaunchDaemon's plist needs root to remove; the command prints how). Deployed on cmux7s
+(store and writer) and cmux8s (node), 2026-09-24.
 
 ## When to switch
 

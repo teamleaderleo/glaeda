@@ -5,15 +5,15 @@
 #                            NODE_HOST... [--apply]
 #
 # Plans by default; --apply deploys. HOST names are ssh aliases (User cmux). The store
-# listens on the store host's LAN address (en0) port 7450; every NODE_HOST gets a read-only
-# node daemon pointed at it, through an ssh relay when it is another host. With --trusted-keys, the store keeps and every node uses only
+# listens on the store host's tailnet address port 7450; every NODE_HOST gets a read-only
+# node daemon pointed at it. With --trusted-keys, the store keeps and every node uses only
 # index entries signed by those keys. --writer makes that host the signing writer: its node
 # signs with the key at --sign-key (a path on the writer, created there beforehand with
-# `fleet-cas keygen`), and its LAN address becomes the store's only allowed writer. Each host
+# `fleet-cas keygen`); it must be the store host, whose tailnet address becomes the store's
+# only allowed writer. Each host
 # receives scripts/glaeda-fleet-cas and tools/fleet-cas-prototype under
 # ~/.cache/glaeda-fleet-cas (also when planning) and runs `glaeda-fleet-cas` there
-# (docs/CMUX_BUILD_SLOT_MODES.md).
-# Minis on another LAN cannot reach the store until the tailnet grants the port.
+# (docs/CMUX_BUILD_SLOT_MODES.md). Every host needs the tailnet grant for the store port.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 PORT=7450
@@ -39,8 +39,7 @@ fi
 # The rollout is stateless: whatever it is given replaces the deployed configuration.
 [ -n "$trusted" ] || echo "warning: no --trusted-keys: the store keeps, and nodes use, unsigned index entries" >&2
 [ -n "$writer" ] || echo "warning: no --writer: the store will accept no writes" >&2
-# The writer must be the store host: a writer elsewhere would need the relay, and relayed
-# connections reach the store from the store host's own address (glaeda#1208).
+# The writer is the store host: the store's writer allowlist is its own tailnet address.
 [ -z "$writer" ] || [ "$writer" = "$store" ] || { echo "--writer must be the --store host" >&2; exit 2; }
 for h in "$store" ${writer:+"$writer"} ${nodes[@]+"${nodes[@]}"}; do
   target=$(ssh -G "$h" | awk '/^hostname /{print $2}')
@@ -60,38 +59,20 @@ run() {  # host, args...
   ssh -o BatchMode=yes "$h" "PATH=\$HOME/.cargo/bin:\$PATH ~/.cache/glaeda-fleet-cas/glaeda/scripts/glaeda-fleet-cas $(printf '%q ' "$@")"
 }
 
-lan_ip() {
-  local ip; ip=$(ssh -o BatchMode=yes "$1" 'ipconfig getifaddr en0')
-  [ -n "$ip" ] || { echo "no en0 address on $1" >&2; exit 1; }
+# The store's tailnet address: launchd-started third-party binaries on these minis cannot
+# reach other hosts' LAN addresses (macOS Local Network privacy), and tailnet addresses work.
+# The tailnet grants the store port to the build minis (cmuxterm-hq#591). Every client,
+# the writer included, then connects from its own tailnet address, so --writers sees real
+# peers (glaeda#1208).
+tailnet_ip() {
+  local ip; ip=$(ssh -o BatchMode=yes "$1" "ifconfig | awk '/inet 100\\./ {print \$2; exit}'")
+  [ -n "$ip" ] || { echo "no tailnet (100.x) address on $1" >&2; exit 1; }
   echo "$ip"
 }
-ip=$(lan_ip "$store")
-writer_ip=
-[ -z "$writer" ] || writer_ip=$(lan_ip "$writer")
-run "$store" store --listen "$ip:$PORT" ${writer_ip:+--writers "$writer_ip"} ${trusted:+--trusted-keys "$trusted"} $apply
+ip=$(tailnet_ip "$store")
+run "$store" store --listen "$ip:$PORT" ${writer:+--writers "$ip"} ${trusted:+--trusted-keys "$trusted"} $apply
 [ -z "$writer" ] || run "$writer" writer --store "$ip:$PORT" --sign-key "$sign_key" --trusted-keys "$trusted" $apply
-# A node on another host reaches the store through its own ssh relay (a /usr/bin/ssh port
-# forward to 127.0.0.1:17450): launchd-started third-party binaries cannot reach other LAN
-# hosts on these minis (macOS Local Network privacy), Apple's ssh can. The store host
-# authorizes each relay key to forward to the store port only.
 for n in ${nodes[@]+"${nodes[@]}"}; do
   [ "$n" = "$writer" ] && continue
-  n_ip=$(lan_ip "$n")
-  if [ "$n_ip" = "$ip" ]; then
-    run "$n" node --store "$ip:$PORT" ${trusted:+--trusted-keys "$trusted"} $apply
-    continue
-  fi
-  # Relayed connections pass the store's --writers check (glaeda#1208): only signatures
-  # keep a relayed host from publishing index entries.
-  [ -n "$trusted" ] || { echo "$n needs the relay, which needs --trusted-keys" >&2; exit 2; }
-  pubs=$(run "$n" relay-key $apply | tee /dev/stderr | sed -n 's/^pubkey //p')
-  [ "$(printf '%s\n' "$pubs" | grep -c .)" -le 1 ] || { echo "$n printed more than one relay key" >&2; exit 1; }
-  pub=$pubs
-  if [ -n "$pub" ]; then
-    run "$store" authorize-relay --pubkey "$pub" --target "$ip:$PORT" $apply
-  else
-    echo "plan authorize $n's relay key on $store once it exists"
-  fi
-  run "$n" relay --store "$ip:$PORT" $apply
-  run "$n" node --store "127.0.0.1:17450" ${trusted:+--trusted-keys "$trusted"} $apply
+  run "$n" node --store "$ip:$PORT" ${trusted:+--trusted-keys "$trusted"} $apply
 done
