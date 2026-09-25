@@ -46,7 +46,7 @@ mod branches;
 pub use branches::{
     GITHUB_SECRET_ENVIRONMENT, GithubLookup, LocalBranchDecision, LocalBranchDeletion,
     LocalBranchFinishedEvidence, LocalBranchKeepReason, LocalBranchReport, MAX_LOCAL_BRANCHES,
-    reclaim_local_branches,
+    landed_worktree_tips, reclaim_local_branches,
 };
 
 pub const LINKED_WORKTREE_RECLAIM_SCHEMA_VERSION: u8 = 1;
@@ -673,12 +673,22 @@ pub struct LinkedWorktreeInventory {
     repository: PathBuf,
     common_dir: PathBuf,
     linked: Vec<LinkedWorktreeEntry>,
+    /// `branch -> tip` a merged pull request contains, supplied by the caller (see
+    /// [`landed_worktree_tips`]); observation itself stays offline.
+    landed_tips: std::collections::BTreeMap<String, String>,
 }
 
 impl LinkedWorktreeInventory {
     #[must_use]
     pub fn linked(&self) -> &[LinkedWorktreeEntry] {
         &self.linked
+    }
+
+    /// Record branch tips known to have landed through a merged pull request. A worktree on one
+    /// of these branches, still at exactly that tip, counts as finished. This only shortens the
+    /// idle window: removal keeps the branch either way.
+    pub fn record_landed_tips(&mut self, tips: std::collections::BTreeMap<String, String>) {
+        self.landed_tips = tips;
     }
 }
 
@@ -752,6 +762,7 @@ pub fn list_linked_worktrees(
         repository: repository.to_path_buf(),
         common_dir,
         linked,
+        landed_tips: std::collections::BTreeMap::new(),
     })
 }
 
@@ -897,13 +908,18 @@ fn observe_detailed(
         ProjectBranchState::Detached => None,
     };
     let head = observation.commit().as_str().to_owned();
-    let work_state = observe_work_state(
-        observer,
-        &inventory.repository,
-        &head,
-        authored_work(&git_dir),
-        executor,
-    );
+    // Like the git-only test, only a worktree that made a commit of its own can be finished: a
+    // fresh branch whose name and start point match an old merged pull request did nothing yet.
+    let authored = authored_work(&git_dir);
+    let landed = authored
+        && branch
+            .as_ref()
+            .is_some_and(|name| inventory.landed_tips.get(name) == Some(&head));
+    let work_state = if landed {
+        WorkState::Finished
+    } else {
+        observe_work_state(observer, &inventory.repository, &head, authored, executor)
+    };
 
     let facts = LinkedWorktreeFacts {
         linked,

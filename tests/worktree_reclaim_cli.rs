@@ -1131,3 +1131,115 @@ fn branches_are_untouched_without_the_flag() {
     assert!(applied.get("branches").is_none());
     assert!(ref_exists(&fixture.main, "refs/heads/landed"));
 }
+
+/// A squash-merged worktree whose files main changed again looks unfinished to Git alone; a merged
+/// pull request containing its tip makes it finished, and only at exactly that tip.
+#[test]
+fn a_merged_pull_request_finishes_a_worktree_git_alone_cannot() {
+    let fixture = Fixture::new();
+    git(
+        &fixture.main,
+        &["remote", "add", "origin", "git@github.com:acme/widgets.git"],
+    );
+    for name in ["squashed", "moved-on", "unmerged"] {
+        let checkout = fixture.add(name);
+        fs::write(checkout.join("tracked.txt"), format!("{name}\n")).expect("write change");
+        git(&checkout, &["add", "tracked.txt"]);
+        commit(&checkout, "change tracked.txt");
+    }
+    // Main squash-merges them, then edits the same file again, so no path comparison matches.
+    fs::write(fixture.main.join("tracked.txt"), "later\n").expect("write later main");
+    git(&fixture.main, &["add", "tracked.txt"]);
+    commit(&fixture.main, "squash, then more");
+    git(
+        &fixture.main,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    git(
+        &fixture.main,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let tip = |name: &str| {
+        String::from_utf8(git_output(&fixture.root.join(name), &["rev-parse", "HEAD"]).stdout)
+            .expect("UTF-8 commit")
+            .trim()
+            .to_owned()
+    };
+    // A fresh branch whose name and start point match an old merged pull request: no work yet.
+    fixture.add("reused");
+    let reused_tip = tip("reused");
+    let squashed_tip = tip("squashed");
+    let moved_on_merged = tip("moved-on");
+    // moved-on kept working after its pull request merged: its new tip is not in the PR head.
+    let moved_on = fixture.root.join("moved-on");
+    fs::write(moved_on.join("after.txt"), "after\n").expect("write follow-up");
+    git(&moved_on, &["add", "after.txt"]);
+    commit(&moved_on, "follow-up after merge");
+    for name in ["squashed", "moved-on", "unmerged", "reused"] {
+        fixture.age_by(name, 2 * 60 * 60);
+    }
+
+    // A fake gh: squashed and moved-on have merged pull requests into main, unmerged has none.
+    let gh = fixture.root.join("gh");
+    fs::write(
+        &gh,
+        format!(
+            r#"#!/bin/sh
+[ "$1" = api ] && [ "$2" = graphql ] || exit 1
+fields=""
+for arg in "$@"; do
+  case "$arg" in
+    b[0-9]*=*)
+      key="${{arg%%=*}}"; name="${{arg#*=}}"
+      case "$name" in
+        squashed) nodes='{{"number":1,"headRefOid":"{squashed_tip}","baseRefName":"main"}}' ;;
+        moved-on) nodes='{{"number":2,"headRefOid":"{moved_on_merged}","baseRefName":"main"}}' ;;
+        reused) nodes='{{"number":3,"headRefOid":"{reused_tip}","baseRefName":"main"}}' ;;
+        *) nodes='' ;;
+      esac
+      fields="$fields,\"$key\":{{\"nodes\":[$nodes]}}" ;;
+  esac
+done
+printf '{{"data":{{"repository":{{"defaultBranchRef":{{"name":"main"}}%s}}}}}}' "$fields"
+"#
+        ),
+    )
+    .expect("write fake gh");
+    let output = Command::new("/bin/chmod")
+        .args(["+x", gh.to_str().expect("UTF-8 fixture path")])
+        .output()
+        .expect("run chmod");
+    assert_child_success("make fake gh executable", &output);
+
+    let with_github = report(&fixture.run(
+        &fixture.main,
+        &["--gh", gh.to_str().expect("UTF-8 fixture path")],
+    ));
+    assert_eq!(
+        entry_by_name(&fixture, &with_github, "squashed")["facts"]["work_state"],
+        "finished"
+    );
+    assert_eq!(
+        entry_by_name(&fixture, &with_github, "squashed")["decision"]["decision"],
+        "eligible"
+    );
+    for name in ["moved-on", "unmerged", "reused"] {
+        let entry = entry_by_name(&fixture, &with_github, name);
+        assert_eq!(entry["facts"]["work_state"], "in_progress", "{name}");
+        assert_eq!(
+            entry["decision"]["vetoes"],
+            serde_json::json!(["recently_active"]),
+            "{name}"
+        );
+    }
+
+    let without = report(&fixture.run(&fixture.main, &["--no-github"]));
+    assert_eq!(
+        entry_by_name(&fixture, &without, "squashed")["facts"]["work_state"],
+        "in_progress"
+    );
+}
