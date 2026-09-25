@@ -124,6 +124,9 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path) -> dict:
     env = {key: value for key, value in os.environ.items() if key not in ("GITHUB_REPOSITORY", "GITHUB_OUTPUT")}
     env["CMUX_SEED_GIT_DIR"] = os.fspath(mirror)
     env["CI_CACHE_R2_PUBLIC_URL"] = BUCKET_URL
+    # r2-cache.sh stages each archive under TMPDIR; kept under .prefetch, a killed download's partial
+    # archive is wiped by the next run instead of waiting for macOS temp cleanup.
+    env["TMPDIR"] = os.fspath(mirror.parent / "tmp")
     env["PATH"] = f"{TOOL_PATH}:{env.get('PATH', '/usr/bin:/bin')}"
     # Its own process group, so a timeout also stops the downloads r2-cache.sh started.
     child = subprocess.Popen([sys.executable, os.fspath(scripts / "scripts/ci/seed_derived_data.py"), "prefetch",
@@ -186,6 +189,8 @@ def run(apply: bool, state: Path = STATE) -> dict:
             return {**record, "state": "current", "roots": len(roots)}
         if not apply:
             return {**record, "state": "plan", "would_fetch": [os.fspath(store) for store in pending]}
+        shutil.rmtree(work / "tmp", ignore_errors=True)
+        (work / "tmp").mkdir()
         try:
             scripts = scripts_for(work, mirror, head)
         except (OSError, subprocess.SubprocessError) as error:
