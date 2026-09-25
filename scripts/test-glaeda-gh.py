@@ -210,8 +210,24 @@ class DaemonTest(Base):
         self.daemon.tick(NOW)
         for i in range(1, 5):
             gg.register("pr:o/r#2")
+            self.age_watch("pr:o/r#2", 1)  # the reader was already there before the last fetch
             self.daemon.tick(NOW + i * gg.CYCLE)
         self.assertEqual(len(self.gh.gql_calls()), 1)
+
+    def test_rerun_of_a_completed_run_is_seen_on_the_next_cycle(self) -> None:
+        self.gh.runs[3] = {"id": 3, "status": "completed", "conclusion": "failure"}
+        gg.register("run:o/r/3")
+        self.age_watch("run:o/r/3", 1)  # registered before the first fetch
+        self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.CYCLE)  # nobody new is reading: a completed run is not re-read
+        self.assertEqual(len(self.gh.rest_calls()), 1)
+        self.gh.runs[3] = {"id": 3, "status": "queued", "conclusion": None}  # gh run rerun 3
+        path = gg.watch_dir() / gg.file_name("run:o/r/3")
+        gg.register("run:o/r/3")  # a new wait
+        os.utime(path, (NOW + gg.CYCLE + 1,) * 2)
+        self.daemon.tick(NOW + 2 * gg.CYCLE)
+        self.assertEqual(len(self.gh.rest_calls()), 2)
+        self.assertEqual(gg.read_cache("run:o/r/3")["data"]["status"], "queued")
 
     def test_budget_floor_goes_lean_then_stops(self) -> None:
         self.gh.runs[9] = {"id": 9, "status": "in_progress"}
@@ -412,8 +428,15 @@ class ClientTest(Base):
     def test_finished_things_answer_at_once_from_an_older_fetch(self) -> None:
         self.put("pr:o/r#1", gg.parse_pr(pr_node(1, state="MERGED", rollup="SUCCESS")), at=time.time() - 300)
         self.assertEqual(self.wait("pr", "o/r#1", until="merged", timeout=0.3)[0], 0)
+        # a completed run may have been rerun since: only data fetched after the wait began decides
         self.put("run:o/r/2", {"status": "completed", "conclusion": "failure"}, at=time.time() - 300)
-        self.assertEqual(self.wait("run", "o/r/2", timeout=0.3)[0], 1)
+        self.assertEqual(self.wait("run", "o/r/2", timeout=0.3)[0], 2)
+        rerun = ({"status": "queued", "conclusion": None}, {})
+        self.assertEqual(self.wait("run", "o/r/2", timeout=0.4, fill=rerun)[0], 2)
+        passed = ({"status": "completed", "conclusion": "success"}, {})
+        self.assertEqual(self.wait("run", "o/r/2", timeout=0.5, fill=passed)[0], 0)
+        self.put("pr:o/r#4", gg.parse_pr(pr_node(4, state="CLOSED", rollup="SUCCESS")), at=time.time() - 300)
+        self.assertEqual(self.wait("pr", "o/r#4", until="merged", timeout=0.3)[0], 2)  # may be reopened
         self.put("run:o/r/3", {"status": "in_progress"}, at=time.time() - 300)
         self.assertEqual(self.wait("run", "o/r/3", timeout=0.3)[0], 2)  # live and stale: not trusted
 

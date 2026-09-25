@@ -377,7 +377,7 @@ class Daemon:
             if age > IDLE_EXPIRY or (done and age > TERMINAL_GRACE):
                 path.unlink(missing_ok=True)
                 continue
-            out.append({"key": key, "jobs": bool(doc.get("jobs")), "cache": cached})
+            out.append({"key": key, "jobs": bool(doc.get("jobs")), "cache": cached, "touched": self.now - age})
         return out
 
     def due(self, kind: str, entries: list[dict]) -> list[dict]:
@@ -397,7 +397,9 @@ class Daemon:
                 continue
             if c is None:
                 out.append(e)
-            elif full and (not terminal(kind, c.get("data")) or self.now - c.get("fetchedAt", 0) >= TERMINAL_REFRESH):
+            elif full and (not terminal(kind, c.get("data")) or self.now - c.get("fetchedAt", 0) >= TERMINAL_REFRESH
+                           # a reader came after the last fetch: a rerun or reopen may have changed it
+                           or e["touched"] > c.get("fetchedAt", 0)):
                 out.append(e)
         for e in out:
             self.attempted[e["key"]] = self.now
@@ -726,8 +728,9 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
             emit(key, entry, as_json, {"result": "failure", "waited_s": waited})
             return EXIT_FAIL  # GitHub says NOT_FOUND; transport errors and 5xx stay pending
         data = (entry or {}).get("data")
-        # merged, closed and completed do not go stale, so an older fetch of them is enough
-        usable = data and ((entry.get("dataAt") or 0) >= began or terminal(kind, data))
+        # only a merge is final; a completed run can be rerun and a closed PR reopened
+        final = kind == "pr" and data and data.get("state") == "MERGED"
+        usable = data and ((entry.get("dataAt") or 0) >= began or final)
         result = verdict(kind, data, until, sha) if usable else None
         if result is not None:
             emit(key, entry, as_json, {"result": "success" if result == EXIT_OK else "failure", "waited_s": waited})
