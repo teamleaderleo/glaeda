@@ -816,9 +816,11 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             # as many compiles as the highest one allows, so re-apply every instance on a mini together.
             copies = {"persistent-dd": max(1, compile_slots), "root": 1 if pinned else max(1, roots)}.get(token, 1)
             order = list(range(copies))
-            if token == "root" and copies > 1:
+            if token == "root" and copies > 1 and klass != "compile-gui":
                 # this runner's own root first (instance i -> root i+1), then any free one: its kept build and
-                # warm labels (cmux#14396) stay with one tree unless a consumer holds that root
+                # warm labels (cmux#14396) stay with one tree unless a consumer holds that root. compile-gui
+                # keeps no per-root state, and seed and cache keys at another root differ from root 1's
+                # (compile-app-host-test-product.sh fingerprint), so it tries root 1 first and falls back
                 own = instance % copies
                 order = [own, *(c for c in order if c != own)]
             for copy in order:

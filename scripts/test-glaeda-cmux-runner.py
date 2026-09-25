@@ -852,6 +852,11 @@ class HookTest(unittest.TestCase):
                 self.assertGreaterEqual(time.monotonic() - waited, 1, f"{job} waits for the gui token")
             self.finish("e0")
             # the fallback test job is a consumer: no root at job start, the producer's root from its restore step
+            # with root 1 free, a build on the second root runner still takes it: root 1's seeds and caches
+            # are the ones main publishes, and it keeps no per-root state to prefer its own root for
+            first = self.job("build", "e3", 8, None, *two, "--instance", "1", env=e2e)
+            self.assertIn("+gui+root-1 for build (compile-gui", first.stdout)
+            self.finish("e3")
             test = self.job("test", "e2", 8, None, *two, env=e2e)
             self.assertEqual(test.returncode, 0, test.stdout)
             self.assertIn("for test (gui", test.stdout)
@@ -860,7 +865,7 @@ class HookTest(unittest.TestCase):
                              "the compile admission still holds root 2")
             self.assertEqual(self.take("/private/tmp/cmux-ci", "e2").returncode, 0)
         finally:
-            for runner in ("e0", "e1", "e2", "g0", "g1", "g2"):
+            for runner in ("e0", "e1", "e2", "e3", "g0", "g1", "g2"):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 

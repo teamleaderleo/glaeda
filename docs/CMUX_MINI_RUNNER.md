@@ -426,8 +426,10 @@ in at the producer's root. So one root job per root per mini:
   still busy after the wait, and 2 for a bad root or outside a runner job.
 - Jobs the hook does not know (seed-swiftpm-manifests, anything new) are pinned to root 1, because they use
   /private/tmp/cmux-ci themselves. Ids that other workflows reuse (`build`, `test`, `lint`) are classed by
-  (workflow file, job id) from `GITHUB_WORKFLOW_REF`, so test-e2e's jobs are not pinned: `build` takes the
-  root its token picks and reads it from `CMUX_CI_CANONICAL_ROOT`, and `test` takes the producer's root.
+  (workflow file, job id) from `GITHUB_WORKFLOW_REF`, so with `canonicalRoots` above 1 test-e2e's jobs are
+  not pinned: `build` takes root 1 when free, else any free root (root 1's seeds and caches are the ones main
+  publishes; it keeps no per-root state), and reads it from `CMUX_CI_CANONICAL_ROOT`. `test` is a consumer and
+  takes the producer's root in its restore step.
 
 ## 2g. iOS simulator runners
 
