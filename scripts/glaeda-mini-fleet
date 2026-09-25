@@ -1698,8 +1698,8 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
         install, _, download = pf["autoupdate"].partition("|")
         on = [name for name, value in (("install", install), ("download", download)) if value.strip() != "0"]
         if on:
-            # Not blocking: the host works, but an update can land mid-day (a CLT update resets xcode-select)
-            # or wait for a restart. Update checks and security data stay on; glaeda-mini-fleet upgrades on purpose.
+            # Not blocking: the host works, but an update can land mid-day or wait for a restart. Update checks
+            # and security data stay on; glaeda-mini-fleet upgrades on purpose.
             put("autoupdate", "todo", f"macOS updates {' and '.join(on)} automatically",
                 "sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates "
                 "-bool false && sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload "
