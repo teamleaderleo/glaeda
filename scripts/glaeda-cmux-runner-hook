@@ -524,7 +524,10 @@ def ensure_test_keychain(home: Path) -> str:
     """A passwordless keychain for PR jobs' tests, unlocked, first in the user search list and the default.
     The login keychain stays locked from a launchd session (errSecInteractionNotAllowed), so tests that add
     items need their own; it holds only test junk, never credentials. Idempotent and best effort: a failure
-    is reported, never fatal, and the login keychain's contents are never touched."""
+    is reported, never fatal, and the login keychain's contents are never touched.
+    The default is the user's, not the job's: anything that later stores a credential as this user on a PR
+    mini without naming a keychain lands here, readable by every PR job. Never store credentials as the
+    runner user on a PR mini (docs/CMUX_MINI_RUNNER.md)."""
     sec = "/usr/bin/security"
     path = os.fspath(home / "Library/Keychains" / TEST_KEYCHAIN)
 
@@ -543,10 +546,12 @@ def ensure_test_keychain(home: Path) -> str:
         if call("unlock-keychain", "-p", "", path).returncode:
             return "test keychain: unlock failed"
         keychains = listed(call("list-keychains", "-d", "user").stdout)
-        if keychains[:1] != [path]:
-            call("list-keychains", "-d", "user", "-s", path, *[k for k in keychains if k != path])
-        if listed(call("default-keychain", "-d", "user").stdout)[:1] != [path]:
-            call("default-keychain", "-d", "user", "-s", path)
+        if keychains[:1] != [path] and call("list-keychains", "-d", "user", "-s", path,
+                                            *[k for k in keychains if k != path]).returncode:
+            return "test keychain: unlocked, but setting the search list failed"
+        if listed(call("default-keychain", "-d", "user").stdout)[:1] != [path] \
+                and call("default-keychain", "-d", "user", "-s", path).returncode:
+            return "test keychain: unlocked, but setting the default failed"
         return f"test keychain {TEST_KEYCHAIN} unlocked and default"
     except (OSError, subprocess.SubprocessError) as error:
         return f"test keychain: {type(error).__name__}"

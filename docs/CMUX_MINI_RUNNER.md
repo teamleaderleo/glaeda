@@ -438,6 +438,18 @@ Hook classes:
   under /tmp, changes the GUI session (open, launchctl setenv, system dark mode) and writes credentials
   to `$HOME`.
 
+
+## 2h. Test keychain
+
+The cmux user's login keychain is locked in the runner's launchd session, so tests that add keychain items
+fail with errSecInteractionNotAllowed. On PR runners (not trusted ones) the job-started hook creates
+`~/Library/Keychains/cmux-ci.keychain-db` with an empty password and no lock timeout, unlocks it, and makes
+it first in the user search list and the user's default keychain. It holds test junk only, and every PR job
+can read it.
+
+**Never store credentials as the runner user on a PR mini** (`gh auth login`, `git credential-osxkeychain`,
+`security import`, Keychain Access). Without an explicit keychain they land in `cmux-ci`, and any later PR job
+can copy that file and read them. Credentials belong on trusted or signing hosts.
 ## 3. Verify
 
 ```bash

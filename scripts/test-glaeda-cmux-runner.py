@@ -1999,6 +1999,21 @@ class RunnerTest(unittest.TestCase):
                                  "idempotent: nothing recreated or reordered")
                 self.assertFalse(any(login in c for c in calls if c[0] != "list-keychains"),
                                  "the login keychain is never changed")
+            state.update({"list": [login, path], "default": login})  # present but not first: reordered
+            with mock.patch.object(hook.subprocess, "run", side_effect=fake):
+                self.assertIn("unlocked and default", hook.ensure_test_keychain(home))
+                self.assertEqual(state, {"list": [path, login], "default": path})
+
+            def failing(verb: str):
+                def run(argv: list[str], **kw: object) -> subprocess.CompletedProcess:
+                    done = fake(argv, **kw)
+                    return (subprocess.CompletedProcess(argv, 1, "", "no") if argv[1] == verb and "-s" in argv
+                            else done)
+                return run
+            for verb, why in (("list-keychains", "search list"), ("default-keychain", "default")):
+                state.update({"list": [login], "default": login})
+                with self.subTest(verb), mock.patch.object(hook.subprocess, "run", side_effect=failing(verb)):
+                    self.assertIn(f"setting the {why} failed", hook.ensure_test_keychain(home))
             with mock.patch.object(hook.subprocess, "run",
                                    return_value=subprocess.CompletedProcess([], 51, "", "locked")):
                 self.assertEqual(hook.ensure_test_keychain(home), "test keychain: unlock failed")
