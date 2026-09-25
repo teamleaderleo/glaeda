@@ -684,6 +684,29 @@ class HookTest(unittest.TestCase):
             for runner in ("g0", "u0"):
                 self.finish(runner)
 
+    def test_capacity_guest_repo_jobs_never_take_cmux_roots(self) -> None:
+        self.fleet()
+        env = {"GITHUB_REPOSITORY": "manaflow-ai/newapp"}
+
+        def guest(name: str, runner: str) -> subprocess.CompletedProcess:
+            return self.job(name, runner, 12, None, "--allowed-repo", "manaflow-ai/newapp", env=env)
+        try:
+            self.assertIn("persistent-dd+root-1", self.job("macos-compile-admission", "h0", 12,
+                                                           env={"GITHUB_REPOSITORY": "manaflow-ai/cmux"}).stdout)
+            build = guest("build", "n0")
+            self.assertEqual(build.returncode, 0, build.stdout)
+            self.assertIn("holding 2/12 units for build (isolated", build.stdout)
+            # a guest id that cmux also uses gets the guest cost, not cmux's compile class
+            same = guest("macos-compile-admission", "n1")
+            self.assertIn("(isolated", same.stdout)
+            self.assertNotIn("root-", same.stdout)
+            self.assertIn("1/12 units for lint-light (light", guest("lint-light", "n2").stdout)
+            self.assertIn("+simulator for ui-tests-sim (simulator", guest("ui-tests-sim", "n3").stdout)
+            self.assertIn("simulator token is taken", guest("ios-simulator", "n4").stdout)
+        finally:
+            for runner in ("h0", "n0", "n1", "n2", "n3", "n4"):
+                self.finish(runner)
+
     def test_capacity_refuses_while_a_fleet_build_holds_the_host(self) -> None:
         fleet = self.fleet()
         holder = subprocess.Popen([sys.executable, "-c",

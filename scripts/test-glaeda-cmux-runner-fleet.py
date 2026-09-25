@@ -131,6 +131,35 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(set(staged["hosts"]), {"mini-a"})
         self.assertEqual(set(staged["defaults"]), {"xcode", "disk"}, "no other hosts, keys or people")
 
+    def test_org_migration_goes_one_member_at_a_time_and_skips_trusted(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["hosts"]["mini-t"] = {"class": "std", "availability": "dedicated", "roles": ["ci-runner"],
+                                       "hardware": "m4pro-48", "overrides": {"runner": {
+                                           "trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"}}}
+        self.manifest.write_text(json.dumps(manifest))
+        result = self.fleet("--apply", "--org", "manaflow-ai", "--group", "glaeda-minis",
+                            "--migrate-from-repo", "manaflow-ai/cmux", FAKE_ELIGIBLE="mini-a,mini-b,mini-t")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = {r["member"]: r for r in json.loads(result.stdout)["members"]}
+        self.assertIn("trusted-only runner stays on manaflow-ai/cmux", rows["mini-t"]["action"])
+        calls = self.calls()
+        gh = [c["argv"][3] for c in calls if c["tool"] == "gh"]
+        self.assertEqual(gh.count("repos/manaflow-ai/cmux/actions/runners/remove-token"), 8)
+        self.assertEqual(gh.count("orgs/manaflow-ai/actions/runners/registration-token"), 8)
+        ssh = [c for c in calls if c["tool"] == "ssh" and "--apply" in c["remote"]]
+        self.assertNotIn("mini-t", {c["host"] for c in ssh})
+        registers = [c for c in ssh if "--uninstall" not in c["remote"]]
+        self.assertTrue(all("--org manaflow-ai --group glaeda-minis" in c["remote"] for c in registers))
+        # one member at a time: every mini-a call happens before any mini-b call
+        hosts = [c["host"] for c in ssh]
+        self.assertEqual(hosts, sorted(hosts), "members migrate one after another")
+        self.assertNotIn(TOKEN, json.dumps([c.get("argv", c.get("remote")) for c in calls]), "token only on stdin")
+
+    def test_group_needs_org(self) -> None:
+        result = self.fleet("--group", "glaeda-minis")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("need --org", result.stderr)
+
     def test_only_named_hosts_and_include_ineligible_stopped(self) -> None:
         result = self.fleet("--apply", "--hosts", "mini-light", "--include-ineligible", "--skip-launchctl")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

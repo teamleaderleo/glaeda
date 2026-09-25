@@ -63,7 +63,7 @@ What `--apply` does:
      It refuses the job (exits 1 before any step runs) for
      `pull_request_target`, for any pull request whose head repository is a fork, is
      missing, or differs from the base repository, for a `workflow_run` from another
-     repository, for any repository other than `manaflow-ai/cmux`, and whenever the
+     repository, for any repository other than `manaflow-ai/cmux` (at org scope: outside the org, 2e2), and whenever the
      event payload is missing or unreadable. Admitted jobs then run
      `glaeda-disk --pressure --apply --top 0` with a 120 s timeout that never fails
      the job.
@@ -341,6 +341,30 @@ What the gate cannot see, and the operator must keep true:
   that trusted runs wrote. A cache namespace that PR runs also write (build seeds, sccache, SwiftPM
   manifest caches) brings PR-produced bytes next to the secret.
 - Also limit the org runner group to the one repository (an admin setting).
+## 2e2. Other repositories on the same minis (org scope)
+
+Registered to `manaflow-ai/cmux`, the runners serve only cmux. To let another repository of the org use
+the pools, register them at org scope into a runner group and allow that repository in the group:
+
+1. An org owner creates the `glaeda-minis` runner group (Settings, Actions, Runner groups): selected
+   repositories `manaflow-ai/cmux` plus each guest repository, public repositories allowed (cmux is
+   public; fork PRs are refused by the hook, not the group). Or the owner grants the operator the
+   organization permission to manage runners and runner groups, and the operator does it.
+2. `glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis --migrate-from-repo manaflow-ai/cmux`
+   deregisters each member's repo runners and registers them in the group, one member at a time, so
+   the other members keep taking cmux jobs. Members with a trusted-only runner (2e) are skipped and
+   stay on their repository.
+3. Adding a later repository is only a group edit:
+   `gh api -X PUT orgs/manaflow-ai/actions/runner-groups/GROUP_ID/repositories/REPO_ID`.
+
+At org scope the hook admits any repository of the org (`--allowed-owner`) under the same event, fork
+and disk rules. Job ids in the hook's table are cmux's (`--home-repo`, default `manaflow-ai/cmux`); a
+guest repository's job never takes a canonical root or the persistent-DerivedData token, whatever its
+id. It costs 2 units (isolated), or 1 unit when its id ends in `-light`, or 2 units plus the one
+simulator token when its id ends in `-sim` or `simulator`. Guests share the runner user's `$HOME` and
+`/Users/Shared/cmux-build-fleet`, so they get the same trust as cmux PRs: members of the org only, no
+secrets on these hosts.
+
 ## 2f. Canonical roots
 
 Compiles build in a canonical root (/private/tmp/cmux-ci; cmux#14338 adds /private/tmp/cmux-ci-2 and on),
