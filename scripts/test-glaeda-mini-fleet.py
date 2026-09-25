@@ -389,6 +389,68 @@ class CheckTests(unittest.TestCase):
         self.assertIn("ok (1 pending)", out.getvalue())
 
 
+class IosSimulatorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest = mf.load_manifest(EXAMPLE)
+        self.manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"], "exclusive": True,
+                                                      "devices": ["iPhone 17 Pro Max"]}
+
+    def ios(self, extra: str) -> list[str]:
+        obs = observed(**{"build-mini-1": probe_text() + extra})
+        return [i["detail"] for i in mf.check(self.manifest, obs, ["build-mini-1"]) if i["area"] == "ios"]
+
+    def test_exact_runtime_and_device_conform(self) -> None:
+        text = ("ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5\n"
+                "ios_device\t26.5|iPhone 17 Pro Max\nios_device\t26.5|iPad (A16)\n")
+        self.assertEqual(self.ios(text), [])
+
+    def test_missing_extra_and_deviceless_runtimes_drift(self) -> None:
+        text = ("ios_runtime\t26.3|26.3.1|23D8133|com.apple.CoreSimulator.SimRuntime.iOS-26-3\n"
+                "ios_device\t26.3|iPhone 17 Pro Max\n")
+        self.assertEqual(self.ios(text), ["iOS simulator runtime 23F77 missing",
+                                          "extra iOS simulator runtime 26.3.1 (23D8133)"])
+        self.manifest["defaults"]["ios_simulator"]["exclusive"] = False
+        self.assertEqual(self.ios(text), ["iOS simulator runtime 23F77 missing"])
+        bare = "ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5\n"
+        self.assertEqual(self.ios(bare), ["no available iPhone 17 Pro Max simulator on iOS 26.5"])
+
+    def test_the_fix_names_the_runtime_identifier(self) -> None:
+        text = ("ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5\n"
+                "ios_device\t26.5|iPhone 17 Pro Max\n"
+                "ios_runtime\t27.0|27.0|24A5390f|com.apple.CoreSimulator.SimRuntime.iOS-27-0\n")
+        obs = observed(**{"build-mini-1": probe_text() + text})
+        fixes = [i["fix"] for i in mf.check(self.manifest, obs, ["build-mini-1"]) if i["area"] == "ios"]
+        self.assertEqual(fixes, ["xcrun simctl runtime delete 24A5390f"])
+
+    def test_unavailable_and_malformed_runtimes(self) -> None:
+        text = ("ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5|unavailable\n"
+                "ios_device\t26.5|iPhone 17 Pro Max\n"
+                "ios_runtime\t26.0|26.0|x;rm -rf|com.apple.CoreSimulator.SimRuntime.iOS-26-0\n")
+        # An unusable declared runtime counts as missing; a malformed line is dropped, never shown.
+        self.assertEqual(self.ios(text), ["iOS simulator runtime 23F77 missing"])
+        stale = ("ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5\n"
+                 "ios_device\t26.5|iPhone 17 Pro Max\n"
+                 "ios_runtime\t17.0|17.0|21A328|com.apple.CoreSimulator.SimRuntime.iOS-17-0|unavailable\n")
+        self.assertEqual(self.ios(stale), ["extra iOS simulator runtime 17.0 (21A328)"])
+
+    def test_declaration_is_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for bad in ({"runtimes": ["26.5"]}, {"runtimes": ["23F77"], "devices": ["iPhone|x"]},
+                        {"exclusive": True}, {"runtimes": ["23F77"], "extra": 1}):
+                data = json.loads(EXAMPLE.read_text())
+                data["defaults"]["ios_simulator"] = bad
+                with self.assertRaises(mf.Failure, msg=bad):
+                    mf.load_manifest(write_manifest(tmp, data))
+
+    def test_probe_emits_runtimes_and_devices(self) -> None:
+        text = mf.PROBE.read_text()
+        self.assertIn("ios_runtime", text)
+        parsed = mf.parse_probe("ios_runtime\t27.0|27.0|24A5390f|com.apple.CoreSimulator.SimRuntime.iOS-27-0\n"
+                                "ios_device\t27.0|iPad Pro 13-inch (M5)\n")
+        self.assertEqual(parsed["ios_runtimes"][0]["build"], "24A5390f")
+        self.assertEqual(parsed["ios_devices"], [{"runtime": "27.0", "name": "iPad Pro 13-inch (M5)"}])
+
+
 class ApplyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.manifest = mf.load_manifest(EXAMPLE)
