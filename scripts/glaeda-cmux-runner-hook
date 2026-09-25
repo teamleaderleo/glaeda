@@ -50,8 +50,9 @@ job-completed stops the sampler (it writes the record), runs the same disk press
     glaeda-cmux-runner-hook listen --runner-dir DIR [--no-waiters]
 
 runs under the runner LaunchAgent's listen.sh: it runs DIR/run.sh, and while the fleet has the host (an exclusive
-host lock, a reservation, or a fleet build waiting for the lock) it stops the idle runner's listener so
-GitHub routes the job to another runner instead of here to be refused (Gate).
+host lock, a reservation, or a fleet build waiting for the lock) or every capacity unit on the mini is taken, it
+stops the idle runner's listener so GitHub routes the job to another runner instead of here to be refused (Gate).
+Full means every unit this runner's own --capacity-units scans, read from its job-started hook.
 """
 
 from __future__ import annotations
@@ -201,6 +202,9 @@ def export_root(name: str) -> str:
             pass
     return f"{CANONICAL_ROOT_ENV}={path} via {'+'.join(wrote) or 'nothing (no GITHUB_ENV or RUNNER_TEMP)'}"
 ADMISSION_WAIT_S = 30.0  # admissions are serialized briefly so two jobs never split the free units
+# The listener gate reads its runner's --capacity-units from the job-started hook glaeda-cmux-runner wrote.
+RUNNER_HOOK_SCRIPT = "glaeda-hooks/job-started.sh"
+CAPACITY_UNITS_RE = re.compile(r"\s--capacity-units\s+([0-9]+)(?:\s|$)")
 LSOF = shutil.which("lsof") or "/usr/sbin/lsof"
 # Events whose code is the repository's own, or a same-repo pull request checked below. Comment,
 # check and review-comment events can run with secrets on behalf of a fork PR, so they are left out.
@@ -917,6 +921,56 @@ def release_holder(pid_file: Path) -> str:
 # ---------------------------------------------------------------- listener gate
 
 
+class Unknown(str):
+    """mini_full's answer when it could not look (an admission held admission.lock): keep the last answer."""
+
+
+UNKNOWN = Unknown("unknown")
+
+
+def runner_units(runner_dir: Path) -> int:
+    """The --capacity-units this runner's job-started hook passes (take_capacity's total), or 0 for a
+    single-runner mini or an unreadable hook. Read on every probe, so a re-apply that changes it counts at once."""
+    try:
+        match = CAPACITY_UNITS_RE.search((runner_dir / RUNNER_HOOK_SCRIPT).read_text())
+    except (OSError, UnicodeDecodeError):
+        return 0
+    return int(match.group(1)) if match else 0
+
+
+def mini_full(capacity_dir: Path | None, total: int) -> str | None:
+    """Why none of this runner's `total` capacity units is free, or None, or UNKNOWN when it could not look.
+    A job handed to a full mini is refused at once, and cmux's rescue re-runs it on Blacksmith along with the
+    siblings fail-fast cancelled (cmux main full suite 36114055694: three shards refused with 0 of 4 units
+    free, and the re-run waited 30 to 40 minutes for Blacksmith 12 vCPU runners). A full mini that stops
+    listening leaves the job queued for the next free runner instead. `total` is what this runner's own
+    admissions try (take_capacity scans unit-0 up to it), so full here means this runner's next job would be
+    refused. The probe holds admission.lock without waiting for it, so no admission can find a unit taken by
+    the probe; while an admission holds it the answer is UNKNOWN."""
+    if capacity_dir is None or total <= 0:
+        return None
+    try:
+        admission = os.open(capacity_dir / "admission.lock", os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None  # no admission has run on this mini yet, so no unit is taken
+    try:
+        try:
+            fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return UNKNOWN
+        for slot in range(total):
+            try:
+                fd = lock_file(capacity_dir / f"unit-{slot}", fcntl.LOCK_EX)
+            except OSError:
+                return None
+            if fd is not None:
+                os.close(fd)
+                return None
+        return f"all {total} capacity units on this mini are taken"
+    finally:
+        os.close(admission)
+
+
 def host_held(host_lock: str, reservation: str, now: float) -> str | None:
     """Why the fleet, not a PR job, holds this host right now, or None. Our own jobs hold the host lock
     shared, so only an exclusive holder or a reservation counts. Microseconds: one non-blocking flock."""
@@ -1009,9 +1063,11 @@ class Gate:
     stop. Anything unexpected hands the runner back to plain run.sh behaviour (unexpected())."""
 
     def __init__(self, runner_dir: Path, host_lock: str, reservation: str, state_dir: Path,
-                 waiters: bool = True) -> None:
+                 waiters: bool = True, capacity_dir: Path | None = None) -> None:
         self.runner_dir, self.host_lock, self.reservation, self.state_dir, self.waiters = \
             runner_dir, host_lock, reservation, state_dir, waiters
+        self.capacity_dir = capacity_dir
+        self.full_why: str | None = None  # the last known mini_full answer, kept across UNKNOWN looks
         self.child: subprocess.Popen[bytes] | None = None
         self.stop_deadline: float | None = None  # set while a stop the gate asked for is under way
         self.streak = 0
@@ -1064,7 +1120,7 @@ class Gate:
             self.waiting, self.waiting_at = host_waiters(self.host_lock, self.state_dir), time.monotonic()
         if why is None and self.waiting:
             why = f"a fleet build is waiting for the host (pid {min(self.waiting)})"
-        return why
+        return why or self.full()
 
     def confirmed(self) -> str | None:
         """A fresh reading right before a stop: the holder still holds, or a waiter seen at least one poll ago
@@ -1075,6 +1131,16 @@ class Gate:
             self.waiting, self.waiting_at = again, time.monotonic()
             if again:
                 why = f"a fleet build is waiting for the host (pid {min(again)})"
+        return why or self.full(fresh=True)
+
+    def full(self, fresh: bool = False) -> str | None:
+        """Every unit this runner's jobs could take is held. A look an admission blocked keeps the previous
+        answer, so a full mini's retrying admissions never read as free and restart a listener; the fresh
+        look right before a stop (confirmed()) stops only on a reading of its own."""
+        why = mini_full(self.capacity_dir, runner_units(self.runner_dir))
+        if isinstance(why, Unknown):
+            return None if fresh else self.full_why
+        self.full_why = why
         return why
 
     def tree(self) -> tuple[list[int], dict[int, tuple[int, str]]]:
@@ -1196,8 +1262,8 @@ class Gate:
 
 
 def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, waiters: bool,
-           adopt: int = 0) -> int:
-    gate = Gate(runner_dir, host_lock, reservation, state_dir, waiters)
+           adopt: int = 0, capacity_dir: Path | None = None) -> int:
+    gate = Gate(runner_dir, host_lock, reservation, state_dir, waiters, capacity_dir)
     if adopt:
         gate.child = Adopted(adopt)  # type: ignore[assignment]
     signal.signal(signal.SIGTERM, gate.terminate)
@@ -1693,7 +1759,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.runner_dir is None:
             p.error("listen needs --runner-dir")
         return listen(args.runner_dir, args.host_lock, args.reservation, args.state_dir, not args.no_waiters,
-                      args.adopt)
+                      args.adopt, args.capacity_dir)
     if args.phase == "take-root":
         if not args.root:
             p.error("take-root needs --root")
