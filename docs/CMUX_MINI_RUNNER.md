@@ -85,7 +85,10 @@ What `--apply` does:
      `refused: node not eligible (...)` unless the node status from the staged
      generation's `cmux_fleet.py status` (the command `glaeda-mini-enroll` uses) says
      `eligible` with `routingCandidateEligible` true and the build role eligible, the
-     enrollment references `~/.config/glaeda/cmux-fleet/class-acceptance/<hardware>.json`,
+     enrollment references `~/.config/glaeda/cmux-fleet/class-acceptance/<hardware>.json`
+     (or this node is that receipt's source: its enrollment references no class receipt,
+     and its node id, enrollment generation, Glaeda generation, toolchain generation,
+     toolchain identity and semantic result all equal the receipt's),
      that receipt validates (its digest recomputed by the generation's
      `validate_class_acceptance`) and records all six toolchain strings, and `rustc`,
      `cargo`, `zig`, `xcodebuild` and `xcrun --show-sdk-version`, run from `$HOME` on the

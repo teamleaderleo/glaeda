@@ -644,6 +644,33 @@ else:
     def done(self) -> None:
         self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"))
 
+    def test_the_receipts_source_node_is_admitted_without_adopting_it(self) -> None:
+        self.fleet()
+        self.node()
+        config = self.dir / ".config/glaeda/cmux-fleet"
+        receipt = json.loads((config / "class-acceptance/m4pro-48.json").read_text())
+        receipt.update(acceptingNodeId="cmux-mac-001", acceptingEnrollmentGeneration=2, glaedaGeneration="sha256:g",
+                       toolchainGeneration="sha256:t", cmuxToolchainIdentity="sha256:i", cmuxSemanticResultSha256="sha256:s")
+        (config / "class-acceptance/m4pro-48.json").write_text(json.dumps(receipt))
+        enrollment = {"state": "eligible", "nodeId": "cmux-mac-001", "enrollmentGeneration": 2,
+                      "glaedaGeneration": "sha256:g", "supportedToolchainGenerations": ["sha256:t"]}
+        acceptance = {"nodeId": "cmux-mac-001", "enrollmentGeneration": 2, "toolchainGeneration": "sha256:t",
+                      "cmuxToolchainIdentity": "sha256:i", "cmuxSemanticResultSha256": "sha256:s"}
+        cases = {"source": ({}, {}, 0), "other-node": ({"nodeId": "cmux-mac-002"}, {}, 1),
+                 "stale-generation": ({"enrollmentGeneration": 1}, {}, 1),
+                 "other-toolchain": ({"supportedToolchainGenerations": ["sha256:x"]}, {}, 1),
+                 "other-result": ({}, {"cmuxSemanticResultSha256": "sha256:z"}, 1),
+                 "references-another-receipt": ({"classAcceptanceSha256": "sha256:bb"}, {}, 1)}
+        for name, (enroll_over, accept_over, code) in cases.items():
+            with self.subTest(name):
+                (config / "enrollment.json").write_text(json.dumps({**enrollment, **enroll_over}))
+                (config / "acceptance/cmux_macos_native_build.json").write_text(json.dumps({**acceptance, **accept_over}))
+                result = self.eligible_start()
+                self.done()
+                self.assertEqual(result.returncode, code, result.stdout)
+                if code:
+                    self.assertIn("does not reference the m4pro-48 class receipt", result.stdout)
+
     def test_eligible_node_on_its_toolchain_is_admitted(self) -> None:
         self.fleet()
         self.node()
