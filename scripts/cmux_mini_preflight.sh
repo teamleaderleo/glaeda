@@ -206,16 +206,16 @@ done
 e pf_home "$HOME"
 shopt -s nullglob dotglob
 while IFS= read -r -d '' f; do
-  case "$f" in *$'\n'*|*$'\t'*) continue ;; esac
+  case "$f" in *$'\n'*|*$'\t'*|*$'\r'*) continue ;; esac
   [ -f "$f" ] && [ -r "$f" ] && [ -s "$f" ] || continue
   case "$f" in
     *.pub) continue ;;
     "$HOME/.config/gh/hosts.yml") grep -q oauth_token "$f" 2>/dev/null || continue ;;
-    "$HOME/.docker/config.json") grep -q auth "$f" 2>/dev/null || continue ;;
+    "$HOME/.docker/config.json") grep -Eq '"auth"[[:space:]]*:' "$f" 2>/dev/null || continue ;;
   esac
   e pf_secret "$f"
 done < <(
-  find /Users/Shared/cmux-build-fleet/secrets "$HOME/.secrets" \
+  find -H /Users/Shared/cmux-build-fleet/secrets "$HOME/.secrets" \
     "$HOME/Library/Application Support/cmux-build-fleet/secrets" \
     "/Library/Application Support/cmux-build-controller/secrets" \( -type f -o -type l \) -print0 2>/dev/null
   printf '%s\0' "$HOME"/.config/glaeda/*.key "$HOME"/.ssh/id_* "$HOME/.config/gh/hosts.yml" "$HOME/.netrc" \

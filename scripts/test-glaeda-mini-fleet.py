@@ -1111,6 +1111,7 @@ class PreflightSecretsScriptTests(unittest.TestCase):
                      ".secrets/nested/deep/.hidden.token": "sekrit-nested\n",
                      ".secrets/bad\nname": "sekrit-newline\n",
                      ".secrets/bad\tname": "sekrit-tab\n",
+                     ".secrets/bad\rname": "sekrit-cr\n",
                      ".netrc": "machine x password sekrit-netrc\n",
                      ".git-credentials": "https://u:sekrit-gitcred@example.com\n",
                      ".docker/config.json": '{"auths": {"x": {"auth": "sekrit-docker"}}}\n',
@@ -1129,7 +1130,7 @@ class PreflightSecretsScriptTests(unittest.TestCase):
             found = [p for p in mf.parse_probe(out)["preflight"]["secrets"] if p.startswith(tmp)]
             # A token-less gh config, or a docker config with no auth, is not a secret.
             (home / ".config/gh/hosts.yml").write_text("github.com:\n    user: someone\n")
-            (home / ".docker/config.json").write_text('{"credsStore": "osxkeychain"}\n')
+            (home / ".docker/config.json").write_text('{"auths": {}, "credsStore": "osxkeychain"}\n')
             again = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True,
                                    env={"HOME": tmp, "PATH": "/usr/bin:/bin"}, timeout=60).stdout
             (home / ".secrets/locked.env").chmod(0o600)
@@ -1141,7 +1142,7 @@ class PreflightSecretsScriptTests(unittest.TestCase):
             want.append(f"{tmp}/.secrets/locked.env")
         self.assertEqual(sorted(found), sorted(want))
         self.assertEqual(mf.parse_probe(out)["preflight"]["home"], tmp)
-        # A newline or tab in a name could forge probe lines, so those paths are skipped whole.
+        # A newline, tab or carriage return in a name could forge or disguise probe lines, so those paths are skipped whole.
         self.assertNotIn("bad", out)
         later = mf.parse_probe(again)["preflight"]["secrets"]
         self.assertNotIn(f"{tmp}/.config/gh/hosts.yml", later)
