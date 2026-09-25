@@ -69,6 +69,7 @@ import re
 import select
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -207,13 +208,20 @@ WANT_FRESH_S = 10.0  # a waiter rewrites its marker every TAKE_ROOT_POLL_S; an o
 
 # Compile admission keeps its DerivedData per canonical root on the mini (cmux ci-macos.yml
 # CMUX_OWNED_STATE_ROOT: root 1 in OWNED_STATE_DIR, root k in OWNED_STATE_DIR/cmux-ci-k), and cmux's
-# owned_build_state.py `keep` stamps it with the build's warm keys: its merge base's first 12 hex digits and
-# pr-<number>. cmux's picker sends admission to a root runner whose mini is warm for the run (warm affinity,
-# cmux#14696), but the root follows the token, not the runner, so the hook gives such a job the root whose
-# stamp holds its merge base, else its pull request, before the runner's own root.
+# owned_build_state.py `keep` stamps it (stamp.json) with the commit the build merged onto (`merged_onto`,
+# cmux#14717) and its pull request (`pr`, cmux#14718). cmux's picker sends admission to a root runner whose
+# mini is warm for the run (warm affinity, cmux#14696), but the root follows the token, not the runner, so
+# the hook gives such a job the root whose stamp holds its base, else its pull request, before the runner's
+# own root. cmux stamps the merge commit's first parent; the event's pull_request.base.sha is the same
+# commit unless the base moved between the event and the merge ref, when only the pull request matches.
+# Any job on the mini can write these files, so they are read as untrusted: regular files only, bounded,
+# never blocking, and any failure means "not warm".
 OWNED_STATE_DIR = os.path.join(FLEET_DIR, "ci")
 WARM_JOBS = ("macos-compile-admission",)
 WARM_SHA = re.compile(r"[0-9a-f]{40}")
+# cmux owned_build_state.py STATE_VERSION: a stamp of another version is cold there too.
+OWNED_STATE_VERSION = "-owned-rec1"
+STAMP_MAX_BYTES = 64 * 1024
 
 
 def job_warm_keys(event: Any) -> tuple[str, ...]:
@@ -233,16 +241,32 @@ def job_warm_keys(event: Any) -> tuple[str, ...]:
 
 
 def root_warm_keys(k: int, state_dir: str = "") -> list[str]:
-    """The warm keys root k's kept DerivedData is stamped with, or [] (none, unreadable, or mid-keep)."""
+    """The warm keys of root k's kept DerivedData ([base sha12, pr-<n>]), or [] (none, unreadable, mid-keep)."""
     base = Path(state_dir or OWNED_STATE_DIR)
-    path = (base if k == 1 else base / f"cmux-ci-{k}") / "stamp.json"
+    store = base if k == 1 else base / f"cmux-ci-{k}"
     try:
-        stamp = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
+        fd = os.open(store / "stamp.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return []
+            raw = os.read(fd, STAMP_MAX_BYTES + 1)
+        finally:
+            os.close(fd)
+        if len(raw) > STAMP_MAX_BYTES or not (store / "derived-data").is_dir():
+            return []
+        stamp = json.loads(raw.decode("utf-8"))
+        if not isinstance(stamp, dict) or not str(stamp.get("fingerprint") or "").endswith(OWNED_STATE_VERSION):
+            return []
+        keys = []
+        merged_onto = str(stamp.get("merged_onto") or "").lower()
+        if WARM_SHA.fullmatch(merged_onto):
+            keys.append(merged_onto[:12])
+        number = stamp.get("pr")
+        if isinstance(number, int) and not isinstance(number, bool) and 0 < number < 10**9:
+            keys.append(f"pr-{number}")
+        return keys
+    except Exception:  # noqa: BLE001 - a stamp any job can write must never refuse or fail a job
         return []
-    if not isinstance(stamp, dict) or not stamp.get("fingerprint") or not isinstance(stamp.get("warm"), list):
-        return []
-    return [str(key) for key in stamp["warm"]]
 
 
 def warm_root_order(order: list[int], keys: tuple[str, ...], state_dir: str = "") -> tuple[list[int], str]:

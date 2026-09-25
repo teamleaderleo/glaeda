@@ -847,10 +847,12 @@ class HookTest(unittest.TestCase):
         two = ("--canonical-roots", "2", "--compile-slots", "2")
         base = "0123456789abcdef0123456789abcdef01234567"
 
-        def stamp(k: int, keys: list, fingerprint: str = "fp-owned-rec1") -> None:
+        def stamp(k: int, merged_onto: str, pr: int, fingerprint: str = "fp-owned-rec1") -> None:
+            # cmux owned_build_state.py keep's stamp (cmux#14717, #14718)
             store = fleet / "ci" if k == 1 else fleet / "ci" / f"cmux-ci-{k}"
-            store.mkdir(parents=True, exist_ok=True)
-            (store / "stamp.json").write_text(json.dumps({"fingerprint": fingerprint, "warm": keys}))
+            (store / "derived-data").mkdir(parents=True, exist_ok=True)
+            (store / "stamp.json").write_text(json.dumps({"fingerprint": fingerprint, "merged_onto": merged_onto,
+                                                          "pr": pr}))
 
         def admit(runner: str, instance: str, pr: dict) -> subprocess.CompletedProcess:
             payload = {"repository": CMUX, "pull_request": {"head": {"repo": CMUX}, "base": {"repo": CMUX}, **pr}}
@@ -863,8 +865,8 @@ class HookTest(unittest.TestCase):
                                  env={"GITHUB_JOB": "macos-compile-admission", "RUNNER_NAME": runner})
 
         try:
-            stamp(1, ["ffffffffffff", "pr-7"])
-            stamp(2, [base[:12], "pr-42"])
+            stamp(1, "f" * 40, 7)
+            stamp(2, base, 42)
             # instance 0 owns root 1, but root 2 is kept for this merge base
             warm = admit("r0", "0", {"base": {"repo": CMUX, "sha": base}, "number": 7})
             self.assertEqual(warm.returncode, 0, warm.stdout + warm.stderr)
@@ -885,7 +887,7 @@ class HookTest(unittest.TestCase):
                 os.close(held)
             self.finish("r0")
             # no match, a stamp mid-keep (no fingerprint), or no pull request: the runner's own root
-            stamp(2, [base[:12]], fingerprint="")
+            stamp(2, base, 42, fingerprint="")
             for runner, instance, pr in (("r1", "1", {"base": {"repo": CMUX, "sha": "d" * 40}, "number": 9}),
                                          ("r0", "0", {"base": {"repo": CMUX, "sha": base}})):
                 plain = admit(runner, instance, pr)
@@ -896,6 +898,29 @@ class HookTest(unittest.TestCase):
             for runner in ("r0", "r1"):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
+
+    def test_root_warm_keys_never_trust_a_stamp_blindly(self) -> None:
+        # any job on the mini can write the stamp: a FIFO, junk, a huge file, another state version or a
+        # missing DerivedData reads as not warm, and never blocks or raises
+        base, ci = "0123456789abcdef0123456789abcdef01234567", self.dir / "ci"
+        (ci / "derived-data").mkdir(parents=True)
+        good = {"fingerprint": "fp-owned-rec1", "merged_onto": base.upper(), "pr": 3}
+        (ci / "stamp.json").write_text(json.dumps(good))
+        self.assertEqual(hook.root_warm_keys(1, os.fspath(self.dir / "ci")), ["0123456789ab", "pr-3"])
+        for bad in ({**good, "fingerprint": "fp-owned-rec0"}, {**good, "fingerprint": ""}, [good],
+                    {**good, "merged_onto": "HEAD", "pr": True}, "[" * 100000):
+            (ci / "stamp.json").write_text(bad if isinstance(bad, str) else json.dumps(bad))
+            self.assertIn(hook.root_warm_keys(1, os.fspath(ci)), ([], ), bad if isinstance(bad, dict) else "junk")
+        (ci / "stamp.json").write_text(json.dumps(good))
+        os.rmdir(ci / "derived-data")
+        self.assertEqual(hook.root_warm_keys(1, os.fspath(ci)), [])
+        (ci / "derived-data").mkdir()
+        (ci / "stamp.json").unlink()
+        os.mkfifo(ci / "stamp.json")
+        start = time.monotonic()
+        self.assertEqual(hook.root_warm_keys(1, os.fspath(ci)), [])
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual(hook.root_warm_keys(2, os.fspath(ci)), [])  # no cmux-ci-2 at all
 
     def test_job_warm_keys_come_from_the_pull_request(self) -> None:
         sha = "ABCDEF0123456789abcdef0123456789abcdef01"
