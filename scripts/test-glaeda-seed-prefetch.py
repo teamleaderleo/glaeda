@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -108,11 +109,11 @@ class SeedPrefetchTest(unittest.TestCase):
         self.keep_seed(self.state, kept)
         for n in range(sp.NEAR_APP_SWIFT_FILES):
             self.write(f"Sources/File{n}.swift")
-        # Not app sources: tests, the iOS packages, docs.
+        # Not app sources: tests, docs. A path git would quote still counts as a file.
         self.write("cmuxTests/ATests.swift")
         self.write("Packages/macOS/CmuxFoundation/Tests/CmuxFoundationTests/ATests.swift")
-        self.write("Packages/iOS/CmuxMobile/Sources/CmuxMobile/A.swift")
         self.write("docs/a.md")
+        self.write("Sources/\u00e9 tab\t.md")
         self.commit()
         result = sp.run(True, self.state)["results"][os.fspath(self.state)]
         self.assertEqual((result["fetched"], result["app_swift_files"]), ("false", sp.NEAR_APP_SWIFT_FILES))
@@ -124,13 +125,49 @@ class SeedPrefetchTest(unittest.TestCase):
         self.assertEqual(len(self.call_lines()), 1)
 
     def test_a_package_source_change_fetches_however_small(self):
+        for path in ("Packages/macOS/CmuxFoundation/Sources/CmuxFoundation/A.swift",
+                     # The macOS app imports several iOS packages (CmuxMobileRPC, ...).
+                     "Packages/iOS/CmuxMobileRPC/Sources/CmuxMobileRPC/A.swift",
+                     "Packages/macOS/CmuxFoundation/Sources/CmuxFoundation/\u00e9 b.swift"):
+            with self.subTest(path=path):
+                self.calls.unlink(missing_ok=True)
+                self.record(self.state)
+                kept = self.commit()
+                shutil.rmtree(self.state / "seeds", ignore_errors=True)
+                self.keep_seed(self.state, kept)
+                self.write(path, path)
+                self.commit()
+                sp.run(True, self.state)
+                self.assertEqual(len(self.call_lines()), 1)
+
+    def test_a_quoted_app_path_counts(self):
         self.record(self.state)
         kept = self.commit()
         self.keep_seed(self.state, kept)
-        self.write("Packages/macOS/CmuxFoundation/Sources/CmuxFoundation/A.swift")
-        self.commit()
+        changes = sp.app_swift_changes(self.state / ".prefetch/cmux.git", kept, kept)
+        self.assertIsNone(changes)  # no mirror yet: cannot compare, so never near
+        sp.run(True, self.state)  # builds the mirror
+        for n in range(sp.NEAR_APP_SWIFT_FILES + 1):
+            self.write(f"Sources/\u00e9{n}.swift")
+        head = self.commit()
+        sp.main_head(self.state / ".prefetch")
+        self.assertEqual(sp.app_swift_changes(self.state / ".prefetch/cmux.git", kept, head),
+                         (sp.NEAR_APP_SWIFT_FILES + 1, False))
+
+    def test_a_submodule_bump_counts_as_a_package_change(self):
+        self.record(self.state)
+        sub = Path(self.tmp.name) / "sub"
+        subprocess.run(["git", "init", "-q", "-b", "main", os.fspath(sub)], check=True)
+        subprocess.run(["git", "-C", os.fspath(sub), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-q", "--allow-empty", "-m", "s"], check=True)
+        kept = self.commit()
+        self.keep_seed(self.state, kept)
+        subprocess.run([*self.git, "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+                        sub.as_uri(), "vendor/bonsplit"], check=True)
+        head = self.commit()
         sp.run(True, self.state)
         self.assertEqual(len(self.call_lines()), 1)
+        self.assertEqual(sp.app_swift_changes(self.state / ".prefetch/cmux.git", kept, head), (0, True))
 
     def test_a_seed_off_mains_history_does_not_count(self):
         self.record(self.state)

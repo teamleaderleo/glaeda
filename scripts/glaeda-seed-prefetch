@@ -71,10 +71,10 @@ BUSY_RATE = "3M"
 BUSY_PREFETCH_TIMEOUT = 1500
 # A kept seed this near main's head is a start that does not recompile the app: skip the download.
 NEAR_APP_SWIFT_FILES = 5
-# Local Swift packages the macOS app imports (cmux owned_build_state.PACKAGE_SOURCES). The iOS
-# packages are not built by the macOS schemes.
+# Local Swift packages (cmux owned_build_state.PACKAGE_SOURCES). Packages/iOS counts too: the macOS
+# app and its packages import several of them (CmuxMobileRPC, CmuxMobileTransport, ...).
 PACKAGE_SOURCES = ("Packages/", "vendor/", "Examples/")
-NOT_APP_SOURCES = ("cmuxTests/", "cmuxUITests/", "Packages/iOS/")
+NOT_APP_SOURCES = ("cmuxTests/", "cmuxUITests/")
 KEEP_SCRIPTS = 2  # extracted scripts/ci trees, by main commit
 
 
@@ -103,12 +103,13 @@ def app_swift_changes(mirror: Path, base: str, head: str) -> tuple[int, bool] | 
     None when the mirror cannot compare them (a commit past its depth). Trees only: no blob fetch.
     """
     try:
-        raw = git(mirror, "diff", "--raw", "--no-renames", "--no-abbrev", base, head)
+        raw = git(mirror, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", base, head)
     except (OSError, subprocess.SubprocessError):
         return None
     files, package = 0, False
-    for line in raw.splitlines():
-        meta, _, path = line.partition("\t")
+    fields = raw.split("\0")
+    # -z: ":<mode> <mode> <sha> <sha> <status>" NUL "<path>" NUL, paths unquoted.
+    for meta, path in zip(fields[0::2], fields[1::2]):
         modes = meta.split()[:2]
         if "160000" in (mode.lstrip(":") for mode in modes):
             package = True  # a submodule bump (vendor/bonsplit): its sources changed
@@ -129,15 +130,16 @@ def near_seed(mirror: Path, store: Path, head: str) -> dict | None:
     if not isinstance(prefix, str) or not prefix:
         return None
     scoped = f"{prefix}j{os.sysconf('SC_NPROCESSORS_ONLN')}-"
+    try:
+        # Only the commits the shallow mirror holds: an older seed counts as far.
+        history = set(git(mirror, "rev-list", head).split())
+    except (OSError, subprocess.SubprocessError):
+        return None
     best = None
     for entry in (store / "seeds").glob(scoped + "*"):
         commit = entry.name[len(scoped):]
-        if not re.fullmatch(r"[0-9a-f]{40}", commit) or not entry.is_dir():
+        if commit not in history or not entry.is_dir():
             continue
-        try:
-            git(mirror, "merge-base", "--is-ancestor", commit, head)
-        except (OSError, subprocess.SubprocessError):
-            continue  # not in main's history here, or past the mirror's depth
         changes = app_swift_changes(mirror, commit, head)
         if changes is None:
             continue
@@ -154,8 +156,11 @@ def stores(state: Path) -> list[Path]:
 
 
 def git(mirror: Path, *args: str, timeout: int = FETCH_TIMEOUT) -> str:
+    # The mirror is shallow and blobless: a commit past its depth must fail, not make git lazily fetch
+    # that commit's whole history from the promisor remote.
+    env = {**os.environ, "GIT_NO_LAZY_FETCH": "1"}
     return subprocess.run(["git", "-C", os.fspath(mirror), *args], check=True, capture_output=True,
-                          text=True, timeout=timeout).stdout
+                          text=True, timeout=timeout, env=env).stdout
 
 
 def main_head(work: Path) -> tuple[Path, str]:
