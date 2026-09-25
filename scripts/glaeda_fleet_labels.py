@@ -24,6 +24,8 @@ VERSION_RE = r"[0-9][0-9.]*"
 # 2 units, a light or GUI job 1. The manifest's defaults.runner.classes.<class> {runners, capacityUnits}
 # overrides these, and a host's overrides.runner.classes likewise. compileSlots (default 1) is how many
 # compiles run at once: more than one needs cmux's compile admission to keep its state per runner.
+# canonicalRoots (default 1) is how many canonical roots (/private/tmp/cmux-ci, -2, ...) the mini has: that
+# many runners (instances 0 to canonicalRoots - 1) also carry the root pool label (root_label).
 CLASS_CAPACITY = {"xl": (8, 8), "std": (4, 4), "light": (2, 2)}
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
@@ -45,6 +47,13 @@ def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
 def pool_label(klass: str, version: str, trusted: bool = False) -> str:
     """The single label a pool picker routes a whole run to: class plus verified Xcode, dedicated only."""
     return f"glaeda-{'trusted-' if trusted else ''}{klass}-xcode-{version}"
+
+
+def root_label(pool: str) -> str:
+    """The label of a pool's root runners (instances below canonicalRoots): the jobs that build in or restore
+    into the canonical root (compile, app-host shards, cli-product, lag) run on it, so GitHub queues them
+    until a root runner is free instead of handing one to a runner whose mini has no free root."""
+    return pool.replace("glaeda-", "glaeda-root-", 1)
 
 
 def xcode_apps(manifest: dict[str, Any], member: str) -> list[dict[str, Any]] | None:
@@ -107,8 +116,9 @@ def member_labels(manifest: Any, member: str,
             return None, f"runner.classes.{klass} is not an object"
         runners, units = declared.get("runners", runners), declared.get("capacityUnits", units)
         compile_slots = declared.get("compileSlots", 1)
+        roots = declared.get("canonicalRoots", 1)
     else:
-        compile_slots = 1
+        compile_slots, roots = 1, 1
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
     if not (isinstance(units, int) and not isinstance(units, bool) and 2 <= units <= 4 * MAX_RUNNERS):
@@ -116,12 +126,18 @@ def member_labels(manifest: Any, member: str,
     if not (isinstance(compile_slots, int) and not isinstance(compile_slots, bool)
             and 1 <= compile_slots <= max(1, units // 2)):
         return None, f"runner.classes.{klass}.compileSlots must be 1 to {max(1, units // 2)} (a compile is 2 units)"
+    if not (isinstance(roots, int) and not isinstance(roots, bool) and 1 <= roots <= runners):
+        return None, f"runner.classes.{klass}.canonicalRoots must be 1 to {runners} (one root runner per root)"
+    if compile_slots > roots:
+        return None, (f"runner.classes.{klass}.compileSlots {compile_slots} needs canonicalRoots {compile_slots} "
+                      "(every compile holds a root)")
     return {"member": member, "class": klass, "availability": availability, "roles": roles,
             "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready],
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
-            "trustedRef": trusted_ref, "trustedRepo": trusted_repo}, None
+            "trustedRef": trusted_ref, "trustedRepo": trusted_repo,
+            "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)]}, None
 
 
 def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool] | None = None) -> dict[str, list[str]]:

@@ -293,6 +293,26 @@ What the gate cannot see, and the operator must keep true:
   that trusted runs wrote. A cache namespace that PR runs also write (build seeds, sccache, SwiftPM
   manifest caches) brings PR-produced bytes next to the secret.
 - Also limit the org runner group to the one repository (an admin setting).
+## 2f. Canonical roots
+
+Compiles build in a canonical root (/private/tmp/cmux-ci; cmux#14338 adds /private/tmp/cmux-ci-2 and on),
+and app-host test consumers restore a product there with `rm -rf <root>/src`, because `#filePath` is baked
+in at the producer's root. So one root job per root per mini:
+
+- Root jobs are compile (macos-compile-admission and any unknown job id), gui (app-host-unit-tests,
+  tests-build-and-lag) and product (cli-product-tests). Each also takes an exclusive `capacity/root-k.token`
+  (k = 1 to `canonicalRoots`), and the hook writes `CMUX_CI_CANONICAL_ROOT=<root k>` to `$GITHUB_ENV` and
+  `$RUNNER_TEMP/glaeda-canonical-root`. The root follows the token, never the runner instance.
+- Light jobs take no root.
+- `defaults.runner.classes.<class>.canonicalRoots` (default 1, at most `runners`) runners per mini
+  (instances 0 and up) also carry the root pool label `glaeda-root-<class>-xcode-<version>`. Root jobs
+  should run on that label, so GitHub queues them until a root runner is free instead of handing one to a
+  runner whose mini is already busy in its root (a "canonical root token is taken" refusal).
+- `compileSlots` may not exceed `canonicalRoots`: every compile holds a root.
+- `declared_pools` and glaeda-route count only the pool labels; the root labels are a per-mini subset of them.
+- Before `canonicalRoots` goes above 1, consumers need `glaeda-canonical-root take <root>` to hold
+  the producer's root (not shipped yet). Workflows that use /private/tmp/cmux-ci directly (app-host-test-rerun,
+  seed-swiftpm-manifests) must hold root 1.
 
 ## 3. Verify
 

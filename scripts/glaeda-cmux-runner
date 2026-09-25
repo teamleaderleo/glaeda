@@ -378,6 +378,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         slots = int((ctx.member or {}).get("compileSlots") or 1)
         if slots > 1:
             scope += f" --compile-slots {slots}"
+        roots = int((ctx.member or {}).get("canonicalRoots") or 1)
+        if roots > 1:
+            scope += f" --canonical-roots {roots}"
     started = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"
@@ -1020,7 +1023,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if not args.capacity_units:
             ctx.capacity_units = int(member.get("capacityUnits") or 0)
-        ctx.labels = list(dict.fromkeys([*BASE_LABELS, *member["labels"]]))
+        roots = member.get("rootPools", []) if ctx.instance < int(member.get("canonicalRoots") or 1) else []
+        ctx.labels = list(dict.fromkeys([*BASE_LABELS, *member["labels"], *roots]))
         ctx.labels_requested = True
         if not args.name:
             ctx.name = f"{args.member}-glaeda{ctx.suffix}"
