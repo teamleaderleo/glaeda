@@ -625,9 +625,11 @@ class LinuxLayoutTest(unittest.TestCase):
 
     def test_cmux_job_units_go_but_unpushed_checkouts_stay(self) -> None:
         job = self.home / ".cache/cmux-job"
-        (job / "reload-cloud-ios/DerivedData/Build").mkdir(parents=True)
-        (job / "reload-cloud-ios/DerivedData/Build/x.o").write_bytes(b"\0" * 4096)
-        base = job / "reload-cloud/cmux-base"
+        # as on cmux13s: SwiftPM clones inside DerivedData, and each slot's clone one level below cmux-base
+        (job / "reload-cloud-ios/DerivedData/slot-1/Build").mkdir(parents=True)
+        (job / "reload-cloud-ios/DerivedData/slot-1/Build/x.o").write_bytes(b"\0" * 4096)
+        (job / "reload-cloud-ios/DerivedData/slot-1/SourcePackages/checkouts/dep/.git").mkdir(parents=True)
+        base = job / "reload-cloud/cmux-base/slot-1"
         env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
         subprocess.run(["git", "init", "-q", str(base)], check=True, env=env)
@@ -650,6 +652,18 @@ class LinuxLayoutTest(unittest.TestCase):
         # a commit no remote holds keeps its checkout
         self.assertEqual(verdicts[".cache/cmux-job/reload-cloud/cmux-base"], ("cmux-job-cache", "git-checkout"))
         self.assertNotIn(".cache/cmux-job", verdicts)  # not listed again as a report-only tool cache
+        receipt = self.home / "receipt.jsonl"
+        fams_by_id = {f.id: f for f in fams}
+        with contextlib.redirect_stdout(io.StringIO()):
+            saved = gd.process_evidence
+            gd.process_evidence = lambda: ([], "")
+            try:
+                gd.apply(items, fams_by_id, receipt, None, 24)
+            finally:
+                gd.process_evidence = saved
+        self.assertFalse((job / "reload-cloud-ios/DerivedData").exists())
+        self.assertEqual([c.name for c in (job / "reload-cloud-ios").iterdir()], [])  # no half-deleted leftover
+        self.assertTrue((base / ".git").is_dir())
 
     def test_claude_session_seen_in_alternate_config_dir(self) -> None:
         t = self.home / ".claude-outlook/projects/-home-leo-Projects/abc-123.jsonl"

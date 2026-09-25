@@ -495,9 +495,8 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "ProgramArguments": [python, disk, "--pressure", "--apply", "--top", "0"],
             "StartInterval": 900,
             "RunAtLoad": True,
-            # Background also throttles CPU and I/O like taskpolicy -b: a 30 GiB delete at normal
-            # priority starved a cold CI compile on the same mini (2026-09-24).
-            "ProcessType": "Background",
+            # Not ProcessType Background: under pressure this job must still finish its lsof and free
+            # space while a build fills the disk. LowPriorityIO and Nice keep it behind the build.
             "LowPriorityIO": True,
             "Nice": 10,
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-disk.log"),
@@ -509,6 +508,7 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "WatchPaths": [os.fspath(ctx.derived_data)],
             "StartInterval": 21600,
             "ThrottleInterval": 600,
+            # Hashing whole DerivedData trees is never urgent: throttle CPU and I/O like taskpolicy -b.
             "ProcessType": "Background",
             "LowPriorityIO": True,
             "Nice": 10,

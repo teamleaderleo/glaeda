@@ -132,7 +132,8 @@ def default_families() -> list[Family]:
                min_bytes=1024**2 if tmpfs else None, git_disposable=True),
         # cmux's cloud reload and CI jobs keep warm trees per unit (reload-cloud/{cmux-base,work},
         # reload-cloud-ios/{DerivedData,work}); a build mini grew 36 GiB here within hours. Depth 2
-        # so a unit's DerivedData can go while its checkout stays, unless that checkout loses nothing.
+        # so a unit's DerivedData can go (see derived_data) while the clones below cmux-base and work
+        # stay protected; hq's cleanup-host.sh ages those out.
         Family("cmux-job-cache", HOME / ".cache/cmux-job", True,
                "next cmux reload or CI job rebuilds it (cold)", depth=2, git_disposable=True),
         Family("user-cache", HOME / ".cache", False, "tool caches (report only)", skip=("cmux-job",)),
@@ -287,6 +288,11 @@ def claude_session_active(session_id: str, idle_s: float) -> bool:
             except OSError:
                 continue
     return False
+
+
+def derived_data(fam: Family, path: Path) -> bool:
+    """Xcode DerivedData is build output even though SourcePackages inside it holds git clones."""
+    return fam.id == "xcode-derived-data" or (fam.id == "cmux-job-cache" and path.name == "DerivedData")
 
 
 REPRODUCIBLE_DIRS = frozenset({"node_modules", ".build", "DerivedData", "target", ".venv",
@@ -739,7 +745,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence) -> list[Item]:
             verdict = "report-only"
         elif reasons:
             verdict = "in-use"
-        elif (fam.id != "xcode-derived-data" and (g := git_state(path)) != "none"
+        elif (not derived_data(fam, path) and (g := git_state(path)) != "none"
               and not (g == "git" and fam.git_disposable and idle >= idle_hours
                        and not (loss := git_loss(path)))):
             verdict = "git-checkout" if g == "git" else "unchecked"
@@ -859,7 +865,11 @@ def remove(path: Path) -> None:
     if not path.is_dir():
         path.unlink()
         return
-    shutil.rmtree(path, ignore_errors=False, onerror=_chmod_retry)
+    # Move it out of the way first (same directory, so one atomic rename): a job that starts during a
+    # minutes-long delete then finds nothing at the path instead of a half-deleted tree it might reuse.
+    doomed = path.with_name(f".glaeda-disk-deleting-{path.name}-{os.getpid()}")
+    os.rename(path, doomed)
+    shutil.rmtree(doomed, ignore_errors=False, onerror=_chmod_retry)
 
 
 def _chmod_retry(func, p, _exc):  # read-only files in SwiftPM/Xcode checkouts
@@ -899,7 +909,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             outcome = "changed:in-use"
         elif (time.time() - newest_mtime(p)) / 3600 < idle_hours:
             outcome = "changed:modified"
-        elif (families[i.family].git_disposable and p.is_dir()
+        elif (families[i.family].git_disposable and p.is_dir() and not derived_data(families[i.family], p)
               and (g := git_state(p)) != "none" and (g != "git" or git_loss(p))):
             outcome = "changed:git"  # the checkout gained something to lose since the survey
         else:
