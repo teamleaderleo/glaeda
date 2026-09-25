@@ -950,7 +950,10 @@ impl Store {
                 if existing != bytes {
                     let servable = kv::Value::decode(existing.as_slice())
                         .is_ok_and(|v| s.trusts(&req.key, &v));
-                    if servable {
+                    // Markers are the writer's statements, not compile results: a newer
+                    // one (REPO/latest names the newest fill) replaces the old. Writes
+                    // come only from --writers peers, and the value is signed.
+                    if servable && !req.key.starts_with(sign::MARKER_PREFIX) {
                         s.stats.kv_put_conflict.fetch_add(1, Relaxed);
                     } else {
                         write_atomic(&path, &bytes)

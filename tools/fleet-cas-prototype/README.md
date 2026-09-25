@@ -98,8 +98,9 @@ Signed index entries (#1134 M3, `src/sign.rs`):
   Readers keep warm between builds: the writer script also publishes `REPO/latest/<Xcode>`
   naming its newest fill, and `scripts/fleet-cas-prewarm.sh REPO` (a 5-minute LaunchAgent
   on each node, `glaeda-fleet-cas-rollout --prewarm REPO`) warms that commit whenever the
-  host lock is free, so a build's own warm finds nearly everything local. Nodes record use
-  on local hits, and prewarm runs `fleet-cas gc` on the node store daily (`--keep-days 3`).
+  host lock is free, so a build's own warm finds nearly everything local. Markers are the
+  one kind of entry a newer signed write replaces. Nodes record use on local hits; pruning
+  the node store stays with `glaeda-fleet-cas-prune`.
   `up_prefetch_micros` and `up_slow_calls` (calls over 100 ms) in a node's stats separate
   a slow store from serial round trips.
 

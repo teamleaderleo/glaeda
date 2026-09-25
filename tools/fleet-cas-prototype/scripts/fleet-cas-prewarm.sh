@@ -6,8 +6,11 @@
 # usage: fleet-cas-prewarm.sh REPO
 # The writer names its newest fill in the signed marker REPO/latest/<Xcode build>. Nearby
 # commits share almost all keys, so a build a few commits away fetches only the difference.
-# Skips while a build holds the host lock (never takes it), and once a commit is warmed. At
-# most daily it prunes the node store to what builds and warms used in the last 3 days.
+# Skips while any build or CI job holds the host lock (never waits for it). Warm is re-run
+# every tick: with everything local it only reads and checks entries (under a second), and it
+# refetches whatever glaeda-fleet-cas-prune evicted. Pruning the node store stays with
+# glaeda-fleet-cas-prune (hourly, deferred while anything builds).
+# Exit: warm's code (0 warmed, 1 no marker, 2 unverified, 3 incomplete); 0 when skipped.
 set -u
 repo=${1:?usage: fleet-cas-prewarm.sh REPO}
 ROOT=${FLEET_CAS_ROOT:-/Users/Shared/cmux-build-fleet/xcode}
@@ -16,9 +19,10 @@ env_get() { sed -n "s/^$1=//p" "$ROOT/fleet-cas.env" 2>/dev/null | tail -1; }
 store=$(env_get FLEET_CAS_STORE) keys=$(env_get FLEET_CAS_TRUSTED_KEYS)
 [ -n "$store" ] && [ -n "$keys" ] || { echo "$ROOT/fleet-cas.env has no store or trusted keys" >&2; exit 2; }
 say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
-# A build holds the lock exclusively; a shared, non-blocking probe dropped at once says whether
-# one is running without ever blocking it.
-if [ -e "$LOCK" ] && ! perl -MFcntl=:flock -e 'open(my $f, "<", shift) or exit 0; exit(flock($f, LOCK_SH | LOCK_NB) ? 0 : 1)' "$LOCK"; then
+# Fleet builds hold the lock exclusively and CI jobs on multi-runner hosts hold it shared, so
+# only an exclusive, non-blocking probe (released at once, as cmux_mini_probe.sh does) sees
+# both. Absent lock file: nothing on this host takes it.
+if [ -e "$LOCK" ] && ! perl -MFcntl=:flock -e 'open(my $f, "<", shift) or exit 0; exit(flock($f, LOCK_EX | LOCK_NB) ? 0 : 1)' "$LOCK"; then
   exit 0
 fi
 xcode=$(xcodebuild -version 2>/dev/null | awk '/Build version/ {print $3}')
@@ -29,19 +33,9 @@ rc=$?
 [ $rc -eq 0 ] || { say "latest marker for $repo/$xcode did not verify or the store is unreachable ($rc)"; exit 2; }
 commit=$(printf '%s\n' "$latest" | sed -n 's/^commit=//p')
 case $commit in *[!0-9a-f]* | "") say "latest marker names no commit"; exit 2 ;; esac
-mkdir -p "$ROOT/run"
-state=$ROOT/run/prewarm-$(printf '%s' "$repo" | tr -c 'A-Za-z0-9.@-' _)-$xcode
-if [ "$(cat "$state" 2>/dev/null)" != "$commit" ]; then
-  out=$(nice -n 10 "$ROOT/bin/fleet-cas" warm "http://$store" "$repo/$commit/$xcode" \
-    --trusted-keys "$keys" --store "$ROOT/node-store" --timeout 900 2>&1)
-  rc=$?
-  say "$out"
-  [ $rc -eq 0 ] && echo "$commit" >"$state"
-fi
-# Prune the node store at most daily (a few seconds). gc keeps entries used within 3 days
-# (local hits and warms record use) and every object they reach.
-gcstamp=$ROOT/run/prewarm.gc
-if [ -z "$(find "$gcstamp" -mtime -1 2>/dev/null)" ]; then
-  touch "$gcstamp"
-  say "$(nice -n 10 "$ROOT/bin/fleet-cas" gc "$ROOT/node-store" --keep-days 3 2>&1)"
-fi
+out=$(nice -n 10 "$ROOT/bin/fleet-cas" warm "http://$store" "$repo/$commit/$xcode" \
+  --trusted-keys "$keys" --store "$ROOT/node-store" --timeout 900 2>&1)
+rc=$?
+# Log only what changed something or failed: an all-local tick is the normal case.
+case $out in *" 0 fetched, 0 missing), 0 objects"*) [ $rc -eq 0 ] || say "$out" ;; *) say "$out" ;; esac
+exit $rc

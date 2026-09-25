@@ -147,7 +147,7 @@ async fn writer_manifest_then_warm() {
     assert_eq!(rc, 1);
 
     // Prewarm (needs Xcode for the build version, as on the minis): the latest marker
-    // names a commit, prewarm warms it into the node store once, then prunes.
+    // names a commit, and prewarm warms it into the node store.
     let xcode = Command::new("xcodebuild").arg("-version").output().ok().and_then(|o| {
         String::from_utf8_lossy(&o.stdout)
             .lines()
@@ -157,8 +157,13 @@ async fn writer_manifest_then_warm() {
         let commit = "ab".repeat(20);
         let (rc, _, err) = run(&["marker", "put", &url, &format!("r/{commit}/{xcode}"), "--sign-key", &p("writer.key"), "--entry", "commit=x", "--manifest", &p("manifest")]);
         assert_eq!(rc, 0, "{err}");
-        let (rc, _, err) = run(&["marker", "put", &url, &format!("r/latest/{xcode}"), "--sign-key", &p("writer.key"), "--entry", &format!("commit={commit}")]);
-        assert_eq!(rc, 0, "{err}");
+        // The latest marker moves: a newer signed put replaces it.
+        for c in ["cd".repeat(20), commit.clone()] {
+            let (rc, _, err) = run(&["marker", "put", &url, &format!("r/latest/{xcode}"), "--sign-key", &p("writer.key"), "--entry", &format!("commit={c}")]);
+            assert_eq!(rc, 0, "{err}");
+        }
+        let (_, out, _) = run(&["marker", "get", &url, &format!("r/latest/{xcode}"), "--trusted-keys", &pubkey]);
+        assert!(out.contains(&format!("commit={commit}")), "{out}");
         let pw = root.join("pw");
         std::fs::create_dir_all(pw.join("bin")).unwrap();
         std::os::unix::fs::symlink(BIN, pw.join("bin/fleet-cas")).unwrap();
@@ -175,9 +180,9 @@ async fn writer_manifest_then_warm() {
             String::from_utf8_lossy(&o.stdout).to_string()
         };
         let out = prewarm();
-        assert!(out.contains("2 fetched") && out.contains("kv kept 2"), "{out}");
+        assert!(out.contains("2 fetched"), "{out}");
         assert_eq!(count_files(&pw.join("node-store/kv")), 2);
-        // Warmed once: the next run neither warms nor prunes again.
+        // Everything local now: the next tick checks and logs nothing.
         assert_eq!(prewarm(), "");
     }
 

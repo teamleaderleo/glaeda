@@ -121,7 +121,7 @@ plist_for() {  # role, label, daemon (1 or empty)
 
 # A reader node's prewarm (fleet-cas-prewarm.sh REPO): a LaunchAgent every 5 minutes that
 # copies the writer's newest fill into the node store between builds. An agent is enough: it
-# reaches the store on its tailnet address, and it only runs while nothing builds.
+# reaches the store on its tailnet address, and it skips while any job holds the host lock.
 PREWARM_LABEL=com.teamleaderleo.glaeda.fleet-cas-prewarm
 prewarm_plist() {  # repo
   local log=$LOGS/glaeda-fleet-cas-prewarm.log
