@@ -1239,7 +1239,7 @@ class SudoPlanTests(unittest.TestCase):
         order = [script.index(s) for s in ("sudo -v", "sudo xcode-select -s /Applications/Xcode.app",
                                            "xcodebuild -license accept", "xcodebuild -runFirstLaunch",
                                            "sudo pmset -c sleep 0", "sudo pmset -a autorestart 1",
-                                           "sudo -H -u admin /opt/homebrew/bin/brew", "for f in rustup zig",
+                                           "sudo -H -u admin env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew", "for f in rustup zig",
                                            'sudo -H -u admin ln -s "/opt/homebrew/opt/rustup/bin/$t"')]
         self.assertEqual(order, sorted(order))
         self.assertEqual(script.count("sudo -v\n"), 1)

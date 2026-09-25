@@ -8,7 +8,7 @@ set -euo pipefail
 # share_recv reads a tar stream on stdin; everything else must not read from the SSH channel.
 [ "${KEEP_STDIN:-}" = 1 ] || exec </dev/null
 export PATH="$WORKLOAD_PATH:$HOME/.local/bin"
-export GIT_TERMINAL_PROMPT=0 HOMEBREW_NO_ENV_HINTS=1
+export GIT_TERMINAL_PROMPT=0 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_ASK=1
 cd "$HOME"
 
 say() { printf 'glaeda-mini-fleet: %s\n' "$*"; }
