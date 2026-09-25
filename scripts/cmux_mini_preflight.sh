@@ -10,7 +10,8 @@
 #   ENROLL_FLAGS    the glaeda-mini-enroll options onboarding passes, space separated
 #   PIN_FORMULAS    the Homebrew formulas class receipts pin, space separated
 # Emits "key<TAB>value" lines like the probe. Installs, downloads and writes nothing: rustup runs with
-# RUSTUP_AUTO_INSTALL=0 and git with GIT_OPTIONAL_LOCKS=0. Never prints tokens or runner URLs.
+# RUSTUP_AUTO_INSTALL=0 and git with GIT_OPTIONAL_LOCKS=0. Never prints tokens or runner URLs; for a readable
+# secret it prints the path alone.
 # The group is parsed whole before it runs, so its </dev/null cannot eat the rest of this script.
 {
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -195,4 +196,30 @@ for r in "$HOME"/actions-runner*/.runner; do
   [ -f "$HOME/.local/state/glaeda/mini-fleet/runner-held/$(basename "$dir")" ] && held=yes
   e pf_runner "$(basename "$dir")|$(grep -o '"agentName": *"[^"]*"' "$r" | sed -E 's/.*"([^"]*)"$/\1/')|$loaded|$listening|$held"
 done
+
+# Secrets this user can read. PR jobs run as the login user on a runner host, so whatever it can read,
+# a PR can read (cmuxterm-hq#595). Paths only, never contents. The secrets directories are walked whole
+# (subdirectories and dotfiles count); nullglob drops a pattern with no match, dotglob keeps .files, and a
+# literal path still comes through, so every entry must be a readable, non-empty file. A path with a
+# newline or tab is skipped: it could forge probe lines.
+# The home the paths below expand, for the manifest's ~-prefixed accepted_secrets.
+e pf_home "$HOME"
+shopt -s nullglob dotglob
+while IFS= read -r -d '' f; do
+  case "$f" in *$'\n'*|*$'\t'*|*$'\r'*) continue ;; esac
+  [ -f "$f" ] && [ -r "$f" ] && [ -s "$f" ] || continue
+  case "$f" in
+    *.pub) continue ;;
+    "$HOME/.config/gh/hosts.yml") grep -q oauth_token "$f" 2>/dev/null || continue ;;
+    "$HOME/.docker/config.json") grep -Eq '"auth"[[:space:]]*:' "$f" 2>/dev/null || continue ;;
+  esac
+  e pf_secret "$f"
+done < <(
+  find -H /Users/Shared/cmux-build-fleet/secrets "$HOME/.secrets" \
+    "$HOME/Library/Application Support/cmux-build-fleet/secrets" \
+    "/Library/Application Support/cmux-build-controller/secrets" \( -type f -o -type l \) -print0 2>/dev/null
+  printf '%s\0' "$HOME"/.config/glaeda/*.key "$HOME"/.ssh/id_* "$HOME/.config/gh/hosts.yml" "$HOME/.netrc" \
+    "$HOME/.git-credentials" "$HOME/.docker/config.json" "$HOME/.aws/credentials" "$HOME/.config/rclone/rclone.conf"
+)
+shopt -u nullglob dotglob
 } </dev/null
