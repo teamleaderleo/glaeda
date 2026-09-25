@@ -815,10 +815,11 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
                 // A damaged entry is a miss, like a damaged object.
                 if let Ok(value) = kv::Value::decode(bytes.as_slice()) {
                     if s.trusts(&key, &value) {
-                        // A fleet store records the use, for `fleet-cas gc`. Not for
-                        // markers: a marker then expires N days after its fill, and
-                        // never outlives the entries it vouches for.
-                        if !s.strip_signatures && !key.starts_with(sign::MARKER_PREFIX) {
+                        // Record the use, for `fleet-cas gc` (the fleet store's, and the
+                        // node store's that prewarm runs). Not for markers: a marker then
+                        // expires N days after its fill, and never outlives the entries it
+                        // vouches for.
+                        if !key.starts_with(sign::MARKER_PREFIX) {
                             gc::touch_if_stale(&path);
                         }
                         s.stats.kv_get_hit.fetch_add(1, Relaxed);

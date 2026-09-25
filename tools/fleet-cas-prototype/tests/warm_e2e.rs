@@ -146,6 +146,41 @@ async fn writer_manifest_then_warm() {
     let (rc, _, _) = run(&["warm", &url, "r/c/none", "--trusted-keys", &pubkey, "--store", &p("reader2")]);
     assert_eq!(rc, 1);
 
+    // Prewarm (needs Xcode for the build version, as on the minis): the latest marker
+    // names a commit, prewarm warms it into the node store once, then prunes.
+    let xcode = Command::new("xcodebuild").arg("-version").output().ok().and_then(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("Build version ").map(str::to_string))
+    });
+    if let Some(xcode) = xcode {
+        let commit = "ab".repeat(20);
+        let (rc, _, err) = run(&["marker", "put", &url, &format!("r/{commit}/{xcode}"), "--sign-key", &p("writer.key"), "--entry", "commit=x", "--manifest", &p("manifest")]);
+        assert_eq!(rc, 0, "{err}");
+        let (rc, _, err) = run(&["marker", "put", &url, &format!("r/latest/{xcode}"), "--sign-key", &p("writer.key"), "--entry", &format!("commit={commit}")]);
+        assert_eq!(rc, 0, "{err}");
+        let pw = root.join("pw");
+        std::fs::create_dir_all(pw.join("bin")).unwrap();
+        std::os::unix::fs::symlink(BIN, pw.join("bin/fleet-cas")).unwrap();
+        std::fs::write(pw.join("fleet-cas.env"), format!("FLEET_CAS_STORE=127.0.0.1:{port}\nFLEET_CAS_TRUSTED_KEYS={pubkey}\nFLEET_CAS_SIGN_KEY=\n")).unwrap();
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/fleet-cas-prewarm.sh");
+        let prewarm = || {
+            let o = Command::new(script)
+                .arg("r")
+                .env("FLEET_CAS_ROOT", &pw)
+                .env("FLEET_HOST_LOCK", root.join("no-such-lock"))
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+        let out = prewarm();
+        assert!(out.contains("2 fetched") && out.contains("kv kept 2"), "{out}");
+        assert_eq!(count_files(&pw.join("node-store/kv")), 2);
+        // Warmed once: the next run neither warms nor prunes again.
+        assert_eq!(prewarm(), "");
+    }
+
     drop(_guard);
     let _ = std::fs::remove_dir_all(&root);
 }

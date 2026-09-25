@@ -222,7 +222,9 @@ that commit and this host's Xcode build exists). Before building, the worker the
 `xcode/bin/fleet-cas-warm.sh cmux <sha>` under a timeout: it copies the whole fill into the
 node, so the build's lookups are local hits. On any other exit (1: no manifest, 2: something
 did not verify, 3: incomplete) or a timeout, fall back to a slot build. Unwarmed, each lookup is two
-serial fleet-store round trips, and a full catch-up read took 1631 s on 09-25. The rows below are read
+serial fleet-store round trips, and a full catch-up read took 1631 s on 09-25. Between builds,
+each reader's prewarm agent copies the writer's newest fill (the `latest` marker) into the node,
+so the in-build warm mostly confirms what is already local. The rows below are read
 top to bottom, first match wins, and the writer is exempt: CI's main build always runs catch-up
 with write-through, since filling the store is its job. A PR commit counts as held when its
 merge base with main has a marker (its own changes are few, and they miss either way).
