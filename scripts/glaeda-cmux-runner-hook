@@ -225,7 +225,9 @@ GATE_FALLBACK = 70  # listen.sh runs run.sh itself: the gate broke before any ru
 # pmset -g therm never reports. At GATE_THERMAL_HOLD or above an idle listener stops, so GitHub routes to a
 # cool mini while this one cools; it listens again once the level is back at GATE_THERMAL_RELEASE or below.
 # GLAEDA_RUNNER_THERMAL_HOLD=0 turns this off.
-GATE_THERMAL_HOLD = int(os.environ.get("GLAEDA_RUNNER_THERMAL_HOLD") or 3)
+THERMAL_HOT = 3  # also what job telemetry calls thermal_limited, whatever the gate's setting
+_hold = os.environ.get("GLAEDA_RUNNER_THERMAL_HOLD", "")
+GATE_THERMAL_HOLD = int(_hold) if _hold.strip().isdigit() else THERMAL_HOT  # never crash a hook on a typo
 GATE_THERMAL_RELEASE = 1
 GATE_THERMAL_EVERY_S = 30.0
 NOTIFYUTIL = "/usr/bin/notifyutil"
@@ -1154,7 +1156,8 @@ class Gate:
         if fresh or time.monotonic() - self.thermal_at >= GATE_THERMAL_EVERY_S:
             level, self.thermal_at = thermal_pressure_level(), time.monotonic()
             if level is not None:
-                limit = GATE_THERMAL_RELEASE if self.thermal is not None else GATE_THERMAL_HOLD - 1
+                release = min(GATE_THERMAL_RELEASE, GATE_THERMAL_HOLD - 1)  # below the hold, or it flaps
+                limit = release if self.thermal is not None else GATE_THERMAL_HOLD - 1
                 self.thermal = level if level > limit else None
         if self.thermal is None:
             return None
@@ -1496,16 +1499,16 @@ def host_io() -> tuple[float | None, float | None]:
 def thermal_limited() -> bool | None:
     """True when macOS reports high thermal pressure, or pmset a CPU speed limit under 100 or a recorded
     thermal/performance warning."""
+    level = thermal_pressure_level()
     try:
         out = subprocess.run([PMSET, "-g", "therm"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
                              timeout=5, check=False).stdout
     except (OSError, subprocess.TimeoutExpired):
-        return None
-    level = thermal_pressure_level()
-    if level is not None and level >= max(GATE_THERMAL_HOLD, 1):
+        out = ""
+    if level is not None and level >= THERMAL_HOT:
         return True  # pmset stays silent at thermal pressure (cmuxterm-hq#663)
     if not out:
-        return None
+        return None if level is None else False
     limit = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", out)
     if limit and int(limit.group(1)) < 100:
         return True

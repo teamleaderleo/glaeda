@@ -1448,6 +1448,23 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook, "GATE_THERMAL_HOLD", 0):
             self.assertIsNone(gate.confirmed())
 
+    def test_a_hold_at_level_one_does_not_flap_at_a_steady_level(self) -> None:
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        self.level = 1
+        with mock.patch.object(hook, "GATE_THERMAL_HOLD", 1):
+            self.assertIsNotNone(gate.claimed())
+            gate.thermal_at -= hook.GATE_THERMAL_EVERY_S
+            self.assertIsNotNone(gate.claimed())  # still held at the same level
+            self.level = 0
+            gate.thermal_at -= hook.GATE_THERMAL_EVERY_S
+            self.assertIsNone(gate.claimed())
+
+    def test_a_bad_hold_setting_falls_back_instead_of_breaking_the_hook(self) -> None:
+        out = subprocess.run([sys.executable, "-c", f"import runpy; m = runpy.run_path({os.fspath(HOOK)!r}, "
+                              "run_name='x'); print(m['GATE_THERMAL_HOLD'])"],
+                             env={**os.environ, "GLAEDA_RUNNER_THERMAL_HOLD": "hot"}, capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(), "3", out.stderr)
+
     def test_a_hot_idle_listener_stops_and_a_busy_one_keeps_its_job(self) -> None:
         self.level = 3
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
@@ -1596,7 +1613,8 @@ class GateTest(unittest.TestCase):
         self.assertEqual(subprocess.run([sys.executable, os.fspath(old), *argv], capture_output=True).returncode, 2)
 
     def run_listen(self, *extra: str) -> tuple[subprocess.Popen, Path]:
-        env = {**os.environ, "GLAEDA_RUNNER_GATE_POLL_S": "0.1"}
+        # The hook runs in its own process, so the setUp patch of the thermal level does not reach it.
+        env = {**os.environ, "GLAEDA_RUNNER_GATE_POLL_S": "0.1", "GLAEDA_RUNNER_THERMAL_HOLD": "0"}
         log = self.tmp / "runner.log"
         with log.open("wb") as out:
             proc = subprocess.Popen([*extra] if extra else
