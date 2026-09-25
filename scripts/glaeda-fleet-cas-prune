@@ -25,8 +25,13 @@ runner hook take), taken without waiting, after checking for a build once more. 
 refuses new jobs and takes idle listeners offline (#1206), so it is held only for a rename and
 the unlinks; the renamed local CAS is removed after the lock is released.
 
-The fleet store itself (xcode/fleet-store, on the store host) is pruned by `fleet-cas gc`, which
-knows which entries are still read; this never touches it. Prints one JSON line per run.
+The fleet store (xcode/fleet-store, on the store host only) is pruned by `fleet-cas gc`, which
+knows which entries are still read (glaeda#1216): kept are entries used within --gc-keep-days,
+everything they reach, and anything written in the last day. It runs at most once a day, from
+this same hourly job, and always as a dry run first: the real run goes ahead only when the dry
+run reports 0 "kept entries naming no stored object" (the check of gc's object-ID heuristic),
+otherwise the numbers are logged and nothing is deleted. gc takes its own lock in the store, not
+host.lock, so it is not gated on builds. Prints one JSON line per run.
 """
 
 from __future__ import annotations
@@ -51,6 +56,8 @@ GIB = 1024**3
 BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
                   r"|/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
 PRUNING = ".cas.pruning-"  # a local CAS renamed aside for deletion
+GC_EVERY = 86400  # seconds between fleet-store gc runs
+GC_REPORT = re.compile(r"kept entries naming no stored object: (\d+)")
 
 
 def busy(commands: list[str]) -> str:
@@ -146,14 +153,51 @@ def take_lock(path: Path):
     return fd
 
 
+def store_gc(root: Path, keep_days: int, now: float | None = None) -> dict:
+    """Daily `fleet-cas gc` on the store host: dry run, then the real run only when it is safe."""
+    store, binary, stamp = root / "fleet-store", root / "bin" / "fleet-cas", root / "run" / "gc.last"
+    if not (store / "kv").is_dir() or not (store / "cas").is_dir():
+        return {}
+    now = time.time() if now is None else now
+    try:
+        if now - stamp.stat().st_mtime < GC_EVERY:
+            return {"gc": "not due"}
+    except FileNotFoundError:
+        pass
+
+    def gc(*extra: str) -> tuple[int, str]:
+        try:
+            out = subprocess.run([str(binary), "gc", str(store), "--keep-days", str(keep_days), *extra],
+                                 capture_output=True, text=True, timeout=3600)
+        except (OSError, subprocess.SubprocessError) as e:
+            return 1, str(e)
+        return out.returncode, (out.stdout + out.stderr).strip()[-400:]
+
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()  # one attempt a day, whatever the outcome
+    code, dry = gc("--dry-run")
+    m = GC_REPORT.search(dry)
+    if code != 0 or not m:
+        return {"gc": "skipped: the dry run failed or fleet-cas predates gc", "gc_dry_run": dry}
+    if int(m.group(1)) != 0:
+        return {"gc": "skipped: kept entries name no stored object, so the ID heuristic is suspect",
+                "gc_dry_run": dry}
+    code, real = gc()
+    return {"gc": "ran" if code == 0 else "failed", "gc_dry_run": dry, "gc_run": real}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="delete (default: plan only)")
     ap.add_argument("--node-gib", type=float, default=20, help="node-store budget (default %(default)s)")
     ap.add_argument("--local-cas-gib", type=float, default=30,
                     help="the local Xcode CAS goes whole above this (default %(default)s)")
+    ap.add_argument("--gc-keep-days", type=int, default=14,
+                    help="on the store host: fleet-cas gc keeps entries used within this many days")
     a = ap.parse_args(argv)
     rec: dict = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "apply": a.apply}
+    if a.apply:
+        rec.update(store_gc(ROOT, a.gc_keep_days))
     if not (ROOT / "fleet-cas.env").exists():
         rec["result"] = "no fleet-cas on this host"
         print(json.dumps(rec))
