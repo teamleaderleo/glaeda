@@ -10,9 +10,9 @@ use glaeda::linked_worktree_reclaim::{
     GithubLookup, LinkedWorktreeFacts, LinkedWorktreeReclaimCompensation,
     LinkedWorktreeReclaimDecision, LinkedWorktreeReclaimOutcome, LinkedWorktreeReclaimPolicy,
     LinkedWorktreeReclaimVeto, LocalBranchDecision, LocalBranchDeletion,
-    LocalBranchFinishedEvidence, LocalBranchReport, ProcessUseEvidence, list_linked_worktrees,
-    observe_linked_worktrees, plan_linked_worktree_reclaim, reclaim_linked_worktree,
-    reclaim_local_branches,
+    LocalBranchFinishedEvidence, LocalBranchReport, ProcessUseEvidence, landed_worktree_tips,
+    list_linked_worktrees, observe_linked_worktrees, plan_linked_worktree_reclaim,
+    reclaim_linked_worktree, reclaim_local_branches,
 };
 use glaeda::process::ProcessExecutor;
 use glaeda::project_checkout_observation::ProjectCheckoutObserver;
@@ -287,7 +287,7 @@ fn main() -> ExitCode {
     let mut repositories = Vec::with_capacity(cli.repositories.len());
 
     for (index, repository) in cli.repositories.iter().enumerate() {
-        let inventory = match list_linked_worktrees(&observer, repository, &executor) {
+        let mut inventory = match list_linked_worktrees(&observer, repository, &executor) {
             Ok(inventory) => inventory,
             Err(error) => {
                 repositories.push(RepositoryReport {
@@ -314,6 +314,11 @@ fn main() -> ExitCode {
                 continue;
             }
         };
+        if let Some(github) = github.as_ref() {
+            inventory.record_landed_tips(landed_worktree_tips(
+                &observer, &inventory, github, &executor,
+            ));
+        }
         let observations = observe_linked_worktrees(&observer, &inventory, &evidence, &executor);
         let mut summary = Summary {
             linked: inventory.linked().len(),

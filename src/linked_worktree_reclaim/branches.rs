@@ -239,6 +239,40 @@ pub fn reclaim_local_branches(
     Ok(reports)
 }
 
+/// Branch tips of linked worktrees that a merged pull request contains, as `branch -> tip`.
+///
+/// Squash merges leave a worktree's commits off every default branch, and files the branch
+/// touched often change again there before the worktree goes idle, so the git-only test in
+/// [`observe_work_state`] keeps such a worktree "in progress" for the long window. This asks
+/// GitHub the question the branch pass already asks, for the branches worktrees have checked out,
+/// so [`observe_linked_worktree`](super::observe_linked_worktree) can call their work finished.
+/// Protected names are never looked up. Every failure only leaves a worktree to the git-only test.
+pub fn landed_worktree_tips(
+    observer: &ProjectCheckoutObserver,
+    inventory: &LinkedWorktreeInventory,
+    github: &GithubLookup,
+    executor: &impl TimedCommandExecutor,
+) -> BTreeMap<String, String> {
+    let repository = inventory.repository.as_path();
+    let (Ok(branches), Ok(protected)) = (
+        list_local_branches(observer, repository, executor),
+        protected_names(observer, repository, executor),
+    ) else {
+        return BTreeMap::new();
+    };
+    let candidates: Vec<&LocalBranch> = branches
+        .iter()
+        .filter(|branch| branch.checked_out && !protected.contains(&branch.name))
+        .take(MAX_GITHUB_LOOKUPS)
+        .collect();
+    let merged = merged_pull_requests(observer, repository, github, &candidates, executor);
+    candidates
+        .into_iter()
+        .filter(|branch| merged.contains_key(&branch.name))
+        .map(|branch| (branch.name.clone(), branch.commit.clone()))
+        .collect()
+}
+
 /// Branches a worktree is rebasing or bisecting, read from every worktree's Git directory.
 ///
 /// Both detach HEAD, so the branch looks free to `%(worktreepath)`, but `rebase --continue` and
