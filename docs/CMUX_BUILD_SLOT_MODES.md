@@ -36,10 +36,10 @@ Later evidence on the pin reopens the first conclusion; treat both as early data
 rules. cmux canary run 36081880621 (Xcode 26.6 17F113, 12vcpu, plain
 `COMPILATION_CACHE_ENABLE_CACHING=YES`) did not reproduce the whole-target rebuild. A
 function-body app edit compiled 1 app file (2 log lines), and a new top-level `private func`
-compiled about 4 (8 lines). A second series, with the cmux#14349 per-target macro and the app
+compiled about 4 (8 lines). A second series, with a per-target macro like cmux#14349's and the app
 cache still on, gave the same two counts; there, a new internal function used across the app
 fanned out (1,078 lines), likely ordinary dependency spread (no caching-off comparison exists).
-The 451 s cell (a different edit, on the 26.3 minis) and the 802 s trial were both on Xcode
+The 451 s cell (a different edit, on the minis) and the 802 s trial were both on Xcode
 26.3, and in the per-target-macro series 26.3 recompiled the whole app target on the body-only
 edit where 26.6 compiled 1 file (2,609 tasks, 5,218 compile lines, run 36035657899).
 
