@@ -83,7 +83,7 @@ rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParamete
   requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { statusCheckRollup { state
 contexts(first: 100) { totalCount pageInfo { hasNextPage } nodes { __typename
 ... on CheckRun { name status conclusion detailsUrl databaseId startedAt isRequired(pullRequestNumber: NUM)
-  checkSuite { conclusion workflowRun { databaseId workflow { name } } } }
+  checkSuite { conclusion workflowRun { databaseId workflow { name databaseId } } } }
 ... on StatusContext { context state targetUrl createdAt isRequired(pullRequestNumber: NUM) } } } } } } }"""
 TOKEN_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9_]{20,251}|github_pat_[A-Za-z0-9_]{20,251}|[0-9a-f]{40})")
 
@@ -245,18 +245,20 @@ def parse_pr(node: dict) -> dict:
     nodes = contexts.get("nodes") or []
     # A run the concurrency group cancelled for a newer run of the same workflow on this commit
     # leaves failed checks (ci-status: cancelled) that the newer run replaces when it gets there.
-    newest: dict[str, int] = {}
-    for c in nodes:
+    def workflow_run(c: dict) -> tuple[object, int]:
         run = (c.get("checkSuite") or {}).get("workflowRun") or {}
-        name = (run.get("workflow") or {}).get("name")
-        if name and run.get("databaseId"):
-            newest[name] = max(newest.get(name, 0), run["databaseId"])
+        workflow = run.get("workflow") or {}
+        return workflow.get("databaseId") or workflow.get("name"), run.get("databaseId") or 0
+
+    newest: dict[object, int] = {}
     for c in nodes:
-        suite = c.get("checkSuite") or {}
-        run = suite.get("workflowRun") or {}
-        name = (run.get("workflow") or {}).get("name")
-        if (suite.get("conclusion") == "CANCELLED" and name and run.get("databaseId")
-                and run["databaseId"] < newest[name]):
+        workflow, run_id = workflow_run(c)
+        if workflow and run_id:
+            newest[workflow] = max(newest.get(workflow, 0), run_id)
+    for c in nodes:
+        workflow, run_id = workflow_run(c)
+        if ((c.get("checkSuite") or {}).get("conclusion") == "CANCELLED" and workflow and run_id
+                and run_id < newest[workflow]):
             continue
         if c.get("__typename") == "StatusContext":
             state = c.get("state")
@@ -641,8 +643,10 @@ def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None 
     checks, decide = data.get("checks") or [], judged(data)
     if not decide:
         return None  # nothing has reported yet
-    # GitHub's own merge state already counts a required check that never reported.
-    waiting = data.get("requiredMissing") and data.get("mergeStateStatus") not in {"CLEAN", "UNSTABLE", "HAS_HOOKS"}
+    # GitHub's own merge state already counts a required check that never reported. A conflicted PR
+    # (DIRTY) runs no pull_request workflows until the next push, and a merged one never will.
+    waiting = (data.get("requiredMissing") and data.get("state") == "OPEN"
+               and data.get("mergeStateStatus") not in {"CLEAN", "UNSTABLE", "HAS_HOOKS", "DIRTY"})
     bad = failing(decide)
     unfinished = [c for c in (decide if until == "green" else checks) if c.get("status") != "COMPLETED"]
     if until == "green" and bad:
@@ -685,7 +689,8 @@ def summary(key: str, entry: dict | None) -> str:
         else:
             lines.append("checks: none reported yet for this head commit")
         if data.get("requiredMissing"):
-            lines.append(f"  required, not reported yet: {', '.join(data['requiredMissing'])}")
+            why = " (merge conflicts: they run after the next push)" if data.get("mergeStateStatus") == "DIRTY" else ""
+            lines.append(f"  required, not reported yet: {', '.join(data['requiredMissing'])}{why}")
         for c in bad[:20]:
             optional = " (not required)" if required and not c.get("required") else ""
             label = f"{c['workflow']} / {c.get('name')}" if c.get("workflow") else c.get("name")
