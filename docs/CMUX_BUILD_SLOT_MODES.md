@@ -36,10 +36,12 @@ Later evidence on the pin reopens the first conclusion; treat both as early data
 rules. cmux canary run 36081880621 (Xcode 26.6 17F113, 12vcpu, plain
 `COMPILATION_CACHE_ENABLE_CACHING=YES`) did not reproduce the whole-target rebuild. A
 function-body app edit compiled 1 app file (2 log lines), and a new top-level `private func`
-compiled about 4 (8 lines). Only a new internal function used across the app fanned out (1,078
-lines), which is ordinary dependency spread. The 451 s cell (a `private let`) and the 802 s
-trial were both on Xcode 26.3, and 26.3 recompiled the whole app target on a body-only edit in
-the same canary series (2,609 tasks, 5,218 compile lines, run 36035657899).
+compiled about 4 (8 lines). A second series, with the cmux#14349 per-target macro and the app
+cache still on, gave the same two counts; there, a new internal function used across the app
+fanned out (1,078 lines), likely ordinary dependency spread (no caching-off comparison exists).
+The 451 s cell (a different edit, on the 26.3 minis) and the 802 s trial were both on Xcode
+26.3, and in the per-target-macro series 26.3 recompiled the whole app target on the body-only
+edit where 26.6 compiled 1 file (2,609 tasks, 5,218 compile lines, run 36035657899).
 
 The same work found a separate cache problem: under the cache the `cmuxTests` driver rewrote
 its chained bridging header on every build, invalidating all 1,073 test inputs. cmux CI now
@@ -51,7 +53,10 @@ turns the cache off for `cmuxTests` only (not the app target) with a per-target 
 files, but that was a seeded incremental build. Package hits on a fresh cache-fed build with
 the macro are still unmeasured, so the second conclusion stays open.
 
-So a slot keeps two DerivedData directories and picks per job:
+On 26.6, flipping caching in one DerivedData still rebuilds everything (606 s and 755 s), so one
+DerivedData cannot serve both modes. Whether iteration mode needs caching off at all on 26.6 is
+now open (Next, item 1), since cache-on edits stayed incremental there. Until that is measured,
+a slot keeps two DerivedData directories and picks per job:
 
 - **Catch-up mode (caching on):** a fresh machine, a slot far behind main, or a one-shot build
   of a commit (CI, a PR product). Fed by the fleet store: about 100 s from nothing.
@@ -89,7 +94,7 @@ Both path rules hold on the fleet pin, Xcode 26.6 (17F113), measured on cmux8s:
 Catch-up DerivedData lifecycle, since one directory serves every slot on the host:
 
 - emptied at the start of each catch-up build (a kept one would turn the next edit into the
-  451 s whole-target rebuild, and it is not where anyone iterates);
+  451 s whole-target rebuild on Xcode 26.3, and it is not where anyone iterates);
 - the job copies its products out before releasing the host lock, because the next catch-up
   build on the host empties the directory;
 - the local CAS is kept between builds (the 102 s result depends on a filled one), except on
@@ -237,8 +242,8 @@ DerivedData is therefore warmed by its own caching-off builds:
 
 1. On the pin: a cancellation in the middle of compiling, the mixed-mode edit and no-op runs,
    and package hits on a fresh cache-fed build with the cmux#14349 macro applied to the app
-   target. Optionally rerun the `private let` edit with caching on, since the canary used a
-   `private func`.
+   target. Optionally rerun the `private let` edit with caching on, to pair with the 323-file
+   caching-off result. Then decide whether iteration mode still needs caching off on 26.6.
 2. Cut the non-compiler work a catch-up build still does. Summed task time, not wall time:
    SwiftDriver planning and scanning 163 s, script phases 18 s (Rust diff sidecar, nucleo FFI,
    wireguard-go), App Intents extraction 16 s over 89 tasks. Script phases can be cached by
