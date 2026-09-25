@@ -133,29 +133,45 @@ What `--apply` does:
    - job-completed releases the host lock (or the capacity share), runs the same disk
      pressure pass and always exits 0.
 4. Writes and loads `~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist`
-   (runs `run.sh` under the listener gate, restarts on crash, logs to
-   `~/Library/Logs/glaeda-cmux-runner.log`).
-   - The listener gate (`glaeda-cmux-runner-hook listen`) keeps an idle runner off
-     GitHub while the fleet has the host, so jobs go to another runner and never
-     reach job-started here just to be refused. Each refusal made cmux's rescue cancel
-     and re-run the whole PR run. On 2026-09-25, 7 of 14 refusals in two hours were
-     "a fleet build holds the host lock": the fleet-cas reader held cmux8s for 47
-     minutes, and hq worker builds hold a mini for about 20.
-   - The fleet has the host when:
-     - a process holds `host.lock` exclusively (every 2 s, one non-blocking shared
-       `flock`, which only an exclusive holder blocks);
-     - a reservation is active; or
-     - a process that is not our holder or gate is waiting for the lock (`lsof`,
-       at most every 30 s because it costs about 0.3 s of CPU on a mini).
-   - After two polls in a row it sends `SIGINT` to the runner's `Runner.Listener`.
-     The listener's graceful exit ends its session, and GitHub shows the runner as
-     offline. A runner with a job (a `Runner.Worker` from its directory) is never
-     stopped.
-   - The gate starts `run.sh` again after two free polls. It logs
-     `glaeda-cmux-runner-gate: holding the listener off: <why>` while it waits, and
-     `--apply`'s verify accepts that line in place of `Listening for Jobs`.
-   - A runner exit the gate didn't ask for passes through, so launchd's KeepAlive
-     behaves as before.
+   (runs `glaeda-hooks/listen.sh`, restarts on crash, logs to
+   `~/Library/Logs/glaeda-cmux-runner.log`). `listen.sh` runs `run.sh` under the listener
+   gate (`glaeda-cmux-runner-hook listen`).
+   - **Why a gate.** Without it, an idle runner keeps listening while the fleet has the
+     host, so GitHub keeps handing it jobs that job-started refuses. Each refusal made
+     cmux's rescue cancel and re-run the whole PR run. On 2026-09-25, 7 of 14 refusals
+     in two hours were "a fleet build holds the host lock": the fleet-cas reader held
+     cmux8s for 47 minutes, and hq worker builds hold a mini for about 20.
+   - **When the fleet has the host.**
+     - A process holds `host.lock` exclusively. The gate checks every 2 s with one
+       non-blocking shared `flock`, which only an exclusive holder blocks.
+     - A reservation is active.
+     - With weighted capacity only: a process waits for the lock. The gate checks with
+       `lsof` at most every 30 s, because each call costs about 0.3 s of CPU on a mini.
+       This hook's own processes never count as waiters (another runner's job-started,
+       a lock holder, a gate). A stop needs the same waiter pid in a second, fresh
+       reading.
+   - **Stopping.** After two idle polls in a row, and one fresh look right before the
+     signal, the gate sends `SIGINT` to the runner's `Runner.Listener`.
+     - The listener's graceful exit ends its session, and GitHub shows the runner as
+       offline.
+     - With no listener running (`run-helper.sh` between listeners), the gate sends
+       `SIGTERM` to the whole runner tree instead.
+     - A runner with a job (a `Runner.Worker` under its tree) is never stopped, and
+       its polls don't count toward the two.
+     - A listener that hasn't exited after 60 s is killed, unless a job slipped in.
+   - **Restarting and logs.** The gate starts `run.sh` again after two free polls. While
+     it waits it logs `glaeda-cmux-runner-gate: holding the listener off: <why>`, and
+     `--apply`'s verify accepts that line with or without gh.
+   - **Failure is safe.** If the gate can't start (a broken hook or interpreter),
+     `listen.sh` runs `run.sh` itself, as before the gate. If the gate fails while
+     the runner runs, it waits for the runner instead of killing it. A runner exit the
+     gate didn't ask for passes through, so launchd's KeepAlive behaves as before.
+   - **Hook updates.** When `--apply` replaces the hook, the gate re-executes the new
+     hook in place and keeps its `run.sh`, so a gate fix reaches every mini without a
+     runner restart. A new hook that fails to load is skipped.
+   - **Busy runners.** An `--apply` that would change a loaded plist while the runner
+     has a job fails that runner's agent step, "the runner has a job; nothing changed,
+     re-run when idle", so it never boots out a running job.
    - job-started still refuses a job handed over in the moment before a stop.
 5. Confirms through the GitHub API that the runner is listed with every label and
    waits up to 90 s for it to report online.

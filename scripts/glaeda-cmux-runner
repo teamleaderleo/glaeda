@@ -394,7 +394,30 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         f"{python} {hook} job-completed || true\n"
         "exit 0\n"
     )
-    return {"job-started.sh": started.encode(), "job-completed.sh": completed.encode()}
+    gate = (f"{python} {hook} listen --runner-dir {shlex.quote(os.fspath(ctx.runner_dir))}"
+            + ("" if ctx.capacity_units else " --no-waiters"))
+    listen = (
+        "#!/bin/bash\n"
+        "# glaeda-cmux-runner listener gate (generated, receipt-owned): the runner LaunchAgent's program. The\n"
+        "# hook's gate runs run.sh and stops an idle listener while the fleet has the host. If the gate cannot\n"
+        "# run, the runner runs without it, as it did before the gate. bash, like run.sh, stays the job's main\n"
+        "# program for macOS privacy grants.\n"
+        f"cd {shlex.quote(os.fspath(ctx.runner_dir))} || exit 1\n"
+        f"{gate} &\n"
+        "gate=$!\n"
+        "stopping=\n"
+        "trap 'stopping=1; kill -TERM \"$gate\" 2>/dev/null' TERM INT\n"
+        "while :; do\n"
+        "    wait \"$gate\"\n"
+        "    code=$?\n"
+        "    kill -0 \"$gate\" 2>/dev/null || break\n"
+        "done\n"
+        "[ -n \"$stopping\" ] && exit 0\n"
+        "[ \"$code\" -eq 0 ] && exit 0\n"
+        "echo \"glaeda-cmux-runner-gate: the gate exited $code; running the runner without it\"\n"
+        "exec ./run.sh\n"
+    )
+    return {"job-started.sh": started.encode(), "job-completed.sh": completed.encode(), "listen.sh": listen.encode()}
 
 
 def agent_plist(ctx: Context) -> dict[str, Any]:
@@ -403,10 +426,9 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
     path = WORKLOAD_PATH
     return {
         "Label": ctx.label,
-        # run.sh under the hook's listener gate: an idle runner stops listening while a fleet build holds
-        # or waits for the host, so GitHub routes its jobs elsewhere instead of here to be refused.
-        "ProgramArguments": [ctx.python or "/usr/bin/python3", os.fspath(ctx.hook_dir / "glaeda-cmux-runner-hook"),
-                             "listen", "--runner-dir", os.fspath(ctx.runner_dir), "--label", ctx.label],
+        # run.sh under the hook's listener gate (listen.sh): an idle runner stops listening while a fleet
+        # build holds or waits for the host, so GitHub routes its jobs elsewhere instead of here to be refused.
+        "ProgramArguments": [os.fspath(ctx.hook_dir / "listen.sh")],
         "WorkingDirectory": os.fspath(ctx.runner_dir),
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
@@ -742,6 +764,9 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             if adopted:
                 receipt_doc["registration"] = adopted
                 act["note"] = "adopted the registration an interrupted --apply finished in this directory"
+        elif kind == "agent" and state == "update" and act.get("loaded") and not ctx.skip_launchctl \
+                and runner_busy(ctx):  # a bootout now would cancel the job; the next --apply updates it
+            act["state"], act["note"] = "failed", "the runner has a job; nothing changed, re-run when idle"
         elif kind in {"hook", "agent"} and state in {"create", "update"}:
             data, mode = desired_files(ctx)[Path(act["path"])]
             if kind == "agent" and (act.get("loaded") or getattr(ctx, "agent_started", False)):
@@ -824,6 +849,19 @@ def verify_local(ctx: Context, act: dict[str, Any], wait: bool) -> None:
         f"; no gh here, so confirm labels from an admin machine: gh api {ctx.scope_api}/actions/runners"
 
 
+def gate_holding(ctx: Context) -> bool:
+    """The listener gate logged, since this --apply started the agent, that it is holding the runner off."""
+    offset = getattr(ctx, "log_offset", None)
+    if offset is None:
+        return False
+    try:
+        with ctx.log_path.open("rb") as log:
+            log.seek(offset)
+            return GATE_HELD.encode() in log.read()
+    except OSError:
+        return False
+
+
 def verify(ctx: Context, act: dict[str, Any], wait: bool) -> None:
     if ctx.gh is None:
         verify_local(ctx, act, wait)
@@ -831,7 +869,7 @@ def verify(ctx: Context, act: dict[str, Any], wait: bool) -> None:
     deadline = time.monotonic() + (ONLINE_WAIT_S if wait else 0)
     while True:
         found = find_runner(ctx)
-        if found and (found.get("status") == "online" or time.monotonic() >= deadline):
+        if found and (found.get("status") == "online" or time.monotonic() >= deadline or gate_holding(ctx)):
             break
         if not found and time.monotonic() >= deadline:
             break
@@ -843,7 +881,8 @@ def verify(ctx: Context, act: dict[str, Any], wait: bool) -> None:
     act.update(runner=found, state="ok" if not missing else "failed",
                note="" if not missing else "missing labels: " + ",".join(missing))
     if found.get("status") != "online" and act["state"] == "ok":
-        act["note"] = f"registered, status {found.get('status')}"
+        act["note"] = f"registered, status {found.get('status')}" + (
+            "; the listener gate is holding it off while a fleet build has the host" if gate_holding(ctx) else "")
 
 
 def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
