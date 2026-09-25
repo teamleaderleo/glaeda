@@ -625,8 +625,9 @@ def owner_retired(fam: Family) -> bool:
     if not fam.owner_job or not DARWIN:
         return False
     try:
+        # 113 is launchctl's "could not find service"; any other failure is not evidence of retirement
         return subprocess.run(["launchctl", "print", fam.owner_job], capture_output=True,
-                              timeout=10).returncode != 0
+                              timeout=10).returncode == 113
     except (OSError, subprocess.SubprocessError):
         return False  # unknown: say nothing rather than call a live owner retired
 
@@ -641,14 +642,16 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def cmux_active(path: Path, levels: int = 2) -> bool:
-    """cmuxterm-hq's reload-cloud marks a slot in use with <slot>/.cmux-active/pid while a job runs
-    (lib/cloud-slot-runtime.sh). A live pid there, at or up to `levels` below path, means in use.
-    An unreadable marker counts as live (fail closed)."""
+def cmux_active(path: Path, levels: int = 3, budget: int = 5000) -> bool:
+    """cmuxterm-hq's reload-cloud marks a slot busy while a job runs: <slot>/.cmux-active/pid with a
+    live pid, or a <slot>/.lock (lib/cloud-slot-runtime.sh). Either, at or up to `levels` below path,
+    means in use. An unreadable pid, or a tree too big to search within `budget`, counts as busy."""
     level = [path]
-    for _ in range(levels + 1):
+    for depth in range(levels + 1):
         nxt: list[Path] = []
         for d in level:
+            if (d / ".lock").exists():
+                return True
             marker = d / ".cmux-active" / "pid"
             if marker.exists():
                 try:
@@ -656,9 +659,24 @@ def cmux_active(path: Path, levels: int = 2) -> bool:
                         return True
                 except (OSError, ValueError, IndexError):
                     return True
-            nxt += [c for c in _children(d) if c.is_dir() and not c.is_symlink() and c.name != ".cmux-active"]
-        level = nxt[:500]
+            if depth == levels:
+                continue
+            for c in _children(d):
+                budget -= 1
+                if budget < 0:
+                    return True
+                if c.name != ".cmux-active" and not c.is_symlink() and c.is_dir():
+                    nxt.append(c)
+        level = nxt
     return False
+
+
+def job_busy(fam: Family, path: Path) -> bool:
+    """A cmux job unit's slots are marked in work/<slot>, not beside DerivedData/<slot>, so a
+    candidate in the job cache is busy when any slot of its whole unit (path.parent) is."""
+    if fam.id == "cmux-job-cache":
+        return cmux_active(path.parent)
+    return fam.reclaimable and cmux_active(path)
 
 
 def value(item: "Item", fam: Family) -> float:
@@ -804,8 +822,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence) -> list[Item]:
             reasons.append("claude session active")
         if fam.reclaimable and holds_socket(path):
             reasons.append("holds a socket")
-        if fam.reclaimable and cmux_active(path):
-            reasons.append("a cmux reload job holds it (.cmux-active)")
+        if fam.reclaimable and job_busy(fam, path):
+            reasons.append("a cmux reload job holds its unit (.cmux-active or .lock)")
         if not fam.reclaimable:
             verdict = "report-only"
         elif reasons:
@@ -1000,7 +1018,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             if dev not in targets or free_bytes(p.parent)[0] >= targets[dev]:
                 continue
         # fresh re-observation right before the destructive step
-        if in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or cmux_active(p):
+        if in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(families[i.family], p):
             outcome = "changed:in-use"
         elif (time.time() - newest_mtime(p)) / 3600 < idle_hours:
             outcome = "changed:modified"

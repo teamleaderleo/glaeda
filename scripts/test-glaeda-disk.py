@@ -217,6 +217,16 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertFalse(gd.cmux_active(self.root / "work"))
         (slot / ".cmux-active/pid").write_text("garbage")
         self.assertTrue(gd.cmux_active(self.root / "work"))  # unreadable: fail closed
+        (slot / ".cmux-active/pid").unlink()
+        (slot / ".lock").write_text("")
+        self.assertTrue(gd.cmux_active(self.root / "work"))  # hq's slot lock also means busy
+        (slot / ".lock").unlink()
+        # the marker lives in work/<slot>; the DerivedData beside it is what glaeda-disk deletes
+        (slot / ".cmux-active/pid").write_text(str(os.getpid()))
+        fam = gd.Family("cmux-job-cache", self.root, True, "x", depth=2)
+        (self.root / "DerivedData/slot-1-simulator").mkdir(parents=True)
+        self.assertTrue(gd.job_busy(fam, self.root / "DerivedData"))
+        self.assertFalse(gd.cmux_active(self.root / "DerivedData"))
 
     def test_pressure_deletes_cheapest_loss_first(self) -> None:
         dd = gd.Family("xcode-derived-data", self.root, True, "x", rebuild_minutes=15)
