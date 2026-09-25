@@ -1,11 +1,10 @@
 [Unit]
 Description=Reclaim idle build output and scratch space under disk pressure (glaeda-disk)
 Documentation=https://github.com/teamleaderleo/glaeda/blob/main/scripts/glaeda-disk
-# Linux counterpart of the macOS pressure LaunchAgent. Install as the owning user:
-#   install -m 0755 scripts/glaeda-disk ~/.local/bin/glaeda-disk
-#   install -m 0644 ops/systemd/glaeda-disk-pressure.{service,timer} ~/.config/systemd/user/
-#   systemctl --user daemon-reload && systemctl --user enable --now glaeda-disk-pressure.timer
-#   loginctl show-user "$USER" -p Linger   # must be yes to run without a login session
+# Linux counterpart of the macOS pressure LaunchAgent. Install as the owning user with
+#   scripts/glaeda-mini-setup --apply
+# which installs every unit in ops/systemd verbatim and enables the timers. Its preflight
+# reports lingering, which must be on to run without a login session.
 # Output goes to the journal (journalctl --user -u glaeda-disk-pressure); deletions are also
 # appended to ~/Projects/recovery/disk-reclaim/receipts.jsonl.
 
