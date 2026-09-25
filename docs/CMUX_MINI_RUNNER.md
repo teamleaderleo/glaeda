@@ -233,7 +233,18 @@ Raise it only once cmux's compile admission keeps its canonical root and kept
 state per runner; with shared paths two compiles would clobber each other. Re-apply
 every instance on the mini together: runners that disagree on the count run as many
 compiles as the highest one allows. Each runner is one
-`--instance K`:
+`--instance K`. From an operator machine (gh as a repo admin, SSH to every member),
+one command brings the whole fleet to the manifest, every member and every instance
+at once:
+
+    scripts/glaeda-cmux-runner-fleet                 # plan: the gate on every member, read-only
+    scripts/glaeda-cmux-runner-fleet --apply         # stage scripts + trimmed manifest, apply every instance
+    scripts/glaeda-cmux-runner-fleet --apply --hosts cmux12s-mac-mini
+
+It runs each member's job-started gate read-only first and skips members that are
+not eligible yet, so a mini joins the pools on the first run after it is onboarded.
+One registration token per instance is minted locally and piped over SSH. By hand,
+for one member, the same thing is:
 
     for k in 0 1 2 3; do
       gh api -X POST repos/manaflow-ai/cmux/actions/runners/registration-token --jq .token |
