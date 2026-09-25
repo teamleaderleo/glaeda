@@ -178,8 +178,9 @@ binary started by launchd reaches cmux7s's tailnet address (verified on cmux8s w
 also allowed Unix-socket and remote forwards (`permitopen` limits TCP forwards only), for
 example to the writer's signing socket, and the tailnet makes it unnecessary.
 
-`--writer HOST --sign-key PATH --trusted-keys HEX` makes that host the writer (above); it
-must be the store host, and its tailnet address is the store's only allowed writer.
+`--writer HOST --sign-key PATH --trusted-keys HEX` makes that host the writer (above), and
+its tailnet address the store's only allowed writer. The writer runs on an hq-only builder
+with no PR runners: any process on the writer host can reach the signing node's socket.
 `--trusted-keys` alone makes every node and the store use only signed entries. A
 LaunchAgent needs the build user's GUI session; the fleet minis log in automatically.
 `glaeda-fleet-cas uninstall --apply` removes the services and keeps the stores (a

@@ -9,8 +9,9 @@
 # node daemon pointed at it. With --trusted-keys, the store keeps and every node uses only
 # index entries signed by those keys. --writer makes that host the signing writer: its node
 # signs with the key at --sign-key (a path on the writer, created there beforehand with
-# `fleet-cas keygen`); it must be the store host, whose tailnet address becomes the store's
-# only allowed writer. Each host
+# `fleet-cas keygen`), and its tailnet address becomes the store's only allowed writer. The
+# writer host must run no PR or other untrusted job: any process there can reach the signing
+# node's socket. Each host
 # receives scripts/glaeda-fleet-cas and tools/fleet-cas-prototype under
 # ~/.cache/glaeda-fleet-cas (also when planning) and runs `glaeda-fleet-cas` there
 # (docs/CMUX_BUILD_SLOT_MODES.md). Every host needs the tailnet grant for the store port.
@@ -39,8 +40,6 @@ fi
 # The rollout is stateless: whatever it is given replaces the deployed configuration.
 [ -n "$trusted" ] || echo "warning: no --trusted-keys: the store keeps, and nodes use, unsigned index entries" >&2
 [ -n "$writer" ] || echo "warning: no --writer: the store will accept no writes" >&2
-# The writer is the store host: the store's writer allowlist is its own tailnet address.
-[ -z "$writer" ] || [ "$writer" = "$store" ] || { echo "--writer must be the --store host" >&2; exit 2; }
 for h in "$store" ${writer:+"$writer"} ${nodes[@]+"${nodes[@]}"}; do
   target=$(ssh -G "$h" | awk '/^hostname /{print $2}')
   case "$h $target" in *lawrence*) echo "refusing $h ($target): cmux-lawrence is the fleet coordinator" >&2; exit 2 ;; esac
@@ -70,7 +69,9 @@ tailnet_ip() {
   echo "$ip"
 }
 ip=$(tailnet_ip "$store")
-run "$store" store --listen "$ip:$PORT" ${writer:+--writers "$ip"} ${trusted:+--trusted-keys "$trusted"} $apply
+writer_ip=
+[ -z "$writer" ] || writer_ip=$(tailnet_ip "$writer")
+run "$store" store --listen "$ip:$PORT" ${writer_ip:+--writers "$writer_ip"} ${trusted:+--trusted-keys "$trusted"} $apply
 [ -z "$writer" ] || run "$writer" writer --store "$ip:$PORT" --sign-key "$sign_key" --trusted-keys "$trusted" $apply
 for n in ${nodes[@]+"${nodes[@]}"}; do
   [ "$n" = "$writer" ] && continue
