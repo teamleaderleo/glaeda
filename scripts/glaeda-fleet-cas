@@ -187,12 +187,10 @@ install_binaries() {
   say "build $proto (cargo build --release --locked)"
   if [ -n "$apply" ]; then
     check_owner
-    # cargo competes with builds for the mini, so it takes the fleet host lock where one exists.
-    if [ -e "${FLEET_HOST_LOCK:-/Users/Shared/cmux-build-fleet/host.lock}" ]; then
-      (cd "$proto" && scripts/with-fleet-lock.pl cargo build --release --locked -q)
-    else
-      (cd "$proto" && cargo build --release --locked -q)
-    fi
+    # No host lock: queuing for it exclusively takes a runner host's PR runners offline while
+    # it waits (glaeda#1206's gate), and an up-to-date build is a no-op anyway. A real rebuild
+    # runs at low priority beside whatever is building.
+    (cd "$proto" && nice -n 15 cargo build --release --locked -q)
     mkdir -p "$BIN"
     local f src
     for f in fleet-cas fleet-cas-run fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-writer-build.sh; do
