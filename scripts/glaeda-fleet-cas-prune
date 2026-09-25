@@ -30,8 +30,8 @@ knows which entries are still read (glaeda#1216): kept are entries used within -
 everything they reach, and anything written in the last day. It runs at most once a day, from
 this same hourly job, and always as a dry run first: the real run goes ahead only when the dry
 run reports 0 "kept entries naming no stored object" (the check of gc's object-ID heuristic),
-otherwise the numbers are logged and nothing is deleted. gc takes its own lock in the store, not
-host.lock, so it is not gated on builds. Prints one JSON line per run.
+otherwise the numbers are logged and nothing is deleted. gc takes no lock: a race with the running
+store only turns into a cache miss, never a wrong answer (gc.rs), so it is not gated on builds. Prints one JSON line per run.
 """
 
 from __future__ import annotations
@@ -171,7 +171,9 @@ def store_gc(root: Path, keep_days: int, now: float | None = None) -> dict:
                                  capture_output=True, text=True, timeout=3600)
         except (OSError, subprocess.SubprocessError) as e:
             return 1, str(e)
-        return out.returncode, (out.stdout + out.stderr).strip()[-400:]
+        # The report is the last stdout line; stderr is kept apart so it cannot push it out.
+        return out.returncode, (out.stdout.strip()[-400:] + (f" | stderr: {out.stderr.strip()[-200:]}"
+                                                            if out.returncode else ""))
 
     stamp.parent.mkdir(parents=True, exist_ok=True)
     stamp.touch()  # one attempt a day, whatever the outcome
