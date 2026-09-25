@@ -6,7 +6,7 @@
 #
 # Plans by default; --apply deploys. HOST names are ssh aliases (User cmux). The store
 # listens on the store host's LAN address (en0) port 7450; every NODE_HOST gets a read-only
-# node daemon pointed at it. With --trusted-keys, the store keeps and every node uses only
+# node daemon pointed at it, through an ssh relay when it is another host. With --trusted-keys, the store keeps and every node uses only
 # index entries signed by those keys. --writer makes that host the signing writer: its node
 # signs with the key at --sign-key (a path on the writer, created there beforehand with
 # `fleet-cas keygen`), and its LAN address becomes the store's only allowed writer. Each host
@@ -67,7 +67,23 @@ writer_ip=
 [ -z "$writer" ] || writer_ip=$(lan_ip "$writer")
 run "$store" store --listen "$ip:$PORT" ${writer_ip:+--writers "$writer_ip"} ${trusted:+--trusted-keys "$trusted"} $apply
 [ -z "$writer" ] || run "$writer" writer --store "$ip:$PORT" --sign-key "$sign_key" --trusted-keys "$trusted" $apply
+# A node on another host reaches the store through its own ssh relay (a /usr/bin/ssh port
+# forward to 127.0.0.1:17450): launchd-started third-party binaries cannot reach other LAN
+# hosts on these minis (macOS Local Network privacy), Apple's ssh can. The store host
+# authorizes each relay key to forward to the store port only.
 for n in ${nodes[@]+"${nodes[@]}"}; do
   [ "$n" = "$writer" ] && continue
-  run "$n" node --store "$ip:$PORT" ${trusted:+--trusted-keys "$trusted"} $apply
+  n_ip=$(lan_ip "$n")
+  if [ "$n_ip" = "$ip" ]; then
+    run "$n" node --store "$ip:$PORT" ${trusted:+--trusted-keys "$trusted"} $apply
+    continue
+  fi
+  pub=$(run "$n" relay-key $apply | tee /dev/stderr | sed -n 's/^pubkey //p')
+  if [ -n "$pub" ]; then
+    run "$store" authorize-relay --pubkey "$pub" --target "$ip:$PORT" $apply
+  else
+    echo "plan authorize $n's relay key on $store once it exists"
+  fi
+  run "$n" relay --store "$ip:$PORT" $apply
+  run "$n" node --store "127.0.0.1:17450" ${trusted:+--trusted-keys "$trusted"} $apply
 done

@@ -4,7 +4,10 @@
 #   glaeda-fleet-cas node --store HOST:PORT [--trusted-keys HEX] [--apply]
 #   glaeda-fleet-cas writer --store HOST:PORT --sign-key PATH --trusted-keys HEX [--apply]
 #   glaeda-fleet-cas store --listen IP:PORT [--writers IP,IP] [--trusted-keys HEX] [--apply]
-#   glaeda-fleet-cas uninstall [--apply]               remove both agents, keep the stores
+#   glaeda-fleet-cas relay-key [--apply]               print (create) this host's relay key
+#   glaeda-fleet-cas authorize-relay --pubkey KEY --target IP:PORT [--apply]   (on the store host)
+#   glaeda-fleet-cas relay --store IP:PORT [--apply]   forward 127.0.0.1:17450 to the store
+#   glaeda-fleet-cas uninstall [--apply]               remove the services, keep the stores
 #
 # Run from a glaeda checkout on the mini (scripts/glaeda-fleet-cas-rollout does that from
 # an operator Mac). Planning changes nothing on this host; --apply is idempotent and restarts
@@ -43,7 +46,10 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 proto=$here/tools/fleet-cas-prototype
 
 role=${1:-}; shift || true
-apply= store= listen= writers= trusted= sign_key=
+apply= store= listen= writers= trusted= sign_key= bin_changed= pubkey= target=
+RELAY_PORT=17450
+RELAY_KEY=$HOME/.ssh/fleet-cas-relay
+RELAY_KNOWN=$HOME/.ssh/fleet-cas-relay.known_hosts
 while [ $# -gt 0 ]; do
   case $1 in
     --apply) apply=1 ;;
@@ -52,6 +58,8 @@ while [ $# -gt 0 ]; do
     --writers) writers=${2:?--writers IP,IP}; shift ;;
     --trusted-keys) trusted=${2:?--trusted-keys HEX,HEX}; shift ;;
     --sign-key) sign_key=${2:?--sign-key PATH}; shift ;;
+    --pubkey) pubkey=${2:?--pubkey KEY}; shift ;;
+    --target) target=${2:?--target IP:PORT}; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -69,14 +77,14 @@ check_owner() {
   fi
 }
 
-bootstrap() {  # label, plist: bootout then bootstrap, retrying the known teardown race
-  launchctl bootout "gui/$(id -u)/$1" 2>/dev/null || true
+bootstrap() {  # domain, label, plist: bootout then bootstrap, retrying the known teardown race
+  launchctl bootout "$1/$2" 2>/dev/null || true
   local i
   for i in 1 2 3 4 5; do
-    launchctl bootstrap "gui/$(id -u)" "$2" 2>/dev/null && return 0
+    launchctl bootstrap "$1" "$3" 2>/dev/null && return 0
     sleep 1
   done
-  launchctl bootstrap "gui/$(id -u)" "$2"
+  launchctl bootstrap "$1" "$3"
 }
 
 health_failed() {  # role
@@ -85,30 +93,38 @@ health_failed() {  # role
   exit 1
 }
 
+# The plist for a role: launchd runs bin/fleet-cas-run ROLE, which execs fleet-cas with
+# run/ROLE.args. The plist never changes with the arguments or the binary, so upgrades need
+# no root: the installer rewrites the args file or binary and stops the process, and launchd
+# (KeepAlive) starts it again on the new ones.
+#
+# LAN access: macOS Local Network privacy blocks third-party binaries started by launchd
+# (agents and daemons alike) from other LAN hosts on these headless minis: the node on
+# cmux8s got "No route to host" for the store on cmux7s, as a LaunchAgent and as a
+# LaunchDaemon, while Apple binaries (/usr/bin/ssh, nc) started the same way got through.
+# So a node on another host reaches the store through the `relay` role, a /usr/bin/ssh
+# port forward to its own loopback. A role runs as a LaunchAgent, or as a LaunchDaemon
+# (run as this user) if root installed the plist below; both work.
+#
 # ProcessType Interactive: builds wait on these daemons. Adaptive, with no XPC activity, ran
 # them in the background band (priority 4), and a full-app fill on cmux7s (Xcode 26.6) then
 # timed out 187 store calls under compile load and published no marker. Standard gave
 # priority 20; Interactive matches a process started from a shell (31).
-write_plist() {  # role, args...
-  local r=$1; shift
-  local label; label=$(label_for "$r")
-  local plist=$AGENTS/$label.plist
-  say "write $plist: $BIN/fleet-cas $*"
-  [ -n "$apply" ] || return 0
-  mkdir -p "$AGENTS" "$LOGS"
-  local args="" a
-  for a in "$BIN/fleet-cas" "$@"; do args+="        <string>$(xml "$a")</string>"$'\n'; done
-  cat >"$plist.tmp" <<PLIST
+plist_for() {  # role, label, daemon (1 or empty)
+  cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- fleet-cas binary sha256 $(shasum -a 256 "$BIN/fleet-cas" | cut -c1-64): a new binary changes this plist, so every role restarts -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>$label</string>
-    <key>ProgramArguments</key>
+    <string>$2</string>
+${3:+    <key>UserName</key>
+    <string>$(xml "$(id -un)")</string>
+}    <key>ProgramArguments</key>
     <array>
-$args    </array>
+        <string>$BIN/fleet-cas-run</string>
+        <string>$1</string>
+    </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -118,19 +134,59 @@ $args    </array>
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
-    <string>$LOGS/glaeda-fleet-cas-$r.log</string>
+    <string>$LOGS/glaeda-fleet-cas-$1.log</string>
     <key>StandardErrorPath</key>
-    <string>$LOGS/glaeda-fleet-cas-$r.log</string>
+    <string>$LOGS/glaeda-fleet-cas-$1.log</string>
 </dict>
 </plist>
 PLIST
-  plutil -lint -s "$plist.tmp"
-  if cmp -s "$plist.tmp" "$plist" \
-    && launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
-    rm -f "$plist.tmp"; echo "unchanged $label"; return 0
+}
+
+# Stop the role's process so launchd starts it again with the current args and binary.
+restart_role() {  # role
+  local pid; pid=$(cat "$ROOT/run/$1.pid" 2>/dev/null) || return 0
+  case $(ps -o comm= -p "$pid" 2>/dev/null) in
+    */fleet-cas) kill "$pid"; for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done ;;
+  esac
+}
+
+write_service() {  # role, args...
+  local r=$1; shift
+  local label; label=$(label_for "$r")
+  local agent=$AGENTS/$label.plist daemon=/Library/LaunchDaemons/$label.plist
+  say "run $label: $BIN/fleet-cas $*"
+  [ -n "$apply" ] || return 0
+  mkdir -p "$AGENTS" "$LOGS" "$ROOT/run" "$ROOT/launchd"
+  local changed=$bin_changed
+  printf '%s\n' "$@" >"$ROOT/run/$r.args.tmp"
+  if ! cmp -s "$ROOT/run/$r.args.tmp" "$ROOT/run/$r.args"; then
+    mv "$ROOT/run/$r.args.tmp" "$ROOT/run/$r.args"; changed=1
+  else
+    rm -f "$ROOT/run/$r.args.tmp"
   fi
-  mv "$plist.tmp" "$plist"
-  bootstrap "$label" "$plist"
+  plist_for "$r" "$label" 1 >"$ROOT/launchd/$label.plist"
+  plutil -lint -s "$ROOT/launchd/$label.plist"
+  if cmp -s "$ROOT/launchd/$label.plist" "$daemon" && launchctl print "system/$label" >/dev/null 2>&1; then
+    # The daemon is installed: retire any agent, which would fight it for the socket or port.
+    if [ -e "$agent" ] || launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+      launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+      rm -f "$agent"
+    fi
+    [ -z "$changed" ] || restart_role "$r"
+    echo "daemon $label"
+    return 0
+  fi
+  plist_for "$r" "$label" >"$agent.tmp"
+  plutil -lint -s "$agent.tmp"
+  if cmp -s "$agent.tmp" "$agent" && launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+    rm -f "$agent.tmp"
+    [ -z "$changed" ] || restart_role "$r"
+    echo "agent $label"
+    return 0
+  fi
+  mv "$agent.tmp" "$agent"
+  bootstrap "gui/$(id -u)" "$label" "$agent"
+  echo "agent $label"
 }
 
 install_binaries() {
@@ -145,10 +201,11 @@ install_binaries() {
     fi
     mkdir -p "$BIN"
     local f src
-    for f in fleet-cas fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-writer-build.sh; do
+    for f in fleet-cas fleet-cas-run fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-writer-build.sh; do
       src=$proto/target/release/$f; [ "$f" = fleet-cas ] || src=$proto/scripts/$f
       if ! cmp -s "$src" "$BIN/$f"; then
         install -m 0755 "$src" "$BIN/$f.new" && mv "$BIN/$f.new" "$BIN/$f"
+        [ "$f" = fleet-cas ] && bin_changed=1
       fi
     done
   fi
@@ -189,9 +246,10 @@ case $role in
     fi
     do_ mkdir -p "$NODE_STORE"
     write_env "$store" "$sign_key"
-    write_plist node "$SOCK" "$NODE_STORE" "${node_args[@]}" --upstream "http://$store" ${trusted:+--trusted-keys "$trusted"}
+    write_service node "$SOCK" "$NODE_STORE" "${node_args[@]}" --upstream "http://$store" ${trusted:+--trusted-keys "$trusted"}
     if [ -n "$apply" ]; then
-      for _ in 1 2 3 4 5 6 7 8 9 10; do "$BIN/fleet-cas-settings.sh" "$SOCK" >/dev/null 2>&1 && break; sleep 0.5; done
+      # launchd restarts a stopped role after ThrottleInterval (10 s).
+      for _ in $(seq 1 40); do "$BIN/fleet-cas-settings.sh" "$SOCK" >/dev/null 2>&1 && break; sleep 0.5; done
       "$BIN/fleet-cas-settings.sh" "$SOCK" >/dev/null 2>&1 || health_failed node
       echo "ok $role answering on $SOCK (upstream $store)"
     fi
@@ -203,18 +261,58 @@ case $role in
     [ -z "$sign_key" ] || { echo "--sign-key is for the writer role" >&2; exit 2; }
     install_binaries
     do_ mkdir -p "$FLEET_STORE"
-    write_plist store "tcp:$listen" "$FLEET_STORE" --writers "$writers" ${trusted:+--trusted-keys "$trusted"}
+    write_service store "tcp:$listen" "$FLEET_STORE" --writers "$writers" ${trusted:+--trusted-keys "$trusted"}
     if [ -n "$apply" ]; then
-      for _ in 1 2 3 4 5 6 7 8 9 10; do nc -z -G 1 "${listen%:*}" "${listen##*:}" 2>/dev/null && break; sleep 0.5; done
+      for _ in $(seq 1 40); do nc -z -G 1 "${listen%:*}" "${listen##*:}" 2>/dev/null && break; sleep 0.5; done
       nc -z -G 2 "${listen%:*}" "${listen##*:}" 2>/dev/null || health_failed store
       echo "ok store listening on $listen (writers: ${writers:-none}, signed entries only: $([ -n "$trusted" ] && echo yes || echo no))"
     fi
     ;;
+  relay-key)
+    if [ ! -f "$RELAY_KEY" ]; then
+      say "create $RELAY_KEY (ed25519, no passphrase: it may only forward to the store port)"
+      [ -n "$apply" ] || exit 0
+      mkdir -p -m 700 "$HOME/.ssh"
+      ssh-keygen -q -t ed25519 -N "" -C "fleet-cas-relay@$(hostname -s)" -f "$RELAY_KEY"
+    fi
+    echo "pubkey $(cut -d" " -f1,2 "$RELAY_KEY.pub")"
+    ;;
+  authorize-relay)
+    # On the store host: the key may open one forward, to the store, and nothing else.
+    case $pubkey in ssh-ed25519\ *) ;; *) echo "--pubkey takes an ssh-ed25519 public key" >&2; exit 2 ;; esac
+    case $target in *[!0-9.:]* | "") echo "--target takes IP:PORT" >&2; exit 2 ;; esac
+    body=$(echo "$pubkey" | cut -d" " -f2)
+    line="restrict,port-forwarding,permitopen=\"$target\",command=\"/usr/bin/false\" $pubkey fleet-cas-relay"
+    if grep -qF "$body" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+      grep -F "$body" "$HOME/.ssh/authorized_keys" | grep -qF "permitopen=\"$target\"" \
+        || { echo "that key is already authorized with other options; not changing it" >&2; exit 1; }
+      echo "unchanged relay key ${body:0:16}..."
+    else
+      say "authorize relay key ${body:0:16}... to forward to $target only"
+      [ -z "$apply" ] || { mkdir -p -m 700 "$HOME/.ssh"; echo "$line" >>"$HOME/.ssh/authorized_keys"; chmod 600 "$HOME/.ssh/authorized_keys"; }
+    fi
+    ;;
+  relay)
+    [ -n "$store" ] || { echo "relay needs --store IP:PORT" >&2; exit 2; }
+    [ -f "$RELAY_KEY" ] || { echo "no relay key; run relay-key first" >&2; exit 2; }
+    install_binaries
+    write_service relay -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 \
+      -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$RELAY_KNOWN" \
+      -o IdentitiesOnly=yes -i "$RELAY_KEY" -L "127.0.0.1:$RELAY_PORT:$store" "$(id -un)@${store%:*}"
+    if [ -n "$apply" ]; then
+      for _ in $(seq 1 40); do nc -z -G 1 127.0.0.1 "$RELAY_PORT" 2>/dev/null && break; sleep 0.5; done
+      nc -z -G 2 127.0.0.1 "$RELAY_PORT" 2>/dev/null || health_failed relay
+      echo "ok relay 127.0.0.1:$RELAY_PORT -> $store"
+    fi
+    ;;
   uninstall)
-    for r in node store; do
+    for r in node store relay; do
       label=$(label_for "$r")
       say "stop and remove $label (stores kept)"
-      [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true; rm -f "$AGENTS/$label.plist"; }
+      [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true; rm -f "$AGENTS/$label.plist" "$ROOT/run/$r.args"; }
+      if [ -e "/Library/LaunchDaemons/$label.plist" ]; then
+        echo "ROOT STEP NEEDED: sudo launchctl bootout system/$label; sudo rm /Library/LaunchDaemons/$label.plist"
+      fi
     done
     do_ rm -f "$ROOT/fleet-cas.env"
     ;;

@@ -50,7 +50,14 @@ time. Slots on a host never build at the same time: every build takes the host l
 | local CAS | `/Users/Shared/cmux-build-fleet/xcode/cas` | required: part of the app target's keys |
 | node socket | `/Users/Shared/cmux-build-fleet/xcode/fleet-cas.sock` | per host |
 | node store | `/Users/Shared/cmux-build-fleet/xcode/node-store` | per host |
+| catch-up checkout | `/Users/Shared/cmux-build-fleet/xcode/src/cmux` | required: part of the keys of every target in the checkout |
 | iteration DerivedData | `/Users/Shared/cmux-build-fleet/xcode/slot-<n>/iter/DerivedData` | no: never touches the cache |
+
+The checkout path enters the keys despite project prefix mapping: a fresh full-app read on
+cmux8s (Xcode 26.6) from a copy of the writer's checkout at another path hit 334 of 4,192,
+the SPM packages, whose clone directory kept its path. So catch-up builds use one fixed
+checkout per host (under the host lock), not the slot's own checkout, and SPM clones stay
+inside the fixed DerivedData.
 
 The catch-up DerivedData is one path per host, not per slot, because its path is in every key
 (mapping it crashes swift-frontend on Xcode 26.3 and 26.6). The host lock already serializes
@@ -146,7 +153,11 @@ the old key is dropped.
 
 `scripts/glaeda-fleet-cas-rollout --store HOST NODE_HOST... [--apply]` from an operator Mac
 deploys both services (plan by default). On each host it runs `scripts/glaeda-fleet-cas`,
-which builds the prototype and installs user LaunchAgents:
+which builds the prototype and installs launchd services (a LaunchAgent, or a LaunchDaemon
+run as the build user where root has installed its plist from `xcode/launchd/`). Each runs
+`xcode/bin/fleet-cas-run ROLE`, which reads its arguments from `xcode/run/ROLE.args`, so an
+upgrade needs no root: the installer rewrites the arguments or binary and stops the process,
+and launchd starts it again.
 
 - `com.teamleaderleo.glaeda.fleet-cas-store` on the store host: the fleet store on the host's
   LAN address, port 7450, store under `xcode/fleet-store`. Only `--writers` addresses may
@@ -154,13 +165,26 @@ which builds the prototype and installs user LaunchAgents:
   is read-only until the trusted writer exists. Other LANs need a tailnet grant for the port.
 - `com.teamleaderleo.glaeda.fleet-cas-node` on every build host: the node daemon on the socket
   above, read-only (`--read-only-kv`) until then, and `xcode/bin/fleet-cas-settings.sh`.
+- `com.teamleaderleo.glaeda.fleet-cas-relay` on every build host other than the store host:
+  `/usr/bin/ssh -N -L 127.0.0.1:17450:<store>:7450` with the host's own key
+  (`~/.ssh/fleet-cas-relay`), which the store host authorizes for that one forward only
+  (`restrict,port-forwarding,permitopen=...`). The node's upstream is `127.0.0.1:17450`.
+
+The relay exists because macOS Local Network privacy blocks launchd-started third-party
+binaries on these headless minis from other LAN hosts, as LaunchAgents and as LaunchDaemons
+alike: the node on cmux8s got "No route to host" for the store on cmux7s while the same
+binary run from ssh reached it, and Apple binaries (`/usr/bin/ssh`, `nc`) started by launchd
+got through. Tailnet addresses are not affected; once the tailnet grants the store port
+(cmuxterm-hq#589) the relay is optional. Relayed connections reach the store from the store
+host's own address, so they pass the `--writers` check: a relayed host could upload objects
+(disk use), not index entries, which still need the writer's signature.
 
 `--writer HOST --sign-key PATH --trusted-keys HEX` makes that host the writer (above) and
 its LAN address the store's only allowed writer; `--trusted-keys` alone makes every node and
 the store use only signed entries. The store listens on a DHCP address, so the store host
-needs a DHCP reservation. The agents need the build user's GUI session; the fleet minis log in
-automatically. `glaeda-fleet-cas uninstall
---apply` removes both agents and keeps the stores. Deployed on cmux7s (store and node) and
+needs a DHCP reservation. A LaunchAgent needs the build user's GUI session; the fleet minis
+log in automatically. `glaeda-fleet-cas uninstall --apply` removes the services and keeps the
+stores (a LaunchDaemon's plist needs root to remove; the command prints how). Deployed on cmux7s (store and node) and
 cmux8s (node) on 2026-09-24.
 
 ## When to switch
