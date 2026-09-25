@@ -536,7 +536,8 @@ class CatchUpTests(unittest.TestCase):
             with self.assertRaisesRegex(mf.Failure, "trustedRef"):
                 mf.load_manifest(write_manifest(tmp, data))
             # cmuxterm-hq#623's cmux15: a trusted-only runner beside the writer.
-            data["hosts"]["build-mini-2"]["overrides"]["runner"] = {"trustedRef": "refs/heads/main"}
+            data["hosts"]["build-mini-2"]["overrides"]["runner"] = {"trustedRef": "refs/heads/main",
+                                                                    "trustedRepo": "manaflow-ai/cmux"}
             self.assertIn("catch-up-writer", mf.load_manifest(write_manifest(tmp, data))["hosts"]["build-mini-2"]["roles"])
             data["hosts"]["small-mini"]["roles"] = ["catch-up-writer"]
             with self.assertRaisesRegex(mf.Failure, "one writer"):

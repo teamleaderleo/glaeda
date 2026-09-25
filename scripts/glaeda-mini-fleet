@@ -305,7 +305,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
                 raise Failure(f"{path}: host {name} is the {CATCH_UP_WRITER} and also {', '.join(clash)}; "
                               "the writer runs no hq worker")
             # PR code must never run next to the signing key: a writer's runners take trusted refs only.
-            if "ci-runner" in host["roles"] and not host_policy(data, name).get("runner", {}).get("trustedRef"):
+            if "ci-runner" in host["roles"] and not (host_policy(data, name).get("runner") or {}).get("trustedRef"):
                 raise Failure(f"{path}: host {name} is the {CATCH_UP_WRITER} and a ci-runner without "
                               "overrides.runner.trustedRef; PR jobs would run next to the signing key")
             if HQ_WORKER_LABEL in host_policy(data, name).get("launchd", {}).get("running", []):
@@ -1014,6 +1014,7 @@ def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, 
         return []
     out: list[tuple[str, str, str]] = []
     keep = "never delete or re-clone it: the catch-up cache keys include this path"
+    rollout = "operator: rerun scripts/glaeda-fleet-cas-rollout for this host"
     if role == CATCH_UP_WRITER:
         states = {j["label"]: j["state"] for j in obs["launchd"]}
         fill = states.get(CATCH_UP_FILL_LABEL)
@@ -1049,7 +1050,7 @@ def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, 
             # A fresh host or an install --reset: informational until the first catch-up build.
             out.append(("pending", f"{where} missing", "the next catch-up build creates it"))
         elif got == "missing":
-            out.append(("fleet-cas", f"{where} missing", "scripts/glaeda-fleet-cas-rollout"))
+            out.append(("fleet-cas", f"{where} missing", rollout))
         else:
             out.append(("fleet-cas", f"{where} is a {got}, want a {want}",
                         f"operator: inspect it{'; ' + keep if rel in FLEET_CAS_BUILD_PATHS else ''}"))
@@ -1061,10 +1062,10 @@ def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, 
                "signing": "the node signs (--sign-key)",
                "read-only": "the node is read-only (--read-only-kv)"}.get(mode, "the node has neither flag")
         out.append(("fleet-cas", f"{got}; a {role} node runs {flag}",
-                    f"scripts/glaeda-fleet-cas {'node' if role == 'reader' else 'writer'} (via glaeda-fleet-cas-rollout)"))
+                    f"operator: scripts/glaeda-fleet-cas {'node' if role == 'reader' else 'writer'} via glaeda-fleet-cas-rollout"))
     if cas.get("node") != "answers":
         out.append(("fleet-cas", "fleet-cas node does not answer on xcode/fleet-cas.sock (the fleet-cas-settings.sh "
-                    "check); builds fall back to the local cache", "scripts/glaeda-fleet-cas-rollout"))
+                    "check); builds fall back to the local cache", rollout))
     # Readers build in catch-up mode from it; the writer's fill runs the same recipe's fill path.
     release = "cmuxterm-hq build-fleet/recipe-release.py (operator)"
     if cas.get("recipe") in (None, "none"):
