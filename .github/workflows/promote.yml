@@ -47,15 +47,14 @@ jobs:
           elif ! grep -q -e "no assets match" -e "release not found" channels/err; then
             cat channels/err; exit 1
           fi
-          # releases newest first; only those past the soak can be promoted, so only they cost API calls
-          cutoff=$(( $(date +%s) - SOAK_HOURS * 3600 ))
+          # releases newest first, down to stable; soaking ones count too, since their canary failures
+          # block promoting anything older
           gh release list --limit 40 --json tagName,createdAt \
             --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | "\(.tagName) \(.createdAt)"' \
             > channels/releases.txt
           : > channels/candidates.jsonl
           considered=0
           while read -r tag created; do
-            [ "$(date -d "$created" +%s)" -le "$cutoff" ] || continue
             gh release download "$tag" --pattern release.json --output channels/release.json --clobber
             source=$(python3 -c 'import json;print(json.load(open("channels/release.json"))["source"])')
             # newest first; one page holds every canary host's latest status
@@ -71,7 +70,7 @@ jobs:
             python3 scripts/glaeda_release.py candidate --release channels/release.json --published "$created" \
               --statuses channels/statuses.json --descends "$descends" >> channels/candidates.jsonl
             considered=$((considered + 1))
-            if [ "$tag" = "$stable_tag" ] || [ "$considered" -ge 10 ]; then break; fi
+            if [ "$tag" = "$stable_tag" ] || [ "$considered" -ge 20 ]; then break; fi
           done < channels/releases.txt
           set +e
           python3 scripts/glaeda_release.py promote --candidates channels/candidates.jsonl "${stable[@]}" \

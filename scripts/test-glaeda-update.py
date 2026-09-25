@@ -299,9 +299,14 @@ class ReleaseTest(unittest.TestCase):
         old = {"entry": self.entry("a", "2026-09-25T01:00:00Z"), "statuses": ok, "descendsFromStable": True}
         mid = {"entry": self.entry("b", "2026-09-25T04:00:00Z"), "statuses": bad, "descendsFromStable": True}
         new = {"entry": self.entry("c", "2026-09-25T10:00:00Z"), "statuses": ok, "descendsFromStable": True}
-        # c is still soaking and b failed on a canary: a, the newest that passes, is promoted
-        chosen, why = gr.choose([new, mid, old], None, self.NOW)
+        # c is still soaking: a, the newest soaked healthy release, is promoted
+        chosen, why = gr.choose([new, old], None, self.NOW)
         self.assertEqual(chosen["tag"], old["entry"]["tag"], why)
+        # a canary failure on b, newer than a, may be a's updater failing to install b: nothing older goes
+        self.assertIsNone(gr.choose([new, mid, old], None, self.NOW)[0])
+        # a failure on a newer release that is still soaking blocks too
+        soaking_bad = {**new, "statuses": bad}
+        self.assertIsNone(gr.choose([soaking_bad, old], None, self.NOW)[0])
         # nothing older than stable is considered, and never a release off stable's line
         stable = {**old["entry"], "ring": "stable"}
         self.assertIsNone(gr.choose([new, mid, old], stable, self.NOW)[0])

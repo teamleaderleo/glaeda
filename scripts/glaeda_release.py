@@ -190,6 +190,7 @@ def choose(candidates: list[dict], stable: dict | None, now: dt.datetime,
     """The newest candidate that may become stable, and why (or why none).
 
     Each candidate is {"entry": <canary-shaped entry>, "statuses": [...], "descendsFromStable": bool}.
+    Candidates include releases still soaking: their failures block older releases.
     """
     reasons = []
     for candidate in sorted(candidates, key=lambda c: c["entry"]["published"], reverse=True):
@@ -197,6 +198,11 @@ def choose(candidates: list[dict], stable: dict | None, now: dt.datetime,
         if stable is not None and entry["tag"] == stable["tag"]:
             reasons.append(f"{entry['tag']}: already stable")
             break  # everything older is older than stable too
+        if canary_verdict(candidate["statuses"])[1]:
+            # A release's own updater installs its successor, so a canary failure on a newer release can
+            # be an older release's fault: nothing older is promoted until a newer one is healthy.
+            reasons.append(f"{entry['tag']}: a canary reported failure; nothing older is promoted")
+            break
         if stable is not None and not candidate.get("descendsFromStable"):
             reasons.append(f"{entry['tag']}: does not descend from stable")
             continue

@@ -50,7 +50,9 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    - the release is at least 6 hours old;
    - at least one canary host reported success;
    - no canary host's newest status is a failure;
-   - it descends from the current stable.
+   - it descends from the current stable;
+   - no newer release has a canary failure. A release's own updater installs its successor, so a
+     failure there can be the older release's fault; promotion waits until a newer one is healthy.
 
    It looks past the current canary on purpose: with several merges a day the newest release is
    never 6 hours old, and stable would never move.
