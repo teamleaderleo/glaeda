@@ -1856,8 +1856,10 @@ class RunnerTest(unittest.TestCase):
         names = [argv[argv.index("--name") + 1] for argv in self.config_argvs()]
         self.assertEqual(names, ["mini-std-glaeda", "mini-std-glaeda-3"])
         labels = [argv[argv.index("--labels") + 1].split(",") for argv in self.config_argvs()]
-        self.assertEqual([("glaeda-root-std-xcode-26.6" in l, "glaeda-std-xcode-26.6" in l) for l in labels],
-                         [(True, True), (False, True)], "only instance 0 is the root runner of a one-root mini")
+        self.assertEqual([("glaeda-root-std-xcode-26.6" in l, "glaeda-std-xcode-26.6" in l,
+                           "glaeda-side-std-xcode-26.6" in l) for l in labels],
+                         [(True, True, False), (False, True, True)],
+                         "only instance 0 is the root runner of a one-root mini; the rest carry the side label")
         self.assertEqual(third["runnerDir"], os.fspath(self.home / "actions-runner-glaeda-3"))
         self.assertEqual(first["runnerDir"], os.fspath(self.home / "actions-runner-glaeda"))
         plist = self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.3.plist"
@@ -2119,6 +2121,7 @@ class ManifestLabelsTest(unittest.TestCase):
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["compileSlots"], 1)
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["canonicalRoots"], 1)
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["rootPools"], ["glaeda-root-std-xcode-26.6"])
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["sidePools"], ["glaeda-side-std-xcode-26.6"])
             manifest["defaults"]["runner"]["classes"]["std"]["compileSlots"] = 2
             self.assertIn("compileSlots 2 needs canonicalRoots 2", cr.member_labels(manifest, "mini-std")[1])
             manifest["defaults"]["runner"]["classes"]["std"]["canonicalRoots"] = 2

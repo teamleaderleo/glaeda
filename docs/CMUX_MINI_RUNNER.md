@@ -356,8 +356,13 @@ in at the producer's root. So one root job per root per mini:
   (instances 0 and up) also carry the root pool label `glaeda-root-<class>-xcode-<version>`. Root jobs
   should run on that label, so GitHub queues them until a root runner is free instead of handing one to a
   runner whose mini is already busy in its root (a "canonical root token is taken" refusal).
+- The other runners (instances `canonicalRoots` and up) carry the side pool label
+  `glaeda-side-<class>-xcode-<version>` instead. cmux's light side-lane jobs run on it
+  (`vars.CI_SIDE_LANE_RUNNER`, cmux#14391), so they never hold a root runner. A class whose
+  `canonicalRoots` equals `runners` has no side runner, so do not point that variable at it.
 - `compileSlots` may not exceed `canonicalRoots`: every compile holds a root.
-- `declared_pools` and glaeda-route count only the pool labels; the root labels are a per-mini subset of them.
+- `declared_pools` and glaeda-route count only the pool labels; the root and side labels split each mini's
+  runners between them.
 - With `canonicalRoots` above 1, consumers (gui and product jobs) take no root at job start. Their restore
   step runs `/Users/Shared/cmux-build-fleet/bin/glaeda-canonical-root take <root> --wait 1800` for the
   producer's root (the path from the product receipt, or N). The job-started hook links that path to its
