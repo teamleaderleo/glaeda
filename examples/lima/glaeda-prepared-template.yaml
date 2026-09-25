@@ -19,9 +19,9 @@ disk: 20GiB
 
 # Lima owns this SSH/control account. Repository code runs only as the separate locked account.
 user:
-  name: smolrunner-admin
-  comment: SmolRunner controller
-  home: /home/smolrunner-admin
+  name: glaeda-admin
+  comment: Glaeda controller
+  home: /home/glaeda-admin
   shell: /bin/bash
   uid: 1000
   passwordlessSudo: true
@@ -74,22 +74,22 @@ provision:
       export LC_ALL=C
       umask 022
 
-      readonly runner_user="smolrunner-runner"
-      readonly runner_guard_group="smolrunner-runner-guard"
-      readonly runner_home="/var/lib/smolrunner-runner"
-      readonly install_parent="/opt/smolrunner"
+      readonly runner_user="glaeda-runner"
+      readonly runner_guard_group="glaeda-runner-guard"
+      readonly runner_home="/var/lib/glaeda-runner"
+      readonly install_parent="/opt/glaeda"
       readonly install_dir="${install_parent}/actions-runner"
       readonly install_stage="${install_parent}/actions-runner.staging"
       readonly runner_work="${install_dir}/_work"
       readonly runner_diag="${install_dir}/_diag"
       readonly launcher_dir="${install_parent}/bin"
-      readonly jit_launcher="${launcher_dir}/smolrunner-jit-launcher"
-      readonly jit_launcher_stage="/var/tmp/smolrunner-jit-launcher.new"
-      readonly jit_launcher_sha256="6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
-      readonly integrity_verifier="${launcher_dir}/smolrunner-runner-integrity"
+      readonly jit_launcher="${launcher_dir}/glaeda-jit-launcher"
+      readonly jit_launcher_stage="/var/tmp/glaeda-jit-launcher.new"
+      readonly jit_launcher_sha256="2553d9346ea569cb23f393a928238cc4fd7c7b486e32be6a6e2f484c963689f4"
+      readonly integrity_verifier="${launcher_dir}/glaeda-runner-integrity"
       readonly integrity_verifier_stage="${integrity_verifier}.new"
-      readonly integrity_verifier_sha256="d8ee50c0981fb6eec4fdc957491e492f3a5befc7153b8916466627c9812a379f"
-      readonly marker_dir="/etc/smolrunner"
+      readonly integrity_verifier_sha256="56608a33d06e0dde70a6dbf482fdc69811416c6bd1543fd5f394c4402887f190"
+      readonly marker_dir="/etc/glaeda"
       readonly runner_entries="${marker_dir}/actions-runner.entries"
       readonly runner_entries_stage="${runner_entries}.new"
       readonly runner_checksums="${marker_dir}/actions-runner.sha256"
@@ -99,8 +99,8 @@ provision:
       readonly runner_bytes="138824064"
       readonly runner_sha256="58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1"
       readonly marker="${marker_dir}/prepared-template.json"
-      readonly apt_policy="/etc/apt/apt.conf.d/99-smolrunner-no-automatic-updates"
-      readonly suid_dumpable_policy="/etc/sysctl.d/99-smolrunner-runner-secrets.conf"
+      readonly apt_policy="/etc/apt/apt.conf.d/99-glaeda-no-automatic-updates"
+      readonly suid_dumpable_policy="/etc/sysctl.d/99-glaeda-runner-secrets.conf"
 
       if [[ "$(/usr/bin/id -u)" != "0" ]]; then
         echo "prepared-template provisioning requires root" >&2
@@ -161,7 +161,7 @@ provision:
       }
 
       verify_runner_install() {
-        [[ "$(${integrity_verifier})" == "smolrunner-runner-integrity-ok" ]]
+        [[ "$(${integrity_verifier})" == "glaeda-runner-integrity-ok" ]]
       }
 
       /usr/bin/install -d -o root -g root -m 0755 \
@@ -170,7 +170,7 @@ provision:
         "${runner_home}"
 
       /usr/bin/printf '%s' \
-        'IyEvYmluL2Jhc2gKc2V0IC1ldW8gcGlwZWZhaWwKCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCgpyZWFkb25seSBpbnN0YWxsX2Rpcj0iL29wdC9zbW9scnVubmVyL2FjdGlvbnMtcnVubmVyIgpyZWFkb25seSBlbnRyaWVzPSIvZXRjL3Ntb2xydW5uZXIvYWN0aW9ucy1ydW5uZXIuZW50cmllcyIKcmVhZG9ubHkgY2hlY2tzdW1zPSIvZXRjL3Ntb2xydW5uZXIvYWN0aW9ucy1ydW5uZXIuc2hhMjU2IgpyZWFkb25seSBydW5uZXJfd29yaz0iJHtpbnN0YWxsX2Rpcn0vX3dvcmsiCnJlYWRvbmx5IHJ1bm5lcl9ndWFyZF9ncm91cD0ic21vbHJ1bm5lci1ydW5uZXItZ3VhcmQiCnJlYWRvbmx5IHJ1bm5lcl9kaWFnPSIke2luc3RhbGxfZGlyfS9fZGlhZyIKcmVhZG9ubHkgaml0X2xhdW5jaGVyPSIvb3B0L3Ntb2xydW5uZXIvYmluL3Ntb2xydW5uZXItaml0LWxhdW5jaGVyIgpyZWFkb25seSBqaXRfbGF1bmNoZXJfc2hhMjU2PSI2ZjA5NmZiNTE4YjZkNDBkNDVjYTFhOTkyM2U0MjNkYTQzNmI2MjY5ZmNlZWM1YTU5ODk1NjZhYmJjOTNhNzZhIgoKW1sgIiQoL3Vzci9iaW4vaWQgLXUpIiA9PSAiMCIgXV0KW1sgIiQoL3Vzci9zYmluL3N5c2N0bCAtbiBmcy5zdWlkX2R1bXBhYmxlKSIgPT0gIjAiIF1dCmxpc3RlbmVyX21vdW50X29wdGlvbnM9IiQoL3Vzci9iaW4vZmluZG1udCAtLW5vaGVhZGluZ3MgLS1vdXRwdXQgT1BUSU9OUyAtLXRhcmdldCAiJHtpbnN0YWxsX2Rpcn0vYmluL1J1bm5lci5MaXN0ZW5lciIpIgpyZWFkb25seSBsaXN0ZW5lcl9tb3VudF9vcHRpb25zCltbIC1uICIke2xpc3RlbmVyX21vdW50X29wdGlvbnN9IiBdXQohIC91c3IvYmluL2dyZXAgLS1xdWlldCAtLXdvcmQtcmVnZXhwIG5vc3VpZCA8PDwiJHtsaXN0ZW5lcl9tb3VudF9vcHRpb25zfSIKW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYSAiJHtpbnN0YWxsX2Rpcn0vYmluL1J1bm5lci5MaXN0ZW5lciIpIiA9PSAicm9vdDoke3J1bm5lcl9ndWFyZF9ncm91cH06Mjc1NSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtpbnN0YWxsX2Rpcn0iKSIgPT0gInJvb3Q6c21vbHJ1bm5lci1ydW5uZXI6MTc3NTpkaXJlY3RvcnkiIF1dCltbICIkKC91c3IvYmluL3N0YXQgLS1mb3JtYXQ9JVU6JUc6JWE6JUYgIiR7ZW50cmllc30iKSIgPT0gInJvb3Q6cm9vdDo0NDQ6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke2NoZWNrc3Vtc30iKSIgPT0gInJvb3Q6cm9vdDo0NDQ6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke2ppdF9sYXVuY2hlcn0iKSIgPT0gInJvb3Q6cm9vdDo3NTU6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke3J1bm5lcl93b3JrfSIpIiA9PSAic21vbHJ1bm5lci1ydW5uZXI6c21vbHJ1bm5lci1ydW5uZXI6NzUwOmRpcmVjdG9yeSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtydW5uZXJfZGlhZ30iKSIgPT0gInNtb2xydW5uZXItcnVubmVyOnNtb2xydW5uZXItcnVubmVyOjc1MDpkaXJlY3RvcnkiIF1dCgppZiAvdXNyL2Jpbi9maW5kIC1QICIke2luc3RhbGxfZGlyfSIgLXhkZXYgLW1pbmRlcHRoIDEgXAogIFwoIC1wYXRoICIke3J1bm5lcl93b3JrfSIgLW8gLXBhdGggIiR7cnVubmVyX2RpYWd9IiBcKSAtcHJ1bmUgLW8gXAogICEgLXVzZXIgcm9vdCAtcHJpbnQgLXF1aXQgfCAvdXNyL2Jpbi9ncmVwIC1xIC47IHRoZW4KICBleGl0IDEKZmkKaWYgL3Vzci9iaW4vZmluZCAtUCAiJHtpbnN0YWxsX2Rpcn0iIC14ZGV2IC1taW5kZXB0aCAxIFwKICBcKCAtcGF0aCAiJHtydW5uZXJfd29ya30iIC1vIC1wYXRoICIke3J1bm5lcl9kaWFnfSIgXCkgLXBydW5lIC1vIFwKICAhIC10eXBlIGwgLXBlcm0gLzAyMiAtcHJpbnQgLXF1aXQgfCAvdXNyL2Jpbi9ncmVwIC1xIC47IHRoZW4KICBleGl0IDEKZmkKCigKICBjZCAiJHtpbnN0YWxsX2Rpcn0iCiAgL3Vzci9iaW4vZmluZCAtUCAuIC14ZGV2IC1taW5kZXB0aCAxIC1wcmludGYgJyV5ICVtICVQICVsXG4nIHwgL3Vzci9iaW4vc29ydAopIHwgL3Vzci9iaW4vY21wIC0tc2lsZW50IC0gIiR7ZW50cmllc30iCigKICBjZCAiJHtpbnN0YWxsX2Rpcn0iCiAgL3Vzci9iaW4vc2hhMjU2c3VtIC0tY2hlY2sgLS1zdHJpY3QgLS1xdWlldCAiJHtjaGVja3N1bXN9IgopCi91c3IvYmluL3ByaW50ZiAnJXNcbicgIiR7aml0X2xhdW5jaGVyX3NoYTI1Nn0gICR7aml0X2xhdW5jaGVyfSIgfCAvdXNyL2Jpbi9zaGEyNTZzdW0gLS1jaGVjayAtLXN0YXR1cwoKL3Vzci9iaW4vcHJpbnRmICclc1xuJyAnc21vbHJ1bm5lci1ydW5uZXItaW50ZWdyaXR5LW9rJwo=' \
+        'IyEvYmluL2Jhc2gKc2V0IC1ldW8gcGlwZWZhaWwKCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCgpyZWFkb25seSBpbnN0YWxsX2Rpcj0iL29wdC9nbGFlZGEvYWN0aW9ucy1ydW5uZXIiCnJlYWRvbmx5IGVudHJpZXM9Ii9ldGMvZ2xhZWRhL2FjdGlvbnMtcnVubmVyLmVudHJpZXMiCnJlYWRvbmx5IGNoZWNrc3Vtcz0iL2V0Yy9nbGFlZGEvYWN0aW9ucy1ydW5uZXIuc2hhMjU2IgpyZWFkb25seSBydW5uZXJfd29yaz0iJHtpbnN0YWxsX2Rpcn0vX3dvcmsiCnJlYWRvbmx5IHJ1bm5lcl9ndWFyZF9ncm91cD0iZ2xhZWRhLXJ1bm5lci1ndWFyZCIKcmVhZG9ubHkgcnVubmVyX2RpYWc9IiR7aW5zdGFsbF9kaXJ9L19kaWFnIgpyZWFkb25seSBqaXRfbGF1bmNoZXI9Ii9vcHQvZ2xhZWRhL2Jpbi9nbGFlZGEtaml0LWxhdW5jaGVyIgpyZWFkb25seSBqaXRfbGF1bmNoZXJfc2hhMjU2PSIyNTUzZDkzNDZlYTU2OWNiMjNmMzkzYTkyODIzOGNjNGZkN2M3YjQ4NmUzMmJlNmE2ZTJmNDg0Yzk2MzY4OWY0IgoKW1sgIiQoL3Vzci9iaW4vaWQgLXUpIiA9PSAiMCIgXV0KW1sgIiQoL3Vzci9zYmluL3N5c2N0bCAtbiBmcy5zdWlkX2R1bXBhYmxlKSIgPT0gIjAiIF1dCmxpc3RlbmVyX21vdW50X29wdGlvbnM9IiQoL3Vzci9iaW4vZmluZG1udCAtLW5vaGVhZGluZ3MgLS1vdXRwdXQgT1BUSU9OUyAtLXRhcmdldCAiJHtpbnN0YWxsX2Rpcn0vYmluL1J1bm5lci5MaXN0ZW5lciIpIgpyZWFkb25seSBsaXN0ZW5lcl9tb3VudF9vcHRpb25zCltbIC1uICIke2xpc3RlbmVyX21vdW50X29wdGlvbnN9IiBdXQohIC91c3IvYmluL2dyZXAgLS1xdWlldCAtLXdvcmQtcmVnZXhwIG5vc3VpZCA8PDwiJHtsaXN0ZW5lcl9tb3VudF9vcHRpb25zfSIKW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYSAiJHtpbnN0YWxsX2Rpcn0vYmluL1J1bm5lci5MaXN0ZW5lciIpIiA9PSAicm9vdDoke3J1bm5lcl9ndWFyZF9ncm91cH06Mjc1NSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtpbnN0YWxsX2Rpcn0iKSIgPT0gInJvb3Q6Z2xhZWRhLXJ1bm5lcjoxNzc1OmRpcmVjdG9yeSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtlbnRyaWVzfSIpIiA9PSAicm9vdDpyb290OjQ0NDpyZWd1bGFyIGZpbGUiIF1dCltbICIkKC91c3IvYmluL3N0YXQgLS1mb3JtYXQ9JVU6JUc6JWE6JUYgIiR7Y2hlY2tzdW1zfSIpIiA9PSAicm9vdDpyb290OjQ0NDpyZWd1bGFyIGZpbGUiIF1dCltbICIkKC91c3IvYmluL3N0YXQgLS1mb3JtYXQ9JVU6JUc6JWE6JUYgIiR7aml0X2xhdW5jaGVyfSIpIiA9PSAicm9vdDpyb290Ojc1NTpyZWd1bGFyIGZpbGUiIF1dCltbICIkKC91c3IvYmluL3N0YXQgLS1mb3JtYXQ9JVU6JUc6JWE6JUYgIiR7cnVubmVyX3dvcmt9IikiID09ICJnbGFlZGEtcnVubmVyOmdsYWVkYS1ydW5uZXI6NzUwOmRpcmVjdG9yeSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtydW5uZXJfZGlhZ30iKSIgPT0gImdsYWVkYS1ydW5uZXI6Z2xhZWRhLXJ1bm5lcjo3NTA6ZGlyZWN0b3J5IiBdXQoKaWYgL3Vzci9iaW4vZmluZCAtUCAiJHtpbnN0YWxsX2Rpcn0iIC14ZGV2IC1taW5kZXB0aCAxIFwKICBcKCAtcGF0aCAiJHtydW5uZXJfd29ya30iIC1vIC1wYXRoICIke3J1bm5lcl9kaWFnfSIgXCkgLXBydW5lIC1vIFwKICAhIC11c2VyIHJvb3QgLXByaW50IC1xdWl0IHwgL3Vzci9iaW4vZ3JlcCAtcSAuOyB0aGVuCiAgZXhpdCAxCmZpCmlmIC91c3IvYmluL2ZpbmQgLVAgIiR7aW5zdGFsbF9kaXJ9IiAteGRldiAtbWluZGVwdGggMSBcCiAgXCggLXBhdGggIiR7cnVubmVyX3dvcmt9IiAtbyAtcGF0aCAiJHtydW5uZXJfZGlhZ30iIFwpIC1wcnVuZSAtbyBcCiAgISAtdHlwZSBsIC1wZXJtIC8wMjIgLXByaW50IC1xdWl0IHwgL3Vzci9iaW4vZ3JlcCAtcSAuOyB0aGVuCiAgZXhpdCAxCmZpCgooCiAgY2QgIiR7aW5zdGFsbF9kaXJ9IgogIC91c3IvYmluL2ZpbmQgLVAgLiAteGRldiAtbWluZGVwdGggMSAtcHJpbnRmICcleSAlbSAlUCAlbFxuJyB8IC91c3IvYmluL3NvcnQKKSB8IC91c3IvYmluL2NtcCAtLXNpbGVudCAtICIke2VudHJpZXN9IgooCiAgY2QgIiR7aW5zdGFsbF9kaXJ9IgogIC91c3IvYmluL3NoYTI1NnN1bSAtLWNoZWNrIC0tc3RyaWN0IC0tcXVpZXQgIiR7Y2hlY2tzdW1zfSIKKQovdXNyL2Jpbi9wcmludGYgJyVzXG4nICIke2ppdF9sYXVuY2hlcl9zaGEyNTZ9ICAke2ppdF9sYXVuY2hlcn0iIHwgL3Vzci9iaW4vc2hhMjU2c3VtIC0tY2hlY2sgLS1zdGF0dXMKCi91c3IvYmluL3ByaW50ZiAnJXNcbicgJ2dsYWVkYS1ydW5uZXItaW50ZWdyaXR5LW9rJwo=' \
         | /usr/bin/base64 --decode >"${integrity_verifier_stage}"
       /usr/bin/printf '%s  %s\n' "${integrity_verifier_sha256}" "${integrity_verifier_stage}" \
         | /usr/bin/sha256sum --check --status
@@ -180,15 +180,15 @@ provision:
       if [[ -f "${marker}" && -x "${install_dir}/bin/Runner.Listener" ]]; then
         /usr/bin/cmp --silent "${marker}" <(/usr/bin/printf '%s\n' \
           '{' \
-          '  "schema_version": 2,' \
+          '  "schema_version": 3,' \
           '  "actions_runner_version": "2.336.0",' \
           '  "actions_runner_digest": "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1",' \
-          '  "workload_user": "smolrunner-runner",' \
+          '  "workload_user": "glaeda-runner",' \
           '  "runner_listener_protection": "setgid_nondumpable",' \
-          '  "runner_install_directory": "/opt/smolrunner/actions-runner",' \
-          '  "runner_work_directory": "/opt/smolrunner/actions-runner/_work",' \
-          '  "jit_launcher_path": "/opt/smolrunner/bin/smolrunner-jit-launcher",' \
-          '  "jit_launcher_digest": "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"' \
+          '  "runner_install_directory": "/opt/glaeda/actions-runner",' \
+          '  "runner_work_directory": "/opt/glaeda/actions-runner/_work",' \
+          '  "jit_launcher_path": "/opt/glaeda/bin/glaeda-jit-launcher",' \
+          '  "jit_launcher_digest": "sha256:2553d9346ea569cb23f393a928238cc4fd7c7b486e32be6a6e2f484c963689f4"' \
           '}')
         verify_runner_install
         verify_runner_secret_protection
@@ -264,7 +264,7 @@ provision:
       /usr/bin/rm -f -- "${archive}"
 
       /usr/bin/printf '%s' \
-        'IyEvYmluL2Jhc2gKc2V0IC1ldW8gcGlwZWZhaWwKCnJlYWRvbmx5IHJ1bm5lcl9saXN0ZW5lcj0iL29wdC9zbW9scnVubmVyL2FjdGlvbnMtcnVubmVyL2Jpbi9SdW5uZXIuTGlzdGVuZXIiCnJlYWRvbmx5IG1heF9qaXRfYnl0ZXM9NjU1MzYKCnVtYXNrIDA3NwpqaXRfY29uZmlnPSIiCklGUz0gcmVhZCAtciBqaXRfY29uZmlnIHx8IGV4aXQgNjQKW1sgLW4gIiR7aml0X2NvbmZpZ30iICYmICR7I2ppdF9jb25maWd9IC1sZSAke21heF9qaXRfYnl0ZXN9IF1dCltbICIke2ppdF9jb25maWd9IiA9fiBeW0EtWmEtejAtOSsvPV8tXSskIF1dCmlmIElGUz0gcmVhZCAtciBfOyB0aGVuCiAgZXhpdCA2NApmaQoKZXhwb3J0IEFDVElPTlNfUlVOTkVSX0lOUFVUX0pJVENPTkZJRz0iJHtqaXRfY29uZmlnfSIKZXhlYyAiJHtydW5uZXJfbGlzdGVuZXJ9IiBydW4gLS1zdGFydHVwdHlwZSBzZXJ2aWNlCg==' \
+        'IyEvYmluL2Jhc2gKc2V0IC1ldW8gcGlwZWZhaWwKCnJlYWRvbmx5IHJ1bm5lcl9saXN0ZW5lcj0iL29wdC9nbGFlZGEvYWN0aW9ucy1ydW5uZXIvYmluL1J1bm5lci5MaXN0ZW5lciIKcmVhZG9ubHkgbWF4X2ppdF9ieXRlcz02NTUzNgoKdW1hc2sgMDc3CmppdF9jb25maWc9IiIKSUZTPSByZWFkIC1yIGppdF9jb25maWcgfHwgZXhpdCA2NApbWyAtbiAiJHtqaXRfY29uZmlnfSIgJiYgJHsjaml0X2NvbmZpZ30gLWxlICR7bWF4X2ppdF9ieXRlc30gXV0KW1sgIiR7aml0X2NvbmZpZ30iID1+IF5bQS1aYS16MC05Ky89Xy1dKyQgXV0KaWYgSUZTPSByZWFkIC1yIF87IHRoZW4KICBleGl0IDY0CmZpCgpleHBvcnQgQUNUSU9OU19SVU5ORVJfSU5QVVRfSklUQ09ORklHPSIke2ppdF9jb25maWd9IgpleGVjICIke3J1bm5lcl9saXN0ZW5lcn0iIHJ1biAtLXN0YXJ0dXB0eXBlIHNlcnZpY2UK' \
         | /usr/bin/base64 --decode >"${jit_launcher_stage}"
       /usr/bin/printf '%s  %s\n' "${jit_launcher_sha256}" "${jit_launcher_stage}" \
         | /usr/bin/sha256sum --check --status
@@ -278,15 +278,15 @@ provision:
       readonly marker_stage="${marker}.new"
       /usr/bin/printf '%s\n' \
         '{' \
-        '  "schema_version": 2,' \
+        '  "schema_version": 3,' \
         '  "actions_runner_version": "2.336.0",' \
         '  "actions_runner_digest": "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1",' \
-        '  "workload_user": "smolrunner-runner",' \
+        '  "workload_user": "glaeda-runner",' \
         '  "runner_listener_protection": "setgid_nondumpable",' \
-        '  "runner_install_directory": "/opt/smolrunner/actions-runner",' \
-        '  "runner_work_directory": "/opt/smolrunner/actions-runner/_work",' \
-        '  "jit_launcher_path": "/opt/smolrunner/bin/smolrunner-jit-launcher",' \
-        '  "jit_launcher_digest": "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"' \
+        '  "runner_install_directory": "/opt/glaeda/actions-runner",' \
+        '  "runner_work_directory": "/opt/glaeda/actions-runner/_work",' \
+        '  "jit_launcher_path": "/opt/glaeda/bin/glaeda-jit-launcher",' \
+        '  "jit_launcher_digest": "sha256:2553d9346ea569cb23f393a928238cc4fd7c7b486e32be6a6e2f484c963689f4"' \
         '}' >"${marker_stage}"
       /usr/bin/chown root:root "${marker_stage}"
       /usr/bin/chmod 0444 "${marker_stage}"
@@ -294,11 +294,11 @@ provision:
 
 probes:
   - mode: readiness
-    description: pinned SmolRunner Actions runner is prepared
+    description: pinned Glaeda Actions runner is prepared
     script: |
       #!/bin/bash
       set -euo pipefail
-      /usr/bin/test -r /etc/smolrunner/prepared-template.json
-      /usr/bin/test -x /opt/smolrunner/actions-runner/bin/Runner.Listener
-      /usr/bin/test -x /opt/smolrunner/bin/smolrunner-jit-launcher
-      /usr/bin/test "$(/usr/bin/id -Gn smolrunner-runner)" = "smolrunner-runner"
+      /usr/bin/test -r /etc/glaeda/prepared-template.json
+      /usr/bin/test -x /opt/glaeda/actions-runner/bin/Runner.Listener
+      /usr/bin/test -x /opt/glaeda/bin/glaeda-jit-launcher
+      /usr/bin/test "$(/usr/bin/id -Gn glaeda-runner)" = "glaeda-runner"
