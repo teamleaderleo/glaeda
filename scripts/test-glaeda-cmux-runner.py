@@ -766,6 +766,10 @@ class HookTest(unittest.TestCase):
                 release.join()
             self.assertEqual(admitted.returncode, 0, admitted.stdout)
             self.assertIn("+gui", admitted.stdout)
+            # the wait never overshoots its deadline by a poll interval
+            waited = time.monotonic()
+            self.job("app-host-unit-tests", "w5", 4, None, "--gui-wait", "1")
+            self.assertLess(time.monotonic() - waited, 4.5, "the last try starts by the deadline")
             # only the gui token is waited for: any other refusal is still immediate
             self.finish("w2")
             self.assertEqual(self.job("macos-compile-admission", "w3", 4).returncode, 0)
@@ -775,7 +779,33 @@ class HookTest(unittest.TestCase):
             self.assertNotIn("gui token", full.stdout)
             self.assertLess(time.monotonic() - waited, 20, "a units refusal does not wait")
         finally:
-            for runner in ("w0", "w1", "w2", "w3", "w4"):
+            for runner in ("w0", "w1", "w2", "w3", "w4", "w5"):
+                self.finish(runner)
+
+    def test_capacity_gui_wait_stops_once_the_refusal_is_not_the_gui_token(self) -> None:
+        self.fleet()
+        release = None
+        try:
+            self.assertEqual(self.job("app-host-unit-tests", "x0", 4).returncode, 0)
+            self.assertEqual(self.job("claude-wrapper", "x1", 4).returncode, 0)
+            self.assertEqual(self.job("claude-wrapper", "x2", 4).returncode, 0)
+            self.assertEqual(self.job("claude-wrapper", "x5", 4).returncode, 0)
+            # the gui holder leaves, but the units it frees go to a light job first: the refusal turns to units
+            def swap() -> None:
+                self.finish("x0")
+                self.job("claude-wrapper", "x3", 4)
+            release = threading.Timer(2.0, swap)
+            release.start()
+            waited = time.monotonic()
+            result = self.job("tests-build-and-lag", "x4", 4, None, "--gui-wait", "30")
+            release.join()
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("units free", result.stdout)
+            self.assertLess(time.monotonic() - waited, 20, "a units refusal after a gui one does not keep waiting")
+        finally:
+            if release is not None:
+                release.cancel()
+            for runner in ("x0", "x1", "x2", "x3", "x4", "x5"):
                 self.finish(runner)
 
     def test_job_class_keys_on_workflow_file_and_job_id(self) -> None:
