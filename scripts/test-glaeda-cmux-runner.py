@@ -1953,12 +1953,72 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--capacity-units 4 --compile-slots 2 --canonical-roots 2 --instance 0",
                       (hooks / "job-started.sh").read_text())  # instance 0 prefers root 1
         self.assertNotIn("--trusted-ref", (hooks / "job-started.sh").read_text())
+        self.assertIn("--test-keychain", (hooks / "job-started.sh").read_text())
         manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {
             "trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"}
         path.write_text(json.dumps(manifest))
         with mock.patch.object(cr, "xcode_present", return_value=True):
             self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
         self.assertIn("--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux", (hooks / "job-started.sh").read_text())
+        self.assertNotIn("--test-keychain", (hooks / "job-started.sh").read_text(), "a secret-holding host keeps its keychains")
+
+    def test_test_keychain_is_created_unlocked_first_and_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "Library/Keychains").mkdir(parents=True)
+            path = os.fspath(home / "Library/Keychains" / hook.TEST_KEYCHAIN)
+            login = os.fspath(home / "Library/Keychains/login.keychain-db")
+            state = {"list": [login], "default": login}
+            calls: list[list[str]] = []
+
+            def fake(argv: list[str], **_: object) -> subprocess.CompletedProcess:
+                calls.append(argv[1:])
+                verb, rest = argv[1], argv[2:]
+                out = ""
+                if verb == "create-keychain":
+                    Path(rest[-1]).write_bytes(b"")
+                elif verb == "list-keychains" and "-s" in rest:
+                    state["list"] = rest[rest.index("-s") + 1:]
+                elif verb == "list-keychains":
+                    out = "".join(f'    "{k}"\n' for k in state["list"])
+                elif verb == "default-keychain" and "-s" in rest:
+                    state["default"] = rest[-1]
+                elif verb == "default-keychain":
+                    out = f'    "{state["default"]}"\n'
+                return subprocess.CompletedProcess(argv, 0, out, "")
+
+            with mock.patch.object(hook.subprocess, "run", side_effect=fake):
+                self.assertIn("unlocked and default", hook.ensure_test_keychain(home))
+                self.assertEqual(state, {"list": [path, login], "default": path})
+                self.assertIn(["create-keychain", "-p", "", path], calls)
+                self.assertIn(["set-keychain-settings", path], calls, "no lock timeout, no lock on sleep")
+                calls.clear()
+                self.assertIn("unlocked and default", hook.ensure_test_keychain(home))
+                self.assertEqual([c[0] for c in calls],
+                                 ["set-keychain-settings", "unlock-keychain", "list-keychains", "default-keychain"],
+                                 "idempotent: nothing recreated or reordered")
+                self.assertFalse(any(login in c for c in calls if c[0] != "list-keychains"),
+                                 "the login keychain is never changed")
+            state.update({"list": [login, path], "default": login})  # present but not first: reordered
+            with mock.patch.object(hook.subprocess, "run", side_effect=fake):
+                self.assertIn("unlocked and default", hook.ensure_test_keychain(home))
+                self.assertEqual(state, {"list": [path, login], "default": path})
+
+            def failing(verb: str):
+                def run(argv: list[str], **kw: object) -> subprocess.CompletedProcess:
+                    done = fake(argv, **kw)
+                    return (subprocess.CompletedProcess(argv, 1, "", "no") if argv[1] == verb and "-s" in argv
+                            else done)
+                return run
+            for verb, why in (("list-keychains", "search list"), ("default-keychain", "default")):
+                state.update({"list": [login], "default": login})
+                with self.subTest(verb), mock.patch.object(hook.subprocess, "run", side_effect=failing(verb)):
+                    self.assertIn(f"setting the {why} failed", hook.ensure_test_keychain(home))
+            with mock.patch.object(hook.subprocess, "run",
+                                   return_value=subprocess.CompletedProcess([], 51, "", "locked")):
+                self.assertEqual(hook.ensure_test_keychain(home), "test keychain: unlock failed")
+            with mock.patch.object(hook.subprocess, "run", side_effect=subprocess.TimeoutExpired("security", 15)):
+                self.assertEqual(hook.ensure_test_keychain(home), "test keychain: TimeoutExpired")
 
     def test_instances_get_their_own_paths_and_share_the_capacity(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):

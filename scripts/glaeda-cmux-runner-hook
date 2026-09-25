@@ -517,6 +517,46 @@ def runner_worker_pid() -> int | None:
 ROOT_SHIM = "glaeda-canonical-root"
 
 
+TEST_KEYCHAIN = "cmux-ci.keychain-db"
+
+
+def ensure_test_keychain(home: Path) -> str:
+    """A passwordless keychain for PR jobs' tests, unlocked, first in the user search list and the default.
+    The login keychain stays locked from a launchd session (errSecInteractionNotAllowed), so tests that add
+    items need their own; it holds only test junk, never credentials. Idempotent and best effort: a failure
+    is reported, never fatal, and the login keychain's contents are never touched.
+    The default is the user's, not the job's: anything that later stores a credential as this user on a PR
+    mini without naming a keychain lands here, readable by every PR job. Never store credentials as the
+    runner user on a PR mini (docs/CMUX_MINI_RUNNER.md)."""
+    sec = "/usr/bin/security"
+    path = os.fspath(home / "Library/Keychains" / TEST_KEYCHAIN)
+
+    def call(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([sec, *args], capture_output=True, text=True, timeout=15)
+
+    def listed(out: str) -> list[str]:
+        return [line.strip().strip('"') for line in out.splitlines() if line.strip()]
+
+    try:
+        if not os.path.exists(path):
+            made = call("create-keychain", "-p", "", path)
+            if made.returncode and not os.path.exists(path):
+                return f"test keychain: create failed ({made.stderr.strip()[:120]})"
+        call("set-keychain-settings", path)  # no -l, -u or -t: never locks on sleep or after a timeout
+        if call("unlock-keychain", "-p", "", path).returncode:
+            return "test keychain: unlock failed"
+        keychains = listed(call("list-keychains", "-d", "user").stdout)
+        if keychains[:1] != [path] and call("list-keychains", "-d", "user", "-s", path,
+                                            *[k for k in keychains if k != path]).returncode:
+            return "test keychain: unlocked, but setting the search list failed"
+        if listed(call("default-keychain", "-d", "user").stdout)[:1] != [path] \
+                and call("default-keychain", "-d", "user", "-s", path).returncode:
+            return "test keychain: unlocked, but setting the default failed"
+        return f"test keychain {TEST_KEYCHAIN} unlocked and default"
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"test keychain: {type(error).__name__}"
+
+
 def ensure_root_shim(bin_dir: Path) -> None:
     """Point FLEET_DIR/bin/glaeda-canonical-root at this hook's shim (the path cmux's restore step calls).
     Best effort and atomic: a symlink written aside and renamed over the old one."""
@@ -1517,6 +1557,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--disk", help="glaeda-disk path (default: PATH, then ~/.local/bin)")
     p.add_argument("--no-disk", action="store_true")
     p.add_argument("--no-telemetry", action="store_true", help="do not sample the host while the job runs")
+    p.add_argument("--test-keychain", action="store_true",
+                   help="give the job an unlocked, passwordless default keychain for tests (PR runner minis)")
     p.add_argument("--job-log", type=Path, default=JOB_LOG, help=argparse.SUPPRESS)
     p.add_argument("--min-free-gib", type=float, default=0, help="refuse a job below this much free disk")
     p.add_argument("--require-eligible", action="store_true",
@@ -1612,6 +1654,8 @@ def main(argv: list[str] | None = None) -> int:
             if aligned:
                 note += f"; {aligned}"
         print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
+        if args.test_keychain:
+            print(f"{PREFIX}: {ensure_test_keychain(Path.home())}", flush=True)
         if telemetry:
             repo = os.environ.get("GITHUB_REPOSITORY") or _repo_name((event or {}).get("repository")
                                                                      if isinstance(event, dict) else None)
