@@ -5,15 +5,16 @@
 #                            NODE_HOST... [--apply]
 #
 # Plans by default; --apply deploys. HOST names are ssh aliases (User cmux). The store
-# listens on the store host's LAN address (en0) port 7450; every NODE_HOST gets a read-only
+# listens on the store host's tailnet address port 7450; every NODE_HOST gets a read-only
 # node daemon pointed at it. With --trusted-keys, the store keeps and every node uses only
 # index entries signed by those keys. --writer makes that host the signing writer: its node
 # signs with the key at --sign-key (a path on the writer, created there beforehand with
-# `fleet-cas keygen`), and its LAN address becomes the store's only allowed writer. Each host
+# `fleet-cas keygen`), and its tailnet address becomes the store's only allowed writer. The
+# writer host must run no PR or other untrusted job: any process there can reach the signing
+# node's socket. Each host
 # receives scripts/glaeda-fleet-cas and tools/fleet-cas-prototype under
 # ~/.cache/glaeda-fleet-cas (also when planning) and runs `glaeda-fleet-cas` there
-# (docs/CMUX_BUILD_SLOT_MODES.md).
-# Minis on another LAN cannot reach the store until the tailnet grants the port.
+# (docs/CMUX_BUILD_SLOT_MODES.md). Every host needs the tailnet grant for the store port.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 PORT=7450
@@ -57,14 +58,19 @@ run() {  # host, args...
   ssh -o BatchMode=yes "$h" "PATH=\$HOME/.cargo/bin:\$PATH ~/.cache/glaeda-fleet-cas/glaeda/scripts/glaeda-fleet-cas $(printf '%q ' "$@")"
 }
 
-lan_ip() {
-  local ip; ip=$(ssh -o BatchMode=yes "$1" 'ipconfig getifaddr en0')
-  [ -n "$ip" ] || { echo "no en0 address on $1" >&2; exit 1; }
+# The store's tailnet address: launchd-started third-party binaries on these minis cannot
+# reach other hosts' LAN addresses (macOS Local Network privacy), and tailnet addresses work.
+# The tailnet grants the store port to the build minis (cmuxterm-hq#591). Every client,
+# the writer included, then connects from its own tailnet address, so --writers sees real
+# peers (glaeda#1208).
+tailnet_ip() {
+  local ip; ip=$(ssh -o BatchMode=yes "$1" "ifconfig | awk '/inet 100\\./ {print \$2; exit}'")
+  [ -n "$ip" ] || { echo "no tailnet (100.x) address on $1" >&2; exit 1; }
   echo "$ip"
 }
-ip=$(lan_ip "$store")
+ip=$(tailnet_ip "$store")
 writer_ip=
-[ -z "$writer" ] || writer_ip=$(lan_ip "$writer")
+[ -z "$writer" ] || writer_ip=$(tailnet_ip "$writer")
 run "$store" store --listen "$ip:$PORT" ${writer_ip:+--writers "$writer_ip"} ${trusted:+--trusted-keys "$trusted"} $apply
 [ -z "$writer" ] || run "$writer" writer --store "$ip:$PORT" --sign-key "$sign_key" --trusted-keys "$trusted" $apply
 for n in ${nodes[@]+"${nodes[@]}"}; do

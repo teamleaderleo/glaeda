@@ -446,8 +446,13 @@ impl Store {
         (!self.upstream_backing_off()).then_some(up)
     }
 
-    fn upstream_failed(&self) {
-        self.stats.up_errors.fetch_add(1, Relaxed);
+    /// A fleet-store call failed: count it, log it (the first few, then every
+    /// hundredth, so an outage cannot flood the log), and back off.
+    fn upstream_failed(&self, what: &str) {
+        let n = self.stats.up_errors.fetch_add(1, Relaxed);
+        if n < 5 || n % 100 == 0 {
+            eprintln!("fleet store call failed ({} so far): {what}", n + 1);
+        }
         self.upstream_down_until
             .store(now_ms() + UPSTREAM_BACKOFF_MS, Relaxed);
     }
@@ -466,7 +471,7 @@ impl Store {
                 }
                 return upstream_err(e);
             }
-            self.upstream_failed();
+            self.upstream_failed(&format!("write: {e}"));
             return upstream_err(e);
         }
         Status::unavailable("fleet store unavailable (backing off)")
@@ -490,9 +495,12 @@ impl Store {
         };
         // An unreachable fleet store degrades to a local miss: the build
         // compiles instead of failing or waiting.
-        let Ok(resp) = self.stats.upstream(up.cas.clone().get(req)).await else {
-            self.upstream_failed();
-            return Ok(None);
+        let resp = match self.stats.upstream(up.cas.clone().get(req)).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.upstream_failed(&format!("cas get: {e}"));
+                return Ok(None);
+            }
         };
         let Some(cas::cas_get_response::Contents::Data(obj)) = resp.into_inner().contents else {
             self.stats.up_cas_fetch_miss.fetch_add(1, Relaxed);
@@ -561,7 +569,7 @@ impl Store {
             .await
             .is_err()
         {
-            self.upstream_failed();
+            self.upstream_failed("prefetch: timed out");
         }
     }
 
@@ -595,8 +603,8 @@ impl Store {
             {
                 return;
             }
-            Err(_) => {
-                self.upstream_failed();
+            Err(e) => {
+                self.upstream_failed(&format!("prefetch: {e}"));
                 return;
             }
         };
@@ -774,9 +782,12 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
         };
         let mut client = up.kv.clone();
         let fetch = client.get_value(kv::GetValueRequest { key: key.clone() });
-        let Ok(resp) = s.stats.upstream(fetch).await else {
-            s.upstream_failed();
-            return Ok(kv_response(None));
+        let resp = match s.stats.upstream(fetch).await {
+            Ok(r) => r,
+            Err(e) => {
+                s.upstream_failed(&format!("kv get: {e}"));
+                return Ok(kv_response(None));
+            }
         };
         let Some(kv::get_value_response::Contents::Value(value)) = resp.into_inner().contents
         else {
