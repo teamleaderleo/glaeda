@@ -46,6 +46,9 @@ def load(name: str, path: Path):
 cr = load("glaeda_cmux_runner", ROOT / "scripts" / "glaeda-cmux-runner")
 cr.DARWIN_REQUIRED = False
 cr.ONLINE_WAIT_S = 0
+# The load gate reads this machine's real load, which on a busy test host would hold every gate under test. Pin
+# it out of reach here and in the hooks the tests start; the load test patches the thresholds itself.
+os.environ["GLAEDA_RUNNER_GATE_LOAD_PAUSE"] = os.environ["GLAEDA_RUNNER_GATE_LOAD_RESUME"] = "1000000"
 hook = load("glaeda_cmux_runner_hook", HOOK)
 REAL_LEVEL = hook.thermal_pressure_level  # GateTest patches the module attribute
 setup = load("glaeda_mini_setup_for_runner", ROOT / "scripts" / "glaeda-mini-setup")
@@ -1346,6 +1349,100 @@ class GateTest(unittest.TestCase):
         self.runner_hook(2)
         self.hold(fcntl.LOCK_EX)
         self.assertEqual(gate.claimed(), "a fleet build holds the host lock", "the fleet's claim comes first")
+
+    def test_a_saturated_mini_claims_the_host_with_hysteresis(self) -> None:
+        pause, resume = 2.0, 1.5
+        for name, value in (("GATE_LOAD_PAUSE", pause), ("GATE_LOAD_RESUME", resume)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.assertIsNone(hook.mini_saturated(False, load=pause * 14 - 0.1, cores=14))
+        why = hook.mini_saturated(False, load=pause * 14, cores=14)
+        self.assertTrue(why and why.startswith(hook.SATURATED), why)
+        self.assertEqual(why, hook.mini_saturated(False, load=pause * 14 + 30, cores=14), "stable text, logged once")
+        self.assertIsNotNone(hook.mini_saturated(True, load=resume * 14, cores=14))
+        self.assertIsNone(hook.mini_saturated(True, load=resume * 14 - 0.1, cores=14))
+        self.assertIsNone(hook.mini_saturated(False, load=99, cores=0), "no core count: never saturated")
+        with mock.patch.object(hook.os, "getloadavg", side_effect=OSError):
+            self.assertIsNone(hook.mini_saturated(False), "an unreadable load never saturates")
+
+        load = [pause * 14]
+        patcher = mock.patch.object(hook.os, "getloadavg", side_effect=lambda: (load[0], 0.0, 0.0))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(hook.os, "cpu_count", return_value=14)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # Full and saturated: the load reason wins, so the resume mark applies.
+        self.runner_hook(2)
+        gate = self.full_gate(self.units(2))
+        self.assertTrue(gate.claimed().startswith(hook.SATURATED))
+        self.assertTrue(gate.confirmed().startswith(hook.SATURATED))
+        load[0] = (pause + resume) / 2 * 14
+        self.assertTrue(gate.claimed().startswith(hook.SATURATED), "between the marks a held gate stays held")
+        load[0] = resume * 14 - 1
+        self.assertEqual(gate.claimed(), "all 2 capacity units on this mini are taken", "then the full reason")
+        self.hold(fcntl.LOCK_EX)
+        load[0] = pause * 14
+        self.assertEqual(gate.claimed(), "a fleet build holds the host lock", "the fleet's claim comes first")
+
+    def test_a_load_hold_ends_after_the_limit_until_the_load_falls(self) -> None:
+        for name, value in (("GATE_LOAD_PAUSE", 2.0), ("GATE_LOAD_RESUME", 1.5), ("GATE_LOAD_MAX_HOLD_S", 60.0)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        load, clock = [40.0], [1000.0]
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        with mock.patch.object(hook.os, "getloadavg", side_effect=lambda: (load[0], 0.0, 0.0)), \
+                mock.patch.object(hook.os, "cpu_count", return_value=14), \
+                mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(hook, "gate_log") as log:
+            self.assertIsNotNone(gate.claimed())
+            clock[0] += 59
+            self.assertIsNotNone(gate.claimed())
+            clock[0] += 2
+            self.assertIsNone(gate.claimed(), "past the limit the mini listens anyway")
+            self.assertIn("longer than any compile", log.call_args[0][0])
+            clock[0] += 600
+            self.assertIsNone(gate.claimed(), "still waived while the load stays up")
+            load[0] = 10.0
+            self.assertIsNone(gate.claimed())
+            load[0] = 40.0
+            self.assertIsNotNone(gate.claimed(), "a fresh overload holds again")
+            # A fleet claim in between restarts the clock: the limit times a load pause, not the fleet's.
+            clock[0] += 50
+            fd = self.hold(fcntl.LOCK_EX)
+            self.assertEqual(gate.claimed(), "a fleet build holds the host lock")
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            clock[0] += 50
+            self.assertIsNotNone(gate.claimed(), "the 100 s since the first look are not all load hold")
+            self.assertIsNotNone(gate.claimed())
+
+    def test_a_saturated_mini_stops_an_idle_listener_through_step(self) -> None:
+        for name, value in (("GATE_LOAD_PAUSE", 2.0), ("GATE_LOAD_RESUME", 1.5)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        load = [40.0]
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        with mock.patch.object(hook.os, "getloadavg", side_effect=lambda: (load[0], 0.0, 0.0)), \
+                mock.patch.object(hook.os, "cpu_count", return_value=14), \
+                mock.patch.object(gate, "start") as start, mock.patch.object(gate, "stop") as stop, \
+                mock.patch.object(gate, "busy", return_value=False), mock.patch.object(gate, "reload"):
+            gate.child = mock.Mock(poll=mock.Mock(return_value=None))
+            gate.step()
+            gate.step()
+            stop.assert_called_once()
+            self.assertTrue(stop.call_args[0][0].startswith(hook.SATURATED))
+            gate.child, gate.held = None, stop.call_args[0][0]
+            load[0] = 25.0  # below pause, above resume: stays off
+            for _ in range(3):
+                gate.step()
+            start.assert_not_called()
+            load[0] = 20.0
+            for _ in range(hook.GATE_CONFIRM):
+                gate.step()
+            start.assert_called_once()
 
     def test_the_full_probe_never_competes_with_an_admission(self) -> None:
         capacity = self.units(1)
