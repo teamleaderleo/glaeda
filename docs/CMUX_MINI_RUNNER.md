@@ -438,7 +438,6 @@ Hook classes:
   under /tmp, changes the GUI session (open, launchctl setenv, system dark mode) and writes credentials
   to `$HOME`.
 
-
 ## 2h. Test keychain
 
 The cmux user's login keychain is locked in the runner's launchd session, so tests that add keychain items
@@ -450,6 +449,7 @@ can read it.
 **Never store credentials as the runner user on a PR mini** (`gh auth login`, `git credential-osxkeychain`,
 `security import`, Keychain Access). Without an explicit keychain they land in `cmux-ci`, and any later PR job
 can copy that file and read them. Credentials belong on trusted or signing hosts.
+
 ## 3. Verify
 
 ```bash
