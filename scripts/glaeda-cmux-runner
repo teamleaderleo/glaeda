@@ -777,11 +777,27 @@ def relabel(ctx: Context, act: dict[str, Any]) -> None:
         return
     if not ctx.skip_launchctl:
         ctx.log_offset = ctx.log_path.stat().st_size if ctx.log_path.is_file() else 0
+        enable(ctx)
         code, out = run([LAUNCHCTL, "bootstrap", f"gui/{ctx.uid}", os.fspath(ctx.plist_path)])
         act["bootstrapped"] = code == 0
         ctx.agent_started = code == 0  # the agent step must not bootstrap it a second time
         if code != 0:
             act["state"], act["note"] = "failed", ("re-registered, but launchctl bootstrap failed: " + out)[:400]
+
+
+def enable(ctx: Context) -> None:
+    """Clear a launchd disable before a bootstrap, which a disabled label refuses.
+
+    cmux_mini_fix.sh runner_hold disables the agent for a repair; when its
+    hold mark is lost, runner_release skips it and every later --apply failed
+    at bootstrap (cmux7s, 2026-09-25). An --apply is the operator asking for
+    the runner, so it re-enables its own agent, unless a hold mark says a
+    repair is still running (runner_release clears that one).
+    """
+    if (ctx.home / ".local/state/glaeda/mini-fleet/runner-held" / ctx.runner_dir.name).exists():
+        print(f"glaeda-cmux-runner: {ctx.label} is held for a repair; leaving it disabled", file=sys.stderr)
+        return
+    run([LAUNCHCTL, "enable", f"gui/{ctx.uid}/{ctx.label}"])
 
 
 def bootout(ctx: Context, wait_s: float = 5.0) -> None:
@@ -843,6 +859,7 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
         if kind == "agent" and act["state"] in {"create", "update", "unchanged"} and not ctx.skip_launchctl \
                 and not act.get("loaded"):
             ctx.log_offset = ctx.log_path.stat().st_size if ctx.log_path.is_file() else 0
+            enable(ctx)
             code, out = run([LAUNCHCTL, "bootstrap", f"gui/{ctx.uid}", act["path"]])
             act["bootstrapped"] = code == 0
             if code != 0:
