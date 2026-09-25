@@ -53,9 +53,12 @@ skip Verify; say so in the PR.
 
 ```bash
 scripts/glaeda-cmux-runner-fleet                     # plan: eligible members and runner counts
-scripts/glaeda-cmux-runner-fleet --apply --hosts ONE # canary one member first
-scripts/glaeda-cmux-runner-fleet --apply             # then the rest
+scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis --hosts ONE  # canary first
+scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis              # then the rest
 ```
+
+The runners are org-scoped. An apply without `--org` refuses every instance ("already has a runner install")
+and changes nothing. Run it from a worktree at `origin/main`, not the shared base checkout.
 
 job-started.sh runs the hook file fresh for every job, so a staged hook takes effect for the next job without a
 restart. After the canary, run a job there and check the new behavior on the host (for telemetry:
