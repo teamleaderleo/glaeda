@@ -411,6 +411,9 @@ in at the producer's root. So one root job per root per mini:
   (instances 0 and up) also carry the root pool label `glaeda-root-<class>-xcode-<version>`. Root jobs
   should run on that label, so GitHub queues them until a root runner is free instead of handing one to a
   runner whose mini is already busy in its root (a "canonical root token is taken" refusal).
+- Each root runner also carries `glaeda-runner-<runner name>`, a static label naming only itself. cmux's
+  picker reads which root runner kept a warm build of a run's merge base and puts that label in compile
+  admission's runs-on, so the routing App only reads runners and nothing writes labels at job time.
 - The other runners (instances `canonicalRoots` and up) carry the side pool label
   `glaeda-side-<class>-xcode-<version>` instead. cmux's light side-lane jobs run on it
   (`vars.CI_SIDE_LANE_RUNNER`, cmux#14391), so they never hold a root runner. A class whose

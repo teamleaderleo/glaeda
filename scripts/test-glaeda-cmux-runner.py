@@ -2476,7 +2476,7 @@ class RunnerTest(unittest.TestCase):
         argv = self.config_argvs()[0]
         self.assertEqual(argv[argv.index("--name") + 1], "mini-std-glaeda")
         self.assertEqual(argv[argv.index("--labels") + 1], "glaeda-mini,glaeda-class-std,glaeda-dedicated,xcode-26.6,glaeda-std-xcode-26.6,"
-                                                         "glaeda-root-std-xcode-26.6")
+                                                         "glaeda-root-std-xcode-26.6,glaeda-runner-mini-std-glaeda")
         self.assertEqual(receipt["member"]["class"], "std")
         self.assertEqual(self.by_kind(receipt)["verify"]["state"], "ok")
         # a plain re-run keeps the registered labels and never asks for a relabel
@@ -2588,6 +2588,9 @@ class RunnerTest(unittest.TestCase):
                            "glaeda-side-std-xcode-26.6" in l) for l in labels],
                          [(True, True, False), (False, True, True)],
                          "only instance 0 is the root runner of a one-root mini; the rest carry the side label")
+        self.assertEqual([[x for x in l if x.startswith("glaeda-runner-")] for l in labels],
+                         [["glaeda-runner-mini-std-glaeda"], []],
+                         "a root runner carries a label naming only itself; a side runner none")
         self.assertEqual(third["runnerDir"], os.fspath(self.home / "actions-runner-glaeda-3"))
         self.assertEqual(first["runnerDir"], os.fspath(self.home / "actions-runner-glaeda"))
         plist = self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.3.plist"
@@ -2634,7 +2637,7 @@ class RunnerTest(unittest.TestCase):
         argv = self.config_argvs()[-1]
         self.assertIn("--replace", argv)
         self.assertEqual(argv[argv.index("--labels") + 1], "glaeda-mini,glaeda-class-std,glaeda-dedicated,xcode-26.6,glaeda-std-xcode-26.6,"
-                                                         "glaeda-root-std-xcode-26.6")
+                                                         "glaeda-root-std-xcode-26.6,glaeda-runner-mini-test-glaeda")
         runners = json.loads((self.state / "runners.json").read_text())["runners"]
         self.assertEqual([(r["name"], r["id"]) for r in runners], [("mini-test-glaeda", 4243)])
         self.assertEqual((runner / "_work" / "hot").read_text(), "derived data")
