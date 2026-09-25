@@ -7,10 +7,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
 use glaeda::linked_worktree_reclaim::{
-    LinkedWorktreeFacts, LinkedWorktreeReclaimCompensation, LinkedWorktreeReclaimDecision,
-    LinkedWorktreeReclaimOutcome, LinkedWorktreeReclaimPolicy, LinkedWorktreeReclaimVeto,
-    ProcessUseEvidence, list_linked_worktrees, observe_linked_worktrees,
-    plan_linked_worktree_reclaim, reclaim_linked_worktree,
+    GithubLookup, LinkedWorktreeFacts, LinkedWorktreeReclaimCompensation,
+    LinkedWorktreeReclaimDecision, LinkedWorktreeReclaimOutcome, LinkedWorktreeReclaimPolicy,
+    LinkedWorktreeReclaimVeto, LocalBranchDecision, LocalBranchDeletion,
+    LocalBranchFinishedEvidence, LocalBranchReport, ProcessUseEvidence, list_linked_worktrees,
+    observe_linked_worktrees, plan_linked_worktree_reclaim, reclaim_linked_worktree,
+    reclaim_local_branches,
 };
 use glaeda::process::ProcessExecutor;
 use glaeda::project_checkout_observation::ProjectCheckoutObserver;
@@ -35,9 +37,32 @@ const DEFAULT_FINISHED_IDLE_SECONDS: i64 = 60 * 60;
 /// if every observation is wrong in the same way.
 const DEFAULT_MAX_RECLAIMS: usize = 32;
 
+/// Default number of local branches one run may delete across all repositories.
+const DEFAULT_MAX_BRANCH_DELETIONS: usize = 64;
+
+/// Where `gh` is looked for when `--gh` is not given, after `~/.local/bin/gh`; scheduled jobs
+/// run with a minimal PATH.
+const GH_CANDIDATES: [&str; 3] = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"];
+
+/// Environment passed to `gh` so it finds its configuration and stored credentials.
+const GH_ENVIRONMENT: [&str; 8] = [
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "GH_CONFIG_DIR",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "USER",
+    // Linux: gh reads a keyring-stored token through the session bus.
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
+
 // Ignored files are gone for good; everything else comes back with `git worktree add` at the
 // preserved commit, and a detached HEAD is pinned under refs/glaeda/worktree-pins/ first.
 const COMPENSATION: &str = "git_worktree_add_at_preserved_commit";
+
+// A deleted branch comes back with `git branch <name> <commit>` from the receipt.
+const BRANCH_COMPENSATION: &str = "git_branch_at_receipt_commit";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -70,7 +95,26 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_FINISHED_IDLE_SECONDS)]
     finished_idle_seconds: i64,
 
-    /// List every worktree in human output, not only the actionable ones.
+    /// Also delete local branches that no worktree has checked out and whose work has landed,
+    /// after the finished window. Runs after worktree removal, which frees their branches.
+    #[arg(long)]
+    branches: bool,
+
+    /// `gh` used to ask GitHub whether a branch's pull request merged (squash merges that main
+    /// has since changed further look unfinished to Git alone). Found automatically if omitted.
+    #[arg(long)]
+    gh: Option<PathBuf>,
+
+    /// Decide branches from Git alone, without asking GitHub.
+    #[arg(long, conflicts_with = "gh")]
+    no_github: bool,
+
+    /// Most local branches one run may delete across all repositories.
+    #[arg(long, default_value_t = DEFAULT_MAX_BRANCH_DELETIONS)]
+    max_branch_deletions: usize,
+
+    /// List every worktree (and, with --branches, every branch) in human output, not only the
+    /// actionable ones.
     #[arg(long)]
     all: bool,
 
@@ -144,6 +188,21 @@ struct RepositoryReport {
     available_bytes_after: Option<u64>,
     #[serde(flatten)]
     result: RepositoryResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branches: Option<BranchSection>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+enum BranchSection {
+    Listed {
+        eligible: usize,
+        deleted: usize,
+        branches: Vec<LocalBranchReport>,
+    },
+    Unlisted {
+        code: &'static str,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -152,9 +211,13 @@ struct Report {
     schema_version: u8,
     mutation_performed: bool,
     compensation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_compensation: Option<&'static str>,
     minimum_idle_seconds: i64,
     finished_idle_seconds: i64,
     max_reclaims: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_branch_deletions: Option<usize>,
     budget_exhausted: bool,
     circuit_breaker_tripped: bool,
     repositories: Vec<RepositoryReport>,
@@ -194,6 +257,30 @@ fn main() -> ExitCode {
     let executor = ProcessExecutor;
 
     let mut remaining_budget = cli.max_reclaims;
+    let mut remaining_branch_budget = cli.max_branch_deletions;
+    let github = (!cli.no_github)
+        .then(|| {
+            cli.gh.clone().or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".local/bin/gh"))
+                    .into_iter()
+                    .chain(GH_CANDIDATES.iter().map(PathBuf::from))
+                    .find(|path| path.is_file())
+            })
+        })
+        .flatten()
+        .map(|gh_program| GithubLookup {
+            gh_program,
+            environment: GH_ENVIRONMENT
+                .iter()
+                .filter_map(|key| {
+                    std::env::var(key)
+                        .ok()
+                        .map(|value| ((*key).to_owned(), value))
+                })
+                .collect(),
+        });
+    let mut branch_budget_exhausted = false;
     let mut budget_exhausted = false;
     let mut circuit_breaker_tripped = false;
     let mut mutation_performed = false;
@@ -208,6 +295,7 @@ fn main() -> ExitCode {
                     available_bytes_before: None,
                     available_bytes_after: None,
                     result: RepositoryResult::Unlisted { code: error.code() },
+                    branches: None,
                 });
                 continue;
             }
@@ -221,6 +309,7 @@ fn main() -> ExitCode {
                     available_bytes_before: None,
                     available_bytes_after: None,
                     result: RepositoryResult::Unlisted { code: error.code() },
+                    branches: None,
                 });
                 continue;
             }
@@ -295,11 +384,54 @@ fn main() -> ExitCode {
                 result,
             });
         }
+        let branches = (cli.branches && !circuit_breaker_tripped).then(|| {
+            match reclaim_local_branches(
+                &observer,
+                &inventory,
+                policy.finished_idle_seconds(),
+                now_seconds,
+                cli.apply,
+                &mut remaining_branch_budget,
+                cli.all,
+                github.as_ref(),
+                &executor,
+            ) {
+                Ok(branches) => {
+                    let eligible = branches
+                        .iter()
+                        .filter(|branch| {
+                            matches!(branch.decision, LocalBranchDecision::Eligible { .. })
+                        })
+                        .count();
+                    let deleted = branches
+                        .iter()
+                        .filter(|branch| branch.deletion == Some(LocalBranchDeletion::Deleted))
+                        .count();
+                    mutation_performed |= deleted > 0;
+                    let attempted = branches
+                        .iter()
+                        .filter(|branch| branch.deletion.is_some())
+                        .count();
+                    circuit_breaker_tripped |= branches
+                        .iter()
+                        .any(|branch| branch.deletion == Some(LocalBranchDeletion::GitRefused));
+                    branch_budget_exhausted |=
+                        cli.apply && !circuit_breaker_tripped && eligible > attempted;
+                    BranchSection::Listed {
+                        eligible,
+                        deleted,
+                        branches,
+                    }
+                }
+                Err(error) => BranchSection::Unlisted { code: error.code() },
+            }
+        });
         repositories.push(RepositoryReport {
             ordinal: index + 1,
             available_bytes_before,
             available_bytes_after: cli.apply.then(|| available_bytes(repository)).flatten(),
             result: RepositoryResult::Listed { summary, worktrees },
+            branches,
         });
     }
 
@@ -312,10 +444,12 @@ fn main() -> ExitCode {
         schema_version: REPORT_SCHEMA_VERSION,
         mutation_performed,
         compensation: COMPENSATION,
+        branch_compensation: cli.branches.then_some(BRANCH_COMPENSATION),
         minimum_idle_seconds: policy.minimum_idle_seconds(),
         finished_idle_seconds: policy.finished_idle_seconds(),
         max_reclaims: cli.max_reclaims,
-        budget_exhausted,
+        max_branch_deletions: cli.branches.then_some(cli.max_branch_deletions),
+        budget_exhausted: budget_exhausted || branch_budget_exhausted,
         circuit_breaker_tripped,
         repositories,
     };
@@ -332,10 +466,10 @@ fn main() -> ExitCode {
         },
         OutputFormat::Human => render_human(&report, cli.apply, cli.all),
     }
-    let any_unlisted = report
-        .repositories
-        .iter()
-        .any(|repository| matches!(repository.result, RepositoryResult::Unlisted { .. }));
+    let any_unlisted = report.repositories.iter().any(|repository| {
+        matches!(repository.result, RepositoryResult::Unlisted { .. })
+            || matches!(repository.branches, Some(BranchSection::Unlisted { .. }))
+    });
     if circuit_breaker_tripped {
         ExitCode::from(3)
     } else if any_unlisted {
@@ -380,6 +514,30 @@ fn render_human(report: &Report, apply: bool, all: bool) {
                         println!("  #{}: {line}", worktree.ordinal);
                     }
                 }
+                match &repository.branches {
+                    None => {}
+                    Some(BranchSection::Unlisted { code }) => {
+                        println!("  branches: not listed: {code}");
+                    }
+                    Some(BranchSection::Listed {
+                        eligible,
+                        deleted,
+                        branches,
+                    }) => {
+                        eligible_total += eligible;
+                        println!(
+                            "  branches: {eligible} finished and idle{}",
+                            if apply {
+                                format!(", {deleted} deleted")
+                            } else {
+                                String::new()
+                            }
+                        );
+                        for branch in branches {
+                            println!("    {}", branch_line(branch));
+                        }
+                    }
+                }
                 if let (Some(before), Some(after)) = (
                     repository.available_bytes_before,
                     repository.available_bytes_after,
@@ -396,8 +554,7 @@ fn render_human(report: &Report, apply: bool, all: bool) {
     if apply {
         if report.budget_exhausted {
             println!(
-                "stopped at the --max-reclaims budget of {}; run again to continue",
-                report.max_reclaims
+                "stopped at the --max-reclaims or --max-branch-deletions budget; run again to continue"
             );
         }
         if report.circuit_breaker_tripped {
@@ -472,6 +629,39 @@ fn worktree_line(result: &WorktreeResult, all: bool) -> Option<String> {
             .then(|| "prunable: registration is stale (directory or .git file missing)".to_owned()),
         WorktreeResult::Unobservable { code } => Some(format!("unobservable: {code}")),
     }
+}
+
+fn branch_line(branch: &LocalBranchReport) -> String {
+    let state = match (&branch.deletion, &branch.decision) {
+        (Some(LocalBranchDeletion::Deleted), _) => "deleted".to_owned(),
+        (Some(LocalBranchDeletion::Changed), _) => "kept: changed since it was checked".to_owned(),
+        (Some(LocalBranchDeletion::GitRefused), _) => "kept: git refused the delete".to_owned(),
+        (
+            None,
+            LocalBranchDecision::Eligible {
+                idle_seconds,
+                finished,
+            },
+        ) => format!(
+            "eligible, idle {}h, {}",
+            idle_seconds / 3_600,
+            match finished {
+                LocalBranchFinishedEvidence::DefaultBranch =>
+                    "landed on a default branch".to_owned(),
+                LocalBranchFinishedEvidence::MergedPullRequest { repository, number } => {
+                    format!("merged as {repository}#{number}")
+                }
+            }
+        ),
+        (None, LocalBranchDecision::Kept { reason }) => format!(
+            "kept: {}",
+            serde_json::to_value(reason)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default()
+        ),
+    };
+    format!("{} {}: {state}", branch.name, short(&branch.commit))
 }
 
 fn short(commit: &str) -> &str {
