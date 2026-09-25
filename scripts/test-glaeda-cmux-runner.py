@@ -748,6 +748,26 @@ class HookTest(unittest.TestCase):
             for runner in ("g0", "u0"):
                 self.finish(runner)
 
+    def test_capacity_a_full_mini_is_seen_by_the_listener_gate(self) -> None:
+        self.fleet()
+        capacity = self.dir / "capacity"
+        runners = [f"f{n}" for n in range(5)]
+        try:
+            self.assertEqual(self.job("swift-package-tests", "f0", 4).returncode, 0)
+            self.assertEqual((capacity / hook.UNITS_TOTAL_FILE).read_text(), "4\n")
+            self.assertIsNone(hook.mini_full(capacity), "3 of 4 units are still free")
+            for runner in runners[1:4]:
+                self.assertEqual(self.job("swift-package-tests", runner, 4).returncode, 0)
+            self.assertEqual(hook.mini_full(capacity), "all 4 capacity units on this mini are taken")
+            # the probe took and gave back nothing: the holders keep every unit, and a job is still refused
+            refused = self.job("swift-package-tests", "f4", 4)
+            self.assertIn("refused: capacity: 0 of 4 units free", refused.stdout)
+            self.finish("f2")
+            self.assertIsNone(hook.mini_full(capacity))
+        finally:
+            for runner in runners:
+                self.finish(runner)
+
     def test_capacity_gui_job_waits_for_the_gui_token(self) -> None:
         self.fleet()
         try:
@@ -1278,6 +1298,47 @@ class GateTest(unittest.TestCase):
         gate.stop = lambda why: (stops.append(why), setattr(gate, "stop_deadline", time.monotonic() + 60),
                                  setattr(gate, "held", why))
         return gate, stops
+
+    def units(self, total: int | None, held: int) -> Path:
+        """A capacity ledger of `total` units (None: nothing recorded) with the first `held` of them taken."""
+        capacity = Path(tempfile.mkdtemp(dir=self.tmp))
+        (capacity / "admission.lock").touch()  # every admission creates it
+        if total is not None:
+            (capacity / hook.UNITS_TOTAL_FILE).write_text(f"{total}\n")
+        for slot in range(held):
+            fd = os.open(capacity / f"unit-{slot}", os.O_RDONLY | os.O_CREAT, 0o644)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.addCleanup(os.close, fd)
+        return capacity
+
+    def test_a_mini_with_every_unit_taken_claims_the_host(self) -> None:
+        self.assertIsNone(hook.mini_full(None))
+        self.assertIsNone(hook.mini_full(self.units(None, 2)), "no recorded total: never full")
+        self.assertIsNone(hook.mini_full(self.units(3, 2)))
+        capacity = self.units(2, 2)
+        self.assertEqual(hook.mini_full(capacity), "all 2 capacity units on this mini are taken")
+        none = os.fspath(self.tmp / "none.json")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), none, self.state, capacity_dir=capacity)
+        self.assertEqual(gate.claimed(), "all 2 capacity units on this mini are taken")
+        self.assertEqual(gate.confirmed(), "all 2 capacity units on this mini are taken")
+        self.assertIsNone(hook.Gate(self.runner, os.fspath(self.lock), none, self.state).claimed(),
+                          "a gate without a ledger never looks")
+        self.hold(fcntl.LOCK_EX)
+        self.assertEqual(gate.claimed(), "a fleet build holds the host lock", "the fleet's claim comes first")
+
+    def test_the_full_probe_never_competes_with_an_admission(self) -> None:
+        capacity = self.units(2, 1)
+        admission = os.open(capacity / "admission.lock", os.O_RDONLY)
+        self.addCleanup(os.close, admission)
+        fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with mock.patch.object(hook, "lock_file", side_effect=AssertionError("probed during an admission")):
+            self.assertIsNone(hook.mini_full(capacity))
+        fcntl.flock(admission, fcntl.LOCK_UN)
+        self.assertIsNone(hook.mini_full(capacity))
+        # and the probe leaves the free unit free
+        fd = hook.lock_file(capacity / "unit-1", fcntl.LOCK_EX)
+        self.assertIsNotNone(fd)
+        os.close(fd)
 
     def test_an_idle_listener_stops_only_after_the_claim_holds_for_two_polls(self) -> None:
         gate, stops = self.gate(["held", None, "held", "held"])
