@@ -120,7 +120,8 @@ What `--apply` does:
      token (one writer of the kept DerivedData at a time), `app-host-unit-tests` and
      `tests-build-and-lag` 1 unit plus the `gui` token (one console session),
      test-e2e's `build` (compile, then the selected tests in the console session) 2 units
-     plus the `gui` token, test-e2e's `test` 1 unit plus the `gui` token,
+     (it takes the `gui` token itself before its tests, with take-gui), test-e2e's `test` 1
+     unit plus the `gui` token,
      `cli-product-tests`, `swift-package-tests` and the side lanes `cli-pipe-regressions`,
      `remote-daemon-macos-tests` and `claude-wrapper` 1 unit, and any other job counts
      as a compile. When units or a token are taken it refuses at once with
@@ -406,8 +407,8 @@ and app-host test consumers restore a product there with `rm -rf <root>/src`, be
 in at the producer's root. So one root job per root per mini:
 
 - Root jobs are compile (macos-compile-admission and any unknown job id), compile-gui (test-e2e's `build`:
-  a producer that holds the gui token as well, and no persistent-dd: it only clones its root's kept state,
-  which the root token already guards), gui (app-host-unit-tests,
+  a producer that takes the gui token later, in its own step with take-gui, and no persistent-dd: it only
+  clones its root's kept state, which the root token already guards), gui (app-host-unit-tests,
   tests-build-and-lag, app-host-test-rerun's `rerun`, test-e2e's `test`) and product (cli-product-tests).
   Each also takes an exclusive `capacity/root-k.token` (k = 1 to `canonicalRoots`), and the hook writes `CMUX_CI_CANONICAL_ROOT=<root k>` to `$GITHUB_ENV` and
   `$RUNNER_TEMP/glaeda-canonical-root`. The root follows the token, never the runner instance.
