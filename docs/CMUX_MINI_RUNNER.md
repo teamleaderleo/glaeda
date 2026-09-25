@@ -306,8 +306,13 @@ one command brings the whole fleet to the manifest, every member and every insta
 at once:
 
     scripts/glaeda-cmux-runner-fleet                 # plan: the gate on every member, read-only
-    scripts/glaeda-cmux-runner-fleet --apply         # stage scripts + trimmed manifest, apply every instance
-    scripts/glaeda-cmux-runner-fleet --apply --hosts cmux12s-mac-mini
+    scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis --hosts cmux12s-mac-mini
+    scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis   # every instance
+
+The fleet is registered at org scope (section 2e2), so an apply names that scope. Without
+`--org`, the apply asks for the repository scope, finds each runner's org-scope receipt, and refuses
+every instance ("this Mac already has a runner install ... on manaflow-ai") before changing
+anything.
 
 It runs each member's job-started gate read-only first and skips members that are
 not eligible yet, so a mini joins the pools on the first run after it is onboarded.
