@@ -75,7 +75,10 @@ HOLDER_MAX_S = 5 * 24 * 3600  # GitHub's limit for a self-hosted job; the job's 
 # session (and tests-build-and-lag runs pkill -x "cmux DEV"), so they hold the gui token. An unknown
 # job is treated as a compile: the safe side of both.
 JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui", "tests-build-and-lag": "gui",
-               "cli-product-tests": "light", "swift-package-tests": "light"}
+               "cli-product-tests": "light", "swift-package-tests": "light",
+               # side lanes: no GUI, no persistent state. cli-pipe-regressions builds only cmux-cli, into
+               # its own $RUNNER_TEMP DerivedData; remote-daemon-macos-tests is go test; claude-wrapper is node.
+               "cli-pipe-regressions": "light", "remote-daemon-macos-tests": "light", "claude-wrapper": "light"}
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (2, ("persistent-dd",)), "gui": (1, ("gui",)), "light": (1, ())}
 ADMISSION_WAIT_S = 30.0  # admissions are serialized briefly so two jobs never split the free units
@@ -382,7 +385,7 @@ def holder_pids(state_dir: Path) -> set[int]:
 
 
 def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watch_pid: int,
-                  state_dir: Path) -> tuple[bool, str]:
+                  state_dir: Path, compile_slots: int = 1) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
     takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
@@ -423,11 +426,22 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             # lsof sees only this user's processes, which is how the fleet worker runs today.
             if waiting:  # flock has no writer preference: stop admitting so the build worker gets in
                 return False, f"capacity: a fleet build is waiting for the host (pid {waiting[0]})"
+        taken: list[str] = []
         for token in tokens:
-            fd = lock_file(capacity_dir / f"{token}.token", fcntl.LOCK_EX)
-            if fd is None:
-                return False, f"capacity: the {token} token is taken ({job or 'unknown job'} is {klass})"
-            fds.append(fd)
+            # persistent-dd comes in compile_slots copies once compile admission keeps its state per
+            # runner; copy 0 keeps the original file name. A mini whose runners disagree on the count runs
+            # as many compiles as the highest one allows, so re-apply every instance on a mini together.
+            copies = max(1, compile_slots) if token == "persistent-dd" else 1
+            for copy in range(copies):
+                name = token if copy == 0 else f"{token}-{copy}"
+                fd = lock_file(capacity_dir / f"{name}.token", fcntl.LOCK_EX)
+                if fd is not None:
+                    fds.append(fd)
+                    taken.append(name)
+                    break
+            else:
+                held = f"all {copies} {token} tokens are taken" if copies > 1 else f"the {token} token is taken"
+                return False, f"capacity: {held} ({job or 'unknown job'} is {klass})"
         got = 0
         for slot in range(total):
             if got == units:
@@ -440,7 +454,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             return False, (f"capacity: {got} of {total} units free, {job or 'an unknown job'} ({klass}) needs {units}")
         held, note = hold(fds, watch_pid, state_dir, drop=(admission,))
         fds = []  # the holder has them now, or hold closed them
-        what = "+".join([f"{units}/{total} units", *tokens])
+        what = "+".join([f"{units}/{total} units", *taken])
         return held, (f"holding {what} for {job or 'an unknown job'} ({klass}; {note})" if held else note)
     except OSError as error:
         return False, f"capacity: cannot take the ledger ({type(error).__name__})"
@@ -589,6 +603,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--toolchain-xcode", help="the Xcode app the class receipt's xcodeVersion and SDK refer to")
     p.add_argument("--capacity-units", type=int, default=0,
                    help="weighted capacity shared by this mini's runners (0: one job holds the host lock alone)")
+    p.add_argument("--compile-slots", type=int, default=1,
+                   help="compiles at once on this mini (persistent-dd tokens; >1 needs per-runner compile state)")
     p.add_argument("--capacity-dir", type=Path, default=Path(FLEET_DIR) / "capacity", help=argparse.SUPPRESS)
     p.add_argument("--host-lock", default=HOST_LOCK, help=argparse.SUPPRESS)
     p.add_argument("--reservation", default=RESERVATION, help=argparse.SUPPRESS)
@@ -622,7 +638,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.capacity_units > 0:
             held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
                                        os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
-                                       args.state_dir)
+                                       args.state_dir, args.compile_slots)
         else:
             held, note = take_host_lock(args.host_lock, args.watch_pid or os.getppid(), args.state_dir)
         if not held:

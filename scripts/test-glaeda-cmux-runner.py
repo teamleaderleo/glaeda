@@ -446,12 +446,33 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free(), "every holder let go")
 
+    def test_capacity_compile_slots(self) -> None:
+        self.fleet()
+        slots = ("--compile-slots", "2")
+        try:
+            first = self.started("--capacity-units", "4", "--capacity-dir", os.fspath(self.dir / "capacity"), *slots,
+                                 env={"GITHUB_JOB": "macos-compile-admission", "RUNNER_NAME": "c0"})
+            self.assertIn("2/4 units+persistent-dd for", first.stdout)
+            second = self.started("--capacity-units", "4", "--capacity-dir", os.fspath(self.dir / "capacity"), *slots,
+                                  env={"GITHUB_JOB": "macos-compile-admission", "RUNNER_NAME": "c1"})
+            self.assertIn("2/4 units+persistent-dd-1 for", second.stdout)
+            third = self.started("--capacity-units", "6", "--capacity-dir", os.fspath(self.dir / "capacity"), *slots,
+                                 env={"GITHUB_JOB": "macos-compile-admission", "RUNNER_NAME": "c2"})
+            self.assertIn("refused: capacity: all 2 persistent-dd tokens are taken", third.stdout)
+        finally:
+            for runner in ("c0", "c1"):
+                self.finish(runner)
+
     def test_capacity_gui_token_and_unknown_jobs(self) -> None:
         self.fleet()
         try:
             self.assertEqual(self.job("tests-build-and-lag", "g0").returncode, 0)
             other = self.job("app-host-unit-tests", "g1")
             self.assertIn("refused: capacity: the gui token is taken", other.stdout)
+            for n, lane in enumerate(("cli-pipe-regressions", "remote-daemon-macos-tests", "claude-wrapper")):
+                side = self.job(lane, f"s{n}", units=8)
+                self.assertIn(f"1/8 units for {lane} (light", side.stdout)
+                self.finish(f"s{n}")
             unknown = self.job("release-build", "u0")
             self.assertIn("persistent-dd for release-build (compile", unknown.stdout)
         finally:
@@ -1201,6 +1222,12 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--require-eligible --fleet-class m4pro-48 --toolchain-xcode /Applications/Xcode_26.6.app",
                       (hooks / "job-started.sh").read_text())
         self.assertTrue((hooks / "glaeda_reservation.py").is_file())
+        self.assertNotIn("--compile-slots", (hooks / "job-started.sh").read_text())  # 1 is the hook's default
+        manifest["defaults"]["runner"] = {"classes": {"std": {"compileSlots": 2}}}
+        path.write_text(json.dumps(manifest))
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
+        self.assertIn("--capacity-units 4 --compile-slots 2", (hooks / "job-started.sh").read_text())
 
     def test_instances_get_their_own_paths_and_share_the_capacity(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
@@ -1441,6 +1468,11 @@ class ManifestLabelsTest(unittest.TestCase):
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["runners"], 3)
             self.assertEqual(cr.member_labels(manifest, "override")[0]["runners"], 1)
             self.assertEqual(cr.member_labels(manifest, "override")[0]["capacityUnits"], 6)
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["compileSlots"], 1)
+            manifest["defaults"]["runner"]["classes"]["std"]["compileSlots"] = 2
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["compileSlots"], 2)
+            manifest["defaults"]["runner"]["classes"]["std"]["compileSlots"] = 4  # 6 units hold 3 compiles
+            self.assertIn("compileSlots must be 1 to 3", cr.member_labels(manifest, "mini-std")[1])
             for bad in ({"runners": 0}, {"runners": True}, {"capacityUnits": 1}, "four"):
                 with self.subTest(bad=bad):
                     manifest["defaults"]["runner"] = {"classes": {"std": bad}}
