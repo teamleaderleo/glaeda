@@ -642,7 +642,8 @@ def holder_pids(state_dir: Path) -> set[int]:
 
 def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watch_pid: int,
                   state_dir: Path, compile_slots: int = 1, roots: int = 1,
-                  repo: str | None = DEFAULT_HOME_REPO, home_repo: str = DEFAULT_HOME_REPO) -> tuple[bool, str]:
+                  repo: str | None = DEFAULT_HOME_REPO, home_repo: str = DEFAULT_HOME_REPO,
+                  instance: int = 0) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
     takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
@@ -694,7 +695,13 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             # runner; copy 0 keeps the original file name. A mini whose runners disagree on the count runs
             # as many compiles as the highest one allows, so re-apply every instance on a mini together.
             copies = {"persistent-dd": max(1, compile_slots), "root": 1 if pinned else max(1, roots)}.get(token, 1)
-            for copy in range(copies):
+            order = list(range(copies))
+            if token == "root" and copies > 1:
+                # this runner's own root first (instance i -> root i+1), then any free one: its kept build and
+                # warm labels (cmux#14396) stay with one tree unless a consumer holds that root
+                own = instance % copies
+                order = [own, *(c for c in order if c != own)]
+            for copy in order:
                 # root tokens are named for the root they hold: root-1 is /private/tmp/cmux-ci
                 name = f"root-{copy + 1}" if token == "root" else token if copy == 0 else f"{token}-{copy}"
                 fd = lock_file(capacity_dir / f"{name}.token", fcntl.LOCK_EX)
@@ -1217,6 +1224,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="compiles at once on this mini (persistent-dd tokens; >1 needs per-runner compile state)")
     p.add_argument("--canonical-roots", type=int, default=1,
                    help="canonical roots on this mini (root-N tokens; one compile or app-host consumer per root)")
+    p.add_argument("--instance", type=int, default=0,
+                   help="this runner's glaeda-cmux-runner instance: it prefers canonical root instance+1")
     p.add_argument("--capacity-dir", type=Path, default=Path(FLEET_DIR) / "capacity", help=argparse.SUPPRESS)
     p.add_argument("--host-lock", default=HOST_LOCK, help=argparse.SUPPRESS)
     p.add_argument("--reservation", default=RESERVATION, help=argparse.SUPPRESS)
@@ -1271,12 +1280,12 @@ def main(argv: list[str] | None = None) -> int:
             # the repository decide() admitted: the runner's variable, else the event payload's
             repo = os.environ.get("GITHUB_REPOSITORY") or _repo_name((event or {}).get("repository")
                                                                      if isinstance(event, dict) else None)
-            deadline = time.monotonic() + (args.guest_wait if is_guest(repo, args.home_repo) else 0)
+            deadline = time.monotonic() + (args.guest_wait if is_guest(repo, args.home_repo, instance=args.instance) else 0)
             while True:
                 held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
                                            os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
                                            args.state_dir, args.compile_slots, args.canonical_roots,
-                                           repo, args.home_repo)
+                                           repo, args.home_repo, instance=args.instance)
                 # cmux refuses fast (its rescue workflow reroutes); a guest has none, so it waits for room
                 if held or not note.startswith("capacity:") or time.monotonic() >= deadline:
                     break

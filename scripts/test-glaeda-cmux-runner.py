@@ -664,6 +664,36 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
+    def test_two_roots_each_runner_prefers_its_own_root(self) -> None:
+        # warm labels (cmux#14396) name one tree, so a root runner keeps compiling in its own root when it can
+        self.fleet()
+        two = ("--canonical-roots", "2", "--compile-slots", "2")
+        try:
+            zero = self.job("macos-compile-admission", "r0", 8, None, *two, "--instance", "0")
+            one = self.job("macos-compile-admission", "r1", 8, None, *two, "--instance", "1")
+            self.assertIn("root-1", zero.stdout)
+            self.assertIn("root-2", one.stdout)
+            self.finish("r0")
+            self.finish("r1")
+            # instance 1 first this time: it still gets root 2, and instance 0 still gets root 1
+            self.assertIn("root-2", self.job("macos-compile-admission", "r1", 8, None, *two, "--instance", "1").stdout)
+            self.assertIn("root-1", self.job("macos-compile-admission", "r0", 8, None, *two, "--instance", "0").stdout)
+            self.finish("r0")
+            self.finish("r1")
+            # root 1 held (as a consumer's take-root holds it): instance 0 falls back to root 2
+            held = os.open(self.dir / "capacity" / "root-1.token", os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                fallback = self.job("macos-compile-admission", "r0", 8, None, *two, "--instance", "0")
+                self.assertEqual(fallback.returncode, 0, fallback.stdout)
+                self.assertIn("root-2", fallback.stdout)
+            finally:
+                os.close(held)
+        finally:
+            for runner in ("r0", "r1"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
     def test_capacity_ios_jobs_take_no_root_or_gui_token(self) -> None:
         self.fleet()
         try:
