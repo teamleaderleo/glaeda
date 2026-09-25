@@ -159,11 +159,13 @@ GUEST_POLL_S = 5.0
 # round trip took 71 s to 18 min (median 126 s, 16 refusals, cmux PR CI 2026-09-25 07:00-09:00Z) and sent the
 # re-run shards to Blacksmith. test-e2e's build takes the token only for its tests (take-gui), so it holds it
 # about as long as a shard does.
-# It must fit inside cmux's owned_pool_rescue.REFUSAL_SECONDS (120) with room to spare: a job that fails later
-# than that after starting no longer counts as refused, so the rescue would not re-run it. Around the wait go
-# about 5 s of runner setup before the hook, the last try (normally under a second, but up to tens of seconds
-# on a loaded mini: admission.lock, lsof and ps timeouts) and 5 to 10 s of steps after a refusal.
-GUI_WAIT_S = 60.0
+# It must fit inside cmux's owned_pool_rescue.REFUSAL_SECONDS (360 since cmux#14758, 120 before) with room to
+# spare: a job that fails later than that after starting no longer counts as refused, so the rescue would not
+# re-run it. Around the wait go about 5 s of runner setup before the hook, the last try (normally under a second,
+# but up to tens of seconds on a loaded mini: admission.lock, lsof and ps timeouts) and 5 to 10 s of steps after
+# a refusal. 240 s covers a sibling shard's gui hold (about 90 s, up to about 4 min on a loaded mini), so the
+# listener gate need not hold a root runner off for the gui token (hq#661 Workstream 7).
+GUI_WAIT_S = 240.0
 GUI_TOKEN_TAKEN = "capacity: the gui token is taken"
 
 
@@ -176,6 +178,16 @@ def workflow_file(ref: str | None) -> str:
     """The workflow file of GITHUB_WORKFLOW_REF (owner/repo/.github/workflows/<file>@<ref>), or ""."""
     path = (ref or "").split("@", 1)[0]
     return path.rsplit("/", 1)[-1] if "/.github/workflows/" in path else ""
+
+
+def job_workflow() -> str:
+    """This job's workflow file, from GITHUB_WORKFLOW_REF, else a workflow_dispatch payload's `workflow` path."""
+    found = workflow_file(os.environ.get("GITHUB_WORKFLOW_REF"))
+    if found:
+        return found
+    event = load_event(os.environ.get("GITHUB_EVENT_PATH")) if os.environ.get("GITHUB_EVENT_PATH") else None
+    path = event.get("workflow") if isinstance(event, dict) else None
+    return path.rsplit("/", 1)[-1] if isinstance(path, str) and path.startswith(".github/workflows/") else ""
 
 
 def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
@@ -309,6 +321,7 @@ def export_root(name: str) -> str:
 ADMISSION_WAIT_S = 30.0  # admissions are serialized briefly so two jobs never split the free units
 # The listener gate reads its runner's --capacity-units from the job-started hook glaeda-cmux-runner wrote.
 RUNNER_HOOK_SCRIPT = "glaeda-hooks/job-started.sh"
+LISTEN_SCRIPT = "glaeda-hooks/listen.sh"
 LSOF = shutil.which("lsof") or "/usr/sbin/lsof"
 # Events whose code is the repository's own, or a same-repo pull request checked below. Comment,
 # check and review-comment events can run with secrets on behalf of a fork PR, so they are left out.
@@ -1217,6 +1230,17 @@ class RunnerScope(NamedTuple):
     root: bool = False
 
 
+def listen_fit_units(runner_dir: Path) -> int:
+    """The --fit-units the runner's current listen.sh passes, or 1. A gate started from an older listen.sh keeps
+    its argv across hook reloads, so it reads this on every probe: an --apply that adds the flag counts at once,
+    without restarting a runner that may be running a job."""
+    try:
+        match = re.search(r"\s--fit-units\s+([0-9]+)(?:\s|$)", (runner_dir / LISTEN_SCRIPT).read_text())
+    except (OSError, UnicodeDecodeError):
+        return 1
+    return int(match.group(1)) if match else 1
+
+
 def runner_scope(runner_dir: Path) -> RunnerScope:
     """RunnerScope from the hook script glaeda-cmux-runner wrote. The hook passes --instance; the directory's
     -K suffix (actions-runner-glaeda-K) is the fallback for hooks written before it always did."""
@@ -1253,12 +1277,14 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
     without admission.lock, so a try that meets the probe's microsecond hold retries once (retake).
 
     With the scope of a root runner (scope.root), full also means this mini cannot admit every job the root
-    label brings: fewer than ROOT_FIT_UNITS units free, or the gui token, every persistent-dd token or every
-    canonical root taken. GitHub hands a root label's job to any idle root runner, so a root runner listening
-    on a mini with one unit left took compiles it then refused (90 of about 400 refusals on 2026-09-25), and
-    one listening beside a running app-host shard took the next shard and refused it for the one gui token
-    (154). Each refusal costs a rescue round trip and, after two, a Blacksmith run. Held off, the job goes to
-    a mini that fits it, or waits in GitHub's queue for this one (hq#661 Workstream 7)."""
+    label brings: fewer than ROOT_FIT_UNITS units free, or every persistent-dd token or every canonical root
+    taken. GitHub hands a root label's job to any idle root runner, so a root runner listening on a mini with
+    one unit left took compiles it then refused (90 of about 400 refusals on 2026-09-25). Each refusal costs a
+    rescue round trip and, after two, a Blacksmith run. Held off, the job goes to a mini that fits it, or waits
+    in GitHub's queue for this one (hq#661 Workstream 7). The gui token is not a reason to hold: a compile
+    needs none, and holding the root runner for it kept a mini's second root idle while roots were the fleet's
+    bottleneck (09-25 22:30Z: 18 of 18 roots busy, 5 held off). A shard that meets a taken gui token waits for
+    it (GUI_WAIT_S) instead of refusing."""
     if capacity_dir is None or total <= 0:
         return None
     try:
@@ -1288,8 +1314,6 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
         if not root:
             return None
         assert scope is not None
-        if not probe(capacity_dir / "gui.token"):
-            return "the gui token is taken (an app-host shard needs it)"
         dd = ["persistent-dd"] + [f"persistent-dd-{c}" for c in range(1, scope.compile_slots)]
         if not any(probe(capacity_dir / f"{name}.token") for name in dd):
             return ("the persistent-dd token is taken" if len(dd) == 1
@@ -1557,7 +1581,7 @@ class Gate:
         answer, so a full mini's retrying admissions never read as free and restart a listener; the fresh
         look right before a stop (confirmed()) stops only on a reading of its own."""
         scope = runner_scope(self.runner_dir)
-        why = mini_full(self.capacity_dir, scope.units, scope, self.fit_units)
+        why = mini_full(self.capacity_dir, scope.units, scope, max(self.fit_units, listen_fit_units(self.runner_dir)))
         if isinstance(why, Unknown):
             return None if fresh else self.full_why
         self.full_why = why
@@ -2048,7 +2072,8 @@ def job_meta(repo: str | None, home_repo: str) -> dict[str, Any]:
         value = os.environ.get(name)
         return value[:limit] if value else None
     job = env("GITHUB_JOB") or ""
-    klass, _ = job_class(job, repo, home_repo) if job else ("unknown", False)
+    # the class admission used (the same workflow lookup), so the record agrees with the ledger
+    klass, _ = job_class(job, repo, home_repo, job_workflow()) if job else ("unknown", False)
     return {"host": os.uname().nodename.split(".")[0][:64], "runner": env("RUNNER_NAME", 80), "job": job or None,
             "class": klass, "workflow": env("GITHUB_WORKFLOW"), "repository": repo,
             "run_id": env("GITHUB_RUN_ID", 32), "run_attempt": env("GITHUB_RUN_ATTEMPT", 8),
@@ -2327,7 +2352,7 @@ def main(argv: list[str] | None = None) -> int:
                                            os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
                                            args.state_dir, args.compile_slots, args.canonical_roots,
                                            repo, args.home_repo, instance=args.instance,
-                                           workflow=workflow_file(os.environ.get("GITHUB_WORKFLOW_REF")),
+                                           workflow=job_workflow(),
                                            warm_keys=job_warm_keys(event), taken_out=taken)
                 # cmux refuses fast (its rescue workflow reroutes); a guest has none, so it waits for room.
                 # A cmux job refused only for the gui token waits for it too: the holder is a short GUI job.

@@ -1039,7 +1039,7 @@ class HookTest(unittest.TestCase):
         try:
             first = self.job("macos-compile-admission", "c0", 4, None, *slots, "--instance", "0")
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-            self.assertIsNone(hook.mini_full(capacity, 4, root), "2 units, the gui token, pdd-1 and root-2 are free")
+            self.assertIsNone(hook.mini_full(capacity, 4, root), "2 units, pdd-1 and root-2 are free")
             shard = self.job("app-host-unit-tests", "g1", 4, None, *slots, "--instance", "1", "--gui-wait", "0")
             self.assertEqual(shard.returncode, 0, shard.stdout + shard.stderr)
             # 1 unit left: the next compile would be refused, so root runners stop; a light side job still fits
@@ -1048,8 +1048,8 @@ class HookTest(unittest.TestCase):
             self.assertIsNone(hook.mini_full(capacity, 4, side))
             self.assertIn("1 of 4 units free", self.job("macos-compile-admission", "c2", 4, None, *slots).stdout)
             self.finish("c0")
-            # 3 units free, but the shard holds the one gui token: the next shard would be refused
-            self.assertEqual(hook.mini_full(capacity, 4, root), "the gui token is taken (an app-host shard needs it)")
+            # 3 units free while the shard holds the gui token: a compile fits, and a shard waits for the token
+            self.assertIsNone(hook.mini_full(capacity, 4, root))
             self.assertIsNone(hook.mini_full(capacity, 4, side))
             self.finish("g1")
             self.assertIsNone(hook.mini_full(capacity, 4, root))
@@ -1810,6 +1810,21 @@ class GateTest(unittest.TestCase):
                 gate.step()
             start.assert_called_once()
 
+    def test_the_job_record_class_uses_the_workflow_like_admission(self) -> None:
+        payload = self.tmp / "event.json"
+        payload.write_text(json.dumps({"workflow": ".github/workflows/test-e2e.yml"}))
+        env = {"GITHUB_JOB": "build", "GITHUB_EVENT_PATH": os.fspath(payload)}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("GITHUB_WORKFLOW_REF", None)
+            self.assertEqual(hook.job_workflow(), "test-e2e.yml", "a dispatch payload names its workflow")
+            self.assertEqual(hook.job_meta("manaflow-ai/cmux", hook.DEFAULT_HOME_REPO)["class"], "compile-gui")
+            os.environ["GITHUB_WORKFLOW_REF"] = "manaflow-ai/cmux/.github/workflows/cmux-tui.yml@refs/heads/main"
+            self.assertEqual(hook.job_meta("manaflow-ai/cmux", hook.DEFAULT_HOME_REPO)["class"], "isolated")
+        payload.write_text(json.dumps({"pull_request": {}}))
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("GITHUB_WORKFLOW_REF", None)
+            self.assertEqual(hook.job_workflow(), "")
+
     def test_runner_scope_reads_the_hook_and_the_runner_directory(self) -> None:
         self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(), "no hook script: no units, no root")
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
@@ -1833,9 +1848,11 @@ class GateTest(unittest.TestCase):
         side = hook.RunnerScope(4, 2, 2, False)
         capacity = self.units(0)
         self.assertIsNone(hook.mini_full(capacity, 4, root))
-        cases = (("gui.token",), ("persistent-dd.token", "persistent-dd-1.token"), ("root-1.token", "root-2.token"))
-        whys = ("the gui token is taken (an app-host shard needs it)",
-                "all 2 persistent-dd tokens on this mini are taken", "all 2 canonical roots on this mini are taken")
+        gui = hook.lock_file(capacity / "gui.token", fcntl.LOCK_EX)
+        self.assertIsNone(hook.mini_full(capacity, 4, root), "a compile needs no gui token; a shard waits for it")
+        os.close(gui)
+        cases = (("persistent-dd.token", "persistent-dd-1.token"), ("root-1.token", "root-2.token"))
+        whys = ("all 2 persistent-dd tokens on this mini are taken", "all 2 canonical roots on this mini are taken")
         for names, why in zip(cases, whys):
             fds = [hook.lock_file(capacity / name, fcntl.LOCK_EX) for name in names]
             self.assertEqual(hook.mini_full(capacity, 4, root), why)
@@ -2132,6 +2149,13 @@ class GateTest(unittest.TestCase):
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
                          capacity_dir=self.units(3), fit_units=2)
         self.assertEqual(gate.claimed(), "only 1 of 4 capacity units on this mini are free; its next job needs 2")
+        # a gate started from an older listen.sh (no flag in its argv) reads the flag from the current one
+        old = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                        capacity_dir=self.units(3))
+        self.assertIsNone(old.claimed())
+        (self.runner / hook.LISTEN_SCRIPT).write_text(script.read_text())
+        self.assertEqual(hook.listen_fit_units(self.runner), 2)
+        self.assertEqual(old.claimed(), "only 1 of 4 capacity units on this mini are free; its next job needs 2")
 
     def test_parse_only_accepts_the_gate_argv_and_an_old_hook_would_not(self) -> None:
         argv = ["listen", "--runner-dir", os.fspath(self.runner), "--no-waiters", "--adopt=1", "--parse-only"]

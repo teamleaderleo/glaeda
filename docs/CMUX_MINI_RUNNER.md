@@ -190,15 +190,15 @@ What `--apply` does:
        reading.
    - **When the mini cannot fit the runner's next job** (weighted capacity only).
      - A side runner stops when every capacity unit is taken.
-     - A root runner stops unless the mini could admit any job its root label brings:
-       at least 2 free units (a compile), the gui token free (an app-host shard), and a
-       free persistent-dd token and canonical root. GitHub hands a root label's job to
-       any idle root runner, so before this a root runner beside one running compile
-       and a light job took the next compile and refused it, and one beside a running
-       shard took the next shard and refused it for the one gui token. On 2026-09-25
-       those were 244 of about 400 refusals, and after two refusals the rescue runs
-       the job on Blacksmith. Held off, the job goes to a mini that fits it or waits in
-       GitHub's queue (cmuxterm-hq#661, Workstream 7).
+     - A root runner stops unless the mini could admit a compile: at least 2 free
+       units, and a free persistent-dd token and canonical root. GitHub hands a root
+       label's job to any idle root runner, so before this a root runner beside one
+       running compile and a light job took the next compile and refused it (90 of about
+       400 refusals on 2026-09-25). The gui token is no reason to stop: a compile needs
+       none, and holding for it kept second roots idle while roots were the bottleneck.
+       An app-host shard that meets a taken gui token waits up to 240 s for it
+       (`--gui-wait`, inside cmux's 360 s refusal window) instead of refusing.
+       (cmuxterm-hq#661, Workstream 7.)
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`.
      - The listener's graceful exit ends its session, and GitHub shows the runner as
