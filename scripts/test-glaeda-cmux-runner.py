@@ -840,6 +840,71 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
+    def test_two_roots_admission_takes_the_root_warm_for_its_pull_request(self) -> None:
+        # the picker sends admission to a runner whose mini is warm for it (cmux warm affinity), but the root
+        # follows the token: the hook gives it the root whose kept build is stamped with its key
+        fleet = self.fleet()
+        two = ("--canonical-roots", "2", "--compile-slots", "2")
+        base = "0123456789abcdef0123456789abcdef01234567"
+
+        def stamp(k: int, keys: list, fingerprint: str = "fp-owned-rec1") -> None:
+            store = fleet / "ci" if k == 1 else fleet / "ci" / f"cmux-ci-{k}"
+            store.mkdir(parents=True, exist_ok=True)
+            (store / "stamp.json").write_text(json.dumps({"fingerprint": fingerprint, "warm": keys}))
+
+        def admit(runner: str, instance: str, pr: dict) -> subprocess.CompletedProcess:
+            payload = {"repository": CMUX, "pull_request": {"head": {"repo": CMUX}, "base": {"repo": CMUX}, **pr}}
+            path = event(self.dir, f"pr-{runner}", payload)
+            return self.run_hook("job-started", "pull_request", path, "--allowed-repo", "manaflow-ai/cmux",
+                                 "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
+                                 "--watch-pid", str(os.getpid()), "--capacity-units", "8",
+                                 "--capacity-dir", os.fspath(self.dir / "capacity"), *two, "--instance", instance,
+                                 repo="manaflow-ai/cmux",
+                                 env={"GITHUB_JOB": "macos-compile-admission", "RUNNER_NAME": runner})
+
+        try:
+            stamp(1, ["ffffffffffff", "pr-7"])
+            stamp(2, [base[:12], "pr-42"])
+            # instance 0 owns root 1, but root 2 is kept for this merge base
+            warm = admit("r0", "0", {"base": {"repo": CMUX, "sha": base}, "number": 7})
+            self.assertEqual(warm.returncode, 0, warm.stdout + warm.stderr)
+            self.assertIn("persistent-dd+root-2, warm for 0123456789ab", warm.stdout)
+            self.finish("r0")
+            # a re-push onto a new base: the root kept for the same pull request
+            again = admit("r1", "1", {"base": {"repo": CMUX, "sha": "e" * 40}, "number": 7})
+            self.assertIn("persistent-dd+root-1, warm for pr-7", again.stdout)
+            self.finish("r1")
+            # the merge base beats the pull request, and a warm root that is held falls back to the other
+            held = os.open(self.dir / "capacity" / "root-2.token", os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                busy = admit("r0", "0", {"base": {"repo": CMUX, "sha": base}, "number": 7})
+                self.assertIn("persistent-dd+root-1 for", busy.stdout)
+                self.assertNotIn("warm for", busy.stdout)
+            finally:
+                os.close(held)
+            self.finish("r0")
+            # no match, a stamp mid-keep (no fingerprint), or no pull request: the runner's own root
+            stamp(2, [base[:12]], fingerprint="")
+            for runner, instance, pr in (("r1", "1", {"base": {"repo": CMUX, "sha": "d" * 40}, "number": 9}),
+                                         ("r0", "0", {"base": {"repo": CMUX, "sha": base}})):
+                plain = admit(runner, instance, pr)
+                self.assertIn(f"root-{int(instance) + 1} for", plain.stdout)
+                self.assertNotIn("warm for", plain.stdout)
+                self.finish(runner)
+        finally:
+            for runner in ("r0", "r1"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
+    def test_job_warm_keys_come_from_the_pull_request(self) -> None:
+        sha = "ABCDEF0123456789abcdef0123456789abcdef01"
+        self.assertEqual(hook.job_warm_keys({"pull_request": {"base": {"sha": sha}, "number": 5}}),
+                         ("abcdef012345", "pr-5"))
+        for payload in (None, {}, {"ref": "refs/heads/main"}, {"pull_request": {"base": {"sha": "x"}, "number": "5"}},
+                        {"pull_request": {"number": True}}, {"pull_request": []}):
+            self.assertEqual(hook.job_warm_keys(payload), (), payload)
+
     def test_capacity_ios_jobs_take_no_root_or_gui_token(self) -> None:
         self.fleet()
         try:

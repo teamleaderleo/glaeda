@@ -205,6 +205,58 @@ TAKE_GUI_GAVE_WAY = 3
 WANT_FRESH_S = 10.0  # a waiter rewrites its marker every TAKE_ROOT_POLL_S; an older one is stale
 
 
+# Compile admission keeps its DerivedData per canonical root on the mini (cmux ci-macos.yml
+# CMUX_OWNED_STATE_ROOT: root 1 in OWNED_STATE_DIR, root k in OWNED_STATE_DIR/cmux-ci-k), and cmux's
+# owned_build_state.py `keep` stamps it with the build's warm keys: its merge base's first 12 hex digits and
+# pr-<number>. cmux's picker sends admission to a root runner whose mini is warm for the run (warm affinity,
+# cmux#14696), but the root follows the token, not the runner, so the hook gives such a job the root whose
+# stamp holds its merge base, else its pull request, before the runner's own root.
+OWNED_STATE_DIR = os.path.join(FLEET_DIR, "ci")
+WARM_JOBS = ("macos-compile-admission",)
+WARM_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def job_warm_keys(event: Any) -> tuple[str, ...]:
+    """A pull request event's warm keys, best first: its base commit's sha12, then pr-<number>."""
+    pr = event.get("pull_request") if isinstance(event, dict) else None
+    if not isinstance(pr, dict):
+        return ()
+    keys = []
+    base = pr.get("base")
+    sha = str(base.get("sha") or "").lower() if isinstance(base, dict) else ""
+    if WARM_SHA.fullmatch(sha):
+        keys.append(sha[:12])
+    number = pr.get("number")
+    if isinstance(number, int) and not isinstance(number, bool) and 0 < number < 10**9:
+        keys.append(f"pr-{number}")
+    return tuple(keys)
+
+
+def root_warm_keys(k: int, state_dir: str = "") -> list[str]:
+    """The warm keys root k's kept DerivedData is stamped with, or [] (none, unreadable, or mid-keep)."""
+    base = Path(state_dir or OWNED_STATE_DIR)
+    path = (base if k == 1 else base / f"cmux-ci-{k}") / "stamp.json"
+    try:
+        stamp = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return []
+    if not isinstance(stamp, dict) or not stamp.get("fingerprint") or not isinstance(stamp.get("warm"), list):
+        return []
+    return [str(key) for key in stamp["warm"]]
+
+
+def warm_root_order(order: list[int], keys: tuple[str, ...], state_dir: str = "") -> tuple[list[int], str]:
+    """ORDER (root copies, 0-based) with the roots warm for KEYS first, best key first, and the key matched."""
+    if not keys:
+        return order, ""
+    kept = {copy: root_warm_keys(copy + 1, state_dir) for copy in order}
+    for key in keys:
+        warm = [copy for copy in order if key in kept[copy]]
+        if warm:
+            return [*warm, *(copy for copy in order if copy not in warm)], key
+    return order, ""
+
+
 def canonical_root(k: int) -> str:
     """Root k (1-based): /private/tmp/cmux-ci, then /private/tmp/cmux-ci-2 and so on (cmux#14338)."""
     return "/private/tmp/cmux-ci" if k == 1 else f"/private/tmp/cmux-ci-{k}"
@@ -871,7 +923,8 @@ def holder_pids(state_dir: Path) -> set[int]:
 def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watch_pid: int,
                   state_dir: Path, compile_slots: int = 1, roots: int = 1,
                   repo: str | None = DEFAULT_HOME_REPO, home_repo: str = DEFAULT_HOME_REPO,
-                  instance: int = 0, workflow: str = "") -> tuple[bool, str]:
+                  instance: int = 0, workflow: str = "", warm_keys: tuple[str, ...] = (),
+                  owned_state_dir: str = "") -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
     takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
@@ -919,6 +972,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 return False, f"capacity: a fleet build is waiting for the host (pid {waiting[0]})"
         taken: list[str] = []
         named: dict[str, int] = {}
+        warm_for = warm_note = ""
         for token in tokens:
             # persistent-dd comes in compile_slots copies once compile admission keeps its state per
             # runner; copy 0 keeps the original file name. A mini whose runners disagree on the count runs
@@ -932,6 +986,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 # (compile-app-host-test-product.sh fingerprint), so it tries root 1 first and falls back
                 own = instance % copies
                 order = [own, *(c for c in order if c != own)]
+                if job in WARM_JOBS:
+                    order, warm_for = warm_root_order(order, warm_keys, owned_state_dir)
             for copy in order:
                 # root tokens are named for the root they hold: root-1 is /private/tmp/cmux-ci
                 name = f"root-{copy + 1}" if token == "root" else token if copy == 0 else f"{token}-{copy}"
@@ -940,6 +996,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                     fds.append(fd)
                     taken.append(name)
                     named[name] = fd
+                    if token == "root" and warm_for and warm_for in root_warm_keys(copy + 1, owned_state_dir):
+                        warm_note = f", warm for {warm_for}"
                     break
             else:
                 what = "canonical root" if token == "root" else token
@@ -967,7 +1025,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             if not held:
                 release_holder(holder_file(state_dir))
                 note = why
-        what = "+".join([f"{units}/{total} units", *taken])
+        what = "+".join([f"{units}/{total} units", *taken]) + warm_note
         if held and "gui" in taken:
             with contextlib.suppress(OSError):
                 gui_file(state_dir).write_text("gui\n")
@@ -2063,7 +2121,8 @@ def main(argv: list[str] | None = None) -> int:
                                            os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
                                            args.state_dir, args.compile_slots, args.canonical_roots,
                                            repo, args.home_repo, instance=args.instance,
-                                           workflow=workflow_file(os.environ.get("GITHUB_WORKFLOW_REF")))
+                                           workflow=workflow_file(os.environ.get("GITHUB_WORKFLOW_REF")),
+                                           warm_keys=job_warm_keys(event))
                 # cmux refuses fast (its rescue workflow reroutes); a guest has none, so it waits for room.
                 # A cmux job refused only for the gui token waits for it too: the holder is a short GUI job.
                 if held or not note.startswith("capacity:"):
