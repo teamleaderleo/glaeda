@@ -88,6 +88,15 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
                # side lanes: no GUI, no persistent state. cli-pipe-regressions builds only cmux-cli, into
                # its own $RUNNER_TEMP DerivedData; remote-daemon-macos-tests is go test; claude-wrapper is node.
                "cli-pipe-regressions": "light", "remote-daemon-macos-tests": "light", "claude-wrapper": "light",
+               # side-lane workflows (runs-on vars.CI_SIDE_LANE_RUNNER, glaeda-side-*): swift test or swiftc into
+               # the workspace .build or a temp dir; no GUI, keychain, fixed port or canonical root (cmux audit
+               # 2026-09-25). iroh-v2 `client`; cloud-command-deadlines `command-regressions`; terminal-hang-
+               # diagnostics `portal-reconciliation` and `phase-attribution`; `lifecycle` is both
+               # cloud-task-local-tests and cloud-machine-tests; relay-tls `diagnostic-presentation`;
+               # auth-refresh-tests. Generic ids: a new job reusing one must be light too, or be renamed.
+               "client": "light", "command-regressions": "light", "portal-reconciliation": "light",
+               "phase-attribution": "light", "lifecycle": "light", "diagnostic-presentation": "light",
+               "auth-refresh-tests": "light",
                # iOS (test-ios, ios-screenshots; runs-on glaeda-ios-sim): builds into their own DerivedData or
                # SwiftPM .build, never /private/tmp/cmux-ci, so no canonical root. Simulator jobs reuse, erase and
                # boot named devices in the user's one CoreSimulator service, so one per mini (the simulator token).

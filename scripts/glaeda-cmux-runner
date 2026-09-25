@@ -1131,7 +1131,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if not args.capacity_units:
             ctx.capacity_units = int(member.get("capacityUnits") or 0)
-        roots = member.get("rootPools", []) if ctx.instance < int(member.get("canonicalRoots") or 1) else []
+        is_root = ctx.instance < int(member.get("canonicalRoots") or 1)
+        roots = member.get("rootPools", []) if is_root else member.get("sidePools", [])
         ctx.labels = list(dict.fromkeys([*BASE_LABELS, *member["labels"], *roots]))
         ctx.labels_requested = True
         if not args.name:

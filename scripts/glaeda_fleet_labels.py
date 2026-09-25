@@ -29,7 +29,8 @@ VERSION_RE = r"[0-9][0-9.]*"
 # overrides these, and a host's overrides.runner.classes likewise. compileSlots (default 1) is how many
 # compiles run at once: more than one needs cmux's compile admission to keep its state per runner.
 # canonicalRoots (default 1) is how many canonical roots (/private/tmp/cmux-ci, -2, ...) the mini has: that
-# many runners (instances 0 to canonicalRoots - 1) also carry the root pool label (root_label).
+# many runners (instances 0 to canonicalRoots - 1) also carry the root pool label (root_label), and the rest
+# carry the side pool label (side_label) instead.
 CLASS_CAPACITY = {"xl": (8, 8), "std": (4, 4), "light": (2, 2)}
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
@@ -58,6 +59,13 @@ def root_label(pool: str) -> str:
     into the canonical root (compile, app-host shards, cli-product, lag) run on it, so GitHub queues them
     until a root runner is free instead of handing one to a runner whose mini has no free root."""
     return pool.replace("glaeda-", "glaeda-root-", 1)
+
+
+def side_label(pool: str) -> str:
+    """The label of a pool's non-root runners (instances from canonicalRoots on). A light side lane (no
+    canonical root, no persistent state, no GUI) runs on it, so it never takes a root runner that a compile
+    or app-host job is waiting for. A mini whose every runner is a root runner has none."""
+    return pool.replace("glaeda-", "glaeda-side-", 1)
 
 
 def xcode_apps(manifest: dict[str, Any], member: str) -> list[dict[str, Any]] | None:
@@ -147,7 +155,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
             "trustedRef": trusted_ref, "trustedRepo": trusted_repo,
-            "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)]}, None
+            "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)],
+            "sidePools": [side_label(label) for label in dict.fromkeys(pools)]}, None
 
 
 def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool] | None = None) -> dict[str, list[str]]:
