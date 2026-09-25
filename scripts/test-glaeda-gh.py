@@ -707,6 +707,39 @@ class ClientTest(Base):
         # waiting registered interest for the daemon to pick up
         self.assertIsNotNone(gg.read_json(gg.watch_dir() / gg.file_name("run:o/r/7")))
 
+    def test_conflicting_pr_stops_green_and_done_but_not_merged(self) -> None:
+        pending = [check_run("a"), check_run("b", "IN_PROGRESS", None)]
+        node = {**pr_node(1, rollup="PENDING", checks=pending), "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"}
+        data = gg.parse_pr(node)
+        for until in ("green", "done"):
+            code, text = self.wait("pr", "o/r#1", until=until, fill=(data, {}))
+            self.assertEqual(code, gg.EXIT_CONFLICT)
+            self.assertEqual(code, 4)
+            self.assertIn("result: conflict", text)
+            self.assertIn("note: PR conflicts with its base", text)
+        self.assertEqual(self.wait("pr", "o/r#1", until="merged", fill=(data, {}))[0], 2)  # keeps waiting
+        # A conflict decides before any check: green checks do not hide it either.
+        green = {**pr_node(2, rollup="SUCCESS", checks=[check_run("a")]), "mergeable": "CONFLICTING",
+                 "mergeStateStatus": "DIRTY"}
+        self.assertEqual(gg.verdict("pr", gg.parse_pr(green), "green"), gg.EXIT_CONFLICT)
+        # GitHub computes mergeability lazily: UNKNOWN is pending, not a conflict.
+        unknown = gg.parse_pr({**node, "mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"})
+        self.assertIsNone(gg.verdict("pr", unknown, "done"))
+        self.assertEqual(self.wait("pr", "o/r#3", until="done", fill=(unknown, {}))[0], 2)
+        # With --sha, an older head's conflict is pending: the push that resolves it has not landed yet.
+        self.assertIsNone(gg.verdict("pr", data, "green", sha="b" * 40))
+        self.assertEqual(gg.verdict("pr", data, "green", sha="a" * 40), gg.EXIT_CONFLICT)
+        # A merged PR is never a conflict.
+        merged = gg.parse_pr({**node, "state": "MERGED"})
+        self.assertEqual(gg.verdict("pr", merged, "merged"), 0)
+
+    def test_closed_unmerged_pr_fails_and_says_so(self) -> None:
+        closed = gg.parse_pr(pr_node(1, state="CLOSED", rollup="PENDING", checks=[check_run("a", "IN_PROGRESS", None)]))
+        for until in ("green", "done", "merged"):
+            code, text = self.wait("pr", "o/r#1", until=until, fill=(closed, {}))
+            self.assertEqual(code, 1)
+            self.assertIn("note: PR was closed without being merged", text)
+
     def test_wait_ignores_cache_from_before_it_began(self) -> None:
         old_green = gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")]))
         self.put("pr:o/r#1", old_green, at=time.time() - 30)
@@ -753,7 +786,8 @@ class ClientTest(Base):
         # GitHub's merge state already counts it: CLEAN means nothing required is outstanding.
         self.assertEqual(gg.verdict("pr", {**data, "mergeStateStatus": "CLEAN"}, "green"), 0)
         # A conflicted PR runs no workflows until the next push, and a merged one never will: no wait.
-        self.assertEqual(gg.verdict("pr", {**data, "mergeStateStatus": "DIRTY"}, "done"), 1)
+        self.assertEqual(gg.check_verdict({**data, "mergeStateStatus": "DIRTY"}, "done"), 1)
+        self.assertEqual(gg.verdict("pr", {**data, "mergeStateStatus": "DIRTY"}, "done"), gg.EXIT_CONFLICT)
         self.assertIn("merge conflicts", gg.summary("pr:o/r#1", {"data": {**data, "mergeStateStatus": "DIRTY"}}))
         self.assertEqual(gg.verdict("pr", {**data, "state": "MERGED", "mergeStateStatus": "UNKNOWN"}, "green"), 0)
         # Classic branch protection lists its contexts too.

@@ -19,8 +19,8 @@ back to the ETag reads.
 
 ```bash
 glaeda-gh wait pr OWNER/REPO#N --sha "$(git rev-parse HEAD)"   # until green; 1 at the first failed check
-glaeda-gh wait pr OWNER/REPO#N --until done      # until every check finishes (0 green, 1 red)
-glaeda-gh wait pr OWNER/REPO#N --until merged
+glaeda-gh wait pr OWNER/REPO#N --until done      # until every check finishes (0 green, 1 red, 4 conflict)
+glaeda-gh wait pr OWNER/REPO#N --until merged    # ignores conflicts; 1 if closed without merging
 glaeda-gh wait run OWNER/REPO/RUN_ID [--jobs]    # 0 success, 1 failure
 glaeda-gh wait comment OWNER/REPO#N --author 'github-actions[bot]' --match 'REGEX' --since COMMENT_URL
 glaeda-gh status pr OWNER/REPO#N                 # one look: state, mergeable, checks, review
@@ -29,8 +29,9 @@ glaeda-gh status comment OWNER/REPO#N            # the latest comments
 glaeda-gh budget                                 # REST and GraphQL left, the daemon's own use, its heartbeat
 ```
 
-- `wait` exits 0 on success (or a matching comment), 1 on failure, 2 on timeout (`--timeout S`,
-  default 3600), 3 when the daemon is down, 64 on bad arguments.
+- `wait` exits 0 on success (or a matching comment), 1 on failure (including a PR closed without
+  being merged), 2 on timeout (`--timeout S`, default 3600), 3 when the daemon is down, 4 when the
+  PR conflicts with its base, 64 on bad arguments.
 - Run one background `wait` per PR, run or comment (Bash `run_in_background`), not one wait
   looping over several: each then notifies you on its own when it exits, and you carry on meanwhile.
 - The summary names what failed and the failed step, e.g.
@@ -49,6 +50,17 @@ as pending until GitHub shows yours. Give the full 40-hex id. A shorter prefix i
 current checkout; one that does not resolve must match the head GitHub shows, or `wait` exits 64
 at once rather than waiting for a commit that will never appear. For a run, a `--sha` that is not
 the run's commit is also an error: a run's commit never changes.
+
+## Merge conflicts: exit 4
+
+A PR that conflicts with its base (mergeable `CONFLICTING`, merge state `DIRTY`) runs no
+pull_request workflows until the next push. This happens to a stacked PR when the PR below it is
+squash-merged and main moves under it. `wait pr --until green` and `--until done` stop with exit 4
+as soon as the daemon sees it, printing `result: conflict` and `note: PR conflicts with its base`.
+Rebase or merge the base, push, and wait again with the new `--sha`. The check uses the daemon's
+cached PR data, so it costs no extra API calls. `UNKNOWN` mergeability (GitHub computes it
+lazily) counts as pending, not as a conflict. With `--sha`, a conflict on an older head is pending
+too. `--until merged` ignores conflicts and keeps waiting.
 
 ## Runner refusals and rescue attempts
 

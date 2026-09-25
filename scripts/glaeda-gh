@@ -40,9 +40,14 @@ the daemon is the only process that talks to GitHub, and clients only read its c
 
 Clients make no API calls. When the daemon is not running they say so and exit 3 rather than
 fall back to polling. `wait` exits 0 on success (or a matching comment), 1 on failure (a failed
-check, a failed run, a PR closed unmerged, an issue that does not exist), 2 on timeout. --until
-green (default) fails as soon as any check fails; done waits for every check to finish; merged
-waits for the merge.
+check, a failed run, a PR closed without being merged, an issue that does not exist), 2 on timeout,
+4 when the PR conflicts with its base. --until green (default) fails as soon as any check fails;
+done waits for every check to finish; merged waits for the merge.
+
+A PR that conflicts with its base (mergeable CONFLICTING, merge state DIRTY), for example after the
+PR it was stacked on was squash-merged, runs no pull_request workflows until the next push. `wait
+pr --until green|done` therefore stops with exit 4 as soon as the daemon's cached data says so;
+--until merged keeps waiting. UNKNOWN mergeability (GitHub computes it lazily) counts as pending.
 
 A job a glaeda runner refused (its "Set up runner" step, the runner's job-started hook, failed
 within two minutes) is usually re-run elsewhere by the repository's own rescue. `wait` holds such
@@ -105,7 +110,7 @@ GLAEDA_RUNNER = re.compile(r"(?:^|-)glaeda(?:-|$)")
 COMMENTS_LAST = 50  # comments per issue per read: more than this within one 15 s cycle are missed
 COMMENT_BODY_MAX = 4000
 STEPS_BATCH = 50  # check runs per steps query
-EXIT_OK, EXIT_FAIL, EXIT_TIMEOUT, EXIT_DOWN = 0, 1, 2, 3
+EXIT_OK, EXIT_FAIL, EXIT_TIMEOUT, EXIT_DOWN, EXIT_CONFLICT = 0, 1, 2, 3, 4
 CONTROLLER_DEFAULT = "http://100.71.114.64:18765"
 CONTROLLER_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
 CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
@@ -1032,7 +1037,7 @@ def run_hold(data: dict, jobs: list[dict] | None, now: float | None = None,
 
 def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None = None,
             jobs: list[dict] | None = None, now: float | None = None, grace: float = RESCUE_GRACE) -> int | None:
-    """EXIT_OK, EXIT_FAIL, or None while still pending."""
+    """EXIT_OK, EXIT_FAIL, EXIT_CONFLICT (a PR that conflicts with its base), or None while still pending."""
     if not data:
         return None
     if kind == "run":
@@ -1049,7 +1054,16 @@ def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None 
         return EXIT_OK if data.get("state") == "MERGED" else None
     if sha and not str(data.get("headRefOid") or "").startswith(sha):
         return None  # the push has not reached GitHub yet, or these are an older commit's checks
+    if conflicting(data):
+        return EXIT_CONFLICT  # no pull_request workflow runs until the next push
     return check_verdict(data, until, now, grace)
+
+
+def conflicting(data: dict) -> bool:
+    """An open PR GitHub says conflicts with its base. UNKNOWN is still being computed: not a conflict."""
+    if data.get("state") != "OPEN" or data.get("mergeable") == "UNKNOWN":
+        return False
+    return data.get("mergeable") == "CONFLICTING" or data.get("mergeStateStatus") == "DIRTY"
 
 
 def age(seconds: float | None) -> str:
@@ -1255,7 +1269,13 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
                 sha, exact = head, True  # resolved: a later push now counts as pending, as for a full id
         result = verdict(kind, data, until, sha, (entry or {}).get("jobs"), time.time(), grace) if usable else None
         if result is not None:
-            extra: dict[str, Any] = {"result": "success" if result == EXIT_OK else "failure", "waited_s": waited}
+            outcome_name = {EXIT_OK: "success", EXIT_CONFLICT: "conflict"}.get(result, "failure")
+            extra: dict[str, Any] = {"result": outcome_name, "waited_s": waited}
+            if kind == "pr" and result == EXIT_CONFLICT:
+                extra["note"] = ("PR conflicts with its base (mergeable CONFLICTING): no checks run until you "
+                                 "merge or rebase onto the base and push")
+            elif kind == "pr" and data.get("state") == "CLOSED":
+                extra["note"] = "PR was closed without being merged"
             if kind == "run" and result == EXIT_FAIL and grace > 0 and run_hold(data, entry.get("jobs"), time.time(), float("inf")):
                 extra["note"] = f"a glaeda runner refused this attempt at setup and no rescue attempt followed within {int(grace)}s"
             emit(key, entry, as_json, extra, until, grace)
@@ -1411,7 +1431,8 @@ def parser() -> argparse.ArgumentParser:
         s.add_argument("--json", action="store_true")
         if name == "wait":
             s.add_argument("--until", choices=("green", "done", "merged"), default="green",
-                           help="PRs: green (fail fast), done (every check finished) or merged")
+                           help="PRs: green (fail fast), done (every check finished) or merged; green and "
+                                "done exit 4 once the PR conflicts with its base")
             s.add_argument("--timeout", type=float, default=3600, help="seconds (default 3600); exit 2 after")
             s.add_argument("--sha", help="the commit you pushed (git rev-parse HEAD): other heads count as pending")
             s.add_argument("--rescue-grace", type=float, default=RESCUE_GRACE, metavar="S",
