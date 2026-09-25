@@ -122,8 +122,8 @@ submodule depth). check, preflight and fix read it from there.
 `apply` only adds, and only what the manifest can prove: it appends a required key whose
 `public_key` the manifest carries and whose fingerprint matches, after copying authorized_keys
 aside, prefixed by the key's `options` when it declares them (from=, command=, no-pty; check then
-requires exactly those options on that key, compared by a digest the probe reports instead of
-their text); and it APFS-clones an Xcode (`cp -c`, a real directory sharing blocks, never a symlink)
+requires exactly those options on that key, compared by a short digest the probe reports in place
+of their text, which hides them from casual reading but not from guessing); and it APFS-clones an Xcode (`cp -c`, a real directory sharing blocks, never a symlink)
 when the source's version and build match the target. It never removes keys, never uses sudo,
 and skips hosts marked `"apply": false`. Without --yes it prints what it would run. Every run
 ends with a fresh observation and check of the hosts it touched.
@@ -290,9 +290,21 @@ def load_manifest(path: Path) -> dict[str, Any]:
             raise Failure(f"{path}: key {key_id} public_key must be one bare key line; restrictions go in options")
         options = key.get("options")
         if options is not None and (not isinstance(options, str) or not options or options != options.strip()
-                                    or any(c in options for c in "\n\r\t") or not options.isprintable()):
+                                    or any(c in options for c in "\n\r\t") or not options.isprintable()
+                                    or not options_well_formed(options)):
             raise Failure(f"{path}: key {key_id} options must be one printable authorized_keys options field")
     return data
+
+
+def options_well_formed(options: str) -> bool:
+    """sshd's options field: quotes balance and no whitespace outside them."""
+    quoted = False
+    for i, c in enumerate(options):
+        if c == '"' and (i == 0 or options[i - 1] != "\\"):
+            quoted = not quoted
+        elif c == " " and not quoted:
+            return False
+    return not quoted
 
 
 def validate_toolchain(path: Path, where: str, toolchain: Any) -> None:

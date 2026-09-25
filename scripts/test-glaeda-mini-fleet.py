@@ -304,7 +304,7 @@ class CheckTests(unittest.TestCase):
             self.assertIn("lacks its declared options", ssh[0]["detail"])
 
     def test_options_must_be_one_printable_field(self) -> None:
-        for bad in ("", " no-pty", "no-pty\nssh-ed25519 AAAA x", 7):
+        for bad in ("", " no-pty", "no-pty\nssh-ed25519 AAAA x", 7, 'command="x', 'no-pty, from="x"'):
             data = copy.deepcopy(self.manifest)
             data["keys"]["coordinator"]["options"] = bad
             with tempfile.TemporaryDirectory() as tmp:
