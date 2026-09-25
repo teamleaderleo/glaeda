@@ -91,6 +91,10 @@ class Family:
     owner: str = ""  # who writes it, so a cache nobody owns any more is visible
     owner_job: str = ""  # launchd service of that owner (e.g. system/ai.x.worker); unloaded = retired
     rebuild_minutes: float = 10.0  # rough cost of losing it; cheaper items go first under pressure
+    skip_prefixes: tuple[str, ...] = ()  # candidates whose name starts with one of these are skipped
+    # size every missing candidate with one `du -d1` walk of root instead of one du per candidate:
+    # a macOS $TMPDIR holds tens of thousands of small leaked directories (25,730 on Air Blue)
+    bulk_sizes: bool = False
 
 
 WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
@@ -117,6 +121,20 @@ def fs_type(path: Path, mounts: Path = Path("/proc/mounts")) -> str:
         return best
     except OSError:
         return ""
+
+
+def darwin_user_tmp() -> Path | None:
+    """The per-user temp dir macOS gives every process as $TMPDIR (/var/folders/../T), resolved.
+
+    It is not /private/tmp, so scratch that tools create with mktemp or tempfile lands here
+    unseen: 14.5 GiB of throwaway cmux copies and build traces sat in it on Air Blue (2026-09-25).
+    """
+    out = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True)
+    value = out.stdout.strip() if out.returncode == 0 else ""
+    if not value:
+        return None
+    path = Path(os.path.realpath(value))
+    return path if path.is_dir() and path != Path("/private/tmp") else None
 
 
 def default_families() -> list[Family]:
@@ -149,6 +167,12 @@ def default_families() -> list[Family]:
         Family("projects", projects, False, "checkouts (report only)",
                skip=tuple(r.name for r in wt_roots)),
     ]
+    user_tmp = darwin_user_tmp() if DARWIN else None
+    if user_tmp is not None:
+        # Apple daemons keep live state in com.apple.* entries without holding them open.
+        fams.append(Family("user-tmp", user_tmp, True, "agent scratch under the per-user $TMPDIR",
+                           skip_prefixes=("com.apple.",), git_disposable=True, bulk_sizes=True,
+                           owner="agents and tools", rebuild_minutes=0.5))
     # The retiring hq build worker's shared cache: visible with its owner, never deleted here. When the
     # worker is unloaded the report says so, since other tools may still read parts of it (2026-09-24).
     fams.append(Family("hq-build-fleet-cache", Path("/Users/Shared/cmux-build-fleet/cache"), False,
@@ -181,6 +205,20 @@ def du_bytes(path: Path) -> int:
         return int(out.stdout.split()[0]) * 1024
     except (IndexError, ValueError):
         return 0
+
+
+BULK_SIZE_MIN = 64  # unsized candidates in a bulk_sizes family before one walk beats per-item du
+
+
+def du_children(root: Path) -> dict[str, int]:
+    """Sizes of every directory directly below root from a single walk, keyed like candidates."""
+    out = subprocess.run(["du", "-xk", "-d", "1", str(root)], capture_output=True, text=True)
+    sizes: dict[str, int] = {}
+    for line in out.stdout.splitlines():
+        size, _, path = line.partition("\t")
+        if path and path != str(root) and size.isdigit():
+            sizes[str(root / Path(path).name)] = int(size) * 1024
+    return sizes
 
 
 def newest_mtime(path: Path, levels: int = 2, budget: int = 3000) -> float:
@@ -257,7 +295,13 @@ def process_evidence() -> tuple[list[str], str]:
         raise NoEvidence(f"ps: {e}") from e
     if ps.returncode != 0 or not ps.stdout.strip():
         raise NoEvidence(f"ps failed (exit {ps.returncode})")
-    return opened, ps.stdout
+    return opened, command_text(ps.stdout)
+
+
+def command_text(ps_output: str) -> str:
+    """Command lines with repeated slashes collapsed: $TMPDIR ends in a slash, so a script's
+    "$TMPDIR/x" reads .../T//x, which would not match the path it names."""
+    return re.sub(r"/{2,}", "/", ps_output)
 
 
 def spellings(path: str) -> list[str]:
@@ -610,6 +654,19 @@ def git_common_dir(path: Path) -> str:
 UNREADABLE: set[str] = set()
 
 
+def _entries(path: Path) -> list[os.DirEntry]:
+    """Like _children, but entries carry their type, so filtering tens of thousands (a macOS
+    $TMPDIR) costs no stat per entry."""
+    try:
+        with os.scandir(path) as it:
+            return list(it)
+    except PermissionError:
+        UNREADABLE.add(str(path))
+        return []
+    except OSError:
+        return []
+
+
 def _children(path: Path) -> list[Path]:
     try:
         return list(path.iterdir())
@@ -744,9 +801,11 @@ def candidates(fam: Family) -> list[Path]:
     else:
         level = [fam.root]
         for _ in range(fam.depth):
-            level = [c for p in level for c in _children(p)
-                     if c.name not in fam.skip and not c.is_symlink()
-                     and (c.is_dir() or (fam.files and c.is_file()))]
+            level = [Path(e.path) for p in level for e in _entries(p)
+                     if e.name not in fam.skip
+                     and not (fam.skip_prefixes and e.name.startswith(fam.skip_prefixes))
+                     and (e.is_dir(follow_symlinks=False)
+                          or (fam.files and e.is_file(follow_symlinks=False)))]
     uid = os.getuid()
     owned = []
     for p in level:
@@ -782,18 +841,28 @@ def _fresh(path: Path, seconds: float) -> bool:
 
 
 def survey(families: list[Family], idle_hours: float, min_bytes: int,
-           known: dict[str, int] | None = None) -> list[Item]:
-    """Judge every candidate live. Sizes come from `known` when present; the rest are measured."""
+           known: dict[str, int] | None = None, defer_bulk: bool = False) -> list[Item]:
+    """Judge every candidate live. Sizes come from `known` when present; the rest are measured.
+
+    With defer_bulk, unsized candidates of bulk_sizes families are left out instead of measured,
+    so a report stays fast; the background refresh sizes them for the next one.
+    """
     with ThreadPoolExecutor(max_workers=1) as bg:
         evidence = bg.submit(process_evidence)  # lsof is the slowest single call; overlap it
-        return _survey(families, idle_hours, min_bytes, known, evidence)
+        return _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk)
 
 
-def _survey(families, idle_hours, min_bytes, known, evidence) -> list[Item]:
+def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) -> list[Item]:
     now = time.time()
     items: list[Item] = []
     known = known if known is not None else {}
     work = [(fam, path) for fam in families for path in candidates(fam)]
+    if defer_bulk:
+        work = [(fam, path) for fam, path in work if not fam.bulk_sizes or str(path) in known]
+    for fam in families:
+        # a few new entries are cheaper to size one by one than by re-walking the whole root
+        if fam.bulk_sizes and sum(str(p) not in known for f, p in work if f is fam) >= BULK_SIZE_MIN:
+            known.update({k: v for k, v in du_children(fam.root).items() if k not in known})
     missing = [path for _, path in work if str(path) not in known]
     with ThreadPoolExecutor(max_workers=8) as pool:
         measured = dict(zip(map(str, missing), pool.map(du_bytes, missing)))
@@ -1270,7 +1339,7 @@ def main(argv: list[str] | None = None) -> int:
         known = {k: v for k, v in known.items() if not candidate_of_selected(k)}
     known = {k: v for k, v in known.items() if os.path.lexists(k)}
     before = len(known)
-    items = survey(fams, idle, a.min_mib * 1024**2, known)
+    items = survey(fams, idle, a.min_mib * 1024**2, known, defer_bulk=bool(at) and not a.apply)
     age_min = (time.time() - at) / 60 if at else 0.0
     if not a.no_snapshot:
         lock = SNAPSHOT.with_suffix(".refreshing")

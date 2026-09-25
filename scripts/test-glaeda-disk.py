@@ -54,6 +54,11 @@ class GlaedaDiskTest(unittest.TestCase):
         make(self.root / "new", age_hours=1)
         self.assertEqual(self.verdicts(), {"old": "reclaimable", "new": "recent"})
 
+    def test_tmpdir_double_slash_still_names_the_path(self) -> None:
+        cmds = gd.command_text("bash /var/folders/px/abc/T//work/build.sh\n")
+        self.assertTrue(gd.named_by("/private/var/folders/px/abc/T/work", cmds))
+        self.assertFalse(gd.named_by("/private/var/folders/px/abc/T/wor", cmds))
+
     def test_process_cwd_and_command_line_veto(self) -> None:
         a, b = make(self.root / "a"), make(self.root / "b")
         make(self.root / "a-sibling")
@@ -71,6 +76,48 @@ class GlaedaDiskTest(unittest.TestCase):
         os.utime(repo, (time.time() - 48 * 3600,) * 2)
         os.utime(repo / ".git", (time.time() - 48 * 3600,) * 2)
         self.assertEqual(gd.survey([self.fam], 24, 0)[0].verdict, "git-checkout")
+
+    def test_bulk_sizes_walk_the_root_once_and_skip_prefixes(self) -> None:
+        self.fam = gd.Family("user-tmp", self.root, True, "scratch", bulk_sizes=True,
+                             skip_prefixes=("com.apple.",))
+        for name in ("a", "b", "c"):
+            make(self.root / name, mib=2)
+        saved_min, gd.BULK_SIZE_MIN = gd.BULK_SIZE_MIN, 2
+        make(self.root / "com.apple.imtransferservices")
+        calls: list[list[str]] = []
+        real_run = gd.subprocess.run
+
+        def counting_run(args, *a, **k):
+            if args and args[0] == "du":
+                calls.append(list(args))
+            return real_run(args, *a, **k)
+
+        gd.subprocess.run = counting_run
+        try:
+            items = gd.survey([self.fam], 24, 1 << 20)
+        finally:
+            gd.subprocess.run = real_run
+            gd.BULK_SIZE_MIN = saved_min
+        self.assertEqual(sorted(Path(i.path).name for i in items), ["a", "b", "c"])
+        self.assertTrue(all(i.bytes >= 2 << 20 and i.verdict == "reclaimable" for i in items))
+        self.assertEqual([c[:4] for c in calls], [["du", "-xk", "-d", "1"]])  # one walk, no per-item du
+        # a report defers unsized bulk candidates to the background refresh instead of walking
+        make(self.root / "d", mib=2)
+        known = {i.path: i.bytes for i in items}
+        deferred = gd.survey([self.fam], 24, 1 << 20, known, defer_bulk=True)
+        self.assertEqual(sorted(Path(i.path).name for i in deferred), ["a", "b", "c"])
+
+    def test_darwin_user_tmp_family(self) -> None:
+        saved = (gd.DARWIN, gd.darwin_user_tmp)
+        gd.DARWIN, gd.darwin_user_tmp = True, lambda: self.root
+        try:
+            fams = {f.id: f for f in gd.default_families()}
+        finally:
+            gd.DARWIN, gd.darwin_user_tmp = saved
+        fam = fams["user-tmp"]
+        self.assertEqual(fam.root, self.root)
+        self.assertTrue(fam.reclaimable and fam.git_disposable and fam.bulk_sizes)
+        self.assertIn("com.apple.", fam.skip_prefixes)
 
     def test_report_only_family_is_never_deleted(self) -> None:
         self.fam = gd.Family("user-cache", self.root, False, "report")
