@@ -104,6 +104,13 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
                # $HOME keep it on Blacksmith (docs/CMUX_MINI_RUNNER.md 2g).
                "mobile-core-package": "isolated", "ios-simulator-build": "isolated",
                "ios-simulator": "simulator", "screenshots": "simulator"}
+# Job ids other workflows reuse, keyed by (workflow file, job id) and checked before JOB_CLASSES, since a bare
+# id such as `build` or `test` also names test-e2e's root jobs. cmux-tui's macOS jobs are cargo lint, test and
+# its reusable build-artifacts `build` (GITHUB_WORKFLOW_REF names the caller), into the workspace target dir: no
+# GUI or canonical root. app-host-test-rerun's `rerun` stays the default (compile, pinned): it hard-codes
+# /private/tmp/cmux-ci, rm -rfs compile admission's DerivedData and never takes a root, so it must hold root 1.
+WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
+                        ("cmux-tui.yml", "build"): "isolated"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
 # restore a product into with rm -rf of its src, so one root job per root per mini (cmux#14338 adds a second).
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
@@ -124,13 +131,22 @@ def is_guest(repo: str | None, home_repo: str = DEFAULT_HOME_REPO) -> bool:
     return not repo or repo.lower() != home_repo.lower()
 
 
-def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO) -> tuple[str, bool]:
+def workflow_file(ref: str | None) -> str:
+    """The workflow file of GITHUB_WORKFLOW_REF (owner/repo/.github/workflows/<file>@<ref>), or ""."""
+    path = (ref or "").split("@", 1)[0]
+    return path.rsplit("/", 1)[-1] if "/.github/workflows/" in path else ""
+
+
+def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
+              workflow: str = "") -> tuple[str, bool]:
     """The job's class and whether it is pinned to /private/tmp/cmux-ci (an unknown job of the home repo)."""
     if is_guest(repo, home_repo):
         name = job.lower()
         if name.endswith("-sim") or name.endswith("simulator"):
             return "simulator", False
         return ("light" if name.endswith("-light") else "isolated"), False
+    if (workflow, job) in WORKFLOW_JOB_CLASSES:
+        return WORKFLOW_JOB_CLASSES[(workflow, job)], False
     return JOB_CLASSES.get(job, "compile"), job not in JOB_CLASSES
 
 
@@ -643,12 +659,12 @@ def holder_pids(state_dir: Path) -> set[int]:
 def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watch_pid: int,
                   state_dir: Path, compile_slots: int = 1, roots: int = 1,
                   repo: str | None = DEFAULT_HOME_REPO, home_repo: str = DEFAULT_HOME_REPO,
-                  instance: int = 0) -> tuple[bool, str]:
+                  instance: int = 0, workflow: str = "") -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
     takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
     the job class's tokens. Everything is a flock, so a holder that dies releases all of it."""
-    klass, pinned = job_class(job, repo, home_repo)
+    klass, pinned = job_class(job, repo, home_repo, workflow)
     units, tokens = CLASS_COST[klass]
     units = min(units, total)
     if roots > 1 and klass in ROOT_CONSUMERS:
@@ -1285,7 +1301,8 @@ def main(argv: list[str] | None = None) -> int:
                 held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
                                            os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
                                            args.state_dir, args.compile_slots, args.canonical_roots,
-                                           repo, args.home_repo, instance=args.instance)
+                                           repo, args.home_repo, instance=args.instance,
+                                           workflow=workflow_file(os.environ.get("GITHUB_WORKFLOW_REF")))
                 # cmux refuses fast (its rescue workflow reroutes); a guest has none, so it waits for room
                 if held or not note.startswith("capacity:") or time.monotonic() >= deadline:
                     break
