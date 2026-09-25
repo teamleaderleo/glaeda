@@ -108,12 +108,17 @@ fi
 for ak in "$HOME"/.ssh/authorized_keys*; do
   [ -f "$ak" ] || continue
   e ak_file "$(basename "$ak")|$(stat -f '%Lp' "$ak")"
-  # Options (from=, command=, restrict) are reported as a flag, never their values.
+  # Options (from=, command=, restrict) are reported as h:<16 hex of their SHA-256>, never
+  # their values, so check can match them against a key's declared options.
   # "|| [ -n ]" keeps a final line that has no trailing newline; sshd still honours it.
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue;; esac
     opts=no
-    case "$line" in ssh-*|ecdsa-*|sk-*) ;; *) opts=yes;; esac
+    case "$line" in
+      ssh-*|ecdsa-*|sk-*) ;;
+      *) prefix=$(printf '%s\n' "$line" | perl -ne 'print $1 if /^(.*?)\s+(?:ssh|ecdsa|sk)-\S+\s+AAAA/')
+         if [ -n "$prefix" ]; then opts="h:$(printf '%s' "$prefix" | shasum -a 256 | cut -c1-16)"; else opts=yes; fi;;
+    esac
     fp=$(printf '%s\n' "$line" | ssh-keygen -lf /dev/stdin 2>/dev/null | head -1)
     [ -n "$fp" ] || fp="unparseable"
     e ak_key "$(basename "$ak")|$opts|$fp"
