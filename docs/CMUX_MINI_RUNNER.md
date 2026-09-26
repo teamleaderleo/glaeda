@@ -199,6 +199,10 @@ What `--apply` does:
        An app-host shard that meets a taken gui token waits up to 240 s for it
        (`--gui-wait`, inside cmux's 360 s refusal window) instead of refusing.
        (cmuxterm-hq#661, Workstream 7.)
+     - A gui runner (`--gui-runner`, below) stops while the gui token is taken, every
+       canonical root is taken, or every unit is. Only it carries the gui pool label, so
+       holding it keeps no compile off the mini, and GitHub hands the GUI job to another
+       mini's gui runner instead.
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`.
      - The listener's graceful exit ends its session, and GitHub shows the runner as
@@ -467,6 +471,15 @@ in at the producer's root. So one root job per root per mini:
   `glaeda-side-<class>-xcode-<version>` instead. cmux's light side-lane jobs run on it
   (`vars.CI_SIDE_LANE_RUNNER`, cmux#14391), so they never hold a root runner. A class whose
   `canonicalRoots` equals `runners` has no side runner, so do not point that variable at it.
+- `guiRunners` (0 or 1, default 0) makes the last instance (`runners - 1`) the mini's gui runner. It carries
+  the gui pool label `glaeda-gui-<class>-xcode-<version>` and neither the pool, root, side nor
+  `glaeda-ios-sim` label, and its job-started hook passes `--gui-runner`. cmux's GUI jobs (app-host shards,
+  tests-build-and-lag) run on it, so GitHub hands each mini at most the one GUI job its gui token allows,
+  and a second one waits in GitHub's queue for any mini's gui runner. Before, two root runners shared one
+  gui token and GitHub gave the second GUI job to the other root runner, which waited up to 240 s and
+  refused (10 of 17 refusals in the hour to 2026-09-26 03:40Z). It is never a root runner, so
+  `canonicalRoots + guiRunners` is at most `runners`. Admission is unchanged: a GUI job takes 1 unit, the
+  gui token, and the producer's root in its restore step.
 - `compileSlots` may not exceed `canonicalRoots`: every compile holds a root.
 - `declared_pools` and glaeda-route count only the pool labels; the root and side labels split each mini's
   runners between them.
