@@ -692,16 +692,17 @@ rebuild-tier from main's head, and each mini had sat fully idle 17 to 33% of the
   runs the steps of a main dispatch's compile admission (check, prefer against kept seeds, adopt, record,
   compile, keep with main's head as `merged_onto`, save). Logs: `ci/.catch-up/logs/`, one line per run in
   `~/Library/Logs/glaeda-idle-warm.jsonl`.
-- **Jobs come first.** Every admission (`take_capacity`, under admission.lock) sends the catch-up SIGTERM and
-  waits up to 5 s for it to exit, then SIGKILLs it. The catch-up leads its own process group and its build runs
-  in it, so one `killpg` ends both and the kernel drops the locks with the last fd; the hook then kills what is
-  left of that group, which also ends the build of a catch-up something else SIGKILLed (holder file under 50
-  minutes old, pid dead). The listener gate counts what the catch-up holds as free, never counts it as a fleet
-  build waiting for the host (it holds host.lock shared, like a job), and when it would hold a runner off for
-  load or heat while the catch-up runs, it stops the catch-up instead. So a mini never stops listening or
-  refuses a job because of it. A kill at any step leaves the kept state as it was, or unstamped (the next job
-  takes a seed); never a partial build marked warm. The holder file is trusted only while its pid is alive and
-  its program is glaeda-idle-warm.
+- **Jobs and fleet builds come first.** Every admission (`take_capacity`, under admission.lock) sends the
+  catch-up SIGTERM and waits up to 5 s for it to exit, then SIGKILLs it. The catch-up leads its own process
+  group and its build runs in it, so one `killpg` ends both and the kernel drops the locks with the last fd;
+  the hook kills whatever is left of that group the moment the catch-up is gone, and launchd kills a
+  LaunchAgent's group whenever it dies. The listener gate counts what the catch-up holds as free, never
+  counts its shared host.lock as a fleet build waiting, stops it when a fleet build holds or waits for the
+  host lock, and stops it instead of holding a runner off for load or heat. So a mini never stops listening
+  or refuses a job because of it. A build killed with no job behind it counts as a failed try of that head,
+  so shedding its load cannot loop. A kill at any step leaves the kept state as it was, or unstamped (the
+  next job takes a seed); never a partial build marked warm. The holder file is trusted only while its pid is
+  alive and its program is glaeda-idle-warm.
 - **Trust.** The build is main's own code, run as the build user on a PR mini. Pull requests admitted to that
   root already share its kept state, so this adds no new boundary. No GitHub token reaches it.
 
