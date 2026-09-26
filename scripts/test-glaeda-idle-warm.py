@@ -77,11 +77,13 @@ class Base(unittest.TestCase):
 
 class GateTest(Base):
     def test_never_on_the_ios_soak_box_or_lawrences_machines(self) -> None:
-        self.assertIn("never", warm.host_denied("cmuxs-Mac-mini-5.local"))
-        self.assertIn("never", warm.host_denied("cmux-lawrences-mac-mini"))
-        self.assertIn("never", warm.host_denied("cmux-lawrence"))
-        self.assertEqual(warm.host_denied("cmux12s-Mac-mini.local"), "")
-        self.assertEqual(warm.host_denied("cmuxs-Mac-mini-4"), "", "cmuxs-mac-mini-5 on the tailnet is a PR mini")
+        self.assertIn("never", warm.host_denied(["cmuxs-Mac-mini-5.local"]))
+        self.assertIn("never", warm.host_denied(["cmuxs-mac-mini-5.lan"]))
+        self.assertIn("never", warm.host_denied(["cmux12s-Mac-mini", "cmuxs-Mac-mini-5"]), "any of its names")
+        self.assertIn("never", warm.host_denied(["cmux-lawrences-mac-mini"]))
+        self.assertIn("never", warm.host_denied(["Lawrence’s Mac mini"]))
+        self.assertEqual(warm.host_denied(["cmux12s-Mac-mini.local", "cmux12s-Mac-mini"]), "")
+        self.assertEqual(warm.host_denied(["cmuxs-Mac-mini-4"]), "", "cmuxs-mac-mini-5 on the tailnet is a PR mini")
 
     def test_runner_setup_needs_capacity_runners_whose_hook_yields(self) -> None:
         self.assertEqual(warm.runner_setup([]), "no glaeda runner on this mini")
@@ -122,6 +124,10 @@ class GateTest(Base):
         memory["roots"]["2"] = {"head": HEAD}
         self.assertIn("near", warm.pick_root(stub, 3, HEAD, self.state, memory))
         self.assertEqual(warm.pick_root(stub, 3, "b" * 40, self.state, memory)[0], 3, "main moved")
+        mixed = {"root-1": {"tier": "cold", "app_swift_files": -1}, "root-2": {"tier": "unknown", "app_swift_files": -1},
+                 "root-3": {"tier": "far", "app_swift_files": 7}}
+        ranked = types.SimpleNamespace(warm_root_costs=lambda order, base, number, state: (order, mixed))
+        self.assertEqual(warm.pick_root(ranked, 3, HEAD, self.state, {"roots": []})[0], 3, "far before unknown, cold")
         cold = types.SimpleNamespace(warm_root_costs=lambda *args: ([], {}))
         self.assertIn("cannot compare", warm.pick_root(cold, 2, HEAD, self.state, {}))
 
@@ -181,7 +187,7 @@ class RunTest(Base):
         predicted = {"root-1": {"seconds": 140.0, "tier": "near"}, "root-2": {"seconds": 400.7, "tier": "rebuild"}}
         stub = types.SimpleNamespace(**{name: getattr(hook, name) for name in ("lock_file", "CLASS_COST", "WARM_HOLDER")},
                                      warm_root_costs=lambda order, base, number, state: (order, predicted))
-        warm.host_denied = lambda name=None: ""
+        warm.host_denied = lambda names=None: ""
         warm.runner_setup = lambda dirs: (stub, scope)
         warm.idle_refusal = lambda hook_module, now, state: ""
         warm.main_head = lambda state: HEAD
@@ -229,7 +235,7 @@ class RunTest(Base):
         if sys.platform != "darwin":
             self.assertEqual(warm.run(True, self.state)["reason"], "not macOS")
             return
-        warm.host_denied = lambda name=None: ""
+        warm.host_denied = lambda names=None: ""
         self.assertIn("no owned compile", warm.run(True, self.state)["reason"])
         warm.KILL_SWITCH.write_text("")
         self.assertIn("exists", warm.run(True, self.state)["reason"])
@@ -255,13 +261,14 @@ class YieldTest(Base):
             state = Path({os.fspath(self.state)!r})
             warm.FLEET_DIR = state.parent
             warm.HOME = state.parent
-            warm.host_denied = lambda name=None: ""
+            warm.host_denied = lambda names=None: ""
             warm.runner_setup = lambda dirs: (hook, {{"units": 4, "roots": 1, "compile_slots": 1, "xcode": "/x.app"}})
             warm.idle_refusal = lambda *a: ""
             warm.main_head = lambda s: "{HEAD}"
             warm.pick_root = lambda *a: (1, {{}})
             warm.prepare_checkout = lambda work, head: None
             warm.running = lambda: ""
+            warm.forget_inode_override = lambda: open({os.fspath(self.dir / 'forgot')!r}, "w").close()
             print(warm.run(True, state), flush=True)
         """))
         proc = subprocess.Popen([sys.executable, os.fspath(driver)], stdout=subprocess.PIPE, text=True,
@@ -276,10 +283,12 @@ class YieldTest(Base):
         self.assertIsNone(hook.lock_file(self.capacity / "root-1.token", fcntl.LOCK_EX))
         started = time.monotonic()
         proc.send_signal(signal.SIGTERM)
-        self.assertEqual(proc.wait(timeout=10), 128 + signal.SIGTERM)
+        # it ends its whole process group, itself included, with one SIGKILL
+        self.assertEqual(proc.wait(timeout=10), -signal.SIGKILL)
         self.assertLess(time.monotonic() - started, 5)
         self.assertIsNotNone(hook.lock_file(self.capacity / "root-1.token", fcntl.LOCK_EX))
-        self.assertFalse((self.capacity / "idle-warm.json").exists())
+        self.assertIsNone(hook.idle_warm(self.capacity), "the file stays, naming a dead pid the hook ignores")
+        self.assertTrue((self.dir / "forgot").exists(), "the Xcode inode override a kill would leave is deleted")
         leftover = subprocess.run(["/usr/bin/pgrep", "-f", "sleep 120"], capture_output=True, text=True).stdout
         self.assertEqual(leftover.strip(), "", "the build's process group was killed")
 

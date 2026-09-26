@@ -1092,13 +1092,35 @@ def pid_alive(pid: int) -> bool:
 
 # Idle catch-up (glaeda-idle-warm): while a mini is idle and a root's kept build is far from main, it holds that
 # root's token, a persistent-dd token and a compile's units (flocks under the capacity dir, like a job) and builds
-# main's head into the root's kept state. Any job comes first. take_capacity stops it (SIGTERM, then SIGKILL) and
-# waits for its locks to go before it takes its own, and the listener gate counts what it holds as free, so a mini
-# never stops listening or refuses a job because of it. It names its pid and locks in WARM_HOLDER, written under
-# admission.lock before that lock is released, so an admission that holds admission.lock always sees it.
+# main's head into the root's kept state. Any job comes first. take_capacity stops it and waits for its locks to
+# go before it takes its own; the listener gate counts what it holds as free, never counts it as a fleet build
+# waiting for the host, and stops it instead of holding a runner off for load or heat. So a mini never stops
+# listening or refuses a job because of it. It names its pid (the leader of the process group its build runs in)
+# and locks in WARM_HOLDER, written under admission.lock before that lock is released, so an admission that holds
+# admission.lock always sees it.
 WARM_HOLDER = "idle-warm.json"
 WARM_PROGRAM = "glaeda-idle-warm"
-WARM_YIELD_S = 15.0
+WARM_YIELD_S = 5.0
+# A holder whose pid is gone may leave its build running (the catch-up was SIGKILLed): its process group is
+# killed too, but only while the file is this recent, so a long-stale file never reaches a reused id.
+WARM_ORPHAN_S = 50 * 60
+
+
+def is_idle_warm(command: str) -> bool:
+    """Whether a ps command line is glaeda-idle-warm itself (the program or the script its interpreter runs)."""
+    return any(os.path.basename(word) == WARM_PROGRAM for word in command.split()[:2])
+
+
+def warm_holder(capacity_dir: Path) -> tuple[int, set[str], float] | None:
+    """The idle catch-up holder file's pid, lock names and age in seconds, or None when there is none that parses."""
+    path = capacity_dir / WARM_HOLDER
+    raw = read_bounded(path)
+    holder = json.loads(raw.decode("utf-8")) if raw is not None else None
+    pid = holder.get("pid") if isinstance(holder, dict) else None
+    held = holder.get("held") if isinstance(holder, dict) else None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or not isinstance(held, list):
+        return None
+    return pid, {str(name) for name in held if isinstance(name, str)}, time.time() - path.stat().st_mtime
 
 
 def idle_warm(capacity_dir: Path) -> tuple[int, set[str]] | None:
@@ -1107,39 +1129,45 @@ def idle_warm(capacity_dir: Path) -> tuple[int, set[str]] | None:
     The file is written by a process of this user, so it is read bounded and trusted only as far as its pid is
     alive and is glaeda-idle-warm: a stale file whose pid was reused never gets another process signalled."""
     try:
-        raw = read_bounded(capacity_dir / WARM_HOLDER)
-        holder = json.loads(raw.decode("utf-8")) if raw is not None else None
-        pid = holder.get("pid") if isinstance(holder, dict) else None
-        held = holder.get("held") if isinstance(holder, dict) else None
-        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or not isinstance(held, list):
+        holder = warm_holder(capacity_dir)
+        if holder is None or holder[0] == os.getpid() or not pid_alive(holder[0]):
             return None
-        if pid == os.getpid() or not pid_alive(pid):
-            return None
-        command = subprocess.run(["/bin/ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
-                                 timeout=5).stdout
-        if WARM_PROGRAM not in command:
-            return None
-        return pid, {str(name) for name in held if isinstance(name, str)}
+        command = subprocess.run(["/bin/ps", "-o", "command=", "-p", str(holder[0])], capture_output=True,
+                                 text=True, timeout=5).stdout
+        return (holder[0], holder[1]) if is_idle_warm(command) else None
     except Exception:  # noqa: BLE001 - a holder file must never refuse or fail a job
         return None
 
 
+def kill_warm_group(pid: int) -> None:
+    """SIGKILL what is left of the catch-up's process group (its build), once its leader PID is gone."""
+    with contextlib.suppress(OSError):
+        os.killpg(pid, signal.SIGKILL)
+
+
 def yield_idle_warm(capacity_dir: Path) -> str:
     """Stop a running idle catch-up so this job gets its locks; a note for the admission line, or ''."""
-    warm = idle_warm(capacity_dir)
-    if warm is None:
+    try:
+        warm = idle_warm(capacity_dir)
+        if warm is None:
+            holder = warm_holder(capacity_dir)
+            if holder is not None and holder[2] < WARM_ORPHAN_S and not pid_alive(holder[0]):
+                kill_warm_group(holder[0])  # a SIGKILLed catch-up's build, still in its process group
+            return ""
+        pid = warm[0]
+        deadline = time.monotonic() + WARM_YIELD_S
+        for signum in (signal.SIGTERM, signal.SIGKILL):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signum)
+            while pid_alive(pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if not pid_alive(pid):
+                kill_warm_group(pid)
+                return f"; stopped the idle catch-up (pid {pid})"
+            deadline = time.monotonic() + 2.0
+        return f"; the idle catch-up (pid {pid}) did not stop"
+    except Exception:  # noqa: BLE001 - yielding must never refuse or fail a job
         return ""
-    pid = warm[0]
-    deadline = time.monotonic() + WARM_YIELD_S
-    for signum in (signal.SIGTERM, signal.SIGKILL):
-        with contextlib.suppress(OSError):
-            os.kill(pid, signum)
-        while pid_alive(pid) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if not pid_alive(pid):
-            return f"; stopped the idle catch-up (pid {pid})"
-        deadline = time.monotonic() + 2.0
-    return f"; the idle catch-up (pid {pid}) did not stop"
 
 
 def holder_file(state_dir: Path) -> Path:
@@ -1202,8 +1230,10 @@ def lock_waiters(path: str, ours: set[int]) -> list[int]:
                                  check=False).stdout
     except (OSError, subprocess.TimeoutExpired):
         return []  # cannot tell a fleet build from our own admission: no waiter, as when lsof cannot tell
+    # The idle catch-up holds it shared, like a job, and gives way to any job: not a fleet build either.
     fleet = {int(line.split(None, 1)[0]) for line in listing.splitlines()
-             if line.strip() and PREFIX not in line and line.split(None, 1)[0].isdigit()}
+             if line.strip() and PREFIX not in line and line.split(None, 1)[0].isdigit()
+             and not is_idle_warm(line.split(None, 1)[1] if len(line.split(None, 1)) > 1 else "")}
     return [pid for pid in pids if pid in fleet]  # a pid gone since lsof is not waiting either
 
 
@@ -1787,7 +1817,16 @@ class Gate:
             why = f"a fleet build is waiting for the host (pid {min(self.waiting)})"
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
-        return why or self.saturated() or self.full() or self.hot()
+        return why or self.shed(self.saturated()) or self.full() or self.shed(self.hot())
+
+    def shed(self, why: str | None) -> str | None:
+        """A load or thermal hold while the idle catch-up runs stops the catch-up instead: holding the runners
+        off would keep away the only thing that makes it stop. The next poll reads the mini without it."""
+        if why and self.capacity_dir is not None and idle_warm(self.capacity_dir) is not None:
+            gate_log(f"{why}: stopping the idle catch-up instead of holding the runner off")
+            yield_idle_warm(self.capacity_dir)
+            return None
+        return why
 
     def saturated(self) -> str | None:
         """mini_saturated with this gate's hysteresis and hold limit. Checked before mini_full, so a mini both
@@ -1837,7 +1876,7 @@ class Gate:
                 why = f"a fleet build is waiting for the host (pid {min(again)})"
         if why:
             self.load_since = None
-        return why or self.saturated() or self.full(fresh=True) or self.hot(fresh=True)
+        return why or self.shed(self.saturated()) or self.full(fresh=True) or self.shed(self.hot(fresh=True))
 
     def full(self, fresh: bool = False) -> str | None:
         """Every unit this runner's jobs could take is held. A look an admission blocked keeps the previous

@@ -78,9 +78,11 @@ FAILURE_BACKOFF_S = 6 * 3600  # after FAILURES_TO_PAUSE failed builds in a row
 FAILURES_TO_PAUSE = 3
 KEEP_LOGS = 12
 PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+GIT = shutil.which("git", path=PATH) or "/usr/bin/git"
 
 _child: subprocess.Popen | None = None
 _holder: Path | None = None
+_grouped = False  # we lead the process group the build runs in
 
 
 def record(**fields: Any) -> dict[str, Any]:
@@ -90,10 +92,21 @@ def record(**fields: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------- gates
 
 
-def host_denied(name: str | None = None) -> str:
-    host = (name or socket.gethostname()).lower().removesuffix(".local")
-    if host in NEVER_HOSTS or any(word in host for word in NEVER_HOST_WORDS):
-        return f"{host} never runs an idle catch-up"
+def host_names() -> list[str]:
+    """Every name this Mac goes by: its hostname and, on macOS, its LocalHostName and ComputerName."""
+    names = [socket.gethostname()]
+    for key in ("LocalHostName", "ComputerName"):
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            names.append(subprocess.run(["/usr/sbin/scutil", "--get", key], capture_output=True, text=True,
+                                        timeout=5).stdout.strip())
+    return [name for name in names if name]
+
+
+def host_denied(names: list[str] | None = None) -> str:
+    for name in names if names is not None else host_names():
+        host = name.lower().split(".")[0].replace(" ", "-").replace("\u2019", "").replace("'", "")
+        if host in NEVER_HOSTS or any(word in host for word in NEVER_HOST_WORDS):
+            return f"{host} never runs an idle catch-up"
     return ""
 
 
@@ -145,7 +158,7 @@ def runner_setup(dirs: list[Path]) -> tuple[Any, dict[str, Any]] | str:
 
 
 def running() -> str:
-    """The first running job or build, or '' when none. Unknown counts as busy."""
+    """The first running job or build (its executable's name), or '' when none. Unknown counts as busy."""
     try:
         out = subprocess.run(["/bin/ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
@@ -154,7 +167,8 @@ def running() -> str:
         return "cannot list processes"
     for command in out.stdout.splitlines():
         if BUSY.search(command):
-            return command.strip()[:120]
+            words = command.split()
+            return os.path.basename(words[0]) if words else "a build"
     return ""
 
 
@@ -203,8 +217,13 @@ def idle_refusal(hook: Any, now: float, state: Path) -> str:
         return "cannot read free disk"
     if free < MIN_FREE_BYTES:
         return f"{free / 1024**3:.0f} GiB free, under {MIN_FREE_BYTES / 1024**3:.0f}"
-    held = hook.host_held(os.fspath(FLEET_DIR / "host.lock"), os.fspath(FLEET_DIR / "reservation.json"), now)
-    return held or ""
+    host_lock = os.fspath(FLEET_DIR / "host.lock")
+    held = hook.host_held(host_lock, os.fspath(FLEET_DIR / "reservation.json"), now)
+    if held:
+        return held
+    if os.path.exists(host_lock) and hook.lock_waiters(host_lock, set()):
+        return "a fleet build is waiting for the host lock"  # flock has no writer preference: let it in
+    return ""
 
 
 # ---------------------------------------------------------------- which root
@@ -214,12 +233,17 @@ def main_head(state: Path) -> str:
     """Main's head as the seed prefetch last fetched it (its blobless mirror), or ''."""
     mirror = state / ".prefetch" / "cmux.git"
     try:
-        out = subprocess.run(["git", "-C", os.fspath(mirror), "rev-parse", "refs/remotes/origin/main"],
+        out = subprocess.run([GIT, "-C", os.fspath(mirror), "rev-parse", "refs/remotes/origin/main"],
                              capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return ""
     head = out.stdout.strip()
     return head if out.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", head) else ""
+
+
+# Which far root first: a known rebuild, then far, then a kept build the hook could not compare, then a root with
+# no kept build at all (a cold build, the costliest to warm).
+TIER_ORDER = {"rebuild": 0, "far": 1, "unknown": 2, "cold": 3}
 
 
 def pick_root(hook: Any, roots: int, head: str, state: Path, memory: dict[str, Any]) -> tuple[int, dict] | str:
@@ -228,15 +252,18 @@ def pick_root(hook: Any, roots: int, head: str, state: Path, memory: dict[str, A
     ranked, predicted = hook.warm_root_costs(order, head, None, os.fspath(state))
     if not ranked:
         return "cannot compare the kept builds with main's head (no mirror, model or stamp)"
-    done = memory.get("roots", {})
+    done = memory.get("roots")
+    done = done if isinstance(done, dict) else {}
     far = []
     for copy in order:
         guess = predicted.get(f"root-{copy + 1}") or {}
-        if guess.get("tier") in (None, "near"):
-            continue
-        if (done.get(str(copy + 1)) or {}).get("head") == head:
+        tier = guess.get("tier")
+        if tier not in TIER_ORDER:
+            continue  # near, or not predicted
+        last = done.get(str(copy + 1))
+        if isinstance(last, dict) and last.get("head") == head:
             continue  # built, or tried, for this head already
-        far.append((-(guess.get("seconds") or 0), -(guess.get("app_swift_files") or 0), copy))
+        far.append((TIER_ORDER[tier], -(guess.get("app_swift_files") or 0), copy))
     if not far:
         return "every root is near main's head, or was warmed for it"
     return sorted(far)[0][2] + 1, predicted
@@ -306,31 +333,74 @@ def take(hook: Any, capacity: Path, setup: dict[str, Any], root: int) -> tuple[l
 
 
 def release(fds: list[int]) -> None:
+    """Close the locks first, then drop the holder file: a holder file that outlives the locks only makes an
+    admission look for a catch-up that is gone, while locks that outlive the file would refuse it."""
     global _holder
-    if _holder is not None:
-        with contextlib.suppress(OSError):
-            if json.loads(_holder.read_text()).get("pid") == os.getpid():
-                _holder.unlink()
-        _holder = None
     for fd in fds:
         with contextlib.suppress(OSError):
             os.close(fd)
+    if _holder is not None:
+        with contextlib.suppress(OSError, ValueError):
+            if json.loads(_holder.read_text()).get("pid") == os.getpid():
+                _holder.unlink()
+        _holder = None
+
+
+def own_group() -> bool:
+    """Lead a process group of our own, which the build joins, so one killpg ends both (and so does the hook's)."""
+    try:
+        if os.getpgid(0) != os.getpid():
+            os.setpgid(0, 0)
+        return os.getpgid(0) == os.getpid()
+    except OSError:
+        return False
+
+
+def kill_build() -> None:
+    """SIGKILL every other process in our group (the build and anything it started), a few passes."""
+    me = os.getpid()
+    for _ in range(3):
+        try:
+            out = subprocess.run(["/bin/ps", "-axo", "pid=,pgid="], capture_output=True, text=True, timeout=2).stdout
+        except (OSError, subprocess.SubprocessError):
+            return
+        members = [int(pid) for pid, pgid in (line.split() for line in out.splitlines() if len(line.split()) == 2)
+                   if pgid.isdigit() and pid.isdigit() and int(pgid) == me and int(pid) != me]
+        if not members:
+            return
+        for pid in members:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        time.sleep(0.05)
+
+
+def forget_inode_override() -> None:
+    """The adopt steps set a per-user Xcode default that the build step deletes after the compile; a kill
+    in between leaves it set for the user's other builds. No job runs while a catch-up does, so none needs it."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(["/usr/bin/defaults", "delete", "com.apple.dt.XCBuild", "IgnoreFileSystemDeviceInodeChanges"],
+                       capture_output=True, timeout=3)
 
 
 def stop(signum: int, _frame: Any) -> None:
-    """A job's admission wants the locks: kill the build at once and exit, which releases them."""
+    """A job's admission (or launchd) wants us gone: end the build, then ourselves with the rest of the group.
+    The kernel drops the locks with the last fd; the hook ignores a holder file whose pid is dead, and kills
+    whatever of the group is left once we are gone."""
     if _child is not None:
         with contextlib.suppress(OSError):
-            os.killpg(_child.pid, signal.SIGKILL)
-    release([])
-    os._exit(128 + signum)  # the lock fds close with the process
+            _child.kill()
+    if _grouped:
+        kill_build()
+        forget_inode_override()
+        os.killpg(os.getpid(), signal.SIGKILL)
+    os._exit(128 + signum)
 
 
 # ---------------------------------------------------------------- build
 
 
 def git(checkout: Path, *args: str, timeout: int = GIT_TIMEOUT_S) -> None:
-    subprocess.run(["git", "-C", os.fspath(checkout), *args], check=True, capture_output=True, timeout=timeout,
+    subprocess.run([GIT, "-C", os.fspath(checkout), *args], check=True, capture_output=True, timeout=timeout,
                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
 
 
@@ -339,8 +409,9 @@ def prepare_checkout(work: Path, head: str) -> None:
     checkout = work / "cmux"
     if not (checkout / ".git").is_dir():
         shutil.rmtree(checkout, ignore_errors=True)
-        subprocess.run(["git", "clone", "-q", "--no-checkout", REPO_URL, os.fspath(checkout)], check=True,
-                       capture_output=True, timeout=GIT_TIMEOUT_S, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        subprocess.run([GIT, "clone", "-q", "--no-checkout", REPO_URL, os.fspath(checkout)], check=True,
+                       capture_output=True, timeout=GIT_TIMEOUT_S,
+                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
     git(checkout, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main")
     git(checkout, "cat-file", "-e", f"{head}^{{commit}}", timeout=60)
     git(checkout, "-c", "advice.detachedHead=false", "checkout", "-q", "--force", "--detach", head)
@@ -350,32 +421,47 @@ def prepare_checkout(work: Path, head: str) -> None:
     git(checkout, "submodule", "foreach", "-q", "--recursive", "git clean -ffdxq")
 
 
+def last_result(log: Path) -> dict[str, Any]:
+    """The build's result line: the last JSON line in its log's tail."""
+    try:
+        with open(log, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 65536))
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return {}
+    for line in reversed(lines):
+        if line.startswith('{"kept"'):
+            with contextlib.suppress(ValueError):
+                result = json.loads(line)
+                if isinstance(result, dict):
+                    return result
+    return {}
+
+
 def build(checkout: Path, root: int, state: Path, xcode: str, log: Path) -> dict[str, Any]:
+    """Run cmux's owned_catch_up.sh in our process group, its output appended to LOG; its result line."""
     global _child
     env = {key: value for key, value in os.environ.items() if not key.startswith(("GITHUB_", "RUNNER_", "CMUX_"))}
     env.update(PATH=PATH, CMUX_CI_XCODE_APP=xcode, CMUX_CATCH_UP_LOG=os.fspath(log))
     started = time.monotonic()
-    _child = subprocess.Popen(["/usr/bin/nice", "-n", "5", "/bin/bash", "scripts/ci/owned_catch_up.sh", str(root),
-                               os.fspath(state)], cwd=checkout, env=env, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    with open(log, "ab") as output:
+        _child = subprocess.Popen(["/usr/bin/nice", "-n", "5", "/bin/bash", "scripts/ci/owned_catch_up.sh", str(root),
+                                   os.fspath(state)], cwd=checkout, env=env, stdin=subprocess.DEVNULL,
+                                  stdout=output, stderr=subprocess.STDOUT)
     try:
-        out, _ = _child.communicate(timeout=BUILD_TIMEOUT_S)
+        code = _child.wait(timeout=BUILD_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        with contextlib.suppress(OSError):
-            os.killpg(_child.pid, signal.SIGKILL)
-        _child.communicate()
-        return {"kept": "false", "reason": f"timed out after {BUILD_TIMEOUT_S} s"}
+        kill_build() if _grouped else _child.kill()
+        _child.wait()
+        return {"kept": "false", "reason": f"timed out after {BUILD_TIMEOUT_S} s",
+                "wall_seconds": round(time.monotonic() - started, 1)}
     finally:
-        code = _child.returncode
         _child = None
-    lines = [line for line in (out or "").splitlines() if line.startswith("{")]
-    try:
-        result = json.loads(lines[-1]) if lines else {}
-    except ValueError:
-        result = {}
-    if not isinstance(result, dict) or not result:
-        tail = (out or "").strip().splitlines()[-1:] or [""]
-        result = {"kept": "false", "reason": f"exit {code}: {tail[0][:160]}"}
+    kill_build()  # anything the build left running in our group (a detached build service)
+    result = last_result(log)
+    if not result:
+        result = {"kept": "false", "reason": f"exit {code}, no result line"}
     result["wall_seconds"] = round(time.monotonic() - started, 1)
     return result
 
@@ -391,11 +477,16 @@ def trim_logs(logs: Path) -> None:
 
 
 def load_memory(path: Path) -> dict[str, Any]:
+    """What earlier runs recorded (per-root heads, failures, pause); a missing or malformed file starts over."""
     try:
         memory = json.loads(path.read_text())
     except (OSError, ValueError):
-        return {}
-    return memory if isinstance(memory, dict) else {}
+        memory = {}
+    if not isinstance(memory, dict):
+        memory = {}
+    if not isinstance(memory.get("roots"), dict):
+        memory["roots"] = {}
+    return memory
 
 
 def save_memory(path: Path, memory: dict[str, Any]) -> None:
@@ -405,6 +496,7 @@ def save_memory(path: Path, memory: dict[str, Any]) -> None:
 
 
 def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
+    global _grouped
     now = time.time() if now is None else now
     if platform.system() != "Darwin":
         return record(state="skip", reason="not macOS")
@@ -456,6 +548,9 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
         why = idle_refusal(hook, time.time(), state)
         if why:
             return {**base, "state": "skip", "reason": why}
+        _grouped = own_group()
+        if not _grouped:
+            return {**base, "state": "skip", "reason": "cannot lead a process group for the build"}
         for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             signal.signal(signum, stop)
         taken = take(hook, FLEET_DIR / "capacity", scope, root)
@@ -474,8 +569,7 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
         finally:
             release(fds)
         kept = result.get("kept") == "true"
-        roots = memory.setdefault("roots", {})
-        roots[str(root)] = {"head": head, "at": int(time.time()), "kept": kept}
+        memory["roots"][str(root)] = {"head": head, "at": int(time.time()), "kept": kept}
         memory["failures"] = 0 if kept else int(memory.get("failures") or 0) + 1
         if memory["failures"] >= FAILURES_TO_PAUSE:
             memory["paused_until"] = int(time.time()) + FAILURE_BACKOFF_S

@@ -678,12 +678,12 @@ rebuild-tier from main's head, and each mini had sat fully idle 17 to 33% of the
 
 - **When.** No Runner.Worker or xcodebuild, no job started or ended for 10 minutes, 1-minute load under
   0.25 per core, thermal pressure nominal, at least 136 GiB free (the 100 GiB admission floor plus a cold
-  compile), no reservation or fleet build. Never on cmux-mac-mini (hostname cmuxs-Mac-mini-5, the production
+  compile), no reservation, no fleet build holding or waiting for the host lock. Never on cmux-mac-mini (hostname cmuxs-Mac-mini-5, the production
   iOS soak box) or Lawrence's machines, never next to a trusted-only runner (a seeder), and only on
   capacity-mode runners. `touch ~/.config/glaeda/idle-warm.disabled` stops it on one mini.
 - **Which root.** The hook's own prediction (`warm_root_costs`) of each root's compile for main's head, from
-  the seed prefetch's mirror and the job-written model: the costliest far or rebuild root that was not
-  already built, or tried, for that head. Three failed builds in a row pause it for six hours.
+  the seed prefetch's mirror and the job-written model: a rebuild root first, then far, then one it could not
+  compare, then one with no kept build (a cold build), skipping any already built or tried for that head. Three failed builds in a row pause it for six hours.
 - **How.** It loads the hook the runners run (from their `glaeda-hooks/`) and refuses if that hook predates
   the yield below, so a rollout in either order is safe. Under `capacity/admission.lock` it takes the root's
   token, a persistent-dd token and a compile's units, with the host lock shared, writes
@@ -693,10 +693,15 @@ rebuild-tier from main's head, and each mini had sat fully idle 17 to 33% of the
   compile, keep with main's head as `merged_onto`, save). Logs: `ci/.catch-up/logs/`, one line per run in
   `~/Library/Logs/glaeda-idle-warm.jsonl`.
 - **Jobs come first.** Every admission (`take_capacity`, under admission.lock) sends the catch-up SIGTERM and
-  waits up to 15 s for it to exit, which releases its locks; it kills its build's process group at once. The
-  listener gate (`mini_full`) counts what the catch-up holds as free, so a mini never stops listening because
-  of it. A kill at any step leaves the kept state as it was, or unstamped (the next job takes a seed); never a
-  partial build marked warm. The holder file is trusted only while its pid is alive and is glaeda-idle-warm.
+  waits up to 5 s for it to exit, then SIGKILLs it. The catch-up leads its own process group and its build runs
+  in it, so one `killpg` ends both and the kernel drops the locks with the last fd; the hook then kills what is
+  left of that group, which also ends the build of a catch-up something else SIGKILLed (holder file under 50
+  minutes old, pid dead). The listener gate counts what the catch-up holds as free, never counts it as a fleet
+  build waiting for the host (it holds host.lock shared, like a job), and when it would hold a runner off for
+  load or heat while the catch-up runs, it stops the catch-up instead. So a mini never stops listening or
+  refuses a job because of it. A kill at any step leaves the kept state as it was, or unstamped (the next job
+  takes a seed); never a partial build marked warm. The holder file is trusted only while its pid is alive and
+  its program is glaeda-idle-warm.
 - **Trust.** The build is main's own code, run as the build user on a PR mini. Pull requests admitted to that
   root already share its kept state, so this adds no new boundary. No GitHub token reaches it.
 
