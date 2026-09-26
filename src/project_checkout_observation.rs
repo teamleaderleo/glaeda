@@ -15,6 +15,16 @@ use serde::Serialize;
 
 pub const PROJECT_CHECKOUT_OBSERVATION_SCHEMA_VERSION: u8 = 2;
 pub const PROJECT_CHECKOUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for the reads whose cost scales with the working tree: `status` and `ls-files`.
+///
+/// `status` stats every tracked file and walks every non-ignored directory. On a Mac with a load
+/// average above 100, an 18,000-file checkout's status spent under a second of CPU but 10 to 54
+/// seconds of wall time, so the general deadline refused most of a 144-worktree repository as
+/// unobservable. A hung Git still fails closed, just later.
+pub const PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT: Duration = Duration::from_secs(180);
+const _: () = assert!(
+    PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT.as_secs() > PROJECT_CHECKOUT_COMMAND_TIMEOUT.as_secs()
+);
 pub const MAX_PROJECT_CHECKOUT_OUTPUT_BYTES: usize = 65_536;
 /// Bound for the one read that scales with index size: one mode line per tracked file.
 ///
@@ -383,10 +393,11 @@ impl ProjectCheckoutObserver {
         let (primary_project, source_ambiguous) = select_primary_project(&remotes);
         let raw_status = self.read_status(checkout, executor)?;
         let status = parse_status(&raw_status)?;
-        let modes = self.git_bounded(
+        let modes = self.git_with_limits(
             checkout,
             &["ls-files", "--format=%(objectmode)"],
             MAX_PROJECT_INDEX_MODE_OUTPUT_BYTES,
+            PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT,
             executor,
         )?;
         require_success(&modes)?;
@@ -463,7 +474,7 @@ impl ProjectCheckoutObserver {
             return Err(unavailable());
         }
 
-        let record = self.git(
+        let record = self.git_with_limits(
             checkout,
             &[
                 "status",
@@ -473,6 +484,8 @@ impl ProjectCheckoutObserver {
                 "--untracked-files=all",
                 "--ignore-submodules=all",
             ],
+            MAX_PROJECT_CHECKOUT_OUTPUT_BYTES,
+            PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT,
             executor,
         )?;
         require_success(&record)?;
@@ -554,7 +567,13 @@ impl ProjectCheckoutObserver {
         let expected_environment_keys = spec.environment.keys().cloned().collect::<Vec<_>>();
         let record = executor
             .execute_with_timeout(&spec, timeout)
-            .map_err(|_| unavailable())?;
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    timed_out()
+                } else {
+                    unavailable()
+                }
+            })?;
         if record.argv != expected_argv
             || record.environment_keys != expected_environment_keys
             || record.stdout.len() > max_stdout_bytes
@@ -843,6 +862,29 @@ fn unavailable() -> ProjectCheckoutObservationError {
     )
 }
 
+/// Kept under the `Unavailable` kind, since callers treat both alike; the code tells them apart.
+fn timed_out() -> ProjectCheckoutObservationError {
+    error(
+        ProjectCheckoutObservationErrorKind::Unavailable,
+        "observation_timed_out",
+        "a Git read did not finish before its deadline",
+    )
+}
+
+/// The deadline [`ProjectCheckoutObserver`] gives the Git command `spec`, for scripted executors.
+#[cfg(test)]
+pub(crate) fn expected_git_timeout(spec: &CommandSpec) -> Duration {
+    let argv = spec.displayed_argv();
+    if argv
+        .iter()
+        .any(|argument| argument == "status" || argument == "ls-files")
+    {
+        PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT
+    } else {
+        PROJECT_CHECKOUT_COMMAND_TIMEOUT
+    }
+}
+
 fn invalid_output() -> ProjectCheckoutObservationError {
     error(
         ProjectCheckoutObservationErrorKind::InvalidOutput,
@@ -864,8 +906,8 @@ mod tests {
     use crate::project_workspace_identity::ProjectWorkspaceIdentityGeneration;
 
     use super::{
-        PROJECT_CHECKOUT_COMMAND_TIMEOUT, ProjectBranchState, ProjectCheckoutObservationErrorKind,
-        ProjectCheckoutObserver,
+        ProjectBranchState, ProjectCheckoutObservationErrorKind, ProjectCheckoutObserver,
+        expected_git_timeout,
     };
 
     const COMMIT: &str = "1111111111111111111111111111111111111111";
@@ -947,7 +989,7 @@ mod tests {
             spec: &CommandSpec,
             timeout: std::time::Duration,
         ) -> io::Result<ExecutionRecord> {
-            assert_eq!(timeout, PROJECT_CHECKOUT_COMMAND_TIMEOUT);
+            assert_eq!(timeout, expected_git_timeout(spec));
             self.commands.borrow_mut().push(spec.clone());
             let response = self
                 .responses
@@ -1001,6 +1043,34 @@ mod tests {
         responses.extend(snapshot.clone());
         responses.extend(snapshot);
         responses
+    }
+
+    struct TimingOutExecutor;
+
+    impl CommandExecutor for TimingOutExecutor {
+        fn execute(&self, _spec: &CommandSpec) -> io::Result<ExecutionRecord> {
+            panic!("checkout observation must use the timed executor")
+        }
+    }
+
+    impl TimedCommandExecutor for TimingOutExecutor {
+        fn execute_with_timeout(
+            &self,
+            _spec: &CommandSpec,
+            _timeout: std::time::Duration,
+        ) -> io::Result<ExecutionRecord> {
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        }
+    }
+
+    #[test]
+    fn deadline_is_reported_apart_from_other_failures() {
+        let checkout = TempDirectory::new("deadline");
+        let error = observer()
+            .git(checkout.path(), &["status"], &TimingOutExecutor)
+            .expect_err("timed out");
+        assert_eq!(error.kind, ProjectCheckoutObservationErrorKind::Unavailable);
+        assert_eq!(error.code, "observation_timed_out");
     }
 
     #[test]
