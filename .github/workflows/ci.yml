@@ -512,6 +512,10 @@ jobs:
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
           cat "$first_receipt"
 
+      # The front door's cargo run is --offline: fetch and build first, as cargo test did when these ran in one job.
+      - name: Build the CLI
+        run: cargo build --locked
+
       - name: Exercise root Glaeda front door
         run: |
           ./glaeda --output json | jq -e '
