@@ -2,7 +2,7 @@
 """glaeda-seed-serve: stream one kept DerivedData seed from the trusted seeder to a PR mini over SSH.
 
     authorized_keys on the seeder (written by scripts/glaeda-seed-lan install):
-        restrict,from="<LAN>",command="/usr/bin/python3 ~/.local/libexec/glaeda-seed-serve" ssh-ed25519 ... glaeda-seed-lan@<mini>
+        restrict,from="<LAN>",command="/usr/bin/python3 -I ~/.local/libexec/glaeda-seed-serve" ssh-ed25519 ... glaeda-seed-lan@<mini>
 
 This runs only as that forced command. The client's requested command arrives in SSH_ORIGINAL_COMMAND:
 
@@ -27,8 +27,12 @@ The seeder must build only trusted code. The glaeda runner receipt on the host m
 refused. That catches an operator moving the seeder into the PR pool without removing this key. It is
 not a defence against PR code already running here, which could rewrite the receipt and the seeds.
 
-At most SLOTS serves run at once (flock), at nice 10 with utility disk I/O, so the seeder's own seed job
-keeps the machine. Each request appends one JSON line to RUN_DIR/serve.jsonl (bounded, rotated).
+PR jobs on the minis can read the client key, so every limit here holds against a hostile client:
+one request at a time per client address (a flock on client-<ip>), at most QUEUE requests past that at
+all (queue-<n>.lock, taken without waiting: beyond it the answer is `busy` at once), of which at most
+SLOTS stream (flock, SLOT_WAIT to get one), each for at most SERVE_TIMEOUT seconds however slowly the
+client reads. Streams run at nice 10 with utility disk I/O, so the seeder's own seed job keeps the
+machine. The forced command runs python3 -I: no user site-packages, no PYTHON* variables. Each request appends one JSON line to RUN_DIR/serve.jsonl (bounded, rotated).
 The options below are fixed by the authorized_keys command, never by the client.
 """
 
@@ -54,8 +58,10 @@ MAX_REQUEST = 16384
 MANIFEST = "cmux-seed-input-mtimes.json"  # seed_derived_data.MANIFEST
 CODECS = ("zstd", "tar")
 SLOTS = 2
+QUEUE = 4  # requests past the per-client guard, streaming or waiting for a slot
 SLOT_WAIT = 60
-SERVE_TIMEOUT = 900
+# A seed streams in ~25 s (zstd) or ~80 s (plain tar) at LAN speed; a client that reads slower loses it.
+SERVE_TIMEOUT = 180
 LOG_BYTES = 1 << 20
 STATE = "/Users/Shared/cmux-build-fleet/ci"
 RUN_DIR = "~/.local/state/glaeda/seed-serve"
@@ -140,6 +146,30 @@ def find(state: Path, keys: list[str]) -> tuple[Path, str] | None:
     return None
 
 
+def try_lock(path: Path) -> int | None:
+    """An fd holding an exclusive flock on PATH, or None when another process holds it."""
+    fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except OSError:
+        os.close(fd)
+        return None
+
+
+def admit(run_dir: Path, client: str) -> list[int] | None:
+    """The fds of this client's lock and a queue place, or None (answer busy at once)."""
+    mine = try_lock(run_dir / f"client-{client.replace(':', '_')}.lock")
+    if mine is None:
+        return None
+    for place in range(QUEUE):
+        fd = try_lock(run_dir / f"queue-{place}.lock")
+        if fd is not None:
+            return [mine, fd]
+    os.close(mine)
+    return None
+
+
 def take_slot(run_dir: Path, wait: float) -> int | None:
     """An fd holding one of SLOTS exclusive flocks, or None when all stay taken for WAIT seconds."""
     deadline = time.monotonic() + wait
@@ -203,7 +233,8 @@ def stream(seeds: Path, key: str, codec: str) -> int:
 
 def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, slot_wait: float) -> int:
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    record: dict = {"time": int(time.time()), "client": client if IP_RE.fullmatch(client) else "?"}
+    client = client if IP_RE.fullmatch(client) else "unknown"
+    record: dict = {"time": int(time.time()), "client": client}
     try:
         verb, codec, keys = parse_request(request)
         if not trusted(receipt):
@@ -228,17 +259,21 @@ def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, 
         os.nice(10)
     except OSError:
         pass
-    slot = take_slot(run_dir, slot_wait)
+    admitted = admit(run_dir, client)
+    slot = take_slot(run_dir, slot_wait) if admitted is not None else None
     if slot is None:
+        for fd in admitted or []:
+            os.close(fd)
         say("busy")
-        log(run_dir, {**record, "outcome": "busy", "key": key})
+        log(run_dir, {**record, "outcome": "busy", "key": key, "queued": admitted is not None})
         return 4
     started = time.monotonic()
     try:
         say(f"hit {key} {codec}")
         status = stream(seeds, key, codec)
     finally:
-        os.close(slot)
+        for fd in [slot, *admitted]:
+            os.close(fd)
     log(run_dir, {**record, "outcome": "served" if status == 0 else "failed", "key": key, "codec": codec,
                   "distance": keys.index(key), "status": status, "seconds": round(time.monotonic() - started, 1)})
     return 0 if status == 0 else 5

@@ -97,6 +97,9 @@ KEEP_SCRIPTS = 2  # extracted scripts/ci trees, by main commit
 # cmux seed_derived_data.py: the manifest every complete seed holds, and how far back seeds are looked for.
 MANIFEST = "cmux-seed-input-mtimes.json"
 ANCESTOR_LIMIT = 50
+# cmux's scripts run under Homebrew's python3, as its jobs do; without one, this agent's own interpreter
+# (reported in the record as cmux_python, since it may be Apple's 3.9).
+CMUX_PYTHONS = ("/opt/homebrew/bin/python3", "/usr/local/bin/python3")
 
 # Seeds over the LAN from the trusted seeder (glaeda-seed-serve). Written by glaeda-seed-lan install; the
 # key and the seeder's host key sit beside it under fixed names. Without it the LAN step is off.
@@ -118,6 +121,11 @@ KEY_RE = re.compile(r"admission-derived-data-v1-[A-Za-z0-9]{1,16}-[A-Za-z0-9]{1,
 ADDRESS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:-]{0,252}")
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 SERVE_HEADER = b"glaeda-seed-serve 1 "
+HEADER_SCAN_BYTES = 4096
+# While a job or build runs, the extraction is paced to this many raw tar bytes a second, so 9 GB of seed
+# lands in ~140 s beside the job's compile rather than as fast as the disk takes it (and inside the
+# seeder's 180 s serve limit).
+LAN_BUSY_RATE = 64 * 1024**2
 
 
 def running_commands() -> list[str] | None:
@@ -245,7 +253,7 @@ def cmux_python() -> str:
 
     This agent runs under /usr/bin/python3 (3.9) for Local Network Privacy; cmux's scripts target its jobs' python3.
     """
-    for candidate in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
+    for candidate in CMUX_PYTHONS:
         if os.access(candidate, os.X_OK):
             return candidate
     return sys.executable
@@ -325,17 +333,24 @@ def ssh_command(config: dict, address: str, request: str) -> list[str]:
             "-l", config["user"], address, request]
 
 
-def read_header(fd: int) -> bytes:
-    """The serve header line, read a byte at a time so the stream after it stays in the pipe."""
-    line = b""
-    while len(line) < 512:
+def read_header(fd: int, limit: int = HEADER_SCAN_BYTES) -> bytes:
+    """The serve header line, read a byte at a time so the stream after it stays in the pipe.
+
+    Lines the seeder's login shell may print first (a noisy ~/.zshenv) are skipped, up to LIMIT bytes.
+    Returns b"" when no header came.
+    """
+    seen, line = 0, b""
+    while seen < limit:
         byte = os.read(fd, 1)
         if not byte:
-            break
+            return b""
+        seen += 1
         line += byte
         if byte == b"\n":
-            break
-    return line
+            if line.startswith(SERVE_HEADER):
+                return line
+            line = b""
+    return b""
 
 
 class Pipeline:
@@ -374,7 +389,7 @@ class Pipeline:
 
 
 def lan_attempt(run: Pipeline, config: dict, address: str, request: str, keys: list[str], codec: str,
-                staging: Path) -> dict | None:
+                staging: Path, rate: int | None = None) -> dict | None:
     """One address: the result, or None when it could not be reached (then the next address is tried)."""
     with tempfile.TemporaryFile() as ssh_err, tempfile.TemporaryFile() as tar_err:
         ssh = run.spawn(ssh_command(config, address, request), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -411,12 +426,17 @@ def lan_attempt(run: Pipeline, config: dict, address: str, request: str, keys: l
         tar = run.spawn([TAR, "-x", "-f", "-", "-C", os.fspath(staging)], stdin=subprocess.PIPE,
                         stdout=subprocess.DEVNULL, stderr=tar_err)
         total, over, into_tar = 0, False, True
+        paced = time.monotonic()
         try:
             while True:
                 chunk = os.read(source.fileno(), 1 << 20)
                 if not chunk:
                     break
                 total += len(chunk)
+                if rate:  # busy: pace to RATE raw bytes a second
+                    ahead = paced + total / rate - time.monotonic()
+                    if ahead > 0:
+                        time.sleep(ahead)
                 if total > LAN_MAX_BYTES:
                     over = True
                     run.stop()
@@ -449,7 +469,7 @@ def lan_attempt(run: Pipeline, config: dict, address: str, request: str, keys: l
         return {"fetched": "true", "key": key, "distance": keys.index(key), "codec": their_codec, "bytes": total}
 
 
-def lan_stream(config: dict, keys: list[str], staging: Path, timeout: float) -> dict:
+def lan_stream(config: dict, keys: list[str], staging: Path, timeout: float, rate: int | None = None) -> dict:
     """Ask the seeder for the first of KEYS it keeps and extract it into STAGING; addresses in order."""
     codec = "zstd" if zstd_tool() else "tar"
     request = " ".join(["seed-v1", codec, *keys])
@@ -468,7 +488,7 @@ def lan_stream(config: dict, keys: list[str], staging: Path, timeout: float) -> 
         timer = threading.Timer(timeout, run.expire)
         timer.start()
         try:
-            result = lan_attempt(run, config, address, request, keys, codec, staging)
+            result = lan_attempt(run, config, address, request, keys, codec, staging, rate)
         finally:
             timer.cancel()
             for signum, handler in previous.items():
@@ -479,7 +499,8 @@ def lan_stream(config: dict, keys: list[str], staging: Path, timeout: float) -> 
     return {"fetched": "false", "reason": "unreachable: " + "; ".join(unreachable)[:300]}
 
 
-def lan_fetch(store: Path, mirror: Path, head: str, config: dict, timeout: float = LAN_TIMEOUT) -> dict:
+def lan_fetch(store: Path, mirror: Path, head: str, config: dict, timeout: float = LAN_TIMEOUT,
+              rate: int | None = None) -> dict:
     """Fetch main's nearest seed from the trusted seeder into STORE/seeds; never raises.
 
     The stream lands in STORE/seeds/.lan-<pid>, is checked, and is renamed into place. Any failure removes
@@ -501,7 +522,7 @@ def lan_fetch(store: Path, mirror: Path, head: str, config: dict, timeout: float
     except OSError as error:
         return {"fetched": "false", "reason": f"staging: {type(error).__name__}"}
     try:
-        result = lan_stream(config, keys, staging, timeout)
+        result = lan_stream(config, keys, staging, timeout, rate)
         if result.get("fetched") != "true":
             return result
         key = result["key"]
@@ -620,6 +641,8 @@ def run(apply: bool, state: Path = STATE) -> dict:
             return {**record, "state": "error", "reason": f"scripts: {type(error).__name__}"}
         results = {}
         lan_settings = lan_config()
+        if cmux_python() == sys.executable and sys.executable not in CMUX_PYTHONS:
+            record["cmux_python"] = f"{sys.executable} (no Homebrew python3)"
         for store in pending:
             near = near_seed(mirror, store, head)
             if near is not None:
@@ -627,8 +650,13 @@ def run(apply: bool, state: Path = STATE) -> dict:
                 continue
             # LAN first. R2 always runs after it: it finds a LAN seed already kept (and prunes), or fetches
             # a nearer seed than the seeder had.
-            lan = lan_fetch(store, mirror, head, lan_settings) if lan_settings else None
             why = busy()
+            lan = None
+            if lan_settings:
+                lan = lan_fetch(store, mirror, head, lan_settings, rate=LAN_BUSY_RATE if why else None)
+                if why:
+                    lan["paced"] = f"{LAN_BUSY_RATE}B/s, busy"
+                why = busy()  # the LAN step may have taken a while
             result = prefetch(scripts, store, head, mirror, throttled=bool(why))
             if why:
                 result["throttled"] = f"{BUSY_RATE}B/s, busy: {why}"

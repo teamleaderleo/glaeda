@@ -301,6 +301,36 @@ if mode == "serve":
     os.environ["SSH_ORIGINAL_COMMAND"] = request
     os.execv(sys.executable, [sys.executable, os.environ["FAKE_SERVE"], "--state", os.environ["FAKE_SEEDER_STATE"],
                               "--run-dir", os.environ["FAKE_SERVE_RUN"], "--receipt", os.environ["FAKE_RECEIPT"]])
+def hostile(entries):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.GNU_FORMAT) as tar:
+        for name, kind, value in entries:
+            info = tarfile.TarInfo(name)
+            if kind == "file":
+                info.size = len(value); tar.addfile(info, io.BytesIO(value))
+            else:
+                info.type = tarfile.SYMTYPE if kind == "symlink" else tarfile.LNKTYPE
+                info.linkname = value; tar.addfile(info)
+    return buf.getvalue()
+outside = os.environ.get("FAKE_OUTSIDE", "/nonexistent")
+manifest = (keys[0] + "/cmux-seed-input-mtimes.json", "file", b"{}") if keys else None
+if mode == "dotdot":
+    header(f"hit {keys[0]} tar")
+    os.write(1, hostile([manifest, (keys[0] + "/../../../escape-dotdot", "file", b"x"),
+                         ("../escape-top", "file", b"x")])); sys.exit(0)
+if mode == "symlink":
+    header(f"hit {keys[0]} tar")
+    os.write(1, hostile([manifest, (keys[0] + "/link", "symlink", outside),
+                         (keys[0] + "/link/escape-symlink", "file", b"x")])); sys.exit(0)
+if mode == "hardlink":
+    header(f"hit {keys[0]} tar")
+    os.write(1, hostile([manifest, (keys[0] + "/hard", "hardlink", outside + "/target"),
+                         (keys[0] + "/hard", "file", b"pwned")])); sys.exit(0)
+if mode == "noisy":  # a login shell that prints before the forced command runs
+    os.write(1, b"Last login: yesterday\\nwelcome to cmux15\\n")
+    os.environ["SSH_ORIGINAL_COMMAND"] = request
+    os.execv(sys.executable, [sys.executable, os.environ["FAKE_SERVE"], "--state", os.environ["FAKE_SEEDER_STATE"],
+                              "--run-dir", os.environ["FAKE_SERVE_RUN"], "--receipt", os.environ["FAKE_RECEIPT"]])
 if mode == "silent":
     time.sleep(60)
 if mode == "garbage":
@@ -477,6 +507,62 @@ class LanSeedTest(PrefetchBase):
                 self.assertIn(reason, lan["reason"])
                 self.assertFalse((self.state / "seeds" / self.key(head)).exists())
                 self.assertEqual(sorted(p.name for p in (self.state / "seeds").iterdir()), [])
+
+    def test_a_hostile_tar_writes_nothing_outside_staging(self):
+        self.record(self.state)
+        head = self.commit()
+        base = Path(self.tmp.name)
+        outside = base / "outside"
+        outside.mkdir()
+        (outside / "target").write_text("original")
+        os.environ["FAKE_OUTSIDE"] = os.fspath(outside)
+        for mode in ("dotdot", "symlink", "hardlink"):
+            with self.subTest(mode=mode):
+                os.environ["FAKE_SSH_MODE"] = mode
+                lan = self.lan()
+                self.assertEqual([p for p in base.rglob("escape-*")], [])
+                self.assertEqual(sorted(p.name for p in outside.iterdir()), ["target"])
+                self.assertEqual(((outside / "target").read_text(), (outside / "target").stat().st_nlink),
+                                 ("original", 1))
+                self.assert_clean()
+                if lan["fetched"] == "true":  # the tool refused the escape and kept the rest
+                    seed = self.state / "seeds" / self.key(head)
+                    self.assertTrue(sp.seed_complete(seed))
+                    self.assertEqual([p for p in seed.rglob("*") if p.is_symlink() and
+                                      not os.path.realpath(p).startswith(os.path.realpath(seed))], [])
+                    shutil.rmtree(seed)
+
+    def test_lines_a_login_shell_prints_before_the_header_are_skipped(self):
+        self.record(self.state)
+        head = self.commit()
+        self.seeder_keeps(head)
+        os.environ["FAKE_SSH_MODE"] = "noisy"
+        lan = self.lan()
+        self.assertEqual((lan["fetched"], lan["key"]), ("true", self.key(head)))
+        r, w = os.pipe()
+        os.write(w, b"x" * (sp.HEADER_SCAN_BYTES + 10) + b"\nglaeda-seed-serve 1 hit k tar\n")
+        os.close(w)
+        self.assertEqual(sp.read_header(r), b"")  # only the first HEADER_SCAN_BYTES are searched
+        os.close(r)
+
+    def test_a_busy_mini_paces_the_lan_extraction(self):
+        self.record(self.state)
+        head = self.commit()
+        os.environ["FAKE_SSH_MODE"] = "big"
+        started = time.monotonic()
+        lan = self.lan(rate=100000)  # ~210 KB of tar at 100 KB/s
+        self.assertEqual(lan["fetched"], "true", lan)
+        self.assertGreater(time.monotonic() - started, 1.5)
+        shutil.rmtree(self.state / "seeds" / self.key(head))
+        sp.running_commands = lambda: ["/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2"]
+        saved = sp.LAN_BUSY_RATE
+        sp.LAN_BUSY_RATE = 10 ** 9
+        try:
+            result = sp.run(True, self.state)["results"][os.fspath(self.state)]
+        finally:
+            sp.LAN_BUSY_RATE = saved
+        self.assertIn("paced", result["lan"])
+        self.assertIn("throttled", result)
 
     def test_padding_tar_leaves_unread_is_drained(self):
         self.record(self.state)

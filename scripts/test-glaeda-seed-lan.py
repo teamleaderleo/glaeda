@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import fcntl
 import hashlib
@@ -16,7 +17,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -167,6 +170,39 @@ class ServeTest(unittest.TestCase):
             for fd in held:
                 os.close(fd)
 
+    def hold(self, names: list[str]) -> list[int]:
+        self.run_dir.mkdir(exist_ok=True)
+        fds = []
+        for name in names:
+            fd = os.open(self.run_dir / name, os.O_RDONLY | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fds.append(fd)
+        return fds
+
+    def test_a_flood_of_waiters_is_answered_busy_at_once(self):
+        self.keep(KEY)
+        held = self.hold([f"queue-{n}.lock" for n in range(serve.QUEUE)])
+        try:
+            started = time.monotonic()
+            code, out, _ = self.ask(f"seed-v1 tar {KEY}", slot_wait=60)
+            self.assertEqual((code, out), (4, b"glaeda-seed-serve 1 busy\n"))
+            self.assertLess(time.monotonic() - started, 10)  # no 60 s slot wait
+        finally:
+            for fd in held:
+                os.close(fd)
+
+    def test_one_request_at_a_time_per_client(self):
+        self.keep(KEY)
+        held = self.hold(["client-172.20.21.196.lock"])
+        try:
+            started = time.monotonic()
+            self.assertEqual(self.ask(f"seed-v1 tar {KEY}", slot_wait=60)[:2], (4, b"glaeda-seed-serve 1 busy\n"))
+            self.assertLess(time.monotonic() - started, 10)
+        finally:
+            os.close(held[0])
+        self.assertEqual(self.ask(f"seed-v1 tar {KEY}")[0], 0)
+        self.assertLessEqual(serve.SERVE_TIMEOUT, 180)
+
     def test_the_log_stays_bounded(self):
         self.run_dir.mkdir()
         (self.run_dir / "serve.jsonl").write_text("x" * (serve.LOG_BYTES + 1))
@@ -188,7 +224,7 @@ homes = os.environ["FAKE_HOMES"]
 if host not in os.listdir(homes):
     sys.stderr.write("ssh: Could not resolve hostname\\n"); sys.exit(255)
 env = {**os.environ, "HOME": os.path.join(homes, host)}
-command = command.replace("/usr/bin/python3 -", sys.executable + " -", 1)
+command = command.replace("/usr/bin/python3 -I -", sys.executable + " -I -", 1)
 sys.exit(subprocess.run(["/bin/sh", "-c", command], env=env).returncode)
 """
 
@@ -264,7 +300,7 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(serve_path.stat().st_mode & 0o777, 0o755)
         lines = self.authorized()
         self.assertEqual(lines[0], self.foreign)
-        command = f"/usr/bin/python3 {self.seeder}/.local/libexec/glaeda-seed-serve"
+        command = f"/usr/bin/python3 -I {self.seeder}/.local/libexec/glaeda-seed-serve"
         for host in ("cmux12s-mac-mini", "cmux13s-mac-mini"):
             conf = self.homes / host / ".config/glaeda/seed-lan"
             self.assertEqual(conf.stat().st_mode & 0o777, 0o700)
@@ -325,6 +361,74 @@ class InstallerTest(unittest.TestCase):
                 except SystemExit as exit_:
                     code = exit_.code
                 self.assertNotEqual(code, 0)
+
+    def test_malformed_or_duplicate_client_keys_are_refused(self):
+        self.install("cmux12s-mac-mini")
+        pub = self.homes / "cmux12s-mac-mini/.config/glaeda/seed-lan/id_ed25519.pub"
+        good = pub.read_text()
+        before = self.authorized()
+        for bad in ("ssh-ed25519 !!!notbase64 x\n", "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ x\n",
+                    "ssh-ed25519 " + base64.b64encode(b"\0\0\0\x0bssh-ed25519\0\0\0\x10" + b"k" * 16).decode() + " x\n"):
+            with self.subTest(bad=bad[:20]):
+                pub.write_text(bad)
+                code, report = self.install("cmux12s-mac-mini")
+                self.assertEqual(code, 1)
+                self.assertIn("not a well-formed", report["hosts"]["cmux12s-mac-mini"]["authorized"])
+                self.assertEqual(self.authorized(), before)
+        pub.write_text(good)
+        # Another mini carrying the same key (copied), and a key already on a foreign line.
+        other = self.homes / "cmux13s-mac-mini/.config/glaeda/seed-lan"
+        other.mkdir(parents=True)
+        for name in ("id_ed25519", "id_ed25519.pub"):
+            shutil.copy(pub.parent / name, other / name)
+        code, report = self.install("cmux13s-mac-mini")
+        self.assertEqual(code, 1)
+        self.assertIn("already authorized", report["hosts"]["cmux13s-mac-mini"]["authorized"])
+        self.assertFalse(any("glaeda-seed-lan@cmux13s-mac-mini" in line for line in self.authorized()))
+        self.cli("remove", "--seeder", "cmux15", "cmux12s-mac-mini", "--apply")
+        with (self.seeder / ".ssh/authorized_keys").open("a") as ak:
+            ak.write(" ".join(good.split()[:2]) + " someone-else\n")
+        code, report = self.install("cmux13s-mac-mini")
+        self.assertIn("already authorized", report["hosts"]["cmux13s-mac-mini"]["authorized"])
+        self.assertEqual(lan.ed25519_blob(" ".join(good.split()[:2])) is not None, True)
+
+    def test_a_symlinked_authorized_keys_or_a_forbidden_host_name_is_refused(self):
+        ak = self.seeder / ".ssh/authorized_keys"
+        real = self.seeder / "ak-real"
+        ak.rename(real)
+        ak.symlink_to(real)
+        code, report = self.install("cmux12s-mac-mini")
+        self.assertEqual(code, 1)
+        self.assertIn("symlink", report["error"])
+        self.assertTrue(ak.is_symlink())
+        ak.unlink()
+        real.rename(ak)
+        os.environ["GLAEDA_SEED_LAN_NAMES"] = "cmuxs-mac-mini-6"  # the probe's LocalHostName
+        code, report = self.install("cmux12s-mac-mini")
+        self.assertEqual(code, 1)
+        self.assertIn("never be a seed source", report["error"])
+
+    def test_old_authorized_keys_backups_are_pruned(self):
+        state = self.seeder / ".local/state/glaeda/seed-lan"
+        state.mkdir(parents=True)
+        for n in range(8):
+            (state / f"authorized_keys.20260101T00000{n}Z.1").write_text("old")
+        self.install("cmux12s-mac-mini")
+        self.assertEqual(len(list(state.glob("authorized_keys.*"))), lan.KEEP_BACKUPS)
+
+    def test_remote_python_runs_isolated_and_ssh_forwards_nothing(self):
+        for option in ("-a", "-x", "ForwardAgent=no", "ClearAllForwardings=yes", "BatchMode=yes"):
+            self.assertIn(option, lan.SSH_OPTIONS)
+        calls = []
+        real = subprocess.run
+
+        def spy(argv, **kwargs):
+            calls.append(argv)
+            return real(argv, **kwargs)
+
+        with unittest.mock.patch.object(lan.subprocess, "run", spy):
+            self.install("cmux12s-mac-mini", apply=False)
+        self.assertTrue(calls and all(c[-1].startswith("/usr/bin/python3 -I - ") for c in calls))
 
     def test_remove_drops_only_its_own_lines(self):
         self.install("cmux12s-mac-mini", "cmux13s-mac-mini")

@@ -245,14 +245,21 @@ def apple_python(platform_name: str = HOST_PLATFORM) -> str | None:
     macOS Local Network Privacy refuses LAN connections from a LaunchAgent whose program is not Apple's,
     children included (2026-09-25: a Homebrew python3 agent and its /usr/bin/ssh got "No route to host").
     The seed prefetch agent streams seeds from the trusted seeder over the LAN, so it runs Apple's python3.
+    It must also run: a broken xcode-select or an unaccepted Xcode licence makes /usr/bin/python3 fail,
+    and then the agent keeps the other interpreter (losing only the LAN step, not the prefetch).
     """
     if platform_name == "linux":
         return None
-    if Path("/Library/Developer/CommandLineTools/usr/bin/python3").exists() or any(
+    if not (Path("/Library/Developer/CommandLineTools/usr/bin/python3").exists() or any(
         Path("/Applications").glob("Xcode*.app")
-    ):
-        return "/usr/bin/python3"
-    return None
+    )):
+        return None
+    try:
+        probe = subprocess.run(["/usr/bin/python3", "-I", "-c", "pass"], stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return "/usr/bin/python3" if probe.returncode == 0 else None
 
 
 _ENROLL: Any = None

@@ -16,7 +16,7 @@ reads only. `install --apply`:
    alias glaeda-seeder (read over this Mac's authenticated SSH session to the seeder, never scanned), and
    config.json (the seeder's addresses and login user), which glaeda-seed-prefetch reads;
 3. on the seeder, authorizes each mini's key with
-   restrict,from="CIDRS",command="/usr/bin/python3 ~/.local/libexec/glaeda-seed-serve"
+   restrict,from="CIDRS",command="/usr/bin/python3 -I ~/.local/libexec/glaeda-seed-serve"
    (no shell, pty, port, agent or X11 forwarding), after copying authorized_keys aside;
 4. asks each HOST to ping the seeder with that key (ping-v1) and reports the answer.
 
@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -47,7 +48,8 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 SSH = "/usr/bin/ssh"  # from this Mac to each host
 CLIENT_SSH = "/usr/bin/ssh"  # from a mini to the seeder (the ping check)
-SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+SSH_OPTIONS = ["-a", "-x", "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes",
+               "-o", "ConnectTimeout=10"]
 # PR code runs there as the fleet user, so seeds it keeps may be tainted. Never a source.
 NEVER_SEEDERS = {"cmuxs-mac-mini-6"}
 DEFAULT_FROM = "172.20.20.0/22"
@@ -55,6 +57,7 @@ TAG = "glaeda-seed-lan@"
 HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
 CIDR_RE = re.compile(r"[0-9a-fA-F.:]{2,45}(/[0-9]{1,3})?")
 REMOTE_TIMEOUT = 120
+KEEP_BACKUPS = 5
 
 
 def prefetch_module():
@@ -68,13 +71,20 @@ def prefetch_module():
 
 # Runs on the seeder under /usr/bin/python3 (3.9). Prints one JSON object.
 SEEDER_REMOTE = r'''
-import base64, hashlib, json, os, sys, time
+import base64, hashlib, json, os, subprocess, sys, time
 args = json.loads(sys.argv[1])
 home = os.path.expanduser("~")
 serve = os.path.join(home, ".local/libexec/glaeda-seed-serve")
 ak = os.path.join(home, ".ssh/authorized_keys")
-command = "/usr/bin/python3 " + serve
-out = {"home": home, "command": command}
+command = "/usr/bin/python3 -I " + serve
+out = {"home": home, "command": command, "ak_symlink": os.path.islink(ak)}
+names = []
+for argv in (["/usr/sbin/scutil", "--get", "LocalHostName"], ["/bin/hostname", "-s"]):
+    try:
+        names.append(subprocess.run(argv, capture_output=True, text=True, timeout=10).stdout.strip())
+    except Exception:
+        pass
+out["names"] = [n for n in names if n] + [n for n in os.environ.get("GLAEDA_SEED_LAN_NAMES", "").split(",") if n]
 try:
     member = json.load(open(os.path.join(home, ".local/state/glaeda/cmux-runner/receipt.json"))).get("member") or {}
     out["trusted_ref"] = member.get("trustedRef") or ""
@@ -96,7 +106,16 @@ def ours(line):
     words = line.split()
     return bool(words) and words[-1].startswith(args["tag"]) and ('command="' + command + '"') in line
 out["authorized"] = {line.split()[-1]: line for line in lines if ours(line)}
+def blob(line):
+    words = line.split()
+    for i, word in enumerate(words[:-1]):
+        if word.startswith(("ssh-", "ecdsa-", "sk-")):
+            return words[i + 1]
+    return ""
+out["foreign_blobs"] = sorted({blob(l) for l in lines if l.strip() and not l.lstrip().startswith("#") and not ours(l)} - {""})
 mode = args["mode"]
+if mode != "probe" and out["ak_symlink"]:
+    sys.exit("authorized_keys is a symlink; refusing to replace it")
 if mode == "probe" or (out["trusted_ref"] == "" and mode == "apply"):
     print(json.dumps(out)); sys.exit(0)
 changed = []
@@ -128,6 +147,9 @@ if new != lines:
             dst.write(src.read())
         os.chmod(backup, 0o600)
         out["backup"] = backup
+        backups = sorted(f for f in os.listdir(state) if f.startswith("authorized_keys."))
+        for old in backups[:-args.get("keep_backups", 5)]:
+            os.unlink(os.path.join(state, old))
     os.makedirs(os.path.dirname(ak), mode=0o700, exist_ok=True)
     tmp = ak + ".glaeda-seed-lan.%d" % os.getpid()
     with open(tmp, "w") as f:
@@ -196,7 +218,8 @@ class Failure(Exception):
 
 def remote(host: str, program: str, args: dict) -> dict:
     """Run PROGRAM with ARGS (JSON) under /usr/bin/python3 on HOST over SSH; its JSON answer."""
-    command = "/usr/bin/python3 - " + shlex.quote(json.dumps(args))
+    # -I: no user site-packages, no PYTHON* variables, and no ~/json.py shadowing the standard library.
+    command = "/usr/bin/python3 -I - " + shlex.quote(json.dumps(args))
     try:
         proc = subprocess.run([SSH, *SSH_OPTIONS, host, command], input=program, capture_output=True, text=True,
                               timeout=REMOTE_TIMEOUT)
@@ -210,9 +233,27 @@ def remote(host: str, program: str, args: dict) -> dict:
         raise Failure(f"{host}: unreadable answer") from error
 
 
+def ed25519_blob(public_key: str) -> bytes | None:
+    """The key blob of a well-formed "ssh-ed25519 BASE64" public key, else None."""
+    words = public_key.split()
+    if len(words) != 2 or words[0] != "ssh-ed25519":
+        return None
+    try:
+        blob = base64.b64decode(words[1], validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    name = b"ssh-ed25519"
+    expected = len(name).to_bytes(4, "big") + name + (32).to_bytes(4, "big")
+    return blob if len(blob) == len(expected) + 32 and blob.startswith(expected) else None
+
+
 def fingerprint(public_key: str) -> str:
     blob = base64.b64decode(public_key.split()[1])
     return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def comment_of(host: str) -> str:
+    return TAG + host
 
 
 def check_names(seeder: str, hosts: list[str], addresses: list[str], cidrs: str) -> None:
@@ -238,6 +279,11 @@ def install(seeder: str, hosts: list[str], addresses: list[str], cidrs: str, use
     serve_sha = hashlib.sha256(serve).hexdigest()
     report: dict = {"tool": "glaeda-seed-lan", "mode": "install", "apply": apply, "seeder": seeder, "hosts": {}}
     probe = remote(seeder, SEEDER_REMOTE, {"mode": "probe", "tag": TAG})
+    forbidden = {name.lower() for name in NEVER_SEEDERS}
+    if any(name.lower() in forbidden for name in probe.get("names", [])):
+        raise Failure(f"{seeder} is {probe['names']}, which runs PR code: it can never be a seed source")
+    if probe.get("ak_symlink"):
+        raise Failure(f"{seeder}: ~/.ssh/authorized_keys is a symlink; refusing to replace it")
     if not probe["trusted_ref"]:
         raise Failure(f"{seeder}: its glaeda runner receipt names no trusted ref; refusing to serve seeds from it")
     if not probe["host_key"].startswith("ssh-ed25519 "):
@@ -248,16 +294,23 @@ def install(seeder: str, hosts: list[str], addresses: list[str], cidrs: str, use
     known_hosts = f"{pm.LAN_HOST_KEY_ALIAS} {probe['host_key']}\n"
     config = json.dumps({"schema": 1, "seeder": seeder, "user": user, "addresses": addresses}, indent=1) + "\n"
     options = f'restrict,from="{cidrs}",command="{probe["command"]}"'
-    lines, manifest_keys = [], []
+    lines, manifest_keys, seen = [], [], set()
     for host in hosts:
-        comment = TAG + host
+        comment = comment_of(host)
         state = remote(host, CLIENT_REMOTE, {"mode": "apply" if apply else "probe", "comment": comment,
                                             "known_hosts": known_hosts, "config": config})
         entry = {"changed": state.get("changed", []),
                  "config": "current" if state["config"] == config else ("stale" if state["config"] else "missing"),
                  "known_hosts": "current" if state["known_hosts"] == known_hosts else "stale or missing"}
         public_key = state.get("public_key", "")
-        if public_key.startswith("ssh-ed25519 "):
+        blob = public_key.split()[1] if ed25519_blob(public_key) else ""
+        others = {line.split()[-2] for comment, line in probe["authorized"].items() if comment != comment_of(host)}
+        if public_key and not blob:
+            entry["authorized"] = "refused: not a well-formed ssh-ed25519 key"
+        elif blob and (blob in probe.get("foreign_blobs", []) or blob in others or blob in seen):
+            entry["authorized"] = "refused: this key is already authorized on the seeder for something else"
+        elif blob:
+            seen.add(blob)
             line = f"{options} {public_key} {comment}"
             lines.append(line)
             entry["fingerprint"] = fingerprint(public_key)
@@ -271,6 +324,7 @@ def install(seeder: str, hosts: list[str], addresses: list[str], cidrs: str, use
         report["hosts"][host] = entry
     if apply:
         done = remote(seeder, SEEDER_REMOTE, {"mode": "apply", "tag": TAG, "serve_sha": serve_sha,
+                                              "keep_backups": KEEP_BACKUPS,
                                               "serve_b64": base64.b64encode(serve).decode(), "lines": lines})
         report["seeder_state"]["changed"] = done.get("changed", [])
         if done.get("backup"):
@@ -289,6 +343,7 @@ def install(seeder: str, hosts: list[str], addresses: list[str], cidrs: str, use
         "check under launchd on one HOST: launchctl kickstart -k gui/$(id -u)/com.teamleaderleo.glaeda.seed-prefetch, "
         "then tail -n 1 ~/Library/Logs/glaeda-seed-prefetch.jsonl (look for results.*.lan)",
     ] if apply else ["rerun with --apply"]
+    report["ok"] = not any(str(h.get("authorized", "")).startswith("refused") for h in report["hosts"].values())
     return report
 
 
@@ -337,7 +392,7 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"tool": "glaeda-seed-lan", "error": str(error)}))
         return 1
     print(json.dumps(report, indent=1))
-    return 0
+    return 0 if report.get("ok", True) else 1
 
 
 if __name__ == "__main__":

@@ -543,14 +543,21 @@ takes 190 to 280 s.
   glaeda runner receipt names a trusted ref. If cmux15 joins the PR pool, run `glaeda-seed-lan remove`
   first.
 - **One-way.** Each mini's own key is authorized on the seeder only as
-  `restrict,from="172.20.20.0/22",command="/usr/bin/python3 ~/.local/libexec/glaeda-seed-serve"`: no shell,
+  `restrict,from="172.20.20.0/22",command="/usr/bin/python3 -I ~/.local/libexec/glaeda-seed-serve"`: no shell,
   pty or forwarding. The forced command reads the request (`seed-v1 CODEC KEY...`), accepts only keys that
   match the seed key pattern (no path, no option), looks each up as a real directory holding the seed
   manifest, and streams the first it keeps. Nothing a mini sends is written anywhere except the serve log.
   The key on a PR mini is readable by PR jobs; all it grants is reading seeds that are public in R2
   anyway, from the LAN, two at a time.
-- **Seeder load.** At most two serves at once (flock slots, 60 s wait, then `busy`), at nice 10 with
-  utility disk I/O.
+- **Seeder load, against a hostile client.** One request at a time per client address, at most four
+  requests in flight (further ones get `busy` at once), at most two streaming (60 s wait for a slot),
+  each cut off after 180 s however slowly the client reads; nice 10 and utility disk I/O. The forced
+  command runs `python3 -I` (no user site-packages or PYTHON* variables).
+- **Mini load.** While a job runs, the LAN extraction is paced to 64 MiB/s (about 140 s for a seed).
+- **Remaining exposure.** A PR job on a mini can rewrite `~/.config/glaeda/seed-lan/config.json` and
+  `known_hosts` (same user), pointing that mini's LAN step at another host. That host could only feed
+  that mini a seed, which a PR job there can already write directly; the seeder and other minis are
+  unaffected. A follow-up could have `glaeda-mini-fleet check` hash both files.
 - **Integrity.** The mini extracts into `seeds/.lan-<pid>`, requires exactly one top-level directory
   named by the requested key with `cmux-seed-input-mtimes.json`, caps the stream at 16 GiB, and renames it
   into place. Any failure removes the staging directory. R2's prefetch then runs unchanged: it finds the
