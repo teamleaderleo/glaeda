@@ -1419,7 +1419,10 @@ def descendants(root: int, table: dict[int, tuple[int, str]]) -> list[int]:
 
 
 def gate_log(message: str) -> None:
-    print(f"{GATE}: {message}", flush=True)
+    """One gate line, stamped like the runner's own lines (`2026-09-25 23:31:11Z: ...`): the runner log keeps
+    weeks of gate lines, and unstamped ones read as current (09-25: thermal holds from before a 13:10Z reboot
+    were taken for live ones at 23:00Z). Readers match the text after the stamp (glaeda-cmux-runner GATE_HELD)."""
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime())}: {GATE}: {message}", flush=True)
 
 
 class Adopted:
