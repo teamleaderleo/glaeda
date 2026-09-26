@@ -1102,6 +1102,75 @@ def holder_file(state_dir: Path) -> Path:
     return state_dir / (f"{HOLDER_FILE}-{name}.pid" if name else f"{HOLDER_FILE}.pid")
 
 
+# A fleet build that yields the host to runner jobs (cmuxterm-hq catch-up/fill-main.py, the fleet-cas main fill
+# on the writer mini) writes its pid to <host lock>.yield while it waits for or holds the host lock. The gate
+# then keeps listening through it, and a job that meets it preempts it instead of being refused: the hook
+# writes <host lock>.preempted, sends the pid SIGTERM (the fill stops its build and releases the lock) and
+# waits up to PREEMPT_WAIT_S for the lock. A fresh DerivedData seed saves more PR compile time than one more
+# main fill, which the next quiet tick redoes from the compile cache (cmux#14792 follow-up). The marker is
+# only a hint: the pid must be alive for the gate, and must hold or wait on the lock (lsof) to be signalled.
+YIELD_SUFFIX = ".yield"
+PREEMPTED_SUFFIX = ".preempted"
+PREEMPT_WAIT_S = 90.0
+
+
+def yielding_pid(host_lock: str) -> int | None:
+    """The live pid <host_lock>.yield names, or None. Bounded and untrusted: a regular file of a few bytes."""
+    path = host_lock + YIELD_SUFFIX
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 32:
+            return None
+        pid = int(Path(path).read_text().strip())
+    except (OSError, ValueError):
+        return None
+    if pid <= 1:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def preempt_yielding(host_lock: str, job: str) -> str | None:
+    """Stop the yielding fleet build holding host_lock (yielding_pid) so this job can have the host; a note
+    for the log, or None when nothing yields. The pid must have the lock open (lsof), so a stale or planted
+    marker never gets an unrelated process signalled."""
+    pid = yielding_pid(host_lock)
+    if pid is None:
+        return None
+    try:
+        out = subprocess.run([LSOF, "-t", "--", host_lock], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, timeout=5, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if str(pid) not in out.split():
+        return None
+    with contextlib.suppress(OSError):
+        incoming = f"{host_lock}{PREEMPTED_SUFFIX}.{os.getpid()}"
+        Path(incoming).write_text(json.dumps({"by": job[:120], "at": int(time.time())}) + "\n")
+        os.replace(incoming, host_lock + PREEMPTED_SUFFIX)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return None
+    return f"preempted the yielding fleet build (pid {pid})"
+
+
+def wait_host_shared(fd: int, seconds: float) -> bool:
+    """A shared flock on fd, retried for up to `seconds` (after preempt_yielding)."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
+
+
 def close_all(fds: list[int]) -> None:
     for fd in fds:
         with contextlib.suppress(OSError):
@@ -1120,8 +1189,21 @@ def take_host_lock(path: str, watch_pid: int, state_dir: Path) -> tuple[bool, st
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        os.close(fd)
-        return False, "another build holds the fleet host lock"
+        preempted = preempt_yielding(path, os.environ.get("GITHUB_JOB") or "a job")
+        deadline = time.monotonic() + PREEMPT_WAIT_S
+        while preempted:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                print(f"{PREFIX}: {preempted}", flush=True)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    preempted = None
+                else:
+                    time.sleep(0.5)
+        if not preempted:
+            os.close(fd)
+            return False, "another build holds the fleet host lock"
     held, note = hold([fd], watch_pid, state_dir)
     return held, (f"holding the fleet host lock for this job ({note})" if held else note)
 
@@ -1213,11 +1295,18 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                     break
                 except OSError:
                     if attempt == 5:
-                        os.close(fd)
-                        return False, "capacity: a fleet build holds the host lock"
+                        preempted = preempt_yielding(host_lock, job or "a job")
+                        if preempted is None or not wait_host_shared(fd, PREEMPT_WAIT_S):
+                            os.close(fd)
+                            return False, ("capacity: a fleet build holds the host lock"
+                                           + (f" ({preempted}, still held after {PREEMPT_WAIT_S:g} s)"
+                                              if preempted else ""))
+                        print(f"{PREFIX}: {preempted}", flush=True)
+                        break
                     time.sleep(0.1)
             fds.append(fd)
-            waiting = lock_waiters(host_lock, holder_pids(state_dir))
+            yielding = yielding_pid(host_lock)
+            waiting = lock_waiters(host_lock, holder_pids(state_dir) | ({yielding} if yielding else set()))
             # lsof sees only this user's processes, which is how the fleet worker runs today.
             if waiting:  # flock has no writer preference: stop admitting so the build worker gets in
                 return False, f"capacity: a fleet build is waiting for the host (pid {waiting[0]})"
@@ -1588,7 +1677,8 @@ def host_held(host_lock: str, reservation: str, now: float) -> str | None:
     try:
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
     except OSError:
-        return "a fleet build holds the host lock"
+        # A yielding build (yielding_pid) gives way to the next job: keep listening through it.
+        return None if yielding_pid(host_lock) else "a fleet build holds the host lock"
     finally:
         os.close(fd)  # drops the probe's shared lock too
     return None
@@ -1599,7 +1689,8 @@ def host_waiters(host_lock: str, state_dir: Path) -> set[int]:
     most every GATE_WAITER_EVERY_S, and a stop needs the same pid in two readings."""
     if not os.path.exists(host_lock):
         return set()
-    return set(lock_waiters(host_lock, holder_pids(state_dir)))
+    yielding = yielding_pid(host_lock)
+    return set(lock_waiters(host_lock, holder_pids(state_dir) | ({yielding} if yielding else set())))
 
 
 def processes() -> dict[int, tuple[int, str]]:
