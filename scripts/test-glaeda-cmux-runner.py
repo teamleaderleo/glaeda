@@ -1279,6 +1279,9 @@ class HookTest(unittest.TestCase):
         for klass in {*hook.JOB_CLASSES.values(), *hook.WORKFLOW_JOB_CLASSES.values()}:
             self.assertIn(klass, hook.CLASS_COST)
         self.assertEqual(hook.job_class("rerun", home, home, "app-host-test-rerun.yml"), ("gui", False))
+        self.assertEqual(hook.job_class("cdp-browser-smoke", home, home, "cmux-tui.yml"), ("isolated", False))
+        self.assertEqual(hook.job_class("build", home, home, "reload-build.yml"), ("isolated", False))
+        self.assertEqual(hook.job_class("build", home, home, "nightly.yml"), ("compile", True))
         self.assertEqual(hook.job_class("rerun", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("release-build", home, home, "ci.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("macos-compile-admission", home, home, "ci.yml"), ("compile", False))
