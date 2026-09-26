@@ -398,7 +398,7 @@ def git_state(path: Path, depth: int = 5, budget: int = 20000) -> str:
                         if e.is_dir(follow_symlinks=False):
                             if e.name not in REPRODUCIBLE_DIRS:
                                 nxt.append(e.path)
-                            elif os.path.lexists(os.path.join(e.path, ".git")):
+                            elif os.path.lexists(os.path.join(e.path, ".git")) or looks_like_repository(e.path):
                                 return "git"  # e.g. `git clone x target`; not searched deeper
             except PermissionError:
                 return "unchecked"
@@ -434,7 +434,7 @@ def checkouts(path: Path, depth: int = 5, budget: int = 20000) -> list[Path] | N
                         if e.is_dir(follow_symlinks=False):
                             if e.name not in REPRODUCIBLE_DIRS:
                                 nxt.append(e.path)
-                            elif os.path.lexists(os.path.join(e.path, ".git")):
+                            elif os.path.lexists(os.path.join(e.path, ".git")) or looks_like_repository(e.path):
                                 found.append(Path(e.path))  # as git_state: not searched deeper
             except PermissionError:
                 return None
@@ -722,8 +722,11 @@ def git_common_dir(path: Path) -> str:
     """The repository of a linked worktree, so its record can be pruned after deletion."""
     if not (path / ".git").is_file():
         return ""
-    r = subprocess.run(["git", "-C", str(path), "rev-parse", "--path-format=absolute",
-                        "--git-common-dir"], capture_output=True, text=True, timeout=60)
+    try:
+        r = subprocess.run(["git", "-C", str(path), "rev-parse", "--path-format=absolute",
+                            "--git-common-dir"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""  # callers treat an unknown repository as one to keep
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
