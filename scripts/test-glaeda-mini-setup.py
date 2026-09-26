@@ -223,6 +223,10 @@ class MiniSetupTest(unittest.TestCase):
             # dedupe is never urgent; pressure must still free space while a build fills the disk
             self.assertEqual(doc.get("ProcessType"),
                              "Background" if label in ("disk-dedupe", "fleet-cas-prune", "seed-prefetch") else None)
+        warm = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.idle-warm.plist").read_bytes())
+        self.assertEqual(warm["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-idle-warm"), "--apply"])
+        self.assertIsNone(warm.get("ProcessType"), "its build runs only while the mini is idle and should be fast")
+        self.assertEqual((bin_dir / "glaeda-idle-warm").read_bytes(), (ROOT / "scripts/glaeda-idle-warm").read_bytes())
         gh = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.gh-watch.plist").read_bytes())
         self.assertEqual(gh["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-gh"), "serve"])
         self.assertTrue(gh["KeepAlive"])

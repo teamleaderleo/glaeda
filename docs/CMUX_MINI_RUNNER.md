@@ -203,6 +203,17 @@ What `--apply` does:
        canonical root is taken, or every unit is. Only it carries the gui pool label, so
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
        mini's gui runner instead.
+   - **When the console session cannot run GUI tests** (gui runner only). GUI jobs run
+     in the console user's session, and a mini whose auto-login session is screen-locked
+     (display sleep, then the lock) or sits at the login window fails every one
+     (cmuxterm-hq#757). The gate reads `ioreg -n Root -d1` (`IOConsoleUsers`:
+     `kCGSSessionOnConsoleKey`, `CGSSessionScreenIsLocked`; Root's `IOConsoleLocked`) at
+     most every 30 s and holds the gui runner while the session is locked or no user is
+     logged in. The same check refuses at job-started any job on the gui runner or of a
+     `gui` class (`refused: console: ...`, before any capacity is taken), so cmux's
+     rescue re-runs it elsewhere, and makes `take-gui` give way (exit 3), so test-e2e's
+     build leaves its tests to the `test` job. An unreadable state changes nothing;
+     `GLAEDA_RUNNER_CONSOLE_GATE=0` in the runner LaunchAgent turns it off.
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`.
      - The listener's graceful exit ends its session, and GitHub shows the runner as
@@ -681,6 +692,49 @@ Check it on a mini with any digest a peer holds:
 `"/Library/Application Support/glaeda/bin/glaeda-lan-fetch" product SHA256 /tmp/x.tar.gz` (the record says
 `"via": "broker"`), then remove `/tmp/x.tar.gz`. Remove the mesh with
 `scripts/glaeda-seed-lan mesh-remove HOST... --apply`.
+
+## 2k. Idle catch-up: build main into a far root while the mini is idle
+
+A root's kept build is the last pull request's, merged onto a main that has moved on since. After a quiet
+spell every root is far from main's head, and the next admission recompiles main's drift as well as its own
+diff (warm-distance tiers: near compiles in about 140 s, rebuild about 400 s, cmux
+`scripts/ci/warm-distance-model.json`). On 2026-09-26 at 04:00Z, 19 of 22 roots on 12 minis were
+rebuild-tier from main's head, and each mini had sat fully idle 17 to 33% of the previous six hours
+(`~/Library/Logs/glaeda-cmux-jobs.jsonl`).
+
+`glaeda-idle-warm` (the 5-minute idle-warm LaunchAgent from glaeda-mini-setup) closes that gap:
+
+- **When.** No Runner.Worker or xcodebuild, no job started or ended for 10 minutes, 1-minute load under
+  0.25 per core, thermal pressure nominal, at least 136 GiB free (the 100 GiB admission floor plus a cold
+  compile), no reservation, no fleet build holding or waiting for the host lock. Never on cmux-mac-mini (hostname cmuxs-Mac-mini-5, the production
+  iOS soak box) or Lawrence's machines, never next to a trusted-only runner (a seeder), and only on
+  capacity-mode runners. `touch ~/.config/glaeda/idle-warm.disabled` stops it on one mini.
+- **Which root.** The hook's own prediction (`warm_root_costs`) of each root's compile for main's head, from
+  the seed prefetch's mirror and the job-written model: a rebuild root first, then far, then one it could not
+  compare, then one with no kept build (a cold build), skipping any already built or tried for that head. Three failed builds in a row pause it for six hours.
+- **How.** It loads the hook the runners run (from their `glaeda-hooks/`) and refuses if that hook predates
+  the yield below, so a rollout in either order is safe. Under `capacity/admission.lock` it takes the root's
+  token, a persistent-dd token and a compile's units, with the host lock shared, writes
+  `capacity/idle-warm.json` (its pid and those names), and lets the admission lock go. Then cmux's
+  `scripts/ci/owned_catch_up.sh`, run from a clean checkout of main's head kept under `ci/.catch-up/cmux`,
+  runs the steps of a main dispatch's compile admission (check, prefer against kept seeds, adopt, record,
+  compile, keep with main's head as `merged_onto`, save). Logs: `ci/.catch-up/logs/`, one line per run in
+  `~/Library/Logs/glaeda-idle-warm.jsonl`.
+- **Jobs and fleet builds come first.** Every admission (`take_capacity`, under admission.lock) sends the
+  catch-up SIGTERM and waits up to 5 s for it to exit, then SIGKILLs it. The catch-up leads its own process
+  group and its build runs in it, so one `killpg` ends both and the kernel drops the locks with the last fd;
+  the hook kills whatever is left of that group the moment the catch-up is gone, and launchd kills a
+  LaunchAgent's group whenever it dies. The listener gate counts what the catch-up holds as free, never
+  counts its shared host.lock as a fleet build waiting, stops it when a fleet build holds or waits for the
+  host lock, and stops it instead of holding a runner off for load or heat. So a mini never stops listening
+  or refuses a job because of it. A build killed with no job behind it counts as a failed try of that head,
+  so shedding its load cannot loop. A kill at any step leaves the kept state as it was, or unstamped (the
+  next job takes a seed); never a partial build marked warm. The holder file is trusted only while its pid is
+  alive and its program is glaeda-idle-warm.
+- **Trust.** The build is main's own code, run as the build user on a PR mini. Pull requests admitted to that
+  root already share its kept state, so this adds no new boundary. No GitHub token reaches it.
+
+Check one mini: `glaeda-idle-warm` (plan) says whether it would warm now and which root, or why not.
 
 ## 3. Verify
 

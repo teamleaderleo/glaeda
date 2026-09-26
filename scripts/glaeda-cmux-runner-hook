@@ -26,6 +26,8 @@ re-runs it elsewhere) when:
     Unix seconds) with now < until, whoever owns it; an unreadable or invalid file also refuses, an expired
     one is ignored (parsed by glaeda_reservation.py, installed next to this hook)
   * free disk is below --min-free-gib
+  * the job needs the console session (a gui class job, or any job on the --gui-runner) and the console
+    session is screen-locked or no user is logged in at the console (console_refusal, cmuxterm-hq#757)
   * another build holds the fleet host lock (/Users/Shared/cmux-build-fleet/host.lock, the flock that
     with-host-lock and the build worker take)
   * with --require-eligible (every fleet member): the local Glaeda node is not eligible, or its toolchain
@@ -54,7 +56,8 @@ runs under the runner LaunchAgent's listen.sh: it runs DIR/run.sh, and while the
 host lock, a reservation, or a fleet build waiting for the lock), every capacity unit on the mini is
 taken, or the mini is saturated (its 1-minute load at least GATE_LOAD_PAUSE per core), it stops the idle
 runner's listener so GitHub routes the job to another runner instead of here to be refused or slowed
-down (Gate). Full means every unit this runner's own --capacity-units scans, read from its job-started hook;
+down (Gate). A gui runner also stops listening while the console session is locked or nobody is logged in there
+(console_refusal). Full means every unit this runner's own --capacity-units scans, read from its job-started hook;
 for a root runner it also means the mini cannot admit a compile or an app-host shard (mini_full).
 """
 
@@ -558,6 +561,17 @@ GATE_THERMAL_RELEASE = 1
 GATE_THERMAL_EVERY_S = 30.0
 NOTIFYUTIL = "/usr/bin/notifyutil"
 THERMAL_PRESSURE_KEY = "com.apple.system.thermalpressurelevel"
+# GUI tests (app-host shards, tests-build-and-lag, test-e2e) run in the console user's session. A mini whose
+# auto-login session is screen-locked (displaysleep, then the lock) or sits at the login window fails every one of
+# them (cmuxterm-hq#757). ioreg's IOConsoleUsers names the console session (kCGSSessionOnConsoleKey) and whether its
+# screen is locked (CGSSessionScreenIsLocked), readable from any user or launchd domain. job-started refuses a job
+# that needs the console there, take-gui gives way, and a gui runner's listener gate holds it off, so GitHub hands
+# the job to another mini. An unreadable state (no ioreg, as on Linux, or a timeout) changes nothing.
+# GLAEDA_RUNNER_CONSOLE_GATE=0 turns all of it off.
+IOREG = os.environ.get("GLAEDA_RUNNER_IOREG") or "/usr/sbin/ioreg"
+CONSOLE_GATE = os.environ.get("GLAEDA_RUNNER_CONSOLE_GATE", "1") != "0"
+CONSOLE_CLASSES = ("gui",)  # job classes that run in the console session from their first step
+GATE_CONSOLE_EVERY_S = 30.0
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -1043,7 +1057,8 @@ def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path) -> int:
     """glaeda-canonical-root take-gui: hold this mini's gui token (one console session) for the rest of this
     job, waiting up to wait_s. A job that already holds it (from admission) is a no-op. Exits 0 when held, 1
     when still taken after the wait, TAKE_GUI_GAVE_WAY when the holder waits for a root this job holds (see
-    TAKE_GUI_GAVE_WAY: the caller then leaves its console-session work to another job), 2 outside a job."""
+    TAKE_GUI_GAVE_WAY: the caller then leaves its console-session work to another job) or when the console session
+    is locked or has no user (console_refusal), 2 outside a job."""
     if not os.environ.get("RUNNER_NAME"):
         print(f"{PREFIX}: take-gui: RUNNER_NAME is not set (not a runner job step)", file=sys.stderr)
         return 2
@@ -1053,6 +1068,10 @@ def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path) -> int:
     if worker is None:
         print(f"{PREFIX}: take-gui: not inside a runner job (no Runner.Worker above this step)", file=sys.stderr)
         return 2
+    locked = console_refusal()
+    if locked:  # the console session cannot run the tests: leave them to a job on another mini
+        print(f"{PREFIX}: take-gui: {locked}", file=sys.stderr)
+        return TAKE_GUI_GAVE_WAY
     deadline = time.monotonic() + max(0.0, wait_s)
     while True:
         fd = lock_file(capacity_dir / "gui.token", fcntl.LOCK_EX)
@@ -1094,6 +1113,81 @@ def pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+# Idle catch-up (glaeda-idle-warm): while a mini is idle and a root's kept build is far from main, it holds that
+# root's token, a persistent-dd token and a compile's units (flocks under the capacity dir, like a job) and builds
+# main's head into the root's kept state. Any job comes first. take_capacity stops it and waits for its locks to
+# go before it takes its own; the listener gate counts what it holds as free, never counts it as a fleet build
+# waiting for the host, and stops it instead of holding a runner off for load or heat. So a mini never stops
+# listening or refuses a job because of it. It names its pid (the leader of the process group its build runs in)
+# and locks in WARM_HOLDER, written under admission.lock before that lock is released, so an admission that holds
+# admission.lock always sees it.
+WARM_HOLDER = "idle-warm.json"
+WARM_PROGRAM = "glaeda-idle-warm"
+WARM_YIELD_S = 5.0
+
+
+def is_idle_warm(command: str) -> bool:
+    """Whether a ps command line is glaeda-idle-warm itself (the program or the script its interpreter runs)."""
+    return any(os.path.basename(word) == WARM_PROGRAM for word in command.split()[:2])
+
+
+def warm_holder(capacity_dir: Path) -> tuple[int, set[str]] | None:
+    """The idle catch-up holder file's pid and lock names, or None when there is none that parses."""
+    raw = read_bounded(capacity_dir / WARM_HOLDER)
+    holder = json.loads(raw.decode("utf-8")) if raw is not None else None
+    pid = holder.get("pid") if isinstance(holder, dict) else None
+    held = holder.get("held") if isinstance(holder, dict) else None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or not isinstance(held, list):
+        return None
+    return pid, {str(name) for name in held if isinstance(name, str)}
+
+
+def idle_warm(capacity_dir: Path) -> tuple[int, set[str]] | None:
+    """The running idle catch-up's pid and the lock names it holds (unit-N, root-K, persistent-dd...), or None.
+
+    The file is written by a process of this user, so it is read bounded and trusted only as far as its pid is
+    alive and is glaeda-idle-warm: a stale file whose pid was reused never gets another process signalled."""
+    try:
+        holder = warm_holder(capacity_dir)
+        if holder is None or holder[0] == os.getpid() or not pid_alive(holder[0]):
+            return None
+        command = subprocess.run(["/bin/ps", "-o", "command=", "-p", str(holder[0])], capture_output=True,
+                                 text=True, timeout=5).stdout
+        return holder if is_idle_warm(command) else None
+    except Exception:  # noqa: BLE001 - a holder file must never refuse or fail a job
+        return None
+
+
+def kill_warm_group(pid: int) -> None:
+    """SIGKILL what is left of the catch-up's process group (its build) the moment its leader PID, which we
+    just saw alive as glaeda-idle-warm, is gone: no other group can have that id while its build lives. A
+    catch-up that dies any other way is a LaunchAgent, and launchd kills its process group."""
+    with contextlib.suppress(OSError):
+        os.killpg(pid, signal.SIGKILL)
+
+
+def yield_idle_warm(capacity_dir: Path) -> str:
+    """Stop a running idle catch-up so this job gets its locks; a note for the admission line, or ''."""
+    try:
+        warm = idle_warm(capacity_dir)
+        if warm is None:
+            return ""
+        pid = warm[0]
+        deadline = time.monotonic() + WARM_YIELD_S
+        for signum in (signal.SIGTERM, signal.SIGKILL):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signum)
+            while pid_alive(pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if not pid_alive(pid):
+                kill_warm_group(pid)
+                return f"; stopped the idle catch-up (pid {pid})"
+            deadline = time.monotonic() + 2.0
+        return f"; the idle catch-up (pid {pid}) did not stop"
+    except Exception:  # noqa: BLE001 - yielding must never refuse or fail a job
+        return ""
 
 
 def holder_file(state_dir: Path) -> Path:
@@ -1156,8 +1250,10 @@ def lock_waiters(path: str, ours: set[int]) -> list[int]:
                                  check=False).stdout
     except (OSError, subprocess.TimeoutExpired):
         return []  # cannot tell a fleet build from our own admission: no waiter, as when lsof cannot tell
+    # The idle catch-up holds it shared, like a job, and gives way to any job: not a fleet build either.
     fleet = {int(line.split(None, 1)[0]) for line in listing.splitlines()
-             if line.strip() and PREFIX not in line and line.split(None, 1)[0].isdigit()}
+             if line.strip() and PREFIX not in line and line.split(None, 1)[0].isdigit()
+             and not is_idle_warm(line.split(None, 1)[1] if len(line.split(None, 1)) > 1 else "")}
     return [pid for pid in pids if pid in fleet]  # a pid gone since lsof is not waiting either
 
 
@@ -1204,6 +1300,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 if time.monotonic() >= deadline:
                     return False, "capacity: another admission on this mini is stuck"
                 time.sleep(0.1)
+        yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
         if os.path.isdir(os.path.dirname(host_lock)):
             # created if missing, so a worker that starts later still has to wait for this job
             fd = os.open(host_lock, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
@@ -1296,7 +1393,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             export_warm_route(warm_route)
             with contextlib.suppress(OSError):
                 roots_file(state_dir).write_text(root + "\n")
-        return held, (f"holding {what} for {job or 'an unknown job'} ({klass}; {note})" if held else note)
+        return held, (f"holding {what} for {job or 'an unknown job'} ({klass}; {note}{yielded})" if held else note)
     except OSError as error:
         return False, f"capacity: cannot take the ledger ({type(error).__name__})"
     finally:
@@ -1513,12 +1610,18 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return UNKNOWN
+        warm = idle_warm(capacity_dir)
+        yielding = warm[1] if warm else set()  # the idle catch-up gives these to the next job
+
+        def open_to_jobs(name: str, path: Path) -> bool:
+            return name in yielding or probe(path)
+
         root = scope is not None and scope.root
         # fit_units: a side runner whose label brings 2-unit jobs (listen --fit-units, glaeda-ios-sim)
         need = min(max(ROOT_FIT_UNITS if root else 1, fit_units), total)
         free = 0
         for slot in range(total):
-            if not probe(capacity_dir / f"unit-{slot}"):
+            if not open_to_jobs(f"unit-{slot}", capacity_dir / f"unit-{slot}"):
                 continue
             free += 1
             if free >= need:
@@ -1539,10 +1642,10 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             return None
         assert scope is not None
         dd = ["persistent-dd"] + [f"persistent-dd-{c}" for c in range(1, scope.compile_slots)]
-        if not any(probe(capacity_dir / f"{name}.token") for name in dd):
+        if not any(open_to_jobs(name, capacity_dir / f"{name}.token") for name in dd):
             return ("the persistent-dd token is taken" if len(dd) == 1
                     else f"all {len(dd)} persistent-dd tokens on this mini are taken")
-        if not any(probe(capacity_dir / f"root-{k}.token") for k in range(1, scope.roots + 1)):
+        if not any(open_to_jobs(f"root-{k}", capacity_dir / f"root-{k}.token") for k in range(1, scope.roots + 1)):
             return ("the canonical root is taken" if scope.roots == 1
                     else f"all {scope.roots} canonical roots on this mini are taken")
         return None
@@ -1572,6 +1675,61 @@ def thermal_pressure_level() -> int | None:
         return None
     found = re.search(re.escape(THERMAL_PRESSURE_KEY) + r"\s+(\d+)", out)
     return int(found.group(1)) if found else None
+
+
+class ConsoleState(NamedTuple):
+    """The console session as ioreg reports it: "unlocked", "locked" or "no_user", and its user name."""
+    state: str
+    user: str | None = None
+
+
+def parse_console_users(text: str) -> ConsoleState | None:
+    """ConsoleState from `ioreg -n Root -d1` text output, or None when it names neither IOConsoleUsers nor
+    IOConsoleLocked (not the Root entry). A session counts only while on the console with its login done; none
+    (or no IOConsoleUsers at all, as at the login window) is no_user. Locked is the session's
+    CGSSessionScreenIsLocked or Root's IOConsoleLocked."""
+    rows = text.splitlines()
+    users = next((row for row in rows if '"IOConsoleUsers" =' in row), None)
+    console_locked = next((row for row in rows if '"IOConsoleLocked" =' in row), None)
+    if users is None and console_locked is None:
+        return None
+    for session in re.findall(r"\{([^{}]*)\}", users or ""):
+        def value(key: str) -> str | None:
+            found = re.search(rf'"{key}"=("[^"]*"|[^,]*)', session)
+            return found.group(1).strip('"') if found else None
+
+        if value("kCGSSessionOnConsoleKey") != "Yes" or value("kCGSessionLoginDoneKey") == "No":
+            continue
+        user = value("kCGSSessionUserNameKey")
+        if not user or user == "loginwindow":
+            continue
+        locked = value("CGSSessionScreenIsLocked") == "Yes" or (console_locked or "").rstrip().endswith("= Yes")
+        return ConsoleState("locked" if locked else "unlocked", user[:64])
+    return ConsoleState("no_user")
+
+
+def console_state() -> ConsoleState | None:
+    """This mini's console session, or None when ioreg cannot be read."""
+    try:
+        out = subprocess.run([IOREG, "-n", "Root", "-d1"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                             timeout=5, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return None
+    return parse_console_users(out)
+
+
+def console_refusal() -> str | None:
+    """Why GUI tests cannot run in this mini's console session right now, or None (also when it is unreadable or
+    the check is off)."""
+    if not CONSOLE_GATE:
+        return None
+    state = console_state()
+    if state is None or state.state == "unlocked":
+        return None
+    if state.state == "locked":
+        return (f"console: the console session ({state.user}) is screen-locked, so GUI tests cannot run on this "
+                "mini; unlock it and turn off the screen lock (cmuxterm-hq#757)")
+    return "console: no user is logged in at the console, so GUI tests cannot run on this mini (cmuxterm-hq#757)"
 
 
 def mini_saturated(paused: bool, load: float | None = None, cores: int | None = None) -> str | None:
@@ -1706,6 +1864,8 @@ class Gate:
         self.thermal_at = -GATE_THERMAL_EVERY_S
         self.load_since: float | None = None  # when the current load hold began
         self.load_waived = False  # a hold ran past GATE_LOAD_MAX_HOLD_S; ignored until the load falls
+        self.console_why: str | None = None  # the last console_refusal, read at most every GATE_CONSOLE_EVERY_S
+        self.console_at = -GATE_CONSOLE_EVERY_S
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -1751,7 +1911,26 @@ class Gate:
             why = f"a fleet build is waiting for the host (pid {min(self.waiting)})"
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
-        return why or self.saturated() or self.full() or self.hot()
+            self.yield_to_fleet()
+        return why or self.shed(self.saturated()) or self.full() or self.shed(self.hot()) or self.locked()
+
+    def yield_to_fleet(self) -> None:
+        """A fleet build waiting for the host lock waits for every holder, the idle catch-up's shared hold
+        too, which would otherwise keep it out for a whole build: stop the catch-up."""
+        if self.capacity_dir is not None and idle_warm(self.capacity_dir) is not None:
+            gate_log("a fleet build wants the host: stopping the idle catch-up")
+            yield_idle_warm(self.capacity_dir)
+
+    def shed(self, why: str | None) -> str | None:
+        """A load or thermal hold while the idle catch-up runs stops the catch-up instead: holding the runners
+        off would keep away the only thing that makes it stop. The next poll reads the mini without it."""
+        if why and self.capacity_dir is not None and idle_warm(self.capacity_dir) is not None:
+            gate_log(f"{why}: stopping the idle catch-up instead of holding the runner off")
+            yield_idle_warm(self.capacity_dir)
+            # the hold was the catch-up's: read the mini afresh without it, not from the resume marks
+            self.load_since, self.thermal, self.thermal_at = None, None, -GATE_THERMAL_EVERY_S
+            return None
+        return why
 
     def saturated(self) -> str | None:
         """mini_saturated with this gate's hysteresis and hold limit. Checked before mini_full, so a mini both
@@ -1801,7 +1980,19 @@ class Gate:
                 why = f"a fleet build is waiting for the host (pid {min(again)})"
         if why:
             self.load_since = None
-        return why or self.saturated() or self.full(fresh=True) or self.hot(fresh=True)
+            self.yield_to_fleet()
+        return (why or self.shed(self.saturated()) or self.full(fresh=True) or self.shed(self.hot(fresh=True))
+                or self.locked(fresh=True))
+
+    def locked(self, fresh: bool = False) -> str | None:
+        """For the gui runner only: why its console session cannot run a GUI job (console_refusal), read at most
+        every GATE_CONSOLE_EVERY_S. Every job its label brings needs the console, so it waits here instead of
+        being refused; a root runner's compiles do not, so it keeps listening."""
+        if not CONSOLE_GATE or not runner_scope(self.runner_dir).gui:
+            return None
+        if fresh or time.monotonic() - self.console_at >= GATE_CONSOLE_EVERY_S:
+            self.console_why, self.console_at = console_refusal(), time.monotonic()
+        return self.console_why
 
     def full(self, fresh: bool = False) -> str | None:
         """Every unit this runner's jobs could take is held. A look an admission blocked keeps the previous
@@ -2568,6 +2759,12 @@ def main(argv: list[str] | None = None) -> int:
             or disk_refusal(os.path.dirname(args.host_lock), args.min_free_gib)
         if why:
             return refused(why)
+        # before any capacity is taken: a job that needs the console session fails on a locked one
+        if args.gui_runner or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
+                                        job_workflow())[0] in CONSOLE_CLASSES:
+            why = console_refusal()
+            if why:
+                return refused(why)
         # The wrapper execs this script, so the parent is the job's Runner.Worker.
         admit_start = time.monotonic()
         taken: dict[str, Any] = {}
