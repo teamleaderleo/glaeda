@@ -1096,6 +1096,81 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+# Idle catch-up (glaeda-idle-warm): while a mini is idle and a root's kept build is far from main, it holds that
+# root's token, a persistent-dd token and a compile's units (flocks under the capacity dir, like a job) and builds
+# main's head into the root's kept state. Any job comes first. take_capacity stops it and waits for its locks to
+# go before it takes its own; the listener gate counts what it holds as free, never counts it as a fleet build
+# waiting for the host, and stops it instead of holding a runner off for load or heat. So a mini never stops
+# listening or refuses a job because of it. It names its pid (the leader of the process group its build runs in)
+# and locks in WARM_HOLDER, written under admission.lock before that lock is released, so an admission that holds
+# admission.lock always sees it.
+WARM_HOLDER = "idle-warm.json"
+WARM_PROGRAM = "glaeda-idle-warm"
+WARM_YIELD_S = 5.0
+
+
+def is_idle_warm(command: str) -> bool:
+    """Whether a ps command line is glaeda-idle-warm itself (the program or the script its interpreter runs)."""
+    return any(os.path.basename(word) == WARM_PROGRAM for word in command.split()[:2])
+
+
+def warm_holder(capacity_dir: Path) -> tuple[int, set[str]] | None:
+    """The idle catch-up holder file's pid and lock names, or None when there is none that parses."""
+    raw = read_bounded(capacity_dir / WARM_HOLDER)
+    holder = json.loads(raw.decode("utf-8")) if raw is not None else None
+    pid = holder.get("pid") if isinstance(holder, dict) else None
+    held = holder.get("held") if isinstance(holder, dict) else None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or not isinstance(held, list):
+        return None
+    return pid, {str(name) for name in held if isinstance(name, str)}
+
+
+def idle_warm(capacity_dir: Path) -> tuple[int, set[str]] | None:
+    """The running idle catch-up's pid and the lock names it holds (unit-N, root-K, persistent-dd...), or None.
+
+    The file is written by a process of this user, so it is read bounded and trusted only as far as its pid is
+    alive and is glaeda-idle-warm: a stale file whose pid was reused never gets another process signalled."""
+    try:
+        holder = warm_holder(capacity_dir)
+        if holder is None or holder[0] == os.getpid() or not pid_alive(holder[0]):
+            return None
+        command = subprocess.run(["/bin/ps", "-o", "command=", "-p", str(holder[0])], capture_output=True,
+                                 text=True, timeout=5).stdout
+        return holder if is_idle_warm(command) else None
+    except Exception:  # noqa: BLE001 - a holder file must never refuse or fail a job
+        return None
+
+
+def kill_warm_group(pid: int) -> None:
+    """SIGKILL what is left of the catch-up's process group (its build) the moment its leader PID, which we
+    just saw alive as glaeda-idle-warm, is gone: no other group can have that id while its build lives. A
+    catch-up that dies any other way is a LaunchAgent, and launchd kills its process group."""
+    with contextlib.suppress(OSError):
+        os.killpg(pid, signal.SIGKILL)
+
+
+def yield_idle_warm(capacity_dir: Path) -> str:
+    """Stop a running idle catch-up so this job gets its locks; a note for the admission line, or ''."""
+    try:
+        warm = idle_warm(capacity_dir)
+        if warm is None:
+            return ""
+        pid = warm[0]
+        deadline = time.monotonic() + WARM_YIELD_S
+        for signum in (signal.SIGTERM, signal.SIGKILL):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signum)
+            while pid_alive(pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if not pid_alive(pid):
+                kill_warm_group(pid)
+                return f"; stopped the idle catch-up (pid {pid})"
+            deadline = time.monotonic() + 2.0
+        return f"; the idle catch-up (pid {pid}) did not stop"
+    except Exception:  # noqa: BLE001 - yielding must never refuse or fail a job
+        return ""
+
+
 def holder_file(state_dir: Path) -> Path:
     """One pid file per runner (RUNNER_NAME comes from the runner, not the job)."""
     name = "".join(c for c in os.environ.get("RUNNER_NAME", "") if c.isalnum() or c in "-_.")
@@ -1156,8 +1231,10 @@ def lock_waiters(path: str, ours: set[int]) -> list[int]:
                                  check=False).stdout
     except (OSError, subprocess.TimeoutExpired):
         return []  # cannot tell a fleet build from our own admission: no waiter, as when lsof cannot tell
+    # The idle catch-up holds it shared, like a job, and gives way to any job: not a fleet build either.
     fleet = {int(line.split(None, 1)[0]) for line in listing.splitlines()
-             if line.strip() and PREFIX not in line and line.split(None, 1)[0].isdigit()}
+             if line.strip() and PREFIX not in line and line.split(None, 1)[0].isdigit()
+             and not is_idle_warm(line.split(None, 1)[1] if len(line.split(None, 1)) > 1 else "")}
     return [pid for pid in pids if pid in fleet]  # a pid gone since lsof is not waiting either
 
 
@@ -1204,6 +1281,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 if time.monotonic() >= deadline:
                     return False, "capacity: another admission on this mini is stuck"
                 time.sleep(0.1)
+        yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
         if os.path.isdir(os.path.dirname(host_lock)):
             # created if missing, so a worker that starts later still has to wait for this job
             fd = os.open(host_lock, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
@@ -1296,7 +1374,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             export_warm_route(warm_route)
             with contextlib.suppress(OSError):
                 roots_file(state_dir).write_text(root + "\n")
-        return held, (f"holding {what} for {job or 'an unknown job'} ({klass}; {note})" if held else note)
+        return held, (f"holding {what} for {job or 'an unknown job'} ({klass}; {note}{yielded})" if held else note)
     except OSError as error:
         return False, f"capacity: cannot take the ledger ({type(error).__name__})"
     finally:
@@ -1513,12 +1591,18 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return UNKNOWN
+        warm = idle_warm(capacity_dir)
+        yielding = warm[1] if warm else set()  # the idle catch-up gives these to the next job
+
+        def open_to_jobs(name: str, path: Path) -> bool:
+            return name in yielding or probe(path)
+
         root = scope is not None and scope.root
         # fit_units: a side runner whose label brings 2-unit jobs (listen --fit-units, glaeda-ios-sim)
         need = min(max(ROOT_FIT_UNITS if root else 1, fit_units), total)
         free = 0
         for slot in range(total):
-            if not probe(capacity_dir / f"unit-{slot}"):
+            if not open_to_jobs(f"unit-{slot}", capacity_dir / f"unit-{slot}"):
                 continue
             free += 1
             if free >= need:
@@ -1539,10 +1623,10 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             return None
         assert scope is not None
         dd = ["persistent-dd"] + [f"persistent-dd-{c}" for c in range(1, scope.compile_slots)]
-        if not any(probe(capacity_dir / f"{name}.token") for name in dd):
+        if not any(open_to_jobs(name, capacity_dir / f"{name}.token") for name in dd):
             return ("the persistent-dd token is taken" if len(dd) == 1
                     else f"all {len(dd)} persistent-dd tokens on this mini are taken")
-        if not any(probe(capacity_dir / f"root-{k}.token") for k in range(1, scope.roots + 1)):
+        if not any(open_to_jobs(f"root-{k}", capacity_dir / f"root-{k}.token") for k in range(1, scope.roots + 1)):
             return ("the canonical root is taken" if scope.roots == 1
                     else f"all {scope.roots} canonical roots on this mini are taken")
         return None
@@ -1751,7 +1835,26 @@ class Gate:
             why = f"a fleet build is waiting for the host (pid {min(self.waiting)})"
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
-        return why or self.saturated() or self.full() or self.hot()
+            self.yield_to_fleet()
+        return why or self.shed(self.saturated()) or self.full() or self.shed(self.hot())
+
+    def yield_to_fleet(self) -> None:
+        """A fleet build waiting for the host lock waits for every holder, the idle catch-up's shared hold
+        too, which would otherwise keep it out for a whole build: stop the catch-up."""
+        if self.capacity_dir is not None and idle_warm(self.capacity_dir) is not None:
+            gate_log("a fleet build wants the host: stopping the idle catch-up")
+            yield_idle_warm(self.capacity_dir)
+
+    def shed(self, why: str | None) -> str | None:
+        """A load or thermal hold while the idle catch-up runs stops the catch-up instead: holding the runners
+        off would keep away the only thing that makes it stop. The next poll reads the mini without it."""
+        if why and self.capacity_dir is not None and idle_warm(self.capacity_dir) is not None:
+            gate_log(f"{why}: stopping the idle catch-up instead of holding the runner off")
+            yield_idle_warm(self.capacity_dir)
+            # the hold was the catch-up's: read the mini afresh without it, not from the resume marks
+            self.load_since, self.thermal, self.thermal_at = None, None, -GATE_THERMAL_EVERY_S
+            return None
+        return why
 
     def saturated(self) -> str | None:
         """mini_saturated with this gate's hysteresis and hold limit. Checked before mini_full, so a mini both
@@ -1801,7 +1904,8 @@ class Gate:
                 why = f"a fleet build is waiting for the host (pid {min(again)})"
         if why:
             self.load_since = None
-        return why or self.saturated() or self.full(fresh=True) or self.hot(fresh=True)
+            self.yield_to_fleet()
+        return why or self.shed(self.saturated()) or self.full(fresh=True) or self.shed(self.hot(fresh=True))
 
     def full(self, fresh: bool = False) -> str | None:
         """Every unit this runner's jobs could take is held. A look an admission blocked keeps the previous

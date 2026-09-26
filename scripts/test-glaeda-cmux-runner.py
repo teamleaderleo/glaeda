@@ -18,6 +18,7 @@ import json
 import os
 import plistlib
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
@@ -1130,6 +1131,117 @@ class HookTest(unittest.TestCase):
         finally:
             for runner in ("c0", "c1", "c2", "g1"):
                 self.finish(runner)
+
+    def idle_warm(self, *held: str) -> subprocess.Popen:
+        """A stand-in glaeda-idle-warm: holds HELD under the capacity dir, names them in the holder file, and
+        exits on SIGTERM, as the real one does."""
+        capacity = self.dir / "capacity"
+        capacity.mkdir(exist_ok=True)
+        fake = make_executable(self.dir / "glaeda-idle-warm", f"""import fcntl, json, os, pathlib, signal, sys, time
+capacity = pathlib.Path({os.fspath(capacity)!r})
+fds = []
+host = os.open(capacity.parent / "fleet" / "host.lock", os.O_RDONLY | os.O_CREAT)
+fcntl.flock(host, fcntl.LOCK_SH | fcntl.LOCK_NB)  # as the real one does, like a job
+for name in sys.argv[1:]:
+    fd = os.open(capacity / (name if name.startswith("unit-") else name + ".token"), os.O_RDONLY | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fds.append(fd)
+(capacity / "idle-warm.json").write_text(json.dumps({{"pid": os.getpid(), "held": sys.argv[1:]}}))
+signal.signal(signal.SIGTERM, lambda *_: os._exit(143))
+print("held", flush=True)
+time.sleep(60)
+""")
+        warm = subprocess.Popen([sys.executable, os.fspath(fake), *held], stdout=subprocess.PIPE, text=True)
+        self.assertEqual(warm.stdout.readline().strip(), "held")
+        self.addCleanup(warm.kill)
+        # launchd reaps the real one at once; a zombie would still look alive to the hook
+        threading.Thread(target=warm.wait, daemon=True).start()
+        return warm
+
+    def test_capacity_a_job_stops_the_idle_catch_up_and_takes_its_locks(self) -> None:
+        self.fleet()
+        capacity = self.dir / "capacity"
+        root = hook.RunnerScope(units=4, compile_slots=1, roots=1, root=True)
+        warm = self.idle_warm("root-1", "persistent-dd", "unit-0", "unit-1")
+        try:
+            # what the catch-up holds counts as free, so the gate keeps the root runner listening
+            self.assertIsNone(hook.mini_full(capacity, 4, root))
+            first = self.job("macos-compile-admission", "y0")
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertIn("holding 2/4 units+persistent-dd+root-1", first.stdout)
+            self.assertIn(f"stopped the idle catch-up (pid {warm.pid})", first.stdout)
+            # SIGTERM, or SIGKILL once WARM_YIELD_S passed (a loaded machine may not run its handler in time)
+            self.assertIn(warm.wait(timeout=10), (143, -signal.SIGKILL))
+            # the job's own locks are not the catch-up's: the gate sees them as taken
+            self.assertEqual(hook.mini_full(capacity, 4, root), "the persistent-dd token is taken")
+        finally:
+            self.finish("y0")
+
+    def test_the_listener_gate_never_holds_a_runner_off_for_the_idle_catch_up(self) -> None:
+        fleet = self.fleet()
+        capacity = self.dir / "capacity"
+        warm = self.idle_warm("root-1", "persistent-dd", "unit-0", "unit-1")
+        # it holds the host lock shared, like a job: never a fleet build waiting for the host
+        self.assertEqual(hook.lock_waiters(os.fspath(fleet / "host.lock"), set()), [])
+        runner = self.dir / "actions-runner-glaeda"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        gate = hook.Gate(runner, os.fspath(fleet / "host.lock"), os.fspath(self.dir / "none.json"),
+                         self.dir / "state", capacity_dir=capacity)
+        self.assertIsNone(gate.shed(None))
+        # a load or thermal hold stops the catch-up instead of holding the runner off
+        self.assertIsNone(gate.shed("the mini is saturated"))
+        self.assertIn(warm.wait(timeout=10), (143, -signal.SIGKILL))
+        self.assertEqual(gate.shed("the mini is saturated"), "the mini is saturated", "no catch-up left to stop")
+        # a fleet build waiting for the host lock would wait out the catch-up's shared hold: stop it
+        again = self.idle_warm("root-1", "persistent-dd")
+        gate.yield_to_fleet()
+        self.assertIn(again.wait(timeout=10), (143, -signal.SIGKILL))
+
+    def test_capacity_yielding_the_idle_catch_up_also_ends_its_build(self) -> None:
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        leader = make_executable(self.dir / "glaeda-idle-warm", f"""import json, os, pathlib, signal, subprocess, time
+build = subprocess.Popen(["/bin/sleep", "60"])  # joins our process group
+pathlib.Path({os.fspath(capacity)!r}, "idle-warm.json").write_text(json.dumps({{"pid": os.getpid(), "held": []}}))
+signal.signal(signal.SIGTERM, lambda *_: os._exit(143))  # exits without ending its build
+print(build.pid, flush=True)
+time.sleep(60)
+""")
+        proc = subprocess.Popen([sys.executable, os.fspath(leader)], stdout=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        self.addCleanup(proc.kill)
+        orphan = int(proc.stdout.readline())
+        self.addCleanup(lambda: subprocess.run(["/bin/kill", "-9", str(orphan)], capture_output=True))
+        threading.Thread(target=proc.wait, daemon=True).start()
+        self.assertIn("stopped the idle catch-up", hook.yield_idle_warm(capacity))
+        deadline = time.monotonic() + 5
+        state = "running"
+        while time.monotonic() < deadline:
+            state = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(orphan)], capture_output=True,
+                                   text=True).stdout.strip()
+            if not state or state.startswith("Z"):
+                break
+            time.sleep(0.1)
+        self.assertTrue(not state or state.startswith("Z"), f"the build still runs: {state!r}")
+
+    def test_capacity_a_stale_idle_catch_up_file_signals_nothing(self) -> None:
+        self.fleet()
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        other = subprocess.Popen(["/bin/sleep", "60"])
+        self.addCleanup(other.kill)
+        (capacity / "idle-warm.json").write_text(json.dumps({"pid": other.pid, "held": ["root-1", "persistent-dd"]}))
+        try:
+            self.assertIsNone(hook.idle_warm(capacity), "a reused pid that is not glaeda-idle-warm")
+            first = self.job("macos-compile-admission", "y1")
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertNotIn("idle catch-up", first.stdout)
+            self.assertIsNone(other.poll(), "never signalled")
+            for junk in ("{", "[]", json.dumps({"pid": True, "held": []}), json.dumps({"pid": 1, "held": []})):
+                (capacity / "idle-warm.json").write_text(junk)
+                self.assertIsNone(hook.idle_warm(capacity))
+        finally:
+            self.finish("y1")
 
     def test_capacity_a_full_mini_is_seen_by_the_listener_gate(self) -> None:
         self.fleet()
