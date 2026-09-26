@@ -1278,6 +1278,10 @@ class HookTest(unittest.TestCase):
         self.assertNotIn("compile-gui", hook.ROOT_CONSUMERS, "a producer takes a token-chosen root")
         for klass in {*hook.JOB_CLASSES.values(), *hook.WORKFLOW_JOB_CLASSES.values()}:
             self.assertIn(klass, hook.CLASS_COST)
+        # a seed job holds the root its matrix names itself (take-root), so no token picks one for it
+        self.assertEqual(hook.job_class("seed", home, home, "seed-derived-data.yml"), ("seed", False))
+        self.assertEqual(hook.CLASS_COST["seed"], (2, ()))
+        self.assertEqual(hook.job_class("seed", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("rerun", home, home, "app-host-test-rerun.yml"), ("gui", False))
         self.assertEqual(hook.job_class("rerun", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("release-build", home, home, "ci.yml"), ("isolated", False))
