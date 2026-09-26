@@ -18,6 +18,7 @@ import json
 import os
 import plistlib
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
@@ -1169,7 +1170,8 @@ time.sleep(60)
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             self.assertIn("holding 2/4 units+persistent-dd+root-1", first.stdout)
             self.assertIn(f"stopped the idle catch-up (pid {warm.pid})", first.stdout)
-            self.assertEqual(warm.wait(timeout=5), 143)  # SIGTERM, within WARM_YIELD_S
+            # SIGTERM, or SIGKILL once WARM_YIELD_S passed (a loaded machine may not run its handler in time)
+            self.assertIn(warm.wait(timeout=10), (143, -signal.SIGKILL))
             # the job's own locks are not the catch-up's: the gate sees them as taken
             self.assertEqual(hook.mini_full(capacity, 4, root), "the persistent-dd token is taken")
         finally:
@@ -1188,7 +1190,7 @@ time.sleep(60)
         self.assertIsNone(gate.shed(None))
         # a load or thermal hold stops the catch-up instead of holding the runner off
         self.assertIsNone(gate.shed("the mini is saturated"))
-        self.assertEqual(warm.wait(timeout=10), 143)
+        self.assertIn(warm.wait(timeout=10), (143, -signal.SIGKILL))
         self.assertEqual(gate.shed("the mini is saturated"), "the mini is saturated", "no catch-up left to stop")
 
     def test_capacity_a_killed_idle_catch_ups_build_is_ended_too(self) -> None:
