@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
+  go:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
@@ -46,6 +46,19 @@ jobs:
           go test ./...
           go build -trimpath -o /tmp/glaeda-scaleset-bridge .
 
+
+  # Script syntax and every script test file but the runner's, which runner-tests shards.
+  scripts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
       - name: Install pinned Rust toolchain
         run: >-
           rustup toolchain install 1.97.1
@@ -53,24 +66,7 @@ jobs:
           --component clippy,rustfmt
           --no-self-update
 
-      # Verify spends most of its wall time compiling the same dependency
-      # graph from scratch on every run. Restore the registry and target
-      # directory so only changed crates are rebuilt. Pull requests read the
-      # generation published by the last main push; only main writes, which
-      # keeps this workflow from multiplying per-branch cache entries.
-      - name: Restore cargo build cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: verify-cargo-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            verify-cargo-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
-
-      - name: Validate workspace bootstrap
+      - name: Validate and test scripts
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -169,6 +165,8 @@ jobs:
               Path("scripts/test-quarry-parallel.py"),
               Path("scripts/status_page.py"),
               Path("scripts/test-status-page.py"),
+              Path("scripts/unittest-shard"),
+              Path("scripts/test-unittest-shard.py"),
               *Path("scripts/workspace_bootstrap").glob("*.py"),
           ]
           for path in paths:
@@ -213,7 +211,6 @@ jobs:
           python3 scripts/test-cmux-fleet-bootstrap.py
           python3 scripts/test-glaeda-mini-setup.py
           python3 scripts/test-glaeda-mini-enroll.py
-          python3 scripts/test-glaeda-cmux-runner.py
           python3 scripts/test-glaeda-cmux-runner-fleet.py
           python3 scripts/test-glaeda-mini-fleet.py
           python3 scripts/test-glaeda-fleet-status.py
@@ -227,7 +224,113 @@ jobs:
           python3 scripts/test-quarry-sweep.py
           python3 scripts/test-quarry-parallel.py
           python3 scripts/test-status-page.py
+          python3 scripts/test-unittest-shard.py
+          # a test that leaves files in the checkout fails, as it did before the split
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
+      - name: Validate Mac helper scripts
+        run: |
+          python3 scripts/test_project_disk_physical_receipt.py
+          bash -n \
+            scripts/macbook-runner-bootstrap.sh \
+            scripts/macbook-runner-observe.sh \
+            scripts/macbook-runner-vm.sh \
+            scripts/macbook-workspace.sh \
+            scripts/quarry-trusted-runner.sh \
+            scripts/test-macbook-runner-bootstrap.sh \
+            scripts/test-macbook-runner-vm.sh \
+            scripts/test-macbook-runner-vm-paths.sh \
+            scripts/test-quarry-trusted-runner.sh
+          bash scripts/test-macbook-runner-bootstrap.sh
+          bash scripts/test-macbook-runner-vm.sh
+          bash scripts/test-macbook-runner-vm-paths.sh
+          bash scripts/test-quarry-trusted-runner.sh
+          bash scripts/macbook-workspace.sh help >/dev/null
+          bash scripts/macbook-workspace.sh notify-doctor 0
+          if grep -Eq 'allowAll|openAccess|CMUX_SOCKET_(PATH|PASSWORD)' scripts/macbook-workspace.sh; then
+            printf 'error: Mac workspace helper widens cmux socket authority\n' >&2
+            exit 1
+          fi
+
+      - name: Validate Glaeda Lima example aliases
+        run: |
+          cmp examples/lima/smolrunner-interactive.yaml examples/lima/glaeda-interactive.yaml
+          cmp examples/lima/smolrunner-jit-launcher examples/lima/glaeda-jit-launcher
+          cmp examples/lima/smolrunner-prepared-template.json examples/lima/glaeda-prepared-template.json
+          cmp examples/lima/smolrunner-prepared-template.yaml examples/lima/glaeda-prepared-template.yaml
+          cmp examples/lima/smolrunner-runner-integrity examples/lima/glaeda-runner-integrity
+          cmp examples/lima/smolrunner-work.yaml examples/lima/glaeda-work.yaml
+          bash -n examples/lima/glaeda-jit-launcher
+          bash -n examples/lima/glaeda-runner-integrity
+
+      - name: Validate repository verification wrappers
+        run: bash -n examples/renderprove/run-renderprove-review.sh
+
+
+  # scripts/test-glaeda-cmux-runner.py took about 300 s of the old single job; its shards run side by side.
+  runner-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy,rustfmt
+          --no-self-update
+
+      - name: Run runner and hook tests (shard ${{ matrix.shard }} of 4)
+        run: |
+          python3 scripts/unittest-shard scripts/test-glaeda-cmux-runner.py ${{ matrix.shard }} 4
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+  rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy,rustfmt
+          --no-self-update
+
+      # Verify spends most of its wall time compiling the same dependency
+      # graph from scratch on every run. Restore the registry and target
+      # directory so only changed crates are rebuilt. Pull requests read the
+      # generation published by the last main push; only main writes, which
+      # keeps this workflow from multiplying per-branch cache entries.
+      - name: Restore cargo build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            verify-cargo-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
+
+      - name: Validate workspace bootstrap
+        run: |
           first_receipt=$(mktemp)
           second_receipt=$(mktemp)
           bootstrap_cache_root=$(mktemp -d)
@@ -291,44 +394,6 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
-
-      - name: Validate Mac helper scripts
-        run: |
-          python3 scripts/test_project_disk_physical_receipt.py
-          bash -n \
-            scripts/macbook-runner-bootstrap.sh \
-            scripts/macbook-runner-observe.sh \
-            scripts/macbook-runner-vm.sh \
-            scripts/macbook-workspace.sh \
-            scripts/quarry-trusted-runner.sh \
-            scripts/test-macbook-runner-bootstrap.sh \
-            scripts/test-macbook-runner-vm.sh \
-            scripts/test-macbook-runner-vm-paths.sh \
-            scripts/test-quarry-trusted-runner.sh
-          bash scripts/test-macbook-runner-bootstrap.sh
-          bash scripts/test-macbook-runner-vm.sh
-          bash scripts/test-macbook-runner-vm-paths.sh
-          bash scripts/test-quarry-trusted-runner.sh
-          bash scripts/macbook-workspace.sh help >/dev/null
-          bash scripts/macbook-workspace.sh notify-doctor 0
-          if grep -Eq 'allowAll|openAccess|CMUX_SOCKET_(PATH|PASSWORD)' scripts/macbook-workspace.sh; then
-            printf 'error: Mac workspace helper widens cmux socket authority\n' >&2
-            exit 1
-          fi
-
-      - name: Validate Glaeda Lima example aliases
-        run: |
-          cmp examples/lima/smolrunner-interactive.yaml examples/lima/glaeda-interactive.yaml
-          cmp examples/lima/smolrunner-jit-launcher examples/lima/glaeda-jit-launcher
-          cmp examples/lima/smolrunner-prepared-template.json examples/lima/glaeda-prepared-template.json
-          cmp examples/lima/smolrunner-prepared-template.yaml examples/lima/glaeda-prepared-template.yaml
-          cmp examples/lima/smolrunner-runner-integrity examples/lima/glaeda-runner-integrity
-          cmp examples/lima/smolrunner-work.yaml examples/lima/glaeda-work.yaml
-          bash -n examples/lima/glaeda-jit-launcher
-          bash -n examples/lima/glaeda-runner-integrity
-
-      - name: Validate repository verification wrappers
-        run: bash -n examples/renderprove/run-renderprove-review.sh
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain
@@ -403,3 +468,19 @@ jobs:
             ~/.cargo/git/db
             target
           key: verify-cargo-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+
+  # One check that stands for the whole workflow, under the old single job's name.
+  verify:
+    if: ${{ always() }}
+    needs: [go, scripts, runner-tests, rust]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every Verify job
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for result in $RESULTS; do
+            test "$result" = success
+          done
