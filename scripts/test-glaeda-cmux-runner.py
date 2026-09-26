@@ -1131,6 +1131,67 @@ class HookTest(unittest.TestCase):
             for runner in ("c0", "c1", "c2", "g1"):
                 self.finish(runner)
 
+    def idle_warm(self, *held: str) -> subprocess.Popen:
+        """A stand-in glaeda-idle-warm: holds HELD under the capacity dir, names them in the holder file, and
+        exits on SIGTERM, as the real one does."""
+        capacity = self.dir / "capacity"
+        capacity.mkdir(exist_ok=True)
+        fake = make_executable(self.dir / "glaeda-idle-warm", f"""import fcntl, json, os, pathlib, signal, sys, time
+capacity = pathlib.Path({os.fspath(capacity)!r})
+fds = []
+for name in sys.argv[1:]:
+    fd = os.open(capacity / (name if name.startswith("unit-") else name + ".token"), os.O_RDONLY | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fds.append(fd)
+(capacity / "idle-warm.json").write_text(json.dumps({{"pid": os.getpid(), "held": sys.argv[1:]}}))
+signal.signal(signal.SIGTERM, lambda *_: os._exit(143))
+print("held", flush=True)
+time.sleep(60)
+""")
+        warm = subprocess.Popen([sys.executable, os.fspath(fake), *held], stdout=subprocess.PIPE, text=True)
+        self.assertEqual(warm.stdout.readline().strip(), "held")
+        self.addCleanup(warm.kill)
+        # launchd reaps the real one at once; a zombie would still look alive to the hook
+        threading.Thread(target=warm.wait, daemon=True).start()
+        return warm
+
+    def test_capacity_a_job_stops_the_idle_catch_up_and_takes_its_locks(self) -> None:
+        self.fleet()
+        capacity = self.dir / "capacity"
+        root = hook.RunnerScope(units=4, compile_slots=1, roots=1, root=True)
+        warm = self.idle_warm("root-1", "persistent-dd", "unit-0", "unit-1")
+        try:
+            # what the catch-up holds counts as free, so the gate keeps the root runner listening
+            self.assertIsNone(hook.mini_full(capacity, 4, root))
+            first = self.job("macos-compile-admission", "y0")
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertIn("holding 2/4 units+persistent-dd+root-1", first.stdout)
+            self.assertIn(f"stopped the idle catch-up (pid {warm.pid})", first.stdout)
+            self.assertEqual(warm.wait(timeout=5), 143)  # SIGTERM, within WARM_YIELD_S
+            # the job's own locks are not the catch-up's: the gate sees them as taken
+            self.assertEqual(hook.mini_full(capacity, 4, root), "the persistent-dd token is taken")
+        finally:
+            self.finish("y0")
+
+    def test_capacity_a_stale_idle_catch_up_file_signals_nothing(self) -> None:
+        self.fleet()
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        other = subprocess.Popen(["/bin/sleep", "60"])
+        self.addCleanup(other.kill)
+        (capacity / "idle-warm.json").write_text(json.dumps({"pid": other.pid, "held": ["root-1", "persistent-dd"]}))
+        try:
+            self.assertIsNone(hook.idle_warm(capacity), "a reused pid that is not glaeda-idle-warm")
+            first = self.job("macos-compile-admission", "y1")
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertNotIn("idle catch-up", first.stdout)
+            self.assertIsNone(other.poll(), "never signalled")
+            for junk in ("{", "[]", json.dumps({"pid": True, "held": []}), json.dumps({"pid": 1, "held": []})):
+                (capacity / "idle-warm.json").write_text(junk)
+                self.assertIsNone(hook.idle_warm(capacity))
+        finally:
+            self.finish("y1")
+
     def test_capacity_a_full_mini_is_seen_by_the_listener_gate(self) -> None:
         self.fleet()
         capacity = self.dir / "capacity"

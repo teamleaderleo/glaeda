@@ -1090,6 +1090,58 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+# Idle catch-up (glaeda-idle-warm): while a mini is idle and a root's kept build is far from main, it holds that
+# root's token, a persistent-dd token and a compile's units (flocks under the capacity dir, like a job) and builds
+# main's head into the root's kept state. Any job comes first. take_capacity stops it (SIGTERM, then SIGKILL) and
+# waits for its locks to go before it takes its own, and the listener gate counts what it holds as free, so a mini
+# never stops listening or refuses a job because of it. It names its pid and locks in WARM_HOLDER, written under
+# admission.lock before that lock is released, so an admission that holds admission.lock always sees it.
+WARM_HOLDER = "idle-warm.json"
+WARM_PROGRAM = "glaeda-idle-warm"
+WARM_YIELD_S = 15.0
+
+
+def idle_warm(capacity_dir: Path) -> tuple[int, set[str]] | None:
+    """The running idle catch-up's pid and the lock names it holds (unit-N, root-K, persistent-dd...), or None.
+
+    The file is written by a process of this user, so it is read bounded and trusted only as far as its pid is
+    alive and is glaeda-idle-warm: a stale file whose pid was reused never gets another process signalled."""
+    try:
+        raw = read_bounded(capacity_dir / WARM_HOLDER)
+        holder = json.loads(raw.decode("utf-8")) if raw is not None else None
+        pid = holder.get("pid") if isinstance(holder, dict) else None
+        held = holder.get("held") if isinstance(holder, dict) else None
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or not isinstance(held, list):
+            return None
+        if pid == os.getpid() or not pid_alive(pid):
+            return None
+        command = subprocess.run(["/bin/ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+                                 timeout=5).stdout
+        if WARM_PROGRAM not in command:
+            return None
+        return pid, {str(name) for name in held if isinstance(name, str)}
+    except Exception:  # noqa: BLE001 - a holder file must never refuse or fail a job
+        return None
+
+
+def yield_idle_warm(capacity_dir: Path) -> str:
+    """Stop a running idle catch-up so this job gets its locks; a note for the admission line, or ''."""
+    warm = idle_warm(capacity_dir)
+    if warm is None:
+        return ""
+    pid = warm[0]
+    deadline = time.monotonic() + WARM_YIELD_S
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signum)
+        while pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not pid_alive(pid):
+            return f"; stopped the idle catch-up (pid {pid})"
+        deadline = time.monotonic() + 2.0
+    return f"; the idle catch-up (pid {pid}) did not stop"
+
+
 def holder_file(state_dir: Path) -> Path:
     """One pid file per runner (RUNNER_NAME comes from the runner, not the job)."""
     name = "".join(c for c in os.environ.get("RUNNER_NAME", "") if c.isalnum() or c in "-_.")
@@ -1198,6 +1250,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 if time.monotonic() >= deadline:
                     return False, "capacity: another admission on this mini is stuck"
                 time.sleep(0.1)
+        yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
         if os.path.isdir(os.path.dirname(host_lock)):
             # created if missing, so a worker that starts later still has to wait for this job
             fd = os.open(host_lock, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
@@ -1290,7 +1343,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             export_warm_route(warm_route)
             with contextlib.suppress(OSError):
                 roots_file(state_dir).write_text(root + "\n")
-        return held, (f"holding {what} for {job or 'an unknown job'} ({klass}; {note})" if held else note)
+        return held, (f"holding {what} for {job or 'an unknown job'} ({klass}; {note}{yielded})" if held else note)
     except OSError as error:
         return False, f"capacity: cannot take the ledger ({type(error).__name__})"
     finally:
@@ -1497,12 +1550,18 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return UNKNOWN
+        warm = idle_warm(capacity_dir)
+        yielding = warm[1] if warm else set()  # the idle catch-up gives these to the next job
+
+        def open_to_jobs(name: str, path: Path) -> bool:
+            return name in yielding or probe(path)
+
         root = scope is not None and scope.root
         # fit_units: a side runner whose label brings 2-unit jobs (listen --fit-units, glaeda-ios-sim)
         need = min(max(ROOT_FIT_UNITS if root else 1, fit_units), total)
         free = 0
         for slot in range(total):
-            if not probe(capacity_dir / f"unit-{slot}"):
+            if not open_to_jobs(f"unit-{slot}", capacity_dir / f"unit-{slot}"):
                 continue
             free += 1
             if free >= need:
@@ -1516,10 +1575,10 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             return None
         assert scope is not None
         dd = ["persistent-dd"] + [f"persistent-dd-{c}" for c in range(1, scope.compile_slots)]
-        if not any(probe(capacity_dir / f"{name}.token") for name in dd):
+        if not any(open_to_jobs(name, capacity_dir / f"{name}.token") for name in dd):
             return ("the persistent-dd token is taken" if len(dd) == 1
                     else f"all {len(dd)} persistent-dd tokens on this mini are taken")
-        if not any(probe(capacity_dir / f"root-{k}.token") for k in range(1, scope.roots + 1)):
+        if not any(open_to_jobs(f"root-{k}", capacity_dir / f"root-{k}.token") for k in range(1, scope.roots + 1)):
             return ("the canonical root is taken" if scope.roots == 1
                     else f"all {scope.roots} canonical roots on this mini are taken")
         return None

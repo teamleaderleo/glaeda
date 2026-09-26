@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""glaeda-idle-warm: while an owned cmux mini is idle, build main's head into a root whose kept build is far.
+
+    glaeda-idle-warm              plan: would this mini warm now, which root, and why not
+    glaeda-idle-warm --apply      warm (the 5-minute LaunchAgent from glaeda-mini-setup)
+
+cmux compile admission on an owned mini starts from the root's kept build (cmux owned_build_state.py) or a
+kept seed. What it compiles depends on how far that start is from the job's tree (cmux warm_distance.py):
+near (at most 5 app Swift files, no package interface change, no hot file) never recompiled the `cmux` module,
+far and rebuild did, about 220 s more per admission (cmuxterm-hq#661 WS6). A kept build is the last pull
+request's, merged onto a main that has since moved, so after a quiet spell every root is far: at 04:00Z on
+2026-09-26, 19 of 22 roots on 12 minis were rebuild-tier from main's head, while each mini sat idle 17 to 33%
+of the evening. Seeds do not close that gap on every mini (the light minis' width has no seeds, and a seed
+lands a build behind main), so an idle root builds main's head into its own kept state, and the next pull
+request admitted there compiles its own diff only.
+
+It runs only when all of these hold, cheapest check first, and says which one stopped it:
+  * a macOS mini that is not on NEVER_HOSTS (cmux-mac-mini is the production iOS soak box; Lawrence's machines
+    run the fleet coordinator) and has no KILL_SWITCH file;
+  * glaeda runners in capacity mode (--capacity-units), none trusted-only (a seeder), whose deployed hook yields
+    to jobs (its WARM_HOLDER); the hook is loaded from the runner, so the model and locks are the ones jobs use;
+  * no job or build running (Runner.Worker, xcodebuild) and none started or ended in the last IDLE_S;
+  * 1-minute load under LOAD_PER_CORE per core, thermal pressure nominal, at least MIN_FREE_BYTES free,
+    no reservation or fleet build on the host lock;
+  * a root whose kept build the hook predicts far or rebuild for main's head (the seed prefetch's mirror),
+    not already built or failed for that head, outside a failure backoff.
+Then it takes that root's token, a persistent-dd token and a compile's units through the capacity ledger, under
+admission.lock, with the host lock shared, exactly as a compile admission would, and writes WARM_HOLDER before
+letting admission.lock go. Every job's admission stops it (SIGTERM) and waits for those locks; on SIGTERM it
+kills the build's process group at once and exits, which releases them. cmux's scripts/ci/owned_catch_up.sh,
+from a checkout of main's head kept under ci/.catch-up, does the build: the same check, prefer, adopt, record,
+compile and keep steps a main dispatch's compile admission runs, and every step is safe to kill.
+
+The build is trusted main code run as the build user on a PR mini. Pull requests admitted to that root already
+share its kept state, so it adds no new trust boundary. One run at a time (flock on ci/.catch-up/lock). Prints
+one JSON line.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+FLEET_DIR = Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet")
+HOME = Path.home()
+REPO_URL = os.environ.get("GLAEDA_IDLE_WARM_REPO", "https://github.com/manaflow-ai/cmux.git")
+# Hostnames (lowercase, no .local) this never runs on: cmux-mac-mini (production iOS soak, hostname
+# cmuxs-Mac-mini-5) and Lawrence's machines (the fleet coordinator and subrouter).
+NEVER_HOSTS = ("cmuxs-mac-mini-5",)
+NEVER_HOST_WORDS = ("lawrence",)
+KILL_SWITCH = HOME / ".config/glaeda/idle-warm.disabled"
+JOB_LOG = HOME / "Library/Logs/glaeda-cmux-jobs.jsonl"
+BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
+                  r"|/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
+IDLE_S = 600  # no job started or ended for this long
+LOAD_PER_CORE = 0.25
+# The job admission floor (100 GiB, mini-fleet.json disk.min_free_gib) plus a cold compile (up to 36 GiB):
+# a catch-up never leaves the mini refusing jobs on disk.
+MIN_FREE_BYTES = 136 * 1024**3
+BUILD_TIMEOUT_S = 45 * 60
+GIT_TIMEOUT_S = 1800  # the first clone of cmux and its submodules
+FAILURE_BACKOFF_S = 6 * 3600  # after FAILURES_TO_PAUSE failed builds in a row
+FAILURES_TO_PAUSE = 3
+KEEP_LOGS = 12
+PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+_child: subprocess.Popen | None = None
+_holder: Path | None = None
+
+
+def record(**fields: Any) -> dict[str, Any]:
+    return {"tool": "glaeda-idle-warm", "time": int(time.time()), **fields}
+
+
+# ---------------------------------------------------------------- gates
+
+
+def host_denied(name: str | None = None) -> str:
+    host = (name or socket.gethostname()).lower().removesuffix(".local")
+    if host in NEVER_HOSTS or any(word in host for word in NEVER_HOST_WORDS):
+        return f"{host} never runs an idle catch-up"
+    return ""
+
+
+def runner_dirs(home: Path = HOME) -> list[Path]:
+    return sorted(path for path in home.glob("actions-runner-glaeda*") if (path / "glaeda-hooks").is_dir())
+
+
+def load_hook(runner_dir: Path) -> Any:
+    """The hook module the runner's jobs run, so the ledger, the model and the yield are theirs."""
+    path = runner_dir / "glaeda-hooks" / "glaeda-cmux-runner-hook"
+    loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_hook_for_warm", os.fspath(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def runner_setup(dirs: list[Path]) -> tuple[Any, dict[str, Any]] | str:
+    """(hook module, {units, roots, compile_slots, xcode}) or why this mini's runners rule a catch-up out."""
+    if not dirs:
+        return "no glaeda runner on this mini"
+    scripts = []
+    for runner in dirs:
+        try:
+            scripts.append((runner / "glaeda-hooks" / "job-started.sh").read_text())
+        except (OSError, UnicodeDecodeError):
+            return f"cannot read {runner.name}'s job-started hook"
+    if any("--trusted-ref" in text for text in scripts):
+        return "a trusted-only runner (a seeder) runs here"
+    try:
+        hook = load_hook(dirs[0])
+    except Exception as error:  # noqa: BLE001
+        return f"cannot load the runner hook ({type(error).__name__})"
+    if not hasattr(hook, "WARM_HOLDER") or not hasattr(hook, "warm_root_costs"):
+        return "the runner hook predates the idle catch-up (it would not yield to jobs)"
+    scopes = [hook.runner_scope(runner) for runner in dirs]
+    units = max(scope.units for scope in scopes)
+    if units <= 0:
+        return "runners are not in capacity mode"
+    xcode = ""
+    for text in scripts:
+        found = re.search(r"\s--toolchain-xcode\s+(\S+)", text)
+        if found:
+            xcode = found.group(1)
+    if not xcode.endswith(".app") or not Path(xcode).is_dir():
+        return "no toolchain Xcode pin in the runner hooks"
+    return hook, {"units": units, "roots": max(scope.roots for scope in scopes),
+                  "compile_slots": max(scope.compile_slots for scope in scopes), "xcode": xcode}
+
+
+def running() -> str:
+    """The first running job or build, or '' when none. Unknown counts as busy."""
+    try:
+        out = subprocess.run(["/bin/ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return "cannot list processes"
+    if out.returncode != 0:
+        return "cannot list processes"
+    for command in out.stdout.splitlines():
+        if BUSY.search(command):
+            return command.strip()[:120]
+    return ""
+
+
+def last_job_at(path: Path = JOB_LOG) -> float | None:
+    """When the last job on this mini started or ended (its telemetry log), or None if none ever did."""
+    try:
+        with open(path, "rb") as log:
+            log.seek(0, os.SEEK_END)
+            size = log.tell()
+            log.seek(max(0, size - 65536))
+            lines = log.read().decode("utf-8", "replace").splitlines()
+        stamp = path.stat().st_mtime
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            times = [event.get(key) for key in ("ended_at", "at", "started_at")]
+            return max([stamp, *(t for t in times if isinstance(t, (int, float)))])
+    return stamp
+
+
+def idle_refusal(hook: Any, now: float, state: Path) -> str:
+    busy = running()
+    if busy:
+        return f"busy: {busy}"
+    last = last_job_at()
+    if last is not None and now - last < IDLE_S:
+        return f"a job ran {int(now - last)} s ago (idle after {IDLE_S} s)"
+    try:
+        load = os.getloadavg()[0]
+    except OSError:
+        return "cannot read the load"
+    cores = os.cpu_count() or 1
+    if load >= LOAD_PER_CORE * cores:
+        return f"1-minute load {load:.1f} on {cores} cores"
+    level = hook.thermal_pressure_level()
+    if level is None or level > 0:
+        return f"thermal pressure {level if level is not None else 'unknown'}"
+    try:
+        free = shutil.disk_usage(state).free
+    except OSError:
+        return "cannot read free disk"
+    if free < MIN_FREE_BYTES:
+        return f"{free / 1024**3:.0f} GiB free, under {MIN_FREE_BYTES / 1024**3:.0f}"
+    held = hook.host_held(os.fspath(FLEET_DIR / "host.lock"), os.fspath(FLEET_DIR / "reservation.json"), now)
+    return held or ""
+
+
+# ---------------------------------------------------------------- which root
+
+
+def main_head(state: Path) -> str:
+    """Main's head as the seed prefetch last fetched it (its blobless mirror), or ''."""
+    mirror = state / ".prefetch" / "cmux.git"
+    try:
+        out = subprocess.run(["git", "-C", os.fspath(mirror), "rev-parse", "refs/remotes/origin/main"],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    head = out.stdout.strip()
+    return head if out.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", head) else ""
+
+
+def pick_root(hook: Any, roots: int, head: str, state: Path, memory: dict[str, Any]) -> tuple[int, dict] | str:
+    """The root to warm (1-based) and the hook's predictions, or why none."""
+    order = list(range(roots))
+    ranked, predicted = hook.warm_root_costs(order, head, None, os.fspath(state))
+    if not ranked:
+        return "cannot compare the kept builds with main's head (no mirror, model or stamp)"
+    done = memory.get("roots", {})
+    far = []
+    for copy in order:
+        guess = predicted.get(f"root-{copy + 1}") or {}
+        if guess.get("tier") in (None, "near"):
+            continue
+        if (done.get(str(copy + 1)) or {}).get("head") == head:
+            continue  # built, or tried, for this head already
+        far.append((-(guess.get("seconds") or 0), -(guess.get("app_swift_files") or 0), copy))
+    if not far:
+        return "every root is near main's head, or was warmed for it"
+    return sorted(far)[0][2] + 1, predicted
+
+
+# ---------------------------------------------------------------- locks
+
+
+def take(hook: Any, capacity: Path, setup: dict[str, Any], root: int) -> tuple[list[int], list[str]] | str:
+    """The root's token, a persistent-dd token and a compile's units, with the host lock shared, under
+    admission.lock, and WARM_HOLDER written before admission.lock is released; or why not."""
+    global _holder
+    capacity.mkdir(parents=True, exist_ok=True)
+    admission = os.open(capacity / "admission.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    fds: list[int] = []
+    try:
+        try:
+            fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "an admission is running"
+        host = os.open(FLEET_DIR / "host.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+        fds.append(host)
+        try:
+            fcntl.flock(host, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return "a fleet build holds the host lock"
+        held = []
+        fd = hook.lock_file(capacity / f"root-{root}.token", fcntl.LOCK_EX)
+        if fd is None:
+            return f"root-{root} is taken"
+        fds.append(fd)
+        held.append(f"root-{root}")
+        for copy in range(setup["compile_slots"]):
+            name = "persistent-dd" if copy == 0 else f"persistent-dd-{copy}"
+            fd = hook.lock_file(capacity / f"{name}.token", fcntl.LOCK_EX)
+            if fd is not None:
+                fds.append(fd)
+                held.append(name)
+                break
+        else:
+            return "every persistent-dd token is taken"
+        units = min(hook.CLASS_COST["compile"][0], setup["units"])
+        for slot in range(setup["units"]):
+            if units == 0:
+                break
+            fd = hook.lock_file(capacity / f"unit-{slot}", fcntl.LOCK_EX)
+            if fd is not None:
+                fds.append(fd)
+                held.append(f"unit-{slot}")
+                units -= 1
+        if units:
+            return "not enough capacity units are free"
+        holder = capacity / hook.WARM_HOLDER
+        incoming = capacity / f".{hook.WARM_HOLDER}.{os.getpid()}"
+        incoming.write_text(json.dumps({"pid": os.getpid(), "held": held, "root": root}) + "\n")
+        incoming.rename(holder)
+        _holder = holder
+        taken, fds = fds, []
+        return taken, held
+    except OSError as error:
+        return f"cannot take the ledger ({type(error).__name__})"
+    finally:
+        for fd in fds:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        os.close(admission)
+
+
+def release(fds: list[int]) -> None:
+    global _holder
+    if _holder is not None:
+        with contextlib.suppress(OSError):
+            if json.loads(_holder.read_text()).get("pid") == os.getpid():
+                _holder.unlink()
+        _holder = None
+    for fd in fds:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def stop(signum: int, _frame: Any) -> None:
+    """A job's admission wants the locks: kill the build at once and exit, which releases them."""
+    if _child is not None:
+        with contextlib.suppress(OSError):
+            os.killpg(_child.pid, signal.SIGKILL)
+    release([])
+    os._exit(128 + signum)  # the lock fds close with the process
+
+
+# ---------------------------------------------------------------- build
+
+
+def git(checkout: Path, *args: str, timeout: int = GIT_TIMEOUT_S) -> None:
+    subprocess.run(["git", "-C", os.fspath(checkout), *args], check=True, capture_output=True, timeout=timeout,
+                   env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
+
+
+def prepare_checkout(work: Path, head: str) -> None:
+    """A clean checkout of HEAD with submodules at WORK/cmux, cloned once and fetched after."""
+    checkout = work / "cmux"
+    if not (checkout / ".git").is_dir():
+        shutil.rmtree(checkout, ignore_errors=True)
+        subprocess.run(["git", "clone", "-q", "--no-checkout", REPO_URL, os.fspath(checkout)], check=True,
+                       capture_output=True, timeout=GIT_TIMEOUT_S, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    git(checkout, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main")
+    git(checkout, "cat-file", "-e", f"{head}^{{commit}}", timeout=60)
+    git(checkout, "-c", "advice.detachedHead=false", "checkout", "-q", "--force", "--detach", head)
+    git(checkout, "clean", "-ffdxq")
+    git(checkout, "submodule", "sync", "-q", "--recursive")
+    git(checkout, "submodule", "update", "-q", "--init", "--recursive", "--force")
+    git(checkout, "submodule", "foreach", "-q", "--recursive", "git clean -ffdxq")
+
+
+def build(checkout: Path, root: int, state: Path, xcode: str, log: Path) -> dict[str, Any]:
+    global _child
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("GITHUB_", "RUNNER_", "CMUX_"))}
+    env.update(PATH=PATH, CMUX_CI_XCODE_APP=xcode, CMUX_CATCH_UP_LOG=os.fspath(log))
+    started = time.monotonic()
+    _child = subprocess.Popen(["/usr/bin/nice", "-n", "5", "/bin/bash", "scripts/ci/owned_catch_up.sh", str(root),
+                               os.fspath(state)], cwd=checkout, env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    try:
+        out, _ = _child.communicate(timeout=BUILD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            os.killpg(_child.pid, signal.SIGKILL)
+        _child.communicate()
+        return {"kept": "false", "reason": f"timed out after {BUILD_TIMEOUT_S} s"}
+    finally:
+        code = _child.returncode
+        _child = None
+    lines = [line for line in (out or "").splitlines() if line.startswith("{")]
+    try:
+        result = json.loads(lines[-1]) if lines else {}
+    except ValueError:
+        result = {}
+    if not isinstance(result, dict) or not result:
+        tail = (out or "").strip().splitlines()[-1:] or [""]
+        result = {"kept": "false", "reason": f"exit {code}: {tail[0][:160]}"}
+    result["wall_seconds"] = round(time.monotonic() - started, 1)
+    return result
+
+
+def trim_logs(logs: Path) -> None:
+    old = sorted(logs.glob("*.log"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for stale in old[KEEP_LOGS:]:
+        with contextlib.suppress(OSError):
+            stale.unlink()
+
+
+# ---------------------------------------------------------------- run
+
+
+def load_memory(path: Path) -> dict[str, Any]:
+    try:
+        memory = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return memory if isinstance(memory, dict) else {}
+
+
+def save_memory(path: Path, memory: dict[str, Any]) -> None:
+    incoming = path.with_name(f".{path.name}.{os.getpid()}")
+    incoming.write_text(json.dumps(memory, sort_keys=True) + "\n")
+    incoming.rename(path)
+
+
+def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
+    now = time.time() if now is None else now
+    if platform.system() != "Darwin":
+        return record(state="skip", reason="not macOS")
+    why = host_denied()
+    if why:
+        return record(state="skip", reason=why)
+    if KILL_SWITCH.exists():
+        return record(state="skip", reason=f"{KILL_SWITCH} exists")
+    stores = [state, *(state / f"cmux-ci-{k}" for k in range(2, 100))]
+    if not any((store / "seed-source.json").is_file() for store in stores):
+        return record(state="skip", reason="no owned compile has run on this mini")
+    setup = runner_setup(runner_dirs())
+    if isinstance(setup, str):
+        return record(state="skip", reason=setup)
+    hook, scope = setup
+    work = state / ".catch-up"
+    work.mkdir(parents=True, exist_ok=True)
+    lock = os.open(work / "lock", os.O_RDONLY | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return record(state="skip", reason="another catch-up is running")
+        memory_path = work / "state.json"
+        memory = load_memory(memory_path)
+        paused = memory.get("paused_until") or 0
+        if isinstance(paused, (int, float)) and now < paused:
+            return record(state="skip", reason=f"paused after {FAILURES_TO_PAUSE} failed builds until {int(paused)}")
+        why = idle_refusal(hook, now, state)
+        if why:
+            return record(state="skip", reason=why)
+        head = main_head(state)
+        if not head:
+            return record(state="skip", reason="no main head in the seed prefetch mirror")
+        picked = pick_root(hook, scope["roots"], head, state, memory)
+        if isinstance(picked, str):
+            return record(state="skip", reason=picked, head=head)
+        root, predicted = picked
+        base = record(head=head, root=root, predicted=predicted)
+        if not apply:
+            return {**base, "state": "plan", "would": f"build main's head into root-{root}"}
+        try:
+            prepare_checkout(work, head)
+        except (OSError, subprocess.SubprocessError) as error:
+            detail = getattr(error, "stderr", b"") or b""
+            detail = detail.decode("utf-8", "replace") if isinstance(detail, bytes) else str(detail)
+            return {**base, "state": "error", "reason": f"checkout: {type(error).__name__} {detail.strip()[-160:]}"}
+        # The checkout may have taken minutes: look again before taking anything.
+        why = idle_refusal(hook, time.time(), state)
+        if why:
+            return {**base, "state": "skip", "reason": why}
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(signum, stop)
+        taken = take(hook, FLEET_DIR / "capacity", scope, root)
+        if isinstance(taken, str):
+            return {**base, "state": "skip", "reason": taken}
+        fds, held = taken
+        try:
+            busy = running()  # a job that started while the locks were taken: it will ask for them
+            if busy:
+                return {**base, "state": "skip", "reason": f"busy: {busy}"}
+            logs = work / "logs"
+            logs.mkdir(exist_ok=True)
+            log = logs / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-root-{root}.log"
+            result = build(work / "cmux", root, state, scope["xcode"], log)
+            trim_logs(logs)
+        finally:
+            release(fds)
+        kept = result.get("kept") == "true"
+        roots = memory.setdefault("roots", {})
+        roots[str(root)] = {"head": head, "at": int(time.time()), "kept": kept}
+        memory["failures"] = 0 if kept else int(memory.get("failures") or 0) + 1
+        if memory["failures"] >= FAILURES_TO_PAUSE:
+            memory["paused_until"] = int(time.time()) + FAILURE_BACKOFF_S
+            memory["failures"] = 0
+        save_memory(memory_path, memory)
+        return {**base, "state": "applied", "held": held, "result": result}
+    finally:
+        os.close(lock)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--apply", action="store_true")
+    args = parser.parse_args(argv)
+    state = Path(os.environ.get("GLAEDA_SEED_STATE") or FLEET_DIR / "ci")
+    print(json.dumps(run(args.apply, state)), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
