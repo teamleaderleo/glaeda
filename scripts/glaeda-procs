@@ -13,8 +13,11 @@ stays moderate, and typing and clicking stall. The report names who holds the me
 - agent sessions (claude, codex) with everything they started, one line per session;
 - Apple builds (swift-build, swift-test, xcodebuild) started directly by a session rather
   than by the CI runner or glaeda-apple, which is the documented way to hurt this machine;
-- leaked idle test fixtures: an orphan (parent is launchd) whose whole command line is a
-  known do-nothing fixture such as `python -c "import signal; signal.pause()"`;
+- leaked test fixtures: an orphan (parent is launchd) whose whole command line is a known
+  do-nothing fixture such as `python -c "import signal; signal.pause()"`, or a headless
+  Chrome/Chromium with a remote-debugging port and a --user-data-dir inside a temp dir, the
+  shape page-perf scratch scripts leave behind. Those spin rather than idle, so CPU is not a
+  criterion for them, and after one exits its temp profile is removed once no process names it;
 - other orphaned commands that run more than once, which are often leaked services.
 
 Only leaked fixtures are ever signalled. Builds, sessions, services and duplicates are
@@ -34,6 +37,7 @@ import dataclasses
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -57,6 +61,10 @@ FIXTURES = {
     "python-signal-pause": re.compile(r"\S*[Pp]ython[0-9.]*\s+-c\s+['\"]?import signal; ?signal\.pause\(\)['\"]?"),
     "sleep-forever": re.compile(r"(\S*/)?sleep\s+(infinity|\d{6,})"),
 }
+# Headless browsers that scratch perf scripts start and then lose. These spin rather than idle,
+# so CPU is not a criterion; the throwaway profile in a temp dir is what marks them as leaked.
+CHROMES = {"Google Chrome", "Google Chrome for Testing", "Chromium"}
+USER_DATA_DIR = re.compile(r"--user-data-dir=(\S+)")
 AGENTS = {"claude", "codex"}
 APPLE_BUILDS = {"swift-build", "swift-test", "xcodebuild"}
 CI_RUNNERS = {"Runner.Listener", "Runner.Worker"}
@@ -204,8 +212,38 @@ def verdict(h: dict) -> str:
     return "normal" if h["pressure"] == "normal" or not DARWIN else "unknown"
 
 
-def fixture_kind(p: Proc, uid: int, min_age: int) -> str | None:
-    if p.ppid != 1 or p.uid != uid or p.elapsed < min_age or p.cpu >= 1.0 or p.stat.startswith("Z"):
+def temp_roots() -> list[Path]:
+    roots = [Path("/tmp"), Path("/private/tmp")]
+    if os.environ.get("TMPDIR"):
+        roots.append(Path(os.environ["TMPDIR"]))
+    return [Path(os.path.realpath(r)) for r in roots]
+
+
+def temp_profile(path: str, roots: list[Path]) -> Path | None:
+    """A throwaway profile strictly inside a temp root, else None."""
+    real = Path(os.path.realpath(path))
+    for root in roots:
+        if real != root and root in real.parents:
+            return real
+    return None
+
+
+def headless_chrome_profile(p: Proc, roots: list[Path]) -> Path | None:
+    words = p.command.split()
+    if p.exe not in CHROMES or "--headless" not in " ".join(w.split("=")[0] for w in words):
+        return None
+    if not any(w.startswith("--remote-debugging-port=") for w in words):
+        return None
+    m = USER_DATA_DIR.search(p.command)
+    return temp_profile(m.group(1), roots) if m else None
+
+
+def fixture_kind(p: Proc, uid: int, min_age: int, roots: list[Path] | None = None) -> str | None:
+    if p.ppid != 1 or p.uid != uid or p.elapsed < min_age or p.stat.startswith("Z"):
+        return None
+    if headless_chrome_profile(p, temp_roots() if roots is None else roots):
+        return "headless-chrome"
+    if p.cpu >= 1.0:
         return None
     for kind, pattern in FIXTURES.items():
         if pattern.fullmatch(p.command.strip()):
@@ -224,7 +262,7 @@ def label(p: Proc) -> str:
     return " ".join(parts)[:60]
 
 
-def survey(procs: list[Proc], uid: int, min_age_hours: float) -> dict:
+def survey(procs: list[Proc], uid: int, min_age_hours: float, roots: list[Path] | None = None) -> dict:
     by_pid = {p.pid: p for p in procs}
     children: dict[int, list[Proc]] = {}
     for p in procs:
@@ -285,16 +323,19 @@ def survey(procs: list[Proc], uid: int, min_age_hours: float) -> dict:
                        "session": session(agent) if agent else None})
 
     min_age = int(min_age_hours * 3600)
+    roots = temp_roots() if roots is None else roots
     fixtures = []
     for p in procs:
-        kind = fixture_kind(p, uid, min_age)
+        kind = fixture_kind(p, uid, min_age, roots)
         if kind:
+            # a browser's helpers are its children and exit with it
             fixtures.append({"pid": p.pid, "kind": kind, "elapsed_seconds": p.elapsed,
-                             "rss_bytes": p.rss_kib * KIB, "_proc": p})
+                             "rss_bytes": subtree_rss(p) * KIB, "_proc": p,
+                             "_profile": headless_chrome_profile(p, roots)})
 
     orphan_counts: dict[str, list[int]] = {}
     for p in procs:
-        if p.ppid == 1 and p.uid == uid and fixture_kind(p, uid, 0) is None and not p.command.startswith("/Applications/") \
+        if p.ppid == 1 and p.uid == uid and fixture_kind(p, uid, 0, roots) is None and not p.command.startswith("/Applications/") \
                 and not p.command.startswith("/System/") and not p.command.startswith("/usr/"):
             orphan_counts.setdefault(p.command, []).append(p.pid)
     duplicates = sorted(({"label": label(by_pid[pids[0]]), "count": len(pids), "pids": sorted(pids)}
@@ -309,11 +350,35 @@ def survey(procs: list[Proc], uid: int, min_age_hours: float) -> dict:
     }
 
 
+def profile_in_use(profile: Path, procs: list[Proc]) -> bool:
+    return any(str(profile) in p.command for p in procs)
+
+
+def remove_profile(profile: Path, uid: int, fresh: Callable[[], list[Proc]]) -> str:
+    """Delete a leaked browser's temp profile once nothing names it any more."""
+    try:
+        st = profile.lstat()
+    except FileNotFoundError:
+        return "absent"
+    if not profile.is_dir() or profile.is_symlink() or st.st_uid != uid:
+        return "kept-not-owned"
+    try:
+        if profile_in_use(profile, fresh()):
+            return "kept-in-use"
+    except NoEvidence:
+        return "kept-no-evidence"
+    shutil.rmtree(profile, ignore_errors=True)
+    return "removed" if not profile.exists() else "partial"
+
+
 def apply(fixtures: list[dict], receipt: Path,
           look: Callable[[int], Proc | None] = observe,
           kill: Callable[[int, int], None] = os.kill,
-          wait_seconds: float = 2.0) -> list[dict]:
+          wait_seconds: float = 2.0,
+          fresh: Callable[[], list[Proc]] = snapshot,
+          uid: int | None = None) -> list[dict]:
     """SIGTERM each fixture whose identity is unchanged; record what happened."""
+    uid = os.getuid() if uid is None else uid
     results = []
     receipt.parent.mkdir(parents=True, exist_ok=True)
     for f in fixtures:
@@ -328,7 +393,8 @@ def apply(fixtures: list[dict], receipt: Path,
                 outcome = "skipped-permission"
             else:
                 outcome = "survived"
-                deadline = time.monotonic() + wait_seconds
+                # a browser flushes its profile and waits for helpers before exiting
+                deadline = time.monotonic() + (wait_seconds * 5 if f.get("_profile") else wait_seconds)
                 while time.monotonic() < deadline:
                     now = look(proc.pid)
                     if not proc.same_process(now) or now.stat.startswith("Z"):
@@ -339,6 +405,9 @@ def apply(fixtures: list[dict], receipt: Path,
             outcome = "gone"
         record = {"schema": SCHEMA, "time": int(time.time()), "pid": proc.pid, "start": proc.start,
                   "kind": f["kind"], "rss_bytes": f["rss_bytes"], "outcome": outcome}
+        if f.get("_profile"):
+            record["profile"] = (remove_profile(f["_profile"], uid, fresh)
+                                 if outcome in ("terminated", "gone") else "kept-process-alive")
         with receipt.open("a") as out:
             out.write(json.dumps(record) + "\n")
         results.append(record)

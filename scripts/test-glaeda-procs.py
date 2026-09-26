@@ -68,6 +68,39 @@ class FixtureTest(unittest.TestCase):
         self.assertIsNone(self.kind(proc(10, command="sleep 30")), "a bounded sleep")
 
 
+CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+ROOTS = [Path("/private/tmp")]
+
+
+def chrome(pid, profile="/private/tmp/cidash-sweep-1", extra="--headless=new --remote-debugging-port=0", **kw):
+    return proc(pid, command=f"{CHROME} {extra} --user-data-dir={profile} about:blank", path=CHROME,
+                cpu=kw.pop("cpu", 80.0), stat=kw.pop("stat", "R"), **kw)
+
+
+class ChromeTest(unittest.TestCase):
+    def kind(self, p):
+        return gp.fixture_kind(p, UID, 3600, ROOTS)
+
+    def test_orphaned_spinning_headless_chrome_is_a_fixture(self) -> None:
+        self.assertEqual(self.kind(chrome(10)), "headless-chrome")
+        self.assertEqual(self.kind(chrome(10, extra="--headless --remote-debugging-port=9222")), "headless-chrome")
+
+    def test_protected_browsers(self) -> None:
+        self.assertIsNone(self.kind(chrome(10, extra="--remote-debugging-port=0")), "not headless")
+        self.assertIsNone(self.kind(chrome(10, extra="--headless=new")), "no debugging port")
+        self.assertIsNone(self.kind(chrome(10, profile="/Users/u/Library/Chrome")), "real profile")
+        self.assertIsNone(self.kind(chrome(10, profile="/private/tmp")), "the temp root itself")
+        self.assertIsNone(self.kind(chrome(10, profile="/private/tmp/../etc")), "escapes the temp root")
+        self.assertIsNone(self.kind(chrome(10, ppid=400)), "still has its parent")
+        self.assertIsNone(self.kind(chrome(10, elapsed=60)), "younger than min age")
+
+    def test_helpers_count_toward_the_leak(self) -> None:
+        procs = [chrome(10, rss=100_000), proc(11, ppid=10, command="Google Chrome Helper", rss=50_000)]
+        [f] = gp.survey(procs, UID, 1, ROOTS)["fixtures"]
+        self.assertEqual((f["pid"], f["rss_bytes"]), (10, 150_000 * 1024))
+        self.assertNotIn("cidash", json.dumps(gp.public(gp.survey(procs, UID, 1, ROOTS))))
+
+
 class SurveyTest(unittest.TestCase):
     def test_attribution(self) -> None:
         procs = [
@@ -146,6 +179,46 @@ class ApplyTest(unittest.TestCase):
 
         out = gp.apply(self.fixtures(p20, p21, p22), self.receipt, look=seen.get, kill=kill, wait_seconds=0.2)
         self.assertEqual([r["outcome"] for r in out], ["gone", "terminated", "survived"])
+
+
+class ChromeApplyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.receipt = self.root / "receipts.jsonl"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def run_apply(self, profile: Path, others: list):
+        p = chrome(10, profile=str(profile))
+        f = [{"pid": 10, "kind": "headless-chrome", "elapsed_seconds": p.elapsed, "rss_bytes": 1,
+              "_proc": p, "_profile": gp.temp_profile(str(profile), [self.root])}]
+        seen = {10: p}
+        return gp.apply(f, self.receipt, look=seen.get, kill=lambda pid, sig: seen.pop(pid),
+                        wait_seconds=0.1, fresh=lambda: others, uid=os.getuid())
+
+    def test_profile_removed_after_exit(self) -> None:
+        profile = self.root / "frametime-1"
+        (profile / "Default").mkdir(parents=True)
+        [r] = self.run_apply(profile, [])
+        self.assertEqual((r["outcome"], r["profile"]), ("terminated", "removed"))
+        self.assertFalse(profile.exists())
+        self.assertNotIn("frametime", self.receipt.read_text())
+
+    def test_profile_kept_while_another_process_names_it(self) -> None:
+        profile = self.root / "shared"
+        profile.mkdir()
+        [r] = self.run_apply(profile, [proc(99, ppid=5, command=f"node x.mjs {profile}")])
+        self.assertEqual(r["profile"], "kept-in-use")
+        self.assertTrue(profile.exists())
+
+    def test_symlinked_profile_is_not_followed(self) -> None:
+        target = self.root / "real"
+        target.mkdir()
+        (self.root / "link").symlink_to(target)
+        self.assertEqual(gp.remove_profile(self.root / "link", os.getuid(), lambda: []), "kept-not-owned")
+        self.assertTrue(target.exists())
 
 
 class RenderTest(unittest.TestCase):
