@@ -629,22 +629,27 @@ scripts/glaeda-seed-lan mesh cmux7s-mac-mini cmux8s-mac-mini ... cmuxs-mac-mini-
 
 LAN addresses come from `ipconfig getifaddr en0` on each host (override with `--address HOST=IP`). Add
 the printed `manifest_keys` to each host's authorized_keys policy in `~/.config/glaeda/mini-fleet.json`.
-Then install the root-owned helper on every mesh host from the operator Mac, and again whenever
-glaeda-mini-setup prints the step (the helper changed):
+Then install the root-owned helper on every mesh host by hand, as root, from an admin account other than
+cmux or at the console. Do it again whenever glaeda-mini-setup prints the step (the helper changed).
+Never pipe a sudo password through the cmux account: its login shell runs files a PR job can write
+(`~/.zshenv`), so they could read it. `helper-install` never runs sudo. It checks each host's copy and
+directory chain, and with `--apply` it writes the root script and prints the commands:
 
 ```bash
-scripts/glaeda-seed-lan helper-install cmux7s-mac-mini ... cmuxs-mac-mini-5            # plan: each host's copy and chain
-scripts/glaeda-seed-lan helper-install cmux7s-mac-mini ... cmuxs-mac-mini-5 --apply
+scripts/glaeda-seed-lan helper-install cmux7s-mac-mini ... cmuxs-mac-mini-5                     # state per host
+scripts/glaeda-seed-lan helper-install cmux7s-mac-mini ... cmuxs-mac-mini-5 --admin ADMIN --apply  # script + commands
+# for each host, as printed:
+scp ~/.local/state/glaeda/seed-lan/glaeda-lan-fetch-install-<sha>.sh ADMIN@HOST:
+ssh -t ADMIN@HOST 'shasum -a 256 glaeda-lan-fetch-install-<sha>.sh && sudo /bin/bash glaeda-lan-fetch-install-<sha>.sh; rm -f glaeda-lan-fetch-install-<sha>.sh'
 ```
 
-`--apply` runs one root script per host through cmuxterm-hq's `build-fleet/mini-ops/fleet-sudo.sh` (the
-sudo password from the login Keychain, `fleet password set GROUP`; override its path with
-`GLAEDA_FLEET_SUDO`). The script carries this checkout's helper and its sha256, never the mini's
-user-writable copy. It creates the missing directories root:wheel 0755, installs through a temporary
-file and a rename, and answers BUSY while another install holds its lock. Busy or unreachable hosts are
-retried three times, 30 s apart, and every host is probed again afterwards. The manual equivalent on one
-mini is `sudo install -d -o root -g wheel -m 0755 "/Library/Application Support/glaeda/bin"` and then
-`sudo install -o root -g wheel -m 0755 <reviewed glaeda-lan-fetch> "/Library/Application Support/glaeda/bin/glaeda-lan-fetch"`.
+The script carries this checkout's helper and its sha256, never the mini's user-writable copy. It fails
+closed unless every existing component of `/Library/Application Support/glaeda/bin/glaeda-lan-fetch`,
+from `/` down, is a non-symlink owned by root without group or other write. It creates only missing
+directories (root:wheel 0755) and installs through a temporary file whose sha256 must match, then a
+rename. It holds a lock directory with its pid: a live holder under 10 minutes old means BUSY, and a
+dead or older one is taken over. Rerun `helper-install` without `--apply` afterwards: every host
+should be `current`.
 
 Check it on a mini with any digest a peer holds:
 `"/Library/Application Support/glaeda/bin/glaeda-lan-fetch" product SHA256 /tmp/x.tar.gz` (the record says

@@ -25,8 +25,10 @@ node_product_cache.py: PRODUCTS/objects/<key[:2]>/<key>/{metadata.json,object.ta
     product-v1 SHA256        glaeda-seed-serve 1 hit-product SHA256 SIZE, then exactly SIZE raw bytes
 
 SHA256 is the archive's content digest (metadata object_digest), 64 lowercase hex. Only an entry whose
-directories are real, whose metadata is cmux's current schema and names that digest and a size under
-MAX_OBJECT_BYTES, and whose object.tar.gz is a regular file of that size (opened O_NOFOLLOW) is served.
+directories are real (walked from / with O_DIRECTORY|O_NOFOLLOW and openat, so none is a symlink),
+whose metadata (at most 64 KiB) is cmux's current schema and names that digest and a size under
+MAX_OBJECT_BYTES, and whose object.tar.gz is a regular file with one link, owned by this user, of that
+size, is served. Lookups are admitted (per-client and queue caps) before the cache is scanned.
 Unlike seeds, any PR mini serves products, and a PR job there can write its cache: the bytes are not
 trusted here. The consumer's sha256 check against the digest GitHub recorded is what makes them safe,
 and it is not optional (glaeda-lan-fetch, then cmux peer_product_source.py again). The product role
@@ -92,7 +94,7 @@ PRODUCT_FORMAT = "app-host-products-tar-gz-v1"
 PRODUCT_OBJECT = "object.tar.gz"
 PRODUCT_METADATA = "metadata.json"
 MAX_OBJECT_BYTES = 20 * 1024**3
-MAX_METADATA_BYTES = 1 << 20
+MAX_METADATA_BYTES = 64 * 1024
 MAX_PRODUCT_ENTRIES = 4096
 SHA_RE = re.compile(r"[a-f0-9]{64}")
 ROLES = ("seed", "product")
@@ -201,57 +203,122 @@ def admit(run_dir: Path, client: str) -> list[int] | None:
     return None
 
 
-def real_dir(path: Path) -> bool:
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def open_dir_path(path: Path) -> int | None:
+    """An fd for PATH walked from / one component at a time, refusing a symlink anywhere; None if not."""
+    if not path.is_absolute():
+        return None
     try:
-        return stat.S_ISDIR(os.lstat(path).st_mode)
+        fd = os.open("/", DIR_FLAGS)
     except OSError:
-        return False
+        return None
+    for part in path.parts[1:]:
+        try:
+            child = os.open(part, DIR_FLAGS, dir_fd=fd)
+        except OSError:
+            os.close(fd)
+            return None
+        os.close(fd)
+        fd = child
+    return fd
+
+
+def open_child_dir(parent: int, name: str) -> int | None:
+    try:
+        return os.open(name, DIR_FLAGS, dir_fd=parent)
+    except OSError:
+        return None
+
+
+def read_metadata(entry: int) -> dict | None:
+    """metadata.json in the ENTRY directory fd: a regular file of at most MAX_METADATA_BYTES, parsed."""
+    try:
+        fd = os.open(PRODUCT_METADATA, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=entry)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_METADATA_BYTES:
+            return None
+        raw = os.read(fd, MAX_METADATA_BYTES + 1)
+        if len(raw) > MAX_METADATA_BYTES:
+            return None
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
 
 
 def open_product(root: Path, sha: str) -> tuple[int, int] | None:
-    """(fd, size) of the cached product whose content digest is SHA, or None."""
-    objects = root / "objects"
-    if not real_dir(root) or not real_dir(objects):
+    """(fd, size) of the cached product whose content digest is SHA, or None.
+
+    Every directory is opened O_DIRECTORY|O_NOFOLLOW relative to its parent's fd, so no path component
+    can be a symlink or be swapped for one between the check and the open. The object must be a regular
+    file with one link, owned by this user (the cache's owner), of exactly the size the metadata names.
+    """
+    root_fd = open_dir_path(root)
+    if root_fd is None:
         return None
     seen = 0
     try:
-        shards = sorted(objects.iterdir())
+        objects = open_child_dir(root_fd, "objects")
+        if objects is None:
+            return None
+        try:
+            for shard_name in sorted(os.listdir(objects)):
+                if not re.fullmatch(r"[a-f0-9]{2}", shard_name):
+                    continue
+                shard = open_child_dir(objects, shard_name)
+                if shard is None:
+                    continue
+                try:
+                    names = sorted(os.listdir(shard))
+                    for name in names:
+                        seen += 1
+                        if seen > MAX_PRODUCT_ENTRIES:
+                            return None
+                        if not SHA_RE.fullmatch(name) or name[:2] != shard_name:
+                            continue
+                        entry = open_child_dir(shard, name)
+                        if entry is None:
+                            continue
+                        try:
+                            found = open_entry_object(entry, sha)
+                        finally:
+                            os.close(entry)
+                        if found is not None:
+                            return found
+                finally:
+                    os.close(shard)
+        finally:
+            os.close(objects)
     except OSError:
         return None
-    for shard in shards:
-        if not re.fullmatch(r"[a-f0-9]{2}", shard.name) or not real_dir(shard):
-            continue
-        try:
-            entries = sorted(shard.iterdir())
-        except OSError:
-            continue
-        for entry in entries:
-            seen += 1
-            if seen > MAX_PRODUCT_ENTRIES:
-                return None
-            if not SHA_RE.fullmatch(entry.name) or entry.name[:2] != shard.name or not real_dir(entry):
-                continue
-            try:
-                info = os.lstat(entry / PRODUCT_METADATA)
-                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_METADATA_BYTES:
-                    continue
-                metadata = json.loads((entry / PRODUCT_METADATA).read_text())
-            except (OSError, ValueError):
-                continue
-            size = metadata.get("size") if isinstance(metadata, dict) else None
-            if (not isinstance(metadata, dict) or metadata.get("object_digest") != sha
-                    or metadata.get("schema_generation") != PRODUCT_SCHEMA
-                    or metadata.get("format_generation") != PRODUCT_FORMAT
-                    or not isinstance(size, int) or isinstance(size, bool) or not 0 < size <= MAX_OBJECT_BYTES):
-                continue
-            try:
-                fd = os.open(entry / PRODUCT_OBJECT, os.O_RDONLY | os.O_NOFOLLOW)
-            except OSError:
-                continue
-            info = os.fstat(fd)
-            if stat.S_ISREG(info.st_mode) and info.st_size == size:
-                return fd, size
-            os.close(fd)
+    finally:
+        os.close(root_fd)
+    return None
+
+
+def open_entry_object(entry: int, sha: str) -> tuple[int, int] | None:
+    metadata = read_metadata(entry)
+    size = metadata.get("size") if metadata else None
+    if (metadata is None or metadata.get("object_digest") != sha
+            or metadata.get("schema_generation") != PRODUCT_SCHEMA
+            or metadata.get("format_generation") != PRODUCT_FORMAT
+            or not isinstance(size, int) or isinstance(size, bool) or not 0 < size <= MAX_OBJECT_BYTES):
+        return None
+    try:
+        fd = os.open(PRODUCT_OBJECT, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=entry)
+    except OSError:
+        return None
+    info = os.fstat(fd)
+    if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.getuid() and info.st_size == size:
+        return fd, size
+    os.close(fd)
     return None
 
 
@@ -389,41 +456,47 @@ def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, 
 
 def serve_product(verb: str, sha: str, products: Path, run_dir: Path, client: str, slot_wait: float,
                   record: dict) -> int:
-    opened = open_product(products, sha)
-    if opened is None:
-        say("miss")
-        log(run_dir, {**record, "outcome": "miss", "verb": verb})
-        return 3
-    fd, size = opened
+    # Admission first, for lookups too: a scan of the cache is work a flood of clients must not multiply.
+    admitted = admit(run_dir, client)
+    if admitted is None:
+        say("busy")
+        log(run_dir, {**record, "outcome": "busy", "verb": verb})
+        return 4
     try:
-        if verb == "product-has":
-            say(f"has {sha} {size}")
-            log(run_dir, {**record, "outcome": "has"})
-            return 0
         try:
             os.nice(10)
         except OSError:
             pass
-        admitted = admit(run_dir, client)
-        slot = take_slot(run_dir, slot_wait) if admitted is not None else None
-        if slot is None:
-            for held in admitted or []:
-                os.close(held)
-            say("busy")
-            log(run_dir, {**record, "outcome": "busy", "verb": verb})
-            return 4
-        started = time.monotonic()
+        opened = open_product(products, sha)
+        if opened is None:
+            say("miss")
+            log(run_dir, {**record, "outcome": "miss", "verb": verb})
+            return 3
+        fd, size = opened
         try:
-            say(f"hit-product {sha} {size}")
-            status = stream_product(fd, size)
+            if verb == "product-has":
+                say(f"has {sha} {size}")
+                log(run_dir, {**record, "outcome": "has"})
+                return 0
+            slot = take_slot(run_dir, slot_wait)
+            if slot is None:
+                say("busy")
+                log(run_dir, {**record, "outcome": "busy", "verb": verb})
+                return 4
+            started = time.monotonic()
+            try:
+                say(f"hit-product {sha} {size}")
+                status = stream_product(fd, size)
+            finally:
+                os.close(slot)
+            log(run_dir, {**record, "outcome": "served" if status == 0 else "failed", "verb": verb, "bytes": size,
+                          "seconds": round(time.monotonic() - started, 1)})
+            return status
         finally:
-            for held in [slot, *admitted]:
-                os.close(held)
-        log(run_dir, {**record, "outcome": "served" if status == 0 else "failed", "verb": verb, "bytes": size,
-                      "seconds": round(time.monotonic() - started, 1)})
-        return status
+            os.close(fd)
     finally:
-        os.close(fd)
+        for held in admitted:
+            os.close(held)
 
 
 def main(argv: list[str]) -> int:

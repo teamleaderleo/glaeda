@@ -1269,7 +1269,8 @@ def operator_steps(ctx: Context, pre: dict[str, Any], fleet_result: dict[str, An
         add("cmux CI fetches compiled products from LAN peers through a root-owned glaeda-lan-fetch in a "
             "root-owned directory chain (cmux refuses anything a job could rewrite or rename)",
             f"scripts/glaeda-seed-lan helper-install {platform.node().split('.')[0] or 'HOST'} --apply",
-            "operator Mac (fleet Keychain sudo; installs this checkout's helper, not the mini's copy)")
+            "operator Mac, then root from a non-cmux admin account or the console, as it prints "
+            "(docs/CMUX_MINI_RUNNER.md 2j); never sudo through the cmux account")
     add("Spotlight should skip build output", "System Settings > Spotlight > Search Privacy: add ~/Library/Developer/Xcode/DerivedData", "human (GUI)")
     add("GitHub Actions runner registration (reserved slot, never automated here)",
         "once enrolled: ~/glaeda/scripts/glaeda-cmux-runner --apply (docs/CMUX_MINI_RUNNER.md; routing is glaeda#1174)",
