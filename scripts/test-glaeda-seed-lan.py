@@ -241,7 +241,7 @@ class InstallerTest(unittest.TestCase):
         base = Path(self.tmp.name)
         self.homes = base / "homes"
         self.seeder = self.homes / "cmux15"
-        for host in ("cmux15", "cmux12s-mac-mini", "cmux13s-mac-mini", "cmuxs-mac-mini-6"):
+        for host in ("cmux15", "cmux11s-mac-mini", "cmux12s-mac-mini", "cmux13s-mac-mini", "cmuxs-mac-mini-6"):
             (self.homes / host / ".ssh").mkdir(parents=True)
         receipt = self.seeder / ".local/state/glaeda/cmux-runner/receipt.json"
         receipt.parent.mkdir(parents=True)
@@ -429,6 +429,209 @@ class InstallerTest(unittest.TestCase):
         with unittest.mock.patch.object(lan.subprocess, "run", spy):
             self.install("cmux12s-mac-mini", apply=False)
         self.assertTrue(calls and all(c[-1].startswith("/usr/bin/python3 -I - ") for c in calls))
+
+    def mesh(self, *extra: str) -> tuple[int, dict]:
+        hosts = ["cmux12s-mac-mini", "cmux13s-mac-mini", "cmux11s-mac-mini"]
+        return self.cli("mesh", *hosts, "--address", "cmux12s-mac-mini=172.20.21.196", "--address",
+                        "cmux13s-mac-mini=172.20.21.197", "--address", "cmux11s-mac-mini=172.20.21.195", *extra)
+
+    def test_the_product_mesh_authorizes_every_other_mini_for_products_only(self):
+        before = self.tree()
+        code, plan = self.mesh()
+        self.assertEqual((code, self.tree()), (0, before))
+        code, report = self.mesh("--apply")
+        self.assertEqual(code, 0, report)
+        hosts = ["cmux12s-mac-mini", "cmux13s-mac-mini", "cmux11s-mac-mini"]
+        keys = {h: " ".join((self.homes / h / ".config/glaeda/lan-mesh/id_ed25519.pub").read_text().split()[:2])
+                for h in hosts}
+        for host in hosts:
+            home = self.homes / host
+            conf = json.loads((home / ".config/glaeda/lan-mesh/config.json").read_text())
+            self.assertEqual([p["name"] for p in conf["peers"]], [h for h in hosts if h != host])
+            self.assertEqual(len((home / ".config/glaeda/lan-mesh/known_hosts").read_text().splitlines()), 3)
+            lines = [l for l in (home / ".ssh/authorized_keys").read_text().splitlines() if "glaeda-lan-mesh@" in l]
+            command = f"/usr/bin/python3 -I {home}/.local/libexec/glaeda-seed-serve --role product"
+            self.assertEqual(sorted(lines), sorted(
+                f'restrict,from="172.20.20.0/22",command="{command}" {keys[p]} glaeda-lan-mesh@{p}'
+                for p in hosts if p != host))
+            self.assertEqual((home / ".local/libexec/glaeda-seed-serve").read_bytes(), SERVE.read_bytes())
+            self.assertEqual(list(report["hosts"][host]["ping"].values()), ["glaeda-seed-serve 1 pong"])
+        # The prefetch-side seed key is separate; the mesh config reads back through glaeda-lan-fetch.
+        lf = load("glaeda_lan_fetch_for_test", ROOT / "scripts/glaeda-lan-fetch")
+        self.assertIsNotNone(lf.load_config(self.homes / "cmux13s-mac-mini/.config/glaeda/lan-mesh/config.json"))
+        self.assertEqual(len(report["manifest_keys"]), 3)
+        after = self.tree()
+        code, again = self.mesh("--apply")
+        self.assertEqual(self.tree(), after)
+        code, removed = self.cli("mesh-remove", "cmux13s-mac-mini", "--apply")
+        self.assertEqual(code, 0)
+        self.assertFalse((self.homes / "cmux13s-mac-mini/.config/glaeda/lan-mesh").exists())
+        self.assertFalse(any("glaeda-lan-mesh@" in l for l in
+                             (self.homes / "cmux13s-mac-mini/.ssh/authorized_keys").read_text().splitlines()))
+        self.assertTrue(any("glaeda-lan-mesh@" in l for l in
+                            (self.homes / "cmux12s-mac-mini/.ssh/authorized_keys").read_text().splitlines()))
+
+    def test_the_mesh_refuses_a_duplicate_key_and_needs_two_hosts(self):
+        self.mesh("--apply")
+        a = self.homes / "cmux12s-mac-mini/.config/glaeda/lan-mesh"
+        b = self.homes / "cmux13s-mac-mini/.config/glaeda/lan-mesh"
+        for name in ("id_ed25519", "id_ed25519.pub"):
+            shutil.copy(a / name, b / name)
+        code, report = self.mesh("--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("refused", report["hosts"]["cmux13s-mac-mini"]["key"])
+        code, report = self.cli("mesh", "cmux12s-mac-mini")
+        self.assertEqual(code, 1)
+
+    def test_helper_install_never_runs_sudo_and_prints_the_commands(self):
+        state = Path(self.tmp.name) / "operator-state"
+        calls = []
+        real = subprocess.run
+
+        def spy(argv, **kwargs):
+            calls.append(argv)
+            return real(argv, **kwargs)
+
+        with unittest.mock.patch.object(lan, "SCRIPT_DIR_OUT", state), \
+                unittest.mock.patch.object(lan.subprocess, "run", spy):
+            code, plan = self.cli("helper-install", "cmux12s-mac-mini")
+            self.assertEqual(plan["hosts"]["cmux12s-mac-mini"]["state"], "missing")
+            self.assertFalse(state.exists())
+            code, report = self.cli("helper-install", "cmux12s-mac-mini", "--admin", "leoadmin", "--apply")
+        # Only read-only probes over plain ssh: no sudo, no fleet-sudo, no password on any stdin.
+        self.assertTrue(calls)
+        for argv in calls:
+            self.assertEqual(argv[0], lan.SSH)
+            self.assertTrue(argv[-1].startswith("/usr/bin/python3 -I - "))
+            self.assertNotIn("sudo", " ".join(argv))
+        script = Path(report["script"]["path"])
+        self.assertEqual(script.parent, state)
+        self.assertEqual(hashlib.sha256(script.read_bytes()).hexdigest(), report["script"]["sha256"])
+        self.assertEqual(script.read_text(), lan.helper_root_script((ROOT / "scripts/glaeda-lan-fetch").read_bytes()))
+        scp, run = report["commands"]["cmux12s-mac-mini"]
+        self.assertEqual(scp, f"scp {script} leoadmin@cmux12s-mac-mini:")
+        self.assertTrue(run.startswith("ssh -t leoadmin@cmux12s-mac-mini "))
+        self.assertIn(f"sudo /bin/bash {script.name}", run)
+        self.assertNotIn("cmux@", " ".join(report["commands"]["cmux12s-mac-mini"]))
+        self.assertIn("other than cmux", report["next"][0])
+        self.assertEqual((code, report["ok"]), (1, False))  # not current until someone runs the commands
+
+    def run_root_script(self, data: bytes, base: Path, **kwargs) -> subprocess.CompletedProcess:
+        """Run the root script as ourselves: uid = ours, the chain checked from BASE down."""
+        target = base / "Library/Application Support/glaeda/bin/glaeda-lan-fetch"
+        script = lan.helper_root_script(data, path=os.fspath(target), owner=f"{os.getuid()}:{os.getgid()}",
+                                        lock=os.fspath(base / "install.lock"), uid=os.getuid(), top=os.fspath(base),
+                                        **kwargs)
+        return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, timeout=60)
+
+    def root_base(self) -> Path:
+        base = Path(os.path.realpath(self.tmp.name)) / "root"
+        base.mkdir(mode=0o755)
+        base.chmod(0o755)
+        return base
+
+    def test_the_root_script_installs_and_fails_closed(self):
+        base = self.root_base()
+        target = base / "Library/Application Support/glaeda/bin/glaeda-lan-fetch"
+        proc = self.run_root_script(b"helper v1", base)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(target.read_bytes(), b"helper v1")
+        self.assertEqual((target.stat().st_mode & 0o777, target.parent.stat().st_mode & 0o777), (0o755, 0o755))
+        self.assertFalse((base / "install.lock").exists())
+        self.assertEqual(self.run_root_script(b"helper v2", base).returncode, 0)
+        self.assertEqual(target.read_bytes(), b"helper v2")
+        # Each unsafe component refuses, and the file stays as it was.
+        glaeda = base / "Library/Application Support/glaeda"
+        for unsafe, undo in ((lambda: glaeda.chmod(0o775), lambda: glaeda.chmod(0o755)),
+                             (lambda: target.chmod(0o757), lambda: target.chmod(0o755))):
+            unsafe()
+            proc = self.run_root_script(b"helper v3", base)
+            undo()
+            self.assertEqual(proc.returncode, 1, proc.stdout)
+            self.assertIn("FAILED", proc.stdout)
+            self.assertEqual(target.read_bytes(), b"helper v2")
+        real = base / "elsewhere"
+        real.mkdir()
+        (base / "Library/Application Support/glaeda/bin").rename(real / "bin")
+        (base / "Library/Application Support/glaeda/bin").symlink_to(real / "bin")
+        proc = self.run_root_script(b"helper v3", base)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("symlink", proc.stdout)
+        self.assertEqual((real / "bin/glaeda-lan-fetch").read_bytes(), b"helper v2")
+
+    def test_the_root_scripts_lock_checks_its_holder(self):
+        base = self.root_base()
+        lock = base / "install.lock"
+        lock.mkdir()
+        (lock / "pid").write_text(str(os.getpid()))  # a live holder: busy
+        proc = self.run_root_script(b"x", base)
+        self.assertEqual(proc.returncode, 75)
+        self.assertIn("BUSY", proc.stdout)
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        (lock / "pid").write_text(str(dead.pid))  # a dead holder: taken over
+        self.assertEqual(self.run_root_script(b"x", base).returncode, 0)
+        lock.mkdir()
+        (lock / "pid").write_text(str(os.getpid()))
+        old = time.time() - 3600
+        os.utime(lock, (old, old))  # a live pid but an hour-old lock: taken over
+        self.assertEqual(self.run_root_script(b"y", base).returncode, 0)
+
+    def test_the_mesh_refuses_the_seeder_and_trusted_hosts(self):
+        for hosts, why in ((["cmux12s-mac-mini", "cmux15"], "trusted seeder"),
+                           (["cmux12s-mac-mini", "cmuxs-mac-mini-6"], "never-source")):
+            with self.subTest(hosts=hosts):
+                code, report = self.cli("mesh", *hosts, "--address", f"{hosts[0]}=172.20.21.196",
+                                        "--address", f"{hosts[1]}=172.20.21.197", "--apply")
+                self.assertEqual(code, 1)
+                self.assertIn("cannot join the product mesh", report["error"])
+        receipt = self.homes / "cmux13s-mac-mini/.local/state/glaeda/cmux-runner/receipt.json"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(json.dumps({"member": {"trustedRef": "refs/heads/main"}}))
+        code, report = self.mesh("--apply")
+        self.assertIn("trusted-only runner", report["error"])
+        receipt.unlink()
+        # A mesh host that the seed-lan config names as the seeder, whatever its alias here.
+        self.install("cmux12s-mac-mini")
+        seed_config = self.homes / "cmux12s-mac-mini/.config/glaeda/seed-lan/config.json"
+        seed_config.write_text(json.dumps({**json.loads(seed_config.read_text()), "seeder": "cmux13s-mac-mini"}))
+        code, report = self.mesh("--apply")
+        self.assertIn("cannot join the product mesh", report["error"])
+        self.assertFalse(any("glaeda-lan-mesh@" in line for line in self.authorized()))
+
+    def test_the_mesh_drops_its_lines_for_hosts_it_no_longer_names(self):
+        self.mesh("--apply")
+        code, report = self.cli("mesh", "cmux12s-mac-mini", "cmux13s-mac-mini", "--address",
+                                "cmux12s-mac-mini=172.20.21.196", "--address", "cmux13s-mac-mini=172.20.21.197",
+                                "--apply")
+        self.assertEqual(code, 0, report)
+        lines = [l for l in (self.homes / "cmux12s-mac-mini/.ssh/authorized_keys").read_text().splitlines()
+                 if "glaeda-lan-mesh@" in l]
+        self.assertEqual([l.split()[-1] for l in lines], ["glaeda-lan-mesh@cmux13s-mac-mini"])
+
+    def test_forced_commands_come_from_constants_and_a_validated_home(self):
+        good = {"home": "/Users/cmux", "command": "/usr/bin/python3 -I /Users/cmux/.local/libexec/glaeda-seed-serve"}
+        self.assertEqual(lan.forced_command(good, "h"), good["command"])
+        for bad in ({**good, "home": "/Users/cmux\" x"}, {**good, "home": "/Users/../etc"}, {**good, "home": "rel"},
+                    {**good, "command": good["command"] + " --role product"}):
+            with self.subTest(bad=bad), self.assertRaises(lan.Failure):
+                lan.forced_command(bad, "h")
+
+    def test_the_root_script_carries_its_own_bytes_and_checks_them(self):
+        script = lan.helper_root_script(b"helper bytes")
+        self.assertIn(hashlib.sha256(b"helper bytes").hexdigest(), script)
+        self.assertNotIn(".local/bin", script)  # never copies the mini's user-writable copy
+        self.assertIn("install -d -o root -g wheel -m 0755 '/Library/Application Support/glaeda/bin'", script)
+        self.assertIn("-user 0 ! -perm -0020 ! -perm -0002", script)
+        self.assertIn("chown root:wheel", script)
+        self.assertEqual(lan.HELPER_PATH, "/Library/Application Support/glaeda/bin/glaeda-lan-fetch")
+        good = [["/x/glaeda-lan-fetch", 0, 0o755, False], ["/x", 0, 0o755, False], ["/", 0, 0o755, False]]
+        want = "a" * 64
+        self.assertEqual(lan.helper_state({"sha": want, "chain": good}, want), "current")
+        self.assertEqual(lan.helper_state({"sha": "", "chain": good}, want), "missing")
+        self.assertEqual(lan.helper_state({"sha": "b" * 64, "chain": good}, want), "stale")
+        for bad in ([["/x", 501, 0o755, False]], [["/x", 0, 0o775, False]], [["/x", 0, 0o755, True]]):
+            self.assertTrue(lan.helper_state({"sha": want, "chain": good[:1] + bad}, want).startswith("not root-owned"))
 
     def test_remove_drops_only_its_own_lines(self):
         self.install("cmux12s-mac-mini", "cmux13s-mac-mini")

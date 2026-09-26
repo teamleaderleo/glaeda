@@ -600,6 +600,71 @@ rewrites the plist within the hour). On the seeder, `~/.local/state/glaeda/seed-
 each request. Roll back with `scripts/glaeda-seed-lan remove --seeder cmux15 [HOST...] --apply`: without a
 config a mini skips the LAN step.
 
+## 2j. Compiled products over the LAN between PR minis
+
+A consumer of the app-host test product (the shards, E2E) downloads ~650-830 MB from GitHub in about
+130 s even when another mini already holds the same object in its node-local product cache
+(`/Users/Shared/cmux-build-fleet/node-products`). On 2026-09-25 a 648 MB object moved cmux14 to cmux15
+over the LAN, including sha256 on arrival, in 5.9 s (~110 MB/s).
+
+- **Serve.** Every PR mini runs `glaeda-seed-serve --role product` as the forced command of a mesh key
+  that each other PR mini holds. It answers `product-has-v1 SHA256` and `product-v1 SHA256`, where SHA256
+  is the archive digest (metadata `object_digest`). It serves only real `objects/<xx>/<key>/` entries
+  with cmux's current metadata schema, a size up to 20 GiB, and a regular `object.tar.gz` of exactly that
+  size. It uses the same per-client, queue, slot and 180 s limits as seeds. It never answers seed verbs,
+  and the seeder key never answers product verbs.
+- **Trust.** Any PR mini may serve, and a PR job on the serving mini can write its cache, so the server
+  is not trusted at all. `glaeda-lan-fetch` hashes the bytes as they arrive, compares them with the digest
+  GitHub recorded for the artifact (passed by cmux CI), and only then links the file to DEST. cmux then
+  checks the digest again and runs its canonical restore validation.
+- **Local Network Privacy.** A CI step cannot reach the LAN itself. Every process with a non-Apple
+  ancestor in its launchd job is refused (probes 2026-09-25: `/bin/bash` -> Homebrew python3 ->
+  `/usr/bin/nc` got "No route to host"; `/bin/bash` -> `/usr/bin/python3` connected), and a runner job
+  descends from the listener gate's `~/.local/bin/python3` and `Runner.Listener`. So `glaeda-lan-fetch
+  product` hands the request to the `lan-fetch` LaunchAgent (program `/usr/bin/python3 -I`) over a Unix
+  socket in `~/.local/state/glaeda/lan-fetch/` (0700). The broker makes the ssh connections.
+- **Helper.** cmux calls `/Library/Application Support/glaeda/bin/glaeda-lan-fetch` only when the file and
+  every directory above it are root-owned and not group- or other-writable, so a PR job can neither rewrite
+  nor rename it. That rules out `/Users/Shared/cmux-build-fleet/bin`, which belongs to the fleet user.
+  glaeda-mini-setup installs `~/.local/bin/glaeda-lan-fetch` and prints the sudo step for the root-owned
+  copy until it is current. cmux runs the helper with a minimal environment (no tokens).
+
+Set up, from the operator Mac (plan, then `--apply`):
+
+```bash
+scripts/glaeda-seed-lan mesh cmux7s-mac-mini cmux8s-mac-mini ... cmuxs-mac-mini-5
+scripts/glaeda-seed-lan mesh cmux7s-mac-mini cmux8s-mac-mini ... cmuxs-mac-mini-5 --apply
+```
+
+LAN addresses come from `ipconfig getifaddr en0` on each host (override with `--address HOST=IP`). Add
+the printed `manifest_keys` to each host's authorized_keys policy in `~/.config/glaeda/mini-fleet.json`.
+Then install the root-owned helper on every mesh host by hand, as root, from an admin account other than
+cmux or at the console. Do it again whenever glaeda-mini-setup prints the step (the helper changed).
+Never pipe a sudo password through the cmux account: its login shell runs files a PR job can write
+(`~/.zshenv`), so they could read it. `helper-install` never runs sudo. It checks each host's copy and
+directory chain, and with `--apply` it writes the root script and prints the commands:
+
+```bash
+scripts/glaeda-seed-lan helper-install cmux7s-mac-mini ... cmuxs-mac-mini-5                     # state per host
+scripts/glaeda-seed-lan helper-install cmux7s-mac-mini ... cmuxs-mac-mini-5 --admin ADMIN --apply  # script + commands
+# for each host, as printed:
+scp ~/.local/state/glaeda/seed-lan/glaeda-lan-fetch-install-<sha>.sh ADMIN@HOST:
+ssh -t ADMIN@HOST 'shasum -a 256 glaeda-lan-fetch-install-<sha>.sh && sudo /bin/bash glaeda-lan-fetch-install-<sha>.sh; rm -f glaeda-lan-fetch-install-<sha>.sh'
+```
+
+The script carries this checkout's helper and its sha256, never the mini's user-writable copy. It fails
+closed unless every existing component of `/Library/Application Support/glaeda/bin/glaeda-lan-fetch`,
+from `/` down, is a non-symlink owned by root without group or other write. It creates only missing
+directories (root:wheel 0755) and installs through a temporary file whose sha256 must match, then a
+rename. It holds a lock directory with its pid: a live holder under 10 minutes old means BUSY, and a
+dead or older one is taken over. Rerun `helper-install` without `--apply` afterwards: every host
+should be `current`.
+
+Check it on a mini with any digest a peer holds:
+`"/Library/Application Support/glaeda/bin/glaeda-lan-fetch" product SHA256 /tmp/x.tar.gz` (the record says
+`"via": "broker"`), then remove `/tmp/x.tar.gz`. Remove the mesh with
+`scripts/glaeda-seed-lan mesh-remove HOST... --apply`.
+
 ## 3. Verify
 
 ```bash

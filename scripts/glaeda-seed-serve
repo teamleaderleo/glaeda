@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""glaeda-seed-serve: stream one kept DerivedData seed from the trusted seeder to a PR mini over SSH.
+"""glaeda-seed-serve: stream a kept seed (trusted seeder) or a compiled product (any PR mini) over SSH.
 
     authorized_keys on the seeder (written by scripts/glaeda-seed-lan install):
         restrict,from="<LAN>",command="/usr/bin/python3 -I ~/.local/libexec/glaeda-seed-serve" ssh-ed25519 ... glaeda-seed-lan@<mini>
@@ -16,6 +16,23 @@ It answers with one header line on stdout, then (on a hit) the stream:
     glaeda-seed-serve 1 busy               exit 4: every serve slot stayed taken for SLOT_WAIT seconds
     glaeda-seed-serve 1 refused REASON     exit 2: malformed request, or this host is not trusted-only
     glaeda-seed-serve 1 pong               exit 0: ping-v1
+
+With --role product (the mesh key every PR mini authorizes for the others, glaeda-seed-lan mesh) it
+answers only product verbs, from this mini's node-local compiled product cache (cmux
+node_product_cache.py: PRODUCTS/objects/<key[:2]>/<key>/{metadata.json,object.tar.gz}):
+
+    product-has-v1 SHA256    glaeda-seed-serve 1 has SHA256 SIZE, or miss (exit 3)
+    product-v1 SHA256        glaeda-seed-serve 1 hit-product SHA256 SIZE, then exactly SIZE raw bytes
+
+SHA256 is the archive's content digest (metadata object_digest), 64 lowercase hex. Only an entry whose
+directories are real (walked from / with O_DIRECTORY|O_NOFOLLOW and openat, so none is a symlink),
+whose metadata (at most 64 KiB) is cmux's current schema and names that digest and a size under
+MAX_OBJECT_BYTES, and whose object.tar.gz is a regular file with one link, owned by this user, of that
+size, is served. Lookups are admitted (per-client and queue caps) before the cache is scanned.
+Unlike seeds, any PR mini serves products, and a PR job there can write its cache: the bytes are not
+trusted here. The consumer's sha256 check against the digest GitHub recorded is what makes them safe,
+and it is not optional (glaeda-lan-fetch, then cmux peer_product_source.py again). The product role
+skips the trusted-receipt check and never answers seed verbs; the seed role never answers product verbs.
 
 Only a KEY that matches KEY_RE (a seed key: no slash, no dot, no option) is looked up, and only as a real
 directory, never a symlink, directly under a canonical root's seed cache (STATE/seeds or
@@ -43,6 +60,7 @@ import fcntl
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -69,6 +87,17 @@ RECEIPT = "~/.local/state/glaeda/cmux-runner/receipt.json"
 TAR = "/usr/bin/tar"
 ZSTD_CANDIDATES = ("/opt/homebrew/bin/zstd", "/usr/local/bin/zstd")
 TASKPOLICY = "/usr/sbin/taskpolicy"
+PRODUCTS = "/Users/Shared/cmux-build-fleet/node-products"
+# cmux node_product_cache.py / peer_product_source.py
+PRODUCT_SCHEMA = 2
+PRODUCT_FORMAT = "app-host-products-tar-gz-v1"
+PRODUCT_OBJECT = "object.tar.gz"
+PRODUCT_METADATA = "metadata.json"
+MAX_OBJECT_BYTES = 20 * 1024**3
+MAX_METADATA_BYTES = 64 * 1024
+MAX_PRODUCT_ENTRIES = 4096
+SHA_RE = re.compile(r"[a-f0-9]{64}")
+ROLES = ("seed", "product")
 IP_RE = re.compile(r"[0-9A-Fa-f.:]{1,64}")
 
 
@@ -76,8 +105,8 @@ class Refused(Exception):
     pass
 
 
-def parse_request(text: str) -> tuple[str, str, list[str]]:
-    """(verb, codec, keys) from SSH_ORIGINAL_COMMAND; raises Refused for anything else."""
+def parse_request(text: str, role: str = "seed") -> tuple[str, str, list[str]]:
+    """(verb, codec, keys) from SSH_ORIGINAL_COMMAND for ROLE; raises Refused for anything else."""
     if len(text) > MAX_REQUEST:
         raise Refused("request too long")
     if not text.isascii() or any(ch in text for ch in "\0\r\n"):
@@ -85,6 +114,10 @@ def parse_request(text: str) -> tuple[str, str, list[str]]:
     words = text.split(" ")
     if words == ["ping-v1"]:
         return "ping", "", []
+    if role == "product":
+        if len(words) == 2 and words[0] in ("product-v1", "product-has-v1") and SHA_RE.fullmatch(words[1]):
+            return words[0].removesuffix("-v1"), "", [words[1]]
+        raise Refused("unknown request")
     if len(words) < 3 or words[0] != "seed-v1":
         raise Refused("unknown request")
     codec, keys = words[1], words[2:]
@@ -170,6 +203,145 @@ def admit(run_dir: Path, client: str) -> list[int] | None:
     return None
 
 
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def open_dir_path(path: Path) -> int | None:
+    """An fd for PATH walked from / one component at a time, refusing a symlink anywhere; None if not."""
+    if not path.is_absolute():
+        return None
+    try:
+        fd = os.open("/", DIR_FLAGS)
+    except OSError:
+        return None
+    for part in path.parts[1:]:
+        try:
+            child = os.open(part, DIR_FLAGS, dir_fd=fd)
+        except OSError:
+            os.close(fd)
+            return None
+        os.close(fd)
+        fd = child
+    return fd
+
+
+def open_child_dir(parent: int, name: str) -> int | None:
+    try:
+        return os.open(name, DIR_FLAGS, dir_fd=parent)
+    except OSError:
+        return None
+
+
+def read_metadata(entry: int) -> dict | None:
+    """metadata.json in the ENTRY directory fd: a regular file of at most MAX_METADATA_BYTES, parsed."""
+    try:
+        fd = os.open(PRODUCT_METADATA, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=entry)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_METADATA_BYTES:
+            return None
+        raw = os.read(fd, MAX_METADATA_BYTES + 1)
+        if len(raw) > MAX_METADATA_BYTES:
+            return None
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
+
+
+def open_product(root: Path, sha: str) -> tuple[int, int] | None:
+    """(fd, size) of the cached product whose content digest is SHA, or None.
+
+    Every directory is opened O_DIRECTORY|O_NOFOLLOW relative to its parent's fd, so no path component
+    can be a symlink or be swapped for one between the check and the open. The object must be a regular
+    file with one link, owned by this user (the cache's owner), of exactly the size the metadata names.
+    """
+    root_fd = open_dir_path(root)
+    if root_fd is None:
+        return None
+    seen = 0
+    try:
+        objects = open_child_dir(root_fd, "objects")
+        if objects is None:
+            return None
+        try:
+            for shard_name in sorted(os.listdir(objects)):
+                if not re.fullmatch(r"[a-f0-9]{2}", shard_name):
+                    continue
+                shard = open_child_dir(objects, shard_name)
+                if shard is None:
+                    continue
+                try:
+                    names = sorted(os.listdir(shard))
+                    for name in names:
+                        seen += 1
+                        if seen > MAX_PRODUCT_ENTRIES:
+                            return None
+                        if not SHA_RE.fullmatch(name) or name[:2] != shard_name:
+                            continue
+                        entry = open_child_dir(shard, name)
+                        if entry is None:
+                            continue
+                        try:
+                            found = open_entry_object(entry, sha)
+                        finally:
+                            os.close(entry)
+                        if found is not None:
+                            return found
+                finally:
+                    os.close(shard)
+        finally:
+            os.close(objects)
+    except OSError:
+        return None
+    finally:
+        os.close(root_fd)
+    return None
+
+
+def open_entry_object(entry: int, sha: str) -> tuple[int, int] | None:
+    metadata = read_metadata(entry)
+    size = metadata.get("size") if metadata else None
+    if (metadata is None or metadata.get("object_digest") != sha
+            or metadata.get("schema_generation") != PRODUCT_SCHEMA
+            or metadata.get("format_generation") != PRODUCT_FORMAT
+            or not isinstance(size, int) or isinstance(size, bool) or not 0 < size <= MAX_OBJECT_BYTES):
+        return None
+    try:
+        fd = os.open(PRODUCT_OBJECT, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=entry)
+    except OSError:
+        return None
+    info = os.fstat(fd)
+    if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.getuid() and info.st_size == size:
+        return fd, size
+    os.close(fd)
+    return None
+
+
+def stream_product(fd: int, size: int) -> int:
+    """Write exactly SIZE bytes of FD to stdout within SERVE_TIMEOUT (SIGALRM ends a stalled reader)."""
+    signal.alarm(SERVE_TIMEOUT)
+    left = size
+    try:
+        while left:
+            chunk = os.read(fd, min(left, 1 << 20))
+            if not chunk:
+                return 5  # the file shrank under us
+            view = memoryview(chunk)
+            while view:
+                view = view[os.write(1, view):]
+            left -= len(chunk)
+    except OSError:
+        return 5
+    finally:
+        signal.alarm(0)
+    return 0
+
+
 def take_slot(run_dir: Path, wait: float) -> int | None:
     """An fd holding one of SLOTS exclusive flocks, or None when all stay taken for WAIT seconds."""
     deadline = time.monotonic() + wait
@@ -231,13 +403,14 @@ def stream(seeds: Path, key: str, codec: str) -> int:
     return status
 
 
-def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, slot_wait: float) -> int:
+def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, slot_wait: float,
+          role: str = "seed", products: Path = Path(PRODUCTS)) -> int:
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     client = client if IP_RE.fullmatch(client) else "unknown"
-    record: dict = {"time": int(time.time()), "client": client}
+    record: dict = {"time": int(time.time()), "client": client, "role": role}
     try:
-        verb, codec, keys = parse_request(request)
-        if not trusted(receipt):
+        verb, codec, keys = parse_request(request, role)
+        if role == "seed" and not trusted(receipt):
             raise Refused("this host is not a trusted-only seeder")
     except Refused as error:
         say(f"refused {str(error).replace(' ', '-')}")
@@ -247,6 +420,8 @@ def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, 
         say("pong")
         log(run_dir, {**record, "outcome": "pong"})
         return 0
+    if verb in ("product", "product-has"):
+        return serve_product(verb, keys[0], products, run_dir, client, slot_wait, record)
     found = find(state, keys)
     if found is None:
         say("miss")
@@ -279,12 +454,59 @@ def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, 
     return 0 if status == 0 else 5
 
 
+def serve_product(verb: str, sha: str, products: Path, run_dir: Path, client: str, slot_wait: float,
+                  record: dict) -> int:
+    # Admission first, for lookups too: a scan of the cache is work a flood of clients must not multiply.
+    admitted = admit(run_dir, client)
+    if admitted is None:
+        say("busy")
+        log(run_dir, {**record, "outcome": "busy", "verb": verb})
+        return 4
+    try:
+        try:
+            os.nice(10)
+        except OSError:
+            pass
+        opened = open_product(products, sha)
+        if opened is None:
+            say("miss")
+            log(run_dir, {**record, "outcome": "miss", "verb": verb})
+            return 3
+        fd, size = opened
+        try:
+            if verb == "product-has":
+                say(f"has {sha} {size}")
+                log(run_dir, {**record, "outcome": "has"})
+                return 0
+            slot = take_slot(run_dir, slot_wait)
+            if slot is None:
+                say("busy")
+                log(run_dir, {**record, "outcome": "busy", "verb": verb})
+                return 4
+            started = time.monotonic()
+            try:
+                say(f"hit-product {sha} {size}")
+                status = stream_product(fd, size)
+            finally:
+                os.close(slot)
+            log(run_dir, {**record, "outcome": "served" if status == 0 else "failed", "verb": verb, "bytes": size,
+                          "seconds": round(time.monotonic() - started, 1)})
+            return status
+        finally:
+            os.close(fd)
+    finally:
+        for held in admitted:
+            os.close(held)
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--state", default=STATE)
     parser.add_argument("--run-dir", default=RUN_DIR)
     parser.add_argument("--receipt", default=RECEIPT)
     parser.add_argument("--slot-wait", type=float, default=SLOT_WAIT)
+    parser.add_argument("--role", choices=ROLES, default="seed")
+    parser.add_argument("--products", default=PRODUCTS)
     args = parser.parse_args(argv)
     request = os.environ.get("SSH_ORIGINAL_COMMAND")
     if request is None:
@@ -292,7 +514,7 @@ def main(argv: list[str]) -> int:
         return 2
     client = (os.environ.get("SSH_CLIENT") or "").split(" ")[0]
     return serve(request, Path(args.state), Path(os.path.expanduser(args.run_dir)),
-                 Path(os.path.expanduser(args.receipt)), client, args.slot_wait)
+                 Path(os.path.expanduser(args.receipt)), client, args.slot_wait, args.role, Path(args.products))
 
 
 if __name__ == "__main__":

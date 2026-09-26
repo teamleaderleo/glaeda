@@ -29,11 +29,14 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
     ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
     ~/.local/bin/glaeda-seed-prefetch          from scripts/glaeda-seed-prefetch (a no-op off an owned cmux runner)
+    ~/.local/bin/glaeda-lan-fetch              from scripts/glaeda-lan-fetch (compiled products from LAN peers; a
+                                               miss without a mesh config). CI calls a root-owned copy at
+                                               LAN_FETCH_ROOT_COPY, which needs sudo: an operator step
     ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
     ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
     ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
     ~/.config/glaeda/update.json               its release ring, written once (--ota-ring canary|stable)
-    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,update,gh-watch}.plist
+    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,lan-fetch,update,gh-watch}.plist
     build-host directories and three git defaults, each set only when unset
     python@3.13 from Homebrew, only when no Python 3.13+ exists and this user owns Homebrew
 
@@ -66,6 +69,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import functools
 import hashlib
 import json
 import os
@@ -74,6 +78,7 @@ import plistlib
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -239,6 +244,7 @@ def pick_python() -> str | None:
     return None
 
 
+@functools.lru_cache(maxsize=None)
 def apple_python(platform_name: str = HOST_PLATFORM) -> str | None:
     """/usr/bin/python3 once it is real (Command Line Tools or an Xcode), else None.
 
@@ -659,6 +665,20 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-seed-prefetch.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-seed-prefetch.err"),
         },
+        # The compiled-product LAN broker (scripts/glaeda-lan-fetch serve-local): CI steps descend from
+        # non-Apple processes (Runner.Listener), so Local Network Privacy keeps them off the LAN; they ask this
+        # agent over a private Unix socket instead. Apple's python3 is what lets its ssh reach the peers.
+        LABEL_PREFIX + "lan-fetch": {
+            "Label": LABEL_PREFIX + "lan-fetch",
+            "ProgramArguments": [apple_python(ctx.platform) or python, "-I", os.fspath(ctx.bin / "glaeda-lan-fetch"),
+                                 "serve-local"],
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "ThrottleInterval": 30,
+            "ProcessType": "Background",
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-lan-fetch.log"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-lan-fetch.err"),
+        },
         # The shared GitHub CI watcher (scripts/glaeda-gh): the one process that polls GitHub for every
         # session on this host. It idles without API calls while nothing is watched and re-executes
         # itself when the tool is updated.
@@ -825,7 +845,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
     for name in ("glaeda-disk", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
-                 "glaeda-update", "glaeda-gh"):
+                 "glaeda-lan-fetch", "glaeda-update", "glaeda-gh"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
@@ -956,7 +976,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
     for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
-                 "glaeda-seed-prefetch", "glaeda-update", "glaeda-gh"):
+                 "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-update", "glaeda-gh"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
     for act in actions:
@@ -1238,11 +1258,41 @@ def operator_steps(ctx: Context, pre: dict[str, Any], fleet_result: dict[str, An
     elif fleet_result.get("eligibleForEnrollment"):
         add("enroll and accept this mini as a fleet node",
             "scripts/glaeda-mini-enroll --cmux-root <cmux checkout> --node-id <cmux-mac-NNN> --apply", "operator")
+    root_copy = Path(LAN_FETCH_ROOT_COPY)
+    want = hashlib.sha256((SCRIPT_DIR / "glaeda-lan-fetch").read_bytes()).hexdigest()
+    try:
+        info = root_copy.lstat()
+        current = hashlib.sha256(root_copy.read_bytes()).hexdigest() if stat.S_ISREG(info.st_mode) else ""
+    except OSError:
+        current = ""
+    if current != want or not root_chain(root_copy):
+        add("cmux CI fetches compiled products from LAN peers through a root-owned glaeda-lan-fetch in a "
+            "root-owned directory chain (cmux refuses anything a job could rewrite or rename)",
+            f"scripts/glaeda-seed-lan helper-install {platform.node().split('.')[0] or 'HOST'} --apply",
+            "operator Mac, then root from a non-cmux admin account or the console, as it prints "
+            "(docs/CMUX_MINI_RUNNER.md 2j); never sudo through the cmux account")
     add("Spotlight should skip build output", "System Settings > Spotlight > Search Privacy: add ~/Library/Developer/Xcode/DerivedData", "human (GUI)")
     add("GitHub Actions runner registration (reserved slot, never automated here)",
         "once enrolled: ~/glaeda/scripts/glaeda-cmux-runner --apply (docs/CMUX_MINI_RUNNER.md; routing is glaeda#1174)",
         "org admin + registration token")
     return steps
+
+
+# What cmux peer_product_source.LAN_FETCH_HELPER runs. Outside /Users/Shared/cmux-build-fleet on purpose: that
+# tree is the fleet user's, so a PR job could rename anything in it.
+LAN_FETCH_ROOT_COPY = "/Library/Application Support/glaeda/bin/glaeda-lan-fetch"
+
+
+def root_chain(path: Path) -> bool:
+    """PATH and every directory above it are root-owned and not group- or other-writable (cmux's check)."""
+    for part in [path, *path.parents]:
+        try:
+            info = part.lstat()
+        except OSError:
+            return False
+        if info.st_uid != 0 or info.st_mode & 0o022 or stat.S_ISLNK(info.st_mode):
+            return False
+    return True
 
 
 def reserved_slots(ctx: Context, fleet_result: dict[str, Any] | None) -> dict[str, Any]:
