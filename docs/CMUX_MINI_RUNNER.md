@@ -182,6 +182,14 @@ What `--apply` does:
    - **When the fleet has the host.**
      - A process holds `host.lock` exclusively. The gate checks every 2 s with one
        non-blocking shared `flock`, which only an exclusive holder blocks.
+     - Except a yielding build: a fleet build that writes its pid to `host.lock.yield`
+       while it waits for or holds the lock (cmuxterm-hq's catch-up fill on the writer
+       mini) neither stops the listener nor counts as a waiter. A job that meets it
+       checks with `lsof` that the pid has the lock open, writes `host.lock.preempted`,
+       sends it SIGTERM and waits up to 90 s for the lock (under the admission lock), then
+       runs; a pid without the lock open is never signalled. A fresh DerivedData seed saves
+       more PR compile time than one more main fill, which a quiet tick redoes from the
+       compile cache.
      - A reservation is active.
      - With weighted capacity only: a process waits for the lock. The gate checks with
        `lsof` at most every 30 s, because each call costs about 0.3 s of CPU on a mini.

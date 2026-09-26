@@ -1445,6 +1445,57 @@ time.sleep(60)
             holder.wait()
             holder.stdout.close()
 
+    def test_capacity_preempts_a_yielding_fleet_build(self) -> None:
+        """A fleet build that wrote <host lock>.yield (cmuxterm-hq's catch-up fill) gives way: the job
+        writes .preempted, SIGTERMs it and is admitted once the lock is free."""
+        fleet = self.fleet()
+        lock = fleet / "host.lock"
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,signal,sys,time\n"
+                                   f"fd=os.open({os.fspath(lock)!r},os.O_RDWR)\n"
+                                   "fcntl.flock(fd,fcntl.LOCK_EX)\n"
+                                   "signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))\n"
+                                   "print('held',flush=True)\ntime.sleep(30)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            (fleet / "host.lock.yield").write_text(f"{holder.pid}\n")
+            result = self.job("cli-product-tests", "w0")
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn(f"preempted the yielding fleet build (pid {holder.pid})", result.stdout)
+            self.assertEqual(holder.wait(timeout=10), 0)
+            self.assertIn("cli-product-tests", (fleet / "host.lock.preempted").read_text())
+        finally:
+            self.finish("w0")
+            with contextlib.suppress(OSError):
+                holder.kill()
+            holder.wait()
+            holder.stdout.close()
+
+    def test_capacity_never_signals_a_marker_pid_without_the_lock(self) -> None:
+        """A stale or planted .yield naming a process that does not have the lock open changes nothing."""
+        fleet = self.fleet()
+        lock = fleet / "host.lock"
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,time\n"
+                                   f"fd=os.open({os.fspath(lock)!r},os.O_RDWR)\n"
+                                   "fcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(30)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            (fleet / "host.lock.yield").write_text(f"{bystander.pid}\n")
+            result = self.job("cli-product-tests", "w0")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("refused: capacity: a fleet build holds the host lock", result.stdout)
+            self.assertIsNone(bystander.poll(), "the bystander was not signalled")
+            self.assertFalse((fleet / "host.lock.preempted").exists())
+        finally:
+            for proc in (holder, bystander):
+                proc.kill()
+                proc.wait()
+            holder.stdout.close()
+
     @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
     def test_capacity_stops_admitting_while_a_fleet_build_waits(self) -> None:
         fleet = self.fleet()
@@ -1822,6 +1873,15 @@ class GateTest(unittest.TestCase):
 
     def test_an_exclusive_holder_claims_the_host(self) -> None:
         self.hold(fcntl.LOCK_EX)
+        self.assertEqual(self.held(), "a fleet build holds the host lock")
+
+    def test_a_yielding_holder_leaves_the_listener_on(self) -> None:
+        self.hold(fcntl.LOCK_EX)
+        (self.tmp / "host.lock.yield").write_text(f"{os.getpid()}\n")
+        self.assertIsNone(self.held(), "a job preempts it, so the gate keeps listening")
+        (self.tmp / "host.lock.yield").write_text("999999\n")  # no such process: a stale marker
+        self.assertEqual(self.held(), "a fleet build holds the host lock")
+        (self.tmp / "host.lock.yield").write_text("x" * 100)
         self.assertEqual(self.held(), "a fleet build holds the host lock")
 
     def test_a_reservation_claims_the_host(self) -> None:
