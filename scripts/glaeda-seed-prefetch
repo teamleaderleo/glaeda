@@ -35,6 +35,22 @@ seed within NEAR_APP_SWIFT_FILES app Swift files of main's head, with no package
 skips the download. Main takes 2 to 9 merges an hour at every hour of the day, so a clock or a commit
 count cannot say when main is quiet; its content can. Measured on the same day, this fetches 15
 seeds per root instead of 34 for the same distance from main.
+
+Seeds come over the LAN first when this mini is configured for it (glaeda-seed-lan install writes
+LAN_CONFIG): the trusted seeder (cmux15) keeps every seed it builds, and glaeda-seed-serve there streams
+the nearest one it keeps in about 25 s (2.3 GB of zstd at ~90 MB/s) instead of R2's 190 to 280 s. The
+candidates are the keys cmux's prefetch looks for, nearest first: this mini's width over main's
+first-parent history (seed_derived_data.lineage), up to the nearest seed already kept here. The stream is
+extracted into a staging directory beside the cache, checked (one top-level directory named by the key,
+holding the seed manifest, under LAN_MAX_BYTES), and renamed into place; any failure removes the staging
+directory. cmux's R2 prefetch then runs exactly as before: it finds the LAN seed "already kept" and
+prunes, or downloads a nearer seed the seeder did not have. So a miss or any error is today's behaviour.
+
+macOS Local Network Privacy blocks LAN connections from a LaunchAgent whose program is not Apple's
+(measured 2026-09-25: Homebrew python3 and its /usr/bin/ssh child got "No route to host"; /usr/bin/python3
+and its children connected). So glaeda-mini-setup runs this agent with /usr/bin/python3, the stream uses
+/usr/bin/ssh and /usr/bin/tar, and cmux's seed_derived_data.py still runs under Homebrew's python3
+(cmux_python), which reaches only the internet.
 """
 
 from __future__ import annotations
@@ -48,6 +64,8 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -76,6 +94,30 @@ NEAR_APP_SWIFT_FILES = 5
 PACKAGE_SOURCES = ("Packages/", "vendor/", "Examples/")
 NOT_APP_SOURCES = ("cmuxTests/", "cmuxUITests/")
 KEEP_SCRIPTS = 2  # extracted scripts/ci trees, by main commit
+# cmux seed_derived_data.py: the manifest every complete seed holds, and how far back seeds are looked for.
+MANIFEST = "cmux-seed-input-mtimes.json"
+ANCESTOR_LIMIT = 50
+
+# Seeds over the LAN from the trusted seeder (glaeda-seed-serve). Written by glaeda-seed-lan install; the
+# key and the seeder's host key sit beside it under fixed names. Without it the LAN step is off.
+LAN_CONFIG = Path(os.environ.get("GLAEDA_SEED_LAN_CONFIG",
+                                 os.path.expanduser("~/.config/glaeda/seed-lan/config.json")))
+LAN_HOST_KEY_ALIAS = "glaeda-seeder"
+SSH = "/usr/bin/ssh"
+TAR = "/usr/bin/tar"
+# /usr/bin/tar cannot read zstd (macOS 26's bsdtar is built without it), so a zstd stream needs Homebrew's
+# zstd. It only decompresses a pipe, so Local Network Privacy does not concern it.
+ZSTD_CANDIDATES = ("/opt/homebrew/bin/zstd", "/usr/local/bin/zstd")
+LAN_CONNECT_TIMEOUT = 5
+LAN_TIMEOUT = 600  # the seeder may wait 60 s for a serve slot; a seed takes ~25 s at LAN speed
+LAN_MAX_BYTES = 16 * 1024**3  # raw tar bytes; cmux saves no seed over 12 GiB (MAX_RAW_BYTES)
+LAN_MIN_FREE_BYTES = 40 * 1024**3
+# The same pattern as glaeda-seed-serve's KEY_RE.
+KEY_RE = re.compile(r"admission-derived-data-v1-[A-Za-z0-9]{1,16}-[A-Za-z0-9]{1,16}-[0-9a-f]{32}"
+                    r"-j[1-9][0-9]{0,2}-[0-9a-f]{40}")
+ADDRESS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:-]{0,252}")
+USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+SERVE_HEADER = b"glaeda-seed-serve 1 "
 
 
 def running_commands() -> list[str] | None:
@@ -198,6 +240,288 @@ def scripts_for(work: Path, mirror: Path, head: str) -> Path:
     return target
 
 
+def cmux_python() -> str:
+    """The interpreter for cmux's seed_derived_data.py: Homebrew's, which cmux jobs use, else this one.
+
+    This agent runs under /usr/bin/python3 (3.9) for Local Network Privacy; cmux's scripts target its jobs' python3.
+    """
+    for candidate in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return sys.executable
+
+
+def lan_config(path: Path | None = None) -> dict | None:
+    """The validated LAN seeder config, or None when this mini has none (or a malformed one)."""
+    path = path or LAN_CONFIG
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or raw.get("schema") != 1:
+        return None
+    user, addresses = raw.get("user"), raw.get("addresses")
+    if not isinstance(user, str) or not USER_RE.fullmatch(user):
+        return None
+    if (not isinstance(addresses, list) or not 1 <= len(addresses) <= 4
+            or not all(isinstance(a, str) and ADDRESS_RE.fullmatch(a) for a in addresses)):
+        return None
+    identity, known_hosts = path.parent / "id_ed25519", path.parent / "known_hosts"
+    if not identity.is_file() or not known_hosts.is_file():
+        return None
+    return {"user": user, "addresses": addresses, "identity": identity, "known_hosts": known_hosts}
+
+
+def zstd_tool() -> str | None:
+    for candidate in ZSTD_CANDIDATES:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("zstd")
+
+
+def seed_complete(path: Path) -> bool:
+    """A complete seed: a real directory holding the manifest as a regular file."""
+    manifest = path / MANIFEST
+    return (path.is_dir() and not path.is_symlink()) and (manifest.is_file() and not manifest.is_symlink())
+
+
+def lan_candidates(mirror: Path, store: Path, head: str) -> tuple[list[str], str]:
+    """The keys to ask the seeder for, nearest first, or why there are none.
+
+    The keys cmux's prefetch looks for: the recorded prefix at this mini's width over HEAD's first-parent
+    history (seed_derived_data.lineage), stopping before the nearest seed kept here.
+    """
+    try:
+        prefix = json.loads((store / SOURCE).read_text()).get("prefix", "")
+    except (OSError, ValueError, AttributeError):
+        return [], "no recorded seed prefix"
+    if not isinstance(prefix, str) or not prefix.startswith("admission-derived-data-v1-"):
+        return [], "recorded seed prefix is invalid"
+    try:
+        listed = git(mirror, "rev-list", "--first-parent", f"--max-count={ANCESTOR_LIMIT}", head).split()
+    except (OSError, subprocess.SubprocessError):
+        listed = []
+    keys = []
+    for revision in [head] + [sha for sha in listed if sha != head]:
+        key = f"{prefix}j{os.sysconf('SC_NPROCESSORS_ONLN')}-{revision}"
+        if not KEY_RE.fullmatch(key):
+            return [], "recorded seed prefix does not make a seed key"
+        if seed_complete(store / "seeds" / key):
+            break
+        keys.append(key)
+    return keys, "" if keys else "the nearest seed is kept here"
+
+
+def ssh_command(config: dict, address: str, request: str) -> list[str]:
+    """/usr/bin/ssh with nothing from ~/.ssh: the seed key, the pinned host key, no forwarding, no tty."""
+    return [SSH, "-F", "/dev/null", "-T", "-a", "-x",
+            "-o", "BatchMode=yes", "-o", f"ConnectTimeout={LAN_CONNECT_TIMEOUT}", "-o", "ConnectionAttempts=1",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+            "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", f"IdentityFile={config['identity']}",
+            "-o", f"UserKnownHostsFile={config['known_hosts']}", "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", "StrictHostKeyChecking=yes", "-o", f"HostKeyAlias={LAN_HOST_KEY_ALIAS}",
+            "-o", "UpdateHostKeys=no", "-o", "ClearAllForwardings=yes",
+            "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "LogLevel=ERROR",
+            "-l", config["user"], address, request]
+
+
+def read_header(fd: int) -> bytes:
+    """The serve header line, read a byte at a time so the stream after it stays in the pipe."""
+    line = b""
+    while len(line) < 512:
+        byte = os.read(fd, 1)
+        if not byte:
+            break
+        line += byte
+        if byte == b"\n":
+            break
+    return line
+
+
+class Pipeline:
+    """The ssh | [zstd -d] | tar -x processes of one LAN attempt, each in its own process group."""
+
+    def __init__(self) -> None:
+        self.procs: list[subprocess.Popen] = []
+        self.timed_out = False
+        self.unreachable = ""  # why this address could not be reached
+
+    def spawn(self, argv: list[str], **kwargs) -> subprocess.Popen:
+        proc = subprocess.Popen(argv, start_new_session=True, **kwargs)
+        self.procs.append(proc)
+        return proc
+
+    def stop(self) -> None:
+        for proc in self.procs:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def expire(self) -> None:
+        self.timed_out = True
+        self.stop()
+
+    def reap(self) -> list[int]:
+        codes = []
+        for proc in self.procs:
+            try:
+                codes.append(proc.wait(timeout=30))
+            except subprocess.TimeoutExpired:
+                self.stop()
+                codes.append(proc.wait())
+        return codes
+
+
+def lan_attempt(run: Pipeline, config: dict, address: str, request: str, keys: list[str], codec: str,
+                staging: Path) -> dict | None:
+    """One address: the result, or None when it could not be reached (then the next address is tried)."""
+    with tempfile.TemporaryFile() as ssh_err, tempfile.TemporaryFile() as tar_err:
+        ssh = run.spawn(ssh_command(config, address, request), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=ssh_err)
+        header = read_header(ssh.stdout.fileno())
+        if not header.startswith(SERVE_HEADER):
+            run.stop()
+            run.reap()
+            ssh.stdout.close()
+            ssh_err.seek(0)
+            detail = ssh_err.read().decode(errors="replace").strip()[-160:]
+            if "No route to host" in detail:
+                detail += " (Local Network Privacy: the agent must run /usr/bin/python3)"
+            run.unreachable = f"{address}: {'timed out' if run.timed_out else detail or 'no answer'}"
+            return None
+        words = header[len(SERVE_HEADER):].decode(errors="replace").split()
+        if not words or words[0] != "hit":
+            run.stop()
+            run.reap()
+            ssh.stdout.close()
+            return {"fetched": "false", "reason": f"seeder: {' '.join(words)[:120] or 'empty answer'}"}
+        if len(words) != 3 or words[1] not in keys or words[2] not in ("zstd", "tar") \
+                or (words[2] == "zstd" and codec != "zstd"):
+            run.stop()
+            run.reap()
+            ssh.stdout.close()
+            return {"fetched": "false", "reason": "seeder answered a key or codec it was not asked for"}
+        key, their_codec = words[1], words[2]
+        source = ssh.stdout
+        if their_codec == "zstd":
+            source = run.spawn([zstd_tool(), "-d", "-q", "-c"], stdin=ssh.stdout, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL).stdout
+            ssh.stdout.close()
+        tar = run.spawn([TAR, "-x", "-f", "-", "-C", os.fspath(staging)], stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL, stderr=tar_err)
+        total, over, into_tar = 0, False, True
+        try:
+            while True:
+                chunk = os.read(source.fileno(), 1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > LAN_MAX_BYTES:
+                    over = True
+                    run.stop()
+                    break
+                if into_tar:
+                    try:
+                        tar.stdin.write(chunk)
+                    except BrokenPipeError:
+                        # bsdtar exits at the end-of-archive marker and leaves the padding unread (cmux
+                        # r2-cache.sh unpack): drain the rest so ssh and zstd exit cleanly; tar's own exit
+                        # status still decides.
+                        into_tar = False
+        except OSError:  # the pipeline was stopped
+            run.stop()
+        finally:
+            for pipe in (tar.stdin, source):
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        codes = run.reap()
+        if over:
+            return {"fetched": "false", "reason": f"seed stream over {LAN_MAX_BYTES} bytes", "key": key}
+        if run.timed_out:
+            return {"fetched": "false", "reason": "stream timed out", "key": key}
+        if any(codes):
+            tar_err.seek(0)
+            detail = tar_err.read().decode(errors="replace").strip()[-120:]
+            return {"fetched": "false", "reason": f"stream exits {codes} {detail}".strip(), "key": key}
+        return {"fetched": "true", "key": key, "distance": keys.index(key), "codec": their_codec, "bytes": total}
+
+
+def lan_stream(config: dict, keys: list[str], staging: Path, timeout: float) -> dict:
+    """Ask the seeder for the first of KEYS it keeps and extract it into STAGING; addresses in order."""
+    codec = "zstd" if zstd_tool() else "tar"
+    request = " ".join(["seed-v1", codec, *keys])
+    unreachable = []
+    for address in config["addresses"]:
+        run = Pipeline()
+
+        # launchd's bootout signals only this job's process group; the pipeline runs in others.
+        def on_signal(signum, _frame, run=run) -> None:
+            run.stop()
+            shutil.rmtree(staging, ignore_errors=True)
+            sys.exit(128 + signum)
+
+        previous = {signum: signal.signal(signum, on_signal)
+                    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+        timer = threading.Timer(timeout, run.expire)
+        timer.start()
+        try:
+            result = lan_attempt(run, config, address, request, keys, codec, staging)
+        finally:
+            timer.cancel()
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+        if result is not None:
+            return {**result, "address": address}
+        unreachable.append(run.unreachable)
+    return {"fetched": "false", "reason": "unreachable: " + "; ".join(unreachable)[:300]}
+
+
+def lan_fetch(store: Path, mirror: Path, head: str, config: dict, timeout: float = LAN_TIMEOUT) -> dict:
+    """Fetch main's nearest seed from the trusted seeder into STORE/seeds; never raises.
+
+    The stream lands in STORE/seeds/.lan-<pid>, is checked, and is renamed into place. Any failure removes
+    that staging directory and leaves the cache as it was.
+    """
+    keys, why = lan_candidates(mirror, store, head)
+    if not keys:
+        return {"fetched": "false", "reason": why}
+    cache = store / "seeds"
+    started = time.monotonic()
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        for stale in cache.glob(".lan-*"):  # a killed run's staging; the prefetch lock makes it ours
+            shutil.rmtree(stale, ignore_errors=True)
+        if shutil.disk_usage(cache).free < LAN_MIN_FREE_BYTES:
+            return {"fetched": "false", "reason": "under the free-space floor for a LAN seed"}
+        staging = cache / f".lan-{os.getpid()}"
+        staging.mkdir()
+    except OSError as error:
+        return {"fetched": "false", "reason": f"staging: {type(error).__name__}"}
+    try:
+        result = lan_stream(config, keys, staging, timeout)
+        if result.get("fetched") != "true":
+            return result
+        key = result["key"]
+        if sorted(os.listdir(staging)) != [key] or not seed_complete(staging / key):
+            return {"fetched": "false", "reason": "stream is not one complete seed", "key": key}
+        target = cache / key
+        if seed_complete(target):
+            # A job stashed the same seed meanwhile and may be cloning it: keep that copy.
+            result = {**result, "fetched": "false", "reason": "kept meanwhile"}
+        else:
+            shutil.rmtree(target, ignore_errors=True)  # an incomplete leftover under the final name
+            (staging / key).rename(target)
+        os.utime(target)
+        return {**result, "seconds": f"{time.monotonic() - started:.1f}"}
+    except OSError as error:
+        return {"fetched": "false", "reason": f"install: {type(error).__name__}"}
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def prefetch(scripts: Path, store: Path, head: str, mirror: Path, throttled: bool = False) -> dict:
     env = {key: value for key, value in os.environ.items() if key not in ("GITHUB_REPOSITORY", "GITHUB_OUTPUT")}
     timeout = PREFETCH_TIMEOUT
@@ -216,7 +540,7 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path, throttled: boo
     env["TMPDIR"] = os.fspath(mirror.parent / "tmp")
     env["PATH"] = f"{TOOL_PATH}:{env.get('PATH', '/usr/bin:/bin')}"
     # Its own process group, so a timeout also stops the downloads r2-cache.sh started.
-    child = subprocess.Popen([sys.executable, os.fspath(scripts / "scripts/ci/seed_derived_data.py"), "prefetch",
+    child = subprocess.Popen([cmux_python(), os.fspath(scripts / "scripts/ci/seed_derived_data.py"), "prefetch",
                               os.fspath(store), head], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                              env=env, start_new_session=True)
 
@@ -286,7 +610,8 @@ def run(apply: bool, state: Path = STATE) -> dict:
         if not pending:
             return {**record, "state": "current", "roots": len(roots)}
         if not apply:
-            return {**record, "state": "plan", "would_fetch": [os.fspath(store) for store in pending]}
+            return {**record, "state": "plan", "would_fetch": [os.fspath(store) for store in pending],
+                    "lan": "configured" if lan_config() else "off"}
         shutil.rmtree(work / "tmp", ignore_errors=True)
         (work / "tmp").mkdir()
         try:
@@ -294,15 +619,21 @@ def run(apply: bool, state: Path = STATE) -> dict:
         except (OSError, subprocess.SubprocessError) as error:
             return {**record, "state": "error", "reason": f"scripts: {type(error).__name__}"}
         results = {}
+        lan_settings = lan_config()
         for store in pending:
             near = near_seed(mirror, store, head)
             if near is not None:
                 results[os.fspath(store)] = {"fetched": "false", "reason": "a kept seed is near main's head", **near}
                 continue
+            # LAN first. R2 always runs after it: it finds a LAN seed already kept (and prunes), or fetches
+            # a nearer seed than the seeder had.
+            lan = lan_fetch(store, mirror, head, lan_settings) if lan_settings else None
             why = busy()
             result = prefetch(scripts, store, head, mirror, throttled=bool(why))
             if why:
                 result["throttled"] = f"{BUSY_RATE}B/s, busy: {why}"
+            if lan is not None:
+                result["lan"] = lan
             results[os.fspath(store)] = result
             # Current only once HEAD's own seed is kept: seeds land a build behind main, so a nearer
             # one may still come. Any other outcome retries next run, which costs a git fetch and one

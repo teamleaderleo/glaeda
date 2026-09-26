@@ -131,6 +131,17 @@ class MiniSetupTest(unittest.TestCase):
              mock.patch.object(ms.Path, "glob", lambda self, pattern: iter([])):
             self.assertIsNone(ms.pick_python())
 
+    def test_seed_prefetch_runs_apples_python_for_local_network_privacy(self) -> None:
+        agents = self.home / "Library/LaunchAgents"
+        for apple, wanted in (("/usr/bin/python3", "/usr/bin/python3"), (None, "/opt/x/python3")):
+            with self.subTest(apple=apple), mock.patch.object(ms, "apple_python", return_value=apple):
+                self.invoke("--apply", "--python", "/opt/x/python3")
+                seed = plistlib.loads((agents / "com.teamleaderleo.glaeda.seed-prefetch.plist").read_bytes())
+                disk = plistlib.loads((agents / "com.teamleaderleo.glaeda.disk-pressure.plist").read_bytes())
+                self.assertEqual(seed["ProgramArguments"][0], wanted)
+                self.assertEqual(disk["ProgramArguments"][0], "/opt/x/python3")
+        self.assertIsNone(ms.apple_python("linux"))
+
     def test_default_xcode_pin_matches_the_cmux_pull_request_lane(self) -> None:
         self.assertEqual(ms.CMUX_XCODE_APP, "/Applications/Xcode_26.6.app")
 

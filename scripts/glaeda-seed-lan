@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""glaeda-seed-lan: set up seeds over the LAN from the trusted seeder to PR minis (operator Mac only).
+
+    glaeda-seed-lan install --seeder cmux15 --address IP [--address NAME] [--from CIDRS] HOST ...          plan
+    glaeda-seed-lan install --seeder cmux15 --address IP [--address NAME] [--from CIDRS] HOST ... --apply
+    glaeda-seed-lan remove  --seeder cmux15 [HOST ...]            plan removal (no HOST: every client)
+    glaeda-seed-lan remove  --seeder cmux15 [HOST ...] --apply
+
+Run from this repository on the operator Mac, which reaches every host over SSH as the fleet user. Planning
+reads only. `install --apply`:
+
+1. on the seeder, installs scripts/glaeda-seed-serve as ~/.local/libexec/glaeda-seed-serve (not an OTA
+   path: only this command changes it);
+2. on each HOST (a PR mini), creates ~/.config/glaeda/seed-lan/ (0700) with its own ed25519 key (made
+   there; the private half never leaves the mini), known_hosts pinning the seeder's host key under the
+   alias glaeda-seeder (read over this Mac's authenticated SSH session to the seeder, never scanned), and
+   config.json (the seeder's addresses and login user), which glaeda-seed-prefetch reads;
+3. on the seeder, authorizes each mini's key with
+   restrict,from="CIDRS",command="/usr/bin/python3 ~/.local/libexec/glaeda-seed-serve"
+   (no shell, pty, port, agent or X11 forwarding), after copying authorized_keys aside;
+4. asks each HOST to ping the seeder with that key (ping-v1) and reports the answer.
+
+It prints the glaeda-mini-fleet manifest key entries for the seeder's authorized_keys policy, which is
+exclusive: add them to ~/.config/glaeda/mini-fleet.json, or `glaeda-mini-fleet check` reports drift.
+
+Only glaeda-seed-lan's own lines (comment glaeda-seed-lan@HOST with this forced command) are ever replaced
+or removed. The seeder must be trusted-only: its glaeda runner receipt must name a trusted ref, and
+cmuxs-mac-mini-6 (PR code as the same user) is refused outright. Verification here runs from an SSH
+shell, where Local Network Privacy does not apply; docs/CMUX_MINI_RUNNER.md shows how to check under launchd.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SSH = "/usr/bin/ssh"  # from this Mac to each host
+CLIENT_SSH = "/usr/bin/ssh"  # from a mini to the seeder (the ping check)
+SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+# PR code runs there as the fleet user, so seeds it keeps may be tainted. Never a source.
+NEVER_SEEDERS = {"cmuxs-mac-mini-6"}
+DEFAULT_FROM = "172.20.20.0/22"
+TAG = "glaeda-seed-lan@"
+HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
+CIDR_RE = re.compile(r"[0-9a-fA-F.:]{2,45}(/[0-9]{1,3})?")
+REMOTE_TIMEOUT = 120
+
+
+def prefetch_module():
+    loader = importlib.machinery.SourceFileLoader("glaeda_seed_prefetch_for_lan",
+                                                  os.fspath(SCRIPT_DIR / "glaeda-seed-prefetch"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+# Runs on the seeder under /usr/bin/python3 (3.9). Prints one JSON object.
+SEEDER_REMOTE = r'''
+import base64, hashlib, json, os, sys, time
+args = json.loads(sys.argv[1])
+home = os.path.expanduser("~")
+serve = os.path.join(home, ".local/libexec/glaeda-seed-serve")
+ak = os.path.join(home, ".ssh/authorized_keys")
+command = "/usr/bin/python3 " + serve
+out = {"home": home, "command": command}
+try:
+    member = json.load(open(os.path.join(home, ".local/state/glaeda/cmux-runner/receipt.json"))).get("member") or {}
+    out["trusted_ref"] = member.get("trustedRef") or ""
+except Exception:
+    out["trusted_ref"] = ""
+try:
+    out["serve_sha"] = hashlib.sha256(open(serve, "rb").read()).hexdigest()
+except OSError:
+    out["serve_sha"] = ""
+try:
+    out["host_key"] = " ".join(open(os.environ.get("GLAEDA_SEED_LAN_HOST_KEY", "/etc/ssh/ssh_host_ed25519_key.pub")).read().split()[:2])
+except OSError:
+    out["host_key"] = ""
+try:
+    lines = open(ak).read().splitlines()
+except OSError:
+    lines = []
+def ours(line):
+    words = line.split()
+    return bool(words) and words[-1].startswith(args["tag"]) and ('command="' + command + '"') in line
+out["authorized"] = {line.split()[-1]: line for line in lines if ours(line)}
+mode = args["mode"]
+if mode == "probe" or (out["trusted_ref"] == "" and mode == "apply"):
+    print(json.dumps(out)); sys.exit(0)
+changed = []
+if mode == "apply" and out["serve_sha"] != args["serve_sha"]:
+    data = base64.b64decode(args["serve_b64"])
+    if hashlib.sha256(data).hexdigest() != args["serve_sha"]:
+        sys.exit("serve script corrupted in transit")
+    os.makedirs(os.path.dirname(serve), exist_ok=True)
+    tmp = serve + ".tmp-%d" % os.getpid()
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, serve)
+    changed.append("serve")
+if mode == "remove" and args.get("remove_serve") and os.path.exists(serve):
+    os.unlink(serve)
+    changed.append("serve removed")
+drop = set(args.get("drop", []))
+want = {line.split()[-1]: line for line in args.get("lines", [])}
+kept = [l for l in lines if not (ours(l) and (l.split()[-1] in drop or l.split()[-1] in want) and want.get(l.split()[-1]) != l)]
+present = set(kept)
+new = kept + [l for l in want.values() if l not in present]
+if new != lines:
+    state = os.path.join(home, ".local/state/glaeda/seed-lan")
+    os.makedirs(state, mode=0o700, exist_ok=True)
+    if os.path.exists(ak):
+        backup = os.path.join(state, "authorized_keys.%s.%d" % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), os.getpid()))
+        with open(ak, "rb") as src, open(backup, "wb") as dst:
+            dst.write(src.read())
+        os.chmod(backup, 0o600)
+        out["backup"] = backup
+    os.makedirs(os.path.dirname(ak), mode=0o700, exist_ok=True)
+    tmp = ak + ".glaeda-seed-lan.%d" % os.getpid()
+    with open(tmp, "w") as f:
+        f.write("\n".join(new) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, ak)
+    changed.append("authorized_keys")
+out["changed"] = changed
+out["authorized"] = {l.split()[-1]: l for l in new if ours(l)}
+print(json.dumps(out))
+'''
+
+# Runs on a PR mini under /usr/bin/python3 (3.9). Prints one JSON object.
+CLIENT_REMOTE = r'''
+import json, os, shutil, subprocess, sys
+args = json.loads(sys.argv[1])
+d = os.path.expanduser("~/.config/glaeda/seed-lan")
+key, kh, conf = os.path.join(d, "id_ed25519"), os.path.join(d, "known_hosts"), os.path.join(d, "config.json")
+def read(p):
+    try:
+        return open(p).read()
+    except OSError:
+        return ""
+out = {"config": read(conf), "known_hosts": read(kh), "public_key": " ".join(read(key + ".pub").split()[:2])}
+mode = args["mode"]
+changed = []
+if mode == "apply":
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    if not out["public_key"] or not os.path.exists(key):
+        for p in (key, key + ".pub"):
+            if os.path.exists(p):
+                os.unlink(p)
+        keygen = "/usr/bin/ssh-keygen" if os.path.exists("/usr/bin/ssh-keygen") else shutil.which("ssh-keygen")
+        subprocess.run([keygen, "-q", "-t", "ed25519", "-N", "", "-C", args["comment"], "-f", key], check=True,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        changed.append("key")
+    for path, text in ((kh, args["known_hosts"]), (conf, args["config"])):
+        if read(path) != text:
+            tmp = path + ".tmp-%d" % os.getpid()
+            with open(tmp, "w") as f:
+                f.write(text)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            changed.append(os.path.basename(path))
+    out["public_key"] = " ".join(read(key + ".pub").split()[:2])
+elif mode == "remove":
+    if os.path.isdir(d):
+        shutil.rmtree(d)
+        changed.append("seed-lan")
+elif mode == "ping":
+    home = os.path.expanduser("~")
+    argv = [a.replace("{home}", home) for a in args["argv"]]
+    p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+    out["answer"] = p.stdout.decode(errors="replace").strip()[:120]
+    out["error"] = p.stderr.decode(errors="replace").strip()[-160:]
+    out["status"] = p.returncode
+out["changed"] = changed
+print(json.dumps(out))
+'''
+
+
+class Failure(Exception):
+    pass
+
+
+def remote(host: str, program: str, args: dict) -> dict:
+    """Run PROGRAM with ARGS (JSON) under /usr/bin/python3 on HOST over SSH; its JSON answer."""
+    command = "/usr/bin/python3 - " + shlex.quote(json.dumps(args))
+    try:
+        proc = subprocess.run([SSH, *SSH_OPTIONS, host, command], input=program, capture_output=True, text=True,
+                              timeout=REMOTE_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise Failure(f"{host}: ssh {type(error).__name__}") from error
+    if proc.returncode != 0:
+        raise Failure(f"{host}: exit {proc.returncode}: {proc.stderr.strip()[-200:]}")
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError) as error:
+        raise Failure(f"{host}: unreadable answer") from error
+
+
+def fingerprint(public_key: str) -> str:
+    blob = base64.b64decode(public_key.split()[1])
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def check_names(seeder: str, hosts: list[str], addresses: list[str], cidrs: str) -> None:
+    if seeder in NEVER_SEEDERS or seeder.split(".")[0] in NEVER_SEEDERS:
+        raise Failure(f"{seeder} runs PR code as the fleet user: it can never be a seed source")
+    for name in [seeder, *hosts]:
+        if not HOST_RE.fullmatch(name):
+            raise Failure(f"not a host name: {name!r}")
+    if seeder in hosts:
+        raise Failure("the seeder cannot be its own client")
+    pm = prefetch_module()
+    for address in addresses:
+        if not pm.ADDRESS_RE.fullmatch(address):
+            raise Failure(f"not an address: {address!r}")
+    if not all(CIDR_RE.fullmatch(part) for part in cidrs.split(",")):
+        raise Failure(f"not a CIDR list: {cidrs!r}")
+
+
+def install(seeder: str, hosts: list[str], addresses: list[str], cidrs: str, user: str, apply: bool) -> dict:
+    check_names(seeder, hosts, addresses, cidrs)
+    pm = prefetch_module()
+    serve = (SCRIPT_DIR / "glaeda-seed-serve").read_bytes()
+    serve_sha = hashlib.sha256(serve).hexdigest()
+    report: dict = {"tool": "glaeda-seed-lan", "mode": "install", "apply": apply, "seeder": seeder, "hosts": {}}
+    probe = remote(seeder, SEEDER_REMOTE, {"mode": "probe", "tag": TAG})
+    if not probe["trusted_ref"]:
+        raise Failure(f"{seeder}: its glaeda runner receipt names no trusted ref; refusing to serve seeds from it")
+    if not probe["host_key"].startswith("ssh-ed25519 "):
+        raise Failure(f"{seeder}: no ed25519 host key")
+    report["seeder_state"] = {"trusted_ref": probe["trusted_ref"],
+                              "serve": "current" if probe["serve_sha"] == serve_sha else
+                                       ("stale" if probe["serve_sha"] else "missing")}
+    known_hosts = f"{pm.LAN_HOST_KEY_ALIAS} {probe['host_key']}\n"
+    config = json.dumps({"schema": 1, "seeder": seeder, "user": user, "addresses": addresses}, indent=1) + "\n"
+    options = f'restrict,from="{cidrs}",command="{probe["command"]}"'
+    lines, manifest_keys = [], []
+    for host in hosts:
+        comment = TAG + host
+        state = remote(host, CLIENT_REMOTE, {"mode": "apply" if apply else "probe", "comment": comment,
+                                            "known_hosts": known_hosts, "config": config})
+        entry = {"changed": state.get("changed", []),
+                 "config": "current" if state["config"] == config else ("stale" if state["config"] else "missing"),
+                 "known_hosts": "current" if state["known_hosts"] == known_hosts else "stale or missing"}
+        public_key = state.get("public_key", "")
+        if public_key.startswith("ssh-ed25519 "):
+            line = f"{options} {public_key} {comment}"
+            lines.append(line)
+            entry["fingerprint"] = fingerprint(public_key)
+            entry["authorized"] = "current" if probe["authorized"].get(comment) == line else "pending"
+            manifest_keys.append({"id": f"seed-lan-{host}", "fingerprint": entry["fingerprint"], "comment": comment,
+                                  "role": f"seeds over the LAN: {host} reads kept seeds from {seeder} "
+                                          "(glaeda-seed-serve, forced command)",
+                                  "status": "active", "options": options, "public_key": f"{public_key} {comment}"})
+        else:
+            entry["authorized"] = "no key yet"
+        report["hosts"][host] = entry
+    if apply:
+        done = remote(seeder, SEEDER_REMOTE, {"mode": "apply", "tag": TAG, "serve_sha": serve_sha,
+                                              "serve_b64": base64.b64encode(serve).decode(), "lines": lines})
+        report["seeder_state"]["changed"] = done.get("changed", [])
+        if done.get("backup"):
+            report["seeder_state"]["backup"] = done["backup"]
+        # The same ssh invocation glaeda-seed-prefetch makes; {home} is the mini's home directory.
+        argv = pm.ssh_command({"user": user, "identity": "{home}/.config/glaeda/seed-lan/id_ed25519",
+                               "known_hosts": "{home}/.config/glaeda/seed-lan/known_hosts"}, addresses[0], "ping-v1")
+        argv[0] = CLIENT_SSH
+        for host in hosts:
+            ping = remote(host, CLIENT_REMOTE, {"mode": "ping", "argv": argv})
+            report["hosts"][host]["ping"] = ping.get("answer") or f"status {ping.get('status')}: {ping.get('error', '')}"
+    report["manifest_keys"] = manifest_keys
+    report["next"] = [
+        f"add manifest_keys to ~/.config/glaeda/mini-fleet.json keys, and their ids to {seeder}'s "
+        "authorized_keys allow list, so glaeda-mini-fleet check stays clean",
+        "check under launchd on one HOST: launchctl kickstart -k gui/$(id -u)/com.teamleaderleo.glaeda.seed-prefetch, "
+        "then tail -n 1 ~/Library/Logs/glaeda-seed-prefetch.jsonl (look for results.*.lan)",
+    ] if apply else ["rerun with --apply"]
+    return report
+
+
+def remove(seeder: str, hosts: list[str], apply: bool) -> dict:
+    for name in [seeder, *hosts]:
+        if not HOST_RE.fullmatch(name):
+            raise Failure(f"not a host name: {name!r}")
+    report: dict = {"tool": "glaeda-seed-lan", "mode": "remove", "apply": apply, "seeder": seeder, "hosts": {}}
+    probe = remote(seeder, SEEDER_REMOTE, {"mode": "probe", "tag": TAG})
+    drop = [TAG + host for host in hosts] if hosts else list(probe["authorized"])
+    report["seeder_state"] = {"would_drop": [c for c in drop if c in probe["authorized"]],
+                              "serve": "present" if probe["serve_sha"] else "absent"}
+    for host in hosts:
+        state = remote(host, CLIENT_REMOTE, {"mode": "remove" if apply else "probe"})
+        report["hosts"][host] = {"changed": state.get("changed", []), "configured": bool(state["config"])}
+    if apply:
+        done = remote(seeder, SEEDER_REMOTE, {"mode": "remove", "tag": TAG, "drop": drop,
+                                              "remove_serve": not hosts})
+        report["seeder_state"]["changed"] = done.get("changed", [])
+        report["seeder_state"]["remaining"] = sorted(done.get("authorized", {}))
+    return report
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    inst = sub.add_parser("install")
+    inst.add_argument("--seeder", required=True)
+    inst.add_argument("--address", action="append", required=True, help="seeder address as the minis reach it; "
+                      "first is tried first")
+    inst.add_argument("--from", dest="cidrs", default=DEFAULT_FROM, help="authorized_keys from= (comma separated)")
+    inst.add_argument("--user", default="cmux")
+    inst.add_argument("--apply", action="store_true")
+    inst.add_argument("hosts", nargs="+")
+    rem = sub.add_parser("remove")
+    rem.add_argument("--seeder", required=True)
+    rem.add_argument("--apply", action="store_true")
+    rem.add_argument("hosts", nargs="*")
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "install":
+            report = install(args.seeder, args.hosts, args.address, args.cidrs, args.user, args.apply)
+        else:
+            report = remove(args.seeder, args.hosts, args.apply)
+    except Failure as error:
+        print(json.dumps({"tool": "glaeda-seed-lan", "error": str(error)}))
+        return 1
+    print(json.dumps(report, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

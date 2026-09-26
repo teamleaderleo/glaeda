@@ -529,6 +529,61 @@ can read it.
 `security import`, Keychain Access). Without an explicit keychain they land in `cmux-ci`, and any later PR job
 can copy that file and read them. Credentials belong on trusted or signing hosts.
 
+## 2i. Seeds over the LAN from the trusted seeder
+
+`glaeda-seed-prefetch` (the 5-minute seed-prefetch LaunchAgent) asks the trusted seeder for main's
+nearest seed over the LAN before it runs cmux's R2 prefetch. The seeder (cmux15, trusted-only, main pushes
+only) keeps every seed it builds or adopts (`CI_SEED_KEEP_LOCAL_RUNNERS`, `seed_derived_data.py keep`) as
+extracted DerivedData under its per-root seed caches. Measured 2026-09-25, cmux15 to a PR mini on the LAN:
+one 9.0 GB seed as `tar | zstd -1 -T0` is 2.3 GB and took 25.5 s; plain tar took 77.6 s. From R2 a mini
+takes 190 to 280 s.
+
+- **Only cmux15 serves.** cmuxs-mac-mini-6 builds PR code as the same user, so its seeds may be tainted;
+  `glaeda-seed-lan` refuses it as a seeder, and `glaeda-seed-serve` refuses every request unless the host's
+  glaeda runner receipt names a trusted ref. If cmux15 joins the PR pool, run `glaeda-seed-lan remove`
+  first.
+- **One-way.** Each mini's own key is authorized on the seeder only as
+  `restrict,from="172.20.20.0/22",command="/usr/bin/python3 ~/.local/libexec/glaeda-seed-serve"`: no shell,
+  pty or forwarding. The forced command reads the request (`seed-v1 CODEC KEY...`), accepts only keys that
+  match the seed key pattern (no path, no option), looks each up as a real directory holding the seed
+  manifest, and streams the first it keeps. Nothing a mini sends is written anywhere except the serve log.
+  The key on a PR mini is readable by PR jobs; all it grants is reading seeds that are public in R2
+  anyway, from the LAN, two at a time.
+- **Seeder load.** At most two serves at once (flock slots, 60 s wait, then `busy`), at nice 10 with
+  utility disk I/O.
+- **Integrity.** The mini extracts into `seeds/.lan-<pid>`, requires exactly one top-level directory
+  named by the requested key with `cmux-seed-input-mtimes.json`, caps the stream at 16 GiB, and renames it
+  into place. Any failure removes the staging directory. R2's prefetch then runs unchanged: it finds the
+  seed already kept (and prunes), or downloads a nearer one. A miss or any error is today's behaviour.
+- **Local Network Privacy.** A LaunchAgent whose program is not Apple's cannot reach LAN addresses, and
+  neither can its children: a Homebrew python3 agent and its `/usr/bin/ssh` got "No route to host", while
+  a `/usr/bin/python3` agent connected (2026-09-25, `launchctl submit` probe on cmux12s). So
+  glaeda-mini-setup runs the seed-prefetch agent with `/usr/bin/python3`, and the client uses
+  `/usr/bin/ssh` and `/usr/bin/tar` (plus Homebrew zstd to decompress a pipe). The tailnet address of
+  cmux15 was not reachable from the PR minis, so the config lists LAN addresses.
+
+Set up, from a checkout at `origin/main` on the operator Mac (plan first, then `--apply`):
+
+```bash
+scripts/glaeda-seed-lan install --seeder cmux15 --address 172.20.21.202 --address cmux15.local HOST...
+scripts/glaeda-seed-lan install --seeder cmux15 --address 172.20.21.202 --address cmux15.local HOST... --apply
+```
+
+It installs the serve script on the seeder, makes each mini's key in `~/.config/glaeda/seed-lan/`, pins the
+seeder's host key (read over the operator's own SSH session), authorizes the keys, and pings from each
+mini. Add the printed `manifest_keys` to `~/.config/glaeda/mini-fleet.json` (cmux15's authorized_keys
+policy is exclusive). Verify under launchd, not an SSH shell, on one mini:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.teamleaderleo.glaeda.seed-prefetch
+tail -n 1 ~/Library/Logs/glaeda-seed-prefetch.jsonl   # results.<root>.lan: fetched true, or its reason
+```
+
+A `lan.reason` with "No route to host" means the agent is not running `/usr/bin/python3` yet (glaeda-update
+rewrites the plist within the hour). On the seeder, `~/.local/state/glaeda/seed-serve/serve.jsonl` records
+each request. Roll back with `scripts/glaeda-seed-lan remove --seeder cmux15 [HOST...] --apply`: without a
+config a mini skips the LAN step.
+
 ## 3. Verify
 
 ```bash
