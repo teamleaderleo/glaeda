@@ -17,14 +17,17 @@ stays moderate, and typing and clicking stall. The report names who holds the me
   do-nothing fixture such as `python -c "import signal; signal.pause()"`, or a headless
   Chrome/Chromium with a remote-debugging port and a --user-data-dir inside a temp dir, the
   shape page-perf scratch scripts leave behind. Those spin rather than idle, so CPU is not a
-  criterion for them, and after one exits its temp profile is removed once no process names it;
+  criterion for them; one is skipped while anything holds a TCP connection to it, and after
+  it exits its temp profile is removed once no process names it. The temp roots are /tmp and
+  the per-user dir from `getconf DARWIN_USER_TEMP_DIR`, never $TMPDIR;
 - other orphaned commands that run more than once, which are often leaked services.
 
 Only leaked fixtures are ever signalled. Builds, sessions, services and duplicates are
 reported, never touched: a survivor gains no cleanup authority by surviving, and a slow
 build does not authorize killing another builder. Before each signal the process is
 observed again and must still have the same parent, owner, start time and command;
-anything else is skipped. Every signal is appended to a JSONL receipt.
+anything else is skipped, and a failed observation is recorded as no-evidence rather than
+read as an exit. Every signal is preceded by an intent record in a JSONL receipt.
 
 Output carries PIDs, session ids, sizes and short labels, never full command lines,
 environments or file contents.
@@ -50,6 +53,8 @@ HOME = Path.home()
 DARWIN = sys.platform == "darwin"
 PS = "/bin/ps"
 SYSCTL = "/usr/sbin/sysctl"
+GETCONF = "/usr/bin/getconf"
+LSOF = "/usr/sbin/lsof"
 CHILD_ENV = {"LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
 TIMEOUT = 20
 GIB = 1024 ** 3
@@ -64,7 +69,10 @@ FIXTURES = {
 # Headless browsers that scratch perf scripts start and then lose. These spin rather than idle,
 # so CPU is not a criterion; the throwaway profile in a temp dir is what marks them as leaked.
 CHROMES = {"Google Chrome", "Google Chrome for Testing", "Chromium"}
-USER_DATA_DIR = re.compile(r"--user-data-dir=(\S+)")
+# The profile must end where an argument visibly ends: at the end, before the next flag, or before
+# a final URL. A path with a space cannot be delimited from ps output and is refused.
+USER_DATA_DIR = re.compile(r"(?:^|\s)--user-data-dir=(\S+)(?=$|\s-|\s(?:about|data|https?|file|chrome):\S*$)")
+SCRIPT_NAME = re.compile(r"[\w.-]{1,48}\.(?:py|mjs|cjs|js|ts|sh|rb)")
 AGENTS = {"claude", "codex"}
 APPLE_BUILDS = {"swift-build", "swift-test", "xcodebuild"}
 CI_RUNNERS = {"Runner.Listener", "Runner.Worker"}
@@ -158,12 +166,39 @@ def snapshot() -> list[Proc]:
 
 
 def observe(pid: int) -> Proc | None:
+    """The process now, None only when the PID provably no longer exists.
+
+    ps also exits non-zero on a timeout or spawn failure, so a failed listing is
+    confirmed with a null-signal probe before it is read as "gone".
+    """
     try:
         text = run([PS, "-o", PS_FIELDS, "-p", str(pid)])
     except NoEvidence:
-        return None  # ps exits non-zero when the PID is gone
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except OSError:
+            pass
+        raise
     found = parse_ps(text)
-    return found[0] if found else None  # identity uses start and command, not comm
+    if not found:
+        raise NoEvidence("ps listed nothing for a live pid")
+    return found[0]  # identity uses start and command, not comm
+
+
+def debugger_connected(pid: int) -> bool:
+    """Whether anything holds an established TCP connection to this process."""
+    try:
+        out = subprocess.run([LSOF, "-a", "-n", "-P", "-p", str(pid), "-iTCP", "-sTCP:ESTABLISHED", "-Fn"],
+                             capture_output=True, text=True, timeout=TIMEOUT, env=CHILD_ENV)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise NoEvidence(f"lsof: {e}") from e
+    if any(line.startswith("n") for line in out.stdout.splitlines()):
+        return True
+    if out.returncode == 1 and not out.stderr.strip():  # lsof's "nothing matched"
+        return False
+    raise NoEvidence(f"lsof exited {out.returncode}")
 
 
 def host() -> dict:
@@ -213,10 +248,17 @@ def verdict(h: dict) -> str:
 
 
 def temp_roots() -> list[Path]:
-    roots = [Path("/tmp"), Path("/private/tmp")]
-    if os.environ.get("TMPDIR"):
-        roots.append(Path(os.environ["TMPDIR"]))
-    return [Path(os.path.realpath(r)) for r in roots]
+    """Shared /tmp plus the per-user macOS temp dir, never taken from the environment."""
+    roots = [Path(os.path.realpath("/tmp"))]
+    if DARWIN:
+        try:
+            user = run([GETCONF, "DARWIN_USER_TEMP_DIR"]).strip()
+        except NoEvidence:
+            user = ""
+        real = Path(os.path.realpath(user)) if user.startswith("/") else None
+        if real is not None and Path("/private/var/folders") in real.parents:
+            roots.append(real)
+    return roots
 
 
 def temp_profile(path: str, roots: list[Path]) -> Path | None:
@@ -230,9 +272,11 @@ def temp_profile(path: str, roots: list[Path]) -> Path | None:
 
 def headless_chrome_profile(p: Proc, roots: list[Path]) -> Path | None:
     words = p.command.split()
-    if p.exe not in CHROMES or "--headless" not in " ".join(w.split("=")[0] for w in words):
+    if p.exe not in CHROMES or not any(w.split("=")[0] == "--headless" for w in words):
         return None
     if not any(w.startswith("--remote-debugging-port=") for w in words):
+        return None
+    if p.command.count("--user-data-dir=") != 1:
         return None
     m = USER_DATA_DIR.search(p.command)
     return temp_profile(m.group(1), roots) if m else None
@@ -252,11 +296,11 @@ def fixture_kind(p: Proc, uid: int, min_age: int, roots: list[Path] | None = Non
 
 
 def label(p: Proc) -> str:
-    """Executable plus the first script-like argument, both as basenames."""
+    """Executable plus a script file name among the first arguments; never other arguments."""
     words = p.command.split()
     parts = [p.exe]
     for w in words[1:4]:
-        if not w.startswith("-") and ("/" in w or "." in w):
+        if not w.startswith("-") and SCRIPT_NAME.fullmatch(os.path.basename(w)):
             parts.append(os.path.basename(w))
             break
     return " ".join(parts)[:60]
@@ -351,10 +395,20 @@ def survey(procs: list[Proc], uid: int, min_age_hours: float, roots: list[Path] 
 
 
 def profile_in_use(profile: Path, procs: list[Proc]) -> bool:
-    return any(str(profile) in p.command for p in procs)
+    """Conservative: any process naming the profile's directory, under any alias, uses it."""
+    for p in procs:
+        if profile.name in p.command:
+            return True
+        for word in p.command.split():
+            value = word.split("=", 1)[1] if word.startswith("-") and "=" in word else word
+            if value.startswith("/"):
+                real = Path(os.path.realpath(value))
+                if real == profile or profile in real.parents:
+                    return True
+    return False
 
 
-def remove_profile(profile: Path, uid: int, fresh: Callable[[], list[Proc]]) -> str:
+def remove_profile(profile: Path, uid: int, fresh: Callable[[], list[Proc]], wait_seconds: float = 0.0) -> str:
     """Delete a leaked browser's temp profile once nothing names it any more."""
     try:
         st = profile.lstat()
@@ -362,11 +416,17 @@ def remove_profile(profile: Path, uid: int, fresh: Callable[[], list[Proc]]) -> 
         return "absent"
     if not profile.is_dir() or profile.is_symlink() or st.st_uid != uid:
         return "kept-not-owned"
-    try:
-        if profile_in_use(profile, fresh()):
+    deadline = time.monotonic() + wait_seconds
+    while True:  # helpers carry the profile too and exit shortly after the main process
+        try:
+            in_use = profile_in_use(profile, fresh())
+        except NoEvidence:
+            return "kept-no-evidence"
+        if not in_use:
+            break
+        if time.monotonic() >= deadline:
             return "kept-in-use"
-    except NoEvidence:
-        return "kept-no-evidence"
+        time.sleep(0.25)
     shutil.rmtree(profile, ignore_errors=True)
     return "removed" if not profile.exists() else "partial"
 
@@ -376,42 +436,66 @@ def apply(fixtures: list[dict], receipt: Path,
           kill: Callable[[int, int], None] = os.kill,
           wait_seconds: float = 2.0,
           fresh: Callable[[], list[Proc]] = snapshot,
+          connected: Callable[[int], bool] = debugger_connected,
           uid: int | None = None) -> list[dict]:
-    """SIGTERM each fixture whose identity is unchanged; record what happened."""
+    """SIGTERM each fixture whose identity is unchanged; record what happened.
+
+    macOS has no pidfd, so a PID could in principle be reused between the final
+    identity check and the signal; the lstart and command comparison makes that window
+    a few milliseconds wide. An intent record is written before every signal.
+    """
     uid = os.getuid() if uid is None else uid
     results = []
     receipt.parent.mkdir(parents=True, exist_ok=True)
-    for f in fixtures:
-        proc: Proc = f["_proc"]
-        outcome = "skipped-changed"
-        if proc.same_process(look(proc.pid)):
-            try:
-                kill(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                outcome = "gone"
-            except PermissionError:
-                outcome = "skipped-permission"
-            else:
-                outcome = "survived"
-                # a browser flushes its profile and waits for helpers before exiting
-                deadline = time.monotonic() + (wait_seconds * 5 if f.get("_profile") else wait_seconds)
-                while time.monotonic() < deadline:
-                    now = look(proc.pid)
-                    if not proc.same_process(now) or now.stat.startswith("Z"):
-                        outcome = "terminated"
-                        break
-                    time.sleep(0.05)
-        elif look(proc.pid) is None:
-            outcome = "gone"
-        record = {"schema": SCHEMA, "time": int(time.time()), "pid": proc.pid, "start": proc.start,
-                  "kind": f["kind"], "rss_bytes": f["rss_bytes"], "outcome": outcome}
-        if f.get("_profile"):
-            record["profile"] = (remove_profile(f["_profile"], uid, fresh)
-                                 if outcome in ("terminated", "gone") else "kept-process-alive")
+
+    def write(record: dict) -> None:
         with receipt.open("a") as out:
             out.write(json.dumps(record) + "\n")
+
+    for f in fixtures:
+        proc: Proc = f["_proc"]
+        profile: Path | None = f.get("_profile")
+        record = {"schema": SCHEMA, "time": int(time.time()), "pid": proc.pid, "start": proc.start,
+                  "kind": f["kind"], "rss_bytes": f["rss_bytes"]}
+        try:
+            outcome = reap(proc, profile, record, write, look, kill, connected,
+                           wait_seconds * 5 if profile else wait_seconds)
+        except NoEvidence:
+            outcome = "no-evidence"
+        record = {**record, "time": int(time.time()), "outcome": outcome}
+        if profile:
+            # only a process this run verified, signalled and saw exit releases its profile
+            record["profile"] = (remove_profile(profile, uid, fresh, wait_seconds * 5)
+                                 if outcome == "terminated" else "kept")
+        write(record)
         results.append(record)
     return results
+
+
+def reap(proc: Proc, profile: Path | None, record: dict, write: Callable[[dict], None],
+         look: Callable[[int], Proc | None], kill: Callable[[int, int], None],
+         connected: Callable[[int], bool], wait_seconds: float) -> str:
+    now = look(proc.pid)
+    if now is None:
+        return "gone"
+    if not proc.same_process(now):
+        return "skipped-changed"
+    if profile and connected(proc.pid):
+        return "skipped-in-use"  # something still drives this browser
+    write({**record, "outcome": "signalling"})
+    try:
+        kill(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        return "skipped-permission"
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        now = look(proc.pid)
+        if now is None or not proc.same_process(now) or now.stat.startswith("Z"):
+            return "terminated"
+        time.sleep(0.05)
+    return "survived"
 
 
 def gib(n: int | None) -> str:
