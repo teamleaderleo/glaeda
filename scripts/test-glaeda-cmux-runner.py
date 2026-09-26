@@ -968,6 +968,55 @@ class HookTest(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 5)
         self.assertEqual(hook.root_warm_keys(2, os.fspath(ci)), [])  # no cmux-ci-2 at all
 
+    def test_warm_root_costs_rank_roots_by_predicted_compile(self) -> None:
+        ci = self.dir / "ci"
+        mirror = ci / ".prefetch" / "cmux.git"
+        mirror.mkdir(parents=True)
+        git = ["git", "-C", os.fspath(mirror), "-c", "user.email=t@t", "-c", "user.name=t"]
+        subprocess.run([*git, "init", "-q"], check=True)
+        (mirror / "Sources").mkdir()
+        (mirror / "Sources" / "A.swift").write_text("a")
+        subprocess.run([*git, "add", "."], check=True)
+        subprocess.run([*git, "commit", "-qm", "0"], check=True)
+        old = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        for n in range(3):
+            (mirror / "Sources" / f"M{n}.swift").write_text("m")
+        subprocess.run([*git, "add", "."], check=True)
+        subprocess.run([*git, "commit", "-qm", "1"], check=True)
+        new = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+
+        def stamp(k: int, onto: str, pr: int, files: list[str], **extra) -> None:
+            store = ci if k == 1 else ci / f"cmux-ci-{k}"
+            (store / "derived-data").mkdir(parents=True, exist_ok=True)
+            (store / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": onto,
+                                                          "pr": pr, "pr_app_swift_files": files, **extra}))
+
+        # root 1 kept pull request 5 (8 files) three main files back; root 2 kept pull request 6 (1 file) on the base
+        stamp(1, old, 5, [f"Sources/P{n}.swift" for n in range(8)], pr_package_interface=False)
+        stamp(2, new, 6, ["Sources/Q.swift"], pr_package_interface=False)
+        order, predicted = hook.warm_root_costs([0, 1], new, 7, os.fspath(ci))
+        self.assertEqual(order, [1, 0])
+        self.assertEqual(predicted["root-1"], {"seconds": 266.5, "tier": "far", "app_swift_files": 11})
+        self.assertEqual(predicted["root-2"], {"seconds": 140.0, "tier": "near", "app_swift_files": 1})
+        # A re-push of pull request 5: its own files are not undone, 3 main files is near, and the own root wins the tie.
+        self.assertEqual(hook.warm_root_costs([0, 1], new, 5, os.fspath(ci))[0], [0, 1])
+        # The fitted model beside the stamps replaces the default; a package interface change or a hot file rebuilds.
+        (ci / hook.WARM_MODEL).write_text(json.dumps({"near_app_swift_files": 5, "hot_files": ["Sources/Q.swift"],
+                                                      "tiers": {"near": {"p50": 100}, "far": {"p50": 200},
+                                                                "rebuild": {"p50": 300}}}))
+        order, predicted = hook.warm_root_costs([0, 1], new, 7, os.fspath(ci))
+        self.assertEqual((order, predicted["root-2"]["tier"], predicted["root-1"]["seconds"]), ([0, 1], "rebuild", 200.0))
+        (ci / hook.WARM_MODEL).write_text("[" * 1000)
+        self.assertEqual(hook.read_warm_model(os.fspath(ci)), hook.WARM_DEFAULT_MODEL)
+        # A base the mirror lacks, a stamp of an older cmux, or no base: fall back to the exact keys.
+        self.assertEqual(hook.warm_root_costs([0, 1], "e" * 40, 7, os.fspath(ci)), ([], {}))
+        self.assertEqual(hook.warm_root_costs([0, 1], "", 7, os.fspath(ci)), ([], {}))
+        (ci / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": old, "pr": 5}))
+        order, predicted = hook.warm_root_costs([0, 1], new, 7, os.fspath(ci))
+        self.assertEqual(predicted["root-1"]["tier"], "unknown")
+        self.assertEqual(hook.job_warm_target({"pull_request": {"base": {"sha": new.upper()}, "number": 5}}), (new, 5))
+        self.assertEqual(hook.job_warm_target({"pull_request": {"number": True}}), ("", None))
+
     def test_job_warm_keys_come_from_the_pull_request(self) -> None:
         sha = "ABCDEF0123456789abcdef0123456789abcdef01"
         self.assertEqual(hook.job_warm_keys({"pull_request": {"base": {"sha": sha}, "number": 5}}),

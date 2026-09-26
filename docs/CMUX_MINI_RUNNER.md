@@ -454,6 +454,15 @@ in at the producer's root. So one root job per root per mini:
   `warm: [<merge base sha12>, "pr-<number>"]`, and the hook matches the event's `pull_request.base.sha`
   first, then its number. The picker routes by the mini's keys, so this sends the job to the right tree
   on a two-root mini; the admission line ends with `warm for <key>` when it did.
+- Before the exact keys, the hook ranks the free roots by predicted compile (cmux#14778,
+  `warm_root_costs`): main's app Swift files between each kept build's merge base and the event's base
+  (the seed prefetch's blobless mirror `ci/.prefetch/cmux.git`, trees only, 5 s per diff), plus the kept
+  pull request's own files from its stamp (`pr_app_swift_files`) unless it is the same pull request, put
+  into the tiers of cmux's fitted model (`ci/warm-distance-model.json`, which admission copies there;
+  near 140 s, far 267 s, rebuild 401 s by default). The cheapest root goes first, the runner's own root on
+  a tie; the admission line ends with `predicted <s> s <tier>`, and the job gets the per-root predictions
+  in `GLAEDA_WARM_ROUTE` for cmux's admission record. Any missing commit, stamp field or model, or an
+  error, falls back to the exact keys.
 - The other runners (instances `canonicalRoots` and up) carry the side pool label
   `glaeda-side-<class>-xcode-<version>` instead. cmux's light side-lane jobs run on it
   (`vars.CI_SIDE_LANE_RUNNER`, cmux#14391), so they never hold a root runner. A class whose
