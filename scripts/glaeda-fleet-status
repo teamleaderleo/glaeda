@@ -527,7 +527,7 @@ JOBS_SCRIPT = (
     "echo @jobs; tail -c 8388608 ~/Library/Logs/glaeda-cmux-jobs.jsonl 2>/dev/null "
     "| grep -v -e '\"event\":\"started\"' -e '\"event\":\"refused\"' | tail -n 400 | tail -c 1048576; echo; "
     "echo @console; /usr/sbin/ioreg -n Root -d1 2>/dev/null | grep -e '\"IOConsoleUsers\" =' -e '\"IOConsoleLocked\" =' "
-    "| cut -c1-8192; "
+    "| cut -c1-65536; "
     "echo @now; date +%s"
 )
 
