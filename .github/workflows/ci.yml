@@ -302,6 +302,12 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
+    # binary's link bigger. The environment, not ~/.cargo/config.toml: local_install_build_execution's tests refuse
+    # an ambient cargo config, as a real install would.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
 
     steps:
       - name: Check out repository
@@ -316,12 +322,6 @@ jobs:
           --profile minimal
           --component clippy,rustfmt
           --no-self-update
-
-      # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
-      # binary's link bigger. Set in ~/.cargo/config.toml, not the environment, so the front door's cargo run (which
-      # scrubs the environment down to HOME and PATH) builds the same profile as cargo test instead of a second one.
-      - name: Build without debuginfo
-        run: printf '[profile.dev]\ndebug = 0\n\n[profile.test]\ndebug = 0\n' >> ~/.cargo/config.toml
 
       # Pull requests read the generation the last main push published; only main writes, so the cache stays
       # proportional to main, not to open branches. Each job keeps only its own artifacts, so each restore is small.
@@ -380,6 +380,12 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
+    # binary's link bigger. The environment, not ~/.cargo/config.toml: local_install_build_execution's tests refuse
+    # an ambient cargo config, as a real install would.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
 
     steps:
       - name: Check out repository
@@ -395,12 +401,6 @@ jobs:
           --component clippy,rustfmt
           --no-self-update
 
-      # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
-      # binary's link bigger. Set in ~/.cargo/config.toml, not the environment, so the front door's cargo run (which
-      # scrubs the environment down to HOME and PATH) builds the same profile as cargo test instead of a second one.
-      - name: Build without debuginfo
-        run: printf '[profile.dev]\ndebug = 0\n\n[profile.test]\ndebug = 0\n' >> ~/.cargo/config.toml
-
       # Pull requests read the generation the last main push published; only main writes, so the cache stays
       # proportional to main, not to open branches. Each job keeps only its own artifacts, so each restore is small.
       - name: Restore cargo build cache
@@ -414,6 +414,40 @@ jobs:
           key: verify-cargo-test-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             verify-cargo-test-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
+
+      - name: Run tests
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Save cargo build cache
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-test-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+
+  # The workspace bootstrap receipt and the operator CLI's own entry points (front door, doctor, plans). The front
+  # door's cargo run scrubs the environment, so it builds the default profile; here that is the only build.
+  cli:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy,rustfmt
+          --no-self-update
 
       - name: Validate workspace bootstrap
         run: |
@@ -478,9 +512,6 @@ jobs:
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
           cat "$first_receipt"
 
-      - name: Run tests
-        run: cargo test --locked --all-targets --all-features
-
       - name: Exercise root Glaeda front door
         run: |
           ./glaeda --output json | jq -e '
@@ -509,21 +540,10 @@ jobs:
           cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
             | jq -e '.schema_version == 1 and .disposition and (.findings | type == "array") and (.report.executables | length == 3) and .report.package_plan and .report.runner_account'
 
-      - name: Save cargo build cache
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: verify-cargo-test-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
-
   # One check that stands for the whole workflow, under the old single job's name.
   verify:
     if: ${{ always() }}
-    needs: [go, scripts, runner-tests, lint, test]
+    needs: [go, scripts, runner-tests, lint, test, cli]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
