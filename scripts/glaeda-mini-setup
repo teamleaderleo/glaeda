@@ -1263,14 +1263,13 @@ def operator_steps(ctx: Context, pre: dict[str, Any], fleet_result: dict[str, An
     try:
         info = root_copy.lstat()
         current = hashlib.sha256(root_copy.read_bytes()).hexdigest() if stat.S_ISREG(info.st_mode) else ""
-        trusted = info.st_uid == 0 and not info.st_mode & 0o022
     except OSError:
-        current, trusted = "", False
-    if current != want or not trusted:
-        add("cmux CI fetches compiled products from LAN peers through a root-owned glaeda-lan-fetch "
-            "(a job-owned copy is refused)",
-            f"sudo install -o root -g wheel -m 0755 ~/.local/bin/glaeda-lan-fetch {LAN_FETCH_ROOT_COPY}",
-            "sudo")
+        current = ""
+    if current != want or not root_chain(root_copy):
+        add("cmux CI fetches compiled products from LAN peers through a root-owned glaeda-lan-fetch in a "
+            "root-owned directory chain (cmux refuses anything a job could rewrite or rename)",
+            f"scripts/glaeda-seed-lan helper-install {platform.node().split('.')[0] or 'HOST'} --apply",
+            "operator Mac (fleet Keychain sudo; installs this checkout's helper, not the mini's copy)")
     add("Spotlight should skip build output", "System Settings > Spotlight > Search Privacy: add ~/Library/Developer/Xcode/DerivedData", "human (GUI)")
     add("GitHub Actions runner registration (reserved slot, never automated here)",
         "once enrolled: ~/glaeda/scripts/glaeda-cmux-runner --apply (docs/CMUX_MINI_RUNNER.md; routing is glaeda#1174)",
@@ -1278,7 +1277,21 @@ def operator_steps(ctx: Context, pre: dict[str, Any], fleet_result: dict[str, An
     return steps
 
 
-LAN_FETCH_ROOT_COPY = "/Users/Shared/cmux-build-fleet/bin/glaeda-lan-fetch"
+# What cmux peer_product_source.LAN_FETCH_HELPER runs. Outside /Users/Shared/cmux-build-fleet on purpose: that
+# tree is the fleet user's, so a PR job could rename anything in it.
+LAN_FETCH_ROOT_COPY = "/Library/Application Support/glaeda/bin/glaeda-lan-fetch"
+
+
+def root_chain(path: Path) -> bool:
+    """PATH and every directory above it are root-owned and not group- or other-writable (cmux's check)."""
+    for part in [path, *path.parents]:
+        try:
+            info = part.lstat()
+        except OSError:
+            return False
+        if info.st_uid != 0 or info.st_mode & 0o022 or stat.S_ISLNK(info.st_mode):
+            return False
+    return True
 
 
 def reserved_slots(ctx: Context, fleet_result: dict[str, Any] | None) -> dict[str, Any]:

@@ -6,7 +6,9 @@
     glaeda-lan-fetch serve-local             the local broker (the lan-fetch LaunchAgent)
 
 cmux CI (scripts/ci/peer_product_source.py) calls the root-owned copy at
-/Users/Shared/cmux-build-fleet/bin/glaeda-lan-fetch before GitHub, with the digest GitHub recorded for
+"/Library/Application Support/glaeda/bin/glaeda-lan-fetch" (every directory up to / root-owned and not
+group- or other-writable, so a job can neither rewrite nor rename it) before GitHub, with the digest
+GitHub recorded for
 the artifact. Peers are the other PR minis in the glaeda-owned mesh config (glaeda-seed-lan mesh writes
 LAN_CONFIG: each peer's name and LAN address, this mini's mesh key, and known_hosts pinning each peer's
 host key under its name). Each peer runs glaeda-seed-serve --role product as a forced command.

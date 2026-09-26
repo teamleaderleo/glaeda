@@ -155,11 +155,18 @@ class MiniSetupTest(unittest.TestCase):
         missing = os.fspath(self.home / "no-such-dir/glaeda-lan-fetch")
         with mock.patch.object(ms, "LAN_FETCH_ROOT_COPY", missing):
             steps = ms.operator_steps(self.ctx_for_steps(), fake_preflight()(None), None)
-        step = next(s for s in steps if "glaeda-lan-fetch" in s["command"])
-        self.assertEqual(step["needs"], "sudo")
-        self.assertIn(f"sudo install -o root -g wheel -m 0755 ", step["command"])
-        self.assertTrue(step["command"].endswith(missing))
-        self.assertIn("~/.local/bin/glaeda-lan-fetch", step["command"])
+        step = next(s for s in steps if "helper-install" in s["command"])
+        self.assertIn("Keychain sudo", step["needs"])
+        self.assertRegex(step["command"], r"^scripts/glaeda-seed-lan helper-install \S+ --apply$")
+        self.assertEqual(ms.LAN_FETCH_ROOT_COPY, "/Library/Application Support/glaeda/bin/glaeda-lan-fetch")
+        # A copy in a directory the fleet user owns (here, the test's) still gets the step.
+        own = self.home / "own-bin/glaeda-lan-fetch"
+        own.parent.mkdir()
+        own.write_bytes((ROOT / "scripts/glaeda-lan-fetch").read_bytes())
+        self.assertFalse(ms.root_chain(own))
+        with mock.patch.object(ms, "LAN_FETCH_ROOT_COPY", os.fspath(own)):
+            steps = ms.operator_steps(self.ctx_for_steps(), fake_preflight()(None), None)
+        self.assertTrue(any("helper-install" in s["command"] for s in steps))
 
     def ctx_for_steps(self):
         return ms.Context(self.home, False, "/usr/bin/python3", True, None, None, None, ms.CMUX_XCODE_APP, 50)

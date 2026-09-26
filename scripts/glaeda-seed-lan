@@ -7,6 +7,7 @@
     glaeda-seed-lan remove  --seeder cmux15 [HOST ...] --apply
     glaeda-seed-lan mesh HOST HOST ... [--address HOST=IP] [--from CIDRS] [--apply]   product mesh (below)
     glaeda-seed-lan mesh-remove HOST ... [--apply]
+    glaeda-seed-lan helper-install HOST ... [--apply]     root-owned glaeda-lan-fetch for cmux CI (sudo)
 
 Run from this repository on the operator Mac, which reaches every host over SSH as the fleet user. Planning
 reads only. `install --apply`:
@@ -39,6 +40,14 @@ which answers product verbs only, from that mini's product cache. Any PR mini ma
 verifies the sha256 GitHub recorded, never the server. Keys are validated and deduplicated as for seeds;
 it adds and replaces only its own lines (comment glaeda-lan-mesh@HOST). mesh-remove takes the mesh off
 the given hosts (their mesh directory and every mesh line in their authorized_keys).
+
+`helper-install` puts this checkout's scripts/glaeda-lan-fetch at HELPER_PATH on each HOST, root:wheel
+0755 in root:wheel 0755 directories, which is the only copy cmux CI will run. Planning reads each host's
+copy and directory chain over plain SSH. --apply goes through the fleet's Keychain sudo path
+(cmuxterm-hq build-fleet/mini-ops/fleet-sudo.sh: the password from the login Keychain, on SSH stdin to
+`sudo -k -S`, never argv or a file). The root script carries the helper's bytes and sha256 from here,
+never the mini's user-writable copy, installs through a temporary file and a rename, and answers BUSY
+when another install holds its lock. Busy or unreachable hosts are retried (RETRIES, RETRY_WAIT apart).
 """
 
 from __future__ import annotations
@@ -55,6 +64,8 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -501,6 +512,141 @@ def mesh_remove(hosts: list[str], apply: bool) -> dict:
     return report
 
 
+HELPER_PATH = "/Library/Application Support/glaeda/bin/glaeda-lan-fetch"
+HELPER_OWNER = "root:wheel"
+HELPER_LOCK = "/var/run/glaeda-lan-fetch-install.lock"
+FLEET_SUDO = os.environ.get("GLAEDA_FLEET_SUDO",
+                            os.path.expanduser("~/Projects/cmuxterm-hq/build-fleet/mini-ops/fleet-sudo.sh"))
+RETRIES = 3
+RETRY_WAIT = 30.0
+RETRIABLE = re.compile(r"BUSY|Connection (timed out|refused|closed|reset)|Operation timed out|No route to host"
+                       r"|Could not resolve|Broken pipe|kex_exchange_identification")
+
+# Runs on a host under /usr/bin/python3 (3.9), as the login user: the helper's state, read-only.
+HELPER_PROBE = r'''
+import hashlib, json, os, stat, sys
+path = json.loads(sys.argv[1])["path"]
+out = {"sha": "", "chain": []}
+try:
+    out["sha"] = hashlib.sha256(open(path, "rb").read()).hexdigest()
+except OSError:
+    pass
+p = path
+while True:
+    try:
+        info = os.lstat(p)
+        out["chain"].append([p, info.st_uid, stat.S_IMODE(info.st_mode), stat.S_ISLNK(info.st_mode)])
+    except OSError:
+        out["chain"].append([p, None, None, False])
+    if p == "/":
+        break
+    p = os.path.dirname(p)
+print(json.dumps(out))
+'''
+
+
+def helper_root_script(data: bytes, path: str = None, owner: str = None, lock: str = None) -> str:
+    """The root script fleet-sudo.sh runs: install DATA at PATH through a checked temporary file."""
+    path, owner, lock = path or HELPER_PATH, owner or HELPER_OWNER, lock or HELPER_LOCK
+    want = hashlib.sha256(data).hexdigest()
+    parents, p = [], os.path.dirname(path)
+    while p not in ("/", ""):
+        parents.append(p)
+        p = os.path.dirname(p)
+    b64 = base64.b64encode(data).decode()
+    return "\n".join([
+        "set -eu",
+        f"lock={shlex.quote(lock)}",
+        'if ! mkdir "$lock" 2>/dev/null; then echo "BUSY another glaeda-lan-fetch install is running"; exit 75; fi',
+        'trap \'rmdir "$lock"\' EXIT',
+        # Create missing directories root-owned; never loosen or re-own an existing one.
+        *[f"[ -d {shlex.quote(d)} ] || install -d -o {owner.split(':')[0]} -g {owner.split(':')[1]} -m 0755 {shlex.quote(d)}"
+          for d in reversed(parents)],
+        f"dir={shlex.quote(os.path.dirname(path))}",
+        'tmp="$(mktemp "$dir/.glaeda-lan-fetch.XXXXXX")"',
+        f"printf '%s' {shlex.quote(b64)} | /usr/bin/base64 --decode > \"$tmp\"",
+        'got="$(/usr/bin/shasum -a 256 "$tmp" | cut -d" " -f1)"',
+        f'if [ "$got" != {want} ]; then rm -f "$tmp"; echo "FAILED sha256 $got"; exit 1; fi',
+        f'chown {owner} "$tmp"',
+        'chmod 0755 "$tmp"',
+        f'mv -f "$tmp" {shlex.quote(path)}',
+        f'echo "INSTALLED {want}"',
+    ]) + "\n"
+
+
+def helper_state(probe: dict, want: str) -> str:
+    chain = probe.get("chain") or []
+    if probe.get("sha") != want:
+        return "missing" if not probe.get("sha") else "stale"
+    for path, uid, mode, link in chain:
+        if uid != 0 or mode is None or mode & 0o022 or link:
+            return f"not root-owned: {path}"
+    return "current"
+
+
+def run_fleet_sudo(hosts: list[str], script: Path) -> dict[str, str]:
+    """HOST -> fleet-sudo.sh's last line for it."""
+    proc = subprocess.run(["/bin/bash", FLEET_SUDO, "--hosts", " ".join(hosts), os.fspath(script)],
+                          capture_output=True, text=True, timeout=600)
+    lines = {}
+    for line in proc.stdout.splitlines():
+        host, _, rest = line.partition(": ")
+        if host:
+            lines[host] = rest
+    for host in hosts:
+        lines.setdefault(host.split("@")[-1], f"FAILED (fleet-sudo exit {proc.returncode}: "
+                                              f"{proc.stderr.strip()[-160:]})")
+    return {host: lines[host.split("@")[-1]] for host in hosts}
+
+
+def helper_install(hosts: list[str], apply: bool, user: str = "cmux") -> dict:
+    for name in hosts:
+        if not HOST_RE.fullmatch(name):
+            raise Failure(f"not a host name: {name!r}")
+    data = (SCRIPT_DIR / "glaeda-lan-fetch").read_bytes()
+    want = hashlib.sha256(data).hexdigest()
+    report: dict = {"tool": "glaeda-seed-lan", "mode": "helper-install", "apply": apply, "path": HELPER_PATH,
+                    "sha256": want, "hosts": {}}
+    pending = []
+    for host in hosts:
+        try:
+            state = helper_state(remote(host, HELPER_PROBE, {"path": HELPER_PATH}), want)
+        except Failure as error:
+            state = f"unreachable: {error}"
+        report["hosts"][host] = {"state": state}
+        if state != "current":
+            pending.append(host)
+    if not apply or not pending:
+        report["next"] = ["rerun with --apply"] if pending else []
+        return report
+    if not os.path.isfile(FLEET_SUDO):
+        raise Failure(f"no fleet-sudo.sh at {FLEET_SUDO} (set GLAEDA_FLEET_SUDO); it holds the Keychain sudo path")
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "install-glaeda-lan-fetch.sh"
+        script.write_text(helper_root_script(data))
+        for attempt in range(1, RETRIES + 1):
+            results = run_fleet_sudo([f"{user}@{h}" for h in pending], script)
+            retry = []
+            for host, target in zip(pending, results):
+                line = results[target]
+                report["hosts"][host].update({"result": line, "attempts": attempt})
+                if not line.startswith("ok") and RETRIABLE.search(line) and attempt < RETRIES:
+                    retry.append(host)
+            pending = retry
+            if not pending:
+                break
+            time.sleep(RETRY_WAIT)
+    for host in hosts:
+        entry = report["hosts"][host]
+        if "result" in entry:
+            try:
+                entry["state"] = helper_state(remote(host, HELPER_PROBE, {"path": HELPER_PATH}), want)
+            except Failure as error:
+                entry["state"] = f"unreachable: {error}"
+    report["ok"] = all(h["state"] == "current" for h in report["hosts"].values())
+    return report
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -522,6 +668,10 @@ def main(argv: list[str]) -> int:
     msh.add_argument("--user", default="cmux")
     msh.add_argument("--apply", action="store_true")
     msh.add_argument("hosts", nargs="+")
+    hin = sub.add_parser("helper-install")
+    hin.add_argument("--user", default="cmux")
+    hin.add_argument("--apply", action="store_true")
+    hin.add_argument("hosts", nargs="+")
     mrm = sub.add_parser("mesh-remove")
     mrm.add_argument("--apply", action="store_true")
     mrm.add_argument("hosts", nargs="+")
@@ -532,6 +682,8 @@ def main(argv: list[str]) -> int:
         elif args.command == "mesh":
             overrides = dict(item.split("=", 1) for item in args.address if "=" in item)
             report = mesh(args.hosts, overrides, args.cidrs, args.user, args.apply)
+        elif args.command == "helper-install":
+            report = helper_install(args.hosts, args.apply, args.user)
         elif args.command == "mesh-remove":
             report = mesh_remove(args.hosts, args.apply)
         else:
