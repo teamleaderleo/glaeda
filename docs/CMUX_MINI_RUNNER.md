@@ -441,6 +441,10 @@ in at the producer's root. So one root job per root per mini:
   Each also takes an exclusive `capacity/root-k.token` (k = 1 to `canonicalRoots`), and the hook writes `CMUX_CI_CANONICAL_ROOT=<root k>` to `$GITHUB_ENV` and
   `$RUNNER_TEMP/glaeda-canonical-root`. The root follows the token, never the runner instance.
 - Light jobs take no root.
+- Seed jobs (seed-derived-data.yml's `seed`, trusted runners only) take 2 units and no token: the seed
+  key names the root, so the job holds that root itself with `glaeda-canonical-root take <root>` before
+  it clears it. On a trusted mini with 2 runners, 4 units and `canonicalRoots` 2, two seeds (one per
+  root) run at once; with one runner nothing changes.
 - `defaults.runner.classes.<class>.canonicalRoots` (default 1, at most `runners`) runners per mini
   (instances 0 and up) also carry the root pool label `glaeda-root-<class>-xcode-<version>`. Root jobs
   should run on that label, so GitHub queues them until a root runner is free instead of handing one to a
