@@ -142,10 +142,15 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # with glaeda-canonical-root take (cmux "seed far main pushes in their own lane") before it clears it. It
 # never touches compile admission's kept DerivedData, so no persistent-dd either. Two seed jobs then fit
 # on one trusted mini with two runners, four units and two canonical roots.
+# nightly.yml's `build-nightly-app` (trusted runners only, cmux "build the nightly app on the trusted owned
+# minis first") compiles the universal Release app into its own workspace (build-universal, cleared at job
+# start) and restores its own compile cache lineage: no canonical root, no kept DerivedData, no GUI. As an
+# unknown id it would take the compile class and hold the root a seed on the same mini waits for.
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("app-host-test-rerun.yml", "rerun"): "gui",
                         ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui",
-                        ("seed-derived-data.yml", "seed"): "seed"}
+                        ("seed-derived-data.yml", "seed"): "seed",
+                        ("nightly.yml", "build-nightly-app"): "isolated"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
 # restore a product into with rm -rf of its src, so one root job per root per mini (cmux#14338 adds a second).
 # compile-gui takes no gui token at job start: the step that decides whether the build tests takes it with

@@ -460,6 +460,8 @@ in at the producer's root. So one root job per root per mini:
   key names the root, so the job holds that root itself with `glaeda-canonical-root take <root>` before
   it clears it. On a trusted mini with 2 runners, 4 units and `canonicalRoots` 2, two seeds (one per
   root) run at once; with one runner nothing changes.
+- The nightly app build (nightly.yml's `build-nightly-app`, trusted runners only) is isolated: 2 units,
+  no token. It compiles into its own workspace, so it never holds a root a seed on the same mini waits for.
 - `defaults.runner.classes.<class>.canonicalRoots` (default 1, at most `runners`) runners per mini
   (instances 0 and up) also carry the root pool label `glaeda-root-<class>-xcode-<version>`. Root jobs
   should run on that label, so GitHub queues them until a root runner is free instead of handing one to a
