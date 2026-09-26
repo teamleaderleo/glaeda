@@ -39,7 +39,9 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::process::{ExecutionRecord, MAX_CAPTURED_STREAM_BYTES, TimedCommandExecutor};
-use crate::project_checkout_observation::{ProjectBranchState, ProjectCheckoutObserver};
+use crate::project_checkout_observation::{
+    ProjectBranchState, ProjectCheckoutObservationError, ProjectCheckoutObserver,
+};
 
 mod branches;
 
@@ -851,7 +853,11 @@ fn observe_detailed(
     let fingerprint = administrative_fingerprint(&git_dir)?;
     let observation = observer
         .observe(&checkout, executor)
-        .map_err(|_| checkout_unobservable())?;
+        .map_err(|error| match error.code {
+            "observation_timed_out" => git_timed_out(),
+            "source_changed" => checkout_changed(),
+            _ => checkout_unobservable(),
+        })?;
     let linked = git_dir != common_dir;
     if linked && read_gitdir_backlink(&git_dir)? != checkout.join(".git") {
         return Err(administrative_directory_mismatch());
@@ -1014,7 +1020,7 @@ fn git(
 ) -> Result<ExecutionRecord, LinkedWorktreeReclaimError> {
     let record = observer
         .git(checkout, arguments, executor)
-        .map_err(|_| unavailable())?;
+        .map_err(|error| git_failure(&error))?;
     require_success(record)
 }
 
@@ -1027,8 +1033,16 @@ fn git_bounded(
 ) -> Result<ExecutionRecord, LinkedWorktreeReclaimError> {
     let record = observer
         .git_bounded(checkout, arguments, max_stdout_bytes, executor)
-        .map_err(|_| unavailable())?;
+        .map_err(|error| git_failure(&error))?;
     require_success(record)
+}
+
+fn git_failure(error: &ProjectCheckoutObservationError) -> LinkedWorktreeReclaimError {
+    if error.code == "observation_timed_out" {
+        git_timed_out()
+    } else {
+        unavailable()
+    }
 }
 
 fn require_success(record: ExecutionRecord) -> Result<ExecutionRecord, LinkedWorktreeReclaimError> {
@@ -1860,6 +1874,22 @@ const fn checkout_unobservable() -> LinkedWorktreeReclaimError {
         LinkedWorktreeReclaimErrorKind::Unavailable,
         "checkout_unobservable",
         "the checkout could not be observed consistently",
+    )
+}
+
+const fn checkout_changed() -> LinkedWorktreeReclaimError {
+    error(
+        LinkedWorktreeReclaimErrorKind::Unavailable,
+        "checkout_changed",
+        "the checkout changed between two observations; it is probably in use",
+    )
+}
+
+const fn git_timed_out() -> LinkedWorktreeReclaimError {
+    error(
+        LinkedWorktreeReclaimErrorKind::Unavailable,
+        "git_timed_out",
+        "a Git read did not finish before its deadline",
     )
 }
 

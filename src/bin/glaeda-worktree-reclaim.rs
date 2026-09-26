@@ -151,6 +151,9 @@ enum WorktreeResult {
 struct WorktreeReport {
     /// Position among linked worktrees in `git worktree list` order, starting at 1.
     ordinal: usize,
+    /// The registered checkout path. The report goes to the operator who owns these checkouts,
+    /// and an ordinal alone had to be mapped back through `git worktree list` by hand.
+    path: PathBuf,
     #[serde(flatten)]
     result: WorktreeResult,
 }
@@ -387,6 +390,7 @@ fn main() -> ExitCode {
             };
             worktrees.push(WorktreeReport {
                 ordinal: position + 1,
+                path: entry.path().to_path_buf(),
                 result,
             });
         }
@@ -517,7 +521,11 @@ fn render_human(report: &Report, apply: bool, all: bool) {
                 );
                 for worktree in worktrees {
                     if let Some(line) = worktree_line(&worktree.result, all) {
-                        println!("  #{}: {line}", worktree.ordinal);
+                        println!(
+                            "  #{} {}: {line}",
+                            worktree.ordinal,
+                            worktree.path.display()
+                        );
                     }
                 }
                 match &repository.branches {
@@ -574,7 +582,7 @@ fn render_human(report: &Report, apply: bool, all: bool) {
         println!("nothing was changed");
     }
     if !all {
-        println!("#N is the Nth linked entry of `git worktree list`; --all lists every worktree");
+        println!("--all lists every worktree");
     }
 }
 
