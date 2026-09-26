@@ -430,6 +430,59 @@ class InstallerTest(unittest.TestCase):
             self.install("cmux12s-mac-mini", apply=False)
         self.assertTrue(calls and all(c[-1].startswith("/usr/bin/python3 -I - ") for c in calls))
 
+    def mesh(self, *extra: str) -> tuple[int, dict]:
+        hosts = ["cmux12s-mac-mini", "cmux13s-mac-mini", "cmuxs-mac-mini-6"]
+        return self.cli("mesh", *hosts, "--address", "cmux12s-mac-mini=172.20.21.196", "--address",
+                        "cmux13s-mac-mini=172.20.21.197", "--address", "cmuxs-mac-mini-6=172.20.21.199", *extra)
+
+    def test_the_product_mesh_authorizes_every_other_mini_for_products_only(self):
+        before = self.tree()
+        code, plan = self.mesh()
+        self.assertEqual((code, self.tree()), (0, before))
+        code, report = self.mesh("--apply")
+        self.assertEqual(code, 0, report)
+        hosts = ["cmux12s-mac-mini", "cmux13s-mac-mini", "cmuxs-mac-mini-6"]
+        keys = {h: " ".join((self.homes / h / ".config/glaeda/lan-mesh/id_ed25519.pub").read_text().split()[:2])
+                for h in hosts}
+        for host in hosts:
+            home = self.homes / host
+            conf = json.loads((home / ".config/glaeda/lan-mesh/config.json").read_text())
+            self.assertEqual([p["name"] for p in conf["peers"]], [h for h in hosts if h != host])
+            self.assertEqual(len((home / ".config/glaeda/lan-mesh/known_hosts").read_text().splitlines()), 3)
+            lines = [l for l in (home / ".ssh/authorized_keys").read_text().splitlines() if "glaeda-lan-mesh@" in l]
+            command = f"/usr/bin/python3 -I {home}/.local/libexec/glaeda-seed-serve --role product"
+            self.assertEqual(sorted(lines), sorted(
+                f'restrict,from="172.20.20.0/22",command="{command}" {keys[p]} glaeda-lan-mesh@{p}'
+                for p in hosts if p != host))
+            self.assertEqual((home / ".local/libexec/glaeda-seed-serve").read_bytes(), SERVE.read_bytes())
+            self.assertEqual(list(report["hosts"][host]["ping"].values()), ["glaeda-seed-serve 1 pong"])
+        # The prefetch-side seed key is separate; the mesh config reads back through glaeda-lan-fetch.
+        lf = load("glaeda_lan_fetch_for_test", ROOT / "scripts/glaeda-lan-fetch")
+        self.assertIsNotNone(lf.load_config(self.homes / "cmux13s-mac-mini/.config/glaeda/lan-mesh/config.json"))
+        self.assertEqual(len(report["manifest_keys"]), 3)
+        after = self.tree()
+        code, again = self.mesh("--apply")
+        self.assertEqual(self.tree(), after)
+        code, removed = self.cli("mesh-remove", "cmux13s-mac-mini", "--apply")
+        self.assertEqual(code, 0)
+        self.assertFalse((self.homes / "cmux13s-mac-mini/.config/glaeda/lan-mesh").exists())
+        self.assertFalse(any("glaeda-lan-mesh@" in l for l in
+                             (self.homes / "cmux13s-mac-mini/.ssh/authorized_keys").read_text().splitlines()))
+        self.assertTrue(any("glaeda-lan-mesh@" in l for l in
+                            (self.homes / "cmux12s-mac-mini/.ssh/authorized_keys").read_text().splitlines()))
+
+    def test_the_mesh_refuses_a_duplicate_key_and_needs_two_hosts(self):
+        self.mesh("--apply")
+        a = self.homes / "cmux12s-mac-mini/.config/glaeda/lan-mesh"
+        b = self.homes / "cmux13s-mac-mini/.config/glaeda/lan-mesh"
+        for name in ("id_ed25519", "id_ed25519.pub"):
+            shutil.copy(a / name, b / name)
+        code, report = self.mesh("--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("refused", report["hosts"]["cmux13s-mac-mini"]["key"])
+        code, report = self.cli("mesh", "cmux12s-mac-mini")
+        self.assertEqual(code, 1)
+
     def test_remove_drops_only_its_own_lines(self):
         self.install("cmux12s-mac-mini", "cmux13s-mac-mini")
         code, plan = self.cli("remove", "--seeder", "cmux15", "cmux12s-mac-mini")

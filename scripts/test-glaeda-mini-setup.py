@@ -143,6 +143,27 @@ class MiniSetupTest(unittest.TestCase):
                 self.assertEqual(disk["ProgramArguments"][0], "/opt/x/python3")
         self.assertIsNone(ms.apple_python("linux"))
 
+    def test_the_lan_fetch_broker_runs_apples_python_and_asks_for_a_root_owned_copy(self) -> None:
+        with mock.patch.object(ms, "apple_python", return_value="/usr/bin/python3"):
+            self.invoke("--apply")
+        agent = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.lan-fetch.plist").read_bytes())
+        self.assertEqual(agent["ProgramArguments"],
+                         ["/usr/bin/python3", "-I", os.fspath(self.home / ".local/bin/glaeda-lan-fetch"), "serve-local"])
+        self.assertTrue(agent["KeepAlive"])
+        self.assertEqual((self.home / ".local/bin/glaeda-lan-fetch").read_bytes(),
+                         (ROOT / "scripts/glaeda-lan-fetch").read_bytes())
+        missing = os.fspath(self.home / "no-such-dir/glaeda-lan-fetch")
+        with mock.patch.object(ms, "LAN_FETCH_ROOT_COPY", missing):
+            steps = ms.operator_steps(self.ctx_for_steps(), fake_preflight()(None), None)
+        step = next(s for s in steps if "glaeda-lan-fetch" in s["command"])
+        self.assertEqual(step["needs"], "sudo")
+        self.assertIn(f"sudo install -o root -g wheel -m 0755 ", step["command"])
+        self.assertTrue(step["command"].endswith(missing))
+        self.assertIn("~/.local/bin/glaeda-lan-fetch", step["command"])
+
+    def ctx_for_steps(self):
+        return ms.Context(self.home, False, "/usr/bin/python3", True, None, None, None, ms.CMUX_XCODE_APP, 50)
+
     def test_apple_python_falls_back_when_it_does_not_run(self) -> None:
         def fake_glob(self, pattern):
             return iter([Path("/Applications/Xcode_26.6.app")]) if pattern == "Xcode*.app" else iter([])
@@ -154,12 +175,16 @@ class MiniSetupTest(unittest.TestCase):
 
         with mock.patch.object(ms.Path, "glob", fake_glob), mock.patch.object(ms.subprocess, "run", fake_run):
             fake_run.code = 0
+            ms.apple_python.cache_clear()
             self.assertEqual(ms.apple_python("macos"), "/usr/bin/python3")
             fake_run.code = 69  # xcrun: Xcode licence not accepted
+            ms.apple_python.cache_clear()
             self.assertIsNone(ms.apple_python("macos"))
         with mock.patch.object(ms.Path, "glob", fake_glob), \
              mock.patch.object(ms.subprocess, "run", side_effect=subprocess.TimeoutExpired("python3", 10)):
+            ms.apple_python.cache_clear()
             self.assertIsNone(ms.apple_python("macos"))
+        ms.apple_python.cache_clear()
         self.assertEqual(runs[0][:3], ["/usr/bin/python3", "-I", "-c"])
 
     def test_default_xcode_pin_matches_the_cmux_pull_request_lane(self) -> None:
