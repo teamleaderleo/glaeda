@@ -31,7 +31,10 @@ VERSION_RE = r"[0-9][0-9.]*"
 # compiles run at once: more than one needs cmux's compile admission to keep its state per runner.
 # canonicalRoots (default 1) is how many canonical roots (/private/tmp/cmux-ci, -2, ...) the mini has: that
 # many runners (instances 0 to canonicalRoots - 1) also carry the root pool label (root_label), and the rest
-# carry the side pool label (side_label) instead.
+# carry the side pool label (side_label) instead. guiRunners (0 or 1, default 0) makes the mini's last runner its
+# gui runner: it carries only the gui pool label (gui_label), so GitHub hands each mini at most one GUI job, the
+# one its single gui token allows, and a second GUI job waits in GitHub's queue for another mini's gui runner
+# instead of on a root runner here (cmuxterm-hq#661). It is neither a root nor a side runner.
 CLASS_CAPACITY = {"xl": (8, 8), "std": (4, 4), "light": (2, 2)}
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
@@ -67,6 +70,13 @@ def side_label(pool: str) -> str:
     canonical root, no persistent state, no GUI) runs on it, so it never takes a root runner that a compile
     or app-host job is waiting for. A mini whose every runner is a root runner has none."""
     return pool.replace("glaeda-", "glaeda-side-", 1)
+
+
+def gui_label(pool: str) -> str:
+    """The label of a pool's gui runner (the last instance when guiRunners is 1). The GUI jobs (app-host shards,
+    tests-build-and-lag, app-host-test-rerun) run on it: each needs the mini's one gui token (one console session),
+    so one runner per mini carries the label, and its listener gate holds while the token or every root is taken."""
+    return pool.replace("glaeda-", "glaeda-gui-", 1)
 
 
 def xcode_apps(manifest: dict[str, Any], member: str) -> list[dict[str, Any]] | None:
@@ -140,8 +150,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         runners, units = declared.get("runners", runners), declared.get("capacityUnits", units)
         compile_slots = declared.get("compileSlots", 1)
         roots = declared.get("canonicalRoots", 1)
+        gui = declared.get("guiRunners", 0)
     else:
-        compile_slots, roots = 1, 1
+        compile_slots, roots, gui = 1, 1, 0
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
     if not (isinstance(units, int) and not isinstance(units, bool) and 2 <= units <= 4 * MAX_RUNNERS):
@@ -151,6 +162,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"runner.classes.{klass}.compileSlots must be 1 to {max(1, units // 2)} (a compile is 2 units)"
     if not (isinstance(roots, int) and not isinstance(roots, bool) and 1 <= roots <= runners):
         return None, f"runner.classes.{klass}.canonicalRoots must be 1 to {runners} (one root runner per root)"
+    if not (isinstance(gui, int) and not isinstance(gui, bool) and 0 <= gui <= 1 and roots + gui <= runners):
+        return None, (f"runner.classes.{klass}.guiRunners must be 0 or 1, and canonicalRoots plus guiRunners at most "
+                      f"runners ({runners}): the gui runner is the last instance, never a root runner")
     if compile_slots > roots:
         return None, (f"runner.classes.{klass}.compileSlots {compile_slots} needs canonicalRoots {compile_slots} "
                       "(every compile holds a root)")
@@ -161,7 +175,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
             "trustedRef": trusted_ref, "trustedRepo": trusted_repo,
             "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)],
-            "sidePools": [side_label(label) for label in dict.fromkeys(pools)]}, None
+            "sidePools": [side_label(label) for label in dict.fromkeys(pools)],
+            "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else []}, None
 
 
 def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool] | None = None) -> dict[str, list[str]]:

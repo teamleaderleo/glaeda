@@ -1430,11 +1430,13 @@ def runner_units(runner_dir: Path) -> int:
 
 class RunnerScope(NamedTuple):
     """What this runner's job-started hook admits with: its --capacity-units, --compile-slots and
-    --canonical-roots, and whether it is a root runner (instance below canonical roots, glaeda-cmux-runner)."""
+    --canonical-roots, whether it is a root runner (instance below canonical roots, glaeda-cmux-runner) and
+    whether it is the mini's gui runner (--gui-runner, the gui pool label; never a root runner)."""
     units: int = 0
     compile_slots: int = 1
     roots: int = 1
     root: bool = False
+    gui: bool = False
 
 
 def listen_fit_units(runner_dir: Path) -> int:
@@ -1463,7 +1465,9 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
     suffix = re.search(r"-([0-9]+)$", runner_dir.name)
     instance = flag("instance", int(suffix.group(1)) if suffix else 0)
     roots = max(1, flag("canonical-roots", 1))
-    return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots, instance < roots)
+    gui = re.search(r"\s--gui-runner(?:\s|$)", text) is not None
+    return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots, instance < roots and not gui,
+                       gui)
 
 
 # A root runner's jobs (compile admission, app-host shards, cli-product, lag) cost up to this many units, and
@@ -1491,7 +1495,13 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
     in GitHub's queue for this one (hq#661 Workstream 7). The gui token is not a reason to hold: a compile
     needs none, and holding the root runner for it kept a mini's second root idle while roots were the fleet's
     bottleneck (09-25 22:30Z: 18 of 18 roots busy, 5 held off). A shard that meets a taken gui token waits for
-    it (GUI_WAIT_S) instead of refusing."""
+    it (GUI_WAIT_S) instead of refusing.
+
+    With the scope of a gui runner (scope.gui, the gui pool label: app-host shards, tests-build-and-lag,
+    app-host-test-rerun), full also means the gui token is taken (test-e2e's take-gui, or a GUI job that reached a
+    root runner) or every canonical root is: a GUI job takes the producer's root in its restore step and would
+    wait there holding the gui token. Held off, GitHub hands the job to another mini's gui runner. Only this
+    runner carries the label, so holding it never keeps a compile off the mini."""
     if capacity_dir is None or total <= 0:
         return None
     try:
@@ -1518,6 +1528,13 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
         if free < need:
             return (f"only {free} of {total} capacity units on this mini are free; "
                     f"{'a compile' if root else 'its next job'} needs {need}")
+        if scope is not None and scope.gui:
+            if not probe(capacity_dir / "gui.token"):
+                return "the gui token is taken"
+            if not any(probe(capacity_dir / f"root-{k}.token") for k in range(1, scope.roots + 1)):
+                return ("the canonical root is taken" if scope.roots == 1
+                        else f"all {scope.roots} canonical roots on this mini are taken")
+            return None
         if not root:
             return None
         assert scope is not None
@@ -2484,6 +2501,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="canonical roots on this mini (root-N tokens; one compile or app-host consumer per root)")
     p.add_argument("--instance", type=int, default=0,
                    help="this runner's glaeda-cmux-runner instance: it prefers canonical root instance+1")
+    p.add_argument("--gui-runner", action="store_true",
+                   help="this is the mini's gui runner (the gui pool label): the listener gate holds it while the "
+                        "gui token, every canonical root or every unit is taken")
     p.add_argument("--capacity-dir", type=Path, default=Path(FLEET_DIR) / "capacity", help=argparse.SUPPRESS)
     p.add_argument("--host-lock", default=HOST_LOCK, help=argparse.SUPPRESS)
     p.add_argument("--reservation", default=RESERVATION, help=argparse.SUPPRESS)

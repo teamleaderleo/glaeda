@@ -1926,6 +1926,12 @@ class GateTest(unittest.TestCase):
         (side / hook.RUNNER_HOOK_SCRIPT).write_text(script.read_text())
         self.assertEqual(hook.runner_scope(side), hook.RunnerScope(4, 1, 1, False))
         self.assertEqual(hook.runner_units(side), 4)
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --compile-slots 2 "
+                          "--canonical-roots 2 --instance 4 --gui-runner\n")
+        self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(5, 2, 2, False, True))
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --instance 0 --gui-runner\n")
+        self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(5, 1, 1, False, True),
+                         "a gui runner is never a root runner, whatever its instance")
 
     def test_a_root_runner_holds_while_a_token_its_jobs_need_is_taken(self) -> None:
         root = hook.RunnerScope(4, 2, 2, True)
@@ -1957,6 +1963,29 @@ class GateTest(unittest.TestCase):
         self.runner_hook(4)
         gate = self.full_gate(self.units(3))
         self.assertEqual(gate.claimed(), "only 1 of 4 capacity units on this mini are free; a compile needs 2")
+
+    def test_a_gui_runner_holds_while_the_gui_token_or_every_root_is_taken(self) -> None:
+        gui = hook.RunnerScope(5, 2, 2, False, True)
+        capacity = self.units(0)
+        self.assertIsNone(hook.mini_full(capacity, 5, gui))
+        held = hook.lock_file(capacity / "gui.token", fcntl.LOCK_EX)
+        self.assertEqual(hook.mini_full(capacity, 5, gui), "the gui token is taken")
+        os.close(held)
+        dd = [hook.lock_file(capacity / name, fcntl.LOCK_EX) for name in ("persistent-dd.token", "persistent-dd-1.token")]
+        self.assertIsNone(hook.mini_full(capacity, 5, gui), "a GUI job needs no persistent-dd token")
+        roots = [hook.lock_file(capacity / name, fcntl.LOCK_EX) for name in ("root-1.token", "root-2.token")]
+        self.assertEqual(hook.mini_full(capacity, 5, gui), "all 2 canonical roots on this mini are taken")
+        os.close(roots.pop())
+        self.assertIsNone(hook.mini_full(capacity, 5, gui), "one free root is enough")
+        for fd in [*roots, *dd]:
+            os.close(fd)
+        self.assertIsNone(hook.mini_full(self.units(4), 5, gui), "a GUI job needs one unit, not a compile's two")
+        self.assertEqual(hook.mini_full(self.units(5), 5, gui), "all 5 capacity units on this mini are taken")
+        one = hook.RunnerScope(5, 1, 1, False, True)
+        capacity = self.units(0)
+        held = hook.lock_file(capacity / "root-1.token", fcntl.LOCK_EX)
+        self.assertEqual(hook.mini_full(capacity, 5, one), "the canonical root is taken")
+        os.close(held)
 
     def test_the_full_probe_never_competes_with_an_admission(self) -> None:
         capacity = self.units(1)
@@ -2990,6 +3019,33 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux", (hooks / "job-started.sh").read_text())
         self.assertNotIn("--test-keychain", (hooks / "job-started.sh").read_text(), "a secret-holding host keeps its keychains")
 
+    def test_the_last_instance_is_the_gui_runner_with_only_the_gui_pool_label(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["hosts"]["mini-std"]["roles"].append("ios-simulators")
+        manifest["hosts"]["mini-std"]["overrides"] = {"ios_simulator": {"runtimes": ["23F77"]}}
+        manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 5, "capacityUnits": 5, "compileSlots": 2,
+                                                              "canonicalRoots": 2, "guiRunners": 1}}}
+        path = self.state / "gui.json"
+        path.write_text(json.dumps(manifest))
+        with mock.patch.object(cr, "xcode_present", return_value=True), \
+                mock.patch.object(cr, "ios_sim_present", return_value=True):
+            for instance in ("0", "2", "4"):
+                self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std", "--instance", instance)
+        labels = [argv[argv.index("--labels") + 1].split(",") for argv in self.config_argvs()]
+        self.assertEqual([[x for x in l if x.startswith(("glaeda-std", "glaeda-root", "glaeda-side", "glaeda-gui"))]
+                          for l in labels],
+                         [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"],
+                          ["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"],
+                          ["glaeda-gui-std-xcode-26.6"]],
+                         "the gui runner carries neither the pool label nor a root or side one")
+        self.assertIn("glaeda-ios-sim", labels[0])
+        self.assertNotIn("glaeda-ios-sim", labels[2], "no iOS job ever takes the gui runner")
+        self.assertFalse([x for x in labels[2] if x.startswith("glaeda-runner-")])
+        started = (self.home / "actions-runner-glaeda-4/glaeda-hooks/job-started.sh").read_text()
+        self.assertIn("--canonical-roots 2 --instance 4 --gui-runner\n", started)
+        self.assertNotIn("--gui-runner", (self.home / "actions-runner-glaeda-2/glaeda-hooks/job-started.sh").read_text())
+        self.assertEqual(hook.runner_scope(self.home / "actions-runner-glaeda-4"), hook.RunnerScope(5, 2, 2, False, True))
+
     def test_test_keychain_is_created_unlocked_first_and_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -3330,6 +3386,15 @@ class ManifestLabelsTest(unittest.TestCase):
             manifest["defaults"]["runner"]["classes"]["std"]["canonicalRoots"] = 2
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["compileSlots"], 2)
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["canonicalRoots"], 2)
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["guiPools"], [], "no gui runner by default")
+            manifest["defaults"]["runner"]["classes"]["std"]["guiRunners"] = 1
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["guiPools"], ["glaeda-gui-std-xcode-26.6"])
+            manifest["defaults"]["runner"]["classes"]["std"]["canonicalRoots"] = 3  # 3 runners, all roots
+            self.assertIn("guiRunners must be 0 or 1", cr.member_labels(manifest, "mini-std")[1])
+            for bad in (2, -1, True, "1"):
+                manifest["defaults"]["runner"]["classes"]["std"].update(canonicalRoots=2, guiRunners=bad)
+                self.assertIn("guiRunners must be 0 or 1", cr.member_labels(manifest, "mini-std")[1], bad)
+            del manifest["defaults"]["runner"]["classes"]["std"]["guiRunners"]
             manifest["defaults"]["runner"]["classes"]["std"]["canonicalRoots"] = 4  # 3 runners
             self.assertIn("canonicalRoots must be 1 to 3", cr.member_labels(manifest, "mini-std")[1])
             del manifest["defaults"]["runner"]["classes"]["std"]["canonicalRoots"]
