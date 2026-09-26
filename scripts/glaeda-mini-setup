@@ -239,6 +239,29 @@ def pick_python() -> str | None:
     return None
 
 
+def apple_python(platform_name: str = HOST_PLATFORM) -> str | None:
+    """/usr/bin/python3 once it is real (Command Line Tools or an Xcode), else None.
+
+    macOS Local Network Privacy refuses LAN connections from a LaunchAgent whose program is not Apple's,
+    children included (2026-09-25: a Homebrew python3 agent and its /usr/bin/ssh got "No route to host").
+    The seed prefetch agent streams seeds from the trusted seeder over the LAN, so it runs Apple's python3.
+    It must also run: a broken xcode-select or an unaccepted Xcode licence makes /usr/bin/python3 fail,
+    and then the agent keeps the other interpreter (losing only the LAN step, not the prefetch).
+    """
+    if platform_name == "linux":
+        return None
+    if not (Path("/Library/Developer/CommandLineTools/usr/bin/python3").exists() or any(
+        Path("/Applications").glob("Xcode*.app")
+    )):
+        return None
+    try:
+        probe = subprocess.run(["/usr/bin/python3", "-I", "-c", "pass"], stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return "/usr/bin/python3" if probe.returncode == 0 else None
+
+
 _ENROLL: Any = None
 
 
@@ -623,10 +646,12 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-fleet-cas-prune.err"),
         },
         # Fetches main's newest DerivedData seed into each canonical root's local seed cache while an owned
-        # cmux runner is idle (cmuxterm-hq#658); it exits at once where no owned job has run.
+        # cmux runner is idle (cmuxterm-hq#658); it exits at once where no owned job has run. Apple's python3,
+        # so it may reach the trusted seeder on the LAN (apple_python).
         LABEL_PREFIX + "seed-prefetch": {
             "Label": LABEL_PREFIX + "seed-prefetch",
-            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-seed-prefetch"), "--apply"],
+            "ProgramArguments": [apple_python(ctx.platform) or python, os.fspath(ctx.bin / "glaeda-seed-prefetch"),
+                                 "--apply"],
             "StartInterval": 300,
             "ProcessType": "Background",
             "LowPriorityIO": True,

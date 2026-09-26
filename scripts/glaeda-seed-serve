@@ -1,0 +1,299 @@
+#!/usr/bin/python3
+"""glaeda-seed-serve: stream one kept DerivedData seed from the trusted seeder to a PR mini over SSH.
+
+    authorized_keys on the seeder (written by scripts/glaeda-seed-lan install):
+        restrict,from="<LAN>",command="/usr/bin/python3 -I ~/.local/libexec/glaeda-seed-serve" ssh-ed25519 ... glaeda-seed-lan@<mini>
+
+This runs only as that forced command. The client's requested command arrives in SSH_ORIGINAL_COMMAND:
+
+    seed-v1 CODEC KEY [KEY ...]   CODEC is zstd or tar; KEYs nearest first, at most MAX_KEYS
+    ping-v1                       installation check
+
+It answers with one header line on stdout, then (on a hit) the stream:
+
+    glaeda-seed-serve 1 hit KEY CODEC      then `tar -cf - KEY` (through zstd -1 -T0 when CODEC is zstd)
+    glaeda-seed-serve 1 miss               exit 3: the seeder keeps none of the KEYs
+    glaeda-seed-serve 1 busy               exit 4: every serve slot stayed taken for SLOT_WAIT seconds
+    glaeda-seed-serve 1 refused REASON     exit 2: malformed request, or this host is not trusted-only
+    glaeda-seed-serve 1 pong               exit 0: ping-v1
+
+Only a KEY that matches KEY_RE (a seed key: no slash, no dot, no option) is looked up, and only as a real
+directory, never a symlink, directly under a canonical root's seed cache (STATE/seeds or
+STATE/cmux-ci-<n>/seeds) holding the seed manifest cmux seed_derived_data.py writes. Nothing the client
+sends is passed to a shell or reaches the seed cache: the direction is read-only, seeder to mini.
+
+The seeder must build only trusted code. The glaeda runner receipt on the host must name a trusted ref
+(member.trustedRef, set by glaeda-cmux-runner for a trusted-only runner); otherwise every request is
+refused. That catches an operator moving the seeder into the PR pool without removing this key. It is
+not a defence against PR code already running here, which could rewrite the receipt and the seeds.
+
+PR jobs on the minis can read the client key, so every limit here holds against a hostile client:
+one request at a time per client address (a flock on client-<ip>), at most QUEUE requests past that at
+all (queue-<n>.lock, taken without waiting: beyond it the answer is `busy` at once), of which at most
+SLOTS stream (flock, SLOT_WAIT to get one), each for at most SERVE_TIMEOUT seconds however slowly the
+client reads. Streams run at nice 10 with utility disk I/O, so the seeder's own seed job keeps the
+machine. The forced command runs python3 -I: no user site-packages, no PYTHON* variables. Each request appends one JSON line to RUN_DIR/serve.jsonl (bounded, rotated).
+The options below are fixed by the authorized_keys command, never by the client.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROTOCOL = "1"
+HEADER = "glaeda-seed-serve " + PROTOCOL
+# cmux seed_derived_data.py keys: admission-derived-data-v1-<os>-<arch>-<fingerprint>-j<width>-<commit>.
+KEY_RE = re.compile(r"admission-derived-data-v1-[A-Za-z0-9]{1,16}-[A-Za-z0-9]{1,16}-[0-9a-f]{32}-j[1-9][0-9]{0,2}-[0-9a-f]{40}")
+MAX_KEYS = 64  # seed_derived_data.ANCESTOR_LIMIT (50) plus HEAD, with margin
+MAX_REQUEST = 16384
+MANIFEST = "cmux-seed-input-mtimes.json"  # seed_derived_data.MANIFEST
+CODECS = ("zstd", "tar")
+SLOTS = 2
+QUEUE = 4  # requests past the per-client guard, streaming or waiting for a slot
+SLOT_WAIT = 60
+# A seed streams in ~25 s (zstd) or ~80 s (plain tar) at LAN speed; a client that reads slower loses it.
+SERVE_TIMEOUT = 180
+LOG_BYTES = 1 << 20
+STATE = "/Users/Shared/cmux-build-fleet/ci"
+RUN_DIR = "~/.local/state/glaeda/seed-serve"
+RECEIPT = "~/.local/state/glaeda/cmux-runner/receipt.json"
+TAR = "/usr/bin/tar"
+ZSTD_CANDIDATES = ("/opt/homebrew/bin/zstd", "/usr/local/bin/zstd")
+TASKPOLICY = "/usr/sbin/taskpolicy"
+IP_RE = re.compile(r"[0-9A-Fa-f.:]{1,64}")
+
+
+class Refused(Exception):
+    pass
+
+
+def parse_request(text: str) -> tuple[str, str, list[str]]:
+    """(verb, codec, keys) from SSH_ORIGINAL_COMMAND; raises Refused for anything else."""
+    if len(text) > MAX_REQUEST:
+        raise Refused("request too long")
+    if not text.isascii() or any(ch in text for ch in "\0\r\n"):
+        raise Refused("request has control characters")
+    words = text.split(" ")
+    if words == ["ping-v1"]:
+        return "ping", "", []
+    if len(words) < 3 or words[0] != "seed-v1":
+        raise Refused("unknown request")
+    codec, keys = words[1], words[2:]
+    if codec not in CODECS:
+        raise Refused("unknown codec")
+    if len(keys) > MAX_KEYS:
+        raise Refused("too many keys")
+    for key in keys:
+        if not KEY_RE.fullmatch(key):
+            raise Refused("malformed key")
+    if len(set(keys)) != len(keys):
+        raise Refused("repeated key")
+    return "seed", codec, keys
+
+
+def trusted(receipt: Path) -> bool:
+    """Whether the glaeda runner receipt says this host runs only a trusted ref."""
+    try:
+        member = json.loads(receipt.read_text()).get("member") or {}
+    except (OSError, ValueError, AttributeError):
+        return False
+    ref = member.get("trustedRef") if isinstance(member, dict) else None
+    return isinstance(ref, str) and ref.startswith("refs/")
+
+
+def seed_dirs(state: Path) -> list[Path]:
+    """Every canonical root's seed cache: STATE/seeds, then STATE/cmux-ci-<n>/seeds. Real directories only."""
+    found = []
+    try:
+        roots = [state, *sorted(p for p in state.iterdir() if re.fullmatch(r"cmux-ci-[0-9]{1,3}", p.name))]
+    except OSError:
+        return []
+    for root in roots:
+        seeds = root / "seeds"
+        try:
+            if stat.S_ISDIR(os.lstat(root).st_mode) and stat.S_ISDIR(os.lstat(seeds).st_mode):
+                found.append(seeds)
+        except OSError:
+            continue
+    return found
+
+
+def kept(seeds: Path, key: str) -> bool:
+    """A complete kept seed: a real directory with the manifest as a regular file."""
+    try:
+        return (stat.S_ISDIR(os.lstat(seeds / key).st_mode)
+                and stat.S_ISREG(os.lstat(seeds / key / MANIFEST).st_mode))
+    except OSError:
+        return False
+
+
+def find(state: Path, keys: list[str]) -> tuple[Path, str] | None:
+    """The seed cache and key of the first KEY this host keeps, nearest first."""
+    dirs = seed_dirs(state)
+    for key in keys:
+        for seeds in dirs:
+            if kept(seeds, key):
+                return seeds, key
+    return None
+
+
+def try_lock(path: Path) -> int | None:
+    """An fd holding an exclusive flock on PATH, or None when another process holds it."""
+    fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except OSError:
+        os.close(fd)
+        return None
+
+
+def admit(run_dir: Path, client: str) -> list[int] | None:
+    """The fds of this client's lock and a queue place, or None (answer busy at once)."""
+    mine = try_lock(run_dir / f"client-{client.replace(':', '_')}.lock")
+    if mine is None:
+        return None
+    for place in range(QUEUE):
+        fd = try_lock(run_dir / f"queue-{place}.lock")
+        if fd is not None:
+            return [mine, fd]
+    os.close(mine)
+    return None
+
+
+def take_slot(run_dir: Path, wait: float) -> int | None:
+    """An fd holding one of SLOTS exclusive flocks, or None when all stay taken for WAIT seconds."""
+    deadline = time.monotonic() + wait
+    while True:
+        for slot in range(SLOTS):
+            fd = os.open(run_dir / f"slot-{slot}.lock", os.O_RDONLY | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except OSError:
+                os.close(fd)
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(1)
+
+
+def zstd_tool() -> str | None:
+    for candidate in ZSTD_CANDIDATES:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def log(run_dir: Path, record: dict) -> None:
+    path = run_dir / "serve.jsonl"
+    try:
+        if path.exists() and path.stat().st_size > LOG_BYTES:
+            path.replace(run_dir / "serve.jsonl.1")
+        with path.open("a") as out:
+            out.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def say(line: str) -> None:
+    os.write(1, (f"{HEADER} {line}\n").encode())
+
+
+def stream(seeds: Path, key: str, codec: str) -> int:
+    """Write KEY's tar (through zstd for CODEC zstd) to stdout; the exit status of the pipeline."""
+    lower = [TASKPOLICY, "-d", "utility"] if os.access(TASKPOLICY, os.X_OK) else []
+    tar = subprocess.Popen([*lower, TAR, "-cf", "-", "-C", os.fspath(seeds), key], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE if codec == "zstd" else 1, stderr=subprocess.DEVNULL)
+    procs = [tar]
+    if codec == "zstd":
+        procs.append(subprocess.Popen([zstd_tool() or "zstd", "-1", "-T0", "-q", "-c"], stdin=tar.stdout,
+                                      stdout=1, stderr=subprocess.DEVNULL))
+        tar.stdout.close()
+    deadline = time.monotonic() + SERVE_TIMEOUT
+    status = 0
+    for proc in procs:
+        try:
+            code = proc.wait(timeout=max(1.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            for other in procs:
+                other.kill()
+            return 124
+        status = status or code
+    return status
+
+
+def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, slot_wait: float) -> int:
+    run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    client = client if IP_RE.fullmatch(client) else "unknown"
+    record: dict = {"time": int(time.time()), "client": client}
+    try:
+        verb, codec, keys = parse_request(request)
+        if not trusted(receipt):
+            raise Refused("this host is not a trusted-only seeder")
+    except Refused as error:
+        say(f"refused {str(error).replace(' ', '-')}")
+        log(run_dir, {**record, "outcome": "refused", "reason": str(error)})
+        return 2
+    if verb == "ping":
+        say("pong")
+        log(run_dir, {**record, "outcome": "pong"})
+        return 0
+    found = find(state, keys)
+    if found is None:
+        say("miss")
+        log(run_dir, {**record, "outcome": "miss", "asked": len(keys)})
+        return 3
+    seeds, key = found
+    if codec == "zstd" and zstd_tool() is None:
+        codec = "tar"
+    try:
+        os.nice(10)
+    except OSError:
+        pass
+    admitted = admit(run_dir, client)
+    slot = take_slot(run_dir, slot_wait) if admitted is not None else None
+    if slot is None:
+        for fd in admitted or []:
+            os.close(fd)
+        say("busy")
+        log(run_dir, {**record, "outcome": "busy", "key": key, "queued": admitted is not None})
+        return 4
+    started = time.monotonic()
+    try:
+        say(f"hit {key} {codec}")
+        status = stream(seeds, key, codec)
+    finally:
+        for fd in [slot, *admitted]:
+            os.close(fd)
+    log(run_dir, {**record, "outcome": "served" if status == 0 else "failed", "key": key, "codec": codec,
+                  "distance": keys.index(key), "status": status, "seconds": round(time.monotonic() - started, 1)})
+    return 0 if status == 0 else 5
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--state", default=STATE)
+    parser.add_argument("--run-dir", default=RUN_DIR)
+    parser.add_argument("--receipt", default=RECEIPT)
+    parser.add_argument("--slot-wait", type=float, default=SLOT_WAIT)
+    args = parser.parse_args(argv)
+    request = os.environ.get("SSH_ORIGINAL_COMMAND")
+    if request is None:
+        print("glaeda-seed-serve runs only as a forced SSH command (SSH_ORIGINAL_COMMAND is unset)", file=sys.stderr)
+        return 2
+    client = (os.environ.get("SSH_CLIENT") or "").split(" ")[0]
+    return serve(request, Path(args.state), Path(os.path.expanduser(args.run_dir)),
+                 Path(os.path.expanduser(args.receipt)), client, args.slot_wait)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

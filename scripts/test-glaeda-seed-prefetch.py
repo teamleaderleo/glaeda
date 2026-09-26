@@ -39,7 +39,7 @@ print(json.dumps({"fetched": "true", "key": "k", "distance": distance}))
 """
 
 
-class SeedPrefetchTest(unittest.TestCase):
+class PrefetchBase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name)
@@ -76,6 +76,8 @@ class SeedPrefetchTest(unittest.TestCase):
     def call_lines(self) -> list[str]:
         return self.calls.read_text().splitlines() if self.calls.exists() else []
 
+
+class SeedPrefetchTest(PrefetchBase):
     def test_a_mini_no_owned_job_has_recorded_is_skipped(self):
         result = sp.run(True, self.state)
         self.assertEqual(result["state"], "skip")
@@ -269,6 +271,400 @@ class SeedPrefetchTest(unittest.TestCase):
         else:
             os.kill(download, signal.SIGKILL)
             self.fail("the download outlived the killed run")
+
+
+# Stands in for /usr/bin/ssh to the seeder. Logs its argv, then acts as FAKE_SSH_MODE says: "serve" runs the
+# real glaeda-seed-serve as the forced command would, over FAKE_SEEDER_STATE.
+FAKE_SSH = """import json, os, sys, tarfile, io, time
+address, request = sys.argv[-2], sys.argv[-1]
+with open(os.environ["FAKE_SSH_LOG"], "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\\n")
+mode = os.environ.get("FAKE_SSH_MODE", "serve")
+if address in os.environ.get("FAKE_UNREACHABLE", "").split(","):
+    sys.stderr.write(f"ssh: connect to host {address} port 22: No route to host\\n")
+    sys.exit(255)
+def header(line):
+    os.write(1, ("glaeda-seed-serve 1 " + line + "\\n").encode())
+def tar_of(entries):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, data in entries:
+            info = tarfile.TarInfo(name); info.size = len(data); tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+keys = request.split()[2:]
+if mode == "serve":
+    race = os.environ.get("FAKE_RACE_TARGET")
+    if race:  # a job stashes the same seed while the stream runs
+        os.makedirs(race, exist_ok=True)
+        open(os.path.join(race, "cmux-seed-input-mtimes.json"), "w").write("{}")
+        open(os.path.join(race, "stashed-by-job"), "w").write("")
+    os.environ["SSH_ORIGINAL_COMMAND"] = request
+    os.execv(sys.executable, [sys.executable, os.environ["FAKE_SERVE"], "--state", os.environ["FAKE_SEEDER_STATE"],
+                              "--run-dir", os.environ["FAKE_SERVE_RUN"], "--receipt", os.environ["FAKE_RECEIPT"]])
+def hostile(entries):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.GNU_FORMAT) as tar:
+        for name, kind, value in entries:
+            info = tarfile.TarInfo(name)
+            if kind == "file":
+                info.size = len(value); tar.addfile(info, io.BytesIO(value))
+            else:
+                info.type = tarfile.SYMTYPE if kind == "symlink" else tarfile.LNKTYPE
+                info.linkname = value; tar.addfile(info)
+    return buf.getvalue()
+outside = os.environ.get("FAKE_OUTSIDE", "/nonexistent")
+manifest = (keys[0] + "/cmux-seed-input-mtimes.json", "file", b"{}") if keys else None
+if mode == "dotdot":
+    header(f"hit {keys[0]} tar")
+    os.write(1, hostile([manifest, (keys[0] + "/../../../escape-dotdot", "file", b"x"),
+                         ("../escape-top", "file", b"x")])); sys.exit(0)
+if mode == "symlink":
+    header(f"hit {keys[0]} tar")
+    os.write(1, hostile([manifest, (keys[0] + "/link", "symlink", outside),
+                         (keys[0] + "/link/escape-symlink", "file", b"x")])); sys.exit(0)
+if mode == "hardlink":
+    header(f"hit {keys[0]} tar")
+    os.write(1, hostile([manifest, (keys[0] + "/hard", "hardlink", outside + "/target"),
+                         (keys[0] + "/hard", "file", b"pwned")])); sys.exit(0)
+if mode == "noisy":  # a login shell that prints before the forced command runs
+    os.write(1, b"Last login: yesterday\\nwelcome to cmux15\\n")
+    os.environ["SSH_ORIGINAL_COMMAND"] = request
+    os.execv(sys.executable, [sys.executable, os.environ["FAKE_SERVE"], "--state", os.environ["FAKE_SEEDER_STATE"],
+                              "--run-dir", os.environ["FAKE_SERVE_RUN"], "--receipt", os.environ["FAKE_RECEIPT"]])
+if mode == "silent":
+    time.sleep(60)
+if mode == "garbage":
+    header(f"hit {keys[0]} tar"); os.write(1, b"not a tar archive" * 100); sys.exit(0)
+if mode == "extra":
+    header(f"hit {keys[0]} tar")
+    os.write(1, tar_of([(keys[0] + "/cmux-seed-input-mtimes.json", b"{}"), ("elsewhere/x", b"x")])); sys.exit(0)
+if mode == "no-manifest":
+    header(f"hit {keys[0]} tar"); os.write(1, tar_of([(keys[0] + "/Build/x", b"x")])); sys.exit(0)
+if mode == "unasked":
+    header("hit " + "admission-derived-data-v1-macOS-ARM64-" + "1" * 32 + "-j14-" + "2" * 40 + " tar"); sys.exit(0)
+if mode == "padded":  # a valid seed, then more padding than bsdtar reads before it exits
+    header(f"hit {keys[0]} tar")
+    os.write(1, tar_of([(keys[0] + "/cmux-seed-input-mtimes.json", b"{}")]) + bytes(4 << 20)); sys.exit(0)
+if mode == "big":
+    header(f"hit {keys[0]} tar")
+    os.write(1, tar_of([(keys[0] + "/cmux-seed-input-mtimes.json", b"{}"), (keys[0] + "/big", b"x" * 200000)]))
+    sys.exit(0)
+sys.exit(1)
+"""
+
+FINGERPRINT = "0" * 32
+PREFIX = f"admission-derived-data-v1-macOS-ARM64-{FINGERPRINT}-"
+
+
+class LanSeedTest(PrefetchBase):
+    """Seeds over the LAN from the trusted seeder, and R2 after it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        base = Path(self.tmp.name)
+        self.width = os.sysconf("SC_NPROCESSORS_ONLN")
+        self.seeder = base / "seeder/ci"
+        (self.seeder / "seeds").mkdir(parents=True)
+        receipt = base / "seeder/receipt.json"
+        receipt.write_text(json.dumps({"member": {"trustedRef": "refs/heads/main"}}))
+        conf = base / "seed-lan"
+        conf.mkdir()
+        (conf / "id_ed25519").write_text("not a real key")
+        (conf / "known_hosts").write_text("glaeda-seeder ssh-ed25519 AAAA\n")
+        (conf / "config.json").write_text(json.dumps({"schema": 1, "user": "cmux", "addresses": ["172.20.21.202"]}))
+        self.conf = conf
+        fake = base / "fake-ssh"
+        fake.write_text(f"#!{sys.executable}\n" + FAKE_SSH)
+        fake.chmod(0o755)
+        self.ssh_log = base / "ssh-log"
+        self.saved_lan = (sp.LAN_CONFIG, sp.SSH, sp.zstd_tool, sp.LAN_MIN_FREE_BYTES, sp.LAN_MAX_BYTES)
+        sp.LAN_CONFIG, sp.SSH = conf / "config.json", os.fspath(fake)
+        sp.zstd_tool = lambda: None
+        sp.LAN_MIN_FREE_BYTES = 0
+        os.environ.update({"FAKE_SSH_LOG": os.fspath(self.ssh_log), "FAKE_SERVE": os.fspath(ROOT / "scripts/glaeda-seed-serve"),
+                           "FAKE_SEEDER_STATE": os.fspath(self.seeder), "FAKE_SERVE_RUN": os.fspath(base / "serve-run"),
+                           "FAKE_RECEIPT": os.fspath(receipt)})
+
+    def tearDown(self) -> None:
+        sp.LAN_CONFIG, sp.SSH, sp.zstd_tool, sp.LAN_MIN_FREE_BYTES, sp.LAN_MAX_BYTES = self.saved_lan
+        super().tearDown()
+
+    def record(self, store: Path) -> None:
+        store.mkdir(parents=True, exist_ok=True)
+        (store / sp.SOURCE).write_text(json.dumps({"prefix": PREFIX}))
+
+    def key(self, commit: str) -> str:
+        return f"{PREFIX}j{self.width}-{commit}"
+
+    def seeder_keeps(self, commit: str, root: str = "") -> Path:
+        seed = self.seeder / root / "seeds" / self.key(commit)
+        (seed / "Build/Products").mkdir(parents=True)
+        (seed / sp.MANIFEST).write_text('{"a": 1}')
+        (seed / "Build/Products/app").write_bytes(os.urandom(4096))
+        return seed
+
+    def mirror(self) -> tuple[Path, str]:
+        return sp.main_head(self.state / ".prefetch")
+
+    def lan(self, **kwargs) -> dict:
+        mirror, head = self.mirror()
+        return sp.lan_fetch(self.state, mirror, head, sp.lan_config(), **kwargs)
+
+    def assert_clean(self) -> None:
+        self.assertEqual(list((self.state / "seeds").glob(".lan-*")), [])
+
+    def test_lan_seed_lands_first_then_r2_finds_it_kept(self):
+        self.record(self.state)
+        head = self.commit()
+        served = self.seeder_keeps(head)
+        result = sp.run(True, self.state)["results"][os.fspath(self.state)]
+        lan = result["lan"]
+        self.assertEqual((lan["fetched"], lan["key"], lan["distance"], lan["codec"], lan["address"]),
+                         ("true", self.key(head), 0, "tar", "172.20.21.202"))
+        kept = self.state / "seeds" / self.key(head)
+        self.assertEqual((kept / "Build/Products/app").read_bytes(), (served / "Build/Products/app").read_bytes())
+        self.assertTrue(sp.seed_complete(kept))
+        self.assert_clean()
+        self.assertEqual(len(self.call_lines()), 1)  # R2's prefetch still runs, and prunes
+        argv = json.loads(self.ssh_log.read_text().splitlines()[0])
+        self.assertEqual(argv[-1].split()[:2], ["seed-v1", "tar"])
+        self.assertEqual(argv[-1].split()[2], self.key(head))
+
+    def test_the_seeders_nearest_kept_seed_is_served(self):
+        self.record(self.state)
+        older = self.commit()
+        self.seeder_keeps(older, "cmux-ci-2")  # any root's cache on the seeder
+        self.commit()
+        lan = self.lan()
+        self.assertEqual((lan["fetched"], lan["key"], lan["distance"]), ("true", self.key(older), 1))
+
+    def test_only_keys_nearer_than_a_kept_seed_are_asked_for(self):
+        self.record(self.state)
+        far = self.commit()
+        near = self.commit()
+        head = self.commit()
+        mirror, _ = self.mirror()
+        (self.state / "seeds" / self.key(near)).mkdir(parents=True)  # incomplete: no manifest
+        self.assertEqual(sp.lan_candidates(mirror, self.state, head)[0][:3],
+                         [self.key(head), self.key(near), self.key(far)])
+        (self.state / "seeds" / self.key(near) / sp.MANIFEST).write_text("{}")
+        self.assertEqual(sp.lan_candidates(mirror, self.state, head)[0], [self.key(head)])
+        (self.state / "seeds" / self.key(head)).mkdir()
+        (self.state / "seeds" / self.key(head) / sp.MANIFEST).write_text("{}")
+        self.assertEqual(sp.lan_candidates(mirror, self.state, head), ([], "the nearest seed is kept here"))
+
+    def test_a_prefix_that_makes_no_seed_key_asks_nothing(self):
+        self.state.mkdir(exist_ok=True)
+        (self.state / sp.SOURCE).write_text(json.dumps({"prefix": "admission-derived-data-v1-x/../-"}))
+        head = self.commit()
+        mirror, _ = self.mirror()
+        self.assertEqual(sp.lan_candidates(mirror, self.state, head)[0], [])
+
+    def test_a_miss_falls_back_to_r2(self):
+        self.record(self.state)
+        self.commit()
+        result = sp.run(True, self.state)["results"][os.fspath(self.state)]
+        self.assertEqual(result["lan"]["reason"], "seeder: miss")
+        self.assertEqual(result["fetched"], "true")  # R2's answer
+        self.assertEqual(len(self.call_lines()), 1)
+        self.assert_clean()
+
+    def test_an_untrusted_seeder_refuses_and_r2_serves(self):
+        self.record(self.state)
+        self.seeder_keeps(self.commit())
+        Path(os.environ["FAKE_RECEIPT"]).write_text(json.dumps({"member": {}}))
+        result = sp.run(True, self.state)["results"][os.fspath(self.state)]
+        self.assertIn("refused", result["lan"]["reason"])
+        self.assertEqual(len(self.call_lines()), 1)
+
+    def test_an_unreachable_address_tries_the_next(self):
+        self.record(self.state)
+        head = self.commit()
+        self.seeder_keeps(head)
+        (self.conf / "config.json").write_text(json.dumps({"schema": 1, "user": "cmux",
+                                                           "addresses": ["172.20.21.202", "cmux15.local"]}))
+        os.environ["FAKE_UNREACHABLE"] = "172.20.21.202"
+        lan = self.lan()
+        self.assertEqual((lan["fetched"], lan["address"]), ("true", "cmux15.local"))
+        os.environ["FAKE_UNREACHABLE"] = "172.20.21.202,cmux15.local"
+        shutil.rmtree(self.state / "seeds" / self.key(head))
+        lan = self.lan()
+        self.assertEqual(lan["fetched"], "false")
+        self.assertIn("No route to host", lan["reason"])
+        self.assertIn("Local Network Privacy", lan["reason"])
+        self.assert_clean()
+
+    def test_every_bad_stream_leaves_the_cache_as_it_was(self):
+        self.record(self.state)
+        head = self.commit()
+        for mode, reason in (("garbage", "stream exits"), ("extra", "not one complete seed"),
+                             ("no-manifest", "not one complete seed"),
+                             ("unasked", "not asked for"), ("nonsense", "unreachable")):
+            with self.subTest(mode=mode):
+                os.environ["FAKE_SSH_MODE"] = mode
+                lan = self.lan()
+                self.assertEqual(lan["fetched"], "false")
+                self.assertIn(reason, lan["reason"])
+                self.assertFalse((self.state / "seeds" / self.key(head)).exists())
+                self.assertEqual(sorted(p.name for p in (self.state / "seeds").iterdir()), [])
+
+    def test_a_hostile_tar_writes_nothing_outside_staging(self):
+        self.record(self.state)
+        head = self.commit()
+        base = Path(self.tmp.name)
+        outside = base / "outside"
+        outside.mkdir()
+        (outside / "target").write_text("original")
+        os.environ["FAKE_OUTSIDE"] = os.fspath(outside)
+        for mode in ("dotdot", "symlink", "hardlink"):
+            with self.subTest(mode=mode):
+                os.environ["FAKE_SSH_MODE"] = mode
+                lan = self.lan()
+                self.assertEqual([p for p in base.rglob("escape-*")], [])
+                self.assertEqual(sorted(p.name for p in outside.iterdir()), ["target"])
+                self.assertEqual(((outside / "target").read_text(), (outside / "target").stat().st_nlink),
+                                 ("original", 1))
+                self.assert_clean()
+                if lan["fetched"] == "true":  # the tool refused the escape and kept the rest
+                    seed = self.state / "seeds" / self.key(head)
+                    self.assertTrue(sp.seed_complete(seed))
+                    self.assertEqual([p for p in seed.rglob("*") if p.is_symlink() and
+                                      not os.path.realpath(p).startswith(os.path.realpath(seed))], [])
+                    shutil.rmtree(seed)
+
+    def test_lines_a_login_shell_prints_before_the_header_are_skipped(self):
+        self.record(self.state)
+        head = self.commit()
+        self.seeder_keeps(head)
+        os.environ["FAKE_SSH_MODE"] = "noisy"
+        lan = self.lan()
+        self.assertEqual((lan["fetched"], lan["key"]), ("true", self.key(head)))
+        r, w = os.pipe()
+        os.write(w, b"x" * (sp.HEADER_SCAN_BYTES + 10) + b"\nglaeda-seed-serve 1 hit k tar\n")
+        os.close(w)
+        self.assertEqual(sp.read_header(r), b"")  # only the first HEADER_SCAN_BYTES are searched
+        os.close(r)
+
+    def test_a_busy_mini_paces_the_lan_extraction(self):
+        self.record(self.state)
+        head = self.commit()
+        os.environ["FAKE_SSH_MODE"] = "big"
+        started = time.monotonic()
+        lan = self.lan(rate=100000)  # ~210 KB of tar at 100 KB/s
+        self.assertEqual(lan["fetched"], "true", lan)
+        self.assertGreater(time.monotonic() - started, 1.5)
+        shutil.rmtree(self.state / "seeds" / self.key(head))
+        sp.running_commands = lambda: ["/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2"]
+        saved = sp.LAN_BUSY_RATE
+        sp.LAN_BUSY_RATE = 10 ** 9
+        try:
+            result = sp.run(True, self.state)["results"][os.fspath(self.state)]
+        finally:
+            sp.LAN_BUSY_RATE = saved
+        self.assertIn("paced", result["lan"])
+        self.assertIn("throttled", result)
+
+    def test_padding_tar_leaves_unread_is_drained(self):
+        self.record(self.state)
+        head = self.commit()
+        os.environ["FAKE_SSH_MODE"] = "padded"
+        lan = self.lan()
+        self.assertEqual(lan["fetched"], "true", lan)
+        self.assertTrue(sp.seed_complete(self.state / "seeds" / self.key(head)))
+
+    def test_a_stream_over_the_bound_is_dropped(self):
+        self.record(self.state)
+        self.commit()
+        os.environ["FAKE_SSH_MODE"] = "big"
+        sp.LAN_MAX_BYTES = 100000
+        lan = self.lan()
+        self.assertIn("over 100000 bytes", lan["reason"])
+        self.assertEqual(list((self.state / "seeds").iterdir()), [])
+
+    def test_a_silent_seeder_times_out_and_is_stopped(self):
+        self.record(self.state)
+        self.commit()
+        os.environ["FAKE_SSH_MODE"] = "silent"
+        started = time.monotonic()
+        lan = self.lan(timeout=1)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(lan["fetched"], "false")
+        self.assertIn("timed out", lan["reason"])
+        self.assert_clean()
+
+    def test_a_seed_a_job_stashed_meanwhile_is_kept(self):
+        self.record(self.state)
+        head = self.commit()
+        self.seeder_keeps(head)
+        target = self.state / "seeds" / self.key(head)
+        os.environ["FAKE_RACE_TARGET"] = os.fspath(target)
+        lan = self.lan()
+        self.assertEqual((lan["fetched"], lan["reason"]), ("false", "kept meanwhile"))
+        self.assertTrue((target / "stashed-by-job").exists())
+        self.assertFalse((target / "Build").exists())
+        self.assert_clean()
+
+    def test_a_killed_runs_staging_is_removed_and_the_disk_floor_holds(self):
+        self.record(self.state)
+        self.commit()
+        stale = self.state / "seeds/.lan-99999/partial"
+        stale.mkdir(parents=True)
+        sp.LAN_MIN_FREE_BYTES = 1 << 62
+        lan = self.lan()
+        self.assertIn("free-space floor", lan["reason"])
+        self.assertFalse(stale.parent.exists())
+        self.assertEqual(self.ssh_log.exists(), False)
+
+    def test_zstd_streams_when_both_ends_have_it(self):
+        zstd = shutil.which("zstd") or next((c for c in sp.ZSTD_CANDIDATES if os.access(c, os.X_OK)), None)
+        if not zstd:
+            self.skipTest("no zstd")
+        sp.zstd_tool = lambda: zstd
+        self.record(self.state)
+        head = self.commit()
+        self.seeder_keeps(head)
+        lan = self.lan()
+        # The seeder answers tar when it has no zstd; either way the seed lands.
+        self.assertEqual(lan["fetched"], "true")
+        self.assertIn(lan["codec"], ("zstd", "tar"))
+        self.assertTrue(sp.seed_complete(self.state / "seeds" / self.key(head)))
+
+    def test_no_config_means_no_lan_step(self):
+        self.record(self.state)
+        self.commit()
+        (self.conf / "config.json").unlink()
+        result = sp.run(True, self.state)
+        self.assertNotIn("lan", result["results"][os.fspath(self.state)])
+        self.assertFalse(self.ssh_log.exists())
+
+    def test_plan_reports_lan_without_contacting_the_seeder(self):
+        self.record(self.state)
+        self.assertEqual(sp.run(False, self.state)["lan"], "configured")
+        self.assertFalse(self.ssh_log.exists())
+
+    def test_a_malformed_config_turns_lan_off(self):
+        good = {"schema": 1, "user": "cmux", "addresses": ["172.20.21.202"]}
+        for bad in ({**good, "addresses": ["-oProxyCommand=sh"]}, {**good, "addresses": ["a b"]},
+                    {**good, "addresses": []}, {**good, "user": "root;x"}, {**good, "schema": 2}, ["x"]):
+            with self.subTest(bad=bad):
+                (self.conf / "config.json").write_text(json.dumps(bad))
+                self.assertIsNone(sp.lan_config())
+        (self.conf / "config.json").write_text(json.dumps(good))
+        (self.conf / "id_ed25519").unlink()
+        self.assertIsNone(sp.lan_config())
+
+    def test_ssh_reads_nothing_from_home_and_forwards_nothing(self):
+        argv = sp.ssh_command(sp.lan_config(), "172.20.21.202", "ping-v1")
+        self.assertEqual(argv[:4], [sp.SSH, "-F", "/dev/null", "-T"])
+        for option in ("BatchMode=yes", "IdentitiesOnly=yes", "IdentityAgent=none", "StrictHostKeyChecking=yes",
+                       "GlobalKnownHostsFile=/dev/null", "HostKeyAlias=glaeda-seeder", "ClearAllForwardings=yes",
+                       "ControlPath=none", f"UserKnownHostsFile={self.conf / 'known_hosts'}"):
+            self.assertIn(option, argv)
+        self.assertIn("-a", argv)
+        self.assertEqual(argv[-2:], ["172.20.21.202", "ping-v1"])
+
+    def test_cmux_scripts_run_under_a_python_other_than_apples(self):
+        self.assertTrue(os.access(sp.cmux_python(), os.X_OK))
 
 
 if __name__ == "__main__":
