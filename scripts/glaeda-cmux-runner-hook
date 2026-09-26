@@ -66,6 +66,7 @@ import fcntl
 import importlib.machinery
 import importlib.util
 import json
+import math
 import os
 import re
 import select
@@ -310,7 +311,9 @@ def warm_root_order(order: list[int], keys: tuple[str, ...], state_dir: str = ""
 WARM_MODEL = "warm-distance-model.json"
 WARM_MIRROR = os.path.join(".prefetch", "cmux.git")
 WARM_ROUTE_ENV = "GLAEDA_WARM_ROUTE"
-WARM_GIT_TIMEOUT_S = 5.0
+WARM_GIT_TIMEOUT_S = 2.0
+# All roots' diffs together, under the admission lock (others wait at most ADMISSION_WAIT_S).
+WARM_BUDGET_S = 3.0
 WARM_MAX_FILES = 400
 WARM_PACKAGE_SOURCES = ("Packages/", "vendor/", "Examples/")
 WARM_NOT_APP = ("cmuxTests/", "cmuxUITests/")
@@ -326,13 +329,19 @@ def warm_app_swift(path: str) -> bool:
 
 def read_warm_model(state_dir: str = "") -> dict[str, Any]:
     """The fitted tiers (seconds), near threshold, hot files and unknown-start cost; the default when unreadable."""
+    def seconds(value: Any) -> float:
+        number = float(value)
+        if not math.isfinite(number) or number < 0:
+            raise ValueError("not a duration")
+        return number
+
     try:
         raw = read_bounded(Path(state_dir or OWNED_STATE_DIR) / WARM_MODEL)
         model = json.loads(raw.decode("utf-8")) if raw is not None else None
-        tiers = {name: float(model["tiers"][name]["p50"]) for name in ("near", "far", "rebuild")}
+        tiers = {name: seconds(model["tiers"][name]["p50"]) for name in ("near", "far", "rebuild")}
         hot = [str(path) for path in model.get("hot_files") or [] if isinstance(path, str)][:200]
         near = int(model.get("near_app_swift_files") or 5)
-        unknown = float(((model.get("start_classes") or {}).get("none") or {}).get("expected") or tiers["far"])
+        unknown = seconds(((model.get("start_classes") or {}).get("none") or {}).get("expected") or tiers["far"])
         return {"near_app_swift_files": near, "hot_files": hot, "tiers": tiers, "unknown": unknown}
     except Exception:  # noqa: BLE001 - a model any job can write only ever falls back to the default
         return dict(WARM_DEFAULT_MODEL)
@@ -373,9 +382,10 @@ def main_changes(mirror: Path, old: str, new: str) -> tuple[set[str], bool] | No
     if old == new:
         return set(), False
     try:
+        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         raw = subprocess.run([GIT, "-C", os.fspath(mirror), "diff", "--raw", "-z", "--no-renames", "--no-abbrev",
-                              old, new], capture_output=True, timeout=WARM_GIT_TIMEOUT_S,
-                             env={**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0"})
+                              old, new, "--"], capture_output=True, timeout=WARM_GIT_TIMEOUT_S,
+                             env={**env, "GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0"})
     except (OSError, subprocess.SubprocessError):
         return None
     if raw.returncode != 0:
@@ -397,41 +407,57 @@ def warm_root_costs(order: list[int], base: str, number: int | None, state_dir: 
     """ORDER with the root of the lowest predicted compile first, and the per-root predictions; ([], {}) to fall back.
 
     A root's prediction is the tier of main's changes from its kept build's merge base to BASE plus the kept
-    pull request's own files (unless it is pull request NUMBER), and the model's unknown-start cost for a
-    root without a current stamp. Falls back when no root could be predicted.
+    pull request's own files (unless it is pull request NUMBER). The job's own files are the same for every
+    root and are left out, so the exported seconds are a lower bound; roots of one tier rank by that file
+    count, then the runner's own root. A kept build that cannot be compared (a base past the mirror's depth,
+    a stamp of an older cmux) costs the model's unknown start; a root with no kept build at all goes last.
+    Falls back when no root could be compared, the mirror is missing, or WARM_BUDGET_S runs out.
     """
     if not WARM_SHA.fullmatch(base or ""):
         return [], {}
-    model = read_warm_model(state_dir)
     mirror = Path(state_dir or OWNED_STATE_DIR) / WARM_MIRROR
+    if not (mirror / "HEAD").is_file():
+        return [], {}
+    model = read_warm_model(state_dir)
+    cold = max(model["tiers"].values()) + 1.0
+    deadline = time.monotonic() + WARM_BUDGET_S
+    diffs: dict[str, tuple[set[str], bool] | None] = {}
     costs: dict[int, tuple[float, str, int]] = {}
     known = 0
     for copy in order:
         stamp = root_stamp(copy + 1, state_dir)
-        onto = str((stamp or {}).get("merged_onto") or "").lower()
-        changes = main_changes(mirror, onto, base) if stamp else None
-        if changes is None:
-            costs[copy] = (model["unknown"], "unknown", -1)
+        if stamp is None:
+            costs[copy] = (cold, "cold", -1)
+            continue
+        onto = str(stamp.get("merged_onto") or "").lower()
+        if onto not in diffs:
+            if time.monotonic() >= deadline:
+                return [], {}
+            diffs[onto] = main_changes(mirror, onto, base)
+        changes = diffs[onto]
+        same = isinstance(stamp.get("pr"), int) and stamp.get("pr") == number
+        if changes is None or (not same and "pr_app_swift_files" not in stamp and stamp.get("pr")):
+            costs[copy] = (model["unknown"], "unknown", -1)  # not comparable, or an older cmux's stamp
             continue
         files, package = changes
-        same = isinstance(stamp.get("pr"), int) and stamp.get("pr") == number
         own = stamp.get("pr_app_swift_files") if not same else []
-        if not isinstance(own, list):
-            own = []
-        own = {str(path) for path in own[:WARM_MAX_FILES] if isinstance(path, str) and warm_app_swift(path)}
-        if not same and "pr_app_swift_files" not in stamp and stamp.get("pr"):
-            costs[copy] = (model["unknown"], "unknown", -1)  # a kept build of an older cmux: its own diff unknown
-            continue
+        own = own if isinstance(own, list) else []
+        own_set = {str(path) for path in own[:WARM_MAX_FILES] if isinstance(path, str) and warm_app_swift(path)}
+        total = stamp.get("pr_app_swift_total") if not same else 0
+        extra = max(0, total - len(own_set)) if isinstance(total, int) and not isinstance(total, bool) else 0
         interface = stamp.get("pr_package_interface") if not same else False
-        package = package or (any(path.startswith(WARM_PACKAGE_SOURCES) for path in own) and interface is not False)
-        changed = files | own
+        # A list cut short may hide a package file: unless the stamp says no interface changed, assume one did.
+        own_package = any(path.startswith(WARM_PACKAGE_SOURCES) for path in own_set) or extra > 0
+        package = package or (own_package and interface is not False)
+        changed = files | own_set
+        count = len(changed) + extra
         hot = bool(changed & set(model["hot_files"]))
-        name = ("rebuild" if package or hot else "far" if len(changed) > model["near_app_swift_files"] else "near")
-        costs[copy] = (model["tiers"][name], name, len(changed))
+        name = ("rebuild" if package or hot else "far" if count > model["near_app_swift_files"] else "near")
+        costs[copy] = (model["tiers"][name], name, count)
         known += 1
     if not known:
         return [], {}
-    ranked = sorted(order, key=lambda copy: (costs[copy][0], order.index(copy)))
+    ranked = sorted(order, key=lambda copy: (costs[copy][0], costs[copy][2], order.index(copy)))
     return ranked, {f"root-{copy + 1}": {"seconds": round(costs[copy][0], 1), "tier": costs[copy][1],
                                          "app_swift_files": costs[copy][2]} for copy in order}
 

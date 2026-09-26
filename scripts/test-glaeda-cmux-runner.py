@@ -970,7 +970,7 @@ class HookTest(unittest.TestCase):
 
     def test_warm_root_costs_rank_roots_by_predicted_compile(self) -> None:
         ci = self.dir / "ci"
-        mirror = ci / ".prefetch" / "cmux.git"
+        mirror = self.dir / "work"  # the commits; the hook reads a bare copy, as the prefetch keeps it
         mirror.mkdir(parents=True)
         git = ["git", "-C", os.fspath(mirror), "-c", "user.email=t@t", "-c", "user.name=t"]
         subprocess.run([*git, "init", "-q"], check=True)
@@ -984,6 +984,9 @@ class HookTest(unittest.TestCase):
         subprocess.run([*git, "add", "."], check=True)
         subprocess.run([*git, "commit", "-qm", "1"], check=True)
         new = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        (ci / ".prefetch").mkdir(parents=True)
+        subprocess.run(["git", "clone", "-q", "--bare", os.fspath(mirror), os.fspath(ci / ".prefetch" / "cmux.git")],
+                       check=True)
 
         def stamp(k: int, onto: str, pr: int, files: list[str], **extra) -> None:
             store = ci if k == 1 else ci / f"cmux-ci-{k}"
@@ -998,19 +1001,36 @@ class HookTest(unittest.TestCase):
         self.assertEqual(order, [1, 0])
         self.assertEqual(predicted["root-1"], {"seconds": 266.5, "tier": "far", "app_swift_files": 11})
         self.assertEqual(predicted["root-2"], {"seconds": 140.0, "tier": "near", "app_swift_files": 1})
-        # A re-push of pull request 5: its own files are not undone, 3 main files is near, and the own root wins the tie.
+        # A re-push of pull request 5: its own files are not undone, so both roots are near; the fewer files win
+        # (root 2's 1 against root 1's 3 main files), and on an equal count the runner's own root.
+        order, predicted = hook.warm_root_costs([0, 1], new, 5, os.fspath(ci))
+        self.assertEqual((order, predicted["root-1"]["tier"], predicted["root-1"]["app_swift_files"]), ([1, 0], "near", 3))
+        stamp(2, new, 6, [f"Sources/Q{n}.swift" for n in range(3)], pr_package_interface=False)
         self.assertEqual(hook.warm_root_costs([0, 1], new, 5, os.fspath(ci))[0], [0, 1])
+        self.assertEqual(hook.warm_root_costs([1, 0], new, 5, os.fspath(ci))[0], [1, 0])
+        # A list the stamp cut short may hide a package change: a rebuild unless the stamp says no interface changed.
+        stamp(2, new, 6, ["Sources/Q.swift"], pr_app_swift_total=500)
+        self.assertEqual(hook.warm_root_costs([0, 1], new, 7, os.fspath(ci))[1]["root-2"]["tier"], "rebuild")
+        stamp(2, new, 6, ["Sources/Q.swift"], pr_package_interface=False)
         # The fitted model beside the stamps replaces the default; a package interface change or a hot file rebuilds.
         (ci / hook.WARM_MODEL).write_text(json.dumps({"near_app_swift_files": 5, "hot_files": ["Sources/Q.swift"],
                                                       "tiers": {"near": {"p50": 100}, "far": {"p50": 200},
                                                                 "rebuild": {"p50": 300}}}))
         order, predicted = hook.warm_root_costs([0, 1], new, 7, os.fspath(ci))
         self.assertEqual((order, predicted["root-2"]["tier"], predicted["root-1"]["seconds"]), ([0, 1], "rebuild", 200.0))
-        (ci / hook.WARM_MODEL).write_text("[" * 1000)
-        self.assertEqual(hook.read_warm_model(os.fspath(ci)), hook.WARM_DEFAULT_MODEL)
+        for junk in ("[" * 1000, '{"tiers": {"near": {"p50": NaN}, "far": {"p50": 1}, "rebuild": {"p50": 2}}}',
+                     '{"tiers": {"near": {"p50": -1}, "far": {"p50": 1}, "rebuild": {"p50": 2}}}'):
+            (ci / hook.WARM_MODEL).write_text(junk)
+            self.assertEqual(hook.read_warm_model(os.fspath(ci)), hook.WARM_DEFAULT_MODEL, junk)
+        # A root with no kept build goes last, after a rebuild.
+        (ci / "cmux-ci-2" / "stamp.json").unlink()
+        order, predicted = hook.warm_root_costs([1, 0], new, 7, os.fspath(ci))
+        self.assertEqual((order, predicted["root-2"]["tier"]), ([0, 1], "cold"))
+        stamp(2, new, 6, ["Sources/Q.swift"], pr_package_interface=False)
         # A base the mirror lacks, a stamp of an older cmux, or no base: fall back to the exact keys.
         self.assertEqual(hook.warm_root_costs([0, 1], "e" * 40, 7, os.fspath(ci)), ([], {}))
         self.assertEqual(hook.warm_root_costs([0, 1], "", 7, os.fspath(ci)), ([], {}))
+        self.assertEqual(hook.warm_root_costs([0, 1], new, 7, os.fspath(self.dir / "nowhere")), ([], {}))
         (ci / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": old, "pr": 5}))
         order, predicted = hook.warm_root_costs([0, 1], new, 7, os.fspath(ci))
         self.assertEqual(predicted["root-1"]["tier"], "unknown")
