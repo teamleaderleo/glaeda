@@ -467,7 +467,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         f"dir={shlex.quote(os.fspath(ctx.runner_dir))}  # as the gate runs it, so pgrep matches its tree\n"
         "tree=\"$dir/run|$dir/bin/Runner\\.(Listener|Worker)\"\n"
         "if /usr/bin/pgrep -f \"$tree\" >/dev/null; then\n"
-        "    echo \"glaeda-cmux-runner-gate: the gate exited $code with its runner running; stopping the runner once it has no job\"\n"
+        "    echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code with its runner running; stopping the runner once it has no job\"\n"
         "    while [ -z \"$stopping\" ] && /usr/bin/pgrep -f \"$tree\" >/dev/null; do\n"
         "        if ! /usr/bin/pgrep -f \"$dir/bin/Runner\\.Worker\" >/dev/null; then\n"
         "            /usr/bin/pkill -INT -f \"$dir/bin/Runner\\.Listener\" ||\n"
@@ -477,7 +477,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "    done\n"
         "    exit 1\n"
         "fi\n"
-        "echo \"glaeda-cmux-runner-gate: the gate exited $code; running the runner without it\"\n"
+        "echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code; running the runner without it\"\n"
         "exec ./run.sh\n"
     )
     # Explicit dirs, so a restore step that changes HOME or FLEET_DIR still finds this runner's roots record.

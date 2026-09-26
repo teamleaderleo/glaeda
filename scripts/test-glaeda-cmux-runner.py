@@ -1752,6 +1752,17 @@ class GateTest(unittest.TestCase):
         load[0] = pause * 14
         self.assertEqual(gate.claimed(), "a fleet build holds the host lock", "the fleet's claim comes first")
 
+    def test_gate_lines_carry_a_utc_stamp_readers_still_match(self) -> None:
+        out = io.StringIO()
+        with mock.patch.object(hook.time, "gmtime", return_value=time.gmtime(1790379071)), \
+                contextlib.redirect_stdout(out):
+            hook.gate_log("holding the listener off: all 4 capacity units on this mini are taken")
+        line = out.getvalue()
+        self.assertEqual(line, "2026-09-25 23:31:11Z: glaeda-cmux-runner-gate: holding the listener off: "
+                               "all 4 capacity units on this mini are taken\n")
+        # glaeda-cmux-runner reads the held state by substring, so the stamp keeps it working
+        self.assertIn(cr.GATE_HELD, line)
+
     def test_a_load_hold_ends_after_the_limit_until_the_load_falls(self) -> None:
         for name, value in (("GATE_LOAD_PAUSE", 2.0), ("GATE_LOAD_RESUME", 1.5), ("GATE_LOAD_MAX_HOLD_S", 60.0)):
             patcher = mock.patch.object(hook, name, value)
