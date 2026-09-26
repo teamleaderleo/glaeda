@@ -302,11 +302,6 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # Line tables are for local debugging; in CI they only make the target dir (and so every cache restore) and
-    # the link of each test binary bigger. Both profiles stay equal so test and run share artifacts.
-    env:
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
 
     steps:
       - name: Check out repository
@@ -321,6 +316,12 @@ jobs:
           --profile minimal
           --component clippy,rustfmt
           --no-self-update
+
+      # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
+      # binary's link bigger. Set in ~/.cargo/config.toml, not the environment, so the front door's cargo run (which
+      # scrubs the environment down to HOME and PATH) builds the same profile as cargo test instead of a second one.
+      - name: Build without debuginfo
+        run: printf '[profile.dev]\ndebug = 0\n\n[profile.test]\ndebug = 0\n' >> ~/.cargo/config.toml
 
       # Pull requests read the generation the last main push published; only main writes, so the cache stays
       # proportional to main, not to open branches. Each job keeps only its own artifacts, so each restore is small.
@@ -379,11 +380,6 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # Line tables are for local debugging; in CI they only make the target dir (and so every cache restore) and
-    # the link of each test binary bigger. Both profiles stay equal so test and run share artifacts.
-    env:
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
 
     steps:
       - name: Check out repository
@@ -398,6 +394,12 @@ jobs:
           --profile minimal
           --component clippy,rustfmt
           --no-self-update
+
+      # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
+      # binary's link bigger. Set in ~/.cargo/config.toml, not the environment, so the front door's cargo run (which
+      # scrubs the environment down to HOME and PATH) builds the same profile as cargo test instead of a second one.
+      - name: Build without debuginfo
+        run: printf '[profile.dev]\ndebug = 0\n\n[profile.test]\ndebug = 0\n' >> ~/.cargo/config.toml
 
       # Pull requests read the generation the last main push published; only main writes, so the cache stays
       # proportional to main, not to open branches. Each job keeps only its own artifacts, so each restore is small.
