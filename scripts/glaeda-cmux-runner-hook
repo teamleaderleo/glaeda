@@ -26,6 +26,8 @@ re-runs it elsewhere) when:
     Unix seconds) with now < until, whoever owns it; an unreadable or invalid file also refuses, an expired
     one is ignored (parsed by glaeda_reservation.py, installed next to this hook)
   * free disk is below --min-free-gib
+  * the job needs the console session (a gui class job, or any job on the --gui-runner) and the console
+    session is screen-locked or no user is logged in at the console (console_refusal, cmuxterm-hq#757)
   * another build holds the fleet host lock (/Users/Shared/cmux-build-fleet/host.lock, the flock that
     with-host-lock and the build worker take)
   * with --require-eligible (every fleet member): the local Glaeda node is not eligible, or its toolchain
@@ -54,7 +56,8 @@ runs under the runner LaunchAgent's listen.sh: it runs DIR/run.sh, and while the
 host lock, a reservation, or a fleet build waiting for the lock), every capacity unit on the mini is
 taken, or the mini is saturated (its 1-minute load at least GATE_LOAD_PAUSE per core), it stops the idle
 runner's listener so GitHub routes the job to another runner instead of here to be refused or slowed
-down (Gate). Full means every unit this runner's own --capacity-units scans, read from its job-started hook;
+down (Gate). A gui runner also stops listening while the console session is locked or nobody is logged in there
+(console_refusal). Full means every unit this runner's own --capacity-units scans, read from its job-started hook;
 for a root runner it also means the mini cannot admit a compile or an app-host shard (mini_full).
 """
 
@@ -558,6 +561,17 @@ GATE_THERMAL_RELEASE = 1
 GATE_THERMAL_EVERY_S = 30.0
 NOTIFYUTIL = "/usr/bin/notifyutil"
 THERMAL_PRESSURE_KEY = "com.apple.system.thermalpressurelevel"
+# GUI tests (app-host shards, tests-build-and-lag, test-e2e) run in the console user's session. A mini whose
+# auto-login session is screen-locked (displaysleep, then the lock) or sits at the login window fails every one of
+# them (cmuxterm-hq#757). ioreg's IOConsoleUsers names the console session (kCGSSessionOnConsoleKey) and whether its
+# screen is locked (CGSSessionScreenIsLocked), readable from any user or launchd domain. job-started refuses a job
+# that needs the console there, take-gui gives way, and a gui runner's listener gate holds it off, so GitHub hands
+# the job to another mini. An unreadable state (no ioreg, as on Linux, or a timeout) changes nothing.
+# GLAEDA_RUNNER_CONSOLE_GATE=0 turns all of it off.
+IOREG = os.environ.get("GLAEDA_RUNNER_IOREG") or "/usr/sbin/ioreg"
+CONSOLE_GATE = os.environ.get("GLAEDA_RUNNER_CONSOLE_GATE", "1") != "0"
+CONSOLE_CLASSES = ("gui",)  # job classes that run in the console session from their first step
+GATE_CONSOLE_EVERY_S = 30.0
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -1043,7 +1057,8 @@ def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path) -> int:
     """glaeda-canonical-root take-gui: hold this mini's gui token (one console session) for the rest of this
     job, waiting up to wait_s. A job that already holds it (from admission) is a no-op. Exits 0 when held, 1
     when still taken after the wait, TAKE_GUI_GAVE_WAY when the holder waits for a root this job holds (see
-    TAKE_GUI_GAVE_WAY: the caller then leaves its console-session work to another job), 2 outside a job."""
+    TAKE_GUI_GAVE_WAY: the caller then leaves its console-session work to another job) or when the console session
+    is locked or has no user (console_refusal), 2 outside a job."""
     if not os.environ.get("RUNNER_NAME"):
         print(f"{PREFIX}: take-gui: RUNNER_NAME is not set (not a runner job step)", file=sys.stderr)
         return 2
@@ -1053,6 +1068,10 @@ def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path) -> int:
     if worker is None:
         print(f"{PREFIX}: take-gui: not inside a runner job (no Runner.Worker above this step)", file=sys.stderr)
         return 2
+    locked = console_refusal()
+    if locked:  # the console session cannot run the tests: leave them to a job on another mini
+        print(f"{PREFIX}: take-gui: {locked}", file=sys.stderr)
+        return TAKE_GUI_GAVE_WAY
     deadline = time.monotonic() + max(0.0, wait_s)
     while True:
         fd = lock_file(capacity_dir / "gui.token", fcntl.LOCK_EX)
@@ -1658,6 +1677,61 @@ def thermal_pressure_level() -> int | None:
     return int(found.group(1)) if found else None
 
 
+class ConsoleState(NamedTuple):
+    """The console session as ioreg reports it: "unlocked", "locked" or "no_user", and its user name."""
+    state: str
+    user: str | None = None
+
+
+def parse_console_users(text: str) -> ConsoleState | None:
+    """ConsoleState from `ioreg -n Root -d1` text output, or None when it names neither IOConsoleUsers nor
+    IOConsoleLocked (not the Root entry). A session counts only while on the console with its login done; none
+    (or no IOConsoleUsers at all, as at the login window) is no_user. Locked is the session's
+    CGSSessionScreenIsLocked or Root's IOConsoleLocked."""
+    rows = text.splitlines()
+    users = next((row for row in rows if '"IOConsoleUsers" =' in row), None)
+    console_locked = next((row for row in rows if '"IOConsoleLocked" =' in row), None)
+    if users is None and console_locked is None:
+        return None
+    for session in re.findall(r"\{([^{}]*)\}", users or ""):
+        def value(key: str) -> str | None:
+            found = re.search(rf'"{key}"=("[^"]*"|[^,]*)', session)
+            return found.group(1).strip('"') if found else None
+
+        if value("kCGSSessionOnConsoleKey") != "Yes" or value("kCGSessionLoginDoneKey") == "No":
+            continue
+        user = value("kCGSSessionUserNameKey")
+        if not user or user == "loginwindow":
+            continue
+        locked = value("CGSSessionScreenIsLocked") == "Yes" or (console_locked or "").rstrip().endswith("= Yes")
+        return ConsoleState("locked" if locked else "unlocked", user[:64])
+    return ConsoleState("no_user")
+
+
+def console_state() -> ConsoleState | None:
+    """This mini's console session, or None when ioreg cannot be read."""
+    try:
+        out = subprocess.run([IOREG, "-n", "Root", "-d1"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                             timeout=5, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return None
+    return parse_console_users(out)
+
+
+def console_refusal() -> str | None:
+    """Why GUI tests cannot run in this mini's console session right now, or None (also when it is unreadable or
+    the check is off)."""
+    if not CONSOLE_GATE:
+        return None
+    state = console_state()
+    if state is None or state.state == "unlocked":
+        return None
+    if state.state == "locked":
+        return (f"console: the console session ({state.user}) is screen-locked, so GUI tests cannot run on this "
+                "mini; unlock it and turn off the screen lock (cmuxterm-hq#757)")
+    return "console: no user is logged in at the console, so GUI tests cannot run on this mini (cmuxterm-hq#757)"
+
+
 def mini_saturated(paused: bool, load: float | None = None, cores: int | None = None) -> str | None:
     """Why this mini is too loaded to take another job, or None: its 1-minute load is at least GATE_LOAD_PAUSE per
     core, or, once `paused` for that, still at least GATE_LOAD_RESUME per core (the gap keeps a listener from
@@ -1790,6 +1864,8 @@ class Gate:
         self.thermal_at = -GATE_THERMAL_EVERY_S
         self.load_since: float | None = None  # when the current load hold began
         self.load_waived = False  # a hold ran past GATE_LOAD_MAX_HOLD_S; ignored until the load falls
+        self.console_why: str | None = None  # the last console_refusal, read at most every GATE_CONSOLE_EVERY_S
+        self.console_at = -GATE_CONSOLE_EVERY_S
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -1836,7 +1912,7 @@ class Gate:
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
-        return why or self.shed(self.saturated()) or self.full() or self.shed(self.hot())
+        return why or self.shed(self.saturated()) or self.full() or self.shed(self.hot()) or self.locked()
 
     def yield_to_fleet(self) -> None:
         """A fleet build waiting for the host lock waits for every holder, the idle catch-up's shared hold
@@ -1905,7 +1981,18 @@ class Gate:
         if why:
             self.load_since = None
             self.yield_to_fleet()
-        return why or self.shed(self.saturated()) or self.full(fresh=True) or self.shed(self.hot(fresh=True))
+        return (why or self.shed(self.saturated()) or self.full(fresh=True) or self.shed(self.hot(fresh=True))
+                or self.locked(fresh=True))
+
+    def locked(self, fresh: bool = False) -> str | None:
+        """For the gui runner only: why its console session cannot run a GUI job (console_refusal), read at most
+        every GATE_CONSOLE_EVERY_S. Every job its label brings needs the console, so it waits here instead of
+        being refused; a root runner's compiles do not, so it keeps listening."""
+        if not CONSOLE_GATE or not runner_scope(self.runner_dir).gui:
+            return None
+        if fresh or time.monotonic() - self.console_at >= GATE_CONSOLE_EVERY_S:
+            self.console_why, self.console_at = console_refusal(), time.monotonic()
+        return self.console_why
 
     def full(self, fresh: bool = False) -> str | None:
         """Every unit this runner's jobs could take is held. A look an admission blocked keeps the previous
@@ -2672,6 +2759,12 @@ def main(argv: list[str] | None = None) -> int:
             or disk_refusal(os.path.dirname(args.host_lock), args.min_free_gib)
         if why:
             return refused(why)
+        # before any capacity is taken: a job that needs the console session fails on a locked one
+        if args.gui_runner or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
+                                        job_workflow())[0] in CONSOLE_CLASSES:
+            why = console_refusal()
+            if why:
+                return refused(why)
         # The wrapper execs this script, so the parent is the job's Runner.Worker.
         admit_start = time.monotonic()
         taken: dict[str, Any] = {}

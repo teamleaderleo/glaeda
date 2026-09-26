@@ -78,6 +78,7 @@ DISK_TIMEOUT = 90
 JOBS_TIMEOUT = 30
 JOBS_WINDOW_S = 24 * 3600
 MAX_CONTENDED_JOBS = 5  # per member, newest first
+CONSOLE_STATES = ("unlocked", "locked", "no_user")
 # A retired owner's family above this is worth a person's decision.
 RETIRED_WARN_BYTES = 5 * GIB
 # fleet-cas-prune runs hourly; three missed runs is a stopped LaunchAgent, not a busy host.
@@ -206,6 +207,12 @@ def _load(name: str, path: Path) -> Any:
 def mini_fleet() -> Any:
     sys.path.insert(0, os.fspath(SCRIPT_DIR))
     return _load("glaeda_mini_fleet", SCRIPT_DIR / "glaeda-mini-fleet")
+
+
+def runner_hook() -> Any:
+    """The runner hook module, for its console parser: one definition of a locked console for both."""
+    return sys.modules.get("glaeda_cmux_runner_hook") or _load("glaeda_cmux_runner_hook",
+                                                              SCRIPT_DIR / "glaeda-cmux-runner-hook")
 
 
 def manifest_source(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -514,10 +521,13 @@ def collect_disk(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
 # Read-only: the tail of the runner hook's per-job log (glaeda-cmux-job/v1; only "completed" lines, or lines with no
 # event from older hooks, carry the host record; "started" and "refused" lines are dropped on the host, so the
 # 400-line tail still holds about 400 completed records). A line cut
-# at the front by tail -c fails to parse and is skipped.
+# at the front by tail -c fails to parse and is skipped. @console is ioreg's console session lines (the runner
+# hook refuses GUI jobs while it is locked or has no user, cmuxterm-hq#757); only its state and user name leave.
 JOBS_SCRIPT = (
     "echo @jobs; tail -c 8388608 ~/Library/Logs/glaeda-cmux-jobs.jsonl 2>/dev/null "
     "| grep -v -e '\"event\":\"started\"' -e '\"event\":\"refused\"' | tail -n 400 | tail -c 1048576; echo; "
+    "echo @console; /usr/sbin/ioreg -n Root -d1 2>/dev/null | grep -e '\"IOConsoleUsers\" =' -e '\"IOConsoleLocked\" =' "
+    "| cut -c1-8192; "
     "echo @now; date +%s"
 )
 
@@ -540,7 +550,9 @@ def parse_jobs(stdout: str, at: int) -> dict[str, Any]:
                and (num(r.get("ended_at")) or 0) >= since]
     contended = [r for r in records if r.get("verdict") == "contended"]
     newest = sorted(contended, key=lambda r: -(num(r.get("ended_at")) or 0))[:MAX_CONTENDED_JOBS]
+    console = runner_hook().parse_console_users("\n".join(sections.get("console", [])))
     return {"reachable": True, "observed_at": at, "count": len(records), "contended": len(contended),
+            "console": None if console is None else {"state": console.state, "user": clean(console.user, 64) or None},
             "jobs": [{"job": clean(r.get("job") or "?", 60), "run_id": clean(r.get("run_id"), 32) or None,
                       "runner": clean(r.get("runner"), 60) or None, "seconds": num(r.get("seconds")),
                       "ended_at": (int(r["ended_at"]) + skew) if num(r.get("ended_at")) is not None else None,
@@ -1102,6 +1114,18 @@ class Builder:
                                              "load_mean": num(j.get("load_mean")),
                                              "reasons": [clean(x, 160) for x in (j.get("reasons") if isinstance(j.get("reasons"), list) else [])[:3]]}
                                             for j in jobs]}
+            console = row.get("console") if isinstance(row.get("console"), dict) else None
+            state = console.get("state") if console else None
+            m["jobs"]["console"] = None if state not in CONSOLE_STATES else {
+                "state": state, "user": clean(console.get("user"), 64) or None}
+            if state in ("locked", "no_user"):
+                who = f" ({m['jobs']['console']['user']})" if m["jobs"]["console"]["user"] else ""
+                self.finding("jobs", f"console_{state}", "warn",
+                             f"console session{who} is screen-locked: GUI jobs are refused here" if state == "locked"
+                             else "no user is logged in at the console: GUI jobs are refused here", member, at,
+                             self.action(member, "unlock_console", "person", None,
+                                         note="log the console user in and turn off the screen lock and display "
+                                              "sleep; the gui runner listens again within a minute (cmuxterm-hq#757)"))
             if contended:
                 latest = m["jobs"]["contended_jobs"][0] if m["jobs"]["contended_jobs"] else {}
                 why = "; ".join(latest.get("reasons") or []) or "no reason recorded"
@@ -1260,13 +1284,15 @@ def jobs_line(j: dict[str, Any] | None) -> str:
         return ""
     if not j.get("reachable"):
         return "unreachable"
+    state = (j.get("console") or {}).get("state")
+    console = {"locked": "; console LOCKED", "no_user": "; console NO USER"}.get(state, "")
     if not j.get("count"):
-        return "no job records"
+        return "no job records" + console
     line = f"{j['count']} jobs, {j.get('contended') or 0} contended"
     latest = (j.get("contended_jobs") or [{}])[0]
     if j.get("contended") and latest:
         line += f"; latest {latest.get('job') or '?'}: {(latest.get('reasons') or ['?'])[0]}"
-    return clean(line, MAX_TEXT)
+    return clean(line + console, MAX_TEXT)
 
 
 def when(stamp: Any, at: int) -> str:
