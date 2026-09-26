@@ -161,9 +161,17 @@ or the host?
 | Code | When | Action |
 | --- | --- | --- |
 | `contended` (warn) | at least one job in 24 h ran contended | `tail -n 20 ~/Library/Logs/glaeda-cmux-jobs.jsonl` (safe) |
+| `console_locked` (warn) | the console session is screen-locked | a person unlocks it and turns off the lock |
+| `console_no_user` (warn) | nobody is logged in at the console | a person logs the console user in |
 | `probe_failed` (info) | the probe timed out | a refresh |
 
-The text output adds one `jobs (24 h):` line per member and the page a column:
+The same probe reads the console session from `ioreg -n Root -d1` (member field
+`jobs.console`: `state` `unlocked`, `locked` or `no_user`, and the user name). The runner
+hook refuses GUI jobs while it is locked or has no user (cmuxterm-hq#757), so such a mini
+runs no GUI tests until a person fixes it.
+
+The text output adds one `jobs (24 h):` line per member and the page a column
+(`console LOCKED` or `console NO USER` at the end when the console cannot run GUI jobs):
 
 ```text
 cmux13s-mac-mini  41 jobs, 1 contended; latest macos-compile-admission: outside processes averaged 5.1 cores (top: zig (cmux))

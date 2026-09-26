@@ -203,6 +203,17 @@ What `--apply` does:
        canonical root is taken, or every unit is. Only it carries the gui pool label, so
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
        mini's gui runner instead.
+   - **When the console session cannot run GUI tests** (gui runner only). GUI jobs run
+     in the console user's session, and a mini whose auto-login session is screen-locked
+     (display sleep, then the lock) or sits at the login window fails every one
+     (cmuxterm-hq#757). The gate reads `ioreg -n Root -d1` (`IOConsoleUsers`:
+     `kCGSSessionOnConsoleKey`, `CGSSessionScreenIsLocked`; Root's `IOConsoleLocked`) at
+     most every 30 s and holds the gui runner while the session is locked or no user is
+     logged in. The same check refuses at job-started any job on the gui runner or of a
+     `gui` class (`refused: console: ...`, before any capacity is taken), so cmux's
+     rescue re-runs it elsewhere, and makes `take-gui` give way (exit 3), so test-e2e's
+     build leaves its tests to the `test` job. An unreadable state changes nothing;
+     `GLAEDA_RUNNER_CONSOLE_GATE=0` in the runner LaunchAgent turns it off.
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`.
      - The listener's graceful exit ends its session, and GitHub shows the runner as
