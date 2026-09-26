@@ -540,8 +540,7 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
             return record(state="skip", reason="another catch-up is running")
         memory_path = work / "state.json"
         memory = load_memory(memory_path)
-        interrupted = settle_attempt(memory)
-        if interrupted:
+        if apply and settle_attempt(memory):  # a plan never writes state
             save_memory(memory_path, memory)
         paused = memory.get("paused_until") or 0
         if isinstance(paused, (int, float)) and now < paused:
