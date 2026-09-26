@@ -225,6 +225,8 @@ jobs:
           python3 scripts/test-quarry-parallel.py
           python3 scripts/test-status-page.py
           python3 scripts/test-unittest-shard.py
+          # a test that leaves files in the checkout fails, as it did before the split
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
       - name: Validate Mac helper scripts
         run: |
@@ -288,7 +290,9 @@ jobs:
           --no-self-update
 
       - name: Run runner and hook tests (shard ${{ matrix.shard }} of 4)
-        run: python3 scripts/unittest-shard scripts/test-glaeda-cmux-runner.py ${{ matrix.shard }} 4
+        run: |
+          python3 scripts/unittest-shard scripts/test-glaeda-cmux-runner.py ${{ matrix.shard }} 4
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
   rust:
     runs-on: ubuntu-24.04

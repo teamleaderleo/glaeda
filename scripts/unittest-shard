@@ -51,6 +51,9 @@ def main(argv: list[str]) -> int:
     if shared:
         print(f"unittest-shard: {', '.join(shared)} share a class fixture; run {path} whole", file=sys.stderr)
         return 2
+    if not tests:  # every shard of an empty file would pass and hide that nothing ran
+        print(f"unittest-shard: {path} defines no tests", file=sys.stderr)
+        return 1
     mine = tests[index::count]
     print(f"unittest-shard: {path} shard {index + 1}/{count}: {len(mine)} of {len(tests)} tests", flush=True)
     result = unittest.TextTestRunner(verbosity=1).run(unittest.TestSuite(mine))

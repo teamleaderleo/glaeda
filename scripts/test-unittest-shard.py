@@ -57,6 +57,12 @@ class UnittestShardTest(unittest.TestCase):
         codes = {self.shard(str(self.file), str(i), "2").returncode for i in range(2)}
         self.assertEqual(codes, {0, 1})
 
+    def test_a_file_without_tests_fails(self) -> None:
+        self.file.write_text("import unittest\n")
+        empty = self.shard(str(self.file), "0", "1")
+        self.assertEqual(empty.returncode, 1)
+        self.assertIn("defines no tests", empty.stderr)
+
     def test_bad_arguments_and_class_fixtures_are_refused(self) -> None:
         for args in ([], [str(self.file), "2", "2"], [str(self.file), "0", "0"], [str(self.dir / "none.py"), "0", "1"],
                      [str(self.file), "x", "1"]):
