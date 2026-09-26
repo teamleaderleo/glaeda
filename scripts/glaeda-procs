@@ -416,6 +416,8 @@ def remove_profile(profile: Path, uid: int, fresh: Callable[[], list[Proc]], wai
         return "absent"
     if not profile.is_dir() or profile.is_symlink() or st.st_uid != uid:
         return "kept-not-owned"
+    if not (profile / "Local State").is_file():  # a Chrome profile, not a shared scratch dir
+        return "kept-not-a-profile"
     deadline = time.monotonic() + wait_seconds
     while True:  # helpers carry the profile too and exit shortly after the main process
         try:
@@ -475,13 +477,14 @@ def apply(fixtures: list[dict], receipt: Path,
 def reap(proc: Proc, profile: Path | None, record: dict, write: Callable[[dict], None],
          look: Callable[[int], Proc | None], kill: Callable[[int, int], None],
          connected: Callable[[int], bool], wait_seconds: float) -> str:
+    # lsof can take seconds under load, so it runs before, not between, check and signal
+    if profile and connected(proc.pid):
+        return "skipped-in-use"  # something still drives this browser
     now = look(proc.pid)
     if now is None:
         return "gone"
     if not proc.same_process(now):
         return "skipped-changed"
-    if profile and connected(proc.pid):
-        return "skipped-in-use"  # something still drives this browser
     write({**record, "outcome": "signalling"})
     try:
         kill(proc.pid, signal.SIGTERM)

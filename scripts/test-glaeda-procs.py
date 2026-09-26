@@ -253,6 +253,7 @@ class ChromeApplyTest(unittest.TestCase):
     def test_profile_removed_after_exit(self) -> None:
         profile = self.root / "frametime-1"
         (profile / "Default").mkdir(parents=True)
+        (profile / "Local State").write_text("{}")
         [r] = self.run_apply(profile, [])
         self.assertEqual((r["outcome"], r["profile"]), ("terminated", "removed"))
         self.assertFalse(profile.exists())
@@ -261,6 +262,7 @@ class ChromeApplyTest(unittest.TestCase):
     def test_profile_kept_while_another_process_names_it(self) -> None:
         profile = self.root / "shared"
         profile.mkdir()
+        (profile / "Local State").write_text("{}")
         [r] = self.run_apply(profile, [proc(99, ppid=5, command=f"node x.mjs {profile}")])
         self.assertEqual(r["profile"], "kept-in-use")
         self.assertTrue(profile.exists())
@@ -268,6 +270,7 @@ class ChromeApplyTest(unittest.TestCase):
     def test_profile_named_through_an_alias_is_in_use(self) -> None:
         profile = self.root / "p1"
         profile.mkdir()
+        (profile / "Local State").write_text("{}")
         (self.root / "alias").symlink_to(self.root)
         helper = proc(98, ppid=5, command=f"Google Chrome Helper --type=renderer --user-data-dir={self.root}/alias/p1")
         self.assertTrue(gp.profile_in_use(profile, [helper]))
@@ -293,6 +296,14 @@ class ChromeApplyTest(unittest.TestCase):
                        fresh=lambda: [], uid=os.getuid(), connected=lambda pid: False)
         self.assertEqual((r["outcome"], r["profile"]), ("gone", "kept"))
         self.assertTrue(profile.exists())
+
+    def test_directory_without_chrome_state_is_kept(self) -> None:
+        scratch = self.root / "shared-scratch"
+        scratch.mkdir()
+        (scratch / "notes.txt").write_text("keep")
+        [r] = self.run_apply(scratch, [])
+        self.assertEqual((r["outcome"], r["profile"]), ("terminated", "kept-not-a-profile"))
+        self.assertTrue((scratch / "notes.txt").exists())
 
     def test_symlinked_profile_is_not_followed(self) -> None:
         target = self.root / "real"
