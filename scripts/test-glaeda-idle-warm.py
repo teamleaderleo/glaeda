@@ -132,6 +132,19 @@ class GateTest(Base):
         self.assertIn("cannot compare", warm.pick_root(cold, 2, HEAD, self.state, {}))
 
 
+class AttemptTest(Base):
+    def test_a_build_killed_without_a_job_counts_as_a_failed_try(self) -> None:
+        memory = {"roots": {}, "attempt": {"root": 2, "head": HEAD, "at": 1000}}
+        self.assertEqual(warm.settle_attempt(memory, last_job=900), "killed with no job")
+        self.assertEqual(memory["roots"]["2"]["head"], HEAD, "not rebuilt for this head")
+        self.assertEqual(memory["failures"], 1)
+        self.assertNotIn("attempt", memory)
+        memory = {"roots": {}, "attempt": {"root": 2, "head": HEAD, "at": 1000}}
+        self.assertEqual(warm.settle_attempt(memory, last_job=1100), "preempted by a job")
+        self.assertEqual(memory["roots"], {}, "a job took over: the next idle spell tries again")
+        self.assertEqual(warm.settle_attempt({"roots": {}}), "")
+
+
 class LedgerTest(Base):
     def test_take_holds_a_compile_worth_of_locks_and_names_them(self) -> None:
         scope = {"units": 4, "roots": 2, "compile_slots": 2, "xcode": ""}

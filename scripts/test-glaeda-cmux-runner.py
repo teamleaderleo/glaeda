@@ -1192,29 +1192,37 @@ time.sleep(60)
         self.assertIsNone(gate.shed("the mini is saturated"))
         self.assertIn(warm.wait(timeout=10), (143, -signal.SIGKILL))
         self.assertEqual(gate.shed("the mini is saturated"), "the mini is saturated", "no catch-up left to stop")
+        # a fleet build waiting for the host lock would wait out the catch-up's shared hold: stop it
+        again = self.idle_warm("root-1", "persistent-dd")
+        gate.yield_to_fleet()
+        self.assertIn(again.wait(timeout=10), (143, -signal.SIGKILL))
 
-    def test_capacity_a_killed_idle_catch_ups_build_is_ended_too(self) -> None:
+    def test_capacity_yielding_the_idle_catch_up_also_ends_its_build(self) -> None:
         capacity = self.dir / "capacity"
         capacity.mkdir()
-        leader = make_executable(self.dir / "glaeda-idle-warm", f"""import json, os, pathlib, subprocess
+        leader = make_executable(self.dir / "glaeda-idle-warm", f"""import json, os, pathlib, signal, subprocess, time
 build = subprocess.Popen(["/bin/sleep", "60"])  # joins our process group
 pathlib.Path({os.fspath(capacity)!r}, "idle-warm.json").write_text(json.dumps({{"pid": os.getpid(), "held": []}}))
+signal.signal(signal.SIGTERM, lambda *_: os._exit(143))  # exits without ending its build
 print(build.pid, flush=True)
-os._exit(9)  # as a SIGKILLed catch-up would leave it
+time.sleep(60)
 """)
         proc = subprocess.Popen([sys.executable, os.fspath(leader)], stdout=subprocess.PIPE, text=True,
                                 start_new_session=True)
+        self.addCleanup(proc.kill)
         orphan = int(proc.stdout.readline())
-        proc.wait()
         self.addCleanup(lambda: subprocess.run(["/bin/kill", "-9", str(orphan)], capture_output=True))
-        self.assertTrue(hook.pid_alive(orphan))
-        self.assertEqual(hook.yield_idle_warm(capacity), "")
+        threading.Thread(target=proc.wait, daemon=True).start()
+        self.assertIn("stopped the idle catch-up", hook.yield_idle_warm(capacity))
         deadline = time.monotonic() + 5
-        while hook.pid_alive(orphan) and time.monotonic() < deadline:
-            subprocess.run(["/bin/ps", "-p", str(orphan)], capture_output=True)  # the zombie is init's to reap
+        state = "running"
+        while time.monotonic() < deadline:
+            state = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(orphan)], capture_output=True,
+                                   text=True).stdout.strip()
+            if not state or state.startswith("Z"):
+                break
             time.sleep(0.1)
-        state = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(orphan)], capture_output=True, text=True).stdout
-        self.assertTrue(state.strip() in ("", "Z") or state.strip().startswith("Z"), f"still running: {state!r}")
+        self.assertTrue(not state or state.startswith("Z"), f"the build still runs: {state!r}")
 
     def test_capacity_a_stale_idle_catch_up_file_signals_nothing(self) -> None:
         self.fleet()

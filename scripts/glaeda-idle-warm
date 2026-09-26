@@ -356,10 +356,10 @@ def own_group() -> bool:
         return False
 
 
-def kill_build() -> None:
-    """SIGKILL every other process in our group (the build and anything it started), a few passes."""
+def kill_build(passes: int = 3) -> None:
+    """SIGKILL every other process in our group (the build and anything it started)."""
     me = os.getpid()
-    for _ in range(3):
+    for _ in range(passes):
         try:
             out = subprocess.run(["/bin/ps", "-axo", "pid=,pgid="], capture_output=True, text=True, timeout=2).stdout
         except (OSError, subprocess.SubprocessError):
@@ -379,7 +379,7 @@ def forget_inode_override() -> None:
     in between leaves it set for the user's other builds. No job runs while a catch-up does, so none needs it."""
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         subprocess.run(["/usr/bin/defaults", "delete", "com.apple.dt.XCBuild", "IgnoreFileSystemDeviceInodeChanges"],
-                       capture_output=True, timeout=3)
+                       capture_output=True, timeout=2)
 
 
 def stop(signum: int, _frame: Any) -> None:
@@ -390,7 +390,7 @@ def stop(signum: int, _frame: Any) -> None:
         with contextlib.suppress(OSError):
             _child.kill()
     if _grouped:
-        kill_build()
+        kill_build(passes=1)  # within the hook's WARM_YIELD_S; the killpg below takes the rest
         forget_inode_override()
         os.killpg(os.getpid(), signal.SIGKILL)
     os._exit(128 + signum)
@@ -489,6 +489,24 @@ def load_memory(path: Path) -> dict[str, Any]:
     return memory
 
 
+def settle_attempt(memory: dict[str, Any], last_job: float | None = None) -> str:
+    """A build a kill cut short, left in MEMORY: '' when there is none. Preempted by a job, it is simply dropped
+    (the next idle spell tries again); killed with no job since it started, it counts as a failed try of that
+    head, like a build that failed."""
+    attempt = memory.pop("attempt", None)
+    if not isinstance(attempt, dict) or not isinstance(attempt.get("at"), int):
+        return ""
+    last_job = last_job_at() if last_job is None else last_job
+    if last_job is not None and last_job >= attempt["at"]:
+        return "preempted by a job"
+    memory["roots"][str(attempt.get("root"))] = {"head": attempt.get("head"), "at": attempt["at"], "kept": False}
+    memory["failures"] = int(memory.get("failures") or 0) + 1
+    if memory["failures"] >= FAILURES_TO_PAUSE:
+        memory["paused_until"] = int(time.time()) + FAILURE_BACKOFF_S
+        memory["failures"] = 0
+    return "killed with no job"
+
+
 def save_memory(path: Path, memory: dict[str, Any]) -> None:
     incoming = path.with_name(f".{path.name}.{os.getpid()}")
     incoming.write_text(json.dumps(memory, sort_keys=True) + "\n")
@@ -522,6 +540,9 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
             return record(state="skip", reason="another catch-up is running")
         memory_path = work / "state.json"
         memory = load_memory(memory_path)
+        interrupted = settle_attempt(memory)
+        if interrupted:
+            save_memory(memory_path, memory)
         paused = memory.get("paused_until") or 0
         if isinstance(paused, (int, float)) and now < paused:
             return record(state="skip", reason=f"paused after {FAILURES_TO_PAUSE} failed builds until {int(paused)}")
@@ -564,7 +585,12 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
             logs = work / "logs"
             logs.mkdir(exist_ok=True)
             log = logs / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-root-{root}.log"
+            # Kept if we are killed: a kill with no job behind it (the gate shedding our load) counts as a
+            # failed try of this head on the next run, so it is not rebuilt into the same kill forever.
+            memory["attempt"] = {"root": root, "head": head, "at": int(time.time())}
+            save_memory(memory_path, memory)
             result = build(work / "cmux", root, state, scope["xcode"], log)
+            memory.pop("attempt", None)
             trim_logs(logs)
         finally:
             release(fds)
