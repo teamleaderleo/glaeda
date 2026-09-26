@@ -297,9 +297,16 @@ jobs:
           python3 scripts/unittest-shard scripts/test-glaeda-cmux-runner.py ${{ matrix.shard }} 4
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
-  rust:
+  # rust was one serial job of about 4.4 min (cache restore 69 s, check and two clippy runs 70 s, tests 100 s);
+  # lint and test now run side by side.
+  lint:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # Line tables are for local debugging; in CI they only make the target dir (and so every cache restore) and
+    # the link of each test binary bigger. Both profiles stay equal so test and run share artifacts.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
 
     steps:
       - name: Check out repository
@@ -315,11 +322,8 @@ jobs:
           --component clippy,rustfmt
           --no-self-update
 
-      # Verify spends most of its wall time compiling the same dependency
-      # graph from scratch on every run. Restore the registry and target
-      # directory so only changed crates are rebuilt. Pull requests read the
-      # generation published by the last main push; only main writes, which
-      # keeps this workflow from multiplying per-branch cache entries.
+      # Pull requests read the generation the last main push published; only main writes, so the cache stays
+      # proportional to main, not to open branches. Each job keeps only its own artifacts, so each restore is small.
       - name: Restore cargo build cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -328,9 +332,86 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: verify-cargo-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          key: verify-cargo-lint-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            verify-cargo-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
+            verify-cargo-lint-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # Cross-check the documented Apple Silicon Lima guest target.
+      - name: Install ARM64 Linux target
+        run: rustup target add aarch64-unknown-linux-gnu
+
+      - name: Check ARM64 Linux build
+        run: cargo check --locked --target aarch64-unknown-linux-gnu
+
+      # Keep the operator CLI buildable on its supported Apple Silicon host.
+      - name: Install Apple Silicon target
+        run: rustup target add aarch64-apple-darwin
+
+      # Glaeda is developed on Apple Silicon, so the repository's own `required` profile has to
+      # pass in the macOS `cfg` configuration, not only the Linux one this job runs natively.
+      # `cargo check` already compiled that configuration and already printed the `cfg` drift it
+      # sees -- code whose only consumers are `target_os = "linux"` -- but nothing promoted those
+      # warnings to errors, so `./scripts/verify required` could be broken on the author's machine
+      # while this job stayed green. Clippy with `-D warnings` subsumes the previous check and
+      # closes that gap without needing a macOS runner.
+      - name: Lint Apple Silicon build
+        run: >-
+          cargo clippy --locked --all-targets --all-features
+          --target aarch64-apple-darwin -- -D warnings
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Save cargo build cache
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-lint-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Line tables are for local debugging; in CI they only make the target dir (and so every cache restore) and
+    # the link of each test binary bigger. Both profiles stay equal so test and run share artifacts.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy,rustfmt
+          --no-self-update
+
+      # Pull requests read the generation the last main push published; only main writes, so the cache stays
+      # proportional to main, not to open branches. Each job keeps only its own artifacts, so each restore is small.
+      - name: Restore cargo build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: verify-cargo-test-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            verify-cargo-test-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
 
       - name: Validate workspace bootstrap
         run: |
@@ -395,38 +476,6 @@ jobs:
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
           cat "$first_receipt"
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Install Rust toolchain
-        run: rustup show active-toolchain
-
-      # Cross-check the documented Apple Silicon Lima guest target.
-      - name: Install ARM64 Linux target
-        run: rustup target add aarch64-unknown-linux-gnu
-
-      - name: Check ARM64 Linux build
-        run: cargo check --locked --target aarch64-unknown-linux-gnu
-
-      # Keep the operator CLI buildable on its supported Apple Silicon host.
-      - name: Install Apple Silicon target
-        run: rustup target add aarch64-apple-darwin
-
-      # Glaeda is developed on Apple Silicon, so the repository's own `required` profile has to
-      # pass in the macOS `cfg` configuration, not only the Linux one this job runs natively.
-      # `cargo check` already compiled that configuration and already printed the `cfg` drift it
-      # sees -- code whose only consumers are `target_os = "linux"` -- but nothing promoted those
-      # warnings to errors, so `./scripts/verify required` could be broken on the author's machine
-      # while this job stayed green. Clippy with `-D warnings` subsumes the previous check and
-      # closes that gap without needing a macOS runner.
-      - name: Lint Apple Silicon build
-        run: >-
-          cargo clippy --locked --all-targets --all-features
-          --target aarch64-apple-darwin -- -D warnings
-
-      - name: Run Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
 
@@ -458,9 +507,6 @@ jobs:
           cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
             | jq -e '.schema_version == 1 and .disposition and (.findings | type == "array") and (.report.executables | length == 3) and .report.package_plan and .report.runner_account'
 
-      # Only main publishes a generation. Pull requests restore from it and
-      # never write, so cache storage stays proportional to main rather than
-      # to the number of open branches.
       - name: Save cargo build cache
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -470,12 +516,12 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: verify-cargo-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          key: verify-cargo-test-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
 
   # One check that stands for the whole workflow, under the old single job's name.
   verify:
     if: ${{ always() }}
-    needs: [go, scripts, runner-tests, rust]
+    needs: [go, scripts, runner-tests, lint, test]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
