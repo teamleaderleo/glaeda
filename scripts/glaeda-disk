@@ -393,8 +393,8 @@ def git_state(path: Path, depth: int = 5, budget: int = 20000) -> str:
                         budget -= 1
                         if budget < 0:
                             return "unchecked"
-                        if e.name == ".git":
-                            return "git"
+                        if e.name == ".git" or (e.name == "HEAD" and looks_like_repository(d)):
+                            return "git"  # a bare repository holds commits just like a checkout
                         if e.is_dir(follow_symlinks=False):
                             if e.name not in REPRODUCIBLE_DIRS:
                                 nxt.append(e.path)
@@ -408,15 +408,21 @@ def git_state(path: Path, depth: int = 5, budget: int = 20000) -> str:
     return "unchecked" if frontier else "none"
 
 
+def looks_like_repository(d: str) -> bool:
+    """A bare repository or a copied git dir: no .git entry of its own, but HEAD, objects and refs."""
+    return (os.path.isfile(os.path.join(d, "HEAD")) and os.path.isdir(os.path.join(d, "objects"))
+            and os.path.isdir(os.path.join(d, "refs")))
+
+
 def checkouts(path: Path, depth: int = 5, budget: int = 20000) -> list[Path] | None:
-    """Every checkout (a directory holding .git) up to `depth` levels below path, not searching
-    inside one; None when the search could not finish."""
+    """Every checkout (a directory holding .git) or bare repository up to `depth` levels below
+    path, not searching inside one; None when the search could not finish."""
     found: list[Path] = []
     frontier = [str(path)]
     for _ in range(depth + 1):
         nxt: list[str] = []
         for d in frontier:
-            if os.path.lexists(os.path.join(d, ".git")):
+            if os.path.lexists(os.path.join(d, ".git")) or looks_like_repository(d):
                 found.append(Path(d))
                 continue
             try:
@@ -445,9 +451,19 @@ def family_git_loss(fam: "Family", path: Path) -> str:
     roots = checkouts(path)
     if roots is None:
         return "too deep or large to find every checkout"
+    inside = os.path.realpath(path) + "/"
     for root in roots:
+        where = root.relative_to(path)
+        if not os.path.lexists(root / ".git"):
+            return f"{where}: a repository without a checkout"  # its commits have no git_loss check
         if (loss := git_loss(root)):
-            return f"{root.relative_to(path)}: {loss}"
+            return f"{where}: {loss}"
+        # git_loss keeps a linked worktree because its repository stays; here the repository
+        # may be inside the item being deleted
+        if (root / ".git").is_file():
+            common = git_common_dir(root)
+            if not common or (os.path.realpath(common) + "/").startswith(inside):
+                return f"{where}: worktree of a repository inside this item"
     return ""
 
 
@@ -1153,7 +1169,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             if dev not in targets or free_bytes(p.parent)[0] >= targets[dev]:
                 continue
         # fresh re-observation right before the destructive step
-        if in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(families[i.family], p):
+        if (in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(families[i.family], p)
+                or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))):
             outcome = "changed:in-use"
         elif (time.time() - newest_mtime(p)) / 3600 < idle_hours:
             outcome = "changed:modified"
