@@ -328,6 +328,7 @@ def warm_root_order(order: list[int], keys: tuple[str, ...], state_dir: str = ""
 # untrusted and bounded, like the stamps above.
 WARM_MODEL = "warm-distance-model.json"
 WARM_PR_BUILDS = "pr-builds"
+WARM_PR_BUILD_HOURS = 6  # cmux owned_build_state.py PR_SLOT_HOURS: an older slot is never unparked
 WARM_MIRROR = os.path.join(".prefetch", "cmux.git")
 WARM_ROUTE_ENV = "GLAEDA_WARM_ROUTE"
 WARM_GIT_TIMEOUT_S = 2.0
@@ -407,7 +408,12 @@ def root_stamp(k: int, state_dir: str = "", number: int | None = None) -> dict[s
     if number is not None and (kept is None or kept.get("pr")):
         # admission's `check` swaps a parked build in only over another pull request's build (or none):
         # a main build is never parked, so the job starts from it.
-        parked = root_stamp_at(store / WARM_PR_BUILDS / f"pr-{number}")
+        slot = store / WARM_PR_BUILDS / f"pr-{number}"
+        try:
+            fresh = time.time() - slot.stat().st_mtime <= WARM_PR_BUILD_HOURS * 3600
+        except OSError:
+            fresh = False
+        parked = root_stamp_at(slot) if fresh else None
         if parked is not None and parked.get("pr") == number:
             return parked
     return kept

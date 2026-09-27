@@ -1267,6 +1267,12 @@ class HookTest(unittest.TestCase):
         # Over a main build admission keeps the main build, so the parked one does not count.
         (ci / "cmux-ci-2" / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": base}))
         self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), None)
+        # An expired slot is never unparked either.
+        (ci / "cmux-ci-2" / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": base,
+                                                                "pr": 6}))
+        self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), 7)
+        os.utime(ci / "cmux-ci-2" / "pr-builds" / "pr-7", (1, 1))
+        self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), 6)
 
     def test_job_warm_keys_come_from_the_pull_request(self) -> None:
         sha = "ABCDEF0123456789abcdef0123456789abcdef01"
