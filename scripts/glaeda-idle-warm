@@ -192,8 +192,13 @@ def running() -> str:
 QUIET_CLASSES = ("compile", "compile-gui", "simulator", "isolated")
 
 
-def last_compile_at(path: Path = JOB_LOG) -> float | None:
-    """When the last compile-class job on this mini started or ended (its telemetry log), or None."""
+def compile_state(path: Path = JOB_LOG, now: float | None = None) -> tuple[float | None, str]:
+    """(when the last compile-class job started or ended, one still running) from the jobs log.
+
+    A compile admitted before the quiet window, and still before xcodebuild (checkout, seed download),
+    shows no busy process, and its admission has already passed, so nothing would preempt a catch-up:
+    a started event without its completed one (at most BUILD_TIMEOUT_S old) counts as running."""
+    now = time.time() if now is None else now
     try:
         with open(path, "rb") as log:
             log.seek(0, os.SEEK_END)
@@ -201,18 +206,31 @@ def last_compile_at(path: Path = JOB_LOG) -> float | None:
             log.seek(max(0, size - 262144))
             lines = log.read().decode("utf-8", "replace").splitlines()
     except OSError:
-        return None
-    for line in reversed(lines):
+        return None, ""
+    last = None
+    open_jobs: dict[tuple, str] = {}
+    for line in lines:
         try:
             event = json.loads(line)
         except ValueError:
             continue
-        if isinstance(event, dict) and event.get("class") in QUIET_CLASSES:
-            times = [event.get(key) for key in ("ended_at", "at", "started_at")]
-            times = [t for t in times if isinstance(t, (int, float))]
-            if times:
-                return max(times)
-    return None
+        if not isinstance(event, dict) or event.get("class") not in QUIET_CLASSES:
+            continue
+        times = [event.get(key) for key in ("ended_at", "at", "started_at")]
+        times = [t for t in times if isinstance(t, (int, float))]
+        if times:
+            last = max(times) if last is None else max(last, *times)
+        key = tuple(event.get(field) for field in ("runner", "run_id", "run_attempt", "job"))
+        if event.get("event") == "started" and times and now - max(times) < BUILD_TIMEOUT_S:
+            open_jobs[key] = f"{event.get('job')} on {event.get('runner')}"
+        else:
+            open_jobs.pop(key, None)
+    return last, next(iter(open_jobs.values()), "")
+
+
+def last_compile_at(path: Path = JOB_LOG) -> float | None:
+    """When the last compile-class job on this mini started or ended (its telemetry log), or None."""
+    return compile_state(path)[0]
 
 
 def last_job_at(path: Path = JOB_LOG) -> float | None:
@@ -241,7 +259,9 @@ def idle_refusal(hook: Any, now: float, state: Path) -> str:
     busy = running()
     if busy:
         return f"busy: {busy}"
-    last = last_compile_at()
+    last, open_job = compile_state(now=now)
+    if open_job:
+        return f"a compile is running: {open_job}"
     if last is not None and now - last < IDLE_S:
         return f"a compile ran {int(now - last)} s ago (idle after {IDLE_S} s)"
     try:

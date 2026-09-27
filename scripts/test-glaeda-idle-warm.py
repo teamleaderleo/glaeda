@@ -115,16 +115,18 @@ class GateTest(Base):
 
     def test_idle_after_three_quiet_minutes_of_compiles(self) -> None:
         self.assertEqual(warm.IDLE_S, 180)
-        saved = warm.last_compile_at
+        saved = warm.compile_state
         stub = types.SimpleNamespace(thermal_pressure_level=lambda: 1)
         try:
             warm.running = lambda: ""
-            warm.last_compile_at = lambda: 1000.0
+            warm.compile_state = lambda now=None: (1000.0, "")
             self.assertIn("a compile ran 179 s ago", warm.idle_refusal(stub, 1179.0, self.state))
             # Past IDLE_S a later gate (load, heat, disk) answers, never the job gate.
             self.assertNotIn("a compile ran", warm.idle_refusal(stub, 1181.0, self.state))
+            warm.compile_state = lambda now=None: (1.0, "macos-compile-admission on m-glaeda")
+            self.assertIn("a compile is running", warm.idle_refusal(stub, 5000.0, self.state))
         finally:
-            warm.last_compile_at = saved
+            warm.compile_state = saved
 
     def test_only_compiles_and_xcode_runs_count_as_busy(self) -> None:
         log = self.dir / "jobs.jsonl"
@@ -134,6 +136,14 @@ class GateTest(Base):
             {"class": "gui", "event": "started", "at": 900},
             {"class": "light", "event": "completed", "ended_at": 950}, "not json")) + "\n")
         self.assertEqual(warm.last_compile_at(log), 200)
+        with open(log, "a") as handle:
+            handle.write(json.dumps({"class": "compile", "event": "started", "at": 5000, "runner": "r",
+                                     "run_id": "1", "job": "macos-compile-admission"}) + "\n")
+        self.assertEqual(warm.compile_state(log, now=5100), (5000, "macos-compile-admission on r"))
+        with open(log, "a") as handle:
+            handle.write(json.dumps({"class": "compile", "event": "completed", "ended_at": 5300, "runner": "r",
+                                     "run_id": "1", "job": "macos-compile-admission"}) + "\n")
+        self.assertEqual(warm.compile_state(log, now=5400), (5300, ""))
         worker = "/Users/cmux/actions-runner-glaeda-2/bin.2.330.0/Runner.Worker spawnclient 1 2"
         self.assertIsNone(warm.BUSY.search(worker), "another job no longer stops a catch-up")
         self.assertIsNotNone(warm.BUSY.search("/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild test"))
