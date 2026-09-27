@@ -19,6 +19,7 @@ import os
 import plistlib
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -1352,7 +1353,8 @@ class HookTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertIn(f"preempted the yielding fleet build (pid {holder.pid})", result.stdout)
             self.assertEqual(holder.wait(timeout=10), 0)
-            self.assertIn("cli-product-tests", (fleet / "host.lock.preempted").read_text())
+            note = json.loads((fleet / "host.lock.preempted").read_text())
+            self.assertEqual((note["by"], note["pid"]), ("cli-product-tests", holder.pid))
         finally:
             self.finish("w0")
             with contextlib.suppress(OSError):
@@ -2263,8 +2265,13 @@ class GateTest(unittest.TestCase):
         gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
         gate.child = mock.Mock(pid=4321)
         gate.source = (0, 0, 0)
+        # reload() blocks SIGTERM/SIGINT for the exec'd gate to unblock. With execv mocked that block would
+        # stay on this test process, and every later child would inherit it (a SIGTERM'd holder never dies).
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, mask)
         with mock.patch.object(hook.os, "execv") as execv, mock.patch.object(hook.sys, "argv", [os.fspath(HOOK), "listen"]):
             gate.reload()
+        self.assertIn(signal.SIGTERM, signal.pthread_sigmask(signal.SIG_SETMASK, mask), "blocked across the exec")
         args = execv.call_args[0][1]
         self.assertEqual(args[1:], [os.fspath(HOOK), "listen", "--adopt=4321"])
         gate.source = (0, 0, 0)

@@ -1149,7 +1149,7 @@ def preempt_yielding(host_lock: str, job: str) -> str | None:
         return None
     with contextlib.suppress(OSError):
         incoming = f"{host_lock}{PREEMPTED_SUFFIX}.{os.getpid()}"
-        Path(incoming).write_text(json.dumps({"by": job[:120], "at": int(time.time())}) + "\n")
+        Path(incoming).write_text(json.dumps({"by": job[:120], "at": int(time.time()), "pid": pid}) + "\n")
         os.replace(incoming, host_lock + PREEMPTED_SUFFIX)
     try:
         os.kill(pid, signal.SIGTERM)

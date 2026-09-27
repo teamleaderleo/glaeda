@@ -185,8 +185,8 @@ What `--apply` does:
      - Except a yielding build: a fleet build that writes its pid to `host.lock.yield`
        while it waits for or holds the lock (cmuxterm-hq's catch-up fill on the writer
        mini) neither stops the listener nor counts as a waiter. A job that meets it
-       checks with `lsof` that the pid has the lock open, writes `host.lock.preempted`,
-       sends it SIGTERM and waits up to 90 s for the lock (under the admission lock), then
+       checks with `lsof` that the pid has the lock open, writes `host.lock.preempted`
+       (`{by, at, pid}`, so the fill can tell the note is about itself), sends it SIGTERM and waits up to 90 s for the lock (under the admission lock), then
        runs; a pid without the lock open is never signalled. A fresh DerivedData seed saves
        more PR compile time than one more main fill, which a quiet tick redoes from the
        compile cache.
