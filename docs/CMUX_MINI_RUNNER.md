@@ -525,6 +525,10 @@ in at the producer's root. So one root job per root per mini:
   detached holder tied to the job's Runner.Worker and released by job-completed. A re-take of a root the
   same job already holds (a compile restoring its own product) is a no-op. It exits 1 when the root is
   still busy after the wait, and 2 for a bad root or outside a runner job.
+- A producer's root this mini does not have (a product compiled at `/private/tmp/cmux-ci-2` on a two-root
+  mini, restored on a one-root mini) is still a valid path to alias: nothing compiles there on this mini.
+  A consumer that already holds every root this mini has (its admission on a one-root mini) gets it as a
+  no-op, since no other root job can run beside it; a job holding no root takes that root's token.
 - A second, different root is refused (exit 2): two jobs taking two roots in opposite orders would deadlock.
   `take ROOT --switch` swaps instead.
   - It waits for ROOT while still holding the old root, and lets the old one go only once ROOT is held.
