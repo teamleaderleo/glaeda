@@ -686,38 +686,64 @@ class HookTest(unittest.TestCase):
         for name in ("cmux-ci/src", "cmux-ci-2/derived", "cmux-ci-20"):
             (parent / name).mkdir(parents=True)
 
-        def spawn(argv: list[str], cwd: Path) -> subprocess.Popen:
-            proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL, start_new_session=True)
-            self.addCleanup(proc.wait)
-            self.addCleanup(lambda: proc.stdin.close())
-            self.addCleanup(lambda: os.killpg(proc.pid, signal.SIGKILL) if proc.poll() is None else None)
-            return proc
-
         def sleeper(*words: str) -> list[str]:  # one process, whose arguments stay what ps shows
             return [sys.executable, "-c", "import time; time.sleep(60)", *words]
 
+        def leftover(argv: list[str], cwd: Path) -> int:
+            """An orphan, like a killed step's compilers: its parent exits at once, so it is under no Runner.Worker
+            even when this test runs in a GitHub Actions job."""
+            started = subprocess.run([sys.executable, "-c", "import subprocess, sys; print(subprocess.Popen("
+                                      "sys.argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+                                      "stderr=subprocess.DEVNULL, start_new_session=True).pid)", *argv],
+                                     cwd=cwd, capture_output=True, text=True, timeout=30, check=True)
+            pid = int(started.stdout)
+            self.addCleanup(end, pid)
+            return pid
+
+        def end(pid: int) -> None:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+        def alive(pid: int, gone_within: float = 0.0) -> bool:
+            deadline = time.monotonic() + gone_within
+            while True:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return False
+                except PermissionError:
+                    return True
+                if time.monotonic() >= deadline:
+                    return True
+                time.sleep(0.05)  # a stopped orphan is reaped by its new parent, not by us
+
         live_path = os.fspath(parent / "cmux-ci" / "derived" / "live.o")
         # a running step of a live job that still names root 1 (a switcher that let it go keeps its arguments)
-        live = spawn([os.fspath(self.runner_worker()), "-c", shlex.join(["exec", *sleeper(live_path)])], self.dir)
-        working = spawn(sleeper(), parent / "cmux-ci" / "src")  # a compiler working in root 1
-        naming = spawn(sleeper(os.fspath(parent / "cmux-ci-2" / "derived" / "x.o")), self.dir)
-        neighbour = spawn(sleeper(), parent / "cmux-ci-20")  # a name that only starts like root 2
-        bystander = spawn(sleeper(os.fspath(parent / "cmux-ci")), self.dir)  # the root itself
+        live = subprocess.Popen([os.fspath(self.runner_worker()), "-c", shlex.join(["exec", *sleeper(live_path)])],
+                                cwd=self.dir, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(live.wait)
+        self.addCleanup(live.stdin.close)
+        self.addCleanup(lambda: os.killpg(live.pid, signal.SIGKILL) if live.poll() is None else None)
+        working = leftover(sleeper(), parent / "cmux-ci" / "src")  # a compiler working in root 1
+        naming = leftover(sleeper(os.fspath(parent / "cmux-ci-2" / "derived" / "x.o")), self.dir)
+        neighbour = leftover(sleeper(), parent / "cmux-ci-20")  # a name that only starts like root 2
+        bystander = leftover(sleeper(os.fspath(parent / "cmux-ci")), self.dir)  # the root itself
         try:
             got = self.take("/private/tmp/cmux-ci", "c0", env=env)
             self.assertEqual((got.returncode, got.stdout.strip()), (0, "/private/tmp/cmux-ci"), got.stderr)
             self.assertIn("stopped 1 leftover process(es)", got.stderr)
-            self.assertIsNotNone(working.poll(), "the process working in root 1 is stopped before the step goes on")
-            self.assertIsNone(naming.poll(), "root 2 is not this job's")
+            self.assertFalse(alive(working, 5), "the process working in root 1 is stopped before the step goes on")
+            self.assertTrue(alive(naming), "root 2 is not this job's")
             compile_ = self.job("macos-compile-admission", "p1", 8, None, *two, "--instance", "1", env=env)
             self.assertIn("persistent-dd+root-2", compile_.stdout)
             self.assertIn("stopped 1 leftover process(es)", compile_.stdout)
-            self.assertIsNotNone(naming.poll(), "admission settles the root it takes as well")
-            for proc in (neighbour, bystander, live):
-                self.assertIsNone(proc.poll(), "neither another root's name nor the bare root path is inside it")
+            self.assertFalse(alive(naming, 5), "admission settles the root it takes as well")
+            for pid in (neighbour, bystander):
+                self.assertTrue(alive(pid), "neither another root's name nor the bare root path is inside it")
+            self.assertIsNone(live.poll(), "a live job's step is never a leftover")
             found = subprocess.run(["/usr/bin/pgrep", "-f", live_path], capture_output=True, text=True).stdout
-            self.assertTrue(found.strip(), "a live job's process is never a leftover")
+            self.assertTrue(found.strip(), "nor is the process it runs")
             quiet = self.take("2", "c1", "--wait", "0", env=env)
             self.assertEqual(quiet.returncode, 1, "root 2 stays p1's")
         finally:
