@@ -779,11 +779,12 @@ runners) looks for what stopped runner minis on 2026-09-25 and 26 without anythi
 | `console_locked`, `console_no_user` | none: root and a reboot (the hook already refuses GUI jobs there, #1286) |
 | `autologin_locks` (loginwindow `autoLoginUserScreenLocked`), `display_sleep` | none: root |
 | `testmanagerd_wedged`: the newest session line of this user's testmanagerd is `XCIDESession is responsible for cleaning up its socket`, 90 s old, nothing after it | the hook's `recycle_testmanagerd` (#1281) while no test runs; a hook without it gets the finding only |
-| `tailscale_down`: not `Running`, two runs in a row | `tailscale up` when Stopped, else `scutil --nc stop/start` of the Tailscale VPN service; a standalone tailscaled or a logged-out node is reported only |
+| `tailscale_down`: not `Running`, two runs in a row | `tailscale up` when Stopped, else `scutil --nc stop/start` of the Tailscale VPN service; no answer, a standalone tailscaled or a logged-out node is reported only |
 | `runner_stopped:<agent>`: a runner LaunchAgent loaded but not running, two runs in a row | `launchctl kickstart` (nothing runs in it, so no job is cut) |
-| `runner_unloaded:<agent>` | none: `glaeda-cmux-runner-fleet --apply` |
+| `runner_unloaded:<agent>` (not one `cmux_mini_fix.sh` holds) | none: `glaeda-cmux-runner-fleet --apply` |
 
-A heal runs at most every 10 minutes and 3 times per finding, then the finding reads `impossible`. The report,
+A heal runs at most every 10 minutes and 3 times a day per finding (a heal that worked but did not last counts),
+then the finding reads `impossible`. The report,
 `~/.local/state/glaeda/mini-health/health.json` (`glaeda-mini-health/v1`: each finding's id, severity, first
 sighting, evidence, `auto_fix` pending or impossible, and the heals of the last day), is what ci-dash's probe
 reads; ci-dash's Health section names the operator command for the rest. `glaeda-mini-health` alone prints

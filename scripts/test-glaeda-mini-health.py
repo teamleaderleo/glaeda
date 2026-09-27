@@ -33,6 +33,7 @@ class FakeMini(health.Mini):
 
     def __init__(self) -> None:
         super().__init__(Path("/nonexistent"))
+        self._hook = False  # no runner hook: the module's own patterns
         self.uid = 501
         self.console_state = ("unlocked", "cmux")
         self.lw: dict = {}
@@ -62,7 +63,7 @@ class FakeMini(health.Mini):
         return 3600
 
     def session_lines(self, pid, minutes):
-        return self.lines
+        return self.lines if self.lines is not None else None
 
     def tailscale(self):
         if self.ts_after and self.did and self.did[-1].startswith(("up", "vpn")):
@@ -180,6 +181,23 @@ class Testmanagerd(Base):
         self.assertEqual(again["findings"][0]["since"], health.iso(NOW))
         self.assertEqual(self.mini.did, ["recycle"], "no heal while a test runs")
 
+    def test_a_test_running_past_the_heal_gate_never_uses_up_tries(self) -> None:
+        self.mini.lines.append((NOW - 300, health.WEDGE_SIGNATURE))
+        self.mini.recycler = lambda: "testmanagerd: kept (a test is running on this mini)"
+        self.run_once()
+        self.mini.procs.append((20, 501, "S", "/usr/bin/xcodebuild test -scheme cmux"))
+        for i in range(1, 6):
+            report = self.run_once(NOW + i * health.HEAL_EVERY_S)
+        self.assertEqual(self.mini.did, ["recycle"])
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending")
+
+    def test_an_unreadable_log_keeps_the_last_verdict(self) -> None:
+        self.mini.lines.append((NOW - 300, health.WEDGE_SIGNATURE))
+        self.mini.recycler = None
+        self.run_once()
+        self.mini.lines = None
+        self.assertEqual(self.ids(self.run_once(NOW + 120)), ["testmanagerd_wedged"])
+
     def test_tries_run_out(self) -> None:
         self.mini.lines.append((NOW - 300, health.WEDGE_SIGNATURE))
         self.mini.recycler = lambda: "testmanagerd: stuck: pid 10 outlived SIGKILL"
@@ -214,6 +232,13 @@ class Tailscale(Base):
         self.run_once(NOW + 120)
         self.assertEqual(self.mini.did, ["vpn C7E1635B-DD04-49D8-A16F-FB4E34804764"])
 
+    def test_no_answer_never_restarts_the_tunnel(self) -> None:
+        self.mini.ts = ("app", "no answer")
+        self.run_once()
+        report = self.run_once(NOW + 120)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertEqual(self.mini.did, [])
+
     def test_standalone_and_logged_out_are_reported_only(self) -> None:
         self.mini.ts = ("standalone", "Starting")
         self.assertEqual(self.run_once()["findings"][0]["auto_fix"], "impossible")
@@ -232,6 +257,25 @@ class Runners(Base):
         second = self.run_once(NOW + 120)
         self.assertEqual(self.mini.did, ["kickstart com.teamleaderleo.glaeda.cmux-runner.1"])
         self.assertEqual(second["findings"], [])
+
+    def test_a_runner_that_keeps_exiting_stops_being_kickstarted(self) -> None:
+        stopped = ("com.teamleaderleo.glaeda.cmux-runner.1", True, False, "0")
+        t = NOW
+        for _ in range(12):
+            self.mini.agents[1] = stopped  # it exits cleanly again after every kickstart
+            report = self.run_once(t)
+            t += health.HEAL_EVERY_S
+        self.assertEqual(self.mini.did.count("kickstart com.teamleaderleo.glaeda.cmux-runner.1"), health.HEAL_TRIES)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+
+    def test_a_held_runner_is_not_a_finding(self) -> None:
+        held = self.dir / "held"
+        (held / "actions-runner-glaeda-1").parent.mkdir(parents=True)
+        (held / "actions-runner-glaeda-1").touch()
+        saved, health.HELD = health.HELD, held
+        self.addCleanup(setattr, health, "HELD", saved)
+        self.mini.agents[1] = ("com.teamleaderleo.glaeda.cmux-runner.1", False, False, "?")
+        self.assertEqual(self.run_once()["findings"], [])
 
     def test_the_first_runner_agent_is_zero(self) -> None:
         self.mini.agents[0] = ("com.teamleaderleo.glaeda.cmux-runner", True, False, "0")
