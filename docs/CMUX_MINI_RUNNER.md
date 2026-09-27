@@ -410,6 +410,23 @@ count is refused. Every instance bakes the same `--capacity-units`, so the mini
 never runs more than its units, however many runners pick up jobs. Uninstall one
 with `--uninstall --apply --instance K`.
 
+### Build worker steps on the same ledger (cmuxterm-hq#794)
+
+The build worker can run CI steps (cmuxterm-hq `ci-step` jobs) beside the runners' jobs, admitted by the
+same `take_capacity`, so a mini claims a step only when it fits:
+
+    glaeda-cmux-runner-hook fits    --capacity-units U
+    glaeda-cmux-runner-hook admit   --class light --job-key KEY --watch-pid WORKER_PID --capacity-units U
+    glaeda-cmux-runner-hook release --job-key KEY
+
+Pass the `--capacity-units` (and `--compile-slots`, `--canonical-roots`) the runners' hooks bake, so the
+worker scans the same unit files. `fits` prints the step classes (`light`, `isolated`, `simulator`) the mini
+could admit now, from the listener gate's probe, for the worker's heartbeat. `admit` takes the class's units
+and tokens without waiting and leaves them with a holder keyed `ci-step-KEY` that watches the worker's pid,
+or exits 1 with the capacity reason. Each prints one JSON line. A dev build's exclusive host lock and a
+step's shared one exclude each other, as with runner jobs. Steps take no root, persistent-dd or gui token
+yet; those classes move behind `admit` with compile placement.
+
 ## 2e. Trusted-only runners on a mini that holds a secret
 
 A mini that holds a secret, such as the fleet-cas signing key on the writer mini, must never run PR
