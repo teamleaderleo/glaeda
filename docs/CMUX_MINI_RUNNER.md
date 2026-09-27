@@ -121,8 +121,9 @@ What `--apply` does:
      `tests-build-and-lag` 1 unit plus the `gui` token (one console session),
      test-e2e's `build` (compile, then the selected tests in the console session) 2 units
      (it takes the `gui` token itself before its tests, with take-gui), test-e2e's `test` 1
-     unit plus the `gui` token,
-     `cli-product-tests`, `swift-package-tests` and the side lanes `cli-pipe-regressions`,
+     unit plus the `gui` token, `cli-product-tests` 1 unit plus the `gui` token (its XCTest
+     run shares the user's testmanagerd with the GUI jobs, see 2h2),
+     `swift-package-tests` and the side lanes `cli-pipe-regressions`,
      `remote-daemon-macos-tests` and `claude-wrapper` 1 unit, and any other job counts
      as a compile. When units or a token are taken it refuses at once with
      `refused: capacity: ...`, which the refusal rescue re-runs elsewhere; it never
@@ -182,6 +183,19 @@ What `--apply` does:
    - **When the fleet has the host.**
      - A process holds `host.lock` exclusively. The gate checks every 2 s with one
        non-blocking shared `flock`, which only an exclusive holder blocks.
+     - Except a yielding build: a fleet build that writes its pid to `host.lock.yield`
+       while it waits for or holds the lock (cmuxterm-hq's catch-up fill on the writer
+       mini) neither stops the listener nor counts as a waiter, as long as `lsof` shows it
+       and its own processes (descendants and their process groups: the fill passes the
+       lock fd to its build) are the only fleet processes with the lock open. A fill
+       waiting behind another fleet build yields nothing, so that build still stops the
+       listener. The gate keeps that verdict for 30 s, since `lsof` is not free. A job that meets a
+       yielding holder writes `host.lock.preempted` (`{by, at, pid}`, so the fill can tell
+       the note is about itself), sends it SIGTERM and waits for the lock: 15 s under the
+       capacity admission lock (half of what another admission waits for it), 90 s on the
+       single-runner path. Then it runs. A pid without the lock open is never signalled.
+       A fresh DerivedData seed saves more PR compile time than one more main fill, which
+       a quiet tick redoes from the compile cache.
      - A reservation is active.
      - With weighted capacity only: a process waits for the lock. The gate checks with
        `lsof` at most every 30 s, because each call costs about 0.3 s of CPU on a mini.
@@ -203,6 +217,17 @@ What `--apply` does:
        canonical root is taken, or every unit is. Only it carries the gui pool label, so
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
        mini's gui runner instead.
+   - **When the console session cannot run GUI tests** (gui runner only). GUI jobs run
+     in the console user's session, and a mini whose auto-login session is screen-locked
+     (display sleep, then the lock) or sits at the login window fails every one
+     (cmuxterm-hq#757). The gate reads `ioreg -n Root -d1` (`IOConsoleUsers`:
+     `kCGSSessionOnConsoleKey`, `CGSSessionScreenIsLocked`; Root's `IOConsoleLocked`) at
+     most every 30 s and holds the gui runner while the session is locked or no user is
+     logged in. The same check refuses at job-started any job on the gui runner or of a
+     `gui` class (`refused: console: ...`, before any capacity is taken), so cmux's
+     rescue re-runs it elsewhere, and makes `take-gui` give way (exit 3), so test-e2e's
+     build leaves its tests to the `test` job. An unreadable state changes nothing;
+     `GLAEDA_RUNNER_CONSOLE_GATE=0` in the runner LaunchAgent turns it off.
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`.
      - The listener's graceful exit ends its session, and GitHub shows the runner as
@@ -316,6 +341,24 @@ it refuses first if that name now belongs to a different runner id. A re-run tha
 passes neither `--labels` nor `--manifest` keeps the labels and name it registered
 and never relabels. If `--replace` itself was interrupted after GitHub assigned the
 new id, the id check blocks; pass `--replace` to take the name back.
+
+The plan names every label drift on the register step: `label drift (receipt)` or
+`label drift (GitHub)`, "registered labels differ from what this version would
+register: +added -removed". A re-run without `--manifest` still reports GitHub drift,
+and says to pass `--manifest` and `--member` to re-register.
+
+**Never relabel from a stale copy.** A copy's labels come from its own code: the Sep 24
+copy in cmux15's `~/glaeda-runner/scripts` planned "unchanged" because it predated the
+`glaeda-runner-<name>` label. On a mini with an OTA release installed (`glaeda-update`),
+a copy whose runner files differ from that release and are older (by its
+`.glaeda-source.json` stamp, its release tag, or its git commit date; unknown counts as
+older) fails the `scriptCopy` preflight: the plan is not ready, `--apply` is refused, the
+note names the release's own copy to run, and the release's plan labels are shown as
+`label drift (release ...)`. `--allow-stale` overrides. `glaeda-cmux-runner-fleet`
+writes the stamp when it stages; `glaeda-update` refreshes an older staged copy from the
+installed release every hour, and keeps a copy an operator staged on the release's day
+or later. From an operator Mac, cmuxterm-hq's `fleet runner relabel HOST` stages glaeda's
+`origin/main` in a temporary directory and does the whole relabel.
 
 Relabelling keeps the runner's name. Moving an existing `<hostname>-glaeda` runner
 to a member whose name `<member>-glaeda` differs is a different install: the
@@ -441,7 +484,8 @@ in at the producer's root. So one root job per root per mini:
 - Root jobs are compile (macos-compile-admission and any unknown job id), compile-gui (test-e2e's `build`:
   a producer that takes the gui token later, in its own step with take-gui, and no persistent-dd: it only
   clones its root's kept state, which the root token already guards), gui (app-host-unit-tests,
-  tests-build-and-lag, app-host-test-rerun's `rerun`, test-e2e's `test`) and product (cli-product-tests).
+  tests-build-and-lag, app-host-test-rerun's `rerun`, test-e2e's `test`) and product (cli-product-tests,
+  which also holds the gui token).
   Each also takes an exclusive `capacity/root-k.token` (k = 1 to `canonicalRoots`), and the hook writes `CMUX_CI_CANONICAL_ROOT=<root k>` to `$GITHUB_ENV` and
   `$RUNNER_TEMP/glaeda-canonical-root`. The root follows the token, never the runner instance.
 - Light jobs take no root.
@@ -449,6 +493,8 @@ in at the producer's root. So one root job per root per mini:
   key names the root, so the job holds that root itself with `glaeda-canonical-root take <root>` before
   it clears it. On a trusted mini with 2 runners, 4 units and `canonicalRoots` 2, two seeds (one per
   root) run at once; with one runner nothing changes.
+- The nightly app build (nightly.yml's `build-nightly-app`, trusted runners only) is isolated: 2 units,
+  no token. It compiles into its own workspace, so it never holds a root a seed on the same mini waits for.
 - `defaults.runner.classes.<class>.canonicalRoots` (default 1, at most `runners`) runners per mini
   (instances 0 and up) also carry the root pool label `glaeda-root-<class>-xcode-<version>`. Root jobs
   should run on that label, so GitHub queues them until a root runner is free instead of handing one to a
@@ -497,6 +543,20 @@ in at the producer's root. So one root job per root per mini:
   detached holder tied to the job's Runner.Worker and released by job-completed. A re-take of a root the
   same job already holds (a compile restoring its own product) is a no-op. It exits 1 when the root is
   still busy after the wait, and 2 for a bad root or outside a runner job.
+- A root's token comes free when its job ends, but its processes may not have. A step that ignores the
+  runner's SIGINT and SIGTERM has its process tree killed, and what xcodebuild started outside that tree
+  (its build service and compilers) keeps writing the root for seconds (cmux run 36312829569: the next
+  holder's `rm -rf <root>/src` failed with "Directory not empty"). So whenever a job takes a root, at
+  admission or with `take`, the hook first stops this user's leftovers still using it: a process with a
+  working directory in the root (lsof) or an argument naming a path inside it (ps) that is under no live
+  Runner.Worker. SIGTERM, then SIGKILL after 3 s, for up to 15 s. Processes of live jobs are spared (a
+  job that switched roots may still name its old one), and so is the hook itself. The admission line or
+  take-root's stderr says `stopped N leftover process(es) in <root>`.
+- A producer's root this mini does not have (a product compiled at `/private/tmp/cmux-ci-2` on a two-root
+  mini, restored on a one-root mini) is still a valid path to alias: nothing compiles there on this mini.
+  Every taker holds that root's `root-N.token`, so two jobs never own its alias at once. A consumer that
+  already holds every root this mini has (its admission on a one-root mini) takes it beside them, as an
+  exception to one root per job; it cannot deadlock, since the root's other takers hold none of this mini's.
 - A second, different root is refused (exit 2): two jobs taking two roots in opposite orders would deadlock.
   `take ROOT --switch` swaps instead.
   - It waits for ROOT while still holding the old root, and lets the old one go only once ROOT is held.
@@ -554,9 +614,53 @@ fail with errSecInteractionNotAllowed. On PR runners (not trusted ones) the job-
 it first in the user search list and the user's default keychain. It holds test junk only, and every PR job
 can read it.
 
+Unlock state is per security session, and each runner's LaunchAgent has `SessionCreate`, so that unlock
+never reaches the desktop. There the default keychain stayed locked, and Spotlight put "Spotlight wants to
+use the cmux-ci keychain" over UI tests (cmux run 36309272077). The hook therefore also writes and kickstarts
+`com.teamleaderleo.glaeda.test-keychain-unlock`, a LaunchAgent limited to the Aqua session that runs
+`security unlock-keychain` on the test keychain. Its RunAtLoad unlocks it again at every login.
+
+The unlock alone does not clear a prompt that is already up. At every login the keychain starts locked in the
+new desktop session, and daemons ask for the default keychain within seconds, usually before the agent runs.
+securityd queues one SecurityAgent prompt per request and keeps it after the keychain is unlocked. Killing
+SecurityAgent cancels only the prompt on screen; securityd starts a new one for the next queued prompt. On
+cmux14 and cmux8s (2026-09-27) prompts queued at the 09-26 reboot were still up the next morning, and the
+assistantd one came back each time the cmux e2e action closed SecurityAgent (cmux run 36317492985). So after
+the unlock the agent kills SecurityAgent, up to 5 times, until no queued prompt starts it again. It does so
+at every job start and every login. No keychain prompt is wanted on a PR mini. When the hook changes the
+agent, it boots the old one out before loading the new one, since a loaded agent keeps running its old
+program.
+
+`cmux-ci` stays the user's default keychain. `swift test` runs in a runner's own session, where the login
+keychain is locked, and tests that add items without naming a keychain need an unlocked default. The
+default is per user, not per session.
+
 **Never store credentials as the runner user on a PR mini** (`gh auth login`, `git credential-osxkeychain`,
 `security import`, Keychain Access). Without an explicit keychain they land in `cmux-ci`, and any later PR job
 can copy that file and read them. Credentials belong on trusted or signing hosts.
+
+## 2h2. A fresh testmanagerd for each XCTest job
+
+Every macOS XCTest run on a mini goes through the runner user's `/usr/libexec/testmanagerd`, a launchd agent
+started on demand. On cmux7s (2026-09-25) it stopped half way through tearing down a control session. From
+then on it accepted xcodebuild's control connections without creating the IDE session, and every XCTest
+run there failed after about 7.5 minutes with `The test runner hung before establishing connection` (exit 65)
+for ten hours. `launchctl kickstart` is refused under SIP, and the wedged daemon ignored SIGTERM.
+
+- On PR runners (`--recycle-testmanagerd`, baked in beside `--test-keychain`), a job that takes the gui
+  token stops the user's testmanagerd, and launchd starts a fresh one at the job's first test. It happens at
+  job start for a job that holds the gui token from admission (gui and product jobs), and in `take-gui`
+  for test-e2e's `build`, whose tests start after it. The admission line (or take-gui's stderr) ends with
+  `testmanagerd: stopped pid N`, `killed pid N (it ignored SIGTERM)`, `not running` or `kept`.
+- It is kept while any `xctest` or `xcodebuild test`/`test-without-building` runs on the mini. The gui
+  token keeps the console-session XCTest jobs apart; this check covers the rest: `swift test` (xctest) in
+  swift-package-tests and the light side lanes, the simulator jobs' xcodebuild, and guests.
+- SIGTERM first; after 3 s, SIGKILL unless a test has started meanwhile (then it is kept for that run).
+  Zombies count as gone. A daemon that outlives SIGKILL by 5 s refuses the job
+  (`refused: testmanagerd: stuck: ...`) and frees its capacity, so the refusal rescue runs it elsewhere.
+  `glaeda-fleet-status` reports such refusals as `jobs.testmanagerd_stuck`; a person decides on a logout
+  or reboot.
+- The simulators' own testmanagerd (under the iOS runtime root) is never touched.
 
 ## 2i. Seeds over the LAN from the trusted seeder
 
@@ -696,19 +800,20 @@ rebuild-tier from main's head, and each mini had sat fully idle 17 to 33% of the
 
 `glaeda-idle-warm` (the 5-minute idle-warm LaunchAgent from glaeda-mini-setup) closes that gap:
 
-- **When.** No Runner.Worker or xcodebuild, no job started or ended for 10 minutes, 1-minute load under
+- **When.** No Runner.Worker or xcodebuild, no job started or ended for 3 minutes (`IDLE_S`), 1-minute load under
   0.25 per core, thermal pressure nominal, at least 136 GiB free (the 100 GiB admission floor plus a cold
   compile), no reservation, no fleet build holding or waiting for the host lock. Never on cmux-mac-mini (hostname cmuxs-Mac-mini-5, the production
   iOS soak box) or Lawrence's machines, never next to a trusted-only runner (a seeder), and only on
   capacity-mode runners. `touch ~/.config/glaeda/idle-warm.disabled` stops it on one mini.
 - **Which root.** The hook's own prediction (`warm_root_costs`) of each root's compile for main's head, from
   the seed prefetch's mirror and the job-written model: a rebuild root first, then far, then one it could not
-  compare, then one with no kept build (a cold build), skipping any already built or tried for that head. Three failed builds in a row pause it for six hours.
+  compare, then one with no kept build (a cold build), skipping any already built or tried for that head. When the hook can compare no root at all (every kept stamp predates the fields it reads, as on the light
+  minis after a quiet spell), every root counts as one it could not compare, so one catch-up per root re-stamps it. Three failed builds in a row pause it for six hours.
 - **How.** It loads the hook the runners run (from their `glaeda-hooks/`) and refuses if that hook predates
   the yield below, so a rollout in either order is safe. Under `capacity/admission.lock` it takes the root's
   token, a persistent-dd token and a compile's units, with the host lock shared, writes
   `capacity/idle-warm.json` (its pid and those names), and lets the admission lock go. Then cmux's
-  `scripts/ci/owned_catch_up.sh`, run from a clean checkout of main's head kept under `ci/.catch-up/cmux`,
+  `scripts/ci/owned_catch_up.sh`, run from a clean checkout of main's head kept under `ci/.catch-up/cmux` (a shallow, blobless clone),
   runs the steps of a main dispatch's compile admission (check, prefer against kept seeds, adopt, record,
   compile, keep with main's head as `merged_onto`, save). Logs: `ci/.catch-up/logs/`, one line per run in
   `~/Library/Logs/glaeda-idle-warm.jsonl`.
@@ -728,6 +833,27 @@ rebuild-tier from main's head, and each mini had sat fully idle 17 to 33% of the
 
 Check one mini: `glaeda-idle-warm` (plan) says whether it would warm now and which root, or why not.
 
+## 2l. Mini health: heal what the runner user can, report the rest
+
+`glaeda-mini-health` (the 2-minute mini-health LaunchAgent from glaeda-mini-setup, a no-op without glaeda
+runners) looks for what stopped runner minis on 2026-09-25 and 26 without anything noticing:
+
+| Finding | Heal |
+|---|---|
+| `console_locked`, `console_no_user` | none: root and a reboot (the hook already refuses GUI jobs there, #1286) |
+| `autologin_locks` (loginwindow `autoLoginUserScreenLocked`), `display_sleep` | none: root |
+| `testmanagerd_wedged`: the newest session line of this user's testmanagerd is `XCIDESession is responsible for cleaning up its socket`, 90 s old, nothing after it | the hook's `recycle_testmanagerd` (#1281) while no test runs; a hook without it gets the finding only |
+| `tailscale_down`: not `Running`, two runs in a row | `tailscale up` when Stopped, else `scutil --nc stop/start` of the Tailscale VPN service; no answer, a standalone tailscaled or a logged-out node is reported only |
+| `runner_stopped:<agent>`: a runner LaunchAgent loaded but not running, two runs in a row | `launchctl kickstart` (nothing runs in it, so no job is cut) |
+| `runner_unloaded:<agent>` (not one `cmux_mini_fix.sh` holds) | none: `glaeda-cmux-runner-fleet --apply` |
+
+A heal runs at most every 10 minutes and 3 times a day per finding (a heal that worked but did not last counts),
+then the finding reads `impossible`. The report,
+`~/.local/state/glaeda/mini-health/health.json` (`glaeda-mini-health/v1`: each finding's id, severity, first
+sighting, evidence, `auto_fix` pending or impossible, and the heals of the last day), is what ci-dash's probe
+reads; ci-dash's Health section names the operator command for the rest. `glaeda-mini-health` alone prints
+the report without healing; `touch ~/.config/glaeda/mini-health.disabled` keeps it reporting but stops heals.
+
 ## 3. Verify
 
 ```bash
@@ -741,8 +867,21 @@ Expect `status: "online"` and labels `self-hosted, macOS, ARM64, glaeda-mini`.
 
 ## 4. Route
 
-The plan prints these; it never runs them. Start with one variable, watch a few
-jobs, then add the rest:
+**Fleet members (`--manifest`) route through cmux's PR pool picker**, which already sends jobs
+to their pool labels (`CI_PR_POOL_OWNED`, `CI_OWNED_POOL_SLOTS`); nothing is set per runner,
+and their plan prints no `MACOS_RUNNER_*` line. Setting those variables to `glaeda-mini`
+would bypass the picker and send every PR job to the generic label. A trusted member
+(section 2e) prints the nightly pair instead, with its rollback:
+
+```bash
+gh variable set CI_SEED_TRUSTED_POOL --body glaeda-trusted-std-xcode-26.6 --repo manaflow-ai/cmux
+gh variable set CI_NIGHTLY_TRUSTED_RUNNER --body glaeda-runner-cmux15-glaeda --repo manaflow-ai/cmux
+gh variable delete CI_NIGHTLY_TRUSTED_RUNNER --repo manaflow-ai/cmux   # rollback: nightly on Blacksmith
+```
+
+The rest of this section is for a single `--labels` runner outside the fleet. The plan
+prints these; it never runs them. Start with one variable, watch a few jobs, then add
+the rest:
 
 ```bash
 gh variable set MACOS_RUNNER_15 --body glaeda-mini --repo manaflow-ai/cmux

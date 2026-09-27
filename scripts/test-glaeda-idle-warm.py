@@ -113,6 +113,19 @@ class GateTest(Base):
         os.utime(log, (50, 50))
         self.assertEqual(warm.last_job_at(log), 200)
 
+    def test_idle_after_three_quiet_minutes(self) -> None:
+        self.assertEqual(warm.IDLE_S, 180)
+        saved = warm.last_job_at
+        stub = types.SimpleNamespace(thermal_pressure_level=lambda: 1)
+        try:
+            warm.running = lambda: ""
+            warm.last_job_at = lambda: 1000.0
+            self.assertIn("a job ran 179 s ago", warm.idle_refusal(stub, 1179.0, self.state))
+            # Past IDLE_S a later gate (load, heat, disk) answers, never the job gate.
+            self.assertNotIn("a job ran", warm.idle_refusal(stub, 1181.0, self.state))
+        finally:
+            warm.last_job_at = saved
+
     def test_pick_root_warms_the_farthest_root_once_per_head(self) -> None:
         predicted = {"root-1": {"seconds": 140.0, "tier": "near", "app_swift_files": 2},
                      "root-2": {"seconds": 266.5, "tier": "far", "app_swift_files": 9},
@@ -128,8 +141,14 @@ class GateTest(Base):
                  "root-3": {"tier": "far", "app_swift_files": 7}}
         ranked = types.SimpleNamespace(warm_root_costs=lambda order, base, number, state: (order, mixed))
         self.assertEqual(warm.pick_root(ranked, 3, HEAD, self.state, {"roots": []})[0], 3, "far before unknown, cold")
-        cold = types.SimpleNamespace(warm_root_costs=lambda *args: ([], {}))
-        self.assertIn("cannot compare", warm.pick_root(cold, 2, HEAD, self.state, {}))
+        blind = types.SimpleNamespace(warm_root_costs=lambda *args: ([], {}))
+        root, guess = warm.pick_root(blind, 2, HEAD, self.state, {})
+        self.assertEqual(root, 1, "the hook compared nothing (a stamp older than its fields): warm anyway")
+        self.assertEqual(guess["root-2"]["tier"], "unknown")
+        self.assertEqual(warm.pick_root(blind, 2, HEAD, self.state, {"roots": {"1": {"head": HEAD}}})[0], 2)
+        self.assertIn("near", warm.pick_root(blind, 2, HEAD, self.state,
+                                             {"roots": {"1": {"head": HEAD}, "2": {"head": HEAD}}}),
+                      "once per root per head")
 
 
 class AttemptTest(Base):
@@ -313,6 +332,43 @@ class YieldTest(Base):
         script = checkout / "scripts/ci/owned_catch_up.sh"
         script.write_text(FAKE_CATCH_UP)
         script.chmod(0o755)
+
+
+class CheckoutTest(unittest.TestCase):
+    def test_first_clone_is_shallow_blobless_and_checks_out_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source, work = Path(tmp) / "source", Path(tmp) / "work"
+            run = lambda *args, cwd=source: subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+            source.mkdir()
+            run("init", "-q", "-b", "main")
+            run("config", "uploadpack.allowFilter", "true")
+            for text in ("zero\n", "one\n"):  # two commits, so a depth-1 clone is shallow
+                (source / "a.txt").write_text(text)
+                run("add", "a.txt")
+                run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", text.strip())
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+            work.mkdir()
+            saved, saved_depth = warm.REPO_URL, warm.CLONE_DEPTH
+            self.addCleanup(setattr, warm, "CLONE_DEPTH", saved_depth)
+            warm.CLONE_DEPTH = 1
+            warm.REPO_URL = source.as_uri()
+            try:
+                warm.prepare_checkout(work, head)
+            finally:
+                warm.REPO_URL = saved
+            checkout = work / "cmux"
+            self.assertEqual((checkout / "a.txt").read_text(), "one\n")
+            partial = subprocess.run(["git", "config", "remote.origin.partialclonefilter"], cwd=checkout,
+                                     capture_output=True, text=True).stdout.strip()
+            self.assertEqual(partial, "blob:none")
+            self.assertTrue((checkout / ".git" / "shallow").is_file())
+            warm.REPO_URL = source.as_uri()
+            try:
+                warm.prepare_checkout(work, head)  # the next run fetches into the kept clone
+            finally:
+                warm.REPO_URL = saved
+            self.assertEqual((checkout / "a.txt").read_text(), "one\n")
 
 
 class NoEmDashTest(unittest.TestCase):

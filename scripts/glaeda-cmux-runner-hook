@@ -26,6 +26,8 @@ re-runs it elsewhere) when:
     Unix seconds) with now < until, whoever owns it; an unreadable or invalid file also refuses, an expired
     one is ignored (parsed by glaeda_reservation.py, installed next to this hook)
   * free disk is below --min-free-gib
+  * the job needs the console session (a gui class job, or any job on the --gui-runner) and the console
+    session is screen-locked or no user is logged in at the console (console_refusal, cmuxterm-hq#757)
   * another build holds the fleet host lock (/Users/Shared/cmux-build-fleet/host.lock, the flock that
     with-host-lock and the build worker take)
   * with --require-eligible (every fleet member): the local Glaeda node is not eligible, or its toolchain
@@ -54,7 +56,8 @@ runs under the runner LaunchAgent's listen.sh: it runs DIR/run.sh, and while the
 host lock, a reservation, or a fleet build waiting for the lock), every capacity unit on the mini is
 taken, or the mini is saturated (its 1-minute load at least GATE_LOAD_PAUSE per core), it stops the idle
 runner's listener so GitHub routes the job to another runner instead of here to be refused or slowed
-down (Gate). Full means every unit this runner's own --capacity-units scans, read from its job-started hook;
+down (Gate). A gui runner also stops listening while the console session is locked or nobody is logged in there
+(console_refusal). Full means every unit this runner's own --capacity-units scans, read from its job-started hook;
 for a root runner it also means the mini cannot admit a compile or an app-host shard (mini_full).
 """
 
@@ -68,6 +71,7 @@ import importlib.util
 import json
 import math
 import os
+import plistlib
 import re
 import select
 import shutil
@@ -139,17 +143,25 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # with glaeda-canonical-root take (cmux "seed far main pushes in their own lane") before it clears it. It
 # never touches compile admission's kept DerivedData, so no persistent-dd either. Two seed jobs then fit
 # on one trusted mini with two runners, four units and two canonical roots.
+# nightly.yml's `build-nightly-app` (trusted runners only, cmux "build the nightly app on the trusted owned
+# minis first") compiles the universal Release app into its own workspace (build-universal, cleared at job
+# start) and restores its own compile cache lineage: no canonical root, no kept DerivedData, no GUI. As an
+# unknown id it would take the compile class and hold the root a seed on the same mini waits for.
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("app-host-test-rerun.yml", "rerun"): "gui",
                         ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui",
-                        ("seed-derived-data.yml", "seed"): "seed"}
+                        ("seed-derived-data.yml", "seed"): "seed",
+                        ("nightly.yml", "build-nightly-app"): "isolated"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
 # restore a product into with rm -rf of its src, so one root job per root per mini (cmux#14338 adds a second).
+# product (cli-product-tests) runs its XCTest bundle through the same user testmanagerd as the gui jobs, so it
+# holds the gui token too: one XCTest run at a time per mini, which lets a gui job restart that daemon
+# (recycle_testmanagerd) without cutting another job's run.
 # compile-gui takes no gui token at job start: the step that decides whether the build tests takes it with
 # glaeda-canonical-root take-gui (cmux#14705), and leaves the tests to test-e2e's `test` job when take-gui gives
 # way or times out. So its compile leaves the console session to other GUI jobs.
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
-    "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("root",)),
+    "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
     "compile-gui": (2, ("root",)),
     "isolated": (2, ()), "simulator": (2, ("simulator",)), "light": (1, ()), "seed": (2, ())}
 # Guest repositories (any repo other than --home-repo, admitted by an org-scoped runner's --allowed-owner)
@@ -327,7 +339,12 @@ WARM_NOT_APP = ("cmuxTests/", "cmuxUITests/")
 # The model fitted on 223 admissions of 2026-09-25/26 (cmux scripts/ci/warm-distance-model.json), used
 # until a job has copied one to this mini.
 WARM_DEFAULT_MODEL = {"near_app_swift_files": 5, "hot_files": [],
-                      "tiers": {"near": 140.0, "far": 266.5, "rebuild": 400.7}, "unknown": 309.7}
+                      "tiers": {"near": 140.0, "far": 266.5, "rebuild": 400.7}, "kept": {}, "unknown": 309.7}
+# Every root the hook compares starts from its kept build, and a kept start compiles faster than the tier's
+# mix of kept and seed starts (a near one about 90 s against 140 s). cmux's model keeps the p50 per tier and
+# start kind (tiers_by_start, with counts); a tier's kept cell costs a root once it has this many compiles,
+# as cmux warm_distance.py predict() does (MIN_START_ROWS).
+WARM_MIN_START_ROWS = 5
 
 
 def warm_app_swift(path: str) -> bool:
@@ -349,7 +366,18 @@ def read_warm_model(state_dir: str = "") -> dict[str, Any]:
         hot = [str(path) for path in model.get("hot_files") or [] if isinstance(path, str)][:200]
         near = int(model.get("near_app_swift_files") or 5)
         unknown = seconds(((model.get("start_classes") or {}).get("none") or {}).get("expected") or tiers["far"])
-        return {"near_app_swift_files": near, "hot_files": hot, "tiers": tiers, "unknown": unknown}
+        kept = {}
+        by_start = model.get("tiers_by_start")
+        for name in tiers:
+            try:  # a model without tiers_by_start, a sparse cell or a bad one: that tier's p50
+                cell = by_start[name]["kept"]
+                count = cell["n"]
+                if isinstance(count, int) and not isinstance(count, bool) and count >= WARM_MIN_START_ROWS \
+                        and not isinstance(cell["p50"], bool) and seconds(cell["p50"]) > 0:
+                    kept[name] = seconds(cell["p50"])
+            except Exception:  # noqa: BLE001
+                pass
+        return {"near_app_swift_files": near, "hot_files": hot, "tiers": tiers, "kept": kept, "unknown": unknown}
     except Exception:  # noqa: BLE001 - a model any job can write only ever falls back to the default
         return dict(WARM_DEFAULT_MODEL)
 
@@ -429,8 +457,9 @@ def warm_root_costs(order: list[int], base: str, number: int | None, state_dir: 
     A root's prediction is the tier of main's changes from its kept build's merge base to BASE plus the kept
     pull request's own files and JOB_FILES, the job's own (the event's changed_files, an upper bound: the
     mirror has no pull request heads), unless the kept build is pull request NUMBER's, which has both
-    built already (09-26: #14149's 124 files were predicted near from other pull requests' builds). Roots
-    of one tier rank by that file count, then the runner's own root. A kept build that cannot be compared (a base past the mirror's depth,
+    built already (09-26: #14149's 124 files were predicted near from other pull requests' builds). It
+    costs that tier's kept-start p50 when the model has one (read_warm_model()). Roots of one tier rank
+    by that file count, then the runner's own root. A kept build that cannot be compared (a base past the mirror's depth,
     a stamp of an older cmux) costs the model's unknown start; a root with no kept build at all goes last.
     Falls back when no root could be compared, the mirror is missing, or WARM_BUDGET_S runs out.
     """
@@ -474,7 +503,7 @@ def warm_root_costs(order: list[int], base: str, number: int | None, state_dir: 
         count = len(changed) + extra + (0 if same else max(0, job_files))
         hot = bool(changed & set(model["hot_files"]))
         name = ("rebuild" if package or hot else "far" if count > model["near_app_swift_files"] else "near")
-        costs[copy] = (model["tiers"][name], name, count)
+        costs[copy] = (model["kept"].get(name, model["tiers"][name]), name, count)
         known += 1
     if not known:
         return [], {}
@@ -575,6 +604,17 @@ GATE_THERMAL_RELEASE = 1
 GATE_THERMAL_EVERY_S = 30.0
 NOTIFYUTIL = "/usr/bin/notifyutil"
 THERMAL_PRESSURE_KEY = "com.apple.system.thermalpressurelevel"
+# GUI tests (app-host shards, tests-build-and-lag, test-e2e) run in the console user's session. A mini whose
+# auto-login session is screen-locked (displaysleep, then the lock) or sits at the login window fails every one of
+# them (cmuxterm-hq#757). ioreg's IOConsoleUsers names the console session (kCGSSessionOnConsoleKey) and whether its
+# screen is locked (CGSSessionScreenIsLocked), readable from any user or launchd domain. job-started refuses a job
+# that needs the console there, take-gui gives way, and a gui runner's listener gate holds it off, so GitHub hands
+# the job to another mini. An unreadable state (no ioreg, as on Linux, or a timeout) changes nothing.
+# GLAEDA_RUNNER_CONSOLE_GATE=0 turns all of it off.
+IOREG = os.environ.get("GLAEDA_RUNNER_IOREG") or "/usr/sbin/ioreg"
+CONSOLE_GATE = os.environ.get("GLAEDA_RUNNER_CONSOLE_GATE", "1") != "0"
+CONSOLE_CLASSES = ("gui",)  # job classes that run in the console session from their first step
+GATE_CONSOLE_EVERY_S = 30.0
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -891,6 +931,109 @@ def runner_worker_pid() -> int | None:
 ROOT_SHIM = "glaeda-canonical-root"
 
 
+# The user's testmanagerd (a launchd agent started on demand) pairs xcodebuild with the xctest it launches.
+# On cmux7s (2026-09-25) it stopped half way through tearing down a control session and from then on
+# accepted xcodebuild's control connections without creating the IDE session, so every macOS XCTest run
+# there hung ("The test runner hung before establishing connection", exit 65) for 10 hours. launchctl
+# kickstart is refused under SIP, and the wedged daemon ignored SIGTERM. So a job taking the gui token
+# (every console-session XCTest job holds it) stops the daemon while no test runs, and launchd starts a
+# fresh one at the next connection. The simulators' own testmanagerd runs from the runtime root, not here.
+TESTMANAGERD = "/usr/libexec/testmanagerd"
+TESTMANAGERD_TERM_S = 3.0
+TESTMANAGERD_KILL_S = 5.0
+TESTMANAGERD_STUCK = "testmanagerd: stuck"
+# A process that may be talking to testmanagerd: an XCTest runner, or xcodebuild testing. A false match only
+# keeps the daemon, so these err wide.
+XCTEST_RUNNING = re.compile(r"(?:^|/)xctest(?:\s|$)|(?:^|/)xcodebuild\s(?:.*\s)?(?:test|test-without-building)(?:\s|$)")
+
+
+def _ps_table() -> list[tuple[int, int, str, str]] | None:
+    """(pid, uid, state, command) for every process, or None when ps fails. Arguments of other jobs' processes
+    are read to decide, never printed."""
+    try:
+        out = subprocess.run(["/bin/ps", "-Aww", "-o", "pid=,uid=,stat=,command="], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, errors="replace", timeout=5, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
+            rows.append((int(parts[0]), int(parts[1]), parts[2], parts[3].strip()))
+    return rows
+
+
+def recycle_testmanagerd(program: str = TESTMANAGERD, busy: re.Pattern[str] = XCTEST_RUNNING) -> str:
+    """Stop this user's testmanagerd unless a test is running, so the next test starts a fresh one.
+    Returns a note, never raises. A daemon that outlives SIGKILL gives a note starting TESTMANAGERD_STUCK."""
+    try:
+        return _recycle_testmanagerd(program, busy)
+    except Exception as error:  # noqa: BLE001  (a failed recycle leaves the daemon; it never fails the job)
+        return f"testmanagerd: not checked ({type(error).__name__})"
+
+
+def _recycle_testmanagerd(program: str, test_running: re.Pattern[str]) -> str:
+    uid, me = os.getuid(), os.getpid()
+
+    def survey() -> tuple[set[int], bool] | None:
+        """This user's live daemons and whether a test runs. A zombie (Z) is gone: its parent just has not reaped
+        it; so is one macOS ps marks as exiting (E), which a loaded mini can take seconds to finish."""
+        rows = _ps_table()
+        if rows is None:
+            return None
+        daemons, busy = set(), False
+        for pid, owner, state, command in rows:
+            if pid == me or state.startswith("Z") or "E" in state:
+                continue
+            if owner == uid and (command == program or command.startswith(program + " ")):
+                daemons.add(pid)
+            elif test_running.search(command):
+                busy = True
+        return daemons, busy
+
+    first = survey()
+    if first is None:
+        return "testmanagerd: not checked (ps failed)"
+    daemons, busy = first
+    if not daemons:
+        return "testmanagerd: not running (launchd starts it at the next test)"
+    if busy:
+        return "testmanagerd: kept (a test is running on this mini)"
+    pids = " ".join(map(str, sorted(daemons)))
+
+    def left_of(wait_s: float) -> tuple[set[int], bool] | None:
+        """The daemons still alive after up to wait_s, and whether a test runs; None when ps failed last."""
+        deadline = time.monotonic() + wait_s
+        while True:
+            now = survey()
+            alive = daemons & now[0] if now is not None else daemons
+            if (now is not None and not alive) or time.monotonic() >= deadline:
+                return None if now is None else (alive, now[1])
+            time.sleep(0.2)
+
+    for pid in daemons:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+    after = left_of(TESTMANAGERD_TERM_S)
+    if after is None:  # unconfirmed: never SIGKILL or refuse on a guess
+        return f"testmanagerd: sent SIGTERM to pid {pids} (not confirmed: ps failed)"
+    alive, running = after
+    if not alive:
+        return f"testmanagerd: stopped pid {pids}"
+    killed = " ".join(map(str, sorted(alive)))
+    if running:  # a test started meanwhile and may be talking to it: leave it to that run
+        return f"testmanagerd: kept pid {killed} (ignored SIGTERM; a test started)"
+    for pid in alive:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+    after = left_of(TESTMANAGERD_KILL_S)
+    if after is None:
+        return f"testmanagerd: sent SIGKILL to pid {killed} (not confirmed: ps failed)"
+    if after[0]:
+        return f"{TESTMANAGERD_STUCK}: pid {' '.join(map(str, sorted(after[0])))} outlived SIGKILL"
+    return f"testmanagerd: killed pid {killed} (it ignored SIGTERM)"
+
+
 TEST_KEYCHAIN = "cmux-ci.keychain-db"
 
 
@@ -931,6 +1074,56 @@ def ensure_test_keychain(home: Path) -> str:
         return f"test keychain: {type(error).__name__}"
 
 
+GUI_UNLOCK_LABEL = "com.teamleaderleo.glaeda.test-keychain-unlock"
+
+
+# Runs in the Aqua session: unlock, then cancel keychain prompts queued while it was locked. A prompt already
+# on screen stays there after the unlock, and killing SecurityAgent only cancels the one shown: securityd
+# starts a new SecurityAgent for the next queued prompt. Stop at the first kill that finds none (at most 5).
+# SIGKILL: a SecurityAgent showing a prompt ignores SIGTERM (cmux12s, 2026-09-27).
+GUI_UNLOCK_SCRIPT = ('/usr/bin/security unlock-keychain -p "" "$1" || exit 1\n'
+                     'n=0\n'
+                     'while [ "$n" -lt 5 ] && /usr/bin/pkill -KILL -x SecurityAgent; do n=$((n + 1)); sleep 1; done\n'
+                     'exit 0\n')
+
+
+def unlock_test_keychain_in_gui(home: Path, uid: int | None = None) -> str:
+    """Unlock the test keychain in the GUI (Aqua) security session too, and cancel keychain prompts queued there
+    while it was locked. Unlock state is per security session, and each runner's LaunchAgent has SessionCreate,
+    so the job-started unlock never reaches the desktop: there the user's default keychain stays locked and
+    Spotlight or assistantd asks for its password over UI tests. A LaunchAgent limited to Aqua runs the unlock in
+    that session: RunAtLoad covers every login, and the kickstart here covers a keychain made since.
+    Daemons ask for the default keychain within seconds of login, often before that agent runs, and securityd
+    keeps such a prompt up after the unlock (cmux14 and cmux8s, 2026-09-27: queued at the 09-26 reboot, still up
+    the next morning). So the agent then kills SecurityAgent until no queued prompt restarts it. On a PR mini
+    no keychain prompt is ever wanted. Best effort; without a GUI login there is nothing to fix."""
+    uid = os.getuid() if uid is None else uid
+    keychain = os.fspath(home / "Library/Keychains" / TEST_KEYCHAIN)
+    plist = home / "Library/LaunchAgents" / f"{GUI_UNLOCK_LABEL}.plist"
+    data = plistlib.dumps({"Label": GUI_UNLOCK_LABEL, "LimitLoadToSessionType": "Aqua", "RunAtLoad": True,
+                           "ProgramArguments": ["/bin/sh", "-c", GUI_UNLOCK_SCRIPT, "sh", keychain]},
+                          sort_keys=True)
+
+    def launchctl(*args: str) -> int:
+        return subprocess.run(["/bin/launchctl", *args], capture_output=True, text=True, timeout=15).returncode
+
+    try:
+        service = f"gui/{uid}/{GUI_UNLOCK_LABEL}"
+        if not plist.is_file() or plist.read_bytes() != data:
+            plist.parent.mkdir(parents=True, exist_ok=True)
+            aside = plist.with_name(f".{plist.name}.{os.getpid()}")
+            aside.write_bytes(data)
+            os.replace(aside, plist)  # runner instances write it at once
+            launchctl("bootout", service)  # a loaded agent keeps its old program until it is loaded again
+        # Not loaded yet: bootstrap runs it (RunAtLoad). Another instance may bootstrap first: kickstart again.
+        if launchctl("kickstart", service) and launchctl("bootstrap", f"gui/{uid}", os.fspath(plist)) \
+                and launchctl("kickstart", service):
+            return "test keychain: no GUI session to unlock it in"
+        return "test keychain: GUI session unlock started"
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"test keychain: GUI unlock {type(error).__name__}"
+
+
 def ensure_root_shim(bin_dir: Path) -> None:
     """Point FLEET_DIR/bin/glaeda-canonical-root at this hook's shim (the path cmux's restore step calls).
     Best effort and atomic: a symlink written aside and renamed over the old one."""
@@ -957,9 +1150,9 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
     it was (exit 1) and never without a root; two switchers after each other's root both time out, so
     callers keep --wait short. On success it points $GITHUB_ENV's CMUX_CI_CANONICAL_ROOT at ROOT. Prints
     the root's path."""
-    k = root_number(spec, roots)
+    k = root_number(spec)
     if k is None:
-        print(f"{PREFIX}: take-root: {spec!r} is not one of this mini's {roots} canonical root(s) "
+        print(f"{PREFIX}: take-root: {spec!r} is not a canonical root "
               "(/private/tmp/cmux-ci, /private/tmp/cmux-ci-N or N)", file=sys.stderr)
         return 2
     if not os.environ.get("RUNNER_NAME"):
@@ -972,7 +1165,14 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
     if name in held:
         print(path)
         return 0
-    if held and not (switch and all(holder_alive(root_holder_file(state_dir, old)) for old in held)):
+    # A consumer on a mini with fewer roots than the producer's (a product compiled at /private/tmp/cmux-ci-2
+    # on a two-root mini, restored on a one-root mini): nothing compiles at root k here, so only consumers
+    # alias it. A job holding every root this mini has (a consumer's admission on a one-root mini) still takes
+    # root k's token, so it and a job holding no root never share the alias. A job that takes root k first and
+    # then switches to one of this mini's roots can wait on this job while this job waits on it; neither hangs,
+    # both give up after their --wait (the restore script waits up to 1800 s). No workflow does that switch today.
+    extra = k > roots and bool(held) and set(held) >= {f"root-{n}" for n in range(1, roots + 1)}
+    if held and not extra and not (switch and all(holder_alive(root_holder_file(state_dir, old)) for old in held)):
         print(f"{PREFIX}: take-root: this job already holds {', '.join(held)}; one root per job"
               + ("" if switch else " (--switch lets go of a root with its own holder first)"), file=sys.stderr)
         return 2
@@ -1004,7 +1204,10 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
     if not ok:
         print(f"{PREFIX}: take-root: {note}", file=sys.stderr)
         return 1
-    if held:  # a switch: ROOT is held, so the old roots can go, after the record stops naming them
+    settled = settle_root(k)
+    if settled:
+        print(f"{PREFIX}: take-root: {settled}", file=sys.stderr)
+    if held and not extra:  # a switch: ROOT is held, so the old roots can go, after the record stops naming them
         with contextlib.suppress(OSError):
             roots_file(state_dir).write_text(name + "\n")
         for old in held:
@@ -1026,6 +1229,92 @@ def retake(path: Path) -> int | None:
     last try that meets a probe must not be the one that fails the job."""
     time.sleep(PROBE_RETRY_S)
     return lock_file(path, fcntl.LOCK_EX)
+
+
+# A root's token is free once its job is gone, but not every process of that job is. When a step ignores the
+# runner's SIGINT and SIGTERM, the runner kills the step's process tree, and processes xcodebuild started that are
+# no longer in that tree (its build service and compilers) keep working in the root for seconds after
+# job-completed released the token (manaflow-ai/cmux 36312829569: a cancelled compile's leftovers were still
+# writing <root>/src when the next holder, a test consumer, ran rm -rf on it: "Directory not empty"). So a job
+# that takes a root stops this user's leftovers still using it before the job goes on: a process working in the
+# root (lsof cwd) or naming a path inside it (ps) that no live job owns. A process under a live Runner.Worker is
+# spared even so: a job that switched roots (take --switch) may still name its old root in a running step's
+# arguments. The hook itself (its detached holders, and take-root waiters, which may name the root with a
+# trailing slash) is spared too. Tests point ROOT_PARENT at a temporary directory, so they never touch this
+# machine's own roots.
+ROOT_PARENT = os.environ.get("GLAEDA_CANONICAL_ROOT_PARENT") or "/private/tmp"
+ROOT_SETTLE_TERM_S = 3.0  # SIGTERM first, then SIGKILL
+ROOT_SETTLE_S = 15.0
+ROOT_SETTLE_POLL_S = 0.2
+ROOT_SETTLE_SPARED = ("glaeda-cmux-runner-hook", ROOT_SHIM)
+
+
+def settle_path(k: int) -> str:
+    return os.path.join(ROOT_PARENT, os.path.basename(canonical_root(k)))
+
+
+def root_users(path: str) -> list[int] | None:
+    """This user's leftover processes working in root `path` or naming a path inside it: none under a live
+    Runner.Worker, and not the hook. None when ps cannot tell."""
+    inside, uid = path.rstrip("/") + "/", str(os.getuid())
+    try:
+        listing = subprocess.run([PS, "-U", uid, "-ww", "-o", "pid=,ppid=,command="], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=10, check=False, env={"LC_ALL": "C"}).stdout
+        cwds = subprocess.run([LSOF, "-nP", "-w", "-a", "-u", uid, "-d", "cwd", "-Fpn"], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=10, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    parent: dict[int, int] = {}
+    command: dict[int, str] = {}
+    for line in listing.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            parent[int(parts[0])], command[int(parts[0])] = int(parts[1]), parts[2] if len(parts) == 3 else ""
+    if not parent:
+        return None
+    users = {pid for pid, argv in command.items() if inside in argv}
+    pid = 0
+    for line in cwds.splitlines():
+        if line[:1] == "p" and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line[:1] == "n" and pid in command and (line[1:] == path or line[1:].startswith(inside)):
+            users.add(pid)
+
+    def in_live_job(pid: int) -> bool:
+        for _ in range(256):
+            if pid <= 1 or pid not in command:
+                return False
+            if os.path.basename(command[pid].split(" ", 1)[0]) == "Runner.Worker":
+                return True
+            pid = parent[pid]
+        return True  # a loop in the table: leave it alone
+
+    return sorted(pid for pid in users if pid != os.getpid() and not in_live_job(pid)
+                  and not any(name in command[pid] for name in ROOT_SETTLE_SPARED))
+
+
+def settle_root(k: int) -> str:
+    """Stop the leftover processes still using root k (root_users) before this job uses it; a note for the log."""
+    path = settle_path(k)
+    if not os.path.lexists(path):
+        return ""
+    start = time.monotonic()
+    stopped: set[int] = set()
+    while True:
+        users = root_users(path)
+        if users is None:
+            return f"cannot list the processes using {path}"
+        if not users:
+            return f"stopped {len(stopped)} leftover process(es) in {path}" if stopped else ""
+        elapsed = time.monotonic() - start
+        if elapsed >= ROOT_SETTLE_S:
+            return f"{len(users)} leftover process(es) still use {path} (pids {', '.join(map(str, users[:8]))})"
+        signum = signal.SIGTERM if elapsed < ROOT_SETTLE_TERM_S else signal.SIGKILL
+        for pid in users:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signum)
+        stopped.update(users)
+        time.sleep(ROOT_SETTLE_POLL_S)
 
 
 def holder_alive(pid_file: Path) -> bool:
@@ -1056,11 +1345,14 @@ def gui_holder_wants(capacity_dir: Path, roots: list[str]) -> str | None:
     return None
 
 
-def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path) -> int:
+def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path, recycle: str | None = None,
+             busy: re.Pattern[str] = XCTEST_RUNNING) -> int:
     """glaeda-canonical-root take-gui: hold this mini's gui token (one console session) for the rest of this
     job, waiting up to wait_s. A job that already holds it (from admission) is a no-op. Exits 0 when held, 1
     when still taken after the wait, TAKE_GUI_GAVE_WAY when the holder waits for a root this job holds (see
-    TAKE_GUI_GAVE_WAY: the caller then leaves its console-session work to another job), 2 outside a job."""
+    TAKE_GUI_GAVE_WAY: the caller then leaves its console-session work to another job) or when the console session
+    is locked or has no user (console_refusal), 2 outside a job.
+    With `recycle` (the testmanagerd program), a newly taken token also restarts testmanagerd for its tests."""
     if not os.environ.get("RUNNER_NAME"):
         print(f"{PREFIX}: take-gui: RUNNER_NAME is not set (not a runner job step)", file=sys.stderr)
         return 2
@@ -1070,6 +1362,10 @@ def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path) -> int:
     if worker is None:
         print(f"{PREFIX}: take-gui: not inside a runner job (no Runner.Worker above this step)", file=sys.stderr)
         return 2
+    locked = console_refusal()
+    if locked:  # the console session cannot run the tests: leave them to a job on another mini
+        print(f"{PREFIX}: take-gui: {locked}", file=sys.stderr)
+        return TAKE_GUI_GAVE_WAY
     deadline = time.monotonic() + max(0.0, wait_s)
     while True:
         fd = lock_file(capacity_dir / "gui.token", fcntl.LOCK_EX)
@@ -1100,6 +1396,8 @@ def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path) -> int:
         release_holder(main.with_name(f"{main.stem}-gui.pid"))
         print(f"{PREFIX}: take-gui: cannot record the gui token ({type(error).__name__})", file=sys.stderr)
         return 1
+    if recycle:  # stdout stays empty for callers; a stuck daemon is only reported here, the tests will show it
+        print(f"{PREFIX}: take-gui: {recycle_testmanagerd(recycle, busy)}", file=sys.stderr)
     return 0
 
 
@@ -1194,6 +1492,125 @@ def holder_file(state_dir: Path) -> Path:
     return state_dir / (f"{HOLDER_FILE}-{name}.pid" if name else f"{HOLDER_FILE}.pid")
 
 
+# A fleet build that yields the host to runner jobs (cmuxterm-hq catch-up/fill-main.py, the fleet-cas main fill
+# on the writer mini) writes its pid to <host lock>.yield while it waits for or holds the host lock. The gate
+# then keeps listening through it, and a job that meets it preempts it instead of being refused: the hook
+# writes <host lock>.preempted, sends the pid SIGTERM (the fill stops its build and releases the lock) and
+# waits up to PREEMPT_WAIT_S for the lock. A fresh DerivedData seed saves more PR compile time than one more
+# main fill, which the next quiet tick redoes from the compile cache (cmux#14792 follow-up). The marker is
+# only a hint: the pid must be alive for the gate, and must hold or wait on the lock (lsof) to be signalled.
+YIELD_SUFFIX = ".yield"
+PREEMPTED_SUFFIX = ".preempted"
+PREEMPT_WAIT_S = 90.0
+# Under the admission lock the wait must end well before another admission gives up (ADMISSION_WAIT_S). A fill
+# that has not let go by then is still dying; the next job gets the host.
+PREEMPT_ADMISSION_WAIT_S = ADMISSION_WAIT_S / 2
+
+
+def yielding_pid(host_lock: str) -> int | None:
+    """The live pid <host_lock>.yield names, or None. Bounded and untrusted: a regular file of a few bytes."""
+    path = host_lock + YIELD_SUFFIX
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 32:
+            return None
+        pid = int(Path(path).read_text().strip())
+    except (OSError, ValueError):
+        return None
+    if pid <= 1:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def yielding_family(host_lock: str) -> set[int]:
+    """The yielding build (yielding_pid) and its descendants and their process groups: the fill passes the lock
+    fd to its recipe (a new session), so the recipe, xcodebuild and the compilers all have the lock open too.
+    Empty without a live marker; just the pid when ps cannot tell."""
+    pid = yielding_pid(host_lock)
+    if pid is None:
+        return set()
+    try:
+        listing = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,pgid="], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=15, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {pid}
+    rows = [tuple(map(int, line.split())) for line in listing.splitlines()
+            if len(line.split()) == 3 and all(f.isdigit() for f in line.split())]
+    family = {pid}
+    while True:
+        grown = family | {child for child, parent, group in rows if parent in family or group in family - {pid}}
+        if grown == family:
+            return family
+        family = grown
+
+
+def preemptible_pid(host_lock: str, ours: set[int]) -> int | None:
+    """The yielding build (yielding_pid) when it and its own processes (yielding_family) are the only fleet
+    processes with host_lock open (lsof), else None. A stale or planted marker never names a process with the
+    lock open, and a fill that only waits behind another fleet build (the worker holding the lock) is not what
+    keeps the host: neither yields it."""
+    family = yielding_family(host_lock)
+    if not family:
+        return None
+    pid = yielding_pid(host_lock)
+    others = set(lock_waiters(host_lock, ours))
+    return pid if pid in others and others <= family else None
+
+
+# The gate polls every GATE_POLL_S; lsof costs about 0.3 s of CPU, so its yielding verdict is kept per marker pid
+# for GATE_WAITER_EVERY_S. job-started always asks afresh.
+_gate_yield_verdict: dict[tuple[str, int], tuple[float, bool]] = {}
+
+
+def gate_yields(host_lock: str, ours: set[int]) -> bool:
+    pid = yielding_pid(host_lock)
+    if pid is None:
+        return False
+    key, at = (host_lock, pid), time.monotonic()
+    seen = _gate_yield_verdict.get(key)
+    if seen is None or at - seen[0] >= GATE_WAITER_EVERY_S:
+        _gate_yield_verdict.clear()
+        seen = _gate_yield_verdict[key] = (at, preemptible_pid(host_lock, ours) == pid)
+    return seen[1]
+
+
+def preempt_yielding(host_lock: str, job: str, ours: set[int]) -> str | None:
+    """Stop the yielding fleet build holding host_lock (preemptible_pid) so this job can have the host; a note
+    for the log, or None when nothing yields. The note names the pid, so the fill honors only its own."""
+    pid = preemptible_pid(host_lock, ours)
+    if pid is None:
+        return None
+    incoming = f"{host_lock}{PREEMPTED_SUFFIX}.{os.getpid()}"
+    try:
+        Path(incoming).write_text(json.dumps({"by": job[:120], "at": int(time.time()), "pid": pid}) + "\n")
+        os.replace(incoming, host_lock + PREEMPTED_SUFFIX)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(incoming)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return None
+    return f"preempted the yielding fleet build (pid {pid})"
+
+
+def wait_host_shared(fd: int, seconds: float) -> bool:
+    """A shared flock on fd, retried for up to `seconds` (after preempt_yielding)."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
+
+
 def close_all(fds: list[int]) -> None:
     for fd in fds:
         with contextlib.suppress(OSError):
@@ -1212,8 +1629,21 @@ def take_host_lock(path: str, watch_pid: int, state_dir: Path) -> tuple[bool, st
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        os.close(fd)
-        return False, "another build holds the fleet host lock"
+        preempted = preempt_yielding(path, os.environ.get("GITHUB_JOB") or "a job", holder_pids(state_dir))
+        deadline = time.monotonic() + PREEMPT_WAIT_S
+        while preempted:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                print(f"{PREFIX}: {preempted}", flush=True)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    preempted = None
+                else:
+                    time.sleep(0.5)
+        if not preempted:
+            os.close(fd)
+            return False, "another build holds the fleet host lock"
     held, note = hold([fd], watch_pid, state_dir)
     return held, (f"holding the fleet host lock for this job ({note})" if held else note)
 
@@ -1308,11 +1738,17 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                     break
                 except OSError:
                     if attempt == 5:
-                        os.close(fd)
-                        return False, "capacity: a fleet build holds the host lock"
+                        preempted = preempt_yielding(host_lock, job or "a job", holder_pids(state_dir))
+                        if preempted is None or not wait_host_shared(fd, PREEMPT_ADMISSION_WAIT_S):
+                            os.close(fd)
+                            return False, ("capacity: a fleet build holds the host lock"
+                                           + (f" ({preempted}, still held after {PREEMPT_ADMISSION_WAIT_S:g} s)"
+                                              if preempted else ""))
+                        print(f"{PREFIX}: {preempted}", flush=True)
+                        break
                     time.sleep(0.1)
             fds.append(fd)
-            waiting = lock_waiters(host_lock, holder_pids(state_dir))
+            waiting = lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock))
             # lsof sees only this user's processes, which is how the fleet worker runs today.
             if waiting:  # flock has no writer preference: stop admitting so the build worker gets in
                 return False, f"capacity: a fleet build is waiting for the host (pid {waiting[0]})"
@@ -1676,6 +2112,61 @@ def thermal_pressure_level() -> int | None:
     return int(found.group(1)) if found else None
 
 
+class ConsoleState(NamedTuple):
+    """The console session as ioreg reports it: "unlocked", "locked" or "no_user", and its user name."""
+    state: str
+    user: str | None = None
+
+
+def parse_console_users(text: str) -> ConsoleState | None:
+    """ConsoleState from `ioreg -n Root -d1` text output, or None when it names neither IOConsoleUsers nor
+    IOConsoleLocked (not the Root entry). A session counts only while on the console with its login done; none
+    (or no IOConsoleUsers at all, as at the login window) is no_user. Locked is the session's
+    CGSSessionScreenIsLocked or Root's IOConsoleLocked."""
+    rows = text.splitlines()
+    users = next((row for row in rows if '"IOConsoleUsers" =' in row), None)
+    console_locked = next((row for row in rows if '"IOConsoleLocked" =' in row), None)
+    if users is None and console_locked is None:
+        return None
+    for session in re.findall(r"\{([^{}]*)\}", users or ""):
+        def value(key: str) -> str | None:
+            found = re.search(rf'"{key}"=("[^"]*"|[^,]*)', session)
+            return found.group(1).strip('"') if found else None
+
+        if value("kCGSSessionOnConsoleKey") != "Yes" or value("kCGSessionLoginDoneKey") == "No":
+            continue
+        user = value("kCGSSessionUserNameKey")
+        if not user or user == "loginwindow":
+            continue
+        locked = value("CGSSessionScreenIsLocked") == "Yes" or (console_locked or "").rstrip().endswith("= Yes")
+        return ConsoleState("locked" if locked else "unlocked", user[:64])
+    return ConsoleState("no_user")
+
+
+def console_state() -> ConsoleState | None:
+    """This mini's console session, or None when ioreg cannot be read."""
+    try:
+        out = subprocess.run([IOREG, "-n", "Root", "-d1"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                             timeout=5, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return None
+    return parse_console_users(out)
+
+
+def console_refusal() -> str | None:
+    """Why GUI tests cannot run in this mini's console session right now, or None (also when it is unreadable or
+    the check is off)."""
+    if not CONSOLE_GATE:
+        return None
+    state = console_state()
+    if state is None or state.state == "unlocked":
+        return None
+    if state.state == "locked":
+        return (f"console: the console session ({state.user}) is screen-locked, so GUI tests cannot run on this "
+                "mini; unlock it and turn off the screen lock (cmuxterm-hq#757)")
+    return "console: no user is logged in at the console, so GUI tests cannot run on this mini (cmuxterm-hq#757)"
+
+
 def mini_saturated(paused: bool, load: float | None = None, cores: int | None = None) -> str | None:
     """Why this mini is too loaded to take another job, or None: its 1-minute load is at least GATE_LOAD_PAUSE per
     core, or, once `paused` for that, still at least GATE_LOAD_RESUME per core (the gap keeps a listener from
@@ -1694,7 +2185,7 @@ def mini_saturated(paused: bool, load: float | None = None, cores: int | None = 
             f"listening resumes below {GATE_LOAD_RESUME:g})")
 
 
-def host_held(host_lock: str, reservation: str, now: float) -> str | None:
+def host_held(host_lock: str, reservation: str, now: float, state_dir: Path | None = None) -> str | None:
     """Why the fleet, not a PR job, holds this host right now, or None. Our own jobs hold the host lock
     shared, so only an exclusive holder or a reservation counts. Microseconds: one non-blocking flock."""
     why = reservation_refusal(reservation, now)
@@ -1707,6 +2198,10 @@ def host_held(host_lock: str, reservation: str, now: float) -> str | None:
     try:
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
     except OSError:
+        # A yielding build gives way to the next job: keep listening through it. lsof only while a marker is
+        # up (a fill on the writer mini), to tell it from another fleet build it is waiting behind.
+        if gate_yields(host_lock, holder_pids(state_dir) if state_dir else set()):
+            return None
         return "a fleet build holds the host lock"
     finally:
         os.close(fd)  # drops the probe's shared lock too
@@ -1718,7 +2213,7 @@ def host_waiters(host_lock: str, state_dir: Path) -> set[int]:
     most every GATE_WAITER_EVERY_S, and a stop needs the same pid in two readings."""
     if not os.path.exists(host_lock):
         return set()
-    return set(lock_waiters(host_lock, holder_pids(state_dir)))
+    return set(lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock)))
 
 
 def processes() -> dict[int, tuple[int, str]]:
@@ -1808,6 +2303,8 @@ class Gate:
         self.thermal_at = -GATE_THERMAL_EVERY_S
         self.load_since: float | None = None  # when the current load hold began
         self.load_waived = False  # a hold ran past GATE_LOAD_MAX_HOLD_S; ignored until the load falls
+        self.console_why: str | None = None  # the last console_refusal, read at most every GATE_CONSOLE_EVERY_S
+        self.console_at = -GATE_CONSOLE_EVERY_S
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -1846,7 +2343,7 @@ class Gate:
             gate_log("the reload failed; keeping this gate")
 
     def claimed(self) -> str | None:
-        why = host_held(self.host_lock, self.reservation, time.time())
+        why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir)
         if why is None and self.waiters and time.monotonic() - self.waiting_at >= GATE_WAITER_EVERY_S:
             self.waiting, self.waiting_at = host_waiters(self.host_lock, self.state_dir), time.monotonic()
         if why is None and self.waiting:
@@ -1854,7 +2351,7 @@ class Gate:
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
-        return why or self.shed(self.saturated()) or self.full() or self.shed(self.hot())
+        return why or self.shed(self.saturated()) or self.full() or self.shed(self.hot()) or self.locked()
 
     def yield_to_fleet(self) -> None:
         """A fleet build waiting for the host lock waits for every holder, the idle catch-up's shared hold
@@ -1914,7 +2411,7 @@ class Gate:
     def confirmed(self) -> str | None:
         """A fresh reading right before a stop: the holder still holds, or a waiter seen at least one poll ago
         is still waiting (a job-started in flight, which lsof also lists, is gone by then)."""
-        why = host_held(self.host_lock, self.reservation, time.time())
+        why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir)
         if why is None and self.waiting:
             again = self.waiting & host_waiters(self.host_lock, self.state_dir)
             self.waiting, self.waiting_at = again, time.monotonic()
@@ -1923,7 +2420,18 @@ class Gate:
         if why:
             self.load_since = None
             self.yield_to_fleet()
-        return why or self.shed(self.saturated()) or self.full(fresh=True) or self.shed(self.hot(fresh=True))
+        return (why or self.shed(self.saturated()) or self.full(fresh=True) or self.shed(self.hot(fresh=True))
+                or self.locked(fresh=True))
+
+    def locked(self, fresh: bool = False) -> str | None:
+        """For the gui runner only: why its console session cannot run a GUI job (console_refusal), read at most
+        every GATE_CONSOLE_EVERY_S. Every job its label brings needs the console, so it waits here instead of
+        being refused; a root runner's compiles do not, so it keeps listening."""
+        if not CONSOLE_GATE or not runner_scope(self.runner_dir).gui:
+            return None
+        if fresh or time.monotonic() - self.console_at >= GATE_CONSOLE_EVERY_S:
+            self.console_why, self.console_at = console_refusal(), time.monotonic()
+        return self.console_why
 
     def full(self, fresh: bool = False) -> str | None:
         """Every unit this runner's jobs could take is held. A look an admission blocked keeps the previous
@@ -2609,6 +3117,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-telemetry", action="store_true", help="do not sample the host while the job runs")
     p.add_argument("--test-keychain", action="store_true",
                    help="give the job an unlocked, passwordless default keychain for tests (PR runner minis)")
+    p.add_argument("--recycle-testmanagerd", action="store_true",
+                   help="job-started, take-gui: a job taking the gui token restarts the user's testmanagerd "
+                        "while no test runs (PR runner minis); a daemon that outlives SIGKILL refuses the job")
+    p.add_argument("--testmanagerd-program", default=TESTMANAGERD, help=argparse.SUPPRESS)
+    p.add_argument("--xctest-pattern", type=re.compile, default=XCTEST_RUNNING, help=argparse.SUPPRESS)
     p.add_argument("--job-log", type=Path, default=JOB_LOG, help=argparse.SUPPRESS)
     p.add_argument("--min-free-gib", type=float, default=0, help="refuse a job below this much free disk")
     p.add_argument("--require-eligible", action="store_true",
@@ -2648,7 +3161,8 @@ def main(argv: list[str] | None = None) -> int:
             p.error("take-root needs --root")
         return take_root(args.root, args.wait, args.capacity_dir, args.state_dir, args.canonical_roots, args.switch)
     if args.phase == "take-gui":
-        return take_gui(args.wait, args.capacity_dir, args.state_dir)
+        return take_gui(args.wait, args.capacity_dir, args.state_dir,
+                        args.testmanagerd_program if args.recycle_testmanagerd else None, args.xctest_pattern)
     if args.phase == "check":
         why, want = node_refusal(args.fleet_class)
         if not why:
@@ -2690,6 +3204,12 @@ def main(argv: list[str] | None = None) -> int:
             or disk_refusal(os.path.dirname(args.host_lock), args.min_free_gib)
         if why:
             return refused(why)
+        # before any capacity is taken: a job that needs the console session fails on a locked one
+        if args.gui_runner or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
+                                        job_workflow())[0] in CONSOLE_CLASSES:
+            why = console_refusal()
+            if why:
+                return refused(why)
         # The wrapper execs this script, so the parent is the job's Runner.Worker.
         admit_start = time.monotonic()
         taken: dict[str, Any] = {}
@@ -2733,9 +3253,21 @@ def main(argv: list[str] | None = None) -> int:
                 return refused(why)
             if aligned:
                 note += f"; {aligned}"
+        for root in held_roots(args.state_dir):
+            settled = settle_root(int(root.rsplit("-", 1)[1]))
+            if settled:
+                note += f"; {settled}"
+        testmanagerd = None
+        if args.recycle_testmanagerd and gui_file(args.state_dir).exists():
+            testmanagerd = recycle_testmanagerd(args.testmanagerd_program, args.xctest_pattern)
+            if testmanagerd.startswith(TESTMANAGERD_STUCK):  # every XCTest run here would hang: go elsewhere
+                release_host_lock(args.state_dir)
+                return refused(testmanagerd)
+            note += f"; {testmanagerd}"
         print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
         if args.test_keychain:
             print(f"{PREFIX}: {ensure_test_keychain(Path.home())}", flush=True)
+            print(f"{PREFIX}: {unlock_test_keychain_in_gui(Path.home())}", flush=True)
         if telemetry:
             meta: dict[str, Any] = {}
             try:  # observation must not fail an admitted job
@@ -2743,6 +3275,8 @@ def main(argv: list[str] | None = None) -> int:
                 meta.update(decision=f"{reason}; {note}"[:400], wait_s=round(time.monotonic() - admit_start, 1),
                             units=taken.get("units"), roots=held_roots(args.state_dir),
                             gui=gui_file(args.state_dir).exists(), instance=args.instance)
+                if testmanagerd:
+                    meta["testmanagerd"] = testmanagerd[:120]
                 job_event("started", meta, args.job_log)
             except Exception:  # noqa: BLE001
                 pass

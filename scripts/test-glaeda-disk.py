@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import contextlib
 import io
+import json
 import os
 import shutil
 import socket
@@ -41,9 +42,13 @@ class GlaedaDiskTest(unittest.TestCase):
         self.fam = gd.Family("xcode-derived-data", self.root, True, "rebuild")
         self.gd_evidence = gd.process_evidence
         gd.process_evidence = lambda: ([], "")
+        self.gd_keep = gd.NESTED_KEEP
+        gd.NESTED_KEEP = self.root.parent / f"{self.root.name}-keep.json"
 
     def tearDown(self) -> None:
         gd.process_evidence = self.gd_evidence
+        gd.NESTED_KEEP.unlink(missing_ok=True)
+        gd.NESTED_KEEP = self.gd_keep
         self.tmp.cleanup()
 
     def verdicts(self, idle: float = 24) -> dict[str, str]:
@@ -178,6 +183,11 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(gd.named_by("/private/tmp/foo", "tool --dirs=/private/tmp/foo,/x\n"))
         self.assertFalse(gd.named_by("/private/tmp/foo", "tool /tmp/foobar\n"))
         self.assertTrue(gd.in_cwd("/private/tmp/foo", ["/tmp/foo/a.log"]))
+        index = gd.open_index(["/tmp/foo/a.log", "/tmp/foobar/b"])
+        self.assertTrue(gd.in_cwd("/tmp/foo", index))
+        self.assertTrue(gd.in_cwd("/tmp/foo/a.log", index))
+        self.assertFalse(gd.in_cwd("/tmp/fo", index))
+        self.assertFalse(gd.in_cwd("/tmp/foo/a", index))
 
     def test_missing_process_evidence_fails_closed(self) -> None:
         make(self.root / "old")
@@ -344,7 +354,9 @@ class GlaedaDiskTest(unittest.TestCase):
         sock = socket.socket(socket.AF_UNIX)
         self.addCleanup(sock.close)
         sock.bind(str(d / "default"))
-        os.utime(d, (time.time() - 48 * 3600,) * 2)
+        # a long-lived server's socket is as old as its directory; only an old enough item pays for the socket walk
+        for p in (d / "default", d):
+            os.utime(p, (time.time() - 48 * 3600,) * 2)
         v = self.verdicts()
         self.assertEqual(v["tmux-1000"], "in-use")
         self.assertEqual(v["plain"], "reclaimable")
@@ -364,8 +376,9 @@ class GlaedaDiskTest(unittest.TestCase):
     def _git(self, *args: str) -> str:
         env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-        return subprocess.run(["git", *args], check=True, capture_output=True, text=True,
-                              env=env).stdout
+        # no detached auto-maintenance: it writes into .git after a test has aged the tree
+        return subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", *args],
+                              check=True, capture_output=True, text=True, env=env).stdout
 
     def _tmp_repos(self) -> tuple[Path, Path]:
         """A tmp-family root plus an origin repository with one commit outside it."""
@@ -416,6 +429,73 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.apply(gd.survey([self.fam], 24, 0), {"tmp": self.fam}, self.receipt(), None, 24)
         self.assertFalse((root / "leaked.so").exists())
         self.assertTrue((root / "fresh.log").exists())
+
+    def test_nested_checkouts_in_idle_scratch_sessions(self) -> None:
+        root, origin = self._tmp_repos()
+        self.fam = gd.replace(self.fam, files=False, nested_git=True)
+        for session in ("clean", "unpushed", "dirty"):
+            (root / session / "scratchpad").mkdir(parents=True)
+            self._git("clone", "-q", str(origin), str(root / session / "scratchpad/a"))
+            self._git("clone", "-q", str(origin), str(root / session / "scratchpad/b"))
+            (root / session / "scratchpad/notes.txt").write_text("n")
+        (root / "unpushed/scratchpad/b/g").write_text("y")
+        self._git("-C", str(root / "unpushed/scratchpad/b"), "add", "g")
+        self._git("-C", str(root / "unpushed/scratchpad/b"), "commit", "-qm", "local")
+        (root / "dirty/scratchpad/a/untracked").write_text("z")
+        # a bare seed with a linked worktree: the branch lives only in the seed, inside the item
+        (root / "seeded/scratchpad").mkdir(parents=True)
+        self._git("clone", "-q", "--bare", str(origin), str(root / "seeded/scratchpad/seed.git"))
+        self._git("-C", str(root / "seeded/scratchpad/seed.git"), "worktree", "add", "-q", "-b", "feat",
+                  str(root / "seeded/scratchpad/wt"))
+        (root / "seeded/scratchpad/wt/g").write_text("y")
+        self._git("-C", str(root / "seeded/scratchpad/wt"), "add", "g")
+        self._git("-C", str(root / "seeded/scratchpad/wt"), "commit", "-qm", "only in the seed")
+        # a bare copy whose commits a remote confirms loses nothing; one with a local commit does
+        (root / "bare/scratchpad").mkdir(parents=True)
+        self._git("clone", "-q", "--bare", str(origin), str(root / "bare/scratchpad/copy.git"))
+        (root / "barelocal/scratchpad").mkdir(parents=True)
+        seed = root / "barelocal/scratchpad/seed"
+        self._git("clone", "-q", "--bare", str(origin), str(seed))
+        tree = self._git("--git-dir", str(seed), "rev-parse", "HEAD^{tree}").strip()
+        local = self._git("--git-dir", str(seed), "commit-tree", tree, "-p", "HEAD", "-m", "local").strip()
+        self._git("--git-dir", str(seed), "update-ref", "refs/heads/main", local)
+        # a clone kept in an ignored directory of a clean checkout is judged too
+        (root / "vendored/scratchpad").mkdir(parents=True)
+        outer = root / "vendored/scratchpad/outer"
+        self._git("clone", "-q", str(origin), str(outer))
+        (outer / ".git/info/exclude").write_text("vendor/\n")
+        (outer / "vendor").mkdir()
+        self._git("clone", "-q", str(origin), str(outer / "vendor/lib"))
+        (outer / "vendor/lib/g").write_text("y")
+        self._git("-C", str(outer / "vendor/lib"), "add", "g")
+        self._git("-C", str(outer / "vendor/lib"), "commit", "-qm", "vendored and unpushed")
+        # checkouts nested deeper than git_state's search are still found and judged
+        deep = root / "deep/scratchpad/a/b/c/d/e/f"
+        deep.mkdir(parents=True)
+        self._git("clone", "-q", str(origin), str(deep / "clone"))
+        (deep / "clone/g").write_text("y")
+        self._git("-C", str(deep / "clone"), "add", "g")
+        self._git("-C", str(deep / "clone"), "commit", "-qm", "deep and unpushed")
+        for d in root.iterdir():
+            self._age(d)
+        items = gd.survey([self.fam], 24, 0)
+        v = {Path(i.path).name: i.verdict for i in items}
+        self.assertEqual(v, {"clean": "reclaimable", "unpushed": "git-checkout", "dirty": "git-checkout",
+                             "seeded": "git-checkout", "bare": "reclaimable", "barelocal": "git-checkout",
+                             "deep": "git-checkout", "vendored": "git-checkout"})
+        why = {Path(i.path).name: i.reasons for i in items}
+        self.assertEqual(why["unpushed"], ["scratchpad/b: commits no remote confirms"])
+        self.assertEqual(why["barelocal"], ["scratchpad/seed: commits no remote confirms"])
+        self.assertEqual(why["deep"], ["scratchpad/a/b/c/d/e/f/clone: commits no remote confirms"])
+        self.assertEqual(why["vendored"], ["scratchpad/outer: vendor/lib: commits no remote confirms"])
+        # kept verdicts are cached, so a dead session with unpushed work is not re-walked every run
+        self.assertIn(str(root / "deep"), json.loads(gd.NESTED_KEEP.read_text()))
+        # a checkout rooted below the item stays protected without the opt-in
+        plain = gd.replace(self.fam, nested_git=False)
+        self.assertLessEqual({i.verdict for i in gd.survey([plain], 24, 0)}, {"git-checkout", "unchecked"})
+        gd.apply(items, {"tmp": self.fam}, self.receipt(), None, 24)
+        self.assertEqual(sorted(p.name for p in root.iterdir()),
+                         ["barelocal", "deep", "dirty", "seeded", "unpushed", "vendored"])
 
     def test_family_size_floor_overrides_min_mib(self) -> None:
         root, _ = self._tmp_repos()
@@ -711,6 +791,21 @@ class LinuxLayoutTest(unittest.TestCase):
         gd.UNREADABLE.clear()
         self.tmp.cleanup()
 
+    def test_cache_families_skip_state_that_is_not_a_cache(self) -> None:
+        fams = {f.id: f for f in gd.default_families() if f.id in ("user-cache", "library-caches")}
+        for fam in fams.values():
+            fam.root.mkdir(parents=True, exist_ok=True)
+        keep = {"user-cache": ["glaeda", "glaeda-disk", "glaeda-fullapp", "glaeda-fleet-cas", "cmux-job",
+                               "huggingface", "codex-runtimes"],
+                "library-caches": ["glaeda", "PassKit", "tidy-branches", "CloudKit", "com.apple.Safari"]}
+        for fid, names in keep.items():
+            fam = fams.get(fid)
+            if fam is None:
+                continue
+            for n in names:
+                self.assertTrue(n in fam.skip or n.startswith(fam.skip_prefixes), f"{fid}/{n}")
+            self.assertTrue(fam.reclaimable)
+
     def test_linux_families(self) -> None:
         for rel in ("Projects/glaeda", "Projects/glaeda-worktrees/a", "Projects/botany-sim-worktrees/b",
                     ".cache/pip"):
@@ -725,7 +820,7 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in by_id["worktrees"]),
                          ["botany-sim-worktrees", "glaeda-worktrees"])
         reclaimable = {f.id for f in fams if f.reclaimable}
-        self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad"})
+        self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad", "user-cache"})
         projects = next(f for f in fams if f.id == "projects")
         self.assertIn("botany-sim-worktrees", projects.skip)
         tmp = next(f for f in fams if f.id == "tmp")
