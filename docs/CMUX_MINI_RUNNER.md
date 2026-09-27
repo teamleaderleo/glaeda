@@ -117,8 +117,11 @@ What `--apply` does:
      plus units and tokens under `/Users/Shared/cmux-build-fleet/capacity`, all as
      `flock`s held by the job's detached holder, so a crash frees them. The cost comes
      from `GITHUB_JOB`: `macos-compile-admission` 2 units plus the `persistent-dd`
-     token (one writer of the kept DerivedData at a time), `app-host-unit-tests` and
-     `tests-build-and-lag` 1 unit plus the `gui` token (one console session),
+     token (one writer of the kept DerivedData at a time), `tests-build-and-lag` 1 unit
+     plus the `gui` token (one console session), `app-host-unit-tests` 1 unit (on a mini
+     with more than one root it takes the `gui` token itself with take-gui in the step
+     before its restore, so its product fetch leaves the console session to other GUI
+     jobs; a one-root mini gives it the token at job start),
      test-e2e's `build` (compile, then the selected tests in the console session) 2 units
      (it takes the `gui` token itself before its tests, with take-gui), test-e2e's `test` 1
      unit plus the `gui` token, `cli-product-tests` 1 unit plus the `gui` token (its XCTest
@@ -212,7 +215,10 @@ What `--apply` does:
        none, and holding for it kept second roots idle while roots were the bottleneck.
        An app-host shard that meets a taken gui token waits up to 240 s for it
        (`--gui-wait`, inside cmux's 360 s refusal window) instead of refusing.
-       (cmuxterm-hq#661, Workstream 7.)
+       (cmuxterm-hq#661, Workstream 7.) A side runner listens with one unit free, so
+       a 2-unit side lane (cmux's release-build, reload-build, cmux-tui) that finds
+       fewer units than it needs waits for them the same 240 s instead of refusing;
+       a root runner still refuses at once.
      - A gui runner (`--gui-runner`, below) stops while the gui token is taken, every
        canonical root is taken, or every unit is. Only it carries the gui pool label, so
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
@@ -410,6 +416,26 @@ count is refused. Every instance bakes the same `--capacity-units`, so the mini
 never runs more than its units, however many runners pick up jobs. Uninstall one
 with `--uninstall --apply --instance K`.
 
+### Build worker steps on the same ledger (cmuxterm-hq#794)
+
+The build worker can run CI steps (cmuxterm-hq `ci-step` jobs) beside the runners' jobs, admitted by the
+same `take_capacity`, so a mini claims a step only when it fits:
+
+    glaeda-cmux-runner-hook fits    --capacity-units U
+    glaeda-cmux-runner-hook admit   --class light --job-key KEY --watch-pid WORKER_PID --capacity-units U
+    glaeda-cmux-runner-hook release --job-key KEY
+
+Pass the `--capacity-units` (and `--compile-slots`, `--canonical-roots`) the runners' hooks bake, and the
+worker's `--host-lock`, `--reservation` and `--capacity-dir`, so both scan one ledger (on the minis the worker
+runs as `cmux` with root `/Users/Shared/cmux-build-fleet`, the runners' `FLEET_DIR`). `fits` prints the step
+classes (`light`, `isolated`) the mini could admit now, from the listener gate's probe, and none while a fleet
+build holds or waits for the host lock. `admit` takes the class's units without waiting and leaves them with a
+holder that watches the worker's pid, or exits 1 with the capacity reason; a key admits once. The holder files
+are named by a digest of the key, so one key's `release` never touches another's. Each prints one JSON line.
+A dev build's exclusive host lock and a step's shared one exclude each other, as with runner jobs. Steps take no
+root, persistent-dd, gui or simulator token yet: the worker is a system LaunchDaemon outside the console
+session, and root classes move behind `admit` with compile placement.
+
 ## 2e. Trusted-only runners on a mini that holds a secret
 
 A mini that holds a secret, such as the fleet-cas signing key on the writer mini, must never run PR
@@ -483,9 +509,10 @@ in at the producer's root. So one root job per root per mini:
 
 - Root jobs are compile (macos-compile-admission and any unknown job id), compile-gui (test-e2e's `build`:
   a producer that takes the gui token later, in its own step with take-gui, and no persistent-dd: it only
-  clones its root's kept state, which the root token already guards), gui (app-host-unit-tests,
-  tests-build-and-lag, app-host-test-rerun's `rerun`, test-e2e's `test`) and product (cli-product-tests,
-  which also holds the gui token).
+  clones its root's kept state, which the root token already guards), gui (tests-build-and-lag,
+  app-host-test-rerun's `rerun`, test-e2e's `test`), gui-step (app-host-unit-tests: a gui job that takes
+  the gui token with take-gui before its restore step takes the root, the order gui jobs take them in) and
+  product (cli-product-tests, which also holds the gui token).
   Each also takes an exclusive `capacity/root-k.token` (k = 1 to `canonicalRoots`), and the hook writes `CMUX_CI_CANONICAL_ROOT=<root k>` to `$GITHUB_ENV` and
   `$RUNNER_TEMP/glaeda-canonical-root`. The root follows the token, never the runner instance.
 - Light jobs take no root.
@@ -532,7 +559,8 @@ in at the producer's root. So one root job per root per mini:
   gui token and GitHub gave the second GUI job to the other root runner, which waited up to 240 s and
   refused (10 of 17 refusals in the hour to 2026-09-26 03:40Z). It is never a root runner, so
   `canonicalRoots + guiRunners` is at most `runners`. Admission is unchanged: a GUI job takes 1 unit, the
-  gui token, and the producer's root in its restore step.
+  gui token (an app-host shard in the step before its restore instead), and the producer's root in its
+  restore step.
 - `compileSlots` may not exceed `canonicalRoots`: every compile holds a root.
 - `declared_pools` and glaeda-route count only the pool labels; the root and side labels split each mini's
   runners between them.
@@ -626,14 +654,17 @@ securityd queues one SecurityAgent prompt per request and keeps it after the key
 SecurityAgent cancels only the prompt on screen; securityd starts a new one for the next queued prompt. On
 cmux14 and cmux8s (2026-09-27) prompts queued at the 09-26 reboot were still up the next morning, and the
 assistantd one came back each time the cmux e2e action closed SecurityAgent (cmux run 36317492985). So after
-the unlock the agent kills SecurityAgent, up to 5 times, until no queued prompt starts it again. It does so
-at every job start and every login. No keychain prompt is wanted on a PR mini. When the hook changes the
+the unlock the agent kills SecurityAgent until no queued prompt has started it again for 15 s (at most 30
+kills): the next queued prompt takes 6 to 9 s to appear (cmux-mac-mini, 2026-09-27), so stopping at the first
+quiet check a second later left it up. It does so at every job start and every login. No keychain prompt is wanted on a PR mini. When the hook changes the
 agent, it boots the old one out before loading the new one, since a loaded agent keeps running its old
 program.
 
 `cmux-ci` stays the user's default keychain. `swift test` runs in a runner's own session, where the login
 keychain is locked, and tests that add items without naming a keychain need an unlocked default. The
-default is per user, not per session.
+default is per user, not per session: macOS refuses `security list-keychains -d dynamic -s` and
+`default-keychain -d dynamic -s` ("The specified preferences domain is not valid"). UI and app-host tests use
+the desktop's session anyway: their xcodebuild goes through `launchctl asuser`, which joins it.
 
 **Never store credentials as the runner user on a PR mini** (`gh auth login`, `git credential-osxkeychain`,
 `security import`, Keychain Access). Without an explicit keychain they land in `cmux-ci`, and any later PR job
