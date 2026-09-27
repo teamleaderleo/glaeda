@@ -3268,7 +3268,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--guest-wait", type=float, default=GUEST_WAIT_S,
                    help="seconds a guest job waits for room on a full mini before it is refused")
     p.add_argument("--gui-wait", type=float, default=GUI_WAIT_S,
-                   help="seconds a home-repository job refused only for the gui token waits for it")
+                   help="seconds a home-repository job refused only for the gui or simulator token waits for it")
     p.add_argument("--allow-event", action="append", default=[],
                    help="admit another event name (pull_request_target is always refused)")
     p.add_argument("--trusted-ref", help="admit only push and schedule jobs on this ref (needs --trusted-repo)")
@@ -3412,7 +3412,7 @@ def main(argv: list[str] | None = None) -> int:
                                            warm_keys=job_warm_keys(event), taken_out=taken,
                                            warm_target=job_warm_target(event))
                 # cmux refuses fast (its rescue workflow reroutes); a guest has none, so it waits for room.
-                # A cmux job refused only for the gui token waits for it too: the holder is a short GUI job.
+                # A cmux job refused only for the gui or simulator token waits for it too: the holder is a short job.
                 if held or not note.startswith("capacity:"):
                     break
                 # decided per try: a cmux job waits only while its latest refusal is the gui or simulator token, or, on a
