@@ -1902,6 +1902,33 @@ time.sleep(60)
             holder.wait()
             holder.stdout.close()
 
+    @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
+    def test_ci_step_fits_nothing_while_a_fleet_build_waits(self) -> None:
+        fleet = self.fleet()
+        worker = self.ci_worker()
+        status, first = self.ci_step("admit", "--class", "light", "--job-key", "wait-1-1", "--watch-pid", str(worker.pid))
+        self.assertEqual(status, 0, first)
+        waiter = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os\n"
+                                   f"fd=os.open({os.fspath(fleet / 'host.lock')!r},os.O_RDWR)\n"
+                                   "print('waiting',flush=True)\nfcntl.flock(fd,fcntl.LOCK_EX)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(waiter.stdout.readline().strip(), "waiting")
+            time.sleep(0.5)
+            self.assertEqual(self.fits(), [], "fits agrees with admit, which refuses while a fleet build waits")
+            status, refused = self.ci_step("admit", "--class", "light", "--job-key", "wait-2-1",
+                                           "--watch-pid", str(worker.pid))
+            self.assertEqual(status, 1)
+            self.assertIn("a fleet build is waiting for the host", refused["reason"])
+            self.ci_step("release", "--job-key", "wait-1-1")
+            self.assertEqual(waiter.wait(timeout=10), 0, "the build worker gets the host once the step lets go")
+        finally:
+            waiter.kill()
+            waiter.wait()
+            waiter.stdout.close()
+            self.ci_step("release", "--job-key", "wait-1-1")
+
     def test_ci_step_fits_is_unknown_while_an_admission_runs(self) -> None:
         self.fleet()
         capacity = self.dir / "capacity"

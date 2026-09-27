@@ -1689,10 +1689,12 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   repo: str | None = DEFAULT_HOME_REPO, home_repo: str = DEFAULT_HOME_REPO,
                   instance: int = 0, workflow: str = "", warm_keys: tuple[str, ...] = (),
                   owned_state_dir: str = "", taken_out: dict[str, Any] | None = None,
-                  warm_target: tuple[str, int | None] = ("", None), klass: str | None = None) -> tuple[bool, str]:
+                  warm_target: tuple[str, int | None] = ("", None), klass: str | None = None,
+                  one_holder: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log. klass, when given,
-    is the class itself (a ci-step names it, step_admit) instead of one looked up from the job id.
+    is the class itself (a ci-step names it, step_admit) instead of one looked up from the job id. one_holder
+    refuses, under admission.lock, when this holder file's holder is still alive (a ci-step key admits once).
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
     takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
     the job class's tokens. Everything is a flock, so a holder that dies releases all of it."""
@@ -1720,6 +1722,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 if time.monotonic() >= deadline:
                     return False, "capacity: another admission on this mini is stuck"
                 time.sleep(0.1)
+        if one_holder and holder_alive(holder_file(state_dir)):
+            return False, f"{job or 'this job'} is already admitted"
         yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
         if os.path.isdir(os.path.dirname(host_lock)):
             # created if missing, so a worker that starts later still has to wait for this job
@@ -1960,10 +1964,12 @@ def step_runner_name(key: str) -> str:
 def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, host_lock: str, reservation: str,
               state_dir: Path, now: float) -> list[str] | Unknown:
     """The STEP_CLASSES this mini could admit right now, or UNKNOWN when an admission held admission.lock
-    throughout. The listener gate's probe (mini_full): the host is not the fleet's (host_held), and under
+    throughout. The listener gate's probe (mini_full): the host is not the fleet's (host_held) and no fleet
+    build waits for it (host_waiters, which admission refuses for too, so a worker never leases a step it
+    would hand back), and under
     admission.lock, held without waiting so no admission meets a unit the probe holds, enough unit files and one
     free copy of each token are free (an idle catch-up's locks count as free: it yields them to the next job)."""
-    if total <= 0 or host_held(host_lock, reservation, now, state_dir):
+    if total <= 0 or host_held(host_lock, reservation, now, state_dir) or host_waiters(host_lock, state_dir):
         return []
     try:
         admission: int | None = os.open(capacity_dir / "admission.lock", os.O_RDONLY | os.O_NOFOLLOW)
@@ -2015,14 +2021,12 @@ def step_admit(klass: str, key: str, watch_pid: int, host_lock: str, reservation
         return refused("admit needs --capacity-units: this mini has no capacity ledger")
     if watch_pid <= 1 or not pid_alive(watch_pid):
         return refused(f"the watched pid {watch_pid} is not running")
-    if holder_alive(holder_file(state_dir)):
-        return refused(f"ci-step {key} is already admitted")
     why = reservation_refusal(reservation, time.time())
     if why:
         return refused(why)
     taken: dict[str, Any] = {}
     held, note = take_capacity(host_lock, capacity_dir, total, f"ci-step {key}", watch_pid, state_dir,
-                               compile_slots, roots, klass=klass, taken_out=taken)
+                               compile_slots, roots, klass=klass, taken_out=taken, one_holder=True)
     if not held:
         return refused(note)
     holder = holder_file(state_dir)
