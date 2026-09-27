@@ -3787,10 +3787,10 @@ class RunnerTest(unittest.TestCase):
 
             code, lines = run(0, 2)
             self.assertEqual(code, 0)
-            self.assertEqual(lines, ["security unlock-keychain -p  /k"] + ["pkill -x SecurityAgent"] * 3,
+            self.assertEqual(lines, ["security unlock-keychain -p  /k"] + ["pkill -KILL -x SecurityAgent"] * 3,
                              "unlock first, then kill until no queued prompt restarts SecurityAgent")
             code, lines = run(0, 9)
-            self.assertEqual(lines.count("pkill -x SecurityAgent"), 5, "bounded")
+            self.assertEqual(lines.count("pkill -KILL -x SecurityAgent"), 5, "bounded")
             code, lines = run(1, 2)
             self.assertEqual((code, lines), (1, ["security unlock-keychain -p  /k"]),
                              "still locked: leave the prompts to the next run")
