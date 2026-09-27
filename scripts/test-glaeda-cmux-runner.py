@@ -3421,7 +3421,7 @@ class RunnerTest(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0 if argv[2] in loaded else 113, "", "")
 
             with mock.patch.object(hook.subprocess, "run", side_effect=fake):
-                self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain unlocked in the GUI session")
+                self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI session unlock started")
                 agent = plistlib.loads(plist.read_bytes())
                 self.assertEqual(agent["LimitLoadToSessionType"], "Aqua", "the unlock must run in the desktop's session")
                 self.assertTrue(agent["RunAtLoad"], "every login unlocks it again")
@@ -3429,7 +3429,7 @@ class RunnerTest(unittest.TestCase):
                                                              os.fspath(home / "Library/Keychains" / hook.TEST_KEYCHAIN)])
                 self.assertEqual(calls, [["kickstart", service], ["bootstrap", "gui/501", os.fspath(plist)]])
                 calls.clear()
-                self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain unlocked in the GUI session")
+                self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI session unlock started")
                 self.assertEqual(calls, [["kickstart", service]], "loaded: a kickstart reruns the unlock")
             with mock.patch.object(hook.subprocess, "run",
                                    return_value=subprocess.CompletedProcess([], 5, "", "no gui")):

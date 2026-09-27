@@ -964,7 +964,7 @@ def unlock_test_keychain_in_gui(home: Path, uid: int | None = None) -> str:
         if launchctl("kickstart", service) and launchctl("bootstrap", f"gui/{uid}", os.fspath(plist)) \
                 and launchctl("kickstart", service):
             return "test keychain: no GUI session to unlock it in"
-        return "test keychain unlocked in the GUI session"
+        return "test keychain: GUI session unlock started"
     except (OSError, subprocess.SubprocessError) as error:
         return f"test keychain: GUI unlock {type(error).__name__}"
 
