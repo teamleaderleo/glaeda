@@ -65,6 +65,7 @@ def probe_text(hostname: str = "build-mini-1", keys: tuple[str, ...] = ("coordin
         "disk\t/System/Volumes/Data|460|220",
         f"launchd\t/Library/LaunchDaemons|com.example.build-worker|{worker}",
         "fleet_root\tpresent", f"fleet_worker_proc\t{worker_proc}",
+        "runner_worker\tabsent", "host_lock\tfree",
         "ak_file\tauthorized_keys|600",
     ]
     if node_id is not None:
@@ -255,6 +256,105 @@ class ClassAndPoolTests(unittest.TestCase):
 
     def test_pool_label_matches_the_runner_rule(self) -> None:
         self.assertEqual(mf.pool_label("std", "26.6"), "glaeda-std-xcode-26.6")
+
+
+class BorrowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest = copy.deepcopy(mf.load_manifest(EXAMPLE))
+        # The public example's first mini is also a dev-build host. Developer borrowing deliberately
+        # accepts only an ordinary CI member, which matches the production PR minis.
+        self.manifest["hosts"]["build-mini-1"]["roles"] = ["ci-runner", "ios-simulators"]
+
+    def obs(self, extra: str = "") -> dict:
+        return observed(**{"build-mini-1": probe_text() + extra})
+
+    def test_idle_ordinary_ci_member_is_a_candidate(self) -> None:
+        got, excluded = mf.borrow_candidates(self.manifest, self.obs(), ["build-mini-1"], "std")
+        self.assertEqual([row["host"] for row in got], ["build-mini-1"])
+        self.assertEqual(excluded, {})
+        self.assertEqual((got[0]["memory_gib"], got[0]["cpus"]), (48, 14))
+
+    def test_busy_reserved_and_special_hosts_fail_closed(self) -> None:
+        for extra, why in (
+            ("runner_worker\trunning\n", "Runner.Worker running"),
+            ("host_lock\theld\n", "host lock held"),
+            (reservation_line(), "reserved"),
+            (reservation_line(raw=b"garbage"), "invalid reservation"),
+        ):
+            got, excluded = mf.borrow_candidates(self.manifest, self.obs(extra), ["build-mini-1"], "std")
+            self.assertEqual(got, [], extra)
+            self.assertEqual(excluded["build-mini-1"], why)
+
+        special = copy.deepcopy(self.manifest)
+        special["hosts"]["build-mini-1"]["roles"].append("cache-host")
+        got, excluded = mf.borrow_candidates(special, self.obs(), ["build-mini-1"], "std")
+        self.assertEqual(got, [])
+        self.assertIn("cache-host", excluded["build-mini-1"])
+
+    def test_wrong_enrollment_and_hardware_are_not_candidates(self) -> None:
+        for text, why in (
+            (probe_text(node_id="cmux-mac-099"), "fleet enrollment does not match"),
+            (probe_text().replace("memory_bytes\t51539607552", "memory_bytes\t17179869184"), "hardware memory_gib does not match"),
+        ):
+            got, excluded = mf.borrow_candidates(
+                self.manifest, observed(**{"build-mini-1": text}), ["build-mini-1"], "std"
+            )
+            self.assertEqual(got, [])
+            self.assertEqual(excluded["build-mini-1"], why)
+
+    def test_dry_run_json_is_a_cmux_consumable_lease_document(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text(json.dumps(self.manifest))
+            obs_path = Path(tmp) / "observed.json"
+            obs_path.write_text(json.dumps(self.obs()))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = mf.main([
+                    "borrow", "--manifest", os.fspath(manifest_path), "--host", "build-mini-1",
+                    "--observed", os.fspath(obs_path), "--class", "std", "--for", "interactive development",
+                    "--hours", "4", "--json",
+                ])
+        self.assertEqual(code, 0)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((doc["schema"], doc["state"], doc["host"]), (
+            "glaeda-developer-lease/v1", "dry_run", "build-mini-1"
+        ))
+        self.assertEqual(doc["connection"], {"kind": "ssh", "host": "build-mini-1", "user": "builder"})
+        self.assertEqual(doc["reservation_schema"], mf.RESERVATION_SCHEMA)
+
+    def test_fresh_post_reservation_worker_race_releases_and_refuses(self) -> None:
+        now = int(time.time())
+        fresh = self.obs(
+            reservation_line(owner="leo@air", purpose="interactive", since=now - 1, until=now + 3600)
+            + "runner_worker\trunning\n"
+        )
+        with mock.patch.object(mf, "cmd_reserve", return_value=0), \
+                mock.patch.object(mf, "cmd_release", return_value=0) as release, \
+                mock.patch.object(mf, "observe", return_value=fresh), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = mf.cmd_borrow(
+                self.manifest, ["build-mini-1"], self.obs(), "std", "interactive", 1, None,
+                "leo@air", True, False
+            )
+        self.assertEqual(code, 1)
+        release.assert_called_once_with(self.manifest, ["build-mini-1"], "leo@air", False, True)
+
+    def test_fresh_post_reservation_idle_host_is_returned(self) -> None:
+        now = int(time.time())
+        fresh = self.obs(
+            reservation_line(owner="leo@air", purpose="interactive", since=now - 1, until=now + 3600)
+        )
+        with mock.patch.object(mf, "cmd_reserve", return_value=0), \
+                mock.patch.object(mf, "cmd_release", return_value=0) as release, \
+                mock.patch.object(mf, "observe", return_value=fresh), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = mf.cmd_borrow(
+                self.manifest, ["build-mini-1"], self.obs(), "std", "interactive", 1, None,
+                "leo@air", True, True
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())["state"], "reserved")
+        release.assert_not_called()
 
 
 class CheckTests(unittest.TestCase):
@@ -2937,6 +3037,8 @@ class ReservationProbeParsingTests(unittest.TestCase):
         self.assertEqual(got["reservation"], {"valid": True, "owner": "leo@air", "purpose": "build a | b\tc",
                                               "since": 100, "until": 200})
         self.assertEqual(got["host_lock"], "held")
+        self.assertEqual(mf.parse_probe("runner_worker\trunning\n")["runner_worker"], "running")
+        self.assertEqual(mf.parse_probe("runner_worker\tabsent\n")["runner_worker"], "absent")
         self.assertIs(mf.reservation_rules, sys.modules["glaeda_reservation"])
 
     def test_invalid_markers_say_why(self) -> None:
