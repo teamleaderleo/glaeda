@@ -946,6 +946,68 @@ fn apply_reclaims_a_worktree_whose_submodules_are_on_their_remotes() {
     assert_eq!(fixture.linked_order(), ["dirty"]);
 }
 
+/// `git submodule update` fetches the recorded commit itself, so a clone often has no
+/// remote-tracking ref reaching its HEAD. A superproject commit on a remote that records it counts
+/// as the evidence; an unpushed one does not.
+#[test]
+fn a_submodule_commit_recorded_by_published_superproject_history_is_preserved() {
+    let fixture = Fixture::new();
+    let remote = fixture.root.join("super-remote.git");
+    git(
+        &fixture.root,
+        &[
+            "init",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().expect("UTF-8"),
+        ],
+    );
+    git(
+        &fixture.main,
+        &["remote", "add", "origin", remote.to_str().expect("UTF-8")],
+    );
+    let source = fixture.root.join("submodule-source");
+    fs::create_dir(&source).expect("create submodule source");
+    git(&source, &["init", "-b", "main"]);
+    commit(&source, "source commit");
+    git(&source, &["checkout", "-b", "side"]);
+    commit(&source, "side commit");
+    git(&source, &["checkout", "main"]);
+
+    let pinned_submodule = |name: &str| {
+        let worktree = fixture.add(name);
+        git_as_user(
+            &worktree,
+            &["submodule", "add", source.to_str().expect("UTF-8"), "sub"],
+        );
+        let sub = worktree.join("sub");
+        git(&sub, &["checkout", "--detach", "origin/side"]);
+        // As if only the recorded commit had been fetched: no remote-tracking ref reaches it.
+        git(&sub, &["update-ref", "-d", "refs/remotes/origin/side"]);
+        git_as_user(&worktree, &["add", "sub"]);
+        git_as_user(&worktree, &["commit", "-m", "record the side commit"]);
+        worktree
+    };
+    let published = pinned_submodule("published");
+    git(&published, &["push", "origin", "published"]);
+    fixture.age("published");
+    pinned_submodule("unpublished");
+    fixture.age("unpublished");
+
+    let report = report(&fixture.plan(&fixture.main));
+    let published = entry_by_name(&fixture, &report, "published");
+    assert_eq!(published["decision"]["decision"], "eligible", "{published}");
+    assert_eq!(
+        published["decision"]["authority"],
+        "preserved_in_repository_and_submodule_remotes"
+    );
+    assert_eq!(
+        vetoes_of(&entry_by_name(&fixture, &report, "unpublished")),
+        ["populated_submodules_present"]
+    );
+}
+
 #[test]
 fn apply_stops_at_the_reclaim_budget() {
     let fixture = Fixture::new();
