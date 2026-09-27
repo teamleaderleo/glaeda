@@ -185,8 +185,10 @@ What `--apply` does:
      - Except a yielding build: a fleet build that writes its pid to `host.lock.yield`
        while it waits for or holds the lock (cmuxterm-hq's catch-up fill on the writer
        mini) neither stops the listener nor counts as a waiter, as long as `lsof` shows it
-       is the only fleet process with the lock open. A fill waiting behind another fleet
-       build yields nothing, so that build still stops the listener. A job that meets a
+       and its own processes (descendants and their process groups: the fill passes the
+       lock fd to its build) are the only fleet processes with the lock open. A fill
+       waiting behind another fleet build yields nothing, so that build still stops the
+       listener. The gate keeps that verdict for 30 s, since `lsof` is not free. A job that meets a
        yielding holder writes `host.lock.preempted` (`{by, at, pid}`, so the fill can tell
        the note is about itself), sends it SIGTERM and waits for the lock: 15 s under the
        capacity admission lock (half of what another admission waits for it), 90 s on the

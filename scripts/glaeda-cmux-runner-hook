@@ -1235,14 +1235,56 @@ def yielding_pid(host_lock: str) -> int | None:
     return pid
 
 
-def preemptible_pid(host_lock: str, ours: set[int]) -> int | None:
-    """The yielding build (yielding_pid) when it is the only fleet process with host_lock open (lsof), else
-    None. A stale or planted marker never names a process with the lock open, and a fill that only waits
-    behind another fleet build (the worker holding the lock) is not what keeps the host: neither yields it."""
+def yielding_family(host_lock: str) -> set[int]:
+    """The yielding build (yielding_pid) and its descendants and their process groups: the fill passes the lock
+    fd to its recipe (a new session), so the recipe, xcodebuild and the compilers all have the lock open too.
+    Empty without a live marker; just the pid when ps cannot tell."""
     pid = yielding_pid(host_lock)
-    if pid is None or set(lock_waiters(host_lock, ours)) != {pid}:
+    if pid is None:
+        return set()
+    try:
+        listing = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,pgid="], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=15, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {pid}
+    rows = [tuple(map(int, line.split())) for line in listing.splitlines()
+            if len(line.split()) == 3 and all(f.isdigit() for f in line.split())]
+    family = {pid}
+    while True:
+        grown = family | {child for child, parent, group in rows if parent in family or group in family - {pid}}
+        if grown == family:
+            return family
+        family = grown
+
+
+def preemptible_pid(host_lock: str, ours: set[int]) -> int | None:
+    """The yielding build (yielding_pid) when it and its own processes (yielding_family) are the only fleet
+    processes with host_lock open (lsof), else None. A stale or planted marker never names a process with the
+    lock open, and a fill that only waits behind another fleet build (the worker holding the lock) is not what
+    keeps the host: neither yields it."""
+    family = yielding_family(host_lock)
+    if not family:
         return None
-    return pid
+    pid = yielding_pid(host_lock)
+    others = set(lock_waiters(host_lock, ours))
+    return pid if pid in others and others <= family else None
+
+
+# The gate polls every GATE_POLL_S; lsof costs about 0.3 s of CPU, so its yielding verdict is kept per marker pid
+# for GATE_WAITER_EVERY_S. job-started always asks afresh.
+_gate_yield_verdict: dict[tuple[str, int], tuple[float, bool]] = {}
+
+
+def gate_yields(host_lock: str, ours: set[int]) -> bool:
+    pid = yielding_pid(host_lock)
+    if pid is None:
+        return False
+    key, at = (host_lock, pid), time.monotonic()
+    seen = _gate_yield_verdict.get(key)
+    if seen is None or at - seen[0] >= GATE_WAITER_EVERY_S:
+        _gate_yield_verdict.clear()
+        seen = _gate_yield_verdict[key] = (at, preemptible_pid(host_lock, ours) == pid)
+    return seen[1]
 
 
 def preempt_yielding(host_lock: str, job: str, ours: set[int]) -> str | None:
@@ -1415,8 +1457,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                         break
                     time.sleep(0.1)
             fds.append(fd)
-            yielding = yielding_pid(host_lock)
-            waiting = lock_waiters(host_lock, holder_pids(state_dir) | ({yielding} if yielding else set()))
+            waiting = lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock))
             # lsof sees only this user's processes, which is how the fleet worker runs today.
             if waiting:  # flock has no writer preference: stop admitting so the build worker gets in
                 return False, f"capacity: a fleet build is waiting for the host (pid {waiting[0]})"
@@ -1867,7 +1908,7 @@ def host_held(host_lock: str, reservation: str, now: float, state_dir: Path | No
     except OSError:
         # A yielding build gives way to the next job: keep listening through it. lsof only while a marker is
         # up (a fill on the writer mini), to tell it from another fleet build it is waiting behind.
-        if preemptible_pid(host_lock, holder_pids(state_dir) if state_dir else set()):
+        if gate_yields(host_lock, holder_pids(state_dir) if state_dir else set()):
             return None
         return "a fleet build holds the host lock"
     finally:
@@ -1880,8 +1921,7 @@ def host_waiters(host_lock: str, state_dir: Path) -> set[int]:
     most every GATE_WAITER_EVERY_S, and a stop needs the same pid in two readings."""
     if not os.path.exists(host_lock):
         return set()
-    yielding = yielding_pid(host_lock)
-    return set(lock_waiters(host_lock, holder_pids(state_dir) | ({yielding} if yielding else set())))
+    return set(lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock)))
 
 
 def processes() -> dict[int, tuple[int, str]]:
