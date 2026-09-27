@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
 use glaeda::linked_worktree_reclaim::{
-    GithubLookup, LINKED_WORKTREE_READ_TIMEOUT, LinkedWorktreeFacts,
+    GithubLookup, LINKED_WORKTREE_GIT_TIMEOUT, LinkedWorktreeFacts,
     LinkedWorktreeReclaimCompensation, LinkedWorktreeReclaimDecision, LinkedWorktreeReclaimOutcome,
     LinkedWorktreeReclaimPolicy, LinkedWorktreeReclaimVeto, LocalBranchDecision,
     LocalBranchDeletion, LocalBranchFinishedEvidence, LocalBranchReport, ProcessUseEvidence,
@@ -255,7 +255,7 @@ fn main() -> ExitCode {
         );
     };
     let observer = match ProjectCheckoutObserver::new(GIT_PROGRAM) {
-        Ok(observer) => observer.with_command_timeout(LINKED_WORKTREE_READ_TIMEOUT),
+        Ok(observer) => observer.with_command_timeout(LINKED_WORKTREE_GIT_TIMEOUT),
         Err(error) => return fail(cli.output, error.code, error.problem),
     };
     let executor = ProcessExecutor;

@@ -339,8 +339,8 @@ impl LinkedWorktreeReclaimPlan {
 ///
 /// # Errors
 ///
-/// Refuses facts whose last activity is in the future relative to `now_seconds`, or whose idle
-/// arithmetic would overflow. Disagreeing clocks are not evidence a decision should rest on.
+/// Refuses facts whose idle arithmetic would overflow. Activity newer than `now_seconds` is
+/// planned as recently active, never as idle.
 pub fn plan_linked_worktree_reclaim(
     facts: &LinkedWorktreeFacts,
     policy: LinkedWorktreeReclaimPolicy,
@@ -1475,10 +1475,11 @@ fn parse_newest_reflog_entry(tail: &[u8]) -> Result<Option<i64>, LinkedWorktreeR
 /// Namespace for commits pinned before their only worktree is removed.
 pub const LINKED_WORKTREE_PIN_REF_PREFIX: &str = "refs/glaeda/worktree-pins/";
 
-/// Deadline for each constant-cost Git read of a reclaim sweep; see
+/// Deadline for each constant-cost Git command of a reclaim sweep: reads, plus the `update-ref`
+/// pins and branch deletions, which are safer finished than killed partway. See
 /// [`ProjectCheckoutObserver::with_command_timeout`]. The sweep runs in the background, where a
 /// read that answers in 30 seconds beats a worktree that stays unobservable for another hour.
-pub const LINKED_WORKTREE_READ_TIMEOUT: Duration = Duration::from_secs(60);
+pub const LINKED_WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Deadline for one `git worktree remove`, which scales with ignored build output in the tree.
 pub const LINKED_WORKTREE_REMOVE_TIMEOUT: Duration = Duration::from_secs(600);
