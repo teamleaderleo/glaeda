@@ -415,11 +415,17 @@ def git(checkout: Path, *args: str, timeout: int = GIT_TIMEOUT_S) -> None:
 
 
 def prepare_checkout(work: Path, head: str) -> None:
-    """A clean checkout of HEAD with submodules at WORK/cmux, cloned once and fetched after."""
+    """A clean checkout of HEAD with submodules at WORK/cmux, cloned once and fetched after.
+
+    Blobless (--filter=blob:none): history and trees only, and the blobs of what is checked out. A full clone
+    is 2.4 GB; on cmux-austin-mini-0 it was still 0.9 GB in after 25 minutes (2026-09-27), so the 30-minute
+    timeout ended every first clone and the next run started it over. The build reads only the checkout, and
+    the seed lookup only commits (CMUX_SEED_GIT_DIR); git fetches any other blob on demand."""
     checkout = work / "cmux"
     if not (checkout / ".git").is_dir():
         shutil.rmtree(checkout, ignore_errors=True)
-        subprocess.run([GIT, "clone", "-q", "--no-checkout", REPO_URL, os.fspath(checkout)], check=True,
+        subprocess.run([GIT, "clone", "-q", "--filter=blob:none", "--no-checkout", REPO_URL,
+                        os.fspath(checkout)], check=True,
                        capture_output=True, timeout=GIT_TIMEOUT_S,
                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
     git(checkout, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main")

@@ -334,6 +334,33 @@ class YieldTest(Base):
         script.chmod(0o755)
 
 
+class CheckoutTest(unittest.TestCase):
+    def test_first_clone_is_blobless_and_checks_out_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source, work = Path(tmp) / "source", Path(tmp) / "work"
+            run = lambda *args, cwd=source: subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+            source.mkdir()
+            run("init", "-q", "-b", "main")
+            run("config", "uploadpack.allowFilter", "true")
+            (source / "a.txt").write_text("one\n")
+            run("add", "a.txt")
+            run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "one")
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+            work.mkdir()
+            saved = warm.REPO_URL
+            warm.REPO_URL = source.as_uri()
+            try:
+                warm.prepare_checkout(work, head)
+            finally:
+                warm.REPO_URL = saved
+            checkout = work / "cmux"
+            self.assertEqual((checkout / "a.txt").read_text(), "one\n")
+            partial = subprocess.run(["git", "config", "remote.origin.partialclonefilter"], cwd=checkout,
+                                     capture_output=True, text=True).stdout.strip()
+            self.assertEqual(partial, "blob:none")
+
+
 class NoEmDashTest(unittest.TestCase):
     def test_no_em_dashes(self) -> None:
         self.assertNotIn("—", (ROOT / "scripts" / "glaeda-idle-warm").read_text())
