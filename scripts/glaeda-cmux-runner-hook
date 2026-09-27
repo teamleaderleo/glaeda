@@ -398,15 +398,19 @@ def root_stamp(k: int, state_dir: str = "", number: int | None = None) -> dict[s
     """Root k's kept-build stamp when it is current (STATE_VERSION, DerivedData present), else None.
 
     With NUMBER, a build of that pull request parked on the root (cmux owned_build_state.py PR slots,
-    `pr-builds/pr-<n>`, which admission swaps back in before it reads the kept build) comes first.
+    `pr-builds/pr-<n>`, which admission swaps back in before it reads the kept build) comes first, unless
+    the kept build is a main build, which admission keeps.
     """
     base = Path(state_dir or OWNED_STATE_DIR)
     store = base if k == 1 else base / f"cmux-ci-{k}"
-    if number is not None:
+    kept = root_stamp_at(store)
+    if number is not None and (kept is None or kept.get("pr")):
+        # admission's `check` swaps a parked build in only over another pull request's build (or none):
+        # a main build is never parked, so the job starts from it.
         parked = root_stamp_at(store / WARM_PR_BUILDS / f"pr-{number}")
         if parked is not None and parked.get("pr") == number:
             return parked
-    return root_stamp_at(store)
+    return kept
 
 
 def root_stamp_at(store: Path) -> dict[str, Any] | None:
