@@ -477,19 +477,24 @@ def bare_loss(gitdir: Path) -> str:
     modules = gitdir / "modules"
     if not modules.is_dir() or modules.is_symlink():
         return ""
-    for dirpath, dirnames, _ in os.walk(modules):
+    unreadable: list[str] = []
+    for dirpath, dirnames, _ in os.walk(modules, onerror=lambda e: unreadable.append(str(e.filename))):
+        if unreadable:
+            return "unreadable submodule store"
         if looks_like_repository(dirpath):
             if (loss := repo_loss(Path(dirpath))):
                 return f"{os.path.relpath(dirpath, gitdir)}: {loss}"
             dirnames[:] = ["modules"] if "modules" in dirnames else []  # nested submodules only
-    return ""
+    return "unreadable submodule store" if unreadable else ""
 
 
 def _load_keep() -> dict:
     try:
-        return json.loads(NESTED_KEEP.read_text())
+        keep = json.loads(NESTED_KEEP.read_text())
     except (OSError, ValueError):
         return {}
+    return {k: v for k, v in keep.items() if isinstance(v, dict) and isinstance(v.get("at"), (int, float))} \
+        if isinstance(keep, dict) else {}
 
 
 def family_git_loss(fam: "Family", path: Path) -> str:
@@ -515,6 +520,36 @@ def family_git_loss(fam: "Family", path: Path) -> str:
     return loss
 
 
+def ignored_checkout_loss(root: Path) -> str:
+    """checkouts() stops at a checkout, and its status hides ignored directories, so a clone kept
+    in one (vendor/ in .gitignore) would go unjudged. Build-output directories are skipped as
+    everywhere else: SwiftPM and friends keep reproducible dependency clones there."""
+    try:
+        r = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "-z", "--ignored=matching",
+                            "--untracked-files=normal"], capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    except (OSError, subprocess.TimeoutExpired):
+        return "unreadable ignored files"
+    if r.returncode != 0:
+        return "unreadable ignored files"
+    for entry in r.stdout.split("\0"):  # -z: paths unquoted, so none is misread and skipped
+        if not entry.startswith("!! ") or not entry.endswith("/"):
+            continue
+        rel = entry[3:].rstrip("/")
+        if Path(rel).name in REPRODUCIBLE_DIRS:
+            continue
+        inner = checkouts(root / rel, NESTED_DEPTH, NESTED_BUDGET)
+        if inner is None:
+            return f"{rel}: too deep or large to find every checkout"
+        for sub in inner:
+            if not os.path.lexists(sub / ".git"):
+                if (loss := bare_loss(sub)):
+                    return f"{sub.relative_to(root)}: {loss}"
+            elif (loss := git_loss(sub)) or (loss := ignored_checkout_loss(sub)):
+                return f"{sub.relative_to(root)}: {loss}"
+    return ""
+
+
 def _nested_loss(path: Path) -> str:
     roots = nested_checkouts(path)
     if roots is None:
@@ -527,6 +562,8 @@ def _nested_loss(path: Path) -> str:
                 return f"{where}: {loss}"
             continue
         if (loss := git_loss(root)):
+            return f"{where}: {loss}"
+        if (loss := ignored_checkout_loss(root)):
             return f"{where}: {loss}"
         # git_loss keeps a linked worktree because its repository stays; here the repository
         # may be inside the item being deleted

@@ -459,6 +459,16 @@ class GlaedaDiskTest(unittest.TestCase):
         tree = self._git("--git-dir", str(seed), "rev-parse", "HEAD^{tree}").strip()
         local = self._git("--git-dir", str(seed), "commit-tree", tree, "-p", "HEAD", "-m", "local").strip()
         self._git("--git-dir", str(seed), "update-ref", "refs/heads/main", local)
+        # a clone kept in an ignored directory of a clean checkout is judged too
+        (root / "vendored/scratchpad").mkdir(parents=True)
+        outer = root / "vendored/scratchpad/outer"
+        self._git("clone", "-q", str(origin), str(outer))
+        (outer / ".git/info/exclude").write_text("vendor/\n")
+        (outer / "vendor").mkdir()
+        self._git("clone", "-q", str(origin), str(outer / "vendor/lib"))
+        (outer / "vendor/lib/g").write_text("y")
+        self._git("-C", str(outer / "vendor/lib"), "add", "g")
+        self._git("-C", str(outer / "vendor/lib"), "commit", "-qm", "vendored and unpushed")
         # checkouts nested deeper than git_state's search are still found and judged
         deep = root / "deep/scratchpad/a/b/c/d/e/f"
         deep.mkdir(parents=True)
@@ -472,11 +482,12 @@ class GlaedaDiskTest(unittest.TestCase):
         v = {Path(i.path).name: i.verdict for i in items}
         self.assertEqual(v, {"clean": "reclaimable", "unpushed": "git-checkout", "dirty": "git-checkout",
                              "seeded": "git-checkout", "bare": "reclaimable", "barelocal": "git-checkout",
-                             "deep": "git-checkout"})
+                             "deep": "git-checkout", "vendored": "git-checkout"})
         why = {Path(i.path).name: i.reasons for i in items}
         self.assertEqual(why["unpushed"], ["scratchpad/b: commits no remote confirms"])
         self.assertEqual(why["barelocal"], ["scratchpad/seed: commits no remote confirms"])
         self.assertEqual(why["deep"], ["scratchpad/a/b/c/d/e/f/clone: commits no remote confirms"])
+        self.assertEqual(why["vendored"], ["scratchpad/outer: vendor/lib: commits no remote confirms"])
         # kept verdicts are cached, so a dead session with unpushed work is not re-walked every run
         self.assertIn(str(root / "deep"), json.loads(gd.NESTED_KEEP.read_text()))
         # a checkout rooted below the item stays protected without the opt-in
@@ -484,7 +495,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertLessEqual({i.verdict for i in gd.survey([plain], 24, 0)}, {"git-checkout", "unchecked"})
         gd.apply(items, {"tmp": self.fam}, self.receipt(), None, 24)
         self.assertEqual(sorted(p.name for p in root.iterdir()),
-                         ["barelocal", "deep", "dirty", "seeded", "unpushed"])
+                         ["barelocal", "deep", "dirty", "seeded", "unpushed", "vendored"])
 
     def test_family_size_floor_overrides_min_mib(self) -> None:
         root, _ = self._tmp_repos()
