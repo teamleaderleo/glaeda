@@ -2160,13 +2160,18 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
 
 
 def min_free_gib(text: str) -> float:
-    """The last --min-free-gib in a job-started hook script (argparse's last one wins), or 0 without one or when it
-    is not a number. glaeda-cmux-runner writes it with :g, so 1e+03 is a valid form. glaeda-disk reads the same."""
-    values = re.findall(r"\s--min-free-gib[\s=]+([0-9.eE+-]+)(?=\s|$)", text)
+    """The last unquoted --min-free-gib in a job-started hook script, as glaeda-cmux-runner writes it (:g, so 1e+03
+    is a valid form), or 0 without one or when it is not a finite number. glaeda-disk's runner_floor_gib reads the
+    same pattern (MIN_FREE_GIB_RE there; a test keeps the two equal)."""
+    values = re.findall(MIN_FREE_GIB_RE, text)
     try:
-        return max(0.0, float(values[-1])) if values else 0.0
+        value = float(values[-1]) if values else 0.0
     except ValueError:
         return 0.0
+    return value if math.isfinite(value) and value > 0 else 0.0
+
+
+MIN_FREE_GIB_RE = r"\s--min-free-gib[\s=]+([0-9.eE+-]+)(?=\s|$)"
 
 
 # A root runner's jobs (compile admission, app-host shards, cli-product, lag) cost up to this many units, and
@@ -2606,19 +2611,22 @@ class Gate:
         A hold resumes only at GATE_DISK_RESUME_GIB above the floor, so a mini at the edge does not flap. glaeda-disk
         --pressure reads the same floor and frees space up to it; a hold past GATE_DISK_NOTE_S logs once that it could
         not, so an operator frees space by hand."""
-        floor = runner_scope(self.runner_dir).min_free_gib
-        if floor > 0 and self.disk_since is not None:
-            floor += GATE_DISK_RESUME_GIB
-        why = disk_refusal(os.path.dirname(self.host_lock), floor)
-        now = time.monotonic()
-        if why is None:
+        # the margin and the hold timer apply only while the listener is actually held off for disk, so a
+        # listening runner that dips once is stopped only on two readings under the floor itself
+        holding = self.child is None and (self.held or "").startswith("disk:")
+        if not holding:
             self.disk_since, self.disk_noted = None, False
-            return None
+        floor = runner_scope(self.runner_dir).min_free_gib
+        why = disk_refusal(os.path.dirname(self.host_lock), floor + GATE_DISK_RESUME_GIB if floor > 0 and holding
+                           else floor)
+        if why is None or not holding:
+            return f"disk: {why}" if why else None
+        now = time.monotonic()
         if self.disk_since is None:
             self.disk_since = now
         elif not self.disk_noted and now - self.disk_since >= GATE_DISK_NOTE_S:
             gate_log(f"held for free disk over {GATE_DISK_NOTE_S / 60:g} min ({why}): glaeda-disk --pressure has not "
-                     "freed enough; free space by hand (glaeda-disk --top 25)")
+                     "freed enough yet (it also waits while a CI job runs here); check with glaeda-disk --top 25")
             self.disk_noted = True
         return f"disk: {why}"
 

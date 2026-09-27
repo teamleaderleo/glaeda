@@ -243,8 +243,9 @@ What `--apply` does:
      every job. On 2026-09-27, 68 of the fleet's 151 refusals in 24 h were this one,
      mostly seeds on cmuxs-mac-mini-6 at 134 of 150 GiB. A hold ends only 2 GiB above the
      floor, so a mini at the edge does not flap. `glaeda-disk --pressure` reads the highest
-     floor among the user's runner hooks and starts freeing at floor + 4 GiB, up to floor +
-     20 GiB, whatever its `--low` and `--target`: otherwise a 460 GiB mini between the default
+     floor among the user's runner hooks (`~/actions-runner*`, the default runner dirs) and,
+     on HOME's volume, starts freeing at floor + 4 GiB, up to floor + 20 GiB (never past half
+     the disk), whatever its `--low` and `--target`: otherwise a 460 GiB mini between the default
      low (about 115 GiB) and a 150 GiB floor would stay held with nothing freed. A hold past
      30 min logs once that space must be freed by hand.
    - **Stopping.** After two idle polls in a row, and one fresh look right before the

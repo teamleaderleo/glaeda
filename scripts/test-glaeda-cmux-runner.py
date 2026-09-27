@@ -2857,6 +2857,13 @@ class GateTest(unittest.TestCase):
         self.assertEqual(hook.min_free_gib(" --min-free-gib=150\n"), 150.0)
         self.assertEqual(hook.min_free_gib(" --min-free-gib x1 "), 0.0)
         self.assertEqual(hook.min_free_gib(" --min-free-gib 1e "), 0.0, "not a number: no floor")
+        self.assertEqual(hook.min_free_gib(" --min-free-gib 1e999 "), 0.0, "not finite: no floor")
+        disk = importlib.machinery.SourceFileLoader("glaeda_disk_re", os.fspath(HOOK.parent / "glaeda-disk"))
+        spec = importlib.util.spec_from_loader("glaeda_disk_re", disk)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules, {"glaeda_disk_re": module}):  # its dataclasses look the module up
+            disk.exec_module(module)
+        self.assertEqual(module.MIN_FREE_GIB_RE, hook.MIN_FREE_GIB_RE, "glaeda-disk reads the floor the same way")
 
     def test_a_disk_hold_resumes_above_the_floor_and_logs_a_long_hold_once(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
@@ -2870,18 +2877,27 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
                 mock.patch.object(hook, "gate_log", side_effect=logs.append), \
                 mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock["t"]):
-            self.assertIn("100 GiB required", gate.low_disk())
+            # listening (a child runs): only the floor itself counts, so a dip that recovers never stops it
+            gate.child = mock.Mock(pid=1)
+            why = gate.low_disk()
+            self.assertIn("100 GiB required", why)
             free["gib"] = 101.0
+            self.assertIsNone(gate.low_disk(), "a listening runner back above the floor is not stopped")
+            # held off for disk: it resumes only 2 GiB above the floor
+            gate.child, gate.held = None, why
             self.assertIn("102 GiB required", gate.low_disk(), "a hold resumes only 2 GiB above the floor")
             clock["t"] += hook.GATE_DISK_NOTE_S
             gate.low_disk()
             gate.low_disk()
             self.assertEqual(len(logs), 1, "a long hold is logged once")
-            self.assertIn("free space by hand", logs[0])
+            self.assertIn("glaeda-disk --top 25", logs[0])
             free["gib"] = 102.0
             self.assertIsNone(gate.low_disk())
+            # held for something else: no margin, and the disk timer does not run
+            gate.held = "a fleet build holds the host lock"
             free["gib"] = 101.0
-            self.assertIsNone(gate.low_disk(), "no hold: the floor itself applies again")
+            self.assertIsNone(gate.low_disk())
+            self.assertIsNone(gate.disk_since)
 
     def test_a_root_runner_holds_while_a_token_its_jobs_need_is_taken(self) -> None:
         root = hook.RunnerScope(4, 2, 2, True)
