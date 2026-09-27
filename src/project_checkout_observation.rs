@@ -630,13 +630,6 @@ impl ProjectCheckoutSnapshot {
     /// the worktree count, and any fetch moves the upstream and with it the ahead/behind line.
     /// Neither changes this checkout, and during a long sweep both happen between snapshots.
     fn same_checkout(&self, other: &Self) -> bool {
-        let local_status = |snapshot: &Self| {
-            snapshot
-                .raw_status
-                .split('\0')
-                .filter(|record| !record.starts_with("# branch.ab "))
-                .collect::<Vec<_>>()
-        };
         self.commit == other.commit
             && self.tree == other.tree
             && self.remotes == other.remotes
@@ -647,8 +640,15 @@ impl ProjectCheckoutSnapshot {
             && self.status.tracked_changes_present == other.status.tracked_changes_present
             && self.status.untracked_entry_count == other.status.untracked_entry_count
             && self.status.upstream_configured == other.status.upstream_configured
-            && local_status(self) == local_status(other)
+            && local_status_records(&self.raw_status).eq(local_status_records(&other.raw_status))
     }
+}
+
+/// Status records without the ahead/behind line, which only an upstream move changes.
+fn local_status_records(raw_status: &str) -> impl Iterator<Item = &str> {
+    raw_status
+        .split('\0')
+        .filter(|record| !record.starts_with("# branch.ab "))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
