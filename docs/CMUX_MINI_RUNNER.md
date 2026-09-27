@@ -118,9 +118,10 @@ What `--apply` does:
      `flock`s held by the job's detached holder, so a crash frees them. The cost comes
      from `GITHUB_JOB`: `macos-compile-admission` 2 units plus the `persistent-dd`
      token (one writer of the kept DerivedData at a time), `tests-build-and-lag` 1 unit
-     plus the `gui` token (one console session), `app-host-unit-tests` 1 unit (it takes
-     the `gui` token itself with take-gui in the step before its restore, so its product
-     fetch leaves the console session to other GUI jobs),
+     plus the `gui` token (one console session), `app-host-unit-tests` 1 unit (on a mini
+     with more than one root it takes the `gui` token itself with take-gui in the step
+     before its restore, so its product fetch leaves the console session to other GUI
+     jobs; a one-root mini gives it the token at job start),
      test-e2e's `build` (compile, then the selected tests in the console session) 2 units
      (it takes the `gui` token itself before its tests, with take-gui), test-e2e's `test` 1
      unit plus the `gui` token, `cli-product-tests` 1 unit plus the `gui` token (its XCTest

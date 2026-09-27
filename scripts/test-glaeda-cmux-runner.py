@@ -1757,10 +1757,10 @@ time.sleep(60)
             refused = self.job("tests-build-and-lag", "g1", 8, None, *two, "--gui-wait", "0")
             self.assertIn("refused: capacity: the gui token is taken", refused.stdout)
             self.assertIn("the gui token holder released", self.finish("s0"))
-            # a one-root mini gives the shard its root at job start, still without the gui token
+            # a one-root mini gives the shard gui and its root at job start, as for a gui job
             one = self.job("app-host-unit-tests", "s1", 8, None, "--gui-wait", "0")
-            self.assertIn("holding 1/8 units+root-1 for app-host-unit-tests (gui-step", one.stdout)
-            self.assertNotIn("gui+", one.stdout)
+            self.assertIn("holding 1/8 units+gui+root-1 for app-host-unit-tests (gui-step", one.stdout)
+            self.assertEqual(self.take_gui("s1").returncode, 0, "its step's take-gui is a no-op")
         finally:
             for runner in ("s0", "s1", "g0", "g1"):
                 self.finish(runner)
