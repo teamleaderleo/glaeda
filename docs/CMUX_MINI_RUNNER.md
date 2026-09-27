@@ -68,8 +68,8 @@ What `--apply` does:
      `glaeda-disk --pressure --apply --top 0` with a 120 s timeout that never fails
      the job.
    - An admitted job is then held to the fleet host (`/Users/Shared/cmux-build-fleet`),
-     so a PR job never lands on a mini that is busy with other work. It is refused fast,
-     so the pool picker re-runs it elsewhere, when the host is reserved
+     so a PR job never lands on a mini that is busy with other work. It is refused, so
+     cmux's rescue re-runs it on Blacksmith, when the host is reserved
      (`reservation.json`, `glaeda-reservation/v1` with integer Unix-second `since` and
      `until`, active while now is before `until`, whoever owns it; an unreadable or
      invalid marker also refuses, an expired one is ignored; parsed by
@@ -133,8 +133,9 @@ What `--apply` does:
      which the refusal rescue re-runs on Blacksmith once the run ends. The listener gate
      let the runner listen, so the mini had room a moment earlier and the wait usually
      outlasts the job that took it. Because `flock` gives no preference to the exclusive waiter, it also
-     refuses while another process (the build worker in `with-host-lock`) is waiting
-     for `host.lock`, so the worker gets the host as soon as the running PR jobs end.
+     takes nothing while another process (the build worker in `with-host-lock`) is waiting
+     for `host.lock`: it retries through the same wait, so the worker gets the host as soon
+     as the running PR jobs end.
      Admissions on one mini are serialized for a moment (`capacity/admission.lock`),
      so two jobs never split the free units between them.
    - The toolchain check also requires `gh` on the job PATH: cmux's CI scripts call
@@ -240,8 +241,12 @@ What `--apply` does:
      `--min-free-gib` of the runner's own job-started hook and `statvfs` on every poll,
      and holds the listener while free disk is below it, since job-started would refuse
      every job. On 2026-09-27, 68 of the fleet's 151 refusals in 24 h were this one,
-     mostly seeds on cmuxs-mac-mini-6 at 134 of 150 GiB. `glaeda-disk --pressure` frees
-     space in the meantime, and the next poll above the floor starts the listener.
+     mostly seeds on cmuxs-mac-mini-6 at 134 of 150 GiB. A hold ends only 2 GiB above the
+     floor, so a mini at the edge does not flap. `glaeda-disk --pressure` reads the highest
+     floor among the user's runner hooks and starts freeing at floor + 4 GiB, up to floor +
+     20 GiB, whatever its `--low` and `--target`: otherwise a 460 GiB mini between the default
+     low (about 115 GiB) and a 150 GiB floor would stay held with nothing freed. A hold past
+     30 min logs once that space must be freed by hand.
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`.
      - The listener's graceful exit ends its session, and GitHub shows the runner as

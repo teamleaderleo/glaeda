@@ -251,7 +251,7 @@ class HookTest(unittest.TestCase):
             environ["GITHUB_REPOSITORY"] = repo
         environ.update(env or {})
         return subprocess.run([sys.executable, os.fspath(HOOK), phase, *extra], env=environ,
-                              capture_output=True, text=True, timeout=30, check=False)
+                              capture_output=True, text=True, timeout=60, check=False)
 
     def test_sample_events(self) -> None:
         for name, (event_name, payload, admitted) in SAMPLE_EVENTS.items():
@@ -2832,6 +2832,35 @@ class GateTest(unittest.TestCase):
         self.assertEqual(gate.confirmed(), why, "the look right before a stop sees it too")
         script.write_text("exec python3 /hook job-started --allowed-owner manaflow-ai --min-free-gib 1\n")
         self.assertIsNone(gate.claimed(), "read on every poll: a re-apply that lowers the floor counts at once")
+        self.assertEqual(hook.min_free_gib(" --min-free-gib 100 --min-free-gib 1e+03 "), 1000.0, "the last one wins")
+        self.assertEqual(hook.min_free_gib(" --min-free-gib=150\n"), 150.0)
+        self.assertEqual(hook.min_free_gib(" --min-free-gib x1 "), 0.0)
+        self.assertEqual(hook.min_free_gib(" --min-free-gib 1e "), 0.0, "not a number: no floor")
+
+    def test_a_disk_hold_resumes_above_the_floor_and_logs_a_long_hold_once(self) -> None:
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec python3 /hook job-started --min-free-gib 100\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        free = {"gib": 99.0}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        logs: list[str] = []
+        clock = {"t": 1000.0}
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "gate_log", side_effect=logs.append), \
+                mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock["t"]):
+            self.assertIn("100 GiB required", gate.low_disk())
+            free["gib"] = 101.0
+            self.assertIn("102 GiB required", gate.low_disk(), "a hold resumes only 2 GiB above the floor")
+            clock["t"] += hook.GATE_DISK_NOTE_S
+            gate.low_disk()
+            gate.low_disk()
+            self.assertEqual(len(logs), 1, "a long hold is logged once")
+            self.assertIn("free space by hand", logs[0])
+            free["gib"] = 102.0
+            self.assertIsNone(gate.low_disk())
+            free["gib"] = 101.0
+            self.assertIsNone(gate.low_disk(), "no hold: the floor itself applies again")
 
     def test_a_root_runner_holds_while_a_token_its_jobs_need_is_taken(self) -> None:
         root = hook.RunnerScope(4, 2, 2, True)

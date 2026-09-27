@@ -339,6 +339,27 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.apply(items, fams, self.receipt(), {dev: 1 << 62}, 24)
         self.assertFalse((self.root / "old").exists())
 
+    def test_a_runner_disk_floor_lifts_the_pressure_thresholds(self) -> None:
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        self.assertEqual(gd.runner_floor_gib(home), 0.0, "no runner: no floor")
+        for name, text in (("actions-runner-glaeda", "exec x job-started --min-free-gib 100 --min-free-gib 150\n"),
+                           ("actions-runner-glaeda-1", "exec x job-started --min-free-gib 1e+02\n"),
+                           ("actions-runner-glaeda-2", "exec x job-started --min-free-gib nope\n")):
+            hook = home / name / "glaeda-hooks/job-started.sh"
+            hook.parent.mkdir(parents=True)
+            hook.write_text(text)
+        self.assertEqual(gd.runner_floor_gib(home), 150.0, "the highest, each hook's last")
+        free, total = gd.free_bytes(self.root)
+        plain = gd.filesystems([self.fam], "0", "0")
+        lifted = gd.filesystems([self.fam], "0", "0", floor_gib=150)
+        (fs,), (up,) = plain.values(), lifted.values()
+        self.assertEqual((fs.low, fs.target), (0, 0))
+        self.assertEqual(up.low, int(154 * gd.GIB), "pressure starts before the gate's 2 GiB resume mark")
+        self.assertEqual(up.target, int(170 * gd.GIB))
+        high = gd.filesystems([self.fam], "100%", "100%", floor_gib=150)
+        self.assertEqual(next(iter(high.values())).low, total, "never lowers a higher threshold")
+
     def test_filesystems_group_roots_and_apply_thresholds(self) -> None:
         other = gd.Family("tmp", self.root, True, "scratch")
         fss = gd.filesystems([self.fam, other], "0", "100%")
