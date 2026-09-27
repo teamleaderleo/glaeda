@@ -1533,8 +1533,8 @@ fn submodule_checkout_preserved(
     // A `.git` directory here is an embedded repository, which removal deletes outright.
     match std::fs::symlink_metadata(path.join(".git")) {
         Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(unavailable()),
     }
     if std::fs::canonicalize(&path).map_err(|_| unavailable())? != path {
