@@ -20,7 +20,10 @@
 //! - The objects of this worktree's own submodule repositories. A submodule counts as preserved
 //!   when it is clean, at the commit the superproject records, and every ref it holds is reachable
 //!   from its remote-tracking refs; those objects then come back from the remote, not from disk,
-//!   and a remote that later drops them takes them with it. The decision says so with
+//!   and a remote that later drops them takes them with it. Any ref under `refs/remotes/` counts,
+//!   including one written by hand or fetched from a local path, and history the submodule reaches
+//!   only through its reflog goes too, even when preserved superproject history records it. The
+//!   decision says so with
 //!   [`LinkedWorktreeReclaimAuthority::PreservedInRepositoryAndSubmoduleRemotes`].
 //!
 //! Shared refs mean branches, tags, and remote-tracking refs. `refs/stash`, prefetch refs, and other
@@ -1433,10 +1436,20 @@ fn observe_submodule_preservation(
         .iter()
         .map(|repository| Ok((repository.clone(), administrative_fingerprint(repository)?)))
         .collect::<Result<Vec<_>, LinkedWorktreeReclaimError>>()?;
+    // Each repository must be the checkout of exactly one populated gitlink: a repository no
+    // checkout uses keeps an index and a `core.worktree` nothing here inspects.
+    let mut checked_out = Vec::with_capacity(populated_gitlinks.len());
     for relative in populated_gitlinks {
-        if !submodule_checkout_preserved(observer, checkout, relative, &repositories, executor)? {
+        let Some(repository) =
+            submodule_checkout_preserved(observer, checkout, relative, &repositories, executor)?
+        else {
             return Ok(None);
-        }
+        };
+        checked_out.push(repository);
+    }
+    checked_out.sort();
+    if checked_out != repositories {
+        return Ok(None);
     }
     for repository in &repositories {
         if !submodule_repository_preserved(observer, repository, executor)? {
@@ -1447,7 +1460,8 @@ fn observe_submodule_preservation(
 }
 
 /// Every Git repository beneath `modules/`, canonicalized; `None` for any layout this module does
-/// not recognize (a symlink, a stray file, a repository nested inside another, too many).
+/// not recognize (a symlink, a stray file, a repository nested inside another, a repository with
+/// linked worktrees of its own, too many).
 fn submodule_repositories(root: &Path) -> Result<Option<Vec<PathBuf>>, LinkedWorktreeReclaimError> {
     let mut repositories = Vec::new();
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
@@ -1460,7 +1474,12 @@ fn submodule_repositories(root: &Path) -> Result<Option<Vec<PathBuf>>, LinkedWor
             Err(_) => return Err(unavailable()),
         };
         if is_git_directory(&directory)? {
-            if depth == 0 || directory_nonempty(&directory.join("modules"))? {
+            // Nested submodules, and linked worktrees of the submodule whose per-worktree refs,
+            // HEADs and indexes live under `worktrees/` and go with it, are not proven here.
+            if depth == 0
+                || directory_nonempty(&directory.join("modules"))?
+                || directory_nonempty(&directory.join("worktrees"))?
+            {
                 return Ok(None);
             }
             if repositories.len() >= MAX_SUBMODULE_REPOSITORIES {
@@ -1502,14 +1521,14 @@ fn is_git_directory(directory: &Path) -> Result<bool, LinkedWorktreeReclaimError
 
 /// One populated gitlink path: an absorbed checkout of a repository under `modules/`, clean, at
 /// the commit the superproject's HEAD and index both record, with nothing Git would hide from
-/// status.
+/// status. Returns that repository, or `None` when anything does not hold.
 fn submodule_checkout_preserved(
     observer: &ProjectCheckoutObserver,
     checkout: &Path,
     relative: &Path,
     repositories: &[PathBuf],
     executor: &impl TimedCommandExecutor,
-) -> Result<bool, LinkedWorktreeReclaimError> {
+) -> Result<Option<PathBuf>, LinkedWorktreeReclaimError> {
     let path = checkout.join(relative);
     // A `.git` directory here is an embedded repository, which removal deletes outright.
     match std::fs::symlink_metadata(path.join(".git")) {
@@ -1519,20 +1538,20 @@ fn submodule_checkout_preserved(
         Err(_) => return Err(unavailable()),
     }
     if std::fs::canonicalize(&path).map_err(|_| unavailable())? != path {
-        return Ok(false);
+        return Ok(None);
     }
     let Ok(git_dir) = absolute_git_path(observer, &path, "--git-dir", executor) else {
-        return Ok(false);
+        return Ok(None);
     };
     let Ok(git_dir) = std::fs::canonicalize(git_dir) else {
-        return Ok(false);
+        return Ok(None);
     };
     if !repositories.contains(&git_dir) {
-        return Ok(false);
+        return Ok(None);
     }
     let top_level = git(observer, &path, &["rev-parse", "--show-toplevel"], executor)?;
     if top_level.stdout.strip_suffix('\n').map(Path::new) != Some(path.as_path()) {
-        return Ok(false);
+        return Ok(None);
     }
 
     // Content filters run configured programs during status; the superproject refuses them too.
@@ -1549,15 +1568,15 @@ fn submodule_checkout_preserved(
         )
         .map_err(|error| git_failure(&error))?;
     if filters.status != Some(1) || !filters.stdout.is_empty() || !filters.stderr.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let index = scan_index(&read_index(&git_dir.join("index"))?)?;
     if index.hidden_entries_present || !index.gitlink_paths.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     for marker in OPERATION_MARKERS {
         if entry_present(&git_dir.join(marker))? {
-            return Ok(false);
+            return Ok(None);
         }
     }
     let status = observer
@@ -1577,11 +1596,11 @@ fn submodule_checkout_preserved(
         .map_err(|error| git_failure(&error))
         .and_then(require_success)?;
     if !status.stdout.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
 
     let Some(relative_text) = relative.to_str() else {
-        return Ok(false);
+        return Ok(None);
     };
     let submodule_head = git(
         observer,
@@ -1603,7 +1622,7 @@ fn submodule_checkout_preserved(
         )
         .map_err(|error| git_failure(&error))?;
     if recorded.status != Some(0) {
-        return Ok(false);
+        return Ok(None);
     }
     let staged = git(
         observer,
@@ -1625,9 +1644,10 @@ fn submodule_checkout_preserved(
         .is_some_and(|(object, rest)| {
             object == recorded && rest == format!("0\t{relative_text}\0")
         });
-    Ok(!recorded.is_empty()
+    let at_recorded_commit = !recorded.is_empty()
         && staged_matches
-        && submodule_head.stdout.strip_suffix('\n') == Some(recorded))
+        && submodule_head.stdout.strip_suffix('\n') == Some(recorded);
+    Ok(at_recorded_commit.then_some(git_dir))
 }
 
 /// Every ref and HEAD of one submodule repository is reachable from its remote-tracking refs.
@@ -1935,7 +1955,9 @@ pub fn reclaim_linked_worktree(
     // Final guard, as close to removal as possible. Git's own check covers new untracked files,
     // staging, locks, and path swaps, but not hidden-flag edits or a new detached commit, so any
     // movement of HEAD or per-worktree Git state since observation keeps the worktree. The window
-    // that remains is the time between these reads and Git's own status check.
+    // that remains is the time between these reads and Git's own status check, or, for a
+    // worktree with submodules, the status check below; ref-only changes inside a submodule
+    // repository (a new tag or branch) in that window are not seen.
     let head_unchanged = git(
         observer,
         &entry.path,
@@ -1956,22 +1978,31 @@ pub fn reclaim_linked_worktree(
     }
     // Git refuses to remove any worktree with submodules, so a proven one needs `--force`, which
     // also skips Git's own cleanliness check. Run that check here instead, as Git would: the
-    // superproject with untracked files shown and submodule contents included.
-    let force = observed.facts.populated_submodules_present;
+    // superproject with untracked files shown and submodule contents included. Git's check trips
+    // on a `modules/` directory even when it is empty, so that needs `--force` too.
+    let force = observed.facts.populated_submodules_present
+        || matches!(entry_present(&observed.git_dir.join("modules")), Ok(true));
     if force {
-        let clean = git(
-            observer,
-            &entry.path,
-            &[
-                "-c",
-                "status.showUntrackedFiles=normal",
-                "status",
-                "--porcelain",
-                "--ignore-submodules=none",
-            ],
-            executor,
-        )
-        .is_ok_and(|record| record.stdout.is_empty());
+        let clean = observer
+            .git_with_limits(
+                &entry.path,
+                &[
+                    "-c",
+                    "status.showUntrackedFiles=normal",
+                    "status",
+                    "--porcelain",
+                    "--ignore-submodules=none",
+                ],
+                crate::project_checkout_observation::MAX_PROJECT_STATUS_OUTPUT_BYTES,
+                crate::project_checkout_observation::PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT,
+                executor,
+            )
+            .is_ok_and(|record| {
+                record.success
+                    && record.status == Some(0)
+                    && record.stderr.is_empty()
+                    && record.stdout.is_empty()
+            });
         if !clean {
             return LinkedWorktreeReclaimOutcome::Changed { target };
         }

@@ -571,6 +571,20 @@ fn hidden_unique_state_is_never_eligible() {
     let moved = add_submodule("sub-moved");
     git(&moved.join("sub"), &["checkout", "--detach", "HEAD~1"]);
     fixture.age("sub-moved");
+    // A submodule with a linked worktree of its own, whose per-worktree state lives in the
+    // submodule repository that removal deletes.
+    let with_worktree = add_submodule("sub-worktree");
+    let submodule_worktree = fixture.root.join("submodule-own-worktree");
+    git(
+        &with_worktree.join("sub"),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            submodule_worktree.to_str().expect("UTF-8"),
+        ],
+    );
+    fixture.age("sub-worktree");
 
     // A per-worktree ref pointing at a commit nothing else reaches.
     let per_worktree = fixture.add("per-worktree");
@@ -638,7 +652,7 @@ fn hidden_unique_state_is_never_eligible() {
         absorbed["decision"]["authority"],
         "preserved_in_repository_and_submodule_remotes"
     );
-    for name in ["sub-unpushed", "sub-dirty", "sub-moved"] {
+    for name in ["sub-unpushed", "sub-dirty", "sub-moved", "sub-worktree"] {
         assert_eq!(
             vetoes_of(&entry_by_name(&fixture, &report, name)),
             ["populated_submodules_present"],
