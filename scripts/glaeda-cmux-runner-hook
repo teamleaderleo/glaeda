@@ -71,6 +71,7 @@ import importlib.util
 import json
 import math
 import os
+import plistlib
 import re
 import select
 import shutil
@@ -894,6 +895,7 @@ ROOT_SHIM = "glaeda-canonical-root"
 
 
 TEST_KEYCHAIN = "cmux-ci.keychain-db"
+TEST_KEYCHAIN_AGENT = "com.teamleaderleo.glaeda.test-keychain"
 
 
 def ensure_test_keychain(home: Path) -> str:
@@ -928,9 +930,45 @@ def ensure_test_keychain(home: Path) -> str:
         if listed(call("default-keychain", "-d", "user").stdout)[:1] != [path] \
                 and call("default-keychain", "-d", "user", "-s", path).returncode:
             return "test keychain: unlocked, but setting the default failed"
-        return f"test keychain {TEST_KEYCHAIN} unlocked and default"
+        return f"test keychain {TEST_KEYCHAIN} unlocked and default; {unlock_in_aqua(home, path)}"
     except (OSError, subprocess.SubprocessError) as error:
         return f"test keychain: {type(error).__name__}"
+
+
+def unlock_in_aqua(home: Path, path: str) -> str:
+    """Unlock the test keychain in the console (Aqua) session too, through a gui LaunchAgent.
+    A keychain is unlocked per security session. The runner's agent has SessionCreate, so the unlock above
+    holds for jobs only; in the console session the keychain stays locked, and because it is in the user's
+    search list Spotlight asks for its password there, a SecurityAgent prompt over the desktop that UI tests
+    cannot get past. This agent has no SessionCreate, so launchd runs it in the console session: at every
+    login (RunAtLoad) and here at each job start (kickstart), so a relock heals before the job's tests.
+    Written and loaded here, not by setup, so it goes wherever the test keychain goes. Best effort."""
+    plist = home / "Library/LaunchAgents" / f"{TEST_KEYCHAIN_AGENT}.plist"
+    data = plistlib.dumps({"Label": TEST_KEYCHAIN_AGENT, "RunAtLoad": True, "ProcessType": "Background",
+                           "ProgramArguments": ["/usr/bin/security", "unlock-keychain", "-p", "", path]},
+                          sort_keys=True)
+    launchctl = "/bin/launchctl"
+    domain = f"gui/{os.getuid()}"
+
+    def call(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([launchctl, *args], capture_output=True, text=True, timeout=15)
+
+    try:
+        if not plist.is_file() or plist.read_bytes() != data:
+            plist.parent.mkdir(parents=True, exist_ok=True)
+            tmp = plist.with_name(f".{plist.name}.{os.getpid()}")
+            tmp.write_bytes(data)
+            os.replace(tmp, plist)
+            call("bootout", f"{domain}/{TEST_KEYCHAIN_AGENT}")  # a changed plist loads fresh; not loaded is fine
+        kick = ("kickstart", f"{domain}/{TEST_KEYCHAIN_AGENT}")
+        if not call(*kick).returncode:
+            return "console session: unlock started"
+        loaded = call("bootstrap", domain, os.fspath(plist))  # RunAtLoad runs it now
+        if not loaded.returncode or not call(*kick).returncode:  # or a concurrent job's hook just loaded it
+            return "console session: unlock started"
+        return f"console session: bootstrap failed ({(loaded.stderr or loaded.stdout).strip()[:120]})"
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"console session: {type(error).__name__}"
 
 
 def ensure_root_shim(bin_dir: Path) -> None:

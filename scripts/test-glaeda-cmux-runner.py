@@ -3355,9 +3355,23 @@ class RunnerTest(unittest.TestCase):
             state = {"list": [login], "default": login}
             calls: list[list[str]] = []
 
+            agents: list[list[str]] = []
+            loaded: set[str] = set()
+
             def fake(argv: list[str], **_: object) -> subprocess.CompletedProcess:
-                calls.append(argv[1:])
                 verb, rest = argv[1], argv[2:]
+                if argv[0] == "/bin/launchctl":
+                    agents.append(argv[1:])
+                    code = 0
+                    if verb == "bootstrap":
+                        loaded.add(hook.TEST_KEYCHAIN_AGENT)
+                    elif verb == "bootout":
+                        code = 0 if hook.TEST_KEYCHAIN_AGENT in loaded else 3
+                        loaded.discard(hook.TEST_KEYCHAIN_AGENT)
+                    elif verb == "kickstart":
+                        code = 0 if hook.TEST_KEYCHAIN_AGENT in loaded else 113
+                    return subprocess.CompletedProcess(argv, code, "", "")
+                calls.append(argv[1:])
                 out = ""
                 if verb == "create-keychain":
                     Path(rest[-1]).write_bytes(b"")
@@ -3371,9 +3385,20 @@ class RunnerTest(unittest.TestCase):
                     out = f'    "{state["default"]}"\n'
                 return subprocess.CompletedProcess(argv, 0, out, "")
 
+            plist = home / "Library/LaunchAgents" / f"{hook.TEST_KEYCHAIN_AGENT}.plist"
+            domain = f"gui/{os.getuid()}"
             with mock.patch.object(hook.subprocess, "run", side_effect=fake):
-                self.assertIn("unlocked and default", hook.ensure_test_keychain(home))
+                self.assertIn("unlocked and default; console session: unlock started", hook.ensure_test_keychain(home))
                 self.assertEqual(state, {"list": [path, login], "default": path})
+                agent = plistlib.loads(plist.read_bytes())
+                self.assertEqual(agent["ProgramArguments"], ["/usr/bin/security", "unlock-keychain", "-p", "", path])
+                self.assertTrue(agent["RunAtLoad"], "unlocks in the console session at every login")
+                self.assertNotIn("SessionCreate", agent, "the console session, not a session of its own")
+                self.assertEqual(agents[-1], ["bootstrap", domain, os.fspath(plist)])
+                agents.clear()
+                self.assertIn("console session: unlock started", hook.ensure_test_keychain(home))
+                self.assertEqual(agents, [["kickstart", f"{domain}/{hook.TEST_KEYCHAIN_AGENT}"]],
+                                 "a loaded agent is only kickstarted, so a relock heals at each job start")
                 self.assertIn(["create-keychain", "-p", "", path], calls)
                 self.assertIn(["set-keychain-settings", path], calls, "no lock timeout, no lock on sleep")
                 calls.clear()
