@@ -322,39 +322,144 @@ class BorrowTests(unittest.TestCase):
         self.assertEqual(doc["connection"], {"kind": "ssh", "host": "build-mini-1", "user": "builder"})
         self.assertEqual(doc["reservation_schema"], mf.RESERVATION_SCHEMA)
 
+    OWNER = "leo@air+0123456789ab"
+
+    def borrow(self, observed_doc: dict, hosts: list[str] | None = None, json_output: bool = False) -> tuple[int, str]:
+        with mock.patch.object(mf.secrets, "token_hex", return_value="0123456789ab"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = mf.cmd_borrow(self.manifest, hosts or ["build-mini-1"], observed_doc, "std", "interactive", 1,
+                                 None, "leo@air", True, json_output)
+        return code, out.getvalue()
+
+    def two_hosts(self) -> dict:
+        self.manifest["hardware"]["m4pro-64"] = dict(self.manifest["hardware"]["m4pro-48"], memory_gib=64)
+        mini2 = self.manifest["hosts"]["build-mini-2"]
+        mini2["roles"] = ["ci-runner"]
+        mini2["hardware"] = "m4pro-64"
+        text2 = probe_text(hostname="Build-Mini-2", node_id="cmux-mac-002").replace(
+            f"memory_bytes\t{48 * 2**30}", f"memory_bytes\t{64 * 2**30}")
+        return observed(**{"build-mini-1": probe_text(), "build-mini-2": text2})
+
+    def test_each_borrow_gets_its_own_owner(self) -> None:
+        first, second = mf.borrow_owner("leo@air"), mf.borrow_owner("leo@air")
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith("leo@air+"))
+        self.assertLessEqual(len(mf.borrow_owner("a" * 100)), 100)
+
+    def test_ranking_prefers_memory_then_host_name(self) -> None:
+        got, excluded = mf.borrow_candidates(self.manifest, self.two_hosts(), ["build-mini-1", "build-mini-2"], "std")
+        self.assertEqual([row["host"] for row in got], ["build-mini-2", "build-mini-1"])
+        self.assertEqual(excluded, {})
+
+    def test_same_operator_cannot_borrow_a_host_another_session_holds(self) -> None:
+        # Session A holds build-mini-1 under its own lease owner; session B (same $USER@host) selected from an
+        # older observation. B's reserve must refuse A's hold instead of extending it, and never write.
+        now = int(time.time())
+        held = {"valid": True, "owner": "leo@air+aaaaaaaaaaaa", "purpose": "interactive", "since": now - 5,
+                "until": now + 3600}
+        current = {"state": "active", "token": "t" * 64, "reservation": held}
+        with mock.patch.object(mf, "read_reservation", return_value=current), \
+                mock.patch.object(mf, "reservation_ssh") as ssh, \
+                mock.patch.object(mf, "observe") as observe:
+            code, out = self.borrow(self.obs())
+        self.assertEqual(code, 1)
+        ssh.assert_not_called()
+        observe.assert_not_called()
+        self.assertIn("no idle eligible std host", out)
+
+    def test_reserve_failure_falls_through_to_the_next_candidate(self) -> None:
+        obs = self.two_hosts()
+        now = int(time.time())
+        fresh = observed(**{"build-mini-1": probe_text() + reservation_line(
+            owner=self.OWNER, purpose="interactive", since=now, until=now + 3600)})
+
+        def reserve(manifest, hosts, *args):
+            print(f"{hosts[0]}: refused: reserved by someone")
+            return 1 if hosts == ["build-mini-2"] else 0
+
+        with mock.patch.object(mf, "cmd_reserve", side_effect=reserve), \
+                mock.patch.object(mf, "read_reservation", return_value={"state": "absent", "reservation": None}), \
+                mock.patch.object(mf, "cmd_release") as release, \
+                mock.patch.object(mf, "observe", return_value=fresh):
+            code, out = self.borrow(obs, ["build-mini-1", "build-mini-2"], json_output=True)
+        self.assertEqual(code, 0)
+        doc = json.loads(out)
+        self.assertEqual((doc["host"], doc["owner"]), ("build-mini-1", self.OWNER))
+        self.assertEqual(doc["release"], ["glaeda-mini-fleet", "release", "build-mini-1", "--owner", self.OWNER, "--yes"])
+        self.assertIn("reserved by someone", doc["selection"]["excluded"]["build-mini-2"])
+        release.assert_not_called()
+
+    def test_failed_reserve_drops_its_own_stray_hold(self) -> None:
+        now = int(time.time())
+        stray = {"state": "active", "reservation": {"valid": True, "owner": self.OWNER, "purpose": "interactive",
+                                                    "since": now, "until": now + 3600}}
+        with mock.patch.object(mf, "cmd_reserve", return_value=1), \
+                mock.patch.object(mf, "read_reservation", return_value=stray), \
+                mock.patch.object(mf, "cmd_release", return_value=0) as release:
+            code, out = self.borrow(self.obs())
+        self.assertEqual(code, 1)
+        release.assert_called_once_with(self.manifest, ["build-mini-1"], self.OWNER, False, True)
+        with mock.patch.object(mf, "cmd_reserve", return_value=1), \
+                mock.patch.object(mf, "read_reservation", return_value=stray), \
+                mock.patch.object(mf, "cmd_release", return_value=1), \
+                self.assertRaisesRegex(mf.Failure, "hold may remain"):
+            self.borrow(self.obs())
+
     def test_fresh_post_reservation_worker_race_releases_and_refuses(self) -> None:
         now = int(time.time())
         fresh = self.obs(
-            reservation_line(owner="leo@air", purpose="interactive", since=now - 1, until=now + 3600)
+            reservation_line(owner=self.OWNER, purpose="interactive", since=now - 1, until=now + 3600)
             + "runner_worker\trunning\n"
         )
         with mock.patch.object(mf, "cmd_reserve", return_value=0), \
                 mock.patch.object(mf, "cmd_release", return_value=0) as release, \
-                mock.patch.object(mf, "observe", return_value=fresh), \
-                contextlib.redirect_stdout(io.StringIO()):
-            code = mf.cmd_borrow(
-                self.manifest, ["build-mini-1"], self.obs(), "std", "interactive", 1, None,
-                "leo@air", True, False
-            )
+                mock.patch.object(mf, "observe", return_value=fresh):
+            code, out = self.borrow(self.obs(), json_output=True)
         self.assertEqual(code, 1)
-        release.assert_called_once_with(self.manifest, ["build-mini-1"], "leo@air", False, True)
+        release.assert_called_once_with(self.manifest, ["build-mini-1"], self.OWNER, False, True)
+        doc = json.loads(out)
+        self.assertEqual(doc["state"], "unavailable")
+        self.assertIn("became busy", doc["selection"]["excluded"]["build-mini-1"])
+        self.assertNotIn("excluded", doc)
+
+    def test_release_failure_after_a_race_raises(self) -> None:
+        fresh = self.obs("runner_worker\trunning\n")
+        with mock.patch.object(mf, "cmd_reserve", return_value=0), \
+                mock.patch.object(mf, "cmd_release", return_value=1), \
+                mock.patch.object(mf, "observe", return_value=fresh), \
+                self.assertRaisesRegex(mf.Failure, "could not be released"):
+            self.borrow(self.obs())
+
+    def test_unreachable_reprobe_leaves_the_reservation_and_says_so(self) -> None:
+        fresh = {"hosts": {"build-mini-1": {"host": "build-mini-1", "reachable": False}}}
+        with mock.patch.object(mf, "cmd_reserve", return_value=0), \
+                mock.patch.object(mf, "cmd_release") as release, \
+                mock.patch.object(mf, "observe", return_value=fresh), \
+                self.assertRaisesRegex(mf.Failure, "left in place"):
+            self.borrow(self.obs())
+        release.assert_not_called()
 
     def test_fresh_post_reservation_idle_host_is_returned(self) -> None:
         now = int(time.time())
         fresh = self.obs(
-            reservation_line(owner="leo@air", purpose="interactive", since=now - 1, until=now + 3600)
+            reservation_line(owner=self.OWNER, purpose="interactive", since=now - 1, until=now + 3600)
         )
         with mock.patch.object(mf, "cmd_reserve", return_value=0), \
                 mock.patch.object(mf, "cmd_release", return_value=0) as release, \
-                mock.patch.object(mf, "observe", return_value=fresh), \
-                contextlib.redirect_stdout(io.StringIO()) as out:
-            code = mf.cmd_borrow(
-                self.manifest, ["build-mini-1"], self.obs(), "std", "interactive", 1, None,
-                "leo@air", True, True
-            )
+                mock.patch.object(mf, "observe", return_value=fresh):
+            code, out = self.borrow(self.obs(), json_output=True)
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out.getvalue())["state"], "reserved")
+        self.assertEqual(json.loads(out)["state"], "reserved")
         release.assert_not_called()
+
+    def test_unavailable_json_uses_the_selection_shape(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = mf.cmd_borrow(self.manifest, ["build-mini-1"], self.obs("host_lock\theld\n"), "std",
+                                 "interactive", 1, None, "leo@air", True, True)
+        self.assertEqual(code, 1)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["state"], "unavailable")
+        self.assertEqual(doc["selection"]["excluded"], {"build-mini-1": "host lock held"})
 
 
 class CheckTests(unittest.TestCase):

@@ -119,6 +119,13 @@ Both are dry runs without --yes. The probe reports the marker and whether a buil
 reserved members (active or invalid marker) out of `conforming`; it lists them, and lists members
 whose host lock was held (`busy`) without removing them.
 
+`borrow` reserves one idle ordinary CI member (roles ci-runner and ios-simulators only, no active
+marker, no Runner.Worker, host lock free) for a developer, preferring more memory, then more cpus,
+then the host name. Its owner is --owner (default $USER@$(hostname -s)) plus a random lease id, so
+two sessions of one operator never share a host; release it with that owner, which the output (JSON
+with --json, glaeda-developer-lease/v1) names. It re-probes after writing and releases a host that
+became busy meanwhile.
+
 The fleet compile-cache catch-up roles (cmuxterm-hq build-fleet README, "Filling the store"): the host
 with role `catch-up-writer` must have the LaunchDaemon ai.manaflow.cmux-build-catch-up-fill loaded (it
 runs every 15 minutes, so "not running" between ticks conforms and a non-zero last exit shows as
@@ -164,6 +171,7 @@ import io
 import getpass
 import hashlib
 import math
+import secrets
 import importlib.machinery
 import importlib.util
 import json
@@ -1273,6 +1281,22 @@ def borrow_candidates(manifest: dict[str, Any], observed: dict[str, Any], hosts:
     return candidates, excluded
 
 
+def borrow_owner(base: str) -> str:
+    """A reservation owner unique to one borrow: the operator plus a random lease id.
+
+    Parallel sessions on one laptop share $USER@host. Keyed by that, a second borrow would extend the
+    first one's hold (reserve extends a hold of the same owner) and both would get the host; a release by
+    either would drop the other's. With a lease id the second session sees another owner's active hold and
+    is refused, the reservation CAS picks one winner, and only this lease's owner releases it.
+    """
+    base = check_owner(base)
+    return check_owner(f"{base[:100 - 13]}+{secrets.token_hex(6)}")
+
+
+def borrow_selection(excluded: dict[str, str]) -> dict[str, Any]:
+    return {"policy": "idle ordinary CI member; memory, cpu, stable-host tie-break", "excluded": excluded}
+
+
 def borrow_document(manifest: dict[str, Any], candidate: dict[str, Any], record: dict[str, Any],
                     state: str, excluded: dict[str, str]) -> dict[str, Any]:
     return {
@@ -1289,11 +1313,17 @@ def borrow_document(manifest: dict[str, Any], candidate: dict[str, Any], record:
         "until": record["until"],
         "reservation_schema": RESERVATION_SCHEMA,
         "connection": {"kind": "ssh", "host": candidate["host"], "user": manifest["ssh_user"]},
-        "selection": {
-            "policy": "idle ordinary CI member; memory, cpu, stable-host tie-break",
-            "excluded": excluded,
-        },
+        "release": ["glaeda-mini-fleet", "release", candidate["host"], "--owner", record["owner"], "--yes"],
+        "selection": borrow_selection(excluded),
     }
+
+
+def emit_unavailable(klass: str, excluded: dict[str, str], json_output: bool, text: str) -> None:
+    if json_output:
+        print(json.dumps({"schema": "glaeda-developer-lease/v1", "state": "unavailable", "class": klass,
+                          "selection": borrow_selection(excluded)}, indent=2, sort_keys=True))
+    else:
+        print(text)
 
 
 def emit_borrow(doc: dict[str, Any], json_output: bool) -> None:
@@ -1306,26 +1336,37 @@ def emit_borrow(doc: dict[str, Any], json_output: bool) -> None:
           f"for {doc['purpose']} ({doc['owner']})")
     if doc["state"] == "dry_run":
         print("dry run; pass --yes to acquire")
+    else:
+        print("release: " + " ".join(shlex.quote(a) for a in doc["release"]))
+
+
+def release_own(manifest: dict[str, Any], name: str, owner: str) -> tuple[int, str]:
+    capture = io.StringIO()
+    with contextlib.redirect_stdout(capture):
+        code = cmd_release(manifest, [name], owner, False, True)
+    return code, capture.getvalue().strip()
 
 
 def cmd_borrow(manifest: dict[str, Any], hosts: list[str], observed: dict[str, Any], klass: str,
                purpose: str | None, hours: float | None, until: int | None, owner: str | None,
                yes: bool, json_output: bool) -> int:
+    """Reserve one idle ordinary CI member for a developer, or say why none is free.
+
+    The reservation stops new runner jobs from being admitted on the host, but a runner whose listener
+    already accepted a job before its Runner.Worker started can still reach the hook, which then refuses
+    that one job on the reservation (the pool picker re-runs it elsewhere), as with reserve today.
+    """
     if not purpose or not purpose.strip():
         raise Failure("borrow needs --for TEXT saying what the host is reserved for")
     if len(purpose) > PURPOSE_MAX or not purpose.isprintable():
         raise Failure(f"--for must be printable text of at most {PURPOSE_MAX} characters")
-    owner = check_owner(owner or default_owner())
+    owner = borrow_owner(owner or default_owner())
     now = int(time.time())
     end = reservation_until(hours, until, now)
     candidates, excluded = borrow_candidates(manifest, observed, hosts, klass)
     if not candidates:
-        if json_output:
-            print(json.dumps({"schema": "glaeda-developer-lease/v1", "state": "unavailable",
-                              "class": klass, "excluded": excluded}, indent=2, sort_keys=True))
-        else:
-            print(f"no idle eligible {klass} host; " + (
-                "; ".join(f"{name}: {why}" for name, why in excluded.items()) or "no candidates"))
+        emit_unavailable(klass, excluded, json_output, f"no idle eligible {klass} host; " + (
+            "; ".join(f"{name}: {why}" for name, why in excluded.items()) or "no candidates"))
         return 1
 
     if not yes:
@@ -1334,17 +1375,30 @@ def cmd_borrow(manifest: dict[str, Any], hosts: list[str], observed: dict[str, A
         emit_borrow(borrow_document(manifest, candidate, record, "dry_run", excluded), json_output)
         return 0
 
-    # Reserve first, then re-observe. The marker prevents a new runner job after acquisition; the
-    # fresh Runner.Worker/host-lock check catches one that started between selection and the CAS.
+    # Reserve first, then re-observe. The owner is unique to this borrow, so reserve only writes over an
+    # absent or expired marker (never another borrow's hold) and its CAS picks one winner. The marker
+    # prevents a new runner job after acquisition; the fresh Runner.Worker/host-lock check catches one
+    # that started between selection and the CAS.
+    user = manifest["ssh_user"]
     for candidate in candidates:
         name = candidate["host"]
         capture = io.StringIO()
         with contextlib.redirect_stdout(capture):
             code = cmd_reserve(manifest, [name], purpose, hours, until, owner, False, True)
         if code != 0:
-            excluded[name] = "lost reservation race"
+            detail = capture.getvalue().strip() or f"reserve exit {code}"
+            # reserve also fails after its write landed (the read-back or ssh failed): drop our own hold.
+            after = read_reservation(name, user)
+            if after["state"] == "error" or ((after.get("reservation") or {}).get("owner") == owner
+                                             and release_own(manifest, name, owner)[0] != 0):
+                raise Failure(f"{name}: reserve failed ({detail}) and this borrow's hold may remain; "
+                              f"release it with: glaeda-mini-fleet release {name} --owner {owner} --yes")
+            excluded[name] = f"not reserved: {detail}"
             continue
         fresh = observe(manifest, [name])["hosts"][name]
+        if not fresh.get("reachable"):
+            raise Failure(f"{name} was reserved but could not be re-observed; the reservation was left in place. "
+                          f"Release it with: glaeda-mini-fleet release {name} --owner {owner} --yes")
         held = fresh.get("reservation")
         held_state = reservation_state(held, fresh.get("observed_at") or time.time())
         safe = (held_state == "active" and held and held.get("owner") == owner
@@ -1354,22 +1408,15 @@ def cmd_borrow(manifest: dict[str, Any], hosts: list[str], observed: dict[str, A
             emit_borrow(borrow_document(manifest, candidate, record, "reserved", excluded), json_output)
             return 0
 
-        release_capture = io.StringIO()
-        with contextlib.redirect_stdout(release_capture):
-            released = cmd_release(manifest, [name], owner, False, True)
+        released, detail = release_own(manifest, name, owner)
         if released != 0:
-            detail = release_capture.getvalue().strip() or "release failed"
-            raise Failure(f"{name} was reserved but became busy and could not be released: {detail}")
+            raise Failure(f"{name} was reserved but became busy and could not be released: {detail or 'release failed'}")
         excluded[name] = (
             f"became busy after reservation (Runner.Worker {fresh.get('runner_worker') or 'unknown'}, "
             f"host lock {fresh.get('host_lock') or 'unknown'})"
         )
 
-    if json_output:
-        print(json.dumps({"schema": "glaeda-developer-lease/v1", "state": "unavailable",
-                          "class": klass, "excluded": excluded}, indent=2, sort_keys=True))
-    else:
-        print(f"no idle eligible {klass} host survived reservation acquisition")
+    emit_unavailable(klass, excluded, json_output, f"no idle eligible {klass} host survived reservation acquisition")
     return 1
 
 
