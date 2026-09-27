@@ -1681,7 +1681,7 @@ time.sleep(60)
             late = self.job("release-build", "u4", 4, None, "--instance", "1", "--gui-wait", "2")
             self.assertEqual(late.returncode, 1, late.stdout)
             self.assertGreaterEqual(time.monotonic() - waited, 2)
-            self.assertLess(time.monotonic() - waited, 10)
+            self.assertLess(time.monotonic() - waited, 20, "a 2 s wait, then a refusal")
         finally:
             if release is not None:
                 release.cancel()

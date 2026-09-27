@@ -3225,8 +3225,8 @@ def main(argv: list[str] | None = None) -> int:
                 if held or not note.startswith("capacity:"):
                     break
                 # decided per try: a cmux job waits only while its latest refusal is the gui token, or, on a
-                # side runner, units (UNITS_SHORT)
-                side = args.instance >= max(1, args.canonical_roots)
+                # side runner (not the gui runner, whose gate holds it until a unit is free), units (UNITS_SHORT)
+                side = args.instance >= max(1, args.canonical_roots) and not args.gui_runner
                 wait = (args.guest_wait if guest else args.gui_wait
                         if note.startswith(GUI_TOKEN_TAKEN) or side and UNITS_SHORT.match(note) else 0)
                 left = start + wait - time.monotonic()
