@@ -19,10 +19,12 @@
 //!   treats as garbage once it expires.
 //! - The objects of this worktree's own submodule repositories. A submodule counts as preserved
 //!   when it is clean, at the commit the superproject records, and every ref it holds is reachable
-//!   from its remote-tracking refs or from that commit when a superproject commit on a remote
+//!   from its remote-tracking refs or from that commit when a superproject remote's default branch
 //!   records it (the published gitlink); those objects then come back from the remote, not disk,
 //!   and a remote that later drops them takes them with it. Any ref under `refs/remotes/` counts,
-//!   including one written by hand or fetched from a local path, and history the submodule reaches
+//!   including one written by hand or fetched from a local path, as does whatever branch
+//!   `refs/remotes/<name>/HEAD` names; a default branch that records a commit its submodule remote
+//!   never had is trusted too. History the submodule reaches
 //!   only through its reflog goes too, even when preserved superproject history records it. The
 //!   decision says so with
 //!   [`LinkedWorktreeReclaimAuthority::PreservedInRepositoryAndSubmoduleRemotes`].
@@ -151,8 +153,8 @@ pub struct LinkedWorktreeFacts {
     /// A submodule path holds a `.git` entry, or per-worktree submodule repositories exist.
     pub populated_submodules_present: bool,
     /// Every populated submodule is clean, checked out at the commit the superproject records,
-    /// and holds nothing its remote-tracking refs, or that commit when a superproject commit on a
-    /// remote records it, do not reach. True when none is populated.
+    /// and holds nothing its remote-tracking refs, or that commit when a superproject remote's
+    /// default branch records it, do not reach. True when none is populated.
     pub submodules_preserved_on_remotes: bool,
     /// Refs under this worktree's own `refs/worktree/`, `refs/bisect/`, or `refs/rewritten/`.
     pub per_worktree_refs_present: bool,
@@ -227,8 +229,8 @@ pub enum LinkedWorktreeReclaimAuthority {
     /// repository or is covered by the named compensation.
     PreservedInRepository,
     /// As [`Self::PreservedInRepository`], and the worktree's own submodule repositories hold
-    /// nothing their remote-tracking refs, or a published superproject commit's recorded gitlink,
-    /// do not reach. Their objects go with the worktree, so
+    /// nothing their remote-tracking refs, or the gitlink a superproject remote's default branch
+    /// records, do not reach. Their objects go with the worktree, so
     /// recreating it (`git submodule update --init`) fetches them from those remotes again.
     PreservedInRepositoryAndSubmoduleRemotes,
 }
@@ -1413,7 +1415,7 @@ fn entry_present(path: &Path) -> Result<bool, LinkedWorktreeReclaimError> {
 // `git worktree remove` deletes the worktree's `modules/` directory, and with it every commit,
 // branch, stash, and edit that exists only in those submodule repositories. A submodule counts as
 // preserved only when all of that is reachable from its remote-tracking refs or is the exact commit
-// a superproject commit on a remote records for it: the remote is where `git submodule update`
+// a superproject remote's default branch records for it: the remote is where `git submodule update`
 // fetches that commit from again. Everything else -- an unusual layout, a nested submodule, a
 // filter, a single unreached ref -- keeps the worktree.
 
@@ -1699,16 +1701,18 @@ fn submodule_checkout_preserved(
 /// A populated gitlink whose checkout passed [`submodule_checkout_preserved`].
 struct PreservedCheckout {
     repository: PathBuf,
-    /// The checked-out commit, when a superproject commit on a remote records it at this path.
+    /// The checked-out commit, when a superproject remote's default branch records it at this path.
     published_commit: Option<String>,
 }
 
-/// Superproject commits whose recorded gitlinks count as published: HEAD when a remote-tracking
-/// ref reaches it, and its merge base with each remote's default branch.
+/// Superproject commits whose recorded gitlinks count as published: HEAD's merge base with each
+/// remote's default branch.
 ///
 /// A submodule is fetched by exact commit (`git submodule update` asks the remote for the
 /// recorded object), so a clone often holds its checked-out commit without any remote-tracking
-/// ref reaching it. The superproject's published history is then the evidence the remote has it.
+/// ref reaching it. A default branch's history is then the evidence the remote has it: it is what
+/// review and every fresh checkout go through. Any other pushed branch is not, since Git pushes a
+/// superproject that records an unpushed submodule commit without complaint.
 fn superproject_published_bases(
     observer: &ProjectCheckoutObserver,
     checkout: &Path,
@@ -1725,15 +1729,6 @@ fn superproject_published_bases(
         .strip_suffix('\n')
         .unwrap_or_default()
         .to_owned();
-    let unreached = git(
-        observer,
-        checkout,
-        &["rev-list", "-n1", &head, "--not", "--remotes"],
-        executor,
-    )?;
-    if unreached.stdout.is_empty() {
-        return Ok(vec![head]);
-    }
     let defaults = git(
         observer,
         checkout,
@@ -1761,7 +1756,7 @@ fn superproject_published_bases(
 }
 
 /// Every ref and HEAD of one submodule repository is reachable from its remote-tracking refs, or
-/// from `published_commit`, the commit a published superproject commit records for it.
+/// from `published_commit`, the commit a superproject remote's default branch records for it.
 fn submodule_repository_preserved(
     observer: &ProjectCheckoutObserver,
     repository: &Path,

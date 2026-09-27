@@ -947,8 +947,8 @@ fn apply_reclaims_a_worktree_whose_submodules_are_on_their_remotes() {
 }
 
 /// `git submodule update` fetches the recorded commit itself, so a clone often has no
-/// remote-tracking ref reaching its HEAD. A superproject commit on a remote that records it counts
-/// as the evidence; an unpushed one does not.
+/// remote-tracking ref reaching its HEAD. A superproject remote's default branch that records it
+/// counts as the evidence; an unpushed recording, or one pushed only on another branch, does not.
 #[test]
 fn a_submodule_commit_recorded_by_published_superproject_history_is_preserved() {
     let fixture = Fixture::new();
@@ -994,11 +994,23 @@ fn a_submodule_commit_recorded_by_published_superproject_history_is_preserved() 
         );
         worktree
     };
+    // Landed on the superproject remote's default branch.
     let published = pinned_submodule("published");
-    git(&published, &["push", "origin", "published"]);
+    git(&published, &["push", "origin", "published:main"]);
+    git(&fixture.main, &["remote", "set-head", "origin", "main"]);
     fixture.age("published");
     pinned_submodule("unpublished");
     fixture.age("unpublished");
+    // A pushed branch recording a submodule commit only this worktree has: Git pushes the
+    // superproject without the submodule, so a branch other than the default proves nothing.
+    let branch_pushed = pinned_submodule("branch-pushed");
+    commit(&branch_pushed.join("sub"), "only this submodule has it");
+    git_as_user(
+        &branch_pushed,
+        &["commit", "-am", "record a submodule commit nobody pushed"],
+    );
+    git(&branch_pushed, &["push", "origin", "branch-pushed"]);
+    fixture.age("branch-pushed");
 
     let report = report(&fixture.plan(&fixture.main));
     let published = entry_by_name(&fixture, &report, "published");
@@ -1007,10 +1019,13 @@ fn a_submodule_commit_recorded_by_published_superproject_history_is_preserved() 
         published["decision"]["authority"],
         "preserved_in_repository_and_submodule_remotes"
     );
-    assert_eq!(
-        vetoes_of(&entry_by_name(&fixture, &report, "unpublished")),
-        ["populated_submodules_present"]
-    );
+    for name in ["unpublished", "branch-pushed"] {
+        assert_eq!(
+            vetoes_of(&entry_by_name(&fixture, &report, name)),
+            ["populated_submodules_present"],
+            "{name}"
+        );
+    }
 }
 
 #[test]
