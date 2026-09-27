@@ -80,7 +80,8 @@ MIN_FREE_BYTES = 136 * 1024**3
 BUILD_TIMEOUT_S = 45 * 60
 GIT_TIMEOUT_S = 1800  # the first clone of cmux and its submodules
 # Commits of main the checkout keeps: the head the seed prefetch mirror names (minutes behind main) plus the
-# 50 first-parent ancestors cmux's seed lookup walks (seed_derived_data.py ANCESTOR_LIMIT), with room.
+# 50 first-parent ancestors cmux's seed lookup walks (seed_derived_data.py ANCESTOR_LIMIT): a mirror up to 150
+# commits behind main still finds every seed candidate.
 CLONE_DEPTH = 200
 FAILURE_BACKOFF_S = 6 * 3600  # after FAILURES_TO_PAUSE failed builds in a row
 FAILURES_TO_PAUSE = 3
