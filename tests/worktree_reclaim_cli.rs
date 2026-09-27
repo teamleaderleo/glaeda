@@ -986,7 +986,12 @@ fn a_submodule_commit_recorded_by_published_superproject_history_is_preserved() 
         // As if only the recorded commit had been fetched: no remote-tracking ref reaches it.
         git(&sub, &["update-ref", "-d", "refs/remotes/origin/side"]);
         git_as_user(&worktree, &["add", "sub"]);
-        git_as_user(&worktree, &["commit", "-m", "record the side commit"]);
+        // The name keeps the two recording commits distinct: made in the same second, identical
+        // commits would share an id, and the pushed one would publish both.
+        git_as_user(
+            &worktree,
+            &["commit", "-m", &format!("record the side commit in {name}")],
+        );
         worktree
     };
     let published = pinned_submodule("published");
