@@ -173,8 +173,16 @@ def default_families() -> list[Family]:
         # Caches are disposable by definition; an idle one goes under pressure, a live one (go-build
         # while a Go build runs) stays recent. Any git data inside keeps it, as everywhere else.
         Family("user-cache", HOME / ".cache", True, "the tool re-downloads or rebuilds it",
-               skip=("cmux-job", "glaeda-disk"), owner="tools (XDG cache)", rebuild_minutes=5),
+               # glaeda* holds glaeda-gh daemon state, the minis' native cache root, fleet-cas deployments
+               # and benchmark receipts; huggingface keeps its token; codex-runtimes is an install
+               skip=("cmux-job", "huggingface", "codex-runtimes"), skip_prefixes=("glaeda",),
+               owner="tools (XDG cache)", rebuild_minutes=5),
         Family("library-caches", HOME / "Library/Caches", True, "the app re-downloads or rebuilds it",
+               # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
+               # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
+               skip=("glaeda", "PassKit", "tidy-branches", "CloudKit", "GeoServices", "FamilyCircle",
+                     "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
+                     "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
                skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
                "use `xcrun simctl delete unavailable` (report only)"),
