@@ -776,6 +776,30 @@ class JobsTests(unittest.TestCase):
         self.assertNotIn('"event":"started"', out)
         self.assertEqual(out.count('"event":"completed"'), 400, "the tail keeps 400 completed records")
 
+    def test_a_locked_console_warns_a_person_and_shows_on_the_line(self):
+        session = '"kCGSSessionOnConsoleKey"=Yes,"kCGSessionLoginDoneKey"=Yes,"kCGSSessionUserNameKey"="cmux"'
+        locked = jobs_stdout(job_record()).replace(
+            "@now", f'@console\n      "IOConsoleUsers" = ({{{session},"CGSSessionScreenIsLocked"=Yes}})\n@now')
+        nobody = jobs_stdout().replace("@now", '@console\n      "IOConsoleLocked" = Yes\n@now')
+        unlocked = jobs_stdout(job_record()).replace("@now", f'@console\n      "IOConsoleUsers" = ({{{session}}})\n@now')
+        rows = {"mini-a": fs.parse_jobs(locked, AT), "mini-b": fs.parse_jobs(nobody, AT)}
+        self.assertEqual(rows["mini-a"]["console"], {"state": "locked", "user": "cmux"})
+        self.assertIsNone(fs.parse_jobs(jobs_stdout(job_record()), AT)["console"], "no ioreg (Linux): unknown")
+        doc = build(jobs=src({"hosts": rows}))
+        [f] = by_id(doc, "jobs.console_locked@mini-a")
+        self.assertEqual((f["severity"], f["action"]["who"], f["action"]["command"]), ("warn", "person", None))
+        self.assertIn("console session (cmux) is screen-locked: GUI jobs are refused here", f["summary"])
+        self.assertIn("turn off the screen lock", f["action"]["note"])
+        [f] = by_id(doc, "jobs.console_no_user@mini-b")
+        self.assertIn("no user is logged in at the console", f["summary"])
+        quiet = build(jobs=src({"hosts": {"mini-a": fs.parse_jobs(unlocked, AT)}}))
+        self.assertFalse(by_id(quiet, "jobs.console"))
+        self.assertEqual(self.member(quiet)["jobs"]["console"], {"state": "unlocked", "user": "cmux"})
+        self.assertEqual(fs.jobs_line(self.member(quiet)["jobs"]), "1 jobs, 0 contended")
+        self.assertEqual(fs.jobs_line(self.member(doc)["jobs"]), "1 jobs, 0 contended; console LOCKED")
+        self.assertEqual(fs.jobs_line(self.member(doc, "mini-b")["jobs"]), "no job records; console NO USER")
+        self.assertIn("console LOCKED", fs.render_text(doc))
+
     def test_jobs_probe_is_read_only_and_skips_never_touch(self):
         seen = []
         with mock.patch.object(fs, "jobs_host", side_effect=lambda h, u: seen.append(h) or {"reachable": True}):

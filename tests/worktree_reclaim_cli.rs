@@ -432,11 +432,14 @@ fn plan_classifies_real_worktrees_and_changes_nothing() {
     );
     assert_eq!(by_name("missing")["result"], "prunable");
 
-    let text = String::from_utf8(serde_json::to_vec(&document).expect("serialize")).expect("UTF-8");
-    assert!(
-        !text.contains(fixture.root.to_str().expect("UTF-8")),
-        "report must not publish checkout paths"
-    );
+    // Each worktree carries its registered path, so an operator never maps ordinals by hand.
+    for name in &order {
+        let path = by_name(name)["path"]
+            .as_str()
+            .expect("worktree path")
+            .to_owned();
+        assert!(path.ends_with(&format!("/{name}")), "{path} is not {name}");
+    }
 
     assert_eq!(
         git_output(&fixture.main, &["worktree", "list", "--porcelain"]).stdout,

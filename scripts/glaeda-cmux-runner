@@ -211,6 +211,7 @@ class Context:
         self.org = args.org
         self.repo = None if args.org else (args.repo or DEFAULT_REPO)
         self.instance = args.instance or 0
+        self.gui_runner = False  # the member's gui runner (glaeda_fleet_labels.gui_label); set from --manifest
         # Instance 0 keeps the original paths; instance K adds -K (dirs, logs, name) or .K (launchd label).
         self.suffix = f"-{self.instance}" if self.instance else ""
         self.label = f"{LABEL}.{self.instance}" if self.instance else LABEL
@@ -425,6 +426,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
             scope += f" --canonical-roots {roots}"
         # always, so the listener gate tells a root runner from a side runner (instance below the roots)
         scope += f" --instance {ctx.instance}"
+        if getattr(ctx, "gui_runner", False):  # the listener gate holds it while the gui token or every root is taken
+            scope += " --gui-runner"
     started = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"
@@ -1208,9 +1211,18 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if not args.capacity_units:
             ctx.capacity_units = int(member.get("capacityUnits") or 0)
-        is_root = ctx.instance < int(member.get("canonicalRoots") or 1)
-        roots = member.get("rootPools", []) if is_root else member.get("sidePools", [])
-        ctx.labels = list(dict.fromkeys([*BASE_LABELS, *member["labels"], *roots]))
+        runners_n = int(member.get("runners") or 1)
+        # the last instance is the gui runner when guiRunners is 1: only the gui pool label, no root or side one
+        ctx.gui_runner = ctx.instance >= runners_n - int(member.get("guiRunners") or 0)
+        is_root = ctx.instance < int(member.get("canonicalRoots") or 1) and not ctx.gui_runner
+        roots = (member.get("guiPools", []) if ctx.gui_runner
+                 else member.get("rootPools", []) if is_root else member.get("sidePools", []))
+        # The gui runner leaves out the pool and iOS simulator labels: a pool-label or iOS job must never take
+        # the one runner a mini's GUI jobs wait for, and the picker's live count of the pool's runners stays
+        # the root and side runners it can route to.
+        own = ([label for label in member["labels"] if label not in member.get("pools", []) and label != IOS_SIM_JOB_LABEL]
+               if ctx.gui_runner else member["labels"])
+        ctx.labels = list(dict.fromkeys([*BASE_LABELS, *own, *roots]))
         ctx.labels_requested = True
         if not args.name:
             ctx.name = f"{args.member}-glaeda{ctx.suffix}"

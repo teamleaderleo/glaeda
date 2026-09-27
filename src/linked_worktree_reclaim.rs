@@ -39,7 +39,9 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::process::{ExecutionRecord, MAX_CAPTURED_STREAM_BYTES, TimedCommandExecutor};
-use crate::project_checkout_observation::{ProjectBranchState, ProjectCheckoutObserver};
+use crate::project_checkout_observation::{
+    ProjectBranchState, ProjectCheckoutObservationError, ProjectCheckoutObserver,
+};
 
 mod branches;
 
@@ -337,8 +339,8 @@ impl LinkedWorktreeReclaimPlan {
 ///
 /// # Errors
 ///
-/// Refuses facts whose last activity is in the future relative to `now_seconds`, or whose idle
-/// arithmetic would overflow. Disagreeing clocks are not evidence a decision should rest on.
+/// Refuses facts whose idle arithmetic would overflow. Activity newer than `now_seconds` is
+/// planned as recently active, never as idle.
 pub fn plan_linked_worktree_reclaim(
     facts: &LinkedWorktreeFacts,
     policy: LinkedWorktreeReclaimPolicy,
@@ -379,9 +381,9 @@ pub fn plan_linked_worktree_reclaim(
     let idle_seconds = now_seconds
         .checked_sub(facts.last_activity_seconds)
         .ok_or_else(idle_overflow)?;
-    if idle_seconds < 0 {
-        return Err(future_timestamp());
-    }
+    // Activity newer than the clock reading is recent by definition. A sweep reads the clock once
+    // and then observes for many minutes on a loaded host, so a worktree touched meanwhile shows
+    // up here; a clock stepped backwards keeps worktrees too, which is the safe direction.
     let window = policy.window_for(facts.work_state);
     if idle_seconds < window {
         vetoes.push(LinkedWorktreeReclaimVeto::RecentlyActive);
@@ -851,7 +853,11 @@ fn observe_detailed(
     let fingerprint = administrative_fingerprint(&git_dir)?;
     let observation = observer
         .observe(&checkout, executor)
-        .map_err(|_| checkout_unobservable())?;
+        .map_err(|error| match error.code {
+            "observation_timed_out" => git_timed_out(),
+            "source_changed" => checkout_changed(),
+            _ => checkout_unobservable(),
+        })?;
     let linked = git_dir != common_dir;
     if linked && read_gitdir_backlink(&git_dir)? != checkout.join(".git") {
         return Err(administrative_directory_mismatch());
@@ -1014,7 +1020,7 @@ fn git(
 ) -> Result<ExecutionRecord, LinkedWorktreeReclaimError> {
     let record = observer
         .git(checkout, arguments, executor)
-        .map_err(|_| unavailable())?;
+        .map_err(|error| git_failure(&error))?;
     require_success(record)
 }
 
@@ -1027,8 +1033,16 @@ fn git_bounded(
 ) -> Result<ExecutionRecord, LinkedWorktreeReclaimError> {
     let record = observer
         .git_bounded(checkout, arguments, max_stdout_bytes, executor)
-        .map_err(|_| unavailable())?;
+        .map_err(|error| git_failure(&error))?;
     require_success(record)
+}
+
+fn git_failure(error: &ProjectCheckoutObservationError) -> LinkedWorktreeReclaimError {
+    if error.code == "observation_timed_out" {
+        git_timed_out()
+    } else {
+        unavailable()
+    }
 }
 
 fn require_success(record: ExecutionRecord) -> Result<ExecutionRecord, LinkedWorktreeReclaimError> {
@@ -1461,6 +1475,12 @@ fn parse_newest_reflog_entry(tail: &[u8]) -> Result<Option<i64>, LinkedWorktreeR
 /// Namespace for commits pinned before their only worktree is removed.
 pub const LINKED_WORKTREE_PIN_REF_PREFIX: &str = "refs/glaeda/worktree-pins/";
 
+/// Deadline for each constant-cost Git command of a reclaim sweep: reads, plus the `update-ref`
+/// pins and branch deletions, which are safer finished than killed partway. See
+/// [`ProjectCheckoutObserver::with_command_timeout`]. The sweep runs in the background, where a
+/// read that answers in 30 seconds beats a worktree that stays unobservable for another hour.
+pub const LINKED_WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Deadline for one `git worktree remove`, which scales with ignored build output in the tree.
 pub const LINKED_WORKTREE_REMOVE_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -1863,6 +1883,22 @@ const fn checkout_unobservable() -> LinkedWorktreeReclaimError {
     )
 }
 
+const fn checkout_changed() -> LinkedWorktreeReclaimError {
+    error(
+        LinkedWorktreeReclaimErrorKind::Unavailable,
+        "checkout_changed",
+        "the checkout changed between two observations; it is probably in use",
+    )
+}
+
+const fn git_timed_out() -> LinkedWorktreeReclaimError {
+    error(
+        LinkedWorktreeReclaimErrorKind::Unavailable,
+        "git_timed_out",
+        "a Git read did not finish before its deadline",
+    )
+}
+
 const fn index_too_large() -> LinkedWorktreeReclaimError {
     error(
         LinkedWorktreeReclaimErrorKind::InvalidOutput,
@@ -1916,14 +1952,6 @@ const fn invalid_index() -> LinkedWorktreeReclaimError {
         LinkedWorktreeReclaimErrorKind::InvalidOutput,
         "invalid_index",
         "the worktree index is malformed or outside the supported v2-v4 layout",
-    )
-}
-
-const fn future_timestamp() -> LinkedWorktreeReclaimError {
-    error(
-        LinkedWorktreeReclaimErrorKind::DisagreeingEvidence,
-        "future_timestamp",
-        "the observed worktree activity is newer than the supplied clock reading",
     )
 }
 
@@ -2135,13 +2163,18 @@ mod tests {
     }
 
     #[test]
-    fn future_activity_is_disagreeing_evidence() {
+    fn activity_after_the_clock_reading_is_recent() {
         let facts = LinkedWorktreeFacts {
             last_activity_seconds: NOW + 1,
             ..clean_idle()
         };
-        let error = plan_linked_worktree_reclaim(&facts, policy(), NOW).expect_err("future");
-        assert_eq!(error.code(), "future_timestamp");
+        assert_eq!(
+            plan_linked_worktree_reclaim(&facts, policy(), NOW)
+                .expect("plan")
+                .decision()
+                .vetoes(),
+            &[LinkedWorktreeReclaimVeto::RecentlyActive]
+        );
     }
 
     #[test]
