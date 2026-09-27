@@ -321,6 +321,7 @@ class BorrowTests(unittest.TestCase):
         ))
         self.assertEqual(doc["connection"], {"kind": "ssh", "host": "build-mini-1", "user": "builder"})
         self.assertEqual(doc["reservation_schema"], mf.RESERVATION_SCHEMA)
+        self.assertIsNone(doc["release"])
 
     OWNER = "leo@air+0123456789ab"
 
@@ -404,6 +405,16 @@ class BorrowTests(unittest.TestCase):
                 mock.patch.object(mf, "cmd_release", return_value=1), \
                 self.assertRaisesRegex(mf.Failure, "hold may remain"):
             self.borrow(self.obs())
+
+    def test_unreadable_host_is_skipped_without_a_hold_to_drop(self) -> None:
+        with mock.patch.object(mf, "read_reservation", return_value={"state": "error", "error": "ssh exit 255"}), \
+                mock.patch.object(mf, "reservation_ssh") as ssh, \
+                mock.patch.object(mf, "cmd_release") as release:
+            code, out = self.borrow(self.obs(), json_output=True)
+        self.assertEqual(code, 1)
+        ssh.assert_not_called()
+        release.assert_not_called()
+        self.assertIn("cannot read reservation", json.loads(out)["selection"]["excluded"]["build-mini-1"])
 
     def test_fresh_post_reservation_worker_race_releases_and_refuses(self) -> None:
         now = int(time.time())

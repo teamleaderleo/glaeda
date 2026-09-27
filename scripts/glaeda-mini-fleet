@@ -1313,7 +1313,9 @@ def borrow_document(manifest: dict[str, Any], candidate: dict[str, Any], record:
         "until": record["until"],
         "reservation_schema": RESERVATION_SCHEMA,
         "connection": {"kind": "ssh", "host": candidate["host"], "user": manifest["ssh_user"]},
-        "release": ["glaeda-mini-fleet", "release", candidate["host"], "--owner", record["owner"], "--yes"],
+        # A dry run's lease id is not the one --yes will create.
+        "release": (["glaeda-mini-fleet", "release", candidate["host"], "--owner", record["owner"], "--yes"]
+                    if state == "reserved" else None),
         "selection": borrow_selection(excluded),
     }
 
@@ -1388,7 +1390,9 @@ def cmd_borrow(manifest: dict[str, Any], hosts: list[str], observed: dict[str, A
         if code != 0:
             detail = capture.getvalue().strip() or f"reserve exit {code}"
             # reserve also fails after its write landed (the read-back or ssh failed): drop our own hold.
-            after = read_reservation(name, user)
+            # Unless reserve could not even read the marker, in which case it wrote nothing.
+            wrote = not detail.startswith(f"{name}: cannot read reservation")
+            after = read_reservation(name, user) if wrote else {"state": "absent"}
             if after["state"] == "error" or ((after.get("reservation") or {}).get("owner") == owner
                                              and release_own(manifest, name, owner)[0] != 0):
                 raise Failure(f"{name}: reserve failed ({detail}) and this borrow's hold may remain; "
