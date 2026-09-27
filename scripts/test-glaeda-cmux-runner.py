@@ -20,7 +20,6 @@ import plistlib
 import shlex
 import signal
 import shutil
-import signal
 import subprocess
 import sys
 import tarfile
@@ -1497,6 +1496,7 @@ time.sleep(60)
             holder.wait()
             holder.stdout.close()
 
+    @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
     def test_capacity_preempts_a_yielding_fleet_build(self) -> None:
         """A fleet build that wrote <host lock>.yield (cmuxterm-hq's catch-up fill) gives way: the job
         writes .preempted, SIGTERMs it and is admitted once the lock is free."""
@@ -1524,6 +1524,37 @@ time.sleep(60)
                 holder.kill()
             holder.wait()
             holder.stdout.close()
+
+    @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
+    def test_capacity_never_preempts_a_fill_waiting_behind_another_build(self) -> None:
+        """The fill marks itself yielding while it waits; if another fleet build holds the lock, the job is
+        refused at once and the waiting fill is left alone."""
+        fleet = self.fleet()
+        lock = fleet / "host.lock"
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,time\n"
+                                   f"fd=os.open({os.fspath(lock)!r},os.O_RDWR)\n"
+                                   "fcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(300)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        waiter = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,time\n"
+                                   f"fd=os.open({os.fspath(lock)!r},os.O_RDWR)\n"
+                                   "print('open',flush=True)\nfcntl.flock(fd,fcntl.LOCK_EX)\ntime.sleep(300)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            self.assertEqual(waiter.stdout.readline().strip(), "open")
+            (fleet / "host.lock.yield").write_text(f"{waiter.pid}\n")
+            result = self.job("cli-product-tests", "w0")
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("refused: capacity: a fleet build holds the host lock", result.stdout)
+            self.assertIsNone(waiter.poll(), f"the waiting fill was not signalled ({waiter.returncode})")
+            self.assertFalse((fleet / "host.lock.preempted").exists())
+        finally:
+            for proc in (holder, waiter):
+                proc.kill()
+                proc.wait()
+                proc.stdout.close()
 
     def test_capacity_never_signals_a_marker_pid_without_the_lock(self) -> None:
         """A stale or planted .yield naming a process that does not have the lock open changes nothing."""
@@ -1928,10 +1959,16 @@ class GateTest(unittest.TestCase):
         self.hold(fcntl.LOCK_EX)
         self.assertEqual(self.held(), "a fleet build holds the host lock")
 
+    @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
     def test_a_yielding_holder_leaves_the_listener_on(self) -> None:
         self.hold(fcntl.LOCK_EX)
         (self.tmp / "host.lock.yield").write_text(f"{os.getpid()}\n")
         self.assertIsNone(self.held(), "a job preempts it, so the gate keeps listening")
+        worker = self.opener("with-host-lock.py")  # another fleet build on the lock: the marker yields nothing
+        self.assertEqual(self.held(), "a fleet build holds the host lock")
+        worker.kill()
+        worker.wait()
+        self.assertIsNone(self.held())
         (self.tmp / "host.lock.yield").write_text("999999\n")  # no such process: a stale marker
         self.assertEqual(self.held(), "a fleet build holds the host lock")
         (self.tmp / "host.lock.yield").write_text("x" * 100)

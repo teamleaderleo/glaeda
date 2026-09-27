@@ -1211,6 +1211,9 @@ def holder_file(state_dir: Path) -> Path:
 YIELD_SUFFIX = ".yield"
 PREEMPTED_SUFFIX = ".preempted"
 PREEMPT_WAIT_S = 90.0
+# Under the admission lock the wait must end well before another admission gives up (ADMISSION_WAIT_S). A fill
+# that has not let go by then is still dying; the next job gets the host.
+PREEMPT_ADMISSION_WAIT_S = ADMISSION_WAIT_S / 2
 
 
 def yielding_pid(host_lock: str) -> int | None:
@@ -1232,24 +1235,29 @@ def yielding_pid(host_lock: str) -> int | None:
     return pid
 
 
-def preempt_yielding(host_lock: str, job: str) -> str | None:
-    """Stop the yielding fleet build holding host_lock (yielding_pid) so this job can have the host; a note
-    for the log, or None when nothing yields. The pid must have the lock open (lsof), so a stale or planted
-    marker never gets an unrelated process signalled."""
+def preemptible_pid(host_lock: str, ours: set[int]) -> int | None:
+    """The yielding build (yielding_pid) when it is the only fleet process with host_lock open (lsof), else
+    None. A stale or planted marker never names a process with the lock open, and a fill that only waits
+    behind another fleet build (the worker holding the lock) is not what keeps the host: neither yields it."""
     pid = yielding_pid(host_lock)
+    if pid is None or set(lock_waiters(host_lock, ours)) != {pid}:
+        return None
+    return pid
+
+
+def preempt_yielding(host_lock: str, job: str, ours: set[int]) -> str | None:
+    """Stop the yielding fleet build holding host_lock (preemptible_pid) so this job can have the host; a note
+    for the log, or None when nothing yields. The note names the pid, so the fill honors only its own."""
+    pid = preemptible_pid(host_lock, ours)
     if pid is None:
         return None
+    incoming = f"{host_lock}{PREEMPTED_SUFFIX}.{os.getpid()}"
     try:
-        out = subprocess.run([LSOF, "-t", "--", host_lock], stdin=subprocess.DEVNULL, capture_output=True,
-                             text=True, timeout=5, check=False).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if str(pid) not in out.split():
-        return None
-    with contextlib.suppress(OSError):
-        incoming = f"{host_lock}{PREEMPTED_SUFFIX}.{os.getpid()}"
         Path(incoming).write_text(json.dumps({"by": job[:120], "at": int(time.time()), "pid": pid}) + "\n")
         os.replace(incoming, host_lock + PREEMPTED_SUFFIX)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(incoming)
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError:
@@ -1288,7 +1296,7 @@ def take_host_lock(path: str, watch_pid: int, state_dir: Path) -> tuple[bool, st
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        preempted = preempt_yielding(path, os.environ.get("GITHUB_JOB") or "a job")
+        preempted = preempt_yielding(path, os.environ.get("GITHUB_JOB") or "a job", holder_pids(state_dir))
         deadline = time.monotonic() + PREEMPT_WAIT_S
         while preempted:
             try:
@@ -1397,11 +1405,11 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                     break
                 except OSError:
                     if attempt == 5:
-                        preempted = preempt_yielding(host_lock, job or "a job")
-                        if preempted is None or not wait_host_shared(fd, PREEMPT_WAIT_S):
+                        preempted = preempt_yielding(host_lock, job or "a job", holder_pids(state_dir))
+                        if preempted is None or not wait_host_shared(fd, PREEMPT_ADMISSION_WAIT_S):
                             os.close(fd)
                             return False, ("capacity: a fleet build holds the host lock"
-                                           + (f" ({preempted}, still held after {PREEMPT_WAIT_S:g} s)"
+                                           + (f" ({preempted}, still held after {PREEMPT_ADMISSION_WAIT_S:g} s)"
                                               if preempted else ""))
                         print(f"{PREFIX}: {preempted}", flush=True)
                         break
@@ -1844,7 +1852,7 @@ def mini_saturated(paused: bool, load: float | None = None, cores: int | None = 
             f"listening resumes below {GATE_LOAD_RESUME:g})")
 
 
-def host_held(host_lock: str, reservation: str, now: float) -> str | None:
+def host_held(host_lock: str, reservation: str, now: float, state_dir: Path | None = None) -> str | None:
     """Why the fleet, not a PR job, holds this host right now, or None. Our own jobs hold the host lock
     shared, so only an exclusive holder or a reservation counts. Microseconds: one non-blocking flock."""
     why = reservation_refusal(reservation, now)
@@ -1857,8 +1865,11 @@ def host_held(host_lock: str, reservation: str, now: float) -> str | None:
     try:
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
     except OSError:
-        # A yielding build (yielding_pid) gives way to the next job: keep listening through it.
-        return None if yielding_pid(host_lock) else "a fleet build holds the host lock"
+        # A yielding build gives way to the next job: keep listening through it. lsof only while a marker is
+        # up (a fill on the writer mini), to tell it from another fleet build it is waiting behind.
+        if preemptible_pid(host_lock, holder_pids(state_dir) if state_dir else set()):
+            return None
+        return "a fleet build holds the host lock"
     finally:
         os.close(fd)  # drops the probe's shared lock too
     return None
@@ -2000,7 +2011,7 @@ class Gate:
             gate_log("the reload failed; keeping this gate")
 
     def claimed(self) -> str | None:
-        why = host_held(self.host_lock, self.reservation, time.time())
+        why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir)
         if why is None and self.waiters and time.monotonic() - self.waiting_at >= GATE_WAITER_EVERY_S:
             self.waiting, self.waiting_at = host_waiters(self.host_lock, self.state_dir), time.monotonic()
         if why is None and self.waiting:
@@ -2068,7 +2079,7 @@ class Gate:
     def confirmed(self) -> str | None:
         """A fresh reading right before a stop: the holder still holds, or a waiter seen at least one poll ago
         is still waiting (a job-started in flight, which lsof also lists, is gone by then)."""
-        why = host_held(self.host_lock, self.reservation, time.time())
+        why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir)
         if why is None and self.waiting:
             again = self.waiting & host_waiters(self.host_lock, self.state_dir)
             self.waiting, self.waiting_at = again, time.monotonic()
