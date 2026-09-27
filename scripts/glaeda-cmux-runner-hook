@@ -74,6 +74,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -1948,8 +1949,9 @@ def release_holder(pid_file: Path) -> str:
 # worker's pid; `release` lets them go when the step ends. A step's holder is keyed by its job key, as a runner
 # job's is by RUNNER_NAME, so several steps hold at once beside the runners' jobs.
 # Steps take no canonical root, persistent-dd or gui token yet: those classes carry per-job setup that job-started
-# does (settle_root, testmanagerd, the console check) and move behind admit with the compile phase.
-STEP_CLASSES = ("light", "isolated", "simulator")
+# does (settle_root, testmanagerd, the console check) and move behind admit with the compile phase. No simulator
+# either: the worker is a system LaunchDaemon, outside the console user's CoreSimulator service.
+STEP_CLASSES = ("light", "isolated")
 STEP_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}")
 STEP_ADMISSION = "glaeda-ci-step-admission/v1"
 STEP_FITS = "glaeda-ci-step-fits/v1"
@@ -1957,8 +1959,10 @@ STEP_FITS_WAIT_S = 1.0  # an admission holds admission.lock for milliseconds; pa
 
 
 def step_runner_name(key: str) -> str:
-    """The RUNNER_NAME a ci-step's holder files are keyed by (holder_file), apart from every runner's."""
-    return f"ci-step-{key}"
+    """The RUNNER_NAME a ci-step's holder files are keyed by (holder_file), apart from every runner's. A digest of
+    the key, fixed length and hex, so release_host_lock's `<holder>-root-*` and `<holder>-gui` globs for one key
+    can never match another key's files, whatever the keys contain."""
+    return "ci-step-" + hashlib.sha256(key.encode()).hexdigest()[:24]
 
 
 def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, host_lock: str, reservation: str,

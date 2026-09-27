@@ -1820,14 +1820,14 @@ time.sleep(60)
         worker = self.ci_worker()
         watch = ("--watch-pid", str(worker.pid))
         try:
-            self.assertEqual(self.fits(), ["light", "isolated", "simulator"])
+            self.assertEqual(self.fits(), ["light", "isolated"])
             status, first = self.ci_step("admit", "--class", "light", "--job-key", "r1-100-1", *watch)
             self.assertEqual(status, 0, first)
             self.assertEqual((first["schema"], first["admitted"], first["units"], first["units_total"],
                               first["tokens"]), ("glaeda-ci-step-admission/v1", True, 1, 3, []))
             self.assertIsInstance(first["holder_pid"], int)
             self.assertTrue(self.shared_lock_blocks_exclusive(), "a dev build's exclusive host lock waits for steps")
-            self.assertEqual(self.fits(), ["light", "isolated", "simulator"], "two of three units are free")
+            self.assertEqual(self.fits(), ["light", "isolated"], "two of three units are free")
             status, second = self.ci_step("admit", "--class", "isolated", "--job-key", "r1-101-1", *watch)
             self.assertEqual((status, second["units"]), (0, 2), second)
             self.assertEqual(self.fits(), [], "every unit is held")
@@ -1870,19 +1870,23 @@ time.sleep(60)
         worker = self.ci_worker()
         watch = ("--watch-pid", str(worker.pid))
         try:
-            status, first = self.ci_step("admit", "--class", "simulator", "--job-key", "sim-1-1", *watch, units=6)
-            self.assertEqual((status, first["tokens"]), (0, ["simulator"]), first)
-            self.assertEqual(self.fits(units=6), ["light", "isolated"], "one simulator step per mini")
-            status, second = self.ci_step("admit", "--class", "simulator", "--job-key", "sim-2-1", *watch, units=6)
+            status, first = self.ci_step("admit", "--class", "isolated", "--job-key", "iso-1-1", *watch)
+            self.assertEqual((status, first["units"]), (0, 2), first)
+            self.assertEqual(self.fits(), ["light"], "one unit left: too few for an isolated step")
+            status, second = self.ci_step("admit", "--class", "isolated", "--job-key", "iso-2-1", *watch)
             self.assertEqual(status, 1)
-            self.assertIn("capacity: the simulator token is taken", second["reason"])
-            status, again = self.ci_step("admit", "--class", "light", "--job-key", "sim-1-1", *watch, units=6)
+            self.assertIn("capacity: 1 of 3 units free", second["reason"])
+            status, again = self.ci_step("admit", "--class", "light", "--job-key", "iso-1-1", *watch)
             self.assertEqual(status, 1, "a key holds one admission")
             self.assertIn("already admitted", again["reason"])
+            status, prefixed = self.ci_step("admit", "--class", "light", "--job-key", "iso-1-1-gui", *watch)
+            self.assertEqual(status, 0, "a key that extends another is its own step")
+            self.ci_step("release", "--job-key", "iso-1-1-gui")
+            self.assertEqual(self.fits(), ["light"], "releasing one key leaves the other's holder")
         finally:
-            self.ci_step("release", "--job-key", "sim-1-1", units=6)
-        for bad in (("--class", "compile", "--job-key", "k-1-1"), ("--class", "light", "--job-key", "../k"),
-                    ("--class", "light")):
+            self.ci_step("release", "--job-key", "iso-1-1")
+        for bad in (("--class", "compile", "--job-key", "k-1-1"), ("--class", "simulator", "--job-key", "k-1-1"),
+                    ("--class", "light", "--job-key", "../k"), ("--class", "light")):
             with self.subTest(bad=bad):
                 result = self.run_hook("admit", None, None, "--capacity-units", "3", *bad, *watch)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
@@ -1940,7 +1944,7 @@ time.sleep(60)
             self.assertEqual((status, result["fits"], result["unknown"]), (0, [], True))
         finally:
             os.close(fd)
-        self.assertEqual(self.fits(), ["light", "isolated", "simulator"])
+        self.assertEqual(self.fits(), ["light", "isolated"])
 
     def test_capacity_refuses_while_a_fleet_build_holds_the_host(self) -> None:
         fleet = self.fleet()

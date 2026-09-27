@@ -419,13 +419,16 @@ same `take_capacity`, so a mini claims a step only when it fits:
     glaeda-cmux-runner-hook admit   --class light --job-key KEY --watch-pid WORKER_PID --capacity-units U
     glaeda-cmux-runner-hook release --job-key KEY
 
-Pass the `--capacity-units` (and `--compile-slots`, `--canonical-roots`) the runners' hooks bake, so the
-worker scans the same unit files. `fits` prints the step classes (`light`, `isolated`, `simulator`) the mini
-could admit now, from the listener gate's probe, for the worker's heartbeat. `admit` takes the class's units
-and tokens without waiting and leaves them with a holder keyed `ci-step-KEY` that watches the worker's pid,
-or exits 1 with the capacity reason. Each prints one JSON line. A dev build's exclusive host lock and a
-step's shared one exclude each other, as with runner jobs. Steps take no root, persistent-dd or gui token
-yet; those classes move behind `admit` with compile placement.
+Pass the `--capacity-units` (and `--compile-slots`, `--canonical-roots`) the runners' hooks bake, and the
+worker's `--host-lock`, `--reservation` and `--capacity-dir`, so both scan one ledger (on the minis the worker
+runs as `cmux` with root `/Users/Shared/cmux-build-fleet`, the runners' `FLEET_DIR`). `fits` prints the step
+classes (`light`, `isolated`) the mini could admit now, from the listener gate's probe, and none while a fleet
+build holds or waits for the host lock. `admit` takes the class's units without waiting and leaves them with a
+holder that watches the worker's pid, or exits 1 with the capacity reason; a key admits once. The holder files
+are named by a digest of the key, so one key's `release` never touches another's. Each prints one JSON line.
+A dev build's exclusive host lock and a step's shared one exclude each other, as with runner jobs. Steps take no
+root, persistent-dd, gui or simulator token yet: the worker is a system LaunchDaemon outside the console
+session, and root classes move behind `admit` with compile placement.
 
 ## 2e. Trusted-only runners on a mini that holds a secret
 
