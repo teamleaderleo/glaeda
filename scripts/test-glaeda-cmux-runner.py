@@ -675,13 +675,22 @@ class HookTest(unittest.TestCase):
             self.assertIn("root-1", consumer.stdout)
             got = self.step(["take-root", "--root", "/private/tmp/cmux-ci-2", *one], "g0")
             self.assertEqual((got.returncode, got.stdout.strip()), (0, "/private/tmp/cmux-ci-2"), got.stderr)
-            self.assertIn("holds all of them", got.stderr)
+            self.assertEqual((self.dir / "state" / "host-lock-holder-g0.roots").read_text().split(),
+                             ["root-1", "root-2"], "it keeps root-1 and records root-2 beside it")
             self.assertEqual(self.step(["take-root", "--root", "1", *one], "g0").returncode, 0)
-            # a job holding no root takes the second root's token, so two consumers never share its alias
-            self.assertEqual(self.take("3", "x0").returncode, 0)
-            self.assertEqual(self.take("3", "x1", "--wait", "1").returncode, 1)
+            self.assertEqual(self.step(["take-root", "--root", "2", *one], "g0").returncode, 0, "a re-take is a no-op")
+            # a job holding no root waits for root-2's token, so two jobs never own its alias at once
+            waited = self.step(["take-root", "--root", "2", "--wait", "1", *one], "x0")
+            self.assertEqual(waited.returncode, 1, waited.stderr)
+            self.assertIn("still in use", waited.stderr)
+            self.finish("g0")
+            self.assertEqual(self.step(["take-root", "--root", "2", *one], "x0").returncode, 0, "released with g0")
+            late = self.job("app-host-unit-tests", "g1", 4, None, *one)
+            self.assertIn("root-1", late.stdout)
+            blocked = self.step(["take-root", "--root", "2", "--wait", "1", *one], "g1")
+            self.assertEqual(blocked.returncode, 1, "and a root-1 holder waits for x0 in turn")
         finally:
-            for runner in ("g0", "x0", "x1"):
+            for runner in ("g0", "x0", "g1"):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
