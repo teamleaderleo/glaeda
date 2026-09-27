@@ -1821,7 +1821,7 @@ time.sleep(60)
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
-    def test_capacity_gui_wait_stops_once_the_refusal_is_not_the_gui_token(self) -> None:
+    def test_capacity_wait_continues_when_the_refusal_turns_to_units(self) -> None:
         self.fleet()
         release = None
         try:
@@ -1836,11 +1836,12 @@ time.sleep(60)
             release = threading.Timer(2.0, swap)
             release.start()
             waited = time.monotonic()
-            result = self.job("tests-build-and-lag", "x4", 4, None, "--gui-wait", "30")
+            result = self.job("tests-build-and-lag", "x4", 4, None, "--gui-wait", "5")
             release.join()
             self.assertEqual(result.returncode, 1, result.stdout)
             self.assertIn("units free", result.stdout)
-            self.assertLess(time.monotonic() - waited, 20, "a units refusal after a gui one does not keep waiting")
+            self.assertGreaterEqual(time.monotonic() - waited, 5, "a units refusal after a gui one keeps waiting")
+            self.assertLess(time.monotonic() - waited, 20, "until the deadline")
         finally:
             if release is not None:
                 release.cancel()
