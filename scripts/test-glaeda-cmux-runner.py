@@ -366,8 +366,10 @@ class HookTest(unittest.TestCase):
 
     def started(self, *extra: str, watch: int | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
         push = event(self.dir, "push", {"repository": CMUX})
+        # --gui-wait 0 unless a test passes its own (the last one wins): every cmux capacity refusal waits
+        # GUI_WAIT_S by default, which the tests of refusals themselves must not sit through
         args = ["--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
-                "--watch-pid", str(watch or os.getpid()), *extra]
+                "--watch-pid", str(watch or os.getpid()), "--gui-wait", "0", *extra]
         return self.run_hook("job-started", "push", push, *args, repo="manaflow-ai/cmux", env=env)
 
     def lock_free(self) -> bool:
@@ -1697,31 +1699,32 @@ time.sleep(60)
             waited = time.monotonic()
             self.job("tests-build-and-lag", "w5", 4, None, "--gui-wait", "1")
             self.assertLess(time.monotonic() - waited, 4.5, "the last try starts by the deadline")
-            # only the gui token is waited for: any other refusal is still immediate
+            # a units refusal waits the same --gui-wait before it refuses (CAPACITY_WAIT)
             self.finish("w2")
             self.assertEqual(self.job("macos-compile-admission", "w3", 4).returncode, 0)
             waited = time.monotonic()
-            full = self.job("cli-product-tests", "w4", 4, None, "--gui-wait", "30")
+            full = self.job("cli-product-tests", "w4", 4, None, "--gui-wait", "2")
             self.assertIn("refused: capacity:", full.stdout)
             self.assertNotIn("gui token", full.stdout)
-            self.assertLess(time.monotonic() - waited, 20, "a units refusal does not wait")
+            self.assertGreaterEqual(time.monotonic() - waited, 2, "a units refusal waits too")
+            self.assertLess(time.monotonic() - waited, 20, "then refuses")
         finally:
             for runner in ("w0", "w1", "w2", "w3", "w4", "w5"):
                 self.finish(runner)
 
-    def test_capacity_side_runner_waits_for_units(self) -> None:
-        # a 2-unit side lane on a side runner (instance past --canonical-roots) waits for units instead of
-        # refusing; a root runner still refuses at once
+    def test_capacity_runners_wait_for_units(self) -> None:
+        # a 2-unit side lane waits for units instead of refusing, on a side runner (instance past
+        # --canonical-roots) and on a root runner alike
         self.fleet()
         release = None
         try:
             self.assertEqual(self.job("macos-compile-admission", "u0", 4).returncode, 0)
             self.assertEqual(self.job("claude-wrapper", "u1", 4).returncode, 0)
             waited = time.monotonic()
-            root = self.job("release-build", "u2", 4, None, "--gui-wait", "30")
+            root = self.job("release-build", "u2", 4, None, "--gui-wait", "2")
             self.assertEqual(root.returncode, 1, root.stdout)
             self.assertIn("refused: capacity: 1 of 4 units free", root.stdout)
-            self.assertLess(time.monotonic() - waited, 20, "a root runner does not wait for units")
+            self.assertGreaterEqual(time.monotonic() - waited, 2, "a root runner waits for units too")
             release = threading.Timer(2.0, self.finish, args=("u1",))
             release.start()
             side = self.job("release-build", "u3", 4, None, "--instance", "1", "--gui-wait", "30")
@@ -2812,6 +2815,22 @@ class GateTest(unittest.TestCase):
             self.assertIsNone(hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"),
                                         self.state).confirmed(), "a root runner's compiles need no console")
             read.assert_not_called()
+
+    def test_every_runner_holds_while_free_disk_is_under_its_floor(self) -> None:
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        script.write_text("exec python3 /hook job-started --allowed-owner manaflow-ai --capacity-units 4 --instance 0\n")
+        self.assertIsNone(gate.claimed(), "no --min-free-gib: no floor")
+        script.write_text("exec python3 /hook job-started --allowed-owner manaflow-ai --min-free-gib 999999999.5 "
+                          "--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux\n")
+        self.assertEqual(hook.runner_scope(self.runner).min_free_gib, 999999999.5)
+        why = gate.claimed()
+        self.assertIsNotNone(why)
+        self.assertRegex(why, r"^disk: [0-9.]+ GiB free, 1e\+09 GiB required$")
+        self.assertEqual(gate.confirmed(), why, "the look right before a stop sees it too")
+        script.write_text("exec python3 /hook job-started --allowed-owner manaflow-ai --min-free-gib 1\n")
+        self.assertIsNone(gate.claimed(), "read on every poll: a re-apply that lowers the floor counts at once")
 
     def test_a_root_runner_holds_while_a_token_its_jobs_need_is_taken(self) -> None:
         root = hook.RunnerScope(4, 2, 2, True)

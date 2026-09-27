@@ -128,9 +128,11 @@ What `--apply` does:
      run shares the user's testmanagerd with the GUI jobs, see 2h2),
      `swift-package-tests` and the side lanes `cli-pipe-regressions`,
      `remote-daemon-macos-tests` and `claude-wrapper` 1 unit, and any other job counts
-     as a compile. When units or a token are taken it refuses at once with
-     `refused: capacity: ...`, which the refusal rescue re-runs elsewhere; it never
-     waits. Because `flock` gives no preference to the exclusive waiter, it also
+     as a compile. When units or a token are taken it retries for `--gui-wait` (240 s,
+     inside cmux's 360 s refusal window), then refuses with `refused: capacity: ...`,
+     which the refusal rescue re-runs on Blacksmith once the run ends. The listener gate
+     let the runner listen, so the mini had room a moment earlier and the wait usually
+     outlasts the job that took it. Because `flock` gives no preference to the exclusive waiter, it also
      refuses while another process (the build worker in `with-host-lock`) is waiting
      for `host.lock`, so the worker gets the host as soon as the running PR jobs end.
      Admissions on one mini are serialized for a moment (`capacity/admission.lock`),
@@ -217,8 +219,8 @@ What `--apply` does:
        (`--gui-wait`, inside cmux's 360 s refusal window) instead of refusing.
        (cmuxterm-hq#661, Workstream 7.) A side runner listens with one unit free, so
        a 2-unit side lane (cmux's release-build, reload-build, cmux-tui) that finds
-       fewer units than it needs waits for them the same 240 s instead of refusing;
-       a root runner still refuses at once.
+       fewer units than it needs waits for them the same 240 s instead of refusing,
+       as does a root runner that lost a race for its units.
      - A gui runner (`--gui-runner`, below) stops while the gui token is taken, every
        canonical root is taken, or every unit is. Only it carries the gui pool label, so
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
@@ -234,6 +236,12 @@ What `--apply` does:
      rescue re-runs it elsewhere, and makes `take-gui` give way (exit 3), so test-e2e's
      build leaves its tests to the `test` job. An unreadable state changes nothing;
      `GLAEDA_RUNNER_CONSOLE_GATE=0` in the runner LaunchAgent turns it off.
+   - **When free disk is under the floor** (every runner). The gate reads the
+     `--min-free-gib` of the runner's own job-started hook and `statvfs` on every poll,
+     and holds the listener while free disk is below it, since job-started would refuse
+     every job. On 2026-09-27, 68 of the fleet's 151 refusals in 24 h were this one,
+     mostly seeds on cmuxs-mac-mini-6 at 134 of 150 GiB. `glaeda-disk --pressure` frees
+     space in the meantime, and the next poll above the floor starts the listener.
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`.
      - The listener's graceful exit ends its session, and GitHub shows the runner as
