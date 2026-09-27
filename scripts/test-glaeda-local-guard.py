@@ -25,6 +25,7 @@ START = "Sun Sep 27 09:00:00 2026"
 HOME = Path("/Users/leo")
 PROJECT = "/Users/leo/Projects/cmux"
 CLAUDE = "/Users/leo/Library/Application Support/Claude/claude-code/2.1.281/claude.app/Contents/MacOS/claude"
+LAUNCHD = None
 
 
 def proc(pid, ppid, command, path=None, elapsed=600, uid=UID, stat="S"):
@@ -32,29 +33,42 @@ def proc(pid, ppid, command, path=None, elapsed=600, uid=UID, stat="S"):
     return lg.Proc(pid, ppid, uid, elapsed, 1024, 0.0, stat, START, command, exe_path)
 
 
-def cwds(mapping):
-    return lambda pids: {p: mapping[p] for p in pids if p in mapping}
+def launchd():
+    return proc(1, 0, "/sbin/launchd")
 
 
 def session(pid=10):
-    """launchd -> Claude desktop helper -> claude CLI -> zsh tool shell."""
+    """launchd -> Claude desktop -> claude CLI -> zsh tool shell (pid + 1)."""
     return [
-        proc(1, 0, "/sbin/launchd"),
+        launchd(),
         proc(5, 1, "/Applications/Claude.app/Contents/MacOS/Claude"),
         proc(pid, 5, CLAUDE + " --session-id 0123abcd-0000-0000-0000-000000000000", path=CLAUDE),
-        proc(pid + 1, pid, "/bin/zsh -c source snapshot && eval 'swift test --filter X'"),
+        proc(pid + 1, pid, "/bin/zsh -c source snapshot && eval 'swift test'"),
     ]
 
 
-def survey(procs, mapping=None, grace=30):
-    return lg.survey(procs, UID, cwds(mapping or {}), grace, HOME)
+def survey(procs, mapping=None):
+    mapping = mapping or {}
+    asked: list[int] = []
+
+    def cwds(pids):
+        asked.extend(pids)
+        return {p: mapping[p] for p in pids if p in mapping}
+
+    s = lg.survey(procs, UID, cwds, HOME)
+    s["asked"] = asked
+    return s
+
+
+def reasons(s):
+    return {e["pid"]: e["reason"] for e in s["kept"]}
 
 
 class RuleTest(unittest.TestCase):
     def rule(self, command, path=None):
         return lg.rule(proc(2, 1, command, path=path))
 
-    def test_heavy_runs_match(self) -> None:
+    def test_runs_match(self) -> None:
         cases = {
             "/usr/bin/swift-build --package-path x": "swift-build",
             "/Applications/Xcode.app/Contents/Developer/usr/bin/swift-test": "swift-test",
@@ -64,9 +78,9 @@ class RuleTest(unittest.TestCase):
             "xcodebuild -project a.xcodeproj build-for-testing": "xcodebuild",
             "/Users/leo/.cargo/bin/cargo +nightly build --release": "cargo-build",
             "cargo test -p foo": "cargo-test",
-            "python3 tests/test_socket.py": "python-tests",
-            "/opt/homebrew/bin/python3 -u /Users/leo/Projects/cmux/tests/test_x.py": "python-tests",
-            "bash ./tests/test_ci_self_hosted_guard.sh": "shell-tests",
+            "python3 tests/test_socket.py -k one": "tests",
+            "/opt/homebrew/bin/python3 -u /Users/leo/Projects/cmux/tests/test_x.py": "tests",
+            "bash ./tests/test_ci_self_hosted_guard.sh": "tests",
             "/bin/bash scripts/merge-main.sh": "merge-main",
             "python3 scripts/ci/merge_main.py --guards": "merge-main",
             "python3 scripts/verify-local.py": "verify-local",
@@ -75,22 +89,19 @@ class RuleTest(unittest.TestCase):
             self.assertEqual(self.rule(command), want, command)
 
     def test_framework_python_is_python(self) -> None:
-        path = "/opt/homebrew/Cellar/python@3.13/3.13.1/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
-        self.assertEqual(self.rule(f"{path} tests/test_a.py", path=path), "python-tests")
+        path = "/opt/homebrew/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
+        self.assertEqual(self.rule(f"{path} tests/test_a.py", path=path), "tests")
 
-    def test_light_and_look_alike_runs_do_not_match(self) -> None:
+    def test_look_alikes_do_not_match(self) -> None:
         for command in (
             "/bin/zsh -c swift test --filter X",  # a tool shell; its child is the run
             "bash -c bash tests/test_x.sh",
             "grep swift test file",
             "python3 -m py_compile tests/test_x.py",
-            "python3 -c import tests",
             "python3 scripts/test-glaeda-procs.py",  # not in a tests directory
             "python3 tests/helper.py",
             "xcodebuild -showBuildSettings",
-            "xcodebuild -list",
             "cargo fmt",
-            "cargo metadata --format-version 1",
             "swift --version",
             "swift package resolve",
             "bash tests/lib.sh",
@@ -99,58 +110,42 @@ class RuleTest(unittest.TestCase):
 
 
 class SurveyTest(unittest.TestCase):
-    def test_agent_session_run_is_stopped_with_its_tree(self) -> None:
+    def test_live_session_runs_are_never_touched(self) -> None:
         procs = session() + [
-            proc(20, 11, "/usr/bin/swift test --filter X"),
-            proc(21, 20, "/usr/bin/swift-test --filter X"),  # nested: the topmost run speaks
-            proc(22, 21, "/usr/bin/swift-frontend -c a.swift"),
+            proc(20, 11, "/usr/bin/xcodebuild -scheme cmux test", elapsed=7200),
+            proc(21, 20, "/usr/bin/swift-frontend -c a.swift"),
+            proc(22, 11, "/bin/bash scripts/merge-main.sh", elapsed=86400),
         ]
-        s = survey(procs, {20: PROJECT})
-        [e] = s["stop"]
-        self.assertEqual((e["pid"], e["rule"], e["owner"], e["processes"]), (20, "swift-test", "agent-session", 3))
-        self.assertEqual(e["session"], {"agent": "claude", "pid": 10, "session_id": "0123abcd-0000-0000-0000-000000000000"})
-        self.assertEqual(e["cwd"], PROJECT)
-        self.assertEqual({q.pid for q in e["_tree"]}, {20, 21, 22})
-        self.assertEqual(s["keep"], [])
+        s = survey(procs, {20: PROJECT, 22: PROJECT})
+        self.assertEqual(s["orphans"], [])
+        self.assertEqual(reasons(s), {20: "live-session", 22: "live-session"})
+        self.assertEqual(s["asked"], [], "no cwd lookup for runs with a live session")
 
-    def test_merge_main_chain_stops_at_the_script(self) -> None:
-        procs = session() + [
-            proc(30, 11, "/bin/bash scripts/merge-main.sh"),
-            proc(31, 30, "python3 scripts/ci/merge_main.py"),
-            proc(32, 31, "python3 tests/test_a.py"),
-        ]
-        [e] = survey(procs)["stop"]
-        self.assertEqual((e["pid"], e["rule"], e["processes"]), (30, "merge-main", 3))
+    def test_codex_counts_as_a_session(self) -> None:
+        procs = [launchd(), proc(40, 1, "/Users/leo/.codex/bin/codex app-server"), proc(41, 40, "cargo build")]
+        self.assertEqual(reasons(survey(procs, {41: PROJECT})), {41: "live-session"})
 
-    def test_codex_counts_as_an_agent(self) -> None:
-        procs = [proc(1, 0, "/sbin/launchd"),
-                 proc(40, 1, "/Users/leo/.codex/bin/codex app-server"),
-                 proc(41, 40, "cargo build")]
-        [e] = survey(procs)["stop"]
-        self.assertEqual(e["session"]["agent"], "codex")
-
-    def test_short_runs_get_grace(self) -> None:
-        procs = session() + [proc(20, 11, "python3 tests/test_fast.py", elapsed=12)]
-        s = survey(procs)
-        self.assertEqual(s["stop"], [])
-        self.assertEqual(s["keep"][0]["reason"], "young")
-
-    def test_orphan_in_projects_is_stopped(self) -> None:
-        procs = [proc(1, 0, "/sbin/launchd"),
-                 proc(50, 1, "/bin/zsh -c eval 'bash tests/test_a.sh'"),
-                 proc(51, 50, "bash tests/test_a.sh"),
-                 proc(52, 1, "/usr/bin/xcodebuild -scheme cmux test"),
-                 proc(53, 1, "/usr/bin/swift build")]
-        s = survey(procs, {51: PROJECT + "/tests", 52: "/private/tmp/claude-501/x/scratch", 53: "/Users/leo/Downloads"})
-        self.assertEqual(sorted((e["pid"], e["owner"]) for e in s["stop"]), [(51, "orphan"), (52, "orphan")])
-        self.assertEqual([(e["pid"], e["reason"]) for e in s["keep"]], [(53, "orphan-outside-projects")])
+    def test_orphans_left_by_a_gone_session(self) -> None:
+        procs = [launchd(),
+                 proc(50, 1, "/bin/zsh -c eval 'bash scripts/merge-main.sh'"),  # the tool shell survived
+                 proc(51, 50, "/bin/bash scripts/merge-main.sh"),
+                 proc(52, 51, "python3 scripts/ci/merge_main.py"),
+                 proc(53, 52, "swift test"),
+                 proc(60, 1, "/usr/bin/xcodebuild -scheme cmux test"),  # reparented directly
+                 proc(70, 1, "/usr/bin/swift build")]
+        s = survey(procs, {51: PROJECT, 60: "/private/tmp/claude-501/x/scratch", 70: "/Users/leo/Downloads"})
+        got = {e["pid"]: (e["rule"], e["processes"]) for e in s["orphans"]}
+        self.assertEqual(got, {51: ("merge-main", 3), 60: ("xcodebuild", 1)})
+        self.assertEqual({q.pid for q in s["orphans"][0]["_tree"]} | {q.pid for q in s["orphans"][1]["_tree"]},
+                         {51, 52, 53, 60})
+        self.assertEqual(reasons(s), {70: "outside-projects"})
 
     def test_orphan_without_cwd_evidence_is_kept(self) -> None:
-        procs = [proc(1, 0, "/sbin/launchd"), proc(53, 1, "/usr/bin/swift build")]
-        self.assertEqual(survey(procs)["keep"][0]["reason"], "orphan-cwd-unknown")
+        procs = [launchd(), proc(53, 1, "/usr/bin/swift build")]
+        self.assertEqual(reasons(survey(procs)), {53: "cwd-unknown"})
 
     def test_leos_interactive_runs_are_kept(self) -> None:
-        procs = [proc(1, 0, "/sbin/launchd"),
+        procs = [launchd(),
                  proc(60, 1, "/Applications/cmux.app/Contents/MacOS/cmux"),
                  proc(61, 60, "/usr/bin/login -flp leo"),
                  proc(62, 61, "-zsh", path="/bin/zsh"),
@@ -161,32 +156,66 @@ class SurveyTest(unittest.TestCase):
                  proc(80, 1, "/Applications/Xcode.app/Contents/MacOS/Xcode"),
                  proc(81, 80, "/usr/bin/xcodebuild -scheme cmux build")]
         s = survey(procs, {63: PROJECT, 72: PROJECT, 81: PROJECT})
-        self.assertEqual(s["stop"], [])
-        self.assertEqual({e["pid"]: e["reason"] for e in s["keep"]}, {63: "not-agent", 72: "not-agent", 81: "not-agent"})
+        self.assertEqual(s["orphans"], [])
+        self.assertEqual(reasons(s), {63: "not-agent", 72: "not-agent", 81: "not-agent"})
 
     def test_ci_runner_and_glaeda_apple_are_kept(self) -> None:
         runner = "/Users/leo/Projects/cmux/.local/runner"
-        procs = session() + [
-            proc(90, 1, f"{runner}/bin/Runner.Listener run", path=f"{runner}/bin/Runner.Listener"),
-            proc(91, 90, f"{runner}/bin/Runner.Worker spawnclient", path=f"{runner}/bin/Runner.Worker"),
-            proc(92, 91, "/bin/bash -e /Users/leo/Projects/cmux/.local/runner/_work/_temp/x.sh"),
-            proc(93, 92, "xcodebuild -scheme cmux test"),
-            proc(94, 1, "swift test"),  # a job's orphan: it runs inside the runner
-            proc(95, 11, "python3 scripts/apple_build.py warm"),
-            proc(96, 95, "xcodebuild -scheme cmux build"),
-        ]
-        s = survey(procs, {93: runner + "/_work/cmux", 94: runner + "/_work/cmux", 96: PROJECT})
-        self.assertEqual(s["stop"], [])
-        self.assertEqual({e["pid"]: e["reason"] for e in s["keep"]},
-                         {93: "ci-runner", 94: "ci-runner", 96: "glaeda-apple"})
+        procs = [launchd(),
+                 proc(90, 1, f"{runner}/bin/Runner.Listener run", path=f"{runner}/bin/Runner.Listener"),
+                 proc(91, 90, f"{runner}/bin/Runner.Worker spawnclient", path=f"{runner}/bin/Runner.Worker"),
+                 proc(92, 91, f"/bin/bash -e {runner}/_work/_temp/x.sh"),
+                 proc(93, 92, "xcodebuild -scheme cmux test"),
+                 proc(94, 1, "swift test"),  # a job's orphan: it runs inside the runner
+                 proc(95, 1, "/bin/zsh -c glaeda-apple warm"),
+                 proc(96, 95, "python3 scripts/apple_build.py warm"),
+                 proc(97, 96, "xcodebuild -scheme cmux build")]
+        s = survey(procs, {93: runner + "/_work/cmux", 94: runner + "/_work/cmux", 97: PROJECT})
+        self.assertEqual(s["orphans"], [])
+        self.assertEqual(reasons(s), {93: "ci-runner", 94: "ci-runner", 97: "glaeda-apple"})
 
     def test_other_users_and_zombies_are_ignored(self) -> None:
-        procs = session() + [proc(20, 11, "swift test", uid=0), proc(21, 11, "swift build", stat="Z")]
-        s = survey(procs)
-        self.assertEqual((s["stop"], s["keep"]), ([], []))
+        procs = [launchd(), proc(20, 1, "swift test", uid=0), proc(21, 1, "swift build", stat="Z")]
+        s = survey(procs, {20: PROJECT, 21: PROJECT})
+        self.assertEqual((s["orphans"], s["kept"]), ([], []))
 
 
-class ScopeTest(unittest.TestCase):
+class GraceTest(unittest.TestCase):
+    def orphans(self):
+        procs = [launchd(), proc(51, 1, "swift test"), proc(52, 1, "swift build")]
+        return survey(procs, {51: PROJECT, 52: PROJECT})["orphans"]
+
+    def test_first_sighting_is_not_raced(self) -> None:
+        due, seen = lg.settle(self.orphans(), {}, now=1000)
+        self.assertEqual(due, [])
+        self.assertEqual(set(seen.values()), {1000})
+
+    def test_seen_a_run_ago_is_due(self) -> None:
+        _, seen = lg.settle(self.orphans(), {}, now=1000)
+        due, seen2 = lg.settle(self.orphans(), seen, now=1030)
+        self.assertEqual(sorted(e["pid"] for e in due), [51, 52])
+        self.assertEqual(due[0]["orphaned_seconds"], 30)
+        self.assertEqual(seen2, seen)
+        early, _ = lg.settle(self.orphans(), seen, now=1010)
+        self.assertEqual(early, [])
+
+    def test_a_reused_pid_starts_over_and_gone_ones_drop(self) -> None:
+        stale = {"51 Sat Sep 26 01:00:00 2026": 1.0, "99 " + START: 1.0}
+        due, seen = lg.settle(self.orphans(), stale, now=1000)
+        self.assertEqual(due, [])
+        self.assertEqual(set(seen), {"51 " + START, "52 " + START})
+
+    def test_seen_file_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state/seen.json"
+            self.assertEqual(lg.read_seen(path), {})
+            lg.write_seen({"1 x": 5.0}, path)
+            self.assertEqual(lg.read_seen(path), {"1 x": 5.0})
+            path.write_text("[1, 2]")
+            self.assertEqual(lg.read_seen(path), {})
+
+
+class HostTest(unittest.TestCase):
     def test_only_a_hygiene_only_mac(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "update.json"
@@ -219,8 +248,8 @@ class ApplyTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.log = Path(self.tmp.name) / "guard.jsonl"
-        self.procs = session() + [proc(20, 11, "swift test"), proc(21, 20, "swift-test"), proc(22, 21, "swift-frontend")]
-        self.stop = survey(self.procs, {20: PROJECT})["stop"]
+        self.procs = [launchd(), proc(20, 1, "swift test"), proc(21, 20, "swift-test"), proc(22, 21, "swift-frontend")]
+        self.due = survey(self.procs, {20: PROJECT})["orphans"]
         self.sent: list[tuple[int, int]] = []
 
     def tearDown(self) -> None:
@@ -234,7 +263,7 @@ class ApplyTest(unittest.TestCase):
 
     def run_apply(self, look, fresh):
         by_pid = {p.pid: p for p in self.procs}
-        return lg.apply(self.stop, self.log, look=look or (lambda pid: by_pid.get(pid)), kill=self.kill,
+        return lg.apply(self.due, self.log, look=look or (lambda pid: by_pid.get(pid)), kill=self.kill,
                         fresh=fresh, sleep=lambda s: None)
 
     def test_term_then_kill_survivors(self) -> None:
@@ -242,11 +271,11 @@ class ApplyTest(unittest.TestCase):
         [r] = self.run_apply(None, lambda: [survivor])
         self.assertEqual(sorted(pid for pid, sig in self.sent if sig == signal.SIGTERM), [20, 21, 22])
         self.assertEqual(self.sent[-1], (22, signal.SIGKILL))
-        self.assertEqual(r["outcome"], "killed")
-        outcomes = [x["outcome"] for x in self.records()]
-        self.assertEqual(outcomes, ["signalling", "killed"])
-        self.assertEqual(self.records()[1]["session"]["agent"], "claude")
-        self.assertNotIn("_proc", self.records()[1])
+        self.assertEqual((r["outcome"], r["reason"]), ("killed", "orphan"))
+        records = self.records()
+        self.assertEqual([x["outcome"] for x in records], ["signalling", "killed"])
+        self.assertEqual(records[1]["cwd"], PROJECT)
+        self.assertNotIn("_proc", records[1])
 
     def test_clean_exit(self) -> None:
         [r] = self.run_apply(None, lambda: [])
@@ -254,18 +283,18 @@ class ApplyTest(unittest.TestCase):
         self.assertNotIn(signal.SIGKILL, {s for _, s in self.sent})
 
     def test_changed_or_gone_root_is_not_signalled(self) -> None:
-        other = proc(20, 11, "swift test --other")
+        other = proc(20, 1, "swift test --other")
         [r] = self.run_apply(lambda pid: other, lambda: [])
         self.assertEqual((r["outcome"], self.sent), ("skipped-changed", []))
         [r] = self.run_apply(lambda pid: None, lambda: [])
         self.assertEqual((r["outcome"], self.sent), ("gone", []))
 
-    def test_recent_skips_intent_records(self) -> None:
+    def test_status_shows_outcomes_not_intents(self) -> None:
         self.run_apply(None, lambda: [])
-        self.assertEqual([r["outcome"] for r in lg.recent(self.log, 10)], ["terminated"])
-        text = lg.render_status(0, None, lg.recent(self.log, 10), True)
-        self.assertIn("swift-test", text)
-        self.assertIn("claude 0123abcd", text)
+        records = lg.recent(self.log, 10)
+        self.assertEqual([r["outcome"] for r in records], ["terminated"])
+        text = lg.render_status(["guard active"], records)
+        self.assertIn("orphan swift-test", text)
 
 
 if __name__ == "__main__":
