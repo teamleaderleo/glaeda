@@ -1237,6 +1237,8 @@ def dequeue_diagnostics_reporter(queues: tuple[Path, ...] = DIAGNOSTICS_QUEUES,
                 else:
                     path.unlink()
                 dequeued += 1
+            except FileNotFoundError:
+                continue  # another runner instance starting a job at once removed it first
             except OSError:
                 failed += 1
                 continue
@@ -3659,7 +3661,9 @@ def main(argv: list[str] | None = None) -> int:
             note += f"; {testmanagerd}"
         print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
         if sys.platform == "darwin":
-            dialogs = dequeue_diagnostics_reporter()
+            dialogs = ""
+            with contextlib.suppress(Exception):  # must not fail an admitted job
+                dialogs = dequeue_diagnostics_reporter()
             if dialogs:
                 print(f"{PREFIX}: {dialogs}", flush=True)
         if args.test_keychain:

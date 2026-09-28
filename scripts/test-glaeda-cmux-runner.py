@@ -4246,6 +4246,10 @@ class RunnerTest(unittest.TestCase):
             with mock.patch.object(hook.subprocess, "run",
                                    return_value=subprocess.CompletedProcess([], 1, "", "")):
                 self.assertEqual(hook.dequeue_diagnostics_reporter((panics, diagnostics), reports, 501), "")
+                # Another runner instance removed the entry first: gone, not a failure.
+                (panics / "raced").write_text("x")
+                with mock.patch.object(hook.Path, "unlink", side_effect=FileNotFoundError):
+                    self.assertEqual(hook.dequeue_diagnostics_reporter((panics,), reports, 501), "")
 
     def test_gui_unlock_script_cancels_every_queued_prompt(self) -> None:
         # Shell-function fakes: each kill finds SecurityAgent while a prompt is left.
