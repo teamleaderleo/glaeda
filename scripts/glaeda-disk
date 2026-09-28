@@ -56,6 +56,7 @@ build output or copies. Nested or unverifiable checkouts stay protected.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import platform
@@ -73,6 +74,7 @@ from pathlib import Path
 HOME = Path.home()
 SNAPSHOT = HOME / ".cache/glaeda-disk/sizes.json"
 DEDUPE_STATE = HOME / ".cache/glaeda-disk/dedupe.json"
+EVICT_LOCK = HOME / ".cache/glaeda-disk/evict.lock"  # one --apply at a time (the runner hooks and the LaunchAgent)
 # Items a nested_git family kept for a git loss, so a dead session with unpushed work is not
 # re-walked every run. Only keep verdicts are cached: a stale entry can delay a deletion, never cause one.
 NESTED_KEEP = HOME / ".cache/glaeda-disk/nested-keep.json"
@@ -1705,6 +1707,15 @@ def main(argv: list[str] | None = None) -> int:
         fams = [f for f in fams if fss[f.root.stat().st_dev].under]
         if a.apply and (why := ci_defer(fss, ci_jobs(), a.emergency, floor_gib)):
             print(why)
+            return 0
+    if a.apply:
+        # a second eviction would only race the first for the same items; its caller re-reads free space instead
+        EVICT_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        evict_lock = EVICT_LOCK.open("a")  # held until this process exits
+        try:
+            fcntl.flock(evict_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("another eviction running; skipped")
             return 0
     idle = a.idle_hours if a.idle_hours is not None else (6 if under else 24)
     at, known = (0.0, {}) if a.refresh or a.no_snapshot else load_snapshot()
