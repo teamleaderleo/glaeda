@@ -362,13 +362,15 @@ class GlaedaDiskTest(unittest.TestCase):
             make(ci / "seeds" / name, age_hours=age)
         make(ci / "pr-builds/pr-1", age_hours=0.5)
         make(ci / "pr-builds/pr-2", age_hours=10)
-        make(ci / "pr-builds/.pr-3.incoming-9", age_hours=2)
+        make(ci / "pr-builds/.pr-3.discard-9", age_hours=2)  # cmux's clear() owns it
         make(ci / "pr-builds/other", age_hours=10)
         make(ci / "derived-data", age_hours=10)
         make(ci / ".derived-data.discard-7", age_hours=60)
         make(ci / "source-packages", age_hours=60)
         make(ci / "cmux-ci-2/derived-data", age_hours=60)
-        make(ci / "cmux-ci-2/seeds/p-z", age_hours=48)  # its root records no seed source
+        # a root with no seed source keeps its newest two of any prefix; dot entries are never seeds
+        for name, age in (("p-y", 48), ("p-z", 49), ("q-z", 50), (".q-w.incoming-3", 50)):
+            make(ci / "cmux-ci-2/seeds" / name, age_hours=age)
         make(ci / "cmux-ci-x/derived-data", age_hours=60)  # not a root store
         # SwiftPM checkouts inside DerivedData do not make it a checkout
         (ci / "pr-builds/pr-2/SourcePackages/checkouts/dep/.git").mkdir(parents=True)
@@ -380,9 +382,22 @@ class GlaedaDiskTest(unittest.TestCase):
         got = {str(Path(i.path).relative_to(ci)): i.verdict for i in items}
         self.assertEqual(got, {
             "seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "reclaimable", "seeds/q-x": "reclaimable",
-            "pr-builds/pr-1": "recent", "pr-builds/pr-2": "reclaimable", "pr-builds/.pr-3.incoming-9": "reclaimable",
+            "pr-builds/pr-1": "recent", "pr-builds/pr-2": "reclaimable",
             "derived-data": "recent", ".derived-data.discard-7": "reclaimable",
-            "cmux-ci-2/derived-data": "reclaimable", "cmux-ci-2/seeds/p-z": "kept"})
+            "cmux-ci-2/derived-data": "reclaimable", "cmux-ci-2/seeds/p-y": "kept", "cmux-ci-2/seeds/p-z": "kept",
+            "cmux-ci-2/seeds/q-z": "reclaimable", "cmux-ci-2/seeds/.q-w.incoming-3": "reclaimable"})
+        # apply keeps the hot-tier windows, and re-reads command lines per item: a job that starts cloning a
+        # parked build during the run keeps it
+        # (apply looks families up by id, as main passes them: every root's family of an id behaves the same)
+        fams = {f.id: f for f in gd.fleet_families(ci)}
+        with mock.patch.object(gd, "FLEET_CI", ci), \
+                mock.patch.object(gd, "command_lines", lambda: f"cp -cR {ci}/pr-builds/pr-2 /tmp/x\n"):
+            reclaimable = [i for i in items if i.verdict == "reclaimable"]
+            gd.apply(reclaimable, fams, self.root / "r.jsonl", None, 6)
+        self.assertTrue((ci / "pr-builds/pr-2").exists())
+        self.assertFalse((ci / "seeds/p-c").exists())
+        self.assertTrue((ci / "seeds/p-a").exists())
+        self.assertFalse((ci / "cmux-ci-2/derived-data").exists())
 
     def test_pressure_targets_are_per_filesystem(self) -> None:
         make(self.root / "old")

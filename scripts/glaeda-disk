@@ -125,7 +125,7 @@ def idle_window(fam: Family, idle_hours: float) -> float:
 # and a campaign may hold work nowhere else. A candidate at, inside or above one of these paths, or whose
 # name matches NEVER_DELETE_NAMES, is dropped before it is judged.
 NEVER_DELETE = ("cmux-browser-fleet", "Library/Caches/cmux-release-support", "Library/Caches/siso")  # under HOME
-NEVER_DELETE_NAMES = re.compile(r"chromium|cmux-browser|siso|depot_tools|cmux-release-support", re.I)
+NEVER_DELETE_NAMES = re.compile(r"chromium|cmux-browser|siso|depot_tools|cmux-release-support|vpython|cipd", re.I)
 
 
 def never_delete(path: Path) -> bool:
@@ -166,7 +166,7 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
         # One parked over PARKED_IDLE_HOURS ago goes first: a re-push soon after its park is the one it helps.
         fams.append(Family("cmux-pr-builds", store / "pr-builds", True,
                            "the pull request's next push compiles from main's kept build",
-                           include=("pr-", ".pr-"), build_output=True, max_idle_hours=PARKED_IDLE_HOURS,
+                           include=("pr-",), build_output=True, max_idle_hours=PARKED_IDLE_HOURS,
                            owner="cmux owned_build_state.py (park)", rebuild_minutes=6))
         # Seeds: the root's newest SEED_KEEP of its current prefix stay (seed_verdict); older and other
         # fingerprints' seeds go LRU. A seed comes back from the LAN seeder or the bucket in 25 to 280 s.
@@ -183,18 +183,19 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
 
 def seed_verdict(path: Path) -> str:
     """Why a seed stays whatever its age, or "": one of its root's newest SEED_KEEP seeds of the prefix the
-    root's last job recorded (seed-source.json). A root that recorded none keeps every seed."""
+    root's last job recorded (seed-source.json), or of any prefix when it recorded none. Dot entries are a
+    download or delete in progress, never a seed."""
     try:
         prefix = json.loads((path.parent.parent / SEED_SOURCE).read_text()).get("prefix") or ""
     except (OSError, ValueError, AttributeError):
         prefix = ""
-    if not isinstance(prefix, str) or not prefix:
-        return "its root records no seed source"
-    if not path.name.startswith(prefix):
+    if not isinstance(prefix, str):
+        prefix = ""
+    if path.name.startswith(".") or not path.name.startswith(prefix):
         return ""
     current = []
     for c in _entries(path.parent):
-        if c.name.startswith(prefix) and c.is_dir(follow_symlinks=False):
+        if c.name.startswith(prefix) and not c.name.startswith(".") and c.is_dir(follow_symlinks=False):
             try:
                 current.append((c.stat(follow_symlinks=False).st_mtime, c.name))
             except OSError:
@@ -425,6 +426,15 @@ def process_evidence() -> tuple[list[str], str]:
     if ps.returncode != 0 or not ps.stdout.strip():
         raise NoEvidence(f"ps failed (exit {ps.returncode})")
     return opened, command_text(ps.stdout)
+
+
+def command_lines() -> str:
+    """Current command lines (command_text), or "" when ps fails."""
+    try:
+        ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return command_text(ps.stdout) if ps.returncode == 0 else ""
 
 
 def command_text(ps_output: str) -> str:
@@ -1446,7 +1456,11 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 continue
             if dev not in targets or free_bytes(p.parent)[0] >= targets[dev]:
                 continue
-        # fresh re-observation right before the destructive step
+        # fresh re-observation right before the destructive step. cmux jobs clone their warm state with
+        # `cp -cR SOURCE ...` at any moment and a clone leaves the source's times alone, so those families
+        # re-read the command lines per item rather than trusting the ones from the start of a long run.
+        if families[i.family].build_output and families[i.family].root.is_relative_to(FLEET_CI):
+            cmds = command_lines() or cmds
         if (in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(families[i.family], p)
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))):
             outcome = "changed:in-use"
