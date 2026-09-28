@@ -859,15 +859,22 @@ def sweep_snapshots(state: Path) -> None:
             shutil.rmtree(state / name, ignore_errors=True)
 
 
+def clone_args() -> list[str]:
+    """cp's recursive copy-on-write flags: APFS clone on the minis, reflink-when-possible elsewhere (CI)."""
+    if sys.platform == "darwin":
+        return [CP, "-cR"]
+    return [CP, "--reflink=auto", "-R"]
+
+
 def snapshot(state: Path, directory: Path, want: str) -> Path | None:
-    """An APFS clone of DIRECTORY's kept state whose stamp has sha256 WANT, taken while it stayed put."""
+    """A copy-on-write clone of DIRECTORY's kept state whose stamp has sha256 WANT, taken while it stayed put."""
     before = read_kept(directory)
     if before is None or hashlib.sha256(before[0]).hexdigest() != want:
         return None
     snap = state / f"{SNAPSHOT_PREFIX}{os.getpid()}-{secrets.token_hex(4)}"
     os.mkdir(snap, 0o700)
     lower = [TASKPOLICY, "-d", "utility"] if os.access(TASKPOLICY, os.X_OK) else []
-    cloned = subprocess.run([*lower, CP, "-cR", os.fspath(directory / DERIVED), os.fspath(snap / DERIVED)],
+    cloned = subprocess.run([*lower, *clone_args(), os.fspath(directory / DERIVED), os.fspath(snap / DERIVED)],
                             stdin=subprocess.DEVNULL, capture_output=True, timeout=300).returncode == 0
     after = read_kept(directory)
     if not cloned or after is None or after[:2] != before[:2]:
