@@ -519,6 +519,13 @@ def checkout_builds(projects: Path) -> list[Path]:
         return [b for bs in pool.map(_checkout_build_dirs, project_checkouts(projects)) for b in bs]
 
 
+def checkout_build_family(projects: Path) -> Family:
+    return Family("checkout-build", projects, True,
+                  "swift build or glaeda-apple warm rebuilds it; also counted in its checkout",
+                  checkout_builds=True, build_output=True, min_idle_hours=CHECKOUT_BUILD_IDLE_HOURS,
+                  owner="SwiftPM and glaeda-apple, per checkout", rebuild_minutes=15)
+
+
 def apple_build_verdict(path: Path) -> str:
     """Why a glaeda-apple cache generation stays whatever its age, or "": a run is in flight or holds the
     build lock. Xcode writes deeper than the idle check looks, so the lock is what shows a build."""
@@ -671,10 +678,7 @@ def default_families() -> list[Family]:
     # SwiftPM and glaeda-apple build output inside the checkouts: every other family here keeps a checkout
     # whole, so under pressure nothing was left to evict while agent sessions compiled packages in hundreds
     # of worktrees (Air Blue fell to 134 MiB free, 2026-09-28). A day idle, since the session may come back.
-    fams.append(Family("checkout-build", projects, True,
-                       "swift build or glaeda-apple warm rebuilds it; also counted in its checkout",
-                       checkout_builds=True, build_output=True, min_idle_hours=CHECKOUT_BUILD_IDLE_HOURS,
-                       owner="SwiftPM and glaeda-apple, per checkout", rebuild_minutes=15))
+    fams.append(checkout_build_family(projects))
     # Cargo owns target validity and RFC #1137 owns Cargo reclaim, so this is visibility only.
     # Sizes here are also counted inside their checkout under projects or worktrees.
     fams.append(Family("cargo-target", projects, False,

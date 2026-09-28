@@ -1270,9 +1270,7 @@ class GlaedaDiskTest(unittest.TestCase):
         (app / ".glaeda/apple-build/receipt.json").write_text("{}")
         for co in (app, projects / "wts/feature"):
             self._age(co)
-        fam = [f for f in gd.default_families() if f.id == "checkout-build"][0]
-        return projects, gd.Family(fam.id, projects, True, fam.rebuild, checkout_builds=True, build_output=True,
-                                   min_idle_hours=fam.min_idle_hours, rebuild_minutes=fam.rebuild_minutes)
+        return projects, gd.checkout_build_family(projects)
 
     def test_checkout_builds_are_package_builds_and_apple_generations(self) -> None:
         projects, fam = self._checkout_builds()
