@@ -62,6 +62,7 @@ and its children connected). So glaeda-mini-setup runs this agent with /usr/bin/
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import json
 import os
@@ -99,6 +100,11 @@ FOREIGN_BUSY_BPS = 512 * 1024
 HOT_HOLD = 15.0
 BURST_SECONDS = 2.0
 JOB_CHECK_SECONDS = 10.0
+WINDOW = 5.0
+# Received bytes per byte of download payload (Ethernet, IP, TCP, TLS headers), measured on cmux9s,
+# and the share of the download's rate by which that measurement may be off.
+WIRE_OVERHEAD = 1.05
+WIRE_TOLERANCE = 0.03
 BUSY_PREFETCH_TIMEOUT = 1500
 # A kept seed this near main's head is a start that does not recompile the app: skip the download.
 NEAR_APP_SWIFT_FILES = 5
@@ -143,8 +149,9 @@ LAN_BUSY_RATE = 64 * 1024**2
 # inside LAN_TIMEOUT, after a random pause in these bounds (seconds): the client queues instead of going
 # to R2. The seeder holds a slot only while the spool fills at line rate (~25 s), so a turn comes soon.
 LAN_ATTEMPTS = 4
-LAN_BUSY_BACKOFF = (15.0, 45.0)
+LAN_BUSY_BACKOFF = (10.0, 30.0)
 LAN_RETRY_BACKOFF = (2.0, 8.0)
+LAN_BUSY_BUDGET = 120.0  # seconds a busy seeder is waited for, from the first attempt
 
 
 def running_commands() -> list[str] | None:
@@ -383,10 +390,19 @@ class Pipeline:
     def spawn(self, argv: list[str], **kwargs) -> subprocess.Popen:
         proc = subprocess.Popen(argv, start_new_session=True, **kwargs)
         self.procs.append(proc)
+        if self.timed_out:  # the deadline passed while it started: it never runs past it
+            self.stop()
         return proc
 
     def stop(self) -> None:
+        """SIGKILL every process group whose leader is not reaped yet.
+
+        A reaped leader's pid (and so its group id) may already belong to another process; an unreaped
+        one, running or a zombie, still holds it.
+        """
         for proc in self.procs:
+            if proc.returncode is not None:
+                continue
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except OSError:
@@ -443,7 +459,7 @@ def lan_download(run: Pipeline, config: dict, address: str, request: str, keys: 
             ssh.stdout.close()
             return {"fetched": "false", "reason": "seeder answered a key or codec it was not asked for"}
         key, their_codec = words[1], words[2]
-        total, over = 0, False
+        total, over, spool_error = 0, False, ""
         try:
             with open(spool, "wb") as out:
                 while True:
@@ -455,12 +471,19 @@ def lan_download(run: Pipeline, config: dict, address: str, request: str, keys: 
                         over = True
                         run.stop()
                         break
-                    out.write(chunk)
-        except OSError:  # the pipeline was stopped, or the disk filled
+                    try:
+                        out.write(chunk)
+                    except OSError as error:  # the disk, not the stream: another attempt would not help
+                        spool_error = errno.errorcode.get(error.errno, type(error).__name__)
+                        run.stop()
+                        break
+        except OSError:  # the pipeline was stopped
             run.stop()
         finally:
             ssh.stdout.close()
         codes = run.reap()
+        if spool_error:
+            return {"fetched": "false", "reason": f"spool: {spool_error}", "key": key}
         if over:
             return {"fetched": "false", "reason": f"seed stream over {LAN_MAX_BYTES} bytes", "key": key}
         if run.timed_out:
@@ -474,13 +497,19 @@ def lan_download(run: Pipeline, config: dict, address: str, request: str, keys: 
         if their_codec == "zstd":
             # Every zstd frame ends in a checksum of its content, which `zstd -t` checks: a stream cut at a
             # frame boundary or damaged on the way fails here, before anything is extracted.
-            try:
-                tested = subprocess.run([zstd_tool(), "-t", "-q", os.fspath(spool)], stdin=subprocess.DEVNULL,
-                                        capture_output=True, timeout=LAN_TIMEOUT)
-            except (OSError, subprocess.SubprocessError) as error:
-                return {"fetched": "false", "reason": f"zstd -t: {type(error).__name__}", "key": key}
-            if tested.returncode != 0:
-                detail = tested.stderr.decode(errors="replace").strip()[-120:]
+            first = len(run.procs)
+            with tempfile.TemporaryFile() as test_err:
+                try:
+                    run.spawn([zstd_tool(), "-t", "-q", os.fspath(spool)], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=test_err)
+                except OSError as error:
+                    return {"fetched": "false", "reason": f"zstd -t: {type(error).__name__}", "key": key}
+                tested = run.reap(first)[0]
+                test_err.seek(0)
+                detail = test_err.read().decode(errors="replace").strip()[-120:]
+            if run.timed_out:
+                return {"fetched": "false", "reason": "stream timed out", "key": key}
+            if tested != 0:
                 return {"fetched": "false", "reason": f"stream fails its checksum: {detail}".strip(), "key": key,
                         "retry": True}
         return {"fetched": "true", "key": key, "distance": keys.index(key), "codec": their_codec, "bytes": total}
@@ -578,7 +607,8 @@ def lan_stream(config: dict, keys: list[str], staging: Path, timeout: float, rat
     unreachable = []
     deadline = time.monotonic() + timeout
     for address in config["addresses"]:
-        attempts, result, run = 0, None, Pipeline()
+        attempts, result, answered, run = 0, None, None, Pipeline()
+        busy_until = time.monotonic() + LAN_BUSY_BUDGET
         while attempts < LAN_ATTEMPTS and time.monotonic() < deadline:
             attempts += 1
             run = Pipeline()
@@ -599,16 +629,19 @@ def lan_stream(config: dict, keys: list[str], staging: Path, timeout: float, rat
                 timer.cancel()
                 for signum, handler in previous.items():
                     signal.signal(signum, handler)
+            answered = result if result is not None else answered
             if result is None or not result.get("retry") or attempts >= LAN_ATTEMPTS:
                 break
-            low, high = LAN_BUSY_BACKOFF if result["reason"].startswith("seeder: busy") else LAN_RETRY_BACKOFF
+            busy = result["reason"].startswith("seeder: busy")
+            low, high = LAN_BUSY_BACKOFF if busy else LAN_RETRY_BACKOFF
             pause = random.uniform(low, high)
-            if time.monotonic() + pause >= deadline:
+            # Queue for a busy seeder only so long: R2 at link speed takes a seed in a minute or two.
+            if time.monotonic() + pause >= (min(deadline, busy_until) if busy else deadline):
                 break
             time.sleep(pause)
-        if result is not None:
-            result.pop("retry", None)
-            return {**result, "address": address, "attempts": attempts}
+        if answered is not None:
+            answered.pop("retry", None)
+            return {**answered, "address": address, "attempts": attempts}
         unreachable.append(run.unreachable or f"{address}: out of time")
     return {"fetched": "false", "reason": "unreachable: " + "; ".join(unreachable)[:300]}
 
@@ -717,7 +750,7 @@ class DownloadBytes:
 def running_group_commands(pgid: int) -> list[str]:
     """The command lines of the processes in process group PGID."""
     try:
-        out = subprocess.run(["ps", "-axww", "-o", "pgid=,command="], capture_output=True, text=True, timeout=30)
+        out = subprocess.run(["ps", "-axww", "-o", "pgid=,command="], capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return []
     commands = []
@@ -732,12 +765,18 @@ class Governor:
     """Paces an R2 download by the running job's own use of the network, not by the job's existence.
 
     Each TICK it reads the bytes the mini received (interface_bytes) and the bytes the download has
-    written (DownloadBytes); the difference is the job's traffic. While a job runs
-    and its traffic stayed over FOREIGN_BUSY_BPS within the last HOT_HOLD seconds (checkout, a seed or
-    product download, package resolution), the download's process group is paused whenever it is ahead of
-    RATE bytes a second, and resumed when it is not. Otherwise (a job compiling or testing, or no job) it
-    runs at the link's speed. A pause holds TCP's window closed for a second or two, well inside any
-    server or curl timeout. When the traffic cannot be read, every job counts as network-heavy.
+    written (DownloadBytes). Over the last WINDOW seconds, the received bytes less the download's (times
+    WIRE_OVERHEAD, the headers its payload arrives in) are the job's traffic; a window absorbs the socket
+    buffer that fills during a pause and drains after it. While a job runs and its traffic exceeded
+    FOREIGN_BUSY_BPS (plus WIRE_TOLERANCE of the download's own rate, for the overhead's error) within the
+    last HOT_HOLD seconds (checkout, a seed or product download, package resolution), the download's
+    process group is stopped whenever it is ahead of RATE bytes a second, and continued when it is not.
+    Otherwise (a job compiling or testing, or no job) it runs at the link's speed. A pause holds TCP's
+    window closed for a second or two, well inside any server or curl timeout. When the traffic cannot be
+    read, every job counts as network-heavy.
+
+    The group is signalled only under the lock and before stop(): the caller stops the Governor before it
+    reaps the group's leader, so a signal never reaches a reused process group.
     """
 
     def __init__(self, pgid: int, rate: int, job: Callable[[], str],
@@ -746,32 +785,44 @@ class Governor:
         self.pgid, self.rate, self.job, self.tick = pgid, rate, job, tick
         self.read_interface, self.read_own = read_interface, read_own or DownloadBytes(pgid)
         self.stop_event = threading.Event()
+        self.lock = threading.Lock()
         self.paused = False
         self.stats = {"hot_seconds": 0.0, "paused_seconds": 0.0, "peak_job_bps": 0}
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
-    def signal(self, signum: int) -> None:
-        try:
-            os.killpg(self.pgid, signum)
-        except OSError:
-            pass
+    def set_paused(self, paused: bool) -> None:
+        with self.lock:
+            if self.stop_event.is_set() or paused == self.paused:
+                return
+            try:
+                os.killpg(self.pgid, signal.SIGSTOP if paused else signal.SIGCONT)
+            except OSError:
+                pass
+            self.paused = paused
 
     def loop(self) -> None:
         last_in, last_own, last = self.read_interface(), self.read_own(), time.monotonic()
-        hot_until, job_checked, has_job, allowance = 0.0, 0.0, True, 0.0
+        hot_until, job_checked, has_job, allowance = 0.0, 0.0, True, self.rate * BURST_SECONDS
+        window: list[tuple[float, int | None, int]] = []
         while not self.stop_event.wait(self.tick):
             now = time.monotonic()
             dt = max(now - last, 1e-3)
             received, own = self.read_interface(), self.read_own()
             own_delta = max(0, own - last_own)
-            if received is None or last_in is None:
-                foreign = None
+            rx_delta = None if received is None or last_in is None else received - last_in
+            window = [*window, (dt, rx_delta, own_delta)]
+            while sum(item[0] for item in window) > WINDOW + 1e-6 and len(window) > 1:
+                window = window[1:]
+            span = sum(item[0] for item in window)
+            if any(item[1] is None for item in window):
+                foreign, own_rate = None, 0.0
             else:
-                foreign = max(0, (received - last_in) - own_delta) / dt
+                own_rate = sum(item[2] for item in window) / span
+                foreign = max(0.0, sum(item[1] for item in window) / span - own_rate * WIRE_OVERHEAD)
                 self.stats["peak_job_bps"] = max(self.stats["peak_job_bps"], int(foreign))
             if now - job_checked >= JOB_CHECK_SECONDS:
                 has_job, job_checked = bool(self.job()), now
-            if has_job and (foreign is None or foreign >= FOREIGN_BUSY_BPS):
+            if has_job and (foreign is None or foreign >= FOREIGN_BUSY_BPS + WIRE_TOLERANCE * own_rate):
                 hot_until = now + HOT_HOLD
             hot = has_job and now < hot_until
             if hot:
@@ -779,31 +830,36 @@ class Governor:
                 allowance = min(allowance + self.rate * dt, self.rate * BURST_SECONDS) - own_delta
             else:
                 allowance = self.rate * BURST_SECONDS
-            want_pause = hot and allowance < 0
             if self.paused:
                 self.stats["paused_seconds"] += dt
-            if want_pause != self.paused:
-                self.signal(signal.SIGSTOP if want_pause else signal.SIGCONT)
-                self.paused = want_pause
+            self.set_paused(hot and allowance < 0)
             last_in, last_own, last = received, own, now
 
-    def __enter__(self) -> "Governor":
+    def start(self) -> "Governor":
         self.thread.start()
         return self
 
-    def __exit__(self, *_exc) -> None:
-        self.stop_event.set()
+    def stop(self) -> None:
+        """Continue the group if it is stopped, and never signal it again."""
+        self.set_paused(False)
+        with self.lock:
+            self.stop_event.set()
         self.thread.join(timeout=30)
-        if self.paused:
-            self.signal(signal.SIGCONT)  # never leave the download stopped (a killed one is gone anyway)
-            self.paused = False
 
     def report(self) -> dict:
         return {"rate": self.rate, **{k: round(v, 1) if isinstance(v, float) else v for k, v in self.stats.items()}}
 
 
+def remove_downloads(paths: list[str]) -> None:
+    """Remove the mktemp directories of r2-cache.sh downloads a killed prefetch left behind."""
+    for path in paths:
+        folder = os.path.dirname(path)
+        if re.fullmatch(r"tmp\.[A-Za-z0-9]{6,}", os.path.basename(folder)) and os.path.basename(path) == "archive":
+            shutil.rmtree(folder, ignore_errors=True)
+
+
 def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "") -> dict:
-    """cmux's R2 prefetch for STORE; JOB (a running job, or '') turns on the Governor and the longer timeout."""
+    """cmux's R2 prefetch for STORE, under the Governor; JOB (running at the start, or '') gives the longer timeout."""
     env = {key: value for key, value in os.environ.items()
            if key not in ("GITHUB_REPOSITORY", "GITHUB_OUTPUT", "CURL_HOME")}
     timeout = BUSY_PREFETCH_TIMEOUT if job else PREFETCH_TIMEOUT
@@ -818,12 +874,17 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "")
     child = subprocess.Popen([cmux_python(), os.fspath(scripts / "scripts/ci/seed_derived_data.py"), "prefetch",
                               os.fspath(store), head], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                              env=env, start_new_session=True)
+    downloads = DownloadBytes(child.pid)
+    governor = Governor(child.pid, BUSY_RATE, busy, read_own=downloads).start()
 
     def stop_child() -> None:
+        # Only while the leader is unreaped (the Governor stopped first), so the group is still ours.
+        governor.stop()
         try:
             os.killpg(child.pid, signal.SIGKILL)
         except OSError:
             pass
+        remove_downloads(list(downloads.sizes))
 
     # launchd's bootout (an OTA update, an uninstall) signals only this job's own process group, so
     # without this the download would outlive us with no timeout and no lock.
@@ -831,33 +892,47 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "")
         stop_child()
         sys.exit(128 + signum)
 
+    # Read both pipes to EOF without reaping the leader: the Governor must stop before its pid can be reused.
+    output: dict[str, str] = {}
+    readers = [threading.Thread(target=lambda name=name, pipe=pipe: output.__setitem__(name, pipe.read()), daemon=True)
+               for name, pipe in (("stdout", child.stdout), ("stderr", child.stderr))]
     previous = {signum: signal.signal(signum, on_signal) for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
-    governor = Governor(child.pid, BUSY_RATE, busy) if job else None
+    timed_out = False
     try:
-        if governor:
-            governor.__enter__()
-        stdout, stderr = child.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        stop_child()
-        child.communicate()
-        return {"fetched": "false", "reason": f"timed out after {timeout} s",
-                **({"paced": governor.report()} if governor else {})}
+        for reader in readers:
+            reader.start()
+        deadline = time.monotonic() + timeout
+        for reader in readers:
+            reader.join(max(0.0, deadline - time.monotonic()))
+        if any(reader.is_alive() for reader in readers):
+            timed_out = True
+            stop_child()
+            for reader in readers:
+                reader.join(30)
+        governor.stop()
+        try:
+            child.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            stop_child()
+            child.wait()
     finally:
-        if governor:
-            governor.__exit__()
+        governor.stop()
         for signum, handler in previous.items():
             signal.signal(signum, handler)
-    out = subprocess.CompletedProcess(child.args, child.returncode, stdout, stderr)
-    lines = [line for line in out.stdout.splitlines() if line.startswith("{")]
-    if out.returncode != 0 or not lines:
-        return {"fetched": "false", "reason": f"exit {out.returncode}: {(out.stderr or out.stdout).strip()[-200:]}"}
+        for pipe in (child.stdout, child.stderr):
+            pipe.close()
+    paced = {"paced": governor.report()}
+    if timed_out:
+        return {"fetched": "false", "reason": f"timed out after {timeout} s", **paced}
+    stdout, stderr = output.get("stdout", ""), output.get("stderr", "")
+    lines = [line for line in stdout.splitlines() if line.startswith("{")]
+    if child.returncode != 0 or not lines:
+        return {"fetched": "false", "reason": f"exit {child.returncode}: {(stderr or stdout).strip()[-200:]}", **paced}
     try:
         result = json.loads(lines[-1])
     except ValueError:
-        return {"fetched": "false", "reason": "unreadable result"}
-    if governor and isinstance(result, dict):
-        result["paced"] = governor.report()
-    return result
+        return {"fetched": "false", "reason": "unreadable result", **paced}
+    return {**result, **paced} if isinstance(result, dict) else {"fetched": "false", "reason": "unreadable result"}
 
 
 def run(apply: bool, state: Path = STATE) -> dict:
@@ -898,6 +973,9 @@ def run(apply: bool, state: Path = STATE) -> dict:
                     "lan": "configured" if lan_config() else "off"}
         shutil.rmtree(work / "tmp", ignore_errors=True)
         (work / "tmp").mkdir()
+        for store in roots:  # a killed run's LAN staging (spool and partial extraction); the lock makes it ours
+            for stale in (store / "seeds").glob(".lan-*"):
+                shutil.rmtree(stale, ignore_errors=True)
         try:
             scripts = scripts_for(work, mirror, head)
         except (OSError, subprocess.SubprocessError) as error:

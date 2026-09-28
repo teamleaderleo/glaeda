@@ -95,7 +95,8 @@ class SeedPrefetchTest(PrefetchBase):
         self.assertEqual(result["paced"]["rate"], sp.BUSY_RATE)
         sp.running_commands = lambda: ["zsh"]
         result = sp.run(True, self.state)["results"][os.fspath(self.state)]
-        self.assertNotIn("paced", result)
+        self.assertNotIn("busy", result)
+        self.assertEqual(result["paced"]["paused_seconds"], 0)
         self.assertEqual([line.rsplit(" curlrc=", 1)[1] for line in self.call_lines()], ["", ""])
         self.assertFalse((self.state / ".prefetch/curl-busy").exists())
 
@@ -279,15 +280,15 @@ class GovernorTest(unittest.TestCase):
     """The R2 download is paused only while a job's own traffic is heavy, and only when ahead of BUSY_RATE."""
 
     def setUp(self) -> None:
-        self.saved = (sp.HOT_HOLD, sp.JOB_CHECK_SECONDS)
-        sp.HOT_HOLD, sp.JOB_CHECK_SECONDS = 0.3, 0.0
+        self.saved = (sp.HOT_HOLD, sp.JOB_CHECK_SECONDS, sp.WINDOW)
+        sp.HOT_HOLD, sp.JOB_CHECK_SECONDS, sp.WINDOW = 0.3, 0.0, 0.2
         self.proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
         self.received = 0
         self.own = 0
         self.job = "Runner.Worker"
 
     def tearDown(self) -> None:
-        sp.HOT_HOLD, sp.JOB_CHECK_SECONDS = self.saved
+        sp.HOT_HOLD, sp.JOB_CHECK_SECONDS, sp.WINDOW = self.saved
         self.proc.kill()
         self.proc.wait()
 
@@ -304,38 +305,65 @@ class GovernorTest(unittest.TestCase):
         while time.monotonic() < end:
             time.sleep(0.02)
             self.own += int(own_bps * 0.02)
-            self.received += int((job_bps + own_bps) * 0.02)
+            self.received += int((job_bps + own_bps * sp.WIRE_OVERHEAD) * 0.02)
 
     def test_a_download_beside_a_job_that_is_not_downloading_runs_free(self):
-        with self.governor() as governor:
+        governor = self.governor().start()
+        try:
             self.run_for(0.6, job_bps=10_000, own_bps=50_000_000)
             self.assertFalse(self.stopped())
+        finally:
+            governor.stop()
         self.assertEqual(governor.stats["paused_seconds"], 0)
         self.assertEqual(governor.stats["hot_seconds"], 0)
 
     def test_a_job_downloading_holds_the_download_to_the_busy_rate_then_frees_it(self):
-        with self.governor() as governor:
-            self.run_for(0.6, job_bps=sp.FOREIGN_BUSY_BPS * 4, own_bps=50_000_000)
+        governor = self.governor().start()
+        try:
+            self.run_for(0.6, job_bps=sp.FOREIGN_BUSY_BPS * 8, own_bps=50_000_000)
             self.assertTrue(self.stopped())
             self.run_for(1.0, job_bps=0, own_bps=0)  # the job starts compiling
             self.assertFalse(self.stopped())
+        finally:
+            governor.stop()
         self.assertGreater(governor.stats["paused_seconds"], 0)
-        self.assertGreaterEqual(governor.stats["peak_job_bps"], sp.FOREIGN_BUSY_BPS * 4 - 1)
+        self.assertGreaterEqual(governor.stats["peak_job_bps"], sp.FOREIGN_BUSY_BPS * 6)
         self.assertFalse(self.stopped())
+
+    def test_header_overhead_on_a_fast_download_is_not_the_jobs_traffic(self):
+        governor = self.governor().start()
+        try:
+            end = time.monotonic() + 0.6
+            while time.monotonic() < end:  # 1% more header than WIRE_OVERHEAD assumes, at 100 MB/s
+                time.sleep(0.02)
+                self.own += 2_000_000
+                self.received += int(2_000_000 * (sp.WIRE_OVERHEAD + 0.01))
+            self.assertFalse(self.stopped())
+        finally:
+            governor.stop()
+        self.assertEqual(governor.stats["hot_seconds"], 0)
 
     def test_no_job_means_no_pause_whatever_the_traffic(self):
         self.job = ""
-        with self.governor():
+        governor = self.governor().start()
+        try:
             self.run_for(0.6, job_bps=sp.FOREIGN_BUSY_BPS * 10, own_bps=50_000_000)
             self.assertFalse(self.stopped())
+        finally:
+            governor.stop()
 
     def test_unreadable_counters_count_a_job_as_downloading(self):
         governor = sp.Governor(self.proc.pid, 1000, lambda: "job",
                                read_interface=lambda: None, read_own=lambda: self.own, tick=0.05)
-        with governor:
+        governor.start()
+        try:
             self.run_for(0.4, job_bps=0, own_bps=50_000_000)
             self.assertTrue(self.stopped())
-        self.assertFalse(self.stopped())  # leaving the governor always resumes the download
+        finally:
+            governor.stop()
+        self.assertFalse(self.stopped())  # stopping the governor always resumes the download
+        governor.set_paused(True)  # and it never signals the group again
+        self.assertFalse(self.stopped())
 
     def test_download_bytes_follows_the_curls_in_the_group_by_their_output_file(self):
         base = Path(tempfile.mkdtemp())
@@ -709,6 +737,49 @@ class LanSeedTest(PrefetchBase):
         self.assertEqual((lan["fetched"], lan["reason"], lan["attempts"]), ("false", "seeder: busy", sp.LAN_ATTEMPTS))
         self.assertEqual(len(self.ssh_log.read_text().splitlines()), sp.LAN_ATTEMPTS)
         self.assert_clean()
+
+    def test_a_busy_seeder_is_waited_for_only_within_the_budget(self):
+        self.record(self.state)
+        self.commit()
+        os.environ["FAKE_SSH_MODE"] = "busy"
+        saved = sp.LAN_BUSY_BUDGET
+        sp.LAN_BUSY_BUDGET = 0.0
+        try:
+            lan = self.lan()
+        finally:
+            sp.LAN_BUSY_BUDGET = saved
+        self.assertEqual((lan["reason"], lan["attempts"]), ("seeder: busy", 1))
+
+    def test_a_reaped_process_is_never_signalled(self):
+        run = sp.Pipeline()
+        done = run.spawn(["true"])
+        run.reap()
+        alive = run.spawn(["sleep", "30"])
+        signalled = []
+        saved = os.killpg
+        os.killpg = lambda pgid, signum: signalled.append(pgid)
+        try:
+            run.stop()
+        finally:
+            os.killpg = saved
+            alive.kill()
+            alive.wait()
+        self.assertEqual(signalled, [alive.pid])
+        self.assertNotIn(done.pid, signalled)
+
+    def test_a_killed_runs_lan_staging_is_swept_for_every_root(self):
+        self.record(self.state)
+        self.record(self.state / "cmux-ci-2")
+        head = self.commit()
+        width = os.sysconf("SC_NPROCESSORS_ONLN")
+        for store in (self.state, self.state / "cmux-ci-2"):  # kept: nothing to ask the seeder for
+            seed = store / "seeds" / f"{PREFIX}j{width}-{head}"
+            seed.mkdir(parents=True)
+            (seed / sp.MANIFEST).write_text("{}")
+            (store / "seeds/.lan-4242/x").mkdir(parents=True)
+            (store / "seeds/.lan-4242/stream").write_bytes(b"z" * 1000)
+        sp.run(True, self.state)
+        self.assertEqual(list(self.state.glob("**/.lan-*")), [])
 
     def test_a_stream_cut_part_way_is_fetched_again_and_nothing_partial_lands(self):
         self.record(self.state)
