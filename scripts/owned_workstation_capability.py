@@ -109,14 +109,20 @@ def bounded_process_stdout(
     max_stdout_bytes: int,
     env: dict[str, str],
 ) -> tuple[int, bytes]:
-    process = subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=env,
-        start_new_session=True,
-    )
+    # Every failure below raises SnapshotError with a constant message. argv
+    # carries the checkout path, and OSError and TimeoutExpired both render it
+    # into str(error), which main() prints to stderr as JSON.
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise SnapshotError("Bounded observation could not be started") from error
     if process.stdout is None:
         terminate_process_group(process)
         raise SnapshotError("Bounded observer stdout is unavailable")
@@ -143,7 +149,15 @@ def bounded_process_stdout(
         if remaining <= 0:
             raise subprocess.TimeoutExpired(argv, timeout)
         return process.wait(timeout=remaining), bytes(output)
-    except (SnapshotError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        # Not re-raised: TimeoutExpired stringifies its argv, which holds the
+        # checkout path. Keep the message constant.
+        terminate_process_group(process)
+        raise SnapshotError("Bounded observation timed out") from None
+    except BaseException:
+        # Anything else, including a selector OSError or KeyboardInterrupt,
+        # must still kill and reap the child rather than orphan it on the
+        # checkout.
         terminate_process_group(process)
         raise
     finally:

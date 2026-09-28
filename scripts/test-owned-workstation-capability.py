@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -94,7 +95,46 @@ class OwnedWorkstationCapabilityTests(unittest.TestCase):
             observer.chmod(0o755)
             with self.assertRaisesRegex(MODULE.SnapshotError, "exceeded output limit"):
                 MODULE.repo_query_project_observation(observer, root)
+            # The observer writes the marker at t≈2s. Checking immediately
+            # would pass whether or not the kill worked, so wait past that.
+            time.sleep(3)
             self.assertFalse(marker.exists())
+
+    def test_observer_timeout_is_refused_without_naming_the_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observer = root / "observer.py"
+            observer.write_text(
+                "#!/usr/bin/env python3\n"
+                "import time\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            observer.chmod(0o755)
+            original = MODULE.bounded_process_stdout
+
+            def brief(argv, **kwargs):
+                return original(argv, **{**kwargs, "timeout": 0.5})
+
+            MODULE.bounded_process_stdout = brief
+            try:
+                with self.assertRaises(MODULE.SnapshotError) as caught:
+                    MODULE.repo_query_project_observation(observer, root)
+            finally:
+                MODULE.bounded_process_stdout = original
+            # TimeoutExpired stringifies its argv, which carries --checkout.
+            self.assertNotIn(str(root), str(caught.exception))
+            self.assertIn("timed out", str(caught.exception))
+
+    def test_missing_observer_is_refused_without_naming_the_program(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observer = root / "observer.py"
+            observer.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            observer.chmod(0o644)
+            with self.assertRaises(MODULE.SnapshotError) as caught:
+                MODULE.repo_query_project_observation(observer, root)
+            self.assertNotIn(str(root), str(caught.exception))
 
     def test_refuses_duplicate_and_over_ceiling_projects(self) -> None:
         with self.assertRaisesRegex(MODULE.SnapshotError, "duplicate projects"):
