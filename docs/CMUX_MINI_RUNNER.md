@@ -943,17 +943,28 @@ rebuild-tier from main's head, and each mini had sat fully idle 17 to 33% of the
 
 Check one mini: `glaeda-idle-warm` (plan) says whether it would warm now and which root, or why not.
 
-**Idle UI fuzzing.** With `~/.config/glaeda/idle-fuzz.enabled`, an idle spell with nothing left to warm runs
-cmux's UI fuzzer (`scripts/fuzz` from the kept main checkout) instead of skipping. It clones the newest main
-build a root keeps into `fuzz/builds/<sha>` (APFS `cp -c`, no root token: the copy counts only if the root's
-stamp is unchanged after it), fuzzes it for up to 10 minutes and minimizes up to two failures, 26 minutes at most;
-runs land in `/Users/Shared/cmux-build-fleet/fuzz/runs`. Same gates and yield as a catch-up, plus: every capacity
-unit free (no admitted job at all, since a gui-step job takes the gui token only later with take-gui), this user
-owns an unlocked console, no Xcode test runs, and 90 GiB free. It holds one unit through
-`capacity/idle-warm.json`, never the gui token or a root (either would stop a gui runner's listener). A job's
-SIGTERM ends the fuzzer and its app together: the app is the fuzzer's child, in the catch-up's process group.
-`glaeda-idle-warm --apply --fuzz` runs it now. cmuxterm-hq's `build-fleet/fuzz/collect.py` files the findings
-as cmux issues.
+**Idle UI fuzzing (a preemptible lane).** The idle-fuzz LaunchAgent (`glaeda-idle-warm --apply --fuzz`, every
+minute, from glaeda-mini-setup, so it ships with glaeda OTA) runs cmux's UI fuzzer on every mini with glaeda
+runners, except NEVER_HOSTS (cmux-mac-mini, Lawrence's machines) and a mini with
+`~/.config/glaeda/idle-fuzz.disabled`. It is not part of the catch-up: it runs at nice 10 beside compiles and
+catch-ups, and holds no capacity unit, root or token, so no admission waits for it or refuses because of it.
+
+- **Starts** when this user owns an unlocked console, no job holds the gui token or asks for it (a take-gui
+  step), no Xcode test and no other cmux DEV app runs, the host has no reservation (someone dogfooding there),
+  and 90 GiB are free. It clones the newest main build a root keeps into `fuzz/builds/<sha>` (APFS `cp -c`, no
+  root token: the copy counts only if the root's stamp is unchanged after it) and exports the fuzzer at that
+  commit (`git archive` of `scripts/fuzz` and `dogfood/fuzz` from the catch-up checkout or the seed mirror) into
+  `fuzz/engines/<sha>`, since a catch-up may check out a newer main meanwhile. It fuzzes for up to 10 minutes
+  and minimizes up to two failures, 26 minutes at most; runs land in `/Users/Shared/cmux-build-fleet/fuzz/runs`.
+- **Stops** the moment a job wants the console. It names its pid in `capacity/idle-fuzz.json` (the hook's
+  FUZZ_HOLDER); a job whose admission takes the gui token, or a step running take-gui, stops it first with SIGTERM,
+  which kills its process group, the app included (the app is the fuzzer's child), within the hook's 5 s yield.
+  The lane also watches for itself every 0.25 s (gui token, reservation) and every second (process list: an
+  Xcode test, a take-gui, another cmux DEV app), so a runner whose hook predates FUZZ_HOLDER loses it too.
+  A compile's admission leaves it alone.
+
+`glaeda-idle-warm --fuzz` prints whether it would run now, or why not; `--apply --fuzz` runs it. cmuxterm-hq's
+`build-fleet/fuzz/collect.py` files the findings as cmux issues.
 
 ## 2l. Mini health: heal what the runner user can, report the rest
 
@@ -976,6 +987,38 @@ then the finding reads `impossible`. The report,
 sighting, evidence, `auto_fix` pending or impossible, and the heals of the last day), is what ci-dash's probe
 reads; ci-dash's Health section names the operator command for the rest. `glaeda-mini-health` alone prints
 the report without healing; `touch ~/.config/glaeda/mini-health.disabled` keeps it reporting but stops heals.
+
+## 2m. Build mesh: the fleet index and kept state between PR minis
+
+Compiled products (2j) are one object per build. The bigger saving is kept compile-admission state: a
+pull request re-pushed onto a different mini starts cold there (PR 13504 cold-started on three minis on
+2026-09-25) while another mini holds its previous build. The same mesh key and forced command carry two
+more verbs, so no new server, port or GitHub call is involved:
+
+- **`inventory-v1`** answers `glaeda-seed-serve 1 inventory SIZE` and SIZE bytes of JSON
+  (`glaeda-lan-inventory/v1`): per canonical root, the stamp of the kept state (`derived-data` +
+  `stamp.json` in `/Users/Shared/cmux-build-fleet/ci`, `ci/cmux-ci-<k>`, and each parked pull-request build
+  `<store>/pr-builds/pr-<n>`) with its sha256, `kept_at` and size (Logs and Index.noindex left out, sizes
+  cached per stamp), the cached product digests and the kept seed keys.
+- **`state-v1 K SLOT STAMP CODEC`** streams `tar` (zstd -1 -T0 when both ends have zstd) of that kept state.
+  The server first takes an APFS clone (`cp -cR`) and serves it only if the stamp bytes and the
+  `derived-data` inode were the same before and after, so a job's `keep` racing it yields `miss`, never a
+  torn tree. The clone is removed afterwards, and clones a killed serve left are swept by pid.
+- **Fleet index.** The `lan-fetch` broker polls every peer's inventory every 60 s into
+  `~/.local/state/glaeda/lan-fetch/fleet-index.json` (`glaeda-fleet-index/v1`); `glaeda-lan-fetch index`
+  prints it. Readers (glaeda-cmux-runner-hook) never touch the network.
+- **Pull.** `glaeda-lan-fetch state PEER K SLOT STAMP` (through the broker, Local Network Privacy) extracts
+  into `ci/.lan-state-*`, requires the stamp it asked for, then swaps `derived-data` and `stamp.json` into
+  root K's store the way cmux `keep` does. A state is only usable in the same canonical root (its
+  fingerprint covers the root path), so a pull always goes root K to root K.
+- **Trust.** Kept state has no recorded digest: a PR mini trusts it exactly as it trusts its own kept state,
+  which any in-repo PR job there may have written (forks never run on the minis). The mesh is PR minis only,
+  and the broker refuses to pull into a mini whose runner receipt names a trusted ref, so PR state never
+  reaches the trusted seed chain (cmux15), and mini-6 is never in the mesh.
+
+Link speed (2026-09-26, every mini): the M4 Pro minis have the built-in 1 GbE port (Broadcom 57762,
+"Maximum Link Speed: 1 Gb/s", negotiated 1000baseT), not the 10 GbE option, and the Thunderbolt bridge is
+inactive. So a kept state (8-12 GB on disk) moves in about 35-50 s through zstd, or ~90 s as plain tar.
 
 ## 3. Verify
 

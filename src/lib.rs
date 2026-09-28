@@ -13,6 +13,9 @@ pub mod cargo_target_holder_observation;
 /// Read-only, descriptor-bound observation of one Linux Cargo target tree.
 #[cfg(target_os = "linux")]
 pub mod cargo_target_observation;
+/// Pure reclaim planning for observed Cargo target trees from reconstructibility.
+#[cfg(target_os = "linux")]
+pub mod cargo_target_reclaim;
 /// Pure projection of measured CMUX product transport/restore receipts into adaptive observations.
 pub mod cmux_product_transport_adapter;
 /// Pure projection of validated CMUX workload results into adaptive verification observations.
@@ -204,6 +207,8 @@ pub mod linux_installation_enrollment;
 /// Staged, durable, no-replace publication of complete project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_publication;
+#[cfg(target_os = "linux")]
+mod linux_kernel_file_locks;
 /// Durable, revision-checked lease persistence beneath one installation directory.
 #[cfg(target_os = "linux")]
 pub mod linux_lease_store;
