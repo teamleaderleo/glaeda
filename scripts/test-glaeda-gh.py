@@ -288,6 +288,22 @@ class ControllerTest(Base):
         self.assertEqual(len(self.gh.rest_calls()), 1)
         self.assertEqual(gg.read_cache("run:o/r/24")["source"], "rest")
 
+    def test_daemon_follows_a_moved_controller(self) -> None:
+        """The client config names the controller. A daemon started before a move kept reading
+        the old, drained controller's feed and reported webhooks hours stale (cmuxterm-hq, 2026-09-28)."""
+        old, new = FakeController(), FakeController()
+        old.base, new.base = "http://old:18765", "http://new:18765"
+        current = [old]
+        self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=lambda: current[0])
+        self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(old.feeds, [None, 0])
+        current[0] = new
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        self.assertIs(self.daemon.controller, new)
+        self.assertEqual(new.feeds, [None])  # a fresh cursor: the old controller's means nothing here
+        self.assertEqual(old.feeds, [None, 0])
+
     def test_controller_down_backs_off(self) -> None:
         self.ctl.down = True
         self.gh.runs[25] = {"id": 25, "status": "in_progress"}
