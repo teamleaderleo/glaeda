@@ -162,13 +162,13 @@ mod linux {
                     allocated_bytes,
                     entry_count,
                     idle_seconds,
-                    released_bytes_are_lower_bound,
+                    released_bytes_are_upper_bound,
                     ..
                 } => {
                     println!(
                         "eligible: {allocated_bytes} bytes across {entry_count} entries, idle {idle_seconds}s{}",
-                        if *released_bytes_are_lower_bound {
-                            " (bytes are a lower bound: external hardlinks)"
+                        if *released_bytes_are_upper_bound {
+                            " (bytes are an upper bound: external hardlinks)"
                         } else {
                             ""
                         }
@@ -204,11 +204,11 @@ mod linux {
                     CargoTargetReclaimOutcome::Reclaimed {
                         entries_removed,
                         released_bytes,
-                        released_bytes_are_lower_bound,
+                        released_bytes_are_upper_bound,
                     } => println!(
                         "reclaimed: {released_bytes} bytes across {entries_removed} entries{}",
-                        if *released_bytes_are_lower_bound {
-                            " (lower bound: external hardlinks)"
+                        if *released_bytes_are_upper_bound {
+                            " (upper bound: external hardlinks)"
                         } else {
                             ""
                         }

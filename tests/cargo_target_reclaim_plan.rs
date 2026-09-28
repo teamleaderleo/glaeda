@@ -7,7 +7,8 @@
 
 use std::fs::{self, File};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt as _;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use glaeda::cargo_target_holder_observation::observe_cargo_target_holders;
@@ -217,6 +218,18 @@ fn reviewed_policy() -> CargoTargetReclaimPolicy {
     CargoTargetReclaimPolicy::new(MIN_CARGO_TARGET_RECLAIM_IDLE_SECONDS).expect("reviewed policy")
 }
 
+/// Leave behind a retiring directory the way an interrupted pass does: build it, then name it after
+/// its own inode. The resume path checks that binding, so a hand-written inode number is not a
+/// retiring directory and a fixture that fabricates one is testing nothing.
+fn interrupted_retiring_directory(checkout: &Path) -> PathBuf {
+    let staging = checkout.join("retiring-staging");
+    fs::create_dir(&staging).expect("create retiring staging");
+    let inode = fs::metadata(&staging).expect("stat retiring staging").ino();
+    let retiring = checkout.join(format!(".glaeda-reclaiming-{inode}"));
+    fs::rename(&staging, &retiring).expect("name the retiring directory after its inode");
+    retiring
+}
+
 #[test]
 fn an_eligible_target_is_actually_removed() {
     let fixture = Fixture::new().with_cargo_target();
@@ -272,7 +285,7 @@ fn an_interrupted_pass_is_finished_by_the_next_one() {
     // Simulate the crash window: a retiring directory left behind after the rename but before the
     // delete finished. A later pass must clean it up without being asked.
     let fixture = Fixture::new().with_cargo_target();
-    let leftover = fixture.checkout.join(".glaeda-reclaiming-999999");
+    let leftover = interrupted_retiring_directory(&fixture.checkout);
     fs::create_dir_all(leftover.join("deep").join("deeper")).expect("create leftover");
     File::create(leftover.join("deep").join("stale.rlib")).expect("create stale artifact");
     let now = fixture.newest_entry_seconds() + ONE_DAY;
@@ -295,8 +308,8 @@ fn a_retiring_tree_deeper_than_any_fixed_ceiling_is_fully_removed() {
     // reclaimed on any later pass. The resume path never observes, so it is the one that must hold
     // at arbitrary depth -- 300 levels is past every ceiling this codebase has used.
     let fixture = Fixture::new().with_cargo_target();
-    let mut deep = fixture.checkout.join(".glaeda-reclaiming-424242");
-    let leftover = deep.clone();
+    let leftover = interrupted_retiring_directory(&fixture.checkout);
+    let mut deep = leftover.clone();
     for level in 0..300 {
         deep = deep.join(format!("l{level}"));
     }
@@ -330,6 +343,36 @@ fn a_target_past_the_observation_bound_says_so() {
         .expect_err("a target past the observation bound must not be reclaimed silently");
 
     assert_eq!(error.code(), "target_exceeds_observation_bound");
+}
+
+#[test]
+fn a_retiring_name_this_tool_did_not_write_is_left_alone() {
+    // The resume path deletes recursively with no observation behind it, so its only evidence is
+    // the directory itself. Anyone who can write in the checkout can create the name; only a rename
+    // this tool performed carries the matching inode. A stranger's tree must survive untouched.
+    let fixture = Fixture::new().with_cargo_target();
+    let planted = fixture.checkout.join(".glaeda-reclaiming-999999");
+    let keepsake = planted.join("not-ours.txt");
+    fs::create_dir_all(&planted).expect("create planted directory");
+    File::create(&keepsake).expect("create planted file");
+    let now = fixture.newest_entry_seconds() + ONE_DAY;
+
+    let receipt = reclaim_cargo_target(&fixture.checkout, reviewed_policy(), now).expect("reclaim");
+
+    assert!(
+        keepsake.exists(),
+        "a planted retiring name must not be deleted"
+    );
+    assert_eq!(
+        receipt.resumed_entries_removed(),
+        0,
+        "nothing was resumed, got {receipt:?}"
+    );
+    // The planted directory does not stop the pass it sits next to.
+    assert!(
+        !fixture.checkout.join("target").exists(),
+        "the eligible target must still be reclaimed, got {receipt:?}"
+    );
 }
 
 #[test]

@@ -25,7 +25,7 @@ use crate::cargo_target_holder_observation::{
 };
 use crate::cargo_target_observation::{
     CargoTargetHardlinkCoverage, CargoTargetObservation, CargoTargetObservationErrorKind,
-    CargoTargetState, RustcInfoObservation, observe_cargo_target,
+    CargoTargetState, RustcInfoObservation, cargo_target_materialization_id, observe_cargo_target,
 };
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
@@ -162,7 +162,7 @@ pub enum CargoTargetReclaimDecision {
         /// Cargo hardlinks its own binaries, so links are ordinary here; an external one costs
         /// accuracy in the reported figure and nothing else, because unlinking one link never
         /// destroys the other.
-        released_bytes_are_lower_bound: bool,
+        released_bytes_are_upper_bound: bool,
     },
 }
 
@@ -298,7 +298,7 @@ pub fn plan_cargo_target_reclaim(
             entry_count: *entry_count,
             idle_seconds,
             holder_evidence: evidence.ok_or_else(missing_holder_evidence)?,
-            released_bytes_are_lower_bound: *hardlink_coverage
+            released_bytes_are_upper_bound: *hardlink_coverage
                 == CargoTargetHardlinkCoverage::ExternalLinksPresent,
         }
     } else {
@@ -422,7 +422,7 @@ pub enum CargoTargetReclaimOutcome {
     Reclaimed {
         entries_removed: u64,
         released_bytes: u64,
-        released_bytes_are_lower_bound: bool,
+        released_bytes_are_upper_bound: bool,
     },
     /// The entry budget ran out. The retiring directory remains and the next pass resumes it.
     Incomplete {
@@ -498,8 +498,18 @@ pub fn reclaim_cargo_target(
 
     // Finish anything a previous pass left behind before measuring, so a resumed tree is not
     // observed as if it were a live target.
-    resume_retiring_directories(&checkout_fd, &mut budget)?;
+    let resume_complete = resume_retiring_directories(&checkout_fd, &mut budget)?;
     let resumed = budget.removed;
+    if !resume_complete {
+        // The budget is shared with the primary phase. Retiring the live target now would rename it
+        // away with nothing left to delete it with, so stop and report the partial pass instead.
+        return Ok(CargoTargetReclaimReceipt {
+            schema_version: CARGO_TARGET_RECLAIM_SCHEMA_VERSION,
+            mutation_performed: resumed > 0,
+            resumed_entries_removed: resumed,
+            outcome: CargoTargetReclaimOutcome::Incomplete { entries_removed: 0 },
+        });
+    }
 
     let observation = observe_cargo_target(checkout).map_err(|error| {
         // A tree past the observer's bound cannot be planned, even though the delete below has no
@@ -516,7 +526,7 @@ pub fn reclaim_cargo_target(
 
     let CargoTargetReclaimDecision::Eligible {
         allocated_bytes,
-        released_bytes_are_lower_bound,
+        released_bytes_are_upper_bound,
         ..
     } = plan.decision()
     else {
@@ -530,13 +540,31 @@ pub fn reclaim_cargo_target(
         });
     };
     let released_bytes = *allocated_bytes;
-    let lower_bound = *released_bytes_are_lower_bound;
+    let upper_bound = *released_bytes_are_upper_bound;
+
+    // The plan was made about one materialization of `<checkout>/target`. Carry its identity down
+    // to the rename so the two name resolutions cannot end up being about different directories.
+    let CargoTargetState::Present {
+        target_id: planned_target_id,
+        ..
+    } = observation.state()
+    else {
+        return Err(target_changed());
+    };
 
     let target_name = c"target";
     let before = rustix_fs::statat(checkout_fd.as_fd(), target_name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|_| target_unreadable())?;
     if !FileType::from_raw_mode(before.st_mode).is_dir() {
         return Err(target_unsafe_shape());
+    }
+    // Same name, second resolution. Everything the plan cleared - owner, holders, idleness,
+    // reconstructibility - is evidence about the measured inode, so a directory that is not that
+    // inode has been vouched for by nothing and must not be renamed away and deleted.
+    let materialization =
+        cargo_target_materialization_id(&before).map_err(|_| target_unreadable())?;
+    if materialization != *planned_target_id {
+        return Err(target_changed());
     }
 
     let retiring = retiring_name(before.st_ino);
@@ -584,7 +612,7 @@ pub fn reclaim_cargo_target(
         outcome: CargoTargetReclaimOutcome::Reclaimed {
             entries_removed: budget.removed - resumed,
             released_bytes,
-            released_bytes_are_lower_bound: lower_bound,
+            released_bytes_are_upper_bound: upper_bound,
         },
     })
 }
@@ -595,10 +623,11 @@ fn retiring_name(inode: u64) -> Vec<u8> {
     name
 }
 
+/// Finish earlier passes' retiring directories. Returns false when the budget ran out first.
 fn resume_retiring_directories(
     checkout_fd: &OwnedFd,
     budget: &mut DeleteBudget,
-) -> Result<(), CargoTargetReclaimError> {
+) -> Result<bool, CargoTargetReclaimError> {
     let mut pending: Vec<CString> = Vec::new();
     {
         let mut entries = Dir::read_from(checkout_fd).map_err(|_| target_unreadable())?;
@@ -624,16 +653,23 @@ fn resume_retiring_directories(
         if !FileType::from_raw_mode(stat.st_mode).is_dir() {
             continue;
         }
+        // The name is not the authority: this pass wrote it, and anyone with write access to the
+        // checkout could write one too. The inode it encodes survives the rename that created it,
+        // so a directory whose own inode does not reproduce its name was never retired by us.
+        // Leave it exactly where it is rather than recursively deleting a stranger's tree.
+        if retiring_name(stat.st_ino) != name.to_bytes() {
+            continue;
+        }
         let fd = open_child_directory(checkout_fd, name.as_c_str())?;
         let complete = delete_directory_contents(&fd, stat.st_dev, budget)?;
         drop(fd);
         if !complete {
-            return Ok(());
+            return Ok(false);
         }
         rustix_fs::unlinkat(checkout_fd.as_fd(), name.as_c_str(), AtFlags::REMOVEDIR)
             .map_err(|_| retire_failed())?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Delete one directory's contents depth-first, holding a descriptor per level.
