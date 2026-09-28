@@ -1245,6 +1245,66 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((self.root / "glaeda/target").exists())
         self.assertFalse(receipt.exists())
 
+    def _checkout_builds(self) -> tuple[Path, gd.Family]:
+        """projects/app (tracked root and nested packages) with a linked worktree in projects/wts and one
+        outside projects; every .build is tagged unless the test says otherwise."""
+        projects = self.root / "projects"
+        app = projects / "app"
+        self._git("init", "-q", "-b", "main", str(app))
+        for rel in ("Package.swift", "Packages/macOS/Core/Package.swift", "Sources/x.swift"):
+            (app / rel).parent.mkdir(parents=True, exist_ok=True)
+            (app / rel).write_text("x")
+        self._git("-C", str(app), "add", ".")
+        self._git("-C", str(app), "commit", "-qm", "c")
+        self._git("-C", str(app), "worktree", "add", "-q", str(projects / "wts/feature"), "-b", "feature")
+        self._git("-C", str(app), "worktree", "add", "-q", str(self.root / "scratch/wt"), "-b", "scratch")
+        tag = "Signature: 8a477f597d28d172789f06886806bc55"
+        for co in (app, projects / "wts/feature", self.root / "scratch/wt"):
+            for pkg in ("", "Packages/macOS/Core"):
+                make(co / pkg / ".build")
+                (co / pkg / ".build/CACHEDIR.TAG").write_text(tag)
+        make(app / "Sources/.build")  # no Package.swift there: not SwiftPM's
+        (app / "Sources/.build/CACHEDIR.TAG").write_text(tag)
+        make(app / "Packages/macOS/Core/Tests/.build")  # untracked location, not a package
+        make(app / ".glaeda/apple-build/cache/k1")
+        (app / ".glaeda/apple-build/receipt.json").write_text("{}")
+        for co in (app, projects / "wts/feature"):
+            self._age(co)
+        fam = [f for f in gd.default_families() if f.id == "checkout-build"][0]
+        return projects, gd.Family(fam.id, projects, True, fam.rebuild, checkout_builds=True, build_output=True,
+                                   min_idle_hours=fam.min_idle_hours, rebuild_minutes=fam.rebuild_minutes)
+
+    def test_checkout_builds_are_package_builds_and_apple_generations(self) -> None:
+        projects, fam = self._checkout_builds()
+        found = sorted(str(p.relative_to(projects)) for p in gd.candidates(fam))
+        self.assertEqual(found, ["app/.build", "app/.glaeda/apple-build/cache/k1",
+                                 "app/Packages/macOS/Core/.build", "wts/feature/.build",
+                                 "wts/feature/Packages/macOS/Core/.build"])
+
+    def test_checkout_build_goes_after_a_day_and_the_checkout_stays(self) -> None:
+        projects, fam = self._checkout_builds()
+        self._age(projects / "wts/feature/.build", hours=12)
+        gd.process_evidence = lambda: ([], f"swift-frontend {projects}/app/Packages/macOS/Core/.build/x.o\n")
+        items = gd.survey([fam], 6, 0)
+        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in items}
+        self.assertEqual(v["app/.build"], "reclaimable")
+        self.assertEqual(v["app/Packages/macOS/Core/.build"], "in-use")
+        self.assertEqual(v["wts/feature/.build"], "recent")  # 12 h: inside the day a session may return in
+        receipt = self.receipt()
+        gd.apply(items, {fam.id: fam}, receipt, None, 6)
+        self.assertFalse((projects / "app/.build").exists())
+        self.assertFalse((projects / "app/.glaeda/apple-build/cache/k1").exists())
+        self.assertTrue((projects / "app/.glaeda/apple-build/receipt.json").exists())
+        self.assertTrue((projects / "app/Packages/macOS/Core/.build").exists())
+        self.assertTrue((projects / "wts/feature/.build").exists())
+        self.assertEqual(self._git("-C", str(projects / "app"), "status", "--porcelain", "-uno"), "")
+
+    def test_apply_refreshes_only_checkout_build_sizes(self) -> None:
+        projects, fam = self._checkout_builds()
+        known = {str(projects / "app/.build"): 1, str(projects / "app"): 2, str(projects / "wts/feature"): 3}
+        self.assertEqual(gd.fresh_for_apply(known, [fam]),
+                         {str(projects / "app"): 2, str(projects / "wts/feature"): 3})
+
 
     def test_idle_sweep_windows_follow_reuse(self) -> None:
         ci = self.root / "ci"
@@ -1418,7 +1478,7 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in by_id["worktrees"]),
                          ["botany-sim-worktrees", "glaeda-worktrees"])
         reclaimable = {f.id for f in fams if f.reclaimable}
-        self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad", "user-cache", "home-caches"})
+        self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad", "user-cache", "home-caches", "checkout-build"})
         projects = next(f for f in fams if f.id == "projects")
         self.assertIn("botany-sim-worktrees", projects.skip)
         tmp = next(f for f in fams if f.id == "tmp")
