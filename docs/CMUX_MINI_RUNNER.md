@@ -946,7 +946,7 @@ Check one mini: `glaeda-idle-warm` (plan) says whether it would warm now and whi
 **Idle UI fuzzing.** With `~/.config/glaeda/idle-fuzz.enabled`, an idle spell with nothing left to warm runs
 cmux's UI fuzzer (`scripts/fuzz` from the kept main checkout) instead of skipping. It clones the newest main
 build a root keeps into `fuzz/builds/<sha>` (APFS `cp -c`, no root token: the copy counts only if the root's
-stamp is unchanged after it), fuzzes it for up to 10 minutes and minimizes up to two failures, 24 minutes at most;
+stamp is unchanged after it), fuzzes it for up to 10 minutes and minimizes up to two failures, 26 minutes at most;
 runs land in `/Users/Shared/cmux-build-fleet/fuzz/runs`. Same gates and yield as a catch-up, plus: every capacity
 unit free (no admitted job at all, since a gui-step job takes the gui token only later with take-gui), this user
 owns an unlocked console, no Xcode test runs, and 90 GiB free. It holds one unit through

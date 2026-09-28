@@ -611,11 +611,11 @@ def trim_logs(logs: Path) -> None:
 # through WARM_HOLDER, so a job's admission stops it the way it stops a catch-up: SIGTERM, then the process group,
 # which the app is in (the fuzzer starts it as its own child). It takes no gui token: holding it would stop a gui
 # runner's listener, and the fuzzer must never keep a job away.
-# A run holds the catch-up lock, so a main push waits for it: at most FUZZ_TIMEOUT_S (24 minutes).
+# A run holds the catch-up lock, so a main push waits for it: at most FUZZ_TIMEOUT_S (26 minutes).
 FUZZ_MINUTES = 10
 FUZZ_MINIMIZE_MINUTES = 5  # per finding
 FUZZ_MAX_FINDINGS = 2
-FUZZ_TIMEOUT_S = (FUZZ_MINUTES + FUZZ_MAX_FINDINGS * FUZZ_MINIMIZE_MINUTES + 4) * 60
+FUZZ_TIMEOUT_S = (FUZZ_MINUTES + FUZZ_MAX_FINDINGS * FUZZ_MINIMIZE_MINUTES + 6) * 60
 FUZZ_KEEP_BUILDS = 2
 FUZZ_KEEP_QUIET_RUNS = 10  # runs without a finding
 FUZZ_KEEP_FINDING_RUNS = 30  # runs with one, until the collector files them; the oldest go first past this
@@ -786,12 +786,19 @@ def take_fuzz(hook: Any, capacity: Path, setup: dict[str, Any]) -> tuple[list[in
 def trim_fuzz_runs(runs: Path) -> None:
     """Keep the newest FUZZ_KEEP_QUIET_RUNS finished runs without a finding and FUZZ_KEEP_FINDING_RUNS with one."""
     quiet, found = [], []
+    now = time.time()
     for run_dir in runs.glob("*"):
         try:
-            summary = json.loads((run_dir / "summary.json").read_text())
             stamp = run_dir.stat().st_mtime
+        except OSError:
+            continue
+        try:
+            summary = json.loads((run_dir / "summary.json").read_text())
         except (OSError, ValueError):
-            continue  # running, or cut short: its own next trim
+            # A job's preemption kills the fuzzer before it writes its summary: past the longest run, it is done.
+            if now - stamp < FUZZ_TIMEOUT_S:
+                continue
+            summary = {"findings": [os.fspath(p.parent) for p in run_dir.glob("session-*/finding.json")]}
         findings = summary.get("findings") if isinstance(summary, dict) else None
         (found if isinstance(findings, list) and findings else quiet).append((stamp, run_dir))
     for kept, group in ((FUZZ_KEEP_QUIET_RUNS, quiet), (FUZZ_KEEP_FINDING_RUNS, found)):

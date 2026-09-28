@@ -547,6 +547,28 @@ class FuzzTest(Base):
         self.assertIsNotNone(hook.lock_file(self.capacity / "unit-0", fcntl.LOCK_EX))
 
 
+class TrimTest(Base):
+    def test_runs_a_preemption_cut_short_are_trimmed_once_old(self) -> None:
+        runs = self.dir / "runs"
+        old = time.time() - warm.FUZZ_TIMEOUT_S - 60
+        for n in range(warm.FUZZ_KEEP_QUIET_RUNS + 3):
+            run = runs / f"cut-{n:02d}"
+            (run / "session-000").mkdir(parents=True)  # no summary.json: SIGKILLed mid-run
+            os.utime(run, (old - n, old - n))
+        live = runs / "live"
+        live.mkdir()  # no summary yet and young: still running
+        found = runs / "found" / "session-000"
+        found.mkdir(parents=True)
+        (found / "finding.json").write_text("{}")
+        os.utime(runs / "found", (old, old))
+        warm.trim_fuzz_runs(runs)
+        left = sorted(p.name for p in runs.iterdir())
+        self.assertIn("live", left)
+        self.assertIn("found", left, "a cut-short run with a finding waits for the collector")
+        self.assertEqual(len([n for n in left if n.startswith("cut-")]), warm.FUZZ_KEEP_QUIET_RUNS)
+        self.assertIn("cut-00", left, "the newest are kept")
+
+
 class CheckoutTest(unittest.TestCase):
     def test_first_clone_is_shallow_blobless_and_checks_out_head(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
