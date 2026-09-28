@@ -30,6 +30,9 @@ SCRIPT = Path(__file__).resolve()
 ROOT = SCRIPT.parent.parent
 HOT_RUN = ROOT / "scripts" / "hot-run"
 BENCHMARK = ROOT / "scripts" / "benchmark-developer-loop"
+REFLINK_TASK = ROOT / "target" / "release" / "glaeda-reflink-task"
+REFLINK_TASK_SOURCE = ROOT / "src" / "bin" / "glaeda-reflink-task.rs"
+REFLINK_TASK_LIBRARY = ROOT / "src" / "linux_reflink_task_materialization.rs"
 FIXTURE = ROOT / "benchmarks" / "developer-loop-doc-edit.patch"
 GIT = Path("/usr/bin/git")
 FINDMNT = Path("/usr/bin/findmnt")
@@ -44,8 +47,13 @@ RUSTC_VERSION = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
 CARGO_VERSION = "cargo 1.97.1 (c980f4866 2026-06-30)"
 RUSTC_SHA256 = "d3a664c970a9fd8361b64194861bebc1ae37b9054e5ee3400dc1c9e691797eea"
 CARGO_SHA256 = "828980723df339d62434390e9fb8ef8831036583343ae2316b7ab5646b5c1953"
-COMPARISON_BASIS_VERSION = 3
+COMPARISON_BASIS_VERSION = 4
 ARMS = ("ordinary-native", "private", "overlay", "private-copy")
+SOURCE_MATERIALIZATIONS = (
+    "git-sequential",
+    "glaeda-ordinary",
+    "glaeda-reflink",
+)
 FANOUTS = (1, 4, 8)
 RETAINED_REUSE_WINDOW_COUNTS = (1, 3, 7)
 PAGE_CACHE_RESIDENT_WARM = "resident_uncontrolled_warm"
@@ -58,6 +66,9 @@ PAGE_CACHE_CLI_TREATMENTS = {
 }
 DEFAULT_DEADLINE_SECONDS = 900
 CHILD_UMASK = 0o022
+PROCESS_GROUP_TERM_GRACE_SECONDS = 2.0
+PROCESS_GROUP_KILL_GRACE_SECONDS = 2.0
+PROCESS_GROUP_POLL_SECONDS = 0.02
 STATE_PHASE_INITIAL = "initial_for_source_state"
 STATE_PHASE_RETAINED_REUSE = "retained_after_accepted_edit"
 
@@ -69,6 +80,8 @@ class ExperimentError(RuntimeError):
 @dataclass(frozen=True)
 class ExperimentPlan:
     arm: str
+    source_materialization: str
+    source_materializer_program_sha256: str | None
     fanout: int
     logical_cpus: int
     cargo_jobs_per_task: int
@@ -112,6 +125,7 @@ class ExperimentPlan:
             "document_type": "glaeda-hot-state-fanout-plan",
             "authority": "performance_observation_only",
             "arm": self.arm,
+            "source_materialization": self.source_materialization,
             "fanout": self.fanout,
             "resources": {
                 "available_logical_cpus": self.logical_cpus,
@@ -184,6 +198,26 @@ def comparison_basis(
         raise ExperimentError("retained-reuse ordinal requires retained reuse")
     else:
         ordinal = None
+    producer_programs = {
+        "fanout_harness_sha256": f"sha256:{file_sha256(SCRIPT)}",
+        "git_sha256": f"sha256:{file_sha256(GIT)}",
+        "hot_run_sha256": f"sha256:{file_sha256(HOT_RUN)}",
+        "semantic_benchmark_sha256": f"sha256:{file_sha256(BENCHMARK)}",
+    }
+    if plan.source_materialization != "git-sequential":
+        producer_programs.update(
+            {
+                "reflink_task_cli_source_sha256": (
+                    f"sha256:{file_sha256(REFLINK_TASK_SOURCE)}"
+                ),
+                "reflink_task_library_source_sha256": (
+                    f"sha256:{file_sha256(REFLINK_TASK_LIBRARY)}"
+                ),
+                "source_materializer_program_sha256": (
+                    plan.source_materializer_program_sha256
+                ),
+            }
+        )
     return {
         "schema_version": COMPARISON_BASIS_VERSION,
         "document_type": "glaeda-hot-state-fanout-comparison-basis",
@@ -200,13 +234,10 @@ def comparison_basis(
             "cargo": CARGO_VERSION,
             "cargo_program_sha256": f"sha256:{CARGO_SHA256}",
         },
-        "producer_programs": {
-            "fanout_harness_sha256": f"sha256:{file_sha256(SCRIPT)}",
-            "hot_run_sha256": f"sha256:{file_sha256(HOT_RUN)}",
-            "semantic_benchmark_sha256": f"sha256:{file_sha256(BENCHMARK)}",
-        },
+        "producer_programs": producer_programs,
         "treatment": {
             "arm": plan.arm,
+            "source_materialization": plan.source_materialization,
             "fanout": plan.fanout,
             "cargo_build_jobs_per_task": plan.cargo_jobs_per_task,
             "configured_total_cargo_jobs": (
@@ -255,11 +286,32 @@ def build_plan(
     page_cache_treatment: str = PAGE_CACHE_RESIDENT_WARM,
     retained_reuse: bool = False,
     retained_reuse_windows: int | None = None,
+    source_materialization: str = "git-sequential",
+    source_materializer_program_sha256: str | None = None,
 ) -> ExperimentPlan:
     if arm not in ARMS:
         raise ExperimentError("unsupported hot-state arm")
     if fanout not in FANOUTS:
         raise ExperimentError("fan-out must be one of 1, 4, or 8")
+    if source_materialization not in SOURCE_MATERIALIZATIONS:
+        raise ExperimentError("unsupported source materialization")
+    if source_materialization == "git-sequential":
+        if source_materializer_program_sha256 is not None:
+            raise ExperimentError(
+                "Git source materialization cannot bind a Glaeda program"
+            )
+    elif (
+        not isinstance(source_materializer_program_sha256, str)
+        or len(source_materializer_program_sha256) != 71
+        or not source_materializer_program_sha256.startswith("sha256:")
+        or any(
+            character not in "0123456789abcdef"
+            for character in source_materializer_program_sha256[7:]
+        )
+    ):
+        raise ExperimentError(
+            "Glaeda source materialization requires an exact program digest"
+        )
     if logical_cpus < fanout:
         raise ExperimentError("fan-out exceeds the available logical CPU grant")
     if deadline_seconds < 1 or deadline_seconds > 3600:
@@ -303,6 +355,10 @@ def build_plan(
     )
     return ExperimentPlan(
         arm=arm,
+        source_materialization=source_materialization,
+        source_materializer_program_sha256=(
+            source_materializer_program_sha256
+        ),
         fanout=fanout,
         logical_cpus=logical_cpus,
         cargo_jobs_per_task=jobs_per_task,
@@ -399,10 +455,18 @@ def validate_toolchain_contract() -> None:
         raise ExperimentError("pinned Rust toolchain identity changed")
 
 
-def validate_static_contract(repository: Path) -> None:
+def validate_static_contract(repository: Path, plan: ExperimentPlan) -> None:
     for capability in (GIT, FINDMNT, TASKSET, HOT_RUN, BENCHMARK, FIXTURE):
         if not capability.is_file():
             raise ExperimentError("required experiment capability is unavailable")
+    if plan.source_materialization != "git-sequential":
+        if not REFLINK_TASK.is_file() or not os.access(REFLINK_TASK, os.X_OK):
+            raise ExperimentError("Glaeda source materializer is unavailable")
+        if (
+            f"sha256:{file_sha256(REFLINK_TASK)}"
+            != plan.source_materializer_program_sha256
+        ):
+            raise ExperimentError("Glaeda source materializer identity changed")
     if git_output(["rev-parse", f"{SOURCE_COMMIT}^{{tree}}"], cwd=repository) != SOURCE_TREE:
         raise ExperimentError("frozen source identity is unavailable")
     fixture_digest = f"sha256:{hashlib.sha256(FIXTURE.read_bytes()).hexdigest()}"
@@ -419,6 +483,8 @@ def validate_static_contract(repository: Path) -> None:
             "scripts/hot-run",
             "scripts/benchmark-developer-loop",
             "benchmarks/developer-loop-doc-edit.patch",
+            "src/bin/glaeda-reflink-task.rs",
+            "src/linux_reflink_task_materialization.rs",
         ],
         cwd=ROOT,
     )
@@ -528,6 +594,230 @@ def add_worktree(repository: Path, destination: Path) -> None:
         ],
         cwd=repository,
     )
+
+
+def process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def signal_process_group(process_group_id: int, sent_signal: signal.Signals) -> None:
+    try:
+        os.killpg(process_group_id, sent_signal)
+    except ProcessLookupError:
+        pass
+
+
+def wait_for_process_group_absence(
+    process: subprocess.Popen[bytes],
+    process_group_id: int,
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        process.poll()
+        if not process_group_exists(process_group_id):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(PROCESS_GROUP_POLL_SECONDS)
+
+
+def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    process_group_id = process.pid
+    process.poll()
+    if process_group_exists(process_group_id):
+        signal_process_group(process_group_id, signal.SIGTERM)
+    if not wait_for_process_group_absence(
+        process,
+        process_group_id,
+        PROCESS_GROUP_TERM_GRACE_SECONDS,
+    ):
+        signal_process_group(process_group_id, signal.SIGKILL)
+        if not wait_for_process_group_absence(
+            process,
+            process_group_id,
+            PROCESS_GROUP_KILL_GRACE_SECONDS,
+        ):
+            raise ExperimentError("source materialization process group cleanup failed")
+    try:
+        process.wait(timeout=PROCESS_GROUP_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=PROCESS_GROUP_KILL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        raise ExperimentError("source materialization leader cleanup failed") from error
+
+
+def validate_source_materialization_report(
+    plan: ExperimentPlan, report: object
+) -> None:
+    expected_fields = {
+        "schema_version",
+        "document_type",
+        "authority",
+        "requested_mode",
+        "task_count",
+        "ordinary_tasks",
+        "reflinked_tasks",
+        "ordinary_fallback_tasks",
+        "fallback_reasons",
+        "commit",
+        "tree",
+        "tracked_regular_files_per_task",
+        "logical_bytes_per_task",
+        "timings",
+        "final_git_proof",
+    }
+    if not isinstance(report, dict) or set(report) != expected_fields:
+        raise ExperimentError("source materialization receipt changed treatment")
+    count_fields = (
+        "task_count",
+        "ordinary_tasks",
+        "reflinked_tasks",
+        "ordinary_fallback_tasks",
+        "tracked_regular_files_per_task",
+        "logical_bytes_per_task",
+    )
+    if not all(
+        isinstance(report[field], int)
+        and not isinstance(report[field], bool)
+        and report[field] >= 0
+        for field in count_fields
+    ):
+        raise ExperimentError("source materialization receipt changed treatment")
+    expected_mode = (
+        "ordinary"
+        if plan.source_materialization == "glaeda-ordinary"
+        else "reflink_with_fallback"
+    )
+    expected_ordinary = (
+        plan.fanout if plan.source_materialization == "glaeda-ordinary" else 0
+    )
+    expected_reflinked = (
+        plan.fanout if plan.source_materialization == "glaeda-reflink" else 0
+    )
+    if (
+        report.get("schema_version") != 1
+        or report.get("document_type") != "glaeda-reflink-task-fanout"
+        or report.get("authority") != "research_materialization_only"
+        or report.get("requested_mode") != expected_mode
+        or report.get("task_count") != plan.fanout
+        or report.get("ordinary_tasks") != expected_ordinary
+        or report.get("reflinked_tasks") != expected_reflinked
+        or report.get("ordinary_fallback_tasks") != 0
+        or report.get("fallback_reasons") != {}
+        or report.get("commit") != SOURCE_COMMIT
+        or report.get("tree") != SOURCE_TREE
+        or report["tracked_regular_files_per_task"] <= 0
+        or report["logical_bytes_per_task"] <= 0
+        or report.get("final_git_proof")
+        != "head_tree_diff_files_diff_index_per_task"
+    ):
+        raise ExperimentError("source materialization receipt changed treatment")
+    timings = report.get("timings")
+    if not isinstance(timings, dict) or set(timings) != {
+        "total_microseconds",
+        "source_proof_microseconds",
+        "parallel_preparation_microseconds",
+        "parallel_finalization_microseconds",
+    }:
+        raise ExperimentError("source materialization timings are invalid")
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in timings.values()
+    ):
+        raise ExperimentError("source materialization timings are invalid")
+
+
+def materialize_tasks(
+    plan: ExperimentPlan,
+    repository: Path,
+    resident: Path,
+    tasks: list[Path],
+) -> dict[str, Any]:
+    started = time.monotonic()
+    if plan.source_materialization == "git-sequential":
+        for task in tasks:
+            add_worktree(repository, task)
+        return {
+            "implementation": "git_sequential_worktree_add",
+            "elapsed_seconds": round(time.monotonic() - started, 6),
+            "semantic_validation": "accepted",
+            "receipt": None,
+        }
+
+    mode = (
+        "ordinary"
+        if plan.source_materialization == "glaeda-ordinary"
+        else "reflink"
+    )
+    expected_program_digest = plan.source_materializer_program_sha256
+    if f"sha256:{file_sha256(REFLINK_TASK)}" != expected_program_digest:
+        raise ExperimentError("Glaeda source materializer identity changed")
+    command = [
+        os.fspath(REFLINK_TASK),
+        "--git",
+        os.fspath(GIT),
+        "--source",
+        os.fspath(resident),
+        "--fanout",
+    ]
+    for task in tasks:
+        command.extend(("--target", os.fspath(task)))
+    command.extend(
+        (
+            "--commit",
+            SOURCE_COMMIT,
+            "--mode",
+            mode,
+            "--output",
+            "json",
+        )
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=repository,
+        env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        stdout, _ = process.communicate(timeout=plan.deadline_seconds)
+    except subprocess.TimeoutExpired as error:
+        terminate_process_group(process)
+        raise ExperimentError("source materialization deadline exceeded") from error
+    except BaseException:
+        terminate_process_group(process)
+        raise
+    if process.returncode != 0:
+        raise ExperimentError("Glaeda source materialization failed")
+    if len(stdout) > 1024 * 1024:
+        raise ExperimentError("source materialization receipt exceeds its bound")
+    try:
+        report = json.loads(stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ExperimentError("source materialization receipt is invalid") from error
+    validate_source_materialization_report(plan, report)
+    if f"sha256:{file_sha256(REFLINK_TASK)}" != expected_program_digest:
+        raise ExperimentError("Glaeda source materializer identity changed")
+    return {
+        "implementation": plan.source_materialization.replace("-", "_"),
+        "elapsed_seconds": round(time.monotonic() - started, 6),
+        "program_sha256": expected_program_digest,
+        "semantic_validation": "accepted",
+        "receipt": report,
+    }
 
 
 def apply_fixture(task: Path) -> None:
@@ -1308,7 +1598,25 @@ def remove_worktree(repository: Path, worktree: Path) -> None:
         stderr=subprocess.DEVNULL,
         check=False,
     )
-    if result.returncode != 0:
+    if result.returncode == 0:
+        return
+    observed = subprocess.run(
+        [os.fspath(GIT), "worktree", "list", "--porcelain", "-z"],
+        cwd=repository,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if observed.returncode != 0 or len(observed.stdout) > 1024 * 1024:
+        raise ExperimentError("experiment worktree cleanup failed")
+    prefix = b"worktree "
+    registered = {
+        Path(os.fsdecode(field.removeprefix(prefix)))
+        for field in observed.stdout.split(b"\0")
+        if field.startswith(prefix)
+    }
+    if worktree in registered:
         raise ExperimentError("experiment worktree cleanup failed")
 
 
@@ -1371,7 +1679,7 @@ def run_experiment(
     output: Path,
     plan: ExperimentPlan,
 ) -> int:
-    validate_static_contract(repository)
+    validate_static_contract(repository, plan)
     scratch_root = validate_scratch_root(scratch_root, output)
     validate_cargo_config_absence(repository, scratch_root)
     storage_filesystem: dict[str, Any] = {
@@ -1389,7 +1697,10 @@ def run_experiment(
     try:
         experiment = Path(
             tempfile.mkdtemp(
-                prefix=f"glaeda-hot-state-{plan.arm}-{plan.fanout}.",
+                prefix=(
+                    f"glaeda-hot-state-{plan.arm}-"
+                    f"{plan.source_materialization}-{plan.fanout}."
+                ),
                 dir=scratch_root,
             )
         )
@@ -1413,9 +1724,6 @@ def run_experiment(
         ]
         add_worktree(repository, resident)
         created_worktrees.append(resident)
-        for task in tasks:
-            add_worktree(repository, task)
-            created_worktrees.append(task)
 
         if plan.arm in ("overlay", "private-copy"):
             resident_prime = prime_resident(
@@ -1427,7 +1735,13 @@ def run_experiment(
             setup["resident_prime"] = resident_prime
             if resident_prime["failure"] is not None:
                 raise ExperimentError(str(resident_prime["failure"]))
-        else:
+
+        created_worktrees.extend(tasks)
+        setup["source_materialization"] = materialize_tasks(
+            plan, repository, resident, tasks
+        )
+
+        if plan.arm not in ("overlay", "private-copy"):
             (resident / "target").mkdir(mode=0o700)
             prime_elapsed, prime_tasks, prime_failure, prime_maximum = run_cohort(
                 plan,
@@ -1448,8 +1762,12 @@ def run_experiment(
             if prime_failure is not None:
                 raise ExperimentError(prime_failure)
 
+        fixture_started = time.monotonic()
         for task in tasks:
             apply_fixture(task)
+        setup["fixture_application_seconds"] = round(
+            time.monotonic() - fixture_started, 6
+        )
 
         before_observation_started = time.monotonic()
         setup["pre_window_bytes"] = {
@@ -1483,6 +1801,15 @@ def run_experiment(
         post_observation_started = time.monotonic()
         window = {
             "elapsed_seconds": round(window_elapsed, 6),
+            "task_known_to_final_result_seconds": round(
+                setup["source_materialization"]["elapsed_seconds"]
+                + setup["fixture_application_seconds"]
+                + window_elapsed,
+                6,
+            ),
+            "task_known_duration_basis": (
+                "source_materialization_plus_fixture_plus_edit_window"
+            ),
             "maximum_simultaneous_observed": window_maximum,
             "tasks": window_tasks,
             "failure": window_failure,
@@ -1630,6 +1957,15 @@ def run_experiment(
 def parse_arguments(arguments: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arm", choices=ARMS, required=True)
+    parser.add_argument(
+        "--source-materialization",
+        choices=SOURCE_MATERIALIZATIONS,
+        default="git-sequential",
+        help=(
+            "create task sources with sequential Git, Glaeda ordinary fan-out, "
+            "or exact Glaeda reflink fan-out"
+        ),
+    )
     parser.add_argument("--fanout", choices=FANOUTS, type=int, required=True)
     parser.add_argument("--deadline-seconds", type=int, default=DEFAULT_DEADLINE_SECONDS)
     parser.add_argument(
@@ -1681,6 +2017,13 @@ def main(arguments: list[str] | None = None) -> int:
         available_cpu_ids = tuple(range(os.cpu_count() or 1))
     logical_cpus = len(available_cpu_ids)
     try:
+        source_materializer_program_sha256 = None
+        if parsed.source_materialization != "git-sequential":
+            if not REFLINK_TASK.is_file() or not os.access(REFLINK_TASK, os.X_OK):
+                raise ExperimentError("Glaeda source materializer is unavailable")
+            source_materializer_program_sha256 = (
+                f"sha256:{file_sha256(REFLINK_TASK)}"
+            )
         plan = build_plan(
             parsed.arm,
             parsed.fanout,
@@ -1690,6 +2033,8 @@ def main(arguments: list[str] | None = None) -> int:
             PAGE_CACHE_CLI_TREATMENTS[parsed.page_cache_treatment],
             parsed.retained_reuse,
             parsed.retained_reuse_windows,
+            parsed.source_materialization,
+            source_materializer_program_sha256,
         )
         if parsed.plan:
             json.dump(plan.to_json(), sys.stdout, indent=2, sort_keys=True)

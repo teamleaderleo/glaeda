@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt as _;
+
 use serde_json::Value;
 
 static NEXT_INVENTORY: AtomicU64 = AtomicU64::new(1);
@@ -23,6 +26,33 @@ impl TempInventory {
 
     fn path(&self) -> &Path {
         &self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct TempHotRunRoot(PathBuf);
+
+#[cfg(target_os = "linux")]
+impl TempHotRunRoot {
+    fn new() -> Self {
+        let sequence = NEXT_INVENTORY.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "glaeda-hot-run-cache-cli-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("create temporary hot-run root");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TempHotRunRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -176,4 +206,124 @@ fn malformed_input_emits_bounded_path_free_error() {
     let rendered = String::from_utf8(output.stdout).expect("UTF-8 output");
     assert!(!rendered.contains("/do/not/echo"));
     assert!(!rendered.contains(inventory.path().to_string_lossy().as_ref()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn hot_run_observation_is_path_free_unknown_and_non_mutating() {
+    let root = TempHotRunRoot::new();
+    let state = root.path().join("a".repeat(64));
+    fs::create_dir(&state).expect("create state");
+    let private_name = "private-project-output-do-not-print";
+    fs::write(state.join(private_name), b"abc").expect("write state data");
+    let before_root = fs::metadata(root.path()).expect("observe root before");
+    let before_state = fs::metadata(&state).expect("observe state before");
+    let data = fs::metadata(state.join(private_name)).expect("observe data");
+
+    let output = run(&[
+        OsStr::new("--output"),
+        OsStr::new("json"),
+        OsStr::new("cache"),
+        OsStr::new("observe-hot-run"),
+        OsStr::new("--root"),
+        root.path().as_os_str(),
+    ]);
+    assert!(
+        output.status.success(),
+        "observation stderr: {:?}",
+        output.stderr
+    );
+    let report = json(&output);
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["authority"], "local_hot_run_filesystem_observation");
+    assert_eq!(report["mutation_performed"], false);
+    assert_eq!(report["completeness"], "complete");
+    assert_eq!(report["summary"]["state_count"], 1);
+    assert_eq!(report["summary"]["unknown_count"], 1);
+    assert_eq!(report["summary"]["reclaimable_count"], 0);
+    assert_eq!(report["summary"]["logical_bytes"], data.size());
+    assert_eq!(
+        report["summary"]["allocated_bytes"],
+        (before_state.blocks() + data.blocks()) * 512
+    );
+    assert_eq!(report["states"][0]["classification"], "unknown");
+    assert!(
+        report["states"][0]["reasons"]
+            .as_array()
+            .expect("reasons")
+            .contains(&Value::String("ownership_unknown".to_owned()))
+    );
+
+    let rendered = String::from_utf8(output.stdout).expect("UTF-8 output");
+    assert!(!rendered.contains(root.path().to_string_lossy().as_ref()));
+    assert!(!rendered.contains(private_name));
+    let after_root = fs::metadata(root.path()).expect("observe root after");
+    let after_state = fs::metadata(&state).expect("observe state after");
+    assert_eq!(before_root.atime(), after_root.atime());
+    assert_eq!(before_root.mtime(), after_root.mtime());
+    assert_eq!(before_root.ctime(), after_root.ctime());
+    assert_eq!(before_state.atime(), after_state.atime());
+    assert_eq!(before_state.mtime(), after_state.mtime());
+    assert_eq!(before_state.ctime(), after_state.ctime());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn partial_hot_run_observation_keeps_bytes_and_classifier_unknown() {
+    let root = TempHotRunRoot::new();
+    let state = root.path().join("a".repeat(64));
+    fs::create_dir(&state).expect("create state");
+    let private_name = "private-socket-name-do-not-print";
+    let status = Command::new("/usr/bin/mkfifo")
+        .arg(state.join(private_name))
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "create fixture FIFO");
+
+    let output = run(&[
+        OsStr::new("--output"),
+        OsStr::new("json"),
+        OsStr::new("cache"),
+        OsStr::new("observe-hot-run"),
+        OsStr::new("--root"),
+        root.path().as_os_str(),
+    ]);
+    assert!(
+        output.status.success(),
+        "partial observation stderr: {:?}",
+        output.stderr
+    );
+    let report = json(&output);
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["authority"], "local_hot_run_filesystem_observation");
+    assert_eq!(report["mutation_performed"], false);
+    assert_eq!(report["completeness"], "partial");
+    assert_eq!(report["summary"]["state_count"], 1);
+    assert_eq!(report["summary"]["logical_bytes"], Value::Null);
+    assert_eq!(report["summary"]["allocated_bytes"], Value::Null);
+    assert_eq!(report["summary"]["reclaimable_count"], Value::Null);
+    assert_eq!(
+        report["summary"]["reclaimable_allocated_bytes"],
+        Value::Null
+    );
+    assert_eq!(report["states"], Value::Array(Vec::new()));
+    assert_eq!(report["problems"], serde_json::json!(["unsupported_node"]));
+
+    let rendered = String::from_utf8(output.stdout).expect("UTF-8 output");
+    assert!(!rendered.contains(root.path().to_string_lossy().as_ref()));
+    assert!(!rendered.contains(private_name));
+
+    let human = run(&[
+        OsStr::new("cache"),
+        OsStr::new("observe-hot-run"),
+        OsStr::new("--root"),
+        root.path().as_os_str(),
+    ]);
+    assert!(human.status.success(), "human partial observation");
+    let human = String::from_utf8(human.stdout).expect("UTF-8 human output");
+    assert!(human.contains("completeness: partial"));
+    assert!(human.contains("reclaimable=unknown"));
+    assert!(human.contains("problems: unsupported_node"));
+    assert!(!human.contains(root.path().to_string_lossy().as_ref()));
+    assert!(!human.contains(private_name));
 }

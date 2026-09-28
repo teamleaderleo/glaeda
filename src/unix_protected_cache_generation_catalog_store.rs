@@ -1,8 +1,8 @@
-//! Unix persistence for the empty protected cache-generation catalog.
+//! Unix persistence for the protected cache-generation catalog.
 //!
-//! This module deliberately supports only creation, loading, and abandoned-create recovery for
-//! the empty revision-one catalog. It does not accept a caller-supplied catalog for publication and
-//! exposes no replacement, generation transition, path adoption, quarantine, or deletion API.
+//! This module supports empty creation plus a crate-sealed current-generation transition built
+//! from an exact loaded revision. It never accepts a caller-supplied catalog for publication and
+//! exposes no public generation producer, path adoption, quarantine, or deletion API.
 
 use std::fmt;
 use std::fmt::Write as _;
@@ -17,11 +17,13 @@ use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
+use crate::cache_inventory::CacheStateId;
 use crate::protected_cache_generation_catalog::{
-    MAX_PROTECTED_CACHE_GENERATION_CATALOG_BYTES, ProtectedCacheCatalogRevision,
+    MAX_PROTECTED_CACHE_GENERATION_CATALOG_BYTES, ProtectedCacheCatalogError,
+    ProtectedCacheCatalogErrorKind, ProtectedCacheCatalogRevision,
     ProtectedCacheGenerationCatalogDocument, ProtectedCacheGenerationFamily,
-    ProtectedCacheNamespaceIdentity, decode_protected_cache_generation_catalog,
-    encode_protected_cache_generation_catalog,
+    ProtectedCacheGenerationIdentity, ProtectedCacheNamespaceIdentity,
+    decode_protected_cache_generation_catalog, encode_protected_cache_generation_catalog,
 };
 use crate::state::InstallationId;
 
@@ -153,15 +155,28 @@ pub enum ProtectedCacheCatalogStoreRead {
 #[serde(rename_all = "snake_case")]
 pub enum ProtectedCacheCatalogRecoveryDisposition {
     PublishedAbandonedCreate,
+    PublishedAbandonedTransition,
     RemovedDuplicateStage,
+}
+
+/// Sealed path-free authorization for one current-generation catalog transition.
+///
+/// The fields and constructor are intentionally unavailable outside this module. A later
+/// replacement-equivalence producer must be separately reviewed before it can mint this type.
+#[derive(Debug)]
+pub struct ProtectedCacheCurrentTransitionAuthorization {
+    expected_revision: ProtectedCacheCatalogRevision,
+    state_id: CacheStateId,
+    generation_identity: ProtectedCacheGenerationIdentity,
 }
 
 /// Descriptor-retained private store for one protected cache-generation catalog.
 ///
-/// `open_or_create` may create only the private store directory and persistent empty lock. Catalog
-/// authority appears only after `create_empty` atomically publishes a fully synchronized envelope.
-/// Every operation retains the installation and store descriptors, validates the persistent lock,
-/// and refuses staging debt before returning a clean snapshot.
+/// `open_or_create` may create only the private store directory and persistent empty lock.
+/// `create_empty` atomically publishes the initial fully synchronized envelope. A sealed
+/// authorization may later advance currentness by one exact revision. Every operation retains the
+/// installation and store descriptors, validates the persistent lock, and refuses staging debt
+/// before returning a clean snapshot.
 #[derive(Debug)]
 pub struct UnixProtectedCacheGenerationCatalogStore {
     installation: OwnedFd,
@@ -295,6 +310,83 @@ impl UnixProtectedCacheGenerationCatalogStore {
         }
     }
 
+    /// Atomically advance the exact clean catalog revision to one new current generation.
+    ///
+    /// Its authorization type is sealed until a separately reviewed replacement-equivalence
+    /// producer exists. The operation records path-free metadata only; the returned snapshot grants
+    /// no physical cache ownership, adoption, reconstruction, lease, inventory, or cleanup
+    /// authority.
+    pub fn transition_current(
+        &self,
+        authorization: ProtectedCacheCurrentTransitionAuthorization,
+    ) -> Result<ProtectedCacheCatalogStoreSnapshot, ProtectedCacheCatalogStoreError> {
+        let _lock = self.acquire_lock(StoreLockMode::Exclusive)?;
+        let entries = self.inspect_entries()?;
+        if !entries.stages.is_empty() {
+            return Err(store_error(
+                ProtectedCacheCatalogStoreErrorKind::RecoveryRequired,
+                "protected cache catalog has abandoned publication state",
+            ));
+        }
+        if !entries.catalog_present {
+            return Err(store_error(
+                ProtectedCacheCatalogStoreErrorKind::Missing,
+                "protected cache catalog does not exist",
+            ));
+        }
+
+        let current = self.open_catalog_locked()?;
+        let successor = current
+            .snapshot
+            .document
+            .prepare_current_transition(
+                authorization.expected_revision,
+                authorization.state_id,
+                authorization.generation_identity,
+            )
+            .map_err(map_catalog_transition_error)?;
+        let encoded = encode_store_envelope(&self.binding, &successor)?;
+        let mut staged = self.stage_envelope(&encoded)?;
+
+        self.verify_retained_store_path()?;
+        self.verify_retained_lock_path()?;
+        verify_open_catalog_unchanged(self, &current)?;
+        verify_retained_file_path(
+            &self.directory,
+            staged.name(),
+            staged.file(),
+            self.owner,
+            "staged protected cache catalog",
+        )?;
+        replace_between_directory_barriers(
+            || synchronize_directory(&self.directory, "protected cache catalog directory"),
+            || {
+                fs::renameat_with(
+                    &self.directory,
+                    staged.name(),
+                    &self.directory,
+                    CATALOG_FILE,
+                    RenameFlags::empty(),
+                )
+                .map_err(|_| {
+                    store_error(
+                        ProtectedCacheCatalogStoreErrorKind::Io,
+                        "could not atomically replace the protected cache catalog",
+                    )
+                })
+            },
+        )?;
+        staged.disarm();
+        let published = self.open_catalog_locked()?.snapshot;
+        if published.document != successor {
+            return Err(store_error(
+                ProtectedCacheCatalogStoreErrorKind::RecoveryRequired,
+                "published protected cache catalog differs from the requested successor",
+            ));
+        }
+        Ok(published)
+    }
+
     /// Resolve exactly one abandoned empty-catalog creation.
     ///
     /// A valid, private, exact-binding stage is synchronized again before publication. If the same
@@ -399,6 +491,124 @@ impl UnixProtectedCacheGenerationCatalogStore {
         })?;
         synchronize_directory(&self.directory, "protected cache catalog directory")?;
         Ok(ProtectedCacheCatalogRecoveryDisposition::PublishedAbandonedCreate)
+    }
+
+    /// Resolve exactly one abandoned current-generation transition.
+    ///
+    /// The stage must either be byte-identical to the published catalog or be the one exact
+    /// revision successor of the retained final catalog. Missing finals, skipped revisions,
+    /// altered prior entries, malformed stages, and ambiguous stages remain recovery-required.
+    pub fn recover_abandoned_transition(
+        &self,
+    ) -> Result<ProtectedCacheCatalogRecoveryDisposition, ProtectedCacheCatalogStoreError> {
+        let _lock = self.acquire_lock(StoreLockMode::Exclusive)?;
+        let entries = self.inspect_entries()?;
+        let [stage_name] = entries.stages.as_slice() else {
+            return Err(store_error(
+                if entries.stages.is_empty() {
+                    ProtectedCacheCatalogStoreErrorKind::Missing
+                } else {
+                    ProtectedCacheCatalogStoreErrorKind::RecoveryRequired
+                },
+                if entries.stages.is_empty() {
+                    "protected cache catalog has no abandoned transition"
+                } else {
+                    "protected cache catalog has ambiguous abandoned publication state"
+                },
+            ));
+        };
+        if !entries.catalog_present {
+            return Err(store_error(
+                ProtectedCacheCatalogStoreErrorKind::RecoveryRequired,
+                "abandoned protected cache catalog transition has no predecessor",
+            ));
+        }
+
+        let stage = open_private_file(
+            &self.directory,
+            stage_name,
+            self.owner,
+            "staged protected cache catalog",
+        )?;
+        let stage_bytes =
+            read_bounded_envelope(&stage, self.owner, "staged protected cache catalog")?;
+        let stage_snapshot = decode_store_envelope(&stage_bytes, &self.binding)?;
+        fs::fsync(&stage).map_err(|_| {
+            store_error(
+                ProtectedCacheCatalogStoreErrorKind::Io,
+                "could not synchronize the abandoned protected cache catalog transition",
+            )
+        })?;
+        let stage_stat = inspect_private_file(
+            &stage,
+            self.owner,
+            "staged protected cache catalog",
+            Some(stage_bytes.len()),
+        )?;
+        let current = self.open_catalog_locked()?;
+
+        self.verify_retained_store_path()?;
+        self.verify_retained_lock_path()?;
+        verify_open_catalog_unchanged(self, &current)?;
+        verify_retained_file_path(
+            &self.directory,
+            stage_name,
+            &stage,
+            self.owner,
+            "staged protected cache catalog",
+        )?;
+        let current_stage_stat = inspect_private_file(
+            &stage,
+            self.owner,
+            "staged protected cache catalog",
+            Some(stage_bytes.len()),
+        )?;
+        if !same_file_snapshot(&stage_stat, &current_stage_stat) {
+            return Err(store_error(
+                ProtectedCacheCatalogStoreErrorKind::RecoveryRequired,
+                "staged protected cache catalog changed during recovery",
+            ));
+        }
+
+        if stage_bytes == current.bytes {
+            fs::unlinkat(&self.directory, stage_name, AtFlags::empty()).map_err(|_| {
+                store_error(
+                    ProtectedCacheCatalogStoreErrorKind::Io,
+                    "could not remove the duplicate protected cache catalog stage",
+                )
+            })?;
+            synchronize_directory(&self.directory, "protected cache catalog directory")?;
+            return Ok(ProtectedCacheCatalogRecoveryDisposition::RemovedDuplicateStage);
+        }
+
+        stage_snapshot
+            .document
+            .require_exact_current_successor(&current.snapshot.document)
+            .map_err(|_| {
+                store_error(
+                    ProtectedCacheCatalogStoreErrorKind::RecoveryRequired,
+                    "abandoned protected cache catalog is not an exact revision successor",
+                )
+            })?;
+        replace_between_directory_barriers(
+            || synchronize_directory(&self.directory, "protected cache catalog directory"),
+            || {
+                fs::renameat_with(
+                    &self.directory,
+                    stage_name,
+                    &self.directory,
+                    CATALOG_FILE,
+                    RenameFlags::empty(),
+                )
+                .map_err(|_| {
+                    store_error(
+                        ProtectedCacheCatalogStoreErrorKind::Io,
+                        "could not publish the abandoned protected cache catalog transition",
+                    )
+                })
+            },
+        )?;
+        Ok(ProtectedCacheCatalogRecoveryDisposition::PublishedAbandonedTransition)
     }
 
     fn acquire_lock(
@@ -598,6 +808,11 @@ impl UnixProtectedCacheGenerationCatalogStore {
         if !catalog_present {
             return Ok(ProtectedCacheCatalogStoreRead::Missing);
         }
+        self.open_catalog_locked()
+            .map(|catalog| ProtectedCacheCatalogStoreRead::Present(catalog.snapshot))
+    }
+
+    fn open_catalog_locked(&self) -> Result<OpenCatalog, ProtectedCacheCatalogStoreError> {
         let file = open_private_file(
             &self.directory,
             CATALOG_FILE,
@@ -612,7 +827,19 @@ impl UnixProtectedCacheGenerationCatalogStore {
             self.owner,
             "protected cache catalog",
         )?;
-        decode_store_envelope(&bytes, &self.binding).map(ProtectedCacheCatalogStoreRead::Present)
+        let stat = inspect_private_file(
+            &file,
+            self.owner,
+            "protected cache catalog",
+            Some(bytes.len()),
+        )?;
+        let snapshot = decode_store_envelope(&bytes, &self.binding)?;
+        Ok(OpenCatalog {
+            file,
+            bytes,
+            stat,
+            snapshot,
+        })
     }
 
     fn stage_envelope<'a>(
@@ -691,6 +918,13 @@ impl Drop for StoreLock {
 struct StoreEntries {
     catalog_present: bool,
     stages: Vec<String>,
+}
+
+struct OpenCatalog {
+    file: OwnedFd,
+    bytes: Vec<u8>,
+    stat: rustix::fs::Stat,
+    snapshot: ProtectedCacheCatalogStoreSnapshot,
 }
 
 struct StagedEnvelope<'a> {
@@ -906,6 +1140,32 @@ fn require_empty_revision_one(
         return Err(store_error(
             ProtectedCacheCatalogStoreErrorKind::RecoveryRequired,
             "abandoned protected cache catalog is not an empty revision-one create",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_open_catalog_unchanged(
+    store: &UnixProtectedCacheGenerationCatalogStore,
+    catalog: &OpenCatalog,
+) -> Result<(), ProtectedCacheCatalogStoreError> {
+    verify_retained_file_path(
+        &store.directory,
+        CATALOG_FILE,
+        &catalog.file,
+        store.owner,
+        "protected cache catalog",
+    )?;
+    let current = inspect_private_file(
+        &catalog.file,
+        store.owner,
+        "protected cache catalog",
+        Some(catalog.bytes.len()),
+    )?;
+    if !same_file_snapshot(&catalog.stat, &current) {
+        return Err(store_error(
+            ProtectedCacheCatalogStoreErrorKind::RecoveryRequired,
+            "protected cache catalog changed during the transition",
         ));
     }
     Ok(())
@@ -1191,6 +1451,15 @@ fn synchronize_directory(
     })
 }
 
+fn replace_between_directory_barriers<E>(
+    mut synchronize: impl FnMut() -> Result<(), E>,
+    replace: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    synchronize()?;
+    replace()?;
+    synchronize()
+}
+
 fn stage_file_name() -> String {
     let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
     let mut name = String::new();
@@ -1288,6 +1557,25 @@ fn map_stage_create_error(error: Errno) -> ProtectedCacheCatalogStoreError {
     }
 }
 
+fn map_catalog_transition_error(
+    error: ProtectedCacheCatalogError,
+) -> ProtectedCacheCatalogStoreError {
+    match error.kind() {
+        ProtectedCacheCatalogErrorKind::RevisionConflict => store_error(
+            ProtectedCacheCatalogStoreErrorKind::Conflict,
+            "protected cache catalog transition revision conflicts with the stored snapshot",
+        ),
+        ProtectedCacheCatalogErrorKind::RecoveryRequired => store_error(
+            ProtectedCacheCatalogStoreErrorKind::RecoveryRequired,
+            "protected cache catalog recovery is required before transition",
+        ),
+        _ => store_error(
+            ProtectedCacheCatalogStoreErrorKind::Conflict,
+            "protected cache catalog transition is invalid for the stored snapshot",
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtectedCacheCatalogStoreErrorKind {
@@ -1340,6 +1628,7 @@ fn store_error(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::fs as stdfs;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::path::{Path, PathBuf};
@@ -1355,13 +1644,17 @@ mod tests {
         CATALOG_FILE, LOCK_FILE, PRIVATE_FILE_MODE, ProtectedCacheCatalogRecoveryDisposition,
         ProtectedCacheCatalogStateRootGeneration, ProtectedCacheCatalogStoreAuthority,
         ProtectedCacheCatalogStoreBinding, ProtectedCacheCatalogStoreErrorKind,
-        ProtectedCacheCatalogStoreRead, STORE_DIRECTORY, StoreLockMode,
-        UnixProtectedCacheGenerationCatalogStore, encode_store_envelope, open_private_file,
+        ProtectedCacheCatalogStoreRead, ProtectedCacheCurrentTransitionAuthorization,
+        STORE_DIRECTORY, StoreLockMode, UnixProtectedCacheGenerationCatalogStore,
+        encode_store_envelope, open_private_file, replace_between_directory_barriers,
         verify_retained_file_path,
     };
+    use crate::cache_inventory::CacheStateId;
     use crate::protected_cache_generation_catalog::{
-        ProtectedCacheCatalogAuthority, ProtectedCacheGenerationCatalogDocument,
-        ProtectedCacheNamespaceIdentity, decode_protected_cache_generation_catalog,
+        ProtectedCacheCatalogAuthority, ProtectedCacheCatalogCorrelation,
+        ProtectedCacheCatalogRevision, ProtectedCacheGenerationCatalogDocument,
+        ProtectedCacheGenerationIdentity, ProtectedCacheNamespaceIdentity,
+        decode_protected_cache_generation_catalog,
     };
     use crate::state::InstallationId;
 
@@ -1417,12 +1710,97 @@ mod tests {
             .expect("open store")
     }
 
+    fn state(value: &str) -> CacheStateId {
+        CacheStateId::parse(value).expect("state identity")
+    }
+
+    fn generation(value: char) -> ProtectedCacheGenerationIdentity {
+        ProtectedCacheGenerationIdentity::parse(&format!("sha256:{}", value.to_string().repeat(64)))
+            .expect("generation identity")
+    }
+
+    fn transition_authorization(
+        expected_revision: ProtectedCacheCatalogRevision,
+        state_id: &str,
+        generation_identity: char,
+    ) -> ProtectedCacheCurrentTransitionAuthorization {
+        ProtectedCacheCurrentTransitionAuthorization {
+            expected_revision,
+            state_id: state(state_id),
+            generation_identity: generation(generation_identity),
+        }
+    }
+
+    #[test]
+    fn currentness_replacement_requires_pre_barrier_and_preserves_order() {
+        let events = RefCell::new(Vec::new());
+        let sync_count = Cell::new(0_u8);
+        replace_between_directory_barriers(
+            || {
+                sync_count.set(sync_count.get() + 1);
+                events.borrow_mut().push("barrier");
+                Ok::<(), &'static str>(())
+            },
+            || {
+                events.borrow_mut().push("replace");
+                Ok(())
+            },
+        )
+        .expect("barrier-replace-barrier sequence");
+        assert_eq!(sync_count.get(), 2);
+        assert_eq!(*events.borrow(), ["barrier", "replace", "barrier"]);
+
+        let replacement_attempted = Cell::new(false);
+        let barrier_calls = Cell::new(0_u8);
+        let error = replace_between_directory_barriers(
+            || {
+                barrier_calls.set(barrier_calls.get() + 1);
+                Err::<(), _>("pre-replacement barrier failed")
+            },
+            || {
+                replacement_attempted.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("failed pre-replacement barrier must stop publication");
+        assert_eq!(error, "pre-replacement barrier failed");
+        assert_eq!(barrier_calls.get(), 1);
+        assert!(!replacement_attempted.get());
+    }
+
     fn abandon_exact_stage(store: &UnixProtectedCacheGenerationCatalogStore) -> String {
         let document = ProtectedCacheGenerationCatalogDocument::empty(
             store.binding.namespace_identity.clone(),
         );
         let encoded = encode_store_envelope(&store.binding, &document).expect("encode envelope");
         let mut staged = store.stage_envelope(&encoded).expect("stage envelope");
+        let name = staged.name().to_owned();
+        staged.disarm();
+        drop(staged);
+        name
+    }
+
+    fn abandon_current_transition(
+        store: &UnixProtectedCacheGenerationCatalogStore,
+        expected_revision: ProtectedCacheCatalogRevision,
+        state_id: &str,
+        generation_identity: char,
+    ) -> String {
+        let ProtectedCacheCatalogStoreRead::Present(current) =
+            store.load().expect("load current catalog")
+        else {
+            panic!("catalog must be present");
+        };
+        let successor = current
+            .document()
+            .prepare_current_transition(
+                expected_revision,
+                state(state_id),
+                generation(generation_identity),
+            )
+            .expect("prepare transition stage");
+        let encoded = encode_store_envelope(&store.binding, &successor).expect("encode successor");
+        let mut staged = store.stage_envelope(&encoded).expect("stage successor");
         let name = staged.name().to_owned();
         staged.disarm();
         drop(staged);
@@ -1494,6 +1872,161 @@ mod tests {
         assert_eq!(
             foreign.load().expect_err("binding drift must fail").kind(),
             ProtectedCacheCatalogStoreErrorKind::Conflict
+        );
+    }
+
+    #[test]
+    fn current_transition_is_revision_cas_and_retires_the_previous_current() {
+        let root = TestInstallation::new("transition-current");
+        let store = open(&root);
+        let empty = store.create_empty().expect("create catalog");
+        let first = store
+            .transition_current(transition_authorization(
+                empty.document().revision(),
+                "state-first",
+                'b',
+            ))
+            .expect("publish first current");
+        assert_eq!(
+            first.authority(),
+            ProtectedCacheCatalogStoreAuthority::ProtectedStoreSnapshotOnly
+        );
+        assert_eq!(first.document().revision().get(), 2);
+        assert_eq!(
+            first
+                .document()
+                .correlate(first.document().revision(), &state("state-first")),
+            Ok(ProtectedCacheCatalogCorrelation::Current)
+        );
+
+        assert_eq!(
+            store
+                .transition_current(transition_authorization(
+                    empty.document().revision(),
+                    "state-stale",
+                    'c',
+                ))
+                .expect_err("stale transition")
+                .kind(),
+            ProtectedCacheCatalogStoreErrorKind::Conflict
+        );
+        let second = store
+            .transition_current(transition_authorization(
+                first.document().revision(),
+                "state-second",
+                'c',
+            ))
+            .expect("publish second current");
+        assert_eq!(second.document().revision().get(), 3);
+        assert_eq!(
+            second
+                .document()
+                .correlate(second.document().revision(), &state("state-first")),
+            Ok(ProtectedCacheCatalogCorrelation::Retired)
+        );
+        assert_eq!(
+            second
+                .document()
+                .correlate(second.document().revision(), &state("state-second")),
+            Ok(ProtectedCacheCatalogCorrelation::Current)
+        );
+    }
+
+    #[test]
+    fn abandoned_exact_transition_is_published_and_duplicate_stage_is_removed() {
+        let root = TestInstallation::new("recover-transition");
+        let store = open(&root);
+        let empty = store.create_empty().expect("create catalog");
+        abandon_current_transition(&store, empty.document().revision(), "state-first", 'b');
+        assert_eq!(
+            store.load().expect_err("stage debt").kind(),
+            ProtectedCacheCatalogStoreErrorKind::RecoveryRequired
+        );
+        assert_eq!(
+            store
+                .recover_abandoned_transition()
+                .expect("publish abandoned transition"),
+            ProtectedCacheCatalogRecoveryDisposition::PublishedAbandonedTransition
+        );
+        let ProtectedCacheCatalogStoreRead::Present(current) =
+            store.load().expect("load recovered transition")
+        else {
+            panic!("catalog must be present");
+        };
+        assert_eq!(current.document().revision().get(), 2);
+
+        let encoded =
+            encode_store_envelope(&store.binding, current.document()).expect("encode current");
+        let duplicate_name = {
+            let mut staged = store.stage_envelope(&encoded).expect("stage duplicate");
+            let name = staged.name().to_owned();
+            staged.disarm();
+            name
+        };
+        assert_eq!(
+            store
+                .recover_abandoned_transition()
+                .expect("remove duplicate transition stage"),
+            ProtectedCacheCatalogRecoveryDisposition::RemovedDuplicateStage
+        );
+        assert!(!root.store_path().join(duplicate_name).exists());
+    }
+
+    #[test]
+    fn skipped_revision_and_missing_predecessor_transition_recovery_fail_closed() {
+        let root = TestInstallation::new("invalid-transition-recovery");
+        let store = open(&root);
+        store.create_empty().expect("create catalog");
+        let skipped = format!(
+            "{{\"schema_version\":1,\"family\":\"cargo_target_v1\",\"namespace_identity\":\"{}\",\"revision\":3,\"current_state_id\":\"state-current\",\"generations\":[{{\"state_id\":\"state-current\",\"generation_identity\":\"{}\",\"lifecycle\":\"current\"}}],\"recovery\":{{\"state\":\"clean\"}}}}",
+            namespace('a').as_str(),
+            generation('b').as_str()
+        );
+        let document = decode_protected_cache_generation_catalog(skipped.as_bytes())
+            .expect("canonical skipped revision fixture");
+        let encoded = encode_store_envelope(&binding('a'), &document).expect("encode envelope");
+        let mut staged = store
+            .stage_envelope(&encoded)
+            .expect("stage invalid successor");
+        staged.disarm();
+        drop(staged);
+        assert_eq!(
+            store
+                .recover_abandoned_transition()
+                .expect_err("skipped revision")
+                .kind(),
+            ProtectedCacheCatalogStoreErrorKind::RecoveryRequired
+        );
+
+        drop(store);
+        for entry in stdfs::read_dir(root.store_path()).expect("list store") {
+            let entry = entry.expect("entry");
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(super::STAGE_PREFIX)
+            {
+                stdfs::remove_file(entry.path()).expect("remove invalid stage");
+            }
+        }
+        stdfs::remove_file(root.store_path().join(CATALOG_FILE)).expect("remove predecessor");
+        let store = open(&root);
+        let empty = ProtectedCacheGenerationCatalogDocument::empty(namespace('a'));
+        let successor = empty
+            .prepare_current_transition(empty.revision(), state("state-current"), generation('b'))
+            .expect("prepare successor");
+        let encoded = encode_store_envelope(&binding('a'), &successor).expect("encode successor");
+        let mut staged = store
+            .stage_envelope(&encoded)
+            .expect("stage without predecessor");
+        staged.disarm();
+        drop(staged);
+        assert_eq!(
+            store
+                .recover_abandoned_transition()
+                .expect_err("missing predecessor")
+                .kind(),
+            ProtectedCacheCatalogStoreErrorKind::RecoveryRequired
         );
     }
 

@@ -156,6 +156,15 @@ memory reservation; per-task memory remains host-default and is reported from th
 The harness cannot accept an arbitrary command, repository, commit, fixture, cache path, or
 validator.
 
+Source creation is a separate closed treatment so it can be composed with one unchanged hot-state
+arm. `--source-materialization git-sequential` is the typical control: it creates each task with a
+separate sequential `git worktree add`. `glaeda-ordinary` invokes the Glaeda fan-out materializer
+once but requests ordinary Git worktrees, isolating orchestration from filesystem copy behavior.
+`glaeda-reflink` invokes the same program and requests exact same-HEAD reflink fan-out. The reflink
+treatment rejects any ordinary fallback, changed Git proof, task-count drift, or receipt-shape
+drift instead of silently changing the mechanism under test. Glaeda treatments bind the exact
+release-binary digest as well as its checked-in CLI and library source digests.
+
 After an unprivileged OverlayFS mount is gone, the kernel may leave its internal work directory at
 mode `000`. Cleanup restores owner traversal only on owned, non-symlink directories inside the
 exact disposable experiment tree, then removes that tree. It does not follow links or alter an
@@ -173,6 +182,7 @@ Run one physical ext4 window with the aggregate receipt outside the disposable s
 ```bash
 scripts/benchmark-hot-state-fanout \
   --arm private-copy \
+  --source-materialization git-sequential \
   --fanout 4 \
   --scratch-root /path/to/owned/ext4-scratch \
   --output /path/to/receipt.json
@@ -181,11 +191,11 @@ scripts/benchmark-hot-state-fanout \
 Every arm now executes through a schema-v4 `hot-run` measurement. The ordinary-native control uses
 the task worktree directly with an explicit `target:native` observation; it receives no mount,
 copy, state, or isolation treatment. Prime and edited work get different caller-owned comparison
-keys. Each key deterministically binds the frozen source/tree/diff, the three producer-program
-content digests, exact Rust and Cargo versions and executable digests, arm, fan-out, Cargo
-concurrency, CPU-affinity sets, memory treatment, offline/incremental settings, page-cache
-declaration, and creation umask. This lets repeated same-treatment receipts feed
-`hot-pressure-shadow` while mixed work or treatment refuses.
+keys. Each key deterministically binds the frozen source/tree/diff, exact producer-program and
+source content digests, exact Rust and Cargo versions and executable digests, arm, source
+materialization treatment, fan-out, Cargo concurrency, CPU-affinity sets, memory treatment,
+offline/incremental settings, page-cache declaration, and creation umask. This lets repeated
+same-treatment receipts feed `hot-pressure-shadow` while mixed work or treatment refuses.
 
 The aggregate observation binds the harness commit/tree, frozen source/tree/edit, arm, fan-out,
 exact CPU-affinity sets, per-task Cargo concurrency, setup and complete-window latency, every
@@ -195,8 +205,11 @@ disposition. Summed `st_blocks` are not unique physical usage on reflink-capable
 filesystem-level observation keeps that distinction visible. A failed task cancels the remaining
 process groups. The child environment is a closed allowlist: caller target overrides, compiler
 wrappers/flags, and toolchain overrides are excluded; the accepted Cargo home is offline and held
-constant. Setup and byte-observation time remain outside the primary request-to-all-results window
-and are reported separately. The default page-cache state remains uncontrolled/resident. For
+constant. Resident priming remains setup because the treatment assumes an already-hot project.
+The receipt separately reports resident-ready task-known to final trustworthy result as source
+materialization plus checked fixture application plus the complete edit/validation window.
+Byte-observation time remains outside that duration and is reported separately. The default
+page-cache state remains uncontrolled/resident. For
 `overlay` and `private-copy`, `--page-cache-treatment resident-target-dontneed` adds the bounded
 cold-read discriminator: after the resident prime and byte observation, it fsyncs every exact owned
 regular file in resident `target` and issues `POSIX_FADV_DONTNEED` immediately before the edit
@@ -548,3 +561,540 @@ Raw receipt SHA-256 digests:
 - final same-producer control hot-run/benchmark: `5c56371de54b921acd81eeba9346e1ea29e834c5d6f0ff76e0b9add999e8c5ed`, `d38ba656c505338929a363775f9f90c7cb51479112aa01e8a019ea89a1077071`
 - final same-producer candidate hot-run/benchmark: `0266d7ff6ebbb3aa21eed1250017187c828ebc77be02ddecc8d6f5e1f7e6e15d`, `9cefe858dbe997d34677d3af57be4b0962b7909ee81bcca24f4110449a08fbae`
 - final retained candidate hot-run/benchmark: `4561f17b0f81ad04f8aec366db5f942ab05c87f66d9befeaf6e281609414b335`, `95a6e0aa78653e574bdbd5162e7dc12b36c4165ee6080cc2115e0cec89ada0ef`
+
+## Composed XFS source and compiler-state loop — 2026-08-30
+
+Exact clean producer `decd8ea38f3e6d8df5b91897df980175f7db99a9` / tree
+`7789bf78967d708c5fd0bbcc80c84c435bf998bd` composed task source materialization with the existing
+`private-copy` compiler-state arm. Its release `glaeda-reflink-task` was 1,799,784 bytes with
+SHA-256 `ff1b9081ab20eb00eac946bf160efc0e01caf49a17a530f39a0a0c6f40e7851c`.
+The physical backend was a route-owned 32 GiB loop image on big-red Ubuntu 26.04, kernel
+7.0.0-30-generic, XFS/xfsprogs 6.18, `reflink=1`, 4 KiB blocks, and `noatime`. The frozen source was
+`b9fa23462420c13a465d635d9694f0c827c1e685` / tree
+`edd0b7bb9d3e59305c21c69b721b5278d8aff6da`: 475 tracked regular files and 9,285,337 logical bytes
+per task source.
+
+The source controls changed one dimension while retaining the same resident prime, checked fixture,
+private-copy target lineage, pinned Rust/Cargo 1.97.1, disjoint 16-CPU grant, and complete semantic
+validator:
+
+- `git-sequential`: one ordinary `git worktree add` process per task, in sequence;
+- `glaeda-ordinary`: one bounded Glaeda fan-out invocation using ordinary Git worktrees;
+- `glaeda-reflink`: the same Glaeda invocation requesting reflink fan-out, with any fallback rejected.
+
+The fan-out-1 smoke demonstrated that reflink proof is not free. Source creation was 48.435 ms for
+sequential Git, 67.642 ms for Glaeda ordinary, and 99.607 ms for Glaeda reflink. Resident-ready
+task-known-to-result was 14.947136, 15.725905, and 15.353203 seconds respectively. Outer wall was
+61.30, 64.92, and 65.05 seconds; GNU-time outer maximum-RSS observations were 2,503,464, 2,447,652,
+and 2,494,540 KiB. The candidate should therefore not replace the simple width-one path for speed.
+
+The primary fan-out-4 bracket ran A-B-C-C-B-A, two samples per treatment:
+
+| Source treatment | Source samples (ms) | Source median (ms) | Edit-window median (s) | Task-known median (s) | Outer-wall median (s) | Outer max-RSS median (KiB) | Peak XFS growth median (bytes) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| sequential Git | 196.034, 176.616 | 186.325 | 26.660149 | 26.854811 | 74.885 | 2,501,790 | 7,263,135,744 |
+| Glaeda ordinary | 88.363, 110.860 | 99.612 | 25.782925 | 25.891474 | 73.625 | 2,509,122 | 7,263,141,888 |
+| Glaeda reflink | 81.510, 77.793 | 79.652 | 26.714207 | 26.801249 | 75.175 | 2,521,654 | 7,224,225,792 |
+
+At width four, bounded Glaeda orchestration alone reduced source setup 46.54% / 1.87x versus
+sequential Git. Reflink reduced it 57.25% / 2.34x versus sequential Git and another 20.04% / 1.25x
+versus Glaeda ordinary. The candidate used 38,909,952 bytes / 37.107 MiB / 0.536% less peak XFS
+growth than sequential Git, consistent with sharing four 9.285 MB source trees. The full
+task-known medians differed by only 53.563 ms / 0.20% between sequential Git and reflink because
+the 80–187 ms source step is small beside a 25–28 second compiler/test window. The differing
+edit-window and outer medians are ordinary run variance, not evidence that source reflinks change
+compiler semantics or performance.
+
+One exploratory fan-out-8 A-B-C scaling bracket produced:
+
+| Source treatment | Source (ms) | Task-known (s) | Outer wall (s) | Outer max RSS (KiB) | Peak XFS growth (bytes) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| sequential Git | 359.378 | 52.846806 | 102.35 | 2,506,268 | 12,551,753,728 |
+| Glaeda ordinary | 120.495 | 52.448307 | 103.53 | 2,514,088 | 12,551,704,576 |
+| Glaeda reflink | 100.159 | 49.869747 | 97.07 | 2,503,764 | 12,469,665,792 |
+
+Glaeda ordinary was 2.98x and Glaeda reflink 3.59x faster than sequential Git for source setup at
+width eight; reflink also used 82,087,936 bytes / 78.285 MiB less peak XFS growth. The candidate's
+2.977-second / 5.63% full-loop advantage is not promoted because this scaling bracket has one
+sample per treatment and no reverse-order repeat.
+
+All 12 physical runs succeeded. Every one of 51 task validators passed the same 1,343 executed
+tests with one ignored and zero failures; all 17 requested reflink tasks reported `reflinked`, zero
+ordinary fallback, the exact commit/tree, and the final per-task Git proof. Cleanup removed all 63
+registered worktrees, the XFS scratch root was empty after every run, and no benchmark worker or
+failed unit remained. The outer RSS observations above are process-lifetime GNU-time maxima, not
+concurrent aggregate memory.
+
+Logical cleanup did not reclaim sparse host backing by itself. After the runs, the empty mounted
+XFS image still had 16,189,345,792 allocated host bytes. One explicit `fstrim` reported the full
+32 GiB range trimmed and reduced host allocation to 4,094,177,280 bytes: 12,095,168,512 bytes /
+11.265 GiB / 74.71% reclaimed. The complete trim-and-reobserve command took 0.13 seconds. The loop
+device advertised 4 KiB discard granularity, 4 GiB maximum discard, and `DISC-ZERO=0`; XFS still
+reported 690,143,232 logical used bytes. This proves task/worktree deletion and host-backing
+reclamation are separate lifecycle phases. A persistent sparse project disk should record both,
+and should test bounded trim at idle/eviction watermarks rather than issuing it on every task. The
+remaining backing allocation is observed, not assumed reclaimable.
+
+Raw aggregate JSON / GNU-time SHA-256 pairs:
+
+- fan-out 1 sequential/Glaeda ordinary/Glaeda reflink: `25133022cf2bf9038f6d903fdacdc28a8b9533e5b88b12fa420464da30d1bf3d` / `8bc9ef53609e80586d330ad9398603b648ec265b6eb0a03fcd9104de3667d3bc`, `2df1c4c70e5a4141f2193de82d70aaa530245704de55b5da1f01fcf97914fe8d` / `9a1e4f62f6badfacd966373779953ef269f2c50001c1cc1e3eb5d3eb50b5bfd7`, `25e7a4e8a90cc54994617c5a30bf93e59bdc0c8d4fc1c82be3448820a27766fc` / `41bf1d830d8ff85415668eb7c1e52b7c43fe310666afb419f322bab6474f9004`;
+- fan-out 4 sequential A1/A2: `f2638f5ff83f6be3fc7e508a638692f59c023f14278c947fcfe6ec0786767bb8` / `772295ef12c227ec38a0211a864c47781bfa231879d754fdc8b1461e3bfa6f24`, `dad0f7459b9f43ffe063cf0e95c5e0eb851d050d31ea4aace9cdc47ab4ac8666` / `88f2f853cae5047c2ce0aeae6ff5ad8c4c0abe2befa4cac2aad807cad52c4e72`;
+- fan-out 4 Glaeda ordinary B1/B2: `ef1c597c8f8076a87f5834296e4bd17ada8a8cb5a594ee1c935a65927cb8bb63` / `da455483cca1dc6ec9cb1403472d0bf7bd5f6df3f09fc995eacc940247588a0d`, `b6091157bf7e767bea4f2427300c8613e5c73cb9391ce206e387a9e0cd2ee82c` / `2d70f4abe45fdabc4cf4d64066a95dd853a8d46555015e0bc10f5694bf067772`;
+- fan-out 4 Glaeda reflink C1/C2: `e33adc1528fa40182e16d1c572912f63e5f4d54a6cccf623a3ab3b95853f3fdc` / `f5870a74f30b5727ec4ce903e2706d360ac27b45b988b16372c0a08a8416e3f1`, `bf0bad735baa4037ab3f9b8f51f2fe1e4ad3259cbaa922a3bad09a1c92afbda5` / `beb94e13c69ad79aeab398772c94b90beb694f9202f8c914322c393ae5ff4a7d`;
+- fan-out 8 sequential/Glaeda ordinary/Glaeda reflink: `c9b4f97e6c23c8037a89645eef02164617b3faf6e0cb1dd03ce0dfe6888ae116` / `52631d684e0bf6f36a5671b4a6be2dfe24ee96c850825f954574150abe15dc77`, `0556db8832354a6aa8b459fda382b005f4906e33b71e4963a8b2f09a7fd57973` / `a298dc61673c4d47f80016b9484041ac9e03211e9f02a88ab03f506bd598defd`, `ad977bfdaa04cb8f9402c6c970d44415c5fa3aae29803e6d17f39199b702af37` / `5de6dc03329b0f3bc68302db11e1b938782771dbd644987a7c15dc03c958ddcb`.
+
+## Default hot-state generation discriminator — 2026-08-30
+
+The same-path replacement control used a fixed linked-worktree pathname, the tiny
+`examples:private-copy` cache, a route-owned XDG cache, and one marker written only into generation
+A's private cache. Exact clean main `c31bf1066028df1ddccb2900ad041029e8becc6a` keyed default
+state only by paths and cache declarations. Generation A reported `seeded`; after removing it and
+recreating generation B at the identical pathname and commit, B printed `inherited`, reported
+`reused`, and performed zero preparation. Command-plus-preparation took 5.865 ms and 4.143 ms. This
+was stale cross-generation reuse, not a speed win.
+
+Exact clean candidate `f635771abaef36a2d932219d3611078eb09d2e1e` added physical
+worktree/Git-object identity and a stable linked-worktree pointer-file witness to the implicit
+lineage, then held the validated task, Git, and cache objects through bubblewrap's FD-bound mount
+interface. The backing filesystem immediately recycled the task `.git` file's device/inode
+(`66306:2884673`) across the two generations, while its ctime witness changed. Generation B printed
+`absent`; A and B both reported `seeded`, selected two distinct 0700 state roots, and took 5.243 ms
+and 5.388 ms command-plus-preparation. An immediate third B invocation printed B's `second` marker,
+reported `reused`, and took 5.727 ms with zero preparation. The discriminator therefore preserved
+same-generation reuse while replacing an invalid approximately 1.7 ms shortcut with a fresh
+private lineage. A deterministic bind-FD regression also atomically replaced the validated source
+pathname before bubblewrap consumed it and proved the held generation—not the replacement—was
+mounted, then proved the consumed descriptor was absent from the payload's `/proc/self/fd` view.
+Explicit `--state` remained outside lineage selection so callers can deliberately own a
+cross-generation lineage.
+
+Raw hot-run receipt SHA-256 digests:
+
+- exact-main control A/B: `84e8dcaaac372defc0b27a1c2a1d2c8145a09bdd44619c5447eee3a105226a27`, `aaa69dac28ba1bb4055a5f145e573b056ec58fb2f10863e388fed035dfbd1782`;
+- exact candidate A/B/B-reuse: `cc982bedb9a6b4b46a8f178a19b3171093b8bad337d764aba2fe67f2d882ae22`, `837d887235bff7cf125a4fc7c32ac01e1f9698157d5b3a127e8aec61e548337f`, `91de07cc575d42403a4f64bba926baddf89aacc671a41941e14df1617e6b5f2f`.
+
+## Bounded hot-run cache observation — 2026-08-30
+
+Exact clean base `27081b365b8f867b96d994d0eddd6f6aff7cbcf9` could classify a hand-authored
+cache inventory but had no producer for physical `hot-run` state. Exact code candidate
+`e37b236c6c95f17f90af3836251b5aff337976c8` / tree
+`c96bf541fbe87a8fd62774513229d32a6f323989` added one explicit-root, descriptor-bound,
+metadata-only Linux observer. The physical fixture was big-red's unchanged ext4 hot-run namespace:
+four opaque legacy states, 1,090,037,078 logical bytes and 1,093,828,608 allocated state bytes. The
+namespace directory itself occupied another 4,096 bytes. One legacy Overlay state accounted for
+1,093,472,256 allocated bytes. None of the states had enough ownership or lifecycle evidence to be
+called reclaimable.
+
+The complete comparison used three warmups and 30 measured samples per arm in rotating/reversed
+four-arm order. All arms observed the same state. The primary metric was complete command wall
+time; secondary metrics were process maximum RSS, byte agreement, terminal status, path-free
+output, and mutation absence.
+
+| Treatment | Validity | Median (ms) | p90 (ms) | Max RSS (KiB) |
+| --- | --- | ---: | ---: | ---: |
+| ordinary-user GNU `du`, apparent + allocated passes | invalid: both passes returned 1 on inaccessible Overlay work internals | 10.294 | 11.976 | 9,136 |
+| privileged GNU `du`, apparent + allocated passes | complete metadata control | 20.701 | 24.107 | 9,136 |
+| existing supplied-inventory classifier | valid classification only; manually supplied bytes, no producer cost | 1.381 | 1.863 | 5,072 |
+| Glaeda explicit-root observer | complete one-pass observation plus classification | 8.091 | 10.307 | 6,684 |
+
+The candidate exactly matched the sum of GNU `du`'s four per-state logical and allocated totals,
+classified all four states `unknown`, reported zero reclaimable bytes, printed no private path or
+child name, and left root/state atime, mtime, and ctime unchanged in the contract test through
+`O_NOATIME`. It was 2.56 times faster than the complete two-pass GNU control while returning the
+typed classifier result rather than raw paths. The 1.381 ms supplied-inventory arm is intentionally
+not an end-to-end competitor: a human or separate producer had already paid for every observation.
+
+A free hosted GitHub Actions arm is inapplicable to this decision because a hosted runner cannot
+observe operator-local hot state without changing the storage and trust boundary. Reset is cold
+reconstruction or selecting a new state, not deletion by this command. The observer has no catalog,
+ownership, generation, non-use, reconstruction, retirement, or cleanup authority; later lifecycle
+work must supply those facts before bounded eviction can exist.
+
+## Cross-worktree Cargo target environment binding — 2026-08-30
+
+While building the lock-observer candidate, a deliberate shared-`CARGO_TARGET_DIR` control exposed
+a real stale-output failure. Base `b92a1a6e67d50ea606bfe2fc9f677a48338f284b` first populated the
+target. Different candidate source `89779b371595e5d0b795e3aac17dfad434090079` had older mtimes;
+Cargo exited successfully in 0.02 seconds and returned the byte-identical 5,083,248-byte base
+binary, SHA-256 `85f653e59b45cc083fc3a401116eab374b7982b37fc548de13a66031d8bee6b1`.
+An isolated candidate target instead took 58.10 seconds and produced the distinct correct
+5,059,856-byte binary, SHA-256
+`311e7d475d1ca569e9b032b55203f402ad7640dd1b395f2473077caba5042865`.
+The invalid output was rejected before any performance sample.
+
+Code inspection then found that cross-worktree `hot-run` mounted its selected `target` view but
+still inherited a caller `CARGO_TARGET_DIR`, allowing Cargo launched directly or through another
+tool to bypass the view. Exact candidate `e98ddabc5ce1f74b39fc475fb28e989899bd5ca5` / tree
+`9c33a18e5b0de9df72917e0c362fea1c09bfd10b` binds that environment variable to the stable in-view
+path whenever the exact `target` cache is selected. A physical temporary Git/Cargo fixture proved
+the semantic difference: current main exited zero while writing only to the ambient target and
+not the task-private state; the candidate exited zero while writing only to the task-private state
+and left the ambient target untouched.
+
+The complete-command performance control used Rust/Cargo 1.97.1, one Cargo job, three warmups per
+arm, and six rotating order permutations on big-red. Raw local, current cross-worktree `hot-run`,
+and candidate cross-worktree `hot-run` operated on the same tiny crate and independently warmed
+targets:
+
+| Workload | Samples/arm | Raw median / p90 | Current median / p90 | Candidate median / p90 | Current / candidate max RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `/bin/true` | 30 | 1.064 / 1.166 ms | 70.094 / 76.830 ms | 68.713 / 76.131 ms | 25,216 / 25,096 KiB |
+| warm `cargo check --offline --quiet` | 20 | 12.296 / 12.652 ms | 81.234 / 88.679 ms | 82.809 / 89.411 ms | 25,056 / 25,164 KiB |
+
+The candidate changed the warm-Cargo median by +1.575 ms / +1.94% and the no-op median by
+-1.381 ms / -1.97%; overlapping distributions and unchanged RSS show no material wrapper cost.
+The raw arm remains the no-isolation latency floor. A hosted Actions arm is not comparable because
+the decision concerns an inherited operator-shell variable and a local mounted cache view, not
+checkout or runner provisioning. The raw receipt was 2,002 bytes with SHA-256
+`8efed1ecb293c622a5b5dd57783a8699e9b19ae94b7c569913e0eb21550f9620`; its private temporary paths
+were not retained. This correction grants no shared-cache selection, publication, adoption,
+reclamation, or deletion authority.
+
+## Read-only project checkout front door — 2026-08-30
+
+Issue [#912](https://github.com/teamleaderleo/glaeda/issues/912) measured one bounded Unix CLI
+invocation over the
+already-landed bounded `ProjectCheckoutObserver`. Exact measured code head
+`71c2d21d26ca0152936246bad559404002ae67d0` / tree
+`8f9b29affd22c7ff09be95083813a3d312d5a49e` produced a 1,786,864-byte release
+`glaeda-project-observe`, SHA-256
+`be59f243d3eb2cef55b82b48cf095a9090516204f707640b3390a87f41ab7d44`.
+
+The command accepts one explicit canonical absolute checkout and human or JSON output. It invokes
+the fixed `/usr/bin/git` through the existing sealed timed executor, requires two equal snapshots,
+and emits exact commit/tree, canonical GitHub source where provable, dirty/untracked/local-ahead
+recovery facts, worktree/submodule topology and one opaque physical materialization identity. It
+adds no catalog, adoption, residency, execution, remote-freshness, cache, cleanup or mutation
+authority.
+
+An independent Python semantic oracle issued the same two preflights and two seven-command
+snapshots, normalized every output fact separately, and produced the exact same 749-byte report.
+Canonical report SHA-256 was
+`1feea1e94f4ae97c020d8bf343692e2132b30b7a07c4bc821e4a33624919e716`.
+A mode-0600 process/network trace observed exactly the candidate plus 16 `/usr/bin/git` children,
+zero unexpected executables and zero network-class syscalls; trace SHA-256 was
+`a6c5b760a35c0c9f14e95466e8016e9194155463136845bba5e40633dbf83d87`.
+
+The first claimed matrix under #911 is invalid and grants no performance evidence. Its timed
+control also parsed the complete report in Python, so Python startup/parsing made it stronger and
+slower than the preregistered weak lower bound. The invalid 30-pair receipt remains identified by
+SHA-256 `a3da3c2233047b9190e476b6f663076c0d9bd117bac2d5fba36cc33400c546d5`.
+
+#912 froze the correction before new samples. The timed control was one env-clean Bash process
+issuing the same 16 fixed Git observations, validating statuses and discarding all output. Its
+trace observed `/usr/bin/env`, `/bin/bash`, exactly 16 Git children and no unexpected executable.
+Bash made two failed local AF_UNIX NSS connections to `/var/run/nscd/socket` before spawning Git;
+there were zero AF_INET/AF_INET6 calls and zero socket calls in every Git child. The 14,003-byte
+mode-0600 trace SHA-256 was
+`68e0ef50dccff421642c829f547d5a4543694cedcf7ee36f0332d87b9caa68e6`.
+
+Two warmup pairs preceded 30 measured serial A-B/B-A pairs on big-red, Python 3.14.4, Git 2.53.0,
+Linux 7.0.0-30-generic. The frozen clean checkout state covered 506 tracked/untracked entries and
+29 Git-state files; its content/metadata vector SHA-256
+`bef67482e5ef363b01175af6fdf31511f8ac30ab19e457d45e8de8b7735ec7d0` remained equal after every
+pair.
+
+| Complete process | n | Median | Mean | Stddev | Min | p95 | Max | Max RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| weak Bash/16-Git lower bound | 30 | 18.579190 ms | 18.4686544333 ms | 0.730956627 ms | 16.115688 ms | 19.629664 ms | 19.657880 ms | 17,048 KiB |
+| typed Glaeda candidate | 30 | 15.6433895 ms | 18.5451014333 ms | 10.644055161 ms | 14.799264 ms | 41.307917 ms | 68.944897 ms | 16,920 KiB |
+
+The candidate median was 2.9358005 ms / 15.8015527049% lower, or 1.18767035750x. Its mean was
+0.076447 ms higher, p95 was 21.678253 ms higher and maximum was 49.287017 ms higher than the lower
+bound. That real tail is consistent with the existing 25 ms bounded-capture poll and is not hidden
+by the median. The candidate nevertheless passed the preregistered interactive limits: median no
+more than 25 ms above the weak control, p95 at most 50 ms and maximum at most 75 ms. Maximum RSS was
+128 KiB / 0.750821210699% lower than control, inside the 25% ceiling.
+
+Every measured process exited zero; candidate report hashes stayed exact; control stdout and all
+stderr remained empty; and every state vector remained unchanged. One pre-matrix wrapper attempt
+aborted on its first warmup control because it mistakenly tried to parse the deliberately empty
+control stdout as JSON. It produced no matrix or receipt. Including that setup error, the semantic
+pair, control smoke/trace, warmups and corrected matrix used 71 complete invocations against the
+cap of 72.
+
+The corrected mode-0600 raw receipt was 25,750 bytes with SHA-256
+`3c3ca2c73ee0a028b507160e7855ba119d95ce98236552647a4b597df33d6a0e`. Frozen lower-bound,
+semantic-control and final harness SHA-256 values were respectively
+`1a93fdeafeb16a01591941f9eb2d1341daa36120562de1a015eff2eec17a6b80`,
+`b911f4c5af9a9d2154c9df52cec058a925cba6edb7c731719ab37ca88b7f57fd`, and
+`56a9b85a03cd2e57c5c16380a14ccedb8d05df0368eb0ea3bb609492e9fae66f`.
+No shared process-executor, hot-run, cache/generation/lifecycle, task-worktree, reflink/storage or
+Quarry code changed. The capture tail remains separate owner evidence, not scope for this command.
+
+## Bounded Linux machine observation — 2026-08-30
+
+Issue [#919](https://github.com/teamleaderleo/glaeda/issues/919) selected a recurring big-red
+handoff loop that agents previously assembled from separate `/proc`, `systemctl`, `ss`, and text
+processing commands. Exact measured code head
+`39fb05b777166e7b6ece0775b2bc983fab542b43` / tree
+`d42a50dfffc78f095ce7545c113ee9fb4b36917f` produced a 1,739,088-byte release
+`glaeda-host-observe`, SHA-256
+`46d5bf3990fe58e64561cc14e83925b2a2bab58f2e338f69bb0494b2d50521c4`.
+
+The command reads bounded fixed `/proc` CPU/load, memory, PSI, and TCP tables directly and starts
+only two fixed `/usr/bin/systemctl` children for failed system/current-user unit counts. Human and
+JSON forms come from the same typed report. Output contains no paths, addresses, unit names, PIDs,
+command lines, environment values, repository content, or arbitrary logs. Systemd unavailability
+is explicit without discarding valid kernel evidence. The report is scoped to the
+`current_execution_context`; it does not prove physical-host or namespace identity and grants no
+admission, ownership, process/service mutation, cleanup, scheduling, or cache authority.
+
+Three local complete-process arms observed the same current big-red execution context:
+
+1. an ordinary Bash composition using one Bash, five `awk` children, `date`, `ss`, and two
+   `systemctl` children;
+2. one Python 3.14 process reading `/proc` directly and starting only the same two systemd
+   observations;
+3. the compiled typed Glaeda candidate.
+
+One warmup per arm preceded 24 serial measurements per arm in six rotating order permutations.
+Every timed command ran under the same GNU `time` wrapper for max-RSS collection. The harness used
+its monotonic clock for complete wall time and waited-child resource deltas for CPU. All 72 reports
+passed shape/range validation; logical CPU count, memory/swap totals, failed-unit states, and the
+watched-port vector produced one exact stable signature, SHA-256
+`a6a0a45ce8e543420f0bd6276aceaba94e6b74625aa1dafb150b5f9c3bb52a8c`. Dynamic timestamps,
+load, available memory, and PSI were range-checked, and cumulative PSI totals never moved
+backwards within an arm. Their expected movement produced 24 distinct output digests per arm.
+
+| Complete process | n | Median | p95 | Maximum | Median child CPU | Max RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ordinary shell composition | 24 | 26.1697515 ms | 27.916760 ms | 31.911187 ms | 25.917000 ms | 9,244 KiB |
+| single-process Python | 24 | 25.603824 ms | 35.235668 ms | 38.723993 ms | 23.366500 ms | 13,064 KiB |
+| typed Glaeda candidate | 24 | 7.960407 ms | 9.466500 ms | 9.906237 ms | 6.223500 ms | 7,864 KiB |
+
+Against the ordinary shell composition, Glaeda reduced median wall by 18.2093445 ms / 69.5816%,
+p95 by 66.0903%, median child CPU by 75.9868%, and max RSS by 14.9286%. Against the direct Python
+control, it reduced median wall by 17.643417 ms / 68.9093%, p95 by 73.1338%, median child CPU by
+73.3657%, and max RSS by 39.8040%.
+
+Separate direct mode-0600 traces excluded the common timing wrapper. The shell arm executed 11
+process images including its `/usr/bin/env` wrapper; Python and Glaeda each executed four, namely
+the wrapper, their own process, and two `systemctl` children. No arm created an AF_INET/AF_INET6
+socket or connection. Each made exactly two successful AF_UNIX connections to the system and user
+systemd managers. Final trace SHA-256 values were
+`ad405a0094126199ac88ac3e6b6e833922b42b66a562199816c36797bb86139d`,
+`bc8b349cd7c16337c2648e4ee1664e47deed80c12a6a676bb08fa90f3df008b8`, and
+`5fa8900c8871c3591dfe7ea982634b257c9fa85867f0a73168eb95dd9c4b395a` for shell, Python, and
+Glaeda respectively.
+
+The complete bounded receipt SHA-256 was
+`0b25a542c769163c60f613c991f44072ded5c5fbedfe94aa113f85909d9ccda7`. Frozen shell, Python, and
+harness SHA-256 values were respectively
+`5719f26e0c149e3c39386a0101a29e488edbafe21228f654c445dc9ff9f3cbdd`,
+`4ad8f882bd0dcdea64913dbaa36108b9deaee92ab5fcee294cb7fa5fda920757`, and
+`51c20e0b4b2149bb5aa4702820f24253e6b409f92ea71e4a8679a496a12b2b69`.
+Free hosted GitHub Actions is not a comparable arm because it cannot observe operator-local
+machine state; a self-hosted Actions job would invoke this same local command. No hot-run, G0,
+resident/cache lifecycle, project/worktree/storage/reflink, protected-cache, or Quarry code
+changed.
+
+Post-merge verification exposed one platform-packaging error outside the measured Linux path. The
+first binary used a non-Linux `compile_error!`, so repository-wide Apple Silicon `--all-targets`
+checking correctly failed after PR #920 merged. Exact fix
+`48ccb95c83809305f7e2d2bff2fc454093a0756c` replaces that compile-time rejection with a target-gated
+non-Linux stub that exits two with a static unsupported-platform message; all Linux implementation
+items remain Linux-gated. The exact
+`cargo check --locked --all-targets --all-features --target aarch64-apple-darwin` control then
+passed. This correction changes no Linux observation semantics, benchmark control, or authority.
+
+## Checkout-local Cargo target cost observation — 2026-08-30
+
+Issue [#926](https://github.com/teamleaderleo/glaeda/issues/926) replaces path/age guesses with one
+bounded observation-only Cargo-target cost surface. Exact candidate
+`317491650fc682763ea199ac439d5a961de3466f` / tree
+`18325f1479473941d8f917a02206bf102244ac0e` produced a 1,809,080-byte release binary, SHA-256
+`467d2efb3d9f9c5e47a483a7e9347d70e0e4e2dfe8de17ef74d35f885e4d8dcc`.
+
+The command accepts one explicit canonical checkout. Two equal offline Git observations bind the
+commit, tree and physical worktree generation around one descriptor-relative `target` walk. The
+walk follows no symlink, reads no file content, uses `O_NOATIME`, remains on one filesystem, and
+rejects drift, unsupported objects, more than 2,000,000 entries or depth above 64. Its typed report
+contains no checkout path or child name. Visible `st_blocks * 512` is explicitly not exclusive or
+necessarily reclaimable when reflinks/shared extents exist. External hardlinks are reported rather
+than mislabeled as savings.
+
+The first all-worktree pass also found a legitimate existing Git shape: four configured branches
+had an upstream name but no `branch.ab` because their tracking refs were unavailable. The existing
+observer model already represents that state as `upstream_configured=true` and ahead count
+`unknown`, but its parser rejected it. The candidate now accepts that exact recovery fact while
+still refusing an ahead/behind record without any upstream; a focused regression covers the
+correction.
+
+The performance control used exact clean main
+`54cc3462220a520687f81e635cf6320d1c0ae664` / tree
+`1eaff79aa67b18796c264bc9b1fb5902d09a2201` and its unchanged retained Cargo target. One warmup
+per arm preceded 30 samples per arm in rotating six-permutation order. The incomplete lower bound
+was one GNU `du` allocated-byte pass; the normal complete control ran separate apparent and
+allocated passes; the candidate returned both totals plus Git, owner, hardlink, marker, count and
+mtime evidence.
+
+| Complete observation | n | Median wall | p95 wall | Median child CPU |
+| --- | ---: | ---: | ---: | ---: |
+| one allocated-only GNU `du` pass | 30 | 11.903998 ms | 14.274691 ms | 12.774000 ms |
+| apparent + allocated GNU `du` passes | 30 | 23.559662 ms | 28.240295 ms | 25.337500 ms |
+| typed Glaeda report | 30 | 41.140622 ms | 80.158346 ms | 45.757500 ms |
+
+Glaeda is not a faster raw directory walk: the additional identity and safety evidence cost
+17.580960 ms / 74.6231% at the median over the two-pass control. The absolute complete latency is
+still about 41 ms. Formal max-RSS is unavailable because the harness's `posix_spawn` child starts
+with the resident Python parent's prior RSS high-water mark; those equal inherited values were
+discarded rather than presented as command memory. Every candidate report and both `du` totals
+agreed on 5,327,636,580 logical and 5,341,753,344 allocated bytes across 6,948 entries. Source,
+target identity and the target/marker metadata vector remained unchanged. Matrix and harness
+SHA-256 values are respectively
+`0692b87d64365d0d9701d0fb803d73bd26842767f8f8127fe67b143c3490ce60` and
+`ef209fd3eb8475bcb95da64dc1c38ff9ac246ada3d4bd811c1f38909e1b7f20f`.
+
+The same exact binary observed all 13 registered Glaeda worktrees while no Cargo/rustc process was
+active. Eleven targets were present and two absent. The present targets contained 111,858 entries,
+95,312,350,828 logical bytes and 95,514,734,592 visible allocated bytes; per-target allocation
+ranged from 3,162,734,592 to 18,379,030,528 bytes. All eleven target/checkout and descendant-owner
+checks passed, all hardlink coverage was complete inside the observed trees, and every byte total
+matched the two GNU `du` controls. The 3,162,734,592-byte minimum is this candidate's disposable
+verification target; excluding it leaves 92,352,000,000 allocated bytes in ten pre-existing
+targets. Current activity, last successful use, rebuild cost, retention value and deletion
+authority remain unknown for every row. Inventory and inventory-harness SHA-256 values are
+`c4755a0a496f267ff1ba845da08d930ba8e959d2e72dd949d96013449711fe68` and
+`d72bc472fd29a3c601391bb785bda23bdd89b24d4fbb3faa52041b633895ba6d`.
+
+This slice performs no holder scan, benchmark-result reuse, cache adoption, worktree cleanup,
+retirement or deletion. The next #926 experiment must attach exact cold-versus-warm rebuild cost
+and direct holder evidence to these opaque target generations before proposing any retention
+policy.
+
+## Checkout-local Cargo target positive-holder observation — 2026-08-30
+
+The next issue #926 slice adds positive-only Linux reference evidence without turning a zero count
+into absence or cleanup authority. Exact measured code head
+`ab22d7b379865b74dc36e2818c3127e554d8832a` / tree
+`556b37c7b96a0c0c8ac4c474c395ecbd242efb61` produced a 1,830,392-byte release
+`glaeda-cargo-target-holders`, SHA-256
+`9698871c4c29bbd518b4d1900aca029893ebccc9a4df754a3b5c7ab2f64c0385`.
+
+The command brackets one bounded `/proc` scan with equal offline checkout observations and binds
+the result to the cost observer's exact physical target identity. It counts visible process CWD,
+root, open-FD, mapped-file and unique mount-namespace references. Output retains no PID, process
+name, command, path, file name, map row, mount row or environment value. Foreign/root processes
+whose evidence the caller cannot read are counted as incomplete. The scan is explicitly non-atomic,
+and `universal_absence_proven` is always false. Its only dispositions are `holders_observed` and
+`none_observed`; neither authorizes retention, signaling, cleanup or deletion.
+
+The no-holder matrix compared three complete processes on the same unchanged target:
+
+1. conventional recursive `lsof 4.99.4 +D`, which walks the named tree and emits raw file/process
+   fields;
+2. an independent Python 3.14.4 implementation of the same positive `/proc` categories and
+   bounds, without Glaeda's Git/target identity or typed error surface;
+3. the compiled Glaeda command, including two complete checkout observations and the typed holder
+   report.
+
+One warmup per arm preceded 30 measurements per arm in rotating six-permutation order. Wall and
+child CPU came from direct shell-free `posix_spawn`/`wait4` execution. Max RSS was measured in a
+separate ten-sample rotating matrix using GNU `time %M` around each exact command so timing did not
+include the measurement wrapper.
+
+| Complete observation | n | Median wall | p95 wall | Median child CPU | Median / max RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| recursive `lsof +D` | 30 | 139.637090 ms | 156.596921 ms | 136.757500 ms | 5,934 / 6,284 KiB |
+| direct Python `/proc` | 30 | 80.8384935 ms | 86.404635 ms | 80.714500 ms | 14,736 / 14,744 KiB |
+| typed Glaeda report | 30 | 79.5290195 ms | 91.491790 ms | 85.210000 ms | 5,704 / 5,784 KiB |
+
+Against recursive `lsof`, Glaeda reduced median wall by 60.1080705 ms / 43.0459%, p95 by
+41.5750%, and median child CPU by 37.6926%; median RSS was 230 KiB / 3.8760% lower. Against the
+direct Python oracle, Glaeda reduced median wall by only 1.309474 ms / 1.6199%. It was not a
+uniform latency or CPU win: p95 was 5.087155 ms / 5.8876% higher and median child CPU was
+4.495500 ms / 5.5696% higher. Median RSS was 9,032 KiB / 61.2921% lower. The additional work buys
+typed checkout/target identity, fixed bounds, fail-closed drift handling and a stable path-private
+schema rather than a raw `/proc` speedup.
+
+Every timed arm produced `none_observed`; both typed implementations kept
+`universal_absence_proven=false`. Glaeda examined 433-435 process entries, completed 145-147 and
+marked 287-288 incomplete, examined 9,207-9,227 FDs, 386-388 readable maps and three mount
+namespaces, and read 5,126,473-5,139,299 pseudo-file bytes. The target identity remained exact.
+
+A separate physical positive oracle started one owned `/usr/bin/sleep` with its CWD at the target
+root and stdin open on one fixed regular target file. Python and Glaeda each reported exactly one
+holder, CWD process and open-FD process; Glaeda excluded itself and retained
+`universal_absence_proven=false`. `lsof +D` emitted a matching positive field record but still
+exited one on this recursive walk, proving that its exit status alone cannot distinguish no match
+from a positive incomplete traversal here. The harness sent SIGTERM only to its owned fresh process
+group, reaped it, and proved its `/proc` entry absent.
+
+Final no-holder matrix, Python control, matrix harness, positive harness and positive receipt
+SHA-256 values are respectively
+`afa1380face7cc075dccdd7981be96d527c9390ec536365ec1d677cc42c8b0cf`,
+`cfe0a98294be93dff335e31c684803dd1ba802008d8b88725db70a7e505ed704`,
+`9b4e2991bf15d5a5612a8fdf030b2e4c64625aaad87600fc2179584f2275db87`,
+`a1e04cf67c69ccf1a39c5601f7a3fbbd81e8476f632b93429fca202b4a868dcc`, and
+`b27e09e3a37afc2cebfd5d154d73c7e908b660503e6540bd48e4d1606ef74a53`.
+
+One earlier matrix used direct `wait4.ru_maxrss` and returned the identical 19,836 KiB launcher
+high-water mark for all three arms. Its latency results were semantically valid but its RSS column
+was not discriminating, so the entire receipt, SHA-256
+`8228bf9a23b03d65f52a5fed704c6088b6ed4df2fbc3af243118e01f4ae85fca`, is excluded from reported
+results. No benchmark process survived. This slice still adds no lock, lease, liveness proof,
+retention policy, reclamation or deletion path; cold-versus-warm rebuild value remains the next
+independent decision input.
+
+## Checkout-local Cargo target rebuild-value composition — 2026-08-30
+
+The next issue #926 slice consumes the schema-v6 measurements produced by `glaeda-hot-run` rather
+than copying benchmark numbers into policy by hand. Measured production and integration-test source
+SHA-256 values were respectively
+`da5f9dc9f93a8385be749fdd95b4dfbfbd1e81c58181ff8a783bd47615e53cda` and
+`38f17147b6112f0e62196615acfbcbd030fb8e8477f5a96981583b782fb4caca`.
+
+The typed command accepts 1-32 explicit private cold receipts and 1-32 warm receipts. It requires
+schema v6, one `target:native` cache view, a successful command, exact comparison/resource/runtime
+equality, the current checkout observation, absent-before cold samples and current-target-ID warm
+reuse. Descriptor-bound file reads reject symlinks, foreign ownership, group/other permission bits,
+more than 1 MiB, metadata drift and duplicate device/inode identities. Equal complete
+checkout/target snapshots bracket the join. The result remains non-atomic, labels caller-supplied
+receipt authenticity unproven, and grants no retention or mutation authority. It explicitly reports
+last successful use as unknown because schema v6 has no epoch timestamp.
+
+The physical workload was a dependency-free Rust 2024 library at exact commit
+`fb75586274c0178e4130d6165875fb4e997c5873`. Five cold `cargo test --locked --quiet` samples each
+started after removal of the route-owned fixture's `target`; twenty warm samples retained the final
+target. All 25 commands passed. The exact comparison key was
+`sha256:bc792d28c871d388676d3ae61597c8554a7b93dce40b80538065a052cea7317e`.
+
+| Workload result | n | Median wall | Median total CPU | Median max RSS |
+| --- | ---: | ---: | ---: | ---: |
+| cold rebuild | 5 | 118.094 ms | 200 ms | 196,544 KiB |
+| warm reuse | 20 | 24.564 ms | 20 ms | 160,098 KiB |
+
+The retained target occupied 8,130,560 visible allocated bytes. Warm reuse saved 93.530 ms /
+79.1996% at the median, a 4.8076x speedup, plus 180 ms median CPU; median max RSS was 36,446 KiB
+lower. These tiny-crate results prove the composition and reset discriminator, not Glaeda's
+full-suite economics. The separate full Glaeda workload above remains the representative result:
+43.985 seconds cold versus 3.355 seconds warm, saving 40.630 seconds / 92.37% / 13.11x while
+retaining about 1.895 GB.
+
+The value command itself was compared with two standalone Python 3.14.4 controls over the identical
+25-file corpus. `python_simple` parsed and calculated medians only. `python_checked` additionally
+validated the receipt/source/target relationships but did not freshly observe Git or the target
+filesystem. Glaeda performed the bounded descriptor checks plus two complete current checkout and
+target observations. One warmup preceded 30 rotating-order runs per arm; ten separately rotated GNU
+time runs measured RSS.
+
+| Complete process | n | Median wall | p95 wall | Median child CPU | Median / max RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Python arithmetic-only lower bound | 30 | 31.748246 ms | 34.865142 ms | 31.567500 ms | 16,888 / 17,044 KiB |
+| Python receipt relationship checks | 30 | 32.275685 ms | 34.797623 ms | 32.103000 ms | 17,042 / 17,120 KiB |
+| typed Glaeda plus fresh physical binding | 30 | 43.621420 ms | 67.015977 ms | 50.267500 ms | 5,298 / 5,372 KiB |
+
+Glaeda's additional current-state binding cost 11.345736 ms / 35.15% median wall over the checked
+Python control and had a wider p95, while using 11,744 KiB / 68.91% less median RSS. All 90 timed
+processes returned exactly equal cold/warm/savings values. The result is a safety/evidence tradeoff,
+not a parser-speed claim.
+
+Final report, accepted-receipt-set, benchmark harness and independent control SHA-256 values were
+respectively `9d0c4e1845e6675a26f0e5967c03f3006902c95e5d1d455084ce699618174bfa`,
+`e08712d62e09656d29fc88e58c5d8a474471fc069a1d01dd3e9019acc18b6e92`,
+`1734c4340a02ee7de377c764149a0f12031e11dead92cf4402d6621c10142729`, and
+`41c22c69bb640a6d9bedf36e60a360f2651f2521641c32379b2fe0cc4acc8b07`. One earlier corpus was
+invalidated before timing because the fixture had not ignored `target/`, so the cold build changed
+its checkout observation. That corpus is excluded rather than averaged. No benchmark worker or
+listener survived; only the named route-owned evidence directory remained for publication.
