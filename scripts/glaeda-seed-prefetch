@@ -681,23 +681,58 @@ def interface_bytes() -> int | None:
     return total if seen else None
 
 
-def tree_bytes(root: Path) -> int:
-    """The size of every regular file under ROOT: the downloads r2-cache.sh stages there."""
-    total = 0
-    for folder, _dirs, files in os.walk(root):
-        for name in files:
+class DownloadBytes:
+    """The bytes the downloads in process group PGID have written so far, counted as they grow.
+
+    r2-cache.sh's curl writes each archive with `-o PATH` into a `mktemp -d` directory (macOS mktemp puts
+    it in the per-user temp directory, whatever TMPDIR says), so the curls in the group are found with ps
+    and their -o files are measured. Growth only: a file that is deleted or replaced adds nothing.
+    """
+
+    def __init__(self, pgid: int) -> None:
+        self.pgid, self.sizes, self.total = pgid, {}, 0
+
+    def outputs(self) -> list[str]:
+        paths = []
+        for line in running_group_commands(self.pgid):
+            argv = line.split()
+            if not argv or os.path.basename(argv[0]) != "curl":
+                continue
+            for flag, value in zip(argv, argv[1:]):
+                if flag in ("-o", "--output") and value.startswith("/"):
+                    paths.append(value)
+        return paths
+
+    def __call__(self) -> int:
+        for path in self.outputs():
             try:
-                total += os.lstat(os.path.join(folder, name)).st_size
+                size = os.stat(path).st_size
             except OSError:
-                pass
-    return total
+                continue
+            self.total += max(0, size - self.sizes.get(path, 0))
+            self.sizes[path] = size
+        return self.total
+
+
+def running_group_commands(pgid: int) -> list[str]:
+    """The command lines of the processes in process group PGID."""
+    try:
+        out = subprocess.run(["ps", "-axww", "-o", "pgid=,command="], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    commands = []
+    for line in out.stdout.splitlines():
+        group, _, command = line.strip().partition(" ")
+        if group == str(pgid):
+            commands.append(command.strip())
+    return commands
 
 
 class Governor:
     """Paces an R2 download by the running job's own use of the network, not by the job's existence.
 
     Each TICK it reads the bytes the mini received (interface_bytes) and the bytes the download has
-    written (tree_bytes of its staging directory); the difference is the job's traffic. While a job runs
+    written (DownloadBytes); the difference is the job's traffic. While a job runs
     and its traffic stayed over FOREIGN_BUSY_BPS within the last HOT_HOLD seconds (checkout, a seed or
     product download, package resolution), the download's process group is paused whenever it is ahead of
     RATE bytes a second, and resumed when it is not. Otherwise (a job compiling or testing, or no job) it
@@ -705,11 +740,11 @@ class Governor:
     server or curl timeout. When the traffic cannot be read, every job counts as network-heavy.
     """
 
-    def __init__(self, pgid: int, own: Path, rate: int, job: Callable[[], str],
+    def __init__(self, pgid: int, rate: int, job: Callable[[], str],
                  read_interface: Callable[[], int | None] = interface_bytes,
-                 read_own: Callable[[Path], int] = tree_bytes, tick: float = 1.0) -> None:
-        self.pgid, self.own, self.rate, self.job, self.tick = pgid, own, rate, job, tick
-        self.read_interface, self.read_own = read_interface, read_own
+                 read_own: Callable[[], int] | None = None, tick: float = 1.0) -> None:
+        self.pgid, self.rate, self.job, self.tick = pgid, rate, job, tick
+        self.read_interface, self.read_own = read_interface, read_own or DownloadBytes(pgid)
         self.stop_event = threading.Event()
         self.paused = False
         self.stats = {"hot_seconds": 0.0, "paused_seconds": 0.0, "peak_job_bps": 0}
@@ -722,12 +757,12 @@ class Governor:
             pass
 
     def loop(self) -> None:
-        last_in, last_own, last = self.read_interface(), self.read_own(self.own), time.monotonic()
+        last_in, last_own, last = self.read_interface(), self.read_own(), time.monotonic()
         hot_until, job_checked, has_job, allowance = 0.0, 0.0, True, 0.0
         while not self.stop_event.wait(self.tick):
             now = time.monotonic()
             dt = max(now - last, 1e-3)
-            received, own = self.read_interface(), self.read_own(self.own)
+            received, own = self.read_interface(), self.read_own()
             own_delta = max(0, own - last_own)
             if received is None or last_in is None:
                 foreign = None
@@ -775,8 +810,8 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "")
     shutil.rmtree(mirror.parent / "curl-busy", ignore_errors=True)  # the old fixed-rate .curlrc
     env["CMUX_SEED_GIT_DIR"] = os.fspath(mirror)
     env["CI_CACHE_R2_PUBLIC_URL"] = BUCKET_URL
-    # r2-cache.sh stages each archive under TMPDIR; kept under .prefetch, a killed download's partial
-    # archive is wiped by the next run instead of waiting for macOS temp cleanup.
+    # For cmux's Python temp files. r2-cache.sh's `mktemp -d` ignores TMPDIR on macOS (it uses the
+    # per-user temp directory), so its archives are found through curl's -o instead (DownloadBytes).
     env["TMPDIR"] = os.fspath(mirror.parent / "tmp")
     env["PATH"] = f"{TOOL_PATH}:{env.get('PATH', '/usr/bin:/bin')}"
     # Its own process group, so a timeout also stops the downloads r2-cache.sh started.
@@ -797,7 +832,7 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "")
         sys.exit(128 + signum)
 
     previous = {signum: signal.signal(signum, on_signal) for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
-    governor = Governor(child.pid, Path(env["TMPDIR"]), BUSY_RATE, busy) if job else None
+    governor = Governor(child.pid, BUSY_RATE, busy) if job else None
     try:
         if governor:
             governor.__enter__()

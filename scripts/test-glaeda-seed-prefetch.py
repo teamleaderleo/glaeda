@@ -296,8 +296,8 @@ class GovernorTest(unittest.TestCase):
         return out.stdout.strip().startswith("T")
 
     def governor(self, rate: int = 1000) -> "sp.Governor":
-        return sp.Governor(self.proc.pid, Path("/nonexistent"), rate, lambda: self.job,
-                           read_interface=lambda: self.received, read_own=lambda _p: self.own, tick=0.05)
+        return sp.Governor(self.proc.pid, rate, lambda: self.job,
+                           read_interface=lambda: self.received, read_own=lambda: self.own, tick=0.05)
 
     def run_for(self, seconds: float, job_bps: int, own_bps: int) -> None:
         end = time.monotonic() + seconds
@@ -330,12 +330,33 @@ class GovernorTest(unittest.TestCase):
             self.assertFalse(self.stopped())
 
     def test_unreadable_counters_count_a_job_as_downloading(self):
-        governor = sp.Governor(self.proc.pid, Path("/nonexistent"), 1000, lambda: "job",
-                               read_interface=lambda: None, read_own=lambda _p: self.own, tick=0.05)
+        governor = sp.Governor(self.proc.pid, 1000, lambda: "job",
+                               read_interface=lambda: None, read_own=lambda: self.own, tick=0.05)
         with governor:
             self.run_for(0.4, job_bps=0, own_bps=50_000_000)
             self.assertTrue(self.stopped())
         self.assertFalse(self.stopped())  # leaving the governor always resumes the download
+
+    def test_download_bytes_follows_the_curls_in_the_group_by_their_output_file(self):
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        archive = base / "tmp.X" / "archive"
+        archive.parent.mkdir()
+        archive.write_bytes(b"x" * 100)
+        pgid = self.proc.pid
+        lines = [f"curl --fail --silent -o {archive} https://ci-cache.cmux.com/v1/k.tar.zst", "bash r2-cache.sh restore"]
+        saved = sp.running_group_commands
+        sp.running_group_commands = lambda group: lines if group == pgid else []
+        try:
+            counter = sp.DownloadBytes(pgid)
+            self.assertEqual(counter(), 100)
+            archive.write_bytes(b"x" * 350)
+            self.assertEqual(counter(), 350)
+            archive.unlink()  # unpacked and removed: nothing more, nothing less
+            self.assertEqual(counter(), 350)
+        finally:
+            sp.running_group_commands = saved
+        self.assertIn(f"sleep 60", " ".join(sp.running_group_commands(pgid)))
 
     def test_interface_bytes_reads_only_physical_links(self):
         out = subprocess.CompletedProcess([], 0, (
