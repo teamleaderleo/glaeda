@@ -743,16 +743,25 @@ class GlaedaDiskTest(unittest.TestCase):
             make(ci / "seeds" / name, age_hours=age)
         log = self.root / "serve.jsonl"
         archive, mini = "172.20.21.158", "172.20.21.9"
-        (log.with_name("serve.jsonl.1")).write_text(
-            json.dumps({"client": archive, "outcome": "list", "role": "seed", "count": 5}) + "\n"
-            + json.dumps({"client": archive, "outcome": "served", "role": "seed", "status": 0, "key": "p-c"}) + "\n")
+
+        def rec(client: str, outcome: str, **kw) -> str:
+            return json.dumps({"client": client, "outcome": outcome, "role": "seed", **kw})
+
+        lst = rec(archive, "list", count=5)
+        (log.with_name("serve.jsonl.1")).write_text("\n".join([
+            lst, rec(archive, "served", status=0, key="p-c"),
+            rec(archive, "served", status=0, key="p-b"), lst, lst]) + "\n")
         log.write_text("\n".join([
-            "not json",
-            json.dumps({"client": archive, "outcome": "served", "role": "seed", "status": 0, "key": "p-a"}),
-            json.dumps({"client": archive, "outcome": "failed", "role": "seed", "status": 1, "key": "p-d"}),
+            "not json", json.dumps({"client": ["x"], "outcome": "list"}), "[" * 5000,
+            lst, rec(archive, "served", status=0, key="p-a"),
+            rec(archive, "failed", status=1, key="p-d"),
             # a client that never listed is not the archive
-            json.dumps({"client": mini, "outcome": "served", "role": "seed", "status": 0, "key": "p-e"}),
-        ]) + "\n")
+            rec(mini, "served", status=0, key="p-e"),
+            lst, lst,
+            # served but not yet seen held by two later lists: the archive may still reject it
+            rec(archive, "served", status=0, key="p-f"), lst,
+            # the archive asked for p-b again (its check failed there): only a key's newest request counts
+            rec(archive, "served", status=0, key="p-b")]) + "\n")
         self.assertEqual(gd.archived_seeds(log), {"p-a", "p-c"})
         self.assertEqual(gd.archived_seeds(self.root / "missing.jsonl"), frozenset())
         # a real DerivedData's module cache is wider than cmux_active's search budget, which reads as busy:

@@ -214,29 +214,41 @@ SEED_SERVE_LOG = HOME / ".local/state/glaeda/seed-serve/serve.jsonl"
 
 
 def archived_seeds(log: Path | None = None) -> frozenset[str]:
-    """Seed keys this seeder streamed whole to the seed archive, read from its serve log (and the rotated one).
+    """Seed keys the seed archive holds, as far as this seeder's serve log (and the rotated one) can show.
 
-    Only the archive's filler asks seed-list-v1, so a client address that listed and then got `served` with
-    status 0 names a seed the archive's SSD now holds, and the PR minis restore it from there over the LAN
-    (63 to 184 s against about 15 minutes cold). Such a seed need not wait out the idle window on this disk.
+    Only the archive's filler asks seed-list-v1, so a client address that lists is the archive. A clean
+    `served` alone is not enough: the filler still checks and renames the file afterwards and drops it on
+    failure. Each run lists first, then asks for every seed it lacks, so two later lists from that client
+    with no new request for the key mean the archive saw the seed as present. The PR minis restore it from
+    there over the LAN (63 to 184 s against about 15 minutes cold), so it need not wait out the idle window.
     A client that lied about being the archive can only make a seed go early, and the next job refetches it.
     An unreadable or rotated-away log proves nothing, so the seed keeps its usual window.
     """
     log = SEED_SERVE_LOG if log is None else log
-    lines: list[dict] = []
+    records: list[dict] = []
     for path in (log.with_name(log.name + ".1"), log):
         try:
             text = path.read_text(errors="replace")
         except OSError:
             continue
         for line in text.splitlines():
-            with contextlib.suppress(ValueError):
-                if isinstance(record := json.loads(line), dict):
-                    lines.append(record)
-    listers = {r.get("client") for r in lines if r.get("outcome") == "list" and r.get("role") == "seed"}
-    return frozenset(r["key"] for r in lines
-                     if r.get("outcome") == "served" and r.get("status") == 0 and r.get("role") == "seed"
-                     and r.get("client") in listers and isinstance(r.get("key"), str))
+            with contextlib.suppress(ValueError, RecursionError):
+                record = json.loads(line)
+                if isinstance(record, dict) and isinstance(record.get("client"), str) \
+                        and record.get("role") == "seed":
+                    records.append(record)
+    lists: dict[str, int] = {}  # client -> lists seen after the record being read (walking backwards)
+    decided: set[str] = set()
+    held: set[str] = set()
+    for r in reversed(records):
+        client, outcome, key = r["client"], r.get("outcome"), r.get("key")
+        if outcome == "list":
+            lists[client] = lists.get(client, 0) + 1
+        elif isinstance(key, str) and key not in decided and outcome in ("served", "failed"):
+            decided.add(key)  # only a key's newest request counts
+            if outcome == "served" and r.get("status") == 0 and lists.get(client, 0) >= 2:
+                held.add(key)
+    return frozenset(held)
 
 
 def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[str] = frozenset()) -> float:
