@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import runpy
 import subprocess
 import sys
@@ -32,6 +34,23 @@ def read_plan(profile: str) -> dict[str, object]:
 
 
 class VerifyPlanTests(unittest.TestCase):
+    def test_focused_plan_is_fixed_and_credentialless_compatible(self) -> None:
+        plan = read_plan("focused")
+        self.assertEqual(plan["profile"], "focused")
+        self.assertEqual(plan["authority"], "developer_feedback_only")
+        self.assertEqual(
+            [phase["name"] for phase in plan["phases"]],
+            ["compile-all-targets", "format", "repo-query-integration"],
+        )
+        self.assertEqual(
+            plan["phases"][0]["argv"],
+            ["cargo", "check", "--locked", "--all-targets", "--all-features"],
+        )
+        self.assertEqual(
+            plan["phases"][2]["argv"],
+            ["cargo", "test", "--locked", "--test", "repo_query_cli"],
+        )
+
     def test_required_profile_is_the_exact_eight_step_agents_sequence(self) -> None:
         plan = read_plan("required")
         self.assertEqual(plan["authority"], "repository_required_checks")
@@ -166,12 +185,15 @@ class VerifyPlanTests(unittest.TestCase):
         )
 
     def test_plans_are_path_free_and_retain_no_logs(self) -> None:
-        for profile in ("fast", "full-tests", "required"):
+        for profile in ("focused", "fast", "full-tests", "required"):
             plan = read_plan(profile)
             encoded = json.dumps(plan, sort_keys=True)
             self.assertNotIn(str(ROOT), encoded)
             self.assertFalse(plan["retained_logs"])
             self.assertTrue(plan["source_must_remain_unchanged"])
+            self.assertEqual(
+                plan["execution_environment"]["file_creation_umask"], "0022"
+            )
 
     def test_source_state_detects_content_changes_with_the_same_git_status(self) -> None:
         source_state = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")[
@@ -285,6 +307,7 @@ class VerifyPlanTests(unittest.TestCase):
 
             encoded = json.dumps(observation, sort_keys=True)
             self.assertEqual(observation["cargo_build_jobs"]["value"], 4)
+            self.assertEqual(observation["file_creation_umask"], "0022")
             self.assertEqual(observation["cargo_target"]["source"], "configured")
             self.assertNotIn(directory, encoded)
             self.assertRegex(
@@ -315,7 +338,76 @@ class VerifyPlanTests(unittest.TestCase):
             receipt_destination(ROOT, ROOT / "verification-receipt.json")
         with tempfile.TemporaryDirectory() as directory:
             expected = Path(directory) / "verification-receipt.json"
-            self.assertEqual(receipt_destination(ROOT, expected), expected)
+            canonical = expected.parent.resolve(strict=True) / expected.name
+            self.assertEqual(receipt_destination(ROOT, expected), canonical)
+
+    def test_summary_mode_counts_and_hashes_combined_phase_output(self) -> None:
+        execute_phase = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")[
+            "execute_phase"
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            program = fixture / "producer"
+            program.write_text(
+                "#!/usr/bin/python3\n"
+                "import os\n"
+                "os.write(1, b'alpha\\n')\n"
+                "os.write(2, b'beta')\n",
+                encoding="utf-8",
+            )
+            program.chmod(0o755)
+
+            returncode, summary, raw_output = execute_phase(
+                program, (), fixture, "summary"
+            )
+            expected = b"alpha\nbeta"
+            self.assertEqual(returncode, 0)
+            self.assertIsNotNone(summary)
+            self.assertEqual(summary.byte_count, len(expected))
+            self.assertEqual(summary.line_count, 2)
+            self.assertEqual(
+                summary.digest,
+                f"sha256:{hashlib.sha256(expected).hexdigest()}",
+            )
+            self.assertEqual(summary.tail, expected)
+            self.assertIsNone(raw_output)
+
+    def test_phase_child_uses_profile_umask_instead_of_ambient_umask(self) -> None:
+        execute_phase = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")[
+            "execute_phase"
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            program = fixture / "producer"
+            program.write_text(
+                "#!/usr/bin/python3\n"
+                "from pathlib import Path\n"
+                "Path('created').mkdir()\n",
+                encoding="utf-8",
+            )
+            program.chmod(0o755)
+            previous = os.umask(0o002)
+            try:
+                for mode in ("summary", "stream"):
+                    phase_root = fixture / mode
+                    phase_root.mkdir()
+                    returncode, summary, raw_output = execute_phase(
+                        program, (), phase_root, mode
+                    )
+                    self.assertEqual(returncode, 0)
+                    if mode == "summary":
+                        self.assertIsNotNone(summary)
+                    else:
+                        self.assertIsNone(summary)
+                    self.assertIsNone(raw_output)
+                    self.assertEqual(
+                        (phase_root / "created").stat().st_mode & 0o777, 0o755
+                    )
+                ambient_after = os.umask(0o002)
+            finally:
+                os.umask(previous)
+
+            self.assertEqual(ambient_after, 0o002)
 
     def test_failed_phase_still_writes_a_terminal_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -352,6 +444,97 @@ class VerifyPlanTests(unittest.TestCase):
             self.assertEqual(receipt["phases"][0]["name"], "unit-and-binary-tests")
             self.assertEqual(receipt["phases"][0]["exit_code"], 7)
             self.assertTrue(receipt["source"]["unchanged"])
+
+    def test_summary_mode_preserves_both_edges_and_raw_large_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_cargo = fixture / "cargo"
+            fake_cargo.write_text(
+                "#!/usr/bin/python3\n"
+                "import sys\n"
+                "sys.stdout.write('EARLY_DIAGNOSTIC\\n' + 'x' * 20000 + "
+                "'\\nFINAL_DIAGNOSTIC\\n')\n"
+                "raise SystemExit(7)\n",
+                encoding="utf-8",
+            )
+            fake_cargo.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fixture}:/usr/bin:/bin"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(VERIFY),
+                    "fast",
+                ],
+                cwd=ROOT,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 7)
+            self.assertIn("EARLY_DIAGNOSTIC", result.stderr)
+            self.assertIn("FINAL_DIAGNOSTIC", result.stderr)
+            self.assertIn("head_bytes=8192 tail_bytes=8192", result.stderr)
+            self.assertRegex(result.stderr, r"omitted_bytes=[1-9][0-9]*")
+            self.assertRegex(result.stderr, r"output_bytes=2003[0-9]")
+            self.assertRegex(result.stderr, r"output_lines=3")
+            self.assertRegex(result.stderr, r"output_digest=sha256:[0-9a-f]{64}")
+            match = re.search(r"raw_output=(.+)", result.stderr)
+            self.assertIsNotNone(match)
+            raw_output = Path(match.group(1).strip())
+            try:
+                self.assertEqual(raw_output.stat().st_mode & 0o777, 0o600)
+                raw = raw_output.read_text(encoding="utf-8")
+                self.assertIn("EARLY_DIAGNOSTIC", raw)
+                self.assertIn("FINAL_DIAGNOSTIC", raw)
+                self.assertEqual(len(raw), 20035)
+            finally:
+                raw_output.unlink(missing_ok=True)
+
+    def test_summary_mode_prints_a_small_failure_in_full(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_cargo = fixture / "cargo"
+            fake_cargo.write_text(
+                "#!/bin/sh\nprintf 'FIRST_DIAGNOSTIC\\nSECOND_DIAGNOSTIC\\n'\nexit 7\n",
+                encoding="utf-8",
+            )
+            fake_cargo.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fixture}:/usr/bin:/bin"
+
+            result = subprocess.run(
+                [sys.executable, str(VERIFY), "fast"],
+                cwd=ROOT,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 7)
+            self.assertIn("head_bytes=35 tail_bytes=0 omitted_bytes=0", result.stderr)
+            self.assertIn("FIRST_DIAGNOSTIC\nSECOND_DIAGNOSTIC\n", result.stderr)
+            match = re.search(r"raw_output=(.+)", result.stderr)
+            self.assertIsNotNone(match)
+            raw_output = Path(match.group(1).strip())
+            try:
+                self.assertEqual(raw_output.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(
+                    raw_output.read_text(encoding="utf-8"),
+                    "FIRST_DIAGNOSTIC\nSECOND_DIAGNOSTIC\n",
+                )
+            finally:
+                raw_output.unlink(missing_ok=True)
 
     def test_plan_only_mode_rejects_a_receipt_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

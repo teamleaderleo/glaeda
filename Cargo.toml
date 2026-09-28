@@ -26,6 +26,12 @@ signal-hook = { version = "=0.4.4", default-features = false }
 # Guarantee compiler-resistant wiping for controller credentials and one-time JIT material.
 zeroize = "1.8.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Seal an admitted benchmark's CPU affinity without project-local unsafe BPF code.
+seccompiler = { version = "0.5.0", default-features = false }
+# Supply the audited syscall and errno constants used by the one-rule seccomp filter.
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Read the controller GitHub App key directly from the macOS Keychain without a secret-bearing
 # subprocess, argv, environment, or public execution record.

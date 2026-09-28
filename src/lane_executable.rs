@@ -156,8 +156,33 @@ pub fn verify_lane_command(
     command
         .required_programs()
         .into_iter()
-        .map(verify_executable)
+        .map(verify_lane_command_executable)
         .collect()
+}
+
+fn verify_lane_command_executable(
+    path: &Path,
+) -> Result<VerifiedExecutable, ExecutableVerificationError> {
+    #[cfg(test)]
+    if is_supported_environment_executable_path(path) {
+        return Ok(VerifiedExecutable {
+            path: path.to_path_buf(),
+            mode: 0o755,
+        });
+    }
+    verify_executable(path)
+}
+
+#[cfg(test)]
+pub(crate) fn test_environment_executable() -> VerifiedEnvironmentExecutable {
+    let path = match fs::symlink_metadata(CLASSIC_ENV_PATH) {
+        Ok(metadata) if metadata.file_type().is_symlink() => UBUNTU_RUST_COREUTILS_ENV_PATH,
+        _ => CLASSIC_ENV_PATH,
+    };
+    VerifiedEnvironmentExecutable(VerifiedExecutable {
+        path: PathBuf::from(path),
+        mode: 0o755,
+    })
 }
 
 /// Verify one reviewed absolute executable path without following a final symlink.
@@ -272,6 +297,8 @@ fn verify_observation(
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::fs;
+    use std::os::unix::fs::MetadataExt as _;
     use std::path::Path;
 
     use crate::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
@@ -438,6 +465,12 @@ mod tests {
     #[test]
     fn runner_git_command_verifies_outer_and_inner_reviewed_programs_when_present() {
         if !Path::new("/usr/sbin/runuser").exists() || !Path::new("/usr/bin/git").exists() {
+            return;
+        }
+        if fs::symlink_metadata("/usr/sbin/runuser").map_or(true, |metadata| metadata.uid() != 0) {
+            // An unprivileged single-ID user namespace reports host-root files
+            // with the overflow UID. The injected metadata tests above retain
+            // exact owner-policy coverage without treating that view as a host.
             return;
         }
         let runner = runner();

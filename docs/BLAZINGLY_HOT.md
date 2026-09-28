@@ -41,6 +41,43 @@ work becomes known
 
 For hostile or unknown work, the quickest safe path may still be a fresh worker. For trusted repeated work, the quickest path may be a prepared environment or warm pool. For ultra-trusted work, the winning optimization is often to keep valuable state resident.
 
+## Native handoff principle
+
+Glaeda should be a thin semantic compiler into the operating system wherever mature primitives
+already provide the physical mechanism:
+
+```text
+exact workload intent + trust + reusable-state identity
+-> choose the cheapest trustworthy native mechanism
+-> hand runnable work to the operating system
+-> observe the effective kernel/filesystem state
+-> return a bounded durable receipt
+```
+
+The ordinary Linux scheduler, page cache, cgroups, process descriptors, filesystems, mount API,
+reflinks and service manager are the baseline implementation toolkit. Glaeda adds the semantic
+identity, authority boundary, composition, validation, recovery and evidence those mechanisms do
+not provide by themselves. It should not remain in the workload hot path merely to duplicate an
+operating-system decision.
+
+The default comparison is therefore native, not bespoke. A custom placement, cache, filesystem or
+lifecycle policy earns promotion only when a complete-loop experiment shows that native behavior
+leaves a material gap and the candidate preserves stronger semantics. If the native control wins,
+keep it.
+
+Big Red's bounded CPU concurrency controls illustrate the rule. At four simultaneous warm
+verification loops, ordinary unpinned Linux scheduling delivered 1.0882 loops/second, external
+`taskset` 1.0496 and Glaeda's opt-in crash-clean CPU-set prototype 1.0325. The explicit set still
+had value for reproducible, collision-free benchmark controls and reduced maximum worker RSS from
+42,278 to 39,246 KiB, but it did not justify a general scheduler. Ordinary work remains unpinned;
+reservations come and go only for experiments that require disjoint placement. Exact evidence and
+candidate scope are tracked in [#953](https://github.com/teamleaderleo/glaeda/issues/953) and
+[#955](https://github.com/teamleaderleo/glaeda/pull/955).
+
+This same rule explains the current storage direction: native OverlayFS for mostly-read task views,
+native CoW/reflink lineage for write-heavy private state where it wins, ordinary private state when
+sharing has no measured value, and native page-cache residency instead of a Glaeda byte cache.
+
 ## Current experiment owners
 
 Keep the implementation lanes separate enough that measurements remain interpretable:
@@ -161,6 +198,12 @@ Do not promote a filesystem primitive because its microbenchmark is attractive. 
 
 ### Ultra-trusted local hot-run prototype
 
+For native SwiftPM, Xcode, and Apple app build helpers, use the
+[native Apple build workflow](APPLE_NATIVE_BUILDS.md). It preserves one checkout
+and gives native cache families stable, toolchain-keyed paths with project locking
+and explicit interrupted-build recovery. Linux filesystem views below remain a
+separate backend.
+
 `scripts/hot-run` is a deliberately small Linux developer-loop prototype. It binds a task Git
 worktree onto the pathname of a warmed resident worktree. Explicit path-class policies can expose
 resident dependencies read-only, give a short-lived task a private OverlayFS upper over warmed
@@ -196,7 +239,14 @@ ambiguous cache request fall through to the unchanged Python implementation. Thi
 optimization for work that was already direct; it grants no project identity, residency, cache,
 observation, isolation, or result authority.
 
-`glaeda-hot-run` is the compiled Linux front door for the equally common measured direct case:
+The Python fallback itself uses a tiny executable launcher and an importable implementation
+module. Ordinary CPython bytecode caching therefore pays source compilation once per changed
+implementation rather than reparsing the complete hot-run implementation on every command. The
+standard cache is ignored by Git, is invalidated by Python's source/cache-tag contract, and grants
+no state, execution, or result authority; deleting it merely makes the next fallback invocation
+compile the module again.
+
+`glaeda-hot-run` is the compiled Linux and macOS front door for the equally common measured direct case:
 
 ```bash
 glaeda-hot-run \
@@ -205,7 +255,30 @@ glaeda-hot-run \
   -- cargo check --locked
 ```
 
-It preserves the schema-v6 measurement shape, workload-scoped GNU-time CPU/RSS boundary, aggregate
+On macOS, it executes directly inside the existing project checkout, retains native build caches
+between invocations, and records schema-v6 wall time plus the command's exit or signal. For a Mac
+project such as cmux, keep one canonical checkout and invoke the normal native build tool there:
+
+```bash
+glaeda-hot-run \
+  --resident /path/to/cmux --task /path/to/cmux/cmux-tui \
+  --cache cmux-tui/target:native --measurement /private/cmux-warm.json \
+  -- cargo test --locked -p cmux-tui-core --lib
+```
+
+The first invocation warms the tool's ordinary cache; repeated invocations reuse whatever the
+tool validates. Cargo, SwiftPM, Xcode or Zig still owns dependency and source invalidation. A
+cache miss follows the native build tool's cold rebuild path. No result is skipped based on a
+Glaeda receipt. This is ultra-trusted host execution with the caller's environment and terminal,
+not a sandbox or a managed resident lease. It creates no duplicate checkout or background daemon.
+Use the project's existing tagged build helper for Xcode builds.
+
+The Mac path rejects `--timeout`, `--resource-profile`, and `--cpu-set` before running anything.
+CPU/RSS accounting and native-target snapshots are unavailable (`null`); the Linux `/proc`
+machine probes are unavailable on macOS too. Wall time remains measured. Cross-worktree and
+private-cache requests remain unsupported rather than falling back to shared mutable state.
+
+On Linux, it preserves the schema-v6 measurement shape, workload-scoped GNU-time CPU/RSS boundary, aggregate
 machine-pressure envelope, exit-versus-signal distinction, atomic receipt publication, caller
 environment and terminal, optional comparison key, runtime executable digest, and optional
 descendant-bin binding without starting Python. The binary accepts only a task directory inside the
@@ -225,7 +298,7 @@ requests remain on `scripts/hot-run` rather than being silently weakened. This i
 observation-only ultra-trusted execution path. It grants no lease, cache, residency, validation,
 publication, or cleanup authority.
 
-When the compiled front door records an exact `target:native` declaration, its schema-v6 receipt
+On Linux, when the compiled front door records an exact `target:native` declaration, its schema-v6 receipt
 also carries a path-private `native_target_observation`. Sequential pre-command observations bind
 the checkout commit/tree/materialization and checkout-local Cargo target generation; an
 unavailable pre-command observation refuses to run an unbound measurement. After the command,
@@ -359,11 +432,12 @@ scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
   -- node ./node_modules/.bin/next build
 ```
 
-`--runtime-bin` requires a runtime ID, accepts only one absolute canonical plain directory, resolves
-the launched executable from that directory, and places the directory first in the inherited
-descendant `PATH`. The receipt records only `runtime_bin_first` plus an opaque binding digest; the
-private-state namespace also includes that digest, so bound and unbound executions or replaced
-directories cannot share mutable lineage. No private path is recorded.
+`--runtime-bin` requires a runtime ID, accepts only one absolute canonical plain directory owned by
+root or the current user and not group- or world-writable, resolves the launched executable from
+that directory, and places the directory first in the inherited descendant `PATH`. The receipt
+records only `runtime_bin_first` plus an opaque binding digest; the private-state namespace also
+includes that digest, so bound and unbound executions or replaced directories cannot share mutable
+lineage. No private path is recorded.
 
 This closes the common `/usr/bin/env node` and package-script shebang path for an explicitly
 selected ultra-trusted toolchain. It does not hash the whole toolchain tree, intercept absolute
@@ -517,6 +591,14 @@ the held directory before publishing the terminal result. Neither observation no
 the generated unit name. A fast-exiting leader and a child that creates a new session therefore
 cannot skip or escape the resource-scope settlement check.
 
+Explicitly deferrable trusted work may instead use `--resource-profile big-red-background`. That
+profile asks the native cgroup-v2 scheduler for `CPUWeight=25` without pinning CPUs or imposing a
+CPU quota, so it remains work-conserving when the machine is otherwise idle and yields relative CPU
+share when foreground work competes. It has the same required deadline, stopped entry,
+descriptor-bound cgroup observation/kill, process settlement, and measurement behavior as the
+heavy profile. Glaeda never selects this profile implicitly; the caller owns the fact that useful
+work is deferrable, and the profile grants no admission or host-wide reservation authority.
+
 The task and resident must be worktrees of the same Git repository. Direct same-worktree execution
 may declare `native` cache observations; all other explicit modes require the cross-worktree path.
 The resident worktree remains the stable compiler pathname, while task source changes remain in the
@@ -559,11 +641,79 @@ pathname replacement therefore cannot substitute a new object between validation
 consumption.
 
 An explicit `--state` remains caller-owned and can intentionally continue a lineage across
-worktree generations. Default-key v1 directories are inert after the v2 transition and are not
-adopted or deleted implicitly. All task state is expendable: discarding it or selecting a new empty
-`--state` path produces a private cold upper and a normal compiler rebuild. Bubblewrap and kernel
-OverlayFS are required for cross-worktree mode; running directly in the resident worktree does not
-require either.
+worktree generations. New implicit generations are first staged with an owner-private producer
+manifest, then atomically published under a retained namespace lock. The manifest itself is first
+written and synced under a private temporary name, moved into place with `RENAME_NOREPLACE`, and
+followed by a directory sync; interruption can therefore leave an unpublished temporary file but
+never a partially published final manifest. The reader requires canonical bytes and independently
+recomputes the v3 state digest from all seven generation objects, Git-relative relationships and
+cache modes before any retirement. The manifest carries no workflow-result or source-validity
+authority. Existing default-key v1 and v2 directories remain disjoint legacy state. A manifestless
+directory at the exact computed v3 path is a collision and fails before any lock, runtime or cache
+state is created; it is never adopted. The collector does not delete arbitrary legacy or collision
+payload. The key transition also prevents an older hot-run implementation that does not
+participate in the namespace protocol from opening a new producer-managed state concurrently.
+
+Ordinary implicit hot-run activity performs one bounded opportunistic recovery/retirement pass
+when it can take the namespace lock exclusively without waiting. No age, timeout, PID, name,
+occupancy total, or `/proc/locks` absence makes a live state eligible. A different manifested state
+is eligible only when at least one exact recorded worktree-generation object is now absent or has a
+different physical identity, every direct and runtime-subgeneration lock can be acquired
+nonblocking, the manifest is unchanged on a second read, and the generation is still unreachable
+on a second observation. The collector atomically renames that state with `RENAME_NOREPLACE` and
+syncs the namespace before allowing a new admission to cold-reconstruct the canonical path.
+Deletion stays beneath held no-follow directory descriptors on the same filesystem, never follows
+symlinks, and removes at most 2,048 entries per invocation. A private retirement record closes the
+final manifest-unlink/directory-removal crash window; later normal activity resumes an interrupted
+publication, retirement, or bounded deletion. One pass refuses after observing more than 256
+namespace entries or more than 64 entries in a candidate generation, so ordinary launch never
+materializes an unbounded directory inventory. Unpublished creating-stage recovery removes only
+at most two private regular manifest/final-manifest-temporary files beneath the exact stage; any
+other payload is preserved as recovery debt. Explicit `--state`, legacy, malformed, forged,
+noncanonical, mode-drifted, foreign-owned, active, and still-reachable state remains untouched.
+#910 tracks unreachable-generation retirement. The first #926 lifecycle slice extends only the
+same producer-managed implicit namespace; it does not adopt checkout-local Cargo targets or
+explicit `--state` directories. After each successful implicit command, while the exact state or
+runtime lock is still held, Glaeda advances one monotonic namespace use sequence in a canonical,
+private, atomically replaced catalog. Each record is bound to the immutable producer manifest's
+device, inode and creation witness. Failed, signaled and deadline-expired commands do not advance
+use. A stale record cannot attach to a cold reconstruction of the same state name because its new
+manifest object has a different witness.
+
+Normal exclusive namespace activity observes filesystem capacity with `statvfs`. At 90% used it
+atomically latches a pressure cycle; bounded later invocations continue through the hysteresis gap
+until use reaches 85% or less. At ordinary capacity the policy performs no retirement. Under
+pressure, it considers successful-use records in deterministic least-recently-used order and
+still requires an authentic reachable manifest, exact manifest-record identity, every direct and
+runtime lock acquired nonblocking, a second equal manifest and reachability observation, unchanged
+locks, and the same pinned state directory before rename. Missing, corrupt, stale, explicit,
+legacy, malformed, current, active and unknown-use state remains untouched. One invocation retires
+at most one state through the existing no-replace rename, namespace sync, external retirement
+record and descriptor-relative bounded deletion transaction.
+
+When a caller supplies a comparison key, the catalog can retain producer-observed reconstruction
+and reuse duration for later health reporting. Those caller-named comparison families never grant
+eligibility or influence retirement order. They remain performance evidence only; Glaeda's own
+successful-use sequence ranks states that the ownership and lock protocol has already made safe.
+`--verbose` reports the path-free lifecycle and success-record dispositions. #926 remains the home
+for health-view composition and for moving future ordinary Cargo targets into this managed
+producer contract; arbitrary historical worktree `target/` trees remain outside deletion authority.
+
+The bounded-discovery repair was measured at exact code `4436b3f63a7c20ae6d15bdce44a10ea6760cbfba`
+against rejected control `dbb3863c14d76880a8c7d155d84888926041c019`, Python 3.14.4 and Linux
+7.0.0-30-generic. Five hundred alternating calls over an empty namespace measured 4.480 microseconds
+control versus 4.565 microseconds candidate median: 85 nanoseconds / 1.90% added to the ordinary
+collector call. Thirty alternating calls over 10,000 foreign entries measured 3.999 milliseconds
+for the old complete scan versus 142.027 microseconds for the new typed bounded refusal: 96.45%
+lower / 28.16x. The large-directory results intentionally have different semantics; the candidate
+does not claim a complete inventory after its 256-entry ceiling. All 1,060 timed calls preserved
+both namespace state vectors. Harness and report SHA-256 values were
+`293d23280ca75429735a26cccaed0d6578df7718f7e4b58b0a0e95ce667c5f29` and
+`ac2872e76a6126892854ab2c6c8596ff9c34d70f7e1e0cd86e2191717da1bfd1`.
+
+All task state is expendable: discarding it or selecting a new empty `--state` path produces a
+private cold upper and a normal compiler rebuild. Bubblewrap and kernel OverlayFS are required for
+cross-worktree mode; running directly in the resident worktree does not require either.
 
 The Linux CLI can turn one explicit hot-run cache root into the existing bounded, path-free cache
 status report:

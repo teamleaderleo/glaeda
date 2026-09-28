@@ -18,6 +18,7 @@ use std::os::unix::fs::{
 use std::os::unix::net::UnixStream;
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt as _;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "linux")]
@@ -41,34 +42,49 @@ use glaeda::process::ProcessExecutor;
 use glaeda::project_checkout_observation::{
     ProjectCheckoutObservation, ProjectCheckoutObservationError, ProjectCheckoutObserver,
 };
+use rustix::process::geteuid;
 #[cfg(target_os = "linux")]
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::OwnedFd,
-    fs::{Mode, OFlags, open as rustix_open, openat as rustix_openat},
-    io::{Errno, write as rustix_write},
-    process::{
-        Pid, PidfdFlags, Signal, WaitOptions, getpgid, getpid, kill_process, kill_process_group,
-        pidfd_open, pidfd_send_signal, test_kill_process_group, waitpid,
+    fs::{
+        AtFlags, FileType, FlockOperation, Mode, OFlags, fcntl_getfl, fcntl_setfl, flock, fstat,
+        mkdirat, open as rustix_open, openat as rustix_openat, statat,
     },
-    thread::sched_getaffinity,
+    io::{Errno, FdFlags, fcntl_getfd, fcntl_setfd, write as rustix_write},
+    process::{
+        Pid, PidfdFlags, Signal, WaitOptions, getgid, getpgid, getpid, getuid, kill_process,
+        kill_process_group, pidfd_open, pidfd_send_signal, test_kill_process_group, waitpid,
+    },
+    thread::{CpuSet, sched_getaffinity, sched_setaffinity},
 };
+#[cfg(target_os = "linux")]
+use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
 #[cfg(target_os = "linux")]
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
 const MAX_OBSERVATION_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "linux")]
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
 const RESOURCE_SCOPE_OBSERVATION_GRACE: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
+const CPU_GRANT_RELEASE_GRACE: Duration = Duration::from_millis(250);
+#[cfg(target_os = "linux")]
 const INTERNAL_SCOPE_ENTRY: &str = "--glaeda-internal-scope-entry-v1";
+#[cfg(target_os = "linux")]
+const INTERNAL_CPU_GRANT_KEEPER: &str = "--glaeda-internal-cpu-grant-keeper-v1";
+#[cfg(target_os = "linux")]
 const HEAVY_SCOPE_PROPERTIES: &[&str] = &[
     "CPUQuota=1200%",
     "MemoryHigh=8G",
     "MemoryMax=12G",
     "TasksMax=1024",
 ];
+#[cfg(target_os = "linux")]
+const BACKGROUND_SCOPE_PROPERTIES: &[&str] = &["CPUWeight=25"];
 const SHA256_PREFIX: &str = "sha256:";
 const GIT_OVERRIDE_NAMES: &[&str] = &[
     "GIT_DIR",
@@ -115,6 +131,9 @@ struct Cli {
     /// Place the command in one reviewed transient resource scope.
     #[arg(long, value_enum)]
     resource_profile: Option<ResourceProfile>,
+    /// Reserve and restrict one benchmark sample to this canonical CPU list.
+    #[arg(long, value_name = "LIST")]
+    cpu_set: Option<String>,
     /// Absolute executable or PATH-resolved command followed by its arguments.
     #[arg(last = true, required = true)]
     command: Vec<OsString>,
@@ -124,14 +143,210 @@ struct Cli {
 enum ResourceProfile {
     #[value(name = "big-red-heavy")]
     BigRedHeavy,
+    #[value(name = "big-red-background")]
+    BigRedBackground,
 }
 
 impl ResourceProfile {
+    #[cfg(target_os = "linux")]
     fn as_str(self) -> &'static str {
         match self {
             Self::BigRedHeavy => "big-red-heavy",
+            Self::BigRedBackground => "big-red-background",
         }
     }
+
+    #[cfg(target_os = "linux")]
+    fn scope_properties(self) -> &'static [&'static str] {
+        match self {
+            Self::BigRedHeavy => HEAVY_SCOPE_PROPERTIES,
+            Self::BigRedBackground => BACKGROUND_SCOPE_PROPERTIES,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cpu_set(value: &str, inherited: &CpuSet) -> Result<CpuSetRequest, String> {
+    if value.is_empty() || value.len() > 4096 {
+        return Err("CPU set must be a nonempty bounded canonical list".into());
+    }
+    let mut cpus = BTreeSet::new();
+    for component in value.split(',') {
+        if component.is_empty() {
+            return Err("CPU set is not a canonical list".into());
+        }
+        let fields = component.split('-').collect::<Vec<_>>();
+        let (first, last) = match fields.as_slice() {
+            [single] => {
+                let cpu = parse_cpu_id(single)?;
+                (cpu, cpu)
+            }
+            [first, last] => (parse_cpu_id(first)?, parse_cpu_id(last)?),
+            _ => return Err("CPU set is not a canonical list".into()),
+        };
+        if first > last {
+            return Err("CPU set range is descending".into());
+        }
+        for cpu in first..=last {
+            if !cpus.insert(cpu) {
+                return Err("CPU set contains duplicate or overlapping CPUs".into());
+            }
+        }
+    }
+    let cpus = cpus.into_iter().collect::<Vec<_>>();
+    let canonical = canonical_cpu_list(&cpus);
+    if value != canonical {
+        return Err(format!("CPU set is not canonical; use {canonical}"));
+    }
+    let mut mask = CpuSet::new();
+    for cpu in &cpus {
+        if !inherited.is_set(*cpu) {
+            return Err("CPU set includes a CPU outside the effective inherited affinity".into());
+        }
+        mask.set(*cpu);
+    }
+    Ok(CpuSetRequest {
+        cpus,
+        canonical,
+        mask,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cpu_id(value: &str) -> Result<usize, String> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("CPU set contains a noncanonical CPU identifier".into());
+    }
+    let cpu = value
+        .parse::<usize>()
+        .map_err(|_| "CPU set contains an invalid CPU identifier".to_owned())?;
+    if cpu >= CpuSet::MAX_CPU {
+        return Err("CPU set exceeds the supported kernel CPU mask".into());
+    }
+    Ok(cpu)
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_cpu_list(cpus: &[usize]) -> String {
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < cpus.len() {
+        let first = cpus[index];
+        let mut last = first;
+        while index + 1 < cpus.len() && cpus[index + 1] == last + 1 {
+            index += 1;
+            last = cpus[index];
+        }
+        ranges.push(if first == last {
+            first.to_string()
+        } else {
+            format!("{first}-{last}")
+        });
+        index += 1;
+    }
+    ranges.join(",")
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_cpu_grant(value: &str) -> Result<CpuGrant, String> {
+    let inherited =
+        sched_getaffinity(None).map_err(|_| "effective CPU affinity is unavailable".to_owned())?;
+    let request = parse_cpu_set(value, &inherited)?;
+    let runtime_path = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| "XDG_RUNTIME_DIR is unavailable or not absolute".to_owned())?;
+    let runtime = rustix_open(
+        &runtime_path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| "XDG_RUNTIME_DIR cannot be opened safely".to_owned())?;
+    inspect_private_cpu_grant_directory(&runtime, "XDG_RUNTIME_DIR")?;
+    match mkdirat(&runtime, "glaeda-cpu-grants", Mode::from_raw_mode(0o700)) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(_) => return Err("CPU grant directory cannot be created".into()),
+    }
+    let directory = rustix_openat(
+        &runtime,
+        "glaeda-cpu-grants",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| "CPU grant directory cannot be opened safely".to_owned())?;
+    inspect_private_cpu_grant_directory(&directory, "CPU grant directory")?;
+    inspect_private_cpu_grant_directory(&runtime, "XDG_RUNTIME_DIR")?;
+
+    let mut locks = Vec::with_capacity(request.cpus.len());
+    for cpu in &request.cpus {
+        let name = format!("cpu-{cpu}.lock");
+        let lock = rustix_openat(
+            &directory,
+            name.as_str(),
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|_| "CPU grant lock cannot be opened safely".to_owned())?;
+        inspect_private_cpu_grant_lock(&directory, &name, &lock)?;
+        let deadline = Instant::now()
+            .checked_add(CPU_GRANT_RELEASE_GRACE)
+            .ok_or_else(|| "CPU grant release observation exceeds the clock range".to_owned())?;
+        loop {
+            match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => break,
+                Err(Errno::WOULDBLOCK) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(Errno::WOULDBLOCK) => return Err(format!("CPU {cpu} is already reserved")),
+                Err(_) => return Err("CPU grant lock cannot be acquired".into()),
+            }
+        }
+        inspect_private_cpu_grant_lock(&directory, &name, &lock)?;
+        locks.push(lock);
+    }
+    Ok(CpuGrant {
+        request,
+        _directory: directory,
+        _locks: locks,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_private_cpu_grant_directory(directory: &OwnedFd, subject: &str) -> Result<(), String> {
+    let stat = fstat(directory).map_err(|_| format!("{subject} cannot be inspected"))?;
+    if !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_uid != getuid().as_raw()
+        || stat.st_gid != getgid().as_raw()
+        || stat.st_mode & 0o7777 != 0o700
+    {
+        return Err(format!("{subject} is not a private current-user directory"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_private_cpu_grant_lock(
+    directory: &OwnedFd,
+    name: &str,
+    lock: &OwnedFd,
+) -> Result<(), String> {
+    let held = fstat(lock).map_err(|_| "CPU grant lock cannot be inspected".to_owned())?;
+    let linked = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| "CPU grant lock cannot be rebound".to_owned())?;
+    if !FileType::from_raw_mode(held.st_mode).is_file()
+        || held.st_nlink != 1
+        || held.st_uid != getuid().as_raw()
+        || held.st_gid != getgid().as_raw()
+        || held.st_mode & 0o7777 != 0o600
+        || held.st_size != 0
+        || (held.st_dev, held.st_ino) != (linked.st_dev, linked.st_ino)
+    {
+        return Err("CPU grant lock is not one private stable empty file".into());
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -163,6 +378,7 @@ struct CommandResult {
     elapsed: Duration,
     timeout_seconds: Option<f64>,
     resource_profile: Option<&'static str>,
+    cpu_set: Option<String>,
     user_cpu_seconds: Option<f64>,
     system_cpu_seconds: Option<f64>,
     max_rss_kib: Option<u64>,
@@ -170,6 +386,40 @@ struct CommandResult {
     exit_code: i32,
     signal: Option<i32>,
     completion_reason: &'static str,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone)]
+struct CpuSetRequest {
+    cpus: Vec<usize>,
+    canonical: String,
+    #[cfg(target_os = "linux")]
+    mask: CpuSet,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug)]
+struct CommandExecution<'a> {
+    command: &'a [OsString],
+    cwd: &'a Path,
+    environment_path: Option<&'a OsStr>,
+    timeout: Option<Duration>,
+    timeout_seconds: Option<f64>,
+    resource_profile: Option<ResourceProfile>,
+    cpu_set: Option<&'a CpuSetRequest>,
+    #[cfg(target_os = "linux")]
+    cpu_locks: &'a [OwnedFd],
+    #[cfg(not(target_os = "linux"))]
+    cpu_locks: &'a [()],
+    measured: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct CpuGrant {
+    request: CpuSetRequest,
+    _directory: OwnedFd,
+    _locks: Vec<OwnedFd>,
 }
 
 #[cfg(target_os = "linux")]
@@ -219,6 +469,12 @@ struct OwnedResourceScope {
 
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
+struct CpuGrantKeeper {
+    child: Child,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
 struct ResourceScopeEntryExecutable {
     executable: File,
 }
@@ -243,6 +499,17 @@ fn main() -> ExitCode {
             }
         };
     }
+    #[cfg(target_os = "linux")]
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new(INTERNAL_CPU_GRANT_KEEPER)) {
+        let arguments = env::args_os().skip(2).collect::<Vec<_>>();
+        return match run_cpu_grant_keeper(arguments) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("glaeda-hot-run CPU grant keeper error: {error}");
+                ExitCode::from(126)
+            }
+        };
+    }
     match run(Cli::parse()) {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
         Err(error) => {
@@ -254,6 +521,21 @@ fn main() -> ExitCode {
 
 #[cfg(target_os = "linux")]
 fn run_resource_scope_entry(mut arguments: Vec<OsString>) -> Result<(), String> {
+    let cpu_set = if arguments.first().map(OsString::as_os_str) == Some(OsStr::new("--cpu-set")) {
+        if arguments.len() < 3 {
+            return Err("internal scope entry CPU set is missing".into());
+        }
+        arguments.remove(0);
+        let value = arguments.remove(0);
+        let value = value
+            .to_str()
+            .ok_or_else(|| "internal scope entry CPU set is invalid".to_owned())?;
+        let inherited = sched_getaffinity(None)
+            .map_err(|_| "internal scope entry affinity is unavailable".to_owned())?;
+        Some(parse_cpu_set(value, &inherited)?)
+    } else {
+        None
+    };
     if arguments.first().map(OsString::as_os_str) != Some(OsStr::new("--")) {
         return Err("internal scope entry arguments are invalid".into());
     }
@@ -261,15 +543,182 @@ fn run_resource_scope_entry(mut arguments: Vec<OsString>) -> Result<(), String> 
     if arguments.is_empty() {
         return Err("internal scope entry command is missing".into());
     }
+    if let Some(cpu_set) = cpu_set.as_ref() {
+        sched_setaffinity(None, &cpu_set.mask)
+            .map_err(|_| "internal scope entry could not apply CPU affinity".to_owned())?;
+        seal_cpu_affinity().map_err(|error| {
+            format!("internal scope entry could not seal CPU affinity: {error}")
+        })?;
+    }
     kill_process(getpid(), Signal::STOP)
         .map_err(|_| "internal scope entry could not stop before admission".to_owned())?;
     let error = Command::new(&arguments[0]).args(&arguments[1..]).exec();
     Err(format!("cannot enter admitted resource scope: {error}"))
 }
 
+#[cfg(target_os = "linux")]
+fn inspect_inherited_cpu_grant_lock(cpu: usize, fd: i32) -> Result<(), String> {
+    let descriptor = PathBuf::from(format!("/proc/self/fd/{fd}"));
+    let stat = fs::metadata(&descriptor)
+        .map_err(|_| "internal scope entry CPU lock descriptor is unavailable".to_owned())?;
+    let target = fs::read_link(&descriptor)
+        .map_err(|_| "internal scope entry CPU lock descriptor cannot be resolved".to_owned())?;
+    if !stat.file_type().is_file()
+        || stat.nlink() != 1
+        || stat.uid() != getuid().as_raw()
+        || stat.gid() != getgid().as_raw()
+        || stat.mode() & 0o7777 != 0o600
+        || stat.size() != 0
+        || target.file_name() != Some(OsStr::new(&format!("cpu-{cpu}.lock")))
+    {
+        return Err("internal scope entry CPU lock descriptor is unsafe".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn seal_cpu_affinity() -> Result<(), String> {
+    let architecture = std::env::consts::ARCH
+        .try_into()
+        .map_err(|_| "the host architecture is unsupported".to_owned())?;
+    let mut rules = BTreeMap::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        // x32 shares AUDIT_ARCH_X86_64 with the native ABI but sets bit 30 in
+        // seccomp_data.nr. Seal both encodings even when libc already exposes
+        // the bit-set number from an x32 build.
+        const X32_SYSCALL_BIT: i64 = 0x4000_0000;
+        let native_number = libc::SYS_sched_setaffinity & !X32_SYSCALL_BIT;
+        rules.insert(native_number, Vec::new());
+        rules.insert(native_number | X32_SYSCALL_BIT, Vec::new());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    rules.insert(libc::SYS_sched_setaffinity, Vec::new());
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        architecture,
+    )
+    .map_err(|error| format!("filter construction failed: {error}"))?;
+    let program: BpfProgram = filter
+        .try_into()
+        .map_err(|error| format!("filter compilation failed: {error}"))?;
+    seccompiler::apply_filter(&program)
+        .map_err(|error| format!("filter installation failed: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn run_cpu_grant_keeper(mut arguments: Vec<OsString>) -> Result<(), String> {
+    if arguments.first().map(OsString::as_os_str) != Some(OsStr::new("--cgroup-fd"))
+        || arguments.len() < 4
+    {
+        return Err("internal CPU grant keeper cgroup descriptor is missing".into());
+    }
+    arguments.remove(0);
+    let cgroup_fd = parse_internal_fd(arguments.remove(0), "cgroup")?;
+    let mut locks = Vec::new();
+    while arguments.first().map(OsString::as_os_str) == Some(OsStr::new("--cpu-lock-fd")) {
+        if arguments.len() < 3 {
+            return Err("internal CPU grant keeper lock descriptor is missing".into());
+        }
+        arguments.remove(0);
+        let cpu = arguments
+            .remove(0)
+            .to_str()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|cpu| *cpu < CpuSet::MAX_CPU)
+            .ok_or_else(|| "internal CPU grant keeper CPU identifier is invalid".to_owned())?;
+        let fd = parse_internal_fd(arguments.remove(0), "lock")?;
+        inspect_inherited_cpu_grant_lock(cpu, fd)?;
+        locks.push(fd);
+    }
+    if !arguments.is_empty() || locks.is_empty() {
+        return Err("internal CPU grant keeper arguments are invalid".into());
+    }
+    if !cpu_grant_scope_is_populated(cgroup_fd)? {
+        return Err("internal CPU grant keeper scope is not populated".into());
+    }
+    std::io::stdout()
+        .write_all(b"1")
+        .and_then(|()| std::io::stdout().flush())
+        .map_err(|_| "internal CPU grant keeper acknowledgement failed".to_owned())?;
+    while cpu_grant_scope_is_populated(cgroup_fd)? {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn parse_internal_fd(value: OsString, subject: &str) -> Result<i32, String> {
+    value
+        .to_str()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|fd| *fd > 2)
+        .ok_or_else(|| format!("internal CPU grant keeper {subject} descriptor is invalid"))
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_grant_scope_is_populated(cgroup_fd: i32) -> Result<bool, String> {
+    let descriptor = PathBuf::from(format!("/proc/self/fd/{cgroup_fd}"));
+    let metadata = match fs::metadata(&descriptor) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err("internal CPU grant keeper scope is unavailable".into()),
+    };
+    let target = fs::read_link(&descriptor)
+        .map_err(|_| "internal CPU grant keeper scope cannot be resolved".to_owned())?;
+    if target.as_os_str().as_bytes().ends_with(b" (deleted)") {
+        return Ok(false);
+    }
+    if !metadata.file_type().is_dir()
+        || !target.starts_with("/sys/fs/cgroup")
+        || !target
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with("glaeda-hot-run-") && name.ends_with(".scope"))
+    {
+        return Err("internal CPU grant keeper scope descriptor is unsafe".into());
+    }
+    let mut raw = String::new();
+    match File::open(descriptor.join("cgroup.events")).and_then(|events| {
+        events
+            .take(MAX_OBSERVATION_BYTES + 1)
+            .read_to_string(&mut raw)
+    }) {
+        Ok(_) => {}
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || cgroup_events_read_means_removed(&error) =>
+        {
+            return Ok(false);
+        }
+        Err(_) => return Err("internal CPU grant keeper scope cannot be observed".into()),
+    }
+    if raw.len() as u64 > MAX_OBSERVATION_BYTES {
+        return Err("internal CPU grant keeper scope observation is too large".into());
+    }
+    let mut populated = raw
+        .lines()
+        .filter_map(|line| line.strip_prefix("populated "));
+    match (populated.next(), populated.next()) {
+        (Some("0"), None) => Ok(false),
+        (Some("1"), None) => Ok(true),
+        _ => Err("internal CPU grant keeper scope population is invalid".into()),
+    }
+}
+
 fn run(cli: Cli) -> Result<i32, String> {
-    if !cfg!(target_os = "linux") {
-        return Err("native hot-run execution currently requires Linux".into());
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Err("native hot-run execution requires Linux or macOS".into());
+    }
+    if cfg!(target_os = "macos")
+        && (cli.timeout.is_some() || cli.resource_profile.is_some() || cli.cpu_set.is_some())
+    {
+        return Err(
+            "macOS native hot-run does not support --timeout, --resource-profile or --cpu-set"
+                .into(),
+        );
     }
     if cli.comparison_key.is_some() && cli.measurement.is_none() {
         return Err("--comparison-key requires --measurement".into());
@@ -281,6 +730,9 @@ fn run(cli: Cli) -> Result<i32, String> {
     let timeout = timeout_seconds.map(validate_timeout).transpose()?;
     if cli.resource_profile.is_some() && timeout.is_none() {
         return Err("--resource-profile requires --timeout".into());
+    }
+    if cli.cpu_set.is_some() && cli.resource_profile.is_none() {
+        return Err("--cpu-set requires --resource-profile".into());
     }
     let runtime_declaration =
         parse_runtime_contract(cli.runtime_id.as_deref(), cli.runtime_sha256.as_deref())?;
@@ -327,6 +779,19 @@ fn run(cli: Cli) -> Result<i32, String> {
     )?;
 
     #[cfg(target_os = "linux")]
+    let cpu_grant = cli.cpu_set.as_deref().map(acquire_cpu_grant).transpose()?;
+    #[cfg(target_os = "linux")]
+    let cpu_set = cpu_grant.as_ref().map(|grant| &grant.request);
+    #[cfg(target_os = "linux")]
+    let cpu_locks = cpu_grant
+        .as_ref()
+        .map(|grant| grant._locks.as_slice())
+        .unwrap_or_default();
+    #[cfg(not(target_os = "linux"))]
+    let cpu_set: Option<&CpuSetRequest> = None;
+    #[cfg(not(target_os = "linux"))]
+    let cpu_locks: &[()] = &[];
+    #[cfg(target_os = "linux")]
     let native_target_before =
         if cli.measurement.is_some() && caches.iter().any(|cache| cache.path == "target") {
             let started = Instant::now();
@@ -339,15 +804,17 @@ fn run(cli: Cli) -> Result<i32, String> {
         };
 
     let machine_before = cli.measurement.as_ref().map(|_| observe_machine());
-    let result = execute_command(
-        &command,
-        &task_cwd,
-        bound_path.as_deref(),
+    let result = execute_command(CommandExecution {
+        command: &command,
+        cwd: &task_cwd,
+        environment_path: bound_path.as_deref(),
         timeout,
         timeout_seconds,
-        cli.resource_profile,
-        cli.measurement.is_some(),
-    )?;
+        resource_profile: cli.resource_profile,
+        cpu_set,
+        cpu_locks,
+        measured: cli.measurement.is_some(),
+    })?;
     if let Some(destination) = cli.measurement.as_ref() {
         let machine_after = observe_machine();
         #[cfg(target_os = "linux")]
@@ -534,6 +1001,12 @@ fn observe_runtime_bin(
     }
     if resolved != path {
         return Err("runtime bin binding contains a symbolic-link component".into());
+    }
+    if details.uid() != 0 && details.uid() != geteuid().as_raw() {
+        return Err("runtime bin binding is not owned by root or the current user".into());
+    }
+    if details.mode() & 0o022 != 0 {
+        return Err("runtime bin binding is writable by an untrusted identity".into());
     }
     Ok(Some(RuntimeBinBinding {
         path: path.to_owned(),
@@ -1299,15 +1772,142 @@ fn abort_resource_scope_execution(
 }
 
 #[cfg(target_os = "linux")]
-fn execute_command(
-    command: &[OsString],
-    cwd: &Path,
-    environment_path: Option<&OsStr>,
-    timeout: Option<Duration>,
-    timeout_seconds: Option<f64>,
-    resource_profile: Option<ResourceProfile>,
-    measured: bool,
-) -> Result<CommandResult, String> {
+fn spawn_cpu_grant_keeper(
+    executable: &ResourceScopeEntryExecutable,
+    scope: &OwnedResourceScope,
+    cpu_set: &CpuSetRequest,
+    locks: &[OwnedFd],
+) -> Result<CpuGrantKeeper, String> {
+    if locks.len() != cpu_set.cpus.len() {
+        return Err("CPU grant keeper lock set is incomplete".into());
+    }
+    let descriptors = std::iter::once(&scope.cgroup)
+        .chain(locks.iter())
+        .collect::<Vec<_>>();
+    let original_flags = descriptors
+        .iter()
+        .map(|fd| fcntl_getfd(fd).map_err(|_| "CPU grant descriptor flags are unavailable"))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (fd, flags) in descriptors.iter().zip(&original_flags) {
+        if fcntl_setfd(fd, *flags & !FdFlags::CLOEXEC).is_err() {
+            for (restore_fd, restore_flags) in descriptors.iter().zip(&original_flags) {
+                let _ = fcntl_setfd(restore_fd, *restore_flags);
+            }
+            return Err("CPU grant descriptors cannot be inherited safely".into());
+        }
+    }
+    let mut command = Command::new(executable.proc_path());
+    command
+        .arg(INTERNAL_CPU_GRANT_KEEPER)
+        .arg("--cgroup-fd")
+        .arg(scope.cgroup.as_raw_fd().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env_clear()
+        .process_group(0);
+    for (cpu, lock) in cpu_set.cpus.iter().zip(locks) {
+        command
+            .arg("--cpu-lock-fd")
+            .arg(cpu.to_string())
+            .arg(lock.as_raw_fd().to_string());
+    }
+    let child = command.spawn();
+    let mut restored = true;
+    for (fd, flags) in descriptors.iter().zip(&original_flags) {
+        if fcntl_setfd(fd, *flags).is_err() {
+            restored = false;
+        }
+    }
+    let mut child =
+        child.map_err(|error| format!("CPU grant keeper cannot be launched: {error}"))?;
+    if !restored {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("CPU grant descriptor inheritance cannot be closed".into());
+    }
+    let mut acknowledgement = child
+        .stdout
+        .take()
+        .ok_or_else(|| "CPU grant keeper acknowledgement is unavailable".to_owned())?;
+    let status_flags = fcntl_getfl(&acknowledgement)
+        .map_err(|_| "CPU grant keeper acknowledgement cannot be observed".to_owned())?;
+    fcntl_setfl(&acknowledgement, status_flags | OFlags::NONBLOCK)
+        .map_err(|_| "CPU grant keeper acknowledgement cannot be observed".to_owned())?;
+    let deadline = Instant::now()
+        .checked_add(RESOURCE_SCOPE_OBSERVATION_GRACE)
+        .ok_or_else(|| "CPU grant keeper acknowledgement exceeds the clock range".to_owned())?;
+    let mut byte = [0_u8; 1];
+    loop {
+        match acknowledgement.read(&mut byte) {
+            Ok(1) if byte == *b"1" => return Ok(CpuGrantKeeper { child }),
+            Ok(0) => break,
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => break,
+        }
+        if child.try_wait().ok().flatten().is_some() || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err("CPU grant keeper did not acknowledge ownership".into())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_cpu_affinity_sealed(pid: Pid) -> Result<(), String> {
+    let status = fs::read_to_string(format!("/proc/{}/status", pid.as_raw_nonzero().get()))
+        .map_err(|_| "admitted CPU affinity seal cannot be observed".to_owned())?;
+    let seccomp = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("Seccomp:\t"))
+        .collect::<Vec<_>>();
+    let no_new_privs = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("NoNewPrivs:\t"))
+        .collect::<Vec<_>>();
+    if seccomp.as_slice() != ["2"] || no_new_privs.as_slice() != ["1"] {
+        return Err("admitted CPU affinity is not sealed".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn settle_cpu_grant_keeper(keeper: &mut CpuGrantKeeper) -> Result<(), String> {
+    let deadline = Instant::now()
+        .checked_add(TERMINATION_GRACE)
+        .ok_or_else(|| "CPU grant keeper cleanup exceeds the clock range".to_owned())?;
+    loop {
+        match keeper.child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => return Err("CPU grant keeper exited unsuccessfully".into()),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = keeper.child.kill();
+                let _ = keeper.child.wait();
+                return Err("CPU grant keeper cleanup is incomplete".into());
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, String> {
+    let CommandExecution {
+        command,
+        cwd,
+        environment_path,
+        timeout,
+        timeout_seconds,
+        resource_profile,
+        cpu_set,
+        cpu_locks,
+        measured,
+    } = execution;
     let mut signal_control = timeout.map(|_| DeadlineSignalControl::new()).transpose()?;
     let systemd_run = resource_profile
         .map(|_| resolve_program(OsStr::new("/usr/bin/systemd-run"), cwd, None))
@@ -1346,17 +1946,24 @@ fn execute_command(
         command.to_vec()
     };
     if let Some(scope_entry) = resource_scope_entry.as_ref() {
-        arguments = [
-            vec![
-                scope_entry.proc_path().into_os_string(),
-                OsString::from(INTERNAL_SCOPE_ENTRY),
-                OsString::from("--"),
-            ],
-            arguments,
-        ]
-        .concat();
+        let mut entry = vec![
+            scope_entry.proc_path().into_os_string(),
+            OsString::from(INTERNAL_SCOPE_ENTRY),
+        ];
+        if let Some(cpu_set) = cpu_set {
+            entry.push(OsString::from("--cpu-set"));
+            entry.push(OsString::from(&cpu_set.canonical));
+        }
+        entry.push(OsString::from("--"));
+        arguments = [entry, arguments].concat();
     }
     if let Some(systemd_run) = systemd_run {
+        let properties = resource_profile
+            .expect("profiled command has a resource profile")
+            .scope_properties()
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
         arguments = [
             vec![
                 systemd_run.into_os_string(),
@@ -1372,7 +1979,7 @@ fn execute_command(
                         .expect("profiled command has a resource scope unit"),
                 ),
             ],
-            HEAVY_SCOPE_PROPERTIES
+            properties
                 .iter()
                 .flat_map(|value| [OsString::from("--property"), OsString::from(value)])
                 .collect(),
@@ -1445,6 +2052,88 @@ fn execute_command(
         },
         None => None,
     };
+    let mut cpu_grant_keeper = if let Some(cpu_set) = cpu_set {
+        let keeper = spawn_cpu_grant_keeper(
+            resource_scope_entry
+                .as_ref()
+                .expect("CPU-granted command has an exact scope entry executable"),
+            resource_scope
+                .as_ref()
+                .expect("CPU-granted command has an owned resource scope"),
+            cpu_set,
+            cpu_locks,
+        );
+        match keeper {
+            Ok(keeper) => Some(keeper),
+            Err(error) => {
+                abort_resource_scope_execution(
+                    &mut child,
+                    child_pid,
+                    resource_scope_pidfd.as_ref(),
+                    resource_scope
+                        .as_ref()
+                        .expect("CPU-granted command has an owned resource scope"),
+                );
+                if let Some(path) = time_report.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(cpu_set) = cpu_set {
+        let observed = match sched_getaffinity(Some(child_pid)) {
+            Ok(observed) => observed,
+            Err(_) => {
+                if let Some(scope) = resource_scope.as_ref() {
+                    abort_resource_scope_execution(
+                        &mut child,
+                        child_pid,
+                        resource_scope_pidfd.as_ref(),
+                        scope,
+                    );
+                } else {
+                    abort_timed_child(&mut child, child_pid, resource_scope_pidfd.as_ref());
+                }
+                if let Some(path) = time_report.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+                return Err("admitted CPU affinity cannot be observed".into());
+            }
+        };
+        if observed != cpu_set.mask {
+            if let Some(scope) = resource_scope.as_ref() {
+                abort_resource_scope_execution(
+                    &mut child,
+                    child_pid,
+                    resource_scope_pidfd.as_ref(),
+                    scope,
+                );
+            } else {
+                abort_timed_child(&mut child, child_pid, resource_scope_pidfd.as_ref());
+            }
+            if let Some(path) = time_report.as_ref() {
+                let _ = fs::remove_file(path);
+            }
+            return Err("admitted CPU affinity does not match the reserved CPU set".into());
+        }
+        if let Err(error) = verify_cpu_affinity_sealed(child_pid) {
+            abort_resource_scope_execution(
+                &mut child,
+                child_pid,
+                resource_scope_pidfd.as_ref(),
+                resource_scope
+                    .as_ref()
+                    .expect("CPU-granted command has an owned resource scope"),
+            );
+            if let Some(path) = time_report.as_ref() {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error);
+        }
+    }
     if let Some(pidfd) = resource_scope_pidfd.as_ref()
         && let Err(error) = pidfd_send_signal(pidfd, Signal::CONT)
     {
@@ -1610,6 +2299,14 @@ fn execute_command(
         }
         return Err(error);
     }
+    if let Some(keeper) = cpu_grant_keeper.as_mut()
+        && let Err(error) = settle_cpu_grant_keeper(keeper)
+    {
+        if let Some(path) = time_report.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+        return Err(error);
+    }
     let elapsed = started.elapsed();
 
     let timed_usage = time_report
@@ -1659,6 +2356,7 @@ fn execute_command(
         elapsed,
         timeout_seconds,
         resource_profile: resource_profile.map(ResourceProfile::as_str),
+        cpu_set: cpu_set.map(|request| request.canonical.clone()),
         user_cpu_seconds,
         system_cpu_seconds,
         max_rss_kib,
@@ -1669,23 +2367,62 @@ fn execute_command(
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-fn execute_command(
-    _command: &[OsString],
-    _cwd: &Path,
-    _environment_path: Option<&OsStr>,
-    _timeout: Option<Duration>,
-    _timeout_seconds: Option<f64>,
-    _resource_profile: Option<ResourceProfile>,
-    _measured: bool,
-) -> Result<CommandResult, String> {
-    Err("native hot-run execution currently requires Linux".into())
+#[cfg(target_os = "macos")]
+fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, String> {
+    // The same-worktree path deliberately leaves native cache validity to the build tool.
+    // It neither materializes a task view nor claims Linux process/resource controls.
+    if execution.timeout.is_some()
+        || execution.resource_profile.is_some()
+        || execution.cpu_set.is_some()
+    {
+        return Err("macOS native hot-run does not support process/resource controls".into());
+    }
+    let mut command = Command::new(&execution.command[0]);
+    command
+        .args(&execution.command[1..])
+        .current_dir(execution.cwd);
+    if let Some(path) = execution.environment_path {
+        command.env("PATH", path);
+    }
+    let started = Instant::now();
+    let status = command
+        .status()
+        .map_err(|error| format!("cannot execute command: {error}"))?;
+    let signal = status.signal();
+    Ok(CommandResult {
+        elapsed: started.elapsed(),
+        timeout_seconds: None,
+        resource_profile: None,
+        cpu_set: None,
+        user_cpu_seconds: None,
+        system_cpu_seconds: None,
+        max_rss_kib: None,
+        resource_accounting: if execution.measured {
+            "unavailable_for_measured_command"
+        } else {
+            "not_measured"
+        },
+        exit_code: status.code().unwrap_or_else(|| 128 + signal.unwrap_or(0)),
+        signal,
+        completion_reason: if signal.is_some() {
+            "signaled"
+        } else {
+            "exited"
+        },
+    })
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn execute_command(_execution: CommandExecution<'_>) -> Result<CommandResult, String> {
+    Err("native hot-run execution requires Linux or macOS".into())
+}
+
+#[cfg(target_os = "linux")]
 fn valid_signal(signal: i32) -> bool {
     (1..=31).contains(&signal) || (34..=64).contains(&signal)
 }
 
+#[cfg(target_os = "linux")]
 fn parse_time_report(path: &Path) -> Result<(f64, f64, u64, i32), String> {
     let raw = read_bounded(path)?;
     let fields = raw.lines().collect::<Vec<_>>();
@@ -2018,6 +2755,7 @@ fn write_measurement(
         "comparison_key": comparison_key,
         "cross_worktree": false,
         "resource_profile": result.resource_profile,
+        "cpu_set": result.cpu_set,
         "machine_observation": {
             "scope": "host_aggregate",
             "before": observations.machine_before,
@@ -2095,6 +2833,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn unique_temporary_path(prefix: &str) -> Result<PathBuf, String> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2129,9 +2868,12 @@ fn round_to(value: f64, places: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::symlink;
+    #[cfg(target_os = "linux")]
     use std::thread;
 
+    #[cfg(target_os = "linux")]
     use rustix::process::test_kill_process;
 
     fn test_directory(label: &str) -> PathBuf {
@@ -2140,6 +2882,7 @@ mod tests {
         path
     }
 
+    #[cfg(target_os = "linux")]
     fn initialize_test_repository(path: &Path) {
         assert!(
             Command::new("/usr/bin/git")
@@ -2169,6 +2912,27 @@ mod tests {
         );
     }
 
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn native_execution_refuses_unsupported_platform_before_observation() {
+        let error = run(Cli {
+            resident: PathBuf::from("/nonexistent/resident"),
+            task: PathBuf::from("/nonexistent/task"),
+            cache: Vec::new(),
+            measurement: None,
+            comparison_key: None,
+            runtime_id: None,
+            runtime_sha256: None,
+            runtime_bin: None,
+            timeout: None,
+            resource_profile: None,
+            cpu_set: None,
+            command: vec![OsString::from("/bin/true")],
+        })
+        .unwrap_err();
+        assert_eq!(error, "native hot-run execution requires Linux or macOS");
+    }
+
     #[test]
     fn comparison_keys_are_canonical() {
         assert!(validate_comparison_key(&format!("sha256:{}", "a".repeat(64))).is_ok());
@@ -2187,6 +2951,32 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn resource_profiles_require_a_timeout_before_host_observation() {
+        for resource_profile in [
+            ResourceProfile::BigRedHeavy,
+            ResourceProfile::BigRedBackground,
+        ] {
+            let error = run(Cli {
+                resident: PathBuf::from("/path/that/must/not/be/observed"),
+                task: PathBuf::from("/path/that/must/not/be/observed"),
+                cache: Vec::new(),
+                measurement: None,
+                comparison_key: None,
+                runtime_id: None,
+                runtime_sha256: None,
+                runtime_bin: None,
+                timeout: None,
+                resource_profile: Some(resource_profile),
+                cpu_set: None,
+                command: vec![OsString::from("/bin/true")],
+            })
+            .unwrap_err();
+            assert_eq!(error, "--resource-profile requires --timeout");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_sets_require_a_resource_profile_before_host_observation() {
         let error = run(Cli {
             resident: PathBuf::from("/path/that/must/not/be/observed"),
             task: PathBuf::from("/path/that/must/not/be/observed"),
@@ -2196,12 +2986,33 @@ mod tests {
             runtime_id: None,
             runtime_sha256: None,
             runtime_bin: None,
-            timeout: None,
-            resource_profile: Some(ResourceProfile::BigRedHeavy),
+            timeout: Some(1.0),
+            resource_profile: None,
+            cpu_set: Some("0".into()),
             command: vec![OsString::from("/bin/true")],
         })
         .unwrap_err();
-        assert_eq!(error, "--resource-profile requires --timeout");
+        assert_eq!(error, "--cpu-set requires --resource-profile");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_set_parser_binds_canonical_effective_cpus() {
+        let mut inherited = CpuSet::new();
+        for cpu in [0, 1, 2, 4, 7, 8] {
+            inherited.set(cpu);
+        }
+        let parsed = parse_cpu_set("0-2,4,7-8", &inherited).unwrap();
+        assert_eq!(parsed.cpus, [0, 1, 2, 4, 7, 8]);
+        assert_eq!(parsed.canonical, "0-2,4,7-8");
+        assert_eq!(parsed.mask.count(), 6);
+        for invalid in ["", "00", "0,0", "0-0", "2-1", "0-1,2", "0,,2"] {
+            assert!(
+                parse_cpu_set(invalid, &inherited).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        assert!(parse_cpu_set("3", &inherited).is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -2291,14 +3102,17 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn direct_measurement_preserves_exit_and_schema() {
         let fixture = test_directory("glaeda-hot-run-test");
+        initialize_test_repository(&fixture);
+        fs::create_dir(fixture.join("target")).unwrap();
+        fs::write(fixture.join("target/fixture"), b"stable target fixture\n").unwrap();
         let measurement = fixture.join("measurement.json");
-        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let code = run(Cli {
-            resident: repository.clone(),
-            task: repository.clone(),
+            resident: fixture.clone(),
+            task: fixture.clone(),
             cache: vec!["target:native".into()],
             measurement: Some(measurement.clone()),
             comparison_key: Some(format!("sha256:{}", "a".repeat(64))),
@@ -2307,6 +3121,7 @@ mod tests {
             runtime_bin: None,
             timeout: Some(3.0),
             resource_profile: None,
+            cpu_set: None,
             command: vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
@@ -2339,6 +3154,7 @@ mod tests {
                 >= report["elapsed_seconds"].as_f64().unwrap()
         );
         assert_eq!(report["resource_accounting"], "gnu_time_command_tree");
+        assert_eq!(report["cpu_set"], Value::Null);
         assert_eq!(report["timeout_seconds"], 3.0);
         assert_eq!(report["exit_code"], 17);
         assert_eq!(report["signal"], Value::Null);
@@ -2347,10 +3163,10 @@ mod tests {
             fs::metadata(&measurement).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        fs::remove_file(measurement).unwrap();
-        fs::remove_dir(fixture).unwrap();
+        fs::remove_dir_all(fixture).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn post_command_target_failure_is_receipted_without_erasing_command_result() {
         let fixture = test_directory("glaeda-hot-run-post-observation-test");
@@ -2368,6 +3184,7 @@ mod tests {
             runtime_bin: None,
             timeout: Some(3.0),
             resource_profile: None,
+            cpu_set: None,
             command: vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
@@ -2391,6 +3208,7 @@ mod tests {
         fs::remove_dir_all(fixture).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn measured_signal_is_distinct_from_same_numeric_exit() {
         let fixture = test_directory("glaeda-hot-run-signal-test");
@@ -2411,6 +3229,7 @@ mod tests {
                 runtime_bin: None,
                 timeout: None,
                 resource_profile: None,
+                cpu_set: None,
                 command: vec![
                     OsString::from("/bin/sh"),
                     OsString::from("-c"),
@@ -2448,6 +3267,7 @@ mod tests {
             runtime_bin: None,
             timeout: Some(0.5),
             resource_profile: None,
+            cpu_set: None,
             command: vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
@@ -2493,6 +3313,7 @@ mod tests {
         fs::remove_dir(fixture).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn runtime_bin_binds_program_digest_and_descendant_path() {
         let fixture = test_directory("glaeda-hot-run-runtime-test");
@@ -2519,6 +3340,7 @@ mod tests {
             runtime_bin: Some(runtime_bin.clone()),
             timeout: None,
             resource_profile: None,
+            cpu_set: None,
             command: vec![OsString::from("runtime-tool")],
         })
         .unwrap_err();
@@ -2539,6 +3361,7 @@ mod tests {
             runtime_bin: Some(runtime_bin.clone()),
             timeout: None,
             resource_profile: None,
+            cpu_set: None,
             command: vec![OsString::from("runtime-tool")],
         })
         .unwrap();
@@ -2566,6 +3389,7 @@ mod tests {
             runtime_bin: Some(runtime_bin.clone()),
             timeout: None,
             resource_profile: None,
+            cpu_set: None,
             command: vec![OsString::from("/bin/true")],
         })
         .unwrap_err();
@@ -2594,6 +3418,32 @@ mod tests {
         fs::remove_file(moved.join("runtime-descendant")).unwrap();
         fs::remove_file(moved.join("runtime-tool")).unwrap();
         fs::remove_dir(moved).unwrap();
+        fs::remove_dir(fixture).unwrap();
+    }
+
+    #[test]
+    fn runtime_bin_refuses_a_group_or_world_writable_directory() {
+        let fixture = test_directory("glaeda-hot-run-runtime-mode-test")
+            .canonicalize()
+            .unwrap();
+        let runtime_bin = fixture.join("bin");
+        fs::create_dir(&runtime_bin).unwrap();
+        for mode in [0o775, 0o757, 0o777] {
+            fs::set_permissions(&runtime_bin, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                observe_runtime_bin(Some(&runtime_bin), Some("fixture")).unwrap_err(),
+                "runtime bin binding is writable by an untrusted identity"
+            );
+        }
+
+        fs::set_permissions(&runtime_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            observe_runtime_bin(Some(&runtime_bin), Some("fixture"))
+                .unwrap()
+                .is_some()
+        );
+
+        fs::remove_dir(runtime_bin).unwrap();
         fs::remove_dir(fixture).unwrap();
     }
 }

@@ -72,6 +72,7 @@ mod linux {
         comparison_key: Option<String>,
         cross_worktree: bool,
         resource_profile: Option<String>,
+        cpu_set: Option<String>,
         timeout_seconds: Option<f64>,
         cache_views: Vec<CacheView>,
         native_target_observation: Value,
@@ -103,6 +104,7 @@ mod linux {
         receipt_identity: ReceiptIdentity,
         comparison_key: String,
         resource_profile: Option<String>,
+        cpu_set: Option<String>,
         timeout_seconds: Option<f64>,
         runtime: Option<RuntimeEvidence>,
         resource_accounting: String,
@@ -143,6 +145,7 @@ mod linux {
         mutation_performed: bool,
         comparison_key: String,
         resource_profile: Option<String>,
+        cpu_set: Option<String>,
         timeout_seconds: Option<f64>,
         runtime: Option<RuntimeEvidence>,
         resource_accounting: String,
@@ -325,6 +328,7 @@ mod linux {
             mutation_performed: false,
             comparison_key: exemplar.comparison_key.clone(),
             resource_profile: exemplar.resource_profile.clone(),
+            cpu_set: exemplar.cpu_set.clone(),
             timeout_seconds: exemplar.timeout_seconds,
             runtime: exemplar.runtime.clone(),
             resource_accounting: exemplar.resource_accounting.clone(),
@@ -368,6 +372,7 @@ mod linux {
         }
         validate_resource_contract(
             receipt.resource_profile.as_deref(),
+            receipt.cpu_set.as_deref(),
             receipt.timeout_seconds,
             &receipt.resource_accounting,
         )?;
@@ -410,6 +415,7 @@ mod linux {
             receipt_identity: read.identity,
             comparison_key,
             resource_profile: receipt.resource_profile,
+            cpu_set: receipt.cpu_set,
             timeout_seconds: receipt.timeout_seconds,
             runtime: receipt.runtime,
             resource_accounting: receipt.resource_accounting,
@@ -532,6 +538,7 @@ mod linux {
         for sample in cold.iter().chain(warm) {
             if sample.comparison_key != exemplar.comparison_key
                 || sample.resource_profile != exemplar.resource_profile
+                || sample.cpu_set != exemplar.cpu_set
                 || sample.timeout_seconds != exemplar.timeout_seconds
                 || sample.runtime != exemplar.runtime
                 || sample.resource_accounting != exemplar.resource_accounting
@@ -544,6 +551,7 @@ mod linux {
 
     fn validate_resource_contract(
         resource_profile: Option<&str>,
+        cpu_set: Option<&str>,
         timeout_seconds: Option<f64>,
         resource_accounting: &str,
     ) -> Result<(), ObservationError> {
@@ -551,14 +559,50 @@ mod linux {
             return Err(invalid("measurement timeout is invalid"));
         }
         match resource_profile {
-            None if resource_accounting == "gnu_time_command_tree" => Ok(()),
+            None if cpu_set.is_none() && resource_accounting == "gnu_time_command_tree" => Ok(()),
             Some("big-red-heavy")
-                if timeout_seconds.is_some() && resource_accounting == "gnu_time_inside_scope" =>
+                if timeout_seconds.is_some()
+                    && cpu_set.is_none_or(canonical_cpu_set_identity)
+                    && resource_accounting == "gnu_time_inside_scope" =>
             {
                 Ok(())
             }
             _ => Err(invalid("measurement resource contract is unsupported")),
         }
+    }
+
+    fn canonical_cpu_set_identity(value: &str) -> bool {
+        if value.is_empty() || value.len() > 4096 {
+            return false;
+        }
+        let mut previous: Option<usize> = None;
+        for component in value.split(',') {
+            let fields = component.split('-').collect::<Vec<_>>();
+            let (first, last) = match fields.as_slice() {
+                [single] => match canonical_cpu_id(single) {
+                    Some(cpu) => (cpu, cpu),
+                    None => return false,
+                },
+                [first, last] => match (canonical_cpu_id(first), canonical_cpu_id(last)) {
+                    (Some(first), Some(last)) if first < last => (first, last),
+                    _ => return false,
+                },
+                _ => return false,
+            };
+            if previous.is_some_and(|previous| first <= previous.saturating_add(1)) {
+                return false;
+            }
+            previous = Some(last);
+        }
+        true
+    }
+
+    fn canonical_cpu_id(value: &str) -> Option<usize> {
+        (!value.is_empty()
+            && !(value.len() > 1 && value.starts_with('0'))
+            && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse::<usize>().ok())
+        .flatten()
     }
 
     fn validate_runtime(runtime: &RuntimeEvidence) -> Result<(), ObservationError> {
@@ -795,6 +839,12 @@ mod linux {
             assert!(canonical_sha256(&format!("sha256:{}", "a".repeat(64))));
             assert!(!canonical_sha256(&format!("sha256:{}", "A".repeat(64))));
             assert!(!canonical_sha256(&format!("sha256:{}", "a".repeat(63))));
+        }
+
+        #[test]
+        fn cpu_set_identity_rejects_extreme_noncanonical_input_without_panicking() {
+            assert!(canonical_cpu_set_identity(&usize::MAX.to_string()));
+            assert!(!canonical_cpu_set_identity(&format!("{},1", usize::MAX)));
         }
     }
 }
