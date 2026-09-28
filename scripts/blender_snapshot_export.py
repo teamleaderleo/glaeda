@@ -89,17 +89,8 @@ def portable_file(
             "Blender dependency contains an unresolved multi-file or template token",
         )
 
-    root = logical_root(project_root)
-    root_real = root.resolve(strict=True)
+    root_real = logical_root(project_root).resolve(strict=True)
     candidate = Path(os.path.abspath(raw_text))
-    try:
-        relative = candidate.relative_to(root)
-    except ValueError as error:
-        raise refuse(
-            "dependency_outside_project_root",
-            "Blender dependency is outside the declared project root",
-        ) from error
-
     try:
         real = candidate.resolve(strict=True)
     except OSError as error:
@@ -107,8 +98,15 @@ def portable_file(
             "missing_blender_dependency",
             "Blender dependency is missing or unreadable",
         ) from error
+
+    # Containment is decided once, with both sides canonicalized. The declared project root and the
+    # Blender-reported dependency arrive from independent sources and may name the same directory
+    # through different symlink spellings -- on macOS `$TMPDIR` lives under `/var`, itself a symlink
+    # to `/private/var` -- so comparing an unresolved candidate against an unresolved root refuses
+    # paths that are genuinely inside the project. Resolving only one side is the defect; resolving
+    # both is identical on Linux, where the root and its canonical form are the same path.
     try:
-        real.relative_to(root_real)
+        relative = real.relative_to(root_real)
     except ValueError as error:
         raise refuse(
             "dependency_outside_project_root",

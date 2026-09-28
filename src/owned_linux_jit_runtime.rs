@@ -5,7 +5,9 @@
 
 use std::fs;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::path::{Component, Path};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -16,7 +18,9 @@ use crate::artifact::Sha256Digest;
 use crate::disposable_attempt_catalog::DisposableAttemptReservation;
 use crate::disposable_clone_runtime::{CloneRuntimeClock, DisposableCloneRuntimeError};
 use crate::disposable_prepared_template::DisposablePreparedTemplateIdentity;
-use crate::disposable_worker_reconciler::{DisposableVmIdentity, DisposableWorkerResources};
+use crate::disposable_worker_reconciler::DisposableVmIdentity;
+#[cfg(target_os = "linux")]
+use crate::disposable_worker_reconciler::DisposableWorkerResources;
 use crate::execution_admission::EpochMillis;
 use crate::process::{CommandSpec, ExecutionRecord, TimedCommandExecutor};
 
@@ -68,6 +72,11 @@ impl std::fmt::Debug for OwnedLinuxJitRuntime {
 }
 
 impl OwnedLinuxJitRuntime {
+    // Constructed only by `owned_linux_jit_enrollment`, which is `target_os = "linux"`. The type
+    // itself stays `cfg(unix)` because the Lima-capable unix backends name it in their signatures
+    // and enum arms, but nothing on a non-Linux host can build one. Gating the construction path to
+    // its consumer keeps `dead_code` honest on both platforms instead of silencing it.
+    #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         helper: impl Into<PathBuf>,
@@ -265,6 +274,7 @@ impl OwnedLinuxJitRuntime {
         Ok(command)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn fixed_resources() -> Result<DisposableWorkerResources, DisposableCloneRuntimeError>
     {
         DisposableWorkerResources::new(4_000, 8 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024)
@@ -593,6 +603,7 @@ fn digest_parts(domain: &[u8], values: &[&str]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+#[cfg(target_os = "linux")]
 fn validate_path(path: PathBuf) -> Result<PathBuf, DisposableCloneRuntimeError> {
     let raw = path
         .to_str()

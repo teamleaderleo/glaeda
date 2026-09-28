@@ -30,6 +30,12 @@ trusted-agent dispatch owns
   caller/provenance correlation
   exact source + named operation freeze
   transport-independent replay state
+  one accepted provider-neutral semantic request identity
+
+provider-neutral Glaeda semantic API owns
+  cross-transport request identity/replay semantics
+  reviewed operation vocabulary
+  typed semantic receipt projection
 
 existing Glaeda workload owns
   workload generation
@@ -85,22 +91,36 @@ and tree from the request document. Physical admission revalidates those exact s
 
 ## Semantic compilation
 
-After provenance matches, v1 compiles to the caller-neutral #1050 adapter:
+After provenance matches, v1 mints one deterministic accepted semantic request identity and
+passes it through the caller-neutral #1050 adapter:
 
 ```text
-verify_named / verify-focused/v1
-  -> glaeda-external-execution-request/v1
+trusted transport request + observed provenance
+  -> accepted semantic request id
+  -> glaeda-semantic-request/v1
+       operation=verify_named
+       request_id=<accepted id>
+  -> #1050 glaeda-external-execution-request/v1
+       semantic_request_id=<accepted id>
   -> operation=verify_focused
   -> requested_capability_class=credentialless_project
   -> existing verify-focused/v1 adapter
 ```
 
-The caller's request ID and provenance remain dispatch identity. #1050 deliberately excludes caller
-correlation from the physical fingerprint, so Glaeda may reuse exact source/profile evidence without
-allowing a caller reference to mint another physical attempt.
+The caller's request ID and provenance remain dispatch identity. They still stay outside the physical
+fingerprint. The accepted semantic request ID enters the reviewed workload fingerprint, so two
+transport requests with equal source/profile bytes remain separate physical work by default. Exact
+replay of one accepted dispatch keeps the same semantic request ID.
 
-The accepted document records the Glaeda-resolved workload ID/generation for correlation. The
-caller never supplies that generation.
+This preserves the cross-transport rule from #1012: physical work is shared only when callers
+deliberately converge on one accepted provider-neutral request identity. The first trusted Git
+adapter always mints a transport-scoped accepted identity; a later reviewed adapter can explicitly
+import/share one provider-neutral identity when that is intended.
+
+The accepted document records the semantic request ID, the exact semantic request digest, the
+Glaeda-resolved workload ID/generation, and the resolved workload command fingerprint. The trusted
+transport must carry that fingerprint unchanged into the verifier launch and recovery path. The
+caller never supplies the workload generation or command fingerprint.
 
 ## Lifecycle and replay
 
@@ -135,6 +155,7 @@ The public result projection is capped at 4096 bytes and includes:
 
 ```text
 request ID + request fingerprint
+accepted semantic request ID
 exact source identity
 named operation/profile
 caller principal
@@ -200,6 +221,3 @@ source, dispatch, and resident-service generations.
 This lane adds no heat-aware placement, adaptive routing, generic SSH, remote shell, second execution
 engine, GitHub node snapshot mirror, merge authority, or alternate physical scheduler. #970 remains
 advisory history; current local admission decides every launch.
-
-
-Accepted caller identity is part of physical replay partitioning: the full dispatch fingerprint derives a bounded `semantic_request_id`, and #1050 includes that identity in the workload fingerprint. Equal source/profile requests from different caller namespaces therefore remain distinct physical work unless a later explicit reusable-result contract says otherwise.

@@ -155,3 +155,36 @@ This gives #547 live repository-owned input without teaching Glaeda CMUX command
 selective-layer work remains a separate evidence question: the current v1 result has no
 consumer-transfer byte/timing fields, so the optimizer cannot claim selective transport savings
 until CMUX measures and exports them.
+
+### Product transport and restore receipts
+
+`src/cmux_product_transport_adapter.rs` joins an already-validated app-host shard semantic batch
+to CMUX's `CMUX_TEST_PRODUCT_RESTORE` JSON payload. That second receipt is physical evidence:
+lookup source, lookup time, peer-transfer time, transferred bytes, archive bytes, and canonical
+restore time.
+
+The adapter first requires the physical receipt to carry the same immutable product identity used
+by CMUX's node cache: repository, artifact/provider identity, archive SHA-256, product-contract
+digest, source revision, producer run, and producer attempt. Source revision and shard must match the
+semantic workload batch before transport evidence is accepted. Glaeda derives the candidate's
+physical archive identity from that complete tuple; the unpacked runtime-input tree remains
+additional validity evidence.
+
+The adapter then emits:
+
+- one `artifact_transfer` observation when the receipt proves a peer hit;
+- one `restore` observation for every accepted receipt;
+- the exact physical archive identity plus the semantic consumer/runtime-input validity evidence;
+- the observed peer backend on the transfer observation;
+- separate compressed archive/transfer bytes and unpacked consumer bytes.
+
+Compressed transfer bytes and unpacked runtime-input bytes are intentionally different quantities.
+The adapter therefore leaves `required_consumer_bytes` unset on transport observations and records
+`split_comparable_bytes_available: false`. Repeated full-product peer transfers can justify
+`retain_local_immutable_artifact`, while they cannot manufacture a `split_consumer_artifact`
+candidate. Selective-layer promotion still requires one receipt that measures selected/required
+bytes in the same transport unit.
+
+Local hits emit restore evidence without inventing transfer bytes. R2/GitHub fallback receipts are
+accepted for restore evidence, but the current CMUX receipt does not expose their transfer time and
+byte count, so Glaeda does not synthesize those observations.

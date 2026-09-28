@@ -48,6 +48,20 @@ class AppleBuildTests(unittest.TestCase):
     def run_plan(self, plan):
         return apple.execute(plan, lambda *args: self.plan(args[2]))
 
+    def test_missing_helper_reports_configuration_failure_without_private_paths(self):
+        self.script.unlink()
+        output = io.StringIO()
+        prepare = apple.prepare
+        with patch.object(sys, "argv", ["apple-build", "plan", "--project", str(self.root)]), \
+                patch.object(apple, "prepare", side_effect=lambda *args, **kwargs: prepare(
+                    *args, toolchain_probe=lambda environment, sdk: self.tools, **kwargs)), \
+                contextlib.redirect_stderr(output):
+            self.assertEqual(apple.main(), 2)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["reason"], "configured build helper is missing; check the profile executable")
+        self.assertNotIn(str(self.root), output.getvalue())
+        self.assertFalse((self.root / ".glaeda").exists())
+
     def test_plan_is_read_only_and_source_edits_preserve_incremental_paths(self):
         plan = self.plan()
         observation = apple.inspect(plan)

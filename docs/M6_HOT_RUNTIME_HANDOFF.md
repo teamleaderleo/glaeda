@@ -112,7 +112,7 @@ Important M6 capabilities already landed:
 | single-writer project-disk lease core | #565 / #567 | logical disk/attachment generations; physical Lima correlation still pending |
 | Git index-v2 stat-cache patcher | #568 / #569 | pure verified index-byte handling |
 | source-anchor/task-view lifecycle | #570 / #571 | exact leases and ready/run/cleanup ordering |
-| trusted OverlayFS mount plan | #572 / #575 | exact lower/upper/work/merged identities and fixed mount policy |
+| trusted OverlayFS mount plan | #572 / #575 | exact lower/upper/work/merged identities, per-role ownership/mode trust, and fixed mount policy |
 | hot-state path policy | #573 / #579 | overlay/private-CoW/private-empty/reviewed-share selection |
 | immutable Git object-pool lease core | #581 / #583 | pool generation identity, consumer leases, draining and retirement |
 | mount-plan reconfirmation | #576 / #582 | fresh authority/evidence before privileged mount work |
@@ -127,6 +127,12 @@ Important M6 capabilities already landed:
 | immutable-pool publication guest operation | #592 / #626 | distinct closed protocol tag for pool publication; no handler or mutation authority |
 
 #607 contains physical mount mechanics, while normal product code still cannot mint the required project-filesystem correlation proof. Physical activation waits for accepted #565 P2 evidence.
+
+Mount-plan role trust declares its enforcement status and cites the exact path plus symbol the claim rests on, the same way `docs/THREAT_MODEL.md` does.
+
+- **enforced** — every OverlayFS role directory must be owned by root or the observing effective identity and must carry no group or world write bit, and `upperdir`/`workdir` must additionally grant full owner access. `src/trusted_overlay_mount_plan.rs::observe_directory` applies `src/trusted_overlay_mount_plan.rs::require_role_trust` before any snapshot becomes plan evidence, so a foreign-owned or untrusted-writable `lowerdir` can never become a task's read-only base. Refusals are `overlay_mount_role_owner_foreign`, `overlay_mount_role_untrusted_writable`, and `overlay_mount_role_owner_access_missing`.
+- **enforced** — later ownership or mode drift on an admitted role is refused as observation drift, because `src/trusted_overlay_mount_plan.rs::revalidate_directory` and `src/trusted_overlay_mount_plan.rs::require_held_directory` compare the complete recorded `DirectorySnapshot`, which includes `uid`, `gid`, and `mode`.
+- **required** — the role directories' parent chains. This observer binds each role by device and inode and holds descriptors, so a swapped role is caught as drift, but it states no policy about who may write the directories above a role. The operator's layout owner must place the four roles under a private, non-foreign-writable parent.
 
 ## Performance and kernel evidence
 

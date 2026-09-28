@@ -156,6 +156,7 @@ Documentation-only changes follow the repository's docs-only verification policy
 - [`docs/WORKSPACE_BOOTSTRAP.md`](docs/WORKSPACE_BOOTSTRAP.md) — repository bootstrap contract.
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — current sequencing and detailed programme state.
 - [`docs/MANIFEST.md`](docs/MANIFEST.md) — project manifest model.
+- [`docs/MODULE_INVENTORY.md`](docs/MODULE_INVENTORY.md) — generated: every exported module and what reaches it.
 - [`AGENTS.md`](AGENTS.md) — repository instructions and task routing for agents.
 
 ## License

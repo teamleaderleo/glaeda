@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import json
 import fcntl
 import importlib.util
@@ -183,6 +185,14 @@ def finalized(
 
 
 class FleetTests(unittest.TestCase):
+    def setUp(self):
+        # create=True so this suite can also be run against a revision that
+        # predates the operator notice, which is how its binding is measured.
+        self.real_notice = getattr(f, "_notice", None)
+        notices = mock.patch.object(f, "_notice", create=True)
+        self.notices = notices.start()
+        self.addCleanup(notices.stop)
+
     def test_current_accepted_role_is_eligible(self):
         e = enrollment()
         r = finalized(e)
@@ -432,6 +442,58 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(receipt["result"], "rejected")
         self.assertFalse(f.node_status(e, [receipt])["routingCandidateEligible"])
 
+    def test_git_oid_uses_closed_environment(self):
+        observed = {}
+
+        def fake_run(argv, **kwargs):
+            observed.update(kwargs)
+            return __import__("subprocess").CompletedProcess(
+                argv,
+                0,
+                stdout=COMMIT + "\n",
+                stderr="",
+            )
+
+        with (
+            mock.patch.dict(
+                f.os.environ,
+                {
+                    "PATH": "/attacker/bin",
+                    "HOME": "/attacker/home",
+                    "PYTHONPATH": "/attacker/python",
+                    "SSH_AUTH_SOCK": "/private/agent.sock",
+                    "SECRET_SENTINEL": "do-not-forward",
+                    "LD_PRELOAD": "/attacker/lib.so",
+                    "GIT_DIR": "/attacker/git",
+                    "GIT_CONFIG_GLOBAL": "/attacker/config",
+                },
+                clear=True,
+            ),
+            mock.patch.object(f.subprocess, "run", side_effect=fake_run),
+        ):
+            value = f._git_oid(Path("/cmux"), "HEAD^{commit}")
+
+        self.assertEqual(value, COMMIT)
+        self.assertEqual(
+            observed["env"],
+            {
+                "LC_ALL": "C",
+                "LANG": "C",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+            },
+        )
+        for forbidden in (
+            "PATH",
+            "HOME",
+            "PYTHONPATH",
+            "SSH_AUTH_SOCK",
+            "SECRET_SENTINEL",
+            "LD_PRELOAD",
+            "GIT_DIR",
+        ):
+            self.assertNotIn(forbidden, observed["env"])
+
     def test_acceptance_child_environment_is_explicit_allowlist(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -564,7 +626,7 @@ class FleetTests(unittest.TestCase):
                 mock.patch.object(
                     f,
                     "_git_oid",
-                    side_effect=[COMMIT, "2" * 40],
+                    side_effect=[COMMIT, "2" * 40, COMMIT, "2" * 40],
                 ),
                 mock.patch.object(f.subprocess, "run", side_effect=fake_run),
             ):
@@ -588,6 +650,328 @@ class FleetTests(unittest.TestCase):
             receipt["cmuxSemanticResultSha256"],
             f.digest(result),
         )
+
+    def test_local_acceptance_rejects_different_result_or_changed_checkout_source(self):
+        for change in ("result_commit", "result_tree", "checkout_commit", "checkout_tree"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                root.chmod(0o700)
+                e = enrollment("linux", state="enrolling")
+                enrollment_path = root / "enrollment.json"
+                enrollment_path.write_bytes(f.canonical(e))
+                enrollment_path.chmod(0o600)
+                cmux_root = root / "cmux"
+                runner = cmux_root / "scripts/ci/cmux_workload_profile.py"
+                runner.parent.mkdir(parents=True)
+                runner.write_text("# fixture\n")
+                glaeda = root / "glaeda"
+                glaeda.write_text("#!/bin/sh\nexit 0\n")
+                glaeda.chmod(0o755)
+                result = cmux_result("cmux_linux_ci")
+                if change.startswith("result_"):
+                    result["source"][change.removeprefix("result_")] = "3" * 40
+                    semantic = f._cmux_semantic_key(result)
+                    result["benchmark"]["semantic_comparison_key"] = semantic
+                    result["benchmark"]["comparison_context_key"] = f._cmux_context_key(
+                        semantic, "cold", result["toolchain"]["identity"])
+                observations = [COMMIT, "2" * 40, COMMIT, "2" * 40]
+                if change == "checkout_commit":
+                    observations[2] = "3" * 40
+                if change == "checkout_tree":
+                    observations[3] = "3" * 40
+
+                def run(argv, **kwargs):
+                    if str(runner) in argv:
+                        path = Path(argv[argv.index("--result") + 1])
+                        path.write_bytes(f.canonical(result))
+                        path.chmod(0o600)
+                        return f.subprocess.CompletedProcess(argv, 0)
+                    return f.subprocess.CompletedProcess(
+                        argv, 0, stdout=f.canonical(bootstrap_for(e)), stderr=b"")
+
+                with mock.patch.object(f, "_git_oid", side_effect=observations), \
+                        mock.patch.object(f.subprocess, "run", side_effect=run):
+                    with self.assertRaisesRegex(f.FleetError, "source"):
+                        f.accept_local(enrollment_path, cmux_root, glaeda, "cmux_linux_ci")
+
+    def _local_acceptance_fixture(self, root):
+        e = enrollment("linux", state="enrolling")
+        enrollment_path = root / "enrollment.json"
+        enrollment_path.write_bytes(f.canonical(e))
+        enrollment_path.chmod(0o600)
+        cmux_root = root / "cmux"
+        runner = cmux_root / "scripts/ci/cmux_workload_profile.py"
+        runner.parent.mkdir(parents=True)
+        runner.write_text("# fixture\n")
+        glaeda = root / "glaeda"
+        glaeda.write_text("#!/bin/sh\nexit 0\n")
+        glaeda.chmod(0o755)
+        return e, enrollment_path, cmux_root, runner, glaeda
+
+    def test_rejected_attempt_keeps_the_evidence_an_acceptance_discards(self):
+        # A rejected receipt carries a verdict and no cause, so deleting the
+        # runner log with the attempt leaves the operator nothing to read.
+        for state, retained in (("failed", True), ("passed", False)):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                root.chmod(0o700)
+                e, enrollment_path, cmux_root, runner, glaeda = (
+                    self._local_acceptance_fixture(root)
+                )
+                result = cmux_result("cmux_linux_ci", state=state)
+
+                def run(argv, **kwargs):
+                    if str(runner) in argv:
+                        path = Path(argv[argv.index("--result") + 1])
+                        (path.parent / "tmp/scratch").mkdir(parents=True, exist_ok=True)
+                        kwargs["stdout"].write(b"zig 0.16.0 is required\n")
+                        path.write_bytes(f.canonical(result))
+                        path.chmod(0o600)
+                        return f.subprocess.CompletedProcess(
+                            argv, 0 if state == "passed" else 1
+                        )
+                    return f.subprocess.CompletedProcess(
+                        argv, 0, stdout=f.canonical(bootstrap_for(e)), stderr=b"")
+
+                with (
+                    mock.patch.object(
+                        f, "_git_oid", side_effect=[COMMIT, "2" * 40, COMMIT, "2" * 40]
+                    ),
+                    mock.patch.object(f.subprocess, "run", side_effect=run),
+                ):
+                    receipt = f.accept_local(
+                        enrollment_path, cmux_root, glaeda, "cmux_linux_ci"
+                    )
+
+                self.assertEqual(receipt["result"] == "accepted", not retained)
+                self.assertEqual(list(root.glob(f.ATTEMPT_PREFIX + "*")), [])
+                kept = list(root.glob(f.RETAINED_ATTEMPT_PREFIX + "*"))
+                self.assertEqual(len(kept), 1 if retained else 0)
+                if retained:
+                    self.notices.assert_called_once()
+                    self.assertIn(
+                        str(kept[0]), self.notices.call_args.args[0]
+                    )
+                    self.assertIn(
+                        "zig 0.16.0 is required",
+                        (kept[0] / "cmux-runner.log").read_text(encoding="utf-8"),
+                    )
+                    self.assertTrue((kept[0] / "result.json").is_file())
+                    # The child's scratch tree is the large part and rebuilds.
+                    self.assertFalse((kept[0] / "tmp").exists())
+
+    def test_unwritable_scratch_tree_is_removed_not_swallowed(self):
+        # A build leaves read-only directories behind; rmtree(ignore_errors=True)
+        # would silently keep the whole tree and the storage bound with it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            locked = root / "attempt/tmp/DerivedData/locked"
+            locked.mkdir(parents=True)
+            (locked / "artifact").write_text("x", encoding="utf-8")
+            locked.chmod(0o500)
+            # Only needed if the removal under test fails; otherwise the
+            # TemporaryDirectory cleanup would inherit the locked tree.
+            self.addCleanup(f._remove_tree, root / "attempt")
+            self.assertTrue(f._remove_tree(root / "attempt"))
+            self.assertFalse((root / "attempt").exists())
+
+    def test_removal_never_reaches_outside_the_tree(self):
+        # os.walk does not traverse a symlink but os.chmod follows one, so a
+        # build that links its TMPDIR at a toolchain or a Cargo registry would
+        # have that directory's bits relaxed by a cleanup that does not own it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            outside = root / "outside"
+            (outside / "keep").mkdir(parents=True)
+            outside.chmod(0o500)
+            attempt = root / "attempt/tmp"
+            attempt.mkdir(parents=True)
+            (attempt / "registry").symlink_to(outside)
+            self.assertTrue(f._remove_tree(root / "attempt"))
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o500)
+            self.assertTrue((outside / "keep").is_dir())
+            # Restore before the temporary directory tries to remove it.
+            outside.chmod(0o700)
+
+    def test_removal_answers_honestly_for_links_and_unreadable_roots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            dangling = root / "dangling"
+            dangling.symlink_to(root / "never")
+            self.assertTrue(f._remove_tree(dangling))
+            self.assertFalse(dangling.is_symlink())
+
+            # os.walk cannot list an unreadable directory, so repairing only
+            # what it yields would leave the top entry behind.
+            sealed = root / "sealed"
+            (sealed / "inner").mkdir(parents=True)
+            sealed.chmod(0o000)
+            self.assertTrue(f._remove_tree(sealed))
+            self.assertFalse(sealed.exists())
+
+    def test_pruning_ranks_only_the_directories_it_created(self):
+        # The doc tells operators this evidence is theirs to keep, so they will
+        # archive it under the same name. An archive must not consume the
+        # retention budget and push real evidence out of it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for index in range(f.RETAINED_ATTEMPT_LIMIT):
+                kept = root / f"{f.RETAINED_ATTEMPT_PREFIX}dir{index}"
+                kept.mkdir()
+                (kept / "cmux-runner.log").write_text(str(index), encoding="utf-8")
+                os.utime(kept, (index + 1, index + 1))
+            for name in ("archive.tar.gz", "elsewhere"):
+                path = root / f"{f.RETAINED_ATTEMPT_PREFIX}{name}"
+                if name.endswith(".tar.gz"):
+                    path.write_text("archived", encoding="utf-8")
+                else:
+                    path.symlink_to(root)
+                os.utime(path, (99, 99), follow_symlinks=False)
+
+            f._prune_retained_attempts(root)
+
+            for index in range(f.RETAINED_ATTEMPT_LIMIT):
+                self.assertTrue(
+                    (root / f"{f.RETAINED_ATTEMPT_PREFIX}dir{index}"
+                     / "cmux-runner.log").is_file()
+                )
+            self.assertTrue((root / f"{f.RETAINED_ATTEMPT_PREFIX}archive.tar.gz").is_file())
+            self.assertTrue((root / f"{f.RETAINED_ATTEMPT_PREFIX}elsewhere").is_symlink())
+
+    def test_notice_never_raises_and_never_writes_to_stdout(self):
+        # _notice runs from a finally. A closed fd 2 leaves sys.stderr as None,
+        # and print(file=None) would put a private path in front of the receipt.
+        captured = io.StringIO()
+        with (
+            mock.patch.object(f.sys, "stderr", None),
+            contextlib.redirect_stdout(captured),
+        ):
+            self.real_notice("attempt retained")
+        self.assertEqual(captured.getvalue(), "")
+
+        class Broken:
+            def write(self, _value):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        with (
+            mock.patch.object(f.sys, "stderr", Broken()),
+            contextlib.redirect_stdout(captured),
+        ):
+            self.real_notice("attempt retained")
+        self.assertEqual(captured.getvalue(), "")
+
+    def test_retention_keeps_evidence_when_the_name_is_taken(self):
+        # The whole point of retaining is that the operator has something to
+        # read, so a name collision must never be resolved by deleting it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            attempt = root / f"{f.ATTEMPT_PREFIX}abcd1234"
+            (attempt / "tmp").mkdir(parents=True)
+            (attempt / "cmux-runner.log").write_text("cause", encoding="utf-8")
+            (root / f"{f.RETAINED_ATTEMPT_PREFIX}abcd1234").write_text(
+                "operator file", encoding="utf-8"
+            )
+            f._retain_attempt(attempt, root)
+            self.assertEqual(
+                (attempt / "cmux-runner.log").read_text(encoding="utf-8"), "cause"
+            )
+            self.assertIn("kept rejected acceptance attempt in place",
+                          self.notices.call_args.args[0])
+
+    def test_pruning_survives_an_unreadable_retained_entry(self):
+        # _retain_attempt runs from a finally: anything it raises replaces the
+        # receipt or the error that explains the rejection.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / f"{f.RETAINED_ATTEMPT_PREFIX}dangling").symlink_to(
+                root / "gone"
+            )
+            attempt = root / f"{f.ATTEMPT_PREFIX}abcd1234"
+            (attempt / "tmp").mkdir(parents=True)
+            (attempt / "cmux-runner.log").write_text("cause", encoding="utf-8")
+            f._retain_attempt(attempt, root)
+            self.assertTrue(
+                (root / f"{f.RETAINED_ATTEMPT_PREFIX}abcd1234"
+                 / "cmux-runner.log").is_file()
+            )
+
+    def test_retained_attempts_stay_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for index in range(f.RETAINED_ATTEMPT_LIMIT + 2):
+                attempt = root / f"{f.ATTEMPT_PREFIX}{index:08d}"
+                (attempt / "tmp").mkdir(parents=True)
+                (attempt / "cmux-runner.log").write_text(str(index), encoding="utf-8")
+                os.utime(attempt, (index + 1, index + 1))
+                f._retain_attempt(attempt, root)
+            kept = sorted(path.name for path in root.glob(f.RETAINED_ATTEMPT_PREFIX + "*"))
+            self.assertEqual(len(kept), f.RETAINED_ATTEMPT_LIMIT)
+            self.assertEqual(kept[-1], f"{f.RETAINED_ATTEMPT_PREFIX}00000004")
+
+    def test_pruning_leaves_operator_directories_alone(self):
+        # The doc promises that evidence an operator renames, copies or keeps
+        # under the prefix is theirs: never ranked, never removed.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            kept_by_operator = [
+                root / f"{f.RETAINED_ATTEMPT_PREFIX}abcd1234.investigating",
+                root / f"{f.RETAINED_ATTEMPT_PREFIX}old-investigation",
+            ]
+            for index, directory in enumerate(kept_by_operator):
+                directory.mkdir()
+                (directory / "notes.txt").write_text("mine", encoding="utf-8")
+                # Oldest and newest: either would decide a naive ranking.
+                os.utime(directory, (1, 1) if index else (10**10, 10**10))
+            for index in range(f.RETAINED_ATTEMPT_LIMIT):
+                attempt = root / f"{f.ATTEMPT_PREFIX}{index:08d}"
+                (attempt / "tmp").mkdir(parents=True)
+                f._retain_attempt(attempt, root)
+            for directory in kept_by_operator:
+                self.assertTrue((directory / "notes.txt").is_file())
+            for index in range(f.RETAINED_ATTEMPT_LIMIT):
+                self.assertTrue(
+                    (root / f"{f.RETAINED_ATTEMPT_PREFIX}{index:08d}").is_dir()
+                )
+
+    def test_retention_never_raises_from_an_unsearchable_attempt(self):
+        # Path.is_symlink re-raises EACCES before Python 3.14. The child holds
+        # the attempt path, so it can revoke search on it before the finally.
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory search permission")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            attempt = root / f"{f.ATTEMPT_PREFIX}abcd1234"
+            (attempt / "tmp").mkdir(parents=True)
+            attempt.chmod(0o600)
+            try:
+                f._retain_attempt(attempt, root)
+                # The scratch tree could not be reached, so it survived; the
+                # operator must be told rather than shown a clean retention.
+                self.assertIn("could not be removed",
+                              self.notices.call_args.args[0])
+            finally:
+                for candidate in (attempt, root / f"{f.RETAINED_ATTEMPT_PREFIX}abcd1234"):
+                    if candidate.exists():
+                        candidate.chmod(0o700)
+
+    def test_interpreter_without_waitid_refuses_before_the_attempt(self):
+        # CPython exposes os.waitid on macOS only from 3.13; the CMUX profile
+        # runner cannot wait on its child without it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            root.chmod(0o700)
+            _, enrollment_path, cmux_root, _, glaeda = (
+                self._local_acceptance_fixture(root)
+            )
+            with mock.patch.object(
+                f, "profile_runner_interpreter_ready", return_value=False
+            ):
+                with self.assertRaisesRegex(f.FleetError, "os.waitid"):
+                    f.accept_local(enrollment_path, cmux_root, glaeda, "cmux_linux_ci")
+            self.assertEqual(list(root.glob(f.ATTEMPT_PREFIX + "*")), [])
 
     def test_accept_local_refuses_fleet_contract_replacement(self):
         e = enrollment("linux", state="enrolling")
@@ -630,7 +1014,7 @@ class FleetTests(unittest.TestCase):
                 mock.patch.object(
                     f,
                     "_git_oid",
-                    side_effect=[COMMIT, "2" * 40],
+                    side_effect=[COMMIT, "2" * 40, COMMIT, "2" * 40],
                 ),
                 mock.patch.object(f.subprocess, "run", side_effect=fake_run),
                 mock.patch.object(
@@ -777,6 +1161,85 @@ class FleetTests(unittest.TestCase):
             {"cmux_macos_native_build": dict(f.ROLE_PROFILES["cmux_macos_native_build"])},
         )
 
+    def test_renewal_refreshes_capabilities_and_requires_new_acceptance(self):
+        for family in ("macos", "linux"):
+            with self.subTest(family=family):
+                original = enrollment(family)
+                old_receipt = finalized(original)
+                current = f.transition(original, "quarantined", "toolchain_mismatch")
+                bootstrap = bootstrap_for(current, D)
+                bootstrap["glaedaGeneration"] = E
+                bootstrap["osVersionClass"] = "updated-os"
+                before = copy.deepcopy(current)
+                plan = f.renewal_plan(current, bootstrap)
+                self.assertEqual(current, before)
+                renewed = plan["replacement"]
+                self.assertEqual(renewed["nodeId"], current["nodeId"])
+                self.assertEqual(renewed["operatorFleetScope"], current["operatorFleetScope"])
+                self.assertEqual(renewed["enrollmentGeneration"], current["enrollmentGeneration"] + 1)
+                self.assertEqual(renewed["supportedToolchainGenerations"], [D])
+                self.assertEqual(renewed["glaedaGeneration"], E)
+                self.assertEqual(renewed["os"]["versionClass"], "updated-os")
+                self.assertEqual(renewed["state"], "enrolling")
+                self.assertIsNone(renewed["quarantineReason"])
+                with self.assertRaisesRegex(f.FleetError, "current accepted role"):
+                    f.transition(renewed, "eligible", None, [old_receipt])
+                fresh_receipt = finalized(renewed, toolchain=D)
+                eligible = f.transition(renewed, "eligible", None, [fresh_receipt])
+                self.assertTrue(f.node_status(eligible, [fresh_receipt])["routingCandidateEligible"])
+                self.assertFalse(f.node_status(eligible, [fresh_receipt])["automaticDispatchAuthorized"])
+
+    def test_renewal_refuses_live_terminal_blocked_and_exhausted_inputs(self):
+        for state in f.STATES:
+            if state == "quarantined":
+                continue
+            with self.subTest(state=state):
+                current = enrollment(state=state)
+                with self.assertRaisesRegex(f.FleetError, "quarantined"):
+                    f.renewal_plan(current, bootstrap_for(current))
+        current = f.transition(enrollment(), "quarantined", "service_mismatch")
+        bootstrap = bootstrap_for(current)
+        bootstrap["eligibleForEnrollment"] = False
+        with self.assertRaisesRegex(f.FleetError, "blocking checks"):
+            f.renewal_plan(current, bootstrap)
+        current["enrollmentGeneration"] = 2**31 - 1
+        with self.assertRaisesRegex(f.FleetError, "exhausted"):
+            f.renewal_plan(current, bootstrap_for(current))
+
+    def test_apply_renewal_binds_plan_and_publishes_once(self):
+        for changed in (None, "enrollment", "bootstrap", "digest"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                root.chmod(0o700)
+                path = root / "enrollment.json"
+                bootstrap_path = root / "bootstrap.json"
+                current = f.transition(enrollment(), "quarantined", "toolchain_mismatch")
+                bootstrap = bootstrap_for(current, D)
+                plan = f.renewal_plan(current, bootstrap)
+                if changed == "enrollment":
+                    current["quarantineReason"] = "hardware_failure"
+                if changed == "bootstrap":
+                    bootstrap["toolchainGeneration"] = E
+                for target, value in ((path, current), (bootstrap_path, bootstrap)):
+                    target.write_bytes(f.canonical(value))
+                    target.chmod(0o600)
+                before = path.read_bytes()
+                self.assertEqual(f.renewal_plan(current, bootstrap)["replacement"]["state"], "enrolling")
+                self.assertFalse((root / ".mutation.lock").exists())
+                if changed:
+                    with self.assertRaisesRegex(f.FleetError, "plan changed"):
+                        f.apply_renewal(path, bootstrap_path, A if changed == "digest" else plan["planSha256"])
+                    self.assertEqual(path.read_bytes(), before)
+                else:
+                    result = f.apply_renewal(path, bootstrap_path, plan["planSha256"])
+                    self.assertEqual(result, plan["replacement"])
+                    self.assertEqual(f.load(path), result)
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                    with self.assertRaisesRegex(f.FleetError, "quarantined"):
+                        f.apply_renewal(path, bootstrap_path, plan["planSha256"])
+                    self.assertEqual(f.load(path), result)
+                self.assertFalse(list(root.glob(".enrollment.next.*")))
+
     def test_blocked_bootstrap_cannot_enroll(self):
         bootstrap = {
             "schema": f.BOOTSTRAP_SCHEMA,
@@ -891,6 +1354,36 @@ class FleetTests(unittest.TestCase):
 
             self.assertEqual(f.load(enrollment_path)["state"], "eligible")
 
+    def test_transition_refuses_replaced_or_changed_lock_before_publication(self):
+        for change in ("replace", "mode", "unlink", "symlink"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                root.chmod(0o700)
+                path = root / "enrollment.json"
+                original = f.canonical(enrollment())
+                path.write_bytes(original)
+                path.chmod(0o600)
+                transition = f.transition
+
+                def changed_lock(*args):
+                    result = transition(*args)
+                    lock = root / ".mutation.lock"
+                    if change == "mode":
+                        lock.chmod(0o644)
+                    else:
+                        lock.rename(root / "old-lock")
+                        if change == "replace":
+                            lock.touch(mode=0o600)
+                        elif change == "symlink":
+                            lock.symlink_to(root / "old-lock")
+                    return result
+
+                with mock.patch.object(f, "transition", side_effect=changed_lock):
+                    with self.assertRaisesRegex(f.FleetError, "lock"):
+                        f.apply_transition(path, "draining", None, [])
+                self.assertEqual(path.read_bytes(), original)
+                self.assertFalse(list(root.glob(".enrollment.next.*")))
+
     def test_transition_apply_refuses_parent_directory_rebind(self):
         with tempfile.TemporaryDirectory() as temporary:
             outer = Path(temporary).resolve()
@@ -987,6 +1480,286 @@ class FleetTests(unittest.TestCase):
         e = enrollment()
         self.assertEqual(f.digest(copy.deepcopy(e)), f.digest(e))
         self.assertLess(len(f.canonical(f.node_status(e, []))), f.MAX_STATUS_BYTES)
+
+
+TOOLCHAIN_OBS = {
+    "cmuxXcodePin": "26",
+    "xcodeVersion": "26.6",
+    "xcodeBuild": "17F113",
+    "macosSdkVersion": "26.5",
+    "zigVersion": "0.16.0",
+    "rustcVersion": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+}
+HARDWARE = {"model": "Mac16,11", "chip": "Apple M4 Pro", "memoryGiB": 48}
+CANDIDATE = {"repository": "teamleaderleo/glaeda", "commit": "5" * 40, "tree": "6" * 40}
+TG = "sha256:" + __import__("hashlib").sha256(
+    (json.dumps(TOOLCHAIN_OBS, sort_keys=True, separators=(",", ":")) + "\n").encode()
+).hexdigest()
+
+
+def class_bootstrap(enrollment_value, *, toolchain=None, hardware=None):
+    toolchain = dict(toolchain or TOOLCHAIN_OBS)
+    value = bootstrap_for(enrollment_value, f.toolchain_generation_of(toolchain))
+    value["observed"] = {"hardware": dict(hardware or HARDWARE), "toolchain": toolchain}
+    return value
+
+
+def class_enrollment(node="cmux-fixture-001", state="eligible", glaeda=C):
+    e = enrollment(state=state)
+    e["nodeId"] = node
+    e["supportedToolchainGenerations"] = [TG]
+    e["glaedaGeneration"] = glaeda
+    return e
+
+
+def std_class_receipt():
+    accepting = class_enrollment()
+    post = class_bootstrap(accepting)
+    local = finalized(accepting, toolchain=TG, post_bootstrap=post)
+    return f.build_class_acceptance(accepting, local, post, "std", CANDIDATE), local
+
+
+class ClassAcceptanceTests(unittest.TestCase):
+    def adopt(self, klass, node=None, *, bootstrap=None, expected=None, fleet_class="std",
+              contract=None, candidate=None):
+        node = node or class_enrollment("cmux-fixture-002", state="enrolling")
+        return f.adopt_class_receipt(
+            node,
+            klass,
+            expected or klass["receiptSha256"],
+            fleet_class,
+            bootstrap or class_bootstrap(node),
+            contract or klass["glaedaFleetContractGeneration"],
+            candidate or CANDIDATE,
+        )
+
+    def test_one_local_acceptance_makes_a_matching_node_eligible(self):
+        klass, local = std_class_receipt()
+        self.assertEqual(klass["fleetClass"], "std")
+        self.assertEqual(klass["hardware"], HARDWARE)
+        self.assertEqual(klass["toolchain"]["xcodeBuild"], "17F113")
+        self.assertEqual(klass["glaedaCandidate"], CANDIDATE)
+        self.assertEqual(klass["acceptingNodeId"], "cmux-fixture-001")
+        self.assertEqual(klass["acceptingReceiptSha256"], f.digest(local))
+        self.assertEqual(f.validate_class_acceptance(copy.deepcopy(klass)), klass)
+
+        node = class_enrollment("cmux-fixture-002", state="enrolling")
+        receipt = self.adopt(klass, node)
+        self.assertEqual(receipt["nodeId"], "cmux-fixture-002")
+        self.assertEqual(receipt["executionClass"], f.CLASS_EXECUTION_CLASS)
+        self.assertEqual(receipt["classAcceptanceSha256"], klass["receiptSha256"])
+        self.assertIsNone(receipt["localExecutionAttemptSha256"])
+        self.assertEqual(receipt["result"], "accepted")
+
+        eligible = f.transition(node, "eligible", None, [receipt])
+        self.assertEqual(eligible["state"], "eligible")
+        self.assertEqual(eligible["classAcceptanceSha256"], klass["receiptSha256"])
+        self.assertTrue(f.node_status(eligible, [receipt])["routingCandidateEligible"])
+
+    def test_every_mismatching_field_is_named_and_refused(self):
+        klass, _ = std_class_receipt()
+        light = dict(HARDWARE, chip="Apple M4", memoryGiB=16, model="Mac16,10")
+        other_xcode = dict(TOOLCHAIN_OBS, xcodeBuild="17F200")
+        cases = {
+            "hardware.chip": {"hardware": light},
+            "hardware.memoryGiB": {"hardware": dict(HARDWARE, memoryGiB=64)},
+            "toolchain.xcodeBuild": {"toolchain": other_xcode},
+        }
+        for field, change in cases.items():
+            with self.subTest(field=field):
+                node = class_enrollment("cmux-fixture-002", state="enrolling")
+                bootstrap = class_bootstrap(node, **change)
+                node["supportedToolchainGenerations"] = [bootstrap["toolchainGeneration"]]
+                with self.assertRaisesRegex(f.FleetError, "run accept-local") as caught:
+                    self.adopt(klass, node, bootstrap=bootstrap)
+                self.assertIn(field, str(caught.exception))
+        node = class_enrollment("cmux-fixture-002", state="enrolling", glaeda=D)
+        with self.assertRaisesRegex(f.FleetError, "glaedaGeneration"):
+            self.adopt(klass, node)
+        with self.assertRaisesRegex(f.FleetError, "glaedaFleetContractGeneration"):
+            self.adopt(klass, contract=B)
+        with self.assertRaisesRegex(f.FleetError, "glaedaCandidate"):
+            self.adopt(klass, candidate=dict(CANDIDATE, commit="7" * 40))
+        with self.assertRaisesRegex(f.FleetError, "this node is class light"):
+            self.adopt(klass, fleet_class="light")
+
+    def test_a_node_must_pass_its_own_bootstrap(self):
+        klass, _ = std_class_receipt()
+        node = class_enrollment("cmux-fixture-002", state="enrolling")
+        blocked = class_bootstrap(node)
+        blocked["eligibleForEnrollment"] = False
+        blocked["blockingChecks"] = ["diskAdmission"]
+        with self.assertRaisesRegex(f.FleetError, "blocking checks"):
+            self.adopt(klass, node, bootstrap=blocked)
+        with self.assertRaisesRegex(f.FleetError, "enrolling node"):
+            self.adopt(klass, class_enrollment("cmux-fixture-002", state="eligible"))
+
+    def test_class_receipt_integrity(self):
+        klass, _ = std_class_receipt()
+        edited = copy.deepcopy(klass)
+        edited["hardware"]["memoryGiB"] = 16
+        with self.assertRaisesRegex(f.FleetError, "digest does not match"):
+            f.validate_class_acceptance(edited)
+        # Re-sealed by whoever edited it: the digest is now self-consistent, so the
+        # operator's expected digest is what refuses it.
+        body = {k: v for k, v in edited.items() if k != "receiptSha256"}
+        resealed = {**body, "receiptSha256": f.digest(body)}
+        with self.assertRaisesRegex(f.FleetError, "operator expected"):
+            self.adopt(resealed, expected=klass["receiptSha256"])
+        toolchain_lie = copy.deepcopy(klass)
+        toolchain_lie["toolchain"]["zigVersion"] = "0.15.0"
+        body = {k: v for k, v in toolchain_lie.items() if k != "receiptSha256"}
+        with self.assertRaisesRegex(f.FleetError, "disagrees with its observations"):
+            f.validate_class_acceptance({**body, "receiptSha256": f.digest(body)})
+        extra = dict(klass, nodeSerial="C02XXXX")
+        with self.assertRaisesRegex(f.FleetError, "unknown or missing"):
+            f.validate_class_acceptance(extra)
+
+    def test_only_a_current_local_acceptance_seeds_a_class(self):
+        klass, _ = std_class_receipt()
+        node = class_enrollment("cmux-fixture-002", state="enrolling")
+        derived = self.adopt(klass, node)
+        eligible = f.transition(node, "eligible", None, [derived])
+        with self.assertRaisesRegex(f.FleetError, "does not chain"):
+            f.build_class_acceptance(eligible, derived, class_bootstrap(eligible), "std", CANDIDATE)
+        accepting = class_enrollment(state="enrolling")
+        local = finalized(accepting, toolchain=TG, post_bootstrap=class_bootstrap(accepting))
+        with self.assertRaisesRegex(f.FleetError, "eligible node"):
+            f.build_class_acceptance(accepting, local, class_bootstrap(accepting), "std", CANDIDATE)
+        stale = class_enrollment()
+        stale["enrollmentGeneration"] += 1
+        with self.assertRaisesRegex(f.FleetError, "acceptance_enrollment_stale"):
+            f.build_class_acceptance(stale, local, class_bootstrap(stale), "std", CANDIDATE)
+        bare = class_enrollment()
+        with self.assertRaisesRegex(f.FleetError, "no hardware or toolchain identity"):
+            f.build_class_acceptance(bare, local, bootstrap_for(bare, TG), "std", CANDIDATE)
+
+    def test_class_derived_receipt_shape_is_closed(self):
+        klass, local = std_class_receipt()
+        derived = self.adopt(klass)
+        missing = {k: v for k, v in derived.items() if k != "classAcceptanceSha256"}
+        with self.assertRaisesRegex(f.FleetError, "unknown or missing"):
+            f.validate_acceptance_receipt(missing)
+        with self.assertRaisesRegex(f.FleetError, "unknown or missing"):
+            f.validate_acceptance_receipt(dict(local, classAcceptanceSha256=A))
+        with self.assertRaisesRegex(f.FleetError, "class acceptance digest"):
+            f.validate_acceptance_receipt(dict(derived, classAcceptanceSha256=None))
+
+    def test_enrollment_records_and_forgets_the_class_it_relied_on(self):
+        klass, _ = std_class_receipt()
+        node = class_enrollment("cmux-fixture-002", state="enrolling")
+        derived = self.adopt(klass, node)
+        eligible = f.transition(node, "eligible", None, [derived])
+        other = dict(eligible, classAcceptanceSha256=A)
+        by_role = {r["role"]: r for r in f.node_status(other, [derived])["roles"]}
+        self.assertEqual(by_role["cmux_macos_native_build"]["reason"], "acceptance_class_stale")
+        quarantined = f.transition(eligible, "quarantined", "toolchain_mismatch")
+        self.assertEqual(quarantined["classAcceptanceSha256"], klass["receiptSha256"])
+        renewed = f.transition(quarantined, "enrolling", None)
+        self.assertNotIn("classAcceptanceSha256", renewed)
+        # A node accepted locally keeps the legacy shape.
+        local_node = class_enrollment(state="enrolling")
+        local = finalized(local_node, toolchain=TG, post_bootstrap=class_bootstrap(local_node))
+        self.assertEqual(
+            set(f.transition(local_node, "eligible", None, [local])),
+            f.ENROLLMENT_KEYS,
+        )
+
+    def test_a_class_receipt_counts_only_while_the_enrollment_names_it(self):
+        klass, _ = std_class_receipt()
+        node = class_enrollment("cmux-fixture-002", state="enrolling")
+        derived = self.adopt(klass, node)
+        eligible = f.transition(node, "eligible", None, [derived])
+        # Swapped onto a node that became eligible some other way, it does not count.
+        legacy = {k: v for k, v in eligible.items() if k != "classAcceptanceSha256"}
+        by_role = {r["role"]: r for r in f.node_status(legacy, [derived])["roles"]}
+        self.assertEqual(by_role["cmux_macos_native_build"]["reason"], "acceptance_class_stale")
+        # Draining and back re-records the same class receipt.
+        draining = f.transition(eligible, "draining", None)
+        back = f.transition(draining, "eligible", None, [derived])
+        self.assertEqual(back["classAcceptanceSha256"], klass["receiptSha256"])
+        # A class receipt offered next to a stale one records nothing it did not rest on.
+        stale = dict(derived, enrollmentGeneration=derived["enrollmentGeneration"] + 1)
+        with self.assertRaisesRegex(f.FleetError, "current accepted role receipt"):
+            f.transition(node, "eligible", None, [stale])
+        with self.assertRaisesRegex(f.FleetError, "no local execution attempt"):
+            f.validate_acceptance_receipt(dict(derived, localExecutionAttemptSha256=E))
+
+    def test_candidate_identity_believes_only_the_running_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "scripts").mkdir()
+            for name in ("cmux_fleet.py", "cmux_fleet_bootstrap.py"):
+                (root / "scripts" / name).write_bytes((MODULE_PATH.parent / name).read_bytes())
+            files = {
+                f"scripts/{name}": {"sha256": f._file_sha256(root / "scripts" / name)[7:], "size": 1}
+                for name in ("cmux_fleet.py", "cmux_fleet_bootstrap.py")
+            }
+            files["bin/glaeda"] = {"sha256": C[7:], "size": 1}
+            manifest = {"schema": f.CANDIDATE_MANIFEST_SCHEMA, "files": files, "source": CANDIDATE}
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            self.assertEqual(f.candidate_identity(C, root), CANDIDATE)
+            with self.assertRaisesRegex(f.FleetError, "running bin/glaeda"):
+                f.candidate_identity(D, root)
+            (root / "scripts/cmux_fleet.py").write_text("# edited after staging\n")
+            with self.assertRaisesRegex(f.FleetError, "running scripts/cmux_fleet.py"):
+                f.candidate_identity(C, root)
+            (root / "manifest.json").unlink()
+            with self.assertRaisesRegex(f.FleetError, "staged Glaeda candidate"):
+                f.candidate_identity(C, root)
+
+    def test_export_and_adopt_run_only_a_read_only_bootstrap(self):
+        klass, local = std_class_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            root.chmod(0o700)
+
+            def private(name, value):
+                path = root / name
+                path.write_bytes(f.canonical(value))
+                path.chmod(0o600)
+                return path
+
+            accepting = class_enrollment()
+            node = class_enrollment("cmux-fixture-002", state="enrolling")
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+            (root / "cmux").mkdir()
+            (root / "cache").mkdir()
+            calls = []
+
+            def fake_run(argv, **kwargs):
+                calls.append((argv, kwargs["env"]))
+                self.assertIn("cmux_fleet_bootstrap.py", " ".join(map(str, argv)))
+                self.assertEqual(argv[argv.index("--cache-root") + 1], str(root / "cache"))
+                return __import__("subprocess").CompletedProcess(
+                    argv, 0, stdout=f.canonical(class_bootstrap(current)), stderr=b"",
+                )
+
+            common = dict(cmux_root=root / "cmux", glaeda=glaeda, cache_root=root / "cache")
+            with (
+                mock.patch.dict(f.os.environ, {"PATH": "/usr/bin:/bin", "SECRET": "x"}, clear=True),
+                mock.patch.object(f.subprocess, "run", side_effect=fake_run),
+                mock.patch.object(f, "candidate_identity", return_value=dict(CANDIDATE)),
+                mock.patch.object(f, "fleet_contract_generation", return_value=local["glaedaFleetContractGeneration"]),
+            ):
+                current = accepting
+                exported = f.export_class_acceptance(
+                    private("enrollment.json", accepting), private("acceptance.json", local), "std", **common,
+                )
+                current = node
+                adopted = f.adopt_class_acceptance(
+                    private("node.json", node), private("std.json", exported), exported["receiptSha256"],
+                    "std", **common,
+                )
+        self.assertEqual(exported, klass)
+        self.assertEqual(adopted["classAcceptanceSha256"], klass["receiptSha256"])
+        self.assertEqual(len(calls), 2)
+        for _argv, env in calls:
+            self.assertNotIn("SECRET", env)
+            self.assertNotIn("TMPDIR", env)
+            self.assertEqual(env["LC_ALL"], "C")
 
 
 if __name__ == "__main__":
