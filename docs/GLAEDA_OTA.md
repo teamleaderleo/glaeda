@@ -85,10 +85,11 @@ personal repository. Nobody develops there; this repository stays the source of 
 release, attestation and promotion.
 
 - **What it holds.** `.github/workflows/mirror.yml`, which runs only in the fork, every 15 minutes
-  (and on dispatch) copies `main`, the newest 30 `r-*` releases and the `ota-channels` files
-  byte for byte: releases first, then channels, so a channel never names a release the fork lacks.
-  `release.yml`, `promote.yml` and `control.yml` run only in this repository, and the mirror job
-  disables every other workflow in the fork.
+  (and on dispatch) copies `main`, the newest 30 `r-*` releases plus the ones `canary.json` and
+  `stable.json` name, and the `ota-channels` files, byte for byte. `control.json` is copied first
+  and on its own, so a pause never waits on a release; a ring file is copied only once its release
+  is published in the fork. `release.yml`, `promote.yml` and `control.yml` run only in this
+  repository, and the mirror job disables every other workflow in the fork before it pushes.
 - **How it pushes.** `main` goes over SSH with a write deploy key of the fork (its secret
   `MIRROR_DEPLOY_KEY`), because the job token cannot push commits that change workflow files.
   Releases use the job token. No personal token is stored anywhere.
@@ -100,8 +101,12 @@ release, attestation and promotion.
 - **Lag.** Up to 15 minutes behind this repository (longer when GitHub's cron lags). A pause
   reaches the minis after the next mirror run; to hurry it, dispatch the mirror too:
   `gh workflow run mirror.yml --repo manaflow-ai/glaeda`.
-- **Checkouts.** The minis' `~/glaeda` fetches from the fork as well: `glaeda-mini-fleet` clones it
-  and moves hosts to the fork's `main`.
+- **Checkouts.** New minis clone the fork (`glaeda-mini-fleet`), and `~/glaeda` moves to the fork's
+  `main`. Hosts set up earlier are moved by cmuxterm-hq's `build-fleet/mini-ops/glaeda-mirror.sh`,
+  which sets their `origin` and `source`, one canary host first.
+- **Takes effect** with the first `glaeda-update` that knows `source`: a host running an older
+  release (or rolled back to one) ignores the key and keeps downloading from this repository, which
+  still works.
 
 ## Operator controls
 

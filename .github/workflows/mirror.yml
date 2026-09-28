@@ -2,8 +2,8 @@ name: Mirror
 
 # Runs only in manaflow-ai/glaeda, the read-only copy of this repository that the Manaflow minis
 # clone and update from (docs/GLAEDA_OTA.md, Fleet mirror). Every 15 minutes it copies main, the
-# newest releases and the ota-channels files from teamleaderleo/glaeda byte for byte, then keeps
-# every other workflow in the copy disabled: releases are built, attested and promoted only here.
+# releases and the ota-channels files from teamleaderleo/glaeda byte for byte, and keeps every other
+# workflow in the copy disabled: releases are built, attested and promoted only upstream.
 
 on:
   schedule:
@@ -28,14 +28,28 @@ jobs:
       UPSTREAM: teamleaderleo/glaeda
       MIRROR: ${{ github.repository }}
     steps:
-      - name: Read upstream releases and channels
-        # before main, so every commit they name is in the main pushed below (main only grows)
+      - name: Keep the copy's other workflows disabled
+        # before main moves, so a push from here does not start them (a deploy-key push does)
+        run: |
+          gh api "repos/$MIRROR/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.state == "active" and (.path | startswith(".github/workflows/"))
+                  and .path != ".github/workflows/mirror.yml") | "\(.id) \(.path)"' |
+          while read -r id path; do
+            gh api -X PUT "repos/$MIRROR/actions/workflows/$id/disable"
+            echo "disabled $path" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Read upstream channels, then releases
+        # Before main, so every commit they name is in the main pushed below (main only grows). The
+        # releases to copy are the newest 30 plus whatever the rings name, however old.
         run: |
           mkdir -p work/channels work/upstream-channels
-          gh release list -R "$UPSTREAM" -L 30 --json tagName \
-            --jq '.[].tagName | select(test("^r-[0-9]{8}-[0-9a-f]{12}$"))' > work/upstream.txt
           gh release download ota-channels -R "$UPSTREAM" -p '*.json' -D work/upstream-channels
-          ls work/upstream-channels
+          {
+            gh release list -R "$UPSTREAM" -L 30 --json tagName --jq '.[].tagName'
+            for ring in work/upstream-channels/canary.json work/upstream-channels/stable.json; do
+              [ ! -f "$ring" ] || python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["tag"])' "$ring"
+            done
+          } | grep -E '^r-[0-9]{8}-[0-9a-f]{12}$' | sort -u > work/upstream.txt
       - name: Mirror main
         env:
           DEPLOY_KEY: ${{ secrets.MIRROR_DEPLOY_KEY }}
@@ -55,44 +69,59 @@ jobs:
           git -C work/main.git fetch -q "https://github.com/$UPSTREAM.git" +refs/heads/main:refs/heads/main
           git -C work/main.git push "git@github.com:$MIRROR.git" +refs/heads/main:refs/heads/main
           rm -f ~/.ssh/mirror
-      - name: Mirror releases
-        run: |
-          # A draft is a copy an earlier run did not finish: start it over.
-          gh release list -R "$MIRROR" -L 100 --json tagName,isDraft \
-            --jq '.[] | "\(.tagName) \(.isDraft)"' > work/mirror.txt
-          while read -r tag; do
-            if grep -qx "$tag false" work/mirror.txt; then continue; fi
-            if grep -qx "$tag true" work/mirror.txt; then gh release delete "$tag" -R "$MIRROR" --yes; fi
-            rm -rf work/rel && mkdir work/rel
-            gh release download "$tag" -R "$UPSTREAM" -D work/rel
-            source=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["source"])' work/rel/release.json)
-            gh release create "$tag" work/rel/* -R "$MIRROR" --draft --target "$source" --prerelease --latest=false \
-              --title "$tag" --notes "Mirror of https://github.com/$UPSTREAM/releases/tag/$tag (glaeda $source)."
-            gh release edit "$tag" -R "$MIRROR" --draft=false
-            echo "copied $tag" >> "$GITHUB_STEP_SUMMARY"
-          done < work/upstream.txt
-      - name: Mirror channels
-        # after the releases, so a channel never names a release this copy lacks
+      - name: Mirror control.json
+        # the pause switch never waits on a release copy
+        if: always()
         run: |
           if ! gh release view ota-channels -R "$MIRROR" >/dev/null 2>&1; then
             gh release create ota-channels -R "$MIRROR" --target main --prerelease --latest=false --title "OTA channels" \
               --notes "Mirror of https://github.com/$UPSTREAM/releases/tag/ota-channels (docs/GLAEDA_OTA.md)."
           fi
           gh release download ota-channels -R "$MIRROR" -p '*.json' -D work/channels || true
-          for file in work/upstream-channels/*.json; do
-            name=$(basename "$file")
-            if ! cmp -s "$file" "work/channels/$name"; then
-              gh release upload ota-channels "$file" -R "$MIRROR" --clobber
-              echo "updated $name" >> "$GITHUB_STEP_SUMMARY"
+          if ! cmp -s work/upstream-channels/control.json work/channels/control.json; then
+            gh release upload ota-channels work/upstream-channels/control.json -R "$MIRROR" --clobber
+            echo "updated control.json" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Mirror releases
+        run: |
+          # A draft is a copy an earlier run did not finish: start it over. One failed copy does not
+          # stop the others; the rings below skip a release that is missing here.
+          gh release list -R "$MIRROR" -L 100 --json tagName,isDraft \
+            --jq '.[] | "\(.tagName) \(.isDraft)"' > work/mirror.txt
+          failed=0
+          while read -r tag; do
+            if grep -qx "$tag false" work/mirror.txt; then continue; fi
+            if gh release view "$tag" -R "$MIRROR" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx false; then continue; fi
+            if grep -qx "$tag true" work/mirror.txt; then gh release delete "$tag" -R "$MIRROR" --yes; fi
+            rm -rf work/rel && mkdir work/rel
+            if gh release download "$tag" -R "$UPSTREAM" -D work/rel \
+              && source=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["source"])' work/rel/release.json) \
+              && gh release create "$tag" work/rel/* -R "$MIRROR" --draft --target "$source" --prerelease --latest=false \
+                   --title "$tag" --notes "Mirror of https://github.com/$UPSTREAM/releases/tag/$tag (glaeda $source)." \
+              && gh release edit "$tag" -R "$MIRROR" --draft=false; then
+              echo "copied $tag" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "FAILED to copy $tag" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
             fi
-          done
-      - name: Keep the copy's other workflows disabled
+          done < work/upstream.txt
+          exit $failed
+      - name: Mirror the rings
+        # after the releases, and only a ring whose release is published here
         if: always()
         run: |
-          gh api "repos/$MIRROR/actions/workflows" --paginate \
-            --jq '.workflows[] | select(.state == "active" and (.path | startswith(".github/workflows/"))
-                  and .path != ".github/workflows/mirror.yml") | "\(.id) \(.path)"' |
-          while read -r id path; do
-            gh api -X PUT "repos/$MIRROR/actions/workflows/$id/disable"
-            echo "disabled $path" >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+          for name in canary.json stable.json; do
+            file=work/upstream-channels/$name
+            [ -f "$file" ] || continue
+            cmp -s "$file" "work/channels/$name" && continue
+            tag=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["tag"])' "$file")
+            if gh release view "$tag" -R "$MIRROR" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx false; then
+              gh release upload ota-channels "$file" -R "$MIRROR" --clobber
+              echo "updated $name to $tag" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "kept $name: $tag is not published here" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
           done
+          exit $failed
