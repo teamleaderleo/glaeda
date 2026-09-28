@@ -44,6 +44,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.fam = gd.Family("xcode-derived-data", self.root, True, "rebuild")
         self.gd_evidence = gd.process_evidence
         gd.process_evidence = lambda: ([], "")
+        gd._DISCOVERED.clear()
         self.gd_keep = gd.NESTED_KEEP
         gd.NESTED_KEEP = self.root.parent / f"{self.root.name}-keep.json"
 
@@ -203,34 +204,50 @@ class GlaedaDiskTest(unittest.TestCase):
         # layout a tool writes is sealed: only its top two levels are searched, whatever its name.
         go = self.hex_store(self.root / "whatever-name")
         self.assertEqual(gd.cache_layout(go), "hash-sharded-store")
-        self.assertEqual(gd.git_state(go, budget=50), "none")
+        self.assertEqual(gd.git_state(go, budget=50, sealed=True), "none")
+        # a family that deletes disposable checkouts (tmp, scratch) never takes the shortcut
+        self.assertEqual(gd.git_state(go, budget=50), "unchecked")
         plain = self.root / "plain"
         for i in range(20):
             (plain / f"d{i}").mkdir(parents=True)
             for j in range(5):
                 (plain / f"d{i}" / f"f{j}").write_bytes(b"x")
-        self.assertEqual(gd.git_state(plain, budget=50), "unchecked")
+        self.assertEqual(gd.git_state(plain, budget=50, sealed=True), "unchecked")
         chrome = self.root / "Browser/Default/Cache/Cache_Data"
         (chrome / "index-dir").mkdir(parents=True)
         (chrome / "index-dir/the-real-index").write_bytes(b"x")
+        # an index and a data_0 are any dataset's names; Chromium's blockfile index carries its magic
+        dataset = self.root / "dataset"
+        dataset.mkdir()
+        for n in ("index", "data_0", "data_1", "data_2", "data_3"):
+            (dataset / n).write_bytes(b"rows")
+        self.assertEqual(gd.cache_layout(dataset), "")
+        (dataset / "index").write_bytes(gd.CHROMIUM_INDEX_MAGIC + b"rest")
+        self.assertEqual(gd.cache_layout(dataset), "chromium-disk-cache")
         for j in range(100):
             (chrome / f"{j:016x}_0").write_bytes(b"x")
         self.assertEqual(gd.cache_layout(chrome), "chromium-disk-cache")
-        self.assertEqual(gd.git_state(self.root / "Browser", budget=50), "none")
+        self.assertEqual(gd.git_state(self.root / "Browser", budget=50, sealed=True), "none")
         tagged = self.root / "tagged"
         (tagged / "a/b/c/d/e/f/g").mkdir(parents=True)
-        self.assertEqual(gd.git_state(tagged), "unchecked")
+        self.assertEqual(gd.git_state(tagged, sealed=True), "unchecked")
         (tagged / "CACHEDIR.TAG").write_bytes(gd.CACHEDIR_TAG + b"\n")
-        self.assertEqual(gd.git_state(tagged), "none")
+        self.assertEqual(gd.git_state(tagged, sealed=True), "none")
+        # a FIFO carrying the name is never opened (the read would block)
+        fifo = self.root / "fifo"
+        (fifo / "a/b/c/d/e/f/g").mkdir(parents=True)
+        os.mkfifo(fifo / "CACHEDIR.TAG")
+        self.assertEqual(gd.cache_layout(fifo), "")
+        self.assertEqual(gd.git_state(fifo, sealed=True), "unchecked")
         # ~/.cache/bazel on Linux: an output user root whose bases hold bazel's own fetched clones
         bazel = self.root / "bazel/_bazel_me"
         (bazel / "install/abc").mkdir(parents=True)
         (bazel / ("0" * 31 + "a") / "external/rules_x/.git").mkdir(parents=True)
         self.assertEqual(gd.cache_layout(bazel), "bazel-output-root")
-        self.assertEqual(gd.git_state(self.root / "bazel"), "none")
+        self.assertEqual(gd.git_state(self.root / "bazel", sealed=True), "none")
         (self.root / "notbazel/install").mkdir(parents=True)
         (self.root / "notbazel" / ("0" * 31 + "a") / "src/repo/.git").mkdir(parents=True)
-        self.assertEqual(gd.git_state(self.root / "notbazel"), "git")
+        self.assertEqual(gd.git_state(self.root / "notbazel", sealed=True), "git")
         # numbered directories (Maven versions) are not hex shards
         maven = self.root / "maven"
         for v in range(10, 30):
@@ -241,9 +258,9 @@ class GlaedaDiskTest(unittest.TestCase):
         # in the last one is found
         mixed = self.hex_store(self.root / "mixed", files=40)
         (mixed / "b3/worktree/.git").mkdir(parents=True)
-        self.assertEqual(gd.git_state(mixed, budget=50), "git")
+        self.assertEqual(gd.git_state(mixed, budget=50, sealed=True), "git")
         (mixed / "b3/worktree/.git").rmdir()
-        self.assertEqual(gd.git_state(mixed, budget=50), "none")
+        self.assertEqual(gd.git_state(mixed, budget=50, sealed=True), "none")
 
     def test_a_clone_at_the_top_of_a_sealed_cache_is_still_kept(self) -> None:
         # sealing skips the deep search, not the shallow one: a person's clone at the top of a cache,
@@ -269,6 +286,7 @@ class GlaedaDiskTest(unittest.TestCase):
     def test_home_caches_are_discovered_by_layout(self) -> None:
         home = self.root / "home"
         tag = gd.CACHEDIR_TAG + b"\n"
+        cargo_tag = gd.CACHEDIR_TAG + b"\n# This file is a cache directory tag created by cargo.\n"
         (home / ".npm/_cacache/index-v5").mkdir(parents=True)
         (home / ".npm/_cacache/content-v2").mkdir()
         bun = home / ".bun/install/cache"
@@ -279,15 +297,22 @@ class GlaedaDiskTest(unittest.TestCase):
         (home / "go/pkg/mod/cache/lock").write_bytes(b"")
         (home / "go/src/mine").mkdir(parents=True)
         (home / ".cargo/registry").mkdir(parents=True)
-        (home / ".cargo/registry/CACHEDIR.TAG").write_bytes(tag)
+        (home / ".cargo/registry/CACHEDIR.TAG").write_bytes(cargo_tag)
         (home / ".cargo/bin").mkdir()
         # never candidates: secrets, source, a checkout's build output, the Chromium trees,
         # a project's node_modules, and a hex-sharded store (a backup repository looks the same)
         for keep in (".ssh/cache", ".config/gh/cache", "Documents/cache", "Projects/x/cache",
                      "code/repo/target", "cmux-browser-fleet/cache", "app/node_modules/.cache",
-                     ".my-tokens/cache"):
+                     ".my-tokens/cache", ".tool/untagged-creator"):
             (home / keep).mkdir(parents=True)
             (home / keep / "CACHEDIR.TAG").write_bytes(tag)
+        # installed environments uv and direnv tag as caches, even ones naming cargo, are not recreatable
+        for env in (".local/share/uv/tools/ruff", ".local/share/uv/python/cpython-3.12", "tools/.direnv",
+                    "envs/myenv", ".pipx-like/venvs/x"):
+            (home / env).mkdir(parents=True)
+            (home / env / "CACHEDIR.TAG").write_bytes(cargo_tag)
+        (home / "envs/myenv/pyvenv.cfg").write_text("home = /usr/bin")
+        (home / ".pipx-like/venvs/x/pyvenv.cfg").write_text("home = /usr/bin")
         (home / "code/repo/.git").mkdir()
         self.hex_store(home / "backups/restic/data")
         with mock.patch.object(gd, "HOME", home):
@@ -297,11 +322,64 @@ class GlaedaDiskTest(unittest.TestCase):
         wide = home / "wide"
         for i in range(50):
             (wide / f"d{i}").mkdir(parents=True)
-        (wide / "d0/CACHEDIR.TAG").write_bytes(tag)
+        (wide / "d0/CACHEDIR.TAG").write_bytes(cargo_tag)
         with mock.patch.object(gd, "HOME", home):
             found = {os.path.relpath(p, home) for p in gd.discover_caches(home, budget=20)}
         self.assertNotIn("wide/d0", found)
         self.assertIn(".cargo/registry", found)
+
+    def test_other_filesystems_and_read_errors_fail_closed(self) -> None:
+        tree = self.root / "tree"
+        (tree / "mnt/data").mkdir(parents=True)
+        (tree / "plain").mkdir()
+        self.assertEqual(gd.git_state(tree), "none")
+        real = os.DirEntry.stat
+        dev = os.lstat(tree).st_dev
+
+        def fake(entry, *a, **k):
+            st = real(entry, *a, **k)
+            if entry.name == "mnt":
+                return os.stat_result((st.st_mode, st.st_ino, dev + 1) + tuple(st)[3:])
+            return st
+        with mock.patch.object(os.DirEntry, "stat", fake):
+            self.assertEqual(gd.git_state(tree), "unchecked")  # a delete would descend into the mount
+        real_lstat = os.lstat
+
+        def fake_lstat(p, *a, **k):
+            st = real_lstat(p, *a, **k)
+            if os.fspath(p).endswith("/mnt"):
+                return os.stat_result((st.st_mode, st.st_ino, dev + 1) + tuple(st)[3:])
+            return st
+        home = self.root / "home"
+        (home / "mnt/cache/index-v5").mkdir(parents=True)
+        (home / "mnt/cache/content-v2").mkdir()
+        with mock.patch.object(os, "lstat", fake_lstat):
+            self.assertEqual(gd.discover_caches(home), [])
+        self.assertEqual(gd.discover_caches(home), [home / "mnt/cache"])
+        # EIO or ESTALE while reading a directory is not evidence that nothing is there
+        real_scandir = os.scandir
+
+        def failing(p="."):
+            if os.fspath(p).endswith("/plain"):
+                raise OSError(5, "Input/output error")
+            return real_scandir(p)
+        with mock.patch.object(os, "scandir", failing):
+            self.assertEqual(gd.git_state(tree), "unchecked")
+        with self.assertRaisesRegex(OSError, "mount"), mock.patch.object(os.path, "ismount", return_value=True):
+            gd.remove(tree / "plain")
+        self.assertTrue((tree / "plain").is_dir())
+
+    def test_apply_refreshes_only_discovered_candidates_sizes(self) -> None:
+        home = self.root / "home"
+        (home / ".npm/_cacache/index-v5").mkdir(parents=True)
+        (home / ".npm/_cacache/content-v2").mkdir()
+        (home / "code/checkout").mkdir(parents=True)
+        disc = gd.Family("home-caches", home, True, "re-download", discover=True)
+        other = gd.Family("xcode-derived-data", self.root / "dd", True, "rebuild")
+        known = {str(home / ".npm/_cacache"): 1, str(home / "code/checkout"): 2,
+                 str(self.root / "dd/x"): 3, str(self.root / "elsewhere"): 4}
+        self.assertEqual(gd.fresh_for_apply(known, [disc, other]),
+                         {str(home / "code/checkout"): 2, str(self.root / "elsewhere"): 4})
 
     def rustup_home(self, home: Path) -> Path:
         rh = home / ".rustup"
@@ -323,7 +401,7 @@ class GlaedaDiskTest(unittest.TestCase):
         home = self.root / "home"
         rh = self.rustup_home(home)
         self.age(rh)
-        # read yesterday, written long ago: access time keeps it (rustc runs from an old install)
+        # read an hour ago, written long ago: where the filesystem records access, LRU order sees it
         now = time.time()
         os.utime(rh / "toolchains/nightly-aarch64-apple-darwin/bin/rustc", (now - 3600, now - 90 * 24 * 3600))
         self.fam = gd.Family("home-caches", home, True, "re-download", discover=True)
@@ -347,6 +425,26 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((rh / "update-hashes/nightly-aarch64-apple-darwin").exists())
         self.assertTrue((rh / "toolchains/stable-aarch64-apple-darwin").exists())
         self.assertTrue((rh / "settings.toml").exists())
+
+    def test_rustup_toolchains_a_checkout_or_the_environment_pins_stay(self) -> None:
+        home = self.root / "home"
+        rh = self.rustup_home(home)
+        (home / ".cargo/bin").mkdir(parents=True)
+        (home / ".cargo/bin/rustup").write_bytes(b"")
+        (home / "Projects/app").mkdir(parents=True)
+        (home / "Projects/app/rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.88.0"\n')
+        (home / "Projects/app-worktrees/b").mkdir(parents=True)
+        (home / "Projects/app-worktrees/b/rust-toolchain").write_text("nightly\n")
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ, {"CARGO_HOME": str(home / ".cargo")}):
+            os.environ.pop("RUSTUP_TOOLCHAIN", None)
+            tcs = rh / "toolchains"
+            self.assertTrue(gd.rustup_verdict(tcs / "1.88.0-aarch64-apple-darwin"))
+            self.assertTrue(gd.rustup_verdict(tcs / "nightly-aarch64-apple-darwin"))
+            (home / "Projects/app-worktrees/b/rust-toolchain").unlink()
+            self.assertEqual(gd.rustup_verdict(tcs / "nightly-aarch64-apple-darwin"), "")
+            os.environ["RUSTUP_TOOLCHAIN"] = "nightly"
+            self.assertTrue(gd.rustup_verdict(tcs / "nightly-aarch64-apple-darwin"))
 
     def test_discovered_cache_in_use_is_kept(self) -> None:
         home = self.root / "home"
