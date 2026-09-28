@@ -442,6 +442,11 @@ class InstallerTest(unittest.TestCase):
                                  "--apply")
         self.assertEqual(removed["seeder_state"]["remaining"], [])
         self.assertEqual((archive / ".ssh/authorized_keys").read_text().splitlines(), [self.foreign])
+        # The trusted seed writers never read from the archive.
+        code, report = self.cli("install", "--seeder", "cmux-lawrence", "--role", "archive", "--user", "cmux-lawrence",
+                                "--address", "172.20.21.158", "cmux12s-mac-mini", "cmux15", "--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("never read from the archive", report["error"])
         # A host that runs glaeda runners (cmux15 here) can never be the archive.
         code, report = self.cli("install", "--seeder", "cmux15", "--role", "archive", "--address", "x",
                                 "cmux12s-mac-mini", "--apply")

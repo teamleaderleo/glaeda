@@ -411,7 +411,7 @@ def main(argv: list[str]) -> int:
     if args.command == "install":
         report = install(args.apply)
         print(json.dumps(report))
-        return 0 if report.get("loaded", True) else 1
+        return 1 if report.get("error") or (args.apply and not report.get("loaded")) else 0
     record = run(args.apply)
     if args.apply:
         append_log(record)
