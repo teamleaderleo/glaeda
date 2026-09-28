@@ -1848,8 +1848,9 @@ time.sleep(60)
             self.assertEqual(waiter.returncode, 0, out)
             self.assertRegex(out, r"waiting \(\d+ s so far\): all 2 persistent-dd tokens are taken "
                                   r"\(macos-compile-admission is compile\)")
-            self.assertIn("held by persistent-dd: h0 macos-compile-admission (run 100); "
-                          "persistent-dd-1: h1 macos-compile-admission (run 101)", out)
+            if sys.platform == "darwin":  # the holders come from lsof and ps -E, macOS here
+                self.assertIn("held by persistent-dd: h0 macos-compile-admission (run 100); "
+                              "persistent-dd-1: h1 macos-compile-admission (run 101)", out)
             self.assertIn("admitted:", out)
             self.assertIn("persistent-dd+root-1", out)
             self.assertEqual(list(capacity.glob("admit.want-*")), [], "the marker goes with the wait")
@@ -1870,7 +1871,7 @@ time.sleep(60)
         (capacity / "admit.want-999999").write_text(json.dumps({"since": now - 20, "wants": ["root"]}))
         stale = capacity / f"admit.want-{os.getpid() + 0}"
         stale.write_text(json.dumps({"since": now - 30, "wants": ["root"]}))
-        old = now - hook.WANT_FRESH_S - 5
+        old = now - hook.ADMIT_FRESH_S - 5
         os.utime(stale, (old, old))
         (capacity / "admit.want-junk").write_text("{}")
         waiters = hook.admission_waiters(capacity)
@@ -2550,6 +2551,21 @@ else:
         result = self.eligible_start()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.done()
+
+    def test_eligible_node_is_admitted_to_capacity(self) -> None:
+        # every fleet member passes --require-eligible and --capacity-units together; the capacity wait's marker
+        # once shadowed the eligibility want and crashed toolchain_refusal after admission
+        self.fleet()
+        self.node()
+        result = self.started("--require-eligible", "--fleet-class", "m4pro-48", "--toolchain-xcode",
+                              "/Applications/Xcode_26.6.app", "--capacity-units", "4", "--capacity-dir",
+                              os.fspath(self.dir / "capacity"),
+                              env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin", "GITHUB_JOB": "swift-package-tests",
+                                   "RUNNER_NAME": "e0"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("admitted:", result.stdout)
+        self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
+                      env={"RUNNER_NAME": "e0"})
 
     def test_ineligible_nodes_refuse(self) -> None:
         self.fleet()

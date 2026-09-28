@@ -213,6 +213,10 @@ GUEST_WAIT_S = 600.0  # guests have no rescue workflow: a full mini holds their 
 ADMIT_POLL_S = 2.0
 ADMIT_NOTE_S = 60.0
 ADMIT_WANT = "admit.want-"
+# A waiter rewrites its marker after every try, and one try can take a minute on a loaded mini (admission.lock,
+# a preempted fleet build, lsof and ps timeouts), so a marker counts until it is this old or its pid is gone.
+ADMIT_FRESH_S = 180.0
+HOLDERS_BUDGET_S = 10.0  # token_holders stops looking after this long: the log line is not worth more
 
 
 def is_guest(repo: str | None, home_repo: str = DEFAULT_HOME_REPO) -> bool:
@@ -1844,7 +1848,7 @@ def holder_pids(state_dir: Path) -> set[int]:
 
 def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, Any]]:
     """The live jobs waiting for capacity on this mini (CAPACITY_WAIT), oldest first: pid, since (Unix seconds),
-    wants (token kinds, and "units" while it lacks units) and who. A marker older than WANT_FRESH_S, or whose
+    wants (token kinds, and "units" while it lacks units) and who. A marker older than ADMIT_FRESH_S, or whose
     waiter is gone, is removed. Markers are written by jobs on this mini, so they are read as untrusted."""
     waiters: list[dict[str, Any]] = []
     for marker in capacity_dir.glob(f"{ADMIT_WANT}*"):
@@ -1852,7 +1856,7 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
             continue
         try:
             pid = int(marker.name[len(ADMIT_WANT):])
-            fresh = time.time() - marker.stat().st_mtime < WANT_FRESH_S
+            fresh = time.time() - marker.stat().st_mtime < ADMIT_FRESH_S
         except (OSError, ValueError):
             continue
         if pid == skip_pid:
@@ -1911,8 +1915,11 @@ def token_holders(capacity_dir: Path, wants: list[str], compile_slots: int, root
         elif kind in ("gui", "simulator"):
             names.append(kind)
     notes = []
+    deadline = time.monotonic() + HOLDERS_BUDGET_S
     for name in names:
         path = capacity_dir / f"{name}.token"
+        if time.monotonic() >= deadline:
+            break
         if probe(path):
             continue
         try:
@@ -2239,7 +2246,8 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
     build waits for it (host_waiters, which admission refuses for too, so a worker never leases a step it
     would hand back), and under
     admission.lock, held without waiting so no admission meets a unit the probe holds, enough unit files and one
-    free copy of each token are free (an idle catch-up's locks count as free: it yields them to the next job)."""
+    free copy of each token are free (an idle catch-up's locks count as free: it yields them to the next job), and
+    no job admitted here waits for units or one of those tokens (CAPACITY_WAIT: it goes first)."""
     if total <= 0 or host_held(host_lock, reservation, now, state_dir) or host_waiters(host_lock, state_dir):
         return []
     try:
@@ -2263,10 +2271,11 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
             return name in yielding or probe(capacity_dir / name)
 
         units = sum(1 for slot in range(total) if free(f"unit-{slot}"))
+        waited = {kind for waiter in admission_waiters(capacity_dir) for kind in waiter["wants"]}
         fits = []
         for klass in STEP_CLASSES:
             need, tokens = CLASS_COST[klass]
-            if units < min(need, total):
+            if units < min(need, total) or waited & {*tokens, "units"}:  # a waiting job goes first (fair_turn)
                 continue
             copies = {"persistent-dd": max(1, compile_slots), "root": max(1, roots)}
             if all(any(free((f"root-{c + 1}" if token == "root" else token if c == 0 else f"{token}-{c}")
@@ -3832,7 +3841,7 @@ def main(argv: list[str] | None = None) -> int:
             # waits GUEST_WAIT_S for room and is then refused.
             cap = args.guest_wait if is_guest(repo, args.home_repo) else args.gui_wait
             start, since = time.monotonic(), time.time()
-            want = args.capacity_dir / f"{ADMIT_WANT}{os.getpid()}"
+            marker = args.capacity_dir / f"{ADMIT_WANT}{os.getpid()}"
             shown, shown_at = "", 0.0
             try:
                 while True:
@@ -3850,7 +3859,7 @@ def main(argv: list[str] | None = None) -> int:
                     if left <= 0:
                         break
                     wants = list(taken.get("wants") or [])
-                    write_want(want, since, wants)
+                    write_want(marker, since, wants)
                     if note != shown or time.monotonic() - shown_at >= ADMIT_NOTE_S:
                         holders = ""
                         with contextlib.suppress(Exception):  # naming holders must never fail the wait
@@ -3862,7 +3871,7 @@ def main(argv: list[str] | None = None) -> int:
                     time.sleep(min(ADMIT_POLL_S, left))  # never start a try after the deadline
             finally:
                 with contextlib.suppress(OSError):
-                    want.unlink()
+                    marker.unlink()
         else:
             with contextlib.suppress(OSError):  # a crashed job's record must not show in this job's log lines
                 roots_file(args.state_dir).unlink(missing_ok=True)
