@@ -44,6 +44,11 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(p.start, START)
         self.assertEqual(p.command, PAUSE)
 
+    def test_usage_tty_and_cpu_time(self) -> None:
+        text = "    1 ??       486:30.13\n66467 ??         2:53.00\n  7 ttys039  1-01:00:00.50\nbad\n"
+        self.assertEqual(gp.parse_usage(text), {1: ("??", 29190.13), 66467: ("??", 173.0),
+                                                7: ("ttys039", 90000.5)})
+
     def test_comm_paths_with_spaces(self) -> None:
         paths = gp.parse_comm("  7 /Applications/Claude.app/Contents/MacOS/Claude Helper\n")
         self.assertEqual(paths, {7: "/Applications/Claude.app/Contents/MacOS/Claude Helper"})

@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import functools
 import json
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -206,13 +208,21 @@ class GraceTest(unittest.TestCase):
         self.assertEqual(set(seen), {"51 " + START, "52 " + START})
 
     def test_seen_file_round_trip(self) -> None:
+        empty = {"runs": {}, "commands": {}}
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state/seen.json"
-            self.assertEqual(lg.read_seen(path), {})
-            lg.write_seen({"1 x": 5.0}, path)
-            self.assertEqual(lg.read_seen(path), {"1 x": 5.0})
+            self.assertEqual(lg.read_seen(path), empty)
+            seen = {"runs": {"1 x": 5.0}, "commands": {"2 y": {"cpu": 1.5, "since": 7.0}}}
+            lg.write_seen(seen, path)
+            self.assertEqual(lg.read_seen(path), seen)
             path.write_text("[1, 2]")
-            self.assertEqual(lg.read_seen(path), {})
+            self.assertEqual(lg.read_seen(path), empty)
+
+    def test_first_format_reads_as_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "seen.json"
+            path.write_text(json.dumps({"1 x": 5.0, "2 y": 6}))
+            self.assertEqual(lg.read_seen(path), {"runs": {"1 x": 5.0, "2 y": 6.0}, "commands": {}})
 
 
 class HostTest(unittest.TestCase):
@@ -295,6 +305,195 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual([r["outcome"] for r in records], ["terminated"])
         text = lg.render_status(["guard active"], records)
         self.assertIn("orphan swift-test", text)
+
+
+DAY = 86400
+T0 = 1_790_000_000.0
+ROOT_PIDS = [66464, 66466, 66467]
+
+
+def incident(elapsed=4 * DAY):
+    """An SSH remote command left under launchd: zsh -c sudo -n sh -c grep, blocked for days."""
+    return [launchd(),
+            proc(66446, 1, "zsh -c sudo -n sh -c 'grep -rIl x /etc /Users'", path="/bin/zsh", elapsed=elapsed),
+            proc(66464, 66446, "sudo -n sh -c grep -rIl x /etc /Users", path="/usr/bin/sudo", uid=0, elapsed=elapsed),
+            proc(66466, 66464, "sh -c grep -rIl x /etc /Users", path="/bin/sh", uid=0, elapsed=elapsed),
+            proc(66467, 66466, "grep -rIl x /etc /Users", path="/usr/bin/grep", uid=0, elapsed=elapsed)]
+
+
+class Host:
+    """Fake ps usage and lsof answers for one guard pass."""
+
+    def __init__(self, tty="??", stdout=("PIPE", "->0x5c1d"), grep_cpu=173.0):
+        self.tty, self.stdout, self.grep_cpu = tty, stdout, grep_cpu
+        self.fds_asked: list[int] = []
+        self.cwds_asked: list[int] = []
+
+    def usage(self):
+        return {66446: (self.tty, 0.0), 66464: ("??", 0.01), 66466: ("??", 0.0), 66467: ("??", self.grep_cpu),
+                20: ("??", 5.0)}
+
+    def fds(self, pids):
+        self.fds_asked.extend(pids)
+        return {66446: {"cwd": "/Users/leo", "stdout": self.stdout}}
+
+    def cwds(self, pids):
+        self.cwds_asked.extend(pids)
+        return {20: PROJECT}
+
+    def run(self, procs, seen, now, runs=False):
+        return lg.guard_pass(procs, UID, runs, seen, now, cwds=self.cwds, usage=self.usage, fds=self.fds, home=HOME)
+
+
+EMPTY = {"runs": {}, "commands": {}}
+
+
+class StaleCommandTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = Path(self.tmp.name) / "guard.jsonl"
+        self.sent: list[tuple[int, int]] = []
+        self.argvs: list[list[str]] = []
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def kill(self, pid, sig):
+        self.sent.append((pid, sig))
+
+    def sudo_run(self, returncode=0, stderr=""):
+        def run(argv, **_):
+            self.argvs.append(argv)
+            return subprocess.CompletedProcess(argv, returncode, "", stderr)
+        return run
+
+    def settled(self, host, procs, first=T0, then=T0 + 3600):
+        seen = host.run(procs, EMPTY, first)["seen"]
+        return host.run(procs, seen, then)
+
+    def apply(self, due, procs, run, survivors=()):
+        by_pid = {p.pid: p for p in procs}
+        return lg.apply(due, self.log, look=by_pid.get, kill=self.kill,
+                        fresh=lambda: [by_pid[pid] for pid in survivors], sleep=lambda s: None,
+                        sudo=functools.partial(lg.sudo_kill, run=run))
+
+    def test_incident_is_stopped_on_a_fleet_mini(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "update.json"
+            config.write_text(json.dumps({"setupArgs": ["--runner"]}))
+            active = lg.laptop(config)
+        self.assertFalse(active)
+        procs = incident() + [proc(20, 1, "swift test")]  # an orphaned run: laptops only
+        host = Host()
+        first = host.run(procs, EMPTY, T0, runs=active)
+        self.assertEqual([(e["pid"], e["status"], e["idle_seconds"]) for e in first["commands"]],
+                         [(66446, "active", 0)])
+        p = host.run(procs, first["seen"], T0 + 3600, runs=active)
+        self.assertEqual(host.cwds_asked, [], "orphaned runs are not surveyed off a laptop")
+        [due] = p["due"]
+        self.assertEqual((due["pid"], due["status"], due["idle_seconds"], due["processes"]), (66446, "due", 3600, 4))
+        self.assertEqual(due["root_pids"], ROOT_PIDS)
+        self.assertEqual(p["seen"]["commands"]["66446 " + START], {"cpu": 173.01, "since": T0})
+
+        [r] = self.apply(p["due"], procs, self.sudo_run(), survivors=[66467])
+        self.assertEqual(self.argvs, [["/usr/bin/sudo", "-n", "/bin/kill", "-s", "TERM", "66464", "66466", "66467"],
+                                      ["/usr/bin/sudo", "-n", "/bin/kill", "-s", "KILL", "66467"]])
+        self.assertEqual(self.sent, [(66446, signal.SIGTERM)])
+        self.assertEqual((r["outcome"], r["rule"], r["root_pids"], r["idle_seconds"]),
+                         ("killed", "stale-command", ROOT_PIDS, 3600))
+        self.assertEqual([x["outcome"] for x in lg.recent(self.log, 10)], ["killed"])
+        text = lg.render_status(["guard active"], lg.recent(self.log, 10))
+        self.assertIn("stale commands:", text)
+        self.assertIn("age 4d0h, idle 1h0m, root pids 66464 66466 66467", text)
+        plan = lg.render_plan(["guard active"], p)
+        self.assertIn("due        pid 66446 age 4d0h, idle 1h0m, 4 processes, root pids 66464 66466 66467", plan)
+
+    def test_a_tree_with_a_tty_is_kept(self) -> None:
+        host = Host(tty="ttys003")
+        p = self.settled(host, incident())
+        self.assertEqual((p["due"], [(e["pid"], e["reason"]) for e in p["commands_kept"]]), ([], [(66446, "tty")]))
+        self.assertEqual(host.fds_asked, [], "lsof only for candidates")
+
+    def test_stdout_to_a_file_or_dev_null_is_kept(self) -> None:
+        for stdout, reason in ((("REG", "/Users/leo/scan.log"), "logged"), (("CHR", "/dev/null"), "detached")):
+            p = self.settled(Host(stdout=stdout), incident())
+            self.assertEqual((p["due"], [e["reason"] for e in p["commands_kept"]]), ([], [reason]))
+
+    def test_a_tree_younger_than_six_hours_is_kept(self) -> None:
+        p = self.settled(Host(), incident(elapsed=5 * 3600), then=T0 + 2 * 3600)
+        self.assertEqual((p["due"], p["commands"][0]["status"]), ([], "young"))
+
+    def test_cpu_progress_resets_the_idle_clock(self) -> None:
+        procs = incident()
+        seen = Host(grep_cpu=173.0).run(procs, EMPTY, T0)["seen"]
+        p = Host(grep_cpu=174.5).run(procs, seen, T0 + 3000)
+        self.assertEqual((p["commands"][0]["status"], p["commands"][0]["idle_seconds"]), ("active", 0))
+        p = Host(grep_cpu=174.5).run(procs, p["seen"], T0 + 3700)
+        self.assertEqual((p["due"], p["commands"][0]["idle_seconds"]), ([], 700))
+        self.assertEqual(p["seen"]["commands"]["66446 " + START]["since"], T0 + 3000)
+
+    def test_refused_sudo_is_needs_root_and_waits(self) -> None:
+        procs = incident()
+        host = Host()
+        p = self.settled(host, procs)
+        [r] = self.apply(p["due"], procs, self.sudo_run(1, "sudo: a password is required\n"))
+        self.assertEqual((r["outcome"], r["needs_root"]), ("needs-root", ROOT_PIDS))
+        self.assertEqual(self.sent, [], "nothing in the tree is signalled without its root members")
+        self.assertTrue(lg.remember_refusals([r], p["due"], p["seen"], T0 + 3600))
+        later = host.run(procs, p["seen"], T0 + 3630)
+        self.assertEqual((later["due"], later["commands"][0]["status"], later["commands"][0]["needs_root"]),
+                         ([], "needs-root", ROOT_PIDS))
+        self.assertIn("needs root for pids 66464 66466 66467", lg.render_plan(["guard active"], later))
+        retry = host.run(procs, later["seen"], T0 + 7200)
+        self.assertEqual([e["pid"] for e in retry["due"]], [66446])
+
+    def test_kill_complaint_is_not_a_refusal(self) -> None:
+        self.assertTrue(lg.sudo_kill("KILL", [9], run=self.sudo_run(1, "kill: 9: No such process\n")))
+        self.assertFalse(lg.sudo_kill("KILL", [9], run=self.sudo_run(1, "sudo: a password is required\n")))
+
+        def missing(argv, **_):
+            raise FileNotFoundError(argv[0])
+        self.assertFalse(lg.sudo_kill("KILL", [9], run=missing))
+
+    def test_runners_sessions_and_foreign_members(self) -> None:
+        top = proc(80, 1, "/bin/bash -lc ./run.sh", elapsed=DAY)
+        cases = {
+            "ci-runner": [top, proc(81, 80, "/Users/leo/actions-runner-glaeda-2/bin/Runner.Worker",
+                                    path="/Users/leo/actions-runner-glaeda-2/bin/Runner.Worker")],
+            "glaeda-apple": [top, proc(81, 80, "python3 scripts/apple_build.py warm")],
+            "live-session": [top, proc(81, 80, CLAUDE, path=CLAUDE)],
+        }
+        for reason, procs in cases.items():
+            s = lg.commands([launchd(), *procs], UID, lambda: {80: ("??", 0.0)}, lambda pids: {})
+            self.assertEqual([e["reason"] for e in s["kept"]], [reason], reason)
+        # a root process not started through sudo in the tree is left alone
+        procs = [launchd(), top, proc(81, 80, "/usr/bin/login -f x", uid=0), proc(82, 80, "sleep 99")]
+        s = lg.commands(procs, UID, lambda: {80: ("??", 0.0)},
+                        lambda pids: {80: {"cwd": "/", "stdout": ("PIPE", "->0x1")}})
+        [e] = s["commands"]
+        self.assertEqual((e["root_pids"], sorted(q.pid for q in e["_tree"])), ([], [80, 82]))
+
+    def test_shells_without_c_and_other_users_are_not_candidates(self) -> None:
+        procs = [launchd(), proc(90, 1, "/bin/zsh -l", elapsed=DAY), proc(91, 1, "/bin/sh -c x", uid=0, elapsed=DAY),
+                 proc(92, 1, "/bin/bash tests/test_x.sh -c", elapsed=DAY)]
+        called = []
+        s = lg.commands(procs, UID, lambda: called.append(1) or {}, lambda pids: {})
+        self.assertEqual((s, called), ({"commands": [], "kept": []}, []))
+        self.assertTrue(lg.runs_string(["-lc", "x"]))
+        self.assertFalse(lg.runs_string(["--login", "script.sh", "-c"]))
+
+    def test_laptop_runs_are_unchanged(self) -> None:
+        procs = incident() + [proc(20, 1, "swift test")]
+        host = Host()
+        seen = host.run(procs, EMPTY, T0, runs=True)["seen"]
+        p = host.run(procs, seen, T0 + 30, runs=True)
+        self.assertEqual([(e["pid"], e["rule"]) for e in p["due"]], [(20, "swift-test")])
+        self.assertEqual(p["seen"]["runs"], {"20 " + START: T0})
+
+    def test_parse_fds(self) -> None:
+        text = "p80\nfcwd\ntDIR\nn/Users/leo\nf1\ntPIPE\nn->0x5c1d\np81\nfcwd\ntDIR\nn/\n"
+        self.assertEqual(lg.parse_fds(text), {80: {"cwd": "/Users/leo", "stdout": ("PIPE", "->0x5c1d")},
+                                              81: {"cwd": "/"}})
 
 
 if __name__ == "__main__":

@@ -165,6 +165,33 @@ def snapshot() -> list[Proc]:
     return procs
 
 
+def parse_cputime(text: str) -> float:
+    """ps time: [dd-][hh:]mm:ss[.cc], as CPU seconds."""
+    days, _, rest = text.rpartition("-")
+    total = 0.0
+    for part in rest.split(":"):
+        total = total * 60 + float(part)
+    return round((int(days) if days else 0) * 86400 + total, 2)
+
+
+def parse_usage(text: str) -> dict[int, tuple[str, float]]:
+    found = {}
+    for line in text.splitlines():
+        f = line.split()
+        if len(f) != 3 or not f[0].isdigit():
+            continue
+        try:
+            found[int(f[0])] = (f[1], parse_cputime(f[2]))
+        except ValueError:
+            continue
+    return found
+
+
+def usage() -> dict[int, tuple[str, float]]:
+    """Controlling terminal (`??` for none) and total CPU seconds of every process."""
+    return parse_usage(run([PS, "-axo", "pid=,tty=,time="]))
+
+
 def observe(pid: int) -> Proc | None:
     """The process now, None only when the PID provably no longer exists.
 
