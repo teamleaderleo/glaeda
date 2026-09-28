@@ -511,9 +511,13 @@ def stop(signum: int, _frame: Any) -> None:
             _child.kill()
     if _grouped:
         kill_build(passes=1)  # within the hook's WARM_YIELD_S; the killpg below takes the rest
-        forget_inode_override()
         if _fuzzing:
+            # Never forget_inode_override here: the fuzz lane runs beside jobs, and a compile between its adopt
+            # and its build needs that default. The lane never sets it.
             dismiss_crash_dialogs()
+            release([])  # the holder file names us: drop it so a reused pid is never signalled for it
+        else:
+            forget_inode_override()
         os.killpg(os.getpid(), signal.SIGKILL)
     os._exit(128 + signum)
 
@@ -634,10 +638,11 @@ FUZZ_MIN_FREE_BYTES = 90 * 1024 ** 3
 # Beside a compile: the compile keeps the cores it wants. The manual runs of 2026-09-28 used nice 10 beside PR
 # compiles on eight minis and saw no stall or hang the app did not also show alone.
 FUZZ_NICE = 10
-# How often the lane looks for a GUI job while the fuzzer runs: the gui token and the reservation (a flock and a
-# small read) every FUZZ_WATCH_S, the process list (ps) every FUZZ_PS_S.
-FUZZ_WATCH_S = 0.25
-FUZZ_PS_S = 1.0
+# How often the lane itself looks for a GUI job while the fuzzer runs (the reservation, the process list and the
+# gui token). A backstop only: the hook stops the lane before any job takes the gui token. The token probe takes
+# its flock for an instant, which a gui runner's listener gate could read as taken, so it stays infrequent.
+FUZZ_WATCH_S = 1.0
+FUZZ_TOKEN_S = 3.0
 FUZZ_APP = "cmux DEV.app"
 FUZZ_KILL_SWITCH = HOME / ".config/glaeda/idle-fuzz.disabled"
 XCODE_TEST = re.compile(r"(^|/)(xctest|XCTRunner)(\s|$)|-Runner\.app/")
@@ -666,22 +671,33 @@ def console_refusal(hook: Any) -> str:
     return "" if state.state == "unlocked" else f"the console session is {state.state}"
 
 
+def ps(field: str) -> list[str] | None:
+    try:
+        out = subprocess.run(["/bin/ps", "-axww", "-o", f"{field}="], capture_output=True, text=True,
+                             errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.splitlines() if out.returncode == 0 else None
+
+
 def gui_process(ours: str = "") -> str:
     """A process that means a GUI job or a person has the console: an Xcode test, a job step asking for the gui
-    token, or a cmux DEV app that is not under OURS (the fuzzer's own staged builds). '' when none."""
-    try:
-        out = subprocess.run(["/bin/ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
+    token, or a cmux DEV app that is not under OURS (the fuzzer's own staged builds). '' when none.
+
+    Tests and apps are matched on the executable (comm), never the arguments: a compile's link, codesign and
+    dsymutil steps name `cmux DEV.app/Contents/MacOS/cmux DEV` and `...-Runner.app/` in theirs."""
+    executables, commands = ps("comm"), ps("command")
+    if executables is None or commands is None:
         return "cannot list processes"
-    if out.returncode != 0:
-        return "cannot list processes"
-    for command in out.stdout.splitlines():
-        if XCODE_TEST.search(command):
+    for program in executables:
+        program = program.strip()
+        if XCODE_TEST.search(program):
             return "an Xcode test is running"
+        if DEV_APP.search(program) and not (ours and program.startswith(ours)):
+            return "another cmux DEV app is running"
+    for command in commands:
         if WANTS_GUI.search(command):
             return "a job is asking for the gui token"
-        if DEV_APP.search(command) and not (ours and command.startswith(ours)):
-            return "another cmux DEV app is running"
     return ""
 
 
@@ -749,13 +765,16 @@ def stage_build(state: Path, root: int, sha: str) -> Path | str:
     builds.mkdir(parents=True, exist_ok=True)
     for stale in builds.glob(".*"):  # copies a kill cut short
         shutil.rmtree(stale, ignore_errors=True)
-    before = (store / "stamp.json").read_bytes()
+    def identity() -> tuple[bytes, int, float]:  # a job's keep swaps derived-data in, then rewrites the stamp
+        info = os.stat(store / "derived-data")
+        return (store / "stamp.json").read_bytes(), info.st_ino, info.st_mtime
+    before = identity()
     final = builds / sha
     incoming = builds / f".{sha}.{os.getpid()}"
     incoming.mkdir()
     subprocess.run(["/bin/cp", "-Rc", os.fspath(source), os.fspath(incoming / FUZZ_APP)], check=True,
                    capture_output=True, timeout=600)
-    if (store / "stamp.json").read_bytes() != before:
+    if identity() != before:
         shutil.rmtree(incoming, ignore_errors=True)
         return f"root-{root}'s kept build changed while it was copied"
     (incoming / "build.json").write_text(json.dumps({"sha": sha, "root": root, "at": int(time.time())}) + "\n")
@@ -862,11 +881,12 @@ def free_bytes(path: Path) -> int | None:
 def watch(hook: Any, capacity: Path, ours: str, timeout_s: float) -> tuple[int | None, str]:
     """Wait for the fuzzer (_child); (its exit code or None, why it was stopped or '').
 
-    Stops at the first sign of a GUI job: the gui token taken (seen twice in a row: a listener gate's probe holds
-    it for microseconds), a reservation, or (every FUZZ_PS_S) an Xcode test, a take-gui or another cmux DEV app."""
+    Stops at the first sign of a GUI job: a reservation or (every FUZZ_WATCH_S) an Xcode test, a take-gui or
+    another cmux DEV app, or (every FUZZ_TOKEN_S) the gui token taken twice in a row (a listener gate's probe holds
+    it for an instant)."""
     assert _child is not None
     deadline = time.monotonic() + timeout_s
-    next_ps = 0.0
+    next_token = 0.0
     token_taken = 0
     while True:
         try:
@@ -876,17 +896,17 @@ def watch(hook: Any, capacity: Path, ours: str, timeout_s: float) -> tuple[int |
         now = time.monotonic()
         if now >= deadline:
             return None, f"timed out after {timeout_s:g} s"
-        token_taken = 0 if hook.probe(capacity / "gui.token") else token_taken + 1
-        if token_taken >= 2:
-            return None, "a job holds the gui token"
         why = reservation_refusal(hook, time.time())
         if why:
             return None, why
-        if now >= next_ps:
-            next_ps = now + FUZZ_PS_S
-            why = gui_process(ours)
-            if why and why != "cannot list processes":
-                return None, why
+        why = gui_process(ours)
+        if why and why != "cannot list processes":
+            return None, why
+        if now >= next_token:
+            next_token = now + FUZZ_TOKEN_S
+            token_taken = 0 if hook.probe(capacity / "gui.token") else token_taken + 1
+            if token_taken >= 2:
+                return None, "a job holds the gui token"
 
 
 def fuzz_setup() -> tuple[Any, int] | str:
@@ -895,14 +915,16 @@ def fuzz_setup() -> tuple[Any, int] | str:
     if not dirs:
         return "no glaeda runner on this mini"
     try:
+        if any("--trusted-ref" in (runner / "glaeda-hooks" / "job-started.sh").read_text() for runner in dirs):
+            return "a trusted-only runner (a seeder) runs here"
         hook = load_hook(dirs[0])
+        scopes = [hook.runner_scope(runner) for runner in dirs]
     except Exception as error:  # noqa: BLE001
         return f"cannot load the runner hook ({type(error).__name__})"
-    try:
-        roots = max(hook.runner_scope(runner).roots for runner in dirs)
-    except Exception:  # noqa: BLE001 - an older hook
-        roots = 1
-    return hook, max(1, roots)
+    # Only capacity-mode admission stops the fuzzer before a gui job (take_capacity's yield_idle_fuzz).
+    if max(scope.units for scope in scopes) <= 0:
+        return "runners are not in capacity mode"
+    return hook, max(1, max(scope.roots for scope in scopes))
 
 
 def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
@@ -984,10 +1006,8 @@ def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
                  "--max-findings", str(FUZZ_MAX_FINDINGS), "--seed", str(seed), "--out", os.fspath(out),
                  "--label", "main", "--sha", build.name],
                 cwd=engine, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-        try:
-            code, stopped = watch(hook, capacity, ours, FUZZ_TIMEOUT_S)
-        finally:
-            _child = None
+        code, stopped = watch(hook, capacity, ours, FUZZ_TIMEOUT_S)
+        _child = None
         kill_build()  # the app and anything else the fuzzer left in our group
         dismiss_crash_dialogs()
         try:
@@ -1004,6 +1024,11 @@ def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return {**base, "state": "error", "reason": f"{type(error).__name__}: {str(error)[:160]}"}
     finally:
+        if _child is not None:  # watch() raised: the fuzzer and its app must not outlive the holder
+            with contextlib.suppress(OSError):
+                _child.kill()
+            _child = None
+            kill_build()
         _fuzzing = False
         release([])
         os.close(lock)

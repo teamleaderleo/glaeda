@@ -1597,7 +1597,11 @@ def idle_warm(capacity_dir: Path, name: str = WARM_HOLDER) -> tuple[int, set[str
             return None
         command = subprocess.run(["/bin/ps", "-o", "command=", "-p", str(holder[0])], capture_output=True,
                                  text=True, timeout=5).stdout
-        return holder if is_idle_warm(command) else None
+        # The two lanes are one program: the fuzz lane runs with --fuzz, the catch-up without. A stale holder whose
+        # pid now belongs to the other lane is not this holder.
+        if not is_idle_warm(command) or ("--fuzz" in command.split()) != (name == FUZZ_HOLDER):
+            return None
+        return holder
     except Exception:  # noqa: BLE001 - a holder file must never refuse or fail a job
         return None
 

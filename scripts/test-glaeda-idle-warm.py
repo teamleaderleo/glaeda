@@ -471,7 +471,7 @@ class FuzzTest(Base):
         return subprocess.Popen(
             [sys.executable, os.fspath(program), os.fspath(ROOT / "scripts" / "glaeda-idle-warm"),
              os.fspath(ROOT / "scripts" / "glaeda-cmux-runner-hook"), os.fspath(self.state), os.fspath(self.dir),
-             self.head], stdout=subprocess.PIPE, text=True, env={**os.environ})
+             self.head, "--fuzz"], stdout=subprocess.PIPE, text=True, env={**os.environ})
 
     def started_app(self, proc: subprocess.Popen) -> int:
         runs = self.dir / "fleet" / "fuzz" / "runs"
@@ -559,12 +559,20 @@ class FuzzTest(Base):
             "/usr/bin/python3 glaeda-cmux-runner-hook take-root --root 1": "",
         }
         real = subprocess.run
-        for command, want in cases.items():
-            subprocess.run = lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=command + "\n")
-            try:
+
+        def fake(comm: str, command: str):
+            return lambda argv, **k: types.SimpleNamespace(returncode=0, stdout=(comm if argv[-1] == "comm=" else command) + "\n")
+        try:
+            for command, want in cases.items():
+                subprocess.run = fake(command.split(" -")[0].split(" --")[0], command)
                 self.assertEqual(warm.gui_process(ours), want, command)
-            finally:
-                subprocess.run = real
+            # A compile names the app and a test runner in its arguments; only running ones count.
+            for command in ("/usr/bin/codesign --force --sign - /dd/Build/Products/Debug/cmux DEV.app/Contents/MacOS/cmux DEV",
+                            "/usr/bin/codesign --force /dd/Build/Products/Debug/cmuxUITests-Runner.app/"):
+                subprocess.run = fake("/usr/bin/codesign", command)
+                self.assertEqual(warm.gui_process(ours), "", command)
+        finally:
+            subprocess.run = real
 
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
     def test_taking_the_gui_token_stops_the_fuzzer_and_its_app_at_once(self) -> None:
@@ -597,7 +605,7 @@ class FuzzTest(Base):
         app_pid = self.started_app(proc)
         gui = hook.lock_file(self.capacity / "gui.token", fcntl.LOCK_EX)
         self.addCleanup(os.close, gui)
-        out, _ = proc.communicate(timeout=10)
+        out, _ = proc.communicate(timeout=30)
         result = json.loads(out.strip().splitlines()[-1])
         self.assertEqual((result["state"], result["reason"]), ("stopped", "a job holds the gui token"), result)
         self.assertLess(result["wall_seconds"], 30)
