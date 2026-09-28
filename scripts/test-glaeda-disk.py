@@ -312,6 +312,12 @@ class GlaedaDiskTest(unittest.TestCase):
             (home / env).mkdir(parents=True)
             (home / env / "CACHEDIR.TAG").write_bytes(cargo_tag)
         (home / "envs/myenv/pyvenv.cfg").write_text("home = /usr/bin")
+        # cargo tags a target directory too: one outside a project (CARGO_TARGET_DIR) is a build
+        (home / ".cargo-target/debug").mkdir(parents=True)
+        (home / "shared-target").mkdir()
+        (home / "shared-target/.rustc_info.json").write_text("{}")
+        for build in (".cargo-target", "shared-target"):
+            (home / build / "CACHEDIR.TAG").write_bytes(cargo_tag)
         (home / ".pipx-like/venvs/x/pyvenv.cfg").write_text("home = /usr/bin")
         (home / "code/repo/.git").mkdir()
         self.hex_store(home / "backups/restic/data")
@@ -445,6 +451,27 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertEqual(gd.rustup_verdict(tcs / "nightly-aarch64-apple-darwin"), "")
             os.environ["RUSTUP_TOOLCHAIN"] = "nightly"
             self.assertTrue(gd.rustup_verdict(tcs / "nightly-aarch64-apple-darwin"))
+
+    def test_apply_rechecks_a_discovered_cache_for_a_new_clone(self) -> None:
+        home = self.root / "home"
+        cache = home / ".npm/_cacache"
+        (cache / "index-v5").mkdir(parents=True)
+        (cache / "content-v2").mkdir()
+        (cache / "content-v2/blob").write_bytes(b"\0" * 1024 * 1024)
+        self.age(home / ".npm")
+        self.fam = gd.Family("home-caches", home, True, "re-download", discover=True)
+        receipt = self.root.parent / f"{self.root.name}-r.jsonl"
+        with mock.patch.object(gd, "HOME", home):
+            items = gd.survey([self.fam], 24, 0)
+            self.assertEqual([i.verdict for i in items], ["reclaimable"])
+            (cache / "mine/.git").mkdir(parents=True)  # someone cloned into it after the survey
+            self.age(home / ".npm")
+            with contextlib.redirect_stdout(io.StringIO()):
+                gd.apply(items, {self.fam.id: self.fam}, receipt, None, 24)
+        outcome = json.loads(receipt.read_text().splitlines()[-1])["outcome"]
+        receipt.unlink(missing_ok=True)
+        self.assertEqual(outcome, "changed:git")
+        self.assertTrue((cache / "mine/.git").is_dir())
 
     def test_discovered_cache_in_use_is_kept(self) -> None:
         home = self.root / "home"
