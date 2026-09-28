@@ -359,7 +359,7 @@ def heal_tailscale(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
         if state == "Running":
             return True, f"{what}: Running"
         mini.sleep(5)
-    return False, f"{what}: still {state}"
+    return False, f"{what}: still {state or 'no BackendState'}"
 
 
 def agent_label(agent: str) -> str:
