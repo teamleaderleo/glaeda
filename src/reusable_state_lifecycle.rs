@@ -14,10 +14,13 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::artifact::{RepositoryRef, Sha256Digest};
+use crate::hot_state_path_policy::{
+    HotStateAdmissionMismatchField, HotStateAdmissionRefusal, HotStateCapabilityObservation,
+    HotStateForbiddenReason,
+};
+use crate::reusable_state_hot_state_policy::select_reusable_state_hot_state;
 
 pub const REUSABLE_STATE_LIFECYCLE_SCHEMA_VERSION: u8 = 1;
-const MAX_METRIC: u64 = 1_000_000_000_000;
-const MAX_DURATION_MILLIS: u64 = 365 * 24 * 60 * 60 * 1_000;
 const HOUR_MILLIS: u64 = 60 * 60 * 1_000;
 const DAY_MILLIS: u64 = 24 * HOUR_MILLIS;
 const WEEK_MILLIS: u64 = 7 * DAY_MILLIS;
@@ -266,6 +269,12 @@ pub struct ReusableStateMetrics {
     pub lookups: u64,
     pub hits: u64,
     pub misses: u64,
+    /// Consumer attempts that computed this identity and resolved no generation to
+    /// evaluate. These never reach `evaluate_reusable_state_consumption`, so they
+    /// produce no field-level mismatch and are invisible to `lookups`/`misses`.
+    /// Counting them separately is what keeps a structurally unreachable identity
+    /// from reading as an untouched new generation.
+    pub unresolved_identity_attempts: u64,
     pub restore_duration_millis: u64,
     pub publication_duration_millis: u64,
     pub bytes_read: u64,
@@ -285,37 +294,12 @@ pub struct ReusableStateMetrics {
 impl ReusableStateMetrics {
     /// # Errors
     ///
-    /// Returns an error when counts disagree or any observation exceeds its reviewed bound.
+    /// Returns an error when counts disagree.
     pub fn validate(&self) -> Result<(), ReusableStatePolicyError> {
-        for count in [
-            self.lookups,
-            self.hits,
-            self.misses,
-            self.validation_failures,
-            self.reset_invalidation_count,
-            self.producer_successes,
-            self.successful_consumers,
-            self.semantic_mismatches,
-        ] {
-            if count > MAX_METRIC {
-                return Err(ReusableStatePolicyError::MetricOutOfRange);
-            }
-        }
         if self.hits.checked_add(self.misses) != Some(self.lookups)
             || self.successful_consumers > self.hits
         {
             return Err(ReusableStatePolicyError::InconsistentMetrics);
-        }
-        for duration in [
-            self.restore_duration_millis,
-            self.publication_duration_millis,
-            self.estimated_cold_work_millis,
-            self.estimated_warm_work_millis,
-            self.reset_invalidation_overhead_millis,
-        ] {
-            if duration > MAX_DURATION_MILLIS {
-                return Err(ReusableStatePolicyError::MetricOutOfRange);
-            }
         }
         Ok(())
     }
@@ -359,16 +343,45 @@ impl ReusableStateMetrics {
         })
     }
 
+    /// Every consumer attempt that addressed this identity, resolved or not.
     #[must_use]
-    pub fn hit_rate_basis_points(&self) -> u16 {
-        u16::try_from(
-            self.hits
-                .saturating_mul(10_000)
-                .checked_div(self.lookups)
-                .unwrap_or(0),
-        )
-        .unwrap_or(10_000)
+    pub fn resolution_attempts(&self) -> u128 {
+        u128::from(self.lookups) + u128::from(self.unresolved_identity_attempts)
     }
+
+    /// Observed hit rate, or `None` when no consumer has addressed this identity at all.
+    ///
+    /// The denominator is every resolution attempt, not only the lookups that resolved a
+    /// generation. An identity no consumer can address therefore reports a measured
+    /// `Some(0)` rather than the `0` that an untouched new generation also reports.
+    #[must_use]
+    pub fn hit_rate_basis_points(&self) -> Option<u16> {
+        let attempts = self.resolution_attempts();
+        if attempts == 0 {
+            return None;
+        }
+        let basis_points = (u128::from(self.hits) * 10_000) / attempts;
+        Some(u16::try_from(basis_points).unwrap_or(10_000))
+    }
+}
+
+/// Why a consumer's computed reuse identity resolved to no generation to evaluate.
+///
+/// `ReusableStateIdentityMismatch` names a disagreement between two identities that are
+/// already in hand. These name the attempts that never got that far: the consumer
+/// addressed a key no publisher could have sealed, or was refused before any candidate
+/// was offered. A reuse path that fails this way produces no mismatch evidence at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReusableStateUnresolvedReason {
+    /// The consumer could not establish an admissible identity for itself, so it never
+    /// addressed a publisher. Every attempt fails identically and the reuse rate this
+    /// produces is structurally zero rather than merely low.
+    ConsumerIdentityUnprovable,
+    /// The consumer's identity is admissible, but no published generation carries it.
+    NoGenerationForIdentity,
+    /// A generation exists under this identity and this consumer may not read it.
+    PublisherBoundaryRefused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -602,6 +615,16 @@ impl ReusableStateGeneration {
         {
             return Ok(ReusableStateRecommendation::Revalidate);
         }
+        // Checked before the lifecycle arms on purpose. `StopPublishing` needs
+        // `min_lookups_for_value` resolved lookups, which an identity nobody can address
+        // never accumulates, so without this a permanently unreachable generation would
+        // stay on `Observe` for its whole life.
+        if self.metrics.hits == 0
+            && self.metrics.unresolved_identity_attempts > 0
+            && self.metrics.unresolved_identity_attempts >= policy.min_unresolved_attempts_for_alarm
+        {
+            return Ok(ReusableStateRecommendation::InvestigateUnreachableIdentity);
+        }
         let utility = self.metrics.utility()?;
         let enough_value_lookups = self.metrics.lookups >= policy.min_lookups_for_value;
         Ok(match self.lifecycle {
@@ -698,6 +721,9 @@ pub struct ReusableStatePromotionPolicy {
     pub min_net_time_saved_millis: i64,
     pub max_validation_failures: u64,
     pub max_resets_per_thousand_lookups: u64,
+    /// Unresolved consumer attempts, with no hit, that make an identity defect the
+    /// likelier explanation than a cold start.
+    pub min_unresolved_attempts_for_alarm: u64,
 }
 
 impl ReusableStatePromotionPolicy {
@@ -710,6 +736,7 @@ impl ReusableStatePromotionPolicy {
             min_net_time_saved_millis: 1,
             max_validation_failures: 0,
             max_resets_per_thousand_lookups: 10,
+            min_unresolved_attempts_for_alarm: 3,
         }
     }
 
@@ -721,11 +748,15 @@ impl ReusableStatePromotionPolicy {
             return Err(ReusableStatePolicyError::InvalidPromotionPolicy);
         }
         let metrics = &generation.metrics;
-        let reset_rate = metrics
-            .reset_invalidation_count
-            .saturating_mul(1_000)
-            .checked_div(metrics.lookups)
-            .unwrap_or(u64::MAX);
+        let reset_rate = if metrics.lookups == 0 {
+            u64::MAX
+        } else {
+            u64::try_from(
+                (u128::from(metrics.reset_invalidation_count) * 1_000)
+                    / u128::from(metrics.lookups),
+            )
+            .unwrap_or(u64::MAX)
+        };
         Ok(
             generation.publication == ReusableStatePublicationState::Complete
                 && generation.integrity == ReusableStateIntegrityState::Verified
@@ -752,6 +783,10 @@ pub enum ReusableStateRecommendation {
     Retire,
     Evict,
     StopPublishing,
+    /// Consumers keep addressing this identity and keep resolving nothing. The defect is
+    /// in the identity the two sides compute, not in the generation's value, so neither
+    /// `StopPublishing` nor `Observe` describes it.
+    InvestigateUnreachableIdentity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -775,8 +810,18 @@ pub enum ReusableStateConsumptionMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "disposition", rename_all = "snake_case")]
 pub enum ReusableStateConsumptionDisposition {
-    Hit { mode: ReusableStateConsumptionMode },
-    MissReset { reason: ReusableStateMissReason },
+    Hit {
+        mode: ReusableStateConsumptionMode,
+    },
+    MissReset {
+        reason: ReusableStateMissReason,
+    },
+    /// No generation was resolved, so no identity comparison happened. A resolver
+    /// reports this; `evaluate_reusable_state_consumption` never returns it, because by
+    /// the time it runs a candidate is already in hand.
+    Unresolved {
+        reason: ReusableStateUnresolvedReason,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -793,15 +838,72 @@ pub enum ReusableStateMissReason {
     InvalidatedPreferredGeneration,
     LifecycleUnavailable,
     LowTrustConsumptionDisallowed,
+    HotStateReuseRefused(ReusableStateHotStateRefusal),
+}
+
+/// Why the hot-state reuse ladder refused a generation this layer had already accepted.
+///
+/// Every variant is one cause an operator would act on differently, so a run that never reuses
+/// reports *which* refusal it kept hitting instead of one undifferentiated count. The granularity
+/// is deliberate rather than mechanical: `LadderMismatch` carries the full
+/// `HotStateAdmissionMismatchField` vocabulary because that rung is *derived here*, by comparing
+/// the publisher and consumer admission contexts, and is recoverable from no other record — the
+/// same reason `IdentityMismatch` carries its field. The remaining causes are named classes,
+/// because each is either recoverable from evidence the caller already holds or is structurally
+/// unreachable from this call site (see each variant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "refusal", rename_all = "snake_case")]
+pub enum ReusableStateHotStateRefusal {
+    /// One ladder rung disagreed between the publisher and consumer sides of the same contract.
+    LadderMismatch {
+        rung: HotStateAdmissionMismatchField,
+    },
+    /// The generation holds unique local work, which is permanently ineligible for reuse.
+    UniqueLocalWork,
+    /// The family owner's recorded standing quarantines or permanently forbids the family.
+    ///
+    /// Unreachable from this call site today: `reusable_state_hot_state_policy::family_standing`
+    /// derives standing only from publication, integrity, and revalidation, and
+    /// `evaluate_reusable_state_consumption` has already returned a more specific miss reason for
+    /// each of those before the ladder runs. It stays a named cause so a future standing source
+    /// cannot land here silently.
+    FamilyStandingRefused,
+    /// Physical resource admission refused the candidate.
+    ///
+    /// Unreachable from this call site today: this layer opens no bytes and always offers
+    /// `HotStateResourceDisposition::Accepted`. The family executor owns the real check.
+    ResourceRefused,
+    /// Admission held, but the host offers no reviewed sharing mode that reuses existing bytes.
+    /// This is a host capability gap, not a disagreement about identity.
+    SharingModeUnavailable,
+    /// Admission held but is stale for the current selector — the capability-observation
+    /// generation or the policy path class/reuse identity moved after it was minted.
+    ///
+    /// Unreachable from this call site today: `select_reusable_state_hot_state` mints and spends
+    /// the admission inside one call against one contract and one capability observation, so the
+    /// selector cannot have moved. It guards callers that hold an admission across observations.
+    AdmissionStale,
+    /// The consumer contract cannot be expressed as a hot-state admission context at all.
+    /// This is an error in the contract, not a mismatch between two well-formed sides.
+    ContextUnderivable,
 }
 
 /// Evaluate one read-only consumption attempt. Broken or ambiguous state becomes a miss/reset.
+///
+/// Semantic identity is necessary but not sufficient. A hit additionally requires the hot-state
+/// path-class policy in `crate::reusable_state_hot_state_policy` to admit the published generation
+/// against `capabilities` and to select a mode that reuses existing bytes. An unproven ladder
+/// dimension, a stale capability generation, and a host that does not offer the reviewed sharing
+/// mode each refuse reuse, and each refuses under its own
+/// `HotStateReuseRefused(ReusableStateHotStateRefusal)` cause: a path that never reuses reports
+/// which rung or capability kept refusing rather than one undifferentiated miss.
 #[must_use]
 pub fn evaluate_reusable_state_consumption(
     expected: &ReusableStateIdentityContract,
     generation: &ReusableStateGeneration,
     consumer: ReusableStateConsumerTrust,
     policy: ReusableStateConsumptionPolicy,
+    capabilities: &HotStateCapabilityObservation,
 ) -> ReusableStateConsumptionDisposition {
     if let Some(mismatch) = expected.first_mismatch(&generation.identity) {
         return ReusableStateConsumptionDisposition::MissReset {
@@ -859,8 +961,13 @@ pub fn evaluate_reusable_state_consumption(
         ),
     };
     if usable {
-        ReusableStateConsumptionDisposition::Hit {
-            mode: ReusableStateConsumptionMode::ReadOnly,
+        match hot_state_reuse_refusal(expected, generation, capabilities) {
+            None => ReusableStateConsumptionDisposition::Hit {
+                mode: ReusableStateConsumptionMode::ReadOnly,
+            },
+            Some(refusal) => ReusableStateConsumptionDisposition::MissReset {
+                reason: ReusableStateMissReason::HotStateReuseRefused(refusal),
+            },
         }
     } else {
         ReusableStateConsumptionDisposition::MissReset {
@@ -873,6 +980,50 @@ pub fn evaluate_reusable_state_consumption(
             },
         }
     }
+}
+
+/// The hot-state ladder's verdict on one already-identity-matched generation.
+///
+/// `None` is exactly `select_reusable_state_hot_state(..).is_ok_and(|d| d.reuse_admitted())`, so
+/// the gate is unchanged: every input that refused reuse before still refuses. Only the
+/// attribution is new.
+fn hot_state_reuse_refusal(
+    expected: &ReusableStateIdentityContract,
+    generation: &ReusableStateGeneration,
+    capabilities: &HotStateCapabilityObservation,
+) -> Option<ReusableStateHotStateRefusal> {
+    // An underivable context is an error about the consumer's own contract, not a disagreement
+    // between two well-formed sides, so it must not share a cause with a rung mismatch.
+    let Ok(decision) = select_reusable_state_hot_state(expected, generation, capabilities) else {
+        return Some(ReusableStateHotStateRefusal::ContextUnderivable);
+    };
+    if decision.reuse_admitted() {
+        return None;
+    }
+    if let Some(refusal) = decision.refusal() {
+        return Some(match refusal {
+            HotStateAdmissionRefusal::Mismatch { field } => {
+                ReusableStateHotStateRefusal::LadderMismatch { rung: field }
+            }
+            HotStateAdmissionRefusal::Forbidden {
+                reason: HotStateForbiddenReason::UniqueLocalWork,
+            } => ReusableStateHotStateRefusal::UniqueLocalWork,
+            HotStateAdmissionRefusal::Forbidden { .. }
+            | HotStateAdmissionRefusal::QuarantineRequired { .. } => {
+                ReusableStateHotStateRefusal::FamilyStandingRefused
+            }
+            HotStateAdmissionRefusal::ResourceRefused => {
+                ReusableStateHotStateRefusal::ResourceRefused
+            }
+        });
+    }
+    // Admission held. Either it no longer matches the selector it was minted against, or it does
+    // and the host simply offers no mode that reuses the published bytes.
+    Some(if decision.receipt().candidate_identity_match() {
+        ReusableStateHotStateRefusal::SharingModeUnavailable
+    } else {
+        ReusableStateHotStateRefusal::AdmissionStale
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1197,7 +1348,10 @@ pub struct ReusableStateUtilityReport {
     pub cache_class: ReusableStateClass,
     pub generation: ReusableStateGenerationId,
     pub storage_size_bytes: u64,
-    pub hit_rate_basis_points: u16,
+    /// `None` when no consumer has addressed this identity, so an unmeasured rate is
+    /// never rendered as a measured zero.
+    pub hit_rate_basis_points: Option<u16>,
+    pub unresolved_identity_attempts: u64,
     pub estimated_saved_per_hit_millis: u64,
     pub restore_duration_millis: u64,
     pub publication_duration_millis: u64,
@@ -1221,6 +1375,7 @@ impl ReusableStateUtilityReport {
             generation: generation.generation.clone(),
             storage_size_bytes: generation.metrics.storage_size_bytes,
             hit_rate_basis_points: generation.metrics.hit_rate_basis_points(),
+            unresolved_identity_attempts: generation.metrics.unresolved_identity_attempts,
             estimated_saved_per_hit_millis: utility.estimated_saved_per_hit_millis,
             restore_duration_millis: generation.metrics.restore_duration_millis,
             publication_duration_millis: generation.metrics.publication_duration_millis,
@@ -1334,6 +1489,20 @@ mod tests {
         Sha256Digest::parse(&format!("sha256:{index:064x}")).unwrap()
     }
 
+    fn overlay_capabilities() -> HotStateCapabilityObservation {
+        HotStateCapabilityObservation::new(
+            crate::hot_state_path_policy::HotStateCapabilityGenerationId::parse(
+                "reusable-state-capability-1",
+            )
+            .unwrap(),
+            true,
+            false,
+            true,
+            false,
+            false,
+        )
+    }
+
     fn identity(class: ReusableStateClass) -> ReusableStateIdentityContract {
         ReusableStateIdentityContract::new(
             class,
@@ -1363,6 +1532,7 @@ mod tests {
             lookups,
             hits,
             misses: lookups - hits,
+            unresolved_identity_attempts: 0,
             restore_duration_millis: 100,
             publication_duration_millis: 500,
             bytes_read: 1_000,
@@ -1520,6 +1690,37 @@ mod tests {
     }
 
     #[test]
+    fn metric_validation_uses_type_range_without_policy_cutoffs() {
+        let metrics = ReusableStateMetrics {
+            lookups: u64::MAX,
+            hits: u64::MAX,
+            misses: 0,
+            unresolved_identity_attempts: u64::MAX,
+            restore_duration_millis: u64::MAX,
+            publication_duration_millis: u64::MAX,
+            bytes_read: u64::MAX,
+            bytes_written: u64::MAX,
+            storage_size_bytes: u64::MAX,
+            estimated_cold_work_millis: u64::MAX,
+            estimated_warm_work_millis: u64::MAX,
+            last_useful_hit_epoch_millis: Some(u64::MAX),
+            validation_failures: u64::MAX,
+            reset_invalidation_count: u64::MAX,
+            reset_invalidation_overhead_millis: u64::MAX,
+            producer_successes: u64::MAX,
+            successful_consumers: u64::MAX,
+            semantic_mismatches: u64::MAX,
+        };
+        metrics.validate().expect("full u64 metric range is valid");
+        assert_eq!(metrics.resolution_attempts(), u128::from(u64::MAX) * 2);
+        assert_eq!(metrics.hit_rate_basis_points(), Some(5_000));
+        assert_eq!(
+            metrics.utility().unwrap_err(),
+            ReusableStatePolicyError::UtilityOverflow
+        );
+    }
+
+    #[test]
     fn utility_subtracts_restore_publication_and_invalidation_with_storage_separate() {
         let mut observed = metrics(4, 3, 10_000, 2_000, 50_000_000, 2, 3);
         observed.restore_duration_millis = 900;
@@ -1591,6 +1792,7 @@ mod tests {
                 ReusableStateConsumptionPolicy {
                     low_trust_read_only_allowed: true
                 },
+                &overlay_capabilities(),
             ),
             ReusableStateConsumptionDisposition::MissReset { .. }
         ));
@@ -1603,9 +1805,66 @@ mod tests {
                 ReusableStateConsumptionPolicy {
                     low_trust_read_only_allowed: true
                 },
+                &overlay_capabilities(),
             ),
             ReusableStateConsumptionDisposition::Hit {
                 mode: ReusableStateConsumptionMode::ReadOnly
+            }
+        );
+    }
+
+    #[test]
+    fn an_exact_identity_match_without_a_reviewed_sharing_mode_is_miss_reset() {
+        let preferred = preferred(
+            candidate(
+                ReusableStateClass::IncrementalBuildState,
+                metrics(4, 4, 40_000, 4_000, 1_000_000, 2, 4),
+            )
+            .transition(
+                ReusableStateLifecycle::Validated,
+                ReusableStatePromotionPolicy::conservative(),
+            )
+            .unwrap(),
+        );
+        let policy = ReusableStateConsumptionPolicy {
+            low_trust_read_only_allowed: false,
+        };
+        let without_overlay = HotStateCapabilityObservation::new(
+            crate::hot_state_path_policy::HotStateCapabilityGenerationId::parse(
+                "reusable-state-capability-1",
+            )
+            .unwrap(),
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            evaluate_reusable_state_consumption(
+                &preferred.identity,
+                &preferred,
+                ReusableStateConsumerTrust::Trusted,
+                policy,
+                &overlay_capabilities(),
+            ),
+            ReusableStateConsumptionDisposition::Hit {
+                mode: ReusableStateConsumptionMode::ReadOnly
+            }
+        );
+        assert_eq!(
+            evaluate_reusable_state_consumption(
+                &preferred.identity,
+                &preferred,
+                ReusableStateConsumerTrust::Trusted,
+                policy,
+                &without_overlay,
+            ),
+            ReusableStateConsumptionDisposition::MissReset {
+                reason: ReusableStateMissReason::HotStateReuseRefused(
+                    ReusableStateHotStateRefusal::SharingModeUnavailable
+                )
             }
         );
     }
@@ -1630,6 +1889,7 @@ mod tests {
                 ReusableStateConsumptionPolicy {
                     low_trust_read_only_allowed: true,
                 },
+                &overlay_capabilities(),
             )
         };
 
@@ -1713,6 +1973,7 @@ mod tests {
                 ReusableStateConsumptionPolicy {
                     low_trust_read_only_allowed: true,
                 },
+                &overlay_capabilities(),
             ),
             ReusableStateConsumptionDisposition::MissReset {
                 reason: ReusableStateMissReason::InvalidatedPreferredGeneration
@@ -1991,5 +2252,124 @@ mod tests {
                 "revalidation_required": false
             })
         );
+    }
+
+    /// The failure shape measured in manaflow-ai/cmux#13709: 112 consumer attempts at a
+    /// compiled-product identity, 0 hits, and every refusal raised before any producer
+    /// was considered. In this model those are resolution attempts that never became
+    /// lookups, so before this accounting existed the generation was indistinguishable
+    /// from one nobody had tried yet.
+    #[test]
+    fn unreachable_identity_is_not_reported_as_an_untried_generation() {
+        let untried = candidate(
+            ReusableStateClass::ImmutableCompiledProduct,
+            metrics(0, 0, 1_300_000, 40_000, 890_000_000, 2, 0),
+        );
+        let mut unreachable_metrics = metrics(0, 0, 1_300_000, 40_000, 890_000_000, 2, 0);
+        unreachable_metrics.unresolved_identity_attempts = 112;
+        let unreachable = candidate(
+            ReusableStateClass::ImmutableCompiledProduct,
+            unreachable_metrics,
+        );
+
+        assert_eq!(untried.metrics().hit_rate_basis_points(), None);
+        assert_eq!(unreachable.metrics().hit_rate_basis_points(), Some(0));
+        assert_eq!(untried.metrics().resolution_attempts(), 0);
+        assert_eq!(unreachable.metrics().resolution_attempts(), 112);
+
+        let policy = ReusableStatePromotionPolicy::conservative();
+        assert_eq!(
+            untried.recommendation(policy).unwrap(),
+            ReusableStateRecommendation::Observe
+        );
+        assert_eq!(
+            unreachable.recommendation(policy).unwrap(),
+            ReusableStateRecommendation::InvestigateUnreachableIdentity
+        );
+    }
+
+    /// `StopPublishing` is gated on `min_lookups_for_value` resolved lookups, which an
+    /// unreachable identity can never accumulate. Without the earlier check the
+    /// recommendation would stay `Observe` at every lifecycle stage.
+    #[test]
+    fn unreachable_identity_is_named_at_every_reachable_lifecycle_stage() {
+        let policy = ReusableStatePromotionPolicy::conservative();
+        let mut observed = metrics(2, 0, 1_300_000, 40_000, 890_000_000, 2, 0);
+        observed.unresolved_identity_attempts = 110;
+        let generation = candidate(ReusableStateClass::ImmutableCompiledProduct, observed);
+        assert_eq!(
+            generation.recommendation(policy).unwrap(),
+            ReusableStateRecommendation::InvestigateUnreachableIdentity
+        );
+        let validated = generation
+            .transition(ReusableStateLifecycle::Validated, policy)
+            .unwrap();
+        assert_eq!(
+            validated.recommendation(policy).unwrap(),
+            ReusableStateRecommendation::InvestigateUnreachableIdentity
+        );
+    }
+
+    /// One unresolved attempt against a generation that is being consumed is a cold
+    /// start or a race, not an identity defect. Only a hitless run of them is.
+    #[test]
+    fn occasional_unresolved_attempts_do_not_displace_normal_recommendations() {
+        let policy = ReusableStatePromotionPolicy::conservative();
+        let mut observed = metrics(4, 3, 1_300_000, 40_000, 890_000_000, 2, 3);
+        observed.unresolved_identity_attempts = 9;
+        let generation = candidate(ReusableStateClass::ImmutableCompiledProduct, observed);
+        assert_eq!(
+            generation.recommendation(policy).unwrap(),
+            ReusableStateRecommendation::Observe
+        );
+        assert_eq!(generation.metrics().hit_rate_basis_points(), Some(2_307));
+    }
+
+    #[test]
+    fn zero_alarm_threshold_still_requires_an_observed_unresolved_attempt() {
+        let mut policy = ReusableStatePromotionPolicy::conservative();
+        policy.min_unresolved_attempts_for_alarm = 0;
+        let generation = candidate(
+            ReusableStateClass::ImmutableCompiledProduct,
+            metrics(0, 0, 1_300_000, 40_000, 890_000_000, 2, 0),
+        );
+        assert_eq!(
+            generation.recommendation(policy).unwrap(),
+            ReusableStateRecommendation::Observe
+        );
+    }
+
+    /// Resolution failure carries its own vocabulary because no identity comparison
+    /// happened: there is no mismatching field to name.
+    #[test]
+    fn unresolved_disposition_is_separate_from_every_identity_mismatch() {
+        let unresolved = ReusableStateConsumptionDisposition::Unresolved {
+            reason: ReusableStateUnresolvedReason::ConsumerIdentityUnprovable,
+        };
+        assert_eq!(
+            serde_json::to_value(unresolved).unwrap(),
+            json!({
+                "disposition": "unresolved",
+                "reason": "consumer_identity_unprovable"
+            })
+        );
+        let expected = identity(ReusableStateClass::ImmutableCompiledProduct);
+        let generation = candidate(
+            ReusableStateClass::ImmutableCompiledProduct,
+            metrics(1, 1, 1_300_000, 40_000, 890_000_000, 2, 1),
+        );
+        let resolved = evaluate_reusable_state_consumption(
+            &expected,
+            &generation,
+            ReusableStateConsumerTrust::Trusted,
+            ReusableStateConsumptionPolicy {
+                low_trust_read_only_allowed: false,
+            },
+            &overlay_capabilities(),
+        );
+        assert!(!matches!(
+            resolved,
+            ReusableStateConsumptionDisposition::Unresolved { .. }
+        ));
     }
 }

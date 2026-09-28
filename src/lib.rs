@@ -13,6 +13,10 @@ pub mod cargo_target_holder_observation;
 /// Read-only, descriptor-bound observation of one Linux Cargo target tree.
 #[cfg(target_os = "linux")]
 pub mod cargo_target_observation;
+/// Pure projection of measured CMUX product transport/restore receipts into adaptive observations.
+pub mod cmux_product_transport_adapter;
+/// Pure projection of validated CMUX workload results into adaptive verification observations.
+pub mod cmux_workload_verification_adapter;
 /// Pure workload-neutral pre-admission compute request.
 pub mod compute_execution_request;
 /// Pure workload-family-neutral identity for declared compute semantics.
@@ -173,6 +177,9 @@ pub mod lima_lifecycle;
 pub mod lima_lifecycle_executor;
 /// Read-only, bounded exact observation of one Lima instance and running guest.
 pub mod lima_observation;
+/// Read-only observation and pure reclaim planning for linked Git worktrees.
+#[cfg(unix)]
+pub mod linked_worktree_reclaim;
 /// Pure bounded parsing of the admitted glibc dynamic-loader cache.
 #[cfg(target_os = "linux")]
 pub mod linux_dynamic_loader_cache;
@@ -197,6 +204,8 @@ pub mod linux_installation_enrollment;
 /// Staged, durable, no-replace publication of complete project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_publication;
+#[cfg(target_os = "linux")]
+mod linux_kernel_file_locks;
 /// Durable, revision-checked lease persistence beneath one installation directory.
 #[cfg(target_os = "linux")]
 pub mod linux_lease_store;
@@ -265,6 +274,12 @@ pub mod operator_remediation;
 pub mod operator_status;
 /// Typed, read-only aggregation of one coherent operator status evidence bundle.
 pub mod operator_status_service;
+/// Canonical controller enrollment for one trusted native-Linux GitHub Actions JIT worker.
+#[cfg(target_os = "linux")]
+pub mod owned_linux_jit_enrollment;
+/// Native owned-Linux task backend for one trusted GitHub Actions JIT runner.
+#[cfg(unix)]
+pub(crate) mod owned_linux_jit_runtime;
 pub mod ownership;
 /// Pure composition of durable queue, Lima lifecycle, and runner-readiness evidence.
 pub mod personal_worker_host_broker;
@@ -280,6 +295,8 @@ pub mod personal_worker_operator_mutation;
 pub mod personal_worker_operator_read;
 /// Config-bound read-only discovery and explicit first initialization of durable worker state.
 pub mod personal_worker_operator_store;
+/// Pure queue-level aggregate PID admission policy and checked reservation arithmetic.
+pub mod personal_worker_pid_capacity;
 pub mod personal_worker_queue;
 /// Pure bounded projection of durable personal-worker status, queue pages, and job state.
 pub mod personal_worker_read_model;
@@ -352,6 +369,8 @@ pub mod resident_repo_query;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod resident_sandbox_catalog;
 pub mod resource;
+/// Binding from the reusable-state identity contract to the hot-state path-class policy.
+pub mod reusable_state_hot_state_policy;
 /// Pure evidence-driven lifecycle and retention policy for expensive reusable state.
 pub mod reusable_state_lifecycle;
 #[cfg(target_os = "linux")]
@@ -430,6 +449,8 @@ pub mod unix_protected_cache_generation_catalog_store;
 /// Descriptor-bound private persistence for the resident-sandbox catalog.
 #[cfg(unix)]
 pub mod unix_resident_sandbox_store;
+/// Pure closed generation selection for verification-derived cache identities.
+pub mod verification_cache_generation;
 /// Pure fixed repository verification command meanings for identity derivation and later execution.
 pub mod verification_command_semantics;
 /// Pure sealed cross-attempt verification-isolation compatibility.

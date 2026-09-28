@@ -41,16 +41,40 @@ jobs:
           --profile minimal
           --no-self-update
 
+      # CULTIST_REV is a fixed commit, so the built binary is identical on
+      # every run. Install it into a stable path and cache it instead of
+      # rebuilding it from source each time. Only main writes the entry;
+      # pull requests restore main's copy, so one cache serves every branch.
+      - name: Restore pinned Cultist binary
+        id: cultist-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cache/glaeda-cultist-install
+          key: cultist-bin-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ env.CULTIST_REV }}
+
       - name: Install exact Cultist revision
+        if: ${{ steps.cultist-cache.outputs.cache-hit != 'true' }}
         run: |
           set -euo pipefail
           cargo install \
             --git https://github.com/teamleaderleo/cultist \
             --rev "$CULTIST_REV" \
             --locked \
-            --root "$RUNNER_TEMP/cultist-install" \
+            --root "$HOME/.cache/glaeda-cultist-install" \
             cargo-cultist
-          echo "$RUNNER_TEMP/cultist-install/bin" >> "$GITHUB_PATH"
+
+      - name: Save pinned Cultist binary
+        if: ${{ steps.cultist-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cache/glaeda-cultist-install
+          key: cultist-bin-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ env.CULTIST_REV }}
+
+      - name: Put pinned Cultist on PATH
+        run: |
+          set -euo pipefail
+          test -x "$HOME/.cache/glaeda-cultist-install/bin/cargo-cultist"
+          echo "$HOME/.cache/glaeda-cultist-install/bin" >> "$GITHUB_PATH"
 
       - name: Resolve comparison base
         id: base
