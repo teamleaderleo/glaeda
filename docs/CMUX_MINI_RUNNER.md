@@ -675,6 +675,16 @@ quiet check a second later left it up. It does so at every job start and every l
 agent, it boots the old one out before loading the new one, since a loaded agent keeps running its old
 program.
 
+Crash and panic dialogs have the same shape. Diagnostics Reporter draws "Your computer was restarted because
+of a problem" after a kernel panic and "cmux DEV cannot be opened because of a problem" after a crashed launch.
+Its LaunchAgent has two QueueDirectories, `/var/db/PanicReporter` and `/var/db/DiagnosticsReporter`: launchd
+starts it while either holds an entry, and the entry stays until someone answers. On cmux8s a panic queued on
+2026-09-25 sat over UI tests for two days, and the cmux e2e action's kill only made launchd start it again with
+the same dialog about two minutes later. So at every job start on macOS the hook empties both queues (they are
+world-writable), removes the unanswered `.contents.*` summary a queued panic points at directly in
+`/Library/Logs/DiagnosticReports`, and then closes Diagnostics Reporter. The full panic and crash reports stay.
+A symlinked entry is removed, never followed.
+
 `cmux-ci` stays the user's default keychain. `swift test` runs in a runner's own session, where the login
 keychain is locked, and tests that add items without naming a keychain need an unlocked default. The
 default is per user, not per session: macOS refuses `security list-keychains -d dynamic -s` and
