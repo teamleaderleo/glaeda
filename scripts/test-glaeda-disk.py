@@ -211,6 +211,25 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.process_evidence = lambda: ([str(go)], "")
         self.assertEqual(self.verdicts()["go-build"], "in-use")
 
+    def test_a_clone_at_the_top_of_a_tool_cache_name_is_still_kept(self) -> None:
+        # git_free skips the deep search, not the shallow one: a person's clone named like a tool cache
+        # (~/.cache/bazel, ~/Library/Caches/node-gyp/repo) is never deleted without a look.
+        self.fam = gd.Family("user-cache", self.root, True, "re-download", git_free=gd.TOOL_CACHES)
+        clone = make(self.root / "bazel")
+        (clone / ".git").mkdir()
+        nested = make(self.root / "node-gyp")
+        (nested / "repo/.git").mkdir(parents=True)
+        deep = make(self.root / "go-build")
+        (deep / "a/b/.git").mkdir(parents=True)
+        old = time.time() - 48 * 3600
+        for top in (clone, nested, deep):
+            for dirpath, dirs, files in os.walk(top):
+                for n in dirs + files:
+                    os.utime(os.path.join(dirpath, n), (old, old))
+            os.utime(top, (old, old))
+        self.assertEqual(self.verdicts(), {"bazel": "git-checkout", "node-gyp": "git-checkout",
+                                           "go-build": "reclaimable"})
+
     def test_cache_families_name_the_tool_caches(self) -> None:
         for fam in gd.default_families():
             if fam.id in ("user-cache", "library-caches"):
