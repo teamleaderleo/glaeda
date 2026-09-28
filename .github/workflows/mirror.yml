@@ -57,11 +57,20 @@ jobs:
           up=$(git ls-remote "https://github.com/$UPSTREAM.git" refs/heads/main | cut -f1)
           here=$(git ls-remote "https://github.com/$MIRROR.git" refs/heads/main | cut -f1)
           echo "upstream main ${up:0:12}, mirror main ${here:0:12}" >> "$GITHUB_STEP_SUMMARY"
+          git init -q --bare work/main.git
+          git -C work/main.git fetch -q "https://github.com/$UPSTREAM.git" +refs/heads/main:refs/heads/main \
+            '+refs/tags/r-*:refs/tags/r-*'
           refs=()
           [ "$up" = "$here" ] || refs+=(+refs/heads/main:refs/heads/main)
           git ls-remote --tags "https://github.com/$MIRROR.git" 'refs/tags/r-*' | cut -f2 > work/mirror-tags.txt
           while read -r tag; do
-            grep -qx "refs/tags/$tag" work/mirror-tags.txt || refs+=("refs/tags/$tag:refs/tags/$tag")
+            grep -qx "refs/tags/$tag" work/mirror-tags.txt && continue
+            # a tag deleted upstream since the listing would fail the whole push, main included
+            if git -C work/main.git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              refs+=("refs/tags/$tag:refs/tags/$tag")
+            else
+              echo "upstream has no tag $tag" >> "$GITHUB_STEP_SUMMARY"
+            fi
           done < work/upstream.txt
           [ ${#refs[@]} -gt 0 ] || exit 0
           # A deploy key of this repository, not the job token: the token cannot push commits that
@@ -72,9 +81,6 @@ jobs:
           chmod 600 ~/.ssh/mirror
           echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/mirror -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
-          git init -q --bare work/main.git
-          git -C work/main.git fetch -q "https://github.com/$UPSTREAM.git" +refs/heads/main:refs/heads/main \
-            '+refs/tags/r-*:refs/tags/r-*'
           git -C work/main.git push "git@github.com:$MIRROR.git" "${refs[@]}"
           rm -f ~/.ssh/mirror
       - name: Mirror control.json
