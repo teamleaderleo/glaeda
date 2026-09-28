@@ -951,7 +951,8 @@ def fuzz_setup() -> tuple[Any, int, bool] | str:
     if not dirs:
         return "no glaeda runner on this mini"
     try:
-        trusted = any("--trusted-ref" in (runner / "glaeda-hooks" / "job-started.sh").read_text() for runner in dirs)
+        # Only picks the mode: the collector decides from the fleet manifest which minis it trusts to replay.
+        trusted = all("--trusted-ref" in (runner / "glaeda-hooks" / "job-started.sh").read_text() for runner in dirs)
         hook = load_hook(dirs[0])
         scopes = [hook.runner_scope(runner) for runner in dirs]
     except Exception as error:  # noqa: BLE001
@@ -983,6 +984,8 @@ def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
     if why:
         return {**base, "state": "skip", "reason": why}
     replay = pending_replay(now) if trusted else None
+    if not trusted:  # requests an older collector left here: never answered on a PR mini
+        shutil.rmtree(fuzz_dir() / "replays", ignore_errors=True)
     if trusted and replay is None:
         return {**base, "state": "skip", "reason": "a trusted-only runner (a seeder) runs here: it only replays for "
                                                    "the collector, and no replay waits"}

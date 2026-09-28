@@ -566,6 +566,8 @@ class FuzzTest(Base):
         warm.runner_dirs = lambda: list(runners)
         self.assertIs(warm.fuzz_setup()[2], False)
         runners.append(self.runner("actions-runner-glaeda-1", flags + " --trusted-ref refs/heads/main"))
+        self.assertIs(warm.fuzz_setup()[2], False, "PR jobs still run beside a trusted runner")
+        runners.pop(0)
         self.assertIs(warm.fuzz_setup()[2], True, "a seeder mini only replays")
 
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
@@ -576,8 +578,7 @@ class FuzzTest(Base):
         self.assertEqual(warm.fuzz(False, self.state)["would"], f"fuzz main {self.head[:12]}")
         result = json.loads(self.driver().communicate(timeout=60)[0].strip().splitlines()[-1])
         self.assertEqual(result["state"], "fuzzed", result)
-        self.assertFalse((request / "out").exists())
-        self.assertFalse((request / ".done").exists())
+        self.assertFalse(request.exists(), "a PR mini removes what an older collector asked of it")
 
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
     def test_a_job_taking_the_gui_token_leaves_the_replay_for_later(self) -> None:

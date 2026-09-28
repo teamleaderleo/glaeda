@@ -968,10 +968,10 @@ catch-ups, and holds no capacity unit, root or token, so no admission waits for 
   can write a finding. Its `mini-serve.sh` leaves a request in `fuzz/replays/req.XXXX/`: the collector's own
   `replay.py`, its own copy of the fuzzer and the checked repro steps. On a PR mini that proves nothing (a job
   there can rewrite the request, the kept build and the answer), so only a mini whose runners are trusted-only
-  (2e, main pushes only: cmux15, cmuxs-mac-mini-6) replays, and it never fuzzes. There the lane runs the oldest
+  (2e, main pushes only) replays, and it never fuzzes. There the lane runs the oldest
   request (up to 5 minutes) against the newest main build, with the same start rules, holder and preemption and
   no disk floor, then writes `.done`; a job that stops it leaves the request for the next tick. A PR mini
-  ignores `fuzz/replays`. Requests older than a day are removed.
+  removes `fuzz/replays`. Requests older than a day are removed.
 
 `glaeda-idle-warm --fuzz` prints whether it would run now (fuzz, or which replay), or why not; `--apply --fuzz`
 runs it. The collector files the findings as cmux issues.
