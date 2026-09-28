@@ -43,7 +43,9 @@ Every deletion is appended to a JSONL receipt.
 
 On an owned cmux mini, cmux CI's warm state under /Users/Shared/cmux-build-fleet/ci is a local hot
 tier, evicted LRU under pressure: parked pull request builds idle over an hour, seeds other than each
-root's newest two current ones, and a root's kept build once the root has been idle two days. The
+root's newest two current ones, and a root's kept build once the root has been idle two days. On the
+trusted seeder, a seed its serve log shows streamed whole to the seed archive (cmux-lawrence's SSD) is
+reclaimable at once instead of after the idle window: the PR minis restore it from there over the LAN. The
 Chromium / cmux-browser trees and their caches are never deleted (NEVER_DELETE).
 
 Free space is judged per filesystem. On Linux /tmp is often its own tmpfs, so pressure there
@@ -179,6 +181,9 @@ def fleet_stores(ci: Path | None = None) -> list[Path]:
                         if p.name[len("cmux-ci-"):].isdigit() and p.is_dir() and not p.is_symlink())]
 
 
+FLEET_FAMILY_IDS = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build")
+
+
 def fleet_families(ci: Path | None = None) -> list[Family]:
     fams = []
     for store in fleet_stores(ci):
@@ -191,6 +196,7 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
                            owner="cmux owned_build_state.py (park)", rebuild_minutes=6))
         # Seeds: the root's newest SEED_KEEP of its current prefix stay (seed_verdict); older and other
         # fingerprints' seeds go LRU. A seed comes back from the LAN seeder or the bucket in 25 to 280 s.
+        # On the trusted seeder, one the seed archive already holds goes without waiting (archived_seeds).
         fams.append(Family("cmux-seeds", store / "seeds", True,
                            "glaeda-seed-prefetch or the next job fetches it again", build_output=True,
                            owner="cmux seed_derived_data.py (CMUX_SEED_LOCAL_CACHE)", rebuild_minutes=4))
@@ -200,6 +206,45 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
                            min_idle_hours=KEPT_BUILD_IDLE_HOURS,
                            owner="cmux owned_build_state.py (keep)", rebuild_minutes=10))
     return fams
+
+
+# The trusted seeder's serve log (glaeda-seed-serve): the seed archive on cmux-lawrence's SSD fills itself from
+# it every 5 minutes (glaeda-seed-archive), asking seed-list-v1 and then one seed-v1 per seed it lacks.
+SEED_SERVE_LOG = HOME / ".local/state/glaeda/seed-serve/serve.jsonl"
+
+
+def archived_seeds(log: Path | None = None) -> frozenset[str]:
+    """Seed keys this seeder streamed whole to the seed archive, read from its serve log (and the rotated one).
+
+    Only the archive's filler asks seed-list-v1, so a client address that listed and then got `served` with
+    status 0 names a seed the archive's SSD now holds, and the PR minis restore it from there over the LAN
+    (63 to 184 s against about 15 minutes cold). Such a seed need not wait out the idle window on this disk.
+    A client that lied about being the archive can only make a seed go early, and the next job refetches it.
+    An unreadable or rotated-away log proves nothing, so the seed keeps its usual window.
+    """
+    log = SEED_SERVE_LOG if log is None else log
+    lines: list[dict] = []
+    for path in (log.with_name(log.name + ".1"), log):
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            with contextlib.suppress(ValueError):
+                if isinstance(record := json.loads(line), dict):
+                    lines.append(record)
+    listers = {r.get("client") for r in lines if r.get("outcome") == "list" and r.get("role") == "seed"}
+    return frozenset(r["key"] for r in lines
+                     if r.get("outcome") == "served" and r.get("status") == 0 and r.get("role") == "seed"
+                     and r.get("client") in listers and isinstance(r.get("key"), str))
+
+
+def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[str] = frozenset()) -> float:
+    """The idle window for one candidate: a seed the archive already holds may go at once (the newest of each
+    root still stay, by keep_verdict), everything else waits out its family's window."""
+    if fam.id == "cmux-seeds" and path.name in archived:
+        return 0.0
+    return idle_window(fam, idle_hours)
 
 
 def seed_verdict(path: Path) -> str:
@@ -1506,7 +1551,11 @@ def job_busy(fam: Family, path: Path) -> bool:
     if fam.id == "cmux-job-cache":
         return cmux_active(path.parent)
     # a sealed cache (home-caches) is never a job unit, and cmux_active calls a tree larger than its
-    # budget busy, which would keep bun's install cache forever
+    # budget busy, which would keep bun's install cache forever. Nor is cmux CI's warm state: a DerivedData
+    # there holds thousands of module cache directories within three levels, so every seed read as busy and
+    # none was ever evicted (cmux15, 2026-09-28). A job using one is seen by its command line and cwd.
+    if fam.id in FLEET_FAMILY_IDS:
+        return False
     return fam.reclaimable and not fam.discover and cmux_active(path)
 
 
@@ -1685,6 +1734,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
     except NoEvidence as e:
         cwds, cmds, blind = [], "", f"no process evidence ({e})"
     opened = open_index(cwds)
+    archived = archived_seeds() if any(fam.id == "cmux-seeds" for fam, _ in work) else frozenset()
     for (fam, path), size, idle, floor in zip(work, sizes, idles, floors):
         if size < floor:
             continue
@@ -1700,7 +1750,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
             reasons.append("claude session active")
         # The tree walks below cost seconds each on a loaded host, and a recent item is kept anyway,
         # so only an item old enough to delete pays for them (apply re-checks before deleting).
-        window = idle_window(fam, idle_hours)
+        window = item_window(fam, path, idle_hours, archived)
         keep = keep_verdict(fam, path)
         deletable_age = fam.reclaimable and idle >= window
         if deletable_age and holds_socket(path):
@@ -1726,6 +1776,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
             verdict = "recent"
         else:
             verdict = "reclaimable"
+            if path.name in archived and fam.id == "cmux-seeds":
+                reasons.append("the seed archive holds it")
         items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons))
     items.sort(key=lambda i: i.bytes, reverse=True)
     return items
@@ -1942,6 +1994,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         return 0
     cwds = open_index(cwds)
     lsof_at, lsof_items = time.monotonic(), 0
+    archived = archived_seeds() if any(i.family == "cmux-seeds" for i in items) else frozenset()
     # cheapest loss per byte first, not simply largest first
     for i in sorted(items, key=lambda i: value(i, families[i.family]), reverse=True):
         if i.verdict != "reclaimable":
@@ -1986,7 +2039,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))):
             outcome = "changed:in-use"
         elif (time.time() - newest_mtime(p, access=families[i.family].discover)) / 3600 \
-                < idle_window(families[i.family], idle_hours):
+                < item_window(families[i.family], p, idle_hours, archived):
             outcome = "changed:modified"
         elif keep_verdict(families[i.family], p):
             outcome = "changed:kept"
