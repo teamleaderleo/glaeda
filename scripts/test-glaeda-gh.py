@@ -304,6 +304,26 @@ class ControllerTest(Base):
         self.assertEqual(new.feeds, [None])  # a fresh cursor: the old controller's means nothing here
         self.assertEqual(old.feeds, [None, 0])
 
+    def test_controller_source_that_raises_does_not_stop_the_tick(self) -> None:
+        """A source that raises while no controller is set reached controller_down with None."""
+        def broken():
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=lambda: None)
+        self.daemon.controller_source = broken
+        self.daemon.tick(NOW)
+        self.assertEqual(self.daemon.controller_status["state"], "down")
+
+    def test_token_file_that_is_not_utf8_reads_as_no_token(self) -> None:
+        path = Path(self.tmp.name) / "token"
+        path.write_bytes(b"\xff\xfe")
+        saved = dict(os.environ)
+        os.environ.update(CMUX_CI_CONTROLLER="http://c:18765", CMUX_CI_TOKEN_FILE=str(path))
+        try:
+            self.assertIsNone(gg.Controller.from_env().token)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
     def test_controller_down_backs_off(self) -> None:
         self.ctl.down = True
         self.gh.runs[25] = {"id": 25, "status": "in_progress"}

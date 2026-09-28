@@ -329,7 +329,7 @@ class Controller:
         path = os.environ.get("CMUX_CI_TOKEN_FILE") or os.fspath(CONTROLLER_TOKEN)
         try:
             token = Path(path).read_text().strip() or None
-        except OSError:
+        except (OSError, ValueError):  # ValueError: a token file that is not UTF-8
             token = None
         return cls(base, token)
 
@@ -873,7 +873,7 @@ class Daemon:
             self.errors.append(what)
         self.controller_down_until = self.now + wait
         self.controller_status = {"state": state, "error": what, "retryAt": self.now + wait,
-                                  "token": bool(self.controller.token)}
+                                  "token": bool(getattr(self.controller, "token", None))}
 
     def read_feed(self) -> list[dict]:
         """The feed pages after the cursor. The first call only learns the cursor; a reset (the
@@ -899,6 +899,9 @@ class Daemon:
         meaningful to the controller that issued it, and the old one, drained, serves stale reads."""
         if self.controller_source is None:
             return
+        if (self.controller_source is Controller.from_env and not os.environ.get("CMUX_CI_CONTROLLER")
+                and CONTROLLER_CONFIG.exists() and not isinstance(read_json(CONTROLLER_CONFIG), dict)):
+            return  # a config caught mid-write reads as garbage: keep the controller rather than the default
         current = self.controller_source()
         if getattr(current, "base", None) == getattr(self.controller, "base", None):
             if current is not None and self.controller is not None:
