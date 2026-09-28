@@ -43,13 +43,17 @@ for four days, a `zsh -c` whose sudo'd grep had blocked, holding files and a CPU
 reading its output. A tree is stopped when all of these hold:
     its top is a child of launchd, belongs to this user, is a shell run with -c and has no
     controlling tty;
-    the top's stdout is neither a regular file nor /dev/null, so `nohup ... > log` and other
-    deliberately detached jobs are kept (lsof asks only about the few candidates);
     nothing in it is a GitHub Actions runner, under a runner path (the local cmux runner, a fleet
-    ~/actions-runner-*), glaeda-apple or a live agent session;
+    ~/actions-runner-*), glaeda-apple or a live agent session, and its cwd is not in a runner;
     its top started at least 6 hours ago;
-    the tree's total CPU time, summed over every member of any user, has not changed for at least
-    1 hour of this guard's observations;
+    for at least 1 hour of this guard's observations, neither the tree's total CPU time (every
+    member of any user, with exited children folded in by ps -S) nor its membership (the set of
+    pid and start time) has changed, so a slow poll loop counts as activity;
+    nobody reads its output: the top's stdout is a pipe or unix socket whose other end is closed
+    or held by no process outside the tree. A regular file or /dev/null (`nohup ... > log` and
+    other deliberately detached jobs) keeps it, and so does a live reader, such as a session
+    waiting on a backgrounded subshell. lsof runs only for trees already past the age and idle
+    gates, and a failed scan keeps the tree. Without root, lsof sees only this user's processes;
     no override is active.
 
 Its whole process tree gets SIGTERM, and whatever still runs 5 seconds later with the same identity
@@ -61,7 +65,8 @@ member owned by another user is included only when its chain up to the top passe
 in the tree (so the user started it), and gets the same signals through `sudo -n /bin/kill`, before
 the user's own members. When sudo -n is refused (no passwordless sudo) nothing in that tree is
 signalled, the outcome records needs-root with those pids, and the tree is tried again an hour
-later. Other members owned by someone else are left alone.
+later. Root members still alive when their SIGKILL is refused are remembered by identity and sent
+SIGKILL again hourly while they live. Other members owned by someone else are left alone.
 
 Every stop appends an intent and an outcome record (time, pid, reason, rule, command cut at 300
 characters, cwd; for a stale command also its idle time and root pids) to
@@ -74,6 +79,7 @@ stopped. `--allow DURATION` writes it; `echo $(( $(date +%s) + 3600 )) > FILE` d
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -135,6 +141,7 @@ STALE_AGE_SECONDS = 6 * 3600
 STALE_IDLE_SECONDS = 3600
 NEEDS_ROOT_RETRY_SECONDS = 3600  # sudo -n that was refused is asked again this often, not every pass
 NO_TTY = {"??", "?", "-"}
+NO_SUCH_PROCESS = re.compile(r"kill: \d+: No such process")
 FLEET_RUNNER_PATH = "/actions-runner"  # ~/actions-runner-glaeda* on a fleet mini
 SUDO = "/usr/bin/sudo"
 KILL = "/bin/kill"
@@ -299,16 +306,15 @@ def runner_path(text: str | None) -> bool:
     return bool(text) and (RUNNER_PATH in text + "/" or FLEET_RUNNER_PATH in text)
 
 
-def commands(procs: list[Proc], uid: int, usage: Callable[[], dict[int, tuple[str, float]]],
-             fds: Callable[[list[int]], dict[int, dict]]) -> dict:
-    """Stale orphaned command candidates, and every other orphaned shell -c with the reason it is kept."""
+def membership(members: list[Proc]) -> str:
+    """A short digest of the tree's pid+start set: a poll loop's short-lived children change it."""
+    return hashlib.sha1("\n".join(sorted(identity(q) for q in members)).encode()).hexdigest()[:16]
+
+
+def commands(procs: list[Proc], uid: int) -> dict:
+    """Orphaned shell -c trees that may be stale commands, and the other orphaned shells with why they are kept."""
     by_pid = {p.pid: p for p in procs}
     children = children_of(procs)
-    tops = [p for p in procs if p.ppid == 1 and p.uid == uid and p.exe in SHELLS
-            and runs_string(p.command.split()[1:]) and not p.stat.startswith("Z")]
-    if not tops:
-        return {"commands": [], "kept": []}
-    use = usage()  # only once there is a candidate: every pass on every Mac runs this
 
     def via_sudo(q: Proc, top: Proc) -> bool:
         while True:
@@ -318,14 +324,15 @@ def commands(procs: list[Proc], uid: int, usage: Callable[[], dict[int, tuple[st
                 return False
             q = by_pid[q.ppid]
 
-    pending, kept = [], []
-    for p in tops:
+    candidates, kept = [], []
+    for p in procs:
+        if p.ppid != 1 or p.uid != uid or p.exe not in SHELLS or p.stat.startswith("Z") \
+                or not runs_string(p.command.split()[1:]):
+            continue
         members = subtree(p, children)
         entry = {"pid": p.pid, "rule": "stale-command", "elapsed_seconds": p.elapsed, "cwd": None,
                  "command": p.command[:COMMAND_LIMIT], "_proc": p}
-        if p.pid not in use:
-            kept.append({**entry, "reason": "no-evidence"})
-        elif use[p.pid][0] not in NO_TTY:
+        if p.tty not in NO_TTY:
             kept.append({**entry, "reason": "tty"})
         elif any(q.exe in RUNNERS or runner_path(q.command) for q in members):
             kept.append({**entry, "reason": "ci-runner"})
@@ -334,44 +341,30 @@ def commands(procs: list[Proc], uid: int, usage: Callable[[], dict[int, tuple[st
         elif any(q.exe in AGENTS for q in members):
             kept.append({**entry, "reason": "live-session"})
         else:
-            pending.append((p, members, entry))
-
-    found = fds([p.pid for p, _, _ in pending]) if pending else {}
-    stale = []
-    for p, members, entry in pending:
-        f = found.get(p.pid, {})
-        entry["cwd"] = f.get("cwd")
-        stdout = f.get("stdout")  # (lsof type, name)
-        if runner_path(entry["cwd"]):
-            kept.append({**entry, "reason": "ci-runner"})
-        elif stdout is None:
-            kept.append({**entry, "reason": "stdout-unknown"})
-        elif stdout[0] == "REG":
-            kept.append({**entry, "reason": "logged"})
-        elif stdout[1] == "/dev/null":
-            kept.append({**entry, "reason": "detached"})
-        else:
-            own = [q for q in members if q.uid == uid]
             root = [q for q in members if q.uid != uid and via_sudo(q, p)]
-            cpu = round(sum(use.get(q.pid, ("", 0.0))[1] for q in members), 2)
-            stale.append({**entry, "reason": "stale", "processes": len(members), "cpu_seconds": cpu,
-                          "root_pids": sorted(q.pid for q in root), "_tree": own, "_root": root})
-    return {"commands": stale, "kept": kept}
+            candidates.append({**entry, "reason": "stale", "processes": len(members),
+                               "cpu_seconds": round(sum(q.cputime for q in members), 2), "tree": membership(members),
+                               "root_pids": sorted(q.pid for q in root), "_members": members,
+                               "_tree": [q for q in members if q.uid == uid], "_root": root})
+    return {"commands": candidates, "kept": kept}
 
 
 def settle_commands(stale: list[dict], seen_before: dict[str, dict], now: float, age: float = STALE_AGE_SECONDS,
                     idle: float = STALE_IDLE_SECONDS) -> tuple[list[dict], dict[str, dict]]:
-    """Each candidate with its idle time and status ("due" is stopped), and the state to keep.
+    """Each candidate with its idle time and status, and the state to keep.
 
-    The idle clock is when the tree's current CPU total was first seen; any change restarts it.
+    The idle clock is when the tree's current CPU total and membership were first seen; any change restarts
+    it. A candidate past the age and idle gates is "ready"; unread() decides whether it is due.
     """
     seen, out = {}, []
     for c in stale:
         key = identity(c["_proc"])
         before = seen_before.get(key) or {}
-        since = before["since"] if before.get("cpu") == c["cpu_seconds"] and "since" in before else now
-        seen[key] = {"cpu": c["cpu_seconds"], "since": since}
+        unchanged = before.get("cpu") == c["cpu_seconds"] and before.get("tree") == c["tree"]
+        since = before.get("since", now) if unchanged else now
+        seen[key] = {"cpu": c["cpu_seconds"], "tree": c["tree"], "since": since}
         refused = before.get("needs_root")
+        refused = refused if isinstance(refused, dict) and isinstance(refused.get("at"), (int, float)) else None
         if refused:
             seen[key]["needs_root"] = refused
         if c["elapsed_seconds"] < age:
@@ -381,25 +374,81 @@ def settle_commands(stale: list[dict], seen_before: dict[str, dict], now: float,
         elif refused and now - refused["at"] < NEEDS_ROOT_RETRY_SECONDS:
             status = "needs-root"
         else:
-            status = "due"
+            status = "ready"
         out.append({**c, "idle_seconds": int(now - since), "status": status,
-                    **({"needs_root": refused["pids"]} if refused else {})})
+                    **({"needs_root": refused.get("pids", [])} if refused else {})})
     return out, seen
 
 
-def read_seen(path: Path = SEEN) -> dict[str, dict]:
-    """{"runs": {identity: first seen}, "commands": {identity: {cpu, since[, needs_root]}}}.
+def unread(stale: list[dict], fds: Callable[[list[int]], dict[int, dict]],
+           holders: Callable[[], dict[str, set[int]] | None]) -> list[dict]:
+    """Resolve each ready tree to "due", or to why it is kept: its cwd or stdout shows someone may want it.
 
-    The first format was the runs map alone, identity to a float; it reads as runs.
+    Due needs stdout on a pipe or unix socket whose reading end no process outside the tree holds. lsof runs
+    only here, for trees already past the age and idle gates; a failed scan keeps the tree.
+    """
+    ready = [e for e in stale if e["status"] == "ready"]
+    found = fds([e["pid"] for e in ready]) if ready else {}
+    status: dict[int, str] = {}
+    pipes = []
+    for e in ready:
+        f = found.get(e["pid"], {})
+        e["cwd"] = f.get("cwd")
+        stdout = f.get("stdout")  # (lsof type, device, peer)
+        if runner_path(e["cwd"]):
+            status[e["pid"]] = "ci-runner"
+        elif stdout is None:
+            status[e["pid"]] = "stdout-unknown"
+        elif stdout[0] == "REG":
+            status[e["pid"]] = "logged"
+        elif stdout[0] not in ("PIPE", "unix"):
+            status[e["pid"]] = "detached"  # /dev/null, a named FIFO, a TCP socket
+        elif not stdout[2]:
+            status[e["pid"]] = "due"  # the reading end is closed
+        else:
+            pipes.append((e, stdout[2]))
+    held = holders() if pipes else {}
+    for e, peer in pipes:
+        inside = {q.pid for q in e["_members"]}
+        if held is None:
+            status[e["pid"]] = "reader-unknown"
+        else:
+            status[e["pid"]] = "read" if held.get(peer, set()) - inside else "due"
+    return [{**e, "status": status.get(e["pid"], e["status"])} for e in stale]
+
+
+def read_seen(path: Path = SEEN) -> dict[str, dict]:
+    """{"runs": {identity: first seen}, "commands": {identity: {cpu, tree, since[, needs_root]}},
+    "roots": {identity: last sudo refusal}}.
+
+    The first format was the runs map alone, identity to a float; it reads as runs. Each section is read on
+    its own, so a malformed one does not reset the others' clocks.
     """
     try:
         doc = json.loads(path.read_text())
-        if "runs" in doc:
-            return {"runs": {str(k): float(v) for k, v in doc["runs"].items()},
-                    "commands": {str(k): dict(v) for k, v in (doc.get("commands") or {}).items()}}
-        return {"runs": {str(k): float(v) for k, v in doc.items()}, "commands": {}}
-    except (OSError, ValueError, AttributeError, TypeError):
-        return {"runs": {}, "commands": {}}
+    except (OSError, ValueError):
+        doc = None
+    if not isinstance(doc, dict):
+        return {"runs": {}, "commands": {}, "roots": {}}
+
+    def section(value, convert) -> dict:
+        out = {}
+        for k, v in (value.items() if isinstance(value, dict) else []):
+            try:
+                out[str(k)] = convert(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def entry(v) -> dict:
+        if not isinstance(v, dict):
+            raise TypeError(v)
+        return v
+
+    if "runs" not in doc:
+        return {"runs": section(doc, float), "commands": {}, "roots": {}}
+    return {"runs": section(doc["runs"], float), "commands": section(doc.get("commands"), entry),
+            "roots": section(doc.get("roots"), float)}
 
 
 def write_seen(seen: dict[str, dict], path: Path = SEEN) -> None:
@@ -434,9 +483,9 @@ def parse_lsof(text: str) -> dict[int, str]:
 
 
 def lsof_fds(pids: list[int]) -> dict[int, dict]:
-    """cwd and stdout (lsof type, name) of each pid; what lsof cannot read stays missing and is kept."""
+    """cwd and stdout (lsof type, device, peer) of each pid; what lsof cannot read stays missing and is kept."""
     try:
-        out = subprocess.run([LSOF, "-a", "-d", "cwd,1", "-n", "-P", "-Fpftn", "-p", ",".join(map(str, pids))],
+        out = subprocess.run([LSOF, "-a", "-d", "cwd,1", "-n", "-P", "-Fpftdn", "-p", ",".join(map(str, pids))],
                              capture_output=True, text=True, timeout=gp.TIMEOUT, env=gp.CHILD_ENV)
     except (OSError, subprocess.TimeoutExpired):
         return {}
@@ -444,22 +493,50 @@ def lsof_fds(pids: list[int]) -> dict[int, dict]:
 
 
 def parse_fds(text: str) -> dict[int, dict]:
+    """lsof -F output; a pipe or unix socket's name is `->` and the peer's address, empty once it closed."""
     found: dict[int, dict] = {}
-    pid, fd, kind = None, None, None
+    pid, fd, kind, device = None, None, None, ""
     for line in text.splitlines():
         tag, value = line[:1], line[1:]
         if tag == "p" and value.isdigit():
-            pid, fd, kind = int(value), None, None
+            pid, fd, kind, device = int(value), None, None, ""
         elif tag == "f":
-            fd, kind = value, None
+            fd, kind, device = value, None, ""
         elif tag == "t":
             kind = value
+        elif tag == "d":
+            device = value
         elif tag == "n" and pid is not None:
             if fd == "cwd":
                 found.setdefault(pid, {})["cwd"] = value
             elif fd == "1":
-                found.setdefault(pid, {})["stdout"] = (kind or "", value)
+                peer = value[2:] if value.startswith("->") else ""
+                found.setdefault(pid, {})["stdout"] = (kind or "", device, peer if kind in ("PIPE", "unix") else value)
     return found
+
+
+def lsof_holders() -> dict[str, set[int]] | None:
+    """Which pids hold each pipe or socket end, by lsof device address; None when lsof gave nothing.
+
+    Without root, lsof sees only this user's processes, so a reader owned by someone else is not seen.
+    """
+    try:
+        out = subprocess.run([LSOF, "-n", "-P", "-Fpd"], capture_output=True, text=True, timeout=gp.TIMEOUT,
+                             env=gp.CHILD_ENV)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_holders(out.stdout) or None
+
+
+def parse_holders(text: str) -> dict[str, set[int]]:
+    held: dict[str, set[int]] = {}
+    pid = None
+    for line in text.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("d0x") and pid is not None:
+            held.setdefault(line[1:], set()).add(pid)
+    return held
 
 
 def laptop(config: Path = UPDATE_CONFIG) -> bool:
@@ -496,16 +573,24 @@ def public(entry: dict) -> dict:
 
 
 def sudo_kill(name: str, pids: list[int], run: Callable = subprocess.run) -> bool:
-    """Signal root members through passwordless sudo; False only when sudo itself refused.
+    """Signal root members through passwordless sudo; True only when kill ran.
 
-    kill's own complaint about a pid that already exited is not a refusal.
+    Success is exit 0, or kill's own "No such process" for a pid that exited meanwhile on every stderr
+    line. Anything else (a password prompt refused by -n, "Sorry, user ... is not allowed") is a refusal.
     """
     try:
         out = run([SUDO, "-n", KILL, "-s", name, *map(str, pids)],
                   capture_output=True, text=True, timeout=gp.TIMEOUT, env=gp.CHILD_ENV)
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return out.returncode == 0 or not out.stderr.lstrip().startswith("sudo:")
+    lines = [line for line in out.stderr.splitlines() if line.strip()]
+    return out.returncode == 0 or (bool(lines) and all(NO_SUCH_PROCESS.fullmatch(line.strip()) for line in lines))
+
+
+def same_member(q: Proc, now: Proc | None) -> bool:
+    """The same process as observed, allowing for reparenting: members outlive the parents signalled first."""
+    return (now is not None and now.pid == q.pid and now.uid == q.uid and now.start == q.start
+            and now.command == q.command and not now.stat.startswith("Z"))
 
 
 def apply(due: list[dict], log: Path,
@@ -536,11 +621,19 @@ def apply(due: list[dict], log: Path,
             results.append({**record, "outcome": outcome})
             write(results[-1])
             continue
-        write({**record, "outcome": "signalling"})
         root = entry.get("_root", [])
+        if root:
+            try:
+                alive = {p.pid: p for p in fresh()}
+            except NoEvidence:
+                results.append({**record, "outcome": "no-evidence"})
+                write(results[-1])
+                continue
+            root = [q for q in root if same_member(q, alive.get(q.pid))]
+        write({**record, "outcome": "signalling"})
         # root first: when sudo is refused, the tree stays whole and visible for the next attempt
         if root and not sudo("TERM", [q.pid for q in root]):
-            results.append({**record, "outcome": "needs-root", "needs_root": [q.pid for q in root]})
+            results.append({**record, "outcome": "needs-root", "stage": "term", "needs_root": [q.pid for q in root]})
             write(results[-1])
             continue
         for q in entry["_tree"]:
@@ -557,14 +650,12 @@ def apply(due: list[dict], log: Path,
         except NoEvidence:
             alive = None
         for record, members, root in signalled:
-            extra = {}
+            extra: dict = {}
             if alive is None:
                 outcome = "terminated-unconfirmed"
             else:
-                def survivors(group: list[Proc]) -> list[Proc]:
-                    return [q for q in group
-                            if q.same_process(alive.get(q.pid)) and not alive[q.pid].stat.startswith("Z")]
-                left, left_root = survivors(members), survivors(root)
+                left = [q for q in members if q.same_process(alive.get(q.pid)) and not alive[q.pid].stat.startswith("Z")]
+                left_root = [q for q in root if same_member(q, alive.get(q.pid))]
                 for q in left:
                     try:
                         kill(q.pid, signal.SIGKILL)
@@ -572,10 +663,37 @@ def apply(due: list[dict], log: Path,
                         pass
                 outcome = "killed" if left or left_root else "terminated"
                 if left_root and not sudo("KILL", [q.pid for q in left_root]):
-                    outcome, extra = "needs-root", {"needs_root": [q.pid for q in left_root]}
+                    # the top is gone now, so these no longer look like a candidate: remember them by identity
+                    outcome = "needs-root"
+                    extra = {"stage": "kill", "needs_root": [q.pid for q in left_root],
+                             "_survivors": [identity(q) for q in left_root]}
             results.append({**record, "time": int(time.time()), "outcome": outcome, **extra})
-            write(results[-1])
+            write(public(results[-1]))
     return results
+
+
+def retry_roots(procs: list[Proc], roots: dict[str, float], now: float, log: Path,
+                sudo: Callable[[str, list[int]], bool] = sudo_kill) -> dict[str, float]:
+    """SIGKILL root survivors whose sudo was refused, hourly; returns the survivors still to retry."""
+    live = {identity(p): p for p in procs if identity(p) in roots and not p.stat.startswith("Z")}
+    left = {k: at for k, at in roots.items() if k in live}
+    due = [live[k] for k, at in left.items() if now - at >= NEEDS_ROOT_RETRY_SECONDS]
+    if not due:
+        return left
+    ok = sudo("KILL", [q.pid for q in due])
+    record = {"schema": SCHEMA, "time": int(time.time()), "pid": due[0].pid, "rule": "stale-command",
+              "reason": "root-retry", "elapsed_seconds": due[0].elapsed, "root_pids": [q.pid for q in due],
+              "command": due[0].command[:COMMAND_LIMIT], "outcome": "killed" if ok else "needs-root",
+              **({} if ok else {"needs_root": [q.pid for q in due]})}
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a") as out:
+        out.write(json.dumps(record) + "\n")
+    for q in due:
+        if ok:
+            left.pop(identity(q))
+        else:
+            left[identity(q)] = now
+    return left
 
 
 # ---------------------------------------------------------------- output
@@ -647,12 +765,14 @@ def render_plan(lines: list[str], s: dict) -> str:
         for e in s["kept"]:
             lines.append(f"  {e['rule']:<12} pid {e['pid']} {e['elapsed_seconds']}s: {e['reason']}")
     lines.append(f"stale commands (stopped at {STALE_AGE_SECONDS // 3600}h old and {STALE_IDLE_SECONDS // 3600}h "
-                 f"without CPU) {len(s['commands'])}:")
+                 f"idle) {len(s['commands'])}:")
     for e in s["commands"]:
         refused = f", needs root for pids {pids(e['needs_root'])}" if e.get("needs_root") else ""
         lines.append(f"  {e['status']:<10} pid {e['pid']} age {gp.age(e['elapsed_seconds'])}, "
                      f"idle {gp.age(e['idle_seconds'])}, {e['processes']} processes, root pids {pids(e['root_pids'])}{refused}")
         lines.append(f"    {e['command'][:160]}")
+    if s["seen"]["roots"]:
+        lines.append(f"root survivors waiting for sudo: {len(s['seen']['roots'])}")
     if s["commands_kept"]:
         lines.append(f"orphaned shells kept {len(s['commands_kept'])}:")
         for e in s["commands_kept"]:
@@ -662,29 +782,38 @@ def render_plan(lines: list[str], s: dict) -> str:
 
 def guard_pass(procs: list[Proc], uid: int, runs: bool, seen: dict[str, dict], now: float,
                cwds: Callable[[list[int]], dict[int, str]] = lsof_cwds,
-               usage: Callable[[], dict[int, tuple[str, float]]] = gp.usage,
-               fds: Callable[[list[int]], dict[int, dict]] = lsof_fds, home: Path = HOME) -> dict:
+               fds: Callable[[list[int]], dict[int, dict]] = lsof_fds,
+               holders: Callable[[], dict[str, set[int]] | None] = lsof_holders, home: Path = HOME) -> dict:
     """One observation: orphaned runs (when runs is set), stale commands, what is due, and the state to keep."""
     s = survey(procs, uid, cwds, home) if runs else {"orphans": [], "kept": []}
-    c = commands(procs, uid, usage, fds)
+    c = commands(procs, uid)
     due, run_seen = settle(s["orphans"], seen["runs"], now)
     stale, command_seen = settle_commands(c["commands"], seen["commands"], now)
+    stale = unread(stale, fds, holders)
     return {**s, "commands": stale, "commands_kept": c["kept"],
             "due": due + [e for e in stale if e["status"] == "due"],
-            "seen": {"runs": run_seen, "commands": command_seen}}
+            "seen": {"runs": run_seen, "commands": command_seen, "roots": dict(seen.get("roots", {}))}}
 
 
 def remember_refusals(results: list[dict], due: list[dict], seen: dict[str, dict], now: float) -> bool:
-    """Note a refused sudo in the seen state, so the tree waits NEEDS_ROOT_RETRY_SECONDS for the next try."""
+    """Note a refused sudo in the seen state, so it is asked again after NEEDS_ROOT_RETRY_SECONDS.
+
+    Refused before the TERM, the tree is whole and waits under its top; refused at the KILL, the top is
+    gone and the root survivors are remembered by their own identities.
+    """
     by_pid = {e["pid"]: e for e in due if e["rule"] == "stale-command"}
     noted = False
     for r in results:
         entry = by_pid.get(r["pid"])
-        if r["outcome"] == "needs-root" and entry:
-            key = identity(entry["_proc"])
-            if key in seen["commands"]:
-                seen["commands"][key]["needs_root"] = {"at": now, "pids": r["needs_root"]}
-                noted = True
+        if r["outcome"] != "needs-root" or not entry:
+            continue
+        key = identity(entry["_proc"])
+        if r.get("stage") == "kill":
+            seen["roots"].update({k: now for k in r.get("_survivors", [])})
+            noted = True
+        elif key in seen["commands"]:
+            seen["commands"][key]["needs_root"] = {"at": now, "pids": r["needs_root"]}
+            noted = True
     return noted
 
 
@@ -732,11 +861,12 @@ def main(argv: list[str] | None = None) -> int:
             write_seen(p["seen"])  # the grace and idle clocks run during an override too
             if until and until > now:
                 return 0
+            roots = retry_roots(procs, p["seen"]["roots"], now, LOG)
             results = apply(p["due"], LOG)
-            if remember_refusals(results, p["due"], p["seen"], now):
-                write_seen(p["seen"])
+            if remember_refusals(results, p["due"], {**p["seen"], "roots": roots}, now) or roots != p["seen"]["roots"]:
+                write_seen({**p["seen"], "roots": roots})
             for r in results:
-                print(json.dumps(r))
+                print(json.dumps(public(r)))
             return 0
         # the plan shows runs even where they are not stopped, and does not advance any clock
         p = guard_pass(procs, os.getuid(), True, read_seen(), now)
