@@ -24,9 +24,17 @@ Only families whose contents are reproducible build output or scratch space are
 ever deleted. Everything else is reported so the space is at least visible.
 An item is never deleted while a process has its cwd inside it, a process command
 line names it, it holds a git checkout, or it changed within the idle window.
-A tool's own cache named in TOOL_CACHES (the Go build cache, Bazel, Edge) is not
-searched for git: it is too large for the search to finish, and it holds no work.
-Only its top two levels are checked, where a person's clone of that name would sit.
+A cache is recognized by its content, never its name (cache_layout: a CACHEDIR.TAG,
+npm's cacache, a hex-sharded content store like Go's build cache, bun's install cache,
+a rustup toolchain, Go's module cache, a Chromium disk cache, a Bazel output root).
+Such a tree is "sealed": the git search checks its top two levels, where a person's
+clone would sit, and does not walk the millions of blobs below. Any other tree is
+searched in full, and one too large to finish stays unchecked (kept).
+The home-caches family finds sealed caches anywhere in the home directory (~/.npm/_cacache,
+~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, a rustup toolchain other than the
+default one) without a list of names, and judges their idle time by file access too, so
+the least recently used goes first. Secrets, keychains, checkouts, the Chromium trees and
+the macOS privacy-protected folders are never searched (HOME_NEVER).
 Bazel's macOS output root (/private/var/tmp/_bazel_$USER) is its own family.
 Every deletion is appended to a JSONL receipt.
 
@@ -121,8 +129,8 @@ class Family:
     include: tuple[str, ...] = ()  # when set, only candidates whose name starts with one of these
     min_idle_hours: float = 0.0  # an item must also be idle this long, whatever the idle window
     max_idle_hours: float | None = None  # a hot-tier item goes once idle this long, whatever the idle window
-    # candidates by name that a tool fills with its own cache: never searched for git (see TOOL_CACHES)
-    git_free: tuple[str, ...] = ()
+    # candidates are the sealed caches discover_caches finds below root, not root's children
+    discover: bool = False
 
 
 def idle_window(fam: Family, idle_hours: float) -> float:
@@ -255,7 +263,7 @@ def darwin_user_tmp() -> Path | None:
 
 
 def bazel_family(root: Path) -> Family:
-    # Bazel's output root on macOS (Linux keeps it under ~/.cache/bazel, a TOOL_CACHES name). One output
+    # Bazel's output root on macOS (Linux keeps it under ~/.cache/bazel, a bazel-output-root layout). One output
     # base per workspace (an md5 name) and the unpacked install/: all rebuilt by bazel, and external/
     # holds its repository fetches, so git inside is fetched, not work (as in DerivedData). A running
     # bazel server holds its output base open and names it on its command line, so the in-use checks
@@ -299,14 +307,21 @@ def default_families() -> list[Family]:
                # glaeda* holds glaeda-gh daemon state, the minis' native cache root, fleet-cas deployments
                # and benchmark receipts; huggingface keeps its token; codex-runtimes is an install
                skip=("cmux-job", "huggingface", "codex-runtimes"), skip_prefixes=("glaeda",),
-               owner="tools (XDG cache)", rebuild_minutes=5, git_free=TOOL_CACHES),
+               owner="tools (XDG cache)", rebuild_minutes=5),
         Family("library-caches", HOME / "Library/Caches", True, "the app re-downloads or rebuilds it",
                # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
                # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
                skip=("glaeda", "PassKit", "tidy-branches", "CloudKit", "GeoServices", "FamilyCircle",
                      "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
                      "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
-               skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5, git_free=TOOL_CACHES),
+               skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5),
+        # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
+        # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
+        # so a tool this list never heard of is covered once its cache has a recognized layout.
+        # A day at least: Linux's relatime moves a file's access time once a day, so a cache read every
+        # hour can show a day-old atime.
+        Family("home-caches", HOME, True, "the tool re-downloads or rebuilds it", discover=True,
+               owner="tools (found by cache layout)", rebuild_minutes=5, min_idle_hours=24.0),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
                "use `xcrun simctl delete unavailable` (report only)"),
         Family("projects", projects, False, "checkouts (report only)",
@@ -379,11 +394,13 @@ def du_children(root: Path) -> dict[str, int]:
     return sizes
 
 
-def newest_mtime(path: Path, levels: int = 2, budget: int = 3000) -> float:
+def newest_mtime(path: Path, levels: int = 2, budget: int = 3000, access: bool = False) -> float:
     """Newest mtime of path and entries up to `levels` below it, visiting at most `budget` entries.
 
     Build tools touch top-level files (DerivedData info.plist, logs) on every run, so a shallow,
-    bounded look is enough to see activity without walking the whole tree.
+    bounded look is enough to see activity without walking the whole tree. With `access`, a file's
+    access time counts too: a cache is read far more often than written (rustc runs from a toolchain
+    installed months ago). Only files: listing a directory, as this does, can move its own atime.
     """
     try:
         newest = path.lstat().st_mtime
@@ -404,6 +421,8 @@ def newest_mtime(path: Path, levels: int = 2, budget: int = 3000) -> float:
                         except OSError:
                             continue
                         newest = max(newest, st.st_mtime)
+                        if access and stat.S_ISREG(st.st_mode):
+                            newest = max(newest, st.st_atime)
                         if stat.S_ISDIR(st.st_mode):
                             nxt.append(e.path)
             except OSError:
@@ -527,40 +546,225 @@ def claude_session_active(session_id: str, idle_s: float) -> bool:
 DELETING_PREFIX = ".glaeda-disk-deleting-"  # remove() renames a tree to this before deleting it
 
 
-def shallow_checkout(path: Path) -> bool:
-    """A .git or repository at `path` or one level down: where a person's clone named like a tool cache would sit."""
-    if os.path.lexists(path / ".git") or looks_like_repository(os.fspath(path)):
-        return True
-    try:
-        with os.scandir(path) as it:
-            return any(e.is_dir(follow_symlinks=False)
-                       and (os.path.lexists(os.path.join(e.path, ".git")) or looks_like_repository(e.path))
-                       for e in it)
-    except OSError:
-        return True  # unreadable: fail closed, as git_state does
-
-
 def derived_data(fam: Family, path: Path) -> bool:
-    """Build output despite git inside: Xcode DerivedData (SourcePackages holds clones), a tool's own
-    cache the family names in git_free (TOOL_CACHES) unless a clone sits at its top (shallow_checkout),
-    and a tree remove() had already renamed aside when it was interrupted, which is only ever reclaimed.
-    None of these is searched for git."""
-    return bool(fam.build_output or (path.name in fam.git_free and not shallow_checkout(path))
+    """Build output despite git inside: Xcode DerivedData (SourcePackages holds clones), and a tree
+    remove() had already renamed aside when it was interrupted, which is only ever reclaimed. Neither
+    is searched for git. A tool's own cache is searched, but git_state does not enter its sealed parts."""
+    return bool(fam.build_output
             or re.fullmatch(re.escape(DELETING_PREFIX) + r".+-[0-9]+", path.name)
             or (fam.id == "cmux-job-cache" and path.name == "DerivedData"))
 
 
-# Caches a tool fills and refills by itself, too large for git_state to finish (the Go build cache
-# held 18 GiB and far more than its 20000-entry budget on Air Blue, 2026-09-27), so without this
-# they stayed "unchecked" and were never evicted. No work lives in them: a git clone inside (Bazel's
-# git_repository, say) is a fetch the tool repeats. They are still kept while in use or recent.
-# Named per filesystem spelling: ~/Library/Caches on macOS, ~/.cache (XDG) on Linux.
-TOOL_CACHES = ("go-build", "bazel", "bazelisk", "node-gyp", "Microsoft Edge", "com.microsoft.edgemac",
-               "microsoft-edge")
+# Cache layouts, recognized by what a tool writes rather than by a directory's name. A tree that
+# matches one is "sealed": the tool alone writes below its top level (content-addressed blobs,
+# unpacked downloads, fetched clones), so git_state checks only that top level and the one below it,
+# where a person's clone would sit, instead of walking millions of files it cannot finish (the Go build
+# cache held 18 GiB and far more than the 20000-entry budget on Air Blue, 2026-09-27). Anything else is
+# searched in full and stays "unchecked" when the search cannot finish.
+CACHEDIR_TAG = b"Signature: 8a477f597d28d172789f06886806bc55"  # https://bford.info/cachedir/
+HEX_SHARD = re.compile(r"[0-9a-f]{1,2}")
+BUN_ENTRY = re.compile(r".+@[^@/]*@@@[0-9]+")  # bun's install cache: <name>@<version>@@@<n>
+MD5_NAME = re.compile(r"[0-9a-f]{32}")
+SEALED_BUDGET = 500_000  # entries git_state reads at the tops of sealed caches, per call
+LAYOUT_LISTING = 4096  # entries a layout test reads from one directory
+SHARD_SAMPLE = 16  # entries sampled from each of the first four shards; all must be blobs or shards
+
+
+def _is_file(p: str) -> bool:
+    return os.path.isfile(p) and not os.path.islink(p)
+
+
+def _is_dir(p: str) -> bool:
+    return os.path.isdir(p) and not os.path.islink(p)
+
+
+def _listing(d: str, limit: int = LAYOUT_LISTING, partial: bool = False) -> list[os.DirEntry] | None:
+    """Up to `limit` entries of d, or None when d is unreadable or, unless `partial`, holds more."""
+    out: list[os.DirEntry] = []
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                if len(out) >= limit:
+                    return out if partial else None
+                out.append(e)
+    except OSError:
+        return None
+    return out
+
+
+def _hash_sharded(d: str, entries: list[os.DirEntry]) -> bool:
+    """A content-addressed store: at least 16 entries, nine in ten of them 1-2 hex digit shard
+    directories (Go's build cache, pip's http cache, ccache), and the sampled contents of the first
+    shards all regular files. A git objects directory looks the same; it is never judged here,
+    since git_state and discovery stop at the repository around it."""
+    if len(entries) < 16 or os.path.basename(d) == "objects" or looks_like_repository(os.path.dirname(d)):
+        return False
+    shards = [e for e in entries if HEX_SHARD.fullmatch(e.name) and e.is_dir(follow_symlinks=False)]
+    # one width, and some a-f: numbered directories (Maven's 10..35 versions) are not hex shards
+    if (len(shards) * 10 < len(entries) * 9 or len({len(e.name) for e in shards}) != 1
+            or not any(re.search("[a-f]", e.name) for e in shards)):
+        return False
+    for shard in sorted(shards, key=lambda e: e.name)[:4]:
+        inner = _listing(shard.path, SHARD_SAMPLE, partial=True)
+        if inner is None:
+            return False
+        for e in inner:
+            # blobs, or deeper shards (pip's http cache nests a/b/c/d/e/<hash>)
+            if not (e.is_file(follow_symlinks=False)
+                    or (e.is_dir(follow_symlinks=False) and HEX_SHARD.fullmatch(e.name))):
+                return False
+    return True
+
+
+def stat_layout(d: str) -> str:
+    """The layout d matches by a few files a tool writes at its top, or "" (see listing_layout)."""
+    try:
+        with open(os.path.join(d, "CACHEDIR.TAG"), "rb") as f:
+            if f.read(len(CACHEDIR_TAG)) == CACHEDIR_TAG:
+                return "cachedir-tag"  # cargo's registry, uv, Gradle and others declare their caches so
+    except OSError:
+        pass
+    j = lambda *parts: os.path.join(d, *parts)  # noqa: E731
+    if _is_dir(j("index-v5")) and _is_dir(j("content-v2")):
+        return "npm-cacache"
+    if _is_file(j("index-dir", "the-real-index")) or (_is_file(j("index")) and _is_file(j("data_0"))):
+        return "chromium-disk-cache"
+    if _is_file(j("lib", "rustlib", "multirust-channel-manifest.toml")) and _is_file(j("lib", "rustlib", "components")):
+        return "rustup-toolchain"
+    if _is_dir(j("cache", "download")) and _is_file(j("cache", "lock")):
+        return "go-module-cache"
+    return ""
+
+
+def listing_layout(d: str, entries: list[os.DirEntry]) -> str:
+    """The layout d matches by the names of its entries, or ""."""
+    if _hash_sharded(d, entries):
+        return "hash-sharded-store"
+    names = [e.name for e in entries]
+    bun = sum(1 for n in names if BUN_ENTRY.fullmatch(n))
+    if bun >= 8 and bun * 2 >= sum(1 for n in names if not n.startswith((".", "@"))):
+        return "bun-install-cache"
+    # Bazel's output user root: install/ plus md5-named output bases (~/.cache/bazel/_bazel_$USER)
+    if "install" in names and any(MD5_NAME.fullmatch(n) for n in names):
+        return "bazel-output-root"
+    return ""
+
+
+def cache_layout(path: Path | str) -> str:
+    """The cache layout a directory matches, or "": never a checkout or repository itself."""
+    d = os.fspath(path)
+    if not _is_dir(d) or os.path.lexists(os.path.join(d, ".git")) or looks_like_repository(d):
+        return ""
+    if (found := stat_layout(d)):
+        return found
+    entries = _listing(d)
+    return listing_layout(d, entries) if entries is not None else ""
 
 
 REPRODUCIBLE_DIRS = frozenset({"node_modules", ".build", "DerivedData", "target", ".venv",
                                "__pycache__", ".gradle", "Pods"})
+
+
+# Never searched by discover_caches, relative to the home directory: secrets and credentials,
+# keychains (under Library), the roots other families own (~/.cache, ~/Library/Caches, ~/Projects), and
+# the folders macOS guards with a privacy prompt, which a LaunchAgent must not trip and which hold no
+# tool's cache. SECRET_NAME drops any directory named like a credential store at any depth.
+HOME_NEVER = (".ssh", ".gnupg", ".secrets", ".aws", ".azure", ".kube", ".docker", ".password-store",
+              ".config/gh", ".local/share/keyrings", ".cache", ".Trash", "Library", "Projects",
+              "Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures", "Public", "Applications")
+SECRET_NAME = re.compile(r"secret|credential|token|keychain|keyring|password", re.I)
+# a project's package and build directories belong to it, not to a tool; ~/.gradle is Gradle's own home
+DISCOVER_SKIP = (REPRODUCIBLE_DIRS - {".gradle"}) | {".git"}
+# A hex-sharded store is a git-search shortcut inside a cache root, never by itself a reason to delete:
+# a backup repository (restic's data/) or an app's only copy of its blobs looks the same. The other
+# listing layouts name the tool that refills them.
+DISCOVERABLE = ("bun-install-cache", "bazel-output-root")
+DISCOVER_DEPTH = 5  # ~/.local/share/pnpm/store sits five levels down
+DISCOVER_BUDGET = 8000  # entries read below each top-level home directory
+
+
+def discover_caches(root: Path, depth: int = DISCOVER_DEPTH, budget: int = DISCOVER_BUDGET) -> list[Path]:
+    """Every sealed cache (cache_layout) up to `depth` levels below root, outermost only.
+
+    Never entered: symlinks, HOME_NEVER, credential-named directories, the Chromium trees
+    (never_delete), a checkout or repository, and package or build-output directories (they belong to
+    the project around them). Each top-level directory gets its own `budget` of entries, so one huge
+    tree can hide only its own caches, never delete anything or starve the others.
+    """
+    never = {os.path.realpath(root / n) for n in HOME_NEVER}
+    found: list[Path] = []
+    for top in _entries(root):
+        if not top.is_dir(follow_symlinks=False):
+            continue
+        left = budget
+        level = [top.path]
+        for _ in range(depth):
+            nxt: list[str] = []
+            for d in level:
+                name = os.path.basename(d)
+                if (os.path.realpath(d) in never or SECRET_NAME.search(name) or name in DISCOVER_SKIP
+                        or never_delete(Path(d)) or os.path.lexists(os.path.join(d, ".git"))
+                        or looks_like_repository(d)):
+                    continue
+                if stat_layout(d):
+                    found.append(Path(d))
+                    continue
+                entries: list[os.DirEntry] = []
+                try:
+                    with os.scandir(d) as it:
+                        for e in it:
+                            left -= 1
+                            if left < 0:
+                                break
+                            entries.append(e)
+                except OSError:
+                    continue
+                if left < 0:
+                    break  # a partial listing can hide a layout, never invent one: stop here
+                if listing_layout(d, entries) in DISCOVERABLE:
+                    found.append(Path(d))
+                    continue
+                nxt += [e.path for e in entries if e.is_dir(follow_symlinks=False)]
+            if left < 0:
+                break
+            level = nxt
+    return found
+
+
+def rustup_verdict(path: Path) -> str:
+    """Why a rustup toolchain stays whatever its age, or "". Only rustup puts one back, so a toolchain
+    goes only from a rustup home (settings.toml beside toolchains/) whose rustup binary exists, and
+    never the default or a directory override's toolchain: those are what a plain `cargo` runs."""
+    home = path.parent.parent
+    settings = home / "settings.toml"
+    if path.parent.name != "toolchains" or not settings.is_file():
+        return "a toolchain outside a rustup home"
+    cargo_home = Path(os.environ.get("CARGO_HOME") or HOME / ".cargo")
+    if not (shutil.which("rustup") or (cargo_home / "bin/rustup").is_file() or (home.parent / ".cargo/bin/rustup").is_file()):
+        return "rustup is not installed to reinstall it"
+    try:
+        text = settings.read_text()
+    except OSError:
+        return "unreadable rustup settings"
+    pinned = set()
+    for m in re.finditer(r'^\s*default_toolchain\s*=\s*"([^"]+)"', text, re.M):
+        pinned.add(m.group(1))
+    overrides = text.partition("[overrides]")[2]
+    for m in re.finditer(r'=\s*"([^"]+)"', overrides):
+        pinned.add(m.group(1))
+    for tc in pinned:
+        if path.name == tc or path.name.startswith(tc + "-"):
+            return "the default or an override toolchain"
+    return ""
+
+
+def keep_verdict(fam: "Family", path: Path) -> str:
+    """Why a candidate stays whatever its age, or ""."""
+    if fam.id == "cmux-seeds":
+        return seed_verdict(path)
+    if fam.discover and stat_layout(os.fspath(path)) == "rustup-toolchain":
+        return rustup_verdict(path)
+    return ""
 
 
 def git_state(path: Path, depth: int = 5, budget: int = 20000) -> str:
@@ -568,12 +772,46 @@ def git_state(path: Path, depth: int = 5, budget: int = 20000) -> str:
     searched without finding one, "unchecked" when the search could not finish.
 
     A clone inside a scratch directory can hold unpushed commits, so callers treat "unchecked"
-    like "git" (fail closed). Package and build-output directories are only checked for a .git of their own, not searched.
+    like "git" (fail closed). Package and build-output directories are only checked for a .git of their
+    own, not searched. A sealed cache (stat_layout, listing_layout), at path or anywhere in the walk, is
+    checked at its top level and the one below, where a person's clone would sit, and not entered further.
+    A hex-sharded store is read in full, but only as blobs: a directory in a shard is walked as usual.
+    Every entry read counts against `budget`, or for sealed caches against SEALED_BUDGET.
     """
+    def repo_at(p: str) -> bool:
+        return os.path.lexists(os.path.join(p, ".git")) or looks_like_repository(p)
+
+    sealed_left = SEALED_BUDGET
+
+    def sealed_state(d: str) -> str:
+        """A sealed cache's top: flat stores (a Chromium cache) hold tens of thousands of blobs, so its
+        entries count against their own, larger budget rather than the walk's."""
+        nonlocal sealed_left
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    sealed_left -= 1
+                    if sealed_left < 0:
+                        return "unchecked"
+                    if e.name == ".git" or (e.name == "HEAD" and looks_like_repository(d)):
+                        return "git"
+                    if e.is_dir(follow_symlinks=False) and repo_at(e.path):
+                        return "git"
+        except PermissionError:
+            return "unchecked"
+        except OSError:
+            pass
+        return "none"
+
     frontier = [str(path)]
     for _ in range(depth + 1):
         nxt: list[str] = []
         for d in frontier:
+            if stat_layout(d) and not repo_at(d):
+                if (st := sealed_state(d)) != "none":
+                    return st
+                continue
+            entries: list[os.DirEntry] = []
             try:
                 with os.scandir(d) as it:
                     for e in it:
@@ -582,15 +820,48 @@ def git_state(path: Path, depth: int = 5, budget: int = 20000) -> str:
                             return "unchecked"
                         if e.name == ".git" or (e.name == "HEAD" and looks_like_repository(d)):
                             return "git"  # a bare repository holds commits just like a checkout
-                        if e.is_dir(follow_symlinks=False):
-                            if e.name not in REPRODUCIBLE_DIRS:
-                                nxt.append(e.path)
-                            elif os.path.lexists(os.path.join(e.path, ".git")) or looks_like_repository(e.path):
-                                return "git"  # e.g. `git clone x target`; not searched deeper
+                        entries.append(e)
             except PermissionError:
                 return "unchecked"
             except OSError:
-                pass
+                continue
+            dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
+            layout = listing_layout(d, entries)
+            if layout == "hash-sharded-store":
+                # blobs are cheap to list and the shards were only sampled: read every shard (on the
+                # sealed budget) and walk anything in one that is neither a blob nor a deeper shard
+                stack = [e.path for e in dirs if HEX_SHARD.fullmatch(e.name)]
+                dirs = [e for e in dirs if not HEX_SHARD.fullmatch(e.name)]
+                while stack:
+                    shard = stack.pop()
+                    try:
+                        with os.scandir(shard) as it:
+                            for e in it:
+                                sealed_left -= 1
+                                if sealed_left < 0:
+                                    return "unchecked"
+                                if e.name == ".git" or (e.name == "HEAD" and looks_like_repository(shard)):
+                                    return "git"
+                                if e.is_dir(follow_symlinks=False):
+                                    if HEX_SHARD.fullmatch(e.name):
+                                        stack.append(e.path)
+                                    else:
+                                        dirs.append(e)
+                    except PermissionError:
+                        return "unchecked"
+                    except OSError:
+                        continue
+            elif layout:
+                # sealed: its entries were just read; a clone one level below its top is the last look
+                if any(repo_at(e.path) for e in dirs):
+                    return "git"
+                continue
+            for e in dirs:
+                if e.name in REPRODUCIBLE_DIRS:
+                    if repo_at(e.path):
+                        return "git"  # e.g. `git clone x target`; not searched deeper
+                else:
+                    nxt.append(e.path)
         frontier = nxt
     return "unchecked" if frontier else "none"
 
@@ -1099,7 +1370,9 @@ def job_busy(fam: Family, path: Path) -> bool:
     candidate in the job cache is busy when any slot of its whole unit (path.parent) is."""
     if fam.id == "cmux-job-cache":
         return cmux_active(path.parent)
-    return fam.reclaimable and cmux_active(path)
+    # a sealed cache (home-caches) is never a job unit, and cmux_active calls a tree larger than its
+    # budget busy, which would keep bun's install cache forever
+    return fam.reclaimable and not fam.discover and cmux_active(path)
 
 
 def value(item: "Item", fam: Family) -> float:
@@ -1162,7 +1435,9 @@ def _search(fam: Family, budget: int = 20000) -> list[Path]:
 
 
 def candidates(fam: Family) -> list[Path]:
-    if fam.match:
+    if fam.discover:
+        level = discover_caches(fam.root)
+    elif fam.match:
         level = _search(fam)
     else:
         level = [fam.root]
@@ -1241,7 +1516,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
     sizes = [known[str(path)] for _, path in work]
     floors = [min_bytes if fam.min_bytes is None else fam.min_bytes for fam, _ in work]
     idles = [(now - newest_mtime(path, 2 if fam.reclaimable else 1,
-                                 3000 if fam.reclaimable else 300)) / 3600
+                                 3000 if fam.reclaimable else 300, access=fam.discover)) / 3600
              if size >= floor else 0.0 for (fam, path), size, floor in zip(work, sizes, floors)]
     try:
         cwds, cmds = evidence.result()
@@ -1265,7 +1540,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
         # The tree walks below cost seconds each on a loaded host, and a recent item is kept anyway,
         # so only an item old enough to delete pays for them (apply re-checks before deleting).
         window = idle_window(fam, idle_hours)
-        keep = seed_verdict(path) if fam.id == "cmux-seeds" else ""
+        keep = keep_verdict(fam, path)
         deletable_age = fam.reclaimable and idle >= window
         if deletable_age and holds_socket(path):
             reasons.append("holds a socket")
@@ -1517,8 +1792,11 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if (in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(families[i.family], p)
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))):
             outcome = "changed:in-use"
-        elif (time.time() - newest_mtime(p)) / 3600 < idle_window(families[i.family], idle_hours):
+        elif (time.time() - newest_mtime(p, access=families[i.family].discover)) / 3600 \
+                < idle_window(families[i.family], idle_hours):
             outcome = "changed:modified"
+        elif keep_verdict(families[i.family], p):
+            outcome = "changed:kept"
         elif (families[i.family].git_disposable and p.is_dir() and not derived_data(families[i.family], p)
               and (g := family_git_state(families[i.family], p)) != "none"
               and (g != "git" or family_git_loss(families[i.family], p))):
@@ -1526,7 +1804,13 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         else:
             try:
                 common = git_common_dir(p) if families[i.family].git_disposable else ""
+                # rustup skips reinstalling a toolchain whose update hash still matches the channel
+                stale_hash = (p.parent.parent / "update-hashes" / p.name
+                              if families[i.family].discover and stat_layout(os.fspath(p)) == "rustup-toolchain"
+                              else None)
                 remove(p)
+                if stale_hash is not None:
+                    stale_hash.unlink(missing_ok=True)
                 outcome = "reclaimed"
                 released += i.bytes
                 if common:  # drop the deleted worktree's record from its repository
