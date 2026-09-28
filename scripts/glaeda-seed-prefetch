@@ -504,6 +504,7 @@ def lan_download(run: Pipeline, config: dict, address: str, request: str, keys: 
                               stdout=subprocess.DEVNULL, stderr=test_err)
                 except OSError as error:
                     return {"fetched": "false", "reason": f"zstd -t: {type(error).__name__}", "key": key}
+                run.procs[first].wait()  # as long as it takes: the attempt's timer (run.expire) bounds it
                 tested = run.reap(first)[0]
                 test_err.seek(0)
                 detail = test_err.read().decode(errors="replace").strip()[-120:]
@@ -606,8 +607,9 @@ def lan_stream(config: dict, keys: list[str], staging: Path, timeout: float, rat
     request = " ".join(["seed-v1", codec, *keys])
     unreachable = []
     deadline = time.monotonic() + timeout
+    answered = None
     for address in config["addresses"]:
-        attempts, result, answered, run = 0, None, None, Pipeline()
+        attempts, result, run = 0, None, Pipeline()
         busy_until = time.monotonic() + LAN_BUSY_BUDGET
         while attempts < LAN_ATTEMPTS and time.monotonic() < deadline:
             attempts += 1
@@ -629,7 +631,8 @@ def lan_stream(config: dict, keys: list[str], staging: Path, timeout: float, rat
                 timer.cancel()
                 for signum, handler in previous.items():
                     signal.signal(signum, handler)
-            answered = result if result is not None else answered
+            if result is not None:
+                answered = {**result, "address": address, "attempts": attempts}
             if result is None or not result.get("retry") or attempts >= LAN_ATTEMPTS:
                 break
             busy = result["reason"].startswith("seeder: busy")
@@ -639,10 +642,13 @@ def lan_stream(config: dict, keys: list[str], staging: Path, timeout: float, rat
             if time.monotonic() + pause >= (min(deadline, busy_until) if busy else deadline):
                 break
             time.sleep(pause)
-        if answered is not None:
+        if result is not None:
             answered.pop("retry", None)
-            return {**answered, "address": address, "attempts": attempts}
+            return answered
         unreachable.append(run.unreachable or f"{address}: out of time")
+    if answered is not None:  # an address answered (busy, say) and then stopped answering
+        answered.pop("retry", None)
+        return answered
     return {"fetched": "false", "reason": "unreachable: " + "; ".join(unreachable)[:300]}
 
 
@@ -785,7 +791,7 @@ class Governor:
         self.pgid, self.rate, self.job, self.tick = pgid, rate, job, tick
         self.read_interface, self.read_own = read_interface, read_own or DownloadBytes(pgid)
         self.stop_event = threading.Event()
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()  # stop() may run in a signal handler on a thread inside stop()
         self.paused = False
         self.stats = {"hot_seconds": 0.0, "paused_seconds": 0.0, "peak_job_bps": 0}
         self.thread = threading.Thread(target=self.loop, daemon=True)
@@ -840,9 +846,14 @@ class Governor:
         return self
 
     def stop(self) -> None:
-        """Continue the group if it is stopped, and never signal it again."""
-        self.set_paused(False)
+        """Continue the group if it is stopped, and never signal it again (one lock hold: no tick between)."""
         with self.lock:
+            if self.paused and not self.stop_event.is_set():
+                try:
+                    os.killpg(self.pgid, signal.SIGCONT)
+                except OSError:
+                    pass
+                self.paused = False
             self.stop_event.set()
         self.thread.join(timeout=30)
 
@@ -880,11 +891,12 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "")
     def stop_child() -> None:
         # Only while the leader is unreaped (the Governor stopped first), so the group is still ours.
         governor.stop()
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        remove_downloads(list(downloads.sizes))
+        if child.returncode is None:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        remove_downloads(list(dict(downloads.sizes)))
 
     # launchd's bootout (an OTA update, an uninstall) signals only this job's own process group, so
     # without this the download would outlive us with no timeout and no lock.
@@ -919,8 +931,9 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "")
         governor.stop()
         for signum, handler in previous.items():
             signal.signal(signum, handler)
-        for pipe in (child.stdout, child.stderr):
-            pipe.close()
+        for pipe, reader in zip((child.stdout, child.stderr), readers):
+            if not reader.is_alive():  # a live reader holds the pipe's lock (a descendant that left the group)
+                pipe.close()
     paced = {"paced": governor.report()}
     if timed_out:
         return {"fetched": "false", "reason": f"timed out after {timeout} s", **paced}
