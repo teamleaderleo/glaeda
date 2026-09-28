@@ -441,6 +441,20 @@ class GlaedaDiskTest(unittest.TestCase):
             other = next(iter(gd.filesystems([self.fam], "0", "0", floor_gib=1).values()))
             self.assertEqual(other.low, 0)
 
+    def test_floor_gib_adds_the_callers_floor(self) -> None:
+        seen: list[float] = []
+
+        def fss(*args: object) -> dict:
+            seen.append(args[-1])
+            return {}
+
+        with mock.patch.object(gd, "runner_floor_gib", return_value=50.0), \
+                mock.patch.object(gd, "filesystems", side_effect=fss), contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--pressure", "--floor-gib", "150", "--no-snapshot"])
+            gd.main(["--pressure", "--floor-gib", "10", "--no-snapshot"])
+            gd.main(["--pressure", "--floor-gib", "inf", "--no-snapshot"])
+        self.assertEqual(seen, [150.0, 50.0, 50.0], "the higher of the hooks' floors and the caller's")
+
     def test_filesystems_group_roots_and_apply_thresholds(self) -> None:
         other = gd.Family("tmp", self.root, True, "scratch")
         fss = gd.filesystems([self.fam, other], "0", "100%")

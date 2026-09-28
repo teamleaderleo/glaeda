@@ -25,7 +25,8 @@ re-runs it elsewhere) when:
   * the host is reserved: /Users/Shared/cmux-build-fleet/reservation.json (glaeda-reservation/v1, integer
     Unix seconds) with now < until, whoever owns it; an unreadable or invalid file also refuses, an expired
     one is ignored (parsed by glaeda_reservation.py, installed next to this hook)
-  * free disk is below --min-free-gib
+  * free disk is below --min-free-gib even after one bounded glaeda-disk --pressure run evicted idle caches
+    (evict; skipped with --no-disk)
   * the job needs the console session (a gui class job, or any job on the --gui-runner) and the console
     session is screen-locked or no user is logged in at the console (console_refusal, cmuxterm-hq#757)
   * another build holds the fleet host lock (/Users/Shared/cmux-build-fleet/host.lock, the flock that
@@ -67,8 +68,9 @@ taken, or the mini is saturated (its 1-minute load at least GATE_LOAD_PAUSE per 
 runner's listener so GitHub routes the job to another runner instead of here to be refused or slowed
 down (Gate). A gui runner also stops listening while the console session is locked or nobody is logged in there
 (console_refusal). Every runner also stops listening while free disk is under its job-started hook's --min-free-gib
-(Gate.low_disk). Full means every unit this runner's own --capacity-units scans, read from its job-started hook;
-for a root runner it also means the mini cannot admit a compile or an app-host shard (mini_full).
+and the same eviction left it short (Gate.low_disk). Full means every unit this runner's own --capacity-units scans,
+read from its job-started hook; for a root runner it also means the mini cannot admit a compile or an app-host shard
+(mini_full).
 """
 
 from __future__ import annotations
@@ -928,14 +930,35 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
     return None, note
 
 
+def free_gib(path: str) -> float:
+    return shutil.disk_usage(path if os.path.isdir(path) else str(Path.home())).free / 1024**3
+
+
 def disk_refusal(path: str, min_free_gib: float) -> str | None:
     if min_free_gib <= 0:
         return None
     try:
-        free = shutil.disk_usage(path if os.path.isdir(path) else str(Path.home())).free / 1024**3
+        free = free_gib(path)
     except OSError as error:
         return f"cannot read free disk ({type(error).__name__})"
     return None if free >= min_free_gib else f"{free:.1f} GiB free, {min_free_gib:g} GiB required"
+
+
+def evict(path: str, min_free_gib: float, explicit: str | None) -> str:
+    """Free disk under the floor before refusing anything for it: one bounded glaeda-disk --pressure run told the
+    floor (--floor-gib), so it frees idle caches up to its runner target and does not wait for the job that
+    holds this runner. glaeda-disk never deletes the Chromium trees (NEVER_DELETE) or anything a running job
+    has open, names or marks busy. Returns a one-line note with the space freed; never raises."""
+    try:
+        before = free_gib(path)
+    except OSError:
+        before = None
+    ran = disk_pressure(explicit, min_free_gib)
+    try:
+        freed = f"{free_gib(path) - before:.1f} GiB" if before is not None else "an unknown amount"
+    except OSError:
+        freed = "an unknown amount"
+    return f"under the {min_free_gib:g} GiB disk floor: {ran}, freed {freed}"
 
 
 def root_number(spec: str, roots: int = 99) -> int | None:
@@ -2450,7 +2473,8 @@ def source_identity() -> tuple[int, int, int] | None:
 
 
 GATE_DISK_RESUME_GIB = 2.0  # a disk hold ends only this far above the floor
-GATE_DISK_NOTE_S = 30 * 60  # two glaeda-disk --pressure runs (every 15 min) that did not end the hold
+GATE_DISK_NOTE_S = 30 * 60  # two evictions that did not end the hold
+GATE_DISK_EVICT_EVERY_S = 15 * 60  # an eviction that left the disk short is retried this often, not every poll
 
 
 class Gate:
@@ -2483,6 +2507,7 @@ class Gate:
         self.console_at = -GATE_CONSOLE_EVERY_S
         self.disk_since: float | None = None  # when the current disk hold began
         self.disk_noted = False  # the hold ran past GATE_DISK_NOTE_S and said so once
+        self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # the last eviction under the floor (evict)
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -2606,27 +2631,32 @@ class Gate:
         """Why job-started would refuse every job for free disk (disk_refusal against this runner's own
         --min-free-gib), or None. A listening runner under the floor took every job its label brought and refused
         it: 68 of the fleet's 151 refusals in the 24 h to 2026-09-27 18:00Z, mostly seeds on cmuxs-mac-mini-6 at
-        134 of 150 GiB. Held off, the job goes to another runner or waits in GitHub's queue while glaeda-disk
-        --pressure frees space. statvfs is cheap, so every poll reads it.
+        134 of 150 GiB. Under the floor the gate first evicts idle caches (evict, at most every
+        GATE_DISK_EVICT_EVERY_S) and holds only if that left the disk short; held off, the job goes to another runner
+        or waits in GitHub's queue. statvfs is cheap, so every poll reads it.
         A hold resumes only at GATE_DISK_RESUME_GIB above the floor, so a mini at the edge does not flap. glaeda-disk
-        --pressure reads the same floor and frees space up to it; a hold past GATE_DISK_NOTE_S logs once that it could
-        not, so an operator frees space by hand."""
+        --pressure frees space well past it; a hold past GATE_DISK_NOTE_S logs once that it could not, so an
+        operator frees space by hand."""
         # the margin and the hold timer apply only while the listener is actually held off for disk, so a
         # listening runner that dips once is stopped only on two readings under the floor itself
         holding = self.child is None and (self.held or "").startswith("disk:")
         if not holding:
             self.disk_since, self.disk_noted = None, False
         floor = runner_scope(self.runner_dir).min_free_gib
-        why = disk_refusal(os.path.dirname(self.host_lock), floor + GATE_DISK_RESUME_GIB if floor > 0 and holding
-                           else floor)
+        path, need = os.path.dirname(self.host_lock), floor + GATE_DISK_RESUME_GIB if floor > 0 and holding else floor
+        why = disk_refusal(path, need)
+        if why and time.monotonic() - self.disk_evicted_at >= GATE_DISK_EVICT_EVERY_S:
+            self.disk_evicted_at = time.monotonic()
+            gate_log(evict(path, floor, None))
+            why = disk_refusal(path, need)
         if why is None or not holding:
             return f"disk: {why}" if why else None
         now = time.monotonic()
         if self.disk_since is None:
             self.disk_since = now
         elif not self.disk_noted and now - self.disk_since >= GATE_DISK_NOTE_S:
-            gate_log(f"held for free disk over {GATE_DISK_NOTE_S / 60:g} min ({why}): glaeda-disk --pressure has not "
-                     "freed enough yet (it also waits while a CI job runs here); check with glaeda-disk --top 25")
+            gate_log(f"held for free disk over {GATE_DISK_NOTE_S / 60:g} min ({why}): evicting idle caches has not "
+                     "freed enough; check with glaeda-disk --top 25")
             self.disk_noted = True
         return f"disk: {why}"
 
@@ -3272,7 +3302,7 @@ def find_disk(explicit: str | None) -> str | None:
     return os.fspath(fallback) if fallback.is_file() else None
 
 
-def disk_pressure(explicit: str | None) -> str:
+def disk_pressure(explicit: str | None, floor_gib: float = 0.0) -> str:
     """Best effort. Returns a one-line note; never raises."""
     try:
         disk = find_disk(explicit)
@@ -3280,7 +3310,8 @@ def disk_pressure(explicit: str | None) -> str:
             return "glaeda-disk not installed; skipped"
         timeout = float(os.environ.get("GLAEDA_RUNNER_DISK_TIMEOUT") or DISK_TIMEOUT_S)
         result = subprocess.run(
-            [sys.executable, disk, "--pressure", "--apply", "--top", "0"],
+            [sys.executable, disk, "--pressure", "--apply", "--top", "0",
+             *(["--floor-gib", f"{floor_gib:g}"] if floor_gib > 0 else [])],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=timeout, check=False,
         )
@@ -3434,8 +3465,11 @@ def main(argv: list[str] | None = None) -> int:
             why, want = node_refusal(args.fleet_class)
             if why:
                 return refused(why)
-        why = reservation_refusal(args.reservation, time.time()) \
-            or disk_refusal(os.path.dirname(args.host_lock), args.min_free_gib)
+        why = reservation_refusal(args.reservation, time.time())
+        disk_path = os.path.dirname(args.host_lock)
+        if not why and not args.no_disk and disk_refusal(disk_path, args.min_free_gib):
+            print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk)}", flush=True)
+        why = why or disk_refusal(disk_path, args.min_free_gib)
         if why:
             return refused(why)
         # before any capacity is taken: a job that needs the console session fails on a locked one

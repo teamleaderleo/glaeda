@@ -58,6 +58,9 @@ os.environ["GLAEDA_RUNNER_GATE_LOAD_PAUSE"] = os.environ["GLAEDA_RUNNER_GATE_LOA
 # ioreg here or in the hooks the tests start (unreadable changes nothing); console tests point it at a fake.
 os.environ["GLAEDA_RUNNER_IOREG"] = "/nonexistent/ioreg"
 hook = load("glaeda_cmux_runner_hook", HOOK)
+# The gate evicts under its disk floor with whatever glaeda-disk it finds: in this process never this machine's own
+# (~/.local/bin); a test that wants one passes it explicitly or patches disk_pressure.
+hook.find_disk = lambda explicit: explicit if explicit and os.path.isfile(explicit) else None
 REAL_LEVEL = hook.thermal_pressure_level  # GateTest patches the module attribute
 setup = load("glaeda_mini_setup_for_runner", ROOT / "scripts" / "glaeda-mini-setup")
 setup.DARWIN_REQUIRED = False
@@ -432,6 +435,24 @@ class HookTest(unittest.TestCase):
         self.fleet()
         result = self.started("--min-free-gib", "999999999")
         self.assertEqual(result.returncode, 1)
+        self.assertIn("GiB required", result.stdout)
+        self.assertNotIn("disk floor", result.stdout, "--no-disk: no eviction either")
+        self.assertTrue(self.lock_free())
+
+    def test_disk_floor_evicts_before_refusing(self) -> None:
+        self.fleet()
+        marker = self.dir / "disk-ran"
+        disk = make_executable(self.dir / "glaeda-disk-fake", "import pathlib, sys\n"
+                               f"pathlib.Path({os.fspath(marker)!r}).write_text(' '.join(sys.argv[1:]))\n")
+        push = event(self.dir, "push", {"repository": CMUX})
+        result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
+                               os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
+                               os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertRegex(result.stdout, r"under the 1e\+09 GiB disk floor: glaeda-disk exited 0, freed -?[0-9.]+ GiB\n")
+        self.assertEqual(marker.read_text(), "--pressure --apply --top 0 --floor-gib 1e+09",
+                         "told the floor, so it does not wait for the job that holds this runner")
+        self.assertLess(result.stdout.index("disk floor"), result.stdout.index("refused"), "evicted, then refused")
         self.assertIn("GiB required", result.stdout)
         self.assertTrue(self.lock_free())
 
@@ -2889,8 +2910,9 @@ class GateTest(unittest.TestCase):
             clock["t"] += hook.GATE_DISK_NOTE_S
             gate.low_disk()
             gate.low_disk()
-            self.assertEqual(len(logs), 1, "a long hold is logged once")
-            self.assertIn("glaeda-disk --top 25", logs[0])
+            held = [line for line in logs if line.startswith("held for free disk")]
+            self.assertEqual(len(held), 1, "a long hold is logged once")
+            self.assertIn("glaeda-disk --top 25", held[0])
             free["gib"] = 102.0
             self.assertIsNone(gate.low_disk())
             # held for something else: no margin, and the disk timer does not run
@@ -2898,6 +2920,47 @@ class GateTest(unittest.TestCase):
             free["gib"] = 101.0
             self.assertIsNone(gate.low_disk())
             self.assertIsNone(gate.disk_since)
+
+    def test_the_gate_evicts_before_holding_for_disk(self) -> None:
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec python3 /hook job-started --min-free-gib 100\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        free = {"gib": 99.0, "after": 130.0}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        runs: list[float] = []
+
+        def pressure(_explicit: str | None, floor_gib: float) -> str:
+            runs.append(floor_gib)
+            free["gib"] = free["after"]
+            return "glaeda-disk exited 0"
+
+        logs: list[str] = []
+        clock = {"t": 1000.0}
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "disk_pressure", side_effect=pressure), \
+                mock.patch.object(hook, "gate_log", side_effect=logs.append), \
+                mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock["t"]):
+            gate.child = mock.Mock(pid=1)
+            self.assertIsNone(gate.low_disk(), "eviction made room: the listener keeps listening")
+            self.assertEqual(runs, [100.0], "told the runner's floor")
+            self.assertEqual(logs, ["under the 100 GiB disk floor: glaeda-disk exited 0, freed 31.0 GiB"])
+            # eviction that leaves the disk short: hold, and do not evict again on every poll
+            free.update(gib=99.0, after=99.5)
+            clock["t"] += hook.GATE_DISK_EVICT_EVERY_S
+            why = gate.low_disk()
+            self.assertIn("99.5 GiB free, 100 GiB required", why)
+            gate.child, gate.held = None, why
+            clock["t"] += hook.GATE_DISK_EVICT_EVERY_S - 1
+            self.assertIsNotNone(gate.low_disk())
+            self.assertEqual(len(runs), 2, "retried only every GATE_DISK_EVICT_EVERY_S")
+            free["after"] = 101.0
+            clock["t"] += 1
+            self.assertIn("102 GiB required", gate.low_disk(), "a held runner still resumes only 2 GiB above")
+            self.assertEqual(len(runs), 3)
+            free["after"] = 125.0
+            clock["t"] += hook.GATE_DISK_EVICT_EVERY_S
+            self.assertIsNone(gate.low_disk(), "an eviction that clears the resume mark ends the hold")
 
     def test_a_root_runner_holds_while_a_token_its_jobs_need_is_taken(self) -> None:
         root = hook.RunnerScope(4, 2, 2, True)

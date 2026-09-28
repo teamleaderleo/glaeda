@@ -1637,6 +1637,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--emergency", default="10%:30-60",
                     help="with --pressure --apply: delete even while a CI job runs once free space is "
                          "below this, same forms as --low (default %(default)s)")
+    ap.add_argument("--floor-gib", type=float, default=0.0,
+                    help="a runner disk floor to honour besides the ones read from runner hooks (runner_floor_gib): "
+                         "the runner hook passes its own --min-free-gib when it evicts before refusing a job")
     ap.add_argument("--idle-hours", type=float, default=None,
                     help="idle window (default 24h, or 6h under pressure)")
     ap.add_argument("--family", action="append", help="limit to these family ids")
@@ -1683,7 +1686,7 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(a.settle_minutes * 60)
         return 0
     try:
-        floor_gib = runner_floor_gib()
+        floor_gib = max(runner_floor_gib(), a.floor_gib if math.isfinite(a.floor_gib) else 0.0)
         fss = filesystems(fams or [Family("home", HOME, False, "")], a.low, a.target,
                           a.tmpfs_low, a.tmpfs_target, floor_gib)
         space(a.emergency, GIB)
