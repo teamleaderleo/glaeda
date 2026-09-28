@@ -1006,6 +1006,10 @@ def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
         os.close(lock)
         return {**base, "state": "skip", "reason": "another fuzz run is under way"}
     try:
+        if replay is not None:  # the run that held the lock may have answered it
+            replay = pending_replay()
+            if replay is None and (free is None or free < FUZZ_MIN_FREE_BYTES):
+                return {**base, "state": "skip", "reason": "the replay was answered"}
         if not apply:
             what = f"replay {replay.name} on" if replay else "fuzz"
             return {**base, "state": "plan", "would": f"{what} main {(newest[1] if newest else next(iter(kept)))[:12]}"}
