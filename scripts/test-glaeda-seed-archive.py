@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -81,6 +82,7 @@ class ArchiveTest(unittest.TestCase):
 
     def run_archive(self, apply: bool = True, **kwargs) -> dict:
         os.environ["GLAEDA_SEED_ARCHIVE"] = os.fspath(self.archive)  # not a mount point in a test
+        kwargs.setdefault("min_free", 0)  # the test machine's own free space is not the archive disk's
         return archive.run(apply, self.archive, **kwargs)
 
     def test_plan_changes_nothing(self):
@@ -118,11 +120,24 @@ class ArchiveTest(unittest.TestCase):
         self.run_archive()
         for n, key in enumerate(KEYS):  # fetched long ago, oldest first
             os.utime(self.archive / (key + ".tar.zst"), (1000 + n, 1000 + n))
+        for key in KEYS:  # the seeder dropped them all; only then may prune take them
+            shutil.rmtree(self.state / "seeds" / key)
         archive.KEEP_NEWEST = 2
         size = (self.archive / (KEYS[0] + ".tar.zst")).stat().st_size
         record = self.run_archive(budget=size * 2 + size // 2)
         self.assertEqual([d["key"] for d in record["pruned"]], KEYS[:3])
         self.assertEqual(sorted(p.name[:-8] for p in self.archive.iterdir()), sorted(KEYS[3:]))
+
+    def test_a_full_archive_fetches_nothing_and_spares_the_seeders_seeds(self):
+        self.keep(KEYS[0], 100)
+        self.run_archive()
+        self.keep(KEYS[1], 101)
+        os.utime(self.archive / (KEYS[0] + ".tar.zst"), (1000, 1000))
+        archive.KEEP_NEWEST = 0
+        record = self.run_archive(budget=1)
+        self.assertTrue(record["full"])
+        self.assertEqual((record["fetched"], record["pruned"]), ([], []))  # KEYS[0] is still on the seeder
+        self.assertTrue((self.archive / (KEYS[0] + ".tar.zst")).exists())
 
     def test_prune_keeps_recently_used_seeds(self):
         self.keep(KEYS[0], 100)
@@ -148,6 +163,9 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(archive.check(pack([f"{key}/{pm.MANIFEST}", f"{key}/._x"]), key), "")
         self.assertIn("outside", archive.check(pack([f"{key}/{pm.MANIFEST}", "../evil"]), key))
         self.assertIn("outside", archive.check(pack([f"{key}/{pm.MANIFEST}", f"{KEYS[1]}/x"]), key))
+        self.assertIn("outside", archive.check(pack([f"{key}/{pm.MANIFEST}", f"{key}/../x"]), key))
+        self.assertIn("outside", archive.check(pack([f"{key}/{pm.MANIFEST}", "._other"]), key))
+        self.assertEqual(archive.check(pack([f"{key}/{pm.MANIFEST}", f"._{key}"]), key), "")
         self.assertEqual(archive.check(pack([f"{key}/x"]), key), "no seed manifest")
 
     def test_an_untrusted_seeder_is_an_error(self):

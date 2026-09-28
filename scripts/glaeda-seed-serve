@@ -203,10 +203,12 @@ def archive_find(archive: Path, keys: list[str]) -> tuple[int, str] | None:
     try:
         for key in keys:
             try:
-                fd = os.open(key + ARCHIVE_SUFFIX, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root)
+                # O_NONBLOCK: a FIFO in the archive must not hang the open; cleared once it is a regular file.
+                fd = os.open(key + ARCHIVE_SUFFIX, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root)
             except OSError:
                 continue
             if stat.S_ISREG(os.fstat(fd).st_mode):
+                fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
                 return fd, key
             os.close(fd)
     finally:
@@ -215,8 +217,8 @@ def archive_find(archive: Path, keys: list[str]) -> tuple[int, str] | None:
 
 
 def listing(role: str, state: Path, archive: Path) -> list[tuple[str, int]]:
-    """(key, mtime) of every kept seed, newest first, at most MAX_LIST."""
-    found = []
+    """(key, mtime) of every kept seed, newest first, at most MAX_LIST; a key kept in several roots once."""
+    found: dict[str, int] = {}
     if role == "archive":
         try:
             entries = [(e.name[:-len(ARCHIVE_SUFFIX)], e) for e in os.scandir(archive)
@@ -225,7 +227,7 @@ def listing(role: str, state: Path, archive: Path) -> list[tuple[str, int]]:
             entries = []
         for key, entry in entries:
             if KEY_RE.fullmatch(key):
-                found.append((key, int(entry.stat(follow_symlinks=False).st_mtime)))
+                found[key] = int(entry.stat(follow_symlinks=False).st_mtime)
     else:
         for seeds in seed_dirs(state):
             try:
@@ -234,8 +236,8 @@ def listing(role: str, state: Path, archive: Path) -> list[tuple[str, int]]:
                 continue
             for key in names:
                 if KEY_RE.fullmatch(key) and kept(seeds, key):
-                    found.append((key, int(os.lstat(seeds / key).st_mtime)))
-    return sorted(found, key=lambda item: (-item[1], item[0]))[:MAX_LIST]
+                    found[key] = max(found.get(key, 0), int(os.lstat(seeds / key).st_mtime))
+    return sorted(found.items(), key=lambda item: (-item[1], item[0]))[:MAX_LIST]
 
 
 def stream_archive(fd: int, codec: str) -> int:
@@ -496,9 +498,19 @@ def serve(request: str, state: Path, run_dir: Path, receipt: Path, client: str, 
     if verb in ("product", "product-has"):
         return serve_product(verb, keys[0], products, run_dir, client, slot_wait, record)
     if verb == "list":
-        kept_seeds = listing(role, state, archive)
-        say(f"list {len(kept_seeds)}")
-        os.write(1, "".join(f"{key} {mtime}\n" for key, mtime in kept_seeds).encode())
+        # Admitted like a product lookup: a scan of the seed caches is work a flood of clients must not multiply.
+        admitted = admit(run_dir, client)
+        if admitted is None:
+            say("busy")
+            log(run_dir, {**record, "outcome": "busy", "verb": "list"})
+            return 4
+        try:
+            kept_seeds = listing(role, state, archive)
+            say(f"list {len(kept_seeds)}")
+            os.write(1, "".join(f"{key} {mtime}\n" for key, mtime in kept_seeds).encode())
+        finally:
+            for held in admitted:
+                os.close(held)
         log(run_dir, {**record, "outcome": "list", "count": len(kept_seeds)})
         return 0
     if role == "archive":

@@ -129,13 +129,21 @@ def check(path: Path, key: str) -> str:
         return "no zstd"
     unpack = subprocess.Popen([zstd, "-d", "-q", "-c", os.fspath(path)], stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL)
-    listing = subprocess.run([pm.TAR, "-t", "-f", "-"], stdin=unpack.stdout, capture_output=True, timeout=600)
-    unpack.stdout.close()
-    if unpack.wait(timeout=60) != 0 or listing.returncode != 0:
+    try:
+        listing = subprocess.run([pm.TAR, "-t", "-f", "-"], stdin=unpack.stdout, capture_output=True, timeout=600)
+        unpacked = unpack.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        unpack.kill()
+        unpack.wait()
+        return "check timed out"
+    finally:
+        unpack.stdout.close()
+    if unpacked != 0 or listing.returncode != 0:
         return "not a readable zstd tar"
     names = [n.rstrip("/") for n in listing.stdout.decode(errors="replace").splitlines()]
-    # bsdtar adds AppleDouble ._ entries for extended attributes.
-    stray = [n for n in names if n != key and not n.startswith(key + "/") and not n.rsplit("/", 1)[-1].startswith("._")]
+    # Everything under KEY/ (bsdtar may add an AppleDouble ._KEY beside it), no absolute or .. paths.
+    stray = [n for n in names if n.startswith("/") or ".." in n.split("/")
+             or not (n in (key, "._" + key) or n.startswith(key + "/"))]
     if stray:
         return f"entry outside {key}: {stray[0][:80]}"
     if f"{key}/{pm.MANIFEST}" not in names:
@@ -165,6 +173,9 @@ def fetch(config: dict, key: str, archive: Path) -> dict:
         with open(incoming, "wb") as out:
             source = proc.stdout
             if words[2] == "tar":  # a seeder without zstd: compress here
+                if not pm.zstd_tool():
+                    proc.kill()
+                    return {"key": key, "outcome": "no-zstd"}
                 compress = subprocess.Popen([pm.zstd_tool(), "-1", "-T0", "-q", "-c"], stdin=proc.stdout,
                                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
                 proc.stdout.close()
@@ -178,7 +189,11 @@ def fetch(config: dict, key: str, archive: Path) -> dict:
                 out.write(chunk)
             out.flush()
             os.fsync(out.fileno())
-        if proc.wait(timeout=60) != 0 or (compress and compress.wait(timeout=60) != 0):
+        try:
+            failed = proc.wait(timeout=60) != 0 or (compress and compress.wait(timeout=60) != 0)
+        except subprocess.TimeoutExpired:
+            failed = True
+        if failed:
             return {"key": key, "outcome": "stream-failed", "bytes": total}
         streamed = time.monotonic() - started
         if why := check(incoming, key):
@@ -200,8 +215,11 @@ def fetch(config: dict, key: str, archive: Path) -> dict:
             pass
 
 
-def prune(archive: Path, budget: int, min_free: int, apply: bool) -> list[dict]:
-    """Delete the oldest archived seeds while over BUDGET or under MIN_FREE; what was (or would be) deleted."""
+def prune(archive: Path, budget: int, min_free: int, apply: bool, spare: set[str] = frozenset()) -> list[dict]:
+    """Delete the oldest archived seeds while over BUDGET or under MIN_FREE; what was (or would be) deleted.
+
+    SPARE (the seeds the seeder still keeps) stay: deleting one would only fetch it again next run.
+    """
     now = time.time()
     for stale in archive.glob(".*.incoming-*"):
         try:
@@ -216,7 +234,7 @@ def prune(archive: Path, budget: int, min_free: int, apply: bool) -> list[dict]:
     for key, st in seeds[:max(0, len(seeds) - KEEP_NEWEST)]:
         if total <= budget and free >= min_free:
             break
-        if now - st.st_mtime < GRACE:
+        if now - st.st_mtime < GRACE or key in spare:
             continue
         if apply:
             try:
@@ -253,10 +271,14 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
         if why:
             return {**record, "state": "error", "reason": why}
         have = archived(archive)
-        missing = [key for key, _ in kept if key not in have]
+        missing = list(dict.fromkeys(key for key, _ in kept if key not in have))
         record["seeder_kept"] = len(kept)
         record["missing"] = len(missing)
         fetched = []
+        held = sum(st.st_size for st in have.values())
+        if held >= budget or shutil.disk_usage(archive).free < min_free:
+            record["full"] = True  # fetch nothing until prune (of seeds the seeder dropped) makes room
+            missing = []
         if apply:
             for key in missing[:MAX_PER_RUN]:
                 result = fetch(config, key, archive)
@@ -266,7 +288,7 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
         else:
             record["would_fetch"] = missing[:MAX_PER_RUN]
         record["fetched"] = fetched
-        record["pruned"] = prune(archive, budget, min_free, apply)
+        record["pruned"] = prune(archive, budget, min_free, apply, {key for key, _ in kept})
         seeds = archived(archive)
         record["archive_seeds"] = len(seeds)
         record["archive_bytes"] = sum(st.st_size for st in seeds.values())

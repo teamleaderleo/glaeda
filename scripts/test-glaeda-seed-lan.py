@@ -214,6 +214,7 @@ class ServeTest(unittest.TestCase):
         os.utime(self.keep(KEY), (100, 100))
         os.utime(self.keep(OTHER, "cmux-ci-2"), (200, 200))
         self.keep(KEY[:-3] + "fff", manifest=False)  # incomplete: not listed
+        os.utime(self.keep(OTHER), (150, 150))  # kept in two roots: listed once, newest time
         code, out, _ = self.ask("seed-list-v1")
         head, body = self.header(out)
         self.assertEqual((code, head), (0, "list 2"))
