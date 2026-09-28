@@ -320,9 +320,30 @@ class RepositoryAgentWorkTests(unittest.TestCase):
     def test_paths_reject_git_control_and_traversal(self) -> None:
         for valid in ['scripts/ci/file.py', 'docs/a file.md']:
             self.assertEqual(w.repository_path(valid), valid)
-        for invalid in ['', '/etc/passwd', '../x', 'a/../x', '.git/config', 'a/.git/config', 'a//b', 'a\\b', 'a/']:
+        for invalid in [
+            '', '/etc/passwd', '../x', 'a/../x', '.git/config', 'a/.git/config',
+            '.GIT/config', 'a/.GIT/config', '.Git/hooks/pre-commit',
+            'a//b', 'a\\b', 'a/',
+        ]:
             with self.subTest(invalid=invalid), self.assertRaises(w.ContractRefusal):
                 w.repository_path(invalid)
+
+    def test_plan_authority_cannot_poison_the_module_constant(self) -> None:
+        raw_request = review_request()
+        request = w.normalize_request(raw_request)
+        plan = w.plan(request)
+        self.assertEqual(plan['authority'], w.AUTHORITY)
+        self.assertIsNot(plan['authority'], w.AUTHORITY)
+        self.assertIsNot(plan['source'], request['source'])
+        plan['authority']['authorizes_merge'] = True
+        self.assertFalse(w.AUTHORITY['authorizes_merge'])
+        # normalize_receipt validates with `!= AUTHORITY`, so a poisoned
+        # constant would silently widen every later check in this process.
+        # It is not poisoned, so the widened authority is still refused.
+        value = receipt(raw_request, {'kind': 'review', 'findings': [finding()]})
+        value['authority'] = plan['authority']
+        with self.assertRaisesRegex(w.ContractRefusal, 'unsupported authority'):
+            w.normalize_receipt(value, request)
 
     def test_review_receipt_validates_finding_digest_and_zero_authority(self) -> None:
         request = w.decode_request(raw(review_request()))

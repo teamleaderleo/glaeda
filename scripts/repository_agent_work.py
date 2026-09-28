@@ -163,7 +163,9 @@ def repository_path(value: object) -> str:
     ):
         raise ContractRefusal("invalid_path", "repository path is not canonical")
     parts = value.split("/")
-    if any(part in {"", ".", "..", ".git"} for part in parts):
+    # Case-folded, because the control plane runs on a case-insensitive
+    # filesystem where `.GIT/config` resolves to `.git/config`.
+    if any(part.lower() in {"", ".", "..", ".git"} for part in parts):
         raise ContractRefusal("invalid_path", "repository path contains an unsafe component")
     return value
 
@@ -446,7 +448,7 @@ def plan(request: dict[str, object]) -> dict[str, object]:
         "schema_version": SCHEMA_VERSION,
         "request_sha256": request_sha256(request),
         "operation": request["operation"],
-        "source": request["source"],
+        "source": dict(request["source"]),
         "compute_workload": compute_workload(request),
         "routing_classification": routing_classification(request),
         "routing_classification_sha256": routing_classification_sha256(request),
@@ -457,7 +459,7 @@ def plan(request: dict[str, object]) -> dict[str, object]:
             "machine_selection": "glaeda_owned",
             "physical_attempt": "separate_receipt",
         },
-        "authority": AUTHORITY,
+        "authority": dict(AUTHORITY),
     }
 
 
@@ -728,10 +730,10 @@ def normalize_receipt(value: object, request: dict[str, object]) -> dict[str, ob
         "schema_version": SCHEMA_VERSION,
         "request_sha256": request_sha256(request),
         "operation": request["operation"],
-        "source": request["source"],
+        "source": dict(request["source"]),
         "state": value["state"],
         "result": normalized_result,
-        "authority": AUTHORITY,
+        "authority": dict(AUTHORITY),
     }
 
 
