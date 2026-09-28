@@ -204,6 +204,8 @@ pub mod linux_installation_enrollment;
 /// Staged, durable, no-replace publication of complete project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_publication;
+#[cfg(target_os = "linux")]
+mod linux_kernel_file_locks;
 /// Durable, revision-checked lease persistence beneath one installation directory.
 #[cfg(target_os = "linux")]
 pub mod linux_lease_store;
@@ -293,6 +295,8 @@ pub mod personal_worker_operator_mutation;
 pub mod personal_worker_operator_read;
 /// Config-bound read-only discovery and explicit first initialization of durable worker state.
 pub mod personal_worker_operator_store;
+/// Pure queue-level aggregate PID admission policy and checked reservation arithmetic.
+pub mod personal_worker_pid_capacity;
 pub mod personal_worker_queue;
 /// Pure bounded projection of durable personal-worker status, queue pages, and job state.
 pub mod personal_worker_read_model;
@@ -445,6 +449,8 @@ pub mod unix_protected_cache_generation_catalog_store;
 /// Descriptor-bound private persistence for the resident-sandbox catalog.
 #[cfg(unix)]
 pub mod unix_resident_sandbox_store;
+/// Pure closed generation selection for verification-derived cache identities.
+pub mod verification_cache_generation;
 /// Pure fixed repository verification command meanings for identity derivation and later execution.
 pub mod verification_command_semantics;
 /// Pure sealed cross-attempt verification-isolation compatibility.

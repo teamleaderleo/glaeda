@@ -6,7 +6,9 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import contextlib
+import fcntl
 import io
+import json
 import os
 import shutil
 import socket
@@ -15,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,9 +44,14 @@ class GlaedaDiskTest(unittest.TestCase):
         self.fam = gd.Family("xcode-derived-data", self.root, True, "rebuild")
         self.gd_evidence = gd.process_evidence
         gd.process_evidence = lambda: ([], "")
+        gd._DISCOVERED.clear()
+        self.gd_keep = gd.NESTED_KEEP
+        gd.NESTED_KEEP = self.root.parent / f"{self.root.name}-keep.json"
 
     def tearDown(self) -> None:
         gd.process_evidence = self.gd_evidence
+        gd.NESTED_KEEP.unlink(missing_ok=True)
+        gd.NESTED_KEEP = self.gd_keep
         self.tmp.cleanup()
 
     def verdicts(self, idle: float = 24) -> dict[str, str]:
@@ -173,11 +181,350 @@ class GlaedaDiskTest(unittest.TestCase):
         (self.root / "repo/sub/.git").mkdir(parents=True)
         self.assertEqual(gd.git_state(self.root / "repo"), "git")
 
+    @staticmethod
+    def age(*tops: Path, hours: float = 48) -> None:
+        old = time.time() - hours * 3600
+        for top in tops:
+            for dirpath, dirs, files in os.walk(top):
+                for n in dirs + files:
+                    os.utime(os.path.join(dirpath, n), (old, old), follow_symlinks=False)
+            os.utime(top, (old, old))
+
+    @staticmethod
+    def hex_store(root: Path, shards: int = 20, files: int = 5) -> Path:
+        for i in range(shards):
+            shard = root / f"{i + 0xa0:02x}"
+            shard.mkdir(parents=True)
+            for j in range(files):
+                (shard / f"{i:02x}{j:062x}-a").write_bytes(b"x")
+        return root
+
+    def test_sealed_caches_are_recognized_by_content_not_name(self) -> None:
+        # The Go build cache outgrew git_state's budget and stayed "unchecked" forever. A tree whose
+        # layout a tool writes is sealed: only its top two levels are searched, whatever its name.
+        go = self.hex_store(self.root / "whatever-name")
+        self.assertEqual(gd.cache_layout(go), "hash-sharded-store")
+        self.assertEqual(gd.git_state(go, budget=50, sealed=True), "none")
+        # a family that deletes disposable checkouts (tmp, scratch) never takes the shortcut
+        self.assertEqual(gd.git_state(go, budget=50), "unchecked")
+        plain = self.root / "plain"
+        for i in range(20):
+            (plain / f"d{i}").mkdir(parents=True)
+            for j in range(5):
+                (plain / f"d{i}" / f"f{j}").write_bytes(b"x")
+        self.assertEqual(gd.git_state(plain, budget=50, sealed=True), "unchecked")
+        chrome = self.root / "Browser/Default/Cache/Cache_Data"
+        (chrome / "index-dir").mkdir(parents=True)
+        (chrome / "index-dir/the-real-index").write_bytes(b"x")
+        # an index and a data_0 are any dataset's names; Chromium's blockfile index carries its magic
+        dataset = self.root / "dataset"
+        dataset.mkdir()
+        for n in ("index", "data_0", "data_1", "data_2", "data_3"):
+            (dataset / n).write_bytes(b"rows")
+        self.assertEqual(gd.cache_layout(dataset), "")
+        (dataset / "index").write_bytes(gd.CHROMIUM_INDEX_MAGIC + b"rest")
+        self.assertEqual(gd.cache_layout(dataset), "chromium-disk-cache")
+        for j in range(100):
+            (chrome / f"{j:016x}_0").write_bytes(b"x")
+        self.assertEqual(gd.cache_layout(chrome), "chromium-disk-cache")
+        self.assertEqual(gd.git_state(self.root / "Browser", budget=50, sealed=True), "none")
+        tagged = self.root / "tagged"
+        (tagged / "a/b/c/d/e/f/g").mkdir(parents=True)
+        self.assertEqual(gd.git_state(tagged, sealed=True), "unchecked")
+        (tagged / "CACHEDIR.TAG").write_bytes(gd.CACHEDIR_TAG + b"\n")
+        self.assertEqual(gd.git_state(tagged, sealed=True), "none")
+        # a FIFO carrying the name is never opened (the read would block)
+        fifo = self.root / "fifo"
+        (fifo / "a/b/c/d/e/f/g").mkdir(parents=True)
+        os.mkfifo(fifo / "CACHEDIR.TAG")
+        self.assertEqual(gd.cache_layout(fifo), "")
+        self.assertEqual(gd.git_state(fifo, sealed=True), "unchecked")
+        # ~/.cache/bazel on Linux: an output user root whose bases hold bazel's own fetched clones
+        bazel = self.root / "bazel/_bazel_me"
+        (bazel / "install/abc").mkdir(parents=True)
+        (bazel / ("0" * 31 + "a") / "external/rules_x/.git").mkdir(parents=True)
+        self.assertEqual(gd.cache_layout(bazel), "bazel-output-root")
+        self.assertEqual(gd.git_state(self.root / "bazel", sealed=True), "none")
+        (self.root / "notbazel/install").mkdir(parents=True)
+        (self.root / "notbazel" / ("0" * 31 + "a") / "src/repo/.git").mkdir(parents=True)
+        self.assertEqual(gd.git_state(self.root / "notbazel", sealed=True), "git")
+        # numbered directories (Maven versions) are not hex shards
+        maven = self.root / "maven"
+        for v in range(10, 30):
+            (maven / str(v)).mkdir(parents=True)
+            (maven / str(v) / "x.pom").write_bytes(b"x")
+        self.assertEqual(gd.cache_layout(maven), "")
+        # shards are only sampled to recognize the store; every shard is still read, so a worktree
+        # in the last one is found
+        mixed = self.hex_store(self.root / "mixed", files=40)
+        (mixed / "b3/worktree/.git").mkdir(parents=True)
+        self.assertEqual(gd.git_state(mixed, budget=50, sealed=True), "git")
+        (mixed / "b3/worktree/.git").rmdir()
+        self.assertEqual(gd.git_state(mixed, budget=50, sealed=True), "none")
+
+    def test_a_clone_at_the_top_of_a_sealed_cache_is_still_kept(self) -> None:
+        # sealing skips the deep search, not the shallow one: a person's clone at the top of a cache,
+        # or one level down, is never deleted without a look; a clone deeper in the blobs is the tool's.
+        self.fam = gd.Family("user-cache", self.root, True, "re-download")
+        tag = gd.CACHEDIR_TAG + b"\n"
+        top = make(self.root / "top")
+        (top / "CACHEDIR.TAG").write_bytes(tag)
+        (top / ".git").mkdir()
+        nested = make(self.root / "nested")
+        (nested / "CACHEDIR.TAG").write_bytes(tag)
+        (nested / "repo/.git").mkdir(parents=True)
+        deep = make(self.root / "deep")
+        (deep / "CACHEDIR.TAG").write_bytes(tag)
+        (deep / "a/b/.git").mkdir(parents=True)
+        inner = make(self.root / "inner")  # a sealed store below an ordinary directory
+        self.hex_store(inner / "store")
+        (inner / "store/a0/clone/.git").mkdir(parents=True)
+        self.age(top, nested, deep, inner)
+        self.assertEqual(self.verdicts(), {"top": "git-checkout", "nested": "git-checkout",
+                                           "deep": "reclaimable", "inner": "git-checkout"})
+
+    def test_home_caches_are_discovered_by_layout(self) -> None:
+        home = self.root / "home"
+        tag = gd.CACHEDIR_TAG + b"\n"
+        cargo_tag = gd.CACHEDIR_TAG + b"\n# This file is a cache directory tag created by cargo.\n"
+        (home / ".npm/_cacache/index-v5").mkdir(parents=True)
+        (home / ".npm/_cacache/content-v2").mkdir()
+        bun = home / ".bun/install/cache"
+        for i in range(10):
+            (bun / f"pkg{i}@1.0.{i}@@@1").mkdir(parents=True)
+        (home / ".bun/bin").mkdir()
+        (home / "go/pkg/mod/cache/download").mkdir(parents=True)
+        (home / "go/pkg/mod/cache/lock").write_bytes(b"")
+        (home / "go/src/mine").mkdir(parents=True)
+        (home / ".cargo/registry").mkdir(parents=True)
+        (home / ".cargo/registry/CACHEDIR.TAG").write_bytes(cargo_tag)
+        (home / ".cargo/bin").mkdir()
+        # never candidates: secrets, source, a checkout's build output, the Chromium trees,
+        # a project's node_modules, and a hex-sharded store (a backup repository looks the same)
+        for keep in (".ssh/cache", ".config/gh/cache", "Documents/cache", "Projects/x/cache",
+                     "code/repo/target", "cmux-browser-fleet/cache", "app/node_modules/.cache",
+                     ".my-tokens/cache", ".tool/untagged-creator"):
+            (home / keep).mkdir(parents=True)
+            (home / keep / "CACHEDIR.TAG").write_bytes(tag)
+        # installed environments uv and direnv tag as caches, even ones naming cargo, are not recreatable
+        for env in (".local/share/uv/tools/ruff", ".local/share/uv/python/cpython-3.12", "tools/.direnv",
+                    "envs/myenv", ".pipx-like/venvs/x"):
+            (home / env).mkdir(parents=True)
+            (home / env / "CACHEDIR.TAG").write_bytes(cargo_tag)
+        (home / "envs/myenv/pyvenv.cfg").write_text("home = /usr/bin")
+        # cargo tags a target directory too: one outside a project (CARGO_TARGET_DIR) is a build
+        (home / ".cargo-target/debug").mkdir(parents=True)
+        (home / "shared-target").mkdir()
+        (home / "shared-target/.rustc_info.json").write_text("{}")
+        for build in (".cargo-target", "shared-target"):
+            (home / build / "CACHEDIR.TAG").write_bytes(cargo_tag)
+        (home / ".pipx-like/venvs/x/pyvenv.cfg").write_text("home = /usr/bin")
+        (home / "code/repo/.git").mkdir()
+        self.hex_store(home / "backups/restic/data")
+        with mock.patch.object(gd, "HOME", home):
+            found = sorted(os.path.relpath(p, home) for p in gd.discover_caches(home))
+        self.assertEqual(found, [".bun/install/cache", ".cargo/registry", ".npm/_cacache", "go/pkg/mod"])
+        # a tree too large for the budget hides its own caches, and only its own
+        wide = home / "wide"
+        for i in range(50):
+            (wide / f"d{i}").mkdir(parents=True)
+        (wide / "d0/CACHEDIR.TAG").write_bytes(cargo_tag)
+        with mock.patch.object(gd, "HOME", home):
+            found = {os.path.relpath(p, home) for p in gd.discover_caches(home, budget=20)}
+        self.assertNotIn("wide/d0", found)
+        self.assertIn(".cargo/registry", found)
+
+    def test_other_filesystems_and_read_errors_fail_closed(self) -> None:
+        tree = self.root / "tree"
+        (tree / "mnt/data").mkdir(parents=True)
+        (tree / "plain").mkdir()
+        self.assertEqual(gd.git_state(tree), "none")
+        real = os.DirEntry.stat
+        dev = os.lstat(tree).st_dev
+
+        def fake(entry, *a, **k):
+            st = real(entry, *a, **k)
+            if entry.name == "mnt":
+                return os.stat_result((st.st_mode, st.st_ino, dev + 1) + tuple(st)[3:])
+            return st
+        with mock.patch.object(os.DirEntry, "stat", fake):
+            self.assertEqual(gd.git_state(tree), "unchecked")  # a delete would descend into the mount
+        real_lstat = os.lstat
+
+        def fake_lstat(p, *a, **k):
+            st = real_lstat(p, *a, **k)
+            if os.fspath(p).endswith("/mnt"):
+                return os.stat_result((st.st_mode, st.st_ino, dev + 1) + tuple(st)[3:])
+            return st
+        home = self.root / "home"
+        (home / "mnt/cache/index-v5").mkdir(parents=True)
+        (home / "mnt/cache/content-v2").mkdir()
+        with mock.patch.object(os, "lstat", fake_lstat):
+            self.assertEqual(gd.discover_caches(home), [])
+        self.assertEqual(gd.discover_caches(home), [home / "mnt/cache"])
+        # EIO or ESTALE while reading a directory is not evidence that nothing is there
+        real_scandir = os.scandir
+
+        def failing(p="."):
+            if os.fspath(p).endswith("/plain"):
+                raise OSError(5, "Input/output error")
+            return real_scandir(p)
+        with mock.patch.object(os, "scandir", failing):
+            self.assertEqual(gd.git_state(tree), "unchecked")
+        with self.assertRaisesRegex(OSError, "mount"), mock.patch.object(os.path, "ismount", return_value=True):
+            gd.remove(tree / "plain")
+        self.assertTrue((tree / "plain").is_dir())
+
+    def test_apply_refreshes_only_discovered_candidates_sizes(self) -> None:
+        home = self.root / "home"
+        (home / ".npm/_cacache/index-v5").mkdir(parents=True)
+        (home / ".npm/_cacache/content-v2").mkdir()
+        (home / "code/checkout").mkdir(parents=True)
+        disc = gd.Family("home-caches", home, True, "re-download", discover=True)
+        other = gd.Family("xcode-derived-data", self.root / "dd", True, "rebuild")
+        known = {str(home / ".npm/_cacache"): 1, str(home / "code/checkout"): 2,
+                 str(self.root / "dd/x"): 3, str(self.root / "elsewhere"): 4}
+        self.assertEqual(gd.fresh_for_apply(known, [disc, other]),
+                         {str(home / "code/checkout"): 2, str(self.root / "elsewhere"): 4})
+
+    def rustup_home(self, home: Path) -> Path:
+        rh = home / ".rustup"
+        for tc in ("stable-aarch64-apple-darwin", "nightly-aarch64-apple-darwin",
+                   "1.88.0-aarch64-apple-darwin", "1.90.0-aarch64-apple-darwin"):
+            lib = rh / "toolchains" / tc / "lib/rustlib"
+            lib.mkdir(parents=True)
+            (lib / "multirust-channel-manifest.toml").write_text("x")
+            (lib / "components").write_text("rustc")
+            (rh / "toolchains" / tc / "bin").mkdir()
+            (rh / "toolchains" / tc / "bin/rustc").write_bytes(b"\0" * 1024 * 1024)
+            (rh / "update-hashes").mkdir(exist_ok=True)
+            (rh / "update-hashes" / tc).write_text("hash")
+        (rh / "settings.toml").write_text('version = "12"\ndefault_toolchain = "stable"\n'
+                                          '[overrides]\n"/p/x" = "1.90.0-aarch64-apple-darwin"\n')
+        return rh
+
+    def test_rustup_toolchains_other_than_the_default_go_lru(self) -> None:
+        home = self.root / "home"
+        rh = self.rustup_home(home)
+        self.age(rh)
+        # read an hour ago, written long ago: where the filesystem records access, LRU order sees it
+        now = time.time()
+        os.utime(rh / "toolchains/nightly-aarch64-apple-darwin/bin/rustc", (now - 3600, now - 90 * 24 * 3600))
+        self.fam = gd.Family("home-caches", home, True, "re-download", discover=True)
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ, {"CARGO_HOME": str(home / ".cargo")}):
+            self.assertTrue(all(v == "kept" for v in self.verdicts().values()))  # no rustup to reinstall
+            (home / ".cargo/bin").mkdir(parents=True)
+            (home / ".cargo/bin/rustup").write_bytes(b"")
+            self.assertEqual(self.verdicts(), {"stable-aarch64-apple-darwin": "kept",
+                                               "1.90.0-aarch64-apple-darwin": "kept",
+                                               "nightly-aarch64-apple-darwin": "recent",
+                                               "1.88.0-aarch64-apple-darwin": "reclaimable"})
+            items = gd.survey([self.fam], 24, 0)
+            receipt = self.root.parent / f"{self.root.name}-r.jsonl"
+            with contextlib.redirect_stdout(io.StringIO()):
+                gd.apply(items, {self.fam.id: self.fam}, receipt, None, 24)
+            receipt.unlink(missing_ok=True)
+        self.assertFalse((rh / "toolchains/1.88.0-aarch64-apple-darwin").exists())
+        # rustup would skip the reinstall while the old update hash still matches the channel
+        self.assertFalse((rh / "update-hashes/1.88.0-aarch64-apple-darwin").exists())
+        self.assertTrue((rh / "update-hashes/nightly-aarch64-apple-darwin").exists())
+        self.assertTrue((rh / "toolchains/stable-aarch64-apple-darwin").exists())
+        self.assertTrue((rh / "settings.toml").exists())
+
+    def test_rustup_toolchains_a_checkout_or_the_environment_pins_stay(self) -> None:
+        home = self.root / "home"
+        rh = self.rustup_home(home)
+        (home / ".cargo/bin").mkdir(parents=True)
+        (home / ".cargo/bin/rustup").write_bytes(b"")
+        (home / "Projects/app").mkdir(parents=True)
+        (home / "Projects/app/rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.88.0"\n')
+        (home / "Projects/app-worktrees/b").mkdir(parents=True)
+        (home / "Projects/app-worktrees/b/rust-toolchain").write_text("nightly\n")
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ, {"CARGO_HOME": str(home / ".cargo")}):
+            os.environ.pop("RUSTUP_TOOLCHAIN", None)
+            tcs = rh / "toolchains"
+            self.assertTrue(gd.rustup_verdict(tcs / "1.88.0-aarch64-apple-darwin"))
+            self.assertTrue(gd.rustup_verdict(tcs / "nightly-aarch64-apple-darwin"))
+            (home / "Projects/app-worktrees/b/rust-toolchain").unlink()
+            self.assertEqual(gd.rustup_verdict(tcs / "nightly-aarch64-apple-darwin"), "")
+            os.environ["RUSTUP_TOOLCHAIN"] = "nightly"
+            self.assertTrue(gd.rustup_verdict(tcs / "nightly-aarch64-apple-darwin"))
+
+    def test_apply_rechecks_a_discovered_cache_for_a_new_clone(self) -> None:
+        home = self.root / "home"
+        cache = home / ".npm/_cacache"
+        (cache / "index-v5").mkdir(parents=True)
+        (cache / "content-v2").mkdir()
+        (cache / "content-v2/blob").write_bytes(b"\0" * 1024 * 1024)
+        self.age(home / ".npm")
+        self.fam = gd.Family("home-caches", home, True, "re-download", discover=True)
+        receipt = self.root.parent / f"{self.root.name}-r.jsonl"
+        with mock.patch.object(gd, "HOME", home):
+            items = gd.survey([self.fam], 24, 0)
+            self.assertEqual([i.verdict for i in items], ["reclaimable"])
+            (cache / "mine/.git").mkdir(parents=True)  # someone cloned into it after the survey
+            self.age(home / ".npm")
+            with contextlib.redirect_stdout(io.StringIO()):
+                gd.apply(items, {self.fam.id: self.fam}, receipt, None, 24)
+        outcome = json.loads(receipt.read_text().splitlines()[-1])["outcome"]
+        receipt.unlink(missing_ok=True)
+        self.assertEqual(outcome, "changed:git")
+        self.assertTrue((cache / "mine/.git").is_dir())
+
+    def test_discovered_cache_in_use_is_kept(self) -> None:
+        home = self.root / "home"
+        cache = home / ".npm/_cacache"
+        (cache / "index-v5").mkdir(parents=True)
+        (cache / "content-v2").mkdir()
+        (cache / "content-v2/blob").write_bytes(b"\0" * 1024 * 1024)
+        self.age(home / ".npm")
+        self.fam = gd.Family("home-caches", home, True, "re-download", discover=True)
+        with mock.patch.object(gd, "HOME", home):
+            self.assertEqual(self.verdicts(), {"_cacache": "reclaimable"})
+            gd.process_evidence = lambda: ([str(cache / "content-v2/blob")], "")
+            self.assertEqual(self.verdicts(), {"_cacache": "in-use"})
+
+    def test_bazel_output_bases_go_and_the_repository_cache_stays(self) -> None:
+        # /private/var/tmp/_bazel_$USER on macOS: output bases (md5 names) and install/ are rebuilt by
+        # bazel, even with fetched clones inside; cache/ is the repository cache and is never a candidate.
+        self.fam = gd.bazel_family(self.root)
+        base = make(self.root / "0123456789abcdef0123456789abcdef")
+        (base / "external/rules_x/.git").mkdir(parents=True)
+        (base / "execroot/_main").mkdir(parents=True)
+        os.symlink(self.root.parent, base / "execroot/_main/outside")
+        (make(self.root / "cache") / "repos/v1").mkdir(parents=True)
+        old = time.time() - 48 * 3600
+        for top in (base, self.root / "cache"):
+            for dirpath, dirs, files in os.walk(top):
+                for n in dirs + files:
+                    os.utime(os.path.join(dirpath, n), (old, old), follow_symlinks=False)
+            os.utime(top, (old, old))
+        self.assertEqual(self.verdicts(), {base.name: "reclaimable"})
+        items = [i for i in gd.survey([self.fam], 24, 0) if i.verdict == "reclaimable"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {self.fam.id: self.fam}, self.root.parent / f"{self.root.name}-r.jsonl", None, 24)
+        (self.root.parent / f"{self.root.name}-r.jsonl").unlink(missing_ok=True)
+        self.assertFalse(base.exists())
+        self.assertTrue((self.root / "cache/repos/v1").is_dir() and self.root.parent.is_dir())
+
+    def test_only_home_caches_discovers(self) -> None:
+        fams = gd.default_families()
+        self.assertEqual([(f.id, f.root) for f in fams if f.discover], [("home-caches", gd.HOME)])
+        for n in (".ssh", ".gnupg", ".secrets", "Library", "Projects", "Documents", ".cache"):
+            self.assertIn(n, gd.HOME_NEVER)
+
     def test_tmp_alias_and_comma_lists_count_as_named(self) -> None:
         self.assertTrue(gd.named_by("/private/tmp/foo", "tool --out /tmp/foo/dist\n"))
         self.assertTrue(gd.named_by("/private/tmp/foo", "tool --dirs=/private/tmp/foo,/x\n"))
         self.assertFalse(gd.named_by("/private/tmp/foo", "tool /tmp/foobar\n"))
         self.assertTrue(gd.in_cwd("/private/tmp/foo", ["/tmp/foo/a.log"]))
+        index = gd.open_index(["/tmp/foo/a.log", "/tmp/foobar/b"])
+        self.assertTrue(gd.in_cwd("/tmp/foo", index))
+        self.assertTrue(gd.in_cwd("/tmp/foo/a.log", index))
+        self.assertFalse(gd.in_cwd("/tmp/fo", index))
+        self.assertFalse(gd.in_cwd("/tmp/foo/a", index))
 
     def test_missing_process_evidence_fails_closed(self) -> None:
         make(self.root / "old")
@@ -314,6 +661,79 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.ci_defer({1: critical}, [job], "10%:30-60"), "")  # the job would fail anyway
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             gd.main(["--pressure", "--emergency", "lots"])
+        # a 50 GiB runner floor lifts the floor to 70 GiB on HOME's volume, so a busy mini reclaims before
+        # its gate stops the runners, not only after
+        home = gd.replace(low, dev=gd.HOME.stat().st_dev)
+        self.assertIn("deferred", gd.ci_defer({1: home}, [job], "10%:30-60", floor_gib=40))
+        self.assertEqual(gd.ci_defer({1: home}, [job], "10%:30-60", floor_gib=50), "")
+        self.assertIn("deferred", gd.ci_defer({1: gd.replace(home, free=75 * gd.GIB)}, [job], "10%:30-60", 50))
+
+    def test_chromium_trees_are_never_candidates(self) -> None:
+        saved = gd.HOME
+        gd.HOME = self.root
+        try:
+            caches = self.root / "Library/Caches"
+            for name in ("siso", "cmux-release-support", "go-build", "chromium-cache"):
+                make(caches / name)
+            make(self.root / "cmux-browser-fleet/build/chromium/src")
+            make(self.root / "other")
+            fams = [gd.Family("library-caches", caches, True, "rebuild"),
+                    gd.Family("home", self.root, True, "rebuild"),
+                    gd.Family("deep", self.root / "cmux-browser-fleet", True, "rebuild", depth=2)]
+            got = {Path(i.path).name: i.verdict for i in gd.survey(fams, 1, 0)}
+            self.assertEqual(got, {"go-build": "reclaimable", "other": "reclaimable"})
+            for rel in ("cmux-browser-fleet", "cmux-browser-fleet/build", "Library/Caches/siso",
+                        "Library/Caches/cmux-release-support/ghostty", "Library"):  # Library holds some
+                self.assertTrue(gd.never_delete(self.root / rel), rel)
+            self.assertTrue(gd.never_delete(Path("/private/tmp/chromium-out")))
+            self.assertFalse(gd.never_delete(self.root / "Library/Caches/go-build"))
+        finally:
+            gd.HOME = saved
+
+    def test_fleet_ci_hot_tier(self) -> None:
+        ci = self.root / "ci"
+        (ci / "seeds").mkdir(parents=True)
+        (ci / "seed-source.json").write_text(json.dumps({"prefix": "p-"}))
+        for name, age in (("p-a", 1), ("p-b", 2), ("p-c", 48), ("q-x", 48)):
+            make(ci / "seeds" / name, age_hours=age)
+        make(ci / "pr-builds/pr-1", age_hours=0.5)
+        make(ci / "pr-builds/pr-2", age_hours=10)
+        make(ci / "pr-builds/.pr-3.discard-9", age_hours=2)  # cmux's clear() owns it
+        make(ci / "pr-builds/other", age_hours=10)
+        make(ci / "derived-data", age_hours=10)
+        make(ci / ".derived-data.discard-7", age_hours=60)
+        make(ci / "source-packages", age_hours=60)
+        make(ci / "cmux-ci-2/derived-data", age_hours=60)
+        # a root with no seed source keeps its newest two of any prefix; dot entries are never seeds
+        for name, age in (("p-y", 48), ("p-z", 49), ("q-z", 50), (".q-w.incoming-3", 50)):
+            make(ci / "cmux-ci-2/seeds" / name, age_hours=age)
+        make(ci / "cmux-ci-x/derived-data", age_hours=60)  # not a root store
+        # SwiftPM checkouts inside DerivedData do not make it a checkout
+        (ci / "pr-builds/pr-2/SourcePackages/checkouts/dep/.git").mkdir(parents=True)
+        for rel in ("SourcePackages/checkouts/dep/.git", "SourcePackages/checkouts/dep", "SourcePackages/checkouts",
+                    "SourcePackages", ""):
+            os.utime(ci / "pr-builds/pr-2" / rel, (time.time() - 36000,) * 2)
+        self.assertEqual(gd.fleet_stores(ci), [ci, ci / "cmux-ci-2"])
+        items = gd.survey(gd.fleet_families(ci), 6, 0)
+        got = {str(Path(i.path).relative_to(ci)): i.verdict for i in items}
+        self.assertEqual(got, {
+            "seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "reclaimable", "seeds/q-x": "reclaimable",
+            "pr-builds/pr-1": "recent", "pr-builds/pr-2": "reclaimable",
+            "derived-data": "recent", ".derived-data.discard-7": "reclaimable",
+            "cmux-ci-2/derived-data": "reclaimable", "cmux-ci-2/seeds/p-y": "kept", "cmux-ci-2/seeds/p-z": "kept",
+            "cmux-ci-2/seeds/q-z": "reclaimable", "cmux-ci-2/seeds/.q-w.incoming-3": "reclaimable"})
+        # apply keeps the hot-tier windows, and re-reads command lines per item: a job that starts cloning a
+        # parked build during the run keeps it
+        # (apply looks families up by id, as main passes them: every root's family of an id behaves the same)
+        fams = {f.id: f for f in gd.fleet_families(ci)}
+        with mock.patch.object(gd, "FLEET_CI", ci), \
+                mock.patch.object(gd, "command_lines", lambda: f"cp -cR {ci}/pr-builds/pr-2 /tmp/x\n"):
+            reclaimable = [i for i in items if i.verdict == "reclaimable"]
+            gd.apply(reclaimable, fams, self.root / "r.jsonl", None, 6)
+        self.assertTrue((ci / "pr-builds/pr-2").exists())
+        self.assertFalse((ci / "seeds/p-c").exists())
+        self.assertTrue((ci / "seeds/p-a").exists())
+        self.assertFalse((ci / "cmux-ci-2/derived-data").exists())
 
     def test_pressure_targets_are_per_filesystem(self) -> None:
         make(self.root / "old")
@@ -328,6 +748,65 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((self.root / "old").exists())
         gd.apply(items, fams, self.receipt(), {dev: 1 << 62}, 24)
         self.assertFalse((self.root / "old").exists())
+
+    def test_a_runner_disk_floor_lifts_the_pressure_thresholds(self) -> None:
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        self.assertEqual(gd.runner_floor_gib(home), 0.0, "no runner: no floor")
+        for name, text in (("actions-runner-glaeda", "exec x job-started --min-free-gib 100 --min-free-gib 150\n"),
+                           ("actions-runner-glaeda-1", "exec x job-started --min-free-gib 1e+02\n"),
+                           ("actions-runner-glaeda-2", "exec x job-started --min-free-gib nope\n"),
+                           ("actions-runner-glaeda-3", "exec x job-started --min-free-gib 1e999\n")):
+            hook = home / name / "glaeda-hooks/job-started.sh"
+            hook.parent.mkdir(parents=True)
+            hook.write_text(text)
+        self.assertEqual(gd.runner_floor_gib(home), 150.0, "the highest, each hook's last")
+        free, total = gd.free_bytes(self.root)
+        with mock.patch.object(gd, "HOME", self.root):  # the floor lifts only HOME's volume
+            plain = gd.filesystems([self.fam], "0", "0")
+            lifted = gd.filesystems([self.fam], "0", "0", floor_gib=1)
+            (fs,), (up,) = plain.values(), lifted.values()
+            self.assertEqual((fs.low, fs.target), (0, 0))
+            self.assertEqual(up.low, min(int(5 * gd.GIB), total // 2), "pressure starts before the resume mark")
+            self.assertEqual(up.target, min(int(21 * gd.GIB), total // 2))
+            huge = next(iter(gd.filesystems([self.fam], "0", "0", floor_gib=1e6).values()))
+            self.assertEqual((huge.low, huge.target), (total // 2, total // 2), "never past half the disk")
+            high = gd.filesystems([self.fam], "100%", "100%", floor_gib=150)
+            self.assertEqual(next(iter(high.values())).low, total, "never lowers a higher threshold")
+        with mock.patch.object(gd, "HOME", Path("/dev")):  # another volume: no lift
+            other = next(iter(gd.filesystems([self.fam], "0", "0", floor_gib=1).values()))
+            self.assertEqual(other.low, 0)
+
+    def test_floor_gib_adds_the_callers_floor(self) -> None:
+        seen: list[float] = []
+
+        def fss(*args: object) -> dict:
+            seen.append(args[-1])
+            return {}
+
+        with mock.patch.object(gd, "runner_floor_gib", return_value=50.0), \
+                mock.patch.object(gd, "filesystems", side_effect=fss), contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--pressure", "--floor-gib", "150", "--no-snapshot"])
+            gd.main(["--pressure", "--floor-gib", "10", "--no-snapshot"])
+            gd.main(["--pressure", "--floor-gib", "inf", "--no-snapshot"])
+        self.assertEqual(seen, [150.0, 50.0, 50.0], "the higher of the hooks' floors and the caller's")
+
+    def test_one_eviction_at_a_time(self) -> None:
+        lock = self.root / "evict.lock"
+        receipt = ["--receipt", os.fspath(self.receipt())]
+        with mock.patch.object(gd, "EVICT_LOCK", lock), mock.patch.object(gd, "filesystems", return_value={}), \
+                mock.patch.object(gd, "survey", return_value=[]) as survey, \
+                mock.patch.object(gd, "apply", return_value=0):
+            with lock.open("a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt]), 0)
+                self.assertIn("another eviction running", out.getvalue())
+                survey.assert_not_called()
+            with contextlib.redirect_stdout(io.StringIO()):
+                gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])
+            survey.assert_called_once()
 
     def test_filesystems_group_roots_and_apply_thresholds(self) -> None:
         other = gd.Family("tmp", self.root, True, "scratch")
@@ -344,7 +823,9 @@ class GlaedaDiskTest(unittest.TestCase):
         sock = socket.socket(socket.AF_UNIX)
         self.addCleanup(sock.close)
         sock.bind(str(d / "default"))
-        os.utime(d, (time.time() - 48 * 3600,) * 2)
+        # a long-lived server's socket is as old as its directory; only an old enough item pays for the socket walk
+        for p in (d / "default", d):
+            os.utime(p, (time.time() - 48 * 3600,) * 2)
         v = self.verdicts()
         self.assertEqual(v["tmux-1000"], "in-use")
         self.assertEqual(v["plain"], "reclaimable")
@@ -364,8 +845,9 @@ class GlaedaDiskTest(unittest.TestCase):
     def _git(self, *args: str) -> str:
         env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-        return subprocess.run(["git", *args], check=True, capture_output=True, text=True,
-                              env=env).stdout
+        # no detached auto-maintenance: it writes into .git after a test has aged the tree
+        return subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", *args],
+                              check=True, capture_output=True, text=True, env=env).stdout
 
     def _tmp_repos(self) -> tuple[Path, Path]:
         """A tmp-family root plus an origin repository with one commit outside it."""
@@ -416,6 +898,73 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.apply(gd.survey([self.fam], 24, 0), {"tmp": self.fam}, self.receipt(), None, 24)
         self.assertFalse((root / "leaked.so").exists())
         self.assertTrue((root / "fresh.log").exists())
+
+    def test_nested_checkouts_in_idle_scratch_sessions(self) -> None:
+        root, origin = self._tmp_repos()
+        self.fam = gd.replace(self.fam, files=False, nested_git=True)
+        for session in ("clean", "unpushed", "dirty"):
+            (root / session / "scratchpad").mkdir(parents=True)
+            self._git("clone", "-q", str(origin), str(root / session / "scratchpad/a"))
+            self._git("clone", "-q", str(origin), str(root / session / "scratchpad/b"))
+            (root / session / "scratchpad/notes.txt").write_text("n")
+        (root / "unpushed/scratchpad/b/g").write_text("y")
+        self._git("-C", str(root / "unpushed/scratchpad/b"), "add", "g")
+        self._git("-C", str(root / "unpushed/scratchpad/b"), "commit", "-qm", "local")
+        (root / "dirty/scratchpad/a/untracked").write_text("z")
+        # a bare seed with a linked worktree: the branch lives only in the seed, inside the item
+        (root / "seeded/scratchpad").mkdir(parents=True)
+        self._git("clone", "-q", "--bare", str(origin), str(root / "seeded/scratchpad/seed.git"))
+        self._git("-C", str(root / "seeded/scratchpad/seed.git"), "worktree", "add", "-q", "-b", "feat",
+                  str(root / "seeded/scratchpad/wt"))
+        (root / "seeded/scratchpad/wt/g").write_text("y")
+        self._git("-C", str(root / "seeded/scratchpad/wt"), "add", "g")
+        self._git("-C", str(root / "seeded/scratchpad/wt"), "commit", "-qm", "only in the seed")
+        # a bare copy whose commits a remote confirms loses nothing; one with a local commit does
+        (root / "bare/scratchpad").mkdir(parents=True)
+        self._git("clone", "-q", "--bare", str(origin), str(root / "bare/scratchpad/copy.git"))
+        (root / "barelocal/scratchpad").mkdir(parents=True)
+        seed = root / "barelocal/scratchpad/seed"
+        self._git("clone", "-q", "--bare", str(origin), str(seed))
+        tree = self._git("--git-dir", str(seed), "rev-parse", "HEAD^{tree}").strip()
+        local = self._git("--git-dir", str(seed), "commit-tree", tree, "-p", "HEAD", "-m", "local").strip()
+        self._git("--git-dir", str(seed), "update-ref", "refs/heads/main", local)
+        # a clone kept in an ignored directory of a clean checkout is judged too
+        (root / "vendored/scratchpad").mkdir(parents=True)
+        outer = root / "vendored/scratchpad/outer"
+        self._git("clone", "-q", str(origin), str(outer))
+        (outer / ".git/info/exclude").write_text("vendor/\n")
+        (outer / "vendor").mkdir()
+        self._git("clone", "-q", str(origin), str(outer / "vendor/lib"))
+        (outer / "vendor/lib/g").write_text("y")
+        self._git("-C", str(outer / "vendor/lib"), "add", "g")
+        self._git("-C", str(outer / "vendor/lib"), "commit", "-qm", "vendored and unpushed")
+        # checkouts nested deeper than git_state's search are still found and judged
+        deep = root / "deep/scratchpad/a/b/c/d/e/f"
+        deep.mkdir(parents=True)
+        self._git("clone", "-q", str(origin), str(deep / "clone"))
+        (deep / "clone/g").write_text("y")
+        self._git("-C", str(deep / "clone"), "add", "g")
+        self._git("-C", str(deep / "clone"), "commit", "-qm", "deep and unpushed")
+        for d in root.iterdir():
+            self._age(d)
+        items = gd.survey([self.fam], 24, 0)
+        v = {Path(i.path).name: i.verdict for i in items}
+        self.assertEqual(v, {"clean": "reclaimable", "unpushed": "git-checkout", "dirty": "git-checkout",
+                             "seeded": "git-checkout", "bare": "reclaimable", "barelocal": "git-checkout",
+                             "deep": "git-checkout", "vendored": "git-checkout"})
+        why = {Path(i.path).name: i.reasons for i in items}
+        self.assertEqual(why["unpushed"], ["scratchpad/b: commits no remote confirms"])
+        self.assertEqual(why["barelocal"], ["scratchpad/seed: commits no remote confirms"])
+        self.assertEqual(why["deep"], ["scratchpad/a/b/c/d/e/f/clone: commits no remote confirms"])
+        self.assertEqual(why["vendored"], ["scratchpad/outer: vendor/lib: commits no remote confirms"])
+        # kept verdicts are cached, so a dead session with unpushed work is not re-walked every run
+        self.assertIn(str(root / "deep"), json.loads(gd.NESTED_KEEP.read_text()))
+        # a checkout rooted below the item stays protected without the opt-in
+        plain = gd.replace(self.fam, nested_git=False)
+        self.assertLessEqual({i.verdict for i in gd.survey([plain], 24, 0)}, {"git-checkout", "unchecked"})
+        gd.apply(items, {"tmp": self.fam}, self.receipt(), None, 24)
+        self.assertEqual(sorted(p.name for p in root.iterdir()),
+                         ["barelocal", "deep", "dirty", "seeded", "unpushed", "vendored"])
 
     def test_family_size_floor_overrides_min_mib(self) -> None:
         root, _ = self._tmp_repos()
@@ -711,6 +1260,21 @@ class LinuxLayoutTest(unittest.TestCase):
         gd.UNREADABLE.clear()
         self.tmp.cleanup()
 
+    def test_cache_families_skip_state_that_is_not_a_cache(self) -> None:
+        fams = {f.id: f for f in gd.default_families() if f.id in ("user-cache", "library-caches")}
+        for fam in fams.values():
+            fam.root.mkdir(parents=True, exist_ok=True)
+        keep = {"user-cache": ["glaeda", "glaeda-disk", "glaeda-fullapp", "glaeda-fleet-cas", "cmux-job",
+                               "huggingface", "codex-runtimes"],
+                "library-caches": ["glaeda", "PassKit", "tidy-branches", "CloudKit", "com.apple.Safari"]}
+        for fid, names in keep.items():
+            fam = fams.get(fid)
+            if fam is None:
+                continue
+            for n in names:
+                self.assertTrue(n in fam.skip or n.startswith(fam.skip_prefixes), f"{fid}/{n}")
+            self.assertTrue(fam.reclaimable)
+
     def test_linux_families(self) -> None:
         for rel in ("Projects/glaeda", "Projects/glaeda-worktrees/a", "Projects/botany-sim-worktrees/b",
                     ".cache/pip"):
@@ -725,7 +1289,7 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in by_id["worktrees"]),
                          ["botany-sim-worktrees", "glaeda-worktrees"])
         reclaimable = {f.id for f in fams if f.reclaimable}
-        self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad"})
+        self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad", "user-cache", "home-caches"})
         projects = next(f for f in fams if f.id == "projects")
         self.assertIn("botany-sim-worktrees", projects.skip)
         tmp = next(f for f in fams if f.id == "tmp")

@@ -17,7 +17,9 @@ import io
 import json
 import os
 import plistlib
+import re
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
@@ -32,6 +34,9 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "scripts" / "glaeda-cmux-runner-hook"
 WORKER_STEP_EXIT = "runner-worker-step-exit "  # the Runner.Worker stand-in's last stdout line (HookTest.take)
+# Where the hook looks for leftover processes in canonical roots (settle_root): nowhere real, so no test run
+# stops a process in this machine's own /private/tmp/cmux-ci. test_taking_a_root_stops_its_leftovers sets its own.
+NO_ROOTS = "/nonexistent/glaeda-test-canonical-roots"
 
 
 def load(name: str, path: Path):
@@ -49,7 +54,13 @@ cr.ONLINE_WAIT_S = 0
 # The load gate reads this machine's real load, which on a busy test host would hold every gate under test. Pin
 # it out of reach here and in the hooks the tests start; the load test patches the thresholds itself.
 os.environ["GLAEDA_RUNNER_GATE_LOAD_PAUSE"] = os.environ["GLAEDA_RUNNER_GATE_LOAD_RESUME"] = "1000000"
+# Likewise the console check reads this Mac's real session, which a locked test host would turn into refusals: no
+# ioreg here or in the hooks the tests start (unreadable changes nothing); console tests point it at a fake.
+os.environ["GLAEDA_RUNNER_IOREG"] = "/nonexistent/ioreg"
 hook = load("glaeda_cmux_runner_hook", HOOK)
+# The gate evicts under its disk floor with whatever glaeda-disk it finds: in this process never this machine's own
+# (~/.local/bin); a test that wants one passes it explicitly or patches disk_pressure.
+hook.find_disk = lambda explicit: explicit if explicit and os.path.isfile(explicit) else None
 REAL_LEVEL = hook.thermal_pressure_level  # GateTest patches the module attribute
 setup = load("glaeda_mini_setup_for_runner", ROOT / "scripts" / "glaeda-mini-setup")
 setup.DARWIN_REQUIRED = False
@@ -234,7 +245,7 @@ class HookTest(unittest.TestCase):
     def run_hook(self, phase: str, event_name: str | None, event_path: Path | None,
                  *extra: str, repo: str | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
         environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
-                   "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet")}
+                   "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet")}
         if event_name is not None:
             environ["GITHUB_EVENT_NAME"] = event_name
         if event_path is not None:
@@ -243,7 +254,7 @@ class HookTest(unittest.TestCase):
             environ["GITHUB_REPOSITORY"] = repo
         environ.update(env or {})
         return subprocess.run([sys.executable, os.fspath(HOOK), phase, *extra], env=environ,
-                              capture_output=True, text=True, timeout=30, check=False)
+                              capture_output=True, text=True, timeout=60, check=False)
 
     def test_sample_events(self) -> None:
         for name, (event_name, payload, admitted) in SAMPLE_EVENTS.items():
@@ -358,8 +369,10 @@ class HookTest(unittest.TestCase):
 
     def started(self, *extra: str, watch: int | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
         push = event(self.dir, "push", {"repository": CMUX})
+        # --gui-wait 0 unless a test passes its own (the last one wins): every cmux capacity refusal waits
+        # GUI_WAIT_S by default, which the tests of refusals themselves must not sit through
         args = ["--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
-                "--watch-pid", str(watch or os.getpid()), *extra]
+                "--watch-pid", str(watch or os.getpid()), "--gui-wait", "0", *extra]
         return self.run_hook("job-started", "push", push, *args, repo="manaflow-ai/cmux", env=env)
 
     def lock_free(self) -> bool:
@@ -412,7 +425,7 @@ class HookTest(unittest.TestCase):
         result = subprocess.run([sys.executable, os.fspath(lonely / "glaeda-cmux-runner-hook"), "job-started",
                                  "--allowed-repo", "manaflow-ai/cmux", "--no-disk"], capture_output=True, text=True,
                                 timeout=30, env={"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir),
-                                                 "GLAEDA_FLEET_DIR": os.fspath(fleet), "GITHUB_EVENT_NAME": "push",
+                                                 "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(fleet), "GITHUB_EVENT_NAME": "push",
                                                  "GITHUB_EVENT_PATH": os.fspath(push),
                                                  "GITHUB_REPOSITORY": "manaflow-ai/cmux"})
         self.assertEqual(result.returncode, 1)
@@ -423,7 +436,44 @@ class HookTest(unittest.TestCase):
         result = self.started("--min-free-gib", "999999999")
         self.assertEqual(result.returncode, 1)
         self.assertIn("GiB required", result.stdout)
+        self.assertNotIn("disk floor", result.stdout, "--no-disk: no eviction either")
         self.assertTrue(self.lock_free())
+
+    def test_disk_floor_evicts_before_refusing(self) -> None:
+        self.fleet()
+        marker = self.dir / "disk-ran"
+        disk = make_executable(self.dir / "glaeda-disk-fake", "import pathlib, sys\n"
+                               f"pathlib.Path({os.fspath(marker)!r}).write_text(' '.join(sys.argv[1:]))\n")
+        push = event(self.dir, "push", {"repository": CMUX})
+        result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
+                               os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
+                               os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertRegex(result.stdout, r"under the 1e\+09 GiB disk floor: glaeda-disk exited 0, freed -?[0-9.]+ GiB\n")
+        self.assertEqual(marker.read_text(), "--pressure --apply --top 0 --floor-gib 1e+09",
+                         "told the floor, so it does not wait for the job that holds this runner")
+        self.assertLess(result.stdout.index("disk floor"), result.stdout.index("refused"), "evicted, then refused")
+        self.assertIn("GiB required", result.stdout)
+        self.assertTrue(self.lock_free())
+        # the runner hooks already carry this floor, which glaeda-disk reads itself: no --floor-gib, so a
+        # glaeda-disk from before it still runs
+        own = self.dir / "actions-runner" / hook.RUNNER_HOOK_SCRIPT
+        own.parent.mkdir(parents=True)
+        own.write_text("exec python3 /hook job-started --min-free-gib 999999999\n")
+        result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
+                               os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
+                               os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(marker.read_text(), "--pressure --apply --top 0")
+
+    def test_job_started_eviction_is_bounded_by_its_own_timeout(self) -> None:
+        with mock.patch.object(hook, "disk_argv", return_value=["glaeda-disk"]), \
+                mock.patch.object(hook.subprocess, "run", return_value=mock.Mock(returncode=0)) as run, \
+                mock.patch.dict(os.environ):
+            os.environ.pop("GLAEDA_RUNNER_DISK_TIMEOUT", None)
+            self.assertIn("glaeda-disk exited 0", hook.evict(os.fspath(self.dir), 100, None))
+        self.assertEqual(run.call_args.kwargs["timeout"], hook.EVICT_TIMEOUT_S)
+        self.assertEqual(hook.EVICT_TIMEOUT_S, 60)
 
     def test_lock_held_by_another_build_refuses_fast(self) -> None:
         fleet = self.fleet()
@@ -578,13 +628,11 @@ class HookTest(unittest.TestCase):
     def take_gui(self, runner: str, *extra: str) -> subprocess.CompletedProcess:
         return self.step(["take-gui", *extra], runner)
 
-    def step(self, argv: list[str], runner: str, env: dict | None = None) -> subprocess.CompletedProcess:
-        """Run a hook phase as a job step would: under a process named Runner.Worker (its ancestor).
-        A real Runner.Worker outlives the step and the root holder watches it, so the stand-in reports
-        the step's exit status and then stays up until the test ends; one that exited with the step
-        would let the holder release the root within HOLDER_POLL_S."""
+    def runner_worker(self) -> Path:
+        """A real parent process named Runner.Worker (a copied /bin/sh is killed on macOS): it runs /bin/sh with
+        its arguments, reports the exit status and stays up until its stdin closes."""
         worker = self.dir / "Runner.Worker"
-        if not worker.exists():  # a real parent process named Runner.Worker (a copied /bin/sh is killed on macOS)
+        if not worker.exists():
             source = self.dir / "worker.c"
             source.write_text("#include <fcntl.h>\n#include <stdio.h>\n#include <sys/wait.h>\n#include <unistd.h>\n"
                               "int main(int c, char **v) {\n"
@@ -599,11 +647,19 @@ class HookTest(unittest.TestCase):
             if cc is None or subprocess.run([cc, "-o", os.fspath(worker), os.fspath(source)],
                                             capture_output=True).returncode != 0:
                 self.skipTest("no C compiler to build a Runner.Worker stand-in")
+        return worker
+
+    def step(self, argv: list[str], runner: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        """Run a hook phase as a job step would: under a process named Runner.Worker (its ancestor).
+        A real Runner.Worker outlives the step and the root holder watches it, so the stand-in reports
+        the step's exit status and then stays up until the test ends; one that exited with the step
+        would let the holder release the root within HOLDER_POLL_S."""
+        worker = self.runner_worker()
         cmd = " ".join(shlex.quote(a) for a in [sys.executable, os.fspath(HOOK), *argv,
                                                 "--capacity-dir", os.fspath(self.dir / "capacity"),
                                                 "--state-dir", os.fspath(self.dir / "state")])
         environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0", "RUNNER_NAME": runner,
-                   "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"), **(env or {})}
+                   "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"), **(env or {})}
         proc = subprocess.Popen([os.fspath(worker), "-c", cmd], env=environ, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(self.end_worker, proc)
@@ -658,6 +714,110 @@ class HookTest(unittest.TestCase):
             self.assertFalse((self.dir / "state" / "host-lock-holder-p0-root-1.pid").exists())
         finally:
             for runner in ("p0", "c0", "c1"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
+    def test_taking_a_root_stops_its_leftovers(self) -> None:
+        # manaflow-ai/cmux 36312829569: a cancelled compile's processes outlived the runner's tree kill and its
+        # job, still writing /private/tmp/cmux-ci/src when a test consumer took root-1 and ran rm -rf on it
+        self.fleet()
+        parent = Path(os.path.realpath(self.dir)) / "roots"  # lsof reports resolved paths
+        env = {"GLAEDA_CANONICAL_ROOT_PARENT": os.fspath(parent)}
+        two = ("--canonical-roots", "2", "--compile-slots", "2")
+        (self.dir / "capacity").mkdir()
+        for name in ("cmux-ci/src", "cmux-ci-2/derived", "cmux-ci-20"):
+            (parent / name).mkdir(parents=True)
+
+        def sleeper(*words: str) -> list[str]:  # one process, whose arguments stay what ps shows
+            return [sys.executable, "-c", "import time; time.sleep(60)", *words]
+
+        def leftover(argv: list[str], cwd: Path) -> int:
+            """An orphan, like a killed step's compilers: its parent exits at once, so it is under no Runner.Worker
+            even when this test runs in a GitHub Actions job."""
+            started = subprocess.run([sys.executable, "-c", "import subprocess, sys; print(subprocess.Popen("
+                                      "sys.argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+                                      "stderr=subprocess.DEVNULL, start_new_session=True).pid)", *argv],
+                                     cwd=cwd, capture_output=True, text=True, timeout=30, check=True)
+            pid = int(started.stdout)
+            self.addCleanup(end, pid)
+            return pid
+
+        def end(pid: int) -> None:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+        def alive(pid: int, gone_within: float = 0.0) -> bool:
+            deadline = time.monotonic() + gone_within
+            while True:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return False
+                except PermissionError:
+                    return True
+                if time.monotonic() >= deadline:
+                    return True
+                time.sleep(0.05)  # a stopped orphan is reaped by its new parent, not by us
+
+        live_path = os.fspath(parent / "cmux-ci" / "derived" / "live.o")
+        # a running step of a live job that still names root 1 (a switcher that let it go keeps its arguments)
+        live = subprocess.Popen([os.fspath(self.runner_worker()), "-c", shlex.join(["exec", *sleeper(live_path)])],
+                                cwd=self.dir, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(live.wait)
+        self.addCleanup(live.stdin.close)
+        self.addCleanup(lambda: os.killpg(live.pid, signal.SIGKILL) if live.poll() is None else None)
+        working = leftover(sleeper(), parent / "cmux-ci" / "src")  # a compiler working in root 1
+        naming = leftover(sleeper(os.fspath(parent / "cmux-ci-2" / "derived" / "x.o")), self.dir)
+        neighbour = leftover(sleeper(), parent / "cmux-ci-20")  # a name that only starts like root 2
+        bystander = leftover(sleeper(os.fspath(parent / "cmux-ci")), self.dir)  # the root itself
+        try:
+            got = self.take("/private/tmp/cmux-ci", "c0", env=env)
+            self.assertEqual((got.returncode, got.stdout.strip()), (0, "/private/tmp/cmux-ci"), got.stderr)
+            self.assertIn("stopped 1 leftover process(es)", got.stderr)
+            self.assertFalse(alive(working, 5), "the process working in root 1 is stopped before the step goes on")
+            self.assertTrue(alive(naming), "root 2 is not this job's")
+            compile_ = self.job("macos-compile-admission", "p1", 8, None, *two, "--instance", "1", env=env)
+            self.assertIn("persistent-dd+root-2", compile_.stdout)
+            self.assertIn("stopped 1 leftover process(es)", compile_.stdout)
+            self.assertFalse(alive(naming, 5), "admission settles the root it takes as well")
+            for pid in (neighbour, bystander):
+                self.assertTrue(alive(pid), "neither another root's name nor the bare root path is inside it")
+            self.assertIsNone(live.poll(), "a live job's step is never a leftover")
+            found = subprocess.run(["/usr/bin/pgrep", "-f", live_path], capture_output=True, text=True).stdout
+            self.assertTrue(found.strip(), "nor is the process it runs")
+            quiet = self.take("2", "c1", "--wait", "0", env=env)
+            self.assertEqual(quiet.returncode, 1, "root 2 stays p1's")
+        finally:
+            for runner in ("c0", "p1", "c1"):
+                self.finish(runner)
+
+    def test_one_root_consumer_restores_a_product_from_a_second_root(self) -> None:
+        # manaflow-ai/cmux 36295033926: a product compiled at /private/tmp/cmux-ci-2 on a two-root mini, restored
+        # on cmux7s (one root), whose consumer holds root-1 from admission; take-root refused it (exit 2)
+        self.fleet()
+        one = ("--canonical-roots", "1")
+        try:
+            consumer = self.job("tests-build-and-lag", "g0", 4, None, *one)
+            self.assertIn("root-1", consumer.stdout)
+            got = self.step(["take-root", "--root", "/private/tmp/cmux-ci-2", *one], "g0")
+            self.assertEqual((got.returncode, got.stdout.strip()), (0, "/private/tmp/cmux-ci-2"), got.stderr)
+            self.assertEqual((self.dir / "state" / "host-lock-holder-g0.roots").read_text().split(),
+                             ["root-1", "root-2"], "it keeps root-1 and records root-2 beside it")
+            self.assertEqual(self.step(["take-root", "--root", "1", *one], "g0").returncode, 0)
+            self.assertEqual(self.step(["take-root", "--root", "2", *one], "g0").returncode, 0, "a re-take is a no-op")
+            # a job holding no root waits for root-2's token, so two jobs never own its alias at once
+            waited = self.step(["take-root", "--root", "2", "--wait", "1", *one], "x0")
+            self.assertEqual(waited.returncode, 1, waited.stderr)
+            self.assertIn("still in use", waited.stderr)
+            self.finish("g0")
+            self.assertEqual(self.step(["take-root", "--root", "2", *one], "x0").returncode, 0, "released with g0")
+            late = self.job("tests-build-and-lag", "g1", 4, None, *one)
+            self.assertIn("root-1", late.stdout)
+            blocked = self.step(["take-root", "--root", "2", "--wait", "1", *one], "g1")
+            self.assertEqual(blocked.returncode, 1, "and a root-1 holder waits for x0 in turn")
+        finally:
+            for runner in ("g0", "x0", "g1"):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
@@ -726,7 +886,7 @@ class HookTest(unittest.TestCase):
         two = ("--canonical-roots", "2", "--compile-slots", "2")
         state = self.dir / "state"
         try:
-            self.assertEqual(self.job("app-host-unit-tests", "g0", 8, None, *two).returncode, 0)
+            self.assertEqual(self.job("tests-build-and-lag", "g0", 8, None, *two).returncode, 0)
             self.assertTrue((state / "host-lock-holder-g0.gui").exists())
             self.assertEqual(self.take_gui("g0").returncode, 0, "a job holding gui from admission: a no-op")
             self.assertEqual(self.job("macos-compile-admission", "c0", 8, None, *two).returncode, 0)
@@ -751,6 +911,51 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
+    def fake_ioreg(self, locked: bool | None) -> dict[str, str]:
+        """GLAEDA_RUNNER_IOREG pointing at a script that prints a console session: locked, unlocked, or (None) at
+        the login window with no user."""
+        users = ('"IOConsoleUsers" = ()' if locked is None else
+                 '"IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"kCGSessionLoginDoneKey"=Yes,'
+                 f'"kCGSSessionUserNameKey"="cmux"{',"CGSSessionScreenIsLocked"=Yes' if locked else ""}}})')
+        script = self.dir / f"ioreg-{locked}"
+        script.write_text(f"#!/bin/sh\ncat <<'X'\n+-o Root\n    {{\n      \"IOConsoleLocked\" = No\n      {users}\n    }}\nX\n")
+        script.chmod(0o755)
+        return {"GLAEDA_RUNNER_IOREG": os.fspath(script)}
+
+    def test_a_locked_console_refuses_gui_jobs_before_taking_capacity(self) -> None:
+        self.fleet()
+        state = self.dir / "state"
+        locked = self.fake_ioreg(True)
+        try:
+            for name in ("app-host-unit-tests", "tests-build-and-lag"):
+                refused = self.job(name, "g0", 8, None, env=locked)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn("refused: console: the console session (cmux) is screen-locked", refused.stdout)
+                self.assertFalse((state / "host-lock-holder-g0.gui").exists(), "no gui token taken")
+            nobody = self.job("app-host-unit-tests", "g0", 8, None, env=self.fake_ioreg(None))
+            self.assertIn("refused: console: no user is logged in at the console", nobody.stdout)
+            # the gui runner's label brings only console jobs, whatever their id
+            side = self.job("swift-package-tests", "g0", 8, None, "--gui-runner", env=locked)
+            self.assertIn("refused: console:", side.stdout)
+            off = self.job("tests-build-and-lag", "g1", 8, None, env={**locked, "GLAEDA_RUNNER_CONSOLE_GATE": "0"})
+            self.assertEqual(off.returncode, 0, "the kill switch turns the check off")
+            self.finish("g1")
+            compile_ = self.job("macos-compile-admission", "c0", 8, None, env=locked)
+            self.assertEqual(compile_.returncode, 0, "a compile needs no console session")
+            self.assertEqual(self.job("swift-package-tests", "l0", 8, None, env=locked).returncode, 0)
+            gave = self.step(["take-gui", "--wait", "5"], "c0", env=locked)
+            self.assertEqual(gave.returncode, hook.TAKE_GUI_GAVE_WAY, "the build leaves its tests to the test job")
+            self.assertIn("take-gui: console: the console session (cmux) is screen-locked", gave.stderr)
+            self.assertFalse((state / "host-lock-holder-c0-gui.pid").exists())
+            self.finish("c0")  # its root
+            admitted = self.job("tests-build-and-lag", "g2", 8, None, env=self.fake_ioreg(False))
+            self.assertEqual(admitted.returncode, 0, admitted.stdout)
+            self.assertIn("+gui", admitted.stdout)
+        finally:
+            for runner in ("g0", "g1", "g2", "c0", "l0"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
     def test_take_gui_gives_way_to_a_gui_job_waiting_for_its_root(self) -> None:
         # the opposite lock orders: a build holds root 1 and wants gui; a gui job holds gui and wants root 1
         self.fleet()
@@ -758,7 +963,7 @@ class HookTest(unittest.TestCase):
         results: dict[str, subprocess.CompletedProcess] = {}
         try:
             self.assertIn("root-1", self.job("macos-compile-admission", "c0", 8, None, *two).stdout)
-            self.assertEqual(self.job("app-host-unit-tests", "g0", 8, None, *two).returncode, 0)
+            self.assertEqual(self.job("tests-build-and-lag", "g0", 8, None, *two).returncode, 0)
             waiter = threading.Thread(target=lambda: results.setdefault("g0", self.take("1", "g0", "--wait", "40")))
             waiter.start()
             deadline = time.monotonic() + 15
@@ -792,9 +997,9 @@ class HookTest(unittest.TestCase):
         for bad in ("/tmp/elsewhere", "/private/tmp/cmux-ci-1", "0", "cmux-ci-2x", "02", "/private/tmp/cmux-ci-02"):
             with self.subTest(bad=bad):
                 self.assertEqual(self.take(bad, "x0").returncode, 2)
-        beyond = self.take("3", "x0", "--canonical-roots", "2")
-        self.assertEqual(beyond.returncode, 2, "a root this mini does not have")
-        self.assertIn("2 canonical root(s)", beyond.stderr)
+        for bad in ("100", "/private/tmp/cmux-ci-100"):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.take(bad, "x0").returncode, 2)
         nameless = self.run_hook("take-root", None, None, "--root", "1", "--state-dir", os.fspath(self.dir / "state"))
         self.assertIn("RUNNER_NAME is not set", nameless.stderr)
         if os.environ.get("GITHUB_ACTIONS"):  # CI itself runs under a real Runner.Worker, so it is "inside a job"
@@ -813,7 +1018,7 @@ class HookTest(unittest.TestCase):
         hooks.mkdir()
         shutil.copy(HOOK, hooks / "glaeda-cmux-runner-hook")
         (hooks / "glaeda-canonical-root").write_text("#!/bin/sh\n")
-        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0", "GLAEDA_FLEET_DIR": os.fspath(fleet),
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0", "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(fleet),
                    "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(event(self.dir, "push", {"repository": CMUX})),
                    "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_JOB": "swift-package-tests", "RUNNER_NAME": "s0"}
         run = subprocess.run([sys.executable, os.fspath(hooks / "glaeda-cmux-runner-hook"), "job-started",
@@ -1018,6 +1223,36 @@ class HookTest(unittest.TestCase):
                                                                 "rebuild": {"p50": 300}}}))
         order, predicted = hook.warm_root_costs([0, 1], new, 7, os.fspath(ci))
         self.assertEqual((order, predicted["root-2"]["tier"], predicted["root-1"]["seconds"]), ([0, 1], "rebuild", 200.0))
+        # Parity with cmux warm_distance.predict(): a root starts from its kept build, so a tier's kept cell costs
+        # it once the cell has 5 compiles; a sparse or bad cell, or a model without tiers_by_start, costs the tier.
+        def cells(near_kept: dict) -> None:
+            (ci / hook.WARM_MODEL).write_text(json.dumps({
+                "near_app_swift_files": 5, "hot_files": ["Sources/Q.swift"],
+                "tiers": {"near": {"p50": 100}, "far": {"p50": 200}, "rebuild": {"p50": 300}},
+                "tiers_by_start": {"near": {"kept": near_kept, "seed": {"n": 50, "p50": 150}},
+                                   "far": {"kept": {"n": 5, "p50": 120.5}, "seed": {"n": 9, "p50": 250}},
+                                   "rebuild": {"kept": {"n": 4, "p50": 250}}}}))
+
+        cells({"n": 5, "p50": 95})
+        model = hook.read_warm_model(os.fspath(ci))
+        self.assertEqual(model["kept"], {"near": 95.0, "far": 120.5})  # rebuild's cell has 4 compiles
+        self.assertEqual(model["tiers"], {"near": 100.0, "far": 200.0, "rebuild": 300.0})
+        order, predicted = hook.warm_root_costs([0, 1], new, 7, os.fspath(ci))
+        self.assertEqual((predicted["root-1"]["seconds"], predicted["root-2"]["seconds"]), (120.5, 300.0))
+        self.assertEqual(order, [0, 1])
+        order, predicted = hook.warm_root_costs([0, 1], new, 5, os.fspath(ci))  # both near on a re-push
+        self.assertEqual(predicted["root-1"], {"seconds": 95.0, "tier": "near", "app_swift_files": 3})
+        for bad in ({"n": 4, "p50": 95}, {"n": 5, "p50": -1}, {"n": 5, "p50": True}, {"n": True, "p50": 95},
+                    {"n": 5}, {"n": "5", "p50": 95}, [], None):
+            cells(bad)
+            model = hook.read_warm_model(os.fspath(ci))
+            self.assertEqual((model["kept"].get("near"), model["kept"]["far"], model["tiers"]["near"]),
+                             (None, 120.5, 100.0), bad)
+        self.assertEqual(hook.read_warm_model(os.fspath(self.dir / "nowhere"))["kept"], {})
+        (ci / hook.WARM_MODEL).write_text(json.dumps({"near_app_swift_files": 5, "hot_files": ["Sources/Q.swift"],
+                                                      "tiers": {"near": {"p50": 100}, "far": {"p50": 200},
+                                                                "rebuild": {"p50": 300}}}))
+        self.assertEqual(hook.read_warm_model(os.fspath(ci))["kept"], {})
         for junk in ("[" * 1000, '{"tiers": {"near": {"p50": NaN}, "far": {"p50": 1}, "rebuild": {"p50": 2}}}',
                      '{"tiers": {"near": {"p50": -1}, "far": {"p50": 1}, "rebuild": {"p50": 2}}}'):
             (ci / hook.WARM_MODEL).write_text(junk)
@@ -1034,8 +1269,52 @@ class HookTest(unittest.TestCase):
         (ci / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": old, "pr": 5}))
         order, predicted = hook.warm_root_costs([0, 1], new, 7, os.fspath(ci))
         self.assertEqual(predicted["root-1"]["tier"], "unknown")
-        self.assertEqual(hook.job_warm_target({"pull_request": {"base": {"sha": new.upper()}, "number": 5}}), (new, 5))
-        self.assertEqual(hook.job_warm_target({"pull_request": {"number": True}}), ("", None))
+        self.assertEqual(hook.job_warm_target({"pull_request": {"base": {"sha": new.upper()}, "number": 5,
+                                                                "changed_files": 12}}), (new, 5, 12))
+        self.assertEqual(hook.job_warm_target({"pull_request": {"number": True, "changed_files": "9"}}), ("", None, 0))
+
+    def test_warm_root_costs_count_the_job_and_find_its_parked_build(self) -> None:
+        ci = self.dir / "ci"
+        work = self.dir / "work"
+        work.mkdir()
+        git = ["git", "-C", os.fspath(work), "-c", "user.email=t@t", "-c", "user.name=t"]
+        subprocess.run([*git, "init", "-q"], check=True)
+        (work / "A.swift").write_text("a")
+        subprocess.run([*git, "add", "."], check=True)
+        subprocess.run([*git, "commit", "-qm", "0"], check=True)
+        base = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        (ci / ".prefetch").mkdir(parents=True)
+        subprocess.run(["git", "clone", "-q", "--bare", os.fspath(work), os.fspath(ci / ".prefetch" / "cmux.git")],
+                       check=True)
+
+        def stamp(store: Path, pr: int) -> None:
+            (store / "derived-data").mkdir(parents=True, exist_ok=True)
+            (store / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": base, "pr": pr,
+                                                          "pr_app_swift_files": ["Sources/X.swift"],
+                                                          "pr_package_interface": False}))
+
+        stamp(ci, 5)
+        stamp(ci / "cmux-ci-2", 6)
+        # The job's own 40 files make every other pull request's build far; its own build (root 1) stays near.
+        order, predicted = hook.warm_root_costs([1, 0], base, 5, os.fspath(ci), job_files=40)
+        self.assertEqual((order, predicted["root-1"]["tier"], predicted["root-2"]["tier"]), ([0, 1], "near", "far"))
+        self.assertEqual(predicted["root-2"]["app_swift_files"], 41)
+        # A build of pull request 7 parked on root 2 counts as its own build there.
+        stamp(ci / "cmux-ci-2" / "pr-builds" / "pr-7", 7)
+        order, predicted = hook.warm_root_costs([0, 1], base, 7, os.fspath(ci), job_files=40)
+        self.assertEqual((order, predicted["root-2"]["tier"]), ([1, 0], "near"))
+        # A parked stamp naming another pull request is not taken for this one.
+        stamp(ci / "cmux-ci-2" / "pr-builds" / "pr-8", 9)
+        self.assertEqual(hook.warm_root_costs([0, 1], base, 8, os.fspath(ci), job_files=40)[1]["root-2"]["tier"], "far")
+        # Over a main build admission adopts from the parked one, so it counts there too.
+        (ci / "cmux-ci-2" / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": base}))
+        self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), 7)
+        # An expired slot is never unparked either.
+        (ci / "cmux-ci-2" / "stamp.json").write_text(json.dumps({"fingerprint": "fp-owned-rec1", "merged_onto": base,
+                                                                "pr": 6}))
+        self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), 7)
+        os.utime(ci / "cmux-ci-2" / "pr-builds" / "pr-7", (1, 1))
+        self.assertEqual(hook.root_stamp(2, os.fspath(ci), 7).get("pr"), 6)
 
     def test_job_warm_keys_come_from_the_pull_request(self) -> None:
         sha = "ABCDEF0123456789abcdef0123456789abcdef01"
@@ -1055,9 +1334,17 @@ class HookTest(unittest.TestCase):
                 self.assertIn(f"holding 2/12 units for {job} (isolated", result.stdout)
             sim = self.job("ios-simulator", "i3", 12)
             self.assertIn("2/12 units+simulator for ios-simulator (simulator", sim.stdout)
-            second = self.job("screenshots", "i4", 12)
+            waited = time.monotonic()
+            second = self.job("screenshots", "i4", 12, None, "--gui-wait", "2")
             self.assertEqual(second.returncode, 1, "one simulator job per mini")
             self.assertIn("the simulator token is taken", second.stdout)
+            self.assertGreaterEqual(time.monotonic() - waited, 2, "it waits for the token before it is refused")
+            self.finish("i4")
+            # the holder finishes within the wait: the waiting simulator job is admitted instead of refused
+            threading.Timer(1.0, self.finish, args=("i3",)).start()
+            later = self.job("screenshots", "i4", 12, None, "--gui-wait", "30")
+            self.assertEqual(later.returncode, 0, later.stdout)
+            self.assertIn("units+simulator for screenshots (simulator", later.stdout)
             self.assertIn("(validate is compile)", self.job("validate", "i5", 12).stdout,
                           "validate is unknown to the hook (compile class): it stays on Blacksmith")
         finally:
@@ -1085,7 +1372,7 @@ class HookTest(unittest.TestCase):
         self.fleet()
         try:
             self.assertEqual(self.job("tests-build-and-lag", "g0").returncode, 0)
-            other = self.job("app-host-unit-tests", "g1", 4, None, "--gui-wait", "0")
+            other = self.job("tests-build-and-lag", "g1", 4, None, "--gui-wait", "0")
             self.assertIn("refused: capacity: the gui token is taken", other.stdout)
             for n, lane in enumerate(("cli-pipe-regressions", "remote-daemon-macos-tests", "claude-wrapper")):
                 side = self.job(lane, f"s{n}", units=8)
@@ -1109,7 +1396,7 @@ class HookTest(unittest.TestCase):
             first = self.job("macos-compile-admission", "c0", 4, None, *slots, "--instance", "0")
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             self.assertIsNone(hook.mini_full(capacity, 4, root), "2 units, pdd-1 and root-2 are free")
-            shard = self.job("app-host-unit-tests", "g1", 4, None, *slots, "--instance", "1", "--gui-wait", "0")
+            shard = self.job("tests-build-and-lag", "g1", 4, None, *slots, "--instance", "1", "--gui-wait", "0")
             self.assertEqual(shard.returncode, 0, shard.stdout + shard.stderr)
             # 1 unit left: the next compile would be refused, so root runners stop; a light side job still fits
             self.assertEqual(hook.mini_full(capacity, 4, root),
@@ -1131,6 +1418,117 @@ class HookTest(unittest.TestCase):
             for runner in ("c0", "c1", "c2", "g1"):
                 self.finish(runner)
 
+    def idle_warm(self, *held: str) -> subprocess.Popen:
+        """A stand-in glaeda-idle-warm: holds HELD under the capacity dir, names them in the holder file, and
+        exits on SIGTERM, as the real one does."""
+        capacity = self.dir / "capacity"
+        capacity.mkdir(exist_ok=True)
+        fake = make_executable(self.dir / "glaeda-idle-warm", f"""import fcntl, json, os, pathlib, signal, sys, time
+capacity = pathlib.Path({os.fspath(capacity)!r})
+fds = []
+host = os.open(capacity.parent / "fleet" / "host.lock", os.O_RDONLY | os.O_CREAT)
+fcntl.flock(host, fcntl.LOCK_SH | fcntl.LOCK_NB)  # as the real one does, like a job
+for name in sys.argv[1:]:
+    fd = os.open(capacity / (name if name.startswith("unit-") else name + ".token"), os.O_RDONLY | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fds.append(fd)
+(capacity / "idle-warm.json").write_text(json.dumps({{"pid": os.getpid(), "held": sys.argv[1:]}}))
+signal.signal(signal.SIGTERM, lambda *_: os._exit(143))
+print("held", flush=True)
+time.sleep(60)
+""")
+        warm = subprocess.Popen([sys.executable, os.fspath(fake), *held], stdout=subprocess.PIPE, text=True)
+        self.assertEqual(warm.stdout.readline().strip(), "held")
+        self.addCleanup(warm.kill)
+        # launchd reaps the real one at once; a zombie would still look alive to the hook
+        threading.Thread(target=warm.wait, daemon=True).start()
+        return warm
+
+    def test_capacity_a_job_stops_the_idle_catch_up_and_takes_its_locks(self) -> None:
+        self.fleet()
+        capacity = self.dir / "capacity"
+        root = hook.RunnerScope(units=4, compile_slots=1, roots=1, root=True)
+        warm = self.idle_warm("root-1", "persistent-dd", "unit-0", "unit-1")
+        try:
+            # what the catch-up holds counts as free, so the gate keeps the root runner listening
+            self.assertIsNone(hook.mini_full(capacity, 4, root))
+            first = self.job("macos-compile-admission", "y0")
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertIn("holding 2/4 units+persistent-dd+root-1", first.stdout)
+            self.assertIn(f"stopped the idle catch-up (pid {warm.pid})", first.stdout)
+            # SIGTERM, or SIGKILL once WARM_YIELD_S passed (a loaded machine may not run its handler in time)
+            self.assertIn(warm.wait(timeout=10), (143, -signal.SIGKILL))
+            # the job's own locks are not the catch-up's: the gate sees them as taken
+            self.assertEqual(hook.mini_full(capacity, 4, root), "the persistent-dd token is taken")
+        finally:
+            self.finish("y0")
+
+    def test_the_listener_gate_never_holds_a_runner_off_for_the_idle_catch_up(self) -> None:
+        fleet = self.fleet()
+        capacity = self.dir / "capacity"
+        warm = self.idle_warm("root-1", "persistent-dd", "unit-0", "unit-1")
+        # it holds the host lock shared, like a job: never a fleet build waiting for the host
+        self.assertEqual(hook.lock_waiters(os.fspath(fleet / "host.lock"), set()), [])
+        runner = self.dir / "actions-runner-glaeda"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        gate = hook.Gate(runner, os.fspath(fleet / "host.lock"), os.fspath(self.dir / "none.json"),
+                         self.dir / "state", capacity_dir=capacity)
+        self.assertIsNone(gate.shed(None))
+        # a load or thermal hold stops the catch-up instead of holding the runner off
+        self.assertIsNone(gate.shed("the mini is saturated"))
+        self.assertIn(warm.wait(timeout=10), (143, -signal.SIGKILL))
+        self.assertEqual(gate.shed("the mini is saturated"), "the mini is saturated", "no catch-up left to stop")
+        # a fleet build waiting for the host lock would wait out the catch-up's shared hold: stop it
+        again = self.idle_warm("root-1", "persistent-dd")
+        gate.yield_to_fleet()
+        self.assertIn(again.wait(timeout=10), (143, -signal.SIGKILL))
+
+    def test_capacity_yielding_the_idle_catch_up_also_ends_its_build(self) -> None:
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        leader = make_executable(self.dir / "glaeda-idle-warm", f"""import json, os, pathlib, signal, subprocess, time
+build = subprocess.Popen(["/bin/sleep", "60"])  # joins our process group
+pathlib.Path({os.fspath(capacity)!r}, "idle-warm.json").write_text(json.dumps({{"pid": os.getpid(), "held": []}}))
+signal.signal(signal.SIGTERM, lambda *_: os._exit(143))  # exits without ending its build
+print(build.pid, flush=True)
+time.sleep(60)
+""")
+        proc = subprocess.Popen([sys.executable, os.fspath(leader)], stdout=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        self.addCleanup(proc.kill)
+        orphan = int(proc.stdout.readline())
+        self.addCleanup(lambda: subprocess.run(["/bin/kill", "-9", str(orphan)], capture_output=True))
+        threading.Thread(target=proc.wait, daemon=True).start()
+        self.assertIn("stopped the idle catch-up", hook.yield_idle_warm(capacity))
+        deadline = time.monotonic() + 5
+        state = "running"
+        while time.monotonic() < deadline:
+            state = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(orphan)], capture_output=True,
+                                   text=True).stdout.strip()
+            if not state or state.startswith("Z"):
+                break
+            time.sleep(0.1)
+        self.assertTrue(not state or state.startswith("Z"), f"the build still runs: {state!r}")
+
+    def test_capacity_a_stale_idle_catch_up_file_signals_nothing(self) -> None:
+        self.fleet()
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        other = subprocess.Popen(["/bin/sleep", "60"])
+        self.addCleanup(other.kill)
+        (capacity / "idle-warm.json").write_text(json.dumps({"pid": other.pid, "held": ["root-1", "persistent-dd"]}))
+        try:
+            self.assertIsNone(hook.idle_warm(capacity), "a reused pid that is not glaeda-idle-warm")
+            first = self.job("macos-compile-admission", "y1")
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertNotIn("idle catch-up", first.stdout)
+            self.assertIsNone(other.poll(), "never signalled")
+            for junk in ("{", "[]", json.dumps({"pid": True, "held": []}), json.dumps({"pid": 1, "held": []})):
+                (capacity / "idle-warm.json").write_text(junk)
+                self.assertIsNone(hook.idle_warm(capacity))
+        finally:
+            self.finish("y1")
+
     def test_capacity_a_full_mini_is_seen_by_the_listener_gate(self) -> None:
         self.fleet()
         capacity = self.dir / "capacity"
@@ -1150,10 +1548,179 @@ class HookTest(unittest.TestCase):
             for runner in runners:
                 self.finish(runner)
 
+    def fake_process(self, name: str, target: str, *args: str) -> int:
+        """Start `self.dir/bin/NAME args` (a symlink to target, so ps shows that path) detached from this
+        process, so launchd or init reaps it as it would the real daemon. Returns its pid."""
+        link = self.dir / "bin" / name
+        link.parent.mkdir(exist_ok=True)
+        if not link.is_symlink():
+            link.symlink_to(target)
+        out = subprocess.run(["/bin/sh", "-c", '"$@" </dev/null >/dev/null 2>&1 & echo $!', "sh", os.fspath(link), *args],
+                             capture_output=True, text=True, timeout=10, check=True).stdout
+        pid = int(out.strip())
+
+        def stop() -> None:
+            with contextlib.suppress(OSError):
+                os.kill(pid, 9)
+        self.addCleanup(stop)
+        return pid
+
+    def own_tests(self) -> tuple[str, str]:
+        """Only this test's fake xctest counts as a running test: real ones and other tests' stay out of it."""
+        return ("--xctest-pattern", re.escape(os.fspath(self.dir / "bin")) + r"/xctest(?:\s|$)")
+
+    def wait_gone(self, pid: int, seconds: float = 5.0) -> bool:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if not hook.pid_alive(pid):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_gui_token_jobs_recycle_testmanagerd_when_no_test_runs(self) -> None:
+        self.fleet()
+        program = os.fspath(self.dir / "bin" / "testmanagerd")
+        recycle = ("--recycle-testmanagerd", "--testmanagerd-program", program, *self.own_tests())
+        try:
+            daemon = self.fake_process("testmanagerd", "/bin/sleep", "60")
+            light = self.job("swift-package-tests", "t0", 4, None, *recycle)
+            self.assertEqual(light.returncode, 0, light.stdout)
+            self.assertNotIn("testmanagerd", light.stdout, "a job without the gui token leaves it")
+            self.assertTrue(hook.pid_alive(daemon))
+            # a test in flight on the mini (another runner's xctest) keeps it
+            xctest = self.fake_process("xctest", "/bin/sleep", "60")
+            kept = self.job("cli-product-tests", "t1", 4, None, *recycle)
+            self.assertEqual(kept.returncode, 0, kept.stdout)
+            self.assertIn("testmanagerd: kept (a test is running on this mini)", kept.stdout)
+            self.assertTrue(hook.pid_alive(daemon))
+            self.finish("t1")
+            os.kill(xctest, 9)
+            self.assertTrue(self.wait_gone(xctest))
+            shard = self.job("tests-build-and-lag", "t2", 4, None, *recycle)
+            self.assertEqual(shard.returncode, 0, shard.stdout)
+            self.assertRegex(shard.stdout, rf"testmanagerd: (stopped|killed) pid {daemon}\b")  # killed: a slow exit
+            self.assertTrue(self.wait_gone(daemon))
+            self.finish("t2")
+            # none running: launchd starts one at the next test
+            none = self.job("tests-build-and-lag", "t3", 4, None, *recycle)
+            self.assertIn("testmanagerd: not running", none.stdout)
+            self.finish("t3")
+            # a wedged daemon that ignores SIGTERM is killed
+            ready = self.dir / "ready"
+            (self.dir / "bin" / "testmanagerd").unlink()
+            wedged = self.fake_process("testmanagerd", "/bin/sh", "-c",
+                                       f"trap '' TERM; : > {shlex.quote(os.fspath(ready))}; while :; do sleep 1; done")
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            killed = self.job("cli-product-tests", "t4", 4, None, *recycle)
+            self.assertEqual(killed.returncode, 0, killed.stdout)
+            self.assertIn(f"testmanagerd: killed pid {wedged} (it ignored SIGTERM)", killed.stdout)
+            self.assertTrue(self.wait_gone(wedged))
+        finally:
+            for runner in ("t0", "t1", "t2", "t3", "t4"):
+                self.finish(runner)
+
+    def test_take_gui_recycles_testmanagerd_for_the_tests(self) -> None:
+        self.fleet()
+        e2e = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/test-e2e.yml@refs/heads/main"}
+        program = os.fspath(self.dir / "bin" / "testmanagerd")
+        try:
+            build = self.job("build", "e0", 8, None, "--recycle-testmanagerd", "--testmanagerd-program", program,
+                             *self.own_tests(), env=e2e)
+            self.assertEqual(build.returncode, 0, build.stdout)
+            self.assertNotIn("testmanagerd", build.stdout, "compile-gui takes the gui token later")
+            daemon = self.fake_process("testmanagerd", "/bin/sleep", "60")
+            took = self.take_gui("e0", "--recycle-testmanagerd", "--testmanagerd-program", program, *self.own_tests())
+            self.assertEqual(took.returncode, 0, took.stderr)
+            self.assertEqual(took.stdout.strip(), "")
+            self.assertRegex(took.stderr, rf"take-gui: testmanagerd: (stopped|killed) pid {daemon}\b")
+            self.assertTrue(self.wait_gone(daemon))
+        finally:
+            self.finish("e0")
+
+    def test_a_testmanagerd_that_outlives_sigkill_refuses_the_job(self) -> None:
+        self.assertIsNone(hook.XCTEST_RUNNING.search("/usr/bin/xcodebuild build -scheme cmux"))
+        self.assertIsNone(hook.XCTEST_RUNNING.search("/x/Debug/cmuxCLITests.xctest"))
+        for busy in ("/Applications/Xcode_26.6.app/Contents/Developer/usr/bin/xctest /x/a.xctest",
+                     "/usr/bin/xcodebuild test-without-building -xctestrun a", "xcodebuild -scheme cmux test"):
+            self.assertIsNotNone(hook.XCTEST_RUNNING.search(busy), busy)
+        daemon, root = (4242, os.getuid(), "Ss", hook.TESTMANAGERD), (4243, 0, "Ss", hook.TESTMANAGERD)
+
+        def recycle(*tables, error=None):
+            """recycle_testmanagerd against ps tables in turn (the last repeats), with os.kill recorded."""
+            seq = list(tables)
+            ps = mock.Mock(side_effect=error or (lambda: seq.pop(0) if len(seq) > 1 else seq[0]))
+            with mock.patch.object(hook, "_ps_table", ps), mock.patch.object(hook.os, "kill") as kill, \
+                    mock.patch.object(hook, "TESTMANAGERD_TERM_S", 0.3), mock.patch.object(hook, "TESTMANAGERD_KILL_S", 0.3):
+                return hook.recycle_testmanagerd(), [c.args for c in kill.call_args_list]
+
+        term, kill = hook.signal.SIGTERM, hook.signal.SIGKILL
+        note, kills = recycle([daemon, root])
+        self.assertEqual(note, f"{hook.TESTMANAGERD_STUCK}: pid 4242 outlived SIGKILL")
+        self.assertEqual(kills, [(4242, term), (4242, kill)], "only this user's daemon")
+        # a zombie is gone: an impostor whose parent never reaps it cannot make the mini refuse every job
+        self.assertEqual(recycle([daemon], [(4242, os.getuid(), "Z", hook.TESTMANAGERD)])[0],
+                         "testmanagerd: stopped pid 4242")
+        self.assertEqual(recycle([daemon], [(4242, os.getuid(), "SE", hook.TESTMANAGERD)])[0],
+                         "testmanagerd: stopped pid 4242", "exiting (macOS ps E) counts as gone")
+        # a test that starts while it ignores SIGTERM keeps it: no SIGKILL under a live run
+        note, kills = recycle([daemon], [daemon, (7, os.getuid(), "S", "/x/usr/bin/xctest /x/a.xctest")])
+        self.assertEqual(note, "testmanagerd: kept pid 4242 (ignored SIGTERM; a test started)")
+        self.assertEqual(kills, [(4242, term)])
+        self.assertEqual(recycle([], error=ValueError("bad bytes"))[0], "testmanagerd: not checked (ValueError)")
+        self.assertEqual(recycle(None)[0], "testmanagerd: not checked (ps failed)")
+        # ps failing after the signal is no proof it is stuck: never SIGKILL or refuse on a guess
+        note, kills = recycle([daemon], None)
+        self.assertEqual((note, kills), ("testmanagerd: sent SIGTERM to pid 4242 (not confirmed: ps failed)", [(4242, term)]))
+        note = f"{hook.TESTMANAGERD_STUCK}: pid 4242 outlived SIGKILL"
+        # job-started refuses and lets its capacity go: the hook itself, with only the daemon's answer stubbed
+        self.fleet()
+        stub = ("import importlib.machinery,importlib.util,sys\n"
+                f"loader=importlib.machinery.SourceFileLoader('h',{os.fspath(HOOK)!r})\n"
+                "spec=importlib.util.spec_from_loader('h',loader);h=importlib.util.module_from_spec(spec)\n"
+                "loader.exec_module(h)\n"
+                f"h.recycle_testmanagerd=lambda *a: {note!r}\n"
+                "sys.exit(h.main(sys.argv[1:]))\n")
+        push = event(self.dir, "push", {"repository": CMUX})
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                   "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"), "GITHUB_EVENT_NAME": "push",
+                   "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": "manaflow-ai/cmux",
+                   "GITHUB_JOB": "tests-build-and-lag", "RUNNER_NAME": "s0"}
+        refused = subprocess.run([sys.executable, "-c", stub, "job-started", "--allowed-repo", "manaflow-ai/cmux",
+                                      "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
+                                      "--watch-pid", str(os.getpid()), "--capacity-units", "4",
+                                      "--capacity-dir", os.fspath(self.dir / "capacity"), "--recycle-testmanagerd"],
+                                     env=environ, capture_output=True, text=True, timeout=30, check=False)
+        try:
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn(f"refused: {note}", refused.stdout)
+            # no job-completed for s0 yet: the refusal itself let the gui token and root go
+            again = self.job("tests-build-and-lag", "s1", 4, None, "--gui-wait", "0")
+            self.assertEqual(again.returncode, 0, "the refused job let the gui token and root go: " + again.stdout)
+        finally:
+            self.finish("s0")
+            self.finish("s1")
+
+    def test_capacity_product_job_holds_the_gui_token(self) -> None:
+        # cli-product-tests runs XCTest through the same testmanagerd as the gui jobs: one at a time per mini
+        self.fleet()
+        try:
+            product = self.job("cli-product-tests", "p0")
+            self.assertEqual(product.returncode, 0, product.stdout)
+            self.assertIn("units+gui+root-1 for cli-product-tests (product", product.stdout)
+            self.finish("p0")
+            self.assertEqual(self.job("tests-build-and-lag", "p1").returncode, 0)
+            refused = self.job("cli-product-tests", "p2", 4, None, "--gui-wait", "0")
+            self.assertIn("refused: capacity: the gui token is taken", refused.stdout)
+        finally:
+            for runner in ("p0", "p1", "p2"):
+                self.finish(runner)
+
     def test_capacity_gui_job_waits_for_the_gui_token(self) -> None:
         self.fleet()
         try:
-            self.assertEqual(self.job("app-host-unit-tests", "w0").returncode, 0)
+            self.assertEqual(self.job("tests-build-and-lag", "w0").returncode, 0)
             waited = time.monotonic()
             busy = self.job("tests-build-and-lag", "w1", 4, None, "--gui-wait", "3")
             self.assertEqual(busy.returncode, 1, busy.stdout)
@@ -1163,25 +1730,57 @@ class HookTest(unittest.TestCase):
             release = threading.Timer(2.0, self.finish, args=("w0",))
             release.start()
             try:
-                admitted = self.job("app-host-unit-tests", "w2", 4, None, "--gui-wait", "30")
+                admitted = self.job("tests-build-and-lag", "w2", 4, None, "--gui-wait", "30")
             finally:
                 release.join()
             self.assertEqual(admitted.returncode, 0, admitted.stdout)
             self.assertIn("+gui", admitted.stdout)
             # the wait never overshoots its deadline by a poll interval
             waited = time.monotonic()
-            self.job("app-host-unit-tests", "w5", 4, None, "--gui-wait", "1")
+            self.job("tests-build-and-lag", "w5", 4, None, "--gui-wait", "1")
             self.assertLess(time.monotonic() - waited, 4.5, "the last try starts by the deadline")
-            # only the gui token is waited for: any other refusal is still immediate
+            # a units refusal waits the same --gui-wait before it refuses (CAPACITY_WAIT)
             self.finish("w2")
             self.assertEqual(self.job("macos-compile-admission", "w3", 4).returncode, 0)
             waited = time.monotonic()
-            full = self.job("cli-product-tests", "w4", 4, None, "--gui-wait", "30")
+            full = self.job("cli-product-tests", "w4", 4, None, "--gui-wait", "2")
             self.assertIn("refused: capacity:", full.stdout)
             self.assertNotIn("gui token", full.stdout)
-            self.assertLess(time.monotonic() - waited, 20, "a units refusal does not wait")
+            self.assertGreaterEqual(time.monotonic() - waited, 2, "a units refusal waits too")
+            self.assertLess(time.monotonic() - waited, 20, "then refuses")
         finally:
             for runner in ("w0", "w1", "w2", "w3", "w4", "w5"):
+                self.finish(runner)
+
+    def test_capacity_runners_wait_for_units(self) -> None:
+        # a 2-unit side lane waits for units instead of refusing, on a side runner (instance past
+        # --canonical-roots) and on a root runner alike
+        self.fleet()
+        release = None
+        try:
+            self.assertEqual(self.job("macos-compile-admission", "u0", 4).returncode, 0)
+            self.assertEqual(self.job("claude-wrapper", "u1", 4).returncode, 0)
+            waited = time.monotonic()
+            root = self.job("release-build", "u2", 4, None, "--gui-wait", "2")
+            self.assertEqual(root.returncode, 1, root.stdout)
+            self.assertIn("refused: capacity: 1 of 4 units free", root.stdout)
+            self.assertGreaterEqual(time.monotonic() - waited, 2, "a root runner waits for units too")
+            release = threading.Timer(2.0, self.finish, args=("u1",))
+            release.start()
+            side = self.job("release-build", "u3", 4, None, "--instance", "1", "--gui-wait", "30")
+            release.join()
+            self.assertEqual(side.returncode, 0, side.stdout)
+            self.assertIn("holding 2/4 units for release-build (isolated", side.stdout)
+            # the wait ends at its deadline
+            waited = time.monotonic()
+            late = self.job("release-build", "u4", 4, None, "--instance", "1", "--gui-wait", "2")
+            self.assertEqual(late.returncode, 1, late.stdout)
+            self.assertGreaterEqual(time.monotonic() - waited, 2)
+            self.assertLess(time.monotonic() - waited, 20, "a 2 s wait, then a refusal")
+        finally:
+            if release is not None:
+                release.cancel()
+            for runner in ("u0", "u1", "u2", "u3", "u4"):
                 self.finish(runner)
 
     def test_capacity_e2e_build_takes_the_gui_token_for_its_tests_only(self) -> None:
@@ -1202,8 +1801,8 @@ class HookTest(unittest.TestCase):
             # its own restore step re-takes the root it holds: a no-op
             self.assertEqual(self.take("/private/tmp/cmux-ci", "e0").returncode, 0)
             # while it compiles, a GUI job runs beside it, and so does a compile admission in the other root
-            shard = self.job("app-host-unit-tests", "g0", 8, None, *two, "--gui-wait", "0")
-            self.assertIn("+gui for app-host-unit-tests (gui", shard.stdout)
+            shard = self.job("tests-build-and-lag", "g0", 8, None, *two, "--gui-wait", "0")
+            self.assertIn("+gui for tests-build-and-lag (gui", shard.stdout)
             self.assertIn("persistent-dd+root-2", self.job("macos-compile-admission", "e1", 8, None, *two).stdout)
             # the build's tests wait for that shard's token, then take it
             self.assertEqual(self.take_gui("e0", "--wait", "1").returncode, 1, "the shard still holds it")
@@ -1217,11 +1816,12 @@ class HookTest(unittest.TestCase):
             first = self.job("build", "e3", 8, None, *two, "--instance", "1", env=e2e)
             self.assertIn("units+root-1 for build (compile-gui", first.stdout)
             self.finish("e3")
-            # the fallback test job is a consumer: gui at job start, the producer's root from its restore step
+            # the fallback test job is a consumer: gui from its take-gui step, then the producer's root from its
+            # restore step
             test = self.job("test", "e2", 8, None, *two, env=e2e)
             self.assertEqual(test.returncode, 0, test.stdout)
-            self.assertIn("+gui for test (gui", test.stdout)
-            self.assertNotIn("root-", test.stdout.split("holding", 1)[1])
+            self.assertIn("holding 1/8 units for test (gui-step", test.stdout)
+            self.assertEqual(self.take_gui("e2").returncode, 0)
             self.assertEqual(self.take("/private/tmp/cmux-ci-2", "e2", "--wait", "0").returncode, 1,
                              "the compile admission still holds root 2")
             self.assertEqual(self.take("/private/tmp/cmux-ci", "e2").returncode, 0)
@@ -1230,11 +1830,63 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
-    def test_capacity_gui_wait_stops_once_the_refusal_is_not_the_gui_token(self) -> None:
+    def test_capacity_shard_takes_the_gui_token_before_its_restore(self) -> None:
+        # an app-host shard (gui-step) fetches its product without the gui token and takes it with take-gui in
+        # the step before its restore takes the producer's root: gui, then root, the order gui jobs take them in
+        self.fleet()
+        two = ("--canonical-roots", "2", "--compile-slots", "2")
+        state = self.dir / "state"
+        try:
+            shard = self.job("app-host-unit-tests", "s0", 8, None, *two, "--gui-wait", "0")
+            self.assertEqual(shard.returncode, 0, shard.stdout)
+            self.assertIn("holding 1/8 units for app-host-unit-tests (gui-step", shard.stdout)
+            self.assertFalse((state / "host-lock-holder-s0.gui").exists())
+            # while the shard fetches, another GUI job takes the console session
+            other = self.job("tests-build-and-lag", "g0", 8, None, *two, "--gui-wait", "0")
+            self.assertIn("+gui for tests-build-and-lag (gui", other.stdout)
+            self.assertEqual(self.take_gui("s0", "--wait", "1").returncode, 1, "the GUI job still holds it")
+            self.finish("g0")
+            self.assertEqual(self.take_gui("s0", "--wait", "5").returncode, 0)
+            self.assertTrue((state / "host-lock-holder-s0.gui").exists())
+            self.assertEqual(self.take_gui("s0").returncode, 0, "a second take-gui is a no-op")
+            self.assertEqual(self.take("/private/tmp/cmux-ci", "s0").returncode, 0)
+            refused = self.job("tests-build-and-lag", "g1", 8, None, *two, "--gui-wait", "0")
+            self.assertIn("refused: capacity: the gui token is taken", refused.stdout)
+            self.assertIn("the gui token holder released", self.finish("s0"))
+            # a one-root mini gives the shard gui and its root at job start, as for a gui job
+            one = self.job("app-host-unit-tests", "s1", 8, None, "--gui-wait", "0")
+            self.assertIn("holding 1/8 units+gui+root-1 for app-host-unit-tests (gui-step", one.stdout)
+            self.assertEqual(self.take_gui("s1").returncode, 0, "its step's take-gui is a no-op")
+        finally:
+            for runner in ("s0", "s1", "g0", "g1"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
+    def test_capacity_e2e_test_job_takes_the_gui_token_in_its_step(self) -> None:
+        # test-e2e's `test` runs when the build could not get the gui token: at job start it takes neither, so a
+        # busy token is waited for in its take-gui step instead of refusing the job after GUI_WAIT_S
+        self.fleet()
+        e2e = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/test-e2e.yml@refs/heads/main"}
+        two = ("--canonical-roots", "2", "--compile-slots", "2")
+        try:
+            shard = self.job("tests-build-and-lag", "g0", 8, None, *two, "--gui-wait", "0")
+            self.assertIn("+gui for tests-build-and-lag (gui", shard.stdout)
+            test = self.job("test", "t0", 8, None, *two, "--gui-wait", "0", env=e2e)
+            self.assertEqual(test.returncode, 0, test.stdout)
+            self.assertIn("holding 1/8 units for test (gui-step", test.stdout)
+            self.assertEqual(self.take_gui("t0", "--wait", "1").returncode, 1, "the GUI job still holds it")
+            self.finish("g0")
+            self.assertEqual(self.take_gui("t0", "--wait", "5").returncode, 0)
+        finally:
+            for runner in ("g0", "t0"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
+    def test_capacity_wait_continues_when_the_refusal_turns_to_units(self) -> None:
         self.fleet()
         release = None
         try:
-            self.assertEqual(self.job("app-host-unit-tests", "x0", 4).returncode, 0)
+            self.assertEqual(self.job("tests-build-and-lag", "x0", 4).returncode, 0)
             self.assertEqual(self.job("claude-wrapper", "x1", 4).returncode, 0)
             self.assertEqual(self.job("claude-wrapper", "x2", 4).returncode, 0)
             self.assertEqual(self.job("claude-wrapper", "x5", 4).returncode, 0)
@@ -1245,11 +1897,12 @@ class HookTest(unittest.TestCase):
             release = threading.Timer(2.0, swap)
             release.start()
             waited = time.monotonic()
-            result = self.job("tests-build-and-lag", "x4", 4, None, "--gui-wait", "30")
+            result = self.job("tests-build-and-lag", "x4", 4, None, "--gui-wait", "5")
             release.join()
             self.assertEqual(result.returncode, 1, result.stdout)
             self.assertIn("units free", result.stdout)
-            self.assertLess(time.monotonic() - waited, 20, "a units refusal after a gui one does not keep waiting")
+            self.assertGreaterEqual(time.monotonic() - waited, 5, "a units refusal after a gui one keeps waiting")
+            self.assertLess(time.monotonic() - waited, 20, "until the deadline")
         finally:
             if release is not None:
                 release.cancel()
@@ -1270,7 +1923,7 @@ class HookTest(unittest.TestCase):
             self.assertEqual(hook.job_class(job, home, home), ("compile", True))
         # test-e2e runs its tests in the console session: build compiles and tests, test is the fallback
         self.assertEqual(hook.job_class("build", home, home, "test-e2e.yml"), ("compile-gui", False))
-        self.assertEqual(hook.job_class("test", home, home, "test-e2e.yml"), ("gui", False))
+        self.assertEqual(hook.job_class("test", home, home, "test-e2e.yml"), ("gui-step", False))
         self.assertEqual(hook.job_class("lint", home, home, "test-e2e.yml"), ("compile", True))
         self.assertEqual(hook.job_class("build", "someone/else", home, "test-e2e.yml"), ("isolated", False))
         self.assertEqual(hook.CLASS_COST["compile-gui"], (2, ("root",)),
@@ -1282,7 +1935,13 @@ class HookTest(unittest.TestCase):
         self.assertEqual(hook.job_class("seed", home, home, "seed-derived-data.yml"), ("seed", False))
         self.assertEqual(hook.CLASS_COST["seed"], (2, ()))
         self.assertEqual(hook.job_class("seed", home, home, "other.yml"), ("compile", True))
+        # the nightly app build compiles in its own workspace: no root a seed on the trusted mini waits for
+        self.assertEqual(hook.job_class("build-nightly-app", home, home, "nightly.yml"), ("isolated", False))
+        self.assertEqual(hook.job_class("build-nightly-app", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("rerun", home, home, "app-host-test-rerun.yml"), ("gui", False))
+        self.assertEqual(hook.job_class("cdp-browser-smoke", home, home, "cmux-tui.yml"), ("isolated", False))
+        self.assertEqual(hook.job_class("build", home, home, "reload-build.yml"), ("isolated", False))
+        self.assertEqual(hook.job_class("build", home, home, "nightly.yml"), ("compile", True))
         self.assertEqual(hook.job_class("rerun", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("release-build", home, home, "ci.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("macos-compile-admission", home, home, "ci.yml"), ("compile", False))
@@ -1316,6 +1975,160 @@ class HookTest(unittest.TestCase):
             for runner in ("h0", "n0", "n1", "n2", "n3", "n4"):
                 self.finish(runner)
 
+    # ------------------------------------------------------------ ci-step admission (cmuxterm-hq#794)
+
+    def ci_step(self, phase: str, *extra: str, units: int = 3) -> tuple[int, dict]:
+        """Run admit, release or fits as the build worker does: one JSON line on stdout."""
+        result = self.run_hook(phase, None, None, "--capacity-units", str(units),
+                               "--capacity-dir", os.fspath(self.dir / "capacity"),
+                               "--state-dir", os.fspath(self.dir / "state"), *extra)
+        lines = result.stdout.strip().splitlines()
+        self.assertEqual(len(lines), 1, result.stdout + result.stderr)
+        return result.returncode, json.loads(lines[0])
+
+    def ci_worker(self) -> subprocess.Popen:
+        """A stand-in for the build worker whose pid a step's holder watches."""
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        self.addCleanup(worker.wait)
+        self.addCleanup(worker.kill)
+        return worker
+
+    def fits(self, units: int = 3) -> list[str]:
+        status, result = self.ci_step("fits", units=units)
+        self.assertEqual((status, result["schema"], result["unknown"]), (0, "glaeda-ci-step-fits/v1", False))
+        return result["fits"]
+
+    def test_ci_step_admission_shares_the_runners_ledger(self) -> None:
+        self.fleet()
+        worker = self.ci_worker()
+        watch = ("--watch-pid", str(worker.pid))
+        try:
+            self.assertEqual(self.fits(), ["light", "isolated"])
+            status, first = self.ci_step("admit", "--class", "light", "--job-key", "r1-100-1", *watch)
+            self.assertEqual(status, 0, first)
+            self.assertEqual((first["schema"], first["admitted"], first["units"], first["units_total"],
+                              first["tokens"]), ("glaeda-ci-step-admission/v1", True, 1, 3, []))
+            self.assertIsInstance(first["holder_pid"], int)
+            self.assertTrue(self.shared_lock_blocks_exclusive(), "a dev build's exclusive host lock waits for steps")
+            self.assertEqual(self.fits(), ["light", "isolated"], "two of three units are free")
+            status, second = self.ci_step("admit", "--class", "isolated", "--job-key", "r1-101-1", *watch)
+            self.assertEqual((status, second["units"]), (0, 2), second)
+            self.assertEqual(self.fits(), [], "every unit is held")
+            start = time.monotonic()
+            status, full = self.ci_step("admit", "--class", "light", "--job-key", "r1-102-1", *watch)
+            self.assertLess(time.monotonic() - start, 25, "a full mini refuses, it never waits")
+            self.assertEqual((status, full["admitted"]), (1, False))
+            self.assertIn("capacity: 0 of 3 units free", full["reason"])
+            runner = self.job("swift-package-tests", "r0", 3)
+            self.assertEqual(runner.returncode, 1, "a runner job sees the units the steps hold")
+            self.assertIn("refused: capacity: 0 of 3 units free", runner.stdout)
+            status, released = self.ci_step("release", "--job-key", "r1-100-1")
+            self.assertEqual((status, released["released"]), (0, "released the fleet host lock"))
+            self.assertEqual(self.fits(), ["light"], "one unit is free again: too few for an isolated step")
+        finally:
+            for key in ("r1-100-1", "r1-101-1", "r1-102-1"):
+                self.ci_step("release", "--job-key", key)
+        self.assertTrue(self.lock_free(), "every step holder let go")
+
+    def test_ci_step_holder_ends_with_the_worker(self) -> None:
+        self.fleet()
+        worker = self.ci_worker()
+        status, admitted = self.ci_step("admit", "--class", "light", "--job-key", "gone-1-1",
+                                        "--watch-pid", str(worker.pid))
+        self.assertEqual(status, 0, admitted)
+        self.assertFalse(self.lock_free())
+        worker.kill()
+        worker.wait()
+        deadline = time.monotonic() + 10
+        while not self.lock_free() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertTrue(self.lock_free(), "a crashed worker strands no capacity")
+        status, again = self.ci_step("admit", "--class", "light", "--job-key", "gone-1-1",
+                                     "--watch-pid", str(worker.pid))
+        self.assertEqual(status, 1)
+        self.assertIn("is not running", again["reason"])
+
+    def test_ci_step_refusals_are_typed_and_never_wait(self) -> None:
+        fleet = self.fleet()
+        worker = self.ci_worker()
+        watch = ("--watch-pid", str(worker.pid))
+        try:
+            status, first = self.ci_step("admit", "--class", "isolated", "--job-key", "iso-1-1", *watch)
+            self.assertEqual((status, first["units"]), (0, 2), first)
+            self.assertEqual(self.fits(), ["light"], "one unit left: too few for an isolated step")
+            status, second = self.ci_step("admit", "--class", "isolated", "--job-key", "iso-2-1", *watch)
+            self.assertEqual(status, 1)
+            self.assertIn("capacity: 1 of 3 units free", second["reason"])
+            status, again = self.ci_step("admit", "--class", "light", "--job-key", "iso-1-1", *watch)
+            self.assertEqual(status, 1, "a key holds one admission")
+            self.assertIn("already admitted", again["reason"])
+            status, prefixed = self.ci_step("admit", "--class", "light", "--job-key", "iso-1-1-gui", *watch)
+            self.assertEqual(status, 0, "a key that extends another is its own step")
+            self.ci_step("release", "--job-key", "iso-1-1-gui")
+            self.assertEqual(self.fits(), ["light"], "releasing one key leaves the other's holder")
+        finally:
+            self.ci_step("release", "--job-key", "iso-1-1")
+        for bad in (("--class", "compile", "--job-key", "k-1-1"), ("--class", "simulator", "--job-key", "k-1-1"),
+                    ("--class", "light", "--job-key", "../k"), ("--class", "light")):
+            with self.subTest(bad=bad):
+                result = self.run_hook("admit", None, None, "--capacity-units", "3", *bad, *watch)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,time\n"
+                                   f"fd=os.open({os.fspath(fleet / 'host.lock')!r},os.O_RDWR)\n"
+                                   "fcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(30)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            self.assertEqual(self.fits(), [], "nothing fits while a dev build holds the host")
+            status, refused = self.ci_step("admit", "--class", "light", "--job-key", "dev-1-1", *watch)
+            self.assertEqual(status, 1)
+            self.assertIn("capacity: a fleet build holds the host lock", refused["reason"])
+        finally:
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
+
+    @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
+    def test_ci_step_fits_nothing_while_a_fleet_build_waits(self) -> None:
+        fleet = self.fleet()
+        worker = self.ci_worker()
+        status, first = self.ci_step("admit", "--class", "light", "--job-key", "wait-1-1", "--watch-pid", str(worker.pid))
+        self.assertEqual(status, 0, first)
+        waiter = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os\n"
+                                   f"fd=os.open({os.fspath(fleet / 'host.lock')!r},os.O_RDWR)\n"
+                                   "print('waiting',flush=True)\nfcntl.flock(fd,fcntl.LOCK_EX)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(waiter.stdout.readline().strip(), "waiting")
+            time.sleep(0.5)
+            self.assertEqual(self.fits(), [], "fits agrees with admit, which refuses while a fleet build waits")
+            status, refused = self.ci_step("admit", "--class", "light", "--job-key", "wait-2-1",
+                                           "--watch-pid", str(worker.pid))
+            self.assertEqual(status, 1)
+            self.assertIn("a fleet build is waiting for the host", refused["reason"])
+            self.ci_step("release", "--job-key", "wait-1-1")
+            self.assertEqual(waiter.wait(timeout=10), 0, "the build worker gets the host once the step lets go")
+        finally:
+            waiter.kill()
+            waiter.wait()
+            waiter.stdout.close()
+            self.ci_step("release", "--job-key", "wait-1-1")
+
+    def test_ci_step_fits_is_unknown_while_an_admission_runs(self) -> None:
+        self.fleet()
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        fd = os.open(capacity / "admission.lock", os.O_RDONLY | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            status, result = self.ci_step("fits")
+            self.assertEqual((status, result["fits"], result["unknown"]), (0, [], True))
+        finally:
+            os.close(fd)
+        self.assertEqual(self.fits(), ["light", "isolated"])
+
     def test_capacity_refuses_while_a_fleet_build_holds_the_host(self) -> None:
         fleet = self.fleet()
         holder = subprocess.Popen([sys.executable, "-c",
@@ -1331,6 +2144,94 @@ class HookTest(unittest.TestCase):
         finally:
             holder.kill()
             holder.wait()
+            holder.stdout.close()
+
+    @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
+    def test_capacity_preempts_a_yielding_fleet_build(self) -> None:
+        """A fleet build that wrote <host lock>.yield (cmuxterm-hq's catch-up fill) gives way: the job
+        writes .preempted, SIGTERMs it and is admitted once the lock is free. Like the fill, it passes the
+        lock fd to a build in a new session, which lsof lists too."""
+        fleet = self.fleet()
+        lock = fleet / "host.lock"
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,signal,subprocess,sys,time\n"
+                                   f"fd=os.open({os.fspath(lock)!r},os.O_RDWR)\n"
+                                   "fcntl.flock(fd,fcntl.LOCK_EX)\n"
+                                   "build=subprocess.Popen([sys.executable,'-c','import time; time.sleep(300)'],"
+                                   "pass_fds=(fd,),start_new_session=True,stdout=subprocess.DEVNULL)\n"
+                                   "def stop(*a):\n os.killpg(build.pid,signal.SIGTERM); build.wait(); sys.exit(0)\n"
+                                   "signal.signal(signal.SIGTERM, stop)\n"
+                                   "print('held',flush=True)\ntime.sleep(300)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            (fleet / "host.lock.yield").write_text(f"{holder.pid}\n")
+            result = self.job("cli-product-tests", "w0")
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn(f"preempted the yielding fleet build (pid {holder.pid})", result.stdout)
+            self.assertEqual(holder.wait(timeout=10), 0)
+            note = json.loads((fleet / "host.lock.preempted").read_text())
+            self.assertEqual((note["by"], note["pid"]), ("cli-product-tests", holder.pid))
+        finally:
+            self.finish("w0")
+            with contextlib.suppress(OSError):
+                holder.kill()
+            holder.wait()
+            holder.stdout.close()
+
+    @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
+    def test_capacity_never_preempts_a_fill_waiting_behind_another_build(self) -> None:
+        """The fill marks itself yielding while it waits; if another fleet build holds the lock, the job is
+        refused at once and the waiting fill is left alone."""
+        fleet = self.fleet()
+        lock = fleet / "host.lock"
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,time\n"
+                                   f"fd=os.open({os.fspath(lock)!r},os.O_RDWR)\n"
+                                   "fcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(300)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        self.assertEqual(holder.stdout.readline().strip(), "held")  # before the waiter, which must not win
+        waiter = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,time\n"
+                                   f"fd=os.open({os.fspath(lock)!r},os.O_RDWR)\n"
+                                   "print('open',flush=True)\nfcntl.flock(fd,fcntl.LOCK_EX)\ntime.sleep(300)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(waiter.stdout.readline().strip(), "open")
+            (fleet / "host.lock.yield").write_text(f"{waiter.pid}\n")
+            result = self.job("cli-product-tests", "w0")
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("refused: capacity: a fleet build holds the host lock", result.stdout)
+            self.assertIsNone(waiter.poll(), f"the waiting fill was not signalled ({waiter.returncode})")
+            self.assertFalse((fleet / "host.lock.preempted").exists())
+        finally:
+            for proc in (holder, waiter):
+                proc.kill()
+                proc.wait()
+                proc.stdout.close()
+
+    def test_capacity_never_signals_a_marker_pid_without_the_lock(self) -> None:
+        """A stale or planted .yield naming a process that does not have the lock open changes nothing."""
+        fleet = self.fleet()
+        lock = fleet / "host.lock"
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,time\n"
+                                   f"fd=os.open({os.fspath(lock)!r},os.O_RDWR)\n"
+                                   "fcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(30)\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            (fleet / "host.lock.yield").write_text(f"{bystander.pid}\n")
+            result = self.job("cli-product-tests", "w0")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("refused: capacity: a fleet build holds the host lock", result.stdout)
+            self.assertIsNone(bystander.poll(), "the bystander was not signalled")
+            self.assertFalse((fleet / "host.lock.preempted").exists())
+        finally:
+            for proc in (holder, bystander):
+                proc.kill()
+                proc.wait()
             holder.stdout.close()
 
     @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
@@ -1712,6 +2613,29 @@ class GateTest(unittest.TestCase):
         self.hold(fcntl.LOCK_EX)
         self.assertEqual(self.held(), "a fleet build holds the host lock")
 
+    @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
+    def test_a_yielding_holder_leaves_the_listener_on(self) -> None:
+        self.hold(fcntl.LOCK_EX)
+        (self.tmp / "host.lock.yield").write_text(f"{os.getpid()}\n")
+        self.addCleanup(hook._gate_yield_verdict.clear)
+        self.assertIsNone(self.held(), "a job preempts it, so the gate keeps listening")
+        self.opener("fill-recipe.py")  # a child of this process with the lock open: the yielding build's own
+        hook._gate_yield_verdict.clear()
+        self.assertIsNone(self.held())
+        worker = self.opener("with-host-lock.py")
+        worker_pid = worker.pid
+        with mock.patch.object(hook, "yielding_family", return_value={os.getpid()}):
+            hook._gate_yield_verdict.clear()  # another fleet build on the lock: the marker yields nothing
+            self.assertEqual(self.held(), "a fleet build holds the host lock")
+            self.assertIn(worker_pid, hook.host_waiters(os.fspath(self.lock), self.tmp / "state"))
+        self.assertEqual(self.held(), "a fleet build holds the host lock", "kept for GATE_WAITER_EVERY_S")
+        hook._gate_yield_verdict.clear()
+        self.assertIsNone(self.held(), "the opener is this process's child, so part of the yielding build")
+        (self.tmp / "host.lock.yield").write_text("999999\n")  # no such process: a stale marker
+        self.assertEqual(self.held(), "a fleet build holds the host lock")
+        (self.tmp / "host.lock.yield").write_text("x" * 100)
+        self.assertEqual(self.held(), "a fleet build holds the host lock")
+
     def test_a_reservation_claims_the_host(self) -> None:
         with mock.patch.object(hook, "reservation_refusal", return_value="host reserved by leo"):
             self.assertEqual(self.held(), "host reserved by leo")
@@ -1926,6 +2850,141 @@ class GateTest(unittest.TestCase):
         (side / hook.RUNNER_HOOK_SCRIPT).write_text(script.read_text())
         self.assertEqual(hook.runner_scope(side), hook.RunnerScope(4, 1, 1, False))
         self.assertEqual(hook.runner_units(side), 4)
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --compile-slots 2 "
+                          "--canonical-roots 2 --instance 4 --gui-runner\n")
+        self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(5, 2, 2, False, True))
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --instance 0 --gui-runner\n")
+        self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(5, 1, 1, False, True),
+                         "a gui runner is never a root runner, whatever its instance")
+
+    def test_a_gui_runner_holds_while_the_console_is_locked(self) -> None:
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --instance 2 --gui-runner\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        why = "console: the console session (cmux) is screen-locked"
+        with mock.patch.object(hook, "console_refusal", return_value=why) as read:
+            self.assertEqual(gate.claimed(), why)
+            self.assertEqual(gate.claimed(), why)
+            self.assertEqual(read.call_count, 1, "read at most every GATE_CONSOLE_EVERY_S")
+            self.assertEqual(gate.confirmed(), why)
+            self.assertEqual(read.call_count, 2, "the look right before a stop is fresh")
+        with mock.patch.object(hook, "console_refusal", return_value=None):
+            self.assertEqual(gate.claimed(), why, "the cached reading holds until the next read")
+            self.assertIsNone(gate.confirmed())
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --instance 0\n")
+        with mock.patch.object(hook, "console_refusal", return_value=why) as read:
+            self.assertIsNone(hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"),
+                                        self.state).confirmed(), "a root runner's compiles need no console")
+            read.assert_not_called()
+
+    def test_every_runner_holds_while_free_disk_is_under_its_floor(self) -> None:
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        script.write_text("exec python3 /hook job-started --allowed-owner manaflow-ai --capacity-units 4 --instance 0\n")
+        self.assertIsNone(gate.claimed(), "no --min-free-gib: no floor")
+        script.write_text("exec python3 /hook job-started --allowed-owner manaflow-ai --min-free-gib 999999999.5 "
+                          "--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux\n")
+        self.assertEqual(hook.runner_scope(self.runner).min_free_gib, 999999999.5)
+        why = gate.claimed()
+        self.assertIsNotNone(why)
+        self.assertRegex(why, r"^disk: [0-9.]+ GiB free, 1e\+09 GiB required$")
+        self.assertEqual(gate.confirmed(), why, "the look right before a stop sees it too")
+        script.write_text("exec python3 /hook job-started --allowed-owner manaflow-ai --min-free-gib 1\n")
+        self.assertIsNone(gate.claimed(), "read on every poll: a re-apply that lowers the floor counts at once")
+        self.assertEqual(hook.min_free_gib(" --min-free-gib 100 --min-free-gib 1e+03 "), 1000.0, "the last one wins")
+        self.assertEqual(hook.min_free_gib(" --min-free-gib=150\n"), 150.0)
+        self.assertEqual(hook.min_free_gib(" --min-free-gib x1 "), 0.0)
+        self.assertEqual(hook.min_free_gib(" --min-free-gib 1e "), 0.0, "not a number: no floor")
+        self.assertEqual(hook.min_free_gib(" --min-free-gib 1e999 "), 0.0, "not finite: no floor")
+        disk = importlib.machinery.SourceFileLoader("glaeda_disk_re", os.fspath(HOOK.parent / "glaeda-disk"))
+        spec = importlib.util.spec_from_loader("glaeda_disk_re", disk)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules, {"glaeda_disk_re": module}):  # its dataclasses look the module up
+            disk.exec_module(module)
+        self.assertEqual(module.MIN_FREE_GIB_RE, hook.MIN_FREE_GIB_RE, "glaeda-disk reads the floor the same way")
+
+    def test_a_disk_hold_resumes_above_the_floor_and_logs_a_long_hold_once(self) -> None:
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec python3 /hook job-started --min-free-gib 100\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        free = {"gib": 99.0}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        logs: list[str] = []
+        clock = {"t": 1000.0}
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "gate_log", side_effect=logs.append), \
+                mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock["t"]):
+            # listening (a child runs): only the floor itself counts, so a dip that recovers never stops it
+            gate.child = mock.Mock(pid=1)
+            why = gate.low_disk()
+            self.assertIn("100 GiB required", why)
+            free["gib"] = 101.0
+            self.assertIsNone(gate.low_disk(), "a listening runner back above the floor is not stopped")
+            # held off for disk: it resumes only 2 GiB above the floor
+            gate.child, gate.held = None, why
+            self.assertIn("102 GiB required", gate.low_disk(), "a hold resumes only 2 GiB above the floor")
+            clock["t"] += hook.GATE_DISK_NOTE_S
+            gate.low_disk()
+            gate.low_disk()
+            held = [line for line in logs if line.startswith("held for free disk")]
+            self.assertEqual(len(held), 1, "a long hold is logged once")
+            self.assertIn("glaeda-disk --top 25", held[0])
+            free["gib"] = 102.0
+            self.assertIsNone(gate.low_disk())
+            # held for something else: no margin, and the disk timer does not run
+            gate.held = "a fleet build holds the host lock"
+            free["gib"] = 101.0
+            self.assertIsNone(gate.low_disk())
+            self.assertIsNone(gate.disk_since)
+
+    def test_the_gate_evicts_in_the_background_before_it_listens_again(self) -> None:
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec python3 /hook job-started --min-free-gib 100\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        free = {"gib": 99.0}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        procs: list[mock.Mock] = []
+
+        def popen(argv: list[str], **_: object) -> mock.Mock:
+            proc = mock.Mock(argv=argv)
+            proc.poll.return_value = None
+            procs.append(proc)
+            return proc
+
+        logs: list[str] = []
+        clock = {"t": 1000.0}
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "disk_argv", side_effect=lambda _e, floor: ["glaeda-disk", f"{floor:g}"]), \
+                mock.patch.object(hook.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(hook, "gate_log", side_effect=logs.append), \
+                mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock["t"]):
+            gate.child = mock.Mock(pid=1)
+            self.assertIn("99.0 GiB free, 100 GiB required", gate.low_disk(), "short while the eviction runs")
+            self.assertEqual([p.argv for p in procs], [["glaeda-disk", "100"]], "told the runner's floor, detached")
+            clock["t"] += 30
+            self.assertIsNotNone(gate.low_disk())
+            self.assertEqual(len(procs), 1, "one eviction at a time; the poll does not wait on it")
+            procs[0].poll.return_value, free["gib"] = 0, 130.0
+            self.assertIsNone(gate.low_disk(), "the eviction made room: listening again")
+            self.assertEqual(logs, ["under the 100 GiB disk floor: glaeda-disk exited 0, freed 31.0 GiB"])
+            # short again soon after: hold, but no new eviction until GATE_DISK_EVICT_EVERY_S has passed
+            free["gib"] = 99.0
+            why = gate.low_disk()
+            gate.child, gate.held = None, why
+            self.assertIn("102 GiB required", gate.low_disk(), "a held runner still resumes only 2 GiB above")
+            self.assertEqual(len(procs), 1)
+            clock["t"] += hook.GATE_DISK_EVICT_EVERY_S
+            gate.low_disk()
+            self.assertEqual(len(procs), 2, "retried every GATE_DISK_EVICT_EVERY_S")
+            clock["t"] += hook.DISK_TIMEOUT_S
+            self.assertIsNotNone(gate.low_disk())
+            procs[1].kill.assert_called_once()
+            self.assertEqual(logs[-1], "under the 100 GiB disk floor: glaeda-disk timed out, freed 0.0 GiB")
+            self.assertIsNone(gate.evicting)
 
     def test_a_root_runner_holds_while_a_token_its_jobs_need_is_taken(self) -> None:
         root = hook.RunnerScope(4, 2, 2, True)
@@ -1957,6 +3016,29 @@ class GateTest(unittest.TestCase):
         self.runner_hook(4)
         gate = self.full_gate(self.units(3))
         self.assertEqual(gate.claimed(), "only 1 of 4 capacity units on this mini are free; a compile needs 2")
+
+    def test_a_gui_runner_holds_while_the_gui_token_or_every_root_is_taken(self) -> None:
+        gui = hook.RunnerScope(5, 2, 2, False, True)
+        capacity = self.units(0)
+        self.assertIsNone(hook.mini_full(capacity, 5, gui))
+        held = hook.lock_file(capacity / "gui.token", fcntl.LOCK_EX)
+        self.assertEqual(hook.mini_full(capacity, 5, gui), "the gui token is taken")
+        os.close(held)
+        dd = [hook.lock_file(capacity / name, fcntl.LOCK_EX) for name in ("persistent-dd.token", "persistent-dd-1.token")]
+        self.assertIsNone(hook.mini_full(capacity, 5, gui), "a GUI job needs no persistent-dd token")
+        roots = [hook.lock_file(capacity / name, fcntl.LOCK_EX) for name in ("root-1.token", "root-2.token")]
+        self.assertEqual(hook.mini_full(capacity, 5, gui), "all 2 canonical roots on this mini are taken")
+        os.close(roots.pop())
+        self.assertIsNone(hook.mini_full(capacity, 5, gui), "one free root is enough")
+        for fd in [*roots, *dd]:
+            os.close(fd)
+        self.assertIsNone(hook.mini_full(self.units(4), 5, gui), "a GUI job needs one unit, not a compile's two")
+        self.assertEqual(hook.mini_full(self.units(5), 5, gui), "all 5 capacity units on this mini are taken")
+        one = hook.RunnerScope(5, 1, 1, False, True)
+        capacity = self.units(0)
+        held = hook.lock_file(capacity / "root-1.token", fcntl.LOCK_EX)
+        self.assertEqual(hook.mini_full(capacity, 5, one), "the canonical root is taken")
+        os.close(held)
 
     def test_the_full_probe_never_competes_with_an_admission(self) -> None:
         capacity = self.units(1)
@@ -2203,8 +3285,13 @@ class GateTest(unittest.TestCase):
         gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
         gate.child = mock.Mock(pid=4321)
         gate.source = (0, 0, 0)
+        # reload() blocks SIGTERM/SIGINT for the exec'd gate to unblock. With execv mocked that block would
+        # stay on this test process, and every later child would inherit it (a SIGTERM'd holder never dies).
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, mask)
         with mock.patch.object(hook.os, "execv") as execv, mock.patch.object(hook.sys, "argv", [os.fspath(HOOK), "listen"]):
             gate.reload()
+        self.assertIn(signal.SIGTERM, signal.pthread_sigmask(signal.SIG_SETMASK, mask), "blocked across the exec")
         args = execv.call_args[0][1]
         self.assertEqual(args[1:], [os.fspath(HOOK), "listen", "--adopt=4321"])
         gate.source = (0, 0, 0)
@@ -2498,7 +3585,7 @@ class RunnerTest(unittest.TestCase):
                 result = subprocess.run(["/bin/bash", os.fspath(hooks / "job-started.sh")], capture_output=True,
                                         text=True, timeout=60, check=False, env={
                                             "PATH": "/usr/bin:/bin", "HOME": os.fspath(self.home),
-                                            "GLAEDA_FLEET_DIR": os.fspath(self.home / "fleet"),
+                                            "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.home / "fleet"),
                                             "GITHUB_EVENT_NAME": event_name, "GITHUB_EVENT_PATH": os.fspath(path),
                                             "GITHUB_REPOSITORY": (payload.get("repository") or {}).get("full_name", "")})
                 self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
@@ -2513,7 +3600,7 @@ class RunnerTest(unittest.TestCase):
         fleet = self.home / "fleet"
         fleet.mkdir()
         (fleet / "host.lock").touch()
-        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.home), "GLAEDA_FLEET_DIR": os.fspath(fleet),
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.home), "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(fleet),
                "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(event(self.state, "push", SAMPLE_EVENTS["push"][1])),
                "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
         # No --watch-pid: the wrapper execs python, so the holder watches this test process, which lives on.
@@ -2981,7 +4068,8 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--capacity-units 4 --compile-slots 2 --canonical-roots 2 --instance 0",
                       (hooks / "job-started.sh").read_text())  # instance 0 prefers root 1
         self.assertNotIn("--trusted-ref", (hooks / "job-started.sh").read_text())
-        self.assertIn("--test-keychain", (hooks / "job-started.sh").read_text())
+        self.assertIn("--test-keychain --recycle-testmanagerd", (hooks / "job-started.sh").read_text())
+        self.assertIn("--recycle-testmanagerd \"$@\"", (hooks / "glaeda-canonical-root").read_text(), "take-gui too")
         manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {
             "trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"}
         path.write_text(json.dumps(manifest))
@@ -2989,6 +4077,35 @@ class RunnerTest(unittest.TestCase):
             self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
         self.assertIn("--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux", (hooks / "job-started.sh").read_text())
         self.assertNotIn("--test-keychain", (hooks / "job-started.sh").read_text(), "a secret-holding host keeps its keychains")
+        self.assertNotIn("--recycle-testmanagerd", (hooks / "job-started.sh").read_text() +
+                         (hooks / "glaeda-canonical-root").read_text(), "a trusted-ref host runs no PR XCTest")
+
+    def test_the_last_instance_is_the_gui_runner_with_only_the_gui_pool_label(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["hosts"]["mini-std"]["roles"].append("ios-simulators")
+        manifest["hosts"]["mini-std"]["overrides"] = {"ios_simulator": {"runtimes": ["23F77"]}}
+        manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 5, "capacityUnits": 5, "compileSlots": 2,
+                                                              "canonicalRoots": 2, "guiRunners": 1}}}
+        path = self.state / "gui.json"
+        path.write_text(json.dumps(manifest))
+        with mock.patch.object(cr, "xcode_present", return_value=True), \
+                mock.patch.object(cr, "ios_sim_present", return_value=True):
+            for instance in ("0", "2", "4"):
+                self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std", "--instance", instance)
+        labels = [argv[argv.index("--labels") + 1].split(",") for argv in self.config_argvs()]
+        self.assertEqual([[x for x in l if x.startswith(("glaeda-std", "glaeda-root", "glaeda-side", "glaeda-gui"))]
+                          for l in labels],
+                         [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"],
+                          ["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"],
+                          ["glaeda-gui-std-xcode-26.6"]],
+                         "the gui runner carries neither the pool label nor a root or side one")
+        self.assertIn("glaeda-ios-sim", labels[0])
+        self.assertNotIn("glaeda-ios-sim", labels[2], "no iOS job ever takes the gui runner")
+        self.assertFalse([x for x in labels[2] if x.startswith("glaeda-runner-")])
+        started = (self.home / "actions-runner-glaeda-4/glaeda-hooks/job-started.sh").read_text()
+        self.assertIn("--canonical-roots 2 --instance 4 --gui-runner\n", started)
+        self.assertNotIn("--gui-runner", (self.home / "actions-runner-glaeda-2/glaeda-hooks/job-started.sh").read_text())
+        self.assertEqual(hook.runner_scope(self.home / "actions-runner-glaeda-4"), hook.RunnerScope(5, 2, 2, False, True))
 
     def test_test_keychain_is_created_unlocked_first_and_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3047,6 +4164,118 @@ class RunnerTest(unittest.TestCase):
                 self.assertEqual(hook.ensure_test_keychain(home), "test keychain: unlock failed")
             with mock.patch.object(hook.subprocess, "run", side_effect=subprocess.TimeoutExpired("security", 15)):
                 self.assertEqual(hook.ensure_test_keychain(home), "test keychain: TimeoutExpired")
+
+    def test_test_keychain_is_unlocked_in_the_gui_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            plist = home / "Library/LaunchAgents" / f"{hook.GUI_UNLOCK_LABEL}.plist"
+            service = f"gui/501/{hook.GUI_UNLOCK_LABEL}"
+            loaded: set[str] = set()
+            calls: list[list[str]] = []
+
+            def fake(argv: list[str], **_: object) -> subprocess.CompletedProcess:
+                calls.append(argv[1:])
+                verb = argv[1]
+                if verb == "bootstrap":
+                    loaded.add(service)
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                code = 0 if argv[2] in loaded else 113
+                if verb == "bootout":
+                    loaded.discard(argv[2])
+                return subprocess.CompletedProcess(argv, code, "", "")
+
+            with mock.patch.object(hook.subprocess, "run", side_effect=fake):
+                self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI session unlock started")
+                agent = plistlib.loads(plist.read_bytes())
+                self.assertEqual(agent["LimitLoadToSessionType"], "Aqua", "the unlock must run in the desktop's session")
+                self.assertTrue(agent["RunAtLoad"], "every login unlocks it again")
+                keychain = os.fspath(home / "Library/Keychains" / hook.TEST_KEYCHAIN)
+                self.assertEqual(agent["ProgramArguments"], ["/bin/sh", "-c", hook.GUI_UNLOCK_SCRIPT, "sh", keychain])
+                self.assertEqual(calls, [["bootout", service], ["kickstart", service],
+                                         ["bootstrap", "gui/501", os.fspath(plist)]])
+                calls.clear()
+                self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI session unlock started")
+                self.assertEqual(calls, [["kickstart", service]], "loaded: a kickstart reruns the unlock")
+                calls.clear()
+                plist.write_bytes(plistlib.dumps({"Label": hook.GUI_UNLOCK_LABEL, "ProgramArguments": ["old"]}))
+                self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI session unlock started")
+                self.assertEqual(calls[0], ["bootout", service], "a changed agent is reloaded, not rerun as it was")
+                self.assertIn(service, loaded)
+            with mock.patch.object(hook.subprocess, "run",
+                                   return_value=subprocess.CompletedProcess([], 5, "", "no gui")):
+                self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: no GUI session to unlock it in")
+            with mock.patch.object(hook.subprocess, "run", side_effect=subprocess.TimeoutExpired("launchctl", 15)):
+                self.assertEqual(hook.unlock_test_keychain_in_gui(home, 501), "test keychain: GUI unlock TimeoutExpired")
+
+    def test_diagnostics_reporter_queues_are_emptied_before_it_is_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            panics, diagnostics, reports, home = (root / "PanicReporter", root / "DiagnosticsReporter",
+                                                  root / "DiagnosticReports", root / "home")
+            for folder in (panics, diagnostics, reports, home):
+                folder.mkdir()
+            summary = reports / ".contents.panic"
+            summary.write_text("summary")
+            full = reports / "panic-full-2026-09-25.panic"
+            full.write_text("full")
+            victim = home / "keep.txt"
+            victim.write_text("user file")
+            os.symlink(summary, panics / "current.panic")
+            # A planted entry naming a file outside the reports directory: only the entry goes.
+            os.symlink(f"{reports}/.contents.x/../../home/keep.txt", panics / "escape")
+            os.symlink(victim, panics / "other")
+            (diagnostics / "crash").mkdir()
+            (diagnostics / "crash" / "report").write_text("x")
+            os.symlink(home, diagnostics / "linked-dir")
+            calls: list[list[str]] = []
+
+            def fake(argv: list[str], **_: object) -> subprocess.CompletedProcess:
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with mock.patch.object(hook.subprocess, "run", side_effect=fake):
+                note = hook.dequeue_diagnostics_reporter((panics, diagnostics, root / "missing"), reports, 501)
+            self.assertEqual(note, "dequeued 5 Diagnostics Reporter entries; closed Diagnostics Reporter")
+            self.assertEqual(list(panics.iterdir()) + list(diagnostics.iterdir()), [])
+            self.assertFalse(summary.exists(), "the unanswered summary goes with its entry")
+            self.assertEqual((full.read_text(), victim.read_text()), ("full", "user file"))
+            self.assertTrue(home.is_dir(), "a symlinked entry is removed, never followed")
+            self.assertEqual(calls, [["/usr/bin/pkill", "-KILL", "-u", "501", "-f",
+                                      "/Diagnostics Reporter.app/Contents/MacOS/"]],
+                             "closed only after the queues are empty")
+            with mock.patch.object(hook.subprocess, "run",
+                                   return_value=subprocess.CompletedProcess([], 1, "", "")):
+                self.assertEqual(hook.dequeue_diagnostics_reporter((panics, diagnostics), reports, 501), "")
+                # Another runner instance removed the entry first: gone, not a failure.
+                (panics / "raced").write_text("x")
+                with mock.patch.object(hook.Path, "unlink", side_effect=FileNotFoundError):
+                    self.assertEqual(hook.dequeue_diagnostics_reporter((panics,), reports, 501), "")
+
+    def test_gui_unlock_script_cancels_every_queued_prompt(self) -> None:
+        # Shell-function fakes: each kill finds SecurityAgent while a prompt is left.
+        def run(unlock_code: int, prompts: int) -> tuple[int, list[str]]:
+            script = hook.GUI_UNLOCK_SCRIPT
+            for tool in ("/usr/bin/security", "/usr/bin/pkill", "/usr/bin/id"):
+                script = script.replace(tool, "fake_" + tool.rsplit("/", 1)[1])
+            fakes = (f'left={prompts}\nfake_security() {{ echo "security $*"; return {unlock_code}; }}\n'
+                     'fake_pkill() { echo "pkill $*"; [ "$left" -gt 0 ] || return 1; left=$((left - 1)); }\n'
+                     'fake_id() { echo 501; }\nsleep() { :; }\n')
+            done = subprocess.run(["/bin/sh", "-c", fakes + script, "sh", "/k"], capture_output=True, text=True,
+                                  timeout=10)
+            return done.returncode, done.stdout.splitlines()
+
+        kill = "pkill -KILL -x -u 501 SecurityAgent"
+        code, lines = run(0, 0)
+        self.assertEqual((code, lines), (0, ["security unlock-keychain -p  /k"] + [kill] * 15),
+                         "unlock first; with no prompt, 15 quiet checks and done")
+        code, lines = run(0, 2)
+        self.assertEqual((code, lines[1:]), (0, [kill] * 17),
+                         "each queued prompt is killed, and the 15 s wait restarts after it")
+        code, lines = run(0, 99)
+        self.assertEqual((code, lines.count(kill)), (0, 30), "bounded")
+        code, lines = run(1, 2)
+        self.assertEqual((code, lines), (1, ["security unlock-keychain -p  /k"]),
+                         "still locked: leave the prompts to the next run")
 
     def test_instances_get_their_own_paths_and_share_the_capacity(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
@@ -3118,6 +4347,137 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(saved["registration"]["runnerId"], 4243)
         self.assertIn("glaeda-class-std", saved["registration"]["labels"])
         self.assertEqual(self.by_kind(receipt)["verify"]["state"], "ok")
+
+    def human(self, *args: str) -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sys, "stdin", io.StringIO("")):
+            cr.main(["--gh", os.fspath(self.gh), "--python", sys.executable, *args])
+        return out.getvalue()
+
+    def test_a_fleet_member_gets_no_macos_runner_hint(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            plan = self.invoke("--manifest", self.manifest(), "--member", "mini-std")
+            text = self.human("--manifest", self.manifest(), "--member", "mini-std")
+        self.assertEqual((plan["routing"]["route"], plan["routing"]["rollback"]), ([], []))
+        self.assertIn("pool picker", plan["routing"]["note"])
+        self.assertNotIn("gh variable set MACOS_RUNNER", text)
+        self.assertIn("routing: fleet member", text)
+        self.assertIn("Never set MACOS_RUNNER_*", text)
+
+    def test_a_trusted_member_prints_the_nightly_variables(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
+                                                                 "trustedRepo": "manaflow-ai/cmux"}}
+        path = self.state / "trusted.json"
+        path.write_text(json.dumps(manifest))
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            plan = self.invoke("--manifest", os.fspath(path), "--member", "mini-std")
+        self.assertEqual(plan["routing"]["route"], [
+            "gh variable set CI_SEED_TRUSTED_POOL --body glaeda-trusted-std-xcode-26.6 --repo manaflow-ai/cmux",
+            "gh variable set CI_NIGHTLY_TRUSTED_RUNNER --body glaeda-runner-mini-std-glaeda --repo manaflow-ai/cmux"])
+        self.assertEqual(plan["routing"]["rollback"], ["gh variable delete CI_NIGHTLY_TRUSTED_RUNNER --repo manaflow-ai/cmux"])
+        self.assertNotIn("MACOS_RUNNER_15 --body", json.dumps(plan["routing"]))
+
+    def test_label_drift_against_the_receipt_and_github_is_reported(self) -> None:
+        self.invoke("--apply", "--labels", "ram48")
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            plan = self.invoke("--manifest", self.manifest(), "--member", "mini-std", "--name", "mini-test-glaeda")
+            text = self.human("--manifest", self.manifest(), "--member", "mini-std", "--name", "mini-test-glaeda")
+        drift = self.by_kind(plan)["register"]["drift"]
+        self.assertEqual({d["against"] for d in drift}, {"receipt", "github"})
+        receipt_drift = next(d for d in drift if d["against"] == "receipt")
+        self.assertEqual(receipt_drift["removed"], ["ram48"])
+        self.assertIn("glaeda-runner-mini-test-glaeda", receipt_drift["added"])
+        self.assertIn("registered labels differ from what this version would register: +glaeda-class-std", text)
+        # GitHub lost a label behind the receipt's back: a plain re-run (labels from the receipt) still says so
+        runners = json.loads((self.state / "runners.json").read_text())
+        runners["runners"][0]["labels"] = [label for label in runners["runners"][0]["labels"] if label["name"] != "ram48"]
+        (self.state / "runners.json").write_text(json.dumps(runners))
+        again = self.by_kind(self.invoke())["register"]
+        self.assertEqual(again["state"], "unchanged")
+        self.assertEqual(again["drift"], [{"against": "github", "added": ["ram48"], "removed": []}])
+        self.assertIn("registered labels differ", again["note"])
+        self.assertTrue(all(e["argv"][:3] != ["api", "-X", "POST"] for e in self.log()[-6:] if e["tool"] == "gh"))
+
+    def installed_release(self, labels: list[str], same_files: bool = False) -> Path:
+        """An OTA release on this fake HOME whose plan registers `labels`; returns the log of its argv."""
+        tag = "r-20260926-abcdefabcdef"
+        root = self.home / ".local/state/glaeda/update"
+        scripts = root / "generations" / tag / "glaeda/scripts"
+        scripts.mkdir(parents=True)
+        (root / "state.json").write_text(json.dumps({"current": tag, "previous": None, "quarantined": []}))
+        seen = self.state / "release-plan.jsonl"
+        if same_files:
+            for name in cr.RUNNER_FILES:
+                shutil.copy2(cr.SCRIPT_DIR / name, scripts / name)
+            return seen
+        make_executable(scripts / "glaeda-cmux-runner", f"""#!/usr/bin/env python3
+import json, os, sys
+with open({os.fspath(seen)!r}, "a") as f:
+    f.write(json.dumps({{"argv": sys.argv[1:], "guard": os.environ.get("{cr.NO_RELEASE_CHECK}")}}) + "\\n")
+print(json.dumps({{"actions": [{{"kind": "register", "labels": {labels!r}}}]}}))
+""")
+        return seen
+
+    def test_a_copy_older_than_the_installed_release_blocks_and_shows_its_labels(self) -> None:
+        seen = self.installed_release(["self-hosted", "macOS", "ARM64", "glaeda-mini", "glaeda-runner-new"])
+        old = {"date": "2026-09-24", "source": "a" * 40, "tag": None, "via": "stamp by fleet"}
+        with mock.patch.object(cr, "script_source", return_value=old):
+            plan = self.invoke("--token-stdin", expect=0)
+            self.assertFalse(plan["ready"])
+            self.assertIn("scriptCopy", plan["preflight"]["blocking"])
+            self.assertEqual(plan["scriptCopy"]["state"], "stale")
+            self.assertEqual(plan["scriptCopy"]["labelDrift"],
+                             {"against": "release", "added": ["glaeda-runner-new"], "removed": []})
+            self.assertIn(".local/state/glaeda/update/generations/r-20260926-abcdefabcdef/glaeda/scripts/glaeda-cmux-runner",
+                          plan["preflight"]["checks"]["scriptCopy"]["note"])
+            text = self.human("--token-stdin")
+            self.assertIn("the installed release would register +glaeda-runner-new against this copy", text)
+            # the release's plan ran read-only, with the same arguments, and without re-checking itself
+            calls = [json.loads(line) for line in seen.read_text().splitlines()]
+            self.assertTrue(all("--apply" not in c["argv"] and c["guard"] == "1" for c in calls), calls)
+            self.assertIn("--token-stdin", calls[0]["argv"])
+            blocked = self.invoke("--apply", "--token-stdin", stdin=REG_TOKEN + "\n", expect=1)
+            self.assertFalse([e for e in self.log() if e["tool"] == "config.sh"], "a stale copy registered")
+            self.assertEqual(self.by_kind(blocked)["register"]["state"], "blocked")
+            self.assertFalse(any(c["argv"].count("--apply") for c in
+                                 (json.loads(line) for line in seen.read_text().splitlines())))
+            forced = self.invoke("--apply", "--allow-stale")
+            self.assertEqual(forced["preflight"]["checks"]["scriptCopy"]["level"], "warn")
+            self.assertEqual(self.by_kind(forced)["verify"]["state"], "ok")
+
+    def test_a_newer_or_identical_copy_is_not_stale(self) -> None:
+        self.installed_release(["self-hosted"])
+        newer = {"date": "2026-09-27", "source": "b" * 40, "tag": None, "via": "git"}
+        with mock.patch.object(cr, "script_source", return_value=newer):
+            plan = self.invoke()
+        self.assertEqual(plan["scriptCopy"]["state"], "differs")
+        self.assertEqual(plan["preflight"]["checks"]["scriptCopy"]["level"], "info")
+        self.assertTrue(plan["ready"])
+        # a copy of an older release is stale even from the same day
+        other = {"date": "2026-09-26", "source": "c" * 40, "tag": "r-20260926-000000000000", "via": "release"}
+        with mock.patch.object(cr, "script_source", return_value=other):
+            self.assertEqual(self.invoke()["scriptCopy"]["state"], "stale")
+        with mock.patch.object(cr, "script_source", return_value=None):  # unknown origin counts as older
+            self.assertEqual(self.invoke()["scriptCopy"]["state"], "stale")
+
+    def test_the_release_copy_itself_is_never_checked(self) -> None:
+        shutil.rmtree(self.home / ".local", ignore_errors=True)
+        self.installed_release([], same_files=True)
+        self.assertNotIn("scriptCopy", self.invoke())
+
+    def test_script_source_reads_a_stamp_a_release_or_git(self) -> None:
+        base = Path(self.tmp.name)
+        staged = base / "glaeda-runner/scripts"
+        staged.mkdir(parents=True)
+        (staged / cr.SOURCE_STAMP).write_text(json.dumps({"by": "fleet runner relabel", "date": "2026-09-26T10:00:00Z",
+                                                          "source": "d" * 40}))
+        self.assertEqual(cr.script_source(staged)["date"], "2026-09-26")
+        gen = base / "generations/r-20260925-0123456789ab"
+        (gen / "glaeda/scripts").mkdir(parents=True)
+        (gen / "release.json").write_text(json.dumps({"tag": "r-20260925-0123456789ab", "source": "e" * 40}))
+        self.assertEqual(cr.script_source(gen / "glaeda/scripts")["tag"], "r-20260925-0123456789ab")
+        self.assertIsNone(cr.script_source(base / "nowhere"))
 
     def test_relabel_starts_a_stopped_agent_exactly_once(self) -> None:
         fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
@@ -3330,6 +4690,15 @@ class ManifestLabelsTest(unittest.TestCase):
             manifest["defaults"]["runner"]["classes"]["std"]["canonicalRoots"] = 2
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["compileSlots"], 2)
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["canonicalRoots"], 2)
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["guiPools"], [], "no gui runner by default")
+            manifest["defaults"]["runner"]["classes"]["std"]["guiRunners"] = 1
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["guiPools"], ["glaeda-gui-std-xcode-26.6"])
+            manifest["defaults"]["runner"]["classes"]["std"]["canonicalRoots"] = 3  # 3 runners, all roots
+            self.assertIn("guiRunners must be 0 or 1", cr.member_labels(manifest, "mini-std")[1])
+            for bad in (2, -1, True, "1"):
+                manifest["defaults"]["runner"]["classes"]["std"].update(canonicalRoots=2, guiRunners=bad)
+                self.assertIn("guiRunners must be 0 or 1", cr.member_labels(manifest, "mini-std")[1], bad)
+            del manifest["defaults"]["runner"]["classes"]["std"]["guiRunners"]
             manifest["defaults"]["runner"]["classes"]["std"]["canonicalRoots"] = 4  # 3 runners
             self.assertIn("canonicalRoots must be 1 to 3", cr.member_labels(manifest, "mini-std")[1])
             del manifest["defaults"]["runner"]["classes"]["std"]["canonicalRoots"]
@@ -3474,6 +4843,52 @@ class FleetLabelsModuleTest(unittest.TestCase):
             member, why = cr.member_labels(MANIFEST, "mini-std")
         self.assertIsNone(member)
         self.assertIn("glaeda_fleet_labels.py must sit next to this script", why)
+
+
+class ConsoleTest(unittest.TestCase):
+    ON = '"kCGSSessionOnConsoleKey"=Yes,"kCGSessionLoginDoneKey"=Yes,"kCGSSessionUserNameKey"="cmux"'
+
+    def parse(self, *rows: str) -> object:
+        return hook.parse_console_users("\n".join(["+-o Root  <class IORegistryEntry>", "    {", *rows, "    }"]))
+
+    def test_parses_the_console_session(self) -> None:
+        on = self.ON
+        cases = {
+            "unlocked": ((f'      "IOConsoleUsers" = ({{{on},"kCGSSessionIDKey"=257}})',), ("unlocked", "cmux")),
+            "screen-locked": ((f'      "IOConsoleUsers" = ({{{on},"CGSSessionScreenIsLocked"=Yes}})',),
+                              ("locked", "cmux")),
+            "console locked": (('      "IOConsoleLocked" = Yes', f'      "IOConsoleUsers" = ({{{on}}})'),
+                               ("locked", "cmux")),
+            "login window": (('      "IOConsoleLocked" = Yes',), ("no_user", None)),
+            "no sessions": (('      "IOConsoleUsers" = ()',), ("no_user", None)),
+            "a switched-out session only": (
+                ('      "IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=No,"kCGSSessionUserNameKey"="cmux"})',),
+                ("no_user", None)),
+            "login in progress": ((f'      "IOConsoleUsers" = ({{{on.replace("LoginDoneKey\"=Yes", "LoginDoneKey\"=No")}}})',),
+                                  ("no_user", None)),
+            "the on-console one of two": (
+                ('      "IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=No,"kCGSSessionUserNameKey"="leo"},'
+                 f'{{{on},"CGSSessionScreenIsLocked"=Yes}})',), ("locked", "cmux")),
+        }
+        for name, (rows, want) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(tuple(self.parse(*rows)), want)
+        self.assertIsNone(hook.parse_console_users(""), "not the Root entry: unknown")
+        self.assertIsNone(hook.parse_console_users("ioreg: error"))
+
+    def test_refusal_follows_the_state_and_an_unreadable_one_changes_nothing(self) -> None:
+        cases = ((hook.ConsoleState("unlocked", "cmux"), None), (None, None),
+                 (hook.ConsoleState("locked", "cmux"), "console: the console session (cmux) is screen-locked"),
+                 (hook.ConsoleState("no_user"), "console: no user is logged in at the console"))
+        for state, want in cases:
+            with self.subTest(state), mock.patch.object(hook, "console_state", return_value=state):
+                why = hook.console_refusal()
+                self.assertEqual(why if why is None else why[:len(want)], want)
+        with mock.patch.object(hook, "CONSOLE_GATE", False), \
+                mock.patch.object(hook, "console_state", return_value=hook.ConsoleState("locked", "cmux")):
+            self.assertIsNone(hook.console_refusal())
+        with mock.patch.object(hook, "IOREG", "/nonexistent/ioreg"):
+            self.assertIsNone(hook.console_state())
 
 
 class NoEmDashTest(unittest.TestCase):

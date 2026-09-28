@@ -223,6 +223,19 @@ class MiniSetupTest(unittest.TestCase):
             # dedupe is never urgent; pressure must still free space while a build fills the disk
             self.assertEqual(doc.get("ProcessType"),
                              "Background" if label in ("disk-dedupe", "fleet-cas-prune", "seed-prefetch") else None)
+        warm = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.idle-warm.plist").read_bytes())
+        self.assertEqual(warm["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-idle-warm"), "--apply"])
+        self.assertIsNone(warm.get("ProcessType"), "its build runs only while the mini is idle and should be fast")
+        self.assertEqual((bin_dir / "glaeda-idle-warm").read_bytes(), (ROOT / "scripts/glaeda-idle-warm").read_bytes())
+        health = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.mini-health.plist").read_bytes())
+        self.assertEqual(health["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-mini-health"), "--apply"])
+        self.assertEqual(health["StartInterval"], 120)
+        self.assertEqual((bin_dir / "glaeda-mini-health").read_bytes(), (ROOT / "scripts/glaeda-mini-health").read_bytes())
+        guard = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.local-guard.plist").read_bytes())
+        self.assertEqual(guard["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-local-guard"), "--apply"])
+        self.assertEqual(guard["StartInterval"], 30)
+        self.assertIsNone(guard.get("ProcessType"), "it must get CPU while the runs it stops hold the machine")
+        self.assertTrue(os.access(bin_dir / "glaeda-local-guard", os.X_OK))
         gh = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.gh-watch.plist").read_bytes())
         self.assertEqual(gh["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-gh"), "serve"])
         self.assertTrue(gh["KeepAlive"])
@@ -697,6 +710,13 @@ class MiniSetupTest(unittest.TestCase):
         self.invoke("--hygiene-only", "--apply", "--ota-ring", "canary")
         config = json.loads(path.read_text())
         self.assertEqual((config["ring"], config["host"], config["reportStatus"]), ("canary", "renamed", True))
+        self.assertNotIn("source", config)
+        # --ota-source moves the host to the fleet mirror and keeps the rest; naming it again changes nothing
+        self.invoke("--hygiene-only", "--apply", "--ota-source", "manaflow-ai/glaeda")
+        config = json.loads(path.read_text())
+        self.assertEqual((config["source"], config["ring"], config["host"]), ("manaflow-ai/glaeda", "canary", "renamed"))
+        self.assertEqual(self.states(self.invoke("--hygiene-only", "--apply", "--ota-source", "manaflow-ai/glaeda")),
+                         {"unchanged"})
         # uninstall removes the updater it installed
         self.invoke("--uninstall", "--apply")
         self.assertFalse((self.home / ".local/bin/glaeda-update").exists())

@@ -25,6 +25,9 @@ GitHub Actions runner and is documented in docs/CMUX_MINI_RUNNER.md.
 
 What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-disk                   from scripts/glaeda-disk
+    ~/.local/bin/glaeda-procs                  from scripts/glaeda-procs (why the Mac lags; --apply ends leaked fixtures)
+    ~/.local/bin/glaeda-local-guard            from scripts/glaeda-local-guard (stops test and build runs orphaned by an
+                                               agent session on a hygiene-only Mac; a no-op on build hosts)
     ~/.local/bin/glaeda-worktree-reclaim       built from src/bin/glaeda-worktree-reclaim.rs
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
     ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
@@ -32,11 +35,17 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-lan-fetch              from scripts/glaeda-lan-fetch (compiled products from LAN peers; a
                                                miss without a mesh config). CI calls a root-owned copy at
                                                LAN_FETCH_ROOT_COPY, which needs sudo: an operator step
+    ~/.local/bin/glaeda-idle-warm              from scripts/glaeda-idle-warm (builds main into a far kept root while an
+                                               owned cmux mini is idle; a no-op anywhere else)
+    ~/.local/bin/glaeda-mini-health            from scripts/glaeda-mini-health (finds what stops a runner mini, heals what
+                                               the runner user can, reports the rest for ci-dash; a no-op off a runner)
     ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
     ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
     ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
-    ~/.config/glaeda/update.json               its release ring, written once (--ota-ring canary|stable)
-    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,lan-fetch,update,gh-watch}.plist
+    ~/.config/glaeda/update.json               its release ring and source, written once (--ota-ring canary|stable,
+                                               --ota-source teamleaderleo/glaeda|manaflow-ai/glaeda)
+    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,lan-fetch,
+                                  idle-warm,mini-health,local-guard,update,gh-watch}.plist
     build-host directories and three git defaults, each set only when unset
     python@3.13 from Homebrew, only when no Python 3.13+ exists and this user owns Homebrew
 
@@ -123,6 +132,8 @@ SKILL_SOURCE = REPO / "skills/github-ci-wait/SKILL.md"
 # glaeda-update runs this command from a release; it sets this so setup never unloads the job running it
 UPDATE_ENV = "GLAEDA_UPDATE_RUNNING"
 OTA_RINGS = ("canary", "stable")
+# where glaeda-update downloads releases: the repository, or the Manaflow fleet's read-only mirror of it
+OTA_SOURCES = ("teamleaderleo/glaeda", "manaflow-ai/glaeda")
 # with --hygiene-only, only these preflight failures block: the agents run python3, and on
 # Linux the timers need a systemd user manager
 HYGIENE_BLOCKING = frozenset({"python", "systemdUser"})
@@ -177,7 +188,8 @@ class Context:
     def __init__(self, home: Path, apply: bool, python: str | None, skip_launchctl: bool,
                  reclaim_binary: Path | None, cmux_root: Path | None, glaeda_bin: Path | None,
                  xcode_app: str, min_free_gib: int, hygiene_only: bool = False,
-                 platform_name: str | None = None, ota_ring: str | None = None) -> None:
+                 platform_name: str | None = None, ota_ring: str | None = None,
+                 ota_source: str | None = None) -> None:
         self.home = home
         self.platform = platform_name or HOST_PLATFORM
         self.hygiene_only = hygiene_only
@@ -204,6 +216,7 @@ class Context:
         self.state = home / ".local/state/glaeda/mini-setup"
         self.receipt_path = self.state / "receipt.json"
         self.ota_ring = ota_ring
+        self.ota_source = ota_source
         self.update_config = home / ".config/glaeda/update.json"
 
     def show(self, path: Path | str) -> str:
@@ -665,6 +678,44 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-seed-prefetch.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-seed-prefetch.err"),
         },
+        # Idle catch-up (scripts/glaeda-idle-warm): on an idle owned cmux mini whose kept build is far from main,
+        # builds main's head into that root and yields to any job; it exits at once anywhere else. Not
+        # ProcessType Background: its build runs only while nothing else does, and should finish fast.
+        LABEL_PREFIX + "idle-warm": {
+            "Label": LABEL_PREFIX + "idle-warm",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-idle-warm"), "--apply"],
+            # Every minute, so a main push reaches an idle root within minutes: a busy mini stops at `ps`,
+            # an idle one asks GitHub for main's head (ls-remote, no API quota).
+            "StartInterval": 60,
+            "Nice": 5,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-idle-warm.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-idle-warm.err"),
+        },
+        # Runner mini health (scripts/glaeda-mini-health): a locked console, display sleep, a wedged testmanagerd,
+        # Tailscale down, a stopped runner agent. Heals what this user can without disturbing a job and writes the
+        # report ci-dash's probe reads; it exits at once on a host without glaeda runners.
+        LABEL_PREFIX + "mini-health": {
+            "Label": LABEL_PREFIX + "mini-health",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-mini-health"), "--apply"],
+            "StartInterval": 120,
+            "RunAtLoad": True,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-mini-health.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-mini-health.err"),
+        },
+        # Tests and builds that outlived their agent session on a personal Mac (scripts/glaeda-local-guard): every
+        # 30 seconds it ends the orphaned ones. It exits at once on a build host. Not ProcessType Background:
+        # it has to get CPU while the orphans it stops hold the machine.
+        LABEL_PREFIX + "local-guard": {
+            "Label": LABEL_PREFIX + "local-guard",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-local-guard"), "--apply"],
+            "StartInterval": 30,
+            "RunAtLoad": True,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-local-guard.log"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-local-guard.err"),
+        },
         # The compiled-product LAN broker (scripts/glaeda-lan-fetch serve-local): CI steps descend from
         # non-Apple processes (Runner.Listener), so Local Network Privacy keeps them off the LAN; they ask this
         # agent over a private Unix socket instead. Apple's python3 is what lets its ssh reach the peers.
@@ -729,16 +780,17 @@ def is_update_agent(label: str) -> bool:
 
 def update_config(ctx: Context) -> dict[str, Any]:
     """What glaeda-update reads: this host's ring and the setup flags it re-runs releases with."""
-    return {
+    config = {
         "ring": ctx.ota_ring or "stable",
         "setupArgs": ["--hygiene-only"] if ctx.hygiene_only else [],
         "host": platform.node().split(".")[0].lower(),
         "reportStatus": (ctx.ota_ring or "stable") == "canary",
     }
+    return {**config, "source": ctx.ota_source} if ctx.ota_source else config
 
 
 def update_config_action(ctx: Context) -> dict[str, Any]:
-    """Written once. A later run changes it only when --ota-ring names a different ring."""
+    """Written once. A later run changes it only when --ota-ring or --ota-source names a different value."""
     path = ctx.update_config
     act: dict[str, Any] = {"kind": "config", "path": os.fspath(path), "mode": "0o644"}
     try:
@@ -749,9 +801,14 @@ def update_config_action(ctx: Context) -> dict[str, Any]:
         return {**act, "state": "blocked", "note": "unreadable; fix or remove it"}
     if current is None:
         return {**act, "state": "create", "value": update_config(ctx)}
+    value = dict(current)
     if ctx.ota_ring and current.get("ring") != ctx.ota_ring:
-        value = {**current, "ring": ctx.ota_ring, "reportStatus": ctx.ota_ring == "canary"}
-        return {**act, "state": "update", "value": value, "previous": current.get("ring")}
+        value.update(ring=ctx.ota_ring, reportStatus=ctx.ota_ring == "canary")
+    if ctx.ota_source and current.get("source", OTA_SOURCES[0]) != ctx.ota_source:
+        value["source"] = ctx.ota_source
+    if value != current:
+        previous = {k: current.get(k) for k in ("ring", "source") if current.get(k) != value.get(k)}
+        return {**act, "state": "update", "value": value, "previous": previous}
     return {**act, "state": "unchanged", "value": current}
 
 
@@ -844,8 +901,9 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     for path, mode in directories(ctx):
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
-    for name in ("glaeda-disk", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
-                 "glaeda-lan-fetch", "glaeda-update", "glaeda-gh"):
+    for name in ("glaeda-disk", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
+                 "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
+                 "glaeda-update", "glaeda-gh"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
@@ -975,8 +1033,9 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         path = agent_path(ctx, label)
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
-    for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
-                 "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-update", "glaeda-gh"):
+    for name in ("glaeda-disk", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
+                 "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
+                 "glaeda-update", "glaeda-gh"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
     for act in actions:
@@ -1401,6 +1460,9 @@ def parser() -> argparse.ArgumentParser:
                    help="write plists or units but do not load, enable or unload them")
     p.add_argument("--ota-ring", choices=OTA_RINGS,
                    help="release ring glaeda-update follows (default stable; set once in ~/.config/glaeda/update.json)")
+    p.add_argument("--ota-source", choices=OTA_SOURCES,
+                   help="repository glaeda-update downloads releases from (default teamleaderleo/glaeda; the Manaflow "
+                        "minis use the mirror manaflow-ai/glaeda)")
     p.add_argument("--hygiene-only", action="store_true",
                    help="only the disk and worktree hygiene tools and agents, for any Mac or Linux host")
     return p
@@ -1433,7 +1495,8 @@ def main(argv: list[str] | None = None) -> int:
                   args.skip_launchctl, args.reclaim_binary,
                   args.cmux_root.expanduser().resolve() if args.cmux_root else None,
                   args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, min_free_gib,
-                  args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring)
+                  args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring,
+                  ota_source=args.ota_source)
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
         checks = {n: ({**c, "level": "warn"} if c["level"] == "block" and n not in HYGIENE_BLOCKING else c)
