@@ -51,8 +51,16 @@ jobs:
           fi
           rust=false
           go=false
+          # Scripts that Rust tests run: the modules they load are Rust input too (fleet_bundle.py through
+          # scripts/test-fleet-bundle.py, for one).
+          rust_named=$(grep -rhoE 'scripts/[A-Za-z0-9_./-]+' src tests | sort -u | while read -r f; do
+            if test -f "$f"; then echo "$f"; fi
+          done)
+          # --no-renames lists a rename's old path too; writing to a file first fails the job, not open, on error.
+          git diff --no-renames --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed"
           while IFS= read -r path; do
             case "$path" in
+              docs/MODULE_INVENTORY.md) rust=true ;;
               docs/*|*.md) ;;
               .github/workflows/ci.yml) rust=true; go=true ;;
               tools/scaleset-bridge/*) go=true ;;
@@ -60,14 +68,15 @@ jobs:
               .github/*|.claude/*|skills/*) ;;
               scripts/*)
                 # The script's name as a whole word: glaeda-gh is not named by glaeda-gha-{token}.
-                if grep -rqwF -- "${path#scripts/}" src tests; then
-                  echo "Rust sources name $path"
+                # shellcheck disable=SC2086
+                if grep -rqwF -- "${path#scripts/}" src tests $rust_named; then
+                  echo "Rust sources or the scripts they run name $path"
                   rust=true
                 fi
                 ;;
               *) rust=true ;;
             esac
-          done < <(git diff --name-only HEAD^1 HEAD)
+          done < "$RUNNER_TEMP/changed"
           printf 'rust=%s\ngo=%s\n' "$rust" "$go" | tee -a "$GITHUB_OUTPUT"
 
   go:
