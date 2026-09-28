@@ -163,6 +163,24 @@ class ProductServeTest(unittest.TestCase):
             os.close(fd)
         self.assertEqual(self.ask(f"product-has-v1 {sha}")[0], 0)
 
+    def test_an_inventory_poll_does_not_hold_the_same_clients_product_lane(self):
+        # The broker polls every peer's inventory every INDEX_INTERVAL seconds from the same host that
+        # fetches products through it. Sharing the per-client guard made a concurrent product lookup
+        # answer busy, and a busy peer is indistinguishable from a miss to the fetcher, so the fetch
+        # reported "no peer has it" about a peer that had it.
+        sha, _ = put_product(self.products, b"x" * 100)
+        run = Path(self.tmp.name) / "run"
+        run.mkdir()
+        import fcntl
+        for holder, asked in (("client-172.20.21.196-inventory.lock", f"product-has-v1 {sha}"),
+                              ("client-172.20.21.196.lock", "inventory-v1")):
+            fd = os.open(run / holder, os.O_RDONLY | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                self.assertEqual(self.ask(asked)[0], 0, f"{holder} must not block {asked}")
+            finally:
+                os.close(fd)
+
     def test_hard_links_other_owners_big_metadata_and_symlinked_paths_are_refused(self):
         data = b"x" * 1000
         sha, entry = put_product(self.products, data)

@@ -304,9 +304,15 @@ def try_lock(path: Path) -> int | None:
         return None
 
 
-def admit(run_dir: Path, client: str) -> list[int] | None:
-    """The fds of this client's lock and a queue place, or None (answer busy at once)."""
-    mine = try_lock(run_dir / f"client-{client.replace(':', '_')}.lock")
+def admit(run_dir: Path, client: str, lane: str = "") -> list[int] | None:
+    """The fds of this client's lock and a queue place, or None (answer busy at once).
+
+    LANE gives a client's bookkeeping traffic its own per-client guard. The guard exists to stop one
+    client flooding this peer with transfers; a fetching client's own index poll is not that flood, and
+    sharing the lane with it makes the fetch read as a miss on a peer that has the object. The queue
+    places are still shared, so total concurrency stays bounded.
+    """
+    mine = try_lock(run_dir / f"client-{client.replace(':', '_')}{lane}.lock")
     if mine is None:
         return None
     for place in range(QUEUE):
@@ -815,7 +821,9 @@ def inventory(state: Path, products: Path, run_dir: Path) -> dict:
 
 
 def serve_inventory(state: Path, products: Path, run_dir: Path, client: str, record: dict) -> int:
-    admitted = admit(run_dir, client)
+    # The broker polls this every INDEX_INTERVAL seconds from the same host that fetches products, so it
+    # takes its own lane: an inventory poll must never make a concurrent product lookup answer busy.
+    admitted = admit(run_dir, client, "-inventory")
     if admitted is None:
         say("busy")
         log(run_dir, {**record, "outcome": "busy", "verb": "inventory"})
