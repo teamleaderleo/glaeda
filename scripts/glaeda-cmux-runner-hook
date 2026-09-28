@@ -2573,6 +2573,8 @@ LISTENER_TAKES = re.compile(r"Acknowledging runner request '([^']+)'|"
                             r"JobDispatcher\] Job request \S+ for plan \S+ job (\S+) received\.")
 LISTENER_DONE = ("Skipping message Job.", "Caught exception from acquiring job message",
                  "JobDispatcher] Worker finished for job", "JobDispatcher] finish job request for job",
+                 # every other dispatcher exit (cancelled before or while the Worker starts, a lost first renew)
+                 "JobDispatcher] Stop renew job request for job", "JobDispatcher] Unable to renew job request for job",
                  "Runner execution has finished")
 
 

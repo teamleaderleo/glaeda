@@ -3462,6 +3462,16 @@ class GateTest(unittest.TestCase):
         self.assertIsNotNone(gate.stop_deadline)
         self.assertIsNotNone(gate.child.wait(timeout=10))
 
+    def test_the_frozen_last_look_keeps_a_listener_that_acknowledged_after_the_poll(self) -> None:
+        gate = self.started_gate()
+        log = self.diag(MID_ACQUIRE_DIAG)  # the acknowledge lands after step()'s busy look, before the signal
+        self.assertFalse(gate.stop("all 2 canonical roots on this mini are taken"))
+        self.assert_listening()
+        self.assertIsNone(gate.stop_deadline)
+        log.write_text(log.read_text() + ACQUIRE_FAILED)
+        self.assertTrue(gate.stop("all 2 canonical roots on this mini are taken"))
+        self.assertIsNotNone(gate.child.wait(timeout=10))
+
     def test_the_agent_stopping_waits_out_an_acquisition_but_not_a_running_job(self) -> None:
         log = self.diag(MID_ACQUIRE_DIAG)
         gate = self.started_gate()
@@ -3473,7 +3483,7 @@ class GateTest(unittest.TestCase):
         # dispatched with a Worker running: launchd is stopping the agent, so the job is cancelled as before
         log.write_text(log.read_text() + "[2026-09-28 13:53:04Z INFO JobDispatcher] Job request 0 for plan p job "
                        "eeb83692-303d-516a-b3bf-e6e6f93c1d90 received.\n")
-        with mock.patch.object(hook.Gate, "worker", return_value=True, create=True):
+        with mock.patch.object(hook.Gate, "worker", return_value=True):
             gate.step()
         self.assertIsNotNone(gate.stop_deadline)
         self.assertIsNotNone(gate.child.wait(timeout=10))
@@ -3488,6 +3498,11 @@ class GateTest(unittest.TestCase):
                     "[x INFO Runner] Skipping message Job. 409 already acquired\n",
                     "[x INFO JobDispatcher] Job request 0 for plan p job eeb83692 received.\n"
                     "[x INFO JobDispatcher] Worker finished for job eeb83692. Code: 100\n",
+                    "[x INFO JobDispatcher] Job request 0 for plan p job eeb83692 received.\n"
+                    "[x INFO JobDispatcher] Stop renew job request for job eeb83692.\n",  # cancelled before its Worker
+                    "[x INFO JobDispatcher] Job request 0 for plan p job eeb83692 received.\n"
+                    "[x INFO JobDispatcher] Unable to renew job request for job eeb83692 for the first time, stop "
+                    "dispatching job to worker.\n",
                     "[x INFO Listener] Runner execution has finished with return code 0\n"):
             self.diag(MID_ACQUIRE_DIAG + end)
             self.assertIsNone(hook.listener_request(self.runner), end)
