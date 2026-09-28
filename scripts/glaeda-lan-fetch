@@ -127,8 +127,9 @@ def header_of(stream) -> bytes:
 
 
 def lookup(config: dict, peer: dict, sha: str, max_bytes: int, timeout: float,
-           stop: threading.Event | None = None) -> int | None:
-    """The size PEER announces for SHA, if it is at most MAX_BYTES; None for a miss, an error, a timeout or STOP."""
+           stops: tuple[threading.Event, ...] = ()) -> int | None:
+    """The size PEER announces for SHA, if it is at most MAX_BYTES; None for a miss, an error, a timeout or
+    once any of STOPS is set."""
     if timeout <= 0:
         return None
     try:
@@ -136,18 +137,20 @@ def lookup(config: dict, peer: dict, sha: str, max_bytes: int, timeout: float,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError:
         return None
+    give_up = time.monotonic() + min(LOOKUP_TIMEOUT, timeout)
     try:
-        give_up = time.monotonic() + min(LOOKUP_TIMEOUT, timeout)
-        while proc.poll() is None:
-            if (stop is not None and stop.is_set()) or time.monotonic() >= give_up:
+        while True:
+            if any(stop.is_set() for stop in stops) or time.monotonic() >= give_up:
                 return None
-            time.sleep(0.05)
-        out = proc.stdout.read(HEADER_SCAN_BYTES * 16)
+            try:
+                out = proc.communicate(timeout=0.05)[0]  # reads as it waits, so a chatty peer cannot block
+                break
+            except subprocess.TimeoutExpired:
+                continue
     finally:
         if proc.poll() is None:
             proc.kill()
-            proc.wait()
-        proc.stdout.close()
+            proc.communicate()
     for line in out.splitlines()[:64]:
         if line.startswith(HEADER):
             words = line[len(HEADER):].decode(errors="replace").split()
@@ -235,7 +238,7 @@ def fetch(sha: str, dest: Path, config: dict | None, max_bytes: int = MAX_OBJECT
     stop = threading.Event()
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(config["peers"]))
     try:
-        futures = {pool.submit(lookup, config, peer, sha, max_bytes, deadline - time.monotonic(), stop): peer
+        futures = {pool.submit(lookup, config, peer, sha, max_bytes, deadline - time.monotonic(), (stop, cancel)): peer
                    for peer in config["peers"]}
         pending, offers, errors, tried = set(futures), [], [], 0
         while tried < MAX_OFFERS and (offers or pending):
