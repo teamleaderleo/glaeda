@@ -38,7 +38,7 @@ skips the trusted-receipt check and never answers seed verbs; the seed role neve
 
 With --role archive (cmux-lawrence, the fleet's seed archive: glaeda-seed-archive fills it from the
 trusted seeder) it answers the seed verbs from ARCHIVE/<KEY>.tar.zst, each a seed's zstd stream exactly as
-the seeder sent it, kept as one file so the archive can sit on an ExFAT disk. A hit streams the file as is
+the seeder sent it, kept as one file. A hit streams the file as is
 (`hit KEY zstd`), or through `zstd -d` for a client that asked for tar; a hit touches the file's mtime,
 which the archive's prune reads as last use. The archive host runs no jobs: with a glaeda runner receipt
 present the archive role refuses everything, since PR code there could rewrite the archive.
@@ -107,9 +107,8 @@ MAX_METADATA_BYTES = 64 * 1024
 MAX_PRODUCT_ENTRIES = 4096
 SHA_RE = re.compile(r"[a-f0-9]{64}")
 ROLES = ("seed", "product", "archive")
-# The seed archive on cmux-lawrence (cmuxterm-hq#821). A constant, not a forced-command argument: the path
-# has a space, and the forced command is split by the login shell.
-ARCHIVE = "/Volumes/X10 Pro/glaeda-seed-archive"
+# The seed archive on cmux-lawrence (cmuxterm-hq#821): an APFS disk image glaeda-seed-archive attaches.
+ARCHIVE = "/Volumes/glaeda-seed-archive/seeds"
 ARCHIVE_SUFFIX = ".tar.zst"
 MAX_LIST = 512
 IP_RE = re.compile(r"[0-9A-Fa-f.:]{1,64}")

@@ -81,9 +81,8 @@ class ArchiveTest(unittest.TestCase):
         os.utime(seed, (mtime, mtime))
 
     def run_archive(self, apply: bool = True, **kwargs) -> dict:
-        os.environ["GLAEDA_SEED_ARCHIVE"] = os.fspath(self.archive)  # not a mount point in a test
         kwargs.setdefault("min_free", 0)  # the test machine's own free space is not the archive disk's
-        return archive.run(apply, self.archive, **kwargs)
+        return archive.run(apply, self.archive, mounted=True, **kwargs)
 
     def test_plan_changes_nothing(self):
         self.keep(KEYS[0], 100)

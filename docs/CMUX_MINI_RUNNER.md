@@ -781,9 +781,10 @@ cmux-lawrence runs no jobs and has TBs of SSD. It keeps every seed cmux15 keeps,
 - **Fill.** The `glaeda-seed-archive` LaunchAgent runs every 5 minutes with `/usr/bin/python3`, so Local
   Network Privacy lets its `/usr/bin/ssh` through. Lawrence is a seed-lan client of cmux15. Each run asks for
   `seed-list-v1` and streams every seed the archive lacks, newest first.
-- **Storage.** Each seed is kept as `/Volumes/X10 Pro/glaeda-seed-archive/<KEY>.tar.zst`: the zstd stream
-  exactly as cmux15 sent it, about 2.4 GB against 9 GB unpacked. It is one plain file, so the ExFAT disk is
-  fine and serving it is a read. The filler checks every file before renaming it into place: all entries
+- **Storage.** Each seed is kept as `/Volumes/glaeda-seed-archive/seeds/<KEY>.tar.zst`: the zstd stream
+  exactly as cmux15 sent it, about 2.1-2.4 GB against 9 GB unpacked, so serving it is a read. The volume is
+  an APFS sparse bundle on the ExFAT X10 Pro (`glaeda-seed-archive.sparsebundle`, attached by each run).
+  macOS privacy lets a launchd job write into an attached image but not onto the external disk itself. The filler checks every file before renaming it into place: all entries
   under `KEY/`, and the seed manifest present.
 - **Prune.** Oldest use first, while the archive holds more than 800 GiB or the disk has less than 300 GiB
   free. Serving a seed touches it.
@@ -796,7 +797,8 @@ scripts/glaeda-seed-lan install --seeder cmux15 --address 172.20.21.202 cmux-law
 # the PR minis read from the archive (replaces their seeder config)
 scripts/glaeda-seed-lan install --seeder cmux-lawrence --role archive --user cmux-lawrence \
   --address 172.20.21.158 HOST... --apply
-# on cmux-lawrence: copy glaeda-seed-archive and glaeda-seed-prefetch to ~/.local/libexec, then
+# on cmux-lawrence, over SSH: copy glaeda-seed-archive and glaeda-seed-prefetch to ~/.local/libexec, then
+# (creates and attaches the image, loads the LaunchAgent)
 ~/.local/libexec/glaeda-seed-archive install --apply
 ```
 

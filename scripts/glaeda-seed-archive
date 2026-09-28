@@ -7,12 +7,16 @@
 
 cmuxterm-hq#821. The owned minis' j14 DerivedData seeds are built by one trusted-only seeder (cmux15), which
 keeps only its recent ones on a 460 GB disk. The archive keeps them all, up to BUDGET, on cmux-lawrence's
-X10 Pro, and the PR minis read seeds from it (glaeda-seed-lan install --seeder cmux-lawrence --role archive,
+X10 Pro SSD, and the PR minis read seeds from it (glaeda-seed-lan install --seeder cmux-lawrence --role archive,
 then glaeda-seed-serve --role archive answers glaeda-seed-prefetch). A seed lands here within a few minutes of
 the seeder keeping it, over the LAN, instead of every mini downloading it from R2.
 
 Each seed is kept as ARCHIVE/<KEY>.tar.zst: exactly the zstd stream the seeder's glaeda-seed-serve sends (a
-tar of one top-level directory named KEY), so serving it is a plain read and the disk may be ExFAT. The
+tar of one top-level directory named KEY), so serving it is a plain read. ARCHIVE is inside IMAGE, an APFS
+sparse bundle on the (ExFAT) X10 Pro, mounted at MOUNT: macOS privacy (TCC) lets a launchd job running
+/usr/bin/python3 write into an attached disk image but not onto the external volume itself (measured on
+cmux-lawrence 2026-09-28, "Operation not permitted"; Lawrence's siso cache uses a sparse bundle on T5 EVO the
+same way). Each run attaches the image if it is not mounted; `install --apply`, run over SSH, creates it. The
 archive is a client of the seeder like any mini (glaeda-seed-lan install --seeder cmux15 ... cmux-lawrence
 writes SEED_LAN_CONFIG); it asks `seed-list-v1` for the seeder's kept seeds and `seed-v1 zstd KEY` for each
 one it lacks. A stream is written to a dot-file beside the archive, checked (every entry under KEY/, the seed
@@ -23,7 +27,7 @@ trusted ref; this host runs no jobs (glaeda-seed-serve --role archive refuses on
 receipt), and the minis' keys here are forced-command, read-only.
 
 Prune: oldest mtime first (glaeda-seed-serve touches a seed it serves) while the archive holds more than
-BUDGET bytes or its disk has less than MIN_FREE free (the disk is Lawrence's). The newest KEEP_NEWEST and
+BUDGET bytes or HOST_VOLUME has less than MIN_FREE free (the disk is Lawrence's). The newest KEEP_NEWEST and
 anything touched in the last GRACE seconds stay.
 
 Local Network Privacy: the LaunchAgent's program is /usr/bin/python3 and its children are /usr/bin/ssh and
@@ -48,7 +52,14 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HOME = Path(os.path.expanduser("~"))
-ARCHIVE = Path(os.environ.get("GLAEDA_SEED_ARCHIVE", "/Volumes/X10 Pro/glaeda-seed-archive"))
+HOST_VOLUME = Path("/Volumes/X10 Pro")
+IMAGE = HOST_VOLUME / "glaeda-seed-archive.sparsebundle"
+IMAGE_SIZE = "1t"  # the most it can grow to; BUDGET keeps it below
+MOUNT = Path("/Volumes/glaeda-seed-archive")
+ARCHIVE = MOUNT / "seeds"  # glaeda-seed-serve ARCHIVE
+# The first version kept the files directly on the X10 Pro, where launchd jobs cannot write; install moves them.
+OLD_ARCHIVE = HOST_VOLUME / "glaeda-seed-archive"
+HDIUTIL = "/usr/bin/hdiutil"
 SUFFIX = ".tar.zst"
 STATE = HOME / ".local/state/glaeda/seed-archive"
 LOG = HOME / "Library/Logs/glaeda-seed-archive.jsonl"
@@ -229,7 +240,7 @@ def prune(archive: Path, budget: int, min_free: int, apply: bool, spare: set[str
             pass
     seeds = sorted(archived(archive).items(), key=lambda item: item[1].st_mtime)
     total = sum(st.st_size for _, st in seeds)
-    free = shutil.disk_usage(archive).free
+    free = free_bytes(archive)
     dropped = []
     for key, st in seeds[:max(0, len(seeds) - KEEP_NEWEST)]:
         if total <= budget and free >= min_free:
@@ -247,11 +258,35 @@ def prune(archive: Path, budget: int, min_free: int, apply: bool, spare: set[str
     return dropped
 
 
-def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: int = MIN_FREE) -> dict:
+def free_bytes(archive: Path) -> int:
+    """Free space for the archive: the image's own, and the X10 Pro's under it."""
+    free = shutil.disk_usage(archive).free
+    if archive.is_relative_to(MOUNT) and os.path.ismount(HOST_VOLUME):
+        free = min(free, shutil.disk_usage(HOST_VOLUME).free)
+    return free
+
+
+def attach() -> str:
+    """"" once MOUNT holds the image (attaching it if needed), else why not."""
+    if os.path.ismount(MOUNT):
+        return ""
+    if not IMAGE.is_dir():
+        return f"{IMAGE} does not exist (glaeda-seed-archive install --apply creates it)"
+    try:
+        proc = subprocess.run([HDIUTIL, "attach", "-quiet", "-nobrowse", "-mountpoint", os.fspath(MOUNT),
+                               os.fspath(IMAGE)], capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return "hdiutil attach timed out"
+    return "" if os.path.ismount(MOUNT) else f"hdiutil attach: {proc.stderr.strip()[-160:]}"
+
+
+def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: int = MIN_FREE,
+        mounted: bool = False) -> dict:
+    """One fill and prune. MOUNTED: ARCHIVE needs no image attached (tests)."""
     record: dict = {"tool": "glaeda-seed-archive", "time": int(time.time()), "apply": apply,
                     "archive": os.fspath(archive)}
-    if not os.path.ismount(archive.parent) and not os.environ.get("GLAEDA_SEED_ARCHIVE"):
-        return {**record, "state": "skipped", "reason": f"{archive.parent} is not mounted"}
+    if not mounted and (why := attach()):
+        return {**record, "state": "skipped", "reason": why}
     if apply:
         archive.mkdir(exist_ok=True)
     elif not archive.is_dir():
@@ -276,7 +311,7 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
         record["missing"] = len(missing)
         fetched = []
         held = sum(st.st_size for st in have.values())
-        if held >= budget or shutil.disk_usage(archive).free < min_free:
+        if held >= budget or free_bytes(archive) < min_free:
             record["full"] = True  # fetch nothing until prune (of seeds the seeder dropped) makes room
             missing = []
         if apply:
@@ -292,7 +327,7 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
         seeds = archived(archive)
         record["archive_seeds"] = len(seeds)
         record["archive_bytes"] = sum(st.st_size for st in seeds.values())
-        record["disk_free_bytes"] = shutil.disk_usage(archive).free
+        record["disk_free_bytes"] = free_bytes(archive)
         record["state"] = "applied" if apply else "planned"
         return record
     finally:
@@ -329,8 +364,31 @@ def install(apply: bool) -> dict:
     want = plistlib.dumps(plist(program))
     current = path.read_bytes() if path.exists() else b""
     report = {"tool": "glaeda-seed-archive", "mode": "install", "apply": apply, "plist": os.fspath(path),
-              "state": "current" if current == want else ("stale" if current else "missing")}
+              "state": "current" if current == want else ("stale" if current else "missing"),
+              "image": "present" if IMAGE.is_dir() else "missing", "mounted": os.path.ismount(MOUNT)}
+    if apply and not IMAGE.is_dir():
+        if not os.path.ismount(HOST_VOLUME):
+            return {**report, "error": f"{HOST_VOLUME} is not mounted"}
+        subprocess.run([HDIUTIL, "create", "-quiet", "-type", "SPARSEBUNDLE", "-fs", "APFS", "-size", IMAGE_SIZE,
+                        "-volname", MOUNT.name, os.fspath(IMAGE)], check=True, timeout=300)
+        report["image"] = "created"
     if apply:
+        if why := attach():
+            return {**report, "error": why}
+        ARCHIVE.mkdir(exist_ok=True)
+        moved = 0
+        if OLD_ARCHIVE.is_dir():
+            for old in OLD_ARCHIVE.iterdir():
+                if old.name.endswith(SUFFIX) and pm.KEY_RE.fullmatch(old.name[:-len(SUFFIX)]):
+                    shutil.move(os.fspath(old), os.fspath(ARCHIVE / old.name))
+                    moved += 1
+                elif ".incoming-" in old.name or old.name.startswith("._"):
+                    old.unlink()
+            try:
+                OLD_ARCHIVE.rmdir()
+            except OSError as error:
+                report["old_archive"] = f"left in place: {error}"
+        report["moved"] = moved
         if current != want:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(f".tmp-{os.getpid()}")
