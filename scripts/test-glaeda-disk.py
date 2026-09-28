@@ -1250,7 +1250,7 @@ class GlaedaDiskTest(unittest.TestCase):
         ci = self.root / "ci"
         (ci / "seeds").mkdir(parents=True)
         (ci / "seed-source.json").write_text(json.dumps({"prefix": "p-"}))
-        for name, age in (("p-a", 1), ("p-b", 2), ("p-c", 8), ("p-d", 14)):
+        for name, age in (("p-a", 1), ("p-b", 2), ("p-c", 12), ("p-d", 30)):
             make(ci / "seeds" / name, age_hours=age)
         make(ci / "pr-builds/pr-1", age_hours=3)
         make(ci / "pr-builds/pr-2", age_hours=7)
@@ -1276,21 +1276,30 @@ class GlaedaDiskTest(unittest.TestCase):
             (fleet / "host.lock").touch()
             self.assertEqual(gd.host_busy(fleet), "")
             with (fleet / "host.lock").open() as held:
-                fcntl.flock(held, fcntl.LOCK_SH)  # a PR job holds it shared
+                fcntl.flock(held, fcntl.LOCK_SH)  # a PR job holds it shared: Runner.Worker says busy
+                self.assertEqual(gd.host_busy(fleet), "")
+            with (fleet / "host.lock").open() as held:
+                fcntl.flock(held, fcntl.LOCK_EX)  # a fleet build
                 self.assertIn("host lock", gd.host_busy(fleet))
-            (fleet / "reservation.json").write_text(json.dumps({"until": int(time.time()) + 60}))
+            marker = {"schema": "glaeda-reservation/v1", "until": int(time.time()) + 60}
+            (fleet / "reservation.json").write_text(json.dumps(marker))
             self.assertIn("reserved", gd.host_busy(fleet))
-            (fleet / "reservation.json").write_text(json.dumps({"until": int(time.time()) - 60}))
+            (fleet / "reservation.json").write_text(json.dumps({**marker, "until": int(time.time()) - 60}))
             self.assertEqual(gd.host_busy(fleet), "")
+            (fleet / "reservation.json").write_text(json.dumps({"until": int(time.time()) - 60}))
+            self.assertIn("reserved", gd.host_busy(fleet))  # another schema is invalid, so active
             (fleet / "reservation.json").write_text("{")
             self.assertIn("unreadable", gd.host_busy(fleet))
             (fleet / "reservation.json").unlink()
-            (fleet / "jobs/abc").mkdir(parents=True)
+            (fleet / "jobs").mkdir()
+            (fleet / "jobs/.DS_Store").touch()
+            self.assertEqual(gd.host_busy(fleet), "")
+            (fleet / "jobs/abc").mkdir()
             self.assertIn("dev-build worker", gd.host_busy(fleet))
             (fleet / "jobs/abc").rmdir()
         with ps("/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"):
             self.assertIn("CI job", gd.host_busy(fleet))
-        with ps("/Applications/Xcode_26.6.app/Contents/Developer/usr/bin/xcodebuild build\n"):
+        with ps("/Applications/Xcode 26.app/Contents/Developer/usr/bin/xcodebuild build\n"):
             self.assertIn("build", gd.host_busy(fleet))
         with ps(""):
             self.assertIn("cannot list", gd.host_busy(fleet))

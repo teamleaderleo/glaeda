@@ -214,12 +214,13 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
 # The idle sweep (--idle): windows from how often each family is read again, not from free space.
 # cmux restores a parked PR build only within PR_SLOT_HOURS (owned_build_state.py, 6 h) of its park, so an
 # older one is never read again. A job touches the seed it starts from, so a seed's mtime is its last use.
-# A busy root lands about four new ~9 GiB seeds an hour; one no job picked for 12 h (beyond the root's
-# newest SEED_KEEP, which stay) sits far behind every new base, and a fetch brings it back in 25 to 280 s. DerivedData, caches and scratch get KEPT_BUILD_IDLE_HOURS, the
+# A busy root lands about four new ~9 GiB seeds an hour; one no job picked for a day (beyond the root's
+# newest SEED_KEEP, which stay) sits far behind every new base, and a fetch brings it back in 25 to 280 s.
+# A day, not less: cmux keeps up to 48 per root on a roomy disk so a PR on an older base starts close. DerivedData, caches and scratch get KEPT_BUILD_IDLE_HOURS, the
 # window a root's own kept build already has: two days covers a quiet day or a weekend's first job.
 IDLE_SWEEP_HOURS = KEPT_BUILD_IDLE_HOURS
 IDLE_PR_BUILD_HOURS = 6.0
-IDLE_SEED_HOURS = 12.0
+IDLE_SEED_HOURS = 24.0
 IDLE_SWEEP_EVERY_S = 3600  # the 15-minute agent sweeps at most hourly: an apply re-measures every candidate
 IDLE_STAMP = HOME / ".cache/glaeda-disk/idle-sweep.last"
 FLEET_DIR = FLEET_CI.parent
@@ -247,11 +248,11 @@ def host_busy(fleet: Path | None = None, now: float | None = None) -> str:
     for line in ps.stdout.splitlines():
         if CI_WORKER.search(line):
             return f"a CI job is running ({line.strip()[:120]})"
-        if BUILD_PROCESS.search(line.strip().split(" ", 1)[0] + " "):
+        if BUILD_PROCESS.search(line):  # the whole line: an Xcode path may hold a space
             return f"a build is running ({line.strip()[:120]})"
     try:
         with os.scandir(fleet / "jobs") as it:
-            if any(True for _ in it):
+            if any(not e.name.startswith(".") for e in it):
                 return f"a dev-build worker job is in {fleet / 'jobs'}"
     except FileNotFoundError:
         pass
@@ -264,8 +265,10 @@ def host_busy(fleet: Path | None = None, now: float | None = None) -> str:
     except (OSError, ValueError):
         return "the host reservation is unreadable"
     else:
+        # glaeda_reservation's rule: another schema or a non-integer time is invalid, and invalid is active
         until = doc.get("until") if isinstance(doc, dict) else None
-        if not isinstance(until, int) or isinstance(until, bool) or now < until:
+        if (not isinstance(doc, dict) or doc.get("schema") != "glaeda-reservation/v1"
+                or not isinstance(until, int) or isinstance(until, bool) or now < until):
             return "the host is reserved"
     try:
         fd = os.open(fleet / "host.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -274,9 +277,11 @@ def host_busy(fleet: Path | None = None, now: float | None = None) -> str:
     except OSError:
         return "the host lock is unreadable"
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # a probe: released at once by the close below
+        # shared, as the runner hook's host_held probes: an exclusive probe could make a PR job's own
+        # one-shot exclusive take fail. PR jobs (shared holders) are caught by Runner.Worker above.
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
     except OSError:
-        return "a job or fleet build holds the host lock"
+        return "a fleet build holds the host lock"
     finally:
         os.close(fd)
     return ""
