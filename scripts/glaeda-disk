@@ -618,10 +618,12 @@ def _hash_sharded(d: str, entries: list[os.DirEntry]) -> bool:
 
 def stat_layout(d: str) -> str:
     """The layout d matches by a few files a tool writes at its top, or "" (see listing_layout)."""
+    tag = os.path.join(d, "CACHEDIR.TAG")
     try:
-        with open(os.path.join(d, "CACHEDIR.TAG"), "rb") as f:
-            if f.read(len(CACHEDIR_TAG)) == CACHEDIR_TAG:
-                return "cachedir-tag"  # cargo's registry, uv, Gradle and others declare their caches so
+        if _is_file(tag):  # never open a FIFO that happens to carry the name: that read would block
+            with open(tag, "rb") as f:
+                if f.read(len(CACHEDIR_TAG)) == CACHEDIR_TAG:
+                    return "cachedir-tag"  # cargo's registry, uv, Gradle and others declare their caches so
     except OSError:
         pass
     j = lambda *parts: os.path.join(d, *parts)  # noqa: E731
@@ -644,8 +646,12 @@ def listing_layout(d: str, entries: list[os.DirEntry]) -> str:
     bun = sum(1 for n in names if BUN_ENTRY.fullmatch(n))
     if bun >= 8 and bun * 2 >= sum(1 for n in names if not n.startswith((".", "@"))):
         return "bun-install-cache"
-    # Bazel's output user root: install/ plus md5-named output bases (~/.cache/bazel/_bazel_$USER)
-    if "install" in names and any(MD5_NAME.fullmatch(n) for n in names):
+    # Bazel's output user root: install/ plus md5-named output bases (~/.cache/bazel/_bazel_$USER),
+    # each holding bazel's own server/, execroot/ or external/
+    if "install" in names and any(
+            MD5_NAME.fullmatch(e.name) and e.is_dir(follow_symlinks=False)
+            and any(_is_dir(os.path.join(e.path, n)) for n in ("server", "execroot", "external"))
+            for e in entries):
         return "bazel-output-root"
     return ""
 

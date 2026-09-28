@@ -222,6 +222,15 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.git_state(tagged), "unchecked")
         (tagged / "CACHEDIR.TAG").write_bytes(gd.CACHEDIR_TAG + b"\n")
         self.assertEqual(gd.git_state(tagged), "none")
+        # ~/.cache/bazel on Linux: an output user root whose bases hold bazel's own fetched clones
+        bazel = self.root / "bazel/_bazel_me"
+        (bazel / "install/abc").mkdir(parents=True)
+        (bazel / ("0" * 31 + "a") / "external/rules_x/.git").mkdir(parents=True)
+        self.assertEqual(gd.cache_layout(bazel), "bazel-output-root")
+        self.assertEqual(gd.git_state(self.root / "bazel"), "none")
+        (self.root / "notbazel/install").mkdir(parents=True)
+        (self.root / "notbazel" / ("0" * 31 + "a") / "src/repo/.git").mkdir(parents=True)
+        self.assertEqual(gd.git_state(self.root / "notbazel"), "git")
         # numbered directories (Maven versions) are not hex shards
         maven = self.root / "maven"
         for v in range(10, 30):
