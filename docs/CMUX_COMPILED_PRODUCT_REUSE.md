@@ -11,8 +11,8 @@ meaning of CMUX workloads. This document adds no new authority to any of them.
 
 ## 1. The measured failure
 
-`manaflow-ai/cmux#13709`, measured over the 12 hours ending 2026-09-22T18:06Z across 386
-`ci.yml` runs:
+`manaflow-ai/cmux#13758` measured the 12 hours ending 2026-09-22T18:06Z across 386 `ci.yml`
+runs, and `manaflow-ai/cmux#13709` explains the mechanism behind the macOS row:
 
 | signal | hits | attempts |
 | --- | ---: | ---: |
@@ -234,8 +234,8 @@ CMUX CI consumes as an accelerator and never as authority.**
 
 This is not speculative. `.github/workflows/persistent-macos-compile.yml` on `upstream/main`
 already pins `GLAEDA_REF` and runs Glaeda's `scripts/apple-build` as the compile step, and
-`.github/workflows/ci-macos.yml` already carries the three consumer steps. `docs/ci/mac-fleet.md`
-records that `vars.CI_PERSISTENT_MAC_COMPILE` is unset, so **the mechanism is built and has never
+`.github/workflows/ci-macos.yml` already carries the three consumer steps. CMUX's own
+`docs/ci/mac-fleet.md` records that `vars.CI_PERSISTENT_MAC_COMPILE` is unset, so **the mechanism is built and has never
 run**. The integration step is to name the artifact's identity, state its failure behavior, and
 turn the variable on for one mini.
 
@@ -284,7 +284,7 @@ valid values; and the Glaeda receipt carries a non-empty `cache_key`, `invocatio
 
 The owned mini is never a required runner. It shortens the hosted job from ~21.7 min to ~7 min,
 which removes offered load from a pool at rho 0.86-1.25. That is the whole lever, and it is
-`docs/ci/mac-fleet.md`'s own conclusion.
+CMUX's `docs/ci/mac-fleet.md`'s own conclusion.
 
 ### 4.5 What happens when validation fails
 
