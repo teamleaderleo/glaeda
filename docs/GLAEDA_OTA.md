@@ -104,6 +104,8 @@ release, attestation and promotion.
 - **Checkouts.** New minis clone the fork (`glaeda-mini-fleet`), and `~/glaeda` moves to the fork's
   `main`. Hosts set up earlier are moved by cmuxterm-hq's `build-fleet/mini-ops/glaeda-mirror.sh`,
   which sets their `origin` and `source`, one canary host first.
+  A `glaeda-mini-fleet --glaeda-ref` pin to a commit merged in the last few minutes fails to fetch
+  until the next mirror run.
 - **Takes effect** with the first `glaeda-update` that knows `source`: a host running an older
   release (or rolled back to one) ignores the key and keeps downloading from this repository, which
   still works.
