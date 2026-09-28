@@ -903,6 +903,14 @@ impl UnixLocalInstallGenerationStore {
         &self,
         mode: StoreLockMode,
     ) -> Result<StoreLock, LocalInstallGenerationStoreError> {
+        self.acquire_lock_with_observer(mode, |_| {})
+    }
+
+    fn acquire_lock_with_observer(
+        &self,
+        mode: StoreLockMode,
+        after_lock: impl FnOnce(&OwnedFd),
+    ) -> Result<StoreLock, LocalInstallGenerationStoreError> {
         let retained = inspect_private_file(
             &self.lock,
             self.owner,
@@ -937,9 +945,13 @@ impl UnixLocalInstallGenerationStore {
         };
         match fs::flock(&lock, operation) {
             Ok(()) => {
+                // Install the explicit-unlock guard before any fallible validation.
+                // Closing a bare descriptor can leave a duplicate holding the flock.
+                let guard = StoreLock { lock };
+                after_lock(&guard.lock);
                 // This is the single retained-boundary pass for every locked public operation.
                 self.verify_boundaries()?;
-                Ok(StoreLock { lock })
+                Ok(guard)
             }
             Err(Errno::AGAIN) => Err(store_error(
                 LocalInstallGenerationStoreErrorKind::Busy,
@@ -3767,7 +3779,9 @@ mod tests {
     impl TestParent {
         fn new(label: &str) -> Self {
             let sequence = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            let temporary_root = std_fs::canonicalize(std::env::temp_dir())
+                .expect("canonicalize test temporary directory");
+            let path = temporary_root.join(format!(
                 "glaeda-local-generation-store-{label}-{}-{sequence}",
                 std::process::id()
             ));
@@ -4104,6 +4118,37 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn boundary_refusal_unlocks_even_when_a_duplicate_descriptor_survives() {
+        for mode in [StoreLockMode::Shared, StoreLockMode::Exclusive] {
+            let test = TestStore::new("refused-lock-duplicate");
+            std_fs::set_permissions(
+                test.root().join(GENERATIONS_DIRECTORY),
+                std_fs::Permissions::from_mode(0o755),
+            )
+            .expect("make generations boundary unsafe");
+            let mut survivor = None;
+            let refusal = test.store.acquire_lock_with_observer(mode, |lock| {
+                survivor = Some(lock.try_clone().expect("duplicate acquired description"));
+            });
+            assert_eq!(
+                refusal.err().expect("refuse unsafe boundary").kind(),
+                LocalInstallGenerationStoreErrorKind::UnsafeFilesystem
+            );
+            let competing = fs::openat(
+                &test.store.root,
+                LOCK_FILE,
+                EXISTING_LOCK_FLAGS,
+                Mode::empty(),
+            )
+            .expect("open independent description");
+            fs::flock(&competing, FlockOperation::NonBlockingLockExclusive)
+                .expect("refusal explicitly releases lock despite surviving duplicate");
+            fs::flock(&competing, FlockOperation::Unlock).expect("release test lock");
+            drop(survivor.expect("keep duplicate alive through reacquisition"));
+        }
     }
 
     #[test]
@@ -4504,7 +4549,10 @@ mod tests {
 
     #[test]
     fn fixed_layout_has_no_legacy_namespace_or_caller_controlled_basename() {
+        #[cfg(target_os = "linux")]
         assert_eq!(GLAEDA_DIRECTORY, "glaeda");
+        #[cfg(target_os = "macos")]
+        assert_eq!(GLAEDA_DIRECTORY, "Glaeda");
         assert_eq!(LOCAL_INSTALL_DIRECTORY, "local-install");
         assert_eq!(STORE_IDENTITY_FILE, "store.identity.json");
         assert_eq!(BINARY_FILE, "glaeda");

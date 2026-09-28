@@ -8,6 +8,7 @@ Cargo, and rustup roots. Repository code runs only inside the closed bubblewrap/
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import argparse
 import fcntl
 import hashlib
@@ -15,8 +16,6 @@ import json
 import math
 import os
 import re
-import selectors
-import shutil
 import stat
 import subprocess
 import sys
@@ -25,24 +24,40 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, NoReturn
 
+import owned_linux_task as owned_task
+import owned_linux_admission as owned_admission
+from owned_linux_task import (
+    Refusal, closed_environment, run_control, remove_task,
+    public_crates_io_cache_arguments, unit_absent, stop_unit,
+    MAX_CONTROL_OUTPUT_BYTES,
+    MAX_SOURCE_OUTPUT_BYTES,
+    FAILURE_TAIL_BYTES,
+    MAX_MATERIALIZED_SOURCE_BYTES,
+    MAX_MATERIALIZED_SOURCE_ENTRIES,
+    CARGO_HOME_TMPFS_BYTES,
+    TEMP_TMPFS_BYTES,
+    PROJECT_HOME_TMPFS_BYTES,
+)
+
 
 SCHEMA_VERSION = 1
 EXECUTION_IDENTITY_CLASS = "credentialless_project"
 RUST_TOOLCHAIN = "1.97.1-x86_64-unknown-linux-gnu"
-MAX_CONTROL_OUTPUT_BYTES = 64 * 1024
 MAX_RECEIPT_BYTES = 32 * 1024
-MAX_SOURCE_OUTPUT_BYTES = 1024 * 1024
-FAILURE_TAIL_BYTES = 8 * 1024
-MAX_MATERIALIZED_SOURCE_BYTES = 512 * 1024 * 1024
-MAX_MATERIALIZED_SOURCE_ENTRIES = 100_000
 TARGET_TMPFS_BYTES = 6 * 1024 * 1024 * 1024
 REQUIRED_TARGET_TMPFS_BYTES = 8 * 1024 * 1024 * 1024
-CARGO_HOME_TMPFS_BYTES = 512 * 1024 * 1024
-TEMP_TMPFS_BYTES = 512 * 1024 * 1024
-PROJECT_HOME_TMPFS_BYTES = 64 * 1024 * 1024
 SHA256_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
 OID_PATTERN = re.compile(r"^[a-f0-9]{40}$")
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+SEMANTIC_REQUEST_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{7,63}$")
+SEMANTIC_BINDING_DOCUMENT_TYPE = "glaeda-semantic-execution-binding"
+SEMANTIC_BINDING_SCHEMA_VERSION = 1
+
+
+class SemanticRequestConflict(Refusal):
+    """One accepted semantic request identity was rebound to different physical work."""
+
+
 @dataclass(frozen=True)
 class Profile:
     profile_id: str
@@ -136,6 +151,10 @@ REQUIRED_PROFILE = fixed_profile(
     "10G",
     "12G",
 )
+REQUIRED_ADMISSION_DEMAND = owned_admission.AdmissionDemand(
+    memory_bytes=12 * 1024**3,
+    minimum_logical_cpus=8,
+)
 
 # Compatibility aliases for the focused profile and its existing tests/consumers.
 PROFILE_ID = FOCUSED_PROFILE.profile_id
@@ -200,10 +219,6 @@ class Request:
     profile: Profile = FOCUSED_PROFILE
 
 
-class Refusal(RuntimeError):
-    pass
-
-
 def canonical_bytes(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -222,6 +237,15 @@ def reject_json_constant(value: str) -> NoReturn:
 
 def profile_generation(profile: Profile = FOCUSED_PROFILE) -> str:
     return sha256(canonical_bytes(profile_spec(profile)))
+
+
+def admission_demand(profile: Profile) -> owned_admission.AdmissionDemand:
+    """Map one reviewed semantic verification profile to its local physical demand."""
+    if profile == FOCUSED_PROFILE:
+        return owned_admission.VERIFY_FOCUSED_DEMAND
+    if profile == REQUIRED_PROFILE:
+        return REQUIRED_ADMISSION_DEMAND
+    raise Refusal("verification profile has no reviewed local admission demand")
 
 
 def exact_directory(raw: str, label: str) -> Path:
@@ -277,36 +301,6 @@ def normalize_request(
     if not SHA256_PATTERN.fullmatch(fingerprint):
         raise Refusal("command fingerprint is invalid")
     return Request(repository, commit, tree, generation, fingerprint, profile)
-
-
-def closed_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
-    environment = {
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "LC_ALL": "C",
-        "PATH": "/usr/bin:/bin",
-    }
-    if extra:
-        environment.update(extra)
-    return environment
-
-
-def run_control(argv: list[str], cwd: Path | None = None) -> bytes:
-    completed = subprocess.run(
-        argv,
-        cwd=cwd,
-        env=closed_environment(),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=60,
-        check=False,
-    )
-    if len(completed.stdout) > MAX_CONTROL_OUTPUT_BYTES:
-        raise Refusal("control command output exceeded its fixed ceiling")
-    if completed.returncode != 0:
-        raise Refusal("exact source materialization or observation failed")
-    return completed.stdout
 
 
 def git_text(repository_root: Path, *arguments: str) -> str:
@@ -429,6 +423,45 @@ def publish_document(path: Path, value: dict[str, object], *, replace: bool) -> 
             pass
 
 
+def bind_semantic_request(state_root: Path, request_id: str, request: Request) -> None:
+    """Durably bind one accepted provider-neutral request identity before physical launch.
+
+    The binding is private Glaeda decision state, separate from transport correlation. Exact replay
+    is accepted; reusing one semantic identity for different physical work fails closed. The same
+    state root is shared by direct Git and owner-local callers that intentionally carry the same
+    accepted semantic request identity.
+    """
+    if not isinstance(request_id, str) or SEMANTIC_REQUEST_ID_PATTERN.fullmatch(request_id) is None:
+        raise Refusal("semantic request identity is invalid")
+    namespace = ensure_private_child(state_root, "semantic-requests")
+    request_root = ensure_private_child(namespace, request_id)
+    expected = {
+        "document_type": SEMANTIC_BINDING_DOCUMENT_TYPE,
+        "schema_version": SEMANTIC_BINDING_SCHEMA_VERSION,
+        "request_id": request_id,
+        "command_fingerprint": request.command_fingerprint,
+        "source": {
+            "repository": request.repository,
+            "commit": request.commit,
+            "tree": request.tree,
+        },
+        "profile": {
+            "id": request.profile.profile_id,
+            "generation": request.profile_generation,
+        },
+    }
+    with open_lock(request_root):
+        path = request_root / "binding.json"
+        existing = read_document(path)
+        if existing is None:
+            publish_document(path, expected, replace=False)
+            return
+        if existing != expected:
+            raise SemanticRequestConflict(
+                "semantic request identity conflicts with existing physical binding"
+            )
+
+
 def matches_request(document: dict[str, object], request: Request) -> bool:
     source = document.get("source")
     profile = document.get("profile")
@@ -521,93 +554,43 @@ def valid_intent(document: dict[str, object], request: Request) -> bool:
     )
 
 
-def remove_task(task_root: Path) -> None:
-    try:
-        shutil.rmtree(task_root)
-    except FileNotFoundError:
-        return
-    if task_root.exists() or task_root.is_symlink():
-        raise Refusal("task-private source/build state cleanup is incomplete")
-
-
 def materialize(repository_root: Path, task_root: Path, request: Request) -> Path:
-    source = task_root / "source"
-    source.mkdir(mode=0o700)
-    template = task_root / "git-template"
-    template.mkdir(mode=0o700)
-    environment = closed_environment({"GIT_TEMPLATE_DIR": os.fspath(template)})
-    commands = (
-        ["/usr/bin/git", "init", "--quiet", os.fspath(source)],
-        [
-            "/usr/bin/git",
-            "-c",
-            "protocol.file.allow=always",
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--depth=1",
-            os.fspath(repository_root),
-            request.commit,
-        ],
-        ["/usr/bin/git", "checkout", "--quiet", "--detach", request.commit],
-    )
-    for index, command in enumerate(commands):
-        cwd = None if index == 0 else source
-        completed = subprocess.run(
-            command,
-            cwd=cwd,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=60,
-            check=False,
-        )
-        if completed.returncode != 0 or len(completed.stdout) > MAX_CONTROL_OUTPUT_BYTES:
-            raise Refusal("exact task-private source materialization failed")
-    try:
-        (source / ".git" / "FETCH_HEAD").unlink()
-    except FileNotFoundError:
-        pass
-    observed = run_control(
-        ["/usr/bin/git", "rev-parse", "HEAD", "HEAD^{tree}"], source
-    ).decode("ascii").splitlines()
-    status = run_control(
-        ["/usr/bin/git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], source
-    )
-    if observed != [request.commit, request.tree] or status:
-        raise Refusal("task-private source does not match the exact clean commit/tree")
-    entries = 0
-    bytes_seen = 0
-    for parent, directories, files in os.walk(source, followlinks=False):
-        entries += len(directories) + len(files)
-        if entries > MAX_MATERIALIZED_SOURCE_ENTRIES:
-            raise Refusal("task-private source exceeds the entry ceiling")
-        for name in files:
-            bytes_seen += (Path(parent) / name).lstat().st_size
-            if bytes_seen > MAX_MATERIALIZED_SOURCE_BYTES:
-                raise Refusal("task-private source exceeds the byte ceiling")
-    return source
+    return owned_task.materialize(repository_root, task_root, request.commit, request.tree)
 
 
-def public_crates_io_cache_arguments(cargo_root: Path) -> list[str]:
-    """Expose public crates.io cache entries without unrelated Git/private-registry state."""
-    arguments = ["--dir", "/cargo-home/registry"]
-    for kind in ("cache", "index", "src"):
-        arguments.extend(["--dir", f"/cargo-home/registry/{kind}"])
-        parent = cargo_root / "registry" / kind
-        if not parent.is_dir() or parent.is_symlink():
-            continue
-        for source in sorted(parent.glob("index.crates.io-*")):
-            if source.is_dir() and not source.is_symlink() and source.parent == parent:
-                arguments.extend(
-                    [
-                        "--ro-bind",
-                        os.fspath(source),
-                        f"/cargo-home/registry/{kind}/{source.name}",
-                    ]
-                )
-    return arguments
+def required_host_plan_evidence_arguments(profile: Profile) -> list[str]:
+    if profile != REQUIRED_PROFILE:
+        return []
+    return [
+        "--ro-bind",
+        "/usr/lib/os-release",
+        "/etc/os-release",
+        "--ro-bind-try",
+        "/etc/nsswitch.conf",
+        "/etc/nsswitch.conf",
+        "--ro-bind-try",
+        "/etc/passwd",
+        "/etc/passwd",
+        "--ro-bind-try",
+        "/etc/group",
+        "/etc/group",
+        "--ro-bind-try",
+        "/etc/subuid",
+        "/etc/subuid",
+        "--ro-bind-try",
+        "/etc/subgid",
+        "/etc/subgid",
+        "--ro-bind-try",
+        "/etc/containers",
+        "/etc/containers",
+        "--dir",
+        "/var",
+        "--dir",
+        "/var/lib",
+        "--ro-bind",
+        "/var/lib/dpkg",
+        "/var/lib/dpkg",
+    ]
 
 
 def sandbox_command(
@@ -618,79 +601,7 @@ def sandbox_command(
     unit_name: str,
     profile: Profile = FOCUSED_PROFILE,
 ) -> list[str]:
-    spec = profile_spec(profile)
-    systemd_properties = [f"--property={value}" for value in spec["systemd_properties"]]
-    bubblewrap = [
-        "/usr/bin/bwrap",
-        "--unshare-all",
-        "--unshare-user",
-        "--die-with-parent",
-        "--new-session",
-        "--cap-drop",
-        "ALL",
-        "--disable-userns",
-        "--uid",
-        "65534",
-        "--gid",
-        "65534",
-        "--hostname",
-        "glaeda-task",
-        "--ro-bind",
-        "/usr",
-        "/usr",
-        "--symlink",
-        "usr/bin",
-        "/bin",
-        "--symlink",
-        "usr/lib",
-        "/lib",
-        "--symlink",
-        "usr/lib64",
-        "/lib64",
-        "--dir",
-        "/etc",
-        "--ro-bind-try",
-        "/etc/ld.so.cache",
-        "/etc/ld.so.cache",
-        "--ro-bind-try",
-        "/etc/alternatives",
-        "/etc/alternatives",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--size",
-        str(TEMP_TMPFS_BYTES),
-        "--tmpfs",
-        "/tmp",
-        "--dir",
-        "/workspace",
-        "--ro-bind",
-        os.fspath(source),
-        "/workspace/source",
-        "--size",
-        str(spec["build_tmpfs_bytes"]),
-        "--tmpfs",
-        "/workspace/target",
-        "--size",
-        str(CARGO_HOME_TMPFS_BYTES),
-        "--tmpfs",
-        "/cargo-home",
-        "--dir",
-        "/home",
-        "--size",
-        str(PROJECT_HOME_TMPFS_BYTES),
-        "--tmpfs",
-        "/home/project",
-        "--ro-bind",
-        os.fspath(cargo_root / "bin"),
-        "/cargo/bin",
-        "--ro-bind",
-        os.fspath(rustup_root),
-        "/rustup",
-    ]
-    bubblewrap.extend(public_crates_io_cache_arguments(cargo_root))
-    bubblewrap.extend(
+    recipe_arguments = (
         [
             "--chdir",
             "/workspace/source",
@@ -706,7 +617,7 @@ def sandbox_command(
             "/cargo-home",
             "--setenv",
             "CARGO_TARGET_DIR",
-            "/workspace/target",
+            "/workspace/source/target",
             "--setenv",
             "CARGO_NET_OFFLINE",
             "true",
@@ -736,43 +647,37 @@ def sandbox_command(
             profile.recipe_name,
         ]
     )
-    return [
-        "/usr/bin/systemd-run",
-        "--user",
-        "--wait",
-        "--pipe",
-        "--quiet",
-        "--collect",
-        "--service-type=exec",
-        f"--unit={unit_name}",
-        *systemd_properties,
-        *bubblewrap,
-    ]
-
-
-def unit_absent(unit_name: str) -> bool:
-    completed = subprocess.run(
-        ["/usr/bin/systemctl", "--user", "show", unit_name, "--property=LoadState", "--value"],
-        env=closed_environment({"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        timeout=10,
-        check=False,
+    spec = profile_spec(profile)
+    return owned_task.sandbox_command(
+        source, cargo_root, rustup_root, unit_name,
+        systemd_properties=spec["systemd_properties"],
+        build_tmpfs_bytes=profile.build_tmpfs_bytes,
+        mount_arguments=(required_host_plan_evidence_arguments(profile)
+                         + public_crates_io_cache_arguments(cargo_root)),
+        recipe_arguments=recipe_arguments,
+        network=owned_task.TaskNetwork.NONE,
     )
-    return completed.returncode == 0 and completed.stdout.strip() in (b"", b"not-found")
 
 
-def stop_unit(unit_name: str) -> None:
-    subprocess.run(
-        ["/usr/bin/systemctl", "--user", "stop", unit_name],
-        env=closed_environment({"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=15,
-        check=False,
-    )
+def admission_binding(request: Request, command_root: Path) -> str:
+    info = command_root.stat()
+    return sha256(canonical_bytes({
+        "command_root": os.fspath(command_root), "device": info.st_dev, "inode": info.st_ino,
+        "repository": request.repository, "commit": request.commit, "tree": request.tree,
+        "profile_id": request.profile.profile_id, "profile_generation": request.profile_generation,
+    }))
+
+
+def sync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def unit_name(request: Request) -> str:
+    return f"glaeda-{request.profile.document_slug}-{request.command_fingerprint[7:39]}.service"
 
 
 def execute_profile(
@@ -781,87 +686,15 @@ def execute_profile(
     cargo_root: Path,
     rustup_root: Path,
     request: Request,
+    admission=None,
 ) -> tuple[str, int, float, bool, int, str]:
     profile = request.profile
-    unit = f"glaeda-{profile.document_slug}-{request.command_fingerprint[7:39]}.service"
-    started = time.monotonic()
-    process = subprocess.Popen(
+    unit = unit_name(request)
+    return owned_task.execute(
         sandbox_command(source, task_root, cargo_root, rustup_root, unit, profile),
-        env=closed_environment({"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
+        unit=unit, deadline_seconds=profile.deadline_seconds, label=profile.document_slug,
+        **({"launch_guard": admission.launch} if admission is not None else {}),
     )
-    assert process.stdout is not None
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
-    digest = hashlib.sha256()
-    output_bytes = 0
-    tail = bytearray()
-    output_exceeded = False
-    forced_timeout = False
-    deadline = started + profile.deadline_seconds + 30
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            forced_timeout = True
-            stop_unit(unit)
-            try:
-                os.killpg(process.pid, 9)
-            except ProcessLookupError:
-                pass
-            break
-        events = selector.select(min(0.1, remaining))
-        for key, _ in events:
-            chunk = os.read(key.fd, 64 * 1024)
-            if not chunk:
-                selector.unregister(process.stdout)
-                continue
-            digest.update(chunk)
-            output_bytes += len(chunk)
-            tail.extend(chunk)
-            if len(tail) > FAILURE_TAIL_BYTES:
-                del tail[:-FAILURE_TAIL_BYTES]
-            if output_bytes > MAX_SOURCE_OUTPUT_BYTES and not output_exceeded:
-                output_exceeded = True
-                stop_unit(unit)
-        if process.poll() is not None and not selector.get_map():
-            break
-    try:
-        returncode = process.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        stop_unit(unit)
-        try:
-            os.killpg(process.pid, 9)
-        except ProcessLookupError:
-            pass
-        returncode = process.wait()
-    selector.close()
-    elapsed = time.monotonic() - started
-    settled = unit_absent(unit)
-    if not settled:
-        stop_unit(unit)
-        settled = unit_absent(unit)
-    terminal = "succeeded" if returncode == 0 else "failed"
-    if forced_timeout or elapsed >= profile.deadline_seconds:
-        terminal = "timed_out"
-    if output_exceeded:
-        terminal = "failed"
-    if not settled:
-        terminal = "cleanup_incomplete"
-    if terminal != "succeeded" and tail:
-        omitted = output_bytes - len(tail)
-        print(
-            f"{profile.document_slug} failure output: tail_bytes={len(tail)} omitted_bytes={omitted}",
-            file=sys.stderr,
-        )
-        sys.stderr.flush()
-        sys.stderr.buffer.write(bytes(tail))
-        if not tail.endswith(b"\n"):
-            sys.stderr.buffer.write(b"\n")
-        sys.stderr.buffer.flush()
-    return terminal, returncode, elapsed, settled, output_bytes, f"sha256:{digest.hexdigest()}"
 
 
 def receipt(
@@ -928,6 +761,9 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
     cargo_root = exact_directory(arguments.cargo_root, "Cargo root")
     rustup_root = exact_directory(arguments.rustup_root, "rustup root")
     state_root = private_state_directory(arguments.state_root)
+    semantic_request_id = vars(arguments).get("semantic_request_id")
+    if semantic_request_id is not None:
+        bind_semantic_request(state_root, semantic_request_id, request)
     verify_resident_source(repository_root, request)
     command_root = ensure_private_child(state_root, request.command_fingerprint[7:])
     with open_lock(command_root):
@@ -937,6 +773,23 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
         if existing is not None:
             if not valid_terminal_receipt(existing, request):
                 raise Refusal("durable receipt conflicts with the exact command")
+            admission_root = getattr(arguments, "admission_root", None)
+            if arguments.reconcile_only and admission_root is not None:
+                def observe_settled():
+                    if (not existing["result"]["task_cleanup_complete"]
+                            or not unit_absent(unit_name(request))
+                            or (command_root / "task").exists()
+                            or (command_root / "task").is_symlink()):
+                        raise Refusal("exact reservation cleanup is incomplete")
+                    old_intent = read_document(intent_path)
+                    if old_intent is not None:
+                        if not valid_intent(old_intent, request):
+                            raise Refusal("reservation recovery intent conflicts")
+                        intent_path.unlink()
+                        sync_directory(command_root)
+                owned_admission.recover(admission_root, request.command_fingerprint,
+                                        unit_name(request), admission_binding(request, command_root),
+                                        observe_settled, admission_demand(profile))
             emit(existing)
             return 0
         intent = read_document(intent_path)
@@ -947,52 +800,74 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
                 raise Refusal("durable intent conflicts with the exact command")
             raise Refusal("previous physical execution is ambiguous; redispatch refused")
 
-        task_root = command_root / "task"
-        remove_task(task_root)
-        task_root.mkdir(mode=0o700)
-        source = materialize(repository_root, task_root, request)
-        base = {
-            "document_type": f"glaeda-{profile.document_slug}-intent",
-            "schema_version": SCHEMA_VERSION,
-            "command_fingerprint": request.command_fingerprint,
-            "source": {
-                "repository": request.repository,
-                "commit": request.commit,
-                "tree": request.tree,
-            },
-            "profile": {"id": profile.profile_id, "generation": request.profile_generation},
-        }
-        publish_document(intent_path, {**base, "phase": "prepared"}, replace=False)
-        publish_document(intent_path, {**base, "phase": "executing"}, replace=True)
-        started_at_ms = time.time_ns() // 1_000_000
-        terminal, exit_code, elapsed, settled, output_bytes, output_sha256 = execute_profile(
-            source, task_root, cargo_root, rustup_root, request
-        )
-        if not settled:
-            raise Refusal("physical process-tree settlement is incomplete; redispatch refused")
-        cleanup_complete = False
-        try:
-            remove_task(task_root)
-            cleanup_complete = True
-        except (Refusal, OSError):
-            terminal = "cleanup_incomplete"
-        settled_at_ms = time.time_ns() // 1_000_000
-        document = receipt(
-            request,
-            terminal,
-            exit_code,
-            elapsed,
-            settled,
-            cleanup_complete,
-            output_bytes,
-            output_sha256,
-            started_at_ms,
-            settled_at_ms,
-        )
-        publish_document(receipt_path, document, replace=False)
-        intent_path.unlink()
-        emit(document)
-        return 0
+        admission_root = getattr(arguments, "admission_root", None)
+        demand = admission_demand(profile) if admission_root is not None else None
+        unit = unit_name(request)
+        gate = (owned_admission.Reservation(admission_root, request.command_fingerprint, unit,
+                                            admission_binding(request, command_root), demand)
+                if admission_root is not None else nullcontext())
+        with gate as admission:
+            try:
+                task_root = command_root / "task"
+                owned_task.prepare_task(task_root)
+                source = materialize(repository_root, task_root, request)
+                base = {
+                    "document_type": f"glaeda-{profile.document_slug}-intent",
+                    "schema_version": SCHEMA_VERSION,
+                    "command_fingerprint": request.command_fingerprint,
+                    "source": {
+                        "repository": request.repository,
+                        "commit": request.commit,
+                        "tree": request.tree,
+                    },
+                    "profile": {"id": profile.profile_id, "generation": request.profile_generation},
+                }
+                publish_document(intent_path, {**base, "phase": "prepared"}, replace=False)
+                publish_document(intent_path, {**base, "phase": "executing"}, replace=True)
+                started_at_ms = time.time_ns() // 1_000_000
+                terminal, exit_code, elapsed, settled, output_bytes, output_sha256 = execute_profile(
+                    source, task_root, cargo_root, rustup_root, request,
+                    **({"admission": admission} if admission is not None else {}),
+                )
+                if not settled:
+                    raise Refusal("physical process-tree settlement is incomplete; redispatch refused")
+                cleanup_complete = False
+                try:
+                    remove_task(task_root)
+                    cleanup_complete = True
+                except (Refusal, OSError):
+                    terminal = "cleanup_incomplete"
+                settled_at_ms = time.time_ns() // 1_000_000
+                document = receipt(
+                    request,
+                    terminal,
+                    exit_code,
+                    elapsed,
+                    settled,
+                    cleanup_complete,
+                    output_bytes,
+                    output_sha256,
+                    started_at_ms,
+                    settled_at_ms,
+                )
+                publish_document(receipt_path, document, replace=False)
+                intent_path.unlink()
+                if admission is not None and cleanup_complete:
+                    sync_directory(command_root)
+                    admission.release()
+                emit(document)
+                return 0
+            finally:
+                # A refused final check has never called Popen. Remove only this exact
+                # attempt's task/intent before freeing its reservation. Any cleanup
+                # error preserves the reservation; post-launch ambiguity always does.
+                if admission is not None and admission.owned and not admission.launch_attempted:
+                    remove_task(command_root / "task")
+                    if intent_path.exists():
+                        intent_path.unlink()
+                    sync_directory(command_root)
+                    admission.release()
+
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1009,7 +884,12 @@ def parser() -> argparse.ArgumentParser:
     execute.add_argument("--tree", required=True)
     execute.add_argument("--profile-generation", required=True)
     execute.add_argument("--command-fingerprint", required=True)
+    execute.add_argument(
+        "--semantic-request-id",
+        help="accepted provider-neutral request identity; binds exact physical work across transports",
+    )
     execute.add_argument("--reconcile-only", action="store_true")
+    execute.add_argument("--admission-root", help="operator-installed reviewed launch gate; never caller-selected")
     return root
 
 

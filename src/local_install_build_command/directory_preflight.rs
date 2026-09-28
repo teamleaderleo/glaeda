@@ -589,7 +589,9 @@ mod tests {
     impl TempBuildRoot {
         fn new(label: &str) -> Self {
             let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-            let container = std::env::temp_dir().join(format!(
+            let temporary_root = fs::canonicalize(std::env::temp_dir())
+                .expect("canonicalize test temporary directory");
+            let container = temporary_root.join(format!(
                 "glaeda-directory-preflight-{label}-{}-{sequence}",
                 std::process::id()
             ));

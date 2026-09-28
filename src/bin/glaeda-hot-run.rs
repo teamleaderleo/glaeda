@@ -18,6 +18,7 @@ use std::os::unix::fs::{
 use std::os::unix::net::UnixStream;
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt as _;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "linux")]
@@ -41,6 +42,7 @@ use glaeda::process::ProcessExecutor;
 use glaeda::project_checkout_observation::{
     ProjectCheckoutObservation, ProjectCheckoutObservationError, ProjectCheckoutObserver,
 };
+use rustix::process::geteuid;
 #[cfg(target_os = "linux")]
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
@@ -64,19 +66,24 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
 const MAX_OBSERVATION_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "linux")]
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
 const RESOURCE_SCOPE_OBSERVATION_GRACE: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
 const CPU_GRANT_RELEASE_GRACE: Duration = Duration::from_millis(250);
 #[cfg(target_os = "linux")]
 const INTERNAL_SCOPE_ENTRY: &str = "--glaeda-internal-scope-entry-v1";
 #[cfg(target_os = "linux")]
 const INTERNAL_CPU_GRANT_KEEPER: &str = "--glaeda-internal-cpu-grant-keeper-v1";
+#[cfg(target_os = "linux")]
 const HEAVY_SCOPE_PROPERTIES: &[&str] = &[
     "CPUQuota=1200%",
     "MemoryHigh=8G",
     "MemoryMax=12G",
     "TasksMax=1024",
 ];
+#[cfg(target_os = "linux")]
 const BACKGROUND_SCOPE_PROPERTIES: &[&str] = &["CPUWeight=25"];
 const SHA256_PREFIX: &str = "sha256:";
 const GIT_OVERRIDE_NAMES: &[&str] = &[
@@ -141,6 +148,7 @@ enum ResourceProfile {
 }
 
 impl ResourceProfile {
+    #[cfg(target_os = "linux")]
     fn as_str(self) -> &'static str {
         match self {
             Self::BigRedHeavy => "big-red-heavy",
@@ -148,6 +156,7 @@ impl ResourceProfile {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn scope_properties(self) -> &'static [&'static str] {
         match self {
             Self::BigRedHeavy => HEAVY_SCOPE_PROPERTIES,
@@ -379,6 +388,7 @@ struct CommandResult {
     completion_reason: &'static str,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone)]
 struct CpuSetRequest {
     cpus: Vec<usize>,
@@ -387,6 +397,7 @@ struct CpuSetRequest {
     mask: CpuSet,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug)]
 struct CommandExecution<'a> {
     command: &'a [OsString],
@@ -698,8 +709,16 @@ fn cpu_grant_scope_is_populated(cgroup_fd: i32) -> Result<bool, String> {
 }
 
 fn run(cli: Cli) -> Result<i32, String> {
-    if !cfg!(target_os = "linux") {
-        return Err("native hot-run execution currently requires Linux".into());
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Err("native hot-run execution requires Linux or macOS".into());
+    }
+    if cfg!(target_os = "macos")
+        && (cli.timeout.is_some() || cli.resource_profile.is_some() || cli.cpu_set.is_some())
+    {
+        return Err(
+            "macOS native hot-run does not support --timeout, --resource-profile or --cpu-set"
+                .into(),
+        );
     }
     if cli.comparison_key.is_some() && cli.measurement.is_none() {
         return Err("--comparison-key requires --measurement".into());
@@ -772,7 +791,6 @@ fn run(cli: Cli) -> Result<i32, String> {
     let cpu_set: Option<&CpuSetRequest> = None;
     #[cfg(not(target_os = "linux"))]
     let cpu_locks: &[()] = &[];
-
     #[cfg(target_os = "linux")]
     let native_target_before =
         if cli.measurement.is_some() && caches.iter().any(|cache| cache.path == "target") {
@@ -983,6 +1001,12 @@ fn observe_runtime_bin(
     }
     if resolved != path {
         return Err("runtime bin binding contains a symbolic-link component".into());
+    }
+    if details.uid() != 0 && details.uid() != geteuid().as_raw() {
+        return Err("runtime bin binding is not owned by root or the current user".into());
+    }
+    if details.mode() & 0o022 != 0 {
+        return Err("runtime bin binding is writable by an untrusted identity".into());
     }
     Ok(Some(RuntimeBinBinding {
         path: path.to_owned(),
@@ -2343,15 +2367,62 @@ fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, Str
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-fn execute_command(_execution: CommandExecution<'_>) -> Result<CommandResult, String> {
-    Err("native hot-run execution currently requires Linux".into())
+#[cfg(target_os = "macos")]
+fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, String> {
+    // The same-worktree path deliberately leaves native cache validity to the build tool.
+    // It neither materializes a task view nor claims Linux process/resource controls.
+    if execution.timeout.is_some()
+        || execution.resource_profile.is_some()
+        || execution.cpu_set.is_some()
+    {
+        return Err("macOS native hot-run does not support process/resource controls".into());
+    }
+    let mut command = Command::new(&execution.command[0]);
+    command
+        .args(&execution.command[1..])
+        .current_dir(execution.cwd);
+    if let Some(path) = execution.environment_path {
+        command.env("PATH", path);
+    }
+    let started = Instant::now();
+    let status = command
+        .status()
+        .map_err(|error| format!("cannot execute command: {error}"))?;
+    let signal = status.signal();
+    Ok(CommandResult {
+        elapsed: started.elapsed(),
+        timeout_seconds: None,
+        resource_profile: None,
+        cpu_set: None,
+        user_cpu_seconds: None,
+        system_cpu_seconds: None,
+        max_rss_kib: None,
+        resource_accounting: if execution.measured {
+            "unavailable_for_measured_command"
+        } else {
+            "not_measured"
+        },
+        exit_code: status.code().unwrap_or_else(|| 128 + signal.unwrap_or(0)),
+        signal,
+        completion_reason: if signal.is_some() {
+            "signaled"
+        } else {
+            "exited"
+        },
+    })
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn execute_command(_execution: CommandExecution<'_>) -> Result<CommandResult, String> {
+    Err("native hot-run execution requires Linux or macOS".into())
+}
+
+#[cfg(target_os = "linux")]
 fn valid_signal(signal: i32) -> bool {
     (1..=31).contains(&signal) || (34..=64).contains(&signal)
 }
 
+#[cfg(target_os = "linux")]
 fn parse_time_report(path: &Path) -> Result<(f64, f64, u64, i32), String> {
     let raw = read_bounded(path)?;
     let fields = raw.lines().collect::<Vec<_>>();
@@ -2762,6 +2833,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn unique_temporary_path(prefix: &str) -> Result<PathBuf, String> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2796,9 +2868,12 @@ fn round_to(value: f64, places: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::symlink;
+    #[cfg(target_os = "linux")]
     use std::thread;
 
+    #[cfg(target_os = "linux")]
     use rustix::process::test_kill_process;
 
     fn test_directory(label: &str) -> PathBuf {
@@ -2807,6 +2882,7 @@ mod tests {
         path
     }
 
+    #[cfg(target_os = "linux")]
     fn initialize_test_repository(path: &Path) {
         assert!(
             Command::new("/usr/bin/git")
@@ -2834,6 +2910,27 @@ mod tests {
                 .unwrap()
                 .success()
         );
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn native_execution_refuses_unsupported_platform_before_observation() {
+        let error = run(Cli {
+            resident: PathBuf::from("/nonexistent/resident"),
+            task: PathBuf::from("/nonexistent/task"),
+            cache: Vec::new(),
+            measurement: None,
+            comparison_key: None,
+            runtime_id: None,
+            runtime_sha256: None,
+            runtime_bin: None,
+            timeout: None,
+            resource_profile: None,
+            cpu_set: None,
+            command: vec![OsString::from("/bin/true")],
+        })
+        .unwrap_err();
+        assert_eq!(error, "native hot-run execution requires Linux or macOS");
     }
 
     #[test]
@@ -3005,6 +3102,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn direct_measurement_preserves_exit_and_schema() {
         let fixture = test_directory("glaeda-hot-run-test");
@@ -3068,6 +3166,7 @@ mod tests {
         fs::remove_dir_all(fixture).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn post_command_target_failure_is_receipted_without_erasing_command_result() {
         let fixture = test_directory("glaeda-hot-run-post-observation-test");
@@ -3109,6 +3208,7 @@ mod tests {
         fs::remove_dir_all(fixture).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn measured_signal_is_distinct_from_same_numeric_exit() {
         let fixture = test_directory("glaeda-hot-run-signal-test");
@@ -3213,6 +3313,7 @@ mod tests {
         fs::remove_dir(fixture).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn runtime_bin_binds_program_digest_and_descendant_path() {
         let fixture = test_directory("glaeda-hot-run-runtime-test");
@@ -3317,6 +3418,32 @@ mod tests {
         fs::remove_file(moved.join("runtime-descendant")).unwrap();
         fs::remove_file(moved.join("runtime-tool")).unwrap();
         fs::remove_dir(moved).unwrap();
+        fs::remove_dir(fixture).unwrap();
+    }
+
+    #[test]
+    fn runtime_bin_refuses_a_group_or_world_writable_directory() {
+        let fixture = test_directory("glaeda-hot-run-runtime-mode-test")
+            .canonicalize()
+            .unwrap();
+        let runtime_bin = fixture.join("bin");
+        fs::create_dir(&runtime_bin).unwrap();
+        for mode in [0o775, 0o757, 0o777] {
+            fs::set_permissions(&runtime_bin, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                observe_runtime_bin(Some(&runtime_bin), Some("fixture")).unwrap_err(),
+                "runtime bin binding is writable by an untrusted identity"
+            );
+        }
+
+        fs::set_permissions(&runtime_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            observe_runtime_bin(Some(&runtime_bin), Some("fixture"))
+                .unwrap()
+                .is_some()
+        );
+
+        fs::remove_dir(runtime_bin).unwrap();
         fs::remove_dir(fixture).unwrap();
     }
 }

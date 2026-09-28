@@ -30,7 +30,9 @@ struct TempToolchain {
 impl TempToolchain {
     fn new(label: &str) -> Self {
         let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
+        let temporary_root =
+            fs::canonicalize(std::env::temp_dir()).expect("canonicalize test temporary directory");
+        let root = temporary_root.join(format!(
             "glaeda-toolchain-preflight-acceptance-{label}-{}-{sequence}",
             std::process::id()
         ));

@@ -4,10 +4,13 @@ use std::path::{Component, Path};
 use serde::Serialize;
 
 use crate::journal::{ExecutionLane, PlannedMutation};
+#[cfg(all(target_os = "linux", not(test)))]
+use crate::lane_executable::resolve_reviewed_environment_executable;
+#[cfg(all(test, target_os = "linux"))]
+use crate::lane_executable::test_environment_executable;
 #[cfg(target_os = "linux")]
 use crate::lane_executable::{
     VerifiedEnvironmentExecutable, is_supported_environment_executable_path,
-    resolve_reviewed_environment_executable,
 };
 use crate::process::CommandSpec;
 #[cfg(target_os = "linux")]
@@ -20,8 +23,11 @@ const USERMOD: &str = "/usr/sbin/usermod";
 const INSTALL: &str = "/usr/bin/install";
 const MIN_SUBORDINATE_ID_COUNT: u64 = 65_536;
 const LOGINCTL: &str = "/usr/bin/loginctl";
+#[cfg(target_os = "linux")]
 const RUNUSER: &str = "/usr/sbin/runuser";
+#[cfg(target_os = "linux")]
 const PODMAN: &str = "/usr/bin/podman";
+#[cfg(target_os = "linux")]
 const GIT: &str = "/usr/bin/git";
 const NOLOGIN: &str = "/usr/sbin/nologin";
 
@@ -566,10 +572,16 @@ fn runner_user_spec(
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(not(test))]
 fn reviewed_environment_program() -> Result<VerifiedEnvironmentExecutable, LaneCommandError> {
     resolve_reviewed_environment_executable().map_err(|_| {
         LaneCommandError::single("no supported reviewed environment executable is available")
     })
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn reviewed_environment_program() -> Result<VerifiedEnvironmentExecutable, LaneCommandError> {
+    Ok(test_environment_executable())
 }
 
 fn require_lane(action: &PlannedMutation, expected: ExecutionLane) -> Result<(), LaneCommandError> {
@@ -608,6 +620,7 @@ fn canonical_absolute_path(field: &str, value: &str) -> Result<String, LaneComma
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::path::Path;
 
     use crate::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
@@ -615,9 +628,11 @@ mod tests {
     use crate::process::CommandValue;
 
     use super::{
-        APT_GET, GIT, GROUPADD, INSTALL, LOGINCTL, LaneCommand, LaneCommandKind, LinuxAccountName,
-        NOLOGIN, PODMAN, PackageName, RUNUSER, RunnerUserContext, USERADD, USERMOD,
+        APT_GET, GROUPADD, INSTALL, LOGINCTL, LaneCommand, LaneCommandKind, LinuxAccountName,
+        NOLOGIN, PackageName, RunnerUserContext, USERADD, USERMOD,
     };
+    #[cfg(target_os = "linux")]
+    use super::{GIT, PODMAN, RUNUSER};
 
     fn action(lane: ExecutionLane) -> PlannedMutation {
         PlannedMutation::new(

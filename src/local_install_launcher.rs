@@ -897,7 +897,9 @@ mod tests {
     impl World {
         fn new(label: &str) -> Self {
             let sequence = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
+            let temporary_root = std_fs::canonicalize(std::env::temp_dir())
+                .expect("canonicalize test temporary directory");
+            let root = temporary_root.join(format!(
                 "glaeda-local-launcher-{label}-{}-{sequence}",
                 std::process::id()
             ));
@@ -1176,8 +1178,14 @@ mod tests {
         let world = World::new("setgid-directory-group");
         let generation = world.publish_generation(None, 'a');
         let launcher = world.launcher_dir();
-        std_fs::set_permissions(&launcher, std_fs::Permissions::from_mode(0o2700))
-            .expect("set setgid launcher mode");
+        if let Err(error) =
+            std_fs::set_permissions(&launcher, std_fs::Permissions::from_mode(0o2700))
+        {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("set setgid launcher mode: {error}");
+        }
         let actual_group = fs::fstat(
             fs::open(&launcher, DIRECTORY_FLAGS, Mode::empty()).expect("open launcher directory"),
         )

@@ -840,7 +840,7 @@ fn inspect_config_file(
 }
 
 fn trusted_owner(uid: u32, gid: u32, context: &LocalInstallCargoConfigPreflightContext) -> bool {
-    (uid == 0 && gid == 0) || (uid == context.runner_uid && gid == context.runner_gid)
+    uid == 0 || (uid == context.runner_uid && gid == context.runner_gid)
 }
 
 fn trusted_ancestor_is_ready(
@@ -980,6 +980,14 @@ mod tests {
         assert!(!trusted_ancestor_is_ready(0, 0, 0o775, &context));
         assert!(!trusted_ancestor_is_ready(501, 20, 0o777, &context));
         assert!(!trusted_ancestor_is_ready(777, 20, 0o755, &context));
+    }
+
+    #[test]
+    fn root_owned_system_group_is_trusted_only_without_group_write() {
+        let context = context();
+        assert!(trusted_owner(0, 80, &context));
+        assert!(trusted_ancestor_is_ready(0, 80, 0o755, &context));
+        assert!(!trusted_ancestor_is_ready(0, 80, 0o775, &context));
     }
 
     fn identity(seed: u64) -> ObjectIdentity {

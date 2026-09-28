@@ -198,6 +198,12 @@ Do not promote a filesystem primitive because its microbenchmark is attractive. 
 
 ### Ultra-trusted local hot-run prototype
 
+For native SwiftPM, Xcode, and Apple app build helpers, use the
+[native Apple build workflow](APPLE_NATIVE_BUILDS.md). It preserves one checkout
+and gives native cache families stable, toolchain-keyed paths with project locking
+and explicit interrupted-build recovery. Linux filesystem views below remain a
+separate backend.
+
 `scripts/hot-run` is a deliberately small Linux developer-loop prototype. It binds a task Git
 worktree onto the pathname of a warmed resident worktree. Explicit path-class policies can expose
 resident dependencies read-only, give a short-lived task a private OverlayFS upper over warmed
@@ -240,7 +246,7 @@ standard cache is ignored by Git, is invalidated by Python's source/cache-tag co
 no state, execution, or result authority; deleting it merely makes the next fallback invocation
 compile the module again.
 
-`glaeda-hot-run` is the compiled Linux front door for the equally common measured direct case:
+`glaeda-hot-run` is the compiled Linux and macOS front door for the equally common measured direct case:
 
 ```bash
 glaeda-hot-run \
@@ -249,7 +255,30 @@ glaeda-hot-run \
   -- cargo check --locked
 ```
 
-It preserves the schema-v6 measurement shape, workload-scoped GNU-time CPU/RSS boundary, aggregate
+On macOS, it executes directly inside the existing project checkout, retains native build caches
+between invocations, and records schema-v6 wall time plus the command's exit or signal. For a Mac
+project such as cmux, keep one canonical checkout and invoke the normal native build tool there:
+
+```bash
+glaeda-hot-run \
+  --resident /path/to/cmux --task /path/to/cmux/cmux-tui \
+  --cache cmux-tui/target:native --measurement /private/cmux-warm.json \
+  -- cargo test --locked -p cmux-tui-core --lib
+```
+
+The first invocation warms the tool's ordinary cache; repeated invocations reuse whatever the
+tool validates. Cargo, SwiftPM, Xcode or Zig still owns dependency and source invalidation. A
+cache miss follows the native build tool's cold rebuild path. No result is skipped based on a
+Glaeda receipt. This is ultra-trusted host execution with the caller's environment and terminal,
+not a sandbox or a managed resident lease. It creates no duplicate checkout or background daemon.
+Use the project's existing tagged build helper for Xcode builds.
+
+The Mac path rejects `--timeout`, `--resource-profile`, and `--cpu-set` before running anything.
+CPU/RSS accounting and native-target snapshots are unavailable (`null`); the Linux `/proc`
+machine probes are unavailable on macOS too. Wall time remains measured. Cross-worktree and
+private-cache requests remain unsupported rather than falling back to shared mutable state.
+
+On Linux, it preserves the schema-v6 measurement shape, workload-scoped GNU-time CPU/RSS boundary, aggregate
 machine-pressure envelope, exit-versus-signal distinction, atomic receipt publication, caller
 environment and terminal, optional comparison key, runtime executable digest, and optional
 descendant-bin binding without starting Python. The binary accepts only a task directory inside the
@@ -269,7 +298,7 @@ requests remain on `scripts/hot-run` rather than being silently weakened. This i
 observation-only ultra-trusted execution path. It grants no lease, cache, residency, validation,
 publication, or cleanup authority.
 
-When the compiled front door records an exact `target:native` declaration, its schema-v6 receipt
+On Linux, when the compiled front door records an exact `target:native` declaration, its schema-v6 receipt
 also carries a path-private `native_target_observation`. Sequential pre-command observations bind
 the checkout commit/tree/materialization and checkout-local Cargo target generation; an
 unavailable pre-command observation refuses to run an unbound measurement. After the command,
@@ -403,11 +432,12 @@ scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
   -- node ./node_modules/.bin/next build
 ```
 
-`--runtime-bin` requires a runtime ID, accepts only one absolute canonical plain directory, resolves
-the launched executable from that directory, and places the directory first in the inherited
-descendant `PATH`. The receipt records only `runtime_bin_first` plus an opaque binding digest; the
-private-state namespace also includes that digest, so bound and unbound executions or replaced
-directories cannot share mutable lineage. No private path is recorded.
+`--runtime-bin` requires a runtime ID, accepts only one absolute canonical plain directory owned by
+root or the current user and not group- or world-writable, resolves the launched executable from
+that directory, and places the directory first in the inherited descendant `PATH`. The receipt
+records only `runtime_bin_first` plus an opaque binding digest; the private-state namespace also
+includes that digest, so bound and unbound executions or replaced directories cannot share mutable
+lineage. No private path is recorded.
 
 This closes the common `/usr/bin/env node` and package-script shebang path for an explicitly
 selected ultra-trusted toolchain. It does not hash the whole toolchain tree, intercept absolute
@@ -694,11 +724,13 @@ glaeda --output json cache observe-hot-run --root <explicit-hot-run-root>
 
 This is filesystem-metadata observation only. It follows no symlinks, reads no file contents, and
 stays on the root filesystem. A complete observation rejects more than 1,024 states, 2,000,000
-objects, depth over 64, cross-state hardlinks, drift, and unsupported filesystem shapes. Logical
-bytes match GNU `du --apparent-size` semantics by excluding directory entry sizes; allocated bytes
-sum unique per-state `st_blocks * 512`, including directories. The namespace root itself is
-excluded from the per-state aggregate. As with `du`, `st_blocks` is inode-reported allocation
-rather than unique backing usage when reflinks or block-level deduplication share extents.
+objects, more than 512 recognized lock candidates, depth over 64, cross-state hardlinks, drift, and
+unsupported filesystem shapes. Logical bytes match GNU `du --apparent-size` semantics by excluding
+directory entry sizes; allocated bytes sum unique per-state `st_blocks * 512`, including
+directories. The namespace root itself is excluded from the per-state aggregate. As with `du`,
+`st_blocks` is inode-reported allocation rather than unique backing usage when reflinks or
+block-level deduplication share extents. The secondary runtime-lock discovery pass has its own
+2,000,000-entry work bound rather than relying on the first traversal's count.
 
 Protected OverlayFS work directories and nested special nodes produce a successful path-free
 schema-v2 `completeness: partial` observation after the top-level state set is revalidated. Its
@@ -708,11 +740,19 @@ or run the development binary with extra privilege to fill it in. Root unavailab
 top-level state shape, drift or rebinding, cross-state physical attribution, bounds, and arithmetic
 failure remain hard errors.
 
+On Linux, a complete observation also reads one bounded `/proc/locks` snapshot. An exact held
+whole-file exclusive BSD flock on the descriptor-retained direct `lock` file or a direct
+`runtime-<64hex>/lock` file establishes `active_lock: true` for that state. An absent, malformed or
+oversized snapshot remains unknown, as do POSIX/OFD/read/partial/blocked rows and every recognized
+lock file without a matching held row. The command never reports lock absence. A partial
+observation never enters the classifier and therefore never emits an active-lock fact.
+
 Every state in a complete observation remains `ownership_unknown` with generation, worktree,
-reconstruction, lease, lock, mount, open-file, process, cleanup, and quarantine evidence unknown.
-A complete observation therefore reports disk occupancy but cannot make any state reclaimable. A
-partial observation does not enter the classifier at all. Neither form creates catalog, marker,
-adoption, retirement, or cleanup authority.
+reconstruction, lease, mount, open-file, process, cleanup, and quarantine evidence unknown. Lock
+evidence is either definitely active at the bounded kernel snapshot or unknown. A complete
+observation therefore reports disk occupancy and can conservatively identify an in-use state, but
+cannot make any state reclaimable. Neither complete nor partial observation creates catalog,
+marker, adoption, retirement, signaling, or cleanup authority.
 
 An explicit checkout-local Cargo target has a separate Linux observation front door:
 
