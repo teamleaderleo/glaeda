@@ -270,6 +270,13 @@ Rules:
 - age is calculated from `observed_at`, so delayed GitHub publication can arrive already stale;
 - signature failure, malformed fields, missing node entry, duplicate node entry, stale data, or future timestamps produce an `unknown` consumer view for that reviewed node.
 
+The sequence advances on publication, not on attempt. `publish` checks `sequence == current + 1` before
+it checks refresh suppression, so a suppressed attempt refuses without changing remote state and the
+caller must reuse the same sequence on its next attempt. A caller that increments per attempt refuses
+forever after its first idle refresh, and the only escape is a new `producer_generation`, which is
+reserved for reboot/reinstallation. Persist the last sequence the caller actually published, not the
+last one it tried.
+
 A dead/sleeping node can therefore remain remotely `available` only until its bounded useful age expires. Dispatch still performs fresh local admission immediately before physical execution.
 
 ## Publication triggers and write ceiling

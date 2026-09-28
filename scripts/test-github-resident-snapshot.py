@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import concurrent.futures
+import contextlib
 import datetime as dt
 import importlib.util
+import io
 import json
 from pathlib import Path
 import shutil
@@ -206,7 +208,7 @@ class ResidentSnapshotPureTests(unittest.TestCase):
         self.assertLessEqual(len(raw), MODULE.MAX_NODE_BYTES)
         text = raw.decode()
         for forbidden in ("private-hostname", "/home/", "/Users/", "argv", "environment", "pid", "command"):
-            self.assertNotIn(forbidden, text.lower())
+            self.assertNotIn(forbidden.lower(), text.lower())
 
     def test_reusable_state_summary_matches_lifecycle_public_contract(self):
         summary = reusable_state_summary()
@@ -841,6 +843,103 @@ class ResidentSnapshotSigningAndTransportTests(unittest.TestCase):
         view = MODULE.consume_fleet(fleet, trust_value, now=BASE_TIME + dt.timedelta(seconds=5), ssh_keygen=SSH_KEYGEN)
         self.assertEqual([item["id"] for item in view["nodes"]], ["node-1111111111111111", "node-2222222222222222"])
         self.assertTrue(all(item["freshness_class"] == "fresh" for item in view["nodes"]))
+
+
+class ResidentSnapshotErrorChannelTests(unittest.TestCase):
+    """The CLI's error channel is held to the same privacy ceiling as the published document."""
+
+    def run_cli(self, argv):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = MODULE.main(argv)
+        return code, stderr.getvalue()
+
+    def assert_no_private_paths(self, text):
+        for forbidden in ("/home/", "/Users/", "/tmp/", "secret", "Traceback"):
+            self.assertNotIn(forbidden.lower(), text.lower())
+
+    def test_a_missing_repository_root_refuses_without_naming_it(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            snapshot_path = Path(scratch) / "snapshot.json"
+            trust_path = Path(scratch) / "trust.json"
+            snapshot_path.write_text(json.dumps(fake_signed(build_unsigned())), encoding="utf-8")
+            trust_path.write_text(json.dumps(trust()), encoding="utf-8")
+            code, text = self.run_cli([
+                "publish",
+                "--snapshot", str(snapshot_path),
+                "--trust", str(trust_path),
+                "--repository-root", "/nonexistent-private-workspace-xyz",
+            ])
+        self.assertEqual(code, 1)
+        self.assertNotIn("nonexistent-private-workspace-xyz", text)
+        self.assert_no_private_paths(text)
+        self.assertEqual(json.loads(text)["error"], "repository root is unavailable")
+
+    def test_a_missing_signing_key_refuses_without_naming_it(self):
+        with self.assertRaises(MODULE.SnapshotError) as caught:
+            MODULE.sign_snapshot(
+                build_unsigned(),
+                trust(),
+                private_key=Path("/nonexistent-private-key-xyz"),
+                ssh_keygen=SSH_KEYGEN,
+            )
+        self.assertNotIn("nonexistent-private-key-xyz", str(caught.exception))
+        self.assertEqual(str(caught.exception), "snapshot signing key is unavailable")
+
+    def test_an_unverifiable_rotation_entry_is_not_recommitted_verbatim(self):
+        # A fleet entry that fails verification is retained under the rotation branch. It is
+        # evidence of nothing and it gets recommitted under the next honest publisher's
+        # authorship, so an injected blob there would both launder and, once the fleet crossed
+        # the read ceiling, stop every node from publishing again.
+        node_a = "node-1111111111111111"
+        node_b = "node-2222222222222222"
+        trust_value = trust(nodes=[
+            {"id": node_a, "key_id": "key-aaaaaaaaaaaaaaaa", "ssh_public_key": fake_public_key("a"),
+             "os_class": "linux", "architecture_class": "x86_64"},
+            {"id": node_b, "key_id": "key-bbbbbbbbbbbbbbbb", "ssh_public_key": fake_public_key("b"),
+             "os_class": "linux", "architecture_class": "x86_64"},
+        ])
+        candidate = fake_signed(build_unsigned(trust_value=trust_value, public_node_id=node_b))
+        junk = {
+            "document_type": MODULE.NODE_DOCUMENT,
+            "schema_version": MODULE.SCHEMA_VERSION,
+            "payload": {
+                "node": {"id": node_a},
+                "producer": {"key_id": "key-9999999999999999"},
+                "filler": "x" * (MODULE.MAX_NODE_BYTES + 1),
+            },
+            "signature": {"key_id": "key-9999999999999999"},
+        }
+        fleet = {"document_type": MODULE.FLEET_DOCUMENT, "schema_version": MODULE.SCHEMA_VERSION,
+                 "nodes": [junk]}
+
+        def verify(value, *_args, **_kwargs):
+            if value is junk:
+                raise MODULE.SnapshotError("snapshot signature verification failed")
+            return value
+
+        with mock.patch.object(MODULE, "validate_signed_snapshot", side_effect=verify):
+            with self.assertRaisesRegex(MODULE.SnapshotError, "exceeds the byte ceiling"):
+                MODULE.upsert_fleet(fleet, candidate, trust_value, now=BASE_TIME)
+
+        smuggled = dict(junk)
+        smuggled["payload"] = {"node": {"id": node_a}, "producer": {"key_id": "key-9999999999999999"}}
+        smuggled["extra"] = "smuggled"
+        fleet["nodes"] = [smuggled]
+
+        def verify_smuggled(value, *_args, **_kwargs):
+            if value is smuggled:
+                raise MODULE.SnapshotError("snapshot signature verification failed")
+            return value
+
+        with mock.patch.object(MODULE, "validate_signed_snapshot", side_effect=verify_smuggled):
+            with self.assertRaisesRegex(MODULE.SnapshotError, "unsupported fields"):
+                MODULE.upsert_fleet(fleet, candidate, trust_value, now=BASE_TIME)
+
+    def test_the_subprocess_ceiling_can_read_any_fleet_the_validator_accepts(self):
+        # remote_fleet reads the status file through git show, so a subprocess ceiling at or below
+        # the fleet ceiling would wedge every node's publish once an accepted fleet crossed it.
+        self.assertGreater(MODULE.MAX_GIT_OUTPUT_BYTES, MODULE.MAX_FLEET_BYTES)
 
 
 if __name__ == "__main__":

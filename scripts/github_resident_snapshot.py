@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import contextlib
 import hashlib
 import json
 import os
@@ -33,7 +34,10 @@ MAX_USEFUL_AGE_SECONDS = 600
 DEFAULT_USEFUL_AGE_SECONDS = 300
 DEFAULT_REFRESH_INTERVAL_SECONDS = 240
 MAX_CLOCK_SKEW_SECONDS = 30
-MAX_GIT_OUTPUT_BYTES = 64 * 1024
+# Above MAX_FLEET_BYTES on purpose: remote_fleet reads the status file through git show, so a
+# subprocess ceiling at or below the fleet ceiling would refuse a fleet that validate_fleet accepts
+# and publishes, wedging every node's next publish with no way back but a force-push.
+MAX_GIT_OUTPUT_BYTES = 256 * 1024
 OID_RE = re.compile(r"[0-9a-f]{40}\Z")
 SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 NODE_RE = re.compile(r"node-[0-9a-f]{16}\Z")
@@ -132,6 +136,27 @@ def format_time(value: dt.datetime) -> str:
     if value.tzinfo is None or value.utcoffset() != dt.timedelta(0):
         raise SnapshotError("time must be UTC")
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+@contextlib.contextmanager
+def scratch_directory(prefix: str):
+    """A private temporary directory whose creation failure refuses with a constant, never a path."""
+    try:
+        directory = tempfile.TemporaryDirectory(prefix=prefix)
+    except OSError as error:
+        raise SnapshotError("a bounded scratch directory is unavailable") from error
+    try:
+        yield directory.name
+    finally:
+        directory.cleanup()
+
+
+def write_scratch(path: Path, payload: bytes) -> None:
+    """Write scratch bytes, refusing with a constant so ENOSPC/EACCES never stringifies the path."""
+    try:
+        path.write_bytes(payload)
+    except OSError as error:
+        raise SnapshotError("a bounded scratch file could not be written") from error
 
 
 def load_json(path: Path, maximum_bytes: int = MAX_FLEET_BYTES) -> object:
@@ -708,10 +733,14 @@ def sign_snapshot(
     reviewed = trust_node(trust, node_id)
     key_id = reviewed["key_id"]
     ssh_keygen = require_executable(ssh_keygen, "ssh-keygen")
-    private_key = private_key.resolve(strict=True)
+    try:
+        private_key = private_key.resolve(strict=True)
+        key_mode = stat.S_IMODE(private_key.stat().st_mode)
+    except OSError as error:
+        raise SnapshotError("snapshot signing key is unavailable") from error
     if not private_key.is_file():
         raise SnapshotError("snapshot signing key is unavailable")
-    if stat.S_IMODE(private_key.stat().st_mode) & 0o077:
+    if key_mode & 0o077:
         raise SnapshotError("snapshot signing key permissions are too broad")
     public = run_bounded(
         [str(ssh_keygen), "-y", "-f", str(private_key)],
@@ -730,9 +759,9 @@ def sign_snapshot(
         raise SnapshotError("snapshot signing key disagrees with reviewed trust")
 
     message = canonical_json(unsigned)
-    with tempfile.TemporaryDirectory(prefix="glaeda-status-sign-") as directory:
+    with scratch_directory("glaeda-status-sign-") as directory:
         message_path = Path(directory) / "snapshot"
-        message_path.write_bytes(message)
+        write_scratch(message_path, message)
         completed = run_bounded(
             [str(ssh_keygen), "-Y", "sign", "-f", str(private_key), "-n", SIGNING_NAMESPACE, str(message_path)],
             env=signing_environment(),
@@ -784,11 +813,11 @@ def verify_snapshot_signature(
     if key_id != reviewed["key_id"] or unsigned["payload"]["producer"]["key_id"] != key_id:
         raise SnapshotError("snapshot signature key disagrees with reviewed trust")
     ssh_keygen = require_executable(ssh_keygen, "ssh-keygen")
-    with tempfile.TemporaryDirectory(prefix="glaeda-status-verify-") as directory:
+    with scratch_directory("glaeda-status-verify-") as directory:
         signature_path = Path(directory) / "snapshot.sig"
         allowed_path = Path(directory) / "allowed_signers"
-        signature_path.write_text(signature["value"], encoding="ascii")
-        allowed_path.write_text(f"{key_id} {reviewed['ssh_public_key']}\n", encoding="ascii")
+        write_scratch(signature_path, signature["value"].encode("ascii"))
+        write_scratch(allowed_path, f"{key_id} {reviewed['ssh_public_key']}\n".encode("ascii"))
         completed = run_bounded(
             [str(ssh_keygen), "-Y", "verify", "-f", str(allowed_path), "-I", key_id, "-n", SIGNING_NAMESPACE, "-s", str(signature_path)],
             input_bytes=canonical_json(unsigned),
@@ -932,8 +961,21 @@ def upsert_fleet(
                 or historical_key_id == reviewed["key_id"]
             ):
                 raise
+            # The entry cannot be verified under the reviewed key, so it is evidence of nothing and
+            # is about to be recommitted under this publisher's authorship. Bound and shape-check
+            # it so a junk blob cannot ride the rotation branch into the status branch and push the
+            # fleet past the ceiling remote_fleet can read. An honestly published entry passed both
+            # of these when it was signed, so only injected bytes can fail here.
+            superseded = exact_object(item, "superseded node snapshot")
+            exact_keys(
+                superseded,
+                {"document_type", "schema_version", "payload", "signature"},
+                "superseded node snapshot",
+            )
+            if len(canonical_json(superseded)) > MAX_NODE_BYTES:
+                raise SnapshotError("superseded node snapshot exceeds the byte ceiling")
             trust_state_by_id[raw_id] = "superseded_key"
-            nodes.append(item)
+            nodes.append(superseded)
         else:
             trust_state_by_id[raw_id] = "current_key"
             nodes.append(current)
@@ -1211,7 +1253,10 @@ def publish_snapshot(
     retries = integer(retries, "publish retries", 0, 3)
     now = now or dt.datetime.now(dt.UTC)
     git = require_executable(git, "git")
-    repository_root = repository_root.resolve(strict=True)
+    try:
+        repository_root = repository_root.resolve(strict=True)
+    except OSError as error:
+        raise SnapshotError("repository root is unavailable") from error
     candidate = validate_signed_snapshot(candidate_value, trust_value, now=now, ssh_keygen=ssh_keygen)
     node_id = candidate["payload"]["node"]["id"]
     candidate_digest = digest(canonical_json(candidate))
@@ -1292,9 +1337,9 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     try:
-        arguments = parser().parse_args()
+        arguments = parser().parse_args(argv)
         if arguments.command == "compose":
             trust = load_json(arguments.trust, 32 * 1024)
             observed = current_time(arguments.observed_at)
@@ -1339,8 +1384,14 @@ def main() -> int:
             sys.stdout.buffer.write(canonical_json(receipt))
             return 0
         raise SnapshotError("unsupported command")
-    except (OSError, SnapshotError, subprocess.SubprocessError) as error:
+    except SnapshotError as error:
         sys.stderr.write(json.dumps({"error": str(error)}, sort_keys=True, separators=(",", ":")) + "\n")
+        return 1
+    except (OSError, subprocess.SubprocessError):
+        # Only SnapshotError carries a reviewed constant message. An OSError or a SubprocessError
+        # stringifies the path or the argv that raised it, so this prints a constant instead.
+        sys.stderr.write(json.dumps({"error": "the command could not be completed"},
+                                    sort_keys=True, separators=(",", ":")) + "\n")
         return 1
 
 
