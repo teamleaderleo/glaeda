@@ -1312,9 +1312,10 @@ class GlaedaDiskTest(unittest.TestCase):
         stamp = self.root.parent / f"{self.root.name}-idle.last"
         self.addCleanup(stamp.unlink, missing_ok=True)
         args = ["--pressure", "--idle", "--apply", "--no-snapshot", "--top", "0", "--min-mib", "0", "--low", "1", "--target", "2",
-                "--root-override", f"xcode-derived-data={self.root}", "--family", "xcode-derived-data",
                 "--receipt", os.fspath(self.receipt())]
-        with mock.patch.object(gd, "IDLE_STAMP", stamp), mock.patch.object(gd, "EVICT_LOCK", self.root.parent / f"{self.root.name}.lock"), \
+        with mock.patch.object(gd, "default_families", return_value=[self.fam]), \
+                mock.patch.object(gd, "free_bytes", return_value=(100 * gd.GIB, 400 * gd.GIB)), \
+                mock.patch.object(gd, "IDLE_STAMP", stamp), mock.patch.object(gd, "EVICT_LOCK", self.root.parent / f"{self.root.name}.lock"), \
                 mock.patch.object(gd, "simulator_runtimes", return_value=[]):
             with mock.patch.object(gd, "host_busy", return_value="a CI job is running (x)"), \
                     contextlib.redirect_stdout(io.StringIO()) as out:
