@@ -10,8 +10,9 @@ mod admission;
 pub use admission::{
     AdmittedHotStateCandidate, HotStateAdmissionAuthority, HotStateAdmissionContext,
     HotStateAdmissionMismatchField, HotStateAdmissionRefusal, HotStateAdmissionSemantics,
-    HotStateAdmissionTarget, HotStateBindingRef, HotStateFamilyRef, HotStateForbiddenReason,
-    HotStateQuarantineReason, HotStateResourceDisposition, HotStateReusableState,
+    HotStateAdmissionTarget, HotStateBindingRef, HotStateFamilyAdmissionEvidence,
+    HotStateFamilyRef, HotStateFamilyStanding, HotStateForbiddenReason, HotStateQuarantineReason,
+    HotStateResourceDisposition, HotStateReusableState, admit_family_evidence,
 };
 
 pub const HOT_STATE_PATH_POLICY_SCHEMA_VERSION: u8 = 1;
