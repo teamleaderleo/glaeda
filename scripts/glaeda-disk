@@ -471,47 +471,72 @@ WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
 CHECKOUT_BUILD_IDLE_HOURS = 24.0
 
 
+def _checkout_git(checkout: Path, *args: str) -> list[str]:
+    """NUL-separated output of a read-only git command in checkout, or [] on any failure. The caller's
+    GIT_* variables would override -C (a hook's GIT_DIR names one repository for every checkout)."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+    try:
+        r = subprocess.run(["git", "-C", os.fspath(checkout), *args], capture_output=True, timeout=60, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [os.fsdecode(f) for f in r.stdout.split(b"\0") if f] if r.returncode == 0 else []
+
+
 def project_checkouts(projects: Path) -> list[Path]:
-    """Every checkout under projects: each repository directly below it and its linked worktrees there.
-    Worktrees outside projects (a Claude session's scratchpad) belong to their own family."""
-    found: dict[str, Path] = {}
-    for c in _children(projects):
-        if not (c / ".git").exists() or c.is_symlink():
-            continue
-        found.setdefault(os.fspath(c), c)
-        try:
-            out = subprocess.run(["git", "-C", os.fspath(c), "worktree", "list", "--porcelain", "-z"],
-                                 capture_output=True, text=True, timeout=60).stdout
-        except (OSError, subprocess.SubprocessError):
-            continue
-        for field_ in out.split("\0"):
-            if field_.startswith("worktree "):
-                w = Path(field_[len("worktree "):])
-                if w.is_relative_to(projects) and w.is_dir():
-                    found.setdefault(os.fspath(w), w)
-    return list(found.values())
+    """Every checkout under projects, by real path: each repository directly below it and its linked
+    worktrees there. Worktrees outside projects (a Claude session's scratchpad) belong to their own family."""
+    real = os.path.realpath(projects)
+    repos = [c for c in _children(projects) if (c / ".git").exists() and not c.is_symlink()]
+    found = {os.path.realpath(c) for c in repos}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for fields in pool.map(lambda c: _checkout_git(c, "worktree", "list", "--porcelain", "-z"), repos):
+            for f in fields:
+                if f.startswith("worktree "):
+                    w = os.path.realpath(f[len("worktree "):])
+                    if w.startswith(real + "/") and os.path.isdir(w):
+                        found.add(w)
+    return [Path(w) for w in sorted(found)]
+
+
+def _checkout_build_dirs(checkout: Path) -> list[Path]:
+    found = []
+    tracked = _checkout_git(checkout, "ls-files", "-z", "--", "Package.swift", ":(glob)**/Package.swift")
+    for rel in sorted({os.path.dirname(r) for r in tracked}):
+        build = checkout / rel / ".build"
+        if not build.is_symlink() and _head(os.fspath(build / "CACHEDIR.TAG"), 64).startswith(CACHEDIR_TAG):
+            found.append(build)
+    found += [g for g in _children(checkout / ".glaeda/apple-build/cache") if g.is_dir() and not g.is_symlink()]
+    return found
 
 
 def checkout_builds(projects: Path) -> list[Path]:
     """The build output inside the checkouts under projects that its tool recreates: SwiftPM's .build
-    (it writes a CACHEDIR.TAG) beside each tracked Package.swift, and each glaeda-apple cache generation
+    (tagged with a CACHEDIR.TAG) beside each tracked Package.swift, and each glaeda-apple cache generation
     (.glaeda/apple-build/cache/<key>; the receipts beside it stay). The index names the packages, so
-    nothing walks the checkouts."""
-    found = []
-    for checkout in project_checkouts(projects):
-        try:
-            out = subprocess.run(["git", "-C", os.fspath(checkout), "ls-files", "-z", "--",
-                                  "Package.swift", ":(glob)**/Package.swift"],
-                                 capture_output=True, text=True, timeout=60).stdout
-        except (OSError, subprocess.SubprocessError):
-            out = ""
-        for rel in sorted({os.path.dirname(r) for r in out.split("\0") if r}):
-            build = checkout / rel / ".build"
-            if (build / "CACHEDIR.TAG").is_file() and not build.is_symlink():
-                found.append(build)
-        found += [g for g in _children(checkout / ".glaeda/apple-build/cache")
-                  if g.is_dir() and not g.is_symlink()]
-    return found
+    nothing walks the checkouts; the git calls run in parallel (hundreds of checkouts on a laptop)."""
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return [b for bs in pool.map(_checkout_build_dirs, project_checkouts(projects)) for b in bs]
+
+
+def apple_build_verdict(path: Path) -> str:
+    """Why a glaeda-apple cache generation stays whatever its age, or "": a run is in flight or holds the
+    build lock. Xcode writes deeper than the idle check looks, so the lock is what shows a build."""
+    state = path.parent.parent
+    if (state / "inflight.json").exists():
+        return "a glaeda-apple run is in flight"
+    try:
+        fd = os.open(state / "build.lock", os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return ""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return ""
+    except OSError:
+        return "a glaeda-apple run holds its build lock"
+    finally:
+        os.close(fd)
 
 
 def worktree_roots(projects: Path) -> list[Path]:
@@ -649,7 +674,7 @@ def default_families() -> list[Family]:
     fams.append(Family("checkout-build", projects, True,
                        "swift build or glaeda-apple warm rebuilds it; also counted in its checkout",
                        checkout_builds=True, build_output=True, min_idle_hours=CHECKOUT_BUILD_IDLE_HOURS,
-                       owner="SwiftPM and glaeda-apple, per checkout", rebuild_minutes=5))
+                       owner="SwiftPM and glaeda-apple, per checkout", rebuild_minutes=15))
     # Cargo owns target validity and RFC #1137 owns Cargo reclaim, so this is visibility only.
     # Sizes here are also counted inside their checkout under projects or worktrees.
     fams.append(Family("cargo-target", projects, False,
@@ -1176,6 +1201,8 @@ def keep_verdict(fam: "Family", path: Path) -> str:
         return seed_verdict(path)
     if fam.discover and stat_layout(os.fspath(path)) == "rustup-toolchain":
         return rustup_verdict(path)
+    if fam.checkout_builds and path.parent.name == "cache" and path.parent.parent.name == "apple-build":
+        return apple_build_verdict(path)
     return ""
 
 

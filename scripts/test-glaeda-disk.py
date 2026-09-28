@@ -1299,6 +1299,28 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((projects / "wts/feature/.build").exists())
         self.assertEqual(self._git("-C", str(projects / "app"), "status", "--porcelain", "-uno"), "")
 
+    def test_apple_generation_stays_while_a_run_holds_the_lock(self) -> None:
+        projects, fam = self._checkout_builds()
+        state = projects / "app/.glaeda/apple-build"
+        fd = os.open(state / "build.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 6, 0)}
+        self.assertEqual(v["app/.glaeda/apple-build/cache/k1"], "kept")
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        (state / "inflight.json").write_text("{}")
+        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 6, 0)}
+        self.assertEqual(v["app/.glaeda/apple-build/cache/k1"], "kept")
+        (state / "inflight.json").unlink()
+        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 6, 0)}
+        self.assertEqual(v["app/.glaeda/apple-build/cache/k1"], "reclaimable")
+
+    def test_checkout_builds_ignore_the_callers_git_dir(self) -> None:
+        projects, fam = self._checkout_builds()
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(self.root / "nowhere/.git")}):
+            found = {str(p.relative_to(projects)) for p in gd.checkout_builds(projects)}
+        self.assertIn("wts/feature/Packages/macOS/Core/.build", found)
+
     def test_apply_refreshes_only_checkout_build_sizes(self) -> None:
         projects, fam = self._checkout_builds()
         known = {str(projects / "app/.build"): 1, str(projects / "app"): 2, str(projects / "wts/feature"): 3}
