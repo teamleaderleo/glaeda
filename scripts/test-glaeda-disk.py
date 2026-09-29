@@ -1721,8 +1721,25 @@ class ActivityClockTest(unittest.TestCase):
         return sorted(self.now - h * 3600 for h in hours_ago)
 
     def due(self, mode: str, idle: float, starts: list[float] | None, window: float = 1.0) -> bool:
-        with mock.patch.object(gd, "ACTIVITY_MODE", mode), mock.patch.object(gd, "job_starts", return_value=starts):
+        with mock.patch.object(gd, "ACTIVITY_MODE", mode), mock.patch.object(gd, "job_starts", return_value=starts), \
+                mock.patch.object(gd, "running_job_hours", return_value=0.0):
             return gd.item_due(self.fam, idle, window)[0]
+
+    def test_running_job_hours_reads_the_oldest_runner_worker(self) -> None:
+        out = (" 1-02:03:04 /Users/cmux/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+               "   05:06 /Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient\n 99:00:00 /bin/zsh\n")
+        with mock.patch.object(gd, "_RUNNING_JOB_HOURS", None), \
+                mock.patch.object(gd.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, out, "")):
+            self.assertAlmostEqual(gd.running_job_hours(), 26 + 3 / 60 + 4 / 3600, places=4)
+        with mock.patch.object(gd, "_RUNNING_JOB_HOURS", None), mock.patch.object(gd.subprocess, "run", side_effect=OSError):
+            self.assertEqual(gd.running_job_hours(), 24.0)
+
+    def test_an_item_a_running_job_may_hold_is_never_due(self) -> None:
+        busy = self.starts(*[i / 100 for i in range(100)])
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "job_starts", return_value=busy), \
+                mock.patch.object(gd, "running_job_hours", return_value=2.0):
+            self.assertFalse(gd.item_due(self.fam, 1.5, 1.0)[0])  # used after the oldest running job began
+            self.assertTrue(gd.item_due(self.fam, 2.5, 1.0)[0])  # older than every running job
 
     def test_a_quiet_fleet_keeps_its_cache(self) -> None:
         # idle 30 h, but only 2 jobs ran since: not stale, nothing had a chance to use it

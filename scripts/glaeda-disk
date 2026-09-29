@@ -381,11 +381,42 @@ def jobs_since_use(fam: "Family", idle_hours: float, now: float | None = None) -
     return len(starts) - bisect.bisect_right(starts, last_use)
 
 
+_RUNNING_JOB_HOURS: float | None = None
+
+
+def running_job_hours() -> float:
+    """Age in hours of the oldest running CI job (Runner.Worker), 0 when none; ps failing counts as a day."""
+    global _RUNNING_JOB_HOURS
+    if _RUNNING_JOB_HOURS is None:
+        try:
+            out = subprocess.run(["ps", "-axww", "-o", "etime=,command="], capture_output=True, text=True,
+                                 timeout=60).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = None
+        oldest = 0.0 if out is not None else 24.0
+        for line in (out or "").splitlines():
+            etime, _, cmd = line.strip().partition(" ")
+            if CI_WORKER.search(cmd):
+                days, _, clock = etime.rpartition("-")
+                parts = [int(x) for x in clock.split(":") if x.isdigit()]
+                secs = sum(v * 60 ** i for i, v in enumerate(reversed(parts))) + int(days or 0) * 86400
+                oldest = max(oldest, secs / 3600)
+        _RUNNING_JOB_HOURS = oldest
+    return _RUNNING_JOB_HOURS
+
+
 def item_due(fam: "Family", idle_hours: float, window: float) -> tuple[bool, int | None]:
-    """Whether an item is old enough to delete, and the job count that decided it (None: wall clock)."""
+    """Whether an item is old enough to delete, and the job count that decided it (None: wall clock).
+
+    A hot-tier item used since the oldest running CI job started is never due: that job may hold it
+    (a `cp -cR` clone leaves the source's times alone, and a step between commands names no path),
+    which the old defer-while-CI-runs rule covered. Its own run counts toward jobs_since, so without
+    this a job could age the seed it started from past pressure_jobs."""
     jobs = jobs_since_use(fam, idle_hours)
     if jobs is None or ACTIVITY_MODE is None:
         return idle_hours >= window, jobs
+    if idle_hours <= running_job_hours():
+        return False, jobs
     if ACTIVITY_MODE == "sweep":
         return (jobs >= POLICY["sweep_jobs"]
                 or (idle_hours >= POLICY["soft_idle_hours"] and jobs >= POLICY["pressure_jobs"])), jobs
@@ -2825,7 +2856,8 @@ def main(argv: list[str] | None = None) -> int:
         apply(items, {f.id: f for f in fams}, a.receipt,
               {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt)
         if sweep:
-            apply_runtimes(tooling, a.receipt, halt)
+            # deleting a runtime restarts CoreSimulatorService: never while a job may be using simulators
+            apply_runtimes(tooling, a.receipt, host_busy)
             IDLE_STAMP.parent.mkdir(parents=True, exist_ok=True)
             IDLE_STAMP.touch()
     return 0
