@@ -459,7 +459,7 @@ def parked_slot_within_reuse_distance(slot: Path) -> bool:
         parked_at = slot.stat().st_mtime
     except OSError:
         return False
-    log = Path.home() / "Library/Logs/glaeda-cmux-jobs.jsonl"
+    log = JOB_LOG
     try:
         jobs = 0
         with log.open(encoding="utf-8", errors="replace") as file:
