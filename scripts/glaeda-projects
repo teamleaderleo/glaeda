@@ -169,6 +169,26 @@ def target_for(repo: str, name: str) -> Path:
     return WORKTREES / repo / name
 
 
+def newest_touch(path: Path, budget: int = 50_000) -> float:
+    """Find recent working-tree edits without letting a huge .git walk dominate the plan."""
+    newest = 0.0
+    try:
+        newest = path.stat().st_mtime
+    except OSError:
+        return time.time()
+    for root, dirs, files in os.walk(path, followlinks=False):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for name in (*dirs, *files):
+            budget -= 1
+            if budget < 0:
+                return time.time()
+            try:
+                newest = max(newest, (Path(root) / name).stat().st_mtime)
+            except OSError:
+                continue
+    return newest
+
+
 def discover_worktrees(repos: list[Path]) -> dict[Path, Path]:
     found: dict[Path, Path] = {}
     for repo in repos:
@@ -206,7 +226,7 @@ def plan() -> list[Action]:
         name = source.name
         destination = target_for(repo.name, name)
         reason = "idle linked worktree"
-        if source.stat().st_mtime > time.time() - AGE_S:
+        if newest_touch(source) > time.time() - AGE_S:
             actions.append(Action("skip", str(source), str(destination), "touched within 24h", "skipped"))
         else:
             actions.append(Action("worktree", str(source), str(destination), reason, branch=branch(source)))
@@ -222,7 +242,7 @@ def plan() -> list[Action]:
         for clone in group:
             if clone == canonical or clone in repos and clone.name == canonical.name:
                 continue
-            if clone.stat().st_mtime > time.time() - AGE_S:
+            if newest_touch(clone) > time.time() - AGE_S:
                 actions.append(Action("skip", str(clone), "", "full clone touched within 24h", "skipped"))
                 continue
             reason = clean_pushed(clone)
@@ -243,7 +263,7 @@ def plan() -> list[Action]:
             continue
         if SCRATCH_NAMES.search(entry.name):
             dst = SCRATCH / entry.name
-            if entry.stat().st_mtime <= time.time() - AGE_S:
+            if newest_touch(entry) <= time.time() - AGE_S:
                 actions.append(Action("scratch", str(entry), str(dst), "scratch or fixture folder"))
             else:
                 actions.append(Action("skip", str(entry), str(dst), "scratch touched within 24h", "skipped"))
