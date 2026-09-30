@@ -109,6 +109,43 @@ class ProjectsTest(unittest.TestCase):
         run("worktree", "add", "-q", str(external), "-b", "external", "HEAD", cwd=repo)
         self.assertIn("backs linked worktrees", gp.clean_pushed(repo))
 
+    def test_referenced_main_checkout_is_kept(self) -> None:
+        repo = self.repo()
+        remote = Path(self.tmp.name) / "remote.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(repo), str(remote)], check=True)
+        run("remote", "add", "origin", str(remote), cwd=repo)
+        run("push", "-q", "-u", "origin", "HEAD", cwd=repo)
+        clone = self.projects / "terminal-kit"
+        subprocess.run(["git", "clone", "-q", str(remote), str(clone)], check=True)
+        old = time.time() - 48 * 3600
+        for item in clone.rglob("*"):
+            os.utime(item, (old, old), follow_symlinks=False)
+        os.utime(clone, (old, old))
+        (self.home / ".zshrc").write_text(f"source {clone}/shell.zsh\n")
+        action = next(a for a in gp.plan() if Path(a.source) == clone)
+        self.assertEqual((action.kind, action.status), ("skip", "skipped"))
+        self.assertIn("referenced", action.reason)
+
+    def test_main_checkout_reference_sources_are_all_checked(self) -> None:
+        repo = self.repo()
+        sources = [
+            (".codex/hooks.json", "hooks"), (".codex/config.toml", "config"),
+            (".claude/settings.json", "claude"), (".zshrc", "zsh"),
+            (".bashrc", "bash"), (".profile", "profile"),
+            ("Library/LaunchAgents/example.plist", "launch"),
+            (".config/systemd/user/example.service", "systemd"),
+        ]
+        for relative, marker in sources:
+            config = self.home / relative
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text(f"{marker} = {repo}/bin/tool\n")
+            self.assertIn("referenced", gp.referenced_main_checkout(repo), relative)
+            config.unlink()
+        local_bin = self.home / ".local/bin"
+        local_bin.mkdir(parents=True)
+        (local_bin / "tool").symlink_to(repo / "bin/tool")
+        self.assertIn("~/.local/bin", gp.referenced_main_checkout(repo))
+
     def test_apply_aborts_when_process_evidence_is_unavailable(self) -> None:
         action = gp.Action("scratch", str(self.projects / "stale"), str(self.projects / "scratch/stale"), "old")
         with mock.patch.object(gp, "process_evidence", side_effect=gp.EvidenceUnavailable("cannot list processes")):

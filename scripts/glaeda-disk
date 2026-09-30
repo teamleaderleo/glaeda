@@ -178,6 +178,79 @@ NEVER_DELETE = ("cmux-browser-fleet", "Library/Caches/cmux-release-support", "Li
 NEVER_DELETE_NAMES = re.compile(r"chromium|cmux-browser|siso|depot_tools|cmux-release-support|vpython|cipd", re.I)
 
 
+def _reference_spellings(path: Path) -> tuple[str, ...]:
+    """Absolute and user-facing spellings that a configuration may use for a checkout."""
+    absolute = os.path.abspath(os.fspath(path))
+    real = os.path.realpath(absolute)
+    values = {absolute, real}
+    home = os.path.abspath(os.fspath(HOME))
+    for value in tuple(values):
+        if value == home or value.startswith(home + "/"):
+            values.add("~" + value[len(home):])
+        if value == "/private" or value.startswith("/private/"):
+            values.add(value.removeprefix("/private"))
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def _reference_mentions(text: str, path: Path) -> bool:
+    for spelling in _reference_spellings(path):
+        start = 0
+        while (index := text.find(spelling, start)) >= 0:
+            before = text[index - 1] if index else ""
+            after_at = index + len(spelling)
+            after = text[after_at] if after_at < len(text) else ""
+            if (not before or before in " \t\r\n'\"=:/,;([{<") and \
+                    (not after or after in " \t\r\n'\"=:/,;)]}>"):
+                return True
+            start = index + 1
+    return False
+
+
+def _reference_files() -> list[Path]:
+    """User-owned launch, shell, and agent configuration that can name a checkout."""
+    files = [HOME / ".codex/hooks.json", HOME / ".codex/config.toml",
+             HOME / ".claude/settings.json", HOME / ".profile",
+             HOME / ".bashrc", HOME / ".bash_profile", HOME / ".bash_login",
+             HOME / ".zshrc", HOME / ".zprofile", HOME / ".zlogin", HOME / ".zshenv",
+             HOME / ".kshrc", HOME / ".config/fish/config.fish",
+             *sorted((HOME / "Library/LaunchAgents").glob("*.plist")),
+             *sorted((HOME / ".config/systemd/user").glob("**/*"))]
+    return [path for path in dict.fromkeys(files) if path.is_file()]
+
+
+def referenced_main_checkout(path: Path, *, nested: bool = False) -> str:
+    """Return a guard reason when user configuration or a tool symlink names this main checkout."""
+    if path.is_symlink():
+        return ""
+    if (path / ".git").is_dir():
+        roots = [path]
+    elif nested:
+        roots = nested_checkouts(path)
+        if roots is None:
+            return "main checkout references unreadable"
+    else:
+        return ""
+    local_bin = HOME / ".local/bin"
+    for root in roots:
+        if not (root / ".git").is_dir():
+            continue
+        try:
+            for entry in local_bin.iterdir():
+                if entry.is_symlink() and Path(os.path.realpath(entry)).is_relative_to(root.resolve()):
+                    return "main checkout referenced by ~/.local/bin symlink"
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return "main checkout references unreadable"
+        for config in _reference_files():
+            try:
+                if _reference_mentions(config.read_text(errors="ignore"), root):
+                    return "main checkout referenced by user configuration"
+            except OSError:
+                return "main checkout references unreadable"
+    return ""
+
+
 def never_delete(path: Path) -> bool:
     if NEVER_DELETE_NAMES.search(path.name):
         return True
@@ -2440,6 +2513,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
         if fam.pressure_only and ACTIVITY_MODE != "pressure":
             reasons.append("package cache: pressure-only policy")
+        if fam.git_disposable and (reference := referenced_main_checkout(path, nested=fam.nested_git)):
+            reasons.append(reference)
         policy_note = ""
         if ROLE == "devbox" and (fam.id == "xcode-derived-data" or
                 (fam.id in ("tmp", "user-tmp") and re.search(r"cmux|terminal-image|derived-data", path.name, re.I))):
@@ -2901,6 +2976,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))):
             outcome = "changed:in-use"
+        elif (families[i.family].git_disposable
+              and referenced_main_checkout(p, nested=families[i.family].nested_git)):
+            outcome = "changed:referenced"
         elif not item_due(families[i.family],
                           (time.time() - item_mtime(families[i.family], p)) / 3600,
                           item_window(families[i.family], p, idle_hours, archived))[0]:

@@ -85,6 +85,36 @@ class GlaedaDiskTest(unittest.TestCase):
         os.utime(repo / ".git", (time.time() - 48 * 3600,) * 2)
         self.assertEqual(gd.survey([self.fam], 24, 0)[0].verdict, "git-checkout")
 
+    def test_referenced_main_checkout_is_kept(self) -> None:
+        home = self.root / "home"
+        home.mkdir()
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        (repo / "README").write_text("ok\n")
+        subprocess.run(["git", "-C", str(repo), "add", "README"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        remote = self.root / "remote.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(repo), str(remote)], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "HEAD"], check=True)
+        (home / ".zshrc").write_text(f"source {repo}/shell.zsh\n")
+        old = time.time() - 48 * 3600
+        os.utime(repo, (old, old))
+        os.utime(repo / ".git", (old, old))
+        fam = gd.Family("tmp", self.root, True, "scratch", git_disposable=True)
+        with mock.patch.object(gd, "HOME", home):
+            item = next(i for i in gd.survey([fam], 24, 0) if i.path == str(repo))
+            self.assertEqual(item.verdict, "in-use")
+            self.assertTrue(any("referenced" in reason for reason in item.reasons))
+            receipt = self.root / "referenced.jsonl"
+            item.verdict = "reclaimable"  # exercise the apply-time reference recheck
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        self.assertTrue(repo.exists())
+        self.assertIn("changed:referenced", receipt.read_text())
+
     def test_bulk_sizes_walk_the_root_once_and_skip_prefixes(self) -> None:
         self.fam = gd.Family("user-tmp", self.root, True, "scratch", bulk_sizes=True,
                              skip_prefixes=("com.apple.",))

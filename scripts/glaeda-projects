@@ -31,6 +31,68 @@ GIT = next((path for path in ("/usr/bin/git", "/usr/local/bin/git", "/opt/homebr
             if os.access(path, os.X_OK)), "/usr/bin/git")
 
 
+def _path_spellings(path: Path) -> tuple[str, ...]:
+    """Absolute and user-facing spellings that a configuration may use for a checkout."""
+    absolute = os.path.abspath(os.fspath(path))
+    real = os.path.realpath(absolute)
+    values = {absolute, real}
+    home = os.path.abspath(os.fspath(HOME))
+    for value in tuple(values):
+        if value == home or value.startswith(home + "/"):
+            values.add("~" + value[len(home):])
+        if value == "/private" or value.startswith("/private/"):
+            values.add(value.removeprefix("/private"))
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def _mentions_path(text: str, path: Path) -> bool:
+    for spelling in _path_spellings(path):
+        start = 0
+        while (index := text.find(spelling, start)) >= 0:
+            before = text[index - 1] if index else ""
+            after_at = index + len(spelling)
+            after = text[after_at] if after_at < len(text) else ""
+            if (not before or before in " \t\r\n'\"=:/,;([{<") and \
+                    (not after or after in " \t\r\n'\"=:/,;)]}>"):
+                return True
+            start = index + 1
+    return False
+
+
+def _reference_files() -> list[Path]:
+    """User-owned launch, shell, and agent configuration that can name a checkout."""
+    files = [HOME / ".codex/hooks.json", HOME / ".codex/config.toml",
+             HOME / ".claude/settings.json", HOME / ".profile",
+             HOME / ".bashrc", HOME / ".bash_profile", HOME / ".bash_login",
+             HOME / ".zshrc", HOME / ".zprofile", HOME / ".zlogin", HOME / ".zshenv",
+             HOME / ".kshrc", HOME / ".config/fish/config.fish",
+             *sorted((HOME / "Library/LaunchAgents").glob("*.plist")),
+             *sorted((HOME / ".config/systemd/user").glob("**/*"))]
+    return [path for path in dict.fromkeys(files) if path.is_file()]
+
+
+def referenced_main_checkout(path: Path) -> str:
+    """Return a guard reason when user configuration or a tool symlink names this main checkout."""
+    if not (path / ".git").is_dir() or path.is_symlink():
+        return ""
+    local_bin = HOME / ".local/bin"
+    try:
+        for entry in local_bin.iterdir():
+            if entry.is_symlink() and Path(os.path.realpath(entry)).is_relative_to(path.resolve()):
+                return "main checkout referenced by ~/.local/bin symlink"
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return "main checkout references unreadable"
+    for config in _reference_files():
+        try:
+            if _mentions_path(config.read_text(errors="ignore"), path):
+                return "main checkout referenced by user configuration"
+        except OSError:
+            return "main checkout references unreadable"
+    return ""
+
+
 @dataclasses.dataclass
 class Action:
     kind: str
@@ -313,6 +375,9 @@ def plan() -> list[Action]:
             if initialized_submodules(clone):
                 actions.append(Action("skip", str(clone), "", "full clone has initialized submodules; kept intact", "skipped"))
                 continue
+            if reference := referenced_main_checkout(clone):
+                actions.append(Action("skip", str(clone), "", reference, "skipped"))
+                continue
             dst = target_for(canonical.name, clone.name)
             actions.append(Action("clone", str(clone), str(dst), "clean pushed duplicate clone",
                                   branch=branch(clone)))
@@ -431,6 +496,8 @@ def mutation_guard(source: Path, *, check_age: bool = True) -> str:
         return "source ownership unreadable"
     if live_in(source, opened, commands) or session_mentions(source):
         return "live process or unfinished session uses checkout"
+    if reason := referenced_main_checkout(source):
+        return reason
     if check_age and newest_touch(source) > time.time() - AGE_S:
         return "touched within 24h"
     return ""
