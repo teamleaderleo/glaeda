@@ -666,6 +666,7 @@ SATURATED = "the mini is saturated"
 # load again once the load has fallen below the resume mark, so one stuck process cannot keep a mini dark.
 GATE_LOAD_MAX_HOLD_S = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_MAX_HOLD_S") or 30 * 60)
 GATE_STOP_WAIT_S = 60.0  # a graceful listener exit, before it is killed
+GATE_WATCH_S = 0.1  # while a job is below the disk floor, notice its Worker exit promptly
 GATE_WAITER_EVERY_S = 30.0
 GATE_MAX_FAILURES = 5  # consecutive failed polls before the gate hands the runner back
 GATE_FALLBACK = 70  # listen.sh runs run.sh itself: the gate broke before any runner started
@@ -2902,6 +2903,8 @@ class Gate:
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
         # the eviction under way: the detached glaeda-disk, when it started and the free GiB before it
         self.evicting: tuple[subprocess.Popen[bytes], float, float | None] | None = None
+        self.watching: tuple[int, ...] = ()
+        self.fast_until = 0.0
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -3129,6 +3132,15 @@ class Gate:
         """The runner has a job: a Runner.Worker under its tree, or a request its listener is taking."""
         return self.worker() or self.taking() is not None
 
+    def worker_pids(self) -> tuple[int, ...]:
+        """Runner.Worker descendants, used to wake a disk hold when the job exits."""
+        try:
+            pids, table = self.tree()
+        except Exception:  # noqa: BLE001
+            return ()
+        worker = os.fspath(self.runner_dir / "bin" / "Runner.Worker")
+        return tuple(pid for pid in pids if worker in table[pid][1])
+
     def worker(self) -> bool:
         """A Runner.Worker under this runner's tree. A failed look counts as busy."""
         try:
@@ -3226,8 +3238,17 @@ class Gate:
             if self.terminating:
                 self.stop("the runner agent is stopping")
                 return None
+            if self.watching and not self.busy():
+                self.watching = ()
+                self.fast_until = time.monotonic() + 5.0
+                if (why := self.low_disk()):
+                    self.stop(why)
+                    return None
             self.reload()
             if self.busy():
+                if (why := self.low_disk()) and (workers := self.worker_pids()):
+                    self.watching = tuple(workers)
+                    self.fast_until = time.monotonic() + 5.0
                 self.streak = 0  # a claim must hold for two idle polls, not carry over from the job
                 self.load_since = None  # the hold limit times a pause, never a job
                 return None
@@ -3257,6 +3278,40 @@ class Gate:
             return 0
         self.start()
         return None
+
+    def nap(self) -> None:
+        """Sleep until the next poll, waking quickly while a disk-held job exits."""
+        if self.watching:
+            if self.fast_until <= time.monotonic():
+                self.fast_until = time.monotonic() + 5.0
+            while self.watching:
+                alive = []
+                for pid in self.watching:
+                    if pid_alive(pid) and not self._zombie(pid):
+                        alive.append(pid)
+                self.watching = tuple(alive)
+                if not self.watching:
+                    self.fast_until = time.monotonic() + 5.0
+                    return
+                time.sleep(GATE_WATCH_S)
+                if time.monotonic() > self.fast_until:
+                    break
+            return
+        delay = GATE_POLL_S
+        if self.fast_until > time.monotonic():
+            delay = GATE_WATCH_S
+        if self.stop_deadline is not None:
+            delay = max(0.0, self.stop_deadline - time.monotonic())
+        time.sleep(delay)
+
+    @staticmethod
+    def _zombie(pid: int) -> bool:
+        try:
+            result = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=1, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.stdout.strip().startswith("Z")
 
     def unexpected(self, error: BaseException) -> int:
         """The gate broke for good: run the runner as plain run.sh would. A live child keeps running (a job is
