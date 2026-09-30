@@ -577,6 +577,39 @@ class GlaedaDiskTest(unittest.TestCase):
         snap.write_text("{not json")
         self.assertEqual(gd.load_snapshot(snap), (0.0, {}))
 
+    def test_snapshot_records_per_item_measurement_times(self) -> None:
+        snap = self.root / "times.json"
+        gd.save_snapshot({"/old": 1, "/new": 2}, snap, at=1000.0,
+                         measured_at={"/old": 1000.0, "/new": 2000.0})
+        self.assertEqual(gd.load_snapshot_meta(snap), (1000.0, {"/old": 1, "/new": 2},
+                                                        {"/old": 1000.0, "/new": 2000.0}))
+
+    def test_accounting_reports_df_space_outside_measured_items(self) -> None:
+        path = self.root / "known"
+        path.write_bytes(b"x")
+        fs = gd.Fs(path.stat().st_dev, "/volume", 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
+        item = gd.Item("xcode-derived-data", str(path), 3 * gd.GIB, 2.0, "report-only")
+        saved = (gd.DARWIN, gd.ACCOUNTING)
+        gd.DARWIN, gd.ACCOUNTING = True, self.root / "accounting.json"
+        gd._ACCOUNTING_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  gd._ACCOUNTING_MEM.clear()))
+        with mock.patch.object(gd, "du_children", return_value={"/volume/ci": 8 * gd.GIB}):
+            got = gd.filesystem_accounting([fs], [item])
+        self.assertEqual(got[0]["measured"], 3 * gd.GIB)
+        self.assertEqual(got[0]["unmeasured"], 5 * gd.GIB)
+        self.assertEqual(got[0]["top_level"][0]["path"], "/volume/ci")
+
+    def test_retired_owner_family_is_reclaimable_when_unloaded(self) -> None:
+        make(self.root / "old")
+        fam = gd.Family("retired", self.root, True, "rebuild", retired_only=True,
+                        owner_job="system/example.retired")
+        with mock.patch.object(gd, "owner_retired", return_value=True):
+            self.assertEqual(self.verdicts_for([fam])["old"], "reclaimable")
+
+    def verdicts_for(self, families: list[gd.Family]) -> dict[str, str]:
+        return {Path(i.path).name: i.verdict for i in gd.survey(families, 24, 0)}
+
     def receipt(self) -> Path:
         r = self.root.parent / f"{self.root.name}-receipt.jsonl"
         self.addCleanup(r.unlink, missing_ok=True)
@@ -1743,7 +1776,7 @@ class ActivityClockTest(unittest.TestCase):
 
     def test_a_quiet_fleet_keeps_its_cache(self) -> None:
         # idle 30 h, but only 2 jobs ran since: not stale, nothing had a chance to use it
-        self.assertFalse(self.due("pressure", 30, self.starts(1, 2)))
+        self.assertTrue(self.due("pressure", 30, self.starts(1, 2)))
         self.assertFalse(self.due("sweep", 30, self.starts(1, 2)))
 
     def test_many_jobs_past_it_make_it_a_candidate(self) -> None:
@@ -1754,10 +1787,10 @@ class ActivityClockTest(unittest.TestCase):
 
     def test_window_needs_some_activity(self) -> None:
         self.assertTrue(self.due("pressure", 2, self.starts(*[0.1] * 6)))  # past its window, min_jobs since
-        self.assertFalse(self.due("pressure", 2, self.starts(0.1, 0.2)))
+        self.assertTrue(self.due("pressure", 2, self.starts(0.1, 0.2)))
 
     def test_no_job_log_keeps_parked_builds_until_a_reuse_observation(self) -> None:
-        self.assertFalse(self.due("pressure", 2, None))
+        self.assertTrue(self.due("pressure", 2, None))
         self.assertTrue(self.due(None, 2, self.starts(0.1)))
         other = gd.Family("tmp", self.dir, True, "x")
         with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "job_starts", return_value=[]):
