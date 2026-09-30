@@ -34,7 +34,7 @@ class FakeRunner:
     def __call__(self, argv, *, home, timeout):
         self.calls.append(list(argv))
         if argv[0] == str(FAKE_LUME) and argv[1] == "ls":
-            return SimpleNamespace(returncode=0, stdout=json.dumps([{"name": "glaeda-desktop", "state": self.state,
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{"name": "glaeda-desktop", "id": "vm-1", "state": self.state,
                 "os": "macOS", "cpuCount": 8, "memorySize": 16 * 1024 ** 3,
                 "diskSize": {"total": 80 * 1024 ** 3}, "locationName": "default"}]), stderr="")
         if argv[0] == str(FAKE_LUME) and argv[1] == "ssh":
@@ -52,7 +52,7 @@ class FakeRunner:
 
 
 def policy() -> vm.VmPolicy:
-    return vm.VmPolicy(provider_path=str(FAKE_LUME), min_free_gib=1)
+    return vm.VmPolicy(provider_path=str(FAKE_LUME), provider_id="vm-1", min_free_gib=1)
 
 
 class ControllerTests(unittest.TestCase):
@@ -79,16 +79,16 @@ class ControllerTests(unittest.TestCase):
         decision = vm.plan(policy(), observed)
         self.assertEqual((decision["disposition"], decision["actions"]), ("ready", ["start"]))
 
-    def test_apply_reobserves_and_persists_post_action_state(self):
+    def test_apply_is_disabled_until_ownership_and_drain_are_proven(self):
         fake = FakeRunner()
         observed = vm.observe(policy(), home="/tmp/home", gui_queue_depth=1, run=fake)
         decision = vm.plan(policy(), observed)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
-            result = vm.apply_plan(policy(), decision, home="/tmp/home", state_path=path, run=fake)
-            self.assertEqual(result["post_observation"]["vm_state"], "running")
-            self.assertEqual(json.loads(path.read_text())["applied"], ["start"])
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            with self.assertRaisesRegex(vm.VmError, "apply is disabled"):
+                vm.apply_plan(policy(), decision, home="/tmp/home", state_path=path, run=fake)
+            self.assertFalse(path.exists())
+            self.assertFalse(any(call[0] == str(FAKE_LUME) and call[1] == "run" for call in fake.calls))
 
     def test_unknown_lume_identity_refuses(self):
         fake = FakeRunner()

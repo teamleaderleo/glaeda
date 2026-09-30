@@ -627,13 +627,10 @@ in at the producer's root. So one root job per root per mini:
   `canonicalRoots + guiRunners` is at most `runners`. Admission is unchanged: a GUI job takes 1 unit, the
   gui token (an app-host shard in the step before its restore instead), and the producer's root in its
   restore step.
-- A desktop VM runner may be installed separately with `glaeda-cmux-runner --gui-runner
-  --gui-token gui-vm --capacity-units 5 --capacity-dir '/Volumes/My Shared Files/capacity'
-  --labels glaeda-gui-<class>-xcode-<version>`. Lume exposes a host `--shared-dir
-  /Users/Shared/cmux-build-fleet/capacity:rw` at that guest path. It uses the same shared capacity
-  directory and GUI labels, but its `gui-vm.token` is independent from the host's `gui.token`, so the
-  mini accounts for two desktop sessions. The VM runner carries no root, side, iOS, or compile label;
-  its host supervisor drains it before a pressure stop and starts it only for a waiting GUI job. See
+- A desktop VM runner is a future, disabled design. It may use the GUI label and a distinct `gui-vm`
+  accounting token, but the guest must not receive read-write access to the host capacity ledger. A
+  host-side broker, immutable VM ownership receipt, and atomic runner drain are required before any
+  enrollment or lifecycle mutation. The VM runner carries no root, side, iOS, or compile label. See
   [`MACOS_DESKTOP_VM.md`](MACOS_DESKTOP_VM.md).
 - `compileSlots` may not exceed `canonicalRoots`: every compile holds a root.
 - `declared_pools` and glaeda-route count only the pool labels; the root and side labels split each mini's

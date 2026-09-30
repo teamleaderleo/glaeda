@@ -10,10 +10,11 @@ The pilot backend is [Lume](https://github.com/trycua/cua), pinned by the fleet
 image receipt. Lume uses Apple's Virtualization.framework, supports unattended
 macOS guests with a native display, and is MIT licensed. Tart is not a runtime
 dependency. The host adapter is [`scripts/glaeda-macos-vm`](../scripts/glaeda-macos-vm):
-`plan` is read-only, while `apply` performs one fresh-observation-bound start or
-stop and verifies the resulting state. A missing tool, unknown VM identity,
-unknown job activity, stale inventory, or failed post-action observation blocks
-the action.
+`plan` is read-only. `apply` is deliberately disabled: immutable provider
+ownership, a runner admission drain barrier, serialized reconciliation, and an
+isolated guest-to-host accounting protocol have not yet been proven. A missing
+tool, unknown VM identity, unknown job activity, stale inventory, or failed
+post-action observation blocks planning.
 
 The base image is macOS 26.5 or newer with the pinned Xcode command-line tools,
 the Actions runner, the Glaeda hook, the UI-test account, and the reviewed
@@ -23,23 +24,18 @@ reversible input probe. The VM is configured for 8 vCPUs, 16 GiB RAM, and an
 80 GiB sparse disk. Its break-glass recovery copy is a stopped Lume clone; it
 is never reset or cloned per job.
 
-The guest runner uses the same GUI label as the mini's host GUI runner, so the
-CI route remains a GUI-only route. Its hook uses the shared capacity ledger and
-the `gui-vm` token. The host GUI runner keeps `gui`. The two independent token
-files represent the two desktop sessions, while the common unit and root locks
-still prevent the VM from competing with builds. The capacity directory is the
-only host path shared into the guest; no source tree, credential directory,
-runner work tree, or product cache is shared.
+The intended guest runner uses the same GUI label as the mini's host GUI runner,
+so the CI route remains GUI-only. Its intended `gui-vm` accounting and the host
+`gui` token still need a host-side broker or another verified isolation boundary;
+the guest must not receive read-write access to the host capacity ledger. No
+runner enrollment, image creation, launchd service, checkout, credential
+directory, runner work tree, or product cache is installed by this PR.
 
-Elastic policy uses a one-second `top` sample and the macOS VM pressure level.
-At 85% CPU busy or pressure level 2/4, a running VM stops admitting new jobs.
-If its current job is idle, the controller gracefully stops the VM to release
-CPU and memory. If a job is active, the controller records a blocked plan and
-waits; it never suspends or kills a job. When CPU is at most 70%, pressure is
-normal, free space is at least 120 GiB, and a GUI job is waiting, the controller
-starts the stopped VM with a native display. The hysteresis avoids start/stop
-flapping. A queue-depth signal is supplied by the fleet scheduler; an offline
-runner is not treated as proof that a job is waiting.
+The proposed elastic policy uses a one-second `top` sample and the macOS VM
+pressure level. Its pressure thresholds, queue signal, drain protocol, and
+serialized start/stop controller remain design inputs only. No guest job is
+admitted, stopped, suspended, or resumed by this PR, and an offline runner is
+not treated as proof that a job is waiting.
 
 ## Pilot gate
 
@@ -52,7 +48,6 @@ same E2E/app-host legs on the host GUI runner and the VM runner for several
 hours. A timing-sensitive Metal, lag, or recorded-tour case remains host-only
 until it passes the same acceptance probe in the guest.
 
-Rollback is `glaeda-macos-vm plan` with no queue signal followed by an idle
-`apply` stop. Runner labels are removed only after the guest runner is drained.
-Deleting the VM is a separate, explicit recovery action and is not part of
-elastic reconciliation.
+Rollback and runner enrollment are future work after the ownership and drain
+protocol are accepted. Deleting a VM is a separate, explicit recovery action
+and is not part of this planning surface.

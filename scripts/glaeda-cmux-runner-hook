@@ -2053,7 +2053,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         # itself with glaeda-canonical-root take (take-root below) instead of a token-chosen one here
         tokens = tuple(t for t in tokens if t != "root")
         if klass == "gui-step":  # and the gui token, which its step takes before that root (take-gui)
-            tokens = tuple(t for t in tokens if t != "gui")
+            tokens = tuple(t for t in tokens if t != gui_token)
     # pinned: home-repo workflows the hook does not know use /private/tmp/cmux-ci itself
     try:
         capacity_dir.mkdir(parents=True, exist_ok=True)

@@ -2006,6 +2006,20 @@ time.sleep(60)
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
+    def test_capacity_gui_step_custom_token_is_taken_only_in_its_step(self) -> None:
+        """A VM desktop token must remain free until gui-step's take-gui step, too."""
+        self.fleet()
+        two = ("--canonical-roots", "2", "--compile-slots", "2", "--gui-token", "gui-vm")
+        try:
+            shard = self.job("app-host-unit-tests", "v0", 8, None, *two, "--gui-wait", "0")
+            self.assertEqual(shard.returncode, 0, shard.stdout)
+            self.assertIn("holding 1/8 units for app-host-unit-tests (gui-step", shard.stdout)
+            self.assertNotIn("gui-vm", shard.stdout)
+            self.assertEqual(self.take_gui("v0", "--gui-token", "gui-vm", "--wait", "1").returncode, 0)
+        finally:
+            self.finish("v0")
+        self.assertTrue(self.lock_free())
+
     def test_capacity_e2e_test_job_takes_the_gui_token_in_its_step(self) -> None:
         # test-e2e's `test` runs when the build could not get the gui token: at job start it takes neither, so a
         # busy token is waited for in its take-gui step instead of refusing the job after GUI_WAIT_S

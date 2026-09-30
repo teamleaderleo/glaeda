@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Plan and reconcile one elastic macOS desktop-test VM on an Apple mini.
 
-The adapter deliberately owns only the host-side lifecycle decision.  Lume is
+The adapter deliberately owns only read-only host-side lifecycle planning.  Lume is
 the selected Virtualization.framework backend because it supports unattended
 macOS guests, native display sessions, SSH, and sparse disks without making
 Tart a product dependency.  The guest runner and its GUI permissions are
 prepared in the image; this command never copies a checkout or resets a job.
 
-Planning is read-only.  Applying a plan requires a fresh observation, exact VM
-identity, a free-space floor, and an idle-job barrier before stopping a VM.
+Planning is read-only.  Mutation is disabled until immutable provider ownership,
+an admission drain barrier, serialized reconciliation, and isolated guest
+accounting are implemented and verified.
 """
 from __future__ import annotations
 
@@ -45,6 +46,7 @@ class VmPolicy:
     vm_name: str = DEFAULT_VM
     provider: str = "lume"
     provider_path: str | None = None
+    provider_id: str | None = None
     storage: str | None = None
     min_free_gib: float = DEFAULT_MIN_FREE_GIB
     gui_token: str = "gui-vm"
@@ -145,6 +147,9 @@ def _parse_lume_state(text: str, policy: VmPolicy) -> tuple[str, str]:
     if state not in ("running", "stopped", "provisioning"):
         raise VmError("Lume returned an unknown VM state")
     row = matches[0]
+    provider_id = row.get("id") or row.get("uuid") or row.get("vmId")
+    if not policy.provider_id or not isinstance(provider_id, str) or provider_id != policy.provider_id:
+        raise VmError("Lume VM immutable provider identity is not pinned")
     if row.get("os") not in ("macOS", "macos") or row.get("locationName") in (None, ""):
         raise VmError("Lume VM identity is incomplete")
     if row.get("cpuCount") != policy.cpus or row.get("memorySize") != policy.memory_gib * (1024 ** 3):
@@ -240,41 +245,12 @@ def _write_state(path: pathlib.Path, document: dict[str, Any]) -> None:
 
 
 def apply_plan(policy: VmPolicy, document: dict[str, Any], *, home: str, state_path: pathlib.Path, run=_run) -> dict[str, Any]:
-    if document.get("schema") != SCHEMA or document.get("disposition") != "ready":
-        raise VmError("only a ready plan can be applied")
-    provider = provider_path(policy)
-    actions = list(document.get("actions") or [])
-    for action in actions:
-        fresh = observe(policy, home=home, gui_queue_depth=int(document["observation"]["gui_queue_depth"]), run=run)
-        fresh_plan = plan(policy, fresh)
-        if fresh.vm_location != document["observation"].get("vm_location"):
-            raise VmError("fresh observation names a different exact VM location")
-        if fresh_plan["actions"] != [action] or fresh_plan["blockers"]:
-            raise VmError("fresh observation no longer matches the plan")
-        if action == "stop" and fresh.job_activity != "idle":
-            raise VmError("refusing to stop a VM with non-idle job activity")
-        argv = [provider, action, policy.vm_name]
-        if action == "start":
-            argv = [provider, "run", policy.vm_name, "--detach", "--display", "native", "--vnc", "disabled",
-                    "--shared-dir", policy.capacity_dir + ":rw"]
-        elif action == "stop":
-            argv += ["--timeout", "60"]
-        if policy.storage:
-            argv += ["--storage", policy.storage]
-        result = run(argv, home=home, timeout=90)
-        if result.returncode != 0:
-            raise VmError(f"Lume {action} failed")
-    final = observe(policy, home=home, gui_queue_depth=int(document["observation"]["gui_queue_depth"]), run=run)
-    expected = "running" if actions and actions[-1] == "start" else "stopped" if actions else final.vm_state
-    if actions and final.vm_state != expected:
-        raise VmError("post-action VM observation did not reach the requested state")
-    result = {**document, "applied": actions, "post_observation": dataclasses.asdict(final)}
-    _write_state(state_path, result)
-    return result
+    del policy, document, home, state_path, run
+    raise VmError("apply is disabled: VM ownership, admission drain, serialized lifecycle, and guest ledger isolation are not proven")
 
 
 def _policy(args: argparse.Namespace) -> VmPolicy:
-    return VmPolicy(vm_name=args.vm, provider_path=args.lume, storage=args.storage,
+    return VmPolicy(vm_name=args.vm, provider_path=args.lume, provider_id=args.provider_id, storage=args.storage,
                     min_free_gib=args.min_free_gib, gui_token=args.gui_token,
                     capacity_dir=args.capacity_dir)
 
@@ -284,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=("observe", "plan", "apply"))
     parser.add_argument("--vm", default=DEFAULT_VM)
     parser.add_argument("--lume")
+    parser.add_argument("--provider-id", help="pinned immutable Lume VM id from the image receipt")
     parser.add_argument("--storage")
     parser.add_argument("--home", default=str(pathlib.Path.home()))
     parser.add_argument("--state", type=pathlib.Path, default=pathlib.Path("~/.local/state/glaeda/macos-vm/state.json").expanduser())
