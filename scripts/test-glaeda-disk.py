@@ -1801,11 +1801,11 @@ class ActivityClockTest(unittest.TestCase):
         with mock.patch.object(gd, "_RUNNING_JOB_HOURS", None), mock.patch.object(gd.subprocess, "run", side_effect=OSError):
             self.assertEqual(gd.running_job_hours(), 24.0)
 
-    def test_an_item_a_running_job_may_hold_is_never_due(self) -> None:
+    def test_pressure_does_not_use_running_job_age_as_a_retention_window(self) -> None:
         busy = self.starts(*[i / 100 for i in range(100)])
         with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "job_starts", return_value=busy), \
                 mock.patch.object(gd, "running_job_hours", return_value=2.0):
-            self.assertFalse(gd.item_due(self.fam, 1.5, 1.0)[0])  # used after the oldest running job began
+            self.assertTrue(gd.item_due(self.fam, 1.5, 1.0)[0])  # process evidence, not job age, protects it
             self.assertTrue(gd.item_due(self.fam, 2.5, 1.0)[0])  # older than every running job
 
     def test_a_quiet_fleet_keeps_its_cache(self) -> None:

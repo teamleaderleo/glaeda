@@ -172,12 +172,18 @@ class DiskAndLeaks(Base):
         self.assertIn("5.0 GiB", report["findings"][0]["evidence"])
         self.assertIn("/Users/Shared", report["findings"][0]["evidence"])
 
+    def test_malformed_disk_accounting_is_ignored(self) -> None:
+        self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{"unmeasured": "unknown"},
+                                                                       {"unmeasured": None}]}
+        self.assertEqual(self.run_once()["findings"], [])
+
     def test_orphaned_apps_are_healed_by_the_backstop(self) -> None:
         self.mini.leaks = [(99, "/tmp/cmux DEV.app")]
         report = self.run_once()
         self.assertEqual(report["findings"], [])
         self.assertEqual(self.mini.did, ["kill leaked apps"])
         self.assertEqual(report["healed"][0]["code"], "leaked_test_apps")
+        self.assertIn("killed pid 99", report["healed"][0]["action"])
 
 
 class Testmanagerd(Base):

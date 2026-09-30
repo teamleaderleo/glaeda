@@ -429,8 +429,9 @@ def item_due(fam: "Family", idle_hours: float, window: float) -> tuple[bool, int
     jobs = jobs_since_use(fam, idle_hours)
     if ACTIVITY_MODE == "pressure" and fam.id in FLEET_FAMILY_IDS:
         # Pressure spends disposable hot state until the free target, even on a quiet host.
-        # A running job may touch a source between commands; preserve that existing veto.
-        return idle_hours > running_job_hours() and idle_hours >= POLICY["pressure_idle_hours"], jobs
+        # A running job may touch a source between commands; cwd, command-line, socket and job-unit
+        # checks preserve that veto. Do not use the job's age as a blanket six-hour retention window.
+        return idle_hours >= POLICY["pressure_idle_hours"], jobs
     if jobs is None and fam.id == "cmux-pr-builds":
         return False, None
     if jobs is None or ACTIVITY_MODE is None:

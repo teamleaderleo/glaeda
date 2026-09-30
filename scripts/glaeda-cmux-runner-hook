@@ -3696,6 +3696,14 @@ def cleanup_leaked_test_apps(ignored_workers: set[int] | None = None) -> list[st
         return []
     killed: list[str] = []
     for pid, path in found:
+        # Re-observe the exact pid and command immediately before each signal. A pid can be reused
+        # between the survey and the kill, and a replacement must never inherit the old verdict.
+        try:
+            current = processes()
+            if (pid, path) not in leaked_test_app_pids(current, ignored_workers):
+                continue
+        except (OSError, subprocess.SubprocessError):
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -3706,6 +3714,12 @@ def cleanup_leaked_test_apps(ignored_workers: set[int] | None = None) -> list[st
         while pid_alive(pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         if pid_alive(pid):
+            try:
+                current = processes()
+                if (pid, path) not in leaked_test_app_pids(current, ignored_workers):
+                    continue
+            except (OSError, subprocess.SubprocessError):
+                continue
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
         if not pid_alive(pid):

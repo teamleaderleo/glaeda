@@ -296,6 +296,8 @@ class Mini:
             return hook.cleanup_leaked_test_apps()
         killed = []
         for pid, path in self.leaked_test_apps():
+            if (pid, path) not in self.leaked_test_apps():
+                continue
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
@@ -303,9 +305,11 @@ class Mini:
             deadline = time.monotonic() + LEAKED_APP_TERM_S
             while pid in {p for p, *_ in self.process_tree()} and time.monotonic() < deadline:
                 time.sleep(0.05)
-            with contextlib.suppress(OSError):
-                os.kill(pid, signal.SIGKILL)
-            killed.append(f"killed pid {pid} {path}")
+            if pid in {p for p, *_ in self.process_tree()} and (pid, path) in self.leaked_test_apps():
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+            if pid not in {p for p, *_ in self.process_tree()}:
+                killed.append(f"killed pid {pid} {path}")
         return killed
 
     def disk_summary(self) -> dict[str, Any]:
@@ -354,7 +358,8 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
     if summary.get("schema") != "glaeda-disk/v1":
         return []
     accounting = summary.get("accounting") or []
-    missing = sum(int(x.get("unmeasured") or 0) for x in accounting if isinstance(x, dict))
+    missing = sum(float(x.get("unmeasured")) for x in accounting
+                  if isinstance(x, dict) and isinstance(x.get("unmeasured"), (int, float)))
     if missing < 1 * 1024**3:
         return []
     top: list[str] = []
@@ -466,12 +471,17 @@ def heal_runner(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
     return running, f"launchctl kickstart {label}: {'running' if running else 'still not running'}"
 
 
+def heal_leaked_test_apps(mini: Mini) -> tuple[bool, str]:
+    notes = mini.kill_leaked_test_apps()
+    return bool(notes), "; ".join(notes) if notes else "no orphaned cmux DEV.app remained after recheck"
+
+
 # code -> (heal, runs in a row seen before healing)
 HEALS: dict[str, tuple[Callable[[Mini, dict[str, Any]], tuple[bool, str]], int]] = {
     "testmanagerd_wedged": (heal_testmanagerd, 1),
     "tailscale_down": (heal_tailscale, 2),
     "runner_stopped": (heal_runner, 2),
-    "leaked_test_apps": (lambda mini, _f: (bool(mini.kill_leaked_test_apps()), "killed orphaned cmux DEV.app processes"), 1),
+    "leaked_test_apps": (lambda mini, _f: heal_leaked_test_apps(mini), 1),
 }
 
 
