@@ -45,6 +45,17 @@ run_attempt)` when comparing attempts.
 On a drained or explicitly observed PR mini, Leo can run these bounded root probes. Redact all
 unrelated paths before publishing:
 
+The checked-in `cx-mini-scan-exclude-root-probe.sh` is the bounded read-only wrapper for the
+same commands. The required one-shot fleet command (after selecting one idle PR mini) is:
+
+```sh
+build-fleet/mini-ops/fleet-sudo.sh --hosts cmux14 \
+  /Users/leoli/Projects/glaeda-worktrees/scan-exclude/cx-mini-scan-exclude-root-probe.sh
+```
+
+Run it from the cmuxterm-hq `build-fleet/mini-ops` checkout with the probe path supplied from
+that checkout. It asks the password group once and makes no host mutation.
+
 ```sh
 sudo /usr/bin/fs_usage -ww -f filesystem -t 30 2>/dev/null \
   | egrep 'fseventsd\\.|XProtect|Xprotect|syspolicyd|amfid' \
