@@ -422,6 +422,11 @@ def mutation_guard(source: Path, *, check_age: bool = True) -> str:
     try:
         if source.stat().st_uid != os.getuid():
             return "source is not owned by this user"
+        for root, dirs, files in os.walk(source, followlinks=False):
+            for name in (*dirs, *files):
+                entry = Path(root) / name
+                if entry.lstat().st_uid != os.getuid():
+                    return "source contains entries not owned by this user"
     except OSError:
         return "source ownership unreadable"
     if live_in(source, opened, commands) or session_mentions(source):
@@ -529,6 +534,9 @@ def apply(actions: list[Action]) -> None:
                         action.status, action.reason = "skipped", f"git refused move; source left intact: {error}"[:240]
                         continue
         elif action.kind == "compat":
+            if reason := mutation_guard(source):
+                action.status, action.reason = "skipped", reason
+                continue
             if any(source.iterdir()):
                 action.status = "skipped"
                 action.reason = "legacy folder still contains unmoved entries"
