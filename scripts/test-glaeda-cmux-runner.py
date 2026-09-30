@@ -3089,6 +3089,8 @@ class GateTest(unittest.TestCase):
         script.write_text("exec python3 /hook job-started --capacity-units 5 --instance 0 --gui-runner\n")
         self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(5, 1, 1, False, True),
                          "a gui runner is never a root runner, whatever its instance")
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --instance 0 --gui-runner --gui-token gui-vm\n")
+        self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(5, 1, 1, False, True, 0, "gui-vm"))
 
     def test_a_gui_runner_holds_while_the_console_is_locked(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
@@ -4551,7 +4553,7 @@ class RunnerTest(unittest.TestCase):
         self.assertNotIn("glaeda-ios-sim", labels[2], "no iOS job ever takes the gui runner")
         self.assertFalse([x for x in labels[2] if x.startswith("glaeda-runner-")])
         started = (self.home / "actions-runner-glaeda-4/glaeda-hooks/job-started.sh").read_text()
-        self.assertIn("--canonical-roots 2 --instance 4 --gui-runner\n", started)
+        self.assertIn("--canonical-roots 2 --instance 4 --gui-runner --gui-token gui\n", started)
         self.assertNotIn("--gui-runner", (self.home / "actions-runner-glaeda-2/glaeda-hooks/job-started.sh").read_text())
         self.assertEqual(hook.runner_scope(self.home / "actions-runner-glaeda-4"), hook.RunnerScope(5, 2, 2, False, True))
 

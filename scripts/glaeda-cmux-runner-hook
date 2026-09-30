@@ -1321,7 +1321,7 @@ def ensure_root_shim(bin_dir: Path) -> None:
 
 
 def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roots: int = 99,
-              switch: bool = False) -> int:
+              switch: bool = False, gui_token: str = "gui") -> int:
     """glaeda-canonical-root take ROOT: hold canonical root ROOT for the rest of this job (cmux#14338), waiting
     up to wait_s for it. A root this job already holds is a no-op; a second, different root is refused (two
     jobs taking two roots in opposite orders would deadlock), unless `switch` and every root the job holds
@@ -1375,7 +1375,7 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
             # take-gui reads it: a gui holder waiting for a root must not be waited on. Rewritten every poll,
             # so a marker a killed waiter left goes stale (WANT_FRESH_S) even if its pid comes back.
             with contextlib.suppress(OSError):
-                want.write_text("gui\n" if gui_file(state_dir).exists() else "\n")
+                want.write_text(f"{gui_token}\n" if gui_file(state_dir).exists() else "\n")
             time.sleep(TAKE_ROOT_POLL_S)
     finally:
         with contextlib.suppress(OSError):
@@ -1505,7 +1505,7 @@ def holder_alive(pid_file: Path) -> bool:
         return False
 
 
-def gui_holder_wants(capacity_dir: Path, roots: list[str]) -> str | None:
+def gui_holder_wants(capacity_dir: Path, roots: list[str], gui_token: str = "gui") -> str | None:
     """A root in `roots` that a job holding the gui token is waiting for in take-root, from its marker."""
     for name in roots:
         for marker in capacity_dir.glob(f"{name}.want-*"):
@@ -1520,13 +1520,13 @@ def gui_holder_wants(capacity_dir: Path, roots: list[str]) -> str | None:
             if not fresh or not pid_alive(pid):
                 with contextlib.suppress(OSError):
                     marker.unlink()  # a waiter that was killed
-            elif mark.strip() == "gui":
+            elif mark.strip() == gui_token:
                 return name
     return None
 
 
 def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path, recycle: str | None = None,
-             busy: re.Pattern[str] = XCTEST_RUNNING) -> int:
+             busy: re.Pattern[str] = XCTEST_RUNNING, gui_token: str = "gui") -> int:
     """glaeda-canonical-root take-gui: hold this mini's gui token (one console session) for the rest of this
     job, waiting up to wait_s. A job that already holds it (from admission) is a no-op. Exits 0 when held, 1
     when still taken after the wait, TAKE_GUI_GAVE_WAY when the holder waits for a root this job holds (see
@@ -1551,15 +1551,15 @@ def take_gui(wait_s: float, capacity_dir: Path, state_dir: Path, recycle: str | 
         print(f"{PREFIX}: take-gui: {stopped[2:]}", file=sys.stderr)
     deadline = time.monotonic() + max(0.0, wait_s)
     while True:
-        fd = lock_file(capacity_dir / "gui.token", fcntl.LOCK_EX)
+        fd = lock_file(capacity_dir / f"{gui_token}.token", fcntl.LOCK_EX)
         if fd is None and time.monotonic() >= deadline:
-            fd = retake(capacity_dir / "gui.token")  # a listener gate's probe holds it for microseconds
+            fd = retake(capacity_dir / f"{gui_token}.token")  # a listener gate's probe holds it for microseconds
         if fd is not None:
             break
         held: list[str] = []
         with contextlib.suppress(OSError):
             held = roots_file(state_dir).read_text().split()
-        wanted = gui_holder_wants(capacity_dir, held)
+        wanted = gui_holder_wants(capacity_dir, held, gui_token)
         if wanted:
             print(f"{PREFIX}: take-gui: the gui token's holder is waiting for {wanted}, which this job holds; "
                   "giving way", file=sys.stderr)
@@ -2030,7 +2030,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   instance: int = 0, workflow: str = "", warm_keys: tuple[str, ...] = (),
                   owned_state_dir: str = "", taken_out: dict[str, Any] | None = None,
                   warm_target: tuple[Any, ...] = ("", None, 0), klass: str | None = None,
-                  one_holder: bool = False, since: float | None = None) -> tuple[bool, str]:
+                  one_holder: bool = False, since: float | None = None, gui_token: str = "gui") -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
@@ -2044,6 +2044,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     the job class's tokens. Everything is a flock, so a holder that dies releases all of it."""
     klass, pinned = (klass, False) if klass else job_class(job, repo, home_repo, workflow)
     units, tokens = CLASS_COST[klass]
+    uses_gui = "gui" in tokens
+    if uses_gui:
+        tokens = tuple(gui_token if token == "gui" else token for token in tokens)
     units = min(units, total)
     if roots > 1 and klass in ROOT_CONSUMERS:
         # a consumer must use the producer's root, which only its restore step knows: it takes that root
@@ -2076,7 +2079,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         if behind:
             return False, behind
         yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
-        if "gui" in tokens:  # this job will drive the console session: the idle fuzzer's app must be gone first
+        if uses_gui:  # this job will drive the console session: the idle fuzzer's app must be gone first
             yielded += yield_idle_fuzz(capacity_dir)
         if os.path.isdir(os.path.dirname(host_lock)):
             # created if missing, so a worker that starts later still has to wait for this job
@@ -2177,7 +2180,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         what = "+".join([f"{units}/{total} units", *taken]) + warm_note
         if held and taken_out is not None:
             taken_out.update(units=units, units_total=total, tokens=list(taken))
-        if held and "gui" in taken:
+        if held and gui_token in taken:
             with contextlib.suppress(OSError):
                 gui_file(state_dir).write_text("gui\n")
         if held and root:
@@ -2451,6 +2454,7 @@ class RunnerScope(NamedTuple):
     root: bool = False
     gui: bool = False
     min_free_gib: float = 0.0
+    gui_token: str = "gui"
 
 
 def listen_fit_units(runner_dir: Path) -> int:
@@ -2480,8 +2484,10 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
     instance = flag("instance", int(suffix.group(1)) if suffix else 0)
     roots = max(1, flag("canonical-roots", 1))
     gui = re.search(r"\s--gui-runner(?:\s|$)", text) is not None
+    gui_match = re.search(r"\s--gui-token\s+([A-Za-z0-9._-]+)(?:\s|$)", text)
+    gui_token = gui_match.group(1) if gui_match else "gui"
     return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots, instance < roots and not gui,
-                       gui, min_free_gib(text))
+                       gui, min_free_gib(text), gui_token)
 
 
 def min_free_gib(text: str) -> float:
@@ -2570,13 +2576,13 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
                     f"{'a compile' if root else 'its next job'} needs {need}")
         # a job already here waits for what this runner's next job would take (CAPACITY_WAIT): it goes first
         compete = {"units"} | ({"root", "persistent-dd"} if root else set()) | (
-            {"gui", "root"} if scope is not None and scope.gui else set())
+            {scope.gui_token, "root"} if scope is not None and scope.gui else set())
         for waiter in admission_waiters(capacity_dir):
             shared = compete & set(waiter["wants"])
             if shared:
                 return f"{waiter['who'] or 'a job'} waits here for {', '.join(sorted(shared))}"
         if scope is not None and scope.gui:
-            if not probe(capacity_dir / "gui.token"):
+            if not probe(capacity_dir / f"{scope.gui_token}.token"):
                 return "the gui token is taken"
             if not any(probe(capacity_dir / f"root-{k}.token") for k in range(1, scope.roots + 1)):
                 return ("the canonical root is taken" if scope.roots == 1
@@ -4029,6 +4035,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--gui-runner", action="store_true",
                    help="this is the mini's gui runner (the gui pool label): the listener gate holds it while the "
                         "gui token, every canonical root or every unit is taken")
+    p.add_argument("--gui-token", default="gui",
+                   help="capacity ledger token for this runner's desktop session (default: gui)")
     p.add_argument("--capacity-dir", type=Path, default=Path(FLEET_DIR) / "capacity", help=argparse.SUPPRESS)
     p.add_argument("--host-lock", default=HOST_LOCK, help=argparse.SUPPRESS)
     p.add_argument("--reservation", default=RESERVATION, help=argparse.SUPPRESS)
@@ -4036,6 +4044,8 @@ def main(argv: list[str] | None = None) -> int:
                    help=argparse.SUPPRESS)
     p.add_argument("--watch-pid", type=int, default=0, help=argparse.SUPPRESS)
     args = p.parse_args(argv)
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", args.gui_token):
+        p.error("--gui-token must be a simple capacity token name")
     if args.parse_only:
         return 0
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
@@ -4072,10 +4082,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.phase == "take-root":
         if not args.root:
             p.error("take-root needs --root")
-        return take_root(args.root, args.wait, args.capacity_dir, args.state_dir, args.canonical_roots, args.switch)
+        return take_root(args.root, args.wait, args.capacity_dir, args.state_dir, args.canonical_roots, args.switch,
+                         args.gui_token)
     if args.phase == "take-gui":
         return take_gui(args.wait, args.capacity_dir, args.state_dir,
-                        args.testmanagerd_program if args.recycle_testmanagerd else None, args.xctest_pattern)
+                        args.testmanagerd_program if args.recycle_testmanagerd else None,
+                        args.xctest_pattern, args.gui_token)
     if args.phase == "check":
         why, want = node_refusal(args.fleet_class)
         if not why:
@@ -4147,7 +4159,8 @@ def main(argv: list[str] | None = None) -> int:
                                                repo, args.home_repo, instance=args.instance,
                                                workflow=job_workflow(),
                                                warm_keys=job_warm_keys(event), taken_out=taken,
-                                               warm_target=job_warm_target(event), since=since)
+                                               warm_target=job_warm_target(event), since=since,
+                                               gui_token=args.gui_token)
                     if held or not note.startswith("capacity:"):
                         break
                     waited = time.monotonic() - start
