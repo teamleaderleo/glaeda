@@ -1042,6 +1042,7 @@ TESTMANAGERD_STUCK = "testmanagerd: stuck"
 # Finished CI XCTest apps can outlive the Runner.Worker after their _temp tree is removed.
 # Only this exact derived-data app family is eligible; arbitrary user apps are never touched.
 LEAKED_TEST_APP = re.compile(r"^\s*'?(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+/Build/Products/Debug/cmux DEV\.app)(?:/Contents/MacOS/[^ ]+)?'?(?:\s|$)")
+LEAKED_TEST_TEMP = re.compile(r"^(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+)(?:/|$)")
 LEAKED_APP_TERM_S = 1.0
 # A process that may be talking to testmanagerd: an XCTest runner, or xcodebuild testing. A false match only
 # keeps the daemon, so these err wide.
@@ -3658,13 +3659,21 @@ def finish_sampler(state_dir: Path, wait_s: float = 5.0) -> str:
 
 
 def leaked_test_app_pids(table: dict[int, tuple[int, str]], ignored_workers: set[int] | None = None) -> list[tuple[int, str]]:
-    """Find exact CI test apps whose process tree no longer has a live Runner.Worker owner."""
+    """Find exact CI test apps whose process tree and temp tree have no live job owner."""
     result: list[tuple[int, str]] = []
     ignored_workers = ignored_workers or set()
     for pid, (ppid, command) in table.items():
         match = LEAKED_TEST_APP.search(command)
         if not match or pid == os.getpid():
             continue
+        temp = LEAKED_TEST_TEMP.match(match.group(1))
+        if temp:
+            # XCTest may reparent through testmanagerd or launchd. A live job process that still names the
+            # same per-run temp tree is ownership evidence even when the app's parent is pid 1.
+            prefix = temp.group(1) + "/"
+            if any(other != pid and prefix in cmd and not LEAKED_TEST_APP.search(cmd)
+                   for other, (_ppid, cmd) in table.items()):
+                continue
         owner = pid
         owned = False
         for _ in range(256):

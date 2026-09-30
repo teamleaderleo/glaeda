@@ -2458,34 +2458,50 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
     cached = _accounting_cache()
     now = time.time()
     out: list[dict[str, Any]] = []
+    cache_records: dict[str, dict[str, Any]] = {}
     for fs in fss:
         key = str(fs.dev)
         hit = cached.get(key) if isinstance(cached.get(key), dict) else None
         mem = _ACCOUNTING_MEM.get((fs.dev, fs.mount))
         if mem is not None:
             top = mem
+            top_at = float(hit.get("at", 0)) if hit else 0.0
         elif not DARWIN:
             # Linux test and development hosts do not need a / walk for the macOS mini report.
             top = []
+            top_at = now
         elif hit and now - float(hit.get("at", 0)) < ACCOUNTING_MAX_AGE_S and hit.get("mount") == fs.mount:
             top = hit.get("top_level") if isinstance(hit.get("top_level"), list) else []
+            top_at = float(hit.get("at", 0))
         else:
             top_map = du_children(Path(fs.mount))
             top = [{"path": p, "bytes": n} for p, n in sorted(top_map.items(), key=lambda kv: -kv[1])[:32]]
+            top_at = now
         _ACCOUNTING_MEM[(fs.dev, fs.mount)] = top
         measured = 0
+        catalogued: list[tuple[Path, int]] = []
         for i in items:
             try:
                 if Path(i.path).stat().st_dev == fs.dev:
-                    measured += i.bytes
+                    catalogued.append((Path(i.path), i.bytes))
             except OSError:
                 continue
+        # A parent catalog item already includes every nested item. Count only the highest-level path
+        # in each overlapping set so the unmeasured figure remains an accounting gap, not an overlap artifact.
+        selected: list[Path] = []
+        for path, size in sorted(catalogued, key=lambda pair: (len(pair[0].parts), str(pair[0]))):
+            if any(path == parent or parent in path.parents for parent in selected):
+                continue
+            selected.append(path)
+            measured += size
         used = max(0, fs.total - fs.free)
-        out.append({"dev": fs.dev, "mount": fs.mount, "used": used, "measured": measured,
-                    "unmeasured": max(0, used - measured), "top_level": top})
+        entry = {"dev": fs.dev, "mount": fs.mount, "used": used, "measured": measured,
+                 "unmeasured": max(0, used - measured), "top_level": top}
+        out.append(entry)
+        cache_records[str(fs.dev)] = {**entry, "at": top_at}
     try:
         ACCOUNTING.parent.mkdir(parents=True, exist_ok=True)
-        ACCOUNTING.write_text(json.dumps({str(x["dev"]): {**x, "at": now} for x in out}))
+        ACCOUNTING.write_text(json.dumps(cache_records))
     except OSError:
         pass
     return out
@@ -2960,6 +2976,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         measure_lock = None
     items = survey(fams, idle, a.min_mib * 1024**2, known, defer_bulk=bool(at) and not a.apply)
+    # Release the measurement lock before starting a background refresh. The child must be able to
+    # acquire it, otherwise every stale report spawns a refresh that immediately skips.
+    if measure_lock is not None:
+        measure_lock.close()
+        measure_lock = None
     fresh_paths = dropped_for_measurement | (set(known) - known_before)
     age_min = (time.time() - at) / 60 if at else 0.0
     if not a.no_snapshot:
@@ -3014,8 +3035,6 @@ def main(argv: list[str] | None = None) -> int:
             apply_runtimes(tooling, a.receipt, host_busy)
             IDLE_STAMP.parent.mkdir(parents=True, exist_ok=True)
             IDLE_STAMP.touch()
-    if measure_lock is not None:
-        measure_lock.close()
     return 0
 
 

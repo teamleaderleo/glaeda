@@ -2730,6 +2730,15 @@ class LeakedAppTest(unittest.TestCase):
         self.assertEqual([pid for pid, _ in hook.leaked_test_app_pids(table)], [10])
         self.assertEqual([pid for pid, _ in hook.leaked_test_app_pids(table, {30})], [10, 20])
 
+    def test_reparented_app_is_protected_by_live_temp_tree_owner(self) -> None:
+        root = "/Users/cmux/actions-runner-glaeda/_work/_temp/cmux-derived-data-tests-123-1-shard-2"
+        app = root + "/Build/Products/Debug/cmux DEV.app/Contents/MacOS/cmux DEV"
+        table = {
+            10: (1, app),
+            40: (1, "/usr/bin/xcodebuild -derivedDataPath " + root + "/Build test-without-building"),
+        }
+        self.assertEqual(hook.leaked_test_app_pids(table), [])
+
 
 class GateTest(unittest.TestCase):
     def setUp(self) -> None:

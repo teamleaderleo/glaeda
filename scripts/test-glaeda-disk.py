@@ -600,6 +600,40 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(got[0]["unmeasured"], 5 * gd.GIB)
         self.assertEqual(got[0]["top_level"][0]["path"], "/volume/ci")
 
+    def test_accounting_does_not_double_count_nested_items(self) -> None:
+        parent = self.root / "parent"
+        child = parent / "child"
+        parent.mkdir()
+        child.mkdir()
+        fs = gd.Fs(parent.stat().st_dev, str(self.root), 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
+        items = [gd.Item("projects", str(parent), 7 * gd.GIB, 2.0, "report-only"),
+                 gd.Item("cargo-target", str(child), 3 * gd.GIB, 2.0, "report-only")]
+        saved = (gd.DARWIN, gd.ACCOUNTING)
+        gd.DARWIN, gd.ACCOUNTING = False, self.root / "accounting-overlap.json"
+        gd._ACCOUNTING_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  gd._ACCOUNTING_MEM.clear()))
+        got = gd.filesystem_accounting([fs], items)
+        self.assertEqual(got[0]["measured"], 7 * gd.GIB)
+
+    def test_accounting_cache_keeps_walk_timestamp_until_walk_is_due(self) -> None:
+        path = self.root / "known"
+        path.write_bytes(b"x")
+        fs = gd.Fs(path.stat().st_dev, "/volume", 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
+        saved = (gd.DARWIN, gd.ACCOUNTING)
+        gd.DARWIN, gd.ACCOUNTING = True, self.root / "accounting-cache.json"
+        gd._ACCOUNTING_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  gd._ACCOUNTING_MEM.clear()))
+        with mock.patch.object(gd, "du_children", return_value={"/volume/ci": 8 * gd.GIB}):
+            gd.filesystem_accounting([fs], [])
+        first = json.loads(gd.ACCOUNTING.read_text())[str(fs.dev)]["at"]
+        gd._ACCOUNTING_MEM.clear()
+        with mock.patch.object(gd, "du_children", side_effect=AssertionError("cache should be used")):
+            gd.filesystem_accounting([fs], [])
+        second = json.loads(gd.ACCOUNTING.read_text())[str(fs.dev)]["at"]
+        self.assertEqual(second, first)
+
     def test_retired_owner_family_is_reclaimable_when_unloaded(self) -> None:
         make(self.root / "old")
         fam = gd.Family("retired", self.root, True, "rebuild", retired_only=True,
