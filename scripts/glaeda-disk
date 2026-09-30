@@ -2630,6 +2630,15 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if halt is not None and (why := halt()):
             print(f"stopped: {why}")
             break
+        if families[i.family].id in FLEET_FAMILY_IDS:
+            # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
+            # before each rename. A job may start using a candidate after the survey or during a long pass.
+            try:
+                opened, cmds = process_evidence()
+            except NoEvidence as e:
+                print(f"refusing to delete the rest: {e}", file=sys.stderr)
+                break
+            cwds = open_index(opened)
         if families[i.family].build_output and families[i.family].root.is_relative_to(FLEET_CI):
             cmds = command_lines() or cmds
         fresh_layout = ""
