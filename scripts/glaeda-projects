@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Plan and apply the canonical ~/Projects layout.
+
+The default is a report.  Applying a plan only moves owned, idle state after a
+fresh status/submodule/live-process check.  The target layout is:
+Projects/<repo>, Projects/worktrees/<repo>/<name>, and Projects/scratch/<name>.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+HOME = Path.home()
+PROJECTS = HOME / "Projects"
+WORKTREES = PROJECTS / "worktrees"
+SCRATCH = PROJECTS / "scratch"
+AGE_S = 24 * 3600
+SCRATCH_NAMES = re.compile(r"(?:-fixture$|-fixtures$|-receipts$|probe|BuildExperiments|^\.tmp-|^scratch[-_])", re.I)
+GROUP_NAMES = {"cmux-worktrees", "codex-review", "hq-worktrees", "worktrees"}
+
+
+@dataclasses.dataclass
+class Action:
+    kind: str
+    source: str
+    destination: str
+    reason: str
+    status: str = "planned"
+    branch: str = ""
+
+
+def git(path: Path, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", "-C", str(path), *args], stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=90, check=check,
+                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"})
+
+
+def canonical_repos() -> list[Path]:
+    return [p for p in sorted(PROJECTS.iterdir()) if p.is_dir() and not p.is_symlink()
+            and p.name not in {"worktrees", "scratch", "briefs", "scripts", "docs"}
+            and (p / ".git").is_dir()]
+
+
+def origin(path: Path) -> str:
+    result = git(path, "config", "--get", "remote.origin.url")
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def worktree_records(repo: Path) -> list[Path]:
+    result = git(repo, "worktree", "list", "--porcelain")
+    if result.returncode:
+        return []
+    paths = []
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            path = Path(line[9:]).resolve()
+            if path != repo.resolve() and path.is_dir():
+                paths.append(path)
+    return paths
+
+
+def git_worktree_root(path: Path) -> Path | None:
+    dotgit = path / ".git"
+    if not dotgit.is_file():
+        return None
+    result = git(path, "rev-parse", "--show-toplevel")
+    return Path(result.stdout.strip()).resolve() if result.returncode == 0 else None
+
+
+def branch(path: Path) -> str:
+    result = git(path, "symbolic-ref", "--quiet", "--short", "HEAD")
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def submodule_status(path: Path) -> str:
+    top = git(path, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
+    if top.returncode != 0:
+        return "top-level status unreadable"
+    if top.stdout.strip():
+        return "top-level has uncommitted or untracked changes"
+    nested = git(path, "submodule", "foreach", "--recursive", "--quiet",
+                 "git status --porcelain --untracked-files=all; git log --oneline HEAD --not --remotes")
+    if nested.returncode != 0:
+        return "submodule status unreadable"
+    if nested.stdout.strip():
+        return "submodule has uncommitted or unpushed changes"
+    return ""
+
+
+def clean_pushed(path: Path) -> str:
+    if (reason := submodule_status(path)):
+        return reason
+    ignored = git(path, "status", "--porcelain", "--ignored", "--untracked-files=all")
+    if ignored.returncode != 0:
+        return "status unreadable"
+    if ignored.stdout.strip():
+        return "ignored or untracked files present"
+    stash = git(path, "for-each-ref", "--count=1", "refs/stash")
+    if stash.returncode != 0:
+        return "stash unreadable"
+    if stash.stdout.strip():
+        return "stash entries present"
+    head = git(path, "rev-parse", "--verify", "HEAD")
+    if head.returncode != 0:
+        return "HEAD unreadable"
+    missing = git(path, "rev-list", head.stdout.strip(), "--not", "--remotes")
+    if missing.returncode != 0:
+        return "local history unreadable"
+    if missing.stdout.strip():
+        return "commits not confirmed by a remote"
+    return ""
+
+
+def process_evidence() -> tuple[list[Path], str]:
+    try:
+        ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True,
+                            timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return [], "cannot list processes"
+    if ps.returncode != 0:
+        return [], "cannot list processes"
+    cwd: list[Path] = []
+    proc = Path("/proc")
+    if proc.is_dir():
+        for entry in proc.iterdir():
+            if entry.name.isdigit():
+                try:
+                    cwd.append(Path(os.path.realpath(entry / "cwd")))
+                except OSError:
+                    continue
+    return cwd, ps.stdout
+
+
+def live_in(path: Path, cwds: list[Path], commands: str) -> bool:
+    target = path.resolve()
+    if any(c == target or target in c.parents for c in cwds):
+        return True
+    return any(str(target) in line for line in commands.splitlines())
+
+
+def session_mentions(path: Path) -> bool:
+    """A recent transcript mentioning a cwd means --resume may still depend on that path."""
+    sessions = HOME / ".codex" / "sessions"
+    if not sessions.is_dir():
+        return False
+    cutoff = time.time() - AGE_S
+    for transcript in sessions.rglob("*.jsonl"):
+        try:
+            if transcript.stat().st_mtime < cutoff or transcript.stat().st_size > 8 * 1024 * 1024:
+                continue
+            if str(path) in transcript.read_text(errors="replace"):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def target_for(repo: str, name: str) -> Path:
+    return WORKTREES / repo / name
+
+
+def discover_worktrees(repos: list[Path]) -> dict[Path, Path]:
+    found: dict[Path, Path] = {}
+    for repo in repos:
+        for path in worktree_records(repo):
+            found[path] = repo
+    # Worktrees whose main checkout is currently hidden in a legacy folder still carry a .git file.
+    for root, dirs, _files in os.walk(PROJECTS):
+        root_path = Path(root)
+        if root_path == WORKTREES or WORKTREES in root_path.parents:
+            dirs[:] = []
+            continue
+        if len(root_path.relative_to(PROJECTS).parts) > 3:
+            dirs[:] = []
+            continue
+        if (root_path / ".git").is_file():
+            common = git(root_path, "rev-parse", "--git-common-dir")
+            if common.returncode == 0:
+                common_path = Path(common.stdout.strip()).resolve()
+                repo = next((r for r in repos if (r / ".git").resolve() == common_path), None)
+                if repo:
+                    found[root_path.resolve()] = repo
+            dirs[:] = []
+    return found
+
+
+def plan() -> list[Action]:
+    repos = canonical_repos()
+    found = discover_worktrees(repos)
+    actions: list[Action] = []
+    for source, repo in sorted(found.items()):
+        if source == repo or source.is_relative_to(WORKTREES):
+            continue
+        if source.is_relative_to(PROJECTS / "briefs") or source.is_relative_to(SCRATCH):
+            continue
+        name = source.name
+        destination = target_for(repo.name, name)
+        reason = "idle linked worktree"
+        if source.stat().st_mtime > time.time() - AGE_S:
+            actions.append(Action("skip", str(source), str(destination), "touched within 24h", "skipped"))
+        else:
+            actions.append(Action("worktree", str(source), str(destination), reason, branch=branch(source)))
+
+    # Convert redundant clean full clones to linked worktrees. Origin identity avoids
+    # guessing from a suffix such as cmux-link15325.
+    by_origin: dict[str, list[Path]] = {}
+    for repo in repos:
+        if (url := origin(repo)):
+            by_origin.setdefault(url, []).append(repo)
+    for group in by_origin.values():
+        canonical = next((r for r in group if r.name.lower() in origin(r).lower()), group[0])
+        for clone in group:
+            if clone == canonical or clone in repos and clone.name == canonical.name:
+                continue
+            if clone.stat().st_mtime > time.time() - AGE_S:
+                actions.append(Action("skip", str(clone), "", "full clone touched within 24h", "skipped"))
+                continue
+            reason = clean_pushed(clone)
+            if reason:
+                actions.append(Action("skip", str(clone), "", f"full clone kept: {reason}", "skipped"))
+                continue
+            dst = target_for(canonical.name, clone.name)
+            actions.append(Action("clone", str(clone), str(dst), "clean pushed duplicate clone",
+                                  branch=branch(clone)))
+
+    for entry in sorted(PROJECTS.iterdir()):
+        if entry.is_symlink() or not entry.is_dir() or entry.name in {"worktrees", "scratch", "briefs", "scripts", "docs"}:
+            continue
+        if entry in repos or (entry / ".git").exists():
+            continue
+        if entry.name in GROUP_NAMES or entry.name.endswith("-worktrees"):
+            # The folder itself becomes a compatibility symlink after its owned children move.
+            continue
+        if SCRATCH_NAMES.search(entry.name):
+            dst = SCRATCH / entry.name
+            if entry.stat().st_mtime <= time.time() - AGE_S:
+                actions.append(Action("scratch", str(entry), str(dst), "scratch or fixture folder"))
+            else:
+                actions.append(Action("skip", str(entry), str(dst), "scratch touched within 24h", "skipped"))
+    planned_sources = {Path(a.source).resolve() for a in actions if a.kind == "worktree"}
+    repo_names = {r.name for r in repos}
+    for entry in sorted(PROJECTS.iterdir()):
+        if entry.is_symlink() or not entry.is_dir() or entry.name == "worktrees":
+            continue
+        if not (entry.name == "cmux-worktrees" or entry.name.endswith("-worktrees")):
+            continue
+        repo_name = entry.name.removesuffix("-worktrees")
+        if repo_name not in repo_names:
+            continue
+        children = [p.resolve() for p in entry.iterdir()]
+        if children and all(p in planned_sources for p in children):
+            actions.append(Action("compat", str(entry), str(WORKTREES / repo_name),
+                                  "compatibility symlink for legacy worktree path"))
+    return actions
+
+
+def print_plan(actions: list[Action]) -> None:
+    for action in actions:
+        arrow = f" -> {action.destination}" if action.destination else ""
+        print(f"{action.status:7s} {action.kind:10s} {action.source}{arrow} ({action.reason})")
+    print(f"\n{sum(a.status == 'planned' for a in actions)} planned, "
+          f"{sum(a.status == 'skipped' for a in actions)} skipped")
+
+
+def recreate_worktree(source: Path, destination: Path, repo: Path) -> None:
+    branch_name = branch(source)
+    if not branch_name:
+        revision = git(source, "rev-parse", "HEAD").stdout.strip()
+        add = ["worktree", "add", "--detach", str(destination), revision]
+    else:
+        add = ["worktree", "add", "--force", str(destination), branch_name]
+    backup = Path(tempfile.mkdtemp(prefix="glaeda-tidy-", dir=str(PROJECTS / "scratch")))
+    try:
+        shutil.copytree(source, backup / "tree", symlinks=True,
+                        ignore=shutil.ignore_patterns(".git"))
+        removed = git(repo, "worktree", "remove", "--force", str(source))
+        if removed.returncode:
+            raise RuntimeError(removed.stderr.strip() or "git worktree remove failed")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        added = git(repo, *add)
+        if added.returncode:
+            raise RuntimeError(added.stderr.strip() or "git worktree add failed")
+        for item in (backup / "tree").iterdir():
+            target = destination / item.name
+            if target.exists() or target.is_symlink():
+                if target.is_dir() and not target.is_symlink():
+                    shutil.copytree(item, target, dirs_exist_ok=True, symlinks=True)
+                else:
+                    target.unlink()
+                    shutil.copy2(item, target, follow_symlinks=False)
+            else:
+                shutil.copytree(item, target, symlinks=True) if item.is_dir() else shutil.copy2(item, target, follow_symlinks=False)
+        git(repo, "worktree", "prune")
+    finally:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
+def apply(actions: list[Action]) -> None:
+    cwds, commands = process_evidence()
+    SCRATCH.mkdir(parents=True, exist_ok=True)
+    for action in actions:
+        if action.status != "planned":
+            continue
+        source = Path(action.source)
+        destination = Path(action.destination)
+        if not source.exists() or live_in(source, cwds, commands) or session_mentions(source):
+            action.status = "skipped"
+            action.reason = "live process or unfinished session uses checkout"
+            continue
+        if action.kind != "compat" and (destination.exists() or destination.is_symlink()):
+            action.status = "skipped"
+            action.reason = "destination already exists"
+            continue
+        if action.kind == "scratch":
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+        elif action.kind == "clone":
+            repo = next((r for r in canonical_repos() if r.name == destination.parts[-2]), None)
+            if repo is None or (reason := clean_pushed(source)):
+                action.status = "skipped"
+                action.reason = reason or "canonical checkout disappeared"
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            added = git(repo, "worktree", "add", "--force", str(destination), action.branch or "HEAD")
+            if added.returncode:
+                action.status = "skipped"
+                action.reason = added.stderr.strip()[:240] or "could not create linked worktree"
+                continue
+            shutil.rmtree(source)
+        elif action.kind == "worktree":
+            repo = next((r for r in canonical_repos() if r.name == destination.parts[-2]), None)
+            if repo is None:
+                action.status = "skipped"
+                action.reason = "canonical checkout disappeared"
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if submodule_status(source):
+                recreate_worktree(source, destination, repo)
+            else:
+                moved = git(repo, "worktree", "move", str(source), str(destination))
+                if moved.returncode:
+                    recreate_worktree(source, destination, repo)
+        elif action.kind == "compat":
+            if any(source.iterdir()):
+                action.status = "skipped"
+                action.reason = "legacy folder still contains unmoved entries"
+                continue
+            source.rmdir()
+            source.symlink_to(destination, target_is_directory=True)
+        action.status = "applied"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="glaeda-projects", description=__doc__)
+    parser.add_argument("tidy", nargs="?", choices=("tidy",), default="tidy")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    actions = plan()
+    if args.apply:
+        apply(actions)
+    if args.json:
+        import json
+        print(json.dumps([dataclasses.asdict(a) for a in actions], indent=2))
+    else:
+        print_plan(actions)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

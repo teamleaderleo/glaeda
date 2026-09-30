@@ -25,6 +25,8 @@ GitHub Actions runner and is documented in docs/CMUX_MINI_RUNNER.md.
 
 What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-disk                   from scripts/glaeda-disk
+    ~/.local/bin/glaeda-worktree               canonical Projects/worktrees creator
+    ~/.local/bin/glaeda-projects               dry-run/apply Projects tidy pass
     ~/.local/bin/glaeda-procs                  from scripts/glaeda-procs (why the Mac lags; --apply ends leaked fixtures)
     ~/.local/bin/glaeda-local-guard            from scripts/glaeda-local-guard (stops test and build runs orphaned by an
                                                agent session on a hygiene-only Mac, and on every Mac shell -c trees
@@ -120,6 +122,8 @@ SYSTEMD_UNITS_DIR = REPO / "ops/systemd"
 LINUX_UNITS = (
     "glaeda-disk-pressure.service",
     "glaeda-disk-pressure.timer",
+    "glaeda-projects-tidy.service",
+    "glaeda-projects-tidy.timer",
     "glaeda-worktree-reclaim.service",
     "glaeda-worktree-reclaim.timer",
     "glaeda-update.service",
@@ -190,7 +194,7 @@ class Context:
                  reclaim_binary: Path | None, cmux_root: Path | None, glaeda_bin: Path | None,
                  xcode_app: str, min_free_gib: int, hygiene_only: bool = False,
                  platform_name: str | None = None, ota_ring: str | None = None,
-                 ota_source: str | None = None) -> None:
+                 ota_source: str | None = None, role: str = "devbox") -> None:
         self.home = home
         self.platform = platform_name or HOST_PLATFORM
         self.hygiene_only = hygiene_only
@@ -218,6 +222,7 @@ class Context:
         self.receipt_path = self.state / "receipt.json"
         self.ota_ring = ota_ring
         self.ota_source = ota_source
+        self.role = role
         self.update_config = home / ".config/glaeda/update.json"
 
     def show(self, path: Path | str) -> str:
@@ -623,10 +628,10 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
     """The LaunchAgents for this user: disk hygiene as hand-installed on Air Blue, plus the fleet-cas pruner."""
     disk = os.fspath(ctx.bin / "glaeda-disk")
     python = ctx.python or "/usr/bin/python3"
-    return {
+    agents = {
         LABEL_PREFIX + "disk-pressure": {
             "Label": LABEL_PREFIX + "disk-pressure",
-            "ProgramArguments": [python, disk, "--pressure", "--idle", "--apply", "--top", "0"],
+            "ProgramArguments": [python, disk, "--role", ctx.role, "--pressure", "--idle", "--apply", "--top", "0"],
             "StartInterval": 900,
             "RunAtLoad": True,
             # Not ProcessType Background: under pressure this job must still finish its lsof and free
@@ -777,6 +782,17 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-gh.err"),
         },
     }
+    if ctx.role == "devbox":
+        agents[LABEL_PREFIX + "projects-tidy"] = {
+            "Label": LABEL_PREFIX + "projects-tidy",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-projects"), "tidy", "--apply"],
+            "StartInterval": 86400,
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-projects-tidy.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-projects-tidy.err"),
+        }
+    return agents
 
 
 def agent_names(ctx: Context) -> list[str]:
@@ -790,7 +806,7 @@ def agent_path(ctx: Context, label: str) -> Path:
 
 def agent_bytes(ctx: Context, label: str) -> bytes:
     if ctx.platform == "linux":
-        return (SYSTEMD_UNITS_DIR / label).read_bytes()
+        return (SYSTEMD_UNITS_DIR / label).read_bytes().replace(b"@GLAEDA_ROLE@", ctx.role.encode())
     return plistlib.dumps(agent_plists(ctx)[label], sort_keys=True)
 
 
@@ -814,7 +830,8 @@ def update_config(ctx: Context) -> dict[str, Any]:
     """What glaeda-update reads: this host's ring and the setup flags it re-runs releases with."""
     config = {
         "ring": ctx.ota_ring or "stable",
-        "setupArgs": ["--hygiene-only"] if ctx.hygiene_only else [],
+        "setupArgs": (["--hygiene-only"] if ctx.hygiene_only else [])
+        + ([] if ctx.role == "devbox" else ["--role", ctx.role]),
         "host": platform.node().split(".")[0].lower(),
         "reportStatus": (ctx.ota_ring or "stable") == "canary",
     }
@@ -933,7 +950,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     for path, mode in directories(ctx):
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
-    for name in ("glaeda-disk", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
+    for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
                  "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
                  "glaeda-update", "glaeda-gh"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
@@ -1065,7 +1082,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         path = agent_path(ctx, label)
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
-    for name in ("glaeda-disk", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
+    for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
                  "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
                  "glaeda-update", "glaeda-gh"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
@@ -1497,6 +1514,8 @@ def parser() -> argparse.ArgumentParser:
                         "minis use the mirror manaflow-ai/glaeda)")
     p.add_argument("--hygiene-only", action="store_true",
                    help="only the disk and worktree hygiene tools and agents, for any Mac or Linux host")
+    p.add_argument("--role", choices=("fleet-mini", "devbox"),
+                   help="disk and workspace policy role (default: devbox for hygiene/Linux, fleet-mini otherwise)")
     return p
 
 
@@ -1523,12 +1542,13 @@ def main(argv: list[str] | None = None) -> int:
         print("glaeda-mini-setup: macOS or Linux only", file=sys.stderr)
         return 2
     min_free_gib = args.min_free_gib if args.min_free_gib is not None else fleet.default_min_free_gib(HOST_PLATFORM)
+    role = args.role or ("devbox" if args.hygiene_only or HOST_PLATFORM == "linux" else "fleet-mini")
     ctx = Context(Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir), args.apply, args.python,
                   args.skip_launchctl, args.reclaim_binary,
                   args.cmux_root.expanduser().resolve() if args.cmux_root else None,
                   args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, min_free_gib,
                   args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring,
-                  ota_source=args.ota_source)
+                  ota_source=args.ota_source, role=role)
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
         checks = {n: ({**c, "level": "warn"} if c["level"] == "block" and n not in HYGIENE_BLOCKING else c)

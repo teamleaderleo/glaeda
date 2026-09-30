@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """glaeda-disk: say where the disk went, and reclaim what is safe to rebuild.
 
+    glaeda-disk report              report: biggest items, guards, reclaimable total
+    glaeda-disk keepup --apply      pressure/idle cleanup using the selected role
     glaeda-disk                     report: biggest items, verdicts, reclaimable total
     glaeda-disk --apply             delete every reclaimable item, largest first
     glaeda-disk --pressure --apply  act only under disk pressure, stop at the free target
@@ -57,10 +59,8 @@ On an owned cmux mini, cmux CI's warm state under /Users/Shared/cmux-build-fleet
 tier, evicted LRU under pressure: parked pull request builds past the measured host-job reuse distance, seeds other than each
 root's newest one under pressure (two during idle sweeps), and a root's kept build once the root has been idle two days. On the
 trusted seeder, a seed its serve log shows streamed whole to the seed archive (cmux-lawrence's SSD) is
-reclaimable at once instead of after the idle window: the PR minis restore it from there over the LAN.
-SwiftPM scratch (spm-scratch/<fingerprint>) that no job holds by its lock ages like any cache, and goes
-whatever its age once free space is below the emergency floor. The Chromium / cmux-browser trees and
-their caches are never deleted (NEVER_DELETE).
+reclaimable at once instead of after the idle window: the PR minis restore it from there over the LAN. The
+Chromium / cmux-browser trees and their caches are never deleted (NEVER_DELETE).
 
 Free space is judged per filesystem. On Linux /tmp is often its own tmpfs, so pressure there
 reclaims only /tmp items, and pressure on the home filesystem never deletes from /tmp.
@@ -90,6 +90,7 @@ import argparse
 import bisect
 import contextlib
 import fcntl
+import gzip
 import json
 import os
 import platform
@@ -157,6 +158,9 @@ class Family:
     # candidates are the build outputs inside the checkouts under root (checkout_builds), not root's children
     checkout_builds: bool = False
     retired_only: bool = False  # reclaim only with fresh evidence the declared service is unloaded
+    pressure_only: bool = False  # dev-box package caches are reclaimed only during pressure runs
+    transcripts: bool = False  # discover individual agent transcript files below root
+    transcript_archives: bool = False  # discover archived transcript files below root
 
 
 def idle_window(fam: Family, idle_hours: float) -> float:
@@ -226,85 +230,7 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
                            include=("derived-data", ".derived-data.discard-"), build_output=True,
                            min_idle_hours=KEPT_BUILD_IDLE_HOURS,
                            owner="cmux owned_build_state.py (keep)", rebuild_minutes=10))
-    if fams:  # root 1's store is the mini's, and the only one that holds SwiftPM scratch (cmux mini_store)
-        fams.append(spm_scratch_family(fleet_stores(ci)[0]))
     return fams
-
-
-# cmux CI's SwiftPM scratch (cmux scripts/ci/owned_spm_scratch.py): swift-package-tests links each package's .build
-# to STORE/spm-scratch/<fingerprint>/<package> so a job rebuilds only what its change touched. A job holds
-# <fingerprint>.lock shared (a holder process) until the runner ends it; `link` touches the lock, so its time is the
-# directory's last use. Its owner bounds it only at a link (24 GiB LRU), so nothing evicted it under pressure:
-# cmux9s held 31 GiB of it, none held by a job, while glaeda-disk --pressure found 0.0 GiB reclaimable and every
-# runner's job-started hook refused at 21.9 GiB free under its 30 GiB floor (2026-09-30). A directory goes only
-# under owned_spm_scratch's own protocol (remove_spm_scratch); its .trash-* leftovers always go.
-SPM_SCRATCH = "cmux-spm-scratch"
-SPM_TRASH = ".trash-"  # owned_spm_scratch.TRASH: a directory renamed aside for deletion, never reused
-SPM_REBUILD_MINUTES = 3.0  # one swift-package-tests job rebuilds the packages its change selects
-
-
-def spm_scratch_family(store: Path) -> Family:
-    return Family(SPM_SCRATCH, store / "spm-scratch", True,
-                  "the next swift-package-tests job rebuilds the packages it selects", build_output=True,
-                  owner="cmux owned_spm_scratch.py", rebuild_minutes=SPM_REBUILD_MINUTES)
-
-
-def spm_lock(path: Path) -> Path:
-    return path.with_name(path.name + ".lock")
-
-
-def spm_scratch_held(path: Path) -> bool:
-    """Whether a job holds this scratch directory: owned_spm_scratch's holder keeps a shared flock on
-    <fingerprint>.lock for the whole job. Probed exclusive and released at once, as owned_spm_scratch's own drop()
-    does: its link takes the lock blocking, so it waits out the probe; its prune skips the directory for that moment.
-    No lock file means no job ever linked it. An unreadable lock counts as held."""
-    if path.name.startswith(SPM_TRASH):
-        return False
-    try:
-        fd = os.open(spm_lock(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return True
-    finally:
-        os.close(fd)  # closing drops the probe's lock
-    return False
-
-
-def remove_spm_scratch(path: Path) -> bool:
-    """owned_spm_scratch.drop(): under an exclusive lock on <fingerprint>.lock, rename the directory aside to
-    .trash-<name>-<pid> (which owned_spm_scratch also sweeps, should this delete be killed) and drop its .size, then
-    delete it outside the lock. False, touching nothing, while a job holds it."""
-    if path.is_symlink():
-        raise OSError("refusing symlink")
-    if os.path.ismount(path) or path.lstat().st_dev != path.parent.stat().st_dev:
-        raise OSError("refusing a mount point")
-    if path.name.startswith(SPM_TRASH):
-        shutil.rmtree(path, onerror=_chmod_retry)
-        return True
-    with open(spm_lock(path), "a") as handle:  # created as owned_spm_scratch creates it
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return False
-        aside = path.with_name(f"{SPM_TRASH}{path.name}-{os.getpid()}")
-        os.rename(path, aside)
-        path.with_name(path.name + ".size").unlink(missing_ok=True)
-    shutil.rmtree(aside, onerror=_chmod_retry)
-    return True
-
-
-# Filesystems whose free space is below the emergency floor (emergency_bytes) in this pressure run or report. There
-# the SwiftPM scratch no job holds goes whatever its age: it rebuilds in minutes, and the runner floor is near.
-EMERGENCY_DEVS: frozenset[int] = frozenset()
-
-
-def emergency_devs(fss: "dict[int, Fs]", emergency: str, floor_gib: float = 0.0) -> frozenset[int]:
-    return frozenset(fs.dev for fs in fss.values() if fs.free < emergency_bytes(fs, emergency, floor_gib))
 
 
 # The trusted seeder's serve log (glaeda-seed-serve): the seed archive on cmux-lawrence's SSD fills itself from
@@ -352,17 +278,9 @@ def archived_seeds(log: Path | None = None) -> frozenset[str]:
 
 def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[str] = frozenset()) -> float:
     """The idle window for one candidate: a seed the archive already holds may go at once (the newest of each
-    root still stay, by keep_verdict), and SwiftPM scratch left in the trash or under the emergency floor
-    (EMERGENCY_DEVS) may go at once (its lock keeps what a job holds). Everything else waits out its family's
-    window."""
+    root still stay, by keep_verdict), everything else waits out its family's window."""
     if fam.id == "cmux-seeds" and path.name in archived:
         return 0.0
-    if fam.id == SPM_SCRATCH:
-        if path.name.startswith(SPM_TRASH):
-            return 0.0
-        with contextlib.suppress(OSError):
-            if fam.root.stat().st_dev in EMERGENCY_DEVS:
-                return 0.0
     return idle_window(fam, idle_hours)
 
 
@@ -415,6 +333,9 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "defer_during_ci": False,
 }
 ACTIVITY_MODE: str | None = None  # "pressure" or "sweep" while main acts; None keeps the wall-clock rule
+ROLE = "fleet-mini"
+DEVBOX_TRANSCRIPT_DAYS = 30
+DEVBOX_TRANSCRIPT_DELETE_DAYS = 180
 
 
 def disk_policy(path: Path | None = None) -> dict[str, Any]:
@@ -803,7 +724,18 @@ def _checkout_build_dirs(checkout: Path) -> list[Path]:
         if not build.is_symlink() and _head(os.fspath(build / "CACHEDIR.TAG"), 64).startswith(CACHEDIR_TAG):
             found.append(build)
     found += [g for g in _children(checkout / ".glaeda/apple-build/cache") if g.is_dir() and not g.is_symlink()]
-    return found
+    # Zig and SwiftPM outputs are per-checkout working state. Ghostty's Zig cache is
+    # intentionally found by its stable location so a source tree is never walked blindly.
+    for candidate in (checkout / ".zig-cache", checkout / "ghostty/.zig-cache"):
+        if candidate.is_dir() and not candidate.is_symlink():
+            found.append(candidate)
+    for package_root in (checkout / "Packages", checkout / "vendor"):
+        if package_root.is_dir() and not package_root.is_symlink():
+            for pattern in ("*/.build", "*/*/.build"):
+                for candidate in package_root.glob(pattern):
+                    if candidate.is_dir() and not candidate.is_symlink():
+                        found.append(candidate)
+    return sorted({p.resolve() for p in found})
 
 
 def checkout_builds(projects: Path) -> list[Path]:
@@ -815,10 +747,12 @@ def checkout_builds(projects: Path) -> list[Path]:
         return [b for bs in pool.map(_checkout_build_dirs, project_checkouts(projects)) for b in bs]
 
 
-def checkout_build_family(projects: Path) -> Family:
+def checkout_build_family(projects: Path, role: str = "fleet-mini") -> Family:
     return Family("checkout-build", projects, True,
                   "swift build or glaeda-apple warm rebuilds it; also counted in its checkout",
-                  checkout_builds=True, build_output=True, min_idle_hours=CHECKOUT_BUILD_IDLE_HOURS,
+                  checkout_builds=True, build_output=True,
+                  min_idle_hours=0.0 if role == "devbox" else CHECKOUT_BUILD_IDLE_HOURS,
+                  max_idle_hours=0.0 if role == "devbox" else None,
                   owner="SwiftPM and glaeda-apple, per checkout", rebuild_minutes=15)
 
 
@@ -892,7 +826,26 @@ def bazel_family(root: Path) -> Family:
                   rebuild_minutes=30, build_output=True)
 
 
-def default_families() -> list[Family]:
+def transcript_candidates(root: Path, archives: bool = False) -> list[Path]:
+    """Return regular transcript files without treating the Codex tree as a cache."""
+    roots = [root / "archive"] if archives else [root / "sessions", root / "thread_history"]
+    found: list[Path] = []
+    for base in roots:
+        if not base.is_dir() or base.is_symlink():
+            continue
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for name in filenames:
+                path = Path(dirpath) / name
+                try:
+                    if path.is_file() and not path.is_symlink():
+                        found.append(path)
+                except OSError:
+                    continue
+    return found
+
+
+def default_families(role: str = "fleet-mini") -> list[Family]:
     tmp = Path("/private/tmp") if DARWIN else Path("/tmp")
     tmpfs = tmp.is_dir() and fs_type(tmp) == "tmpfs"
     uid = os.getuid()
@@ -901,7 +854,7 @@ def default_families() -> list[Family]:
     fams = [
         Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
                "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15,
-               build_output=True),
+               build_output=True, max_idle_hours=0.0 if role == "devbox" else None),
         Family("claude-scratchpad", tmp / f"claude-{uid}", True,
                "session scratch space; the session is idle", depth=2,
                skip=("bundled-skills", "bash-edit-diff"), owner="Claude sessions", rebuild_minutes=0.5,
@@ -909,7 +862,7 @@ def default_families() -> list[Family]:
                git_disposable=True, nested_git=True),
         Family("tmp", tmp, True, "agent scratch under the temp dir",
                skip=(f"claude-{uid}",), files=True,
-               min_bytes=1024**2 if tmpfs else None, git_disposable=True, owner="agents and tools",
+               min_bytes=1024**2 if tmpfs or role == "devbox" else None, git_disposable=True, owner="agents and tools",
                rebuild_minutes=0.5),
         # cmux's cloud reload and CI jobs keep warm trees per unit (reload-cloud/{cmux-base,work},
         # reload-cloud-ios/{DerivedData,work}); a build mini grew 36 GiB here within hours. Depth 2
@@ -924,21 +877,23 @@ def default_families() -> list[Family]:
                # glaeda* holds glaeda-gh daemon state, the minis' native cache root, fleet-cas deployments
                # and benchmark receipts; huggingface keeps its token; codex-runtimes is an install
                skip=("cmux-job", "huggingface", "codex-runtimes"), skip_prefixes=("glaeda",),
-               owner="tools (XDG cache)", rebuild_minutes=5),
+               owner="tools (XDG cache)", rebuild_minutes=5, pressure_only=role == "devbox"),
         Family("library-caches", HOME / "Library/Caches", True, "the app re-downloads or rebuilds it",
                # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
                # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
                skip=("glaeda", "PassKit", "tidy-branches", "CloudKit", "GeoServices", "FamilyCircle",
                      "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
                      "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
-               skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5),
+               skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5,
+               pressure_only=role == "devbox"),
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
         # A day at least: Linux's relatime moves a file's access time once a day, so a cache read every
         # hour can show a day-old atime.
         Family("home-caches", HOME, True, "the tool re-downloads or rebuilds it", discover=True,
-               owner="tools (found by cache layout)", rebuild_minutes=5, min_idle_hours=24.0),
+               owner="tools (found by cache layout)", rebuild_minutes=5, min_idle_hours=24.0,
+               pressure_only=role == "devbox"),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
                "use `xcrun simctl delete unavailable` (report only)"),
         Family("projects", projects, False, "checkouts (report only)",
@@ -980,12 +935,26 @@ def default_families() -> list[Family]:
     # SwiftPM and glaeda-apple build output inside the checkouts: every other family here keeps a checkout
     # whole, so under pressure nothing was left to evict while agent sessions compiled packages in hundreds
     # of worktrees (Air Blue fell to 134 MiB free, 2026-09-28). A day idle, since the session may come back.
-    fams.append(checkout_build_family(projects))
+    fams.append(checkout_build_family(projects, role))
     # Cargo owns target validity and RFC #1137 owns Cargo reclaim, so this is visibility only.
     # Sizes here are also counted inside their checkout under projects or worktrees.
     fams.append(Family("cargo-target", projects, False,
                        "report only: cargo clean; also counted in its checkout",
                        depth=4, match="target", marker="CACHEDIR.TAG"))
+    if role == "devbox":
+        # Apply the same clean, pushed, live-process and age guards used for disposable
+        # scratch checkouts to developer workspaces. Fleet minis keep their owned hot tier.
+        fams.append(Family("devbox-checkouts", projects, True,
+                           "clone or fetch the checkout again", depth=1, git_disposable=True,
+                           nested_git=True, owner="developer workspaces", rebuild_minutes=8))
+        codex = HOME / ".codex"
+        fams.append(Family("agent-transcripts", codex, True,
+                           "gzip archive (resume and chief history remain available)",
+                           min_idle_hours=DEVBOX_TRANSCRIPT_DAYS * 24, transcripts=True,
+                           owner="Codex sessions", rebuild_minutes=0.1))
+        fams.append(Family("agent-transcript-archives", codex, True,
+                           "recreate from the chief archive", min_idle_hours=DEVBOX_TRANSCRIPT_DELETE_DAYS * 24,
+                           transcript_archives=True, owner="Codex transcript archive", rebuild_minutes=0.1))
     return [f for f in fams if f.root.is_dir()]
 
 
@@ -1060,16 +1029,6 @@ def newest_mtime(path: Path, levels: int = 2, budget: int = 3000, access: bool =
             except OSError:
                 pass
         frontier = nxt
-    return newest
-
-
-def item_mtime(fam: Family, path: Path) -> float:
-    """An item's last use as survey and apply judge it: its newest mtime near the top, and for SwiftPM scratch
-    also its lock, which owned_spm_scratch touches whenever a job links the directory."""
-    newest = newest_mtime(path, 2 if fam.reclaimable else 1, 3000 if fam.reclaimable else 300, access=fam.discover)
-    if fam.id == SPM_SCRATCH:
-        with contextlib.suppress(OSError):
-            newest = max(newest, spm_lock(path).stat().st_mtime)
     return newest
 
 
@@ -2148,8 +2107,6 @@ def job_busy(fam: Family, path: Path) -> bool:
     # none was ever evicted (cmux15, 2026-09-28). A job using one is seen by its command line and cwd.
     if fam.id in FLEET_FAMILY_IDS:
         return False
-    if fam.id == SPM_SCRATCH:  # dozens of package builds within three levels; its lock is its in-use signal
-        return False
     return fam.reclaimable and not fam.discover and cmux_active(path)
 
 
@@ -2217,7 +2174,9 @@ _DISCOVERED: dict[str, list[Path]] = {}
 
 
 def candidates(fam: Family) -> list[Path]:
-    if fam.discover:
+    if fam.transcripts or fam.transcript_archives:
+        level = transcript_candidates(fam.root, fam.transcript_archives)
+    elif fam.discover:
         key = os.fspath(fam.root)
         if key not in _DISCOVERED:  # one walk per run: main() and survey both ask
             _DISCOVERED[key] = discover_caches(fam.root)
@@ -2257,14 +2216,14 @@ def fresh_for_apply(known: dict[str, int], fams: list[Family]) -> dict[str, int]
     reclaimable candidate is re-measured. A discovering family's root is the whole home directory, so
     only its current candidates are dropped, not every size below it (that re-measured the report-only
     checkouts too and ran past the hooks' timeout on the minis)."""
-    drop = {os.fspath(p) for f in fams if f.reclaimable and (f.discover or f.checkout_builds)
+    drop = {os.fspath(p) for f in fams if f.reclaimable and (f.discover or f.checkout_builds or f.transcripts or f.transcript_archives)
             for p in candidates(f)}
 
     def candidate_of_selected(k: str) -> bool:
         if k in drop:
             return True
         for f in fams:
-            if not f.reclaimable or f.discover or f.checkout_builds:
+            if not f.reclaimable or f.discover or f.checkout_builds or f.transcripts or f.transcript_archives:
                 continue
             root = str(f.root) + "/"
             if k.startswith(root) and k[len(root):].split("/")[0] not in f.skip:
@@ -2339,7 +2298,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
     known.update(measured)
     sizes = [known[str(path)] for _, path in work]
     floors = [min_bytes if fam.min_bytes is None else fam.min_bytes for fam, _ in work]
-    idles = [(now - item_mtime(fam, path)) / 3600
+    idles = [(now - newest_mtime(path, 2 if fam.reclaimable else 1,
+                                 3000 if fam.reclaimable else 300, access=fam.discover)) / 3600
              if size >= floor else 0.0 for (fam, path), size, floor in zip(work, sizes, floors)]
     try:
         cwds, cmds = evidence.result()
@@ -2361,8 +2321,11 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
             reasons.append("named by a running command")
         if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_hours * 3600):
             reasons.append("claude session active")
-        if fam.id == SPM_SCRATCH and spm_scratch_held(path):
-            reasons.append("a job holds its lock (owned_spm_scratch.py)")
+        if fam.pressure_only and ACTIVITY_MODE != "pressure":
+            reasons.append("package cache: pressure-only policy")
+        if ROLE == "devbox" and (fam.id == "xcode-derived-data" or
+                (fam.id in ("tmp", "user-tmp") and re.search(r"cmux|terminal-image|derived-data", path.name, re.I))):
+            reasons.append("policy violation: build output on a no-build dev box")
         # The tree walks below cost seconds each on a loaded host, and a recent item is kept anyway,
         # so only an item old enough to delete pays for them (apply re-checks before deleting).
         window = item_window(fam, path, idle_hours, archived)
@@ -2375,7 +2338,9 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
             reasons.append("holds a socket")
         if deletable_age and job_busy(fam, path):
             reasons.append("a cmux reload job holds its unit (.cmux-active or .lock)")
-        if not fam.reclaimable:
+        if fam.pressure_only and ACTIVITY_MODE != "pressure":
+            verdict = "kept"
+        elif not fam.reclaimable:
             verdict = "report-only"
         elif reasons:
             verdict = "in-use"
@@ -2628,6 +2593,7 @@ def write_health_summary(fss: list[Fs], items: list[Item], accounting: list[dict
 def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
            notes: dict[str, str] | None = None, fams: dict[str, Family] | None = None,
            accounting: list[dict[str, Any]] | None = None) -> None:
+    print(f"role {ROLE}")
     for fs in fss:
         print(f"free {gib(fs.free).strip()} of {gib(fs.total).strip()} "
               f"({100 * fs.free / max(fs.total, 1):.0f}%) on {fs.mount}, pressure below "
@@ -2661,6 +2627,19 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
     print(f"\nreclaimable now: {gib(total_r).strip()}  ->  glaeda-disk --apply")
 
 
+def notify_disk(title: str, body: str) -> None:
+    """Best-effort cmux notification; a missing GUI must never change cleanup decisions."""
+    binary = shutil.which("cmux")
+    if not binary:
+        return
+    try:
+        subprocess.run([binary, "notify", "--title", title[:128], "--body", body[:1024]],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def remove(path: Path, after_rename=None) -> None:
     """Delete path. `after_rename` runs once the tree is out of the way, before the long delete."""
     if path.is_symlink():
@@ -2688,6 +2667,23 @@ def _chmod_retry(func, p, _exc):  # read-only files in SwiftPM/Xcode checkouts
     if not os.path.islink(p):  # never chmod through a symlink to something outside the tree
         os.chmod(p, rwx)
     func(p)
+
+
+def archive_transcript(path: Path) -> Path:
+    """Compress one old transcript into the Codex archive, then remove its live copy."""
+    relative = path.relative_to(HOME / ".codex")
+    destination = HOME / ".codex" / "archive" / relative
+    destination = destination.with_name(destination.name + ".gz")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.glaeda-{os.getpid()}.tmp")
+    try:
+        with path.open("rb") as source, gzip.open(temporary, "wb", compresslevel=6) as target:
+            shutil.copyfileobj(source, target)
+        os.replace(temporary, destination)
+        path.unlink()
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
 
 
 APPLY_LSOF_ITEMS, APPLY_LSOF_S = 8, 20.0  # apply re-takes lsof for discovered items this often
@@ -2768,11 +2764,10 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         elif families[i.family].discover and not fresh_layout:
             outcome = "changed:layout"
         elif (in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(families[i.family], p)
-                or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
-                or (i.family == SPM_SCRATCH and spm_scratch_held(p))):
+                or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))):
             outcome = "changed:in-use"
         elif not item_due(families[i.family],
-                          (time.time() - item_mtime(families[i.family], p)) / 3600,
+                          (time.time() - newest_mtime(p, access=families[i.family].discover)) / 3600,
                           item_window(families[i.family], p, idle_hours, archived))[0]:
             outcome = "changed:modified"
         elif keep_verdict(families[i.family], p):
@@ -2786,18 +2781,20 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         else:
             try:
                 common = git_common_dir(p) if families[i.family].git_disposable else ""
+                if families[i.family].transcripts:
+                    original_bytes = p.stat().st_size
+                    destination = archive_transcript(p)
+                    outcome = "archived"
+                    released += max(0, original_bytes - destination.stat().st_size)
+                else:
                 # rustup skips reinstalling a toolchain whose update hash still matches the channel
                 # the moment the toolchain is renamed away, so an interrupted delete cannot leave it behind
-                stale_hash = (p.parent.parent / "update-hashes" / p.name
-                              if fresh_layout == "rustup-toolchain" else None)
-                if i.family == SPM_SCRATCH:
-                    gone = remove_spm_scratch(p)  # only under its lock: a job may link it right now
-                else:
+                    stale_hash = (p.parent.parent / "update-hashes" / p.name
+                                  if fresh_layout == "rustup-toolchain" else None)
                     remove(p, after_rename=None if stale_hash is None
                            else lambda h=stale_hash: h.unlink(missing_ok=True))
-                    gone = True
-                outcome = "reclaimed" if gone else "changed:in-use"
-                released += i.bytes if gone else 0
+                    outcome = "reclaimed"
+                    released += i.bytes
                 if common:  # drop the deleted worktree's record from its repository
                     subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
                                    capture_output=True, timeout=60)
@@ -2942,7 +2939,12 @@ def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", nargs="?", choices=("report", "keepup"),
+                    help="report is read-only; keepup enables the same policy surface explicitly")
     ap.add_argument("--apply", action="store_true", help="delete reclaimable items")
+    ap.add_argument("--role", choices=("fleet-mini", "devbox"), default=None,
+                    help="policy role (default: fleet-mini; hygiene installs default to devbox)")
+    ap.add_argument("--devbox", dest="role_devbox", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--pressure", action="store_true",
                     help="only act when free space is below --low; stop at --target")
     ap.add_argument("--idle", action="store_true",
@@ -2989,6 +2991,18 @@ def main(argv: list[str] | None = None) -> int:
                     help=argparse.SUPPRESS)  # tests
     a = ap.parse_args(argv)
 
+    if a.command == "report":
+        a.apply = False
+        a.pressure = False
+        a.idle = False
+    elif a.command == "keepup":
+        # Keepup is intentionally report-first; callers must opt into mutation with --apply.
+        a.pressure = bool(a.apply)
+        a.idle = bool(a.apply)
+    role = "devbox" if a.role_devbox else (a.role or "fleet-mini")
+    global ROLE
+    ROLE = role
+
     if a.need is not None:
         if not math.isfinite(a.need) or a.need <= 0:
             ap.error("--need must be a positive GiB value")
@@ -2996,7 +3010,7 @@ def main(argv: list[str] | None = None) -> int:
         a.low = f"{a.need + POLICY['low_margin_gib']:g}"
         a.target = f"{a.need + POLICY['target_margin_gib']:g}"
 
-    fams = default_families()
+    fams = default_families(role)
     for ov in a.root_override:
         fid, _, p = ov.partition("=")
         fams = [replace(f, root=Path(p), files=False, min_bytes=None, git_disposable=False)
@@ -3041,10 +3055,8 @@ def main(argv: list[str] | None = None) -> int:
         if not idle_due():
             print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
             return 0
-    global ACTIVITY_MODE, EMERGENCY_DEVS
+    global ACTIVITY_MODE
     ACTIVITY_MODE = "sweep" if sweep else "pressure" if a.pressure else None
-    # the idle sweep judges by reuse windows alone; a pressure run or a report sees the emergency floor
-    EMERGENCY_DEVS = frozenset() if sweep else emergency_devs(fss, a.emergency, floor_gib)
     busy = host_busy() if sweep else ""
     if sweep:
         print(f"idle sweep: {'host busy, ' + busy if busy else 'host idle'}")
@@ -3115,7 +3127,7 @@ def main(argv: list[str] | None = None) -> int:
             save_snapshot(known, at=at or None, measured_at=updated_times)
         if at and age_min > a.max_age and not a.apply and not _fresh(lock, 600):
             lock.touch()
-            subprocess.Popen([sys.executable, os.path.abspath(__file__), "--refresh", "--top", "0",
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), "--role", ROLE, "--refresh", "--top", "0",
                               "--min-mib", "0"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              stdin=subprocess.DEVNULL, start_new_session=True)
@@ -3129,7 +3141,8 @@ def main(argv: list[str] | None = None) -> int:
     # Xcode copies are sized by a walk, so only a report shows them (the agent runs with --top 0)
     tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) if sweep and DARWIN else []
     if a.json:
-        print(json.dumps({"free": shown[0].free, "total": shown[0].total, "idle_hours": idle,
+        print(json.dumps({"schema": "glaeda-disk/v2", "role": ROLE, "free": shown[0].free,
+                          "total": shown[0].total, "idle_hours": idle,
                           "tooling": [asdict(i) for i in tooling],
                           "filesystems": [asdict(fs) for fs in shown],
                           "accounting": accounting,
@@ -3146,8 +3159,23 @@ def main(argv: list[str] | None = None) -> int:
     if a.apply:
         print()
         halt = host_busy if sweep and POLICY["defer_during_ci"] else None
-        apply(items, {f.id: f for f in fams}, a.receipt,
-              {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt)
+        released = apply(items, {f.id: f for f in fams}, a.receipt,
+                         {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt)
+        remaining = []
+        for fs in shown:
+            try:
+                free, _ = free_bytes(Path(fs.mount))
+            except OSError:
+                free = fs.free
+            if free < fs.low:
+                remaining.append(f"{gib(free).strip()} free on {fs.mount}")
+        if released:
+            notify_disk("glaeda disk keepup", f"{gib(released).strip()} reclaimed on {platform.node()}")
+        if remaining:
+            kept = [i for i in items if i.verdict != "reclaimable"][:3]
+            blocked = ", ".join(f"{gib(i.bytes).strip()} {Path(i.path).name} ({i.verdict})" for i in kept)
+            notify_disk("glaeda disk pressure", "still below floor: " + "; ".join(remaining)
+                        + (f"; biggest guarded items: {blocked}" if blocked else ""))
         if sweep:
             # deleting a runtime restarts CoreSimulatorService: never while a job may be using simulators
             apply_runtimes(tooling, a.receipt, host_busy)
