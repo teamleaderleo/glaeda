@@ -19,11 +19,24 @@ from pathlib import Path
 
 HOME = Path.home()
 PROJECTS = HOME / "Projects"
+GIT = next((path for path in ("/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git")
+            if os.access(path, os.X_OK)), "/usr/bin/git")
+
+
+def git_environment() -> dict[str, str]:
+    env = {"HOME": os.environ.get("HOME", str(HOME)),
+           "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+           "GIT_TERMINAL_PROMPT": "0"}
+    if os.environ.get("GIT_ALLOW_PROTOCOL"):
+        env["GIT_ALLOW_PROTOCOL"] = os.environ["GIT_ALLOW_PROTOCOL"]
+    return env
 
 
 def run(argv: list[str], *, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, cwd=cwd, stdin=subprocess.DEVNULL, text=True,
-                          capture_output=True, check=check, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    command = [GIT if argument == "git" and index == 0 else argument
+               for index, argument in enumerate(argv)]
+    return subprocess.run(command, cwd=cwd, stdin=subprocess.DEVNULL, text=True,
+                          capture_output=True, check=check, env=git_environment())
 
 
 def repository_root(value: str) -> Path:

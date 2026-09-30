@@ -623,6 +623,12 @@ class MiniSetupTest(unittest.TestCase):
         ctx.role = "fleet-mini"
         self.assertEqual(ms.update_config(ctx)["setupArgs"], ["--role=fleet-mini"])
 
+    def test_explicit_devbox_role_is_preserved_for_ota(self) -> None:
+        ctx = self.ctx_for_steps()
+        ctx.role = "devbox"
+        ctx.role_explicit = True
+        self.assertEqual(ms.update_config(ctx)["setupArgs"], ["--role=devbox"])
+
     def test_linux_uninstall_removes_only_our_units(self) -> None:
         self.linux()
         self.invoke("--apply")

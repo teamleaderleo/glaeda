@@ -195,7 +195,8 @@ class Context:
                  reclaim_binary: Path | None, cmux_root: Path | None, glaeda_bin: Path | None,
                  xcode_app: str, min_free_gib: int, hygiene_only: bool = False,
                  platform_name: str | None = None, ota_ring: str | None = None,
-                 ota_source: str | None = None, role: str = "devbox") -> None:
+                 ota_source: str | None = None, role: str = "devbox",
+                 role_explicit: bool = False) -> None:
         self.home = home
         self.platform = platform_name or HOST_PLATFORM
         self.hygiene_only = hygiene_only
@@ -224,6 +225,7 @@ class Context:
         self.ota_ring = ota_ring
         self.ota_source = ota_source
         self.role = role
+        self.role_explicit = role_explicit
         self.update_config = home / ".config/glaeda/update.json"
 
     def show(self, path: Path | str) -> str:
@@ -849,10 +851,12 @@ def is_update_agent(label: str) -> bool:
 
 def update_config(ctx: Context) -> dict[str, Any]:
     """What glaeda-update reads: this host's ring and the setup flags it re-runs releases with."""
+    setup_args = ["--hygiene-only"] if ctx.hygiene_only else []
+    if ctx.role_explicit or ctx.role != "devbox":
+        setup_args.append(f"--role={ctx.role}")
     config = {
         "ring": ctx.ota_ring or "stable",
-        "setupArgs": (["--hygiene-only"] if ctx.hygiene_only else [])
-        + ([] if ctx.role == "devbox" else [f"--role={ctx.role}"]),
+        "setupArgs": setup_args,
         "host": platform.node().split(".")[0].lower(),
         "reportStatus": (ctx.ota_ring or "stable") == "canary",
     }
@@ -1593,7 +1597,7 @@ def main(argv: list[str] | None = None) -> int:
                   args.cmux_root.expanduser().resolve() if args.cmux_root else None,
                   args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, min_free_gib,
                   args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring,
-                  ota_source=args.ota_source, role=role)
+                  ota_source=args.ota_source, role=role, role_explicit=args.role is not None)
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
         checks = {n: ({**c, "level": "warn"} if c["level"] == "block" and n not in HYGIENE_BLOCKING else c)

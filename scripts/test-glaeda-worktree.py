@@ -27,7 +27,8 @@ class WorktreeTest(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "add", "README"], check=True)
             subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
             result = subprocess.run([str(ROOT / "scripts/glaeda-worktree"), "add", "--no-build",
-                                     str(repo), "feature"], env={**os.environ, "HOME": str(home)},
+                                     str(repo), "feature"],
+                                    env={**os.environ, "HOME": str(home), "GIT_DIR": str(home / "foreign.git")},
                                     capture_output=True, text=True, check=True)
             target = Path(result.stdout.strip())
             self.assertEqual(target, projects / "worktrees/demo/feature")

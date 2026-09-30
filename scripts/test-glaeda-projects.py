@@ -103,6 +103,18 @@ class ProjectsTest(unittest.TestCase):
         run("commit", "-qm", "private", cwd=repo)
         self.assertIn("not confirmed by a remote", gp.clean_pushed(repo))
 
+    def test_duplicate_clone_with_external_linked_worktree_is_kept(self) -> None:
+        repo = self.repo()
+        external = Path(self.tmp.name) / "external-worktree"
+        run("worktree", "add", "-q", str(external), "-b", "external", "HEAD", cwd=repo)
+        self.assertIn("backs linked worktrees", gp.clean_pushed(repo))
+
+    def test_apply_aborts_when_process_evidence_is_unavailable(self) -> None:
+        action = gp.Action("scratch", str(self.projects / "stale"), str(self.projects / "scratch/stale"), "old")
+        with mock.patch.object(gp, "process_evidence", side_effect=gp.EvidenceUnavailable("cannot list processes")):
+            gp.apply([action])
+        self.assertEqual((action.status, action.reason), ("skipped", "cannot list processes"))
+
     def test_legacy_worktree_discovery_resolves_relative_common_dir(self) -> None:
         repo = self.repo()
         legacy = self.projects / "legacy-worktrees" / "old"

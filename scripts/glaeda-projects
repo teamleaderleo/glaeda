@@ -27,6 +27,8 @@ SCRATCH = PROJECTS / "scratch"
 AGE_S = 24 * 3600
 SCRATCH_NAMES = re.compile(r"(?:-fixture$|-fixtures$|-receipts$|probe|BuildExperiments|^\.tmp-|^scratch[-_])", re.I)
 GROUP_NAMES = {"cmux-worktrees", "codex-review", "hq-worktrees", "worktrees"}
+GIT = next((path for path in ("/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git")
+            if os.access(path, os.X_OK)), "/usr/bin/git")
 
 
 @dataclasses.dataclass
@@ -40,9 +42,14 @@ class Action:
 
 
 def git(path: Path, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", "-C", str(path), *args], stdin=subprocess.DEVNULL,
+    env = {"HOME": os.environ.get("HOME", str(HOME)),
+           "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+           "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
+    if os.environ.get("GIT_ALLOW_PROTOCOL"):
+        env["GIT_ALLOW_PROTOCOL"] = os.environ["GIT_ALLOW_PROTOCOL"]
+    return subprocess.run([GIT, "-C", str(path), *args], stdin=subprocess.DEVNULL,
                           capture_output=True, text=True, timeout=90, check=check,
-                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"})
+                          env=env)
 
 
 def canonical_repos() -> list[Path]:
@@ -56,7 +63,7 @@ def origin(path: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def worktree_records(repo: Path) -> list[Path]:
+def worktree_records(repo: Path, *, projects_only: bool = True) -> list[Path]:
     result = git(repo, "worktree", "list", "--porcelain")
     if result.returncode:
         return []
@@ -64,8 +71,11 @@ def worktree_records(repo: Path) -> list[Path]:
     for line in result.stdout.splitlines():
         if line.startswith("worktree "):
             path = Path(line[9:]).resolve()
-            if (path != repo.resolve() and path.is_relative_to(PROJECTS.resolve())
-                    and path.is_dir()):
+            if path == repo.resolve():
+                continue
+            if projects_only and not path.is_relative_to(PROJECTS.resolve()):
+                continue
+            if not projects_only or path.is_dir():
                 paths.append(path)
     return paths
 
@@ -99,7 +109,7 @@ def submodule_status(path: Path) -> str:
 
 
 def clean_pushed(path: Path) -> str:
-    if worktree_records(path):
+    if worktree_records(path, projects_only=False):
         return "clone backs linked worktrees"
     if (reason := submodule_status(path)):
         return reason
@@ -121,14 +131,18 @@ def clean_pushed(path: Path) -> str:
     return ""
 
 
+class EvidenceUnavailable(RuntimeError):
+    pass
+
+
 def process_evidence() -> tuple[list[Path], str]:
     try:
         ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True,
                             timeout=30, check=False)
     except (OSError, subprocess.SubprocessError):
-        return [], "cannot list processes"
+        raise EvidenceUnavailable("cannot list processes")
     if ps.returncode != 0:
-        return [], "cannot list processes"
+        raise EvidenceUnavailable("cannot list processes")
     cwd: list[Path] = []
     proc = Path("/proc")
     if proc.is_dir():
@@ -138,6 +152,31 @@ def process_evidence() -> tuple[list[Path], str]:
                     cwd.append(Path(os.path.realpath(entry / "cwd")))
                 except OSError:
                     continue
+                # Include open regular files and directories. A build/editor process can have a
+                # checkout open while its cwd and command line point elsewhere.
+                try:
+                    for fd in (entry / "fd").iterdir():
+                        try:
+                            target = os.path.realpath(fd)
+                        except OSError:
+                            continue
+                        if target.startswith("/"):
+                            cwd.append(Path(target))
+                except OSError:
+                    continue
+    else:
+        lsof = next((path for path in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.access(path, os.X_OK)), None)
+        if lsof is None:
+            raise EvidenceUnavailable("cannot inspect open files")
+        try:
+            opened = subprocess.run([lsof, "-nP", "-Fn", "-a", "-d", "cwd,txt,mem"],
+                                    capture_output=True, text=True, timeout=30, check=False)
+        except (OSError, subprocess.SubprocessError):
+            raise EvidenceUnavailable("cannot inspect open files")
+        if opened.returncode != 0:
+            raise EvidenceUnavailable("cannot inspect open files")
+        cwd.extend(Path(line[1:]) for line in opened.stdout.splitlines()
+                   if line.startswith("n") and line[1:].startswith("/"))
     return cwd, ps.stdout
 
 
@@ -338,11 +377,24 @@ def recreate_worktree(source: Path, destination: Path, repo: Path) -> None:
 
 
 def apply(actions: list[Action]) -> None:
-    cwds, commands = process_evidence()
     SCRATCH.mkdir(parents=True, exist_ok=True)
-    for action in actions:
+    for index, action in enumerate(actions):
         if action.status != "planned":
             continue
+        try:
+            cwds, commands = process_evidence()
+        except EvidenceUnavailable as error:
+            for pending in actions[index:]:
+                if pending.status == "planned":
+                    pending.status = "skipped"
+                    pending.reason = str(error)
+            break
+        if commands in {"cannot list processes", "cannot inspect open files"}:
+            for pending in actions[index:]:
+                if pending.status == "planned":
+                    pending.status = "skipped"
+                    pending.reason = commands
+            break
         source = Path(action.source)
         destination = Path(action.destination)
         if not source.exists() or live_in(source, cwds, commands) or session_mentions(source):
