@@ -5667,6 +5667,25 @@ class JobTelemetryTest(unittest.TestCase):
             self.assertIsNone(self.hook.compile_telemetry(meta))
         self.assertFalse(telemetry.exists())
 
+    def test_completed_record_rejects_oversized_numeric_without_raising(self) -> None:
+        telemetry = self.dir / self.hook.COMPILE_TELEMETRY_FILE
+        telemetry.write_text(json.dumps({
+            "schema": self.hook.COMPILE_TELEMETRY_SCHEMA,
+            "run_id": "123",
+            "run_attempt": "1",
+            "cacheable_tasks": 1,
+            "hits": 1,
+            "misses": 0,
+            "hit_rate": 1,
+            "seed_distance": None,
+            "compile_seconds": 10 ** 400,
+            "fetch_seconds": None,
+            "link_seconds": 1,
+        }))
+        with mock.patch.dict(self.hook.os.environ, {"RUNNER_TEMP": str(self.dir)}, clear=False):
+            self.assertIsNone(self.hook.compile_telemetry({"run_id": "123", "run_attempt": "1"}))
+        self.assertFalse(telemetry.exists())
+
     def test_sampler_records_when_the_job_dies_first(self) -> None:
         watched = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1)"])
         state = self.dir / "state"

@@ -3805,7 +3805,13 @@ def compile_telemetry(meta: dict[str, Any]) -> dict[str, Any] | None:
         value = payload.get(key)
         if value is None and key in ("hit_rate", "fetch_seconds"):
             result[key] = None
-        elif isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value <= 10_000_000:
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            # Check the JSON number's range before converting an arbitrarily
+            # large integer to float; float conversion can raise OverflowError.
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            if not 0 <= value <= 10_000_000:
+                return None
             result[key] = round(float(value), 6)
         else:
             return None
