@@ -2736,6 +2736,7 @@ class LeakedAppTest(unittest.TestCase):
         table = {
             10: (1, app),
             40: (1, "/usr/bin/xcodebuild -derivedDataPath " + root + "/Build test-without-building"),
+            50: (1, "/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient"),
         }
         self.assertEqual(hook.leaked_test_app_pids(table), [])
 

@@ -3669,10 +3669,15 @@ def leaked_test_app_pids(table: dict[int, tuple[int, str]], ignored_workers: set
         temp = LEAKED_TEST_TEMP.match(match.group(1))
         if temp:
             # XCTest may reparent through testmanagerd or launchd. A live job process that still names the
-            # same per-run temp tree is ownership evidence even when the app's parent is pid 1.
+            # same per-run temp tree is ownership evidence even when the app's parent is pid 1, but only
+            # alongside that runner's live Runner.Worker. A stale command line alone is not ownership.
             prefix = temp.group(1) + "/"
-            if any(other != pid and prefix in cmd and not LEAKED_TEST_APP.search(cmd)
-                   for other, (_ppid, cmd) in table.items()):
+            runner_prefix = temp.group(1).split("/_work/", 1)[0]
+            worker = any(other not in ignored_workers and runner_prefix in cmd
+                         and re.search(r"(?:^|/)Runner\.Worker(?:\s|$)", cmd)
+                         for other, (_ppid, cmd) in table.items())
+            if worker and any(other != pid and prefix in cmd and not LEAKED_TEST_APP.search(cmd)
+                              for other, (_ppid, cmd) in table.items()):
                 continue
         owner = pid
         owned = False
