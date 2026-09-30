@@ -431,7 +431,7 @@ class MiniSetupTest(unittest.TestCase):
 
     def test_bootout_waits_and_bootstrap_retries_eio(self) -> None:
         calls: list[tuple[str, ...]] = []
-        answers = {"print": [(0, ""), (0, ""), (113, "")], "bootstrap": [(5, "Bootstrap failed: 5: Input/output error"), (0, "")]}
+        answers = {"print": [(0, ""), (0, ""), (113, "Could not find service")], "bootstrap": [(5, "Bootstrap failed: 5: Input/output error"), (0, "")]}
 
         def fake(ctx, *args):
             calls.append(args)
@@ -443,6 +443,12 @@ class MiniSetupTest(unittest.TestCase):
             self.assertTrue(ms.bootout(ctx, "x"))
             self.assertEqual(ms.bootstrap(ctx, "/p.plist")[0], 0)
         self.assertEqual([c[0] for c in calls], ["bootout", "print", "print", "print", "bootstrap", "bootstrap"])
+
+    def test_bootout_fails_closed_when_unload_is_not_confirmed(self) -> None:
+        ctx = mock.Mock(uid=501)
+        with mock.patch.object(ms, "launchctl", return_value=(127, "")) as ctl:
+            self.assertFalse(ms.bootout(ctx, "x", wait_s=0))
+        ctl.assert_called_once_with(ctx, "bootout", "gui/501/x")
 
     def test_power_parser_reuses_fleet_rule(self) -> None:
         with mock.patch.object(ms, "run", lambda argv, **kw: (0, PMSET_SLEEPY)):

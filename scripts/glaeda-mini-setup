@@ -1191,10 +1191,14 @@ def launchctl(ctx: Context, *args: str) -> tuple[int, str]:
 
 def bootout(ctx: Context, label: str, wait_s: float = 5.0) -> bool:
     """Unload a job and wait (bounded) until launchd no longer lists it."""
-    launchctl(ctx, "bootout", f"gui/{ctx.uid}/{label}")
+    code, output = launchctl(ctx, "bootout", f"gui/{ctx.uid}/{label}")
+    if code != 0 and "could not find" not in output.lower() and "no such process" not in output.lower():
+        return False
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        if launchctl(ctx, "print", f"gui/{ctx.uid}/{label}")[0] != 0:
+        print_code, print_output = launchctl(ctx, "print", f"gui/{ctx.uid}/{label}")
+        if print_code != 0 and ("could not find" in print_output.lower()
+                                or "no such process" in print_output.lower()):
             return True
         time.sleep(0.25)
     return False
