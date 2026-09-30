@@ -804,6 +804,21 @@ def project_checkouts(projects: Path) -> list[Path]:
     return [Path(w) for w in sorted(found)]
 
 
+def contained_directory(path: Path, root: Path) -> bool:
+    """A directory reached without symlinks and wholly inside its declared root."""
+    try:
+        if root.is_symlink() or not path.is_relative_to(root):
+            return False
+        for ancestor in (path, *path.parents):
+            if ancestor.is_symlink():
+                return False
+            if ancestor == root:
+                break
+        return path.is_dir() and path.resolve().is_relative_to(root.resolve())
+    except OSError:
+        return False
+
+
 def _checkout_build_dirs(checkout: Path) -> list[Path]:
     found = []
     tracked = _checkout_git(checkout, "ls-files", "-z", "--", "Package.swift", ":(glob)**/Package.swift")
@@ -823,7 +838,7 @@ def _checkout_build_dirs(checkout: Path) -> list[Path]:
                 for candidate in package_root.glob(pattern):
                     if candidate.is_dir() and not candidate.is_symlink():
                         found.append(candidate)
-    return sorted({p.resolve() for p in found})
+    return sorted({p.resolve() for p in found if contained_directory(p, checkout)})
 
 
 def checkout_builds(projects: Path) -> list[Path]:
@@ -1032,9 +1047,10 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
     if role == "devbox":
         # Apply the same clean, pushed, live-process and age guards used for disposable
         # scratch checkouts to developer workspaces. Fleet minis keep their owned hot tier.
-        fams.append(Family("devbox-checkouts", projects / "worktrees", True,
-                           "clone or fetch the checkout again", depth=2, git_disposable=True,
-                           nested_git=True, owner="developer workspaces", rebuild_minutes=8))
+        if contained_directory(projects / "worktrees", projects):
+            fams.append(Family("devbox-checkouts", projects / "worktrees", True,
+                               "clone or fetch the checkout again", depth=2, git_disposable=True,
+                               nested_git=True, owner="developer workspaces", rebuild_minutes=8))
         codex = HOME / ".codex"
         fams.append(Family("agent-transcripts", codex, True,
                            "gzip archive (resume and chief history remain available)",

@@ -64,11 +64,13 @@ def origin(path: Path) -> str:
 
 
 def worktree_records(repo: Path, *, projects_only: bool = True) -> list[Path]:
-    result = git(repo, "worktree", "list", "--porcelain")
+    result = git(repo, "worktree", "list", "--porcelain", "-z")
     if result.returncode:
+        if not projects_only:
+            raise RuntimeError("linked worktree records unreadable")
         return []
     paths = []
-    for line in result.stdout.splitlines():
+    for line in result.stdout.split("\0"):
         if line.startswith("worktree "):
             path = Path(line[9:]).resolve()
             if path == repo.resolve():
@@ -109,7 +111,11 @@ def submodule_status(path: Path) -> str:
 
 
 def clean_pushed(path: Path) -> str:
-    if worktree_records(path, projects_only=False):
+    try:
+        linked = worktree_records(path, projects_only=False)
+    except RuntimeError:
+        return "linked worktree records unreadable"
+    if linked:
         return "clone backs linked worktrees"
     if (reason := submodule_status(path)):
         return reason
@@ -131,17 +137,28 @@ def clean_pushed(path: Path) -> str:
     return ""
 
 
+def initialized_submodules(path: Path) -> bool:
+    result = git(path, "submodule", "status", "--recursive")
+    if result.returncode != 0:
+        return True
+    for line in result.stdout.splitlines():
+        fields = line[1:].split()
+        if fields and (path / fields[-1] / ".git").exists():
+            return True
+    return False
+
+
 class EvidenceUnavailable(RuntimeError):
     pass
 
 
 def process_evidence() -> tuple[list[Path], str]:
     try:
-        ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True,
-                            timeout=30, check=False)
+        ps = subprocess.run(["/bin/ps", "-axww", "-o", "command="], capture_output=True, text=True,
+                            timeout=30, check=False, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
     except (OSError, subprocess.SubprocessError):
         raise EvidenceUnavailable("cannot list processes")
-    if ps.returncode != 0:
+    if ps.returncode != 0 or not ps.stdout.strip():
         raise EvidenceUnavailable("cannot list processes")
     cwd: list[Path] = []
     proc = Path("/proc")
@@ -149,33 +166,38 @@ def process_evidence() -> tuple[list[Path], str]:
         for entry in proc.iterdir():
             if entry.name.isdigit():
                 try:
-                    cwd.append(Path(os.path.realpath(entry / "cwd")))
-                except OSError:
+                    cwd.append(Path(os.readlink(entry / "cwd")).resolve())
+                except FileNotFoundError:
                     continue
+                except OSError as error:
+                    raise EvidenceUnavailable("cannot inspect process cwd") from error
                 # Include open regular files and directories. A build/editor process can have a
                 # checkout open while its cwd and command line point elsewhere.
                 try:
                     for fd in (entry / "fd").iterdir():
                         try:
-                            target = os.path.realpath(fd)
-                        except OSError:
+                            target = os.readlink(fd)
+                        except FileNotFoundError:
                             continue
                         if target.startswith("/"):
-                            cwd.append(Path(target))
-                except OSError:
+                            cwd.append(Path(target).resolve())
+                except FileNotFoundError:
                     continue
+                except OSError as error:
+                    raise EvidenceUnavailable("cannot inspect open files") from error
     else:
         lsof = next((path for path in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.access(path, os.X_OK)), None)
         if lsof is None:
             raise EvidenceUnavailable("cannot inspect open files")
         try:
-            opened = subprocess.run([lsof, "-nP", "-Fn", "-a", "-d", "cwd,txt,mem"],
-                                    capture_output=True, text=True, timeout=30, check=False)
+            opened = subprocess.run([lsof, "-nP", "-Fn"],
+                                    capture_output=True, text=True, timeout=30, check=False,
+                                    env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
         except (OSError, subprocess.SubprocessError):
             raise EvidenceUnavailable("cannot inspect open files")
-        if opened.returncode != 0:
+        if opened.returncode != 0 or not opened.stdout.strip() or opened.stderr.strip():
             raise EvidenceUnavailable("cannot inspect open files")
-        cwd.extend(Path(line[1:]) for line in opened.stdout.splitlines()
+        cwd.extend(Path(line[1:]).resolve() for line in opened.stdout.splitlines()
                    if line.startswith("n") and line[1:].startswith("/"))
     return cwd, ps.stdout
 
@@ -288,6 +310,9 @@ def plan() -> list[Action]:
             if reason:
                 actions.append(Action("skip", str(clone), "", f"full clone kept: {reason}", "skipped"))
                 continue
+            if initialized_submodules(clone):
+                actions.append(Action("skip", str(clone), "", "full clone has initialized submodules; kept intact", "skipped"))
+                continue
             dst = target_for(canonical.name, clone.name)
             actions.append(Action("clone", str(clone), str(dst), "clean pushed duplicate clone",
                                   branch=branch(clone)))
@@ -332,52 +357,81 @@ def print_plan(actions: list[Action]) -> None:
 
 
 def recreate_worktree(source: Path, destination: Path, repo: Path) -> None:
-    """Relocate a complete submodule worktree without deleting its Git metadata.
-
-    Git refuses worktree move for initialized submodules. Keep every index, reflog,
-    and module object store in place; change only their path links after a rename.
-    A failed repair renames the source back and restores the original links.
-    """
-    top_dir = git(source, "rev-parse", "--absolute-git-dir", check=True).stdout.strip()
-    gitdir = Path(top_dir).resolve()
+    """Rename a linked worktree with initialized submodules and repair every path link."""
+    gitdir = Path(git(source, "rev-parse", "--absolute-git-dir", check=True).stdout.strip()).resolve()
     common = (repo / git(repo, "rev-parse", "--git-common-dir", check=True).stdout.strip()).resolve()
     if not gitdir.is_relative_to(common / "worktrees"):
         raise RuntimeError("not a linked worktree of the expected canonical checkout")
-    nested = git(source, "submodule", "foreach", "--quiet", "--recursive",
-                 'printf "%s\\0" "$toplevel/$sm_path"', check=True)
-    roots = [source, *(Path(value) for value in nested.stdout.split("\0") if value)]
-    links = []
-    for root in roots:
-        link = root / ".git"
+    links: list[tuple[Path, Path, bytes, bytes]] = []
+    for root, dirs, _files in os.walk(source):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        root_path = Path(root)
+        if root_path == source:
+            continue
+        link = root_path / ".git"
+        if not link.exists():
+            continue
         if not link.is_file() or link.is_symlink():
             raise RuntimeError("unsupported submodule Git layout; source left intact")
-        directory = Path(git(root, "rev-parse", "--absolute-git-dir", check=True).stdout.strip()).resolve()
-        if directory != gitdir and not directory.is_relative_to(gitdir):
+        text = link.read_text().strip()
+        if not text.startswith("gitdir:"):
+            raise RuntimeError("unsupported submodule Git layout; source left intact")
+        module_gitdir = (link.parent / text.split(":", 1)[1].strip()).resolve()
+        if not module_gitdir.is_relative_to(gitdir / "modules"):
             raise RuntimeError("module metadata outside this worktree; source left intact")
-        config = directory / "config"
-        links.append((root.relative_to(source), link.read_bytes(), directory))
+        config = module_gitdir / "config"
+        if not config.is_file():
+            raise RuntimeError("submodule metadata unreadable; source left intact")
+        links.append((root_path.relative_to(source), module_gitdir, link.read_bytes(), config.read_bytes()))
+    top_link = source / ".git"
+    top_link_bytes = top_link.read_bytes()
     backref = gitdir / "gitdir"
     previous_backref = backref.read_bytes()
     destination.parent.mkdir(parents=True, exist_ok=True)
     os.rename(source, destination)  # fail without mutation across filesystems
     try:
-        for relative, _data, directory in links:
+        top_link = destination / ".git"
+        top_link.write_text(f"gitdir: {gitdir}\n")
+        for relative, module_gitdir, _data, _config in links:
             root = destination / relative
-            (root / ".git").write_text(f"gitdir: {directory}\n")
+            (root / ".git").write_text(f"gitdir: {os.path.relpath(module_gitdir, root)}\n")
+            git(repo, "config", "--file", str(module_gitdir / "config"),
+                "core.worktree", os.path.relpath(root, module_gitdir), check=True)
         backref.write_text(f"{destination / '.git'}\n")
         git(repo, "worktree", "repair", str(destination), check=True)
-        for relative, _data, _directory in links:
+        for relative, _module_gitdir, _data, _config in links:
             git(destination / relative, "status", "--porcelain", check=True)
     except Exception:
         os.rename(destination, source)
-        for relative, data, directory in links:
+        (source / ".git").write_bytes(top_link_bytes)
+        for relative, _module_gitdir, data, config in links:
             (source / relative / ".git").write_bytes(data)
+            # Restore the exact config bytes, including its previous core.worktree.
+            (_module_gitdir / "config").write_bytes(config)
         backref.write_bytes(previous_backref)
         raise
 
 
+def mutation_guard(source: Path, *, check_age: bool = True) -> str:
+    try:
+        opened, commands = process_evidence()
+    except EvidenceUnavailable as error:
+        return str(error)
+    if not source.exists() or source.is_symlink():
+        return "source disappeared or became a symlink"
+    try:
+        if source.stat().st_uid != os.getuid():
+            return "source is not owned by this user"
+    except OSError:
+        return "source ownership unreadable"
+    if live_in(source, opened, commands) or session_mentions(source):
+        return "live process or unfinished session uses checkout"
+    if check_age and newest_touch(source) > time.time() - AGE_S:
+        return "touched within 24h"
+    return ""
+
+
 def apply(actions: list[Action]) -> None:
-    SCRATCH.mkdir(parents=True, exist_ok=True)
     for index, action in enumerate(actions):
         if action.status != "planned":
             continue
@@ -406,6 +460,9 @@ def apply(actions: list[Action]) -> None:
             action.reason = "destination already exists"
             continue
         if action.kind == "scratch":
+            if reason := mutation_guard(source):
+                action.status, action.reason = "skipped", reason
+                continue
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(source), str(destination))
         elif action.kind == "clone":
@@ -416,6 +473,7 @@ def apply(actions: list[Action]) -> None:
                 action.reason = reason
                 continue
             revision = git(source, "rev-parse", "HEAD", check=True).stdout.strip()
+            source_identity = (source.stat().st_dev, source.stat().st_ino)
             # Import the exact source commit. A stale canonical branch is not the source HEAD.
             fetched = git(repo, "fetch", "--no-tags", str(source), revision)
             if fetched.returncode:
@@ -433,6 +491,13 @@ def apply(actions: list[Action]) -> None:
             if reason := clean_pushed(source):
                 action.status, action.reason = "skipped", reason
                 continue
+            if (source.stat().st_dev, source.stat().st_ino) != source_identity or git(
+                    source, "rev-parse", "HEAD", check=True).stdout.strip() != revision:
+                action.status, action.reason = "skipped", "source changed during conversion; both checkouts retained"
+                continue
+            if reason := mutation_guard(source):
+                action.status, action.reason = "skipped", reason + "; both checkouts retained"
+                continue
             shutil.rmtree(source)
         elif action.kind == "worktree":
             repo = next((r for r in canonical_repos() if r.name == destination.parts[-2]), None)
@@ -441,16 +506,28 @@ def apply(actions: list[Action]) -> None:
                 action.reason = "canonical checkout disappeared"
                 continue
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if submodule_status(source):
-                action.status = "skipped"
-                action.reason = "submodule worktree has local changes or unpushed history"
+            status_reason = submodule_status(source)
+            if status_reason and "unreadable" in status_reason:
+                action.status, action.reason = "skipped", status_reason
                 continue
+            if reason := mutation_guard(source):
+                action.status, action.reason = "skipped", reason
+                continue
+            if status_reason:
+                try:
+                    recreate_worktree(source, destination, repo)
+                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    action.status, action.reason = "skipped", f"submodule relocation failed; source left intact: {error}"[:240]
+                    continue
             else:
                 moved = git(repo, "worktree", "move", str(source), str(destination))
                 if moved.returncode:
-                    action.status = "skipped"
-                    action.reason = "git refused worktree move; submodule metadata left intact"
-                    continue
+                    # A clean initialized-submodule worktree needs the same path repair as a dirty one.
+                    try:
+                        recreate_worktree(source, destination, repo)
+                    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                        action.status, action.reason = "skipped", f"git refused move; source left intact: {error}"[:240]
+                        continue
         elif action.kind == "compat":
             if any(source.iterdir()):
                 action.status = "skipped"

@@ -864,7 +864,7 @@ def update_config(ctx: Context) -> dict[str, Any]:
 
 
 def update_config_action(ctx: Context) -> dict[str, Any]:
-    """Written once. A later run changes it only when --ota-ring or --ota-source names a different value."""
+    """Preserve hand edits; explicit ring, source and role flags update their owned fields."""
     path = ctx.update_config
     act: dict[str, Any] = {"kind": "config", "path": os.fspath(path), "mode": "0o644"}
     try:
@@ -880,8 +880,22 @@ def update_config_action(ctx: Context) -> dict[str, Any]:
         value.update(ring=ctx.ota_ring, reportStatus=ctx.ota_ring == "canary")
     if ctx.ota_source and current.get("source", OTA_SOURCES[0]) != ctx.ota_source:
         value["source"] = ctx.ota_source
+    if ctx.role_explicit:
+        setup_args = current.get("setupArgs", ["--hygiene-only"])
+        if not isinstance(setup_args, list) or not all(isinstance(arg, str) for arg in setup_args):
+            return {**act, "state": "blocked", "note": "invalid setupArgs; fix or remove it"}
+        retained = []
+        skip_value = False
+        for arg in setup_args:
+            if skip_value:
+                skip_value = False
+            elif arg == "--role":
+                skip_value = True
+            elif not arg.startswith("--role="):
+                retained.append(arg)
+        value["setupArgs"] = [*retained, f"--role={ctx.role}"]
     if value != current:
-        previous = {k: current.get(k) for k in ("ring", "source") if current.get(k) != value.get(k)}
+        previous = {k: current.get(k) for k in ("ring", "source", "setupArgs") if current.get(k) != value.get(k)}
         return {**act, "state": "update", "value": value, "previous": previous}
     return {**act, "state": "unchanged", "value": current}
 

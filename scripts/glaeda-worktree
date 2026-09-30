@@ -61,8 +61,11 @@ def target_for(root: Path, name: str) -> Path:
 
 def ghostty_reference(root: Path, target: Path) -> None:
     source = root / "ghostty"
-    if not source.is_dir() or not (target / "ghostty").exists():
+    tracked = run(["git", "-C", str(root), "ls-files", "--stage", "--", "ghostty"])
+    if not tracked.stdout.startswith("160000 "):
         return
+    if not source.is_dir() or not (source / ".git").exists():
+        raise SystemExit("Ghostty reference unavailable; initialize it in the canonical checkout first")
     # Git 2.53 parses --reference as a repository-local option when it follows
     # the pathspec, so keep all options before the submodule path.
     result = run(["git", "-C", str(target), "submodule", "update", "--reference", str(source),
