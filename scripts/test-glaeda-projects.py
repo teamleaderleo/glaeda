@@ -61,6 +61,8 @@ class ProjectsTest(unittest.TestCase):
         legacy = self.projects / "demo-worktrees" / "old"
         run("worktree", "add", "-q", str(legacy), "-b", "old", "HEAD", cwd=repo)
         old = time.time() - 48 * 3600
+        for item in legacy.rglob("*"):
+            os.utime(item, (old, old), follow_symlinks=False)
         os.utime(legacy, (old, old))
         with mock.patch.object(gp, "process_evidence", return_value=([], "")), \
                 mock.patch.object(gp, "session_mentions", return_value=False):
@@ -73,6 +75,8 @@ class ProjectsTest(unittest.TestCase):
         legacy = self.projects / "loose-worktree"
         run("worktree", "add", "-q", str(legacy), "-b", "feature", "HEAD", cwd=repo)
         old = time.time() - 48 * 3600
+        for item in legacy.rglob("*"):
+            os.utime(item, (old, old), follow_symlinks=False)
         os.utime(legacy, (old, old))
         with mock.patch.object(gp, "process_evidence", return_value=([], "")), \
                 mock.patch.object(gp, "session_mentions", return_value=False):
