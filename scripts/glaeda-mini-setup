@@ -803,6 +803,24 @@ def agent_names(ctx: Context) -> list[str]:
     return [name for name in LINUX_UNITS if ctx.role == "devbox" or name not in DEVBOX_LINUX_UNITS]
 
 
+def stale_agent_actions(ctx: Context, desired: set[str], owned: dict[str, str | None]) -> list[dict[str, Any]]:
+    """Remove role-specific agents installed by an earlier profile."""
+    actions = []
+    for label, digest in owned.items():
+        if not label or label in desired:
+            continue
+        path = agent_path(ctx, label)
+        current = sha256_file(path)
+        if current is None:
+            continue
+        state = "remove" if digest and current == digest else "kept"
+        actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
+                        "state": state, "sha256": current, "owned": state == "remove",
+                        "ownedSha256": digest, "loaded": agent_loaded(ctx, label),
+                        "note": "stale agent from previous role" if state == "remove" else "changed since install"})
+    return actions
+
+
 def agent_path(ctx: Context, label: str) -> Path:
     return ctx.agents / (label if ctx.platform == "linux" else f"{label}.plist")
 
@@ -834,7 +852,7 @@ def update_config(ctx: Context) -> dict[str, Any]:
     config = {
         "ring": ctx.ota_ring or "stable",
         "setupArgs": (["--hygiene-only"] if ctx.hygiene_only else [])
-        + ([] if ctx.role == "devbox" else ["--role", ctx.role]),
+        + ([] if ctx.role == "devbox" else [f"--role={ctx.role}"]),
         "host": platform.node().split(".")[0].lower(),
         "reportStatus": (ctx.ota_ring or "stable") == "canary",
     }
@@ -1011,6 +1029,11 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         act[scheduler] = "skipped (sandbox HOME)" if ctx.sandbox else ("skipped" if ctx.skip_launchctl else "managed")
         actions.append(act)
 
+    previous_agents = {a.get("label"): a.get("ownedSha256") or a.get("sha256")
+                       for a in prior_receipt.get("actions", [])
+                       if a.get("kind") == "agent" and a.get("owned")}
+    actions.extend(stale_agent_actions(ctx, set(agent_names(ctx)), previous_agents))
+
     actions.append(update_config_action(ctx))
 
     # owned: this command wrote the file (now or on an earlier run) and it is still those bytes.
@@ -1168,6 +1191,15 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             if state == "create":
                 path.mkdir(parents=True, exist_ok=True, mode=int(act["mode"], 8))
                 act["applied"] = True
+            continue
+        if kind == "agent" and state == "remove":
+            if ctx.platform == "linux" and not ctx.sandbox:
+                run([systemctl(), "--user", "disable", "--now", act["label"]])
+            elif ctx.platform != "linux" and act.get("loaded"):
+                bootout(ctx, act["label"])
+            with contextlib.suppress(FileNotFoundError):
+                Path(act["path"]).unlink()
+            act["applied"] = True
             continue
         if kind == "agent" and is_reclaim_agent(act["label"]) and reclaim_failed:
             act["state"], act["note"] = "blocked", "glaeda-worktree-reclaim could not be installed"

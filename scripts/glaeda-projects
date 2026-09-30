@@ -98,6 +98,8 @@ def submodule_status(path: Path) -> str:
 
 
 def clean_pushed(path: Path) -> str:
+    if worktree_records(path):
+        return "clone backs linked worktrees"
     if (reason := submodule_status(path)):
         return reason
     ignored = git(path, "status", "--porcelain", "--ignored", "--untracked-files=all")
@@ -113,8 +115,7 @@ def clean_pushed(path: Path) -> str:
     refs = git(path, "rev-list", "--all", "--reflog", "--not", "--remotes")
     if refs.returncode != 0:
         return "local history unreadable"
-    missing = refs
-    if missing.stdout.strip():
+    if refs.stdout.strip():
         return "local refs or reflogs contain commits not confirmed by a remote"
     return ""
 
@@ -291,55 +292,48 @@ def print_plan(actions: list[Action]) -> None:
 
 
 def recreate_worktree(source: Path, destination: Path, repo: Path) -> None:
-    branch_name = branch(source)
-    if not branch_name:
-        revision = git(source, "rev-parse", "HEAD").stdout.strip()
-        add = ["worktree", "add", "--detach", str(destination), revision]
-    else:
-        add = ["worktree", "add", "--force", str(destination), branch_name]
-    backup = Path(tempfile.mkdtemp(prefix="glaeda-tidy-", dir=str(PROJECTS / "scratch")))
-    completed = False
+    """Relocate a complete submodule worktree without deleting its Git metadata.
+
+    Git refuses worktree move for initialized submodules. Keep every index, reflog,
+    and module object store in place; change only their path links after a rename.
+    A failed repair renames the source back and restores the original links.
+    """
+    top_dir = git(source, "rev-parse", "--absolute-git-dir", check=True).stdout.strip()
+    gitdir = Path(top_dir).resolve()
+    common = (repo / git(repo, "rev-parse", "--git-common-dir", check=True).stdout.strip()).resolve()
+    if not gitdir.is_relative_to(common / "worktrees"):
+        raise RuntimeError("not a linked worktree of the expected canonical checkout")
+    nested = git(source, "submodule", "foreach", "--quiet", "--recursive",
+                 'printf "%s\\0" "$toplevel/$sm_path"', check=True)
+    roots = [source, *(Path(value) for value in nested.stdout.split("\0") if value)]
+    links = []
+    for root in roots:
+        link = root / ".git"
+        if not link.is_file() or link.is_symlink():
+            raise RuntimeError("unsupported submodule Git layout; source left intact")
+        directory = Path(git(root, "rev-parse", "--absolute-git-dir", check=True).stdout.strip()).resolve()
+        if directory != gitdir and not directory.is_relative_to(gitdir):
+            raise RuntimeError("module metadata outside this worktree; source left intact")
+        config = directory / "config"
+        links.append((root.relative_to(source), link.read_bytes(), directory))
+    backref = gitdir / "gitdir"
+    previous_backref = backref.read_bytes()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.rename(source, destination)  # fail without mutation across filesystems
     try:
-        shutil.copytree(source, backup / "tree", symlinks=True,
-                        ignore=shutil.ignore_patterns(".git"))
-        removed = git(repo, "worktree", "remove", "--force", str(source))
-        if removed.returncode:
-            raise RuntimeError(removed.stderr.strip() or "git worktree remove failed")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        added = git(repo, *add)
-        if added.returncode:
-            restore = list(add)
-            restore[3] = str(source)
-            restored = git(repo, *restore)
-            if restored.returncode:
-                raise RuntimeError((added.stderr.strip() or "git worktree add failed")
-                                    + f"; source restoration failed; backup kept at {backup}")
-            for item in (backup / "tree").iterdir():
-                target = source / item.name
-                if target.exists() or target.is_symlink():
-                    if target.is_dir() and not target.is_symlink():
-                        shutil.copytree(item, target, dirs_exist_ok=True, symlinks=True)
-                    else:
-                        target.unlink()
-                        shutil.copy2(item, target, follow_symlinks=False)
-                else:
-                    shutil.copytree(item, target, symlinks=True) if item.is_dir() else shutil.copy2(item, target, follow_symlinks=False)
-            raise RuntimeError(added.stderr.strip() or "git worktree add failed; source restored")
-        for item in (backup / "tree").iterdir():
-            target = destination / item.name
-            if target.exists() or target.is_symlink():
-                if target.is_dir() and not target.is_symlink():
-                    shutil.copytree(item, target, dirs_exist_ok=True, symlinks=True)
-                else:
-                    target.unlink()
-                    shutil.copy2(item, target, follow_symlinks=False)
-            else:
-                shutil.copytree(item, target, symlinks=True) if item.is_dir() else shutil.copy2(item, target, follow_symlinks=False)
-        git(repo, "worktree", "prune")
-        completed = True
-    finally:
-        if completed:
-            shutil.rmtree(backup, ignore_errors=True)
+        for relative, _data, directory in links:
+            root = destination / relative
+            (root / ".git").write_text(f"gitdir: {directory}\n")
+        backref.write_text(f"{destination / '.git'}\n")
+        git(repo, "worktree", "repair", str(destination), check=True)
+        for relative, _data, _directory in links:
+            git(destination / relative, "status", "--porcelain", check=True)
+    except Exception:
+        os.rename(destination, source)
+        for relative, data, directory in links:
+            (source / relative / ".git").write_bytes(data)
+        backref.write_bytes(previous_backref)
+        raise
 
 
 def apply(actions: list[Action]) -> None:
@@ -363,15 +357,28 @@ def apply(actions: list[Action]) -> None:
             shutil.move(str(source), str(destination))
         elif action.kind == "clone":
             repo = next((r for r in canonical_repos() if r.name == destination.parts[-2]), None)
-            if repo is None or (reason := clean_pushed(source)):
+            reason = "canonical checkout disappeared" if repo is None else clean_pushed(source)
+            if reason:
                 action.status = "skipped"
-                action.reason = reason or "canonical checkout disappeared"
+                action.reason = reason
+                continue
+            revision = git(source, "rev-parse", "HEAD", check=True).stdout.strip()
+            # Import the exact source commit. A stale canonical branch is not the source HEAD.
+            fetched = git(repo, "fetch", "--no-tags", str(source), revision)
+            if fetched.returncode:
+                action.status, action.reason = "skipped", "could not import source revision"
                 continue
             destination.parent.mkdir(parents=True, exist_ok=True)
-            added = git(repo, "worktree", "add", "--force", str(destination), action.branch or "HEAD")
+            added = git(repo, "worktree", "add", "--detach", str(destination), revision)
             if added.returncode:
                 action.status = "skipped"
                 action.reason = added.stderr.strip()[:240] or "could not create linked worktree"
+                continue
+            if git(destination, "rev-parse", "HEAD", check=True).stdout.strip() != revision:
+                raise RuntimeError("replacement revision mismatch; source left intact")
+            # Recheck after creation before deleting the clone.
+            if reason := clean_pushed(source):
+                action.status, action.reason = "skipped", reason
                 continue
             shutil.rmtree(source)
         elif action.kind == "worktree":
@@ -382,11 +389,13 @@ def apply(actions: list[Action]) -> None:
                 continue
             destination.parent.mkdir(parents=True, exist_ok=True)
             if submodule_status(source):
-                recreate_worktree(source, destination, repo)
+                action.status = "skipped"
+                action.reason = "submodule worktree has local changes or unpushed history"
             else:
                 moved = git(repo, "worktree", "move", str(source), str(destination))
                 if moved.returncode:
-                    recreate_worktree(source, destination, repo)
+                    action.status = "skipped"
+                    action.reason = "git refused worktree move; submodule metadata left intact"
         elif action.kind == "compat":
             if any(source.iterdir()):
                 action.status = "skipped"

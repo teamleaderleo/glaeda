@@ -54,6 +54,8 @@ class DevboxTest(unittest.TestCase):
             gd.apply(items, {family.id: family}, receipt, None, 24)
         archive = self.home / ".codex/archive/sessions/old.jsonl.gz"
         self.assertTrue(archive.is_file())
+        self.assertEqual(archive.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((archive.parent.stat().st_mode & 0o777), 0o700)
         self.assertEqual(gzip.open(archive, "rt").read().strip(), '{"cwd":"/old"}')
         self.assertFalse(old.exists())
         self.assertTrue(new.exists())

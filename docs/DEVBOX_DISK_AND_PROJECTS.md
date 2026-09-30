@@ -23,8 +23,8 @@ the canonical checkout's module objects. Worktrees live under `~/Projects/worktr
 `glaeda projects tidy` reports older linked worktrees, redundant clean pushed clones, and scratch
 folders that can move to the canonical layout. It skips live processes, recent paths, and recent
 Codex sessions whose cwd names the checkout. Submodule worktrees are status-checked recursively;
-when `git worktree move` refuses them, the planner recreates the worktree on the same branch and
-carries the complete working tree before pruning the old registration. The default is report-only;
+if Git refuses to move one, the planner leaves it in place with the metadata and index intact.
+The default is report-only;
 the compatibility symlink step runs only after every child of a legacy `<repo>-worktrees` folder
 has moved successfully.
 

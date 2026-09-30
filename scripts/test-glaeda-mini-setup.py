@@ -618,6 +618,11 @@ class MiniSetupTest(unittest.TestCase):
         self.assertFalse((units / "glaeda-projects-tidy.service").exists())
         self.assertFalse((units / "glaeda-projects-tidy.timer").exists())
 
+    def test_fleet_role_update_config_uses_valid_single_argument(self) -> None:
+        ctx = self.ctx_for_steps()
+        ctx.role = "fleet-mini"
+        self.assertEqual(ms.update_config(ctx)["setupArgs"], ["--role=fleet-mini"])
+
     def test_linux_uninstall_removes_only_our_units(self) -> None:
         self.linux()
         self.invoke("--apply")
