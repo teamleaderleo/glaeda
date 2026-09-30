@@ -1221,10 +1221,15 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
                 act["applied"] = True
             continue
         if kind == "agent" and state == "remove":
+            unloaded = True
             if ctx.platform == "linux" and not ctx.sandbox:
-                run([systemctl(), "--user", "disable", "--now", act["label"]])
+                code, _ = run([systemctl(), "--user", "disable", "--now", act["label"]])
+                unloaded = code == 0
             elif ctx.platform != "linux" and act.get("loaded"):
-                bootout(ctx, act["label"])
+                unloaded = bootout(ctx, act["label"])
+            if not unloaded:
+                act["state"], act["note"] = "blocked", "could not unload stale agent; file retained"
+                continue
             with contextlib.suppress(FileNotFoundError):
                 Path(act["path"]).unlink()
             act["applied"] = True

@@ -2750,13 +2750,15 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
 
 def notify_disk(title: str, body: str) -> None:
     """Best-effort cmux notification; a missing GUI must never change cleanup decisions."""
-    binary = shutil.which("cmux")
+    binary = next((path for path in ("/usr/local/bin/cmux", "/opt/homebrew/bin/cmux", "/usr/bin/cmux")
+                   if os.access(path, os.X_OK)), None)
     if not binary:
         return
     try:
         subprocess.run([binary, "notify", "--title", title[:128], "--body", body[:1024]],
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=5, check=False)
+                       timeout=5, check=False,
+                       env={"PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin", "LC_ALL": "C"})
     except (OSError, subprocess.SubprocessError):
         pass
 
