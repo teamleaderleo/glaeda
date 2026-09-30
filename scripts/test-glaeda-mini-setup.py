@@ -585,7 +585,7 @@ class MiniSetupTest(unittest.TestCase):
         platform_patch.start()
         self.patches.append(platform_patch)
 
-    def test_linux_installs_the_ops_systemd_units_verbatim_then_is_idempotent(self) -> None:
+    def test_linux_installs_the_ops_systemd_units_then_is_idempotent(self) -> None:
         self.linux()
         receipt = self.invoke("--apply")  # Linux gets the hygiene profile without the flag
         self.assertEqual((receipt["platform"], receipt["profile"]), ("linux", "hygiene"))
@@ -593,7 +593,8 @@ class MiniSetupTest(unittest.TestCase):
         units = self.home / ".config/systemd/user"
         self.assertEqual(sorted(p.name for p in units.iterdir()), sorted(ms.LINUX_UNITS))
         for name in ms.LINUX_UNITS:
-            self.assertEqual((units / name).read_bytes(), (ROOT / "ops/systemd" / name).read_bytes(), name)
+            expected = (ROOT / "ops/systemd" / name).read_bytes().replace(b"@GLAEDA_ROLE@", b"devbox")
+            self.assertEqual((units / name).read_bytes(), expected, name)
         for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
             self.assertTrue(os.access(self.home / ".local/bin" / name, os.X_OK), name)
         self.assertTrue((self.home / ".local/state").is_dir())
@@ -605,6 +606,17 @@ class MiniSetupTest(unittest.TestCase):
         again = self.invoke("--apply")
         self.assertEqual(self.states(again), {"unchanged"})
         self.assertFalse(any("systemctl" in os.path.basename(c[0]) for c in self.calls))
+
+    def test_linux_fleet_role_does_not_install_devbox_tidy_units(self) -> None:
+        self.linux()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(ms.main(["--output", "json", "--python", "/usr/bin/python3",
+                                      "--reclaim-binary", os.fspath(self.reclaim), "--role", "fleet-mini",
+                                      "--apply"]), 0)
+        units = self.home / ".config/systemd/user"
+        self.assertFalse((units / "glaeda-projects-tidy.service").exists())
+        self.assertFalse((units / "glaeda-projects-tidy.timer").exists())
 
     def test_linux_uninstall_removes_only_our_units(self) -> None:
         self.linux()

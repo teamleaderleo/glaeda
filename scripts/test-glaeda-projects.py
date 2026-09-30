@@ -91,6 +91,18 @@ class ProjectsTest(unittest.TestCase):
         (repo / "dirty").write_text("keep\n")
         self.assertIn("uncommitted", gp.submodule_status(repo))
 
+    def test_duplicate_clone_keeps_unpublished_local_refs(self) -> None:
+        repo = self.repo()
+        remote = Path(self.tmp.name) / "remote.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(repo), str(remote)], check=True)
+        run("remote", "add", "origin", str(remote), cwd=repo)
+        run("push", "-q", "-u", "origin", "HEAD", cwd=repo)
+        run("checkout", "-qb", "private", cwd=repo)
+        (repo / "private").write_text("keep\n")
+        run("add", "private", cwd=repo)
+        run("commit", "-qm", "private", cwd=repo)
+        self.assertIn("not confirmed by a remote", gp.clean_pushed(repo))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -944,8 +944,8 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
     if role == "devbox":
         # Apply the same clean, pushed, live-process and age guards used for disposable
         # scratch checkouts to developer workspaces. Fleet minis keep their owned hot tier.
-        fams.append(Family("devbox-checkouts", projects, True,
-                           "clone or fetch the checkout again", depth=1, git_disposable=True,
+        fams.append(Family("devbox-checkouts", projects / "worktrees", True,
+                           "clone or fetch the checkout again", depth=2, git_disposable=True,
                            nested_git=True, owner="developer workspaces", rebuild_minutes=8))
         codex = HOME / ".codex"
         fams.append(Family("agent-transcripts", codex, True,
@@ -2323,9 +2323,12 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
             reasons.append("claude session active")
         if fam.pressure_only and ACTIVITY_MODE != "pressure":
             reasons.append("package cache: pressure-only policy")
+        policy_note = ""
         if ROLE == "devbox" and (fam.id == "xcode-derived-data" or
                 (fam.id in ("tmp", "user-tmp") and re.search(r"cmux|terminal-image|derived-data", path.name, re.I))):
-            reasons.append("policy violation: build output on a no-build dev box")
+            # This is an informational reason. It must not turn stale build output into
+            # in-use state: devbox cleanup is specifically meant to reclaim it.
+            policy_note = "policy violation: build output on a no-build dev box"
         # The tree walks below cost seconds each on a loaded host, and a recent item is kept anyway,
         # so only an item old enough to delete pays for them (apply re-checks before deleting).
         window = item_window(fam, path, idle_hours, archived)
@@ -2367,6 +2370,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
                 reasons.append("the seed archive holds it")
         if jobs is not None and verdict in ("recent", "reclaimable"):
             reasons.append(reasons_jobs)
+        if policy_note:
+            reasons.append(policy_note)
         items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons, jobs))
     items.sort(key=lambda i: i.bytes, reverse=True)
     return items

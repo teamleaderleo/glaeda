@@ -50,8 +50,10 @@ def ghostty_reference(root: Path, target: Path) -> None:
     source = root / "ghostty"
     if not source.is_dir() or not (target / "ghostty").exists():
         return
-    result = run(["git", "-C", str(target), "submodule", "update", "--init", "ghostty",
-                  "--reference", str(source)], check=False)
+    # Git 2.53 parses --reference as a repository-local option when it follows
+    # the pathspec, so keep all options before the submodule path.
+    result = run(["git", "-C", str(target), "submodule", "update", "--reference", str(source),
+                  "--init", "ghostty"], check=False)
     if result.returncode:
         raise SystemExit(f"Ghostty reference initialization failed: {result.stderr.strip()[:500]}")
 

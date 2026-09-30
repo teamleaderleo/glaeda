@@ -110,14 +110,12 @@ def clean_pushed(path: Path) -> str:
         return "stash unreadable"
     if stash.stdout.strip():
         return "stash entries present"
-    head = git(path, "rev-parse", "--verify", "HEAD")
-    if head.returncode != 0:
-        return "HEAD unreadable"
-    missing = git(path, "rev-list", head.stdout.strip(), "--not", "--remotes")
-    if missing.returncode != 0:
+    refs = git(path, "rev-list", "--all", "--reflog", "--not", "--remotes")
+    if refs.returncode != 0:
         return "local history unreadable"
+    missing = refs
     if missing.stdout.strip():
-        return "commits not confirmed by a remote"
+        return "local refs or reflogs contain commits not confirmed by a remote"
     return ""
 
 
@@ -300,6 +298,7 @@ def recreate_worktree(source: Path, destination: Path, repo: Path) -> None:
     else:
         add = ["worktree", "add", "--force", str(destination), branch_name]
     backup = Path(tempfile.mkdtemp(prefix="glaeda-tidy-", dir=str(PROJECTS / "scratch")))
+    completed = False
     try:
         shutil.copytree(source, backup / "tree", symlinks=True,
                         ignore=shutil.ignore_patterns(".git"))
@@ -309,7 +308,23 @@ def recreate_worktree(source: Path, destination: Path, repo: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         added = git(repo, *add)
         if added.returncode:
-            raise RuntimeError(added.stderr.strip() or "git worktree add failed")
+            restore = list(add)
+            restore[3] = str(source)
+            restored = git(repo, *restore)
+            if restored.returncode:
+                raise RuntimeError((added.stderr.strip() or "git worktree add failed")
+                                    + f"; source restoration failed; backup kept at {backup}")
+            for item in (backup / "tree").iterdir():
+                target = source / item.name
+                if target.exists() or target.is_symlink():
+                    if target.is_dir() and not target.is_symlink():
+                        shutil.copytree(item, target, dirs_exist_ok=True, symlinks=True)
+                    else:
+                        target.unlink()
+                        shutil.copy2(item, target, follow_symlinks=False)
+                else:
+                    shutil.copytree(item, target, symlinks=True) if item.is_dir() else shutil.copy2(item, target, follow_symlinks=False)
+            raise RuntimeError(added.stderr.strip() or "git worktree add failed; source restored")
         for item in (backup / "tree").iterdir():
             target = destination / item.name
             if target.exists() or target.is_symlink():
@@ -321,8 +336,10 @@ def recreate_worktree(source: Path, destination: Path, repo: Path) -> None:
             else:
                 shutil.copytree(item, target, symlinks=True) if item.is_dir() else shutil.copy2(item, target, follow_symlinks=False)
         git(repo, "worktree", "prune")
+        completed = True
     finally:
-        shutil.rmtree(backup, ignore_errors=True)
+        if completed:
+            shutil.rmtree(backup, ignore_errors=True)
 
 
 def apply(actions: list[Action]) -> None:

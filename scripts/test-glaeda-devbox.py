@@ -75,6 +75,26 @@ class DevboxTest(unittest.TestCase):
         self.assertEqual({p.relative_to(checkout).as_posix() for p in gd._checkout_build_dirs(checkout)},
                          {"ghostty/.zig-cache", "Packages/macOS/Core/.build"})
 
+    def test_devbox_checkout_family_only_scans_linked_worktrees(self) -> None:
+        projects = self.home / "Projects"
+        (projects / "canonical").mkdir(parents=True)
+        worktree = projects / "worktrees/repo/feature"
+        worktree.mkdir(parents=True)
+        families = gd.default_families("devbox")
+        family = next(f for f in families if f.id == "devbox-checkouts")
+        self.assertEqual(family.root, projects / "worktrees")
+        self.assertEqual(gd.candidates(family), [worktree])
+
+    def test_stale_derived_data_is_reclaimable_on_devbox(self) -> None:
+        derived = self.home / "Library/Developer/Xcode/DerivedData/old"
+        derived.mkdir(parents=True)
+        (derived / "build.bin").write_bytes(b"x" * (2 * 1024 * 1024))
+        os.utime(derived, (time.time() - 48 * 3600,) * 2)
+        family = gd.Family("xcode-derived-data", self.home / "Library/Developer/Xcode/DerivedData", True,
+                           "rebuild", build_output=True, max_idle_hours=0.0)
+        item = gd.survey([family], 24, 0)[0]
+        self.assertEqual(item.verdict, "reclaimable")
+
 
 if __name__ == "__main__":
     unittest.main()
