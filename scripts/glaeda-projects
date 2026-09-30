@@ -204,7 +204,7 @@ def discover_worktrees(repos: list[Path]) -> dict[Path, Path]:
         if (root_path / ".git").is_file():
             common = git(root_path, "rev-parse", "--git-common-dir")
             if common.returncode == 0:
-                common_path = Path(common.stdout.strip()).resolve()
+                common_path = (root_path / common.stdout.strip()).resolve()
                 repo = next((r for r in repos if (r / ".git").resolve() == common_path), None)
                 if repo:
                     found[root_path.resolve()] = repo

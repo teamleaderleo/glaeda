@@ -103,6 +103,19 @@ class ProjectsTest(unittest.TestCase):
         run("commit", "-qm", "private", cwd=repo)
         self.assertIn("not confirmed by a remote", gp.clean_pushed(repo))
 
+    def test_legacy_worktree_discovery_resolves_relative_common_dir(self) -> None:
+        repo = self.repo()
+        legacy = self.projects / "legacy-worktrees" / "old"
+        run("worktree", "add", "-q", str(legacy), "-b", "old", "HEAD", cwd=repo)
+        old = time.time() - 48 * 3600
+        for item in legacy.rglob("*"):
+            os.utime(item, (old, old), follow_symlinks=False)
+        os.utime(legacy, (old, old))
+        with mock.patch.object(gp, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gp, "session_mentions", return_value=False):
+            actions = gp.plan()
+        self.assertTrue(any(a.kind == "worktree" and Path(a.source) == legacy for a in actions))
+
 
 if __name__ == "__main__":
     unittest.main()
