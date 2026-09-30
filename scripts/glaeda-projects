@@ -89,7 +89,7 @@ def submodule_status(path: Path) -> str:
     if top.stdout.strip():
         return "top-level has uncommitted or untracked changes"
     nested = git(path, "submodule", "foreach", "--recursive", "--quiet",
-                 "git status --porcelain --untracked-files=all; git log --oneline HEAD --not --remotes")
+                 "git status --porcelain --untracked-files=all; git rev-list --all --reflog --not --remotes")
     if nested.returncode != 0:
         return "submodule status unreadable"
     if nested.stdout.strip():
@@ -391,11 +391,13 @@ def apply(actions: list[Action]) -> None:
             if submodule_status(source):
                 action.status = "skipped"
                 action.reason = "submodule worktree has local changes or unpushed history"
+                continue
             else:
                 moved = git(repo, "worktree", "move", str(source), str(destination))
                 if moved.returncode:
                     action.status = "skipped"
                     action.reason = "git refused worktree move; submodule metadata left intact"
+                    continue
         elif action.kind == "compat":
             if any(source.iterdir()):
                 action.status = "skipped"
