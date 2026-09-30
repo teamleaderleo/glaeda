@@ -68,7 +68,13 @@ def add(root: Path, name: str, revision: str, build: bool) -> Path:
     if result.returncode:
         raise SystemExit(result.stderr.strip() or "git worktree add failed")
     if build:
-        ghostty_reference(root, target)
+        try:
+            ghostty_reference(root, target)
+        except (RuntimeError, SystemExit):
+            cleanup = run(["git", "-C", str(root), "worktree", "remove", "--force", str(target)], check=False)
+            if cleanup.returncode:
+                raise SystemExit(f"Ghostty initialization failed and worktree cleanup failed: {cleanup.stderr.strip()[:500]}")
+            raise
     print(target)
     return target
 

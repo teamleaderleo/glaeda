@@ -1104,7 +1104,17 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
     if receipt is None:
         actions.append({"kind": "note", "state": "kept",
                         "note": f"no install receipt at {ctx.show(ctx.receipt_path)}; nothing is removed"})
-    for label in agent_names(ctx):
+    roles = {ctx.role}
+    recorded_role = (receipt or {}).get("role")
+    if recorded_role in {"devbox", "fleet-mini"}:
+        roles.add(recorded_role)
+    labels: set[str] = set()
+    original_role = ctx.role
+    for role in roles:
+        ctx.role = role
+        labels.update(agent_names(ctx))
+    ctx.role = original_role
+    for label in sorted(labels):
         path = agent_path(ctx, label)
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
@@ -1605,6 +1615,7 @@ def main(argv: list[str] | None = None) -> int:
         "schema": SCHEMA,
         "mode": "uninstall" if args.uninstall else "install",
         "profile": "hygiene" if ctx.hygiene_only else "build-host",
+        "role": ctx.role,
         "platform": ctx.platform,
         "applied": args.apply,
         "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),

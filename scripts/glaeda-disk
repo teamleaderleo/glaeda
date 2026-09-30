@@ -2775,20 +2775,28 @@ def _chmod_retry(func, p, _exc):  # read-only files in SwiftPM/Xcode checkouts
 
 
 def archive_transcript(path: Path) -> Path:
-    """Compress one old transcript into the Codex archive, then remove its live copy."""
+    """Atomically detach and compress one old transcript into the Codex archive."""
     relative = path.relative_to(HOME / ".codex")
     destination = HOME / ".codex" / "archive" / relative
     destination = destination.with_name(destination.name + ".gz")
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(destination.parent, 0o700)
+    holding = path.with_name(f".{path.name}.glaeda-archive-{os.getpid()}")
     temporary = destination.with_name(f".{destination.name}.glaeda-{os.getpid()}.tmp")
+    os.rename(path, holding)
     try:
-        with path.open("rb") as source, gzip.open(temporary, "wb", compresslevel=6) as target:
+        with holding.open("rb") as source, gzip.open(temporary, "wb", compresslevel=6) as target:
             shutil.copyfileobj(source, target)
         os.chmod(temporary, 0o600)
         os.replace(temporary, destination)
         os.chmod(destination, 0o600)
-        path.unlink()
+        holding.unlink()
+    except BaseException:
+        # A session may recreate the live pathname after the handoff. Never replace that new file;
+        # leave the detached copy for a later retry if restoration is no longer safe.
+        if not path.exists() and holding.exists():
+            os.rename(holding, path)
+        raise
     finally:
         temporary.unlink(missing_ok=True)
     return destination

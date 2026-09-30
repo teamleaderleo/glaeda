@@ -337,6 +337,12 @@ def restore(state_dir: Path, bin_dir: Path) -> bool:
     root = state_dir / "pre-ota"
     if not root.is_dir():
         return False
+    saved = {path.name for path in root.iterdir() if path.is_file()}
+    for name in TOOLS:
+        if name not in saved:
+            current = bin_dir / name
+            if current.exists() or current.is_symlink():
+                current.unlink()
     for path in root.iterdir():
         tmp = bin_dir / f".{path.name}.restore"
         tmp.write_bytes(path.read_bytes())

@@ -64,7 +64,8 @@ def worktree_records(repo: Path) -> list[Path]:
     for line in result.stdout.splitlines():
         if line.startswith("worktree "):
             path = Path(line[9:]).resolve()
-            if path != repo.resolve() and path.is_dir():
+            if (path != repo.resolve() and path.is_relative_to(PROJECTS.resolve())
+                    and path.is_dir()):
                 paths.append(path)
     return paths
 

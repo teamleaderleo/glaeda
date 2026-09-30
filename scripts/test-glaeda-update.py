@@ -300,6 +300,8 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(result["result"], "rolled-back")
         self.assertEqual(result["rollback"], "restored the tools installed before the first update")
         self.assertEqual((self.bin / "glaeda-disk").read_text(), "hand-installed\n")
+        self.assertFalse((self.bin / "glaeda-worktree").exists())
+        self.assertFalse((self.bin / "glaeda-projects").exists())
 
     def test_malformed_channel_names_are_refused(self) -> None:
         entry = self.server.publish(SOURCES[0])
