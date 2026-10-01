@@ -5677,6 +5677,25 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertEqual(result["cache_backend"], "fleet")
         self.assertFalse(telemetry.exists())
 
+    def test_completed_record_accepts_legacy_v1_telemetry(self) -> None:
+        telemetry = self.dir / self.hook.COMPILE_TELEMETRY_FILE
+        telemetry.write_text(json.dumps({
+            "schema": self.hook.COMPILE_TELEMETRY_SCHEMA,
+            "run_id": "legacy",
+            "run_attempt": "1",
+            "cacheable_tasks": 1,
+            "hits": 1,
+            "misses": 0,
+            "hit_rate": 1.0,
+            "seed_distance": None,
+            "compile_seconds": 1.0,
+            "fetch_seconds": None,
+            "link_seconds": 0.0,
+        }))
+        with mock.patch.dict(self.hook.os.environ, {"RUNNER_TEMP": str(self.dir)}, clear=False):
+            result = self.hook.compile_telemetry({"run_id": "legacy", "run_attempt": "1"})
+        self.assertNotIn("cache_backend", result)
+
     def test_completed_record_rejects_inconsistent_compile_telemetry(self) -> None:
         telemetry = self.dir / self.hook.COMPILE_TELEMETRY_FILE
         telemetry.write_text(json.dumps({

@@ -3855,9 +3855,10 @@ def compile_telemetry(meta: dict[str, Any]) -> dict[str, Any] | None:
         else:
             return None
     backend = payload.get("cache_backend")
-    if backend not in ("local", "fleet"):
-        return None
-    result["cache_backend"] = backend
+    if backend is not None:
+        if backend not in ("local", "fleet"):
+            return None
+        result["cache_backend"] = backend
     if (result["hits"] + result["misses"] != result["cacheable_tasks"]
             or result["hits"] > result["cacheable_tasks"]
             or result["misses"] > result["cacheable_tasks"]):
