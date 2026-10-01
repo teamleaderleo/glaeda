@@ -229,9 +229,11 @@ install_binaries() {
   local prebuilt=${GLAEDA_FLEET_CAS_PREBUILT:-} f src
   if [ -n "$prebuilt" ]; then
     say "install prebuilt fleet-cas bundle $prebuilt (Cargo skipped)"
+    [ -f "$prebuilt/SHA256SUMS" ] && [ ! -L "$prebuilt/SHA256SUMS" ] || { echo "missing prebuilt SHA256SUMS: $prebuilt/SHA256SUMS" >&2; exit 1; }
+    (cd "$prebuilt" && shasum -a 256 -c SHA256SUMS) || { echo "prebuilt bundle checksum failed" >&2; exit 1; }
     for f in fleet-cas fleet-cas-run fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-prewarm.sh fleet-cas-writer-build.sh; do
       src=$prebuilt/$f
-      [ -x "$src" ] || { echo "missing prebuilt executable: $src" >&2; exit 1; }
+      [ -f "$src" ] && [ ! -L "$src" ] && [ -x "$src" ] || { echo "missing regular prebuilt executable: $src" >&2; exit 1; }
     done
   else
     say "build $proto (cargo build --release --locked)"

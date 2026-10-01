@@ -38,8 +38,10 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$store" ] || { sed -n '2,6p' "$0" >&2; exit 2; }
 if [ -n "$prebuilt_dir" ]; then
+  [ -f "$prebuilt_dir/SHA256SUMS" ] && [ ! -L "$prebuilt_dir/SHA256SUMS" ] || { echo "prebuilt bundle missing regular SHA256SUMS" >&2; exit 2; }
+  (cd "$prebuilt_dir" && shasum -a 256 -c SHA256SUMS) || { echo "prebuilt bundle checksum failed" >&2; exit 2; }
   for f in fleet-cas fleet-cas-run fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-prewarm.sh fleet-cas-writer-build.sh; do
-    [ -x "$prebuilt_dir/$f" ] || { echo "prebuilt bundle missing executable $prebuilt_dir/$f" >&2; exit 2; }
+    [ -f "$prebuilt_dir/$f" ] && [ ! -L "$prebuilt_dir/$f" ] && [ -x "$prebuilt_dir/$f" ] || { echo "prebuilt bundle missing regular executable $prebuilt_dir/$f" >&2; exit 2; }
   done
 fi
 if [ -n "$writer" ]; then
