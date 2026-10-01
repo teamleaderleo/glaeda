@@ -38,6 +38,8 @@ FANOUTS = (1, 8, 32)
 IMPORT_METHODS = ("auto", "hardlink", "clone")
 MAX_REPETITIONS = 100
 MAX_SAMPLE_FILES = 256
+MAX_PRIVATE_COPY_DIAGNOSTICS = 16
+CLONE_SHARED_EXTENT_MIN_PERCENT = 95
 MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 MAX_PACKAGE_JSON_BYTES = 4 * 1024 * 1024
 DEFAULT_DEADLINE_SECONDS = 600
@@ -680,7 +682,12 @@ def sample_physical_mechanism(node_modules: Path) -> dict[str, Any]:
     hardlinked = 0
     shared = 0
     fiemap_observed = 0
-    for directory, _, filenames in os.walk(node_modules, followlinks=False):
+    sample_path_hasher = hashlib.sha256()
+    private_copy_path_hasher = hashlib.sha256()
+    private_copy_diagnostics: list[dict[str, Any]] = []
+    for directory, dirnames, filenames in os.walk(node_modules, followlinks=False):
+        dirnames.sort()
+        filenames.sort()
         for name in filenames:
             path = Path(directory) / name
             observed = path.lstat()
@@ -690,6 +697,10 @@ def sample_physical_mechanism(node_modules: Path) -> dict[str, Any]:
                 or not virtual_store_package_payload_file(node_modules, path)
             ):
                 continue
+            relative_path = path.relative_to(node_modules).as_posix()
+            relative_bytes = relative_path.encode("utf-8")
+            sample_path_hasher.update(relative_bytes)
+            sample_path_hasher.update(b"\0")
             sampled += 1
             if observed.st_nlink > 1:
                 hardlinked += 1
@@ -698,6 +709,19 @@ def sample_physical_mechanism(node_modules: Path) -> dict[str, Any]:
                 fiemap_observed += 1
                 if shared_extent:
                     shared += 1
+                else:
+                    private_copy_path_hasher.update(relative_bytes)
+                    private_copy_path_hasher.update(b"\0")
+                    if len(private_copy_diagnostics) < MAX_PRIVATE_COPY_DIAGNOSTICS:
+                        private_copy_diagnostics.append(
+                            {
+                                "path_sha256": (
+                                    "sha256:"
+                                    + hashlib.sha256(relative_bytes).hexdigest()
+                                ),
+                                "bytes": observed.st_size,
+                            }
+                        )
             if sampled >= MAX_SAMPLE_FILES:
                 break
         if sampled >= MAX_SAMPLE_FILES:
@@ -705,10 +729,18 @@ def sample_physical_mechanism(node_modules: Path) -> dict[str, Any]:
     mechanism = classify_mechanism(sampled, hardlinked, fiemap_observed, shared)
     return {
         "sample_scope": "pnpm_virtual_store_nonempty_package_payload_regular_files",
+        "sample_selection": "lexicographic_relative_path_first_256",
+        "sample_path_set_sha256": "sha256:" + sample_path_hasher.hexdigest(),
         "sampled_regular_files": sampled,
         "hardlinked_files": hardlinked,
         "fiemap_observed_files": fiemap_observed,
         "shared_extent_files": shared,
+        "private_copy_files": sampled - shared,
+        "private_copy_path_set_sha256": (
+            "sha256:" + private_copy_path_hasher.hexdigest()
+        ),
+        "private_copy_diagnostics": private_copy_diagnostics,
+        "shared_extent_percent": round(shared * 100.0 / sampled, 6),
         "mechanism": mechanism,
     }
 
@@ -726,10 +758,22 @@ def validate_mechanisms(import_method: str, physical: list[dict[str, Any]]) -> s
             continue
         if sample["mechanism"] == "hardlink_observed":
             raise BenchmarkError("dependency link evidence changed during observation")
+        if import_method == "clone":
+            sampled = sample["sampled_regular_files"]
+            fiemap_observed = sample["fiemap_observed_files"]
+            shared = sample["shared_extent_files"]
+            if sampled < 1 or fiemap_observed != sampled:
+                raise BenchmarkError("clone mode lacks complete FIEMAP observation")
+            if shared * 100 < sampled * CLONE_SHARED_EXTENT_MIN_PERCENT:
+                raise BenchmarkError(
+                    "clone mode lacks CoW-dominant per-task shared-extent evidence"
+                )
         mechanisms.add(sample["mechanism"])
 
-    if import_method == "clone" and mechanisms != {"reflink_observed"}:
-        raise BenchmarkError("clone mode lacks per-task shared-extent evidence")
+    if import_method == "clone":
+        allowed = {"reflink_observed", "mixed_private_copy_and_reflink_observed"}
+        if not mechanisms or not mechanisms.issubset(allowed):
+            raise BenchmarkError("clone mode physical mechanism is unsafe or unproven")
     if import_method == "hardlink" and mechanisms != {"hardlink_observed"}:
         raise BenchmarkError("hardlink mode lacks per-task shared-inode evidence")
     return mechanisms
