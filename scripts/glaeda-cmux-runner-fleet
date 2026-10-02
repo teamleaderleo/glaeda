@@ -40,7 +40,9 @@ reports it now (git ls-remote: nothing is fetched or written here, and an old ch
 ref cannot vouch for it), and reads every target member's .glaeda-source.json over SSH. --apply refuses,
 changing nothing on any member, when HEAD is not origin's main (or either cannot be read), or when a member's
 stamped commit is not an ancestor of HEAD: a downgrade, or a deploy from a branch HEAD does not contain. It also
-refuses when the staged files have uncommitted changes. A member with no stamp, or one that cannot be read, is
+refuses when the staged files or this tool have uncommitted changes, or are marked assume-unchanged or
+skip-worktree (edits git status cannot see). A run from origin's main replaces a member's still-active canary.
+A member with no stamp, or one that cannot be read, is
 not a downgrade; the output says so. A member whose stamp records allowDowngrade was deployed off main on
 purpose (a canary of a PR that then squash-merged), so a run from origin's main rolls it forward instead of
 refusing. --allow-downgrade REASON overrides every refusal; the reason is printed and recorded in each staged
