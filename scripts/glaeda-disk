@@ -97,6 +97,7 @@ import pwd
 import math
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -123,6 +124,11 @@ DEDUPE_SUBDIRS = ("SourcePackages", "ModuleCache.noindex", "SDKExplicitPrecompil
 DEDUPE_MIN_BYTES = 1024 * 1024
 GIB = 1024**3
 DARWIN = platform.system() == "Darwin"
+# A blocked filesystem walk must not hold evict.lock or pause a runner indefinitely.  A walk that
+# cannot finish in this window is left unsized and retried on a later report; it never becomes a
+# zero-byte reclaim candidate.
+DU_TIMEOUT_S = 30
+DU_KILL_GRACE_S = 1
 
 
 @dataclass(frozen=True)
@@ -702,7 +708,11 @@ def xcode_items(apps: Path = Path("/Applications"), pins: dict[str, str] | None 
         pin = pins.get(os.path.realpath(app))
         why = [f"Xcode {version}, owned by {owner}",
                f"pinned by {pin}" if pin else "no pin names it: remove it by hand if no workflow uses it"]
-        items.append(Item("xcode-apps", str(app), du_bytes(app), 0.0, "report-only", why))
+        size = du_bytes(app)
+        if size is None:
+            size = 0
+            why.append("size walk timed out; size is unsized")
+        items.append(Item("xcode-apps", str(app), size, 0.0, "report-only", why))
     return items
 
 
@@ -1000,22 +1010,54 @@ class Item:
     jobs_since: int | None = None  # host CI jobs started since its last use (activity_due), when counted
 
 
-def du_bytes(path: Path) -> int:
-    out = subprocess.run(["du", "-xsk", str(path)], capture_output=True, text=True)
+def _du_output(argv: list[str]) -> str | None:
+    """Run one du walk with a killable process group; None means the tree is unsized."""
     try:
-        return int(out.stdout.split()[0]) * 1024
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            out, _ = proc.communicate(timeout=DU_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            # du can be stuck in a kernel open() on a dead or remote filesystem.  Kill the group
+            # and do not wait indefinitely for a post-kill read: callers must remain fail-closed.
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.communicate(timeout=DU_KILL_GRACE_S)
+            return None
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return out
+
+
+def du_bytes(path: Path) -> int | None:
+    out = _du_output(["du", "-xsk", str(path)])
+    if out is None:
+        return None
+    try:
+        return int(out.split()[0]) * 1024
     except (IndexError, ValueError):
-        return 0
+        return None
 
 
 BULK_SIZE_MIN = 64  # unsized candidates in a bulk_sizes family before one walk beats per-item du
 
 
-def du_children(root: Path) -> dict[str, int]:
+def du_children(root: Path) -> dict[str, int] | None:
     """Sizes of every directory directly below root from a single walk, keyed like candidates."""
-    out = subprocess.run(["du", "-xk", "-d", "1", str(root)], capture_output=True, text=True)
+    out = _du_output(["du", "-xk", "-d", "1", str(root)])
+    if out is None:
+        return None
     sizes: dict[str, int] = {}
-    for line in out.stdout.splitlines():
+    for line in out.splitlines():
         fields = line.split(None, 1)
         if len(fields) == 2 and fields[1] != str(root) and fields[0].isdigit():
             sizes[str(root / Path(fields[1]).name)] = int(fields[0]) * 1024
@@ -2332,11 +2374,16 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
     for fam in families:
         # a few new entries are cheaper to size one by one than by re-walking the whole root
         if fam.bulk_sizes and sum(str(p) not in known for f, p in work if f is fam) >= BULK_SIZE_MIN:
-            known.update({k: v for k, v in du_children(fam.root).items() if k not in known})
+            walked = du_children(fam.root)
+            if walked is not None:
+                known.update({k: v for k, v in walked.items() if k not in known})
     missing = [path for _, path in work if str(path) not in known]
     with ThreadPoolExecutor(max_workers=8) as pool:
         measured = dict(zip(map(str, missing), pool.map(du_bytes, missing)))
-    known.update(measured)
+    # A failed walk is unsized, never zero bytes.  Do not put it in the snapshot or judge it for
+    # reclaim; the next report will retry it without allowing a stale zero to hide the tree.
+    known.update({path: size for path, size in measured.items() if size is not None})
+    work = [(fam, path) for fam, path in work if str(path) in known]
     sizes = [known[str(path)] for _, path in work]
     floors = [min_bytes if fam.min_bytes is None else fam.min_bytes for fam, _ in work]
     idles = [(now - item_mtime(fam, path)) / 3600
@@ -2577,8 +2624,14 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
             top_at = float(hit.get("at", 0))
         else:
             top_map = du_children(Path(fs.mount))
-            top = [{"path": p, "bytes": n} for p, n in sorted(top_map.items(), key=lambda kv: -kv[1])[:32]]
-            top_at = now
+            if top_map is None:
+                # Keep a prior complete reading, if any, but leave its timestamp old so a later
+                # report retries.  An unsized root must not erase accounting or look fresh.
+                top = hit.get("top_level") if hit and isinstance(hit.get("top_level"), list) else []
+                top_at = float(hit.get("at", 0)) if hit else 0.0
+            else:
+                top = [{"path": p, "bytes": n} for p, n in sorted(top_map.items(), key=lambda kv: -kv[1])[:32]]
+                top_at = now
         _ACCOUNTING_MEM[(fs.dev, fs.mount)] = top
         measured = 0
         catalogued: list[tuple[Path, int]] = []

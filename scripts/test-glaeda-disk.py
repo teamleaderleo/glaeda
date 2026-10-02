@@ -122,18 +122,18 @@ class GlaedaDiskTest(unittest.TestCase):
         saved_min, gd.BULK_SIZE_MIN = gd.BULK_SIZE_MIN, 2
         make(self.root / "com.apple.imtransferservices")
         calls: list[list[str]] = []
-        real_run = gd.subprocess.run
+        real_du_output = gd._du_output
 
-        def counting_run(args, *a, **k):
+        def counting_du_output(args):
             if args and args[0] == "du":
                 calls.append(list(args))
-            return real_run(args, *a, **k)
+            return real_du_output(args)
 
-        gd.subprocess.run = counting_run
+        gd._du_output = counting_du_output
         try:
             items = gd.survey([self.fam], 24, 1 << 20)
         finally:
-            gd.subprocess.run = real_run
+            gd._du_output = real_du_output
             gd.BULK_SIZE_MIN = saved_min
         self.assertEqual(sorted(Path(i.path).name for i in items), ["a", "b", "c"])
         self.assertTrue(all(i.bytes >= 2 << 20 and i.verdict == "reclaimable" for i in items))
