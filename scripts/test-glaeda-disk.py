@@ -54,6 +54,35 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.NESTED_KEEP = self.gd_keep
         self.tmp.cleanup()
 
+    def test_du_walk_timeout_kills_child_and_returns_unsized(self) -> None:
+        class HungDu:
+            pid = 7319
+            returncode = None
+
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+                self.timeout = None
+                self.killed = False
+
+            def communicate(self, timeout=None):
+                self.timeout = timeout
+                raise subprocess.TimeoutExpired(self.argv, timeout)
+
+        with mock.patch.object(gd.subprocess, "Popen", HungDu), \
+                mock.patch.object(gd.os, "killpg") as killpg:
+            self.assertIsNone(gd.du_bytes(self.root))
+            self.assertIsNone(gd.du_children(self.root))
+        self.assertEqual(killpg.call_count, 2)
+        self.assertTrue(all(call.args[1] == gd.signal.SIGKILL for call in killpg.call_args_list))
+
+    def test_timed_out_bulk_walk_does_not_cache_zero_sizes(self) -> None:
+        self.fam = gd.Family("user-tmp", self.root, True, "scratch", bulk_sizes=True)
+        make(self.root / "a", mib=2)
+        with mock.patch.object(gd, "du_children", return_value=None), \
+                mock.patch.object(gd, "du_bytes", return_value=None):
+            items = gd.survey([self.fam], 24, 1 << 20)
+        self.assertEqual(items, [])
+
     def verdicts(self, idle: float = 24) -> dict[str, str]:
         return {Path(i.path).name: i.verdict for i in gd.survey([self.fam], idle, 0)}
 
