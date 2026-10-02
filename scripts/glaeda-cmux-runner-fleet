@@ -39,10 +39,15 @@ Downgrade guard. Before anything is staged, the run compares this checkout's HEA
 reports it now (git ls-remote: nothing is fetched or written here, and an old checkout's own stale origin/main
 ref cannot vouch for it), and reads every target member's .glaeda-source.json over SSH. --apply refuses,
 changing nothing on any member, when HEAD is not origin's main (or either cannot be read), or when a member's
-stamped commit is not an ancestor of HEAD: a downgrade, or a deploy from a branch HEAD does not contain. A member
-with no stamp, or one that cannot be read, is not a downgrade; the output says so. --allow-downgrade REASON
-overrides both refusals; the reason is printed and recorded in each staged stamp (allowDowngrade). A plan
-reports the same findings and does not fail.
+stamped commit is not an ancestor of HEAD: a downgrade, or a deploy from a branch HEAD does not contain. It also
+refuses when the staged files have uncommitted changes. A member with no stamp, or one that cannot be read, is
+not a downgrade; the output says so. A member whose stamp records allowDowngrade was deployed off main on
+purpose (a canary of a PR that then squash-merged), so a run from origin's main rolls it forward instead of
+refusing. --allow-downgrade REASON overrides every refusal; the reason is printed and recorded in each staged
+stamp (allowDowngrade). The stamp names the HEAD the guard checked. A copy outside a git checkout (an OTA
+release) has no HEAD to check, so it needs --allow-downgrade. A shallow checkout fails closed: an older stamp
+beyond its history reads as not an ancestor; fetch the full history. A plan reports the same findings and does
+not fail.
 """
 
 from __future__ import annotations
@@ -59,6 +64,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -234,9 +240,34 @@ def checkout_source() -> dict[str, Any]:
     return {"head": head, "originMain": main, "refusal": refusal}
 
 
-def host_source(member: str, head: str | None) -> dict[str, Any]:
+def clean_reason(text: object) -> str:
+    """One line, no control or format characters, at most MAX_REASON characters."""
+    words = " ".join(str(text or "").split())
+    return " ".join("".join(ch for ch in words if unicodedata.category(ch)[0] != "C").split())[:MAX_REASON]
+
+
+def dirty_staged() -> list[str] | None:
+    """The staged files (and this tool) with uncommitted changes, by repository path; None when git cannot tell."""
+    paths = [f"scripts/{name}" for name in (*STAGED, "glaeda-cmux-runner-fleet")]
+    code, out, _ = git("status", "--porcelain", "--", *paths)
+    if code != 0:
+        return None
+    return sorted({line[3:].strip() for line in out.splitlines() if len(line) > 3})
+
+
+def head_stamp(head: str) -> dict[str, Any] | None:
+    """The stamp for the commit the guard checked: its UTC commit day, like source_stamp's git branch."""
+    code, out, _ = run(["env", "TZ=UTC", "git", "-C", os.fspath(SCRIPT_DIR.parent), "log", "-1", "--format=%cd",
+                        "--date=format-local:%Y-%m-%d", head], 30)
+    day = out.strip()
+    return {"by": "glaeda-cmux-runner-fleet", "date": day, "source": head} if code == 0 and re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}", day) else None
+
+
+def host_source(member: str, head: str | None, on_main: bool = False) -> dict[str, Any]:
     """What the member's stamp says it runs, against HEAD. state: none, unreadable, current, behind, downgrade
-    (not an ancestor of HEAD) or unchecked (no HEAD). Read-only: one head -c over SSH."""
+    (not an ancestor of HEAD), rolling_forward (not an ancestor, but deployed off main on purpose with
+    --allow-downgrade, and HEAD is origin's main) or unchecked (no HEAD). Read-only: one head -c over SSH."""
     code, out, _ = run(["ssh", *SSH_OPTIONS, member, STAMP_READ], CHECK_TIMEOUT_S)
     text = out.strip()
     if code != 0:
@@ -257,6 +288,11 @@ def host_source(member: str, head: str | None) -> dict[str, Any]:
         return {**row, "state": "unchecked", "note": "HEAD unknown"}
     code, _, _ = git("merge-base", "--is-ancestor", source, head)
     if code != 0:  # 1: not an ancestor; anything else: a commit this checkout does not have, so not one either
+        override = stamp.get("allowDowngrade")
+        reason = clean_reason(override.get("reason")) if isinstance(override, dict) else ""
+        if on_main and reason:  # a squash-merged canary is never an ancestor of main: roll it forward
+            return {**row, "state": "rolling_forward", "reason": reason,
+                    "note": f"rolling forward from a deliberate off-main deploy (reason: {reason})"}
         unknown = "" if code == 1 else " (a commit this checkout does not have)"
         return {**row, "state": "downgrade",
                 "note": f"stamped {source} is not an ancestor of HEAD {head}{unknown}: a downgrade or a diverged deploy"}
@@ -268,12 +304,21 @@ def host_source(member: str, head: str | None) -> dict[str, Any]:
 def source_guard(chosen: list[str], jobs: int) -> dict[str, Any]:
     """The checkout and every target member's stamp, and the refusals they add up to (each {member, text})."""
     guard = checkout_source()
+    on_main = guard["head"] is not None and guard["head"] == guard["originMain"]
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-        hosts = dict(zip(chosen, pool.map(lambda m: host_source(m, guard["head"]), chosen)))
+        hosts = dict(zip(chosen, pool.map(lambda m: host_source(m, guard["head"], on_main), chosen)))
     guard["hosts"] = hosts
-    guard["refusals"] = ([{"member": None, "text": guard["refusal"]}] if guard["refusal"] else []) + [
+    refusal = guard.pop("refusal")
+    checkout = [refusal] if refusal else []
+    if guard["head"] is not None:
+        dirty = dirty_staged()
+        if dirty is None:
+            checkout.append("cannot tell whether the staged files have uncommitted changes (git status failed)")
+        elif dirty:
+            checkout.append(f"uncommitted changes to staged files: {', '.join(dirty)}; the stamp would name HEAD "
+                            f"{guard['head']} for files that differ from it")
+    guard["refusals"] = [{"member": None, "text": text} for text in checkout] + [
         {"member": m, "text": f"{m}: {row['note']}"} for m, row in sorted(hosts.items()) if row["state"] == "downgrade"]
-    del guard["refusal"]
     return guard
 
 
@@ -287,6 +332,8 @@ def guard_lines(guard: dict[str, Any], applied: bool) -> list[str]:
         elif row["state"] in ("current", "behind"):
             behind = "?" if row.get("behind") is None else row["behind"]
             lines.append(f"  {member}: stamped {row['source'][:12]}, {behind} behind HEAD")
+        elif row["state"] == "rolling_forward":
+            lines.append(f"  {member}: {row['note']}")
         elif row["state"] == "unchecked":
             lines.append(f"  {member}: stamped {row['source'][:12]}, not checked ({row['note']})")
     return lines + refusal_lines(guard, applied)
@@ -303,13 +350,14 @@ def refusal_lines(guard: dict[str, Any], applied: bool) -> list[str]:
 
 
 def stage(member: str, manifest: dict[str, Any], scratch: Path,
-          override: dict[str, Any] | None = None) -> str | None:
+          override: dict[str, Any] | None = None, head: str | None = None) -> str | None:
     """Copy the scripts, their source stamp and the member's trimmed manifest. Returns why it failed, or None.
-    override: the --allow-downgrade reason and the refusals it overrode, recorded in the stamp."""
+    override: the --allow-downgrade reason and the refusals it overrode, recorded in the stamp. head: the commit
+    the guard checked, which the stamp then names (else source_stamp's guess: a stamp or release beside us)."""
     local = scratch / f"{member}.manifest.json"
     local.write_text(json.dumps(trimmed(manifest, member), indent=1) + "\n")
     files = [os.fspath(SCRIPT_DIR / f) for f in STAGED]
-    stamp = source_stamp()
+    stamp = (head_stamp(head) if head else None) or source_stamp()
     if stamp is not None and override is not None:
         stamp = {**stamp, "allowDowngrade": override}
     if stamp is not None:
@@ -437,7 +485,7 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     if args.allow_downgrade is not None:
         override = {"reason": args.allow_downgrade,
                     "refusals": [r["text"] for r in args.guard["refusals"] if r["member"] in (None, member)]}
-    failed = stage(member, manifest, scratch, override)
+    failed = stage(member, manifest, scratch, override, args.guard.get("head"))
     if failed:
         row["action"] = f"stage failed: {failed}"
         return row
@@ -517,8 +565,9 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
     if args.allow_downgrade is not None:
-        args.allow_downgrade = " ".join(args.allow_downgrade.split())
-        if not args.allow_downgrade or len(args.allow_downgrade) > MAX_REASON:
+        reason = " ".join(args.allow_downgrade.split())
+        args.allow_downgrade = clean_reason(reason)
+        if not args.allow_downgrade or len(reason) > MAX_REASON:
             print(f"glaeda-cmux-runner-fleet: --allow-downgrade needs a reason, at most {MAX_REASON} characters",
                   file=sys.stderr)
             return 2
