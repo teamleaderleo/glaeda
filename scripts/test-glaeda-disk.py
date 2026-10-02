@@ -786,6 +786,42 @@ class GlaedaDiskTest(unittest.TestCase):
         finally:
             gd.HOME = saved
 
+    def test_fleet_artifacts_use_cutoff_and_live_lease_references(self) -> None:
+        fleet = self.root / "fleet"
+        cache = fleet / "cache"
+        cache.mkdir(parents=True)
+        old = make(cache / "old-artifact", age_hours=24)
+        fresh = make(cache / "fresh-artifact", age_hours=1)
+        gd.ARTIFACT_CUTOFF = time.time() - 12 * 3600
+        fam = gd.Family("fleet-artifacts", cache, True, "rebuild", stale_before=gd.ARTIFACT_CUTOFF,
+                        allow_stale_protected=True, reference_root=fleet)
+        try:
+            with mock.patch.object(gd, "live_artifact_references", return_value=frozenset()):
+                got = {Path(i.path).name: i.verdict for i in gd.survey([fam], 24, 0)}
+            self.assertEqual(got, {"old-artifact": "reclaimable", "fresh-artifact": "recent"})
+            with mock.patch.object(gd, "live_artifact_references", return_value=frozenset({str(fresh)})):
+                got = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([fam], 0, 0)}
+            self.assertEqual(got["fresh-artifact"][0], "in-use")
+            self.assertIn("live lease or running job", got["fresh-artifact"][1])
+        finally:
+            gd.ARTIFACT_CUTOFF = None
+
+    def test_default_families_cover_fleet_and_browser_artifacts(self) -> None:
+        saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME = self.root
+        gd.FLEET_ROOT = self.root / "shared-fleet"
+        gd.DARWIN = True
+        try:
+            (gd.HOME / "cmux-browser-fleet").mkdir()
+            (gd.FLEET_ROOT / "cache").mkdir(parents=True)
+            fams = {f.id: f for f in gd.default_families()}
+            self.assertIn("fleet-artifacts", fams)
+            self.assertIn("browser-artifacts", fams)
+            self.assertTrue(fams["fleet-artifacts"].allow_stale_protected)
+            self.assertTrue(fams["browser-artifacts"].allow_stale_protected)
+        finally:
+            gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
+
     def test_fleet_ci_hot_tier(self) -> None:
         ci = self.root / "ci"
         (ci / "seeds").mkdir(parents=True)

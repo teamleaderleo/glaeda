@@ -59,8 +59,10 @@ root's newest one under pressure (two during idle sweeps), and a root's kept bui
 trusted seeder, a seed its serve log shows streamed whole to the seed archive (cmux-lawrence's SSD) is
 reclaimable at once instead of after the idle window: the PR minis restore it from there over the LAN.
 SwiftPM scratch (spm-scratch/<fingerprint>) that no job holds by its lock ages like any cache, and goes
-whatever its age once free space is below the emergency floor. The Chromium / cmux-browser trees and
-their caches are never deleted (NEVER_DELETE).
+whatever its age once free space is below the emergency floor. The Chromium source tree under
+cmux-browser-fleet/build and protected release-support caches are never deleted. Small top-level
+browser tour artifacts and fleet cache entries older than the 2026-09-17 migration cutoff are
+disposable; newer ones stay when a live reservation or lease names them.
 
 Free space is judged per filesystem. On Linux /tmp is often its own tmpfs, so pressure there
 reclaims only /tmp items, and pressure on the home filesystem never deletes from /tmp.
@@ -88,6 +90,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import calendar
 import contextlib
 import fcntl
 import json
@@ -163,6 +166,11 @@ class Family:
     # candidates are the build outputs inside the checkouts under root (checkout_builds), not root's children
     checkout_builds: bool = False
     retired_only: bool = False  # reclaim only with fresh evidence the declared service is unloaded
+    # Fleet artifacts use a fixed migration cutoff. Older cruft is eligible immediately; newer
+    # entries follow the normal idle window and are protected when a live lease names them.
+    stale_before: float | None = None
+    allow_stale_protected: bool = False  # permit an explicit family below NEVER_DELETE roots
+    reference_root: Path | None = None  # root containing lease/job markers for this family
 
 
 def idle_window(fam: Family, idle_hours: float) -> float:
@@ -176,6 +184,10 @@ def idle_window(fam: Family, idle_hours: float) -> float:
 # name matches NEVER_DELETE_NAMES, is dropped before it is judged.
 NEVER_DELETE = ("cmux-browser-fleet", "Library/Caches/cmux-release-support", "Library/Caches/siso")  # under HOME
 NEVER_DELETE_NAMES = re.compile(r"chromium|cmux-browser|siso|depot_tools|cmux-release-support|vpython|cipd", re.I)
+# Leo's fleet cleanup cutoff: artifacts predating this migration are known cruft. Keep this as
+# an epoch so the comparison is deterministic on hosts in any local timezone.
+ARTIFACT_CUTOFF = calendar.timegm((2026, 9, 17, 0, 0, 0))
+FLEET_ROOT = Path("/Users/Shared/cmux-build-fleet")
 
 
 def never_delete(path: Path) -> bool:
@@ -187,6 +199,55 @@ def never_delete(path: Path) -> bool:
         if p == k or p.startswith(k + "/") or k.startswith(p + "/"):
             return True
     return False
+
+
+_LIVE_REFERENCES: dict[str, frozenset[str]] = {}
+
+
+def live_artifact_references(root: Path = FLEET_ROOT) -> frozenset[str]:
+    """Return paths named by active fleet reservations or leases, using read-only evidence."""
+    key = os.fspath(root)
+    if key in _LIVE_REFERENCES:
+        return _LIVE_REFERENCES[key]
+    refs: set[str] = set()
+    now = time.time()
+    reservation = root / "reservation.json"
+    try:
+        doc = json.loads(reservation.read_text())
+        if doc.get("schema") == "glaeda-reservation/v1" and float(doc["until"]) > now:
+            refs.add(os.path.realpath(root))
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    # Jobs and product leases are small JSON markers. Old history and empty lock files must not
+    # pin the whole cache forever.
+    for base in (root / "node-products/leases", root / "jobs", root / "job-volumes"):
+        if not base.is_dir():
+            continue
+        try:
+            paths = [p for p in base.rglob("*") if p.is_file() and p.stat().st_size <= 1 << 20]
+        except OSError:
+            continue
+        for marker in paths:
+            try:
+                text = marker.read_text(errors="replace")
+                doc = json.loads(text)
+                state = str(doc.get("state", "")).lower()
+                until = float(doc.get("until", 0) or 0)
+                active = until > now or state in {"active", "running", "leased", "reserved", "started"}
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+            if not active:
+                continue
+            for match in re.findall(r"/(?:Users|private|tmp|var)/[^\s\"']+", text):
+                refs.add(os.path.realpath(match.rstrip(",]}")))
+    result = frozenset(refs)
+    _LIVE_REFERENCES[key] = result
+    return result
+
+
+def artifact_referenced(path: Path, references: frozenset[str]) -> bool:
+    p = os.path.realpath(path)
+    return any(p == ref or p.startswith(ref + os.sep) or ref.startswith(p + os.sep) for ref in references)
 
 
 # cmux CI's warm state on an owned mini (cmux scripts/ci/owned_build_state.py, seed_derived_data.py).
@@ -941,7 +1002,8 @@ def default_families() -> list[Family]:
                skip=("glaeda", "PassKit", "tidy-branches", "CloudKit", "GeoServices", "FamilyCircle",
                      "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
                      "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
-               skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5),
+               skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5,
+               stale_before=ARTIFACT_CUTOFF, reference_root=FLEET_ROOT),
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
@@ -973,6 +1035,21 @@ def default_families() -> list[Family]:
     if DARWIN and bazel_user:
         fams.append(bazel_family(Path(f"/private/var/tmp/_bazel_{bazel_user}")))
     if DARWIN:  # the owned cmux minis
+        # These roots contain disposable build products outside the CI hot tier. Keep Chromium's
+        # source tree under cmux-browser-fleet/build, but allow old top-level tour artifacts and
+        # fleet cache entries to age out. A live reservation/lease still protects referenced paths.
+        fleet_cache = FLEET_ROOT / "cache"
+        if fleet_cache.is_dir():
+            fams.append(Family("fleet-artifacts", fleet_cache, True,
+                               "the fleet worker rebuilds or fetches the artifact", depth=1,
+                               files=True, allow_stale_protected=True, stale_before=ARTIFACT_CUTOFF,
+                               reference_root=FLEET_ROOT, owner="cmux fleet worker", rebuild_minutes=8))
+        browser = HOME / "cmux-browser-fleet"
+        if browser.is_dir():
+            fams.append(Family("browser-artifacts", browser, True,
+                               "the browser tour rebuilds the artifact", depth=1, files=True,
+                               skip=("build",), allow_stale_protected=True, stale_before=ARTIFACT_CUTOFF,
+                               reference_root=FLEET_ROOT, owner="cmux browser fleet", rebuild_minutes=20))
         fams += fleet_families()
         for runner in HOME.glob("actions-runner*"):
             temp = runner / "_work/_temp"
@@ -2284,7 +2361,7 @@ def candidates(fam: Family) -> list[Path]:
     uid = os.getuid()
     owned = []
     for p in level:
-        if never_delete(p):
+        if never_delete(p) and not fam.allow_stale_protected:
             continue
         try:
             if p.lstat().st_uid == uid:
@@ -2394,6 +2471,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
     except NoEvidence as e:
         cwds, cmds, blind = [], "", f"no process evidence ({e})"
     opened = open_index(cwds)
+    references_by_root: dict[str, frozenset[str]] = {}
     archived = archived_seeds() if any(fam.id == "cmux-seeds" for fam, _ in work) else frozenset()
     for (fam, path), size, idle, floor in zip(work, sizes, idles, floors):
         if size < floor:
@@ -2408,6 +2486,12 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
             reasons.append("named by a running command")
         if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_hours * 3600):
             reasons.append("claude session active")
+        references = frozenset()
+        if fam.reference_root is not None:
+            key = os.fspath(fam.reference_root)
+            references = references_by_root.setdefault(key, live_artifact_references(fam.reference_root))
+            if artifact_referenced(path, references):
+                reasons.append("live lease or running job")
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
         # The tree walks below cost seconds each on a loaded host, and a recent item is kept anyway,
@@ -2415,6 +2499,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
         window = item_window(fam, path, idle_hours, archived)
         keep = keep_verdict(fam, path)
         due, jobs = item_due(fam, idle, window)
+        if fam.stale_before is not None and item_mtime(fam, path) <= fam.stale_before:
+            due = True
         if jobs is not None:
             reasons_jobs = f"{jobs} host jobs since its last use"
         deletable_age = fam.reclaimable and due
