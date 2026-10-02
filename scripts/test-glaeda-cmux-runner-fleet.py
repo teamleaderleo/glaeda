@@ -468,7 +468,7 @@ class FleetTest(unittest.TestCase):
             self.git("update-index", flag, f"scripts/{name}")
             path = self.repo / "scripts" / name
             path.write_text(path.read_text() + "\n# hand edit git status cannot see\n")
-            self.assertEqual(self.git("status", "--porcelain"), "", "git status hides the edit")
+            self.assertEqual(self.git("status", "--porcelain", "--", f"scripts/{name}"), "", "git status hides the edit")
             self.log.unlink(missing_ok=True)
             result = self.fleet("--apply")
             self.assertEqual(result.returncode, 2, f"{flag}: {result.stdout}{result.stderr}")
