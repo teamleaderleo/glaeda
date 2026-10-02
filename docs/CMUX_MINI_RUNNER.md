@@ -474,6 +474,18 @@ at once:
     scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis --hosts cmux12s-mac-mini
     scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis   # every instance
 
+Run it from a worktree at origin's `main`. Before anything is staged, the run reads origin's
+`main` with `git ls-remote` (nothing is fetched; an old checkout's own stale `origin/main`
+ref cannot vouch for it) and every target member's `~/glaeda-runner/scripts/.glaeda-source.json`
+over SSH. `--apply` refuses, changing nothing on any member, when HEAD is not origin's `main`
+(or either cannot be read), or when a member's stamped commit is not an ancestor of HEAD: a
+downgrade from an old checkout, or a deploy from a branch HEAD does not contain. The refusal
+names the member, its stamped commit and HEAD. A member with no stamp, or one that cannot be
+read, is not a downgrade, and the output says so. The plan lists the same findings and exits 0.
+`--allow-downgrade "REASON"` overrides both refusals for a deliberate rollback or branch canary;
+the reason is printed and recorded in every staged stamp as `allowDowngrade` (`reason`, and the
+refusals it overrode for that member). Automatic rollout on merge is proposed in #1385.
+
 The fleet is registered at org scope (section 2e2), so an apply names that scope. Without
 `--org`, the apply asks for the repository scope, finds each runner's org-scope receipt, and refuses
 every instance ("this Mac already has a runner install ... on manaflow-ai") before changing
