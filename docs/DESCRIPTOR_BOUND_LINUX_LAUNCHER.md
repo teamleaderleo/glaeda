@@ -36,8 +36,11 @@ Only direct ELF executables are supported. Scripts are rejected before spawn so 
 - stdout and stderr are captured privately and concurrently;
 - each stream has the repository-wide fixed one-MiB limit;
 - the child starts in a new process group;
+- a bounded launch polls leader status independently of pipe completion, so closing both capture
+  pipes cannot disable the wall-clock deadline;
 - the launcher does not forward ambient signals;
 - capture failure or output exhaustion sends `SIGKILL` to the child process group;
+- leader exit with another member still in the assigned process group kills that group and fails;
 - normal exits from 0 through 255 and terminating signals from 1 through 255 are represented explicitly;
 - an inherited-credential launch executes on the caller thread with the exact reviewed effective UID/GID;
 - a root-to-nonroot launch moves the complete launch operation to a short-lived helper thread;
@@ -45,6 +48,12 @@ Only direct ELF executables are supported. Scripts are rejected before spawn so 
 - the child then applies the reviewed GID and UID transition through `CommandExt` and enters the reviewed ELF with no inherited supplementary groups;
 - the helper thread exits after capture, so the caller thread's credentials and supplementary groups are unchanged;
 - no unsafe Rust or process-wide credential mutation is introduced.
+
+A process group is cleanup coordination, not a non-escapeable sandbox. A descendant can call
+`setsid`/`setpgid`, and synchronous filesystem calls can block outside a userspace polling deadline.
+Any adapter that needs hostile-code containment, a hard deadline, or proof of descendant emptiness
+must add a separately reviewed dedicated cgroup/PID-namespace boundary and restrict or prove the
+filesystem class. The descriptor launcher alone grants none of those claims.
 
 Public JSON and `Debug` output contain no executable path, cwd path, device, inode, descriptor number, raw diagnostics, or secret command value. Errors use fixed classifications without raw operating-system text.
 
