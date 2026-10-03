@@ -259,10 +259,8 @@ runner_domain() {
 }
 
 runner_launchctl() {
-  case "$1" in
-    /Library/LaunchDaemons/*) shift; sudo -n launchctl "$@" ;;
-    *) shift; launchctl "$@" ;;
-  esac
+  shift
+  launchctl "$@"
 }
 
 runner_hold() {  # WAIT_SECONDS
