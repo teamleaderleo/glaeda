@@ -14,7 +14,7 @@ The closed treatments are:
 - `hardlink`: measurement control only;
 - `clone`: task-private CoW candidate and the preferred treatment to test on XFS `reflink=1`.
 
-On current pnpm 12, Linux `auto` tries hardlink before clone, so `auto` is an observation arm rather than a task-execution policy. `hardlink` can couple package bytes through a shared inode. Its per-task directory root does not make those package bytes task-private. The harness therefore refuses repository probe scripts in the explicit hardlink arm. If `auto` physically resolves to hardlinks, the harness also refuses the probe after observing that evidence. `clone` must prove FIEMAP shared extents for every sampled non-empty imported package-payload regular file in every task or the sample fails. The whole `node_modules` tree is also scanned for multiply-linked regular files, so any hardlink evidence rejects explicit clone.
+On current pnpm 12, Linux `auto` tries hardlink before clone, so `auto` is an observation arm rather than a task-execution policy. `hardlink` can couple package bytes through a shared inode. Its per-task directory root does not make those package bytes task-private. The harness therefore refuses repository probe scripts in the explicit hardlink arm. If `auto` physically resolves to hardlinks, the harness also refuses the probe after observing that evidence. `clone` must prove complete FIEMAP observability plus CoW-dominant sharing: at least 95% of sampled non-empty imported package-payload regular files in every task must retain shared extents. The remaining sampled files are explicit private-copy bytes, which are safe for repository execution and remain visible in write-amplification accounting. The whole `node_modules` tree is also scanned for multiply-linked regular files, so any hardlink evidence rejects explicit clone.
 
 ## What stays fixed
 
@@ -83,7 +83,7 @@ Storage evidence includes:
 - signed filesystem available-space (`statvfs.f_bavail`) and available-inode deltas at workspace-ready time;
 - exact `node_modules` logical bytes, summed `st_blocks * 512` bytes, and inode counts;
 - exhaustive regular-file and multiply-linked regular-file counts;
-- sampled FIEMAP shared-extent observations over non-empty imported package payload files;
+- deterministic lexicographic sampled FIEMAP (with a sample-set digest and bounded hashed private-copy diagnostics) shared-extent observations over non-empty imported package payload files;
 - signed filesystem available-space/inode deltas during cleanup;
 - signed residual filesystem available-space/inode deltas after cleanup.
 
@@ -91,7 +91,29 @@ The filesystem available-space deltas stay signed. Negative task-ready consumpti
 
 The benchmark binds the full scratch mount identity before materialization. At task-ready time it reads capacity with direct `stat`/`statvfs` calls against that already-bound device and receipts the observation cost separately, avoiding a `findmnt` child in front of the first useful command. Later full observations must still agree with the bound filesystem identity.
 
-Summary distributions publish p50/p90/p99 over successful samples. Explicit `clone` requires every sampled non-empty package-payload regular file to have observable shared FIEMAP extents in every task, while the exhaustive link-count scan must remain free of hardlinks. Explicit `hardlink` requires shared-inode evidence in every task. Any multiply-linked regular dependency file makes the task hardlink-observed and blocks repository probe execution. `auto` reports the observed physical mechanism without granting it policy authority.
+Summary distributions publish p50/p90/p99 over successful samples. Explicit `clone` requires FIEMAP to observe every sampled non-empty package-payload regular file and at least 95% of those files in every task to retain shared extents, while the exhaustive link-count scan remains free of hardlinks. This threshold is deliberately much stronger than accepting one shared extent anywhere, while allowing safe private-copy outliers that pnpm can materialize alongside CoW files. Explicit `hardlink` requires shared-inode evidence in every task. Any multiply-linked regular dependency file makes the task hardlink-observed and blocks repository probe execution. `auto` reports the observed physical mechanism without granting it policy authority.
+
+## Hosted Linux physical control
+
+`.github/workflows/pnpm-task-dependency-physical-control.yml` supplies a disposable GitHub-hosted Linux control for this benchmark. It is a control plane for physical evidence, outside the resident-project promotion environment.
+
+The workflow pins:
+
+- benchmark code to the pull-request head or dispatched commit;
+- Node 22.19.0 and pnpm 12.5.1;
+- pnpm's official immutable `pnpm-linux-x64.tar.gz` release asset at SHA-256 `5a397dfb6b3d4b07d3d7769586aeb471048faf04299a492e2808b95a9a1c701f`;
+- the trusted `teamleaderleo/scrapbook` repository at exact commit `5b128c23079efdd8f9aeed6688af4b9b382d9537`, with its source tree and dependency/config digests left untouched;
+- 32 GiB sparse loop images with either ext4 or XFS `reflink=1`;
+- one benchmark user whose home, resident pnpm store, source, scratch, and results live on the selected filesystem;
+- package-manager network access only during source/store preparation; measured installs remain offline and frozen-store.
+
+The full matrix runs `auto`, `hardlink`, and `clone` at widths 1/8/32 with 20 repetitions. The explicit XFS clone arm must prove complete FIEMAP observation, at least 95% sampled shared-extent coverage in every successful task, and zero hardlinks; hardlink controls must prove shared inodes. The ext4 clone arm may produce a failed treatment receipt when the filesystem cannot satisfy explicit clone semantics.
+
+A second real-repository composition makes the prehydrated resident store root-owned and read-only. With Linux protected-hardlink policy recorded, it compares ext4 `auto` expected to fall through to private copies against XFS explicit `clone`, then runs Scrapbook `test` at widths 1/8/32 for 6 repetitions. Repository code starts only after the benchmark's task-private/CoW dependency proof. The receipts therefore combine task-ready, first-command, first-test, FIEMAP/nlink, filesystem free-space, visible `st_blocks`, backing-allocation, and cleanup observations in one bounded path.
+
+Every job records kernel/tool/filesystem/source identities, validates every sample against the selected filesystem, syncs the mounted filesystem before backing-file allocation measurement, unmounts the loop filesystem, detaches the loop device, deletes the sparse image, and removes the benchmark user. The workflow installs no filesystem packages; missing ext4/XFS tooling is an explicit control failure.
+
+GitHub-hosted results remain a platform control. Product promotion still requires the reviewed resident-Linux project-disk path, including the existing project ownership/recovery gates.
 
 ## Interruption boundary
 
