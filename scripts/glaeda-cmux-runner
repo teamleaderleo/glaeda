@@ -259,7 +259,9 @@ class Context:
         # A fake HOME (tests, rehearsals) must never reach the real launchd session.
         self.sandbox = os.path.realpath(self.home) != os.path.realpath(real_home)
         self.skip_launchctl = args.skip_launchctl or self.sandbox
-        self.headless = bool(args.headless)
+        # Never let a fake HOME used by tests or rehearsals reach the real system
+        # LaunchDaemon path, even when --headless was passed.
+        self.headless = bool(args.headless) and not self.sandbox
         self.apply = args.apply
         self.org = args.org
         self.repo = None if args.org else (args.repo or DEFAULT_REPO)
@@ -1109,7 +1111,7 @@ def install_service_file(ctx: Context, path: Path, data: bytes, mode: int) -> No
 def ensure_headless_helper(ctx: Context) -> None:
     if not ctx.headless:
         return
-    helper = b"#!/bin/sh\nset -eu\nrunner=\"$1\"\nwhile /usr/bin/pgrep -f \"$runner/bin/Runner.Listener\" >/dev/null 2>&1; do\n  /bin/sleep 15\ndone\nexec \"$runner/glaeda-hooks/listen.sh\"\n"
+    helper = b"#!/bin/sh\nset -eu\nrunner=\"$1\"\nwhile /usr/bin/pgrep -f \"$runner/bin/Runner.Listener\" >/dev/null 2>&1 || /usr/bin/pgrep -f \"$runner/glaeda-hooks/listen.sh\" >/dev/null 2>&1; do\n  /bin/sleep 15\ndone\nexec \"$runner/glaeda-hooks/listen.sh\"\n"
     with tempfile.NamedTemporaryFile(prefix="glaeda-supervise-", delete=False) as tmp:
         tmp.write(helper)
         tmp.flush()
@@ -1802,6 +1804,11 @@ def main(argv: list[str] | None = None) -> int:
 
 def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[str]) -> int:
     prior = load_receipt(ctx)
+    if isinstance(prior, dict) and prior.get("headless") and not ctx.sandbox:
+        # Uninstall and plain re-apply must address the same system service even
+        # when the operator omits --headless on the follow-up command.
+        ctx.headless = True
+        ctx.service_plist_path = SYSTEM_DAEMON_DIR / f"{ctx.label}.plist"
     if args.uninstall and prior:
         # Uninstall acts only on what the receipt recorded; flags cannot point it elsewhere.
         if prior.get("runnerDir"):
@@ -1822,6 +1829,8 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
                 ctx.org, ctx.repo = (None, f"{scope[1]}/{scope[2]}") if scope[2] else (scope[1], None)
             elif local:
                 ctx.unreadable_registration = True
+        if ctx.headless:
+            ctx.service_plist_path = SYSTEM_DAEMON_DIR / f"{ctx.label}.plist"
     if not args.uninstall and owned_dir(ctx, prior):
         registered = (prior or {}).get("registration") or {}
         kept = (prior or {}).get("member")
@@ -1851,6 +1860,7 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
         "applied": args.apply,
         "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "sandboxHome": ctx.sandbox,
+        "headless": ctx.headless,
         "runnerDir": os.fspath(ctx.runner_dir),
         "installId": (prior or {}).get("installId") if owned_dir(ctx, prior) else secrets.token_hex(16),
         "runnerDirOwned": owned_dir(ctx, prior),

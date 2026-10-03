@@ -418,10 +418,32 @@ def prepare_headless(member: str, summary: dict[str, Any], manifest: dict[str, A
         return None
     xcodes = summary.get("xcodeApps") or []
     pinned = next((p for p in xcodes if str(p).startswith("/Applications/Xcode_") and str(p).endswith(".app")), None)
-    lines = ["set -eu", "if [ -x /opt/homebrew/bin/gh ]; then sudo -n /usr/bin/install -d -m 755 /usr/local/bin && sudo -n /bin/ln -sfn /opt/homebrew/bin/gh /usr/local/bin/gh; fi"]
+    lines = [
+        "set -eu",
+        # These are global paths. Refuse a conflicting owner instead of replacing
+        # a real file or someone else's link; reruns are safe when our link is
+        # already present.
+        "if [ -x /opt/homebrew/bin/gh ]; then "
+        "if [ -L /usr/local/bin/gh ]; then "
+        "[ \"$(/usr/bin/readlink /usr/local/bin/gh)\" = /opt/homebrew/bin/gh ] || "
+        "{ echo 'refusing conflicting /usr/local/bin/gh' >&2; exit 1; }; "
+        "elif [ -e /usr/local/bin/gh ]; then "
+        "echo 'refusing non-symlink /usr/local/bin/gh' >&2; exit 1; "
+        "else sudo -n /usr/bin/install -d -m 755 /usr/local/bin && "
+        "sudo -n /bin/ln -s /opt/homebrew/bin/gh /usr/local/bin/gh; fi; fi",
+    ]
     if pinned:
         q = _quote(str(pinned))
-        lines.append(f"if [ -d {q} ]; then sudo -n /bin/ln -sfn {q} /Applications/Xcode.app; sudo -n /usr/bin/xcode-select -s {q}/Contents/Developer; fi")
+        lines.append(
+            f"if [ -d {q} ]; then "
+            f"if [ -L /Applications/Xcode.app ]; then "
+            f"[ \"$(/usr/bin/readlink /Applications/Xcode.app)\" = {q} ] || "
+            "{ echo 'refusing conflicting /Applications/Xcode.app' >&2; exit 1; }; "
+            "elif [ -e /Applications/Xcode.app ]; then "
+            "echo 'refusing non-symlink /Applications/Xcode.app' >&2; exit 1; "
+            f"else sudo -n /bin/ln -s {q} /Applications/Xcode.app; fi; "
+            f"sudo -n /usr/bin/xcode-select -s {q}/Contents/Developer; fi"
+        )
     lines.append(f"chmod +x ~/{REMOTE_DIR}/scripts/* 2>/dev/null || true")
     code, _, err = run(["ssh", *SSH_OPTIONS, member, "; ".join(lines)], 90)
     return None if code == 0 else f"headless preparation failed: {err.strip()[-240:]}"
