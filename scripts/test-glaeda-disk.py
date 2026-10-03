@@ -113,6 +113,37 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.EVICT_OWNER = owner_path
             gd._LIVE_REFERENCES.clear()
 
+    def test_paused_runner_work_is_cleared_only_for_held_idle_runner(self) -> None:
+        saved_home = gd.HOME
+        gd.HOME = self.root
+        try:
+            runner = self.root / "actions-runner-glaeda-2"
+            work = runner / "_work/cmux"
+            work.mkdir(parents=True)
+            (work / "old-build").write_bytes(b"old")
+            (runner / ".runner").write_text("{}")
+            (runner / "glaeda-hooks").mkdir()
+            held = self.root / gd.RUNNER_HELD_DIR / runner.name
+            held.parent.mkdir(parents=True)
+            held.write_text("held")
+            receipt = self.root / "receipt.jsonl"
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                    mock.patch.object(gd, "du_bytes", return_value=1234):
+                self.assertEqual(gd.cleanup_paused_runner_work(receipt), 1234)
+            self.assertFalse(work.exists())
+            record = json.loads(receipt.read_text())
+            self.assertEqual(record["family"], "paused-runner-work")
+            # Without the explicit drain marker, the same idle-looking tree remains intact.
+            work.mkdir(parents=True)
+            (work / "new").write_bytes(b"new")
+            held.unlink()
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                    mock.patch.object(gd, "du_bytes", return_value=1234):
+                self.assertEqual(gd.cleanup_paused_runner_work(receipt), 0)
+            self.assertTrue(work.exists())
+        finally:
+            gd.HOME = saved_home
+
     def test_timed_out_bulk_walk_does_not_cache_zero_sizes(self) -> None:
         self.fam = gd.Family("user-tmp", self.root, True, "scratch", bulk_sizes=True)
         make(self.root / "a", mib=2)
@@ -1827,6 +1858,7 @@ class LinuxLayoutTest(unittest.TestCase):
         gd.process_evidence = lambda: ([], "")
         try:
             fams = [f for f in gd.default_families() if f.id in ("cmux-job-cache", "user-cache")]
+            self.assertEqual(next(f for f in fams if f.id == "cmux-job-cache").min_idle_hours, 24.0)
             items = gd.survey(fams, 24, 0)
         finally:
             gd.process_evidence = saved
