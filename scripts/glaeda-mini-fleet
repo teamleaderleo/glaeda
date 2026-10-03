@@ -16,6 +16,7 @@
     glaeda-mini-fleet reserve  HOST ... --for TEXT (--hours N | --until EPOCH) [--owner O] [--force] [--yes]
     glaeda-mini-fleet borrow   [HOST ...] [--class std] --for TEXT (--hours N | --until EPOCH) [--owner O] [--yes]
     glaeda-mini-fleet release  HOST ... [--owner O] [--force] [--yes]           drop a reservation
+    glaeda-mini-fleet manifest-sync [--manifest M] [--yes]                      copy cmuxterm-hq main's manifest here
 
 The manifest names every host, its fleet node id (node_id, so every enrollment rerun asks for the
 same one), its hardware and scheduling class, the toolchain it must carry, the SSH keys that must, may, and must
@@ -159,6 +160,14 @@ ends with a fresh observation and check of the hosts it touched.
 A real fleet manifest names hosts, people, and keys. Keep it out of this public repository:
 the default path is ~/.config/glaeda/mini-fleet.json (override with --manifest or
 $GLAEDA_MINI_FLEET_MANIFEST). examples/mini-fleet/manifest.example.json shows the shape.
+
+The canonical manifest is cmuxterm-hq build-fleet/mini-fleet.json on main; the default path holds a copy. When
+--manifest is not given, every command first compares that copy with main (gh api, else the origin/main of a local
+cmuxterm-hq checkout, ~/Projects/cmuxterm-hq or $GLAEDA_HQ_CHECKOUT, as of its last fetch) and, if they differ,
+warns on stderr with the copy's age, the first differing fields and the refresh command, then runs on the copy it
+has. A failed comparison (offline, no gh, no checkout) is a warning too. It never rewrites the copy by itself: an
+upgrade records receipts in it before they reach main. `manifest-sync` prints the diff against main; with --yes it
+backs the copy up to <name>.bak-<UTC time> and replaces it atomically with main's, which must load.
 """
 
 from __future__ import annotations
@@ -178,6 +187,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -226,6 +236,11 @@ PROBE = SCRIPT_DIR / "cmux_mini_probe.sh"
 PREFLIGHT_PROBE = SCRIPT_DIR / "cmux_mini_preflight.sh"
 FIX_LIBRARY = SCRIPT_DIR / "cmux_mini_fix.sh"
 DEFAULT_MANIFEST = Path(os.environ.get("GLAEDA_MINI_FLEET_MANIFEST", "~/.config/glaeda/mini-fleet.json")).expanduser()
+# The canonical manifest: the default one above is a copy of this file on cmuxterm-hq main.
+HQ_REPO = "manaflow-ai/cmuxterm-hq"
+HQ_MANIFEST = "build-fleet/mini-fleet.json"
+HQ_CHECKOUT = "~/Projects/cmuxterm-hq"  # or $GLAEDA_HQ_CHECKOUT: the offline fallback reads its origin/main
+HQ_FETCH_TIMEOUT = 15
 SSH = "/usr/bin/ssh"
 PROBE_TIMEOUT = 90
 PREFLIGHT_TIMEOUT = 180
@@ -3960,6 +3975,123 @@ def rewrite_manifest(path: Path, change: Any, write: bool = True) -> str:
     return diff
 
 
+def fetch_hq_manifest() -> tuple[str, str]:
+    """(cmuxterm-hq main's manifest text, where it came from): gh api, else a local checkout's origin/main."""
+    errors = []
+    gh = shutil.which("gh")
+    if gh:
+        try:
+            proc = subprocess.run([gh, "api", "-H", "Accept: application/vnd.github.raw+json",
+                                   f"repos/{HQ_REPO}/contents/{HQ_MANIFEST}?ref=main"],
+                                  capture_output=True, text=True, timeout=HQ_FETCH_TIMEOUT)
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout, f"{HQ_REPO} main"
+            errors.append(f"gh api: {(proc.stderr.strip().splitlines() or ['exit ' + str(proc.returncode)])[-1]}")
+        except (OSError, subprocess.SubprocessError) as error:
+            errors.append(f"gh api: {type(error).__name__}")
+    else:
+        errors.append("no gh")
+    checkout = Path(os.environ.get("GLAEDA_HQ_CHECKOUT") or HQ_CHECKOUT).expanduser()
+    if (checkout / ".git").exists():
+        git = ["git", "-C", os.fspath(checkout)]
+        try:
+            show = subprocess.run([*git, "show", f"origin/main:{HQ_MANIFEST}"], capture_output=True, text=True,
+                                  timeout=HQ_FETCH_TIMEOUT)
+            head = subprocess.run([*git, "log", "-1", "--format=%h %cs", "origin/main"], capture_output=True,
+                                  text=True, timeout=HQ_FETCH_TIMEOUT)
+            if show.returncode == 0 and show.stdout.strip():
+                return show.stdout, f"{checkout} origin/main {head.stdout.strip()} (as of its last fetch)"
+            errors.append(f"{checkout}: no {HQ_MANIFEST} on origin/main")
+        except (OSError, subprocess.SubprocessError) as error:
+            errors.append(f"{checkout}: {type(error).__name__}")
+    else:
+        errors.append(f"no cmuxterm-hq checkout at {checkout}")
+    raise Failure("; ".join(errors))
+
+
+def json_differences(old: Any, new: Any, where: str = "") -> list[str]:
+    """Each differing field as `path: old -> new`, scalars shown (shortened), objects and lists by kind."""
+    def show(value: Any) -> str:
+        if isinstance(value, dict):
+            return "{...}"
+        if isinstance(value, list):
+            return f"[{len(value)} items]"
+        text = json.dumps(value)
+        return text if len(text) <= 40 else text[:37] + "..."
+    if isinstance(old, dict) and isinstance(new, dict):
+        out = []
+        for key in sorted(set(old) | set(new), key=lambda k: (k not in old, k not in new, k)):
+            path = f"{where}.{key}" if where else key
+            if key not in new:
+                out.append(f"{path}: only in the copy")
+            elif key not in old:
+                out.append(f"{path}: only on main")
+            else:
+                out += json_differences(old[key], new[key], path)
+        return out
+    return [] if old == new else [f"{where or '(top)'}: {show(old)} -> {show(new)}"]
+
+
+def manifest_staleness(path: Path, now: float | None = None) -> str | None:
+    """A warning when the manifest copy at path differs from cmuxterm-hq main's or cannot be compared, else None."""
+    refresh = f"glaeda-mini-fleet manifest-sync --yes (writes {path}, keeps a backup; drop --yes to see the diff)"
+    try:
+        text, source = fetch_hq_manifest()
+        main = json.loads(text)
+    except (Failure, ValueError) as error:
+        return (f"could not compare {path} with cmuxterm-hq main ({error}); using it as is. "
+                "`glaeda-mini-fleet manifest-sync` shows the diff once main is reachable.")
+    try:
+        copy = json.loads(path.read_text())
+        written = path.stat().st_mtime
+    except (OSError, ValueError):
+        return f"{path} is missing or not JSON; cmuxterm-hq main has the manifest. Refresh: {refresh}"
+    if copy == main:
+        return None
+    days = int(((time.time() if now is None else now) - written) // 86400)
+    age = time.strftime("%Y-%m-%d", time.localtime(written)) + (f", {days} days ago" if days >= 1 else ", today")
+    changes = json_differences(copy, main)
+    shown = "\n".join(f"  {c}" for c in changes[:8]) + (f"\n  ... {len(changes) - 8} more" if len(changes) > 8 else "")
+    return (f"{path} differs from {source} (copy written {age}); results below use the copy:\n{shown}\n"
+            f"Refresh: {refresh}. If the copy holds edits main lacks (an upgrade's receipts), land them in "
+            f"cmuxterm-hq {HQ_MANIFEST} first.")
+
+
+def cmd_manifest_sync(path: Path, yes: bool) -> int:
+    """Show the diff from the copy at path to cmuxterm-hq main's manifest; with yes, back the copy up and replace it."""
+    import difflib
+    text, source = fetch_hq_manifest()
+    old = path.read_text() if path.exists() else ""
+    if old == text:
+        print(f"{path} already matches {source}")
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(text)
+        load_manifest(tmp)  # main's must load with this tool before it replaces a working copy
+        print("".join(difflib.unified_diff(old.splitlines(True), text.splitlines(True), os.fspath(path), source)),
+              end="")
+        if not yes:
+            print(f"dry run: rerun with --yes to write {path} (the copy is backed up first)")
+            return 0
+        if old:
+            backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}")
+            fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as out:
+                out.write(old)
+            print(f"backed up {path} to {backup}")
+        os.replace(tmp, path)
+        print(f"wrote {path} from {source}")
+        return 0
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
 def candidate_pin(candidate: dict[str, str]) -> dict[str, str]:
     return {k: candidate[k] for k in ("source", "sha256", "run", "artifact", "repo", "expires") if k in candidate}
 
@@ -4227,16 +4359,19 @@ def read_observed(path: Path) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("observe", "check", "plan", "apply", "preflight", "fix", "sudo-plan",
-                                            "share", "onboard", "repair", "upgrade", "pools", "reserve", "borrow", "release"))
+                                            "share", "onboard", "repair", "upgrade", "pools", "reserve", "borrow", "release",
+                                            "manifest-sync"))
     parser.add_argument("names", nargs="*", metavar="HOST", help="hosts to act on (same as --host)")
-    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--manifest", type=Path, help="the fleet manifest (default ~/.config/glaeda/mini-fleet.json "
+                        "or $GLAEDA_MINI_FLEET_MANIFEST, compared with cmuxterm-hq main's on every run)")
     parser.add_argument("--host", action="append", dest="hosts")
     parser.add_argument("--observed", type=Path, help="reuse an observe output instead of probing")
     parser.add_argument("--out", type=Path, help="observe: also write the JSON here")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--output", choices=("text", "json"), default="text", help="preflight: output format")
     parser.add_argument("--yes", action="store_true",
-                        help="apply, fix, share, onboard, repair, upgrade, reserve, borrow, release: make changes instead of printing them")
+                        help="apply, fix, share, onboard, repair, upgrade, reserve, borrow, release, manifest-sync: "
+                             "make changes instead of printing them")
     parser.add_argument("--run", action="store_true", help="sudo-plan: run each host's plan over ssh -t")
     parser.add_argument("--ask-once", action="store_true",
                         help="sudo-plan --run: read the password once here, check it on every host, then run each "
@@ -4283,6 +4418,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.names:
         args.hosts = [*(args.hosts or []), *args.names]
     global PINNED_CANDIDATE, GLAEDA_REF
+    if args.command == "manifest-sync":
+        try:
+            return cmd_manifest_sync(args.manifest or DEFAULT_MANIFEST, args.yes)
+        except (Failure, OSError) as error:
+            print(f"glaeda-mini-fleet: manifest-sync: {error}", file=sys.stderr)
+            return 2
+    if args.manifest is None:
+        args.manifest = DEFAULT_MANIFEST
+        warning = manifest_staleness(args.manifest)
+        if warning:
+            print(f"glaeda-mini-fleet: warning: {warning}", file=sys.stderr, flush=True)
     try:
         if args.glaeda_ref is not None and not re.fullmatch(r"[0-9a-f]{40}", args.glaeda_ref):
             raise Failure("--glaeda-ref is a full commit id (40 lowercase hex)")
