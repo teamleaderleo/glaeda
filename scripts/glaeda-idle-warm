@@ -634,9 +634,11 @@ FUZZ_KEEP_BUILDS = 2
 FUZZ_KEEP_ENGINES = 2
 FUZZ_KEEP_QUIET_RUNS = 10  # runs without a finding
 FUZZ_KEEP_FINDING_RUNS = 30  # runs with one, until the collector files them; the oldest go first past this
-# Runs and staged builds add bytes (a catch-up rebuilds in place), so the fuzzer stays well above the runner's
-# 50 GiB admission floor: it must never be why a job is refused for disk.
-FUZZ_MIN_FREE_BYTES = 90 * 1024 ** 3
+# The fuzzer starts only above this mini's runner disk floor: the highest --min-free-gib of its job-started hooks
+# (glaeda-cmux-runner writes the manifest's defaults.disk.min_free_gib there), else the fleet default of 30 GiB
+# (cmuxterm-hq build-fleet/mini-fleet.json): one floor for the whole mini, not a second, higher one that idles the
+# fuzzer on a disk the runners still take jobs on (it was 90 GiB until 2026-10-03).
+FUZZ_DEFAULT_MIN_FREE_GIB = 30
 # Beside a compile: the compile keeps the cores it wants. The manual runs of 2026-09-28 used nice 10 beside PR
 # compiles on eight minis and saw no stall or hang the app did not also show alone.
 FUZZ_NICE = 10
@@ -913,6 +915,16 @@ def free_bytes(path: Path) -> int | None:
     return stat.f_bavail * stat.f_frsize
 
 
+def fuzz_min_free_bytes(hook: Any) -> int:
+    """The free disk the fuzzer needs: the highest --min-free-gib among this mini's runners, else
+    FUZZ_DEFAULT_MIN_FREE_GIB."""
+    floors = [0.0]
+    for runner in runner_dirs():
+        with contextlib.suppress(Exception):
+            floors.append(float(hook.runner_scope(runner).min_free_gib))
+    return int((max(floors) or FUZZ_DEFAULT_MIN_FREE_GIB) * 1024 ** 3)
+
+
 def watch(hook: Any, capacity: Path, ours: str, timeout_s: float) -> tuple[int | None, str]:
     """Wait for the fuzzer (_child); (its exit code or None, why it was stopped or '').
 
@@ -990,9 +1002,10 @@ def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
         return {**base, "state": "skip", "reason": "a trusted-only runner (a seeder) runs here: it only replays for "
                                                    "the collector, and no replay waits"}
     free = free_bytes(FLEET_DIR)
-    if not trusted and (free is None or free < FUZZ_MIN_FREE_BYTES):
+    floor = 0 if trusted else fuzz_min_free_bytes(hook)
+    if not trusted and (free is None or free < floor):
         return {**base, "state": "skip", "reason": f"{(free or 0) // 1024 ** 3} GiB free, the fuzzer needs "
-                                                   f"{FUZZ_MIN_FREE_BYTES // 1024 ** 3}"}
+                                                   f"{floor / 1024 ** 3:g}"}
     roots = main_roots(hook, roots_n, state)
     kept = {path.name: path for path in staged_builds()}
     newest = roots[0] if roots else None
