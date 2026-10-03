@@ -399,8 +399,32 @@ def stage(member: str, manifest: dict[str, Any], scratch: Path,
         run(["ssh", *SSH_OPTIONS, member, f"rm -f ~/{REMOTE_DIR}/scripts/{SOURCE_STAMP}"], 60)
     code, _, err = run(["scp", "-q", *SSH_OPTIONS, *files, f"{member}:{REMOTE_DIR}/scripts/"], 300)
     if code == 0:
+        # scp normally preserves executable bits, but an SSH implementation or a mounted
+        # home can discard them. The runner copy is ours, so repair the modes explicitly.
+        code, _, err = run(["ssh", *SSH_OPTIONS, member,
+                            f"chmod +x ~/{REMOTE_DIR}/scripts/glaeda-cmux-runner "
+                            f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner-hook "
+                            f"~/{REMOTE_DIR}/scripts/glaeda_fleet_labels.py "
+                            f"~/{REMOTE_DIR}/scripts/glaeda_reservation.py"], 60)
+    if code == 0:
         code, _, err = run(["scp", "-q", *SSH_OPTIONS, os.fspath(local), f"{member}:{REMOTE_DIR}/mini-fleet.json"], 60)
     return None if code == 0 else f"scp: {err.strip()[-200:]}"
+
+
+def prepare_headless(member: str, summary: dict[str, Any], manifest: dict[str, Any]) -> str | None:
+    """Converge the small operator fixes needed before a GUI-less AWS runner can start."""
+    host = (manifest.get("hosts") or {}).get(member) or {}
+    if host.get("gui") is not False or host.get("ssh_user") != "ec2-user":
+        return None
+    xcodes = summary.get("xcodeApps") or []
+    pinned = next((p for p in xcodes if str(p).startswith("/Applications/Xcode_") and str(p).endswith(".app")), None)
+    lines = ["set -eu", "if [ -x /opt/homebrew/bin/gh ]; then sudo -n /usr/bin/install -d -m 755 /usr/local/bin && sudo -n /bin/ln -sfn /opt/homebrew/bin/gh /usr/local/bin/gh; fi"]
+    if pinned:
+        q = _quote(str(pinned))
+        lines.append(f"if [ -d {q} ]; then sudo -n /bin/ln -sfn {q} /Applications/Xcode.app; sudo -n /usr/bin/xcode-select -s {q}/Contents/Developer; fi")
+    lines.append(f"chmod +x ~/{REMOTE_DIR}/scripts/* 2>/dev/null || true")
+    code, _, err = run(["ssh", *SSH_OPTIONS, member, "; ".join(lines)], 90)
+    return None if code == 0 else f"headless preparation failed: {err.strip()[-240:]}"
 
 
 def _uninstall_cmd(member: str, instance: int, apply: bool) -> str:
@@ -517,7 +541,13 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     if failed:
         row["action"] = f"stage failed: {failed}"
         return row
-    extra = ["--skip-launchctl"] if args.skip_launchctl else []
+    prepared = prepare_headless(member, summary, manifest)
+    if prepared:
+        row["action"] = f"prepare failed: {prepared}"
+        return row
+    extra = ["--headless"] if ((manifest.get("hosts") or {}).get(member) or {}).get("gui") is False else []
+    if args.skip_launchctl:
+        extra.append("--skip-launchctl")
     with concurrent.futures.ThreadPoolExecutor(max_workers=row["runners"]) as pool:
         results = list(pool.map(lambda k: apply_instance(member, k, args.repo, extra, args.org, args.group,
                                                          args.migrate_from_repo), range(row["runners"])))
