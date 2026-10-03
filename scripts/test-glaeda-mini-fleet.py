@@ -3543,6 +3543,164 @@ class ReserveReleaseTests(unittest.TestCase):
         self.assertEqual(target.read_text(), "keep")
 
 
+class ManifestFreshnessTests(unittest.TestCase):
+    """The default ~/.config/glaeda/mini-fleet.json is a copy of cmuxterm-hq build-fleet/mini-fleet.json on main;
+    a stale copy once made preflight report disk failures against a 100 GiB floor main had lowered to 30."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.local = self.dir / "mini-fleet.json"
+        self.main_text = EXAMPLE.read_text()
+        self.fetches = 0
+        patches = [mock.patch.object(mf, "DEFAULT_MANIFEST", self.local),
+                   mock.patch.object(mf, "fetch_hq_manifest", self.fetch)]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.obs = self.dir / "obs.json"
+        self.obs.write_text(json.dumps(observed(**{"build-mini-1": probe_text()})))
+
+    def fetch(self) -> tuple[str, str]:
+        self.fetches += 1
+        if isinstance(self.main_text, Exception):
+            raise self.main_text
+        return self.main_text, "manaflow-ai/cmuxterm-hq main"
+
+    def stale(self, floor: int = 100) -> str:
+        data = json.loads(EXAMPLE.read_text())
+        data["defaults"]["disk"]["min_free_gib"] = floor
+        text = json.dumps(data, indent=2) + "\n"
+        self.local.write_text(text)
+        old = time.time() - 8 * 86400
+        os.utime(self.local, (old, old))
+        return text
+
+    def run_main(self, *argv: str) -> tuple[int, str, str]:
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            code = mf.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def check(self) -> tuple[int, str, str]:
+        return self.run_main("check", "build-mini-1", "--observed", os.fspath(self.obs))
+
+    def test_a_stale_default_manifest_warns_with_the_difference_and_the_refresh_command(self) -> None:
+        self.stale()
+        _, out, err = self.check()
+        self.assertIn("hosts,", out, "the command still runs on the copy it has")
+        self.assertIn(f"{self.local} differs from manaflow-ai/cmuxterm-hq main", err)
+        self.assertIn("defaults.disk.min_free_gib: 100 -> 30", err)
+        self.assertIn("8 days ago", err)
+        self.assertIn("glaeda-mini-fleet manifest-sync --yes", err)
+        self.assertEqual(self.stale(), self.local.read_text(), "a warning never rewrites the copy")
+
+    def test_a_matching_default_manifest_is_silent(self) -> None:
+        self.local.write_text(self.main_text)
+        code, out, err = self.check()
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(err, "")
+        self.assertEqual(self.fetches, 1)
+
+    def test_formatting_alone_is_not_a_difference(self) -> None:
+        self.local.write_text(json.dumps(json.loads(self.main_text)))
+        self.assertEqual(self.check()[2], "")
+
+    def test_a_failed_fetch_degrades_to_a_warning(self) -> None:
+        self.local.write_text(self.main_text)
+        self.main_text = mf.Failure("gh api: could not resolve host; no cmuxterm-hq checkout")
+        code, out, err = self.check()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("ok", out)
+        self.assertIn(f"could not compare {self.local} with cmuxterm-hq main", err)
+        self.assertIn("could not resolve host", err)
+
+    def test_an_explicit_manifest_is_never_compared(self) -> None:
+        self.local.write_text(self.stale())
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            mf.main(["check", "build-mini-1", "--manifest", os.fspath(self.local), "--observed", os.fspath(self.obs)])
+        self.assertEqual((self.fetches, err.getvalue()), (0, ""))
+
+    def test_manifest_sync_dry_run_shows_the_diff_and_writes_nothing(self) -> None:
+        before = self.stale()
+        code, out, _ = self.run_main("manifest-sync")
+        self.assertEqual(code, 0)
+        self.assertIn('-      "min_free_gib": 100', out)
+        self.assertIn('+      "min_free_gib": 30', out)
+        self.assertIn("--yes", out)
+        self.assertEqual(self.local.read_text(), before)
+        self.assertEqual(list(self.dir.glob("mini-fleet.json.bak-*")), [])
+
+    def test_manifest_sync_writes_main_atomically_and_keeps_a_backup(self) -> None:
+        before = self.stale()
+        self.local.chmod(0o600)
+        code, out, err = self.run_main("manifest-sync", "--yes")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.local.read_text(), self.main_text)
+        self.assertEqual(self.local.stat().st_mode & 0o777, 0o600)
+        backups = list(self.dir.glob("mini-fleet.json.bak-*"))
+        self.assertEqual([b.read_text() for b in backups], [before])
+        self.assertEqual([p.name for p in self.dir.iterdir() if p.name.startswith(".")], [], "no temp file left")
+        self.assertEqual(self.check()[2], "", "in sync afterwards")
+        code, out, _ = self.run_main("manifest-sync", "--yes")
+        self.assertEqual(code, 0)
+        self.assertIn("already matches", out)
+        self.assertEqual(len(list(self.dir.glob("mini-fleet.json.bak-*"))), 1, "no backup when nothing changes")
+
+    def test_manifest_sync_creates_a_missing_copy(self) -> None:
+        code, out, err = self.run_main("manifest-sync", "--yes")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.local.read_text(), self.main_text)
+
+    def test_manifest_sync_refuses_an_invalid_main_or_a_failed_fetch(self) -> None:
+        before = self.stale()
+        self.main_text = json.dumps({"schema": "something-else"})
+        code, _, err = self.run_main("manifest-sync", "--yes")
+        self.assertEqual(code, 2)
+        self.assertIn("schema", err)
+        self.main_text = mf.Failure("gh api: HTTP 404")
+        code, _, err = self.run_main("manifest-sync", "--yes")
+        self.assertEqual(code, 2)
+        self.assertIn("HTTP 404", err)
+        self.assertEqual(self.local.read_text(), before)
+        self.assertEqual(list(self.dir.glob("mini-fleet.json.bak-*")), [])
+
+
+class HqManifestFetchTests(unittest.TestCase):
+    def test_falls_back_to_the_local_checkouts_origin_main_without_gh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "cmuxterm-hq"
+            (repo / "build-fleet").mkdir(parents=True)
+            (repo / "build-fleet" / "mini-fleet.json").write_text('{"on": "main"}\n')
+            git = ["git", "-C", os.fspath(repo), "-c", "user.email=t@t", "-c", "user.name=t"]
+            subprocess.run([*git, "init", "-q"], check=True)
+            subprocess.run([*git, "add", "-A"], check=True)
+            subprocess.run([*git, "commit", "-qm", "main"], check=True)
+            subprocess.run([*git, "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+            (repo / "build-fleet" / "mini-fleet.json").write_text('{"on": "a local edit"}\n')
+            with mock.patch.dict(os.environ, {"GLAEDA_HQ_CHECKOUT": os.fspath(repo)}), \
+                    mock.patch.object(mf.shutil, "which", return_value=None):
+                text, source = mf.fetch_hq_manifest()
+            self.assertEqual(text, '{"on": "main"}\n', "origin/main, not the working tree")
+            self.assertIn(f"{repo} origin/main", source)
+            with mock.patch.dict(os.environ, {"GLAEDA_HQ_CHECKOUT": os.fspath(Path(tmp) / "absent")}), \
+                    mock.patch.object(mf.shutil, "which", return_value=None):
+                with self.assertRaises(mf.Failure):
+                    mf.fetch_hq_manifest()
+
+    def test_asks_github_for_main_first(self) -> None:
+        done = subprocess.CompletedProcess([], 0, '{"from": "github"}\n', "")
+        with mock.patch.object(mf.shutil, "which", return_value="/usr/bin/gh"), \
+                mock.patch.object(mf.subprocess, "run", return_value=done) as run:
+            text, source = mf.fetch_hq_manifest()
+        self.assertEqual(text, '{"from": "github"}\n')
+        self.assertIn("manaflow-ai/cmuxterm-hq", source)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:2], ["/usr/bin/gh", "api"])
+        self.assertIn("repos/manaflow-ai/cmuxterm-hq/contents/build-fleet/mini-fleet.json?ref=main", argv)
+        self.assertTrue(run.call_args.kwargs.get("timeout"))
+
+
 class ReservationScriptShapeTests(unittest.TestCase):
     def test_scripts_parse_as_bash(self) -> None:
         for script in (mf.READ_RESERVATION, mf.WRITE_RESERVATION, mf.REMOVE_RESERVATION):

@@ -596,6 +596,29 @@ class FuzzTest(Base):
         self.assertFalse((request / ".done").exists(), "asked again next tick")
         self.assertEqual(warm.pending_replay(), request)
 
+    def test_the_fuzzer_keeps_the_runners_disk_floor(self) -> None:
+        # The fleet job floor (cmuxterm-hq build-fleet/mini-fleet.json defaults.disk.min_free_gib) is 30 GiB: the
+        # fuzzer stops where the runners stop, not 60 GiB above them.
+        runners: list[Path] = []
+        self.saved["runner_dirs"] = warm.runner_dirs
+        warm.runner_dirs = lambda: list(runners)
+        self.assertEqual(warm.fuzz_min_free_bytes(hook), 30 * 1024 ** 3, "no runner floor: the fleet default")
+        runners.append(self.runner("actions-runner-glaeda", "--capacity-units 4 --canonical-roots 2"))
+        self.assertEqual(warm.fuzz_min_free_bytes(hook), 30 * 1024 ** 3, "a runner without --min-free-gib")
+        runners.append(self.runner("actions-runner-glaeda-1", "--min-free-gib 30 --capacity-units 4"))
+        self.assertEqual(warm.fuzz_min_free_bytes(hook), 30 * 1024 ** 3)
+        runners.append(self.runner("actions-runner-glaeda-2", "--min-free-gib 45 --capacity-units 4"))
+        self.assertEqual(warm.fuzz_min_free_bytes(hook), 45 * 1024 ** 3, "the highest floor of this mini's runners")
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_fuzzes_down_to_the_30_gib_fleet_floor(self) -> None:
+        self.fuzz_setup()
+        warm.free_bytes = lambda path: 40 * 1024 ** 3
+        result = warm.fuzz(False, self.state)
+        self.assertEqual(result.get("would"), f"fuzz main {self.head[:12]}", result)
+        warm.free_bytes = lambda path: 25 * 1024 ** 3
+        self.assertEqual(warm.fuzz(False, self.state)["reason"], "25 GiB free, the fuzzer needs 30")
+
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
     def test_never_beside_a_gui_job_a_reservation_or_without_a_main_build(self) -> None:
         stub = self.fuzz_setup()
