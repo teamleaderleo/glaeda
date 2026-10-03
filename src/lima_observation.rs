@@ -39,6 +39,7 @@ pub enum LimaObservationRefusalCode {
     CommandIdentityMismatch,
     UnboundedOutput,
     MissingInstanceEvidence,
+    UnexpectedInstanceEvidence,
     DuplicateInstanceEvidence,
     MalformedInstanceEvidence,
     AliasedEvidence,
@@ -435,6 +436,117 @@ impl LimaObservationAdapter {
                 private_evidence: evidence,
             }),
             Err(problem) => Err(LimaObservationFailure::from_problem(problem, evidence)),
+        }
+    }
+
+    /// Prove that one exact named instance is absent using two strict `limactl list` observations.
+    ///
+    /// This crate-private primitive is inventory evidence only. It retains no filesystem source
+    /// ancestry and grants no create, adoption, lifecycle, guest, or cleanup authority. A
+    /// higher-level kind-specific owner must combine it with its own held source/locator proof.
+    pub(crate) fn observe_named_absence(
+        &self,
+        request: &LimaObservationRequest,
+        executor: &impl CommandExecutor,
+        clock: &impl LimaObservationClock,
+    ) -> Result<LimaInstanceAbsenceObservation, LimaObservationFailure> {
+        let mut evidence = LimaObservationPrivateEvidence::default();
+        let result = self.observe_named_absence_inner(request, executor, clock, &mut evidence);
+        match result {
+            Ok(timing) => Ok(LimaInstanceAbsenceObservation {
+                timing,
+                private_evidence: evidence,
+            }),
+            Err(problem) => Err(LimaObservationFailure::from_problem(problem, evidence)),
+        }
+    }
+
+    fn observe_named_absence_inner(
+        &self,
+        request: &LimaObservationRequest,
+        executor: &impl CommandExecutor,
+        clock: &impl LimaObservationClock,
+        evidence: &mut LimaObservationPrivateEvidence,
+    ) -> Result<LimaObservationTiming, ObservationProblem> {
+        let started_at_unix_seconds = clock.unix_seconds().map_err(|_| {
+            ObservationProblem::new(
+                LimaObservationRefusalCode::ClockFailure,
+                LimaObservationPhase::Freshness,
+                "the Lima absence observation start time could not be recorded",
+            )
+        })?;
+
+        self.observe_one_named_absence(request, executor, evidence)?;
+        self.observe_one_named_absence(request, executor, evidence)?;
+
+        let observed_at_unix_seconds = clock.unix_seconds().map_err(|_| {
+            ObservationProblem::new(
+                LimaObservationRefusalCode::ClockFailure,
+                LimaObservationPhase::Freshness,
+                "the Lima absence observation completion time could not be recorded",
+            )
+        })?;
+        let duration_seconds = observed_at_unix_seconds
+            .checked_sub(started_at_unix_seconds)
+            .ok_or_else(|| {
+                ObservationProblem::new(
+                    LimaObservationRefusalCode::ClockFailure,
+                    LimaObservationPhase::Freshness,
+                    "the Lima absence observation clock moved backwards",
+                )
+            })?;
+        if duration_seconds > request.max_age_seconds {
+            return Err(ObservationProblem::new(
+                LimaObservationRefusalCode::StaleObservation,
+                LimaObservationPhase::Freshness,
+                "the Lima absence observation exceeded its reviewed freshness window",
+            ));
+        }
+        let expires_at_unix_seconds = observed_at_unix_seconds
+            .checked_add(request.max_age_seconds)
+            .ok_or_else(|| {
+                ObservationProblem::new(
+                    LimaObservationRefusalCode::ClockFailure,
+                    LimaObservationPhase::Freshness,
+                    "the Lima absence observation expiry time could not be represented",
+                )
+            })?;
+
+        Ok(LimaObservationTiming {
+            started_at_unix_seconds,
+            observed_at_unix_seconds,
+            expires_at_unix_seconds,
+            duration_seconds,
+            freshness: LimaObservationFreshness::Fresh,
+        })
+    }
+
+    fn observe_one_named_absence(
+        &self,
+        request: &LimaObservationRequest,
+        executor: &impl CommandExecutor,
+        evidence: &mut LimaObservationPrivateEvidence,
+    ) -> Result<(), ObservationProblem> {
+        match self.run_instance_command(
+            executor,
+            evidence,
+            LimaObservationPhase::InstanceObservation,
+            self.list_command(request),
+            request.instance.as_str(),
+        ) {
+            Err(problem) if problem.code == LimaObservationRefusalCode::MissingInstanceEvidence => {
+                Ok(())
+            }
+            Err(problem) => Err(problem),
+            Ok(output) => {
+                let raw = parse_instance_output(&output)?;
+                validate_instance_evidence(request, raw)?;
+                Err(ObservationProblem::new(
+                    LimaObservationRefusalCode::UnexpectedInstanceEvidence,
+                    LimaObservationPhase::InstanceObservation,
+                    "the exact requested Lima instance is already present",
+                ))
+            }
         }
     }
 
@@ -970,6 +1082,31 @@ pub struct LimaInstanceObservation {
     public: LimaInstanceObservationReport,
     #[serde(skip)]
     private_evidence: LimaObservationPrivateEvidence,
+}
+
+/// Strict external evidence that one exact named Lima instance was absent twice in one bounded
+/// observation window. This value deliberately carries no held source descriptor or authority.
+pub(crate) struct LimaInstanceAbsenceObservation {
+    timing: LimaObservationTiming,
+    private_evidence: LimaObservationPrivateEvidence,
+}
+
+impl LimaInstanceAbsenceObservation {
+    #[must_use]
+    pub(crate) const fn timing(&self) -> &LimaObservationTiming {
+        &self.timing
+    }
+}
+
+impl fmt::Debug for LimaInstanceAbsenceObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LimaInstanceAbsenceObservation")
+            .field("timing", &self.timing)
+            .field("command_count", &self.private_evidence.commands.len())
+            .field("private_evidence", &REDACTED_PRIVATE_EVIDENCE)
+            .finish()
+    }
 }
 
 impl LimaInstanceObservation {
