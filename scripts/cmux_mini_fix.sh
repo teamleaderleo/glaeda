@@ -242,9 +242,9 @@ runner_plist() {  # DIR: the runner's LaunchAgent or headless LaunchDaemon, or f
   elif [ -z "$plist" ] && [[ "$base" =~ ^actions-runner-glaeda-([0-9]+)$ ]]; then  # --instance K
     plist="$HOME/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.${BASH_REMATCH[1]}.plist"
   fi
-  if [ -z "$plist" ] && [ "$base" = actions-runner-glaeda ]; then
+  if { [ -z "$plist" ] || [ ! -f "$plist" ]; } && [ "$base" = actions-runner-glaeda ]; then
     plist="/Library/LaunchDaemons/com.teamleaderleo.glaeda.cmux-runner.plist"
-  elif [ -z "$plist" ] && [[ "$base" =~ ^actions-runner-glaeda-([0-9]+)$ ]]; then
+  elif { [ -z "$plist" ] || [ ! -f "$plist" ]; } && [[ "$base" =~ ^actions-runner-glaeda-([0-9]+)$ ]]; then
     plist="/Library/LaunchDaemons/com.teamleaderleo.glaeda.cmux-runner.${BASH_REMATCH[1]}.plist"
   fi
   [ -n "$plist" ] && [ -f "$plist" ] || return 1
