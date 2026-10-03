@@ -89,6 +89,7 @@ build output or copies. Nested or unverifiable checkouts stay protected.
 from __future__ import annotations
 
 import argparse
+import atexit
 import bisect
 import calendar
 import contextlib
@@ -116,6 +117,8 @@ MEASURE_LOCK = HOME / ".cache/glaeda-disk/measure.lock"
 ACCOUNTING = HOME / ".cache/glaeda-disk/accounting.json"
 HEALTH_SUMMARY = HOME / ".local/state/glaeda/disk/summary.json"
 EVICT_LOCK = HOME / ".cache/glaeda-disk/evict.lock"  # one --apply at a time (the runner hooks and the LaunchAgent)
+EVICT_OWNER = HOME / ".cache/glaeda-disk/evict.owner.json"
+EVICT_OWNER_STALE_S = 30 * 60
 # Items a nested_git family kept for a git loss, so a dead session with unpushed work is not
 # re-walked every run. Only keep verdicts are cached: a stale entry can delay a deletion, never cause one.
 NESTED_KEEP = HOME / ".cache/glaeda-disk/nested-keep.json"
@@ -132,6 +135,16 @@ DARWIN = platform.system() == "Darwin"
 # zero-byte reclaim candidate.
 DU_TIMEOUT_S = 30
 DU_KILL_GRACE_S = 1
+EVICTION_STUCK: list[dict[str, Any]] = []
+_EVICT_HANDLE = None
+
+# Never ask du to enumerate the data volume. These are the bounded roots that account for
+# runner work and rebuildable state on a mini. Cloud/FileProvider placeholders can block in
+# the kernel while opening a directory, so they are excluded before a walk starts.
+MEASURE_SKIP_COMPONENTS = frozenset({
+    "FileProvider", "CloudStorage", "Mobile Documents", ".DocumentRevisions-V100",
+    "com.apple.FileProvider", "com.apple.CloudDocs",
+})
 
 
 @dataclass(frozen=True)
@@ -942,7 +955,11 @@ def darwin_user_tmp() -> Path | None:
     It is not /private/tmp, so scratch that tools create with mktemp or tempfile lands here
     unseen: 14.5 GiB of throwaway cmux copies and build traces sat in it on Air Blue (2026-09-25).
     """
-    out = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True)
+    try:
+        out = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True,
+                             timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
     value = out.stdout.strip() if out.returncode == 0 else ""
     if not value:
         return None
@@ -1087,6 +1104,60 @@ class Item:
     jobs_since: int | None = None  # host CI jobs started since its last use (activity_due), when counted
 
 
+def _record_eviction_stuck(argv: list[str]) -> None:
+    path = str(argv[-1]) if argv else "unknown"
+    EVICTION_STUCK.append({"id": "eviction_stuck", "severity": "error", "path": path,
+                           "evidence": f"du timed out after {DU_TIMEOUT_S}s",
+                           "auto_fix": "pending"})
+
+
+def _measurement_path_allowed(path: Path) -> bool:
+    """Reject the volume root and known privacy/FileProvider trees before invoking du."""
+    try:
+        absolute = Path(os.path.abspath(path))
+    except (OSError, ValueError):
+        return False
+    if absolute == Path("/") or any(part in MEASURE_SKIP_COMPONENTS for part in absolute.parts):
+        return False
+    try:
+        st = absolute.stat()
+    except OSError:
+        return False
+    # Newer macOS exposes a dataless flag on some FileProvider placeholders.  Python's
+    # stat module does not define it on every SDK, so probe the platform value when present.
+    dataless = getattr(stat, "UF_DATALESS", 0)
+    return not bool(getattr(st, "st_flags", 0) & dataless)
+
+
+def fixed_measurement_roots() -> list[Path]:
+    """Return only bounded, rebuildable roots used for volume accounting.
+
+    This deliberately does not include ``/``: FileProvider and other privacy-protected
+    directories can block a recursive fts walk in the kernel for hours.
+    """
+    candidates: list[Path] = [
+        FLEET_ROOT,
+        HOME / "cmux-browser-fleet",
+        HOME / "Library/Caches",
+        HOME / "Library/Developer/Xcode/DerivedData",
+        HOME / "Library/Developer/CoreSimulator",
+        HOME / ".cache",
+    ]
+    candidates.extend(sorted(HOME.glob("actions-runner*/_work")))
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        resolved = Path(os.path.abspath(path))
+        key = os.fspath(resolved)
+        if key in seen or resolved == Path("/") or any(part in MEASURE_SKIP_COMPONENTS for part in resolved.parts):
+            continue
+        seen.add(key)
+        # Keep configured roots in the list even before the directory is created; accounting
+        # will simply skip a missing root, and tests can substitute a bounded fake root.
+        roots.append(resolved)
+    return roots
+
+
 def _du_output(argv: list[str]) -> str | None:
     """Run one du walk with a killable process group; None means the tree is unsized."""
     try:
@@ -1107,6 +1178,7 @@ def _du_output(argv: list[str]) -> str | None:
                 os.killpg(proc.pid, signal.SIGKILL)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.communicate(timeout=DU_KILL_GRACE_S)
+            _record_eviction_stuck(argv)
             return None
     except OSError:
         return None
@@ -1116,6 +1188,8 @@ def _du_output(argv: list[str]) -> str | None:
 
 
 def du_bytes(path: Path) -> int | None:
+    if not _measurement_path_allowed(path):
+        return None
     out = _du_output(["du", "-xsk", str(path)])
     if out is None:
         return None
@@ -1130,6 +1204,8 @@ BULK_SIZE_MIN = 64  # unsized candidates in a bulk_sizes family before one walk 
 
 def du_children(root: Path) -> dict[str, int] | None:
     """Sizes of every directory directly below root from a single walk, keyed like candidates."""
+    if not _measurement_path_allowed(root):
+        return None
     out = _du_output(["du", "-xk", "-d", "1", str(root)])
     if out is None:
         return None
@@ -2709,8 +2785,20 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
             top = hit.get("top_level") if isinstance(hit.get("top_level"), list) else []
             top_at = float(hit.get("at", 0))
         else:
-            top_map = du_children(Path(fs.mount))
-            if top_map is None:
+            # Account only bounded, known-heavy roots.  In particular, never call du on the
+            # filesystem mount itself: ``du -d1 /`` can enter a FileProvider/TCC directory and
+            # block in the kernel while holding the eviction lock.
+            top_map: dict[str, int] = {}
+            for root in fixed_measurement_roots():
+                try:
+                    if root.stat().st_dev != fs.dev or not _measurement_path_allowed(root):
+                        continue
+                except OSError:
+                    continue
+                size = du_bytes(root)
+                if size is not None:
+                    top_map[str(root)] = size
+            if not top_map:
                 # Keep a prior complete reading, if any, but leave its timestamp old so a later
                 # report retries.  An unsized root must not erase accounting or look fresh.
                 top = hit.get("top_level") if hit and isinstance(hit.get("top_level"), list) else []
@@ -2754,6 +2842,7 @@ def write_health_summary(fss: list[Fs], items: list[Item], accounting: list[dict
         HEALTH_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
         payload = {"schema": "glaeda-disk/v1", "at": int(time.time()),
                    "reclaimable": sum(i.bytes for i in items if i.verdict == "reclaimable"),
+                   "findings": list(EVICTION_STUCK),
                    "accounting": [dict(x) for x in accounting],
                    "filesystems": [{"mount": x.mount, "free": x.free, "total": x.total,
                                     "under": x.under} for x in fss]}
@@ -2762,6 +2851,111 @@ def write_health_summary(fss: list[Fs], items: list[Item], accounting: list[dict
         os.replace(tmp, HEALTH_SUMMARY)
     except OSError:
         pass
+
+
+def _owner_command(pid: int) -> str:
+    try:
+        result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True,
+                                text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip()
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _take_over_stale_evict_owner() -> bool:
+    """Stop only an identified, stale glaeda-disk owner so a lost lock cannot wedge evictions."""
+    try:
+        owner = json.loads(EVICT_OWNER.read_text())
+        pid = int(owner.get("pid", 0))
+        started = float(owner.get("started_at", 0))
+    except (OSError, ValueError, TypeError):
+        return False
+    if pid == os.getpid() or not started or time.time() - started < EVICT_OWNER_STALE_S:
+        return False
+    if not _pid_alive(pid):
+        # A dead owner has already released flock; retrying the acquisition is sufficient.
+        return True
+    command = _owner_command(pid)
+    if "glaeda-disk" not in command:
+        return False
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and _pid_alive(pid):
+        time.sleep(0.05)
+    if _pid_alive(pid):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+    return True
+
+
+def _write_evict_owner() -> None:
+    EVICT_OWNER.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"schema": "glaeda-disk/evict-owner/v1", "pid": os.getpid(),
+               "started_at": time.time(), "command": " ".join(sys.argv)}
+    tmp = EVICT_OWNER.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, separators=(",", ":")))
+    os.replace(tmp, EVICT_OWNER)
+
+
+def acquire_evict_lock():
+    """Acquire the eviction lock and publish an owner record for stale-lock recovery."""
+    global _EVICT_HANDLE
+    EVICT_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    handle = EVICT_LOCK.open("a")
+    with contextlib.suppress(OSError):
+        fcntl.fcntl(handle.fileno(), fcntl.F_SETFD,
+                    fcntl.fcntl(handle.fileno(), fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
+    for attempt in range(2):
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _write_evict_owner()
+            _EVICT_HANDLE = handle
+            return handle
+        except BlockingIOError:
+            if attempt == 0 and _take_over_stale_evict_owner():
+                time.sleep(0.05)
+                continue
+            handle.close()
+            return None
+    handle.close()
+    return None
+
+
+def release_evict_lock(handle) -> None:
+    global _EVICT_HANDLE
+    if handle is None:
+        return
+    try:
+        try:
+            owner = json.loads(EVICT_OWNER.read_text())
+        except (OSError, ValueError, TypeError):
+            owner = {}
+        if int(owner.get("pid", -1)) == os.getpid():
+            EVICT_OWNER.unlink(missing_ok=True)
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        handle.close()
+        if _EVICT_HANDLE is handle:
+            _EVICT_HANDLE = None
+
+
+def _release_evict_lock_at_exit() -> None:
+    if _EVICT_HANDLE is not None:
+        release_evict_lock(_EVICT_HANDLE)
+
+
+atexit.register(_release_evict_lock_at_exit)
 
 
 def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
@@ -2988,7 +3182,7 @@ def clone_over(canonical: str, target: str, expect: list[int],
         return False
     tmp = os.path.join(os.path.dirname(target), f".{os.path.basename(target)}.glaeda-clone-{os.getpid()}")
     try:
-        subprocess.run(["/bin/cp", "-c", canonical, tmp], check=True, capture_output=True)
+        subprocess.run(["/bin/cp", "-c", canonical, tmp], check=True, capture_output=True, timeout=60)
         os.chmod(tmp, stat.S_IMODE(st.st_mode))
         os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
         if _file_key(os.lstat(target)) != expect:
@@ -3063,7 +3257,7 @@ def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
                 if ok:
                     new_state[target] = {"key": _file_key(os.lstat(target)), "sha": sha,
                                          "cloned": True}
-            except (OSError, subprocess.CalledProcessError):
+            except (OSError, subprocess.SubprocessError):
                 ok = False
                 new_state.pop(target, None)  # vanished or unreadable; rehash next run
             if ok:
@@ -3199,12 +3393,10 @@ def main(argv: list[str] | None = None) -> int:
             print(why)
             return 0
     if a.apply:
-        # a second eviction would only race the first for the same items; its caller re-reads free space instead
-        EVICT_LOCK.parent.mkdir(parents=True, exist_ok=True)
-        evict_lock = EVICT_LOCK.open("a")  # held until this process exits
-        try:
-            fcntl.flock(evict_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        # A second eviction would only race the first for the same items; its caller re-reads free
+        # space instead.  The owner record lets a later run recover from a daemon that died while
+        # its lock descriptor remained open.
+        if acquire_evict_lock() is None:
             print("another eviction running; skipped")
             return 0
     idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else 24)
@@ -3292,6 +3484,7 @@ def main(argv: list[str] | None = None) -> int:
             apply_runtimes(tooling, a.receipt, host_busy)
             IDLE_STAMP.parent.mkdir(parents=True, exist_ok=True)
             IDLE_STAMP.touch()
+        release_evict_lock(_EVICT_HANDLE)
     return 0
 
 

@@ -74,6 +74,44 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertIsNone(gd.du_children(self.root))
         self.assertEqual(killpg.call_count, 2)
         self.assertTrue(all(call.args[1] == gd.signal.SIGKILL for call in killpg.call_args_list))
+        self.assertEqual(gd.EVICTION_STUCK[-1]["id"], "eviction_stuck")
+        self.assertIn(str(self.root), gd.EVICTION_STUCK[-1]["path"])
+
+    def test_du_root_walk_refuses_filesystem_root(self) -> None:
+        with mock.patch.object(gd, "_du_output") as run:
+            self.assertIsNone(gd.du_children(Path("/")))
+        run.assert_not_called()
+
+    def test_fixed_measurement_roots_skip_fileprovider_and_root(self) -> None:
+        saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME = self.root
+        gd.FLEET_ROOT = self.root / "shared"
+        gd.DARWIN = True
+        try:
+            roots = gd.fixed_measurement_roots()
+            self.assertTrue(roots)
+            self.assertNotIn(Path("/"), roots)
+            self.assertFalse(any("FileProvider" in p.parts for p in roots))
+            self.assertIn(gd.FLEET_ROOT, roots)
+        finally:
+            gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
+
+    def test_eviction_lock_owner_is_recorded_and_released(self) -> None:
+        lock_path, owner_path = gd.EVICT_LOCK, gd.EVICT_OWNER
+        gd.EVICT_LOCK = self.root / "evict.lock"
+        gd.EVICT_OWNER = self.root / "evict.owner.json"
+        try:
+            handle = gd.acquire_evict_lock()
+            self.assertIsNotNone(handle)
+            self.assertEqual(json.loads(gd.EVICT_OWNER.read_text())["pid"], os.getpid())
+            gd.release_evict_lock(handle)
+            self.assertFalse(gd.EVICT_OWNER.exists())
+            with gd.EVICT_LOCK.open("a") as other:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            gd.EVICT_LOCK = lock_path
+            gd.EVICT_OWNER = owner_path
+            gd._LIVE_REFERENCES.clear()
 
     def test_timed_out_bulk_walk_does_not_cache_zero_sizes(self) -> None:
         self.fam = gd.Family("user-tmp", self.root, True, "scratch", bulk_sizes=True)
@@ -616,18 +654,19 @@ class GlaedaDiskTest(unittest.TestCase):
     def test_accounting_reports_df_space_outside_measured_items(self) -> None:
         path = self.root / "known"
         path.write_bytes(b"x")
-        fs = gd.Fs(path.stat().st_dev, "/volume", 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
+        fs = gd.Fs(path.stat().st_dev, str(self.root), 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
         item = gd.Item("xcode-derived-data", str(path), 3 * gd.GIB, 2.0, "report-only")
         saved = (gd.DARWIN, gd.ACCOUNTING)
         gd.DARWIN, gd.ACCOUNTING = True, self.root / "accounting.json"
         gd._ACCOUNTING_MEM.clear()
         self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
                                   gd._ACCOUNTING_MEM.clear()))
-        with mock.patch.object(gd, "du_children", return_value={"/volume/ci": 8 * gd.GIB}):
+        with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB):
             got = gd.filesystem_accounting([fs], [item])
         self.assertEqual(got[0]["measured"], 3 * gd.GIB)
         self.assertEqual(got[0]["unmeasured"], 5 * gd.GIB)
-        self.assertEqual(got[0]["top_level"][0]["path"], "/volume/ci")
+        self.assertEqual(got[0]["top_level"][0]["path"], str(self.root))
 
     def test_accounting_does_not_double_count_nested_items(self) -> None:
         parent = self.root / "parent"
@@ -648,17 +687,18 @@ class GlaedaDiskTest(unittest.TestCase):
     def test_accounting_cache_keeps_walk_timestamp_until_walk_is_due(self) -> None:
         path = self.root / "known"
         path.write_bytes(b"x")
-        fs = gd.Fs(path.stat().st_dev, "/volume", 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
+        fs = gd.Fs(path.stat().st_dev, str(self.root), 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
         saved = (gd.DARWIN, gd.ACCOUNTING)
         gd.DARWIN, gd.ACCOUNTING = True, self.root / "accounting-cache.json"
         gd._ACCOUNTING_MEM.clear()
         self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
                                   gd._ACCOUNTING_MEM.clear()))
-        with mock.patch.object(gd, "du_children", return_value={"/volume/ci": 8 * gd.GIB}):
+        with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB):
             gd.filesystem_accounting([fs], [])
         first = json.loads(gd.ACCOUNTING.read_text())[str(fs.dev)]["at"]
         gd._ACCOUNTING_MEM.clear()
-        with mock.patch.object(gd, "du_children", side_effect=AssertionError("cache should be used")):
+        with mock.patch.object(gd, "fixed_measurement_roots", side_effect=AssertionError("cache should be used")):
             gd.filesystem_accounting([fs], [])
         second = json.loads(gd.ACCOUNTING.read_text())[str(fs.dev)]["at"]
         self.assertEqual(second, first)
