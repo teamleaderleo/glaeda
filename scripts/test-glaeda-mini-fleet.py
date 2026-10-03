@@ -3554,15 +3554,21 @@ class ManifestFreshnessTests(unittest.TestCase):
         self.local = self.dir / "mini-fleet.json"
         self.main_text = EXAMPLE.read_text()
         self.fetches = 0
+        self.tty = True
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("GLAEDA_MINI_FLEET_MANIFEST", "GLAEDA_MINI_FLEET_SKIP_HQ_CHECK")}
         patches = [mock.patch.object(mf, "DEFAULT_MANIFEST", self.local),
-                   mock.patch.object(mf, "fetch_hq_manifest", self.fetch)]
+                   mock.patch.object(mf, "fetch_hq_manifest", self.fetch),
+                   mock.patch.object(mf, "STATE_DIR", self.dir / "state"),
+                   mock.patch.object(mf, "stderr_is_tty", lambda: self.tty),
+                   mock.patch.dict(os.environ, env, clear=True)]
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
         self.obs = self.dir / "obs.json"
         self.obs.write_text(json.dumps(observed(**{"build-mini-1": probe_text()})))
 
-    def fetch(self) -> tuple[str, str]:
+    def fetch(self, *args: object) -> tuple[str, str]:
         self.fetches += 1
         if isinstance(self.main_text, Exception):
             raise self.main_text
@@ -3623,8 +3629,12 @@ class ManifestFreshnessTests(unittest.TestCase):
 
     def test_manifest_sync_dry_run_shows_the_diff_and_writes_nothing(self) -> None:
         before = self.stale()
-        code, out, _ = self.run_main("manifest-sync")
+        listing = sorted(p.name for p in self.dir.iterdir())
+        with mock.patch.object(mf.os, "open", side_effect=AssertionError("a dry run opens nothing for writing")), \
+                mock.patch.object(mf.os, "replace", side_effect=AssertionError("a dry run replaces nothing")):
+            code, out, _ = self.run_main("manifest-sync")
         self.assertEqual(code, 0)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), listing)
         self.assertIn('-      "min_free_gib": 100', out)
         self.assertIn('+      "min_free_gib": 30', out)
         self.assertIn("--yes", out)
@@ -3666,7 +3676,95 @@ class ManifestFreshnessTests(unittest.TestCase):
         self.assertEqual(list(self.dir.glob("mini-fleet.json.bak-*")), [])
 
 
+    def test_only_an_operator_at_a_terminal_is_checked(self) -> None:
+        self.stale()
+        self.tty = False
+        self.assertEqual(self.check()[2], "", "a script reading stderr (glaeda-route's tick) is never slowed")
+        self.tty = True
+        for argv in (["pools", "build-mini-1", "--observed", os.fspath(self.obs)],
+                     ["check", "build-mini-1", "--observed", os.fspath(self.obs), "--json"],
+                     ["preflight", "build-mini-1", "--observed", os.fspath(self.obs), "--output", "json"]):
+            self.assertNotIn("differs from", self.run_main(*argv)[2], argv)
+        self.assertEqual(self.fetches, 0, "pools and JSON output never compare")
+
+    def test_the_opt_out_and_the_environment_manifest_skip_the_check(self) -> None:
+        self.stale()
+        with mock.patch.dict(os.environ, {"GLAEDA_MINI_FLEET_SKIP_HQ_CHECK": "1"}):
+            self.assertEqual(self.check()[2], "")
+        with mock.patch.dict(os.environ, {"GLAEDA_MINI_FLEET_MANIFEST": os.fspath(self.local)}):
+            self.assertEqual(self.check()[2], "", "the environment names the manifest explicitly")
+        self.assertEqual(self.fetches, 0)
+
+    def test_the_result_is_cached_for_an_hour_per_copy(self) -> None:
+        self.stale()
+        first = self.check()[2]
+        self.assertIn("differs from", first)
+        self.assertEqual(self.check()[2], first, "the cached verdict still warns")
+        self.assertEqual(self.fetches, 1)
+        cache = next((self.dir / "state").glob("hq-manifest-check*.json"))
+        record = json.loads(cache.read_text())
+        record["checked_at"] -= 3601
+        cache.write_text(json.dumps(record))
+        self.check()
+        self.assertEqual(self.fetches, 2, "an hour-old verdict is fetched again")
+        self.local.write_text(self.main_text)
+        self.assertEqual(self.check()[2], "", "a changed copy is compared again")
+        self.assertEqual(self.fetches, 3)
+
+    def test_a_failed_fetch_is_cached_too(self) -> None:
+        self.local.write_text(self.main_text)
+        self.main_text = mf.Failure("gh api: timed out")
+        self.assertIn("could not compare", self.check()[2])
+        self.assertIn("could not compare", self.check()[2])
+        self.assertEqual(self.fetches, 1, "offline, the budget is spent once an hour, not on every run")
+
+    def test_manifest_sync_refuses_a_symlinked_copy(self) -> None:
+        target = self.dir / "real.json"
+        target.write_text(self.stale())
+        self.local.unlink()
+        self.local.symlink_to(target)
+        before = target.read_text()
+        code, _, err = self.run_main("manifest-sync", "--yes")
+        self.assertEqual(code, 2)
+        self.assertIn("is a symlink", err)
+        self.assertIn(os.fspath(target), err)
+        self.assertTrue(self.local.is_symlink())
+        self.assertEqual(target.read_text(), before)
+
+    def test_manifest_sync_reports_any_load_error_without_a_traceback(self) -> None:
+        before = self.stale()
+        broken = json.loads(self.main_text)
+        broken["hosts"] = ["not", "a", "mapping"]
+        self.main_text = json.dumps(broken)
+        code, _, err = self.run_main("manifest-sync", "--yes")
+        self.assertEqual(code, 2)
+        self.assertIn("glaeda-mini-fleet: manifest-sync:", err)
+        self.assertEqual(self.local.read_text(), before)
+
+
 class HqManifestFetchTests(unittest.TestCase):
+    def test_gh_and_the_checkout_share_one_time_budget(self) -> None:
+        clock = [1000.0]
+        timeouts: list[float] = []
+
+        def slow(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+            timeouts.append(float(kwargs["timeout"]))
+            clock[0] += float(kwargs["timeout"])
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".git").mkdir()
+            with mock.patch.dict(os.environ, {"GLAEDA_HQ_CHECKOUT": tmp}), \
+                    mock.patch.object(mf.shutil, "which", return_value="/usr/bin/gh"), \
+                    mock.patch.object(mf.time, "monotonic", lambda: clock[0]), \
+                    mock.patch.object(mf.subprocess, "run", side_effect=slow):
+                with self.assertRaises(mf.Failure):
+                    mf.fetch_hq_manifest()
+        self.assertGreaterEqual(len(timeouts), 1)
+        self.assertLessEqual(sum(timeouts), mf.HQ_CHECK_BUDGET_S + 1e-6)
+        self.assertLessEqual(mf.HQ_CHECK_BUDGET_S, 10)
+
+
     def test_falls_back_to_the_local_checkouts_origin_main_without_gh(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "cmuxterm-hq"
