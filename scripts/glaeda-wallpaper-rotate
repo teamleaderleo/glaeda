@@ -10,7 +10,6 @@ the fleet operator owns the shared directory and its provenance.
 from __future__ import annotations
 
 import fcntl
-import base64
 import json
 import os
 import plistlib
@@ -29,12 +28,7 @@ STATE = Path(os.environ.get(
     str(Path.home() / "Library/Application Support/com.teamleaderleo.glaeda/wallpaper.json"),
 ))
 LOCK = STATE.with_suffix(".lock")
-IMAGE_OPTIONS = base64.b64decode(
-    "YnBsaXN0MDDRAQJWdmFsdWVz0gMEBRJVY29sb3JZcGxhY2VtZW500QMG0QcIUl8w0QMJ0goLDBFaY29tcG9uZW50c1pjb2xvclNwYWNl"
-    "pA0ODxAjP9BQUFBQUFAjP9paWlpaWlojP+VVVVVVVVUjP/AAAAAAAABPEENicGxpc3QwMF8QF2tDR0NvbG9yU3BhY2VHZW5lcmljUkdC"
-    "CAAAAAAAAAEBAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAi0RMUVnBpY2tldctHFdEWF1JpZFRDcm9wCAsSFx0nKi0wMzhDTlNcZW53vcDH"
-    "ys3QAAAAAAAAAQEAAAAAAAAAGAAAAAAAAAAAAAAAAAAAANU="
-)
+IMAGE_OPTIONS = plistlib.dumps({"values": {}}, fmt=plistlib.FMT_BINARY)
 
 
 def images() -> list[Path]:
@@ -48,12 +42,20 @@ def file_url(path: Path) -> str:
     return "file://" + quote(str(path), safe="/")
 
 
+def image_configuration(image: Path) -> bytes:
+    return plistlib.dumps(
+        {"type": "imageFile", "url": {"relative": file_url(image)}},
+        fmt=plistlib.FMT_BINARY,
+    )
+
+
 def set_choice(document: dict, image: Path) -> int:
     """Replace every desktop choice, including per-display and per-space entries."""
     changed = 0
     choice = {
         "Provider": "com.apple.wallpaper.choice.image",
-        "Files": [{"relative": file_url(image)}],
+        "Files": [],
+        "Configuration": image_configuration(image),
     }
 
     def apply_desktop(desktop: object) -> None:
@@ -63,15 +65,17 @@ def set_choice(document: dict, image: Path) -> int:
         content = desktop.get("Content")
         if not isinstance(content, dict):
             return
-        choices = content.get("Choices")
-        previous = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
         next_choice = dict(choice)
-        if previous and "Configuration" in previous:
-            next_choice["Configuration"] = previous["Configuration"]
         content["Choices"] = [next_choice]
-        # WallpaperAgent rejects a file choice with "$null" options on macOS 26.  This is
-        # the real encoded crop/color payload produced by the system's image picker.
-        content["EncodedOptionValues"] = IMAGE_OPTIONS
+        options = content.get("EncodedOptionValues")
+        if not isinstance(options, bytes):
+            options = IMAGE_OPTIONS
+        else:
+            try:
+                plistlib.loads(options)
+            except (plistlib.InvalidFileException, ValueError):
+                options = IMAGE_OPTIONS
+        content["EncodedOptionValues"] = options
         changed += 1
 
     def visit(node: object) -> None:
@@ -80,17 +84,18 @@ def set_choice(document: dict, image: Path) -> int:
                 for item in node:
                     visit(item)
             return
-        if isinstance(node.get("Linked"), dict) and "Content" in node["Linked"]:
+        if (not isinstance(node.get("Desktop"), dict)
+                and isinstance(node.get("Linked"), dict)
+                and "Content" in node["Linked"]):
             node["Desktop"] = node.pop("Linked")
         if isinstance(node.get("Desktop"), dict):
             apply_desktop(node["Desktop"])
-            if isinstance(node.get("Desktop"), dict) and isinstance(node["Desktop"].get("Content"), dict):
+            if isinstance(node["Desktop"].get("Content"), dict):
                 node["Type"] = "individual"
-        if "Content" in node:
-            apply_desktop(node)
-        for value in list(node.values()):
-            if value is not node.get("Desktop"):
-                visit(value)
+        for key, value in list(node.items()):
+            if key in {"Desktop", "Idle", "Content"}:
+                continue
+            visit(value)
 
     visit(document)
     return changed

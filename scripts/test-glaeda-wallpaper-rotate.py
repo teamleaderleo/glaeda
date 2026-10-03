@@ -24,10 +24,25 @@ class WallpaperRotateTests(unittest.TestCase):
             (images / "02-second.jpg").write_bytes(b"second")
             (images / "01-first.jpg").write_bytes(b"first")
             document = {
-                "AllSpacesAndDisplays": {"Linked": {"Content": {"Choices": [{"Provider": "aerial"}]}}},
-                "SystemDefault": {"Desktop": {"Content": {"Choices": [{"Provider": "image"}]}}},
-                "Displays": {"display-1": {"Desktop": {"Content": {"Choices": [{"Provider": "image"}]}}}},
-                "Spaces": {"space-1": {"Default": {"Desktop": {"Content": {"Choices": [{"Provider": "image"}]}}}}},
+                "AllSpacesAndDisplays": {
+                    "Linked": {"Content": {"Choices": [{"Provider": "aerial"}]}},
+                    "Idle": {"Content": {"Choices": [{"Provider": "screen-saver"}]}}},
+                "SystemDefault": {
+                    "Desktop": {"Content": {"Choices": [{"Provider": "image"}], "EncodedOptionValues": "$null"}},
+                    "Idle": {"Content": {"Choices": [{"Provider": "screen-saver"}]}}},
+                "Displays": {
+                    "display-1": {
+                        "Desktop": {
+                            "Content": {
+                                "Choices": [{"Provider": "image", "Configuration": b"old"}],
+                                "EncodedOptionValues": b"old",
+                            }},
+                        "Idle": {"Content": {"Choices": [{"Provider": "screen-saver"}]}}}},
+                "Spaces": {
+                    "space-1": {
+                        "Default": {
+                            "Desktop": {"Content": {"Choices": [{"Provider": "image"}]}},
+                            "Idle": {"Content": {"Choices": [{"Provider": "screen-saver"}]}}}}},
             }
             plist = store / "Index.plist"
             plist.write_bytes(plistlib.dumps(document, fmt=plistlib.FMT_BINARY))
@@ -41,13 +56,28 @@ class WallpaperRotateTests(unittest.TestCase):
             first = subprocess.run([str(SCRIPT)], env=env, text=True, capture_output=True, check=True)
             self.assertIn("01-first.jpg (4 spaces)", first.stdout)
             updated = plistlib.loads(plist.read_bytes())
-            for name in ("AllSpacesAndDisplays", "SystemDefault"):
-                space = updated[name]
-                self.assertEqual(space["Type"], "individual")
-                content = space["Desktop"]["Content"]
-                self.assertEqual(content["Choices"][0]["Provider"], "com.apple.wallpaper.choice.image")
-                self.assertTrue(content["Choices"][0]["Files"][0]["relative"].endswith("01-first.jpg"))
-                self.assertNotEqual(content["EncodedOptionValues"], "$null")
+            desktop_nodes = [
+                updated["AllSpacesAndDisplays"]["Desktop"],
+                updated["SystemDefault"]["Desktop"],
+                updated["Displays"]["display-1"]["Desktop"],
+                updated["Spaces"]["space-1"]["Default"]["Desktop"],
+            ]
+            for desktop in desktop_nodes:
+                content = desktop["Content"]
+                choice = content["Choices"][0]
+                self.assertEqual(choice["Provider"], "com.apple.wallpaper.choice.image")
+                self.assertEqual(choice["Files"], [])
+                config = plistlib.loads(choice["Configuration"])
+                self.assertEqual(config["type"], "imageFile")
+                self.assertTrue(config["url"]["relative"].endswith("01-first.jpg"))
+                self.assertEqual(plistlib.loads(content["EncodedOptionValues"]), {"values": {}})
+            self.assertEqual(
+                updated["AllSpacesAndDisplays"]["Idle"]["Content"]["Choices"][0]["Provider"], "screen-saver")
+            self.assertEqual(updated["SystemDefault"]["Idle"]["Content"]["Choices"][0]["Provider"], "screen-saver")
+            self.assertEqual(
+                updated["Displays"]["display-1"]["Idle"]["Content"]["Choices"][0]["Provider"], "screen-saver")
+            self.assertEqual(
+                updated["Spaces"]["space-1"]["Default"]["Idle"]["Content"]["Choices"][0]["Provider"], "screen-saver")
             self.assertTrue((state.parent / "Index.plist.previous").is_file())
             self.assertEqual(json.loads(state.read_text())["index"], 1)
 
