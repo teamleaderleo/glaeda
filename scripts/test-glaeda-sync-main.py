@@ -235,6 +235,21 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(result.exit_code, gs.EXIT_FAILED)
         self.assertEqual(self.fx.head("mirror"), before)
 
+    def test_a_refused_merge_push_to_an_unmoved_upstream_leaves_the_mirror_alone(self) -> None:
+        # Pushing the merge to the mirror anyway would leave it ahead of upstream, and every later
+        # run would try (and fail) the same upstream push.
+        up = self.fx.commit("upstream", "a.txt", "a\n")
+        mf = self.fx.commit("mirror", "b.txt", "b\n")
+        hook = self.fx.remotes["upstream"] / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\necho refused >&2\nexit 1\n")
+        hook.chmod(0o755)
+        result = self.fx.sync()
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(result.exit_code, gs.EXIT_FAILED)
+        self.assertEqual(self.fx.head("upstream"), up)
+        self.assertEqual(self.fx.head("mirror"), mf)
+        self.assertEqual(len(self.fx.pushes()), 1)
+
     def test_dry_run_pushes_nothing(self) -> None:
         self.fx.commit("upstream", "a.txt", "a\n")
         result = self.fx.sync(dry_run=True)
