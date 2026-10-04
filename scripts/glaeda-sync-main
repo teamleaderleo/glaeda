@@ -222,10 +222,14 @@ def sync(
         result.outcome = "merged"
         result.merge = make_merge(git, tree, up, mf, upstream_name, mirror_name)
         if not dry_run:
-            # Upstream first: its push starts release.yml. Each push is independent; a race on one
-            # still leaves the other a fast-forward, and the next run joins whatever moved.
-            result.pushes.append(push(git, "upstream", upstream, result.merge, up))
-            result.pushes.append(push(git, "mirror", mirror, result.merge, mf))
+            # Upstream first: its push starts release.yml. A race there still leaves the mirror push a
+            # fast-forward, and the next run joins whatever moved. A refusal while upstream has not
+            # moved stops here: the merge on the mirror alone would leave it ahead, and every later
+            # run would fail the same upstream push.
+            first = push(git, "upstream", upstream, result.merge, up)
+            result.pushes.append(first)
+            if first["status"] != "failed":
+                result.pushes.append(push(git, "mirror", mirror, result.merge, mf))
         return finish(result)
     except SyncError as err:
         result.outcome, result.detail = "failed", str(err)

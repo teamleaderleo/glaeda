@@ -120,10 +120,14 @@ back, pause the rollout (`control.yml`, below).
 - **How it pushes.** Over SSH with one write deploy key per repository, stored in this repository
   as the secrets `SYNC_UPSTREAM_DEPLOY_KEY` (a deploy key of this repository) and
   `SYNC_MIRROR_DEPLOY_KEY` (a deploy key of the fork). Not the job token: a push made with it does
-  not start `release.yml`, and it cannot push commits that change workflow files.
+  not start `release.yml`, and it cannot push commits that change workflow files. The workflow runs
+  the checked-out `scripts/glaeda-sync-main` with both write keys, so anyone who can merge to either
+  `main` can change the sync logic itself.
 - **Checks in the fork.** `ci.yml` (Verify) runs there for pull requests only; its jobs skip on a
   push outside this repository. `release.yml`, `promote.yml` and `control.yml` run only here. The
-  fork's `main` takes changes only through pull requests and the sync's deploy key.
+  fork's `main` takes changes only through pull requests and the sync's deploy key. A deploy-key
+  push starts the fork's push workflows, so gate every new push-triggered workflow (or its jobs)
+  with `github.repository == 'teamleaderleo/glaeda'`.
 - **Releases and rings.** `.github/workflows/mirror.yml` runs only in the fork, every 15 minutes
   (and on dispatch). It copies the release tags, the newest 30 `r-*` releases plus the ones
   `canary.json` and `stable.json` name, and the `ota-channels` files, byte for byte; it no longer

@@ -46,9 +46,8 @@ jobs:
           test -n "$UPSTREAM_KEY" || { echo "::error::secret SYNC_UPSTREAM_DEPLOY_KEY is not set"; exit 1; }
           test -n "$MIRROR_KEY" || { echo "::error::secret SYNC_MIRROR_DEPLOY_KEY is not set"; exit 1; }
           install -m 700 -d ~/.ssh
-          printf '%s\n' "$UPSTREAM_KEY" > ~/.ssh/sync-upstream
-          printf '%s\n' "$MIRROR_KEY" > ~/.ssh/sync-mirror
-          chmod 600 ~/.ssh/sync-upstream ~/.ssh/sync-mirror
+          # mode 600 from the first byte
+          (umask 077; printf '%s\n' "$UPSTREAM_KEY" > ~/.ssh/sync-upstream; printf '%s\n' "$MIRROR_KEY" > ~/.ssh/sync-mirror)
           echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
           # One host alias per key: a deploy key opens exactly one repository.
           cat > ~/.ssh/config <<EOF
@@ -58,12 +57,14 @@ jobs:
             IdentityFile $HOME/.ssh/sync-upstream
             IdentitiesOnly yes
             UserKnownHostsFile $HOME/.ssh/known_hosts
+            StrictHostKeyChecking yes
           Host mirror.github.com
             HostName github.com
             HostKeyAlias github.com
             IdentityFile $HOME/.ssh/sync-mirror
             IdentitiesOnly yes
             UserKnownHostsFile $HOME/.ssh/known_hosts
+            StrictHostKeyChecking yes
           EOF
           chmod 600 ~/.ssh/config
 
