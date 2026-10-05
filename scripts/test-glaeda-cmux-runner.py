@@ -295,6 +295,9 @@ class RunnerTest(unittest.TestCase):
             mock.patch.object(cr, "CURL", os.fspath(self.curl)),
             mock.patch.object(cr, "LAUNCHCTL", os.fspath(self.launchctl)),
             mock.patch.object(cr, "default_name", lambda: "mini-test-glaeda"),
+            # Exercise the retained legacy planning/uninstall machinery without
+            # weakening the production entry point's retirement guard.
+            mock.patch.object(cr, "INSTALL_SUPPORTED", True),
         ]
         for p in self.patches:
             p.start()
@@ -344,6 +347,15 @@ class RunnerTest(unittest.TestCase):
 
     # ------------------------------------------------------------ plan
 
+    def test_install_entry_point_is_retired_before_any_side_effect(self) -> None:
+        with mock.patch.object(cr, "INSTALL_SUPPORTED", False):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = cr.main(["--apply", "--token-stdin"])
+        self.assertEqual(code, 1)
+        self.assertIn("without a disposable isolation boundary", stderr.getvalue())
+        self.assertEqual(self.tree(), {})
+
     def test_plan_is_side_effect_free_and_prints_routing(self) -> None:
         receipt = self.invoke()
         self.assertFalse(receipt["applied"])
@@ -365,9 +377,12 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("gh variable set MACOS_RUNNER_26 --body glaeda-mini --repo manaflow-ai/cmux", human.getvalue())
         self.assertEqual(self.tree(), {})
 
-    def test_mini_setup_runner_flag_delegates(self) -> None:
-        receipt = self.invoke(via_setup=True)
-        self.assertEqual(receipt["schema"], "glaeda-cmux-runner/v1")
+    def test_mini_setup_runner_flag_preserves_retirement_guard(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = setup.main(["--runner"])
+        self.assertEqual(code, 1)
+        self.assertIn("without a disposable isolation boundary", stderr.getvalue())
         self.assertEqual(self.tree(), {})
 
     # ------------------------------------------------------------ apply

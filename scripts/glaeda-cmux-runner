@@ -1,43 +1,15 @@
 #!/usr/bin/env python3
-"""glaeda-cmux-runner: turn a cmux Mac mini into a GitHub Actions self-hosted runner.
+"""glaeda-cmux-runner: remove the retired direct-host cmux GitHub Actions runner.
 
-    glaeda-cmux-runner                                plan: what --apply would do (no side effects)
-    glaeda-cmux-runner --apply                        download, verify, register, load the LaunchAgent
+    glaeda-cmux-runner                                refuse retired installation
+    glaeda-cmux-runner --apply                        refuse retired installation
     glaeda-cmux-runner --uninstall                    plan removal
     glaeda-cmux-runner --uninstall --apply            deregister and remove what --apply installed
     glaeda-mini-setup --runner [...]                  same thing, through the mini setup front door
 
-Defaults register to --repo manaflow-ai/cmux. Use --org ORG for an organization runner.
-A fleet member passes --manifest M --member NAME instead of --labels: its class, availability and
-verified Xcodes become the labels, and a later change re-registers it in place (docs/CMUX_MINI_RUNNER.md 2c).
-
-What --apply does, all under $HOME and owned by the current user (no sudo):
-    1. downloads the official actions/runner osx-arm64 release (latest, or --runner-version),
-       verifies its SHA-256 against the release notes (and the asset digest when GitHub has one),
-       and unpacks it into ~/actions-runner-glaeda (or --runner-dir)
-    2. registers it with labels self-hosted,macOS,ARM64,glaeda-mini (+ --labels), persistent
-       (not ephemeral) so the _work tree keeps hot state between jobs
-    3. writes job hooks: job-started refuses fork pull requests and pull_request_target and
-       runs glaeda-disk pressure; job-completed runs disk pressure again (never fatal)
-    4. writes and loads ~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist
-    5. confirms the registration through the GitHub API
-
-The one-time registration token comes from `gh api -X POST .../registration-token` on stdout.
-It is never placed in any argv, written to disk, or printed. It reaches config.sh only through
-ACTIONS_RUNNER_INPUT_TOKEN in that one child's environment, which the runner reads and clears.
-
-A mini without gh (or without admin credentials on it) takes the token on stdin instead, minted
-on the operator's own machine, so no GitHub credential ever lands on the mini:
-
-    gh api -X POST repos/OWNER/REPO/actions/runners/registration-token --jq .token \
-      | ssh MINI glaeda-cmux-runner --apply --repo OWNER/REPO --token-stdin
-
-Without gh the release is read from the public API with curl, a name collision is left to
-config.sh (which refuses one), and step 5 is confirmed locally from the runner log instead.
-
-Routing is never automated: the plan prints the `gh variable set` commands that point cmux
-workflows at the glaeda-mini label, and the `gh variable delete` commands that roll back.
-The receipt lands in ~/.local/state/glaeda/cmux-runner/receipt.json.
+Installation is disabled because repository-controlled jobs ran directly as the persistent macOS
+build user. Event filtering is not an isolation boundary. Existing receipt-bound installations can
+still be deregistered and removed; see docs/CMUX_MINI_RUNNER.md.
 """
 
 from __future__ import annotations
@@ -82,6 +54,10 @@ PLATFORM_ASSET = "osx-arm64"
 MARKER = ".glaeda-cmux-runner"
 HOOK_DIR = "glaeda-hooks"
 DARWIN_REQUIRED = True
+# Direct host execution cannot satisfy Glaeda's hostile-job boundary. Keep the
+# uninstall path available for existing installations, but never create or
+# reconfigure this retired runner.
+INSTALL_SUPPORTED = False
 RUN_TIMEOUT = 60
 CURL = "/usr/bin/curl"
 LAUNCHCTL = "/bin/launchctl"
@@ -951,6 +927,13 @@ def main(argv: list[str] | None = None) -> int:
     if DARWIN_REQUIRED and platform.system() != "Darwin":
         print("glaeda-cmux-runner: macOS only", file=sys.stderr)
         return 2
+    if not args.uninstall and not INSTALL_SUPPORTED:
+        print(
+            "glaeda-cmux-runner: installation is retired because jobs would run "
+            "without a disposable isolation boundary; use --uninstall to remove an existing runner",
+            file=sys.stderr,
+        )
+        return 1
     if args.org and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", args.org):
         print("glaeda-cmux-runner: --org must be an organization login", file=sys.stderr)
         return 2
