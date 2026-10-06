@@ -283,7 +283,8 @@ def fleet_stores(ci: Path | None = None) -> list[Path]:
                         if p.name[len("cmux-ci-"):].isdigit() and p.is_dir() and not p.is_symlink())]
 
 
-FLEET_FAMILY_IDS = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build", "ci-derived-data")
+FLEET_FAMILY_IDS = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build", "ci-derived-data",
+                    "ci-ios-derived-data")
 
 
 def fleet_families(ci: Path | None = None) -> list[Family]:
@@ -310,6 +311,15 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
     if fams:  # root 1's store is the mini's, and the only one that holds SwiftPM scratch (cmux mini_store)
         fams.append(spm_scratch_family(fleet_stores(ci)[0]))
     return fams
+
+
+def ci_ios_family(root: Path | None = None) -> Family:
+    """DerivedData left by the iOS runner pool, one generation per runner."""
+    root = FLEET_ROOT / "ci-ios" if root is None else root
+    return Family("ci-ios-derived-data", root, True,
+                  "the next iOS job rebuilds its DerivedData", depth=2,
+                  match="derived-data", build_output=True,
+                  reference_root=FLEET_ROOT, owner="cmux iOS CI jobs", rebuild_minutes=8)
 
 
 # cmux CI's SwiftPM scratch (cmux scripts/ci/owned_spm_scratch.py): swift-package-tests links each package's .build
@@ -1063,6 +1073,9 @@ def default_families() -> list[Family]:
                                "the fleet worker rebuilds or fetches the artifact", depth=1,
                                files=True, allow_stale_protected=True, stale_before=ARTIFACT_CUTOFF,
                                reference_root=FLEET_ROOT, owner="cmux fleet worker", rebuild_minutes=8))
+        ci_ios = FLEET_ROOT / "ci-ios"
+        if ci_ios.is_dir():
+            fams.append(ci_ios_family(ci_ios))
         browser = HOME / "cmux-browser-fleet"
         if browser.is_dir():
             fams.append(Family("browser-artifacts", browser, True,
@@ -1138,7 +1151,14 @@ def fixed_measurement_roots() -> list[Path]:
     directories can block a recursive fts walk in the kernel for hours.
     """
     candidates: list[Path] = [
-        FLEET_ROOT,
+        # Keep known-heavy fleet roots separate. A single du of the shared
+        # fleet tree can hold evict.lock long enough to starve admission.
+        FLEET_ROOT / "cache",
+        FLEET_ROOT / "ci",
+        FLEET_ROOT / "ci-ios",
+        FLEET_ROOT / "ci-ios-packages",
+        FLEET_ROOT / "job-volumes",
+        FLEET_ROOT / "logs",
         HOME / "cmux-browser-fleet",
         HOME / "Library/Caches",
         HOME / "Library/Developer/Xcode/DerivedData",

@@ -92,7 +92,8 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertTrue(roots)
             self.assertNotIn(Path("/"), roots)
             self.assertFalse(any("FileProvider" in p.parts for p in roots))
-            self.assertIn(gd.FLEET_ROOT, roots)
+            self.assertIn(gd.FLEET_ROOT / "cache", roots)
+            self.assertIn(gd.FLEET_ROOT / "ci-ios", roots)
         finally:
             gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
 
@@ -885,13 +886,26 @@ class GlaedaDiskTest(unittest.TestCase):
         try:
             (gd.HOME / "cmux-browser-fleet").mkdir()
             (gd.FLEET_ROOT / "cache").mkdir(parents=True)
+            (gd.FLEET_ROOT / "ci-ios" / "runner-a" / "derived-data").mkdir(parents=True)
             fams = {f.id: f for f in gd.default_families()}
             self.assertIn("fleet-artifacts", fams)
+            self.assertIn("ci-ios-derived-data", fams)
             self.assertIn("browser-artifacts", fams)
             self.assertTrue(fams["fleet-artifacts"].allow_stale_protected)
             self.assertTrue(fams["browser-artifacts"].allow_stale_protected)
         finally:
             gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
+
+    def test_ci_ios_derived_data_is_reclaimable_without_deleting_runner_root(self) -> None:
+        root = self.root / "ci-ios"
+        old = root / "runner-a" / "derived-data"
+        make(old, age_hours=48)
+        fam = gd.ci_ios_family(root)
+        with mock.patch.object(gd, "live_artifact_references", return_value=frozenset()):
+            got = gd.survey([fam], 24, 0)
+        self.assertEqual([Path(i.path) for i in got], [old])
+        self.assertEqual(got[0].verdict, "reclaimable")
+        self.assertTrue((root / "runner-a").is_dir())
 
     def test_fleet_ci_hot_tier(self) -> None:
         ci = self.root / "ci"
