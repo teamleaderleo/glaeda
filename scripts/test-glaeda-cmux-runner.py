@@ -2472,7 +2472,7 @@ time.sleep(60)
                 time.sleep(0.5)
                 result = self.job("swift-package-tests", "l1")
                 self.assertEqual(result.returncode, 1, result.stdout)
-                self.assertIn("refused: capacity: a fleet build is waiting for the host", result.stdout)
+                self.assertIn("refused: a fleet build is waiting for the host", result.stdout)
                 self.finish("l0")
                 self.assertEqual(waiter.wait(timeout=10), 0, "the build worker gets the host once our job ends")
             finally:
