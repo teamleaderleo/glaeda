@@ -29,6 +29,10 @@ them back to Blacksmith.
 - Automatic login for the build user (`sysadminctl -autologin status`). The runner is
   a LaunchAgent in that user's GUI session, so it starts again after a reboot only
   when the user logs in automatically.
+- A GUI-less EC2 Mac uses the system domain instead: pass `--headless` (the fleet
+  command adds it automatically for manifest members with `gui: false`). The apply
+  path installs a root-owned supervisor and a `UserName` LaunchDaemon, so listeners
+  return after reboot without a GUI login. This requires passwordless sudo on the host.
 
 ## 2. One command
 
@@ -44,7 +48,8 @@ Useful flags: `--name NAME` (default `<short hostname>-glaeda`), `--labels a,b` 
 (extra labels), `--org ORG [--group GROUP]` instead of the default
 `--repo manaflow-ai/cmux`, `--runner-dir DIR` (default `~/actions-runner-glaeda`),
 `--runner-version V --runner-sha256 HEX` to pin, `--replace` to take over an existing
-registration with the same name, `--output json` for the receipt.
+registration with the same name, `--headless` for an EC2 system LaunchDaemon, or
+`--output json` for the receipt.
 
 What `--apply` does:
 
@@ -194,7 +199,8 @@ What `--apply` does:
      disk pressure pass and always exits 0. The two-minute `glaeda-mini-health` agent repeats
      that ownership check when a post-job hook was skipped.
 4. Writes and loads `~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist`
-   (runs `glaeda-hooks/listen.sh`, restarts on crash, logs to
+   (runs `glaeda-hooks/listen.sh`, restarts after clean or failed listener exits,
+   with launchd's ten-second throttle, and logs to
    `~/Library/Logs/glaeda-cmux-runner.log`). `listen.sh` runs `run.sh` under the listener
    gate (`glaeda-cmux-runner-hook listen`).
    - **Why a gate.** Without it, an idle runner keeps listening while the fleet has the
@@ -459,7 +465,12 @@ or pass `--name` with the existing name to relabel it in place.
 A manifest class carries a runner count and the capacity units they share
 (defaults: `std` 4 runners and 4 units, `light` 2 and 2, `xl` 8 and 8). Override
 them with `defaults.runner.classes.<class>` `{"runners": N, "capacityUnits": U,
-"compileSlots": C}`, or per host under `overrides.runner.classes.<class>`.
+"compileSlots": C}`, or per host under `overrides.runner.classes.<class>`. A
+dedicated pool can set `runner.poolPrefix` to a lowercase prefix such as
+`aws-`; its pool, root, side, and GUI labels then become
+`glaeda-aws-std-xcode-26.3`, `glaeda-aws-root-std-xcode-26.3`, and their
+corresponding role labels. Keep that namespace in the CI pool allowlist so
+ordinary `glaeda-std-*` jobs cannot select it accidentally.
 `compileSlots` (default 1, at most U/2) is how many compiles run at once, one
 `persistent-dd` token each (`persistent-dd.token`, `persistent-dd-1.token`, ...).
 Raise it only once cmux's compile admission keeps its canonical root and kept
@@ -1052,8 +1063,13 @@ catch-ups, and holds no capacity unit, root or token, so no admission waits for 
 
 - **Starts** when this user owns an unlocked console, no job holds the gui token or asks for it (a take-gui
   step), no Xcode test and no other cmux DEV app runs, the host has no reservation (someone dogfooding there),
-  and 90 GiB are free. It clones the newest main build a root keeps into `fuzz/builds/<sha>` (APFS `cp -c`, no
-  root token: the copy counts only if the root's stamp is unchanged after it) and exports the fuzzer at that
+  and free disk is at least the runners' floor plus 20 GiB (the manifest's `defaults.disk.job_growth_gib`). The
+  floor is the highest `--min-free-gib` of this mini's job-started hooks, else 30 GiB, the fleet's
+  `defaults.disk.min_free_gib`, so the fuzzer starts at 50 GiB free on today's fleet. While it runs, it stops (as
+  for a gui job) once free disk drops below the floor plus 10 GiB, so it is never why a job is refused for disk.
+  It clones the newest main build a root keeps into
+  `fuzz/builds/<sha>` (APFS `cp -c`, no root token: the copy counts only if the root's stamp is unchanged after
+  it) and exports the fuzzer at that
   commit (`git archive` of `scripts/fuzz` and `dogfood/fuzz` from the catch-up checkout or the seed mirror) into
   `fuzz/engines/<sha>`, since a catch-up may check out a newer main meanwhile. It fuzzes for up to 10 minutes
   and minimizes up to two failures, 26 minutes at most; runs land in `/Users/Shared/cmux-build-fleet/fuzz/runs`.

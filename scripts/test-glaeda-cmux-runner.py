@@ -9,6 +9,7 @@ reaches an argv, a file, or the output.
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import hashlib
 import importlib.machinery
@@ -526,6 +527,11 @@ class HookTest(unittest.TestCase):
         while not self.lock_free() and time.monotonic() < deadline:
             time.sleep(0.2)
         self.assertTrue(self.lock_free())
+
+    def test_holder_does_not_follow_a_reused_watcher_pid(self) -> None:
+        with mock.patch.object(hook, "pid_alive", return_value=True), \
+                mock.patch.object(hook, "process_identity", return_value="ps:new"):
+            self.assertFalse(hook.process_alive(73305, "ps:old"))
 
     def test_stale_holder_file_is_not_success(self) -> None:
         self.fleet()
@@ -2430,6 +2436,27 @@ time.sleep(60)
                 proc.wait()
             holder.stdout.close()
 
+    def test_capacity_fleet_drain_refuses_without_entering_admission_wait(self) -> None:
+        fleet = self.fleet()
+        markers = Path(str(fleet / "host.lock") + ".waiters")
+        markers.mkdir()
+        drain = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            # A reserved worker waits for Runner.Worker to exit. Waiting inside its
+            # job-started child would prevent that exit and deadlock both schedulers.
+            for job in ("swift-package-tests", "macos-compile-admission"):
+                with self.subTest(job=job):
+                    (markers / f"{drain.pid}-refresh-lend_drain-test").touch()
+                    result = self.job(job, "draining", 4, None, "--gui-wait", "2")
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("a fleet build is waiting for the host", result.stdout)
+                    self.assertNotIn("waiting (", result.stdout)
+                    self.assertFalse(list((self.dir / "capacity").glob("admit.want-*")))
+                    self.assertTrue(self.lock_free())
+        finally:
+            drain.kill()
+            drain.wait()
+
     @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
     def test_capacity_stops_admitting_while_a_fleet_build_waits(self) -> None:
         fleet = self.fleet()
@@ -2445,7 +2472,7 @@ time.sleep(60)
                 time.sleep(0.5)
                 result = self.job("swift-package-tests", "l1")
                 self.assertEqual(result.returncode, 1, result.stdout)
-                self.assertIn("refused: capacity: a fleet build is waiting for the host", result.stdout)
+                self.assertIn("refused: a fleet build is waiting for the host", result.stdout)
                 self.finish("l0")
                 self.assertEqual(waiter.wait(timeout=10), 0, "the build worker gets the host once our job ends")
             finally:
@@ -2866,6 +2893,27 @@ class GateTest(unittest.TestCase):
         self.addCleanup(proc.kill)
         proc.stdout.readline()
         return proc
+
+    def test_registered_fleet_waiter_is_seen_without_a_kernel_wait_channel(self) -> None:
+        waiters = Path(str(self.lock) + ".waiters")
+        waiters.mkdir()
+        (waiters / "4242-refresh-build-1").touch()
+        with mock.patch.object(hook, "_lock_processes", return_value=([], "")), \
+                mock.patch.object(hook, "pid_alive", return_value=True):
+            self.assertEqual(hook.lock_waiters(os.fspath(self.lock), set()), [4242])
+
+    def test_waiter_markers_ignore_dead_stale_own_and_symlink_entries(self) -> None:
+        waiters = Path(str(self.lock) + ".waiters")
+        waiters.mkdir()
+        for name in ("4242-refresh-build-1", "4243-blocked", "4244-refresh-stale-1", "4245-own"):
+            (waiters / name).touch()
+        old = time.time() - 60
+        os.utime(waiters / "4244-refresh-stale-1", (old, old))
+        os.utime(waiters / "4243-blocked", (old, old))
+        (waiters / "4246-symlink").symlink_to(waiters / "4243-blocked")
+        with mock.patch.object(hook, "_lock_processes", return_value=([], "")), \
+                mock.patch.object(hook, "pid_alive", side_effect=lambda pid: pid != 4242):
+            self.assertEqual(hook.lock_waiters(os.fspath(self.lock), {4245}), [4243])
 
     def test_lock_waiter_parser_counts_only_a_blocked_exclusive_lock(self) -> None:
         process_table = """\
@@ -4118,6 +4166,8 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(config["argv"][config["argv"].index("--url") + 1], "https://github.com/manaflow-ai/cmux")
         plist = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist").read_bytes())
         self.assertEqual(plist["ProgramArguments"], [os.fspath(runner / "glaeda-hooks/listen.sh")])
+        self.assertIs(plist["KeepAlive"], True)
+        self.assertEqual(plist["ThrottleInterval"], 10)
         listen = runner / "glaeda-hooks/listen.sh"
         self.assertTrue(os.access(listen, os.X_OK))
         self.assertIn(f"listen --runner-dir {runner} --no-waiters &", listen.read_text())  # no capacity units
@@ -5345,6 +5395,20 @@ class ManifestLabelsTest(unittest.TestCase):
         with mock.patch.object(cr, "xcode_present", return_value=False):
             self.assertEqual(cr.member_labels(MANIFEST, "mini-std")[0]["labels"],
                              ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated"])
+        aws = copy.deepcopy(MANIFEST)
+        aws["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"poolPrefix": "aws-"}
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            member, why = cr.member_labels(aws, "mini-std")
+        self.assertIsNone(why)
+        self.assertIn("glaeda-aws-std-xcode-26.6", member["labels"])
+        self.assertEqual(member["rootPools"], ["glaeda-aws-root-std-xcode-26.6"])
+        self.assertEqual(member["sidePools"], ["glaeda-aws-side-std-xcode-26.6"])
+        for prefix in ("root-", "side-", "gui-", "trusted-", "std-", "light-", "xl-"):
+            invalid = copy.deepcopy(MANIFEST)
+            invalid["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"poolPrefix": prefix}
+            member, why = cr.member_labels(invalid, "mini-std")
+            self.assertIsNone(member)
+            self.assertIn("poolPrefix", why)
         for name, why in (("mini-no-role", "ci-runner"), ("laptop", "never runs"), ("borrowed", "never runs"),
                           ("old-shape", "m4pro-48"), ("bad-avail", "availability"), ("absent", "not a member"),
                           ("no-hardware", "no hardware class")):
@@ -5390,6 +5454,10 @@ class FleetLabelsModuleTest(unittest.TestCase):
     def test_pool_label_string(self) -> None:
         self.assertEqual(fleet_labels.pool_label("std", "26.6"), "glaeda-std-xcode-26.6")
         self.assertEqual(fleet_labels.pool_label("light", "26.6"), "glaeda-light-xcode-26.6")
+        self.assertEqual(fleet_labels.pool_label("std", "26.3", pool_prefix="aws-"),
+                         "glaeda-aws-std-xcode-26.3")
+        self.assertEqual(fleet_labels.root_label("glaeda-aws-std-xcode-26.3"),
+                         "glaeda-aws-root-std-xcode-26.3")
 
     def test_runner_and_module_agree(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
