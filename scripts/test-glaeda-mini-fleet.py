@@ -39,11 +39,14 @@ STRAY = "SHA256:DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
 
 
 def fleet_cas_text(mode: str = "read-only", node: str = "answers", build_mode: str | None = "present",
-                   **kinds: str) -> str:
+                   store: str | None = None, stats: dict[str, int] | None = None, **kinds: str) -> str:
     """Probe lines for a conforming fleet-cas host; kinds overrides a path's kind (src_cmux="symlink")."""
     lines = [f"fleet_cas_path\t{rel}|{kinds.get(rel.replace('xcode/', '').replace('/', '_').replace('.', '_').replace('-', '_'), want)}"
              for rel, want in {**mf.FLEET_CAS_PATHS, **mf.FLEET_CAS_WRITER_PATHS}.items()]
     lines += [f"fleet_cas_node_mode\t{mode}", f"fleet_cas_node\t{node}"]
+    if store:
+        lines.append(f"fleet_cas_store\t{store}")
+    lines += [f"fleet_cas_stat\t{k}|{v}" for k, v in (stats or {}).items()]
     if build_mode is None:
         lines.append("fleet_recipe_released\tnone")
     else:
@@ -89,6 +92,14 @@ class ManifestTests(unittest.TestCase):
 
     def test_example_loads(self) -> None:
         self.assertEqual(set(self.manifest["hosts"]), {"build-mini-1", "build-mini-2", "small-mini"})
+
+    def test_host_jump_route_is_validated_and_emitted(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["ssh_jump_host"] = "cmux-lawrence"
+        self.assertEqual(mf.host_ssh_options(self.manifest, "build-mini-1"),
+                         ("-o", "ProxyJump=cmux-lawrence"))
+        self.manifest["hosts"]["build-mini-1"]["ssh_jump_host"] = "bad host"
+        with self.assertRaisesRegex(mf.Failure, "ssh_jump_host"):
+            mf.host_ssh_options(self.manifest, "build-mini-1")
 
     def test_never_touch_host_is_refused(self) -> None:
         with self.assertRaisesRegex(mf.Failure, "never_touch"):
@@ -352,6 +363,13 @@ class BorrowTests(unittest.TestCase):
         self.assertEqual(doc["reservation_schema"], mf.RESERVATION_SCHEMA)
         self.assertIsNone(doc["release"])
 
+    def test_lease_document_uses_host_ssh_user(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["ssh_user"] = "ec2-user"
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = mf.cmd_borrow(self.manifest, ["build-mini-1"], self.obs(), "std", "interactive", 1,
+                                 None, "leo@air", False, True)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())["connection"]["user"], "ec2-user")
     OWNER = "leo@air+0123456789ab"
 
     def borrow(self, observed_doc: dict, hosts: list[str] | None = None, json_output: bool = False) -> tuple[int, str]:
@@ -500,6 +518,14 @@ class BorrowTests(unittest.TestCase):
         doc = json.loads(out.getvalue())
         self.assertEqual(doc["state"], "unavailable")
         self.assertEqual(doc["selection"]["excluded"], {"build-mini-1": "host lock held"})
+class ObservationTests(unittest.TestCase):
+    def test_observe_uses_host_ssh_user(self) -> None:
+        manifest = mf.load_manifest(EXAMPLE)
+        manifest["hosts"]["build-mini-1"]["ssh_user"] = "ec2-user"
+        with mock.patch.object(mf, "observe_host", return_value={"host": "build-mini-1", "reachable": True}) as probe:
+            got = mf.observe(manifest, ["build-mini-1"])
+        self.assertTrue(got["hosts"]["build-mini-1"]["reachable"])
+        probe.assert_called_once_with(manifest, "build-mini-1", options=())
 
 
 class CheckTests(unittest.TestCase):
@@ -731,6 +757,10 @@ class CatchUpTests(unittest.TestCase):
         (issue,) = self.writer(fleet_cas=fleet_cas_text(mode="signing", build_mode="missing"))
         self.assertEqual(issue[0], "recipe")
 
+    def test_writer_lifetime_upstream_failures_are_gated_per_fill(self) -> None:
+        self.assertEqual(self.writer(fleet_cas=fleet_cas_text(mode="signing", store="100.89.140.13:7450",
+                                                              stats={"up_errors": 548179, "up_skipped": 2240091})), [])
+
     def test_failing_fill_is_pending_not_hidden(self) -> None:
         text = probe_text(hostname="Build-Mini-2", node_id="cmux-mac-002", worker_proc="absent",
                           fleet_cas=fleet_cas_text(mode="signing"))
@@ -787,6 +817,25 @@ class CatchUpTests(unittest.TestCase):
         (issue,) = self.reader(fleet_cas_text(**{"bin_fleet_cas_settings_sh": "missing"}))
         self.assertIn("fleet-cas-settings.sh missing", issue["detail"])
 
+    def test_reader_reports_upstream_failures_even_when_socket_answers(self) -> None:
+        text = fleet_cas_text(store="100.89.140.13:7450", stats={"up_calls": 12, "up_errors": 2,
+                                                                  "up_skipped": 8})
+        parsed = mf.parse_probe(probe_text(fleet_cas=text))["fleet_cas"]
+        self.assertEqual(parsed["store"], "100.89.140.13:7450")
+        self.assertEqual(parsed["stats"]["up_errors"], 2)
+        issues = self.reader(text)
+        (issue,) = [i for i in issues if "upstream errors" in i["detail"]]
+        self.assertEqual(issue["area"], "fleet-cas")
+        self.assertIn("100.89.140.13:7450", issue["detail"])
+
+    def test_orphaned_reader_reports_upstream_failures(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["roles"] = ["ci-runner"]
+        text = fleet_cas_text(store="100.100.232.95:7450", stats={"up_errors": 238, "up_skipped": 40667})
+        issues = mf.check(self.manifest, observed(**{"build-mini-1": probe_text(fleet_cas=text)}), ["build-mini-1"])
+        (issue,) = [i for i in issues if "outside a catch-up role" in i["detail"]]
+        self.assertEqual(issue["area"], "fleet-cas")
+        self.assertIn("100.100.232.95:7450", issue["detail"])
+
     def test_reader_recipe_without_build_mode_is_drift(self) -> None:
         (issue,) = self.reader(fleet_cas_text(build_mode="missing"))
         self.assertEqual((issue["area"], issue["detail"]),
@@ -840,6 +889,12 @@ class CatchUpTests(unittest.TestCase):
         parsed = mf.parse_probe(fleet_cas_text(src_cmux="symlink"))["fleet_cas"]
         self.assertEqual(parsed["paths"]["xcode/src/cmux"], "symlink")
         self.assertEqual((parsed["node_mode"], parsed["node"], parsed["build_mode"]), ("read-only", "answers", "present"))
+
+    def test_probe_uses_launchd_worker_state_when_release_path_differs(self) -> None:
+        text = mf.PROBE.read_text()
+        self.assertIn('launchctl print "system/ai.manaflow.cmux-build-worker"', text)
+        self.assertIn('worker_state=$(launchctl print', text)
+        self.assertIn('e fleet_worker_proc running', text)
 
 
 class IosSimulatorTests(unittest.TestCase):
@@ -1729,6 +1784,15 @@ class ToolchainTests(unittest.TestCase):
         self.assertEqual(checks["xcode"]["state"], "fail")
         self.assertIn("want 26.3 (17C999)", checks["xcode"]["detail"])
 
+    def test_legacy_xcode_apps_supply_the_class_acceptance_pin(self) -> None:
+        self.manifest["defaults"]["toolchain"] = {}
+        self.assertEqual(mf.toolchain(self.manifest, "build-mini-1")["xcode"], {
+            "app": "/Applications/Xcode.app", "version": "26.3", "build": "17C529"
+        })
+        self.manifest["defaults"]["xcode"]["select"] = "/Applications/Xcode_26.3.app/Contents/Developer"
+        self.assertEqual(mf.toolchain(self.manifest, "build-mini-1")["xcode"]["app"],
+                         "/Applications/Xcode_26.3.app")
+
     def test_selection_and_metal_can_be_declared_optional(self) -> None:
         self.manifest["defaults"]["toolchain"]["xcode"]["select"] = False
         self.manifest["defaults"]["toolchain"]["metal"] = False
@@ -2082,10 +2146,12 @@ class FixLibraryTests(unittest.TestCase):
         self.assertEqual([line.strip() for line in body if "rm -r" in line],
                          ['case "$stage" in */.glaeda-share.partial) rm -rf "$stage" ;; esac',
                           'rm -rf "$stage"  # what is left are copies of toolchains this host already had'])
-        self.assertFalse([line for line in body if re.search(r"(^|[;&|(]\s*)sudo\b", line.strip())])
+        self.assertEqual([line for line in body if "sudo -n launchctl" in line],
+                         ['    /Library/LaunchDaemons/*) sudo -n launchctl "$@" ;;'])
         # The only removals are the step lock's own pid file and directory, and the runner held marks it writes.
         self.assertEqual([line.strip() for line in body if "rm " in line and "rm -r" not in line],
                          ["""trap 'rm -f "$HOME/.local/state/glaeda/mini-fleet/step.lock/pid"; rmdir "$HOME/.local/state/glaeda/mini-fleet/step.lock" 2>/dev/null || true' EXIT""",
+                          'rm -f "$(held_dir)/$(basename "$dir")"',
                           'rm -f "$(held_dir)/$(basename "$dir")"'])
 
     @unittest.skipUnless(shutil.which("shasum") or shutil.which("sha256sum"), "needs shasum")
@@ -2921,6 +2987,37 @@ class RepairTests(unittest.TestCase):
                 check = mf.preflight_host(manifest, "build-mini-1", observed(h=text)["hosts"]["h"])["checks"]["runner"]
                 self.assertEqual(check["state"], "todo")
                 self.assertIn(want, check["detail"])
+            lock_text = down + "host_lock\theld\n" \
+                + "host_lock_owner\t123|worker-current\n" \
+                + "host_lock_activity\tworker-only\n"
+            check = mf.preflight_host(manifest, "build-mini-1", observed(h=lock_text)["hosts"]["h"])["checks"]["runner"]
+            self.assertIn("host.lock worker-only (pid 123|worker-current)", check["detail"])
+
+    def test_class_mode_repairs_a_current_node_missing_the_class_link(self) -> None:
+        manifest = pinned_manifest(self.tmp.name)
+        loaded = mf.load_manifest(manifest)
+        with mock.patch.object(mf, "PINNED_CANDIDATE", loaded["candidate"]):
+            result = mf.preflight_host(loaded, "build-mini-1",
+                                       observed(h=on_candidate(generation=NEW_GEN))["hosts"]["h"])
+            self.assertTrue(mf.missing_class_acceptance(loaded, "build-mini-1", result))
+            code, out, calls = run_command({"build-mini-1": on_candidate(generation=NEW_GEN)},
+                                           command="repair", manifest=manifest)
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("would: renew and adopt the class receipt", out)
+
+    def test_class_mode_relinks_a_current_node_before_adopting(self) -> None:
+        manifest = pinned_manifest(self.tmp.name)
+        code, out, calls = run_command(
+            {"build-mini-1": on_candidate(generation=NEW_GEN)}, "--yes", command="repair",
+            manifest=manifest, after={"build-mini-1": on_candidate(generation=NEW_GEN)},
+        )
+        self.assertEqual(code, 0, out)
+        relink = calls_to(calls, "transition-apply")
+        self.assertEqual(len(relink), 1)
+        self.assertIn("--to quarantined --reason stale_glaeda_generation", relink[0][1])
+        self.assertEqual(len(calls_to(calls, ENROLL)), 1)
+        self.assertIn("--renew --class-receipt - --class-receipt-sha256", calls_to(calls, ENROLL)[0][1])
+        self.assertIn("eligible", out)
 
     def test_dry_run_names_what_it_would_do_and_touches_nothing(self) -> None:
         code, out, calls = run_command({"build-mini-1": on_candidate(), "build-mini-2": on_candidate(
@@ -2979,9 +3076,13 @@ class RepairTests(unittest.TestCase):
         self.assertIn("transition-apply ENROLLMENT --to enrolling", result["checks"]["enroll"]["fix"])
 
     def test_runners_are_restarted_or_released_and_drains_are_left_alone(self) -> None:
-        texts = {"build-mini-1": on_candidate(generation=NEW_GEN, runners=("actions-runner-x|mini-1|yes|no|no",)),
-                 "build-mini-2": on_candidate(generation=NEW_GEN, runners=("actions-runner-x|mini-2|no|no|yes",),
-                                              node_id="cmux-mac-002")}
+        class_accepted = lambda text: text.replace("pf_acceptance\taccepted",
+                                                    "pf_acceptance\taccepted\npf_acceptance_class\tglaeda-class-acceptance/v1")
+        texts = {"build-mini-1": class_accepted(on_candidate(generation=NEW_GEN,
+                                                               runners=("actions-runner-x|mini-1|yes|no|no",))),
+                 "build-mini-2": class_accepted(on_candidate(generation=NEW_GEN,
+                                                               runners=("actions-runner-x|mini-2|no|no|yes",),
+                                                               node_id="cmux-mac-002"))}
         code, out, calls = run_command(texts, "--yes", command="repair", manifest=self.manifest, after=texts)
         self.assertEqual(code, 0, out)
         self.assertEqual([c[0] for c in calls_to(calls, "lock none; runner_kick")], ["build-mini-1"])
@@ -3194,13 +3295,25 @@ def reservation_line(owner: str = "leo@air", purpose: str = "chromium campaign",
 
 class ReservationProbeParsingTests(unittest.TestCase):
     def test_parses_the_raw_marker_with_the_shared_rule(self) -> None:
-        got = mf.parse_probe(reservation_line(purpose="build a | b\tc", since=100, until=200) + "host_lock\theld\n")
+        got = mf.parse_probe(reservation_line(purpose="build a | b\tc", since=100, until=200)
+                             + "host_lock\theld\n"
+                             + "host_lock_owner\t123|worker-current\n"
+                             + "host_lock_activity\tworker-only\n")
         self.assertEqual(got["reservation"], {"valid": True, "owner": "leo@air", "purpose": "build a | b\tc",
                                               "since": 100, "until": 200})
         self.assertEqual(got["host_lock"], "held")
+        self.assertEqual(got["host_lock_owners"], [{"pid": 123, "command": "worker-current", "kind": "worker"}])
+        self.assertEqual(got["host_lock_activity"], "worker-only")
         self.assertEqual(mf.parse_probe("runner_worker\trunning\n")["runner_worker"], "running")
         self.assertEqual(mf.parse_probe("runner_worker\tabsent\n")["runner_worker"], "absent")
         self.assertIs(mf.reservation_rules, sys.modules["glaeda_reservation"])
+
+    def test_lock_owner_parser_drops_malformed_remote_evidence(self) -> None:
+        got = mf.parse_probe("host_lock_owner\tbad\n"
+                             "host_lock_owner\t1|worker\n"
+                             "host_lock_owner\t42|\n"
+                             "host_lock_owner\t43|Runner.Worker\n")
+        self.assertEqual(got["host_lock_owners"], [{"pid": 43, "command": "Runner.Worker", "kind": "job"}])
 
     def test_invalid_markers_say_why(self) -> None:
         good = {"schema": "glaeda-reservation/v1", "owner": "a", "purpose": "b", "since": 1, "until": 2}
@@ -3255,13 +3368,26 @@ class ReservationProbeScriptTests(unittest.TestCase):
             try:
                 self.assertEqual(holder.stdout.readline(), "locked\n")
                 started = time.monotonic()
-                self.assertEqual(self.run_probe(root)["host_lock"], "held")
+                locked = self.run_probe(root)
+                self.assertEqual(locked["host_lock"], "held")
+                # lsof is optional on the Linux runner that executes this contract test,
+                # and a restricted lsof can also see no owner.  Unknown is safe: it never
+                # authorizes a mutation.  When an owner is visible, the holder must be
+                # classified as an active job and identified precisely.
+                if locked["host_lock_owners"]:
+                    self.assertEqual(locked["host_lock_activity"], "active-job")
+                    self.assertIn({"pid": holder.pid, "command": "perl", "kind": "job"}, locked["host_lock_owners"])
+                else:
+                    self.assertEqual(locked["host_lock_activity"], "unknown")
                 self.assertLess(time.monotonic() - started, 20)  # never waits for the holder
             finally:
                 holder.kill()
                 holder.wait()
                 holder.stdout.close()
-            self.assertEqual(self.run_probe(root)["host_lock"], "free")
+            free = self.run_probe(root)
+            self.assertEqual(free["host_lock"], "free")
+            self.assertEqual(free["host_lock_owners"], [])
+            self.assertIsNone(free["host_lock_activity"])
             import fcntl
             shared = os.open(lock, os.O_RDONLY)
             try:  # a PR job's shared share of the host counts as held
@@ -3851,8 +3977,23 @@ class ReservationScriptShapeTests(unittest.TestCase):
             self.assertEqual(mf.read_reservation("build-mini-1", "cmux")["state"], "absent")
         argv = run.call_args.args[0]
         self.assertEqual(argv[:8], [mf.SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", "cmux", "build-mini-1"])
-        self.assertTrue(argv[8].startswith("/bin/bash -c "))
-        self.assertTrue(argv[8].endswith(" glaeda " + mf.FLEET_ROOT))
+        self.assertTrue(argv[8].startswith("( /bin/bash -c "))
+        self.assertIn(" glaeda " + mf.FLEET_ROOT, argv[8])
+        self.assertIn("__GLAEDA_REMOTE_STATUS__", argv[8])
+
+
+class RemoteStatusTests(unittest.TestCase):
+    def test_remote_status_overrides_a_transport_zero(self) -> None:
+        output = b"remote output\n__GLAEDA_REMOTE_STATUS__:7\n"
+        self.assertEqual(mf.remote_result(output, 0), (7, b"remote output"))
+
+    def test_ssh_stream_adds_a_remote_status_receipt(self) -> None:
+        with mock.patch.object(mf, "run_remote_logged", return_value=0) as run:
+            self.assertEqual(mf.ssh_stream("host", "user", "false", None), 0)
+        command = run.call_args.args[0][-1]
+        self.assertIn("( false", command)
+        self.assertIn("_glaeda_remote_status=$?", command)
+        self.assertTrue(command.endswith("; exit 0"))
 
 
 if __name__ == "__main__":
