@@ -174,6 +174,32 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(self.manifest["defaults"]["disk"]["min_free_gib"], 30)
 
 
+class TransportTests(unittest.TestCase):
+    def route_manifest(self) -> dict:
+        return {"ssh_user": "cmux", "hosts": {"aws-m4pro-7": {
+            "ssh_jump_host": "cmux-lawrence", "ssh_user": "ec2-user",
+            "ssh_identity": "~/.ssh/cmux-mac-builder.pem", "ssh_jump_host_local": True,
+            "tailnet_ip": "100.68.123.70"}}}
+
+    def test_aws_status_uses_controller_jump_and_preserves_target_exit(self) -> None:
+        manifest = self.route_manifest()
+        argv = mf.ssh_command(manifest, "aws-m4pro-7", "cmux", "echo ready")
+        self.assertEqual(argv[-2], "cmux-lawrence")
+        self.assertIn("ec2-user@100.68.123.70", argv[-1])
+        self.assertIn("cmux-mac-builder.pem", argv[-1])
+        self.assertIn(mf.SSH_RC_MARKER, argv[-1])
+        proc = subprocess.CompletedProcess(argv, 0, "ready\n\n" + mf.SSH_RC_MARKER + "7\n", "")
+        result = mf.ssh_result(manifest, "aws-m4pro-7", proc)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, "ready\n")
+
+    def test_incomplete_route_fails_closed(self) -> None:
+        manifest = self.route_manifest()
+        del manifest["hosts"]["aws-m4pro-7"]["tailnet_ip"]
+        with self.assertRaisesRegex(mf.Failure, "incomplete SSH route"):
+            mf.ssh_command(manifest, "aws-m4pro-7", "cmux", "true")
+
+
 class ClassAndPoolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.manifest = mf.load_manifest(EXAMPLE)
