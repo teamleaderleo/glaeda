@@ -15,7 +15,8 @@ clear_wait_receipts() {
   rm -f "$pid_file" "$bin_file"
 }
 record_wait_pid() {
-  printf '%s\n' "$$" >"$pid_file" || exit 1
+  clear_wait_receipts
+  printf '%s\n' "$$" >"$pid_file" || { clear_wait_receipts; exit 1; }
   rm -f "$bin_file"
 }
 record_wait_pid
