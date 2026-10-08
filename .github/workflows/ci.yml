@@ -216,7 +216,6 @@ jobs:
               Path("scripts/glaeda-update"),
               Path("scripts/glaeda_release.py"),
               Path("scripts/test-glaeda-update.py"),
-              Path("scripts/glaeda-fleet-cas"),
               Path("scripts/glaeda-fleet-cas-prune"),
               Path("scripts/test-glaeda-fleet-cas-prune.py"),
               Path("scripts/test-glaeda-fleet-cas.py"),
