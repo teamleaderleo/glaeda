@@ -1355,7 +1355,9 @@ class GlaedaDiskTest(unittest.TestCase):
     def test_one_eviction_at_a_time(self) -> None:
         lock = self.root / "evict.lock"
         receipt = ["--receipt", os.fspath(self.receipt())]
-        with mock.patch.object(gd, "EVICT_LOCK", lock), mock.patch.object(gd, "filesystems", return_value={}), \
+        with mock.patch.object(gd, "EVICT_LOCK", lock), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "filesystems", return_value={}), \
                 mock.patch.object(gd, "survey", return_value=[]) as survey, \
                 mock.patch.object(gd, "apply", return_value=0):
             with lock.open("a") as held:
