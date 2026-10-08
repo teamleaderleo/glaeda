@@ -359,6 +359,8 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
         return []
     findings: list[dict[str, Any]] = []
     eviction_paths: list[str] = []
+    eviction_path_seen: set[str] = set()
+    eviction_path_count = 0
     eviction_count = 0
     eviction_severity = "warn"
     eviction_auto_fix = "pending"
@@ -372,8 +374,11 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
                 if isinstance(evidence, str) and evidence:
                     eviction_evidence = evidence
             path = entry.get("path")
-            if isinstance(path, str) and path and path not in eviction_paths:
-                eviction_paths.append(path)
+            if isinstance(path, str) and path and path not in eviction_path_seen:
+                eviction_path_seen.add(path)
+                eviction_path_count += 1
+                if len(eviction_paths) < 32:
+                    eviction_paths.append(path)
             count = entry.get("count", 1)
             try:
                 count = max(1, int(count)) if not isinstance(count, bool) else 1
@@ -394,10 +399,10 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
                             f"({len(eviction_paths)} unique)", eviction_auto_fix,
                             "glaeda-disk reported repeated measurement timeouts")
         aggregate["timeout_count"] = eviction_count
-        aggregate["path_count"] = len(eviction_paths)
-        aggregate["paths"] = eviction_paths[:32]
-        if len(eviction_paths) > len(aggregate["paths"]):
-            aggregate["paths_truncated"] = len(eviction_paths) - len(aggregate["paths"])
+        aggregate["path_count"] = eviction_path_count
+        aggregate["paths"] = eviction_paths
+        if eviction_path_count > len(aggregate["paths"]):
+            aggregate["paths_truncated"] = eviction_path_count - len(aggregate["paths"])
         observed_at = summary.get("at")
         if isinstance(observed_at, (int, float)) and not isinstance(observed_at, bool):
             aggregate["observed_at"] = observed_at
