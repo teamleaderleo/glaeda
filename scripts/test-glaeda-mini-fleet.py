@@ -2085,6 +2085,7 @@ class FixLibraryTests(unittest.TestCase):
         # The only removals are the step lock's own pid file and directory, and the runner held marks it writes.
         self.assertEqual([line.strip() for line in body if "rm " in line and "rm -r" not in line],
                          ["""trap 'rm -f "$HOME/.local/state/glaeda/mini-fleet/step.lock/pid"; rmdir "$HOME/.local/state/glaeda/mini-fleet/step.lock" 2>/dev/null || true' EXIT""",
+                          'rm -f "$(held_dir)/$(basename "$dir")"',
                           'rm -f "$(held_dir)/$(basename "$dir")"'])
 
     @unittest.skipUnless(shutil.which("shasum") or shutil.which("sha256sum"), "needs shasum")
