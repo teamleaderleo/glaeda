@@ -1103,7 +1103,22 @@ def catch_up_role(host: dict[str, Any]) -> str | None:
 def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, Any]) -> list[tuple[str, str, str]]:
     """Drift for the fleet compile-cache catch-up roles, as (area, detail, fix). Reports only."""
     role = catch_up_role(host)
+    cas = obs.get("fleet_cas") or {}
     if role is None:
+        # A host can retain an old reader daemon after its role leaves the
+        # catch-up pool. Keep healthy, unused installations quiet, but surface
+        # a daemon that is actively failing its configured upstream so an
+        # orphaned deployment cannot masquerade as a healthy local socket.
+        stats = cas.get("stats") or {}
+        upstream_errors = stats.get("up_errors", 0)
+        upstream_skipped = stats.get("up_skipped", 0)
+        if upstream_errors or upstream_skipped:
+            store = cas.get("store") or "unknown store"
+            return [("fleet-cas", f"fleet-cas node outside a catch-up role has {upstream_errors} upstream errors "
+                    f"and {upstream_skipped} skipped calls for {store}; its local socket can answer while "
+                    "remote cache reads fall back to local CAS",
+                    f"inspect {FLEET_ROOT}/xcode/fleet-cas.env and node-store/stats.json; "
+                    "uninstall the orphaned node or rerun the approved fleet-cas rollout")]
         return []
     out: list[tuple[str, str, str]] = []
     keep = "never delete or re-clone it: the catch-up cache keys include this path"
@@ -1125,7 +1140,6 @@ def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, 
             out.append(("catch-up", f"the dev-build worker ({FLEET_ROOT}/bin/worker) runs on the {CATCH_UP_WRITER}; "
                         "team-submitted builds would run next to the signing key",
                         f"drain it: exclude the host in fleet.json and make its {HQ_WORKER_LABEL} wrapper idle"))
-    cas = obs.get("fleet_cas") or {}
     paths = cas.get("paths") or {}
     if not paths:
         out.append(("fleet-cas", f"no fleet-cas observation ({FLEET_ROOT} missing)", ""))

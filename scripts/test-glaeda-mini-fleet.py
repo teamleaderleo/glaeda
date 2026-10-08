@@ -784,6 +784,14 @@ class CatchUpTests(unittest.TestCase):
         self.assertEqual(issue["area"], "fleet-cas")
         self.assertIn("100.89.140.13:7450", issue["detail"])
 
+    def test_orphaned_reader_reports_upstream_failures(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["roles"] = ["ci-runner"]
+        text = fleet_cas_text(store="100.100.232.95:7450", stats={"up_errors": 238, "up_skipped": 40667})
+        issues = mf.check(self.manifest, observed(**{"build-mini-1": probe_text(fleet_cas=text)}), ["build-mini-1"])
+        (issue,) = [i for i in issues if "outside a catch-up role" in i["detail"]]
+        self.assertEqual(issue["area"], "fleet-cas")
+        self.assertIn("100.100.232.95:7450", issue["detail"])
+
     def test_reader_recipe_without_build_mode_is_drift(self) -> None:
         (issue,) = self.reader(fleet_cas_text(build_mode="missing"))
         self.assertEqual((issue["area"], issue["detail"]),
