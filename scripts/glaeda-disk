@@ -678,6 +678,13 @@ def host_busy(fleet: Path | None = None, now: float | None = None) -> str:
     return ""
 
 
+def _fresh(path: Path, seconds: float) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime < seconds
+    except OSError:
+        return False
+
+
 def idle_due(stamp: Path | None = None, every_s: float = IDLE_SWEEP_EVERY_S) -> bool:
     return not _fresh(IDLE_STAMP if stamp is None else stamp, every_s)
 
