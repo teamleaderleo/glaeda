@@ -144,6 +144,30 @@ for role_endpoint in \
 done
 test ! -e "$temporary_root/ifconfig.unexpected"
 
+# The installer must recognize a wrapper that is still waiting for its address. Otherwise a
+# changed args file would leave the old endpoint loaded until launchd eventually restarts it.
+cat >"$run_root/bin/fleet-cas-run" <<'EOF'
+#!/usr/bin/env python3
+import signal
+import time
+def stop(*_):
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+while True:
+    time.sleep(1)
+EOF
+chmod +x "$run_root/bin/fleet-cas-run"
+"$run_root/bin/fleet-cas-run" store &
+waiting_pid=$!
+sleep 0.2
+printf '%s\n' "$waiting_pid" >"$run_root/run/store.pid"
+ROOT="$run_root" BIN="$run_root/bin"
+eval "$(sed -n '/^restart_role()/,/^}/p' "$script")"
+restart_role store tcp:100.89.140.13:7450
+wait "$waiting_pid" 2>/dev/null || true
+! kill -0 "$waiting_pid" 2>/dev/null
+
 # A missing args file fails before launching the binary and clears the wrapper identity.
 rm -f "$run_root/run/store.args"
 printf 'stale-pid\n' >"$run_root/run/store.pid"
