@@ -2889,6 +2889,11 @@ class RepairTests(unittest.TestCase):
                 check = mf.preflight_host(manifest, "build-mini-1", observed(h=text)["hosts"]["h"])["checks"]["runner"]
                 self.assertEqual(check["state"], "todo")
                 self.assertIn(want, check["detail"])
+            lock_text = down + "host_lock\theld\n" \
+                + "host_lock_owner\t123|worker-current\n" \
+                + "host_lock_activity\tworker-only\n"
+            check = mf.preflight_host(manifest, "build-mini-1", observed(h=lock_text)["hosts"]["h"])["checks"]["runner"]
+            self.assertIn("host.lock worker-only (pid 123|worker-current)", check["detail"])
 
     def test_dry_run_names_what_it_would_do_and_touches_nothing(self) -> None:
         code, out, calls = run_command({"build-mini-1": on_candidate(), "build-mini-2": on_candidate(
@@ -3162,13 +3167,25 @@ def reservation_line(owner: str = "leo@air", purpose: str = "chromium campaign",
 
 class ReservationProbeParsingTests(unittest.TestCase):
     def test_parses_the_raw_marker_with_the_shared_rule(self) -> None:
-        got = mf.parse_probe(reservation_line(purpose="build a | b\tc", since=100, until=200) + "host_lock\theld\n")
+        got = mf.parse_probe(reservation_line(purpose="build a | b\tc", since=100, until=200)
+                             + "host_lock\theld\n"
+                             + "host_lock_owner\t123|worker-current\n"
+                             + "host_lock_activity\tworker-only\n")
         self.assertEqual(got["reservation"], {"valid": True, "owner": "leo@air", "purpose": "build a | b\tc",
                                               "since": 100, "until": 200})
         self.assertEqual(got["host_lock"], "held")
+        self.assertEqual(got["host_lock_owners"], [{"pid": 123, "command": "worker-current", "kind": "worker"}])
+        self.assertEqual(got["host_lock_activity"], "worker-only")
         self.assertEqual(mf.parse_probe("runner_worker\trunning\n")["runner_worker"], "running")
         self.assertEqual(mf.parse_probe("runner_worker\tabsent\n")["runner_worker"], "absent")
         self.assertIs(mf.reservation_rules, sys.modules["glaeda_reservation"])
+
+    def test_lock_owner_parser_drops_malformed_remote_evidence(self) -> None:
+        got = mf.parse_probe("host_lock_owner\tbad\n"
+                             "host_lock_owner\t1|worker\n"
+                             "host_lock_owner\t42|\n"
+                             "host_lock_owner\t43|Runner.Worker\n")
+        self.assertEqual(got["host_lock_owners"], [{"pid": 43, "command": "Runner.Worker", "kind": "job"}])
 
     def test_invalid_markers_say_why(self) -> None:
         good = {"schema": "glaeda-reservation/v1", "owner": "a", "purpose": "b", "since": 1, "until": 2}
@@ -3223,13 +3240,19 @@ class ReservationProbeScriptTests(unittest.TestCase):
             try:
                 self.assertEqual(holder.stdout.readline(), "locked\n")
                 started = time.monotonic()
-                self.assertEqual(self.run_probe(root)["host_lock"], "held")
+                locked = self.run_probe(root)
+                self.assertEqual(locked["host_lock"], "held")
+                self.assertEqual(locked["host_lock_activity"], "active-job")
+                self.assertIn({"pid": holder.pid, "command": "perl", "kind": "job"}, locked["host_lock_owners"])
                 self.assertLess(time.monotonic() - started, 20)  # never waits for the holder
             finally:
                 holder.kill()
                 holder.wait()
                 holder.stdout.close()
-            self.assertEqual(self.run_probe(root)["host_lock"], "free")
+            free = self.run_probe(root)
+            self.assertEqual(free["host_lock"], "free")
+            self.assertEqual(free["host_lock_owners"], [])
+            self.assertIsNone(free["host_lock_activity"])
             import fcntl
             shared = os.open(lock, os.O_RDONLY)
             try:  # a PR job's shared share of the host counts as held

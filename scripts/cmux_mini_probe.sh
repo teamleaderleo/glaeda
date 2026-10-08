@@ -155,6 +155,59 @@ if [ -e "$L" ] || [ -L "$L" ]; then
     if (flock($f, LOCK_EX | LOCK_NB)) { flock($f, LOCK_UN); print "free" }
     else { print $!{EWOULDBLOCK} ? "held" : "unknown" }' "$L" </dev/null 2>/dev/null)
   e host_lock "${hl:-unknown}"
+  # A non-blocking flock tells us that the lock is held, but not who holds it.  When the
+  # kernel exposes the open descriptor, lsof gives us a bounded PID and executable name.
+  # This is advisory evidence only: a root-owned process or a fast hand-off may be invisible.
+  # Never print argv, which can contain private job paths or credentials.
+  if [ "$hl" = held ] && [ -x /usr/sbin/lsof ]; then
+    owner_pid=
+    owner_comm=
+    saw_worker=no
+    saw_job=no
+    owners=$(/usr/sbin/lsof -nP -a -w -Fpc -- "$L" 2>/dev/null)
+    while IFS= read -r field; do
+      case "$field" in
+        p[0-9]*)
+          if [ -n "$owner_pid" ]; then
+            owner_comm=${owner_comm:-unknown}
+            # lsof's command field is a process name, not an argv.  Keep the record
+            # printable and bounded before it crosses the probe protocol.
+            owner_comm=$(printf '%s' "$owner_comm" | tr '\t\r\n' '   ' | cut -c1-120)
+            e host_lock_owner "$owner_pid|$owner_comm"
+            case "$owner_comm" in
+              worker|worker-*|worker_*|*cmux-build-worker*) saw_worker=yes ;;
+              *) saw_job=yes ;;
+            esac
+          fi
+          owner_pid=${field#p}
+          owner_comm=
+          ;;
+        c*) owner_comm=${field#c} ;;
+      esac
+    done <<EOF
+$owners
+EOF
+    if [ -n "$owner_pid" ]; then
+      owner_comm=${owner_comm:-unknown}
+      owner_comm=$(printf '%s' "$owner_comm" | tr '\t\r\n' '   ' | cut -c1-120)
+      e host_lock_owner "$owner_pid|$owner_comm"
+      case "$owner_comm" in
+        worker|worker-*|worker_*|*cmux-build-worker*) saw_worker=yes ;;
+        *) saw_job=yes ;;
+      esac
+    fi
+    if [ "$saw_job" = yes ]; then
+      e host_lock_activity active-job
+    elif [ "$saw_worker" = yes ]; then
+      # Only the persistent worker is visible.  This is the useful signal for a
+      # possible orphan, but it is not permission to kill or restart anything.
+      e host_lock_activity worker-only
+    else
+      e host_lock_activity unknown
+    fi
+  elif [ "$hl" = held ]; then
+    e host_lock_activity unknown
+  fi
 else
   e host_lock missing
 fi
