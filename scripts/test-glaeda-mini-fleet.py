@@ -39,11 +39,14 @@ STRAY = "SHA256:DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
 
 
 def fleet_cas_text(mode: str = "read-only", node: str = "answers", build_mode: str | None = "present",
-                   **kinds: str) -> str:
+                   store: str | None = None, stats: dict[str, int] | None = None, **kinds: str) -> str:
     """Probe lines for a conforming fleet-cas host; kinds overrides a path's kind (src_cmux="symlink")."""
     lines = [f"fleet_cas_path\t{rel}|{kinds.get(rel.replace('xcode/', '').replace('/', '_').replace('.', '_').replace('-', '_'), want)}"
              for rel, want in {**mf.FLEET_CAS_PATHS, **mf.FLEET_CAS_WRITER_PATHS}.items()]
     lines += [f"fleet_cas_node_mode\t{mode}", f"fleet_cas_node\t{node}"]
+    if store:
+        lines.append(f"fleet_cas_store\t{store}")
+    lines += [f"fleet_cas_stat\t{k}|{v}" for k, v in (stats or {}).items()]
     if build_mode is None:
         lines.append("fleet_recipe_released\tnone")
     else:
@@ -769,6 +772,17 @@ class CatchUpTests(unittest.TestCase):
         self.assertIn("does not answer", issue["detail"])
         (issue,) = self.reader(fleet_cas_text(**{"bin_fleet_cas_settings_sh": "missing"}))
         self.assertIn("fleet-cas-settings.sh missing", issue["detail"])
+
+    def test_reader_reports_upstream_failures_even_when_socket_answers(self) -> None:
+        text = fleet_cas_text(store="100.89.140.13:7450", stats={"up_calls": 12, "up_errors": 2,
+                                                                  "up_skipped": 8})
+        parsed = mf.parse_probe(probe_text(fleet_cas=text))["fleet_cas"]
+        self.assertEqual(parsed["store"], "100.89.140.13:7450")
+        self.assertEqual(parsed["stats"]["up_errors"], 2)
+        issues = self.reader(text)
+        (issue,) = [i for i in issues if "upstream errors" in i["detail"]]
+        self.assertEqual(issue["area"], "fleet-cas")
+        self.assertIn("100.89.140.13:7450", issue["detail"])
 
     def test_reader_recipe_without_build_mode_is_drift(self) -> None:
         (issue,) = self.reader(fleet_cas_text(build_mode="missing"))
