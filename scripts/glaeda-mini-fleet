@@ -1088,7 +1088,11 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
     # sudo is declared per host because fixes that need it go to an operator, not to this tool.
     if host.get("sudo") and obs.get("sudo") and obs["sudo"] != host["sudo"]:
         drift("sudo", f"sudo is {obs['sudo']}, manifest says {host['sudo']}")
-    token = policy.get("controller_token")
+    # The fleet-wide default describes hosts that run a controller worker.  PR
+    # runners and other deliberately excluded hosts inherit that default in
+    # the merged policy, but must not be made broken for lacking a token they
+    # are not allowed to use.  Worker/controller roles remain token-gated.
+    token = policy.get("controller_token") if host.get("controller") in ("worker", "controller") else None
     got_token = obs["fleet_worker"].get("controller_token")
     if token and got_token and got_token != token:
         drift("worker", f"controller token {got_token}, want {token}", "provision secrets/controller.token (operator)")

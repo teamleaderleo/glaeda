@@ -622,10 +622,16 @@ class CheckTests(unittest.TestCase):
 
     def test_sudo_and_token_drift(self) -> None:
         self.manifest["hosts"]["build-mini-1"]["sudo"] = "password"
+        self.manifest["hosts"]["build-mini-1"]["controller"] = "worker"
         self.manifest["defaults"]["controller_token"] = "present"
         text = probe_text() + "sudo\tnopasswd\ncontroller_token\tmissing\n"
         areas = {i["area"] for i in self.issues(text)}
         self.assertTrue({"sudo", "worker"} <= areas)
+
+    def test_excluded_controller_does_not_require_inherited_token(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["controller"] = "excluded"
+        text = probe_text() + "controller_token\tmissing\n"
+        self.assertFalse([i for i in self.issues(text) if i["area"] == "worker"])
 
     def test_versions_compare_padded(self) -> None:
         self.assertEqual(mf.version_tuple("26.3"), mf.version_tuple("26.3.0"))
