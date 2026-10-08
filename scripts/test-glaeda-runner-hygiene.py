@@ -87,6 +87,12 @@ class RunnerHygieneTest(unittest.TestCase):
         with self.assertRaisesRegex(rh.HygieneError, "not a glaeda-runner-hygiene"):
             rh.plan(self.install, uninstall=True)
 
+    def test_orphan_managed_plist_is_not_removed(self) -> None:
+        with mock.patch.object(rh, "_managed_plist", return_value=(True, "managed")), \
+                mock.patch.object(rh, "_managed_install", return_value=(False, "missing")):
+            with self.assertRaisesRegex(rh.HygieneError, "matching install manifest"):
+                rh.plan(self.install, uninstall=True)
+
     def test_unrelated_install_contents_are_refused(self) -> None:
         self.install.install_dir.mkdir(parents=True)
         (self.install.install_dir / "operator-file").write_text("keep")
