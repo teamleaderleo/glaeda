@@ -1176,7 +1176,11 @@ def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, 
     stats = cas.get("stats") or {}
     upstream_errors = stats.get("up_errors", 0)
     upstream_skipped = stats.get("up_skipped", 0)
-    if upstream_errors or upstream_skipped:
+    # The trusted writer's build wrapper already compares these monotonic
+    # counters before publishing each marker. Lifetime writer errors therefore
+    # do not mean its current fill is unhealthy; readers have no equivalent
+    # per-build gate, so retain the diagnostic for them.
+    if (upstream_errors or upstream_skipped) and role != CATCH_UP_WRITER:
         store = cas.get("store") or "unknown store"
         out.append(("fleet-cas", f"fleet-cas node has {upstream_errors} upstream errors and "
                     f"{upstream_skipped} skipped calls for {store}; its local socket can answer while "

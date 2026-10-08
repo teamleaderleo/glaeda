@@ -717,6 +717,10 @@ class CatchUpTests(unittest.TestCase):
         (issue,) = self.writer(fleet_cas=fleet_cas_text(mode="signing", build_mode="missing"))
         self.assertEqual(issue[0], "recipe")
 
+    def test_writer_lifetime_upstream_failures_are_gated_per_fill(self) -> None:
+        self.assertEqual(self.writer(fleet_cas=fleet_cas_text(mode="signing", store="100.89.140.13:7450",
+                                                              stats={"up_errors": 548179, "up_skipped": 2240091})), [])
+
     def test_failing_fill_is_pending_not_hidden(self) -> None:
         text = probe_text(hostname="Build-Mini-2", node_id="cmux-mac-002", worker_proc="absent",
                           fleet_cas=fleet_cas_text(mode="signing"))
