@@ -185,6 +185,19 @@ class GlaedaDiskTest(unittest.TestCase):
         os.utime(repo / ".git", (time.time() - 48 * 3600,) * 2)
         self.assertEqual(gd.survey([self.fam], 24, 0)[0].verdict, "git-checkout")
 
+    def test_tmp_checkout_git_metadata_does_not_reset_idle_clock(self) -> None:
+        self.fam = gd.Family("tmp", self.root, True, "scratch", git_disposable=True,
+                             max_idle_hours=1.0)
+        repo = self.root / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        old = time.time() - 48 * 3600
+        os.utime(repo, (old, old))
+        os.utime(repo / ".git", (time.time(), time.time()))
+        age = (time.time() - gd.item_mtime(self.fam, repo)) / 3600
+        self.assertGreater(age, 47)
+        self.assertEqual(gd.idle_window(self.fam, 6), 1.0)
+
     def test_bulk_sizes_walk_the_root_once_and_skip_prefixes(self) -> None:
         self.fam = gd.Family("user-tmp", self.root, True, "scratch", bulk_sizes=True,
                              skip_prefixes=("com.apple.",))
@@ -911,6 +924,11 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.space("2.5", 0), int(2.5 * 1024**3))
         with self.assertRaises(ValueError):
             gd.space("lots", 1000)
+
+    def test_tmp_family_does_not_treat_marker_search_budget_as_job_use(self) -> None:
+        fam = gd.Family("tmp", self.root, True, "scratch")
+        with mock.patch.object(gd, "cmux_active", return_value=True):
+            self.assertFalse(gd.job_busy(fam, self.root))
 
     def test_cmux_active_marker_holds_a_slot(self) -> None:
         slot = self.root / "work/slot-1"

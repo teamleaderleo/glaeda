@@ -1075,8 +1075,10 @@ def default_families() -> list[Family]:
                skip=("bundled-skills", "bash-edit-diff"), owner="Claude sessions", rebuild_minutes=0.5,
                # sessions clone into <session>/scratchpad/<name>; each clone must lose nothing
                git_disposable=True, nested_git=True, platform="shared"),
+        # Scratch and disposable CI checkouts are cold after an hour under either pressure or an
+        # idle sweep. Process, socket, root-token and git-loss checks still veto live or valuable work.
         Family("tmp", tmp, True, "agent scratch under the temp dir",
-               skip=(f"claude-{uid}",), files=True,
+               skip=(f"claude-{uid}",), files=True, max_idle_hours=1.0,
                min_bytes=1024**2 if tmpfs else None, git_disposable=True, owner="agents and tools",
                rebuild_minutes=0.5, platform=host_cache_platform()),
         # cmux's cloud reload and CI jobs keep warm trees per unit (reload-cloud/{cmux-base,work},
@@ -1340,7 +1342,8 @@ def du_children_with_status(root: Path) -> tuple[dict[str, int], bool] | None:
     return sizes, complete
 
 
-def newest_mtime(path: Path, levels: int = 2, budget: int = 3000, access: bool = False) -> float:
+def newest_mtime(path: Path, levels: int = 2, budget: int = 3000, access: bool = False,
+                 skip_names: frozenset[str] = frozenset()) -> float:
     """Newest mtime of path and entries up to `levels` below it, visiting at most `budget` entries.
 
     Build tools touch top-level files (DerivedData info.plist, logs) on every run, so a shallow,
@@ -1366,6 +1369,12 @@ def newest_mtime(path: Path, levels: int = 2, budget: int = 3000, access: bool =
                         if budget <= 0:
                             return newest
                         budget -= 1
+                        # Read-only git checks can still update metadata directories (for example
+                        # a submodule index). Those writes are tool bookkeeping, not user activity;
+                        # counting them would keep a clean disposable checkout "recent" forever
+                        # because every disk survey refreshes its own evidence.
+                        if e.name in skip_names:
+                            continue
                         try:
                             st = e.stat(follow_symlinks=False)
                         except OSError:
@@ -1384,7 +1393,9 @@ def newest_mtime(path: Path, levels: int = 2, budget: int = 3000, access: bool =
 def item_mtime(fam: Family, path: Path) -> float:
     """An item's last use as survey and apply judge it: its newest mtime near the top, and for SwiftPM scratch
     also its lock, which owned_spm_scratch touches whenever a job links the directory."""
-    newest = newest_mtime(path, 2 if fam.reclaimable else 1, 3000 if fam.reclaimable else 300, access=fam.discover)
+    skip_names = frozenset(VCS_MARKERS) if fam.id == "tmp" else frozenset()
+    newest = newest_mtime(path, 2 if fam.reclaimable else 1, 3000 if fam.reclaimable else 300,
+                          access=fam.discover, skip_names=skip_names)
     if fam.id == SPM_SCRATCH:
         with contextlib.suppress(OSError):
             newest = max(newest, spm_lock(path).stat().st_mtime)
@@ -2511,7 +2522,10 @@ def job_busy(fam: Family, path: Path) -> bool:
     # budget busy, which would keep bun's install cache forever. Nor is cmux CI's warm state: a DerivedData
     # there holds thousands of module cache directories within three levels, so every seed read as busy and
     # none was ever evicted (cmux15, 2026-09-28). A job using one is seen by its command line and cwd.
-    if fam.id in FLEET_FAMILY_IDS:
+    # The generic tmp family also contains the canonical CI checkout. Its source tree is wider than
+    # cmux_active's bounded marker search, so treating budget exhaustion as busy would pin it forever;
+    # the runner's root token and process/socket evidence are the live-use checks there.
+    if fam.id in FLEET_FAMILY_IDS or fam.id == "tmp":
         return False
     if fam.id == SPM_SCRATCH:  # dozens of package builds within three levels; its lock is its in-use signal
         return False
