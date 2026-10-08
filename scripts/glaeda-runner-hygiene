@@ -142,9 +142,17 @@ def _safe_executable(path: Path, label: str) -> Path:
         raise HygieneError(f"{label} must not be a symlink: {path}")
     if not stat.S_ISREG(st.st_mode) or not os.access(path, os.X_OK):
         raise HygieneError(f"{label} is not a regular executable: {path}")
+    if st.st_uid != 0:
+        raise HygieneError(f"{label} is not root-owned: {path}")
     # A launchd executable must not be replaceable by the enrolled user.
     if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise HygieneError(f"{label} is writable by another account: {path}")
+    for parent in path.parents:
+        if not parent.exists():
+            continue
+        pst = parent.stat()
+        if pst.st_uid != 0 or pst.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise HygieneError(f"{label} has an unsafe parent: {parent}")
     return path
 
 
@@ -218,10 +226,10 @@ def _launchctl(path: Path | None) -> Path:
 
 def build_install(account_name: str, source: Path | None = None, python: Path | None = None,
                   root: Path = INSTALL_ROOT, daemons: Path = LAUNCH_DAEMONS,
-                  launchctl: Path | None = None) -> Install:
+                  launchctl: Path | None = None, uninstall: bool = False) -> Install:
     account = _validate_home(account_name)
-    source_path = _source(source or DEFAULT_SOURCE)
-    python_path = resolve_python(python)
+    source_path = _source(source or DEFAULT_SOURCE) if not uninstall else None
+    python_path = resolve_python(python) if not uninstall else None
     root = _absolute_real(root, "install root") if root.exists() else root
     if root.exists() and root.is_symlink():
         raise HygieneError(f"install root must not be a symlink: {root}")
@@ -231,7 +239,21 @@ def build_install(account_name: str, source: Path | None = None, python: Path | 
         raise HygieneError(f"account install directory must not be a symlink: {uid_dir}")
     daemons = _absolute_real(daemons, "LaunchDaemons directory") if daemons.exists() else daemons
     plist = daemons / f"{LABEL_PREFIX}.{account.uid}.plist"
-    return Install(account, python_path, source_path, root, uid_dir, uid_dir / DISK_NAME,
+    snapshot = uid_dir / DISK_NAME
+    # Uninstall does not depend on a checkout or a working Python. Recover the
+    # pinned interpreter from the existing plist solely to verify its exact
+    # managed bytes; a missing plist is a no-op plan.
+    if uninstall:
+        source_path = snapshot if snapshot.is_file() else Path("/dev/null")
+        python_path = Path("/usr/bin/python3")
+        if plist.is_file():
+            with contextlib.suppress(OSError, ValueError, plistlib.InvalidFileException):
+                installed = plistlib.loads(plist.read_bytes())
+                argv = installed.get("ProgramArguments", []) if isinstance(installed, dict) else []
+                if isinstance(argv, list) and argv and isinstance(argv[0], str):
+                    python_path = Path(argv[0])
+    assert source_path is not None and python_path is not None
+    return Install(account, python_path, source_path, root, uid_dir, snapshot,
                    uid_dir / MANIFEST_NAME, plist, f"{LABEL_PREFIX}.{account.uid}",
                    _launchctl(launchctl))
 
@@ -278,6 +300,14 @@ def _managed_plist(install: Install) -> tuple[bool, str]:
         return False, "existing plist is not a glaeda-runner-hygiene plist"
     if content.get("Label") != install.label or content.get("UserName") != install.account.name:
         return False, "existing plist belongs to another account or label"
+    if content != plist_for(install):
+        return False, "existing plist was edited"
+    try:
+        st = install.plist.stat()
+    except OSError as exc:
+        return False, f"cannot stat existing plist: {exc}"
+    if st.st_uid != 0 or st.st_gid != _root_gid() or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return False, "existing plist is not root-owned and protected"
     return True, "managed"
 
 
@@ -295,6 +325,15 @@ def _managed_install(install: Install) -> tuple[bool, str]:
         if item.is_symlink() or not item.is_file():
             return False, "install snapshot contains a symlink or non-file"
     try:
+        snapshot_stat = install.snapshot.stat()
+        manifest_stat = install.manifest.stat()
+        if (snapshot_stat.st_uid != 0 or manifest_stat.st_uid != 0 or
+                snapshot_stat.st_gid != _root_gid() or manifest_stat.st_gid != _root_gid()):
+            return False, "install snapshot is not root-owned"
+        if (snapshot_stat.st_mode & 0o777) != 0o555 or (manifest_stat.st_mode & 0o777) != 0o444:
+            return False, "install snapshot has unsafe permissions"
+        if (snapshot_stat.st_mode | manifest_stat.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
+            return False, "install snapshot is writable by another account"
         manifest = json.loads(install.manifest.read_text())
     except (OSError, ValueError) as exc:
         return False, f"invalid install manifest: {exc}"
@@ -302,12 +341,16 @@ def _managed_install(install: Install) -> tuple[bool, str]:
         return False, "install manifest is not managed by this version"
     if manifest.get("user") != install.account.name or manifest.get("home") != os.fspath(install.account.home):
         return False, "install manifest is bound to another account home"
+    if manifest.get("snapshot") != os.fspath(install.snapshot):
+        return False, "install manifest points at another snapshot"
     try:
         device = install.install_dir.stat().st_dev
     except OSError as exc:
         return False, f"cannot stat install device: {exc}"
     if manifest.get("device") != device:
         return False, "install manifest is bound to another filesystem"
+    if manifest.get("sha256") != _sha256(install.snapshot):
+        return False, "install snapshot digest does not match its manifest"
     return True, "managed"
 
 
@@ -435,9 +478,11 @@ def apply_install(install: Install) -> dict:
         result = launchctl_run(install, "bootstrap", "system", os.fspath(install.plist))
         if result.returncode:
             raise HygieneError(f"launchctl bootstrap failed: {result.stderr.strip()[-200:]}")
+        if not service_loaded(install):
+            raise HygieneError("launchctl bootstrap returned success but the daemon is not loaded")
     return {"state": "applied", "operation": "install", "uid": install.account.uid,
             "user": install.account.name, "label": install.label, "sha256": digest,
-            "snapshot": os.fspath(install.snapshot), "plist": os.fspath(install.plist)}
+            "snapshot": os.fspath(install.snapshot), "plist": os.fspath(install.plist), "loaded": True}
 
 
 def apply_uninstall(install: Install) -> dict:
@@ -481,7 +526,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--source is only valid for install")
     try:
         install = build_install(args.user, None if args.uninstall else args.source, args.python,
-                                args.install_root, args.launch_daemons, args.launchctl)
+                                args.install_root, args.launch_daemons, args.launchctl,
+                                uninstall=args.uninstall)
         result = (apply_uninstall(install) if args.uninstall and args.apply else
                   apply_install(install) if args.apply else plan(install, args.uninstall))
     except HygieneError as exc:

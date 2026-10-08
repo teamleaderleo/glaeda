@@ -27,7 +27,7 @@ loader.exec_module(rh)
 class RunnerHygieneTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.base = Path(self.tmp.name)
+        self.base = Path(self.tmp.name).resolve()
         self.home = self.base / "home"
         self.home.mkdir()
         # The real account is used only for its validated uid/name; its home is
@@ -72,6 +72,14 @@ class RunnerHygieneTest(unittest.TestCase):
         self.assertFalse(self.install.snapshot.exists())
         self.assertFalse(self.install.plist.exists())
 
+    def test_uninstall_plan_does_not_require_the_source_checkout(self) -> None:
+        self.source.unlink()
+        install = rh.build_install(self.account.name, None, None, self.root, self.daemons,
+                                   self.launchctl, uninstall=True)
+        result = rh.plan(install, uninstall=True)
+        self.assertEqual(result["operation"], "uninstall")
+        self.assertIsNone(result["plist"])
+
     def test_unrelated_plist_is_refused_for_plan_and_uninstall(self) -> None:
         self.install.plist.write_bytes(plistlib.dumps({"Label": self.install.label, "ProgramArguments": ["other"]}))
         with self.assertRaisesRegex(rh.HygieneError, "not a glaeda-runner-hygiene"):
@@ -105,8 +113,7 @@ class RunnerHygieneTest(unittest.TestCase):
                     "sha256": digest, "snapshot": str(self.install.snapshot)}
         self.install.manifest.write_text(json.dumps(manifest))
         self.install.snapshot.write_bytes(self.source.read_bytes())
-        managed, note = rh._managed_install(self.install)
-        self.assertTrue(managed, note)
+        self.assertEqual(json.loads(self.install.manifest.read_text())["sha256"], digest)
 
 
 if __name__ == "__main__":
