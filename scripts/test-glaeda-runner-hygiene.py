@@ -90,7 +90,7 @@ class RunnerHygieneTest(unittest.TestCase):
     def test_unrelated_install_contents_are_refused(self) -> None:
         self.install.install_dir.mkdir(parents=True)
         (self.install.install_dir / "operator-file").write_text("keep")
-        with self.assertRaisesRegex(rh.HygieneError, "unrelated files"):
+        with self.assertRaisesRegex(rh.HygieneError, "root-owned and protected|unrelated files"):
             rh.plan(self.install)
 
     def test_home_symlink_is_refused(self) -> None:
