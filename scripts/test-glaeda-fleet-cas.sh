@@ -99,9 +99,61 @@ cat >"$stub_bin/sleep" <<'EOF'
 EOF
 chmod +x "$stub_bin/ifconfig" "$stub_bin/sleep"
 printf 'tcp:100.89.140.13:7450\nstore\n' >"$run_root/run/store.args"
+printf 'old-pid\n' >"$run_root/run/store.pid"
+printf 'old-bin\n' >"$run_root/run/store.bin"
 env FLEET_CAS_ROOT="$run_root" FLEET_CAS_IFCONFIG_STATE="$temporary_root/ifconfig.calls" PATH="$stub_bin:$PATH" \
   "$repo_root/tools/fleet-cas-prototype/scripts/fleet-cas-run" store >"$temporary_root/run-wrapper.out" 2>"$temporary_root/run-wrapper.err"
 grep -q 'waiting for local bind address 100.89.140.13' "$temporary_root/run-wrapper.err"
 grep -q 'started tcp:100.89.140.13:7450 store' "$temporary_root/run-wrapper.out"
+test "$(cat "$run_root/run/store.pid")" != old-pid
+test "$(cat "$run_root/run/store.bin")" = "$(shasum -a 256 "$run_root/bin/fleet-cas" | cut -c1-64)"
+
+# A missing address is bounded and clears stale receipts instead of leaving a false daemon
+# identity behind. The no-op sleep keeps this test fast while the wrapper still counts seconds.
+cat >"$stub_bin/ifconfig" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+printf 'stale-pid\n' >"$run_root/run/store.pid"
+printf 'stale-bin\n' >"$run_root/run/store.bin"
+if env FLEET_CAS_ROOT="$run_root" PATH="$stub_bin:$PATH" \
+  "$repo_root/tools/fleet-cas-prototype/scripts/fleet-cas-run" store >"$temporary_root/timeout.out" 2>"$temporary_root/timeout.err"; then
+  exit 1
+fi
+grep -q 'timed out after 60s waiting for local bind address 100.89.140.13' "$temporary_root/timeout.err"
+test ! -e "$run_root/run/store.pid"
+test ! -e "$run_root/run/store.bin"
+! grep -q '^started ' "$temporary_root/timeout.out"
+
+# Node, wildcard and IPv6 endpoints go straight to the binary's own validation.
+cat >"$stub_bin/ifconfig" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FLEET_CAS_IFCONFIG_CALLS:?}"
+exit 1
+EOF
+for role_endpoint in \
+  'node|unix:/tmp/fleet-cas.sock' \
+  'store|tcp:0.0.0.0:7450' \
+  'store|tcp:[fd7a:115c:a1e0::1]:7450' \
+  'store|tcp:999.1.1.1:7450' \
+  'store|tcp:100.89.140.13:not-a-port'; do
+  role=${role_endpoint%%|*}; endpoint=${role_endpoint#*|}
+  printf '%s\n' "$endpoint" >"$run_root/run/$role.args"
+  env FLEET_CAS_ROOT="$run_root" FLEET_CAS_IFCONFIG_CALLS="$temporary_root/ifconfig.unexpected" PATH="$stub_bin:$PATH" \
+    "$repo_root/tools/fleet-cas-prototype/scripts/fleet-cas-run" "$role" >"$temporary_root/$role-${endpoint//[^A-Za-z0-9]/_}.out"
+done
+test ! -e "$temporary_root/ifconfig.unexpected"
+
+# A missing args file fails before launching the binary and clears the wrapper identity.
+rm -f "$run_root/run/store.args"
+printf 'stale-pid\n' >"$run_root/run/store.pid"
+printf 'stale-bin\n' >"$run_root/run/store.bin"
+if env FLEET_CAS_ROOT="$run_root" PATH="$stub_bin:$PATH" \
+  "$repo_root/tools/fleet-cas-prototype/scripts/fleet-cas-run" store >"$temporary_root/missing.out" 2>"$temporary_root/missing.err"; then
+  exit 1
+fi
+test ! -e "$run_root/run/store.pid"
+test ! -e "$run_root/run/store.bin"
+! grep -q '^started ' "$temporary_root/missing.out"
 
 echo "glaeda-fleet-cas role-scoped uninstall and bind-wait tests passed"
