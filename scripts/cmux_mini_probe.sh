@@ -91,7 +91,16 @@ if [ -d "$F" ]; then
   e fleet_last_job "$last"
   e fleet_recipe "$(ls "$F/recipe-releases" 2>/dev/null | tail -1 | cut -c1-12)"
   e fleet_worker_sha "$(shasum -a 256 "$F/bin/worker" 2>/dev/null | cut -c1-12)"
-  pgrep -f "$F/bin/worker" >/dev/null && e fleet_worker_proc running || e fleet_worker_proc absent
+  # The installed worker may run from the root-only release path while the
+  # operator-facing fleet root keeps the wrapper and receipts. Prefer the
+  # launchd service state so the probe does not call a healthy worker absent.
+  worker_state=$(launchctl print "system/ai.manaflow.cmux-build-worker" 2>/dev/null |
+    awk -F' = ' '/^[[:space:]]*state = /{print $2; exit}')
+  if [ "$worker_state" = running ] || pgrep -f "$F/bin/worker" >/dev/null 2>&1; then
+    e fleet_worker_proc running
+  else
+    e fleet_worker_proc absent
+  fi
   # 0 when the wrapper turns catch-up off on purpose (remote-hit catch-up was slower until bulk warm lands).
   e fleet_catch_up "$(grep -oE '^export CMUX_CI_CATCH_UP=[0-9]+' "$F/bin/worker" 2>/dev/null | tail -1 | cut -d= -f2)"
   # Fleet compile cache (glaeda-fleet-cas): the fixed paths catch-up builds key on, by kind only.

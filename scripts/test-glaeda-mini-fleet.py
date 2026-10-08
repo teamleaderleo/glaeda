@@ -809,6 +809,12 @@ class CatchUpTests(unittest.TestCase):
         self.assertEqual(parsed["paths"]["xcode/src/cmux"], "symlink")
         self.assertEqual((parsed["node_mode"], parsed["node"], parsed["build_mode"]), ("read-only", "answers", "present"))
 
+    def test_probe_uses_launchd_worker_state_when_release_path_differs(self) -> None:
+        text = mf.PROBE.read_text()
+        self.assertIn('launchctl print "system/ai.manaflow.cmux-build-worker"', text)
+        self.assertIn('worker_state=$(launchctl print', text)
+        self.assertIn('e fleet_worker_proc running', text)
+
 
 class IosSimulatorTests(unittest.TestCase):
     def setUp(self) -> None:
