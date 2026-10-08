@@ -493,7 +493,15 @@ def parse_disk(stdout: str, at: int) -> dict[str, Any]:
                 continue
             clean_entry = {"used": num(entry.get("used")), "measured": num(entry.get("measured")),
                            "unmeasured": num(entry.get("unmeasured")),
+                           "unclassified": num(entry.get("unclassified", entry.get("unmeasured"))),
+                           "reclaimable": num(entry.get("reclaimable")),
                            "coverage_note": clean(entry.get("coverage_note"), 160), "coverage": []}
+            container = entry.get("container") if isinstance(entry.get("container"), dict) else None
+            if container is not None:
+                clean_entry["container"] = {"status": clean(container.get("status"), 20) or "unknown",
+                                             "total": num(container.get("total")),
+                                             "free": num(container.get("free")),
+                                             "used": num(container.get("used"))}
             for coverage in entry.get("coverage") or []:
                 if not isinstance(coverage, dict):
                     continue
@@ -501,7 +509,8 @@ def parse_disk(stdout: str, at: int) -> dict[str, Any]:
                 for child in coverage.get("children") or []:
                     if isinstance(child, dict) and num(child.get("bytes")) is not None:
                         children.append({"category": clean(child.get("category"), 80),
-                                         "bytes": int(child["bytes"]), "private": child.get("private") is True})
+                                         "bytes": int(child["bytes"]), "private": child.get("private") is True,
+                                         "classification": clean(child.get("classification"), 32) or "unknown"})
                 clean_entry["coverage"].append({"scope": clean(coverage.get("scope"), 40),
                                                   "complete": coverage.get("complete") is True,
                                                   "platform": clean(coverage.get("platform"), 20),
@@ -1452,6 +1461,17 @@ def disk_line(d: dict[str, Any] | None, at: int) -> str:
                         categories.append(f"{label} {gib(child['bytes'])}")
         if categories:
             parts.append("accounted " + ", ".join(categories[:3]))
+        accounting_totals = []
+        for entry in d.get("accounting") or []:
+            if entry.get("reclaimable") is not None:
+                accounting_totals.append(f"reclaimable {gib(entry['reclaimable'])} GiB")
+            if entry.get("unclassified") is not None:
+                accounting_totals.append(f"unclassified {gib(entry['unclassified'])} GiB")
+            container = entry.get("container") or {}
+            if container.get("free") is not None:
+                accounting_totals.append(f"APFS container free {gib(container['free'])} GiB")
+        if accounting_totals:
+            parts.append("; ".join(accounting_totals[:3]))
     prune, gc = d.get("prune"), d.get("gc")
     if prune:
         result = str(prune.get("result") or "?").split(" (")[0]

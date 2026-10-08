@@ -131,11 +131,24 @@ for state that can serve either host class, and `unknown` when the path does not
 This label is routing and accounting evidence only. It never authorizes deletion. macOS minis keep
 the macOS families needed by their runners; Linux work and its cache belong on the Blacksmith pool.
 
-The `accounting.coverage` rows explain the space that the eviction catalogue does not own. They
-are bounded, report-only lower bounds and may overlap. User homes are emitted only as one
-`private-user-data` aggregate with no account names or child paths. Shared runner storage is a
-separate category, so a large `Users` or `Other` number cannot be mistaken for disposable CI
-state. Wallpapers and other user-owned content remain outside the disposable families.
+The accounting object separates `reclaimable` bytes (live candidate verdicts that an apply pass can
+target), `unclassified` bytes (used volume space outside the catalog), and `container.free`/
+`container.total` (APFS container capacity from `diskutil`, which is not volume free space and is
+never counted as reclaimable). The `coverage` rows explain the unclassified space with bounded,
+report-only lower bounds and may overlap. On a proven CI runner account, Glaeda also reports the
+runner home, its Library caches, and browser build tree by operational category. User homes are
+otherwise emitted only as one `private-user-data` aggregate with no account names or child paths.
+Wallpapers and other user-owned content remain outside the disposable families.
+
+The same coverage includes the local `/Users/Shared/cmux-build-fleet` hot tier as `shared-fleet`
+rows: `cache` is shared cache, `xcode` is macOS build state, `ci` and `ci-ios` are macOS CI
+state, and `node-products` is the bounded shared product cache. These rows describe bytes on the
+mini. The controller's external SSD cache remains a separate host resource and is not added to
+every mini's physical totals.
+
+Dashboard consumers should render these `accounting` and `coverage` fields directly. They should
+not start a second recursive `du` sampler with a different cache age or reclaim policy, because
+that recreates the `Other` bucket and can disagree with the eviction receipt.
 
 A missing log or receipts file is simply absent from the member's `disk` object.
 Findings, all `warn` unless noted:

@@ -595,7 +595,8 @@ class DiskTests(unittest.TestCase):
                                   "coverage": [{"scope": "data-users", "complete": False,
                                                 "path": "/System/Volumes/Data/Users",
                                                 "children": [{"category": "private-user-data",
-                                                              "bytes": 80 * GIB, "private": True}]}]}]}
+                                                              "bytes": 80 * GIB, "private": True,
+                                                              "classification": "private"}]}]}]}
         receipts = [{"at": "2027-01-15T08:00:00+0000", "outcome": "reclaimed", "bytes": 2 * GIB},
                     {"at": "2027-01-15T07:00:00+0000", "outcome": "changed:in-use", "bytes": 9 * GIB},
                     {"at": "2027-01-10T00:00:00+0000", "outcome": "reclaimed", "bytes": 9 * GIB}]
@@ -615,7 +616,8 @@ class DiskTests(unittest.TestCase):
                                               "retired": True, "platform": "macos"})
         self.assertEqual([f["family"] for f in row["families"]], ["hq", "tmp", "empty"])
         self.assertEqual(row["accounting"][0]["coverage"][0]["children"][0],
-                         {"category": "private-user-data", "bytes": 80 * GIB, "private": True})
+                         {"category": "private-user-data", "bytes": 80 * GIB, "private": True,
+                          "classification": "private"})
         self.assertEqual(row["reclaimed_24h"], {"bytes": 2 * GIB, "count": 1})
         self.assertEqual((row["prune"]["result"], row["prune"]["node_store_bytes"]), ("ok", 5))
         self.assertEqual(row["prune"]["at"], now - 3600 + 100)  # moved onto this machine's clock

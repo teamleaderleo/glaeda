@@ -97,6 +97,7 @@ import fcntl
 import json
 import os
 import platform
+import plistlib
 import pwd
 import math
 import re
@@ -162,6 +163,50 @@ PLATFORM_VALUES = frozenset({"macos", "linux", "shared", "unknown"})
 def host_cache_platform() -> str:
     """An execution-host fact for generic caches, used only to label routing evidence."""
     return "macos" if DARWIN else "linux"
+
+
+def runner_home_roots() -> list[tuple[str, Path]]:
+    """Return extra accounting scopes only when the home proves it is a CI runner account."""
+    if not DARWIN:
+        return []
+    try:
+        runners = [p for p in HOME.glob("actions-runner*")
+                   if (p / ".runner").is_file() and (p / "glaeda-hooks").is_dir()]
+    except OSError:
+        return []
+    if not runners:
+        return []
+    return [("runner-home", HOME),
+            ("runner-library-caches", HOME / "Library/Caches"),
+            ("runner-browser-build", HOME / "cmux-browser-fleet/build")]
+
+
+def shared_fleet_roots() -> list[tuple[str, Path]]:
+    """Return bounded scopes for the local shared fleet tier.
+
+    The shared tree is a local hot tier, not the controller's external SSD. Keep its
+    direct children visible so the dashboard can distinguish CI state from caches and
+    node products without exposing job names or user paths. The controller's external
+    cache is observed by its own host and is deliberately not counted on a mini.
+    """
+    if not DARWIN:
+        return []
+    root = Path("/Users/Shared/cmux-build-fleet")
+    try:
+        if not root.is_dir() or not _measurement_path_allowed(root):
+            return []
+    except OSError:
+        return []
+    scopes = [("shared-fleet", root)]
+    for name in ("cache", "xcode", "ci", "ci-ios", "node-products", "logs", "tools",
+                 "job-volumes", "bin"):
+        child = root / name
+        try:
+            if child.is_dir() and _measurement_path_allowed(child):
+                scopes.append((f"shared-fleet/{name}", child))
+        except OSError:
+            continue
+    return scopes
 
 
 @dataclass(frozen=True)
@@ -1061,8 +1106,8 @@ def default_families() -> list[Family]:
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
-        # A day at least: Linux's relatime moves a file's access time once a day, so a cache read every
-        # hour can show a day-old atime.
+        # Twelve hours at least: Linux's relatime moves a file's access time once a day, so a cache read
+        # every hour can show a day-old atime. The live process and command checks still protect use.
         Family("home-caches", HOME, True, "the tool re-downloads or rebuilds it", discover=True,
                owner="tools (found by cache layout)", rebuild_minutes=5, min_idle_hours=12.0,
                platform=host_cache_platform()),
@@ -2876,6 +2921,7 @@ def gib(n: int) -> str:
 ACCOUNTING_MAX_AGE_S = 6 * 3600
 _ACCOUNTING_MEM: dict[tuple[int, str], list[dict[str, Any]]] = {}
 _ACCOUNTING_COVERAGE_MEM: dict[tuple[int, str], tuple[float, list[dict[str, Any]]]] = {}
+_APFS_CONTAINER_MEM: dict[str, dict[str, Any]] = {}
 
 
 def _accounting_cache() -> dict[str, Any]:
@@ -2900,6 +2946,43 @@ def _safe_cached_coverage(value: Any) -> list[dict[str, Any]] | None:
     return value
 
 
+def apfs_container_capacity(mount: str, now: float | None = None) -> dict[str, Any] | None:
+    """Read APFS container capacity without treating it as volume or reclaimable space.
+
+    `df` reports the Data volume's free blocks. `diskutil info -plist` also reports free
+    capacity in the enclosing APFS container, which can differ because the container holds
+    sibling volumes and snapshots. This is observation only and is cached for the same six
+    hour window as the bounded accounting walk.
+    """
+    if not DARWIN:
+        return None
+    now = time.time() if now is None else now
+    cached = _APFS_CONTAINER_MEM.get(mount)
+    if cached is not None and now - float(cached.get("at", 0)) < ACCOUNTING_MAX_AGE_S:
+        return dict(cached)
+    def unavailable() -> dict[str, Any]:
+        entry = {"status": "unavailable", "at": now}
+        _APFS_CONTAINER_MEM[mount] = entry
+        return dict(entry)
+    try:
+        result = subprocess.run(["/usr/sbin/diskutil", "info", "-plist", mount],
+                                capture_output=True, timeout=15, check=False)
+        if result.returncode != 0:
+            return unavailable()
+        info = plistlib.loads(result.stdout)
+        total = int(info["APFSContainerSize"])
+        free = int(info["APFSContainerFree"])
+        if total < 0 or free < 0 or free > total:
+            return unavailable()
+    except (OSError, ValueError, TypeError, KeyError, plistlib.InvalidFileException,
+            subprocess.SubprocessError):
+        return unavailable()
+    entry = {"status": "observed", "total": total, "free": free,
+             "used": total - free, "at": now}
+    _APFS_CONTAINER_MEM[mount] = entry
+    return dict(entry)
+
+
 def accounting_coverage(dev: int, now: float) -> list[dict[str, Any]]:
     """Collect bounded, report-only Data-volume categories for the operator view.
 
@@ -2910,16 +2993,28 @@ def accounting_coverage(dev: int, now: float) -> list[dict[str, Any]]:
     if not DARWIN:
         return []
     rows: list[dict[str, Any]] = []
-    for scope, root in DARWIN_ACCOUNTING_ROOTS:
+    shared_children: dict[str, int] | None = None
+    shared_complete = False
+    for scope, root in (*DARWIN_ACCOUNTING_ROOTS, *shared_fleet_roots(), *runner_home_roots()):
         try:
             if root.stat().st_dev != dev or not _measurement_path_allowed(root):
                 continue
         except OSError:
             continue
-        result = du_children_with_status(root)
-        if result is None:
-            continue
-        children, complete = result
+        if scope.startswith("shared-fleet/") and shared_children is not None:
+            # The parent walk already measured each direct child. Reuse those bytes instead of
+            # walking the same cache or build tree again for every explanatory nested row.
+            name = scope.split("/", 1)[1]
+            size = sum(value for path, value in shared_children.items()
+                       if Path(path).name == name)
+            children, complete = ({str(root): size}, shared_complete) if size else ({}, shared_complete)
+        else:
+            result = du_children_with_status(root)
+            if result is None:
+                continue
+            children, complete = result
+            if scope == "shared-fleet":
+                shared_children, shared_complete = children, complete
         # Never emit user-home names or paths. The Users walk is for accounting only and is
         # deliberately reduced to an aggregate private bucket plus the explicitly shared tree.
         if scope == "data-users":
@@ -2930,17 +3025,67 @@ def accounting_coverage(dev: int, now: float) -> list[dict[str, Any]]:
             children_out = []
             if private_bytes:
                 children_out.append({"category": "private-user-data", "bytes": private_bytes,
-                                     "private": True})
+                                     "private": True, "classification": "private"})
             if shared_bytes:
                 children_out.append({"category": "shared-users-data", "bytes": shared_bytes,
-                                     "private": False})
+                                     "private": False, "classification": "shared-runner"})
+        elif scope == "runner-home":
+            children_out = []
+            for path, size in sorted(children.items(), key=lambda kv: -kv[1])[:32]:
+                name = Path(path).name
+                if name == "cmux-browser-fleet":
+                    classification = "build"
+                elif name.startswith("actions-runner"):
+                    classification = "runner-work"
+                elif name in {".cache", ".bun", ".cargo", ".rustup", "go"}:
+                    classification = "tool-cache"
+                elif name in {"cmux", "nx-jobs", "fun", "cmux-browser-client-kits", "codex-cli"}:
+                    classification = "workspace"
+                elif name in {"Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures", "Public"}:
+                    classification = "user-owned"
+                else:
+                    classification = "unclassified"
+                children_out.append({"category": name, "bytes": size,
+                                     "private": classification == "user-owned",
+                                     "classification": classification})
+        elif scope == "runner-library-caches":
+            children_out = [{"category": f"cache/{Path(path).name}", "bytes": size,
+                             "private": False, "classification": "cache"}
+                            for path, size in sorted(children.items(), key=lambda kv: -kv[1])[:32]]
+        elif scope == "runner-browser-build":
+            children_out = [{"category": "browser-build", "bytes": sum(children.values()),
+                             "private": False, "classification": "build"}] if children else []
+        elif scope == "shared-fleet":
+            children_out = []
+            for path, size in sorted(children.items(), key=lambda kv: -kv[1])[:32]:
+                name = Path(path).name
+                if name in {"cache", "xcode"}:
+                    classification = "shared-cache" if name == "cache" else "macos-build"
+                elif name in {"ci", "ci-ios"}:
+                    classification = "macos-ci"
+                elif name == "node-products":
+                    classification = "shared-node-products"
+                else:
+                    classification = "shared-fleet"
+                children_out.append({"category": name, "bytes": size,
+                                     "private": False, "classification": classification})
+        elif scope.startswith("shared-fleet/"):
+            name = scope.split("/", 1)[1]
+            classification = ("shared-cache" if name == "cache" else
+                              "macos-build" if name == "xcode" else
+                              "macos-ci" if name in {"ci", "ci-ios"} else
+                              "shared-node-products" if name == "node-products" else
+                              "shared-fleet")
+            children_out = [{"category": name, "bytes": sum(children.values()),
+                             "private": False, "classification": classification}] if children else []
         else:
             children_out = []
             for path, size in sorted(children.items(), key=lambda kv: -kv[1])[:32]:
                 private = scope == "data-volume" and Path(path).name == "Users"
                 children_out.append({"category": "private-user-data" if private else Path(path).name,
-                                     "bytes": size, "private": private})
-        rows.append({"scope": scope, "path": str(root), "complete": complete,
+                                     "bytes": size, "private": private,
+                                     "classification": "private" if private else "unclassified"})
+        rows.append({"scope": scope, "complete": complete,
                      "at": now, "platform": "macos", "children": children_out})
     return rows
 
@@ -2994,21 +3139,32 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
                 top_at = now
         _ACCOUNTING_MEM[(fs.dev, fs.mount)] = top
         measured = 0
-        catalogued: list[tuple[Path, int]] = []
+        catalogued: list[tuple[Path, int, str]] = []
         for i in items:
             try:
                 if Path(i.path).stat().st_dev == fs.dev:
-                    catalogued.append((Path(i.path), i.bytes))
+                    catalogued.append((Path(i.path), i.bytes, i.verdict))
             except OSError:
                 continue
         # A parent catalog item already includes every nested item. Count only the highest-level path
         # in each overlapping set so the unmeasured figure remains an accounting gap, not an overlap artifact.
         selected: list[Path] = []
-        for path, size in sorted(catalogued, key=lambda pair: (len(pair[0].parts), str(pair[0]))):
+        for path, size, _ in sorted(catalogued, key=lambda pair: (len(pair[0].parts), str(pair[0]))):
             if any(path == parent or parent in path.parents for parent in selected):
                 continue
             selected.append(path)
             measured += size
+        # A report-only checkout must not mask a reclaimable build directory nested inside it.
+        # Deduplicate reclaimable candidates independently so this number is the bytes the next
+        # apply can actually target, rather than every item carrying a reclaimable verdict.
+        reclaimable = 0
+        reclaimable_selected: list[Path] = []
+        for path, size, verdict in sorted(catalogued, key=lambda pair: (len(pair[0].parts), str(pair[0]))):
+            if verdict != "reclaimable" or any(path == parent or parent in path.parents
+                                               for parent in reclaimable_selected):
+                continue
+            reclaimable_selected.append(path)
+            reclaimable += size
         used = max(0, fs.total - fs.free)
         coverage_mem = _ACCOUNTING_COVERAGE_MEM.get((fs.dev, fs.mount))
         cached_coverage = _safe_cached_coverage(hit.get("coverage")) if hit else None
@@ -3023,8 +3179,11 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
             coverage = accounting_coverage(fs.dev, now)
             coverage_at = now if coverage else 0.0
         _ACCOUNTING_COVERAGE_MEM[(fs.dev, fs.mount)] = (coverage_at, coverage)
+        unclassified = max(0, used - measured)
         entry = {"dev": fs.dev, "mount": fs.mount, "used": used, "measured": measured,
-                 "unmeasured": max(0, used - measured), "top_level": top,
+                 "unmeasured": unclassified, "unclassified": unclassified,
+                 "reclaimable": reclaimable, "top_level": top,
+                 "container": apfs_container_capacity(fs.mount, now),
                  "coverage": coverage, "coverage_at": coverage_at,
                  "coverage_note": "coverage rows overlap and incomplete rows are lower bounds"}
         out.append(entry)
@@ -3169,8 +3328,13 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
               f"{' (under pressure)' if fs.under else ''}")
     print(f"idle window {idle_hours:g}h\n")
     for a in accounting or []:
-        print(f"unmeasured {gib(a['unmeasured']).strip()} on {a['mount']} "
+        print(f"accounting on {a['mount']}: reclaimable {gib(a.get('reclaimable', 0)).strip()}, "
+              f"unclassified {gib(a.get('unclassified', a.get('unmeasured', 0))).strip()} "
               f"(df used {gib(a['used']).strip()}, measured {gib(a['measured']).strip()})")
+        container = a.get("container") or {}
+        if container.get("free") is not None:
+            print(f"  APFS container free {gib(container['free']).strip()} of "
+                  f"{gib(container.get('total', 0)).strip()} (not volume free or reclaimable)")
         for coverage in a.get("coverage", []):
             scope = coverage.get("scope", "unknown")
             state = "complete" if coverage.get("complete") else "lower bound"
