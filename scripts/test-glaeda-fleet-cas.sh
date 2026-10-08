@@ -158,12 +158,28 @@ while True:
     time.sleep(1)
 EOF
 chmod +x "$run_root/bin/fleet-cas-run"
+ROOT="$run_root" BIN="$run_root/bin"
+eval "$(sed -n '/^restart_role()/,/^}/p' "$script")"
+
+# A same-role wrapper from another checkout must not be killed by this checkout's stale PID.
+foreign_root=$temporary_root/foreign-wrapper
+mkdir -p "$foreign_root/bin"
+cp "$run_root/bin/fleet-cas-run" "$foreign_root/bin/fleet-cas-run"
+"$foreign_root/bin/fleet-cas-run" store &
+foreign_pid=$!
+sleep 0.2
+printf '%s\n' "$foreign_pid" >"$run_root/run/store.pid"
+ROOT="$run_root" BIN="$run_root/bin"
+restart_role store tcp:100.89.140.13:7450
+kill -0 "$foreign_pid" 2>/dev/null
+kill "$foreign_pid" 2>/dev/null || true
+wait "$foreign_pid" 2>/dev/null || true
+
 "$run_root/bin/fleet-cas-run" store &
 waiting_pid=$!
 sleep 0.2
 printf '%s\n' "$waiting_pid" >"$run_root/run/store.pid"
 ROOT="$run_root" BIN="$run_root/bin"
-eval "$(sed -n '/^restart_role()/,/^}/p' "$script")"
 restart_role store tcp:100.89.140.13:7450
 wait "$waiting_pid" 2>/dev/null || true
 ! kill -0 "$waiting_pid" 2>/dev/null
