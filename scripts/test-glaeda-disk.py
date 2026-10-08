@@ -401,6 +401,7 @@ class GlaedaDiskTest(unittest.TestCase):
         # never candidates: secrets, source, a checkout's build output, the Chromium trees,
         # a project's node_modules, and a hex-sharded store (a backup repository looks the same)
         for keep in (".ssh/cache", ".config/gh/cache", "Documents/cache", "Projects/x/cache",
+                     "Pictures/Wallpapers/cache",
                      "code/repo/target", "cmux-browser-fleet/cache", "app/node_modules/.cache",
                      ".my-tokens/cache", ".tool/untagged-creator"):
             (home / keep).mkdir(parents=True)
@@ -694,7 +695,8 @@ class GlaedaDiskTest(unittest.TestCase):
         self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
                                   gd._ACCOUNTING_MEM.clear()))
         with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
-                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB):
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB), \
+                mock.patch.object(gd, "accounting_coverage", return_value=[]):
             got = gd.filesystem_accounting([fs], [item])
         self.assertEqual(got[0]["measured"], 3 * gd.GIB)
         self.assertEqual(got[0]["unmeasured"], 5 * gd.GIB)
@@ -723,10 +725,12 @@ class GlaedaDiskTest(unittest.TestCase):
         saved = (gd.DARWIN, gd.ACCOUNTING)
         gd.DARWIN, gd.ACCOUNTING = True, self.root / "accounting-cache.json"
         gd._ACCOUNTING_MEM.clear()
+        gd._ACCOUNTING_COVERAGE_MEM.clear()
         self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
-                                  gd._ACCOUNTING_MEM.clear()))
+                                  gd._ACCOUNTING_MEM.clear(), gd._ACCOUNTING_COVERAGE_MEM.clear()))
         with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
-                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB):
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB), \
+                mock.patch.object(gd, "accounting_coverage", return_value=[]):
             gd.filesystem_accounting([fs], [])
         first = json.loads(gd.ACCOUNTING.read_text())[str(fs.dev)]["at"]
         gd._ACCOUNTING_MEM.clear()
@@ -734,6 +738,50 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.filesystem_accounting([fs], [])
         second = json.loads(gd.ACCOUNTING.read_text())[str(fs.dev)]["at"]
         self.assertEqual(second, first)
+
+    def test_accounting_coverage_is_cached_and_private_names_are_not_emitted(self) -> None:
+        path = self.root / "known"
+        path.write_bytes(b"x")
+        fs = gd.Fs(path.stat().st_dev, str(self.root), 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
+        saved = (gd.DARWIN, gd.ACCOUNTING, gd.DARWIN_ACCOUNTING_ROOTS)
+        data = self.root / "Data"
+        users = data / "Users"
+        shared = users / "Shared"
+        shared.mkdir(parents=True)
+        gd.DARWIN, gd.ACCOUNTING = True, self.root / "accounting-coverage.json"
+        gd.DARWIN_ACCOUNTING_ROOTS = (("data-volume", data), ("data-users", users),
+                                      ("data-users-shared", shared))
+        gd._ACCOUNTING_MEM.clear()
+        gd._ACCOUNTING_COVERAGE_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  setattr(gd, "DARWIN_ACCOUNTING_ROOTS", saved[2]),
+                                  gd._ACCOUNTING_MEM.clear(), gd._ACCOUNTING_COVERAGE_MEM.clear()))
+        coverage = [
+            ({str(data / "Users"): 100, str(data / "Applications"): 20}, False),
+            ({str(users / "leo"): 80, str(users / "Shared"): 30}, False),
+            ({str(shared / "cmux-build-fleet"): 30}, True),
+        ]
+        with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB), \
+                mock.patch.object(gd, "du_children_with_status", side_effect=coverage) as covered:
+            got = gd.filesystem_accounting([fs], [])
+            gd._ACCOUNTING_MEM.clear()
+            again = gd.filesystem_accounting([fs], [])
+        self.assertEqual(covered.call_count, 3)
+        self.assertEqual(got[0]["coverage"], again[0]["coverage"])
+        encoded = json.dumps(got)
+        self.assertNotIn("leo", encoded)
+        users_row = next(x for x in got[0]["coverage"] if x["scope"] == "data-users")
+        self.assertEqual(users_row["children"], [
+            {"category": "private-user-data", "bytes": 80, "private": True},
+            {"category": "shared-users-data", "bytes": 30, "private": False},
+        ])
+
+    def test_partial_du_coverage_is_a_lower_bound(self) -> None:
+        with mock.patch.object(gd, "_du_output",
+                               return_value=f"5 {self.root / 'one'}\ndu: protected\n"):
+            self.assertEqual(gd.du_children_with_status(self.root),
+                             ({str(self.root / "one"): 5 * 1024}, False))
 
     def test_retired_owner_family_is_reclaimable_when_unloaded(self) -> None:
         make(self.root / "old")
@@ -1622,7 +1670,7 @@ class GlaedaDiskTest(unittest.TestCase):
                                  "app/Packages/macOS/Core/.build", "wts/feature/.build",
                                  "wts/feature/Packages/macOS/Core/.build"])
 
-    def test_checkout_build_goes_after_a_day_and_the_checkout_stays(self) -> None:
+    def test_checkout_build_goes_after_half_a_day_and_the_checkout_stays(self) -> None:
         projects, fam = self._checkout_builds()
         self._age(projects / "wts/feature/.build", hours=12)
         gd.process_evidence = lambda: ([], f"swift-frontend {projects}/app/Packages/macOS/Core/.build/x.o\n")
@@ -1630,14 +1678,14 @@ class GlaedaDiskTest(unittest.TestCase):
         v = {str(Path(i.path).relative_to(projects)): i.verdict for i in items}
         self.assertEqual(v["app/.build"], "reclaimable")
         self.assertEqual(v["app/Packages/macOS/Core/.build"], "in-use")
-        self.assertEqual(v["wts/feature/.build"], "recent")  # 12 h: inside the day a session may return in
+        self.assertEqual(v["wts/feature/.build"], "reclaimable")  # 12 h retention for disposable output
         receipt = self.receipt()
         gd.apply(items, {fam.id: fam}, receipt, None, 6)
         self.assertFalse((projects / "app/.build").exists())
         self.assertFalse((projects / "app/.glaeda/apple-build/cache/k1").exists())
         self.assertTrue((projects / "app/.glaeda/apple-build/receipt.json").exists())
         self.assertTrue((projects / "app/Packages/macOS/Core/.build").exists())
-        self.assertTrue((projects / "wts/feature/.build").exists())
+        self.assertFalse((projects / "wts/feature/.build").exists())
         self.assertEqual(self._git("-C", str(projects / "app"), "status", "--porcelain", "-uno"), "")
 
     def test_apple_generation_stays_while_a_run_holds_the_lock(self) -> None:
@@ -1680,15 +1728,15 @@ class GlaedaDiskTest(unittest.TestCase):
         make(ci / "derived-data", age_hours=30)
         fams = gd.idle_families(gd.fleet_families(ci))
         got = {str(Path(i.path).relative_to(ci)): i.verdict for i in gd.survey(fams, gd.IDLE_SWEEP_HOURS, 0)}
-        self.assertEqual(got, {"seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "recent",
+        self.assertEqual(got, {"seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "reclaimable",
                                "seeds/p-d": "reclaimable", "pr-builds/pr-1": "recent",
-                               "pr-builds/pr-2": "recent", "derived-data": "recent"})
-        # DerivedData and caches wait the full window
+                               "pr-builds/pr-2": "recent", "derived-data": "reclaimable"})
+        # DerivedData and caches use the 12 h idle window for disposable output.
         make(self.root / "dd/old", age_hours=50)
         make(self.root / "dd/day", age_hours=30)
         fam = gd.Family("xcode-derived-data", self.root / "dd", True, "rebuild")
         got = {Path(i.path).name: i.verdict for i in gd.survey(gd.idle_families([fam]), gd.IDLE_SWEEP_HOURS, 0)}
-        self.assertEqual(got, {"old": "reclaimable", "day": "recent"})
+        self.assertEqual(got, {"old": "reclaimable", "day": "reclaimable"})
 
     def test_host_busy_sees_jobs_builds_locks_and_reservations(self) -> None:
         fleet = self.root / "fleet"
@@ -1759,7 +1807,7 @@ class GlaedaDiskTest(unittest.TestCase):
                     contextlib.redirect_stdout(io.StringIO()):
                 gd.main(args)
             self.assertFalse((self.root / "old").exists())
-            self.assertTrue((self.root / "day").exists())
+            self.assertFalse((self.root / "day").exists())
             self.assertTrue(stamp.exists())
             make(self.root / "old", age_hours=50)
             with mock.patch.object(gd, "host_busy", return_value=""), contextlib.redirect_stdout(io.StringIO()) as out:
@@ -1844,6 +1892,9 @@ class LinuxLayoutTest(unittest.TestCase):
                          ["botany-sim-worktrees", "glaeda-worktrees"])
         reclaimable = {f.id for f in fams if f.reclaimable}
         self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad", "user-cache", "home-caches", "checkout-build"})
+        self.assertEqual(next(f for f in fams if f.id == "tmp").platform, "linux")
+        self.assertEqual(next(f for f in fams if f.id == "user-cache").platform, "linux")
+        self.assertEqual(next(f for f in fams if f.id == "home-caches").platform, "linux")
         projects = next(f for f in fams if f.id == "projects")
         self.assertIn("botany-sim-worktrees", projects.skip)
         tmp = next(f for f in fams if f.id == "tmp")
@@ -1872,7 +1923,7 @@ class LinuxLayoutTest(unittest.TestCase):
         gd.process_evidence = lambda: ([], "")
         try:
             fams = [f for f in gd.default_families() if f.id in ("cmux-job-cache", "user-cache")]
-            self.assertEqual(next(f for f in fams if f.id == "cmux-job-cache").min_idle_hours, 24.0)
+            self.assertEqual(next(f for f in fams if f.id == "cmux-job-cache").min_idle_hours, 12.0)
             items = gd.survey(fams, 24, 0)
         finally:
             gd.process_evidence = saved

@@ -147,6 +147,22 @@ MEASURE_SKIP_COMPONENTS = frozenset({
     "com.apple.FileProvider", "com.apple.CloudDocs",
 })
 
+# These roots are for accounting only. They are deliberately separate from the eviction
+# catalogue: their sizes may overlap, and an incomplete walk is a lower bound rather than
+# permission to delete anything. Keeping the Data volume at one bounded level makes the
+# dashboard's "other" bucket explainable without walking `/` or entering FileProvider trees.
+DARWIN_ACCOUNTING_ROOTS = (
+    ("data-volume", Path("/System/Volumes/Data")),
+    ("data-users", Path("/System/Volumes/Data/Users")),
+    ("data-users-shared", Path("/System/Volumes/Data/Users/Shared")),
+)
+PLATFORM_VALUES = frozenset({"macos", "linux", "shared", "unknown"})
+
+
+def host_cache_platform() -> str:
+    """An execution-host fact for generic caches, used only to label routing evidence."""
+    return "macos" if DARWIN else "linux"
+
 
 @dataclass(frozen=True)
 class Family:
@@ -185,6 +201,7 @@ class Family:
     stale_before: float | None = None
     allow_stale_protected: bool = False  # permit an explicit family below NEVER_DELETE roots
     reference_root: Path | None = None  # root containing lease/job markers for this family
+    platform: str = "unknown"  # macos | linux | shared | unknown; reporting only, never deletion authority
 
 
 def idle_window(fam: Family, idle_hours: float) -> float:
@@ -271,7 +288,7 @@ def artifact_referenced(path: Path, references: frozenset[str]) -> bool:
 FLEET_CI = Path("/Users/Shared/cmux-build-fleet/ci")
 SEED_SOURCE = "seed-source.json"
 SEED_KEEP = 2  # seed_derived_data.LOCAL_KEEP_LOW_DISK: newest seeds of the current prefix each root keeps
-KEPT_BUILD_IDLE_HOURS = 48.0
+KEPT_BUILD_IDLE_HOURS = 24.0
 PARKED_IDLE_HOURS = float("inf")  # parked builds age by host-job reuse distance, not wall clock
 
 
@@ -296,18 +313,21 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
         fams.append(Family("cmux-pr-builds", store / "pr-builds", True,
                            "the pull request's next push compiles from main's kept build",
                            include=("pr-",), build_output=True, max_idle_hours=PARKED_IDLE_HOURS,
-                           owner="cmux owned_build_state.py (park)", rebuild_minutes=6))
+                           owner="cmux owned_build_state.py (park)", rebuild_minutes=6,
+                           platform="macos"))
         # Seeds: the root's newest SEED_KEEP of its current prefix stay (seed_verdict); older and other
         # fingerprints' seeds go LRU. A seed comes back from the LAN seeder or the bucket in 25 to 280 s.
         # On the trusted seeder, one the seed archive already holds goes without waiting (archived_seeds).
         fams.append(Family("cmux-seeds", store / "seeds", True,
                            "glaeda-seed-prefetch or the next job fetches it again", build_output=True,
-                           owner="cmux seed_derived_data.py (CMUX_SEED_LOCAL_CACHE)", rebuild_minutes=4))
+                           owner="cmux seed_derived_data.py (CMUX_SEED_LOCAL_CACHE)", rebuild_minutes=4,
+                           platform="macos"))
         # A root's kept build (and a discard a killed job left) goes only when the root is dead.
         fams.append(Family("cmux-kept-build", store, True, "the next job on this root starts from a seed",
                            include=("derived-data", ".derived-data.discard-"), build_output=True,
                            min_idle_hours=KEPT_BUILD_IDLE_HOURS,
-                           owner="cmux owned_build_state.py (keep)", rebuild_minutes=10))
+                           owner="cmux owned_build_state.py (keep)", rebuild_minutes=10,
+                           platform="macos"))
     if fams:  # root 1's store is the mini's, and the only one that holds SwiftPM scratch (cmux mini_store)
         fams.append(spm_scratch_family(fleet_stores(ci)[0]))
     return fams
@@ -319,7 +339,8 @@ def ci_ios_family(root: Path | None = None) -> Family:
     return Family("ci-ios-derived-data", root, True,
                   "the next iOS job rebuilds its DerivedData", depth=2,
                   match="derived-data", build_output=True,
-                  reference_root=FLEET_ROOT, owner="cmux iOS CI jobs", rebuild_minutes=8)
+                  reference_root=FLEET_ROOT, owner="cmux iOS CI jobs", rebuild_minutes=8,
+                  platform="macos")
 
 
 # cmux CI's SwiftPM scratch (cmux scripts/ci/owned_spm_scratch.py): swift-package-tests links each package's .build
@@ -337,7 +358,8 @@ SPM_REBUILD_MINUTES = 3.0  # one swift-package-tests job rebuilds the packages i
 def spm_scratch_family(store: Path) -> Family:
     return Family(SPM_SCRATCH, store / "spm-scratch", True,
                   "the next swift-package-tests job rebuilds the packages it selects", build_output=True,
-                  owner="cmux owned_spm_scratch.py", rebuild_minutes=SPM_REBUILD_MINUTES)
+                  owner="cmux owned_spm_scratch.py", rebuild_minutes=SPM_REBUILD_MINUTES,
+                  platform="macos")
 
 
 def spm_lock(path: Path) -> Path:
@@ -462,11 +484,12 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
 # touches the seed it starts from, so a seed's mtime is its last use.
 # A busy root lands about four new ~9 GiB seeds an hour; one no job picked for a day (beyond the root's
 # newest SEED_KEEP, which stay) sits far behind every new base, and a fetch brings it back in 25 to 280 s.
-# A day, not less: cmux keeps up to 48 per root on a roomy disk so a PR on an older base starts close. DerivedData, caches and scratch get KEPT_BUILD_IDLE_HOURS, the
-# window a root's own kept build already has: two days covers a quiet day or a weekend's first job.
+# Twelve hours, not less: cmux keeps the newest seeds per root while older generations can be
+# fetched again from the LAN archive. DerivedData, caches and scratch get KEPT_BUILD_IDLE_HOURS,
+# which bounds stale disposable output without touching a live job's state.
 IDLE_SWEEP_HOURS = KEPT_BUILD_IDLE_HOURS
 IDLE_PR_BUILD_HOURS = float("inf")
-IDLE_SEED_HOURS = 24.0
+IDLE_SEED_HOURS = 12.0
 IDLE_SWEEP_EVERY_S = 3600  # the 15-minute agent sweeps at most hourly: an apply re-measures every candidate
 IDLE_STAMP = HOME / ".cache/glaeda-disk/idle-sweep.last"
 FLEET_DIR = FLEET_CI.parent
@@ -737,7 +760,7 @@ def runtime_items(runtimes: dict, devices: dict, now: float | None = None) -> li
         verdict = ("kept" if keep else "recent" if idle is not None and idle < RUNTIME_IDLE_DAYS * 24
                    else "reclaimable")
         items.append(Item("simulator-runtimes", str(rid), size if isinstance(size, int) else 0,
-                          round(idle or 0.0, 1), verdict, reasons + keep))
+                          round(idle or 0.0, 1), verdict, reasons + keep, platform="macos"))
     return items
 
 
@@ -797,7 +820,7 @@ def xcode_items(apps: Path = Path("/Applications"), pins: dict[str, str] | None 
         if size is None:
             size = 0
             why.append("size walk timed out; size is unsized")
-        items.append(Item("xcode-apps", str(app), size, 0.0, "report-only", why))
+        items.append(Item("xcode-apps", str(app), size, 0.0, "report-only", why, platform="macos"))
     return items
 
 
@@ -913,8 +936,9 @@ def checkout_builds(projects: Path) -> list[Path]:
 def checkout_build_family(projects: Path) -> Family:
     return Family("checkout-build", projects, True,
                   "swift build or glaeda-apple warm rebuilds it; also counted in its checkout",
-                  checkout_builds=True, build_output=True, min_idle_hours=CHECKOUT_BUILD_IDLE_HOURS,
-                  owner="SwiftPM and glaeda-apple, per checkout", rebuild_minutes=15)
+                  checkout_builds=True, build_output=True, min_idle_hours=min(CHECKOUT_BUILD_IDLE_HOURS, 12.0),
+                  owner="SwiftPM and glaeda-apple, per checkout", rebuild_minutes=15,
+                  platform="shared")
 
 
 def apple_build_verdict(path: Path) -> str:
@@ -988,7 +1012,7 @@ def bazel_family(root: Path) -> Family:
     # no process names it, newer Bazel links output bases' external/ into it, and it is what an
     # offline build or a vanished URL needs. install/ bases carry future mtimes, so they read recent.
     return Family("bazel-output", root, True, "bazel rebuilds it", skip=("cache",), owner="bazel",
-                  rebuild_minutes=30, build_output=True)
+                  rebuild_minutes=30, build_output=True, platform=host_cache_platform())
 
 
 def default_families() -> list[Family]:
@@ -1000,31 +1024,32 @@ def default_families() -> list[Family]:
     fams = [
         Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
                "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15,
-               build_output=True),
+               build_output=True, platform="macos"),
         Family("claude-scratchpad", tmp / f"claude-{uid}", True,
                "session scratch space; the session is idle", depth=2,
                skip=("bundled-skills", "bash-edit-diff"), owner="Claude sessions", rebuild_minutes=0.5,
                # sessions clone into <session>/scratchpad/<name>; each clone must lose nothing
-               git_disposable=True, nested_git=True),
+               git_disposable=True, nested_git=True, platform="shared"),
         Family("tmp", tmp, True, "agent scratch under the temp dir",
                skip=(f"claude-{uid}",), files=True,
                min_bytes=1024**2 if tmpfs else None, git_disposable=True, owner="agents and tools",
-               rebuild_minutes=0.5),
+               rebuild_minutes=0.5, platform=host_cache_platform()),
         # cmux's cloud reload and CI jobs keep warm trees per unit (reload-cloud/{cmux-base,work},
         # reload-cloud-ios/{DerivedData,work}); a build mini grew 36 GiB here within hours. Depth 2
         # so a unit's DerivedData can go while the clones below cmux-base and work stay protected.
-        # Reload-cloud state must be at least a day old before this pass considers it; pressure
-        # runs therefore cannot erase a slot that was used earlier in the same day.
+        # Reload-cloud state must be at least half a day old before this pass considers it; pressure
+        # runs therefore cannot erase a slot used recently in the same work period.
         Family("cmux-job-cache", HOME / ".cache/cmux-job", True,
                "next cmux reload or CI job rebuilds it (cold)", depth=2, git_disposable=True,
-               owner="cmuxterm-hq reload-cloud scripts", rebuild_minutes=30, min_idle_hours=24.0),
+               owner="cmuxterm-hq reload-cloud scripts", rebuild_minutes=30, min_idle_hours=12.0,
+               platform=host_cache_platform()),
         # Caches are disposable by definition; an idle one goes under pressure, a live one (go-build
         # while a Go build runs) stays recent. Any git data inside keeps it, as everywhere else.
         Family("user-cache", HOME / ".cache", True, "the tool re-downloads or rebuilds it",
                # glaeda* holds glaeda-gh daemon state, the minis' native cache root, fleet-cas deployments
                # and benchmark receipts; huggingface keeps its token; codex-runtimes is an install
                skip=("cmux-job", "huggingface", "codex-runtimes"), skip_prefixes=("glaeda",),
-               owner="tools (XDG cache)", rebuild_minutes=5),
+               owner="tools (XDG cache)", rebuild_minutes=5, platform=host_cache_platform()),
         Family("library-caches", HOME / "Library/Caches", True, "the app re-downloads or rebuilds it",
                # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
                # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
@@ -1032,32 +1057,33 @@ def default_families() -> list[Family]:
                      "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
                      "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
                skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5,
-               stale_before=ARTIFACT_CUTOFF, reference_root=FLEET_ROOT),
+               stale_before=ARTIFACT_CUTOFF, reference_root=FLEET_ROOT, platform="macos"),
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
         # A day at least: Linux's relatime moves a file's access time once a day, so a cache read every
         # hour can show a day-old atime.
         Family("home-caches", HOME, True, "the tool re-downloads or rebuilds it", discover=True,
-               owner="tools (found by cache layout)", rebuild_minutes=5, min_idle_hours=24.0),
+               owner="tools (found by cache layout)", rebuild_minutes=5, min_idle_hours=12.0,
+               platform=host_cache_platform()),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
-               "use `xcrun simctl delete unavailable` (report only)"),
+               "use `xcrun simctl delete unavailable` (report only)", platform="macos"),
         Family("projects", projects, False, "checkouts (report only)",
-               skip=tuple(r.name for r in wt_roots)),
+               skip=tuple(r.name for r in wt_roots), platform="shared"),
     ]
     user_tmp = darwin_user_tmp() if DARWIN else None
     if user_tmp is not None:
         # Apple daemons keep live state in com.apple.* entries without holding them open.
         fams.append(Family("user-tmp", user_tmp, True, "agent scratch under the per-user $TMPDIR",
                            skip_prefixes=("com.apple.",), git_disposable=True, bulk_sizes=True,
-                           owner="agents and tools", rebuild_minutes=0.5))
+                           owner="agents and tools", rebuild_minutes=0.5, platform="shared"))
     # The dev-build worker's shared cache (the cmuxterm-hq controller's worker, live only on the dev-build worker
     # host since cmuxterm-hq#661): visible with its owner, never deleted here. When the worker is unloaded the
     # report says so, since other tools may still read parts of it (2026-09-24).
     fams.append(Family("hq-build-fleet-cache", Path("/Users/Shared/cmux-build-fleet/cache"), True,
                        "the retired dev-build worker rebuilds its cache", retired_only=True,
                        owner="cmux dev-build worker (hq controller)",
-                       owner_job="system/ai.manaflow.cmux-build-worker"))
+                       owner_job="system/ai.manaflow.cmux-build-worker", platform="macos"))
     bazel_user = ""
     with contextlib.suppress(KeyError):
         bazel_user = pwd.getpwuid(uid).pw_name
@@ -1072,7 +1098,8 @@ def default_families() -> list[Family]:
             fams.append(Family("fleet-artifacts", fleet_cache, True,
                                "the fleet worker rebuilds or fetches the artifact", depth=1,
                                files=True, allow_stale_protected=True, stale_before=ARTIFACT_CUTOFF,
-                               reference_root=FLEET_ROOT, owner="cmux fleet worker", rebuild_minutes=8))
+                               reference_root=FLEET_ROOT, owner="cmux fleet worker", rebuild_minutes=8,
+                               platform="macos"))
         ci_ios = FLEET_ROOT / "ci-ios"
         if ci_ios.is_dir():
             fams.append(ci_ios_family(ci_ios))
@@ -1081,30 +1108,32 @@ def default_families() -> list[Family]:
             fams.append(Family("browser-artifacts", browser, True,
                                "the browser tour rebuilds the artifact", depth=1, files=True,
                                skip=("build",), allow_stale_protected=True, stale_before=ARTIFACT_CUTOFF,
-                               reference_root=FLEET_ROOT, owner="cmux browser fleet", rebuild_minutes=20))
+                               reference_root=FLEET_ROOT, owner="cmux browser fleet", rebuild_minutes=20,
+                               platform="macos"))
         fams += fleet_families()
         for runner in HOME.glob("actions-runner*"):
             temp = runner / "_work/_temp"
             if (runner / ".runner").is_file() and (runner / "glaeda-hooks").is_dir() and temp.is_dir():
                 fams.append(Family("ci-derived-data", temp, True, "the CI test job rebuilds it",
                                    include=("cmux-derived-data-tests-",), build_output=True,
-                                   owner="cmux CI test jobs", rebuild_minutes=6))
+                                   owner="cmux CI test jobs", rebuild_minutes=6, platform="macos"))
         # Bounded by its owner: node_product_cache.py evicts LRU to CMUX_NODE_PRODUCT_CACHE_MAX_BYTES (24 GiB).
         fams.append(Family("cmux-node-products", Path("/Users/Shared/cmux-build-fleet/node-products"), False,
                            "report only: its owner evicts LRU to a 24 GiB budget",
-                           owner="cmux node_product_cache.py"))
+                           owner="cmux node_product_cache.py", platform="macos"))
     for root in wt_roots:
         fams.append(Family("worktrees", root, False,
-                           "run glaeda-worktree-reclaim-all (report only)"))
+                           "run glaeda-worktree-reclaim-all (report only)", platform="shared"))
     # SwiftPM and glaeda-apple build output inside the checkouts: every other family here keeps a checkout
     # whole, so under pressure nothing was left to evict while agent sessions compiled packages in hundreds
-    # of worktrees (Air Blue fell to 134 MiB free, 2026-09-28). A day idle, since the session may come back.
+    # of worktrees (Air Blue fell to 134 MiB free, 2026-09-28). Half a day idle leaves a return window
+    # while preventing old package output from filling a runner.
     fams.append(checkout_build_family(projects))
     # Cargo owns target validity and RFC #1137 owns Cargo reclaim, so this is visibility only.
     # Sizes here are also counted inside their checkout under projects or worktrees.
     fams.append(Family("cargo-target", projects, False,
                        "report only: cargo clean; also counted in its checkout",
-                       depth=4, match="target", marker="CACHEDIR.TAG"))
+                       depth=4, match="target", marker="CACHEDIR.TAG", platform="shared"))
     return [f for f in fams if f.root.is_dir()]
 
 
@@ -1117,6 +1146,12 @@ class Item:
     verdict: str  # reclaimable | recent | in-use | git-checkout | unchecked | report-only | kept
     reasons: list[str] = field(default_factory=list)
     jobs_since: int | None = None  # host CI jobs started since its last use (activity_due), when counted
+    platform: str = "unknown"
+
+
+def platform_label(fam: Family) -> str:
+    """Return a bounded reporting label; platform is evidence for display, never deletion authority."""
+    return fam.platform if fam.platform in PLATFORM_VALUES else "unknown"
 
 
 def _record_eviction_stuck(argv: list[str]) -> None:
@@ -1180,7 +1215,7 @@ def fixed_measurement_roots() -> list[Path]:
     return roots
 
 
-def _du_output(argv: list[str]) -> str | None:
+def _du_output(argv: list[str], allow_nonzero: bool = False) -> str | None:
     """Run one du walk with a killable process group; None means the tree is unsized."""
     try:
         proc = subprocess.Popen(
@@ -1204,7 +1239,7 @@ def _du_output(argv: list[str]) -> str | None:
             return None
     except OSError:
         return None
-    if proc.returncode != 0:
+    if proc.returncode != 0 and not allow_nonzero:
         return None
     return out
 
@@ -1237,6 +1272,27 @@ def du_children(root: Path) -> dict[str, int] | None:
         if len(fields) == 2 and fields[1] != str(root) and fields[0].isdigit():
             sizes[str(root / Path(fields[1]).name)] = int(fields[0]) * 1024
     return sizes
+
+
+def du_children_with_status(root: Path) -> tuple[dict[str, int], bool] | None:
+    """Return a bounded one-level walk plus whether every entry was readable.
+
+    macOS `du` exits nonzero when an unprivileged health agent meets a protected
+    directory, but it still prints useful lower-bound rows. This function preserves
+    those rows and marks the result incomplete; callers must keep it report-only.
+    """
+    if not _measurement_path_allowed(root):
+        return None
+    out = _du_output(["du", "-xk", "-d", "1", str(root)], allow_nonzero=True)
+    if out is None:
+        return None
+    sizes: dict[str, int] = {}
+    for line in out.splitlines():
+        fields = line.split(None, 1)
+        if len(fields) == 2 and fields[1] != str(root) and fields[0].isdigit():
+            sizes[str(root / Path(fields[1]).name)] = int(fields[0]) * 1024
+    complete = not any(line.startswith("du:") for line in out.splitlines())
+    return sizes, complete
 
 
 def newest_mtime(path: Path, levels: int = 2, budget: int = 3000, access: bool = False) -> float:
@@ -2680,7 +2736,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
                 reasons.append("the seed archive holds it")
         if jobs is not None and verdict in ("recent", "reclaimable"):
             reasons.append(reasons_jobs)
-        items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons, jobs))
+        items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons, jobs,
+                          platform_label(fam)))
     items.sort(key=lambda i: i.bytes, reverse=True)
     return items
 
@@ -2818,6 +2875,7 @@ def gib(n: int) -> str:
 
 ACCOUNTING_MAX_AGE_S = 6 * 3600
 _ACCOUNTING_MEM: dict[tuple[int, str], list[dict[str, Any]]] = {}
+_ACCOUNTING_COVERAGE_MEM: dict[tuple[int, str], tuple[float, list[dict[str, Any]]]] = {}
 
 
 def _accounting_cache() -> dict[str, Any]:
@@ -2826,6 +2884,65 @@ def _accounting_cache() -> dict[str, Any]:
         return doc if isinstance(doc, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _safe_cached_coverage(value: Any) -> list[dict[str, Any]] | None:
+    """Accept only the redacted coverage shape; old/path-bearing rows are rescanned."""
+    if not isinstance(value, list):
+        return None
+    for row in value:
+        if not isinstance(row, dict) or not isinstance(row.get("scope"), str):
+            return None
+        for child in row.get("children", []):
+            if (not isinstance(child, dict) or not isinstance(child.get("category"), str)
+                    or "path" in child):
+                return None
+    return value
+
+
+def accounting_coverage(dev: int, now: float) -> list[dict[str, Any]]:
+    """Collect bounded, report-only Data-volume categories for the operator view.
+
+    The rows intentionally overlap (Data -> Users -> Users/Shared). Each row names its
+    scope and completeness so the UI can show where the bytes live without pretending
+    that their sum is a physical total.
+    """
+    if not DARWIN:
+        return []
+    rows: list[dict[str, Any]] = []
+    for scope, root in DARWIN_ACCOUNTING_ROOTS:
+        try:
+            if root.stat().st_dev != dev or not _measurement_path_allowed(root):
+                continue
+        except OSError:
+            continue
+        result = du_children_with_status(root)
+        if result is None:
+            continue
+        children, complete = result
+        # Never emit user-home names or paths. The Users walk is for accounting only and is
+        # deliberately reduced to an aggregate private bucket plus the explicitly shared tree.
+        if scope == "data-users":
+            private_bytes = sum(size for path, size in children.items()
+                                if Path(path).name != "Shared")
+            shared_bytes = sum(size for path, size in children.items()
+                               if Path(path).name == "Shared")
+            children_out = []
+            if private_bytes:
+                children_out.append({"category": "private-user-data", "bytes": private_bytes,
+                                     "private": True})
+            if shared_bytes:
+                children_out.append({"category": "shared-users-data", "bytes": shared_bytes,
+                                     "private": False})
+        else:
+            children_out = []
+            for path, size in sorted(children.items(), key=lambda kv: -kv[1])[:32]:
+                private = scope == "data-volume" and Path(path).name == "Users"
+                children_out.append({"category": "private-user-data" if private else Path(path).name,
+                                     "bytes": size, "private": private})
+        rows.append({"scope": scope, "path": str(root), "complete": complete,
+                     "at": now, "platform": "macos", "children": children_out})
+    return rows
 
 
 def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, Any]]:
@@ -2893,8 +3010,23 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
             selected.append(path)
             measured += size
         used = max(0, fs.total - fs.free)
+        coverage_mem = _ACCOUNTING_COVERAGE_MEM.get((fs.dev, fs.mount))
+        cached_coverage = _safe_cached_coverage(hit.get("coverage")) if hit else None
+        cached_coverage_at = float(hit.get("coverage_at", 0)) if hit else 0.0
+        if coverage_mem is not None and now - coverage_mem[0] < ACCOUNTING_MAX_AGE_S:
+            coverage = coverage_mem[1]
+            coverage_at = coverage_mem[0]
+        elif cached_coverage is not None and now - cached_coverage_at < ACCOUNTING_MAX_AGE_S:
+            coverage = cached_coverage
+            coverage_at = cached_coverage_at
+        else:
+            coverage = accounting_coverage(fs.dev, now)
+            coverage_at = now if coverage else 0.0
+        _ACCOUNTING_COVERAGE_MEM[(fs.dev, fs.mount)] = (coverage_at, coverage)
         entry = {"dev": fs.dev, "mount": fs.mount, "used": used, "measured": measured,
-                 "unmeasured": max(0, used - measured), "top_level": top}
+                 "unmeasured": max(0, used - measured), "top_level": top,
+                 "coverage": coverage, "coverage_at": coverage_at,
+                 "coverage_note": "coverage rows overlap and incomplete rows are lower bounds"}
         out.append(entry)
         cache_records[str(fs.dev)] = {**entry, "at": top_at}
     try:
@@ -3039,6 +3171,14 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
     for a in accounting or []:
         print(f"unmeasured {gib(a['unmeasured']).strip()} on {a['mount']} "
               f"(df used {gib(a['used']).strip()}, measured {gib(a['measured']).strip()})")
+        for coverage in a.get("coverage", []):
+            scope = coverage.get("scope", "unknown")
+            state = "complete" if coverage.get("complete") else "lower bound"
+            print(f"  coverage {scope} ({state}, report-only, overlapping categories)")
+            for child in coverage.get("children", []):
+                category = child.get("category", "unknown")
+                private = " private" if child.get("private") else ""
+                print(f"    {gib(int(child.get('bytes', 0))).strip()}  {category}{private}")
     by_fam: dict[str, int] = {}
     for i in items:
         by_fam[i.family] = by_fam.get(i.family, 0) + i.bytes
@@ -3049,12 +3189,14 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
         f = (fams or {}).get(fam)
         if f and f.owner:
             note += f"  owner: {f.owner}" + (" (RETIRED: its service is not loaded)" if owner_retired(f) else "")
-        print(f"  {gib(n)}  {fam:20s}  reclaimable {gib(r).strip()}{note}")
+        label = f.platform if f and f.platform in PLATFORM_VALUES else "unknown"
+        print(f"  {gib(n)}  {fam:20s}  {label:7s} reclaimable {gib(r).strip()}{note}")
     print(f"\ntop {limit}")
     for i in items[:limit]:
         why = f" ({', '.join(i.reasons)})" if i.reasons else ""
         path = i.path.replace(str(HOME), "~")
-        print(f"  {gib(i.bytes)}  {i.verdict:12s} {i.idle_hours:6.1f}h  {path}{why}")
+        print(f"  {gib(i.bytes)}  {i.verdict:12s} {i.idle_hours:6.1f}h  "
+              f"{i.platform:7s} {path}{why}")
     for u in sorted(UNREADABLE):
         hint = (f"background jobs need Full Disk Access for {os.path.realpath(sys.executable)}"
                 if DARWIN else f"not readable by uid {os.getuid()}; its items are skipped")

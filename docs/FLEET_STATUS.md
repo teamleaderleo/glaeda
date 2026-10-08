@@ -125,6 +125,18 @@ The `disk` probe reads, per member:
 - bytes and deletions with outcome `reclaimed` in the last 24 h, from
   `~/Projects/recovery/disk-reclaim/receipts.jsonl`.
 
+The disk JSON labels each catalog family and item with an evidence-bound `platform`: `macos` for
+Apple build and runner state, `linux` for generic cache state observed on a Linux host, `shared`
+for state that can serve either host class, and `unknown` when the path does not prove a class.
+This label is routing and accounting evidence only. It never authorizes deletion. macOS minis keep
+the macOS families needed by their runners; Linux work and its cache belong on the Blacksmith pool.
+
+The `accounting.coverage` rows explain the space that the eviction catalogue does not own. They
+are bounded, report-only lower bounds and may overlap. User homes are emitted only as one
+`private-user-data` aggregate with no account names or child paths. Shared runner storage is a
+separate category, so a large `Users` or `Other` number cannot be mistaken for disposable CI
+state. Wallpapers and other user-owned content remain outside the disposable families.
+
 A missing log or receipts file is simply absent from the member's `disk` object.
 Findings, all `warn` unless noted:
 
