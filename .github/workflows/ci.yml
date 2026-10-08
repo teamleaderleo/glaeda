@@ -218,7 +218,6 @@ jobs:
               Path("scripts/test-glaeda-update.py"),
               Path("scripts/glaeda-fleet-cas-prune"),
               Path("scripts/test-glaeda-fleet-cas-prune.py"),
-              Path("scripts/glaeda-fleet-cas"),
               Path("scripts/test-glaeda-fleet-cas.py"),
               Path("scripts/glaeda-seed-prefetch"),
               Path("scripts/test-glaeda-seed-prefetch.py"),
