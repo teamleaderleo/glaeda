@@ -135,8 +135,8 @@ CI's main build is the only writer (#1134 M3; tested in
 - It runs on one dedicated writer mini whose node daemon holds the signing key and signs
   every index entry (`glaeda-fleet-cas writer`). The store keeps, and every node uses, only
   entries signed by a trusted key (`--trusted-keys`); objects need no signature.
-- The main build runs under `xcode/bin/fleet-cas-writer-build.sh cmux <sha> -- <build>`. It
-  publishes the signed marker `cmux/<sha>/<Xcode build>` only after a successful build that
+- The main build runs under `xcode/bin/fleet-cas-writer-build.sh cmux@catchup-v1 <sha> -- <build>`. It
+  publishes the signed marker `cmux@catchup-v1/<sha>/<Xcode build>` only after a successful build that
   used the node, with no write error, no failed or skipped fleet-store call and no node
   restart, and with the node still up afterwards; otherwise it exits 4 and later main builds
   fill the rest. It empties the local CAS (`xcode/cas`) first, so every lookup reaches the node (an entry answered from the
@@ -234,9 +234,9 @@ cmux8s (node), 2026-09-24.
 Catch-up is only fast when the store already holds the target commit; on a store miss it
 is a cold build (756 s on Xcode 26.3 minis; a full caching-on rebuild took 606 s on 26.6), slower than an incremental caching-off rebuild. So the
 worker asks first: the writer records a marker per commit it has filled, and catch-up is
-chosen only when `xcode/bin/fleet-cas-marker.sh cmux <sha>` exits 0 (the signed marker for
+chosen only when `xcode/bin/fleet-cas-marker.sh cmux@catchup-v1 <sha>` exits 0 (the signed marker for
 that commit and this host's Xcode build exists). Before building, the worker then runs
-`xcode/bin/fleet-cas-warm.sh cmux <sha>` under a timeout: it copies the whole fill into the
+`xcode/bin/fleet-cas-warm.sh cmux@catchup-v1 <sha>` under a timeout: it copies the whole fill into the
 node, so the build's lookups are local hits. On any other exit (1: no manifest, 2: something
 did not verify, 3: incomplete) or a timeout, fall back to a slot build. Unwarmed, each lookup is two
 serial fleet-store round trips, and a full catch-up read took 1631 s on 09-25. Between builds,
