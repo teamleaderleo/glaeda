@@ -292,10 +292,16 @@ restart_role() {  # role, first argument the running process was started with
   echo "fleet-cas $1 (pid $pid) did not exit" >&2; exit 1
 }
 
-# The binary the role's process started with (fleet-cas-run records it) differs from bin/.
+# The service process is launched through fleet-cas-run, which waits for the
+# bind address and then execs fleet-cas. Fingerprint both files so a helper-only
+# OTA update restarts an already-running role instead of waiting for reboot.
+service_fingerprint() {  # role
+  local runner; runner=$(runner_for "$1")
+  shasum -a 256 "$BIN/fleet-cas" "$runner" | shasum -a 256 | cut -c1-64
+}
 stale_binary() {  # role
   local state; state=$(state_for "$1")
-  [ "$(cat "$state/$1.bin" 2>/dev/null)" != "$(shasum -a 256 "$BIN/fleet-cas" | cut -c1-64)" ]
+  [ "$(cat "$state/$1.bin" 2>/dev/null)" != "$(service_fingerprint "$1")" ]
 }
 
 write_service() {  # role, args...

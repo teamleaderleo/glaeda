@@ -205,7 +205,19 @@ env -u FLEET_CAS_ROOT FLEET_CAS_IFCONFIG_STATE="$temporary_root/ifconfig.calls" 
 grep -q 'waiting for local bind address 100.89.140.13' "$temporary_root/run-wrapper.err"
 grep -q 'started tcp:100.89.140.13:7450 store' "$temporary_root/run-wrapper.out"
 test "$(cat "$run_root/run/store.pid")" != old-pid
-test "$(cat "$run_root/run/store.bin")" = "$(shasum -a 256 "$run_root/bin/fleet-cas" | cut -c1-64)"
+expected_fingerprint=$(shasum -a 256 "$run_root/bin/fleet-cas" "$wrapper" | shasum -a 256 | cut -c1-64)
+test "$(cat "$run_root/run/store.bin")" = "$expected_fingerprint"
+
+# A helper-only update must invalidate the running-service receipt too. The
+# previous installer compared only fleet-cas and left the old wrapper loaded.
+runner_for() { printf '%s\n' "$run_root/fleet-cas-run"; }
+state_for() { printf '%s\n' "$run_root/run"; }
+eval "$(sed -n '/^service_fingerprint()/,/^}/p' "$repo_root/scripts/glaeda-fleet-cas")"
+eval "$(sed -n '/^stale_binary()/,/^}/p' "$repo_root/scripts/glaeda-fleet-cas")"
+ROOT="$run_root" BIN="$run_root/bin"
+! stale_binary store
+printf '# helper-only update\n' >>"$run_root/fleet-cas-run"
+stale_binary store
 
 # A missing address is bounded and clears stale receipts instead of leaving a false daemon
 # identity behind. The no-op sleep keeps this test fast while the wrapper still counts seconds.

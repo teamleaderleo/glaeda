@@ -162,7 +162,10 @@ if [ "$role" = store ] && [ "${args[0]:-}" != "" ] && ! wait_for_store_address "
   exit 78
 fi
 
-# Record the pid and the binary it runs, so the installer can restart a stale one.
+# Record the pid and the complete service closure, so the installer can restart
+# a stale role after either the wrapper or the daemon changes. Include filenames
+# in the input that is hashed by `shasum` so the two file digests cannot collide
+# through simple concatenation.
 trap - HUP INT TERM
-shasum -a 256 "$ROOT/bin/fleet-cas" | cut -c1-64 >"$bin_file"
+shasum -a 256 "$ROOT/bin/fleet-cas" "$0" | shasum -a 256 | cut -c1-64 >"$bin_file"
 exec "$ROOT/bin/fleet-cas" "${args[@]}"
