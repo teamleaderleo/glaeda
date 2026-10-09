@@ -43,7 +43,6 @@ case "${1:-}" in
       [ "$1" = -mountpoint ] && mount_point=$2
       shift
     done
-    mkdir -p "$mount_point"
     : >"${FLEET_CAS_MOUNT_STATE:?}"
     ;;
   detach)
@@ -73,6 +72,17 @@ mkdir -p "$mount_root"
 : >"$mount_state"
 env "${mount_env[@]}" "$helper" "$mount_root" "$image" E36525CA-ED1B-4141-907E-59213CFC8FC6
 test ! -s "$mount_calls"
+
+# Disk Arbitration creates a missing /Volumes mountpoint as part of attach. An
+# unprivileged caller cannot mkdir below the real root-owned /Volumes parent,
+# so the helper must leave creation to hdiutil. The stub models that attach
+# contract without writing the mountpoint itself.
+rm -rf "$mount_root" "$mount_state"
+chmod 0555 "$mount_base"
+: >"$mount_calls"
+env "${mount_env[@]}" "$helper" "$mount_root" "$image" E36525CA-ED1B-4141-907E-59213CFC8FC6
+chmod 0755 "$mount_base"
+grep -q -- "attach -quiet -nobrowse -mountpoint $mount_root $image" "$mount_calls"
 
 # An absent root attaches exactly the configured image, then validates it.
 rm -rf "$mount_root" "$mount_state"
