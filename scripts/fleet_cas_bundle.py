@@ -221,9 +221,11 @@ def stage(archive: Path, destination: Path, source: str, target: str, expected_d
         if not apply:
             return receipt
         os.mkdir(destination.name, 0o700, dir_fd=parent)
-        generation = os.open(destination.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
-        info = os.fstat(generation)
+        info = os.stat(destination.name, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            raise BundleError("staging destination is not a directory")
         created_identity = (info.st_dev, info.st_ino)
+        generation = os.open(destination.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
         try:
             all_files = {**files, "manifest.json": canonical(manifest)}
             all_files["SHA256SUMS"] = ("".join(f"{digest(data)}  {name}\n" for name, data in sorted(all_files.items()))).encode()

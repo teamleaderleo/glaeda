@@ -36,6 +36,7 @@ jobs:
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
       go: ${{ steps.scope.outputs.go }}
+      fleet_cas: ${{ steps.scope.outputs.fleet_cas }}
 
     steps:
       - name: Check out repository
@@ -52,11 +53,12 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           if test "$EVENT" != pull_request; then
-            printf 'rust=true\ngo=true\n' >> "$GITHUB_OUTPUT"
+            printf 'rust=true\ngo=true\nfleet_cas=false\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           rust=false
           go=false
+          fleet_cas=false
           # Scripts that Rust tests run: the modules they load are Rust input too (fleet_bundle.py through
           # scripts/test-fleet-bundle.py, for one).
           rust_named=$(grep -rhoE 'scripts/[A-Za-z0-9_./-]+' src tests | sort -u | while read -r f; do
@@ -66,6 +68,7 @@ jobs:
           git diff --no-renames --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed"
           while IFS= read -r path; do
             case "$path" in
+              tools/fleet-cas-prototype/*|scripts/fleet_cas_bundle.py|scripts/test-fleet-cas-bundle.py|.github/workflows/release.yml|.github/workflows/ci.yml|tools/fleet-cas-prototype/README.md) fleet_cas=true ;;
               docs/MODULE_INVENTORY.md) rust=true ;;
               docs/*|*.md) ;;
               .github/workflows/ci.yml) rust=true; go=true ;;
@@ -83,7 +86,7 @@ jobs:
               *) rust=true ;;
             esac
           done < "$RUNNER_TEMP/changed"
-          printf 'rust=%s\ngo=%s\n' "$rust" "$go" | tee -a "$GITHUB_OUTPUT"
+          printf 'rust=%s\ngo=%s\nfleet_cas=%s\n' "$rust" "$go" "$fleet_cas" | tee -a "$GITHUB_OUTPUT"
 
   go:
     needs: changes
@@ -687,7 +690,8 @@ jobs:
           key: verify-cargo-cli-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
   fleet-cas-build:
     name: fleet-cas-build (${{ matrix.target }})
-    if: ${{ github.event_name == 'pull_request' }}
+    needs: changes
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.fleet_cas == 'true' }}
     strategy:
       fail-fast: true
       matrix:

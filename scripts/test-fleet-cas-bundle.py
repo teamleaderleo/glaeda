@@ -99,6 +99,28 @@ class FleetCasBundleTest(unittest.TestCase):
                     module.stage(archive, destination, source, "x86_64-unknown-linux-gnu", hashlib.sha256(raw).hexdigest(), True)
             self.assertFalse(destination.exists())
 
+    def test_failed_generation_open_removes_empty_destination(self) -> None:
+        raw, source = self.make_archive()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            archive = root / "candidate.tar.gz"
+            archive.write_bytes(raw)
+            destination = root / "out"
+            original_open = module.os.open
+            failed = False
+
+            def fail_generation_open(path, flags, *args, **kwargs):
+                nonlocal failed
+                if not failed and path == "out" and kwargs.get("dir_fd") is not None and flags & module.os.O_DIRECTORY:
+                    failed = True
+                    raise OSError("injected generation open failure")
+                return original_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(module.os, "open", side_effect=fail_generation_open):
+                with self.assertRaises(OSError):
+                    module.stage(archive, destination, source, "x86_64-unknown-linux-gnu", hashlib.sha256(raw).hexdigest(), True)
+            self.assertFalse(destination.exists())
+
     def test_malformed_entries_and_expansion_limits_are_rejected(self) -> None:
         raw, source = self.make_archive()
 
