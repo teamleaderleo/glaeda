@@ -20,7 +20,7 @@ fail() {
 }
 
 case "$root" in
-  /Volumes/*/*) ;;
+  /Volumes/*) [ "$root" != /Volumes ] || { fail "store root must name a volume below /Volumes" || exit 1; } ;;
   *) fail "store root must be below /Volumes: $root" || exit 1 ;;
 esac
 case "$image" in
