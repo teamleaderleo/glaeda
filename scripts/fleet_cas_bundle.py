@@ -188,6 +188,8 @@ def stage(archive: Path, destination: Path, source: str, target: str, expected_d
     if destination.name in ("", ".", ".."):
         raise BundleError("staging destination already exists")
     parent = private_parent(destination.parent)
+    generation = None
+    created_identity = None
     try:
         try:
             os.stat(destination.name, dir_fd=parent, follow_symlinks=False)
@@ -202,6 +204,8 @@ def stage(archive: Path, destination: Path, source: str, target: str, expected_d
             return receipt
         os.mkdir(destination.name, 0o700, dir_fd=parent)
         generation = os.open(destination.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        info = os.fstat(generation)
+        created_identity = (info.st_dev, info.st_ino)
         try:
             all_files = {**files, "manifest.json": canonical(manifest)}
             all_files["SHA256SUMS"] = ("".join(f"{digest(data)}  {name}\n" for name, data in sorted(all_files.items()))).encode()
@@ -217,16 +221,25 @@ def stage(archive: Path, destination: Path, source: str, target: str, expected_d
             os.fsync(generation)
         finally:
             os.close(generation)
+            generation = None
         os.fsync(parent)
         return receipt
     except BaseException:
         try:
-            if os.path.isdir(destination) and not os.path.islink(destination):
-                shutil.rmtree(destination)
+            if generation is not None:
+                for entry in os.scandir(generation):
+                    os.unlink(entry.name, dir_fd=generation)
+                os.close(generation)
+                generation = None
+            current = os.stat(destination.name, dir_fd=parent, follow_symlinks=False)
+            if created_identity == (current.st_dev, current.st_ino) and stat.S_ISDIR(current.st_mode):
+                os.rmdir(destination.name, dir_fd=parent)
                 os.fsync(parent)
         finally:
             raise
     finally:
+        if generation is not None:
+            os.close(generation)
         os.close(parent)
 
 
