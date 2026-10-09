@@ -183,11 +183,11 @@ def build(root: Path, expected_source: str, target: str, output: Path) -> dict:
         raise BundleError("fleet-CAS build requires a native supported target")
     build_root = root / "target/fleet-cas-bundle-build"
     command(root, ["cargo", "build", "--locked", "--release", "--manifest-path", "tools/fleet-cas-prototype/Cargo.toml", "--target", target, "--target-dir", str(build_root)], capture=False)
-    if source_identity(root, expected_source) != source:
-        raise BundleError("candidate source changed during build")
     files = {"fleet-cas": read_file(build_root / target / "release/fleet-cas")}
     for name in FILES[1:]:
         files[name] = read_file(root / "tools/fleet-cas-prototype/scripts" / name)
+    if source_identity(root, expected_source) != source:
+        raise BundleError("candidate source changed during build")
     manifest = {"schema": SCHEMA, "source": source, "target": target, "toolchain": toolchain,
                 "files": {name: {"sha256": digest(data), "size": len(data)} for name, data in files.items()}}
     raw = archive_bytes(files, manifest)

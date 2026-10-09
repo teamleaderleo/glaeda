@@ -78,6 +78,10 @@ establish release provenance. Staging refuses existing paths. This artifact does
 OTA install or change routing; an operator must separately validate it before invoking the
 existing rollout.
 
+`stage --apply` requires the destination's parent directory to already exist, resolve without
+symlinks, and be owned by the current user with mode `0700`; the command does not create or
+adopt a parent directory.
+
 Signed index entries (#1134 M3, `src/sign.rs`):
 
 - `fleet-cas keygen PATH` creates the writer's Ed25519 key (a 0600 file, never
