@@ -40,6 +40,14 @@ def mount_validation_body() -> str:
     return text[start:end]
 
 
+def install_binaries_body() -> str:
+    """Extract the installer copy logic for a provenance test."""
+    text = INSTALLER.read_text(encoding="utf-8")
+    start = text.index("install_binaries() {")
+    end = text.index("\n}\n\nwrite_env", start) + 2
+    return text[start:end]
+
+
 class UpstreamPreflightTest(unittest.TestCase):
     def run_check(self, endpoint: str, nc_exit: int = 0) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as td:
@@ -182,6 +190,67 @@ class SparsebundleMountContractTest(unittest.TestCase):
         self.assertIn("sparsebundle symlinks are refused", text)
         self.assertNotIn("hdiutil create", text)
         self.assertNotIn("hdiutil partition", text)
+
+
+class PrebuiltProvenanceTest(unittest.TestCase):
+    def test_custom_store_helpers_use_checked_prebuilt_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prebuilt = root / "prebuilt"
+            source = root / "source"
+            bin_dir = root / "bin"
+            launch = root / "launch"
+            for directory in (prebuilt, source / "scripts"):
+                directory.mkdir(parents=True)
+            files = (
+                "fleet-cas",
+                "fleet-cas-run",
+                "fleet-cas-mount",
+                "fleet-cas-settings.sh",
+                "fleet-cas-marker.sh",
+                "fleet-cas-warm.sh",
+                "fleet-cas-prewarm.sh",
+                "fleet-cas-writer-build.sh",
+            )
+            for name in files:
+                path = prebuilt / name
+                path.write_text(f"checked-prebuilt-{name}\n", encoding="utf-8")
+                path.chmod(0o755)
+            for name in ("fleet-cas-run", "fleet-cas-mount"):
+                path = source / "scripts" / name
+                path.write_text(f"poison-source-{name}\n", encoding="utf-8")
+                path.chmod(0o755)
+            sums = subprocess.run(
+                ["shasum", "-a", "256", *files],
+                cwd=prebuilt,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            (prebuilt / "SHA256SUMS").write_text(sums.stdout, encoding="utf-8")
+            command = (
+                'say() { :; }; check_owner() { :; }; '
+                f'proto={source!s}; BIN={bin_dir!s}; ROOT={root / "root"!s}; '
+                'apply=--apply; custom_store_image=/Volumes/T5-EVO/store.sparsebundle; '
+                f'launch_root={launch!s}; GLAEDA_FLEET_CAS_PREBUILT={prebuilt!s}; '
+                f'{install_binaries_body()}\n'
+                'install_binaries\n'
+            )
+            result = subprocess.run(
+                ["bash", "-c", command],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (launch / "fleet-cas-run").read_text(encoding="utf-8"),
+                "checked-prebuilt-fleet-cas-run\n",
+            )
+            self.assertEqual(
+                (launch / "fleet-cas-mount").read_text(encoding="utf-8"),
+                "checked-prebuilt-fleet-cas-mount\n",
+            )
 
 
 if __name__ == "__main__":
