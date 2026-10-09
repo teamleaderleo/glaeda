@@ -181,6 +181,11 @@ impl UpstreamFailureCode {
     }
 }
 
+enum PrefetchOutcome {
+    Complete,
+    StreamError(UpstreamFailureCode),
+}
+
 impl Stats {
     fn line(&self) -> String {
         let fields = [
@@ -814,6 +819,7 @@ impl Store {
         // not a streamed body: bound the whole prefetch, so a store that
         // stalls mid-stream costs one timeout, then the backoff.
         let limit = std::time::Duration::from_secs(30);
+        let started = Instant::now();
         let result = tokio::time::timeout(
             limit,
             self.stats.upstream(
@@ -823,7 +829,14 @@ impl Store {
         )
         .await;
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(PrefetchOutcome::Complete)) => {}
+            // Preserve the existing best-effort stream fallback: a stream
+            // error stops this prefetch, but leaves object-by-object reads
+            // available without opening the global upstream backoff.
+            Ok(Ok(PrefetchOutcome::StreamError(code))) => {
+                self.stats
+                    .record_failure(UpstreamOperation::ClosureGet, code);
+            }
             Ok(Err(e)) if e.code() == tonic::Code::Unimplemented => {
                 self.stats
                     .record_failure(UpstreamOperation::ClosureGet, UpstreamFailureCode::Protocol);
@@ -845,6 +858,11 @@ impl Store {
                 );
             }
             Err(_) => {
+                // Cancellation happens before Stats::upstream can observe
+                // the result, so account for the timed-out call here. This
+                // also keeps the legacy up_calls/up_micros totals complete.
+                self.stats
+                    .record_call(UpstreamOperation::ClosureGet, started, false);
                 self.upstream_failed(
                     UpstreamOperation::ClosureGet,
                     UpstreamFailureCode::Timeout,
@@ -854,7 +872,11 @@ impl Store {
         }
     }
 
-    async fn prefetch_inner(&self, up: &Upstream, roots: Vec<Vec<u8>>) -> Result<(), Status> {
+    async fn prefetch_inner(
+        &self,
+        up: &Upstream,
+        roots: Vec<Vec<u8>>,
+    ) -> Result<PrefetchOutcome, Status> {
         let t = Instant::now();
         let mut client = up.fleet.clone();
         let mut stream = match client.get_closure(fleet::ClosureRequest { roots }).await {
@@ -876,33 +898,48 @@ impl Store {
             Err(e) => return Err(e),
         };
         self.stats.up_prefetch_calls.fetch_add(1, Relaxed);
-        while let Some(m) = stream.message().await? {
-            let Ok(obj) = cas::CasObject::decode(m.object.as_slice()) else {
-                self.stats.up_cas_verify_fail.fetch_add(1, Relaxed);
-                self.stats
-                    .record_failure(UpstreamOperation::ClosureGet, UpstreamFailureCode::Protocol);
-                continue;
-            };
-            let data = blob_data(&obj).to_vec();
-            if object_id(&obj.references, &data) != m.id {
-                self.stats.up_cas_verify_fail.fetch_add(1, Relaxed);
-                self.stats
-                    .record_failure(UpstreamOperation::ClosureGet, UpstreamFailureCode::Protocol);
-                continue;
+        let stream_error = loop {
+            match stream.message().await {
+                Ok(Some(m)) => {
+                    let Ok(obj) = cas::CasObject::decode(m.object.as_slice()) else {
+                        self.stats.up_cas_verify_fail.fetch_add(1, Relaxed);
+                        self.stats.record_failure(
+                            UpstreamOperation::ClosureGet,
+                            UpstreamFailureCode::Protocol,
+                        );
+                        continue;
+                    };
+                    let data = blob_data(&obj).to_vec();
+                    if object_id(&obj.references, &data) != m.id {
+                        self.stats.up_cas_verify_fail.fetch_add(1, Relaxed);
+                        self.stats.record_failure(
+                            UpstreamOperation::ClosureGet,
+                            UpstreamFailureCode::Protocol,
+                        );
+                        continue;
+                    }
+                    if self.cas_path(&m.id).exists() {
+                        continue;
+                    }
+                    let len = data.len() as u64;
+                    if self.put(obj.references, data).is_ok() {
+                        self.stats.up_prefetched.fetch_add(1, Relaxed);
+                        self.stats.up_prefetch_bytes.fetch_add(len, Relaxed);
+                    }
+                }
+                Ok(None) => break None,
+                // Match the old `while let Ok(Some(...))` behavior: stop a
+                // failed stream and keep the per-object fallback available.
+                Err(e) => break Some(classify_failure(&e)),
             }
-            if self.cas_path(&m.id).exists() {
-                continue;
-            }
-            let len = data.len() as u64;
-            if self.put(obj.references, data).is_ok() {
-                self.stats.up_prefetched.fetch_add(1, Relaxed);
-                self.stats.up_prefetch_bytes.fetch_add(len, Relaxed);
-            }
-        }
+        };
         self.stats
             .up_prefetch_micros
             .fetch_add(t.elapsed().as_micros() as u64, Relaxed);
-        Ok(())
+        Ok(match stream_error {
+            Some(code) => PrefetchOutcome::StreamError(code),
+            None => PrefetchOutcome::Complete,
+        })
     }
 
     /// Count entries that name absent objects (the M3 publication rule,
