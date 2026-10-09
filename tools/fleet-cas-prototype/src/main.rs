@@ -287,6 +287,11 @@ impl Stats {
             .last_failure_code
             .store(UpstreamFailureCode::Backoff as u64, Relaxed);
     }
+
+    fn record_prefetch_duration(&self, started: Instant) {
+        self.up_prefetch_micros
+            .fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    }
 }
 
 impl UpstreamOperationStats {
@@ -840,6 +845,7 @@ impl Store {
             Ok(Err(e)) if e.code() == tonic::Code::Unimplemented => {
                 self.stats
                     .record_failure(UpstreamOperation::ClosureGet, UpstreamFailureCode::Protocol);
+                self.stats.record_prefetch_duration(started);
             }
             Ok(Err(e))
                 if matches!(
@@ -849,6 +855,7 @@ impl Store {
             {
                 self.stats
                     .record_failure(UpstreamOperation::ClosureGet, classify_failure(&e));
+                self.stats.record_prefetch_duration(started);
             }
             Ok(Err(e)) => {
                 self.upstream_failed(
@@ -856,6 +863,7 @@ impl Store {
                     classify_failure(&e),
                     &format!("prefetch: {e}"),
                 );
+                self.stats.record_prefetch_duration(started);
             }
             Err(_) => {
                 // Cancellation happens before Stats::upstream can observe
@@ -863,6 +871,7 @@ impl Store {
                 // also keeps the legacy up_calls/up_micros totals complete.
                 self.stats
                     .record_call(UpstreamOperation::ClosureGet, started, false);
+                self.stats.record_prefetch_duration(started);
                 self.upstream_failed(
                     UpstreamOperation::ClosureGet,
                     UpstreamFailureCode::Timeout,
@@ -933,9 +942,7 @@ impl Store {
                 Err(e) => break Some(classify_failure(&e)),
             }
         };
-        self.stats
-            .up_prefetch_micros
-            .fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+        self.stats.record_prefetch_duration(t);
         Ok(match stream_error {
             Some(code) => PrefetchOutcome::StreamError(code),
             None => PrefetchOutcome::Complete,
@@ -1653,6 +1660,30 @@ mod tests {
         );
         assert!(operation.last_call_ms.load(Relaxed) > 0);
         assert!(operation.last_success_ms.load(Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_call_can_publish_an_external_timeout_receipt() {
+        let stats = Stats::default();
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_millis(1),
+            stats.upstream(
+                UpstreamOperation::ClosureGet,
+                std::future::pending::<Result<(), Status>>(),
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "pending call must be cancelled by timeout");
+        assert_eq!(stats.up_calls.load(Relaxed), 0);
+
+        stats.record_call(UpstreamOperation::ClosureGet, started, false);
+        stats.record_prefetch_duration(started);
+        let operation = stats.operation(UpstreamOperation::ClosureGet);
+        assert_eq!(stats.up_calls.load(Relaxed), 1);
+        assert_eq!(operation.calls.load(Relaxed), 1);
+        assert_eq!(operation.last_success_ms.load(Relaxed), 0);
+        assert!(stats.up_prefetch_micros.load(Relaxed) > 0);
     }
 
     #[test]
