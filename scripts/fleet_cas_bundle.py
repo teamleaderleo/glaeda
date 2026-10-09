@@ -73,6 +73,24 @@ def source_identity(root: Path, expected: str) -> dict[str, str]:
     return {"repository": "teamleaderleo/glaeda", "commit": commit, "tree": tree}
 
 
+def private_parent(path: Path) -> int:
+    if not path.is_absolute() or ".." in path.parts or path.resolve(strict=True) != path:
+        raise BundleError("staging parent must be an existing canonical absolute directory")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        info = os.fstat(fd)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise BundleError("staging parent must be owned by the current user with mode 0700")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def archive_bytes(files: dict[str, bytes], manifest: dict) -> bytes:
     out = io.BytesIO()
     with gzip.GzipFile(fileobj=out, mode="wb", mtime=0) as gz, tarfile.open(fileobj=gz, mode="w", format=tarfile.USTAR_FORMAT) as tar:
@@ -116,7 +134,8 @@ def verified_contents(raw: bytes, expected_digest: str, source: str, target: str
             raise BundleError("fleet-CAS archive is incomplete")
         manifest = json.loads(contents["manifest.json"])
         source_doc = manifest.get("source", {}) if isinstance(manifest, dict) else {}
-        if (not isinstance(manifest, dict) or manifest.get("schema") != SCHEMA
+        if (not isinstance(manifest, dict) or set(manifest) != {"schema", "source", "target", "toolchain", "files"}
+                or manifest.get("schema") != SCHEMA
                 or target not in TARGETS or manifest.get("target") != target or not isinstance(source_doc, dict)
                 or source_doc.get("commit") != source
                 or source_doc.get("repository") != "teamleaderleo/glaeda"
@@ -146,6 +165,8 @@ def build(root: Path, expected_source: str, target: str, output: Path) -> dict:
         raise BundleError("fleet-CAS build requires a native supported target")
     build_root = root / "target/fleet-cas-bundle-build"
     command(root, ["cargo", "build", "--locked", "--release", "--manifest-path", "tools/fleet-cas-prototype/Cargo.toml", "--target", target, "--target-dir", str(build_root)], capture=False)
+    if source_identity(root, expected_source) != source:
+        raise BundleError("candidate source changed during build")
     files = {"fleet-cas": read_file(build_root / target / "release/fleet-cas")}
     for name in FILES[1:]:
         files[name] = read_file(root / "tools/fleet-cas-prototype/scripts" / name)
@@ -161,42 +182,67 @@ def build(root: Path, expected_source: str, target: str, output: Path) -> dict:
     return {"archive": destination.name, "sha256": digest(raw), "source": source, "target": target}
 
 
-def stage(archive: Path, destination: Path, source: str, target: str, apply: bool) -> dict:
+def stage(archive: Path, destination: Path, source: str, target: str, expected_digest: str, apply: bool) -> dict:
     raw = read_file(archive, MAX_ARCHIVE)
-    manifest, files = verified_contents(raw, digest(raw), source, target)
-    if os.path.lexists(destination) or destination.name in ("", ".", ".."):
+    manifest, files = verified_contents(raw, expected_digest, source, target)
+    if destination.name in ("", ".", ".."):
         raise BundleError("staging destination already exists")
-    receipt = {"schema": "glaeda-fleet-cas-stage/v1", "state": "planned" if not apply else "staged",
-               "archiveSha256": digest(raw), "source": manifest["source"], "target": target,
-               "automaticUpdateAuthorized": False}
-    if not apply:
-        return receipt
-    destination.mkdir(mode=0o700)
+    parent = private_parent(destination.parent)
     try:
-        for name, data in files.items():
-            path = destination / name
-            with path.open("xb") as stream:
-                stream.write(data); stream.flush(); os.fsync(stream.fileno())
-            path.chmod(0o755)
-        (destination / "manifest.json").write_bytes(canonical(manifest))
-        (destination / "SHA256SUMS").write_bytes(("".join(f"{digest(data)}  {name}\n" for name, data in sorted({**files, "manifest.json": canonical(manifest)}.items()))).encode())
+        try:
+            os.stat(destination.name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise BundleError("staging destination already exists")
+        receipt = {"schema": "glaeda-fleet-cas-stage/v1", "state": "planned" if not apply else "staged",
+                   "archiveSha256": digest(raw), "source": manifest["source"], "target": target,
+                   "automaticUpdateAuthorized": False}
+        if not apply:
+            return receipt
+        os.mkdir(destination.name, 0o700, dir_fd=parent)
+        generation = os.open(destination.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            all_files = {**files, "manifest.json": canonical(manifest)}
+            all_files["SHA256SUMS"] = ("".join(f"{digest(data)}  {name}\n" for name, data in sorted(all_files.items()))).encode()
+            for name, data in all_files.items():
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o755 if name in FILES else 0o644, dir_fd=generation)
+                try:
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(fd, view):]
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            os.fsync(generation)
+        finally:
+            os.close(generation)
+        os.fsync(parent)
         return receipt
     except BaseException:
-        shutil.rmtree(destination, ignore_errors=True)
-        raise
+        try:
+            if os.path.isdir(destination) and not os.path.islink(destination):
+                shutil.rmtree(destination)
+                os.fsync(parent)
+        finally:
+            raise
+    finally:
+        os.close(parent)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     b = sub.add_parser("build"); b.add_argument("--source", required=True); b.add_argument("--target", required=True); b.add_argument("--output", type=Path, required=True); b.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
-    v = sub.add_parser("verify"); v.add_argument("archive", type=Path); v.add_argument("--source", required=True); v.add_argument("--target", required=True)
-    s = sub.add_parser("stage"); s.add_argument("archive", type=Path); s.add_argument("--source", required=True); s.add_argument("--target", required=True); s.add_argument("--destination", type=Path, required=True); s.add_argument("--apply", action="store_true")
+    v = sub.add_parser("verify"); v.add_argument("archive", type=Path); v.add_argument("--source", required=True); v.add_argument("--target", required=True); v.add_argument("--sha256", required=True, help="SHA-256 from the authenticated release.json asset entry")
+    s = sub.add_parser("stage"); s.add_argument("archive", type=Path); s.add_argument("--source", required=True); s.add_argument("--target", required=True); s.add_argument("--sha256", required=True, help="SHA-256 from the authenticated release.json asset entry"); s.add_argument("--destination", type=Path, required=True); s.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     try:
         if args.command == "build": result = build(args.root, args.source, args.target, args.output)
-        elif args.command == "verify": result = {"state": "verified", **verified_contents(read_file(args.archive, MAX_ARCHIVE), digest(read_file(args.archive, MAX_ARCHIVE)), args.source, args.target)[0]}
-        else: result = stage(args.archive, args.destination, args.source, args.target, args.apply)
+        elif args.command == "verify":
+            raw = read_file(args.archive, MAX_ARCHIVE)
+            result = {"state": "verified", **verified_contents(raw, args.sha256, args.source, args.target)[0]}
+        else: result = stage(args.archive, args.destination, args.source, args.target, args.sha256, args.apply)
         print(json.dumps(result, sort_keys=True)); return 0
     except BundleError as error:
         print(f"fleet-cas bundle: {error}", file=os.sys.stderr); return 2

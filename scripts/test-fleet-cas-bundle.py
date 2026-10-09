@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import hashlib
+import gzip
+import io
 import importlib.util
 import json
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,23 +31,24 @@ class FleetCasBundleTest(unittest.TestCase):
 
     def test_verify_and_stage_are_bounded_and_no_overwrite(self) -> None:
         raw, source = self.make_archive()
+        archive_digest = hashlib.sha256(raw).hexdigest()
         manifest, files = module.verified_contents(raw, hashlib.sha256(raw).hexdigest(), source, "x86_64-unknown-linux-gnu")
         self.assertEqual(set(files), set(module.FILES))
         with tempfile.TemporaryDirectory() as temporary:
-            destination = Path(temporary) / "bundle"
-            archive = Path(temporary) / "candidate.tar.gz"
+            destination = Path(temporary).resolve() / "bundle"
+            archive = Path(temporary).resolve() / "candidate.tar.gz"
             archive.write_bytes(raw)
-            self.assertEqual(module.stage(archive, destination, source, "x86_64-unknown-linux-gnu", False)["state"], "planned")
+            self.assertEqual(module.stage(archive, destination, source, "x86_64-unknown-linux-gnu", archive_digest, False)["state"], "planned")
             self.assertFalse(destination.exists())
-            self.assertEqual(module.stage(archive, destination, source, "x86_64-unknown-linux-gnu", True)["state"], "staged")
+            self.assertEqual(module.stage(archive, destination, source, "x86_64-unknown-linux-gnu", archive_digest, True)["state"], "staged")
             self.assertEqual((destination / "fleet-cas").read_bytes(), files["fleet-cas"])
             self.assertEqual((destination / "fleet-cas").stat().st_mode & 0o777, 0o755)
             with self.assertRaises(module.BundleError):
-                module.stage(archive, destination, source, "x86_64-unknown-linux-gnu", True)
-            dangling = Path(temporary) / "dangling"
+                module.stage(archive, destination, source, "x86_64-unknown-linux-gnu", archive_digest, True)
+            dangling = Path(temporary).resolve() / "dangling"
             dangling.symlink_to("missing")
             with self.assertRaises(module.BundleError):
-                module.stage(archive, dangling, source, "x86_64-unknown-linux-gnu", True)
+                module.stage(archive, dangling, source, "x86_64-unknown-linux-gnu", archive_digest, True)
 
     def test_tampered_checksum_and_identity_are_rejected(self) -> None:
         raw, source = self.make_archive()
@@ -52,6 +56,59 @@ class FleetCasBundleTest(unittest.TestCase):
             module.verified_contents(raw[:-1], hashlib.sha256(raw).hexdigest(), source, "x86_64-unknown-linux-gnu")
         with self.assertRaises(module.BundleError):
             module.verified_contents(raw, hashlib.sha256(raw).hexdigest(), "c" * 40, "x86_64-unknown-linux-gnu")
+
+    def test_external_digest_is_required_to_accept_archive(self) -> None:
+        raw, source = self.make_archive()
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary).resolve() / "candidate.tar.gz"
+            archive.write_bytes(raw)
+            with self.assertRaises(module.BundleError):
+                module.stage(archive, Path(temporary).resolve() / "out", source, "x86_64-unknown-linux-gnu", "0" * 64, False)
+
+    def test_malformed_entries_and_expansion_limits_are_rejected(self) -> None:
+        raw, source = self.make_archive()
+
+        def mutate(entry: tarfile.TarInfo, payload: bytes = b"") -> bytes:
+            out = io.BytesIO()
+            with gzip.GzipFile(fileobj=out, mode="wb", mtime=0) as gz, tarfile.open(fileobj=gz, mode="w") as tar:
+                tar.addfile(entry, io.BytesIO(payload))
+            return out.getvalue()
+
+        for entry in (
+            tarfile.TarInfo("../escape"),
+            tarfile.TarInfo("fleet-cas"),
+        ):
+            if entry.name == "fleet-cas":
+                entry.type = tarfile.SYMTYPE
+                entry.linkname = "outside"
+            with self.subTest(entry=entry.name):
+                with self.assertRaises(module.BundleError):
+                    module.verified_contents(mutate(entry), hashlib.sha256(mutate(entry)).hexdigest(), source, "x86_64-unknown-linux-gnu")
+
+        duplicate = tarfile.TarInfo("fleet-cas")
+        duplicate.mode, duplicate.size = 0o755, 1
+        out = io.BytesIO()
+        with gzip.GzipFile(fileobj=out, mode="wb", mtime=0) as gz, tarfile.open(fileobj=gz, mode="w") as tar:
+            tar.addfile(duplicate, io.BytesIO(b"a"))
+            tar.addfile(duplicate, io.BytesIO(b"a"))
+        duplicate_raw = out.getvalue()
+        with self.assertRaises(module.BundleError):
+            module.verified_contents(duplicate_raw, hashlib.sha256(duplicate_raw).hexdigest(), source, "x86_64-unknown-linux-gnu")
+
+        bomb = tarfile.TarInfo("fleet-cas")
+        bomb.mode, bomb.size = 0o755, module.MAX_FILE + 1
+        out = io.BytesIO()
+        class Zeroes:
+            def __init__(self, remaining: int): self.remaining = remaining
+            def read(self, size: int = -1) -> bytes:
+                size = min(size, self.remaining)
+                self.remaining -= size
+                return b"\0" * size
+        with gzip.GzipFile(fileobj=out, mode="wb", mtime=0) as gz, tarfile.open(fileobj=gz, mode="w") as tar:
+            tar.addfile(bomb, Zeroes(bomb.size))
+        bomb_raw = out.getvalue()
+        with self.assertRaises(module.BundleError):
+            module.verified_contents(bomb_raw, hashlib.sha256(bomb_raw).hexdigest(), source, "x86_64-unknown-linux-gnu")
 
 
 if __name__ == "__main__":
