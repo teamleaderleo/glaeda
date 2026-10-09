@@ -38,6 +38,10 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: python3 scripts/fleet_bundle.py build --source "$GITHUB_SHA" --target "$TARGET" --output release-assets
+      - name: Fleet-CAS prebuilt candidate
+        env:
+          TARGET: ${{ matrix.target }}
+        run: python3 scripts/fleet_cas_bundle.py build --source "$GITHUB_SHA" --target "$TARGET" --output release-assets
       - name: Hygiene tools archive
         env:
           TARGET: ${{ matrix.target }}
