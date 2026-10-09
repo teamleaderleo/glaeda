@@ -244,9 +244,22 @@ impl Stats {
         operation: UpstreamOperation,
         f: impl std::future::Future<Output = Result<T, Status>>,
     ) -> Result<T, Status> {
+        self.upstream_with_success(operation, f, |_| true).await
+    }
+
+    async fn upstream_with_success<T>(
+        &self,
+        operation: UpstreamOperation,
+        f: impl std::future::Future<Output = Result<T, Status>>,
+        success: impl Fn(&T) -> bool,
+    ) -> Result<T, Status> {
         let t = Instant::now();
         let r = f.await;
-        self.record_call(operation, t, r.is_ok());
+        let successful = match &r {
+            Ok(value) => success(value),
+            Err(_) => false,
+        };
+        self.record_call(operation, t, successful);
         r
     }
 
@@ -827,9 +840,10 @@ impl Store {
         let started = Instant::now();
         let result = tokio::time::timeout(
             limit,
-            self.stats.upstream(
+            self.stats.upstream_with_success(
                 UpstreamOperation::ClosureGet,
                 self.prefetch_inner(up, roots),
+                |out| matches!(out, PrefetchOutcome::Complete),
             ),
         )
         .await;
@@ -1684,6 +1698,27 @@ mod tests {
         assert_eq!(operation.calls.load(Relaxed), 1);
         assert_eq!(operation.last_success_ms.load(Relaxed), 0);
         assert!(stats.up_prefetch_micros.load(Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn stream_error_is_not_counted_as_a_success() {
+        let stats = Stats::default();
+        let result = stats
+            .upstream_with_success(
+                UpstreamOperation::ClosureGet,
+                async {
+                    Ok::<_, Status>(PrefetchOutcome::StreamError(
+                        UpstreamFailureCode::Unavailable,
+                    ))
+                },
+                |out| matches!(out, PrefetchOutcome::Complete),
+            )
+            .await;
+        assert!(matches!(result, Ok(PrefetchOutcome::StreamError(_))));
+
+        let operation = stats.operation(UpstreamOperation::ClosureGet);
+        assert_eq!(operation.calls.load(Relaxed), 1);
+        assert_eq!(operation.last_success_ms.load(Relaxed), 0);
     }
 
     #[test]
