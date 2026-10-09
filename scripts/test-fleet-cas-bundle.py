@@ -7,6 +7,7 @@ import json
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,6 +76,28 @@ class FleetCasBundleTest(unittest.TestCase):
             alias.symlink_to(real)
             with self.assertRaises(module.BundleError):
                 module.stage(alias, root / "out", source, "x86_64-unknown-linux-gnu", hashlib.sha256(raw).hexdigest(), False)
+
+    def test_failed_write_removes_partial_generation(self) -> None:
+        raw, source = self.make_archive()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            archive = root / "candidate.tar.gz"
+            archive.write_bytes(raw)
+            destination = root / "out"
+            original_write = module.os.write
+            calls = 0
+
+            def fail_after_first(fd, data):
+                nonlocal calls
+                calls += 1
+                if calls > 1:
+                    raise OSError("injected write failure")
+                return original_write(fd, data)
+
+            with mock.patch.object(module.os, "write", side_effect=fail_after_first):
+                with self.assertRaises(OSError):
+                    module.stage(archive, destination, source, "x86_64-unknown-linux-gnu", hashlib.sha256(raw).hexdigest(), True)
+            self.assertFalse(destination.exists())
 
     def test_malformed_entries_and_expansion_limits_are_rejected(self) -> None:
         raw, source = self.make_archive()

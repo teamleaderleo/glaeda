@@ -244,13 +244,17 @@ def stage(archive: Path, destination: Path, source: str, target: str, expected_d
         return receipt
     except BaseException:
         try:
-            if generation is not None:
+            current = os.stat(destination.name, dir_fd=parent, follow_symlinks=False)
+            if created_identity == (current.st_dev, current.st_ino) and stat.S_ISDIR(current.st_mode):
+                if generation is None:
+                    generation = os.open(destination.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                held = os.fstat(generation)
+                if (held.st_dev, held.st_ino) != created_identity:
+                    raise BundleError("staging destination changed during cleanup")
                 for entry in os.scandir(generation):
                     os.unlink(entry.name, dir_fd=generation)
                 os.close(generation)
                 generation = None
-            current = os.stat(destination.name, dir_fd=parent, follow_symlinks=False)
-            if created_identity == (current.st_dev, current.st_ino) and stat.S_ISDIR(current.st_mode):
                 os.rmdir(destination.name, dir_fd=parent)
                 os.fsync(parent)
         finally:
