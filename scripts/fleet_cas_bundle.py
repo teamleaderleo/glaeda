@@ -40,13 +40,31 @@ def digest(raw: bytes) -> str:
 
 
 def read_file(path: Path, limit: int = MAX_FILE) -> bytes:
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
-        raise BundleError(f"bundle input must be a bounded regular file: {path}")
-    raw = path.read_bytes()
-    if len(raw) > limit:
-        raise BundleError(f"bundle input exceeds size limit: {path}")
-    return raw
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise BundleError(f"bundle input cannot be opened safely: {path}") from error
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            raise BundleError(f"bundle input must be a bounded regular file: {path}")
+        chunks = []
+        total = 0
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise BundleError(f"bundle input changed while reading: {path}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+            total += len(chunk)
+        after = os.fstat(fd)
+        if ((after.st_dev, after.st_ino, after.st_size) != (before.st_dev, before.st_ino, before.st_size)
+                or total != before.st_size):
+            raise BundleError(f"bundle input changed while reading: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def command(root: Path, argv: list[str], capture: bool = True) -> bytes:

@@ -65,6 +65,17 @@ class FleetCasBundleTest(unittest.TestCase):
             with self.assertRaises(module.BundleError):
                 module.stage(archive, Path(temporary).resolve() / "out", source, "x86_64-unknown-linux-gnu", "0" * 64, False)
 
+    def test_archive_symlink_is_refused_before_read(self) -> None:
+        raw, source = self.make_archive()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            real = root / "real.tar.gz"
+            real.write_bytes(raw)
+            alias = root / "alias.tar.gz"
+            alias.symlink_to(real)
+            with self.assertRaises(module.BundleError):
+                module.stage(alias, root / "out", source, "x86_64-unknown-linux-gnu", hashlib.sha256(raw).hexdigest(), False)
+
     def test_malformed_entries_and_expansion_limits_are_rejected(self) -> None:
         raw, source = self.make_archive()
 
