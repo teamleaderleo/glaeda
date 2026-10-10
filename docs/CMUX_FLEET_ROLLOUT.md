@@ -191,11 +191,14 @@ them, and an old controller drops unknown fields.
 cmux-lawrence remains in `never_touch` for Glaeda host enrollment, runner enrollment, and worker
 deployment. The agent is not installed there, and controller changes install only after its owner
 approves a specific hash. The fleet-CAS rollout has a separate, explicit coordinator-store path:
-an operator may pass `--allow-coordinator` only with an already-mounted owner-writable APFS
-`--store-root` (and, when needed, the exact pre-existing `--store-image`). That path installs only
-the read-only-capable store service; it refuses a coordinator writer or reader node. This keeps
-the controller's worker safety boundary while allowing the approved Lawrence compiler-CAS
-placement described in `CMUX_BUILD_SLOT_MODES.md`.
+an operator may pass `--allow-coordinator` only for the store role, with an owner-writable APFS
+`--store-root` mounted when `--apply` runs. For a sparsebundle store, its backing volume must
+already be mounted and the exact pre-existing `--store-image` must be supplied. The boot-volume
+wrapper then reattaches only that image after reboot and fails closed on a missing or mismatched
+image, mount point, or volume UUID. That path installs only the read-only-capable store service;
+it refuses a coordinator writer or reader node. This keeps the controller's worker safety
+boundary while allowing the approved Lawrence compiler-CAS placement described in
+`CMUX_BUILD_SLOT_MODES.md`.
 
 ### 7. Security
 

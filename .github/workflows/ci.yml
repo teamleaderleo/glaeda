@@ -2,14 +2,12 @@ name: Verify
 
 on:
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
   push:
     branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
+
+# Keep this workflow active for documentation-only changes so the required
+# `ci-status` check is reported. The `changes` job still scopes Rust, Go, and
+# fleet-CAS work; the script and runner test lanes remain the broad safety net.
 
 permissions:
   contents: read
