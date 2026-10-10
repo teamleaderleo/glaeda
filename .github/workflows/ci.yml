@@ -4,10 +4,13 @@ on:
   pull_request:
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
 
-# Keep this workflow active for documentation-only changes so the required
-# `ci-status` check is reported. The `changes` job still scopes Rust, Go, and
-# fleet-CAS work; the script and runner test lanes remain the broad safety net.
+# Keep pull requests active for documentation-only changes so the required
+# `ci-status` check is reported. Main pushes retain the path filter because
+# synchronization already verifies the changed executable surfaces.
 
 permissions:
   contents: read
