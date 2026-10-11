@@ -387,6 +387,8 @@ def member_labels(manifest: Any, member: str, prior_labels: list[str] | None = N
     def ios_sim_ok(apps: list[dict[str, Any]], builds: list[str]) -> bool:
         found = ios_sim_present(apps, builds)
         return found if found is not None else getattr(rule, "IOS_SIM_LABEL", "glaeda-ios-sim") in (prior_labels or [])
+    if not hasattr(rule, "macos_label"):  # an older label module beside this script: no OS label, no traceback
+        return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok)
     major = macos_major()
     if major is None:
         prefix = rule.MACOS_LABEL_PREFIX
