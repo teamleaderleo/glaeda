@@ -3077,6 +3077,22 @@ class GateTest(unittest.TestCase):
                                  setattr(gate, "held", why))
         return gate, stops
 
+    def test_a_listener_just_started_keeps_its_first_poll(self) -> None:
+        # 2026-10-12 03:46Z, cmux14: the root runner's listener created its broker session at 03:46:41 and the
+        # gate stopped it at 03:46:44 (another runner's job made it wait for root). Its first message poll was
+        # cancelled with no job seen, but GitHub had already given it the queued root job, which then failed at
+        # 03:49:28: "The job was not acquired by Runner of type self-hosted even after multiple attempts".
+        full = "all 5 capacity units on this mini are taken"
+        gate, stops = self.gate([full] * 8)
+        with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child):
+            gate.start()
+        for _ in range(3):
+            gate.step()
+        self.assertEqual(stops, [], "a new listener's first poll may already carry a job: it is not stopped")
+        gate.listening_since -= getattr(hook, "GATE_FIRST_POLL_S", 30.0)
+        gate.step()
+        self.assertEqual(stops, ["held"], "once its first poll has had time to deliver, the hold stops it")
+
     def units(self, held: int) -> Path:
         """A capacity ledger an admission has used, with its first `held` units taken."""
         capacity = Path(tempfile.mkdtemp(dir=self.tmp))
