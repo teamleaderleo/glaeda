@@ -3853,6 +3853,32 @@ class GateTest(unittest.TestCase):
         self.assertEqual(check.call_args[0][0][1:], [os.fspath(HOOK), "listen", "--no-waiters", "--adopt=4321",
                                                      "--parse-only"])
 
+    def test_a_reload_keeps_the_listeners_first_poll(self) -> None:
+        # An --apply that lands inside a listener's first poll must not hand the re-executed gate a listener it
+        # may stop at once (GATE_FIRST_POLL_S). The start goes in the environment, so argv stays one an older hook
+        # (a rollback) accepts.
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock(pid=4321)
+        gate.source = (0, 0, 0)
+        gate.listening_since = time.monotonic() - 5.0
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, mask)
+        self.addCleanup(os.environ.pop, hook.GATE_LISTENING_SINCE_ENV, None)
+        handed: list[str | None] = []
+        with mock.patch.object(hook.os, "execv",
+                               side_effect=lambda *_: handed.append(os.environ.get(hook.GATE_LISTENING_SINCE_ENV))), \
+                mock.patch.object(hook.sys, "argv", [os.fspath(HOOK), "listen"]):
+            gate.reload()
+        self.assertEqual(handed, [repr(gate.listening_since)])
+        seen: list[float | None] = []
+        def step(new: hook.Gate) -> int:
+            seen.append(new.listening_since)
+            return 0
+        with mock.patch.object(hook.Gate, "step", step), mock.patch.object(hook, "Adopted", return_value=mock.Mock()):
+            self.assertEqual(hook.listen(self.runner, os.fspath(self.lock), "", self.state, True, adopt=4321), 0)
+        self.assertEqual(seen, [gate.listening_since], "the adopted listener keeps its first poll")
+        self.assertNotIn(hook.GATE_LISTENING_SINCE_ENV, os.environ, "read once; run.sh's children never see it")
+
     def test_an_ios_sim_side_runner_listens_only_with_room_for_a_2_unit_job(self) -> None:
         self.assertNotIn("--fit-units", self.listen_sh(sys.executable).read_text())
         script = self.listen_sh(sys.executable, ["glaeda-mini", "glaeda-side-std-xcode-26.6", "glaeda-ios-sim"])
