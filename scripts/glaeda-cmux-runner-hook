@@ -693,6 +693,9 @@ GATE_STOP_WAIT_S = 60.0  # a graceful listener exit, before it is killed
 # attempts" (cmux14 root runner, 2026-10-12: session at 03:46:41, stopped at 03:46:44). A job that does arrive on a
 # full host is refused at job-started in seconds and rescued, which a lost one never is.
 GATE_FIRST_POLL_S = float(os.environ.get("GLAEDA_RUNNER_GATE_FIRST_POLL_S") or 30.0)
+# reload() hands the listener's start (time.monotonic, system-wide) to the re-executed gate here, not in argv, so a
+# rollback to a hook without it still accepts the exec.
+GATE_LISTENING_SINCE_ENV = "GLAEDA_RUNNER_GATE_LISTENING_SINCE"
 GATE_WATCH_S = 0.1  # while a job is below the disk floor, notice its Worker exit promptly
 GATE_WAITER_EVERY_S = 30.0
 GATE_MAX_FAILURES = 5  # consecutive failed polls before the gate hands the runner back
@@ -3041,9 +3044,12 @@ class Gate:
         if self.terminating:  # arrived just before the block
             signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
             return
+        if self.listening_since is not None:
+            os.environ[GATE_LISTENING_SINCE_ENV] = repr(self.listening_since)
         try:
             os.execv(sys.executable, [sys.executable, *argv])
         except OSError:
+            os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
             signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
             gate_log("the reload failed; keeping this gate")
 
@@ -3476,6 +3482,9 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
     gate = Gate(runner_dir, host_lock, reservation, state_dir, waiters, capacity_dir, fit_units)
     if adopt:
         gate.child = Adopted(adopt)  # type: ignore[assignment]
+        with contextlib.suppress(ValueError):  # the adopted listener keeps its first poll (GATE_FIRST_POLL_S)
+            gate.listening_since = float(os.environ.get(GATE_LISTENING_SINCE_ENV, ""))
+    os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
     signal.signal(signal.SIGTERM, gate.terminate)
     signal.signal(signal.SIGINT, gate.terminate)
     # reload() blocks both before its exec, so a stop that arrives across it stays pending until here.
