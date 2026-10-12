@@ -3890,7 +3890,9 @@ class GateTest(unittest.TestCase):
 
     def run_listen(self, *extra: str) -> tuple[subprocess.Popen, Path]:
         # The hook runs in its own process, so the setUp patch of the thermal level does not reach it.
-        env = {**os.environ, "GLAEDA_RUNNER_GATE_POLL_S": "0.1", "GLAEDA_RUNNER_THERMAL_HOLD": "0"}
+        # No first-poll hold (GATE_FIRST_POLL_S): these tests stop a listener the moment a claim confirms.
+        env = {**os.environ, "GLAEDA_RUNNER_GATE_POLL_S": "0.1", "GLAEDA_RUNNER_THERMAL_HOLD": "0",
+               "GLAEDA_RUNNER_GATE_FIRST_POLL_S": "0"}
         log = self.tmp / "runner.log"
         with log.open("wb") as out:
             proc = subprocess.Popen([*extra] if extra else
@@ -3914,7 +3916,10 @@ class GateTest(unittest.TestCase):
         return diag / name
 
     def started_gate(self) -> hook.Gate:
-        """A real gate over the fake listener, held for a full mini."""
+        """A real gate over the fake listener, held for a full mini, past its first poll (GATE_FIRST_POLL_S)."""
+        patcher = mock.patch.object(hook, "GATE_FIRST_POLL_S", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
         gate.reload = lambda: None  # type: ignore[method-assign]
         gate.claimed = lambda: "all 2 canonical roots on this mini are taken"  # type: ignore[method-assign]
