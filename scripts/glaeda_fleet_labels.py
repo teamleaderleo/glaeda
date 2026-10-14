@@ -210,7 +210,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"runner.classes.{klass}.canonicalRoots must be 1 to {runners} (one root runner per root)"
     if not (isinstance(gui, int) and not isinstance(gui, bool) and 0 <= gui <= 1 and roots + gui <= runners):
         return None, (f"runner.classes.{klass}.guiRunners must be 0 or 1, and canonicalRoots plus guiRunners at most "
-                      f"runners ({runners}): the gui runner is the last instance, never a root runner")
+                      f"runners ({runners}): the gui runner is the last instance (one before the fast runner), never a root runner")
     if not (isinstance(fast, int) and not isinstance(fast, bool) and 0 <= fast <= 1 and roots + gui + fast <= runners):
         return None, (f"runner.classes.{klass}.fastRunners must be 0 or 1, and canonicalRoots plus guiRunners plus "
                       f"fastRunners at most runners ({runners}): the fast runner is the last instance")

@@ -4647,6 +4647,10 @@ def main(argv: list[str] | None = None) -> int:
         if (admit_class is None and args.fast_runner and not is_guest(repo, args.home_repo)
                 and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS):
             admit_class = "fast"  # its own tokens on its own runner; on any other runner it keeps its usual cost
+        if args.fast_runner and admit_class != "fast":
+            # It listens on a full mini (it needs no general units), so any other job would wait here for units
+            # with no limit and idle the runner; refused, it is rescued onto its own pool.
+            return refused("the fast runner takes only the fast tier")
         # The wrapper execs this script, so the parent is the job's Runner.Worker.
         admit_start = time.monotonic()
         taken: dict[str, Any] = {}
