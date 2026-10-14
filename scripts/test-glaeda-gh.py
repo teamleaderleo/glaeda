@@ -1292,6 +1292,10 @@ class ClientTest(Base):
         broken = gg.parse_pr(pr_node(2, rollup="FAILURE", checks=[queued, check_run("lint", conclusion="FAILURE")]))
         broken["checks"][0]["stepCount"] = 0
         self.assertEqual(gg.verdict("pr", {**broken, "checksTruncated": True, "checkState": "FAILURE"}, "green"), 1)
+        # --until done waits for every shown check to finish, failure or not, as under 100 checks
+        busy = gg.parse_pr(pr_node(5, rollup="FAILURE", checks=[check_run("lint", conclusion="FAILURE"), running]))
+        self.assertIsNone(gg.verdict("pr", {**busy, "checksTruncated": True, "checkState": "FAILURE"}, "done"))
+        self.assertEqual(gg.verdict("pr", {**busy, "checksTruncated": True, "checkState": "FAILURE"}, "green"), 1)
         hidden = gg.parse_pr(pr_node(3, rollup="FAILURE", checks=[check_run("build")]))
         self.assertEqual(gg.verdict("pr", {**hidden, "checksTruncated": True, "checkState": "FAILURE"}, "green"), 1)
         ok = gg.parse_pr(pr_node(4, rollup="SUCCESS", checks=[check_run("build")]))
