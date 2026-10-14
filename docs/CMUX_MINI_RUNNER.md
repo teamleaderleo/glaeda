@@ -575,7 +575,9 @@ root, persistent-dd, gui or simulator token yet: the worker is a system LaunchDa
 session, and root classes move behind `admit` with compile placement.
 Rollout order for `--reserve-units`: an older hook rejects the flag (argparse exits 2), so the hq worker must
 not pass it to `fits` or `admit` until every mini's installed hook has the fast-runner change. Roll the hooks
-out first (`--refresh-hooks --apply` or a re-apply on each mini), then the worker.
+out first (`--refresh-hooks --apply` or a re-apply on each mini), then the worker. Turning on
+`fastRunners` itself needs a full `--apply` on the mini: `--refresh-hooks` copies only the hook files, and the
+fast runner's reserve is baked into its wrapper (`--fast-runner --reserve-units N`).
 
 ## 2e. Trusted-only runners on a mini that holds a secret
 
