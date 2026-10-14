@@ -514,12 +514,14 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         if getattr(ctx, "gui_runner", False):  # the listener gate holds it while the gui token or every root is taken
             scope += " --gui-runner"
             scope += f" --gui-token {shlex.quote(gui_token)}"
-        if getattr(ctx, "fast_runner", False):  # takes the reserved units first; busy CPU never holds it
+        reserve = int((ctx.member or {}).get("fastReserveUnits") or 0)
+        fast = getattr(ctx, "fast_runner", False)
+        if fast:  # takes the reserved units first; busy CPU never holds it
             scope += " --fast-runner"
-        elif int((ctx.member or {}).get("fastReserveUnits") or 0) and \
-                ctx.instance >= int((ctx.member or {}).get("canonicalRoots") or 1):
-            # a side or gui runner leaves the fast runner's units free; a root runner keeps the whole mini
-            scope += f" --reserve-units {int(ctx.member['fastReserveUnits'])}"
+        if reserve and (fast or ctx.instance >= int((ctx.member or {}).get("canonicalRoots") or 1)):
+            # a side or gui runner leaves the fast runner's units free, and the fast runner skips the units fair
+            # turn only on those; a root runner keeps the whole mini
+            scope += f" --reserve-units {reserve}"
     started = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"

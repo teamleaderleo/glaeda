@@ -2193,9 +2193,10 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   reserve: int = 0, fast: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     reserve (a side or gui runner on a mini with a fast runner, --reserve-units) keeps the top `reserve` units for
-    the fast runner: this admission takes units only from unit-0 up to total - reserve. fast (--fast-runner) scans
-    from the top down, so the fast runner takes the reserved units first, and it never queues behind an older
-    waiter for units (that waiter cannot take the reserved ones); it still waits behind one for a token.
+    the fast runner: this admission takes units only from unit-0 up to total - reserve. fast (--fast-runner, whose
+    hook passes the same --reserve-units) scans from the top down, so the fast runner takes the reserved units
+    first. It never queues behind an older waiter for units on those (that waiter cannot take them), but it takes
+    a unit below the reserve only in turn, like every other admission; it still waits behind one for a token.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
     every token kind its class takes. since is when this job began to wait (a
@@ -2239,10 +2240,12 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             return False, f"{job or 'this job'} is already admitted"
         if taken_out is not None:
             taken_out["wants"] = list(tokens)
-        behind = fair_turn(capacity_dir, {*tokens} if fast else {*tokens, "units"},
-                           time.time() if since is None else since)
+        began = time.time() if since is None else since
+        behind = fair_turn(capacity_dir, {*tokens} if fast else {*tokens, "units"}, began)
         if behind:
             return False, behind
+        # the fast runner's turn for the units below its reserve (an older waiter for units may take those)
+        lower_behind = fair_turn(capacity_dir, {"units"}, began) if fast else None
         yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
         if uses_gui:  # this job will drive the console session: the idle fuzzer's app must be gone first
             yielded += yield_idle_fuzz(capacity_dir)
@@ -2322,6 +2325,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         for slot in (range(total - 1, -1, -1) if fast else range(own)):
             if got == units:
                 break
+            if fast and slot < own and lower_behind:
+                break
             fd = lock_file(capacity_dir / f"unit-{slot}", fcntl.LOCK_EX)
             if fd is not None:
                 fds.append(fd)
@@ -2330,6 +2335,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         if got < units:
             if taken_out is not None:
                 taken_out["wants"] = ["units"]
+            if fast and lower_behind:
+                return False, lower_behind
             kept = f" ({total - own} reserved for the fast runner)" if own < total else ""
             return False, (f"capacity: {got} of {total} units free{kept}, {job or 'an unknown job'} ({klass}) "
                            f"needs {units}")
@@ -2625,7 +2632,8 @@ class RunnerScope(NamedTuple):
     --canonical-roots, whether it is a root runner (instance below canonical roots, glaeda-cmux-runner),
     whether it is the mini's gui runner (--gui-runner, the gui pool label; never a root runner), its
     --min-free-gib disk floor (0: none), whether it is the mini's fast runner (--fast-runner, the fast pool label)
-    and the units it leaves for the fast runner (--reserve-units: a side or gui runner on a mini that has one)."""
+    and the units reserved for the fast runner (--reserve-units: the units a side or gui runner leaves for it, or on
+    the fast runner the top units that are its own)."""
     units: int = 0
     compile_slots: int = 1
     roots: int = 1
@@ -2669,7 +2677,7 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
     gui_token = gui_match.group(1) if gui_match else "gui"
     return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots,
                        instance < roots and not gui and not fast, gui, min_free_gib(text), gui_token, fast,
-                       0 if fast else flag("reserve-units", 0))
+                       flag("reserve-units", 0))
 
 
 def min_free_gib(text: str) -> float:
@@ -2731,7 +2739,8 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
     total - reserve, the units its admissions may take, so it stops listening once taking a job would eat the
     fast runner's reserve. The fast runner (scope.fast) needs 2 free units anywhere on the mini (a fast-tier
     isolated job costs 2), and no root, persistent-dd or gui token; a waiter for units does not hold it, since
-    that waiter cannot take the reserved units the fast runner's job would."""
+    that waiter cannot take the reserved units (the top scope.reserve), but then only those count, since the
+    units below them go to that waiter first."""
     if capacity_dir is None or total <= 0:
         return None
     try:
@@ -2755,15 +2764,24 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
         own = total - reserve
         if own <= 0:
             return f"all {total} capacity units on this mini are reserved for the fast runner"
+        scan: range = range(own)
+        units_waiter = None
+        if fast:
+            mine = max(0, min(scope.reserve, total))  # the reserved units, which no waiter can take
+            units_waiter = next((w for w in admission_waiters(capacity_dir) if "units" in w["wants"]), None)
+            scan = range(total - 1, total - mine - 1, -1) if units_waiter else range(total - 1, -1, -1)
         # fit_units: a side runner whose label brings 2-unit jobs (listen --fit-units: glaeda-ios-sim's isolated builds)
         need = min(max(ROOT_FIT_UNITS if root else FAST_FIT_UNITS if fast else 1, fit_units), own)
         free = 0
-        for slot in range(own):
+        for slot in scan:
             if not open_to_jobs(f"unit-{slot}", capacity_dir / f"unit-{slot}"):
                 continue
             free += 1
             if free >= need:
                 break
+        if units_waiter is not None and free < need:
+            return (f"{units_waiter['who'] or 'a job'} waits here for units, and only {free} of the "
+                    f"{len(scan)} reserved for the fast runner are free; its next job needs {need}")
         kept = f" ({reserve} more reserved for the fast runner)" if reserve else ""
         if free == 0:
             return (f"all {own} capacity units this runner may take on this mini are taken{kept}" if reserve
@@ -4547,7 +4565,8 @@ def main(argv: list[str] | None = None) -> int:
                         "other runners reserve for it first, and busy CPU never holds its listener")
     p.add_argument("--reserve-units", type=int, default=0,
                    help="leave this many of --capacity-units for the mini's fast runner (a side or gui runner on a "
-                        "mini with one): admission and the listener gate use only the rest")
+                        "mini with one): admission and the listener gate use only the rest; with --fast-runner, the "
+                        "top units that are its own")
     p.add_argument("--capacity-dir", type=Path, default=Path(FLEET_DIR) / "capacity", help=argparse.SUPPRESS)
     p.add_argument("--host-lock", default=HOST_LOCK, help=argparse.SUPPRESS)
     p.add_argument("--reservation", default=RESERVATION, help=argparse.SUPPRESS)
@@ -4559,8 +4578,6 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--gui-token must be a simple capacity token name")
     if args.reserve_units < 0 or (args.capacity_units > 0 and args.reserve_units >= args.capacity_units):
         p.error("--reserve-units must be 0 or more and below --capacity-units")
-    if args.fast_runner and args.reserve_units:
-        p.error("--fast-runner takes the reserved units; it reserves none itself")
     if args.parse_only:
         return 0
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
