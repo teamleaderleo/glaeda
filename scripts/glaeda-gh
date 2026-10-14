@@ -4,7 +4,7 @@
     glaeda-gh serve                                     the daemon (LaunchAgent or systemd user unit)
     glaeda-gh status pr OWNER/REPO#N [--json]           PR state, checks, mergeability, review
     glaeda-gh status run OWNER/REPO/RUN_ID [--jobs] [--json]
-    glaeda-gh wait pr OWNER/REPO#N [--until green|done|merged] [--timeout S] [--json]
+    glaeda-gh wait pr OWNER/REPO#N [--until green|done|required|merged] [--timeout S] [--json]
     glaeda-gh wait run OWNER/REPO/RUN_ID [--jobs] [--rescue-grace S] [--timeout S] [--json]
     glaeda-gh wait comment OWNER/REPO#N [--author LOGIN] [--match REGEX] [--since ID|URL|TIME|10m]
     glaeda-gh status comment OWNER/REPO#N               the latest comments on an issue or PR
@@ -50,7 +50,7 @@ any are marked); merged waits for the merge.
 
 A PR that conflicts with its base (mergeable CONFLICTING, merge state DIRTY), for example after the
 PR it was stacked on was squash-merged, runs no pull_request workflows until the next push. `wait
-pr --until green|done` therefore stops with exit 4 as soon as the daemon's cached data says so;
+pr --until green|done|required` therefore stops with exit 4 as soon as the daemon's cached data says so;
 --until merged keeps waiting. UNKNOWN mergeability (GitHub computes it lazily) counts as pending.
 
 A job a glaeda runner refused (its "Set up runner" step, the runner's job-started hook, failed
