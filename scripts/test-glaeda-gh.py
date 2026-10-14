@@ -1285,6 +1285,21 @@ class ClientTest(Base):
         self.assertIn("held: cmux-next / fast tier: cancelled before any step ran", text)
         self.assertEqual(gg.verdict("pr", data, "green", now=now + gg.RESCUE_GRACE + 1), 1)
         self.assertEqual(gg.verdict("pr", data, "green", grace=0), 1)
+        # the rescue cancels the whole run: a sibling that was running is cancelled with steps, and held
+        # too; a real failure in that run still decides at once
+        running = {**check_run("daemon tests", conclusion="CANCELLED"), "id": "CR_r", "databaseId": 6,
+                   "startedAt": iso(now - 300), "completedAt": iso(now - 5),
+                   "checkSuite": {"conclusion": "CANCELLED", "workflowRun": {"databaseId": 9, "workflow": {"name": "cmux-next"}}}}
+        both = gg.parse_pr(pr_node(2, rollup="FAILURE", checks=[queued, running, check_run("build")]))
+        both["checks"][0]["stepCount"], both["checks"][1]["stepCount"] = 0, 7
+        self.assertIsNone(gg.verdict("pr", both, "green"))
+        self.assertIn("held: cmux-next / daemon tests: its run was cancelled while a job was still queued",
+                      gg.summary("pr:o/r#2", {"data": both}, "green"))
+        broken = {**check_run("lint", conclusion="FAILURE"), "id": "CR_l", "databaseId": 7,
+                  "checkSuite": {"conclusion": "FAILURE", "workflowRun": {"databaseId": 9, "workflow": {"name": "cmux-next"}}}}
+        mixed = gg.parse_pr(pr_node(3, rollup="FAILURE", checks=[queued, broken]))
+        mixed["checks"][0]["stepCount"] = 0
+        self.assertEqual(gg.verdict("pr", mixed, "green"), 1)
         # a job that ran steps, or whose steps were never read, was cancelled for real
         data["checks"][0]["stepCount"] = 3
         self.assertEqual(gg.verdict("pr", data, "green"), 1)
