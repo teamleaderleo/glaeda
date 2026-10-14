@@ -1891,6 +1891,13 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
             ctx.labels = registered["labels"]
         if not args.name and not args.member and registered.get("name"):
             ctx.name = registered["name"]
+    reserve = int((ctx.member or {}).get("fastReserveUnits") or 0)
+    if not args.uninstall and reserve and ctx.capacity_units and ctx.capacity_units - reserve < 2:
+        # the manifest's capacityUnits was checked against the reserve; an override must be too
+        print(f"glaeda-cmux-runner: --capacity-units {ctx.capacity_units} leaves {ctx.capacity_units - reserve} "
+              f"unit(s) outside fastReserveUnits {reserve}; the side and gui runners need at least 2 (a compile)",
+              file=sys.stderr)
+        return 2
     ctx.allow_stale = args.allow_stale
     ctx.copy = None if args.uninstall else copy_check(ctx)
     if ctx.copy is not None and ctx.copy["state"] == "stale":
