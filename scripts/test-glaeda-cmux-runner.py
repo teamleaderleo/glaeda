@@ -5265,6 +5265,29 @@ class RunnerTest(unittest.TestCase):
         self.apply_instances(self.fast_manifest(fastReserveUnits=3), ("2",))
         self.assertIn("--instance 2 --reserve-units 3\n", self.started_script(2))
 
+    def test_install_refuses_capacity_that_leaves_no_compile_room_outside_the_reserve(self) -> None:
+        path = self.fast_manifest()
+        for units in ("3", "2"):  # 5 units in the manifest: an override that leaves under 2 outside the reserve
+            err = io.StringIO()
+            with self.subTest(units=units), mock.patch.object(cr, "xcode_present", return_value=True), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cr.main(["--gh", os.fspath(self.gh), "--python", sys.executable, "--apply",
+                                          "--manifest", os.fspath(path), "--member", "mini-std", "--instance", "2",
+                                          "--capacity-units", units]), 2)
+                self.assertIn(f"--capacity-units {units}", err.getvalue())
+                self.assertIn("fastReserveUnits 2", err.getvalue())
+        self.assertFalse((self.home / "actions-runner-glaeda-2").exists(), "a refusal installs nothing")
+        self.apply_instances(path, ("2",))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cr.main(["--gh", os.fspath(self.gh), "--python", sys.executable, "--apply",
+                                      "--instance", "2", "--capacity-units", "3"]), 2,
+                             "a plain re-run's override is checked against the kept member too")
+        self.assertIn("fastReserveUnits 2", err.getvalue())
+        self.assertIn("--capacity-units 5 ", self.started_script(2), "the refused re-run left the hook alone")
+        self.invoke("--apply", "--instance", "2", "--capacity-units", "4")  # 4 - 2 leaves a compile its 2 units
+        self.assertIn("--capacity-units 4 ", self.started_script(2))
+
     def test_a_member_without_fast_runners_keeps_todays_labels_and_scope(self) -> None:
         manifest = json.loads(self.fast_manifest().read_text())
         manifest["defaults"]["runner"]["classes"]["std"].update(runners=5)
