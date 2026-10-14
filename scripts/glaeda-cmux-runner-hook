@@ -2189,8 +2189,13 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   instance: int = 0, workflow: str = "", warm_keys: tuple[str, ...] = (),
                   owned_state_dir: str = "", taken_out: dict[str, Any] | None = None,
                   warm_target: tuple[Any, ...] = ("", None, 0), klass: str | None = None,
-                  one_holder: bool = False, since: float | None = None, gui_token: str = "gui") -> tuple[bool, str]:
+                  one_holder: bool = False, since: float | None = None, gui_token: str = "gui",
+                  reserve: int = 0, fast: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
+    reserve (a side or gui runner on a mini with a fast runner, --reserve-units) keeps the top `reserve` units for
+    the fast runner: this admission takes units only from unit-0 up to total - reserve. fast (--fast-runner) scans
+    from the top down, so the fast runner takes the reserved units first, and it never queues behind an older
+    waiter for units (that waiter cannot take the reserved ones); it still waits behind one for a token.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
     every token kind its class takes. since is when this job began to wait (a
@@ -2234,7 +2239,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             return False, f"{job or 'this job'} is already admitted"
         if taken_out is not None:
             taken_out["wants"] = list(tokens)
-        behind = fair_turn(capacity_dir, {*tokens, "units"}, time.time() if since is None else since)
+        behind = fair_turn(capacity_dir, {*tokens} if fast else {*tokens, "units"},
+                           time.time() if since is None else since)
         if behind:
             return False, behind
         yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
@@ -2312,7 +2318,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 return False, f"capacity: {held} ({job or 'unknown job'} is {klass})"
         got = 0
         unit_fds: list[int] = []
-        for slot in range(total):
+        own = max(0, total - max(0, reserve))
+        for slot in (range(total - 1, -1, -1) if fast else range(own)):
             if got == units:
                 break
             fd = lock_file(capacity_dir / f"unit-{slot}", fcntl.LOCK_EX)
@@ -2323,7 +2330,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         if got < units:
             if taken_out is not None:
                 taken_out["wants"] = ["units"]
-            return False, (f"capacity: {got} of {total} units free, {job or 'an unknown job'} ({klass}) needs {units}")
+            kept = f" ({total - own} reserved for the fast runner)" if own < total else ""
+            return False, (f"capacity: {got} of {total} units free{kept}, {job or 'an unknown job'} ({klass}) "
+                           f"needs {units}")
         root = next((name for name in taken if name.startswith("root-")), None)
         split = named[root] if root and klass in ROOT_SWITCHERS else None
         if split is not None:  # its own holder (ROOT_SWITCHERS); the main holder must not inherit it
@@ -2515,14 +2524,15 @@ def step_runner_name(key: str) -> str:
 
 
 def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, host_lock: str, reservation: str,
-              state_dir: Path, now: float) -> list[str] | Unknown:
+              state_dir: Path, now: float, reserve: int = 0) -> list[str] | Unknown:
     """The STEP_CLASSES this mini could admit right now, or UNKNOWN when an admission held admission.lock
     throughout. The listener gate's probe (mini_full): the host is not the fleet's (host_held) and no fleet
     build waits for it (host_waiters, which admission refuses for too, so a worker never leases a step it
     would hand back), and under
     admission.lock, held without waiting so no admission meets a unit the probe holds, enough unit files and one
     free copy of each token are free (an idle catch-up's locks count as free: it yields them to the next job), and
-    no job admitted here waits for units or one of those tokens (CAPACITY_WAIT: it goes first)."""
+    no job admitted here waits for units or one of those tokens (CAPACITY_WAIT: it goes first). reserve
+    (--reserve-units) counts only the units take_capacity would give such an admission: unit-0 up to total - reserve."""
     if total <= 0 or host_held(host_lock, reservation, now, state_dir) or host_waiters(host_lock, state_dir):
         return []
     try:
@@ -2545,7 +2555,7 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
         def free(name: str) -> bool:
             return name in yielding or probe(capacity_dir / name)
 
-        units = sum(1 for slot in range(total) if free(f"unit-{slot}"))
+        units = sum(1 for slot in range(max(0, total - max(0, reserve))) if free(f"unit-{slot}"))
         waited = {kind for waiter in admission_waiters(capacity_dir) for kind in waiter["wants"]}
         fits = []
         for klass in STEP_CLASSES:
@@ -2563,7 +2573,8 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
 
 
 def step_admit(klass: str, key: str, watch_pid: int, host_lock: str, reservation: str, capacity_dir: Path,
-               total: int, state_dir: Path, compile_slots: int = 1, roots: int = 1) -> tuple[int, dict[str, Any]]:
+               total: int, state_dir: Path, compile_slots: int = 1, roots: int = 1, reserve: int = 0,
+               fast: bool = False) -> tuple[int, dict[str, Any]]:
     """Admit one ci-step now or refuse it, never waiting for room. (exit status, typed result): 0 and the units and
     tokens its holder keeps, or 1 and the reason. RUNNER_NAME must already be step_runner_name(key)."""
     result: dict[str, Any] = {"schema": STEP_ADMISSION, "class": klass, "key": key, "admitted": False}
@@ -2581,7 +2592,8 @@ def step_admit(klass: str, key: str, watch_pid: int, host_lock: str, reservation
         return refused(why)
     taken: dict[str, Any] = {}
     held, note = take_capacity(host_lock, capacity_dir, total, f"ci-step {key}", watch_pid, state_dir,
-                               compile_slots, roots, klass=klass, taken_out=taken, one_holder=True)
+                               compile_slots, roots, klass=klass, taken_out=taken, one_holder=True,
+                               reserve=reserve, fast=fast)
     if not held:
         return refused(note)
     holder = holder_file(state_dir)
@@ -2611,8 +2623,9 @@ def runner_units(runner_dir: Path) -> int:
 class RunnerScope(NamedTuple):
     """What this runner's job-started hook admits with: its --capacity-units, --compile-slots and
     --canonical-roots, whether it is a root runner (instance below canonical roots, glaeda-cmux-runner),
-    whether it is the mini's gui runner (--gui-runner, the gui pool label; never a root runner) and its
-    --min-free-gib disk floor (0: none)."""
+    whether it is the mini's gui runner (--gui-runner, the gui pool label; never a root runner), its
+    --min-free-gib disk floor (0: none), whether it is the mini's fast runner (--fast-runner, the fast pool label)
+    and the units it leaves for the fast runner (--reserve-units: a side or gui runner on a mini that has one)."""
     units: int = 0
     compile_slots: int = 1
     roots: int = 1
@@ -2620,6 +2633,8 @@ class RunnerScope(NamedTuple):
     gui: bool = False
     min_free_gib: float = 0.0
     gui_token: str = "gui"
+    fast: bool = False
+    reserve: int = 0
 
 
 def listen_fit_units(runner_dir: Path) -> int:
@@ -2649,10 +2664,12 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
     instance = flag("instance", int(suffix.group(1)) if suffix else 0)
     roots = max(1, flag("canonical-roots", 1))
     gui = re.search(r"\s--gui-runner(?:\s|$)", text) is not None
+    fast = re.search(r"\s--fast-runner(?:\s|$)", text) is not None
     gui_match = re.search(r"\s--gui-token\s+([A-Za-z0-9._-]+)(?:\s|$)", text)
     gui_token = gui_match.group(1) if gui_match else "gui"
-    return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots, instance < roots and not gui,
-                       gui, min_free_gib(text), gui_token)
+    return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots,
+                       instance < roots and not gui and not fast, gui, min_free_gib(text), gui_token, fast,
+                       0 if fast else flag("reserve-units", 0))
 
 
 def min_free_gib(text: str) -> float:
@@ -2673,6 +2690,8 @@ MIN_FREE_GIB_RE = r"\s--min-free-gib[\s=]+([0-9.eE+-]+)(?=\s|$)"
 # A root runner's jobs (compile admission, app-host shards, cli-product, lag) cost up to this many units, and
 # the costliest takes a persistent-dd and a root token, and a shard the gui token (CLASS_COST).
 ROOT_FIT_UNITS = max(CLASS_COST[k][0] for k in ("compile", "gui", "product", "compile-gui", "gui-step"))
+# The fast runner's jobs (the fast tier's isolated jobs) cost this many units, which fastReserveUnits keeps for it.
+FAST_FIT_UNITS = CLASS_COST["isolated"][0]
 
 
 def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None = None,
@@ -2706,7 +2725,13 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
     Full also means a job admitted to this mini is waiting (CAPACITY_WAIT, its admit.want marker) for units or
     for a token this runner's next job would take (a root runner: a canonical root or persistent-dd; a gui
     runner: the gui token or a root). That job goes first, so a job this runner took now would only queue
-    behind it here, while GitHub could hand it to a mini with room."""
+    behind it here, while GitHub could hand it to a mini with room.
+
+    On a mini with a fast runner, a side or gui runner (scope.reserve, --reserve-units) counts only unit-0 up to
+    total - reserve, the units its admissions may take, so it stops listening once taking a job would eat the
+    fast runner's reserve. The fast runner (scope.fast) needs 2 free units anywhere on the mini (a fast-tier
+    isolated job costs 2), and no root, persistent-dd or gui token; a waiter for units does not hold it, since
+    that waiter cannot take the reserved units the fast runner's job would."""
     if capacity_dir is None or total <= 0:
         return None
     try:
@@ -2725,20 +2750,29 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             return name in yielding or probe(path)
 
         root = scope is not None and scope.root
+        fast = scope is not None and scope.fast
+        reserve = 0 if scope is None or fast or root else max(0, min(scope.reserve, total))
+        own = total - reserve
+        if own <= 0:
+            return f"all {total} capacity units on this mini are reserved for the fast runner"
         # fit_units: a side runner whose label brings 2-unit jobs (listen --fit-units: glaeda-ios-sim's isolated builds)
-        need = min(max(ROOT_FIT_UNITS if root else 1, fit_units), total)
+        need = min(max(ROOT_FIT_UNITS if root else FAST_FIT_UNITS if fast else 1, fit_units), own)
         free = 0
-        for slot in range(total):
+        for slot in range(own):
             if not open_to_jobs(f"unit-{slot}", capacity_dir / f"unit-{slot}"):
                 continue
             free += 1
             if free >= need:
                 break
+        kept = f" ({reserve} more reserved for the fast runner)" if reserve else ""
         if free == 0:
-            return f"all {total} capacity units on this mini are taken"
+            return (f"all {own} capacity units this runner may take on this mini are taken{kept}" if reserve
+                    else f"all {total} capacity units on this mini are taken")
         if free < need:
-            return (f"only {free} of {total} capacity units on this mini are free; "
+            return (f"only {free} of {own if reserve else total} capacity units on this mini are free{kept}; "
                     f"{'a compile' if root else 'its next job'} needs {need}")
+        if fast:
+            return None
         # a job already here waits for what this runner's next job would take (CAPACITY_WAIT): it goes first
         compete = {"units"} | ({"root", "persistent-dd"} if root else set()) | (
             {scope.gui_token, "root"} if scope is not None and scope.gui else set())
@@ -3151,8 +3185,11 @@ class Gate:
         if now - self.memory_at >= GATE_CPU_EVERY_S:
             self.memory_pressure = memory_pressure_level()
             self.memory_at = now
+        # the fast runner's jobs are short and its units are reserved: busy CPU (the mini's compiles) never holds
+        # it, only memory pressure does
+        fast = runner_scope(self.runner_dir).fast
         why = host_saturated(paused=self.load_since is not None or self.load_waived,
-                             cpu_busy=self.cpu_busy, memory_pressure=self.memory_pressure)
+                             cpu_busy=None if fast else self.cpu_busy, memory_pressure=self.memory_pressure)
         if why is None:
             if self.load_waived:
                 gate_log("host pressure fell below the resume mark; pressure holds apply again")
@@ -4505,6 +4542,12 @@ def main(argv: list[str] | None = None) -> int:
                         "gui token, every canonical root or every unit is taken")
     p.add_argument("--gui-token", default="gui",
                    help="capacity ledger token for this runner's desktop session (default: gui)")
+    p.add_argument("--fast-runner", action="store_true",
+                   help="this is the mini's fast runner (the fast pool label): its admissions take the units the "
+                        "other runners reserve for it first, and busy CPU never holds its listener")
+    p.add_argument("--reserve-units", type=int, default=0,
+                   help="leave this many of --capacity-units for the mini's fast runner (a side or gui runner on a "
+                        "mini with one): admission and the listener gate use only the rest")
     p.add_argument("--capacity-dir", type=Path, default=Path(FLEET_DIR) / "capacity", help=argparse.SUPPRESS)
     p.add_argument("--host-lock", default=HOST_LOCK, help=argparse.SUPPRESS)
     p.add_argument("--reservation", default=RESERVATION, help=argparse.SUPPRESS)
@@ -4514,6 +4557,10 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", args.gui_token):
         p.error("--gui-token must be a simple capacity token name")
+    if args.reserve_units < 0 or (args.capacity_units > 0 and args.reserve_units >= args.capacity_units):
+        p.error("--reserve-units must be 0 or more and below --capacity-units")
+    if args.fast_runner and args.reserve_units:
+        p.error("--fast-runner takes the reserved units; it reserves none itself")
     if args.parse_only:
         return 0
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
@@ -4528,7 +4575,7 @@ def main(argv: list[str] | None = None) -> int:
             p.error("admit needs --class")
         status, result = step_admit(args.step_class, args.job_key, args.watch_pid, args.host_lock, args.reservation,
                                     args.capacity_dir, args.capacity_units, args.state_dir, args.compile_slots,
-                                    args.canonical_roots)
+                                    args.canonical_roots, args.reserve_units, args.fast_runner)
         print(json.dumps(result, sort_keys=True), flush=True)
         return status
     if args.phase == "release":
@@ -4537,7 +4584,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.phase == "fits":
         fits = step_fits(args.capacity_dir, args.capacity_units, args.compile_slots, args.canonical_roots,
-                         args.host_lock, args.reservation, args.state_dir, time.time())
+                         args.host_lock, args.reservation, args.state_dir, time.time(), args.reserve_units)
         unknown = isinstance(fits, Unknown)
         print(json.dumps({"schema": STEP_FITS, "fits": [] if unknown else fits, "unknown": unknown}, sort_keys=True),
               flush=True)
@@ -4638,7 +4685,8 @@ def main(argv: list[str] | None = None) -> int:
                                                workflow=job_workflow(),
                                                warm_keys=job_warm_keys(event), taken_out=taken,
                                                warm_target=job_warm_target(event), since=since,
-                                               gui_token=args.gui_token, klass=admit_class)
+                                               gui_token=args.gui_token, klass=admit_class,
+                                               reserve=args.reserve_units, fast=args.fast_runner)
                     if held or not note.startswith("capacity:"):
                         break
                     waited = time.monotonic() - start

@@ -40,6 +40,10 @@ VERSION_RE = r"[0-9][0-9.]*"
 # gui runner: it carries only the gui pool label (gui_label), so GitHub hands each mini at most one GUI job, the
 # one its single gui token allows, and a second GUI job waits in GitHub's queue for another mini's gui runner
 # instead of on a root runner here (cmuxterm-hq#661). It is neither a root nor a side runner.
+# fastRunners (0 or 1, default 0) adds the mini's fast runner as its last instance, after the gui runner: it carries
+# only the fast pool label (fast_label), so the fast tier's short jobs never wait behind the mini's other runners.
+# fastReserveUnits (default 2 with a fast runner, else 0) is how many units the side and gui runners leave free for
+# it; the root runners keep the whole mini. A member without fastRunners is exactly what it was before.
 CLASS_CAPACITY = {"xl": (8, 8), "std": (4, 4), "light": (2, 2)}
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
@@ -49,7 +53,7 @@ MAX_RUNNERS = 16
 TRUSTED_REF_RE = r"refs/heads/[A-Za-z0-9._/-]+"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 POOL_PREFIX_RE = r"[a-z0-9]+-"
-RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "trusted-", "std-", "light-", "xl-"}
+RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-"}
 
 
 def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
@@ -89,6 +93,13 @@ def gui_label(pool: str) -> str:
     tests-build-and-lag, app-host-test-rerun) run on it: each needs the mini's one gui token (one console session),
     so one runner per mini carries the label, and its listener gate holds while the token or every root is taken."""
     return _role_label(pool, "gui")
+
+
+def fast_label(pool: str) -> str:
+    """The label of a pool's fast runner (the last instance when fastRunners is 1): glaeda-fast-std-xcode-26.6. The
+    fast tier's short jobs run on it, and the other runners leave fastReserveUnits for it, so they never queue behind
+    every unit of a busy mini."""
+    return _role_label(pool, "fast")
 
 
 def _role_label(pool: str, role: str) -> str:
@@ -185,8 +196,10 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         compile_slots = declared.get("compileSlots", 1)
         roots = declared.get("canonicalRoots", 1)
         gui = declared.get("guiRunners", 0)
+        fast = declared.get("fastRunners", 0)
+        reserve = declared.get("fastReserveUnits", 2 if fast == 1 and not isinstance(fast, bool) else 0)
     else:
-        compile_slots, roots, gui = 1, 1, 0
+        compile_slots, roots, gui, fast, reserve = 1, 1, 0, 0, 0
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
     if not (isinstance(units, int) and not isinstance(units, bool) and 2 <= units <= 4 * MAX_RUNNERS):
@@ -199,18 +212,30 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     if not (isinstance(gui, int) and not isinstance(gui, bool) and 0 <= gui <= 1 and roots + gui <= runners):
         return None, (f"runner.classes.{klass}.guiRunners must be 0 or 1, and canonicalRoots plus guiRunners at most "
                       f"runners ({runners}): the gui runner is the last instance, never a root runner")
+    if not (isinstance(fast, int) and not isinstance(fast, bool) and 0 <= fast <= 1 and roots + gui + fast <= runners):
+        return None, (f"runner.classes.{klass}.fastRunners must be 0 or 1, and canonicalRoots plus guiRunners plus "
+                      f"fastRunners at most runners ({runners}): the fast runner is the last instance")
+    if fast and not (isinstance(reserve, int) and not isinstance(reserve, bool) and 2 <= reserve <= units - 2):
+        return None, (f"runner.classes.{klass}.fastReserveUnits must be 2 to {units - 2} (the side and gui runners "
+                      "leave it for the fast runner, and a compile still needs 2 units)")
+    if not fast and reserve != 0:
+        return None, f"runner.classes.{klass}.fastReserveUnits needs fastRunners 1"
     if compile_slots > roots:
         return None, (f"runner.classes.{klass}.compileSlots {compile_slots} needs canonicalRoots {compile_slots} "
                       "(every compile holds a root)")
-    return {"member": member, "class": klass, "availability": availability, "roles": roles,
-            "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
-            "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
-            "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
-            "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
-            "trustedRef": trusted_ref, "trustedRepo": trusted_repo,
-            "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)],
-            "sidePools": [side_label(label) for label in dict.fromkeys(pools)],
-            "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else []}, None
+    summary = {"member": member, "class": klass, "availability": availability, "roles": roles,
+               "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
+               "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
+               "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
+               "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
+               "trustedRef": trusted_ref, "trustedRepo": trusted_repo,
+               "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)],
+               "sidePools": [side_label(label) for label in dict.fromkeys(pools)],
+               "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else []}
+    if fast:  # only then, so a member without a fast runner keeps exactly today's summary
+        summary.update(fastRunners=fast, fastReserveUnits=reserve,
+                       fastPools=[fast_label(label) for label in dict.fromkeys(pools)])
+    return summary, None
 
 
 def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool] | None = None) -> dict[str, list[str]]:

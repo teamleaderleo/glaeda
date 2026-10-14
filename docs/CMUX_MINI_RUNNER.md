@@ -562,7 +562,8 @@ same `take_capacity`, so a mini claims a step only when it fits:
     glaeda-cmux-runner-hook admit   --class light --job-key KEY --watch-pid WORKER_PID --capacity-units U
     glaeda-cmux-runner-hook release --job-key KEY
 
-Pass the `--capacity-units` (and `--compile-slots`, `--canonical-roots`) the runners' hooks bake, and the
+Pass the `--capacity-units` (and `--compile-slots`, `--canonical-roots`, and on a mini with a fast runner
+`--reserve-units`) the runners' hooks bake, and the
 worker's `--host-lock`, `--reservation` and `--capacity-dir`, so both scan one ledger (on the minis the worker
 runs as `cmux` with root `/Users/Shared/cmux-build-fleet`, the runners' `FLEET_DIR`). `fits` prints the step
 classes (`light`, `isolated`) the mini could admit now, from the listener gate's probe, and none while a fleet
@@ -698,6 +699,18 @@ in at the producer's root. So one root job per root per mini:
   `canonicalRoots + guiRunners` is at most `runners`. Admission is unchanged: a GUI job takes 1 unit, the
   gui token (an app-host shard in the step before its restore instead), and the producer's root in its
   restore step.
+- `fastRunners` (0 or 1, default 0) adds the mini's fast runner as its last instance (`runners - 1`); the gui
+  runner then sits just below it (`runners - fastRunners - 1`), so raising `runners` by one for the fast runner
+  keeps the gui runner's instance. The fast runner carries only the fast pool label
+  `glaeda-fast-<class>-xcode-<version>` (no pool, root, side, gui or `glaeda-ios-sim` label, no warm-affinity
+  `glaeda-runner-*` label) and its job-started hook passes `--fast-runner`. `fastReserveUnits` (default 2 with a
+  fast runner) is how many units the side and gui runners leave for it: their hooks pass `--reserve-units N`, so
+  their admissions take only `unit-0` up to `capacityUnits - N` and their listener gates hold once that much is
+  taken. Root runners do not reserve, so a compile can still use the whole mini. The fast runner's admissions scan
+  the units from the top, taking the reserved ones first; its gate needs 2 free units and no token, and busy CPU
+  never holds it (memory pressure, a fleet hold, heat and low disk still do). `canonicalRoots + guiRunners +
+  fastRunners` is at most `runners`, and `fastReserveUnits` is 2 to `capacityUnits - 2`. A member without
+  `fastRunners` registers and bakes exactly what it did before.
 - A desktop VM runner is a future, disabled design. It may use the GUI label and a distinct `gui-vm`
   accounting token, but the guest must not receive read-write access to the host capacity ledger. A
   host-side broker, immutable VM ownership receipt, and atomic runner drain are required before any
