@@ -2398,6 +2398,42 @@ time.sleep(60)
                 self.ci_step("release", "--job-key", key)
         self.assertTrue(self.lock_free(), "every step holder let go")
 
+    def test_fast_runner_takes_units_below_its_reserve_only_in_turn(self) -> None:
+        """The fast runner (--fast-runner --reserve-units 2, 4 units) skips an older waiter for units only on the
+        units it owns (unit-2, unit-3): a side waiter can never take those, but it can take unit-0 and unit-1, so
+        the fast runner queues behind it there like every other runner."""
+        self.fleet()
+        worker = self.ci_worker()
+        watch = ("--watch-pid", str(worker.pid))
+        fast = ("--fast-runner", "--reserve-units", "2")
+        capacity = self.dir / "capacity"
+        capacity.mkdir(parents=True, exist_ok=True)
+        keys = [f"fq-{n}-1" for n in range(2)]
+        marker = capacity / f"{hook.ADMIT_WANT}{worker.pid}"
+        marker.write_text(json.dumps({"since": time.time() - 20, "wants": ["units"], "who": "an older side job"}))
+
+        def held() -> list[int]:
+            return [slot for slot in range(4) if not hook.probe(capacity / f"unit-{slot}")]
+
+        try:
+            status, took = self.ci_step("admit", "--class", "isolated", "--job-key", keys[0], *fast, *watch, units=4)
+            self.assertEqual((status, took.get("units")), (0, 2), took)
+            self.assertEqual(held(), [2, 3], "the reserved units are the fast runner's, waiter or not")
+            status, refused = self.ci_step("admit", "--class", "light", "--job-key", keys[1], *fast, *watch, units=4)
+            self.assertEqual((status, refused["admitted"]), (1, False), refused)
+            self.assertIn("has waited longer here for units", refused["reason"])
+            self.assertEqual(held(), [2, 3], "unit-0 and unit-1 go to the older side waiter first")
+            marker.unlink()
+            status, took = self.ci_step("admit", "--class", "light", "--job-key", keys[1], *fast, *watch, units=4)
+            self.assertEqual(status, 0, took)
+            self.assertEqual(held(), [1, 2, 3], "with no one waiting it takes a lower unit")
+        finally:
+            with contextlib.suppress(OSError):
+                marker.unlink()
+            for key in keys:
+                self.ci_step("release", "--job-key", key)
+        self.assertTrue(self.lock_free(), "every step holder let go")
+
     def test_ci_step_holder_ends_with_the_worker(self) -> None:
         self.fleet()
         worker = self.ci_worker()
@@ -3828,6 +3864,31 @@ class GateTest(unittest.TestCase):
         self.assertEqual(hook.runner_scope(self.runner), side._replace(roots=1, compile_slots=1))
         self.assertIn("reserved for the fast runner", self.full_gate(self.units(3)).claimed())
 
+    def test_fast_runner_listens_past_a_units_waiter_only_on_its_reserve(self) -> None:
+        fast = hook.RunnerScope(5, 2, 2, False, fast=True, reserve=2)
+
+        def ledger(held: tuple[int, ...]) -> Path:
+            capacity = self.units(0)
+            for slot in held:
+                fd = os.open(capacity / f"unit-{slot}", os.O_RDONLY | os.O_CREAT, 0o644)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.addCleanup(os.close, fd)
+            return capacity
+
+        def wait_for_units(capacity: Path) -> None:
+            (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(
+                json.dumps({"since": time.time() - 20, "wants": ["units"], "who": "an older side job"}))
+
+        lower = ledger((3, 4))  # the reserve is taken, unit-0 to unit-2 are free
+        self.assertIsNone(hook.mini_full(lower, 5, fast), "no one waits: the fast runner may take a lower unit")
+        wait_for_units(lower)
+        why = hook.mini_full(lower, 5, fast)
+        self.assertIsNotNone(why, "the units below the reserve go to the older waiter first")
+        self.assertIn("waits here for units", why)
+        reserved = ledger((0, 1, 2))  # only the reserve is free
+        wait_for_units(reserved)
+        self.assertIsNone(hook.mini_full(reserved, 5, fast), "the waiter cannot take the reserved units")
+
     def test_the_full_probe_never_competes_with_an_admission(self) -> None:
         capacity = self.units(1)
         admission = os.open(capacity / "admission.lock", os.O_RDONLY)
@@ -5192,11 +5253,11 @@ class RunnerTest(unittest.TestCase):
         self.assertNotIn("--reserve-units", self.started_script(0))
         self.assertIn("--canonical-roots 2 --instance 2 --reserve-units 2\n", self.started_script(2))
         self.assertIn("--instance 4 --gui-runner --gui-token gui --reserve-units 2\n", self.started_script(4))
-        self.assertIn("--canonical-roots 2 --instance 5 --fast-runner\n", self.started_script(5))
-        self.assertNotIn("--reserve-units", self.started_script(5))
+        self.assertIn("--canonical-roots 2 --instance 5 --fast-runner --reserve-units 2\n", self.started_script(5),
+                      "the fast runner knows its reserve: it skips the units fair turn only there")
         self.assertNotIn("--gui-runner", self.started_script(5))
         self.assertEqual(hook.runner_scope(self.home / "actions-runner-glaeda-5"),
-                         hook.RunnerScope(5, 2, 2, False, False, fast=True))
+                         hook.RunnerScope(5, 2, 2, False, False, fast=True, reserve=2))
         self.assertEqual(hook.runner_scope(self.home / "actions-runner-glaeda-2"),
                          hook.RunnerScope(5, 2, 2, False, False, reserve=2))
         self.assertEqual(hook.runner_scope(self.home / "actions-runner-glaeda-4"),
