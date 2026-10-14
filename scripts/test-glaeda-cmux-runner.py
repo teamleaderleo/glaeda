@@ -5288,6 +5288,15 @@ class RunnerTest(unittest.TestCase):
         self.invoke("--apply", "--instance", "2", "--capacity-units", "4")  # 4 - 2 leaves a compile its 2 units
         self.assertIn("--capacity-units 4 ", self.started_script(2))
 
+    def test_a_plain_rerun_keeps_the_fast_and_gui_roles(self) -> None:
+        self.apply_instances(self.fast_manifest(), ("4", "5"))
+        self.invoke("--apply", "--instance", "5")
+        self.invoke("--apply", "--instance", "4")
+        self.assertIn("--instance 5 --fast-runner --reserve-units 2\n", self.started_script(5),
+                      "a re-run without --manifest keeps the fast runner's role from the receipt")
+        self.assertIn("--instance 4 --gui-runner --gui-token gui --reserve-units 2\n", self.started_script(4),
+                      "and the gui runner's")
+
     def test_a_member_without_fast_runners_keeps_todays_labels_and_scope(self) -> None:
         manifest = json.loads(self.fast_manifest().read_text())
         manifest["defaults"]["runner"]["classes"]["std"].update(runners=5)
