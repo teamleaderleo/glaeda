@@ -1886,7 +1886,7 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
                 ctx.min_free_gib = float(kept.get("minFreeGib") or 0)
             # and its role: the fast runner's and the gui runner's hooks stay theirs
             fast, gui = member_roles(kept, ctx.instance)
-            ctx.fast_runner, ctx.gui_runner = fast, ctx.gui_runner or gui
+            ctx.fast_runner, ctx.gui_runner = fast, not fast and (ctx.gui_runner or gui)
         # a re-run that names nothing keeps what this install registered, not the hostname default
         if not ctx.labels_requested and isinstance(registered.get("labels"), list) and registered["labels"]:
             ctx.labels = registered["labels"]
