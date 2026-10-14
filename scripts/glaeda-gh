@@ -814,7 +814,7 @@ class Daemon:
                     c["failedSteps"], c["stepCount"] = known[c["id"]]
                 else:
                     want.setdefault(c["id"], []).append(c)
-        ids = list(want)[:2 * STEPS_BATCH]  # the rest wait a cycle: a PR with 100 failures fails anyway
+        ids = list(want)[:2 * STEPS_BATCH]  # the rest wait a cycle (failed and cancelled checks; each is read once)
         for i in range(0, len(ids), STEPS_BATCH):
             if self.mode("graphql") == "stop":
                 return
@@ -827,7 +827,8 @@ class Daemon:
                     steps = (node.get("steps") or {}).get("nodes")
                     names = failed_steps(steps)
                     for c in want[node["id"]]:
-                        c["failedSteps"], c["stepCount"] = names, len(steps or [])
+                        # steps null (a partial error) is unknown, never "no step ran"
+                        c["failedSteps"], c["stepCount"] = names, len(steps) if isinstance(steps, list) else None
 
     def get(self, path: str, etag: str | None) -> tuple[str, Any, str | None]:
         """("fresh", doc, etag), ("same", None, etag) on 304, or ("error", message, None)."""
@@ -1213,15 +1214,19 @@ def classify(data: dict, now: float | None = None, grace: float = RESCUE_GRACE) 
     before any step ran is held as long: the rescue cancelled it in the queue and re-runs it."""
     now = time.time() if now is None else now
     checks = data.get("checks") or []
-    held_runs = {c.get("runId") for c in checks if c.get("runId") and refused_check(c)
-                 and now - (iso_epoch(c.get("completedAt")) or 0) < grace}
+    def recent(c: dict) -> bool:
+        return now - (iso_epoch(c.get("completedAt")) or 0) < grace
+    held_runs = {c.get("runId") for c in checks if c.get("runId") and refused_check(c) and recent(c)}
+    # the rescue cancels the whole run: its jobs that were running come back cancelled with steps
+    queued_runs = {c.get("runId") for c in checks if c.get("runId") and cancelled_unstarted(c) and recent(c)}
     out: dict[str, list[dict]] = {"passed": [], "failed": [], "pending": [], "held": []}
     for c in checks:
-        recent = now - (iso_epoch(c.get("completedAt")) or 0) < grace
+        cancelled = (c.get("conclusion") or "").upper() == "CANCELLED"
         if c.get("status") != "COMPLETED":
             out["pending"].append(c)
         elif (c.get("conclusion") or "").upper() in FAILED:
-            held = c.get("runId") in held_runs or (cancelled_unstarted(c) and recent)
+            held = (c.get("runId") in held_runs or (cancelled_unstarted(c) and recent(c))
+                    or (cancelled and c.get("runId") in queued_runs))
             out["held" if held else "failed"].append(c)
         else:
             out["passed"].append(c)
@@ -1375,8 +1380,10 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
         if len(bad) > 20:
             lines.append(f"  ... {len(bad) - 20} more failed")
         for c in groups["held"][:20]:
+            refused = any(refused_check(o) and o.get("runId") == c.get("runId") for o in checks)
             why = ("cancelled before any step ran" if cancelled_unstarted(c)
-                   else "its run had a job refused at runner setup")
+                   else "its run had a job refused at runner setup" if refused
+                   else "its run was cancelled while a job was still queued")
             lines.append(f"  held: {label(c)}{steps_note(c)}: {why}; "
                          f"pending up to {int(grace)}s for the re-run  {c.get('url') or ''}".rstrip())
         for c in (data.get("superseded") or [])[:10]:
