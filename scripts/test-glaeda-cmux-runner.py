@@ -753,21 +753,22 @@ class HookTest(unittest.TestCase):
         self.assertEqual(full.returncode, 1, full.stdout)
         self.assertIn("refused: capacity: 1 of 5 units free, fast-tier (isolated) needs 2", full.stdout)
 
-    def test_no_other_job_takes_a_fast_token_even_on_the_fast_runner(self) -> None:
+    def test_the_fast_runner_refuses_every_other_job(self) -> None:
+        """The fast runner keeps listening on a full mini (it needs no general units), so another job that
+        reached it would wait there for units with no limit and idle the runner. It is refused instead, before
+        taking anything, and the fast tokens stay free."""
         self.fleet()
         capacity = self.dir / "capacity"
-        cases = (("swift-package-tests", {}, "1/5 units for swift-package-tests (light"),
-                 ("release-compile", self.FAST_TIER, "2/5 units for release-compile (isolated"),
-                 ("fast-tier", {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/other.yml@refs/heads/main"},
-                  "persistent-dd"))
-        for index, (job, env, holding) in enumerate(cases):
+        cases = (("swift-package-tests", {}),
+                 ("release-compile", self.FAST_TIER),
+                 ("fast-tier", {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/other.yml@refs/heads/main"}))
+        for index, (job, env) in enumerate(cases):
             with self.subTest(job):
                 runner = f"n{index}"
                 try:
                     started = self.job(job, runner, 5, None, "--fast-runner", env=env)
-                    self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
-                    self.assertIn(holding, started.stdout)
-                    self.assertNotIn("fast-0", started.stdout)
+                    self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+                    self.assertIn("refused: the fast runner takes only the fast tier", started.stdout)
                     self.assertTrue(hook.probe(capacity / "fast-0.token") and hook.probe(capacity / "fast-1.token"))
                 finally:
                     self.finish(runner)
