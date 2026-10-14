@@ -2355,6 +2355,49 @@ time.sleep(60)
                 self.ci_step("release", "--job-key", key)
         self.assertTrue(self.lock_free(), "every step holder let go")
 
+    def test_take_capacity_never_gives_reserved_units_to_a_reserving_runner(self) -> None:
+        """A mini with a fast runner: side and gui runners pass --reserve-units 2, so of 5 units they may take
+        unit-0 to unit-2 only; the fast runner (--fast-runner) scans from the top and takes the reserved ones."""
+        self.fleet()
+        worker = self.ci_worker()
+        watch = ("--watch-pid", str(worker.pid))
+        reserve = ("--reserve-units", "2")
+        capacity = self.dir / "capacity"
+        keys = [f"rs-{n}-1" for n in range(6)]
+
+        def held() -> list[int]:
+            return [slot for slot in range(5) if not hook.probe(capacity / f"unit-{slot}")]
+
+        try:
+            status, fast = self.ci_step("admit", "--class", "light", "--job-key", keys[0], "--fast-runner", *watch,
+                                        units=5)
+            self.assertEqual(status, 0, fast)
+            self.assertEqual(held(), [4], "the fast runner takes the top (reserved) unit first")
+            self.ci_step("release", "--job-key", keys[0])
+            for key in keys[1:4]:
+                status, side = self.ci_step("admit", "--class", "light", "--job-key", key, *reserve, *watch, units=5)
+                self.assertEqual(status, 0, side)
+            self.assertEqual(held(), [0, 1, 2])
+            status, fits = self.ci_step("fits", *reserve, units=5)
+            self.assertEqual(fits["fits"], [], "fits keeps the reserve too")
+            self.assertEqual(self.ci_step("fits", units=5)[1]["fits"], ["light", "isolated"])
+            status, refused = self.ci_step("admit", "--class", "light", "--job-key", keys[4], *reserve, *watch,
+                                           units=5)
+            self.assertEqual((status, refused["admitted"]), (1, False), refused)
+            self.assertIn("capacity:", refused["reason"])
+            self.assertEqual(held(), [0, 1, 2], "two units are free, but both are the fast runner's")
+            runner = self.job("swift-package-tests", "r-side", 5, None, "--reserve-units", "2")
+            self.assertEqual(runner.returncode, 1, runner.stdout + runner.stderr)
+            self.assertIn("refused: capacity:", runner.stdout)
+            status, fast = self.ci_step("admit", "--class", "isolated", "--job-key", keys[5], "--fast-runner", *watch,
+                                        units=5)
+            self.assertEqual((status, fast["units"]), (0, 2), fast)
+            self.assertEqual(held(), [0, 1, 2, 3, 4])
+        finally:
+            for key in keys:
+                self.ci_step("release", "--job-key", key)
+        self.assertTrue(self.lock_free(), "every step holder let go")
+
     def test_ci_step_holder_ends_with_the_worker(self) -> None:
         self.fleet()
         worker = self.ci_worker()
@@ -3273,6 +3316,36 @@ class GateTest(unittest.TestCase):
             self.assertIsNone(hook.host_saturated(True, cpu_busy=69.9, memory_pressure=1))
             self.assertIsNone(hook.host_saturated(False, cpu_busy=None, memory_pressure=None))
 
+    def test_fast_runner_ignores_cpu_saturation_but_holds_on_memory_pressure(self) -> None:
+        for name, value in (("GATE_CPU_PAUSE", 80.0), ("GATE_CPU_RESUME", 70.0), ("GATE_CPU_EVERY_S", 0.0)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(exist_ok=True)
+
+        def scope(extra: str) -> None:
+            script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai "
+                              f"--capacity-units 5 --instance 5{extra}\n")
+
+        pressure = [1]
+        with mock.patch.object(hook, "host_io", return_value=(0.0, 99.0)), \
+                mock.patch.object(hook, "memory_pressure_level", side_effect=lambda: pressure[0]):
+            scope(" --reserve-units 2")
+            side = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+            self.assertTrue((side.saturated() or "").startswith(hook.SATURATED), "a side runner holds on CPU")
+            scope(" --fast-runner")
+            self.assertTrue(hook.runner_scope(self.runner).fast)
+            fast = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+            self.assertIsNone(fast.saturated(), "a fast-tier job is short: busy CPU never holds its runner")
+            self.assertIsNone(fast.claimed())
+            pressure[0] = 2
+            why = fast.saturated()
+            self.assertTrue(why and why.startswith(hook.SATURATED), why)
+            self.assertIn("memory pressure level 2", why)
+            self.assertNotIn("CPU", why.split(";")[0])
+            self.assertTrue((fast.claimed() or "").startswith(hook.SATURATED))
+
     def test_gate_lines_carry_a_utc_stamp_readers_still_match(self) -> None:
         out = io.StringIO()
         with mock.patch.object(hook.time, "gmtime", return_value=time.gmtime(1790379071)), \
@@ -3726,6 +3799,34 @@ class GateTest(unittest.TestCase):
         held = hook.lock_file(capacity / "root-1.token", fcntl.LOCK_EX)
         self.assertEqual(hook.mini_full(capacity, 5, one), "the canonical root is taken")
         os.close(held)
+
+    def test_side_and_gui_runners_hold_when_taking_a_job_would_eat_the_fast_reserve(self) -> None:
+        side = hook.RunnerScope(5, 2, 2, False, reserve=2)
+        gui = hook.RunnerScope(5, 2, 2, False, True, reserve=2)
+        root = hook.RunnerScope(5, 2, 2, True)
+        fast = hook.RunnerScope(5, 2, 2, False, fast=True)
+        for scope in (side, gui):
+            self.assertIsNone(hook.mini_full(self.units(2), 5, scope), "unit-2 is still outside the reserve")
+            why = hook.mini_full(self.units(3), 5, scope)
+            self.assertIsNotNone(why, "the two free units are the fast runner's")
+            self.assertIn("reserved for the fast runner", why)
+        self.assertIsNone(hook.mini_full(self.units(3), 5, root), "a root runner does not keep the reserve")
+        self.assertIsNone(hook.mini_full(self.units(3), 5, fast), "the fast runner listens on its reserve")
+        self.assertEqual(hook.mini_full(self.units(4), 5, fast),
+                         "only 1 of 5 capacity units on this mini are free; its next job needs 2")
+        capacity = self.units(0)
+        tokens = [hook.lock_file(capacity / name, fcntl.LOCK_EX)
+                  for name in ("gui.token", "root-1.token", "root-2.token", "persistent-dd.token", "persistent-dd-1.token")]
+        self.assertIsNone(hook.mini_full(capacity, 5, fast), "the fast runner needs no root, gui or persistent-dd token")
+        self.assertIsNotNone(hook.mini_full(capacity, 5, gui))
+        for fd in tokens:
+            os.close(fd)
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(exist_ok=True)
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai "
+                          "--capacity-units 5 --instance 2 --reserve-units 2\n")
+        self.assertEqual(hook.runner_scope(self.runner), side._replace(roots=1, compile_slots=1))
+        self.assertIn("reserved for the fast runner", self.full_gate(self.units(3)).claimed())
 
     def test_the_full_probe_never_competes_with_an_admission(self) -> None:
         capacity = self.units(1)
@@ -5044,6 +5145,75 @@ class RunnerTest(unittest.TestCase):
         self.assertNotIn("--gui-runner", (self.home / "actions-runner-glaeda-2/glaeda-hooks/job-started.sh").read_text())
         self.assertEqual(hook.runner_scope(self.home / "actions-runner-glaeda-4"), hook.RunnerScope(5, 2, 2, False, True))
 
+    def fast_manifest(self, **std: object) -> Path:
+        """The gui-runner mini above with one more runner: the fast one."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["hosts"]["mini-std"]["roles"].append("ios-simulators")
+        manifest["hosts"]["mini-std"]["overrides"] = {"ios_simulator": {"runtimes": ["23F77"]}}
+        manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 6, "capacityUnits": 5, "compileSlots": 2,
+                                                              "canonicalRoots": 2, "guiRunners": 1, "fastRunners": 1,
+                                                              **std}}}
+        path = self.state / "fast.json"
+        path.write_text(json.dumps(manifest))
+        return path
+
+    def apply_instances(self, path: Path, instances: tuple[str, ...]) -> list[list[str]]:
+        with mock.patch.object(cr, "xcode_present", return_value=True), \
+                mock.patch.object(cr, "ios_sim_present", return_value=True), \
+                mock.patch.object(cr, "macos_major", return_value="27"):
+            for instance in instances:
+                self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std", "--instance", instance)
+        return [argv[argv.index("--labels") + 1].split(",") for argv in self.config_argvs()]
+
+    def started_script(self, instance: int) -> str:
+        suffix = f"-{instance}" if instance else ""
+        return (self.home / f"actions-runner-glaeda{suffix}/glaeda-hooks/job-started.sh").read_text()
+
+    def test_the_fast_runner_is_the_last_instance_with_only_the_fast_label(self) -> None:
+        labels = self.apply_instances(self.fast_manifest(), ("0", "2", "4", "5"))
+        self.assertEqual([[x for x in l if x.startswith(("glaeda-std", "glaeda-root", "glaeda-side", "glaeda-gui",
+                                                         "glaeda-fast"))] for l in labels],
+                         [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"],
+                          ["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"],
+                          ["glaeda-gui-std-xcode-26.6"],
+                          ["glaeda-fast-std-xcode-26.6"]],
+                         "today's gui instance (4) keeps its index; the new last instance is the fast runner")
+        fast = labels[3]
+        self.assertNotIn("glaeda-ios-sim", fast, "no iOS job ever takes the fast runner")
+        self.assertFalse([x for x in fast if x.startswith("glaeda-runner-")], "no warm-affinity runner label")
+        self.assertEqual(fast.count("glaeda-macos-27"), 1)
+        self.assertIn("glaeda-mini", fast)
+        self.assertEqual([l.count("glaeda-fast-std-xcode-26.6") for l in labels], [0, 0, 0, 1],
+                         "only the fast runner carries the fast label")
+
+    def test_hook_scope_passes_fast_runner_and_reserve_units(self) -> None:
+        self.apply_instances(self.fast_manifest(), ("0", "2", "4", "5"))
+        self.assertIn("--canonical-roots 2 --instance 0\n", self.started_script(0), "a root runner keeps no reserve")
+        self.assertNotIn("--reserve-units", self.started_script(0))
+        self.assertIn("--canonical-roots 2 --instance 2 --reserve-units 2\n", self.started_script(2))
+        self.assertIn("--instance 4 --gui-runner --gui-token gui --reserve-units 2\n", self.started_script(4))
+        self.assertIn("--canonical-roots 2 --instance 5 --fast-runner\n", self.started_script(5))
+        self.assertNotIn("--reserve-units", self.started_script(5))
+        self.assertNotIn("--gui-runner", self.started_script(5))
+        self.assertEqual(hook.runner_scope(self.home / "actions-runner-glaeda-5"),
+                         hook.RunnerScope(5, 2, 2, False, False, fast=True))
+        self.assertEqual(hook.runner_scope(self.home / "actions-runner-glaeda-2"),
+                         hook.RunnerScope(5, 2, 2, False, False, reserve=2))
+        self.assertEqual(hook.runner_scope(self.home / "actions-runner-glaeda-4"),
+                         hook.RunnerScope(5, 2, 2, False, True, reserve=2))
+        self.apply_instances(self.fast_manifest(fastReserveUnits=3), ("2",))
+        self.assertIn("--instance 2 --reserve-units 3\n", self.started_script(2))
+
+    def test_a_member_without_fast_runners_keeps_todays_labels_and_scope(self) -> None:
+        manifest = json.loads(self.fast_manifest().read_text())
+        manifest["defaults"]["runner"]["classes"]["std"].update(runners=5)
+        del manifest["defaults"]["runner"]["classes"]["std"]["fastRunners"]
+        path = self.state / "today.json"
+        path.write_text(json.dumps(manifest))
+        labels = self.apply_instances(path, ("0", "2", "4"))
+        self.assertEqual(labels, TODAY_LABELS)
+        self.assertEqual([self.started_script(i).rsplit("glaeda-cmux-runner-hook job-started ", 1)[1] for i in (0, 2, 4)], TODAY_SCOPES)
+
     def test_test_keychain_is_created_unlocked_first_and_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -5640,6 +5810,21 @@ MANIFEST = {
 }
 
 
+# What a 5-runner gui mini (2 roots, iOS simulators) registers and bakes on main before fastRunners existed
+# (instances 0, 2 and 4): a member without fastRunners must keep exactly this.
+_TODAY_COMMON = ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated", "xcode-26.6"]
+TODAY_LABELS = [
+    [*_TODAY_COMMON, "glaeda-std-xcode-26.6", "glaeda-ios-sim", "glaeda-macos-27", "glaeda-root-std-xcode-26.6",
+     "glaeda-runner-mini-std-glaeda"],
+    [*_TODAY_COMMON, "glaeda-std-xcode-26.6", "glaeda-ios-sim", "glaeda-macos-27", "glaeda-side-std-xcode-26.6"],
+    [*_TODAY_COMMON, "glaeda-macos-27", "glaeda-gui-std-xcode-26.6"],
+]
+_TODAY_SCOPE = ("--allowed-repo manaflow-ai/cmux --require-eligible --fleet-class m4pro-48 --toolchain-xcode "
+                "/Applications/Xcode_26.6.app --test-keychain --recycle-testmanagerd --capacity-units 5 --compile-slots 2 "
+                "--canonical-roots 2 --instance ")
+TODAY_SCOPES = [_TODAY_SCOPE + "0\n", _TODAY_SCOPE + "2\n", _TODAY_SCOPE + "4 --gui-runner --gui-token gui\n"]
+
+
 class ManifestLabelsTest(unittest.TestCase):
     def test_runner_capacity_per_class(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
@@ -5771,6 +5956,46 @@ class ManifestLabelsTest(unittest.TestCase):
                 member, reason = cr.member_labels(MANIFEST, name)
                 self.assertIsNone(member)
                 self.assertIn(why, reason)
+
+    def test_member_labels_fast_runner_gets_fast_pool_and_validates_counts(self) -> None:
+        self.assertEqual(fleet_labels.fast_label("glaeda-std-xcode-26.6"), "glaeda-fast-std-xcode-26.6")
+        self.assertEqual(fleet_labels.fast_label("glaeda-aws-std-xcode-26.6"), "glaeda-aws-fast-std-xcode-26.6")
+        self.assertIn("fast-", fleet_labels.RESERVED_POOL_PREFIXES)
+        manifest = copy.deepcopy(MANIFEST)
+        std = {"runners": 6, "capacityUnits": 5, "compileSlots": 2, "canonicalRoots": 2, "guiRunners": 1}
+        manifest["defaults"]["runner"] = {"classes": {"std": dict(std)}}
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            before, _ = cr.member_labels(manifest, "mini-std")
+            for key in ("fastRunners", "fastReserveUnits", "fastPools"):
+                self.assertNotIn(key, before, "a member without fastRunners keeps today's summary")
+            manifest["defaults"]["runner"]["classes"]["std"]["fastRunners"] = 1
+            member, why = cr.member_labels(manifest, "mini-std")
+            self.assertIsNone(why)
+            self.assertEqual((member["fastRunners"], member["fastReserveUnits"], member["fastPools"]),
+                             (1, 2, ["glaeda-fast-std-xcode-26.6"]))
+            self.assertEqual(member["labels"], before["labels"], "the shared labels do not change")
+            self.assertEqual(member["pools"], before["pools"], "the picker's pool count leaves the fast runner out")
+            self.assertNotIn("glaeda-fast-std-xcode-26.6", fleet_labels.declared_pools(manifest))
+            manifest["defaults"]["runner"]["classes"]["std"]["fastReserveUnits"] = 3
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["fastReserveUnits"], 3)
+            for bad in (0, 4, True, "2"):  # 5 units: a compile still needs 2 outside the reserve
+                manifest["defaults"]["runner"]["classes"]["std"]["fastReserveUnits"] = bad
+                self.assertIn("fastReserveUnits", cr.member_labels(manifest, "mini-std")[1] or "", bad)
+            del manifest["defaults"]["runner"]["classes"]["std"]["fastReserveUnits"]
+            for bad in (2, -1, True, "1"):
+                manifest["defaults"]["runner"]["classes"]["std"]["fastRunners"] = bad
+                self.assertIn("fastRunners must be 0 or 1", cr.member_labels(manifest, "mini-std")[1] or "", bad)
+            manifest["defaults"]["runner"]["classes"]["std"].update(fastRunners=1, runners=3)  # 2 roots + gui + fast
+            self.assertIn("fastRunners must be 0 or 1", cr.member_labels(manifest, "mini-std")[1] or "")
+            manifest["defaults"]["runner"]["classes"]["std"].update(fastRunners=0, fastReserveUnits=2, runners=6)
+            self.assertIn("fastReserveUnits", cr.member_labels(manifest, "mini-std")[1] or "",
+                          "a reserve with no fast runner would idle units")
+            del manifest["defaults"]["runner"]["classes"]["std"]["fastReserveUnits"]
+            zero, _ = cr.member_labels(manifest, "mini-std")
+            self.assertEqual(zero, before, "fastRunners 0 is today's member")
+            prefixed = copy.deepcopy(MANIFEST)
+            prefixed["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"poolPrefix": "fast-"}
+            self.assertIn("poolPrefix", cr.member_labels(prefixed, "mini-std")[1])
 
     def test_xcode_present_needs_the_exact_build(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
