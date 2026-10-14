@@ -1271,6 +1271,33 @@ class ClientTest(Base):
         data["checks"][0]["failedSteps"] = ["Run selected tests"]
         self.assertEqual(gg.verdict("pr", data, "green"), 1)
 
+    def test_a_check_cancelled_before_any_step_is_held_for_the_rescue(self) -> None:
+        """manaflow-ai/cmux#20608: the owned-pool rescue cancelled a fast tier still queued for a
+        runner (no step ran) and re-ran it; a wait that read the gap exited 1 before the re-run."""
+        now = time.time()
+        queued = {**check_run("fast tier", conclusion="CANCELLED"), "id": "CR_q", "databaseId": 5,
+                  "startedAt": iso(now - 104), "completedAt": iso(now - 5),
+                  "checkSuite": {"conclusion": "CANCELLED", "workflowRun": {"databaseId": 9, "workflow": {"name": "cmux-next"}}}}
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[queued, check_run("build")]))
+        data["checks"][0]["stepCount"] = 0
+        self.assertIsNone(gg.verdict("pr", data, "green"))
+        text = gg.summary("pr:o/r#1", {"data": data}, "green")
+        self.assertIn("held: cmux-next / fast tier: cancelled before any step ran", text)
+        self.assertEqual(gg.verdict("pr", data, "green", now=now + gg.RESCUE_GRACE + 1), 1)
+        self.assertEqual(gg.verdict("pr", data, "green", grace=0), 1)
+        # a job that ran steps, or whose steps were never read, was cancelled for real
+        data["checks"][0]["stepCount"] = 3
+        self.assertEqual(gg.verdict("pr", data, "green"), 1)
+        del data["checks"][0]["stepCount"]
+        self.assertEqual(gg.verdict("pr", data, "green"), 1)
+
+    def test_steps_are_read_for_a_cancelled_check_too(self) -> None:
+        cancelled = {"id": "CR_c", "conclusion": "CANCELLED"}
+        self.assertTrue(gg.wants_steps(cancelled))
+        self.assertTrue(gg.wants_steps({"id": "CR_f", "conclusion": "FAILURE"}))
+        self.assertFalse(gg.wants_steps({"id": "CR_s", "conclusion": "SUCCESS"}))
+        self.assertFalse(gg.wants_steps({"conclusion": "CANCELLED"}))  # no node id to ask for
+
     def test_headline_agrees_with_the_verdict(self) -> None:
         """manaflow-ai/cmux#14667: GitHub's rollup was FAILURE for a Web complexity run cancelled
         between two passing ones, and the headline printed that next to result: success."""
