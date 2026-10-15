@@ -77,6 +77,7 @@ py=""
 for c in $PYTHONS; do
   c="${c/#\~/$HOME}"
   [ -x "$c" ] || continue
+  case "$c" in /usr/bin/*) [ "$shims" = run ] || continue ;; esac
   v=$("$c" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null) || continue
   case "$v" in 3.1[3-9]|3.[2-9][0-9]|[4-9].*) py="$c|$v"; break ;; esac
   [ -n "$py" ] || py="|$v"
@@ -90,6 +91,11 @@ if [ -n "$p3" ] && [ -z "$v3" ]; then
   v3=$("$p3" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>&1 | first)
 fi
 e pf_python3 "$p3|$v3"
+# git for the checkout questions below: the workload PATH's, unless that is the /usr/bin stub with no developer
+# directory, when they go unasked (fix waits on xcode-select before any git step).
+g=$(PATH="$WORKLOAD_PATH" command -v git 2>/dev/null)
+case "$g" in /usr/bin/*) [ "$shims" = run ] || g="" ;; esac
+git() { [ -n "$g" ] && "$g" "$@"; }
 [ -x /opt/homebrew/bin/python3.13 ] && e pf_brew_python3 /opt/homebrew/bin/python3.13
 # gh as the workload resolves it (cmux CI jobs call it with GH_TOKEN); only its path, so nothing runs.
 e pf_gh "$(PATH="$WORKLOAD_PATH" command -v gh 2>/dev/null)"

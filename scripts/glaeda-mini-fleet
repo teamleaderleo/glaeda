@@ -2537,7 +2537,12 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
                            "accepted": accepted, "reason": pf.get("enroll_reason"),
                            "acceptance_class": pf.get("acceptance_class"),
                            "local": pf.get("acceptance_class") not in {None, "glaeda-class-acceptance/v1"}},
-            "runners": runners}
+            "runners": runners,
+            # What fix reads before a step that runs git or python3 (CLT_TOOLS): the selected developer directory
+            # ("" when xcode-select -p fails) and where the workload PATH resolves them.
+            "devtools": {"developer_dir": obs.get("xcode_select") or "",
+                         "git": ((pf.get("tools") or {}).get("git") or {}).get("path"),
+                         "python3": (pf.get("python3") or {}).get("path")}}
 
 
 # Quarantine reasons a renewal fixes; any other reason is an operator's, and upgrade and repair leave it.
@@ -2630,6 +2635,20 @@ FIX_NEEDS = {"metal": ("licence", "launch"), "setup": ("cmux", "licence", "launc
              "python_link": ("brew",), "glaeda": ("python", "rust"),
              # git runs through the /usr/bin shim, which needs a selected, licensed developer directory.
              "homebrew_fetch": ("select", "licence")}
+# Repairs that run git or python3 with no DEVELOPER_DIR of their own. On a Mac with no developer directory
+# (xcode-select -p fails), /usr/bin's git and python3 are Command Line Tools stubs that open the "install developer
+# tools" dialog on the mini's screen, so such a repair waits for xcode-select unless the workload PATH resolves the
+# tool outside /usr/bin. "python" is the interpreter the glaeda repair runs glaeda-mini-setup with. metal and setup
+# pass the pinned Xcode as DEVELOPER_DIR and wait for its licence; cmux_mini_fix.sh's clt_guard checks all of them
+# again on the host.
+CLT_TOOLS = {"cmux_clone": ("git",), "submodules": ("git",), "homebrew_fetch": ("git",), "brew": ("git",),
+             "glaeda_sync": ("git",), "glaeda": ("git", "python")}
+CLT_BLOCKED = "blocked: needs xcode-select (sudo step)"
+CLT_BLOCKED_EXIT = 21  # cmux_mini_fix.sh clt_guard
+# fix's brew step runs without the fix library, so it carries the same check: brew runs git from the PATH.
+CLT_GUARD_BREW = ('if [ "$(uname -s)" = Darwin ] && ! xcode-select -p >/dev/null 2>&1 && '
+                  '[ ! -x /opt/homebrew/bin/git ]; then echo "glaeda-mini-fleet: ' + CLT_BLOCKED
+                  + '; brew would run the Command Line Tools stub /usr/bin/git" >&2; exit 21; fi')
 # Remote functions that only read; every other one takes the host's step lock.
 # share_send only reads, and stays lock-free so one source can feed several peers at once.
 READ_ONLY_FUNCTIONS = {"candidate_check", "share_have", "share_source", "share_send", "host_check"}
@@ -2695,6 +2714,27 @@ def waiting_on(action: dict[str, Any], checks: dict[str, Any], fixed: set[str]) 
         who = {"password": "sudo-plan", "person": "a person", "self": "fix"}.get(got["group"], "a person")
         return f"{need} ({who})"
     return None
+
+
+def clt_stub_blocked(action: dict[str, Any], result: dict[str, Any]) -> bool:
+    """Whether a repair would run a /usr/bin Command Line Tools stub: no developer directory is selected and a
+    tool it runs resolves to /usr/bin. A result without the devtools section (not from preflight_host) is blocked."""
+    tools = CLT_TOOLS.get(action["kind"])
+    if not tools:
+        return False
+    devtools = result.get("devtools")
+    if devtools is None:
+        return True
+    if devtools.get("developer_dir"):
+        return False
+    for tool in tools:
+        path = devtools.get(tool) or ""
+        if tool == "python":
+            python = action.get("python") or "python3"
+            path = (devtools.get("python3") or "") if python == "python3" else python
+        if not path or path.startswith("/usr/bin/"):
+            return True
+    return False
 
 
 def describe(action: dict[str, Any]) -> str:
@@ -3165,9 +3205,12 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
     if kind in {"brew", "python_link"}:
         lines = brew_commands(action["owner"], action["formulas"], False) if kind == "brew" else \
             python_link_commands(action["owner"], False)
-        script = "\n".join(["set -euo pipefail", "cd /", *lines])
+        guard = [CLT_GUARD_BREW] if kind == "brew" else []
+        script = "\n".join(["set -euo pipefail", "cd /", *guard, *lines])
         code = routed_ssh_stream(name, user, "/bin/bash -c " + shlex.quote(script), log,
                                  timeout=FIX_TIMEOUTS["brew"], options=route)
+        if code == CLT_BLOCKED_EXIT:
+            return False, CLT_BLOCKED
         return code == 0, "" if code == 0 else f"exit {code}; see the log"
     if kind == "homebrew_fetch":
         return fetch_homebrew(manifest, name, log, seed)
@@ -3177,6 +3220,8 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
         except Failure as error:
             return False, str(error)
         code = routed_fix_call(name, user, "glaeda_sync", [ref, *ENROLL_FLAGS], log, FIX_TIMEOUTS["glaeda_sync"], route)
+        if code == CLT_BLOCKED_EXIT:
+            return False, CLT_BLOCKED
         return code == 0, f"~/glaeda at {ref[:12]}" if code == 0 else held_or(code, None, "could not move ~/glaeda")
     calls = {
         "cmux_clone": ("cmux_clone", lambda a: [a["repo"], a["ref"], a["root"], str(a["depth"])]),
@@ -3189,6 +3234,8 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
     }
     func, args = calls[kind]
     code = routed_fix_call(name, user, func, args(action), log, FIX_TIMEOUTS.get(kind, 600), route)
+    if code == CLT_BLOCKED_EXIT:
+        return False, CLT_BLOCKED
     return code == 0, "" if code == 0 else f"exit {code}; see the log"
 
 
@@ -3209,6 +3256,8 @@ def fetch_homebrew(manifest: dict[str, Any], name: str, log: Any, seed: str | No
     code = routed_ssh_stream(name, user, library_command("homebrew_fetch", [HOMEBREW_REPO, *args]), log,
                              timeout=FIX_TIMEOUTS["homebrew_fetch"],
                              options=(*host_ssh_options(manifest, name), *options))
+    if code == CLT_BLOCKED_EXIT:
+        return False, CLT_BLOCKED
     if code:
         return False, held_or(code, None, "could not fetch Homebrew")
     return True, f"Homebrew in /opt/homebrew (from {seed if args else 'GitHub'})"
@@ -3243,6 +3292,9 @@ def fix_host(manifest: dict[str, Any], name: str, result: dict[str, Any], yes: b
                 python = (checks.get("python") or {}).get("detail", "")
                 action = {**action, "python": python.split(" at ", 1)[1] if checks["python"]["state"] == "ok"
                           else "~/.local/bin/python3" if "python" in fixed else "python3"}
+            if clt_stub_blocked(action, result):
+                out["waiting"].append(f"{label} ({CLT_BLOCKED})")
+                continue
             if seed and (action["kind"] in SEEDABLE or action["kind"] == "homebrew_fetch"):
                 label += f" [from {seed} over the LAN]"
             if not yes:
