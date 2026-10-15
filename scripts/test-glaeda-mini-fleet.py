@@ -1706,6 +1706,28 @@ class PreflightScriptTests(unittest.TestCase):
         self.assertEqual(pf["glaeda_lacking"], ["--class-receipt", "--fleet-class"])
         self.assertEqual(pf["gh"], f"{tools}/gh")
 
+    @unittest.skipUnless(os.path.exists("/usr/bin/git") and os.path.exists("/usr/bin/python3"),
+                         "needs /usr/bin/git and /usr/bin/python3")
+    def test_no_developer_dir_runs_no_git_or_python3_stub(self) -> None:
+        # xcode-select -p fails here (Linux has none), as on a fresh Mac, where /usr/bin/git and python3 are stubs.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "cmux/.git").mkdir(parents=True)
+            (home / "glaeda/.git").mkdir(parents=True)
+            (home / "glaeda/scripts").mkdir()
+            (home / "glaeda/scripts/glaeda-mini-enroll").write_text('p.add_argument("--renew")\n')
+            header = ("CMUX_ROOT='~/cmux'\nXCODE_PIN=''\nWORKLOAD_PATH=/usr/bin:/bin\nWORKLOAD_TOOLS='git'\n"
+                      "PYTHONS='/usr/bin/python3'\nCANDIDATE_PIN=''\nENROLL_FLAGS='--renew'\nPIN_FORMULAS=''\n")
+            script = mf.PROBE.read_text() + "\n" + header + mf.PREFLIGHT_PROBE.read_text()
+            out = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True,
+                                 env={"HOME": tmp, "PATH": "/usr/bin:/bin"}, timeout=60).stdout
+            pf = mf.parse_probe(out)["preflight"]
+        # Real git would have printed "fatal: not a git repository" for these empty .git directories.
+        self.assertEqual(pf["submodules"], [])
+        self.assertIsNone(pf["glaeda_head"])
+        self.assertEqual(pf["python"], {"path": None, "version": None})
+        self.assertEqual(pf["tools"]["git"]["version"], "not run: no developer directory selected")
+
 
 class PreflightSecretsScriptTests(unittest.TestCase):
     def test_lists_readable_secret_paths_never_contents(self) -> None:
@@ -1951,6 +1973,46 @@ class FixPlanTests(unittest.TestCase):
         self.assertEqual(probe.call_args.args[1], ["build-mini-1"])
         self.assertIn("small-mini: skipped (apply: false)", out.getvalue())
         self.assertIn("would run", out.getvalue())
+
+    def test_no_developer_dir_never_runs_git_or_python3(self) -> None:
+        # 2026-10-15, fix on fresh minis (cmux17 and six more): xcode-select -p failed and there were no Command
+        # Line Tools, so the cmux clone's /usr/bin/git was the stub, which opened the "install developer tools"
+        # dialog on each mini's screen. No step may send git or python3 to such a host.
+        text = preflight_text(user="builder", brew_owner=None, brew_dir="builder|empty", python="|",
+                              python3="/usr/bin/python3|not run: no developer directory selected",
+                              artifacts=False, node_id=None)
+        text = text.replace("xcode_select\t/Applications/Xcode.app/Contents/Developer\n", "xcode_select\t\n")
+        text = text.replace("pf_cmux\tpresent", "pf_cmux\tmissing").replace("pf_glaeda\tpresent", "pf_glaeda\tmissing")
+        clt_functions = {"cmux_clone", "submodules", "glaeda", "glaeda_sync", "homebrew_fetch", "metal", "cmux_setup"}
+
+        def fix(text: str) -> tuple[dict, list[str]]:
+            obs = observed(**{"build-mini-1": text})["hosts"]["build-mini-1"]
+            result = mf.preflight_host(self.manifest, "build-mini-1", obs, "0.16.0")
+            sent = []
+
+            def ssh(name, user, command, log, stdin=b"", timeout=None, options=()):
+                script = shlex.split(command)[2] if command.startswith("/bin/bash -c ") else command
+                sent.append(script.strip().splitlines()[-1])
+                return 0
+
+            with tempfile.TemporaryDirectory() as tmp, mock.patch.object(mf, "ssh_stream", side_effect=ssh), \
+                    mock.patch.object(mf, "run_logged", return_value=0), \
+                    mock.patch.object(mf, "operator_python_dist", return_value=(Path(tmp), "3.14.0")), \
+                    mock.patch.object(mf, "routed_remote", return_value=(0, "")), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                out = mf.fix_host(self.manifest, "build-mini-1", result, True, Path(tmp))
+            return out, sent
+
+        out, sent = fix(text)
+        ran = [line for line in sent if re.sub(r"^lock[^;]*; ", "", line).split(" ")[0] in clt_functions
+               or re.search(r"(^|[\s/])(git|python3)(\s|$)", line)]
+        self.assertEqual(ran, [], sent)
+        self.assertTrue(any(w.startswith("cmux: shallow clone") and w.endswith(f"({mf.CLT_BLOCKED})")
+                            for w in out["waiting"]), out["waiting"])
+        # A real git outside /usr/bin (Homebrew's) is no stub: the clone runs.
+        homebrew_git = text.replace("pf_tool\tgit|/usr/bin/git|", "pf_tool\tgit|/opt/homebrew/bin/git|")
+        _, sent = fix(homebrew_git)
+        self.assertTrue(any(line.startswith("lock; cmux_clone ") for line in sent), sent)
 
 
 class SudoPlanTests(unittest.TestCase):
@@ -2232,6 +2294,39 @@ class FixLibraryTests(unittest.TestCase):
             (lock / "pid").write_text(str(finished.pid))  # its process is gone: taken over, then released
             self.assertEqual(self.call(home, "candidate_dir", "abc").returncode, 0)
             self.assertFalse(lock.exists())
+
+    @unittest.skipUnless(os.path.exists("/usr/bin/git"), "needs /usr/bin/git")
+    def test_no_developer_dir_blocks_before_any_clt_stub(self) -> None:
+        # A Mac with no developer directory: /usr/bin/git, python3, xcrun and make are stubs whose first run opens
+        # the "install developer tools" dialog (cmux17, 2026-10-15). The guard refuses before any of them runs.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = home / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "uname").write_text("#!/bin/sh\necho Darwin\n")
+            (bin_dir / "uname").chmod(0o755)
+            # Were git to run anyway, it fails fast offline rather than cloning from GitHub.
+            (home / ".gitconfig").write_text(f'[url "file://{tmp}/no-such-remote/"]\n\tinsteadOf = https://github.com/\n')
+            with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{bin_dir}:/usr/bin:/bin"):
+                for func, args in (("cmux_clone", ("manaflow-ai/cmux", "main", "~/cmux", "1")),
+                                   ("glaeda", ("/usr/bin/python3",)),
+                                   ("metal", (f"{tmp}/Xcode.app/Contents/Developer",)),
+                                   ("cmux_setup", ("~/cmux", f"{tmp}/Xcode.app/Contents/Developer"))):
+                    blocked = self.call(home, func, *args)
+                    self.assertEqual(blocked.returncode, mf.CLT_BLOCKED_EXIT, (func, blocked.stderr))
+                    self.assertIn(mf.CLT_BLOCKED, blocked.stderr, func)
+                self.assertFalse((home / "cmux").exists())
+                self.assertFalse((home / "glaeda").exists())
+                # fix's brew step carries the same check.
+                brew = subprocess.run(["bash", "-c", mf.CLT_GUARD_BREW], capture_output=True, text=True,
+                                      env={"PATH": f"{bin_dir}:/usr/bin:/bin"}, timeout=30)
+                self.assertEqual((brew.returncode, mf.CLT_BLOCKED in brew.stderr), (mf.CLT_BLOCKED_EXIT, True))
+                # With a developer directory selected the clone goes ahead (and fails offline here).
+                (bin_dir / "xcode-select").write_text("#!/bin/sh\necho /Applications/Xcode.app/Contents/Developer\n")
+                (bin_dir / "xcode-select").chmod(0o755)
+                selected = self.call(home, "cmux_clone", "manaflow-ai/cmux", "main", "~/cmux", "1")
+                self.assertNotIn(mf.CLT_BLOCKED, selected.stderr)
+                self.assertNotEqual(selected.returncode, mf.CLT_BLOCKED_EXIT)
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_glaeda_sync_moves_only_a_clean_checkout_to_a_commit_that_can_renew(self) -> None:
