@@ -70,6 +70,30 @@ host_held() {
 
 held_refuse() { say "held: $*, skipped" >&2; exit 20; }
 
+# On a Mac with no developer directory (xcode-select -p fails, no Command Line Tools), /usr/bin's git, python3,
+# xcrun, make, cc and clang are stubs: running one opens the "install developer tools" dialog on the mini's
+# screen. xcode-select -p itself never prompts. clt_guard TOOL... exits 21 before a step would run such a stub;
+# a tool outside /usr/bin (/opt/homebrew/bin/git, ~/.local/bin/python3) is real and passes. A DEVELOPER_DIR
+# that exists (the pinned Xcode, as metal and cmux_setup pass it) also makes the stubs real tools.
+CLT_BLOCKED_EXIT=21
+developer_dir_ok() {
+  if [ -n "${DEVELOPER_DIR:-}" ] && [ -d "$DEVELOPER_DIR/usr/bin" ]; then return 0; fi
+  xcode-select -p >/dev/null 2>&1
+}
+clt_guard() {  # TOOL...
+  local t p
+  [ "$(uname -s)" = Darwin ] || return 0  # the stubs exist only on macOS
+  developer_dir_ok && return 0
+  for t in "$@"; do
+    p=$(command -v "$t" 2>/dev/null || true)
+    case "$p" in
+      ""|/usr/bin/*)
+        say "blocked: needs xcode-select (sudo step); $t would run the Command Line Tools stub ${p:-/usr/bin/$t}" >&2
+        exit "$CLT_BLOCKED_EXIT" ;;
+    esac
+  done
+}
+
 host_check() {  # exit 0 when the host is free, 20 (and why on stdout) when it is held
   local why
   if why=$(host_held); then say "held: $why"; exit 20; fi
@@ -96,6 +120,7 @@ lock() {  # [reservation|none]: how much of the host gate this step honors (defa
 # The cmux checkout: a shallow clone of REF with submodules, as the fleet bootstrap reads them.
 cmux_clone() {  # REPO REF ROOT DEPTH
   local root; root=$(home "$3")
+  clt_guard git
   if [ -e "$root/.git" ]; then
     # An interrupted clone leaves a .git with no HEAD; building on it would fail later and obscurely.
     git -C "$root" rev-parse --verify -q HEAD >/dev/null || refuse "$root is an unfinished clone (no HEAD); move it aside"
@@ -109,6 +134,7 @@ cmux_clone() {  # REPO REF ROOT DEPTH
 submodules() {  # ROOT DEPTH (0 means full history)
   local root; root=$(home "$1")
   [ -e "$root/.git" ] || refuse "$root is not a git checkout"
+  clt_guard git
   if [ "$2" = 0 ]; then
     git -C "$root" submodule update --init --recursive --progress
   else
@@ -147,6 +173,9 @@ rust_channel() {  # ROOT CHANNEL (the toolchain rust-toolchain.toml in the check
 # Glaeda itself: the checkout glaeda-mini-enroll runs from, then its user-level setup.
 glaeda() {  # PYTHON
   local dir="$HOME/glaeda"
+  # glaeda-mini-setup runs git too, so both are checked even when the checkout exists; it also runs xcrun, probes
+  # /usr/bin/python3 when an Xcode is installed and links its cargo build through cc, which are always /usr/bin.
+  clt_guard git "$(home "$1")" xcrun cc
   if [ ! -f "$dir/scripts/cmux_fleet.py" ]; then
     [ ! -e "$dir" ] || refuse "$dir exists and is not a Glaeda checkout"
     # the fleet's read-only mirror of teamleaderleo/glaeda (docs/GLAEDA_OTA.md, Fleet mirror)
@@ -166,6 +195,7 @@ glaeda_sync() {  # COMMIT [FLAG...]
   [ $# -gt 0 ] || set -- --renew
   set -- "$commit" "$@"
   [ -f "$dir/scripts/cmux_fleet.py" ] || refuse "$dir is not a Glaeda checkout; run glaeda-mini-fleet fix first"
+  clt_guard git
   head=$(git -C "$dir" rev-parse -q --verify HEAD || true)
   if [ "$head" != "$1" ]; then
     [ -z "$(git -C "$dir" status --porcelain=v1 --untracked-files=no)" ] || refuse "$dir has local changes; commit or move them aside"
@@ -199,6 +229,7 @@ glaeda_sync() {  # COMMIT [FLAG...]
 homebrew_fetch() {  # UPSTREAM [PEER_URL [IDENTITY]]
   local dir="${GLAEDA_HOMEBREW_DIR:-/opt/homebrew}" upstream="$1" peer="${2:-}" identity="${3:-}" tag ref
   if [ -x "$dir/bin/brew" ]; then say "unchanged: $dir has brew"; return; fi
+  clt_guard git
   [ -d "$dir" ] || refuse "$dir does not exist; glaeda-mini-fleet sudo-plan creates it"
   [ -O "$dir" ] || refuse "$dir is not $(id -un)'s; glaeda-mini-fleet sudo-plan hands it over"
   if [ ! -d "$dir/.git" ]; then
@@ -349,6 +380,7 @@ runner_kick() {
 
 # Xcode 26 ships Metal separately; the fleet bootstrap runs xcrun metal.
 metal() {  # DEVELOPER_DIR
+  DEVELOPER_DIR="$1" clt_guard xcrun xcodebuild
   if DEVELOPER_DIR="$1" xcrun metal --version >/dev/null 2>&1; then say "unchanged: Metal toolchain present"; return; fi
   DEVELOPER_DIR="$1" xcodebuild -downloadComponent MetalToolchain
   DEVELOPER_DIR="$1" xcrun metal --version | head -1
@@ -356,6 +388,7 @@ metal() {  # DEVELOPER_DIR
 
 # cmux scripts/setup.sh builds GhosttyKit, the artifacts the bootstrap checks for.
 cmux_setup() {  # ROOT DEVELOPER_DIR
+  DEVELOPER_DIR="$2" clt_guard git xcrun make cc
   cd "$(home "$1")" && DEVELOPER_DIR="$2" ./scripts/setup.sh
 }
 
@@ -442,6 +475,7 @@ share_source() {  # THING ARGS...: exit 0 when this host can seed THING
 share_prepare() {  # THING ARGS...: ready THING on the source; for metal, export a bundle once
   if [ "$1" != metal ]; then share_source "$@"; return; fi
   local stage tmp; stage=$(share_stage metal)
+  DEVELOPER_DIR="$2" clt_guard xcodebuild
   mkdir -p "$stage"
   if ! ls -d "$stage"/*.exportedBundle >/dev/null 2>&1; then
     # Export beside the cache and move it in whole, so an interrupted export is never shipped.
@@ -458,7 +492,8 @@ share_have() {  # THING ARGS...: exit 0 when this host already has THING, 1 (10 
     xcode) if [ -e "$2" ] || [ -L "$2" ]; then xcode_matches "$2" "$3" "$4" || refuse "$2 exists and is not Xcode $3 ($4)"; say "unchanged: $2"; exit 0; fi; exit 1 ;;
     candidate) candidate_check "$2" "$3" "$4" ;;  # exits 10 when absent
     python) local p="$HOME/.local/bin/python3"; [ -x "$p" ] && python_at_least "$p" "$2" && { say "unchanged: $p"; exit 0; }; exit 1 ;;
-    metal) DEVELOPER_DIR="$2" xcrun metal --version >/dev/null 2>&1 && { say "unchanged: Metal toolchain present"; exit 0; }; exit 1 ;;
+    metal) DEVELOPER_DIR="$2" clt_guard xcrun
+           DEVELOPER_DIR="$2" xcrun metal --version >/dev/null 2>&1 && { say "unchanged: Metal toolchain present"; exit 0; }; exit 1 ;;
     rustup|brew) exit 1 ;;
     *) refuse "unknown thing $1" ;;
   esac
@@ -515,6 +550,7 @@ share_finish() {  # THING ARGS...: move what share_recv staged into place, never
       ;;
     metal)
       local bundle; bundle=$(ls -d "$stage"/*.exportedBundle | tail -1)
+      DEVELOPER_DIR="$2" clt_guard xcodebuild xcrun
       DEVELOPER_DIR="$2" xcodebuild -importComponent MetalToolchain -importPath "$bundle"
       DEVELOPER_DIR="$2" xcrun metal --version | head -1 ;;
     brew) say "staged $(ls "$stage" | wc -l | tr -d ' ') Homebrew downloads in $stage; the next brew install (fix or sudo-plan) uses them" ;;
