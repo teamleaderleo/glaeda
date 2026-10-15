@@ -2727,6 +2727,8 @@ def clt_stub_blocked(action: dict[str, Any], result: dict[str, Any]) -> bool:
         return True
     if devtools.get("developer_dir"):
         return False
+    if action["kind"] == "glaeda":  # glaeda-mini-setup also runs xcrun, /usr/bin/python3 and cc, always stubs here
+        return True
     for tool in tools:
         path = devtools.get(tool) or ""
         if tool == "python":

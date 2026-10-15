@@ -173,8 +173,9 @@ rust_channel() {  # ROOT CHANNEL (the toolchain rust-toolchain.toml in the check
 # Glaeda itself: the checkout glaeda-mini-enroll runs from, then its user-level setup.
 glaeda() {  # PYTHON
   local dir="$HOME/glaeda"
-  # glaeda-mini-setup runs git too, so both are checked even when the checkout exists.
-  clt_guard git "$(home "$1")"
+  # glaeda-mini-setup runs git too, so both are checked even when the checkout exists; it also runs xcrun, probes
+  # /usr/bin/python3 when an Xcode is installed and links its cargo build through cc, which are always /usr/bin.
+  clt_guard git "$(home "$1")" xcrun cc
   if [ ! -f "$dir/scripts/cmux_fleet.py" ]; then
     [ ! -e "$dir" ] || refuse "$dir exists and is not a Glaeda checkout"
     # the fleet's read-only mirror of teamleaderleo/glaeda (docs/GLAEDA_OTA.md, Fleet mirror)
