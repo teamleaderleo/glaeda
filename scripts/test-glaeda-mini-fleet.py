@@ -2328,6 +2328,26 @@ class FixLibraryTests(unittest.TestCase):
                 self.assertNotIn(mf.CLT_BLOCKED, selected.stderr)
                 self.assertNotEqual(selected.returncode, mf.CLT_BLOCKED_EXIT)
 
+    def test_no_developer_dir_blocks_glaeda_even_with_real_git_and_python(self) -> None:
+        # glaeda-mini-setup runs xcrun and probes /usr/bin/python3 when an Xcode is installed, and its cargo build
+        # links through cc: with no developer directory those are stubs even when git and python3 are real.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = home / "bin"
+            bin_dir.mkdir()
+            for tool, body in (("uname", "echo Darwin"), ("git", "exit 0"), ("python3", "exit 0")):
+                (bin_dir / tool).write_text(f"#!/bin/sh\n{body}\n")
+                (bin_dir / tool).chmod(0o755)
+            with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{bin_dir}:/usr/bin:/bin"):
+                blocked = self.call(home, "glaeda", str(bin_dir / "python3"))
+            self.assertEqual(blocked.returncode, mf.CLT_BLOCKED_EXIT, blocked.stderr)
+            self.assertFalse((home / "glaeda").exists())
+        devtools = {"developer_dir": "", "git": "/opt/homebrew/bin/git", "python3": "/opt/homebrew/bin/python3"}
+        action = {"kind": "glaeda", "python": "/Users/cmux/.local/bin/python3"}
+        self.assertTrue(mf.clt_stub_blocked(action, {"devtools": devtools}))
+        selected = {**devtools, "developer_dir": "/Applications/Xcode.app/Contents/Developer"}
+        self.assertFalse(mf.clt_stub_blocked(action, {"devtools": selected}))
+
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_glaeda_sync_moves_only_a_clean_checkout_to_a_commit_that_can_renew(self) -> None:
         env = {"HOME": "/nonexistent", "PATH": "/usr/bin:/bin", "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
