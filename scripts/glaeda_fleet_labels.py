@@ -163,6 +163,12 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     if (trusted_ref is None) != (trusted_repo is None) or (
         trusted_repo is not None and not (isinstance(trusted_repo, str) and re.fullmatch(REPO_RE, trusted_repo))):
         return None, f"{member} runner.trustedRef and runner.trustedRepo (owner/name) go together"
+    next_nightly = runner.get("trustedNextNightly", False) if isinstance(runner, dict) else False
+    if not isinstance(next_nightly, bool) or (next_nightly and (
+            trusted_ref != "refs/heads/main" or trusted_repo != "manaflow-ai/cmux"
+            or availability != "dedicated" or "dev-builds" in roles)):
+        return None, (f"{member} runner.trustedNextNightly must be boolean and true needs a dedicated "
+                      "manaflow-ai/cmux trusted main runner with no dev-builds")
     pool_prefix = runner.get("poolPrefix", "") if isinstance(runner, dict) else ""
     if not (isinstance(pool_prefix, str) and (pool_prefix == "" or (
             re.fullmatch(POOL_PREFIX_RE, pool_prefix) and pool_prefix not in RESERVED_POOL_PREFIXES))):
@@ -222,7 +228,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
-            "trustedRef": trusted_ref, "trustedRepo": trusted_repo,
+            "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "trustedNextNightly": next_nightly,
             "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)],
             "sidePools": [side_label(label) for label in dict.fromkeys(pools)],
             "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else [],
