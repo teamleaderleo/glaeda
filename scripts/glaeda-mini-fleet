@@ -2142,6 +2142,12 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     checkout = cmux_checkout(manifest, name)
     root = checkout["root"]
 
+    # Manifest members with no GUI (the AWS EC2 Macs) must keep their maintenance
+    # agents in the system LaunchDaemon domain.  A GUI LaunchAgent appears healthy
+    # while an operator session is logged in, then disappears after reboot, which
+    # strands disk pressure and OTA maintenance on a headless worker.
+    setup_headless = " --headless" if host.get("gui") is False else ""
+
     def brew(formula: str) -> dict[str, Any]:
         return {"kind": "brew", "formula": formula, "owner": owner or user,
                 **({"default": declared.get("rustup_default") or "stable"} if formula == "rustup" else {})}
@@ -2364,7 +2370,7 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     if glaeda_missing:
         put("glaeda", "fail", f"missing: {', '.join(glaeda_missing)}",
             f"git clone https://github.com/{FLEET_SOURCE}.git ~/glaeda; "
-            f"~/glaeda/scripts/glaeda-mini-setup --apply --ota-source {FLEET_SOURCE}",
+            f"~/glaeda/scripts/glaeda-mini-setup --apply{setup_headless} --ota-source {FLEET_SOURCE}",
             "self", {"kind": "glaeda"})
     elif behind and pf.get("glaeda_dirty"):
         put("glaeda", "fail", f"~/glaeda is {behind} and has {pf['glaeda_dirty']} local changes",
@@ -3183,7 +3189,7 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
         "submodules": ("submodules", lambda a: [a["root"], str(a["depth"])]),
         "rust_default": ("rust_default", lambda a: [a["toolchain"]]),
         "rust_channel": ("rust_channel", lambda a: [a["root"], a["channel"]]),
-        "glaeda": ("glaeda", lambda a: [a["python"]]),
+        "glaeda": ("glaeda", lambda a: [a["python"], *(["--headless"] if manifest["hosts"][name].get("gui") is False else [])]),
         "metal": ("metal", lambda a: [a["developer"]]),
         "setup": ("cmux_setup", lambda a: [a["root"], a["developer"]]),
     }

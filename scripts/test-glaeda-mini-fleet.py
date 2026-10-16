@@ -1255,6 +1255,16 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual({k for k, v in result["checks"].items() if v["state"] not in {"ok", "info"}}, set())
         self.assertEqual(list(result["checks"]), list(mf.PREFLIGHT_CHECKS))
 
+    def test_headless_host_plan_uses_system_maintenance_agents(self) -> None:
+        # AWS EC2 Macs have no GUI login.  A plain LaunchAgent would disappear after
+        # reboot, leaving disk pressure and OTA maintenance stopped until an operator
+        # creates a GUI session.
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        text = preflight_text().replace("pf_glaeda\tpresent", "pf_glaeda\tmissing")
+        check = self.result(text)["checks"]["glaeda"]
+        self.assertEqual(check["action"], {"kind": "glaeda"})
+        self.assertIn("glaeda-mini-setup --apply --headless --ota-source", check["fix"])
+
     def test_missing_rustdoc_is_a_repairable_rust_toolchain_failure(self) -> None:
         text = preflight_text().replace("pf_tool\trustdoc|/opt/homebrew/bin/rustdoc|rustdoc 1.88.0 (abc 2025-06-23)\n", "")
         result = self.result(text)
@@ -1940,6 +1950,14 @@ class FixPlanTests(unittest.TestCase):
             mf.fix_host(self.manifest, "build-mini-1", self.result, True, Path(tmp))
         self.assertEqual(seen["glaeda"]["python"], "~/.local/bin/python3")
 
+    def test_glaeda_repair_passes_headless_mode_for_gui_less_hosts(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        action = {"kind": "glaeda", "python": "/opt/homebrew/bin/python3.13"}
+        with mock.patch.object(mf, "routed_fix_call", return_value=0) as call:
+            ok, _ = mf.run_repair(self.manifest, "build-mini-1", action, None)
+        self.assertTrue(ok)
+        self.assertEqual(call.call_args.args[2:4], ("glaeda", ["/opt/homebrew/bin/python3.13", "--headless"]))
+
     def test_fix_command_skips_record_only_hosts_and_probes_once(self) -> None:
         obs = observed(**{"build-mini-1": morning_text()})
         with mock.patch.object(mf, "observe", return_value=obs) as probe, mock.patch.object(mf, "run_repair") as run, \
@@ -2176,6 +2194,19 @@ class FixLibraryTests(unittest.TestCase):
                          ["""trap 'rm -f "$HOME/.local/state/glaeda/mini-fleet/step.lock/pid"; rmdir "$HOME/.local/state/glaeda/mini-fleet/step.lock" 2>/dev/null || true' EXIT""",
                           'rm -f "$(held_dir)/$(basename "$dir")"',
                           'rm -f "$(held_dir)/$(basename "$dir")"'])
+
+    def test_glaeda_setup_preserves_headless_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "glaeda/scripts").mkdir(parents=True)
+            (home / "glaeda/scripts/cmux_fleet.py").write_text("")
+            setup = home / "glaeda/scripts/glaeda-mini-setup"
+            setup.write_text("#!/bin/bash\n# --ota-source\nprintf '%s\\n' \"$@\" > \"$HOME/setup-args\"\n")
+            setup.chmod(0o755)
+            result = self.call(home, "glaeda", "/bin/bash", "--headless")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((home / "setup-args").read_text().splitlines(),
+                             ["--apply", "--headless", "--ota-source", "manaflow-ai/glaeda"])
 
     @unittest.skipUnless(shutil.which("shasum") or shutil.which("sha256sum"), "needs shasum")
     def test_candidate_is_placed_only_when_its_digest_matches(self) -> None:
