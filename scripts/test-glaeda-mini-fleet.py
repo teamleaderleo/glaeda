@@ -57,7 +57,9 @@ def fleet_cas_text(mode: str = "read-only", node: str = "answers", build_mode: s
 def probe_text(hostname: str = "build-mini-1", keys: tuple[str, ...] = ("coordinator", "operator"),
                extra_keys: tuple[str, ...] = (), clone: bool = True, license_: str = "26.3",
                worker: str = "running pid=10", node_id: str | None = "cmux-mac-001",
-               worker_proc: str = "running", fleet_cas: str | None = None) -> str:
+               worker_proc: str = "running", fleet_cas: str | None = None,
+               sudo: str | None = None,
+               glaeda_jobs: tuple[tuple[str, str, str], ...] = ()) -> str:
     lines = [
         "user\tbuilder", "uid\t501", "admin_group\tyes", f"hostname\t{hostname}", "computer_name\tMini",
         "model\tMac16,11", "chip\tApple M4 Pro", "cpus\t14", f"memory_bytes\t{48 * 2**30}",
@@ -73,6 +75,9 @@ def probe_text(hostname: str = "build-mini-1", keys: tuple[str, ...] = ("coordin
     ]
     if node_id is not None:
         lines.append(f"fleet_node_id\t{node_id}")
+    if sudo is not None:
+        lines.append(f"sudo\t{sudo}")
+    lines.extend(f"launchd\t{domain}|{label}|{state}" for domain, label, state in glaeda_jobs)
     if clone:
         lines.append("xcode_app\t/Applications/Xcode_26.3.app|dir|26.3|17C529")
     for key in keys:
@@ -1265,6 +1270,22 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(check["action"], {"kind": "glaeda"})
         self.assertIn("glaeda-mini-setup --apply --headless --ota-source", check["fix"])
 
+    def test_existing_gui_agents_are_a_headless_setup_drift(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        jobs = (("/Users/builder/Library/LaunchAgents", mf.GLAEDA_LABEL_PREFIX + "disk-pressure", "running"),)
+        check = self.result(preflight_text(sudo="nopasswd", glaeda_jobs=jobs))["checks"]["glaeda"]
+        self.assertEqual(check["action"], {"kind": "glaeda"})
+        self.assertEqual(check["state"], "fail")
+        self.assertIn("GUI LaunchAgents", check["detail"])
+        self.assertIn("--apply --headless --ota-source", check["fix"])
+
+    def test_headless_setup_requires_passwordless_sudo(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        result = self.result(preflight_text(sudo="password"))
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["checks"]["headless_sudo"]["state"], "fail")
+        self.assertEqual(result["checks"]["headless_sudo"]["group"], "person")
+
     def test_missing_rustdoc_is_a_repairable_rust_toolchain_failure(self) -> None:
         text = preflight_text().replace("pf_tool\trustdoc|/opt/homebrew/bin/rustdoc|rustdoc 1.88.0 (abc 2025-06-23)\n", "")
         result = self.result(text)
@@ -1957,6 +1978,28 @@ class FixPlanTests(unittest.TestCase):
             ok, _ = mf.run_repair(self.manifest, "build-mini-1", action, None)
         self.assertTrue(ok)
         self.assertEqual(call.call_args.args[2:4], ("glaeda", ["/opt/homebrew/bin/python3.13", "--headless"]))
+
+    def test_headless_fix_dry_run_describes_the_mode(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        result = {"checks": {
+            "python": {"state": "ok", "detail": "python at /opt/homebrew/bin/python3.13", "fix": "", "group": ""},
+            "rust": {"state": "ok", "detail": "", "fix": "", "group": ""},
+            "glaeda": {"state": "fail", "detail": "", "fix": "", "group": "self",
+                        "action": {"kind": "glaeda"}},
+            "headless_sudo": {"state": "ok", "detail": "", "fix": "", "group": ""},
+        }}
+        out = mf.fix_host(self.manifest, "build-mini-1", result, False, None)
+        self.assertEqual(len(out["planned"]), 1)
+        self.assertIn("glaeda-mini-setup --apply --headless", out["planned"][0])
+
+    def test_headless_fix_waits_for_sudo_before_setup(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        obs = observed(**{"build-mini-1": preflight_text(sudo="password")})["hosts"]["build-mini-1"]
+        result = mf.preflight_host(self.manifest, "build-mini-1", obs, "0.16.0")
+        with mock.patch.object(mf, "run_repair") as run:
+            out = mf.fix_host(self.manifest, "build-mini-1", result, True, None)
+        run.assert_not_called()
+        self.assertTrue(any("waits for headless_sudo (a person)" in item for item in out["waiting"]), out)
 
     def test_fix_command_skips_record_only_hosts_and_probes_once(self) -> None:
         obs = observed(**{"build-mini-1": morning_text()})
