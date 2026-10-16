@@ -603,8 +603,11 @@ workflow_dispatch is refused: a dispatched workflow on main can check out any re
 app-host-test-rerun takes `refs/pull/N/merge`). pull_request, merge_group and workflow_run are refused too.
 
 `runner.trustedNextNightly: true` is a separate, default-off trust decision for cmux's NEXT nightly.
-It requires a dedicated `manaflow-ai/cmux` trusted main runner with no `dev-builds` role and adds
-`--trusted-next-nightly` to its host hook. The only additional admission is a push whose environment
+It requires a dedicated `manaflow-ai/cmux` trusted main runner with no `dev-builds` role, adds
+`--trusted-next-nightly` to its host hook, and adds the `glaeda-trusted-next-nightly` capability label.
+That label makes the owner relabel plan regenerate the wrapper; OTA hook refresh alone does not
+change wrapper arguments. NEXT routing must require that label as well as the trusted pool and exact
+runner labels. The only additional admission is a push whose environment
 and payload both name `refs/heads/nightly-next`, whose `GITHUB_WORKFLOW_REF` is exactly
 `manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next`, whose job is
 `build-nightly-app`, and whose run attempt is `1`. Repository and hostile-payload checks still apply.

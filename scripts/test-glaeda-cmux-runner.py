@@ -5900,6 +5900,8 @@ class ManifestLabelsTest(unittest.TestCase):
             host["roles"].remove("dev-builds")
             host["overrides"] = {"runner": trusted}
             self.assertTrue(cr.member_labels(manifest, "mini-std")[0]["trustedNextNightly"])
+            self.assertIn("glaeda-trusted-next-nightly", cr.member_labels(manifest, "mini-std")[0]["labels"])
+            self.assertNotIn("glaeda-trusted-next-nightly", cr.member_labels(MANIFEST, "mini-std")[0]["labels"])
             self.assertFalse(cr.member_labels(MANIFEST, "mini-std")[0]["trustedNextNightly"])
             for bad in ({**trusted, "trustedNextNightly": "true"}, {**trusted, "trustedNextNightly": 1},
                         {**trusted, "trustedNextNightly": None}, {"trustedNextNightly": True},

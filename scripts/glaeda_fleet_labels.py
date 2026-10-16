@@ -186,7 +186,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     ios_sim = (IOS_SIM_ROLE in roles and bool(ready) and bool(builds)
                and (ios_sim_ok is None or ios_sim_ok(ready, builds)))
     labels = [MINI_LABEL, f"glaeda-class-{klass}", f"glaeda-{availability}",
-              *(["glaeda-trusted"] if trusted_ref else []), *[f"xcode-{v}" for v in versions], *pools,
+              *(["glaeda-trusted"] if trusted_ref else []),
+              *(["glaeda-trusted-next-nightly"] if next_nightly else []),
+              *[f"xcode-{v}" for v in versions], *pools,
               *([IOS_SIM_LABEL] if ios_sim else []),
               *([macos_label(macos_major)] if isinstance(macos_major, str)
                 and re.fullmatch(MACOS_MAJOR_RE, macos_major) else [])]
