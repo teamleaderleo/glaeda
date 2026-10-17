@@ -42,12 +42,17 @@ pub struct BuildKey {
     pub stream: TipStream,
     pub commit: CommitId,
     pub tree: GitTreeId,
+    pub workflow_revision: String,
+    pub lockfile_digest: Option<Sha256Digest>,
+    pub source_bundle_digest: Option<Sha256Digest>,
     pub toolchain: String,
+    pub toolchain_image_digest: Option<Sha256Digest>,
+    pub capability_digest: Option<Sha256Digest>,
+    pub reset_digest: Option<Sha256Digest>,
     pub target: String,
     pub platform: String,
     pub architecture: String,
     pub configuration: String,
-    pub bundle_key: Option<Sha256Digest>,
 }
 
 impl BuildKey {
@@ -57,14 +62,20 @@ impl BuildKey {
         stream: TipStream,
         commit: CommitId,
         tree: GitTreeId,
+        workflow_revision: &str,
+        lockfile_digest: Option<Sha256Digest>,
+        source_bundle_digest: Option<Sha256Digest>,
         toolchain: &str,
+        toolchain_image_digest: Option<Sha256Digest>,
+        capability_digest: Option<Sha256Digest>,
+        reset_digest: Option<Sha256Digest>,
         target: &str,
         platform: &str,
         architecture: &str,
         configuration: &str,
-        bundle_key: Option<Sha256Digest>,
     ) -> Result<Self, RollingTipLedgerError> {
         for (field, value) in [
+            ("workflow_revision", workflow_revision),
             ("toolchain", toolchain),
             ("target", target),
             ("platform", platform),
@@ -77,12 +88,17 @@ impl BuildKey {
             stream,
             commit,
             tree,
+            workflow_revision: workflow_revision.to_owned(),
+            lockfile_digest,
+            source_bundle_digest,
             toolchain: toolchain.to_owned(),
+            toolchain_image_digest,
+            capability_digest,
+            reset_digest,
             target: target.to_owned(),
             platform: platform.to_owned(),
             architecture: architecture.to_owned(),
             configuration: configuration.to_owned(),
-            bundle_key,
         })
     }
 }
@@ -489,6 +505,9 @@ impl RollingTipLedger {
         )?;
         self.states
             .insert(build.clone(), ExecutionRecord { attempt, state });
+        if attempt > current.attempt && state == BuildExecutionState::Queued {
+            self.in_flight.insert(build.clone());
+        }
         if matches!(
             state,
             BuildExecutionState::Succeeded
@@ -614,13 +633,18 @@ impl RollingTipLedger {
                 actual,
             });
         }
-        if decision == PromotionDecision::Accepted
-            && (self.artifacts.get(&build).is_none()
-                || self.states.get(&build).map_or(true, |record| {
-                    record.state != BuildExecutionState::Succeeded
-                }))
-        {
-            return Err(RollingTipLedgerError::PromotionArtifactUnavailable);
+        if decision == PromotionDecision::Accepted {
+            let Some(artifact) = self.artifacts.get(&build) else {
+                return Err(RollingTipLedgerError::PromotionArtifactUnavailable);
+            };
+            let Some(execution) = self.states.get(&build) else {
+                return Err(RollingTipLedgerError::PromotionArtifactUnavailable);
+            };
+            if execution.state != BuildExecutionState::Succeeded
+                || artifact.execution_attempt != execution.attempt
+            {
+                return Err(RollingTipLedgerError::PromotionArtifactUnavailable);
+            }
         }
         let revision = actual.saturating_add(1);
         self.ensure_capacity(1)?;
@@ -774,12 +798,17 @@ mod tests {
             stream,
             CommitId::parse(&commit_byte.repeat(40)).expect("commit"),
             GitTreeId::parse(&"b".repeat(40)).expect("tree"),
+            "workflow-v1",
+            Some(digest("f")),
+            Some(digest("e")),
             "swift-6",
+            Some(digest("d")),
+            Some(digest("c")),
+            Some(digest("b")),
             "cmux-next",
             "macos",
             "arm64",
             "debug",
-            Some(digest("a")),
         )
         .expect("build")
     }
@@ -1060,5 +1089,51 @@ mod tests {
             .publish_artifact(attempt_two, 8)
             .expect("publish matching artifact");
         assert!(ledger.artifact_for(&first).is_some());
+    }
+
+    #[test]
+    fn terminal_to_next_attempt_queued_restores_in_flight_deduplication() {
+        let first = build("a");
+        let mut ledger = RollingTipLedger::new(first.stream.clone());
+        ledger.admit(first.clone(), 1).expect("attempt one");
+        ledger
+            .record_state(first.clone(), BuildExecutionState::Failed, 1, 2)
+            .expect("failed");
+        ledger
+            .record_state(first.clone(), BuildExecutionState::Queued, 2, 3)
+            .expect("retry queued");
+        assert_eq!(
+            ledger.admit(first, 4).expect("dedupe retry"),
+            BuildAdmission::InFlight
+        );
+    }
+
+    #[test]
+    fn accepted_promotion_rejects_stale_artifact_attempt() {
+        let first = build("a");
+        let mut ledger = RollingTipLedger::new(first.stream.clone());
+        ledger.admit(first.clone(), 1).expect("admit");
+        ledger
+            .record_state(first.clone(), BuildExecutionState::Succeeded, 1, 2)
+            .expect("success");
+        ledger
+            .publish_artifact(artifact(first.clone()), 3)
+            .expect("publish");
+        // A recovered ledger can observe a newer successful execution while retaining the older
+        // immutable artifact. Accepted promotion must refuse that stale provenance.
+        ledger.states.insert(
+            first.clone(),
+            ExecutionRecord {
+                attempt: 2,
+                state: BuildExecutionState::Succeeded,
+            },
+        );
+        ledger
+            .request_promotion(first.clone(), 0, 4)
+            .expect("request");
+        assert_eq!(
+            ledger.decide_promotion(first, PromotionDecision::Accepted, 0, 5),
+            Err(RollingTipLedgerError::PromotionArtifactUnavailable)
+        );
     }
 }

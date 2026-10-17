@@ -6,8 +6,9 @@ continuously building development branch. It is scoped to one stream, such as
 transport-independent.
 
 Each `BuildKey` includes the repository and branch, complete commit and tree
-IDs, toolchain, target, platform, architecture, configuration, and an optional
-bundle key. A published artifact carries that key plus content digest and
+IDs, workflow revision, lockfile and source-bundle digests, toolchain, toolchain
+image, capability and reset digests, target, platform, architecture, and
+configuration. A published artifact carries that key plus content digest and
 producer run provenance. The ledger therefore reuses only an exact build and
 does not treat a mutable `latest` label as identity. Publication also records
 the execution attempt that produced the bytes, and Glaeda accepts the artifact
@@ -29,6 +30,10 @@ stale caller receives a conflict and cannot clobber a newer operator decision.
 The in-memory ledger is the MVP kernel; a later Glaeda
 adapter can persist envelopes and publish idempotent events to fleet
 intelligence without changing these identities or transitions.
+
+Lease ownership validation, durable persistence, deserialization, and replay
+verification remain adapter responsibilities for the next tranche. This kernel
+does not infer ownership from a lease label or accept an unverified replay.
 
 The first consumer should ingest the existing CI receipts for the
 `feat-cmux-next` stream. Scheduler changes, host selection, cancellation, and
