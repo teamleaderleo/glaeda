@@ -113,9 +113,11 @@ fn failed_operation_is_not_committed() {
     let first = build("a");
     let mut store = RollingTipLedgerStore::open(&root, stream()).expect("open");
     store.admit(first.clone(), 1).expect("admit");
-    assert!(store
-        .record_state(first, BuildExecutionState::Succeeded, 2, 2)
-        .is_err());
+    assert!(
+        store
+            .record_state(first, BuildExecutionState::Succeeded, 2, 2)
+            .is_err()
+    );
     assert_eq!(store.receipt().event_count, 3);
     store.close().expect("close");
     let mut reopened = RollingTipLedgerStore::open(&root, stream()).expect("reopen");
