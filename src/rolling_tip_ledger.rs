@@ -785,7 +785,7 @@ mod tests {
     use super::*;
 
     fn digest(byte: &str) -> Sha256Digest {
-        Sha256Digest::parse(&format!("sha256:{}", byte.repeat(32))).expect("digest")
+        Sha256Digest::parse(&format!("sha256:{}", byte.repeat(64))).expect("digest")
     }
 
     fn build(commit_byte: &str) -> BuildKey {
