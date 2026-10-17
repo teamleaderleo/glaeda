@@ -96,13 +96,14 @@ pub struct ArtifactProvenance {
     pub producer: String,
     pub producer_run_id: u64,
     pub producer_attempt: u32,
+    pub execution_attempt: u32,
 }
 
 impl ArtifactProvenance {
     /// # Errors
     ///
-    /// Returns an error when the artifact/producer labels are unbounded or a provider identifier
-    /// is zero. Content and build identity remain caller-supplied immutable evidence.
+    /// Returns an error when the artifact/producer labels are unbounded or a provider/execution
+    /// identifier is zero. Content and build identity remain caller-supplied immutable evidence.
     pub fn new(
         artifact_id: &str,
         build: BuildKey,
@@ -110,10 +111,11 @@ impl ArtifactProvenance {
         producer: &str,
         producer_run_id: u64,
         producer_attempt: u32,
+        execution_attempt: u32,
     ) -> Result<Self, RollingTipLedgerError> {
         validate_token("artifact_id", artifact_id)?;
         validate_token("producer", producer)?;
-        if producer_run_id == 0 || producer_attempt == 0 {
+        if producer_run_id == 0 || producer_attempt == 0 || execution_attempt == 0 {
             return Err(RollingTipLedgerError::InvalidIdentifier("producer run"));
         }
         Ok(Self {
@@ -123,6 +125,7 @@ impl ArtifactProvenance {
             producer: producer.to_owned(),
             producer_run_id,
             producer_attempt,
+            execution_attempt,
         })
     }
 }
@@ -245,6 +248,8 @@ pub enum RollingTipLedgerError {
     InvalidToken(&'static str),
     InvalidTimestamp,
     InvalidAttempt,
+    InvalidAttemptTransition { expected: u32, actual: u32 },
+    InvalidBuildState,
     StreamMismatch,
     UnknownBuild,
     ConflictingArtifact,
@@ -252,6 +257,7 @@ pub enum RollingTipLedgerError {
     StaleBuildState,
     PromotionNotRequested,
     PromotionArtifactUnavailable,
+    ArtifactExecutionMismatch,
     StalePromotionRevision { expected: u64, actual: u64 },
 }
 
@@ -262,6 +268,13 @@ impl fmt::Display for RollingTipLedgerError {
             Self::InvalidToken(field) => write!(formatter, "invalid {field} token"),
             Self::InvalidTimestamp => formatter.write_str("timestamp must be non-zero"),
             Self::InvalidAttempt => formatter.write_str("build attempt must be non-zero"),
+            Self::InvalidAttemptTransition { expected, actual } => {
+                write!(
+                    formatter,
+                    "invalid build attempt transition: expected {expected}, actual {actual}"
+                )
+            }
+            Self::InvalidBuildState => formatter.write_str("invalid build execution state"),
             Self::StreamMismatch => formatter.write_str("build belongs to another stream"),
             Self::UnknownBuild => formatter.write_str("build has not been admitted"),
             Self::ConflictingArtifact => {
@@ -277,6 +290,9 @@ impl fmt::Display for RollingTipLedgerError {
             Self::PromotionNotRequested => formatter.write_str("promotion was not requested"),
             Self::PromotionArtifactUnavailable => {
                 formatter.write_str("promotion requires a published successful artifact")
+            }
+            Self::ArtifactExecutionMismatch => {
+                formatter.write_str("artifact is not bound to the current successful execution")
             }
             Self::StalePromotionRevision { expected, actual } => {
                 write!(
@@ -361,6 +377,12 @@ impl RollingTipLedger {
             },
         )?;
         if let Some(artifact) = self.artifacts.get(&build).cloned() {
+            if self.states.get(&build).map_or(true, |execution| {
+                execution.state != BuildExecutionState::Succeeded
+                    || execution.attempt != artifact.execution_attempt
+            }) {
+                return Err(RollingTipLedgerError::ArtifactExecutionMismatch);
+            }
             self.append(
                 occurred_at_millis,
                 RollingTipEvent::ArtifactReuse {
@@ -429,6 +451,9 @@ impl RollingTipLedger {
         if attempt == 0 {
             return Err(RollingTipLedgerError::InvalidAttempt);
         }
+        if state == BuildExecutionState::Observed {
+            return Err(RollingTipLedgerError::InvalidBuildState);
+        }
         let Some(current) = self.states.get(&build).copied() else {
             return Err(RollingTipLedgerError::UnknownBuild);
         };
@@ -438,9 +463,19 @@ impl RollingTipLedger {
                 actual: attempt,
             });
         }
-        if attempt == current.attempt
-            && (state_rank(state) < state_rank(current.state)
-                || (is_terminal(state) && is_terminal(current.state) && state != current.state))
+        if attempt > current.attempt {
+            let expected = current.attempt.saturating_add(1);
+            if attempt != expected
+                || !is_terminal(current.state)
+                || state != BuildExecutionState::Queued
+            {
+                return Err(RollingTipLedgerError::InvalidAttemptTransition {
+                    expected,
+                    actual: attempt,
+                });
+            }
+        } else if state_rank(state) < state_rank(current.state)
+            || (is_terminal(state) && is_terminal(current.state) && state != current.state)
         {
             return Err(RollingTipLedgerError::StaleBuildState);
         }
@@ -500,6 +535,14 @@ impl RollingTipLedger {
     ) -> Result<(), RollingTipLedgerError> {
         self.require_stream(&artifact.build)?;
         self.require_timestamp(occurred_at_millis)?;
+        let Some(execution) = self.states.get(&artifact.build) else {
+            return Err(RollingTipLedgerError::UnknownBuild);
+        };
+        if execution.state != BuildExecutionState::Succeeded
+            || execution.attempt != artifact.execution_attempt
+        {
+            return Err(RollingTipLedgerError::ArtifactExecutionMismatch);
+        }
         if let Some(existing) = self.artifacts.get(&artifact.build) {
             if existing == &artifact {
                 return Ok(());
@@ -571,10 +614,11 @@ impl RollingTipLedger {
                 actual,
             });
         }
-        if self.artifacts.get(&build).is_none()
-            || self.states.get(&build).map_or(true, |record| {
-                record.state != BuildExecutionState::Succeeded
-            })
+        if decision == PromotionDecision::Accepted
+            && (self.artifacts.get(&build).is_none()
+                || self.states.get(&build).map_or(true, |record| {
+                    record.state != BuildExecutionState::Succeeded
+                }))
         {
             return Err(RollingTipLedgerError::PromotionArtifactUnavailable);
         }
@@ -741,8 +785,16 @@ mod tests {
     }
 
     fn artifact(build: BuildKey) -> ArtifactProvenance {
-        ArtifactProvenance::new("dev-build-1", build, digest("c"), "github-actions", 42, 1)
-            .expect("artifact")
+        ArtifactProvenance::new(
+            "dev-build-1",
+            build,
+            digest("c"),
+            "github-actions",
+            42,
+            1,
+            1,
+        )
+        .expect("artifact")
     }
 
     #[test]
@@ -852,6 +904,7 @@ mod tests {
             "github-actions",
             43,
             1,
+            1,
         )
         .expect("artifact");
         assert_eq!(
@@ -915,5 +968,97 @@ mod tests {
                 .expect("promotion"),
             1
         );
+    }
+
+    #[test]
+    fn delayed_and_rejected_decisions_can_precede_artifact_success() {
+        let first = build("a");
+        let mut ledger = RollingTipLedger::new(first.stream.clone());
+        ledger.admit(first.clone(), 1).expect("admit");
+        ledger
+            .request_promotion(first.clone(), 0, 2)
+            .expect("request");
+        assert_eq!(
+            ledger
+                .decide_promotion(first.clone(), PromotionDecision::Delayed, 0, 3)
+                .expect("delay"),
+            1
+        );
+        ledger
+            .request_promotion(first.clone(), 1, 4)
+            .expect("request");
+        assert_eq!(
+            ledger
+                .decide_promotion(first, PromotionDecision::Rejected, 1, 5)
+                .expect("reject"),
+            2
+        );
+    }
+
+    #[test]
+    fn attempt_leaps_and_invented_states_are_rejected() {
+        let first = build("a");
+        let mut ledger = RollingTipLedger::new(first.stream.clone());
+        ledger.admit(first.clone(), 1).expect("admit");
+        assert_eq!(
+            ledger.record_state(first.clone(), BuildExecutionState::Running, 3, 2),
+            Err(RollingTipLedgerError::InvalidAttemptTransition {
+                expected: 2,
+                actual: 3,
+            })
+        );
+        assert_eq!(
+            ledger.record_state(first.clone(), BuildExecutionState::Running, 2, 3),
+            Err(RollingTipLedgerError::InvalidAttemptTransition {
+                expected: 2,
+                actual: 2,
+            })
+        );
+        assert_eq!(
+            ledger.record_state(first.clone(), BuildExecutionState::Observed, 1, 4),
+            Err(RollingTipLedgerError::InvalidBuildState)
+        );
+        assert!(ledger.in_flight.contains(&first));
+    }
+
+    #[test]
+    fn artifact_requires_current_successful_execution_attempt() {
+        let first = build("a");
+        let mut ledger = RollingTipLedger::new(first.stream.clone());
+        let unknown = artifact(first.clone());
+        assert_eq!(
+            ledger.publish_artifact(unknown, 1),
+            Err(RollingTipLedgerError::UnknownBuild)
+        );
+        ledger.admit(first.clone(), 2).expect("admit");
+        assert_eq!(
+            ledger.publish_artifact(artifact(first.clone()), 3),
+            Err(RollingTipLedgerError::ArtifactExecutionMismatch)
+        );
+        ledger
+            .record_state(first.clone(), BuildExecutionState::Failed, 1, 4)
+            .expect("failed");
+        ledger.admit(first.clone(), 5).expect("retry");
+        ledger
+            .record_state(first.clone(), BuildExecutionState::Succeeded, 2, 6)
+            .expect("success");
+        assert_eq!(
+            ledger.publish_artifact(artifact(first.clone()), 7),
+            Err(RollingTipLedgerError::ArtifactExecutionMismatch)
+        );
+        let attempt_two = ArtifactProvenance::new(
+            "dev-build-attempt-two",
+            first.clone(),
+            digest("e"),
+            "github-actions",
+            44,
+            1,
+            2,
+        )
+        .expect("artifact");
+        ledger
+            .publish_artifact(attempt_two, 8)
+            .expect("publish matching artifact");
+        assert!(ledger.artifact_for(&first).is_some());
     }
 }
