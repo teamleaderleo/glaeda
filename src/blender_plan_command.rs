@@ -8,9 +8,16 @@ use glaeda::compute_execution_request::accelerator_burst::{
 use glaeda::compute_execution_request::blender_burst_work_plan::{
     BlenderBurstWorkPlan, BlenderBurstWorkPlanError,
 };
+#[cfg(unix)]
+use glaeda::compute_execution_request::blender_content_store_observation::{
+    BlenderContentStoreObservationError, observe_blender_content_store,
+};
 use glaeda::compute_execution_request::blender_remote_inventory_document::{
     BlenderRemoteInventoryDocumentError, MAX_BLENDER_REMOTE_INVENTORY_DOCUMENT_BYTES,
     decode_blender_remote_inventory_document,
+};
+use glaeda::compute_execution_request::blender_snapshot::{
+    BlenderProjectSnapshot, BlenderRemoteInventory,
 };
 use glaeda::compute_execution_request::blender_snapshot_document::{
     BlenderSnapshotDocumentError, decode_blender_snapshot_document,
@@ -26,14 +33,7 @@ pub fn build_blender_plan(
     intent: AcceleratorIntent,
     maximum_rtt_ms: Option<u32>,
 ) -> Result<BlenderBurstWorkPlan, BlenderPlanCommandError> {
-    let snapshot_bytes = read_bounded_document(
-        snapshot_path,
-        MAX_BLENDER_SNAPSHOT_DOCUMENT_BYTES,
-        "blender_snapshot_read_failed",
-        "Blender snapshot document could not be read within its bounded maximum",
-    )?;
-    let snapshot = decode_blender_snapshot_document(&snapshot_bytes).map_err(snapshot_error)?;
-
+    let snapshot = read_snapshot(snapshot_path)?;
     let inventory_bytes = read_bounded_document(
         inventory_path,
         MAX_BLENDER_REMOTE_INVENTORY_DOCUMENT_BYTES,
@@ -42,7 +42,66 @@ pub fn build_blender_plan(
     )?;
     let inventory =
         decode_blender_remote_inventory_document(&inventory_bytes).map_err(inventory_error)?;
+    build_with_inventory(
+        &snapshot,
+        &inventory,
+        minimum_vram_gib,
+        intent,
+        maximum_rtt_ms,
+    )
+}
 
+#[cfg(unix)]
+pub fn build_blender_plan_from_store(
+    snapshot_path: &Path,
+    content_store_root: &Path,
+    minimum_vram_gib: u64,
+    intent: AcceleratorIntent,
+    maximum_rtt_ms: Option<u32>,
+) -> Result<BlenderBurstWorkPlan, BlenderPlanCommandError> {
+    let snapshot = read_snapshot(snapshot_path)?;
+    let inventory =
+        observe_blender_content_store(content_store_root, &snapshot).map_err(store_error)?;
+    build_with_inventory(
+        &snapshot,
+        &inventory,
+        minimum_vram_gib,
+        intent,
+        maximum_rtt_ms,
+    )
+}
+
+#[cfg(not(unix))]
+pub fn build_blender_plan_from_store(
+    _snapshot_path: &Path,
+    _content_store_root: &Path,
+    _minimum_vram_gib: u64,
+    _intent: AcceleratorIntent,
+    _maximum_rtt_ms: Option<u32>,
+) -> Result<BlenderBurstWorkPlan, BlenderPlanCommandError> {
+    Err(BlenderPlanCommandError::new(
+        "blender_content_store_observation_unsupported",
+        "Blender content-store observation requires a Unix host",
+    ))
+}
+
+fn read_snapshot(path: &Path) -> Result<BlenderProjectSnapshot, BlenderPlanCommandError> {
+    let snapshot_bytes = read_bounded_document(
+        path,
+        MAX_BLENDER_SNAPSHOT_DOCUMENT_BYTES,
+        "blender_snapshot_read_failed",
+        "Blender snapshot document could not be read within its bounded maximum",
+    )?;
+    decode_blender_snapshot_document(&snapshot_bytes).map_err(snapshot_error)
+}
+
+fn build_with_inventory(
+    snapshot: &BlenderProjectSnapshot,
+    inventory: &BlenderRemoteInventory,
+    minimum_vram_gib: u64,
+    intent: AcceleratorIntent,
+    maximum_rtt_ms: Option<u32>,
+) -> Result<BlenderBurstWorkPlan, BlenderPlanCommandError> {
     let minimum_memory_bytes = minimum_vram_gib.checked_mul(GIB).ok_or_else(|| {
         BlenderPlanCommandError::new(
             "blender_vram_overflow",
@@ -60,7 +119,7 @@ pub fn build_blender_plan(
         BlenderPlanCommandError::new(error.code(), "accelerator requirement is invalid")
     })?;
 
-    BlenderBurstWorkPlan::new(&snapshot, &inventory, accelerator).map_err(plan_error)
+    BlenderBurstWorkPlan::new(snapshot, inventory, accelerator).map_err(plan_error)
 }
 
 fn read_bounded_document(
@@ -94,6 +153,11 @@ fn snapshot_error(error: BlenderSnapshotDocumentError) -> BlenderPlanCommandErro
 
 fn inventory_error(error: BlenderRemoteInventoryDocumentError) -> BlenderPlanCommandError {
     BlenderPlanCommandError::new(error.code(), "Blender remote inventory document is invalid")
+}
+
+#[cfg(unix)]
+fn store_error(error: BlenderContentStoreObservationError) -> BlenderPlanCommandError {
+    BlenderPlanCommandError::new(error.code(), "Blender content-store observation failed")
 }
 
 fn plan_error(error: BlenderBurstWorkPlanError) -> BlenderPlanCommandError {
@@ -189,6 +253,50 @@ mod tests {
         assert_eq!(plan.present_bytes(), 200);
         assert_eq!(plan.missing_bytes(), 100);
         assert_eq!(plan.accelerator().minimum_memory_bytes(), 24 * GIB);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_store_bytes_replace_manual_inventory() {
+        use sha2::{Digest as _, Sha256};
+
+        let scene = b"scene bytes";
+        let asset = b"asset bytes";
+        let scene_digest = format!("sha256:{:x}", Sha256::digest(scene));
+        let asset_digest = format!("sha256:{:x}", Sha256::digest(asset));
+        let document = format!(
+            "{{\"schema_version\":1,\"runtime_id\":\"blender-5.2.0\",\"main_scene\":\"scenes/main.blend\",\"files\":[{{\"relative_path\":\"scenes/main.blend\",\"class\":\"scene\",\"digest\":\"{scene_digest}\",\"bytes\":{}}},{{\"relative_path\":\"assets/wood.exr\",\"class\":\"asset\",\"digest\":\"{asset_digest}\",\"bytes\":{}}}]}}",
+            scene.len(),
+            asset.len(),
+        );
+        let snapshot = temporary_document("snapshot-store", document.as_bytes());
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let store = parent.join(format!(
+            "glaeda-blender-plan-store-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&store).unwrap();
+        let hex = asset_digest.strip_prefix("sha256:").unwrap();
+        let path = store
+            .join("objects/v1/sha256")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, asset).unwrap();
+
+        let plan =
+            build_blender_plan_from_store(&snapshot, &store, 24, AcceleratorIntent::Batch, None)
+                .unwrap();
+        std::fs::remove_file(snapshot).unwrap();
+        std::fs::remove_dir_all(store).unwrap();
+
+        assert_eq!(plan.logical_project_files(), 2);
+        assert_eq!(plan.present_bytes(), asset.len() as u64);
+        assert_eq!(plan.missing_bytes(), scene.len() as u64);
     }
 
     #[test]
