@@ -1347,6 +1347,12 @@ class GlaedaDiskTest(unittest.TestCase):
         linked_release.parent.mkdir(parents=True, exist_ok=True)
         linked_release.symlink_to(linked_release_target, target_is_directory=True)
         (linked_release_target / "xcode-2c2299e9015ce0c8/Build").mkdir(parents=True)
+        linked_daily_target = self.root / "linked-daily"
+        (linked_daily_target / "abcdef0123456789/Release/xcode-2c2299e9015ce0c8/Build").mkdir(parents=True)
+        linked_root = self.root / "symlink-cache"
+        linked_root.mkdir()
+        (linked_root / "dev-daily-release").symlink_to(linked_daily_target, target_is_directory=True)
+        self.assertEqual(gd.cmux_next_ci_state_roots(linked_root), [])
         fam = gd.cmux_next_ci_family(root)
         with mock.patch.object(gd, "process_evidence", return_value=([], "")):
             items = gd.survey([fam], 24, 0)

@@ -4202,6 +4202,8 @@ def cmux_next_ci_state_roots(root: Path) -> list[Path]:
     # cache directories never become deletion candidates.
     for daily_name in ("dev-daily-release", "release-compile"):
         daily = root / daily_name
+        if daily.is_symlink() or not daily.is_dir():
+            continue
         for fingerprint in _children(daily):
             if fingerprint.is_symlink() or not fingerprint.is_dir() \
                     or re.fullmatch(r"[0-9a-fA-F]{8,64}", fingerprint.name) is None:
