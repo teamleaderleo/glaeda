@@ -4320,7 +4320,7 @@ def cmux_next_ci_dedupe_roots(root: Path) -> list[Path]:
                 products = child / "Products"
                 if products.is_dir() and not products.is_symlink():
                     found.append(products)
-    return found
+    return sorted(found)
 
 
 def cmux_next_ci_dedupe_guard(root: Path):
