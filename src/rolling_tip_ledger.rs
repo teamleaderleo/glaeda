@@ -736,6 +736,7 @@ impl RollingTipLedger {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn replay_lease_acquired(
         &mut self,
         build: &BuildKey,
@@ -795,6 +796,7 @@ impl RollingTipLedger {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn replay_lease_released(
         &mut self,
         build: &BuildKey,
@@ -831,6 +833,7 @@ impl RollingTipLedger {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn replay_lease_reclaimed(
         &mut self,
         build: &BuildKey,
@@ -1013,6 +1016,7 @@ impl RollingTipLedger {
     }
 
     /// Acquire the sole active lease for the current build attempt.
+    #[allow(clippy::too_many_arguments)]
     pub fn acquire_lease(
         &mut self,
         build: BuildKey,
@@ -1051,6 +1055,7 @@ impl RollingTipLedger {
     }
 
     /// Release an active lease only with the exact attempt, owner and fence evidence.
+    #[allow(clippy::too_many_arguments)]
     pub fn release_lease(
         &mut self,
         build: BuildKey,
@@ -1093,6 +1098,7 @@ impl RollingTipLedger {
 
     /// Reclaim a lease only after its recorded expiry. This is the recovery path for a crashed
     /// worker; a late holder's ordinary release remains fenced and is rejected.
+    #[allow(clippy::too_many_arguments)]
     pub fn reclaim_expired_lease(
         &mut self,
         build: BuildKey,

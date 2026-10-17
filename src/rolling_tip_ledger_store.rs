@@ -167,6 +167,7 @@ impl RollingTipLedgerStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn acquire_lease(
         &mut self,
         build: BuildKey,
@@ -190,6 +191,7 @@ impl RollingTipLedgerStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn release_lease(
         &mut self,
         build: BuildKey,
@@ -213,6 +215,7 @@ impl RollingTipLedgerStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn reclaim_expired_lease(
         &mut self,
         build: BuildKey,
