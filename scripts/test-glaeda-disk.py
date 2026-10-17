@@ -1406,8 +1406,11 @@ class GlaedaDiskTest(unittest.TestCase):
         root = self.root / "Library/Caches/cmux-next-ci"
         state = root / "cmux-scheme/runner-a"
         products = make(state / "Products", age_hours=96)
+        nested_products = make(state / "Build/Products", age_hours=96)
         guard = gd.cmux_next_ci_dedupe_guard(root)
         self.assertTrue(guard(products / "blob"))
+        nested_guard = gd.cmux_next_ci_dedupe_guard(root)
+        self.assertTrue(nested_guard(nested_products / "blob"))
         (state / ".lock").write_text("")
         self.assertFalse(guard(products / "blob"))
         (state / ".lock").unlink()
@@ -1422,10 +1425,11 @@ class GlaedaDiskTest(unittest.TestCase):
         state = root / "cmux-scheme/runner-a"
         products = make(state / "Products", age_hours=96)
         build = make(state / "Build", age_hours=96)
+        nested_products = make(state / "Build/Products", age_hours=96)
         (state / "Logs").mkdir(parents=True)
         (state / "SourcePackages").mkdir()
         (state / "unknown").mkdir()
-        self.assertEqual(gd.cmux_next_ci_dedupe_roots(root), [products])
+        self.assertEqual(gd.cmux_next_ci_dedupe_roots(root), [products, nested_products])
 
     def test_fleet_ci_hot_tier(self) -> None:
         ci = self.root / "ci"
