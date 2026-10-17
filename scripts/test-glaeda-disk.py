@@ -1376,6 +1376,16 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(got[recent].verdict, "in-use")
         self.assertIn("active or ambiguous marker", got[recent].reasons[0])
 
+    def test_cmux_next_ci_idle_floor_survives_pressure_mode(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        build = make(root / "cmux-scheme/runner-a/Build", age_hours=48)
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            got = gd.survey([fam], 0, 0)
+        self.assertEqual(got[0].path, str(build))
+        self.assertEqual(got[0].verdict, "recent")
+
     def test_cmux_next_ci_apply_rechecks_process_and_marker(self) -> None:
         root = self.root / "Library/Caches/cmux-next-ci"
         state = root / "cmux-scheme/runner-a"

@@ -1206,7 +1206,7 @@ def default_families() -> list[Family]:
         Family("projects", projects, False, "checkouts (report only)",
                skip=tuple(r.name for r in wt_roots), platform="shared"),
     ]
-    cmux_next_ci = HOME / "Library/Caches/cmux-next-ci"
+    cmux_next_ci = HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT
     if DARWIN and cmux_next_ci.is_dir():
         fams.append(cmux_next_ci_family(cmux_next_ci))
     user_tmp = darwin_user_tmp() if DARWIN else None
@@ -1312,7 +1312,7 @@ def runner_cache_families() -> list[Family]:
                skip=("index.json", "manifest.json", "state.json", ".metadata_never_index", ".lock"),
                owner="cmux CUA", rebuild_minutes=1, min_idle_hours=168.0, platform="macos"),
     ]
-    if (HOME / "Library/Caches/cmux-next-ci").is_dir():
+    if (HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT).is_dir():
         roots.append(replace(cmux_next_ci_family(), min_idle_hours=168.0))
     return [f for f in roots if f.root.is_dir()]
 
@@ -4165,7 +4165,7 @@ def cmux_next_ci_dirs(home: Path | None = None) -> list[Path]:
     """The cmux-next workflow's DerivedData, one per runner: ~/Library/Caches/cmux-next-ci/<scheme>/<runner>.
     Each runner keeps its own copy of the same SourcePackages and module caches (3.9 GiB, three times on
     every mini, 2026-10-11), so each <scheme> directory is a dedupe base like Xcode's DerivedData."""
-    root = (HOME if home is None else home) / "Library/Caches/cmux-next-ci"
+    root = (HOME if home is None else home) / "Library/Caches" / CMUX_NEXT_CI_ROOT
     if not root.is_dir() or root.is_symlink():
         return []
     return [d for d in _children(root) if d.is_dir() and not d.is_symlink()]
@@ -4218,7 +4218,7 @@ def cmux_next_ci_generated_paths(root: Path) -> list[Path]:
 
 def cmux_next_ci_family(root: Path | None = None) -> Family:
     """Reclaim old generated cmux-next CI output while preserving reusable inputs."""
-    root = (HOME / "Library/Caches/cmux-next-ci") if root is None else root
+    root = (HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT) if root is None else root
     return Family(CMUX_NEXT_CI_FAMILY, root, True,
                   "the cmux-next workflow rebuilds generated DerivedData output",
                   checkout_builds=True, build_output=True,
