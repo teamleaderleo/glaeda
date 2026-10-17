@@ -251,6 +251,10 @@ pub struct PromotionPointer {
     pub decision: PromotionDecision,
 }
 
+// The artifact is deliberately returned inline so exact-key reuse carries its
+// immutable provenance without a second lookup. Keep the public result shape;
+// callers already treat this as a short-lived admission decision.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildAdmission {
     Queued,
@@ -634,7 +638,7 @@ impl RollingTipLedger {
             },
         )?;
         if let Some(artifact) = self.artifacts.get(&build).cloned() {
-            if self.states.get(&build).map_or(true, |execution| {
+            if self.states.get(&build).is_none_or(|execution| {
                 execution.state != BuildExecutionState::Succeeded
                     || execution.attempt != artifact.execution_attempt
             }) {
