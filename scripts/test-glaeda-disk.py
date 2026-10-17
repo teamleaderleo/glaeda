@@ -1331,7 +1331,9 @@ class GlaedaDiskTest(unittest.TestCase):
         root = self.root / "Library/Caches/cmux-next-ci"
         runner = root / "cmux-scheme/runner-a"
         daily = root / "dev-daily-release/abcdef0123456789/Release/26f113aa"
-        for state in (runner, daily):
+        xcode_daily = root / "dev-daily-release/1234567890abcdef/Release/xcode-2c2299e9015ce0c8"
+        release_compile = root / "release-compile/bcc51113400dc347/Release/xcode-2c2299e9015ce0c8"
+        for state in (runner, daily, xcode_daily, release_compile):
             state.mkdir(parents=True)
             for name in ("Build", "Index.noindex", "Logs", "Products"):
                 make(state / name, age_hours=96)
@@ -1344,7 +1346,7 @@ class GlaedaDiskTest(unittest.TestCase):
             items = gd.survey([fam], 24, 0)
         paths = {Path(i.path) for i in items}
         expected = {
-            state / name for state in (runner, daily)
+            state / name for state in (runner, daily, xcode_daily, release_compile)
             for name in ("Build", "Index.noindex", "Logs", "Products")
         }
         self.assertEqual(paths, expected)
