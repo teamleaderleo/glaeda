@@ -246,6 +246,12 @@ pub enum RollingTipLedgerError {
     InvalidTimestamp,
     InvalidAttempt,
     StreamMismatch,
+    UnknownBuild,
+    ConflictingArtifact,
+    StaleBuildAttempt { expected: u32, actual: u32 },
+    StaleBuildState,
+    PromotionNotRequested,
+    PromotionArtifactUnavailable,
     StalePromotionRevision { expected: u64, actual: u64 },
 }
 
@@ -257,6 +263,21 @@ impl fmt::Display for RollingTipLedgerError {
             Self::InvalidTimestamp => formatter.write_str("timestamp must be non-zero"),
             Self::InvalidAttempt => formatter.write_str("build attempt must be non-zero"),
             Self::StreamMismatch => formatter.write_str("build belongs to another stream"),
+            Self::UnknownBuild => formatter.write_str("build has not been admitted"),
+            Self::ConflictingArtifact => {
+                formatter.write_str("conflicting artifact for exact build key")
+            }
+            Self::StaleBuildAttempt { expected, actual } => {
+                write!(
+                    formatter,
+                    "stale build attempt: expected at least {expected}, actual {actual}"
+                )
+            }
+            Self::StaleBuildState => formatter.write_str("stale build state transition"),
+            Self::PromotionNotRequested => formatter.write_str("promotion was not requested"),
+            Self::PromotionArtifactUnavailable => {
+                formatter.write_str("promotion requires a published successful artifact")
+            }
             Self::StalePromotionRevision { expected, actual } => {
                 write!(
                     formatter,
@@ -277,7 +298,15 @@ pub struct RollingTipLedger {
     events: Vec<EventEnvelope>,
     artifacts: BTreeMap<BuildKey, ArtifactProvenance>,
     in_flight: BTreeSet<BuildKey>,
+    states: BTreeMap<BuildKey, ExecutionRecord>,
+    promotion_requests: BTreeSet<BuildKey>,
     promotion: Option<PromotionPointer>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExecutionRecord {
+    attempt: u32,
+    state: BuildExecutionState,
 }
 
 impl RollingTipLedger {
@@ -289,6 +318,8 @@ impl RollingTipLedger {
             events: Vec::new(),
             artifacts: BTreeMap::new(),
             in_flight: BTreeSet::new(),
+            states: BTreeMap::new(),
+            promotion_requests: BTreeSet::new(),
             promotion: None,
         }
     }
@@ -316,6 +347,13 @@ impl RollingTipLedger {
     ) -> Result<BuildAdmission, RollingTipLedgerError> {
         self.require_stream(&build)?;
         self.require_timestamp(occurred_at_millis)?;
+        let event_count = if self.artifacts.contains_key(&build) || self.in_flight.contains(&build)
+        {
+            2
+        } else {
+            3
+        };
+        self.ensure_capacity(event_count)?;
         self.append(
             occurred_at_millis,
             RollingTipEvent::TipObserved {
@@ -344,7 +382,6 @@ impl RollingTipLedger {
             )?;
             return Ok(BuildAdmission::InFlight);
         }
-        self.in_flight.insert(build.clone());
         self.append(
             occurred_at_millis,
             RollingTipEvent::ArtifactReuse {
@@ -353,14 +390,29 @@ impl RollingTipLedger {
                 artifact_digest: None,
             },
         )?;
+        let attempt = self
+            .states
+            .get(&build)
+            .map_or(1, |record| record.attempt.saturating_add(1));
+        if attempt == 0 {
+            return Err(RollingTipLedgerError::InvalidAttempt);
+        }
         self.append(
             occurred_at_millis,
             RollingTipEvent::BuildStateChanged {
-                build,
+                build: build.clone(),
                 state: BuildExecutionState::Queued,
-                attempt: 1,
+                attempt,
             },
         )?;
+        self.in_flight.insert(build.clone());
+        self.states.insert(
+            build,
+            ExecutionRecord {
+                attempt,
+                state: BuildExecutionState::Queued,
+            },
+        );
         Ok(BuildAdmission::Queued)
     }
 
@@ -377,6 +429,21 @@ impl RollingTipLedger {
         if attempt == 0 {
             return Err(RollingTipLedgerError::InvalidAttempt);
         }
+        let Some(current) = self.states.get(&build).copied() else {
+            return Err(RollingTipLedgerError::UnknownBuild);
+        };
+        if attempt < current.attempt {
+            return Err(RollingTipLedgerError::StaleBuildAttempt {
+                expected: current.attempt,
+                actual: attempt,
+            });
+        }
+        if attempt == current.attempt
+            && (state_rank(state) < state_rank(current.state)
+                || (is_terminal(state) && is_terminal(current.state) && state != current.state))
+        {
+            return Err(RollingTipLedgerError::StaleBuildState);
+        }
         self.append(
             occurred_at_millis,
             RollingTipEvent::BuildStateChanged {
@@ -385,6 +452,8 @@ impl RollingTipLedger {
                 attempt,
             },
         )?;
+        self.states
+            .insert(build.clone(), ExecutionRecord { attempt, state });
         if matches!(
             state,
             BuildExecutionState::Succeeded
@@ -431,13 +500,23 @@ impl RollingTipLedger {
     ) -> Result<(), RollingTipLedgerError> {
         self.require_stream(&artifact.build)?;
         self.require_timestamp(occurred_at_millis)?;
+        if let Some(existing) = self.artifacts.get(&artifact.build) {
+            if existing == &artifact {
+                return Ok(());
+            }
+            return Err(RollingTipLedgerError::ConflictingArtifact);
+        }
+        self.ensure_capacity(1)?;
+        self.append(
+            occurred_at_millis,
+            RollingTipEvent::ArtifactPublished {
+                artifact: artifact.clone(),
+            },
+        )?;
         self.artifacts
             .insert(artifact.build.clone(), artifact.clone());
         self.in_flight.remove(&artifact.build);
-        self.append(
-            occurred_at_millis,
-            RollingTipEvent::ArtifactPublished { artifact },
-        )
+        Ok(())
     }
 
     #[must_use]
@@ -453,13 +532,19 @@ impl RollingTipLedger {
     ) -> Result<(), RollingTipLedgerError> {
         self.require_stream(&build)?;
         self.require_timestamp(occurred_at_millis)?;
+        if !self.is_known(&build) {
+            return Err(RollingTipLedgerError::UnknownBuild);
+        }
+        self.ensure_capacity(1)?;
         self.append(
             occurred_at_millis,
             RollingTipEvent::PromotionRequested {
-                build,
+                build: build.clone(),
                 expected_revision,
             },
-        )
+        )?;
+        self.promotion_requests.insert(build);
+        Ok(())
     }
 
     /// Compare-and-swap the candidate pointer. Execution state is untouched; accepted artifacts
@@ -473,6 +558,9 @@ impl RollingTipLedger {
     ) -> Result<u64, RollingTipLedgerError> {
         self.require_stream(&build)?;
         self.require_timestamp(occurred_at_millis)?;
+        if !self.promotion_requests.contains(&build) {
+            return Err(RollingTipLedgerError::PromotionNotRequested);
+        }
         let actual = self
             .promotion
             .as_ref()
@@ -483,22 +571,30 @@ impl RollingTipLedger {
                 actual,
             });
         }
+        if self.artifacts.get(&build).is_none()
+            || self.states.get(&build).map_or(true, |record| {
+                record.state != BuildExecutionState::Succeeded
+            })
+        {
+            return Err(RollingTipLedgerError::PromotionArtifactUnavailable);
+        }
         let revision = actual.saturating_add(1);
+        self.ensure_capacity(1)?;
+        self.append(
+            occurred_at_millis,
+            RollingTipEvent::PromotionDecided {
+                build: build.clone(),
+                decision,
+                expected_revision,
+                pointer_revision: revision,
+            },
+        )?;
         self.promotion = Some(PromotionPointer {
             stream: self.stream.clone(),
             revision,
             build: build.clone(),
             decision,
         });
-        self.append(
-            occurred_at_millis,
-            RollingTipEvent::PromotionDecided {
-                build,
-                decision,
-                expected_revision,
-                pointer_revision: revision,
-            },
-        )?;
         Ok(revision)
     }
 
@@ -550,11 +646,25 @@ impl RollingTipLedger {
         }
     }
 
+    fn is_known(&self, build: &BuildKey) -> bool {
+        self.states.contains_key(build)
+            || self.in_flight.contains(build)
+            || self.artifacts.contains_key(build)
+    }
+
+    fn ensure_capacity(&self, count: u64) -> Result<(), RollingTipLedgerError> {
+        self.next_sequence
+            .checked_add(count)
+            .ok_or(RollingTipLedgerError::InvalidIdentifier("event sequence"))
+            .map(|_| ())
+    }
+
     fn append(
         &mut self,
         occurred_at_millis: u64,
         event: RollingTipEvent,
     ) -> Result<(), RollingTipLedgerError> {
+        self.ensure_capacity(1)?;
         let event_id = format!("{}-{:016x}", self.stream.branch, self.next_sequence);
         self.events.push(EventEnvelope {
             schema_version: ROLLING_TIP_LEDGER_SCHEMA_VERSION,
@@ -564,12 +674,30 @@ impl RollingTipLedger {
             occurred_at_millis,
             event,
         });
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or(RollingTipLedgerError::InvalidIdentifier("event sequence"))?;
+        self.next_sequence += 1;
         Ok(())
     }
+}
+
+const fn state_rank(state: BuildExecutionState) -> u8 {
+    match state {
+        BuildExecutionState::Observed => 0,
+        BuildExecutionState::Queued => 1,
+        BuildExecutionState::Leased => 2,
+        BuildExecutionState::Running => 3,
+        BuildExecutionState::Succeeded
+        | BuildExecutionState::Failed
+        | BuildExecutionState::Cancelled => 4,
+    }
+}
+
+const fn is_terminal(state: BuildExecutionState) -> bool {
+    matches!(
+        state,
+        BuildExecutionState::Succeeded
+            | BuildExecutionState::Failed
+            | BuildExecutionState::Cancelled
+    )
 }
 
 fn validate_token(field: &'static str, value: &str) -> Result<(), RollingTipLedgerError> {
@@ -631,10 +759,13 @@ mod tests {
             BuildAdmission::InFlight
         );
         ledger
-            .publish_artifact(artifact(first.clone()), 3)
+            .record_state(first.clone(), BuildExecutionState::Succeeded, 1, 3)
+            .expect("success");
+        ledger
+            .publish_artifact(artifact(first.clone()), 4)
             .expect("publish");
         assert!(matches!(
-            ledger.admit(first, 4).expect("reuse"),
+            ledger.admit(first, 5).expect("reuse"),
             BuildAdmission::Reused(_)
         ));
         assert!(ledger.events().iter().any(|event| matches!(
@@ -660,20 +791,30 @@ mod tests {
         let mut ledger = RollingTipLedger::new(stream);
         ledger.admit(first.clone(), 1).expect("admit");
         ledger
+            .record_state(first.clone(), BuildExecutionState::Succeeded, 1, 2)
+            .expect("success");
+        ledger
+            .publish_artifact(artifact(first.clone()), 3)
+            .expect("publish");
+        ledger
             .request_promotion(first.clone(), 0, 2)
             .expect("request");
         assert_eq!(
             ledger
-                .decide_promotion(first.clone(), PromotionDecision::Accepted, 0, 3)
+                .decide_promotion(first.clone(), PromotionDecision::Accepted, 0, 4)
                 .expect("accept"),
             1
         );
         let newer = build("b");
+        ledger.admit(newer.clone(), 5).expect("new tip");
+        ledger
+            .request_promotion(newer.clone(), 1, 6)
+            .expect("new request");
         assert!(matches!(
-            ledger.decide_promotion(newer, PromotionDecision::Delayed, 0, 4),
+            ledger.decide_promotion(newer, PromotionDecision::Delayed, 0, 7),
             Err(RollingTipLedgerError::StalePromotionRevision { .. })
         ));
-        assert!(ledger.in_flight.contains(&first));
+        assert!(ledger.in_flight.contains(&build("b")));
         assert_eq!(
             ledger.promotion().expect("pointer").decision,
             PromotionDecision::Accepted
@@ -690,5 +831,89 @@ mod tests {
         let json = serde_json::to_string(&ledger.events()[0]).expect("json");
         assert!(json.contains("backpressure"));
         assert!(json.contains("feat-cmux-next"));
+    }
+
+    #[test]
+    fn conflicting_artifact_preserves_first_provenance() {
+        let first = build("a");
+        let mut ledger = RollingTipLedger::new(first.stream.clone());
+        ledger.admit(first.clone(), 1).expect("admit");
+        ledger
+            .record_state(first.clone(), BuildExecutionState::Succeeded, 1, 2)
+            .expect("success");
+        let original = artifact(first.clone());
+        ledger
+            .publish_artifact(original.clone(), 3)
+            .expect("publish");
+        let conflicting = ArtifactProvenance::new(
+            "dev-build-2",
+            first.clone(),
+            digest("d"),
+            "github-actions",
+            43,
+            1,
+        )
+        .expect("artifact");
+        assert_eq!(
+            ledger.publish_artifact(conflicting, 4),
+            Err(RollingTipLedgerError::ConflictingArtifact)
+        );
+        assert_eq!(ledger.artifact_for(&first), Some(&original));
+    }
+
+    #[test]
+    fn stale_attempt_and_state_cannot_clear_newer_in_flight_work() {
+        let first = build("a");
+        let mut ledger = RollingTipLedger::new(first.stream.clone());
+        ledger.admit(first.clone(), 1).expect("attempt one");
+        ledger
+            .record_state(first.clone(), BuildExecutionState::Failed, 1, 2)
+            .expect("failed attempt one");
+        ledger.admit(first.clone(), 3).expect("attempt two");
+        assert_eq!(
+            ledger.record_state(first.clone(), BuildExecutionState::Failed, 1, 4),
+            Err(RollingTipLedgerError::StaleBuildAttempt {
+                expected: 2,
+                actual: 1,
+            })
+        );
+        assert_eq!(
+            ledger.record_state(first.clone(), BuildExecutionState::Queued, 1, 5),
+            Err(RollingTipLedgerError::StaleBuildAttempt {
+                expected: 2,
+                actual: 1,
+            })
+        );
+        assert!(ledger.in_flight.contains(&first));
+    }
+
+    #[test]
+    fn promotion_requires_request_and_successful_published_artifact() {
+        let first = build("a");
+        let mut ledger = RollingTipLedger::new(first.stream.clone());
+        assert_eq!(
+            ledger.decide_promotion(first.clone(), PromotionDecision::Accepted, 0, 1),
+            Err(RollingTipLedgerError::PromotionNotRequested)
+        );
+        ledger.admit(first.clone(), 2).expect("admit");
+        ledger
+            .request_promotion(first.clone(), 0, 3)
+            .expect("request");
+        assert_eq!(
+            ledger.decide_promotion(first.clone(), PromotionDecision::Accepted, 0, 4),
+            Err(RollingTipLedgerError::PromotionArtifactUnavailable)
+        );
+        ledger
+            .record_state(first.clone(), BuildExecutionState::Succeeded, 1, 5)
+            .expect("success");
+        ledger
+            .publish_artifact(artifact(first.clone()), 6)
+            .expect("publish");
+        assert_eq!(
+            ledger
+                .decide_promotion(first, PromotionDecision::Accepted, 0, 7)
+                .expect("promotion"),
+            1
+        );
     }
 }
