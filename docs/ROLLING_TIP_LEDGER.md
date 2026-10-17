@@ -27,13 +27,21 @@ revision. `accept` additionally requires a published artifact bound to the
 current successful execution attempt; `delay` and `reject` can record an
 operator decision for a requested tip before a successful artifact exists. A
 stale caller receives a conflict and cannot clobber a newer operator decision.
-The in-memory ledger is the MVP kernel; a later Glaeda
-adapter can persist envelopes and publish idempotent events to fleet
-intelligence without changing these identities or transitions.
+The in-memory ledger remains the transition kernel. `RollingTipLedgerStore`
+provides the first durable adapter: it writes one envelope per JSONL line,
+syncs the complete event before exposing the resulting state, and reconstructs
+the derived indexes with strict schema, stream, sequence, event-id, and state
+validation on reopen. An unterminated final line is treated as a crash tail
+and truncated; malformed complete lines fail closed. The store exposes a
+receipt query for the latest observed tip, latest artifact, event sequence, and
+promotion pointer so Glaeda can forward one idempotent stream to fleet
+intelligence without adding scheduler behavior to this module.
 
-Lease ownership validation, durable persistence, deserialization, and replay
-verification remain adapter responsibilities for the next tranche. This kernel
-does not infer ownership from a lease label or accept an unverified replay.
+The store's transaction boundary clones the kernel, applies one operation,
+syncs only its new envelopes, then swaps the clone into memory. A failed write
+therefore cannot publish an in-memory state that is absent from the journal.
+Lease ownership remains intentionally descriptive: this kernel does not infer
+ownership from a lease label or accept an unverified replay.
 
 The first consumer should ingest the existing CI receipts for the
 `feat-cmux-next` stream. Scheduler changes, host selection, cancellation, and

@@ -10,14 +10,14 @@ use std::{
     fmt,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
 
 pub const ROLLING_TIP_LEDGER_SCHEMA_VERSION: u8 = 1;
 
 /// A bounded repository/branch stream identity. Mutable branch names are scoped to a repository.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TipStream {
     pub repository: RepositoryRef,
     pub branch: String,
@@ -37,7 +37,7 @@ impl TipStream {
 }
 
 /// Exact inputs that make one build result reusable. No mutable alias is part of this key.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BuildKey {
     pub stream: TipStream,
     pub commit: CommitId,
@@ -104,7 +104,7 @@ impl BuildKey {
 }
 
 /// Immutable producer and content evidence for a published artifact.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ArtifactProvenance {
     pub artifact_id: String,
     pub build: BuildKey,
@@ -146,7 +146,7 @@ impl ArtifactProvenance {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuildExecutionState {
     Observed,
@@ -158,7 +158,7 @@ pub enum BuildExecutionState {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReuseDecision {
     Hit,
@@ -166,7 +166,7 @@ pub enum ReuseDecision {
     InFlight,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromotionDecision {
     Accepted,
@@ -174,7 +174,7 @@ pub enum PromotionDecision {
     Rejected,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptOutcome {
     Succeeded,
@@ -183,7 +183,7 @@ pub enum ReceiptOutcome {
 }
 
 /// Typed, append-only facts consumed by Glaeda or a fleet coordinator.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RollingTipEvent {
     TipObserved {
@@ -233,7 +233,7 @@ pub enum RollingTipEvent {
 }
 
 /// Envelope identity and ordering are assigned by [`RollingTipLedger::append`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub schema_version: u8,
     pub sequence: u64,
@@ -243,7 +243,7 @@ pub struct EventEnvelope {
     pub event: RollingTipEvent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromotionPointer {
     pub stream: TipStream,
     pub revision: u64,
@@ -369,6 +369,247 @@ impl RollingTipLedger {
     #[must_use]
     pub fn promotion(&self) -> Option<&PromotionPointer> {
         self.promotion.as_ref()
+    }
+
+    /// Rebuild a ledger from its durable event envelopes.
+    ///
+    /// Replay accepts only the exact schema, stream, sequence, and event-id
+    /// contract emitted by [`RollingTipLedger::append`]. Every transition is
+    /// revalidated before the envelope is added to the derived indexes, so a
+    /// corrupt or reordered journal cannot manufacture a successful artifact
+    /// or promotion pointer.
+    pub fn replay(
+        stream: TipStream,
+        events: impl IntoIterator<Item = EventEnvelope>,
+    ) -> Result<Self, RollingTipLedgerError> {
+        let mut ledger = Self::new(stream);
+        for envelope in events {
+            if envelope.schema_version != ROLLING_TIP_LEDGER_SCHEMA_VERSION
+                || envelope.stream != ledger.stream
+                || envelope.sequence != ledger.next_sequence
+                || envelope.occurred_at_millis == 0
+            {
+                return Err(RollingTipLedgerError::InvalidIdentifier("event envelope"));
+            }
+            let expected_id = format!("{}-{:016x}", ledger.stream.branch, envelope.sequence);
+            if envelope.event_id != expected_id {
+                return Err(RollingTipLedgerError::InvalidIdentifier("event id"));
+            }
+            ledger.apply_replayed_event(&envelope)?;
+            ledger.events.push(envelope);
+            ledger.next_sequence = ledger.next_sequence.saturating_add(1);
+        }
+        Ok(ledger)
+    }
+
+    fn apply_replayed_event(
+        &mut self,
+        envelope: &EventEnvelope,
+    ) -> Result<(), RollingTipLedgerError> {
+        let timestamp = envelope.occurred_at_millis;
+        match &envelope.event {
+            RollingTipEvent::TipObserved { build } => {
+                self.require_stream(build)?;
+                self.require_timestamp(timestamp)
+            }
+            RollingTipEvent::BuildStateChanged {
+                build,
+                state,
+                attempt,
+            } => self.replay_state(build, *state, *attempt, timestamp),
+            RollingTipEvent::LeaseAcquired {
+                build,
+                lease_id,
+                host_id,
+            }
+            | RollingTipEvent::LeaseReleased {
+                build,
+                lease_id,
+                host_id,
+            } => {
+                self.require_stream(build)?;
+                self.require_timestamp(timestamp)?;
+                validate_token("lease_id", lease_id)?;
+                validate_token("host_id", host_id)
+            }
+            RollingTipEvent::ArtifactPublished { artifact } => {
+                self.require_stream(&artifact.build)?;
+                self.require_timestamp(timestamp)?;
+                let Some(execution) = self.states.get(&artifact.build) else {
+                    return Err(RollingTipLedgerError::UnknownBuild);
+                };
+                if execution.state != BuildExecutionState::Succeeded
+                    || execution.attempt != artifact.execution_attempt
+                {
+                    return Err(RollingTipLedgerError::ArtifactExecutionMismatch);
+                }
+                if self.artifacts.contains_key(&artifact.build) {
+                    return Err(RollingTipLedgerError::ConflictingArtifact);
+                }
+                self.artifacts
+                    .insert(artifact.build.clone(), artifact.clone());
+                self.in_flight.remove(&artifact.build);
+                Ok(())
+            }
+            RollingTipEvent::ArtifactReuse {
+                build,
+                decision,
+                artifact_digest,
+            } => {
+                self.require_stream(build)?;
+                self.require_timestamp(timestamp)?;
+                match decision {
+                    ReuseDecision::Hit => {
+                        let Some(artifact) = self.artifacts.get(build) else {
+                            return Err(RollingTipLedgerError::ArtifactExecutionMismatch);
+                        };
+                        let Some(execution) = self.states.get(build) else {
+                            return Err(RollingTipLedgerError::ArtifactExecutionMismatch);
+                        };
+                        if artifact_digest.as_ref() != Some(&artifact.content_digest)
+                            || execution.state != BuildExecutionState::Succeeded
+                            || artifact.execution_attempt != execution.attempt
+                        {
+                            return Err(RollingTipLedgerError::ArtifactExecutionMismatch);
+                        }
+                    }
+                    ReuseDecision::InFlight => {
+                        if artifact_digest.is_some() || !self.in_flight.contains(build) {
+                            return Err(RollingTipLedgerError::StaleBuildState);
+                        }
+                    }
+                    ReuseDecision::Miss => {
+                        if artifact_digest.is_some()
+                            || self.artifacts.contains_key(build)
+                            || self.in_flight.contains(build)
+                        {
+                            return Err(RollingTipLedgerError::StaleBuildState);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            RollingTipEvent::PromotionRequested {
+                build,
+                expected_revision: _,
+            } => {
+                self.require_stream(build)?;
+                self.require_timestamp(timestamp)?;
+                if !self.is_known(build) {
+                    return Err(RollingTipLedgerError::UnknownBuild);
+                }
+                self.promotion_requests.insert(build.clone());
+                Ok(())
+            }
+            RollingTipEvent::PromotionDecided {
+                build,
+                decision,
+                expected_revision,
+                pointer_revision,
+            } => {
+                self.require_stream(build)?;
+                self.require_timestamp(timestamp)?;
+                if !self.promotion_requests.contains(build) {
+                    return Err(RollingTipLedgerError::PromotionNotRequested);
+                }
+                let actual = self
+                    .promotion
+                    .as_ref()
+                    .map_or(0, |pointer| pointer.revision);
+                if *expected_revision != actual || *pointer_revision != actual.saturating_add(1) {
+                    return Err(RollingTipLedgerError::StalePromotionRevision {
+                        expected: *expected_revision,
+                        actual,
+                    });
+                }
+                if *decision == PromotionDecision::Accepted {
+                    let Some(artifact) = self.artifacts.get(build) else {
+                        return Err(RollingTipLedgerError::PromotionArtifactUnavailable);
+                    };
+                    let Some(execution) = self.states.get(build) else {
+                        return Err(RollingTipLedgerError::PromotionArtifactUnavailable);
+                    };
+                    if execution.state != BuildExecutionState::Succeeded
+                        || artifact.execution_attempt != execution.attempt
+                    {
+                        return Err(RollingTipLedgerError::PromotionArtifactUnavailable);
+                    }
+                }
+                self.promotion = Some(PromotionPointer {
+                    stream: self.stream.clone(),
+                    revision: *pointer_revision,
+                    build: build.clone(),
+                    decision: *decision,
+                });
+                Ok(())
+            }
+            RollingTipEvent::Backpressure { build, reason } => {
+                self.require_stream(build)?;
+                self.require_timestamp(timestamp)?;
+                validate_token("backpressure reason", reason)
+            }
+            RollingTipEvent::ReceiptClosed { build, outcome: _ } => {
+                self.require_stream(build)?;
+                self.require_timestamp(timestamp)
+            }
+        }
+    }
+
+    fn replay_state(
+        &mut self,
+        build: &BuildKey,
+        state: BuildExecutionState,
+        attempt: u32,
+        timestamp: u64,
+    ) -> Result<(), RollingTipLedgerError> {
+        self.require_stream(build)?;
+        self.require_timestamp(timestamp)?;
+        if attempt == 0 {
+            return Err(RollingTipLedgerError::InvalidAttempt);
+        }
+        if state == BuildExecutionState::Observed {
+            return Err(RollingTipLedgerError::InvalidBuildState);
+        }
+        let Some(current) = self.states.get(build).copied() else {
+            if state != BuildExecutionState::Queued || attempt != 1 {
+                return Err(RollingTipLedgerError::UnknownBuild);
+            }
+            self.states
+                .insert(build.clone(), ExecutionRecord { attempt, state });
+            self.in_flight.insert(build.clone());
+            return Ok(());
+        };
+        if attempt < current.attempt {
+            return Err(RollingTipLedgerError::StaleBuildAttempt {
+                expected: current.attempt,
+                actual: attempt,
+            });
+        }
+        if attempt > current.attempt {
+            let expected = current.attempt.saturating_add(1);
+            if attempt != expected
+                || !is_terminal(current.state)
+                || state != BuildExecutionState::Queued
+            {
+                return Err(RollingTipLedgerError::InvalidAttemptTransition {
+                    expected,
+                    actual: attempt,
+                });
+            }
+        } else if state_rank(state) < state_rank(current.state)
+            || (is_terminal(state) && is_terminal(current.state) && state != current.state)
+        {
+            return Err(RollingTipLedgerError::StaleBuildState);
+        }
+        self.states
+            .insert(build.clone(), ExecutionRecord { attempt, state });
+        if attempt > current.attempt && state == BuildExecutionState::Queued {
+            self.in_flight.insert(build.clone());
+        }
+        if is_terminal(state) {
+            self.in_flight.remove(build);
+        }
+        Ok(())
     }
 
     /// Observe a tip and admit it once. Existing artifacts and in-flight work are never rebuilt.

@@ -378,6 +378,8 @@ pub mod reusable_state_hot_state_policy;
 pub mod reusable_state_lifecycle;
 /// Append-only rolling-tip build observations and compare-and-swap promotion pointers.
 pub mod rolling_tip_ledger;
+/// Crash-safe JSONL persistence and replay adapter for one rolling-tip ledger.
+pub mod rolling_tip_ledger_store;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;
 /// Strict, bounded, nonblocking, descriptor-relative, identity-bound observation of reviewed Podman sources.
