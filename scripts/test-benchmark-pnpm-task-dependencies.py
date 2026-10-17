@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import runpy
@@ -259,13 +260,64 @@ class PnpmTaskDependencyBenchmarkTests(unittest.TestCase):
         self.assertEqual(evidence['sampled_regular_files'], 1)
         self.assertEqual(evidence['fiemap_observed_files'], 1)
         self.assertEqual(evidence['shared_extent_files'], 1)
+        self.assertEqual(evidence['private_copy_files'], 0)
+        self.assertEqual(
+            evidence['sample_selection'],
+            'lexicographic_relative_path_first_256',
+        )
+        self.assertTrue(evidence['sample_path_set_sha256'].startswith('sha256:'))
+        self.assertEqual(len(evidence['sample_path_set_sha256']), 71)
+        self.assertTrue(
+            evidence['private_copy_path_set_sha256'].startswith('sha256:')
+        )
+        self.assertEqual(len(evidence['private_copy_path_set_sha256']), 71)
+        self.assertEqual(evidence['private_copy_diagnostics'], [])
+        self.assertEqual(evidence['shared_extent_percent'], 100.0)
         self.assertEqual(evidence['mechanism'], 'reflink_observed')
+
+    def test_physical_sample_is_deterministic_and_hashes_private_copy_paths(self) -> None:
+        sample = NAMESPACE['sample_physical_mechanism']
+        with tempfile.TemporaryDirectory() as root_text:
+            node_modules = Path(root_text) / 'node_modules'
+            package = node_modules / '.pnpm' / 'pkg@1.0.0' / 'node_modules' / 'pkg'
+            package.mkdir(parents=True)
+            late = package / 'z.js'
+            early = package / 'a.js'
+            late.write_bytes(b'late')
+            early.write_bytes(b'early')
+            with mock.patch.dict(
+                sample.__globals__,
+                {
+                    'fiemap_has_shared_extent': lambda _path: False,
+                    'MAX_SAMPLE_FILES': 1,
+                },
+            ):
+                evidence = sample(node_modules)
+
+        expected_relative = '.pnpm/pkg@1.0.0/node_modules/pkg/a.js'
+        expected_digest = 'sha256:' + hashlib.sha256(
+            expected_relative.encode('utf-8')
+        ).hexdigest()
+        self.assertEqual(evidence['sampled_regular_files'], 1)
+        self.assertEqual(evidence['private_copy_files'], 1)
+        self.assertEqual(
+            evidence['private_copy_diagnostics'],
+            [{'path_sha256': expected_digest, 'bytes': len(b'early')}],
+        )
+        self.assertNotIn(expected_relative, json.dumps(evidence))
 
     def test_explicit_import_methods_require_per_task_physical_proof(self) -> None:
         validate = NAMESPACE['validate_mechanisms']
         BenchmarkError = NAMESPACE['BenchmarkError']
 
-        def evidence(mechanism: str, hardlinks: int = 0) -> dict[str, object]:
+        def evidence(
+            mechanism: str,
+            hardlinks: int = 0,
+            *,
+            sampled: int = 100,
+            fiemap_observed: int = 100,
+            shared: int = 100,
+        ) -> dict[str, object]:
             return {
                 'usage': {
                     'regular_file_count': 10,
@@ -273,15 +325,45 @@ class PnpmTaskDependencyBenchmarkTests(unittest.TestCase):
                 },
                 'sample': {
                     'mechanism': mechanism,
+                    'sampled_regular_files': sampled,
+                    'fiemap_observed_files': fiemap_observed,
+                    'shared_extent_files': shared,
                 },
             }
 
         reflink = [evidence('reflink_observed') for _ in range(8)]
-        hardlink = [evidence('hardlink_observed', hardlinks=10) for _ in range(8)]
-        copy = [evidence('copy_observed') for _ in range(8)]
+        mixed = [
+            evidence('mixed_private_copy_and_reflink_observed', shared=95)
+            for _ in range(8)
+        ]
+        weak_mixed = [
+            evidence('mixed_private_copy_and_reflink_observed', shared=94)
+            for _ in range(8)
+        ]
+        unproven = [
+            evidence(
+                'physical_mechanism_unproven',
+                fiemap_observed=99,
+                shared=99,
+            )
+            for _ in range(8)
+        ]
+        hardlink = [
+            evidence('hardlink_observed', hardlinks=10, shared=0)
+            for _ in range(8)
+        ]
+        copy = [evidence('copy_observed', shared=0) for _ in range(8)]
         self.assertEqual(validate('clone', reflink), {'reflink_observed'})
+        self.assertEqual(
+            validate('clone', mixed),
+            {'mixed_private_copy_and_reflink_observed'},
+        )
         self.assertEqual(validate('hardlink', hardlink), {'hardlink_observed'})
         self.assertEqual(validate('auto', copy), {'copy_observed'})
+        with self.assertRaises(BenchmarkError):
+            validate('clone', weak_mixed)
+        with self.assertRaises(BenchmarkError):
+            validate('clone', unproven)
         with self.assertRaises(BenchmarkError):
             validate('clone', reflink[:-1] + hardlink[:1])
         with self.assertRaises(BenchmarkError):
