@@ -1341,6 +1341,12 @@ class GlaedaDiskTest(unittest.TestCase):
                 (state / name).mkdir()
         invalid = root / "dev-daily-release/not-a-fingerprint/Release/26f113aa"
         (invalid / "Build").mkdir(parents=True)
+        linked_release_target = self.root / "linked-release"
+        linked_release_target.mkdir(parents=True)
+        linked_release = root / "dev-daily-release/2222222222222222/Release"
+        linked_release.parent.mkdir(parents=True, exist_ok=True)
+        linked_release.symlink_to(linked_release_target, target_is_directory=True)
+        (linked_release_target / "xcode-2c2299e9015ce0c8/Build").mkdir(parents=True)
         fam = gd.cmux_next_ci_family(root)
         with mock.patch.object(gd, "process_evidence", return_value=([], "")):
             items = gd.survey([fam], 24, 0)
