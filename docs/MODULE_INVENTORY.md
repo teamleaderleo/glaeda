@@ -91,7 +91,7 @@ let the gate hold the line.
 | `actions_runner_readiness` | `all` | library | 7 |
 | `adaptive_ci_routing` | `all` | none | 0 |
 | `adaptive_verification_compiler` | `all` | library | 2 |
-| `artifact` | `all` | binary | 163 |
+| `artifact` | `all` | binary | 164 |
 | `cache_inventory` | `all` | binary | 5 |
 | `cargo_target_holder_observation` | `target_os="linux"` | binary | 4 |
 | `cargo_target_observation` | `target_os="linux"` | binary | 7 |
