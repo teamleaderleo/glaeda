@@ -1,135 +1,205 @@
 # Typed live-apply admission design
 
-This is the next implementation contract after the receipt-backed synthetic
-matrix. It defines the production-shaped admission and replay boundary without
-enabling live deletion. The current `StoreAdmission` remains the only minted
-capability, and `apply_live` continues to return `live_apply_disabled` until
-this contract has an implementation and managed-host evidence.
+Status: proposed contract for review, not an implemented API or approval to
+mutate live data. Ordinary CLI apply remains `reclaim_not_ready` and the
+production adapter's `apply_live` remains `live_apply_disabled`. The separate
+synthetic fixture helper is not a live admission capability.
 
-## What exists today
+## Observed implementation and missing guarantees
 
-`ProductionRecoveryAdapter::admit_descriptor_store` already binds an observer
-identity, store generation, plan digest, enrollment, root, policy, and clean
-recovery result. `RunnerLogStore` already holds the descriptor-bound lock and
-uses monotonic `prepared → staged → delete_intent → projected|aborted` rows.
-The durable adapter journal supports acknowledgement, cancellation, and
-restart of the synthetic projection.
+`ProductionRecoveryAdapter::admit_descriptor_store` opens the descriptor-bound
+store, compares a store-generation value, runs recovery, vetoes pending rows,
+and binds report actions to the observation. It does not retain the store lock
+after returning. Policy is used during recovery but is not included in the
+current plan digest. Root/enrollment validation at open is not a complete
+immutable binding between the report and the eventual apply.
 
-The missing production pieces are a durable admission lease, cancellation
-epochs tied to the store journal, and a terminal apply receipt that replay can
-return after a lost response. A random transaction nonce alone is insufficient:
-retrying the same plan after a timeout must find the existing transaction rather
-than mint another one.
+The adapter's events are in memory. `checkpoint` returns serialized bytes and
+`restart` reconstructs a synthetic projection; neither persists those bytes or
+proves fsync. The descriptor store separately persists file-transaction phases
+and generates random transaction IDs. It has no durable admission identity,
+cancellation epoch, or stored terminal apply result.
 
-## Typed contract
+The proposed path must close those gaps without letting a retry, cancellation,
+expired token, or synthetic observer acquire new deletion authority.
 
-The production-only capability should be an opaque `LiveApplyAdmission` whose
-private fields bind:
+## Capability and operation identity
 
-```text
-admission_id       opaque stable ID
-plan_digest        exact observer plan digest
-root_generation    root, diagnostics, marker, UID identity tuple
-store_generation   descriptor-bound store generation
-policy_digest      idle window, batch limit, and schema
-journal_digest     digest and byte length observed under the store lock
-cancel_epoch       monotonic cancellation epoch
-expires_at         bounded deadline
-batch_sequence     monotonic sequence within the admission
-```
+Use a distinct, non-deserializable `LiveApplyAdmission` with private fields.
+Only the validated store/admission boundary may mint it, while holding the
+transaction lock after recovery. A public receipt is evidence, not a token.
+The apply call consumes the capability, retains the lock through the batch,
+and checks fresh authority again before each effect. A capability cannot be
+cloned, restored from JSON, or retained across process restart.
 
-Its public `AdmissionReceipt` is path-free and contains the same binding plus
-the recovery receipt and candidate snapshots. Callers cannot construct it from
-a CLI boolean or an arbitrary `LogItem` list.
+Bind the admission receipt and capability to:
 
-The live result should be a typed `LiveApplyReceipt`:
-
-```text
-admission_id
-plan_digest
-recovery           pending-before, repaired, pending-after, disposition
-items[]            transaction ID, candidate identity, phase, outcome
-post_action        fresh root/process/journal identity and pending count
-terminal           applied | cancelled | refused | replayed
-```
-
-`replayed` means the store found a durable terminal receipt for the same
-`admission_id`, `plan_digest`, and batch sequence. It is not a second filesystem
-effect. Every item outcome is bounded to `reclaimed`, `already_reclaimed`,
-`skipped`, `cancelled`, or a typed refusal.
-
-## Durable journal additions
-
-Extend the state journal with admission metadata and terminal receipts. Each
-row remains bound to the enrolled root/install tuple:
-
-```text
-admission_opened(admission_id, plan_digest, cancel_epoch, expires_at, batch_sequence,
-                 root_generation, store_generation, policy_digest, journal_digest)
-admission_cancelled(admission_id, cancel_epoch, phase)
-item_prepared(admission_id, transaction_id, candidate_identity)
-item_staged(admission_id, transaction_id, staged_identity)
-item_delete_intent(admission_id, transaction_id)
-item_projected(admission_id, transaction_id, outcome)
-admission_terminal(admission_id, terminal_receipt_digest, terminal)
-```
-
-Rows must reject phase regression, conflicting duplicates, foreign admission
-IDs, changed root/store generations, and a cancellation epoch lower than the
-latest durable epoch. The terminal receipt is written and synced after the
-final item projection and before the operation returns. Reopening the store
-first reads that terminal row and returns the stored receipt byte-for-byte.
-
-## Cancellation semantics
-
-Cancellation is a durable epoch bump, not a process flag. The store checks the
-epoch and deadline while holding the exclusive lock:
-
-| Current phase | Cancellation result |
+| Binding | Required evidence |
 | --- | --- |
-| admission opened, no item prepared | append `admission_cancelled`; terminal `cancelled`; no file effect |
-| item prepared, source not staged | leave the prepared row for recovery; terminal `cancelled` only after recovery proves no pending row |
-| item staged or delete-intent | do not unlink; return a recovery-pending receipt unless fresh identity/open checks prove safe recovery |
-| item projected | preserve the projection; cancellation applies before the next item |
-| terminal | replay the existing terminal receipt; cancellation is idempotent |
+| Operation | installation namespace, persisted caller request key, plan digest, batch sequence |
+| Filesystem | held root/diagnostics/marker/state identities, UID, enrollment value/digest |
+| Store | exact generation tuple and journal format version; the current folded `u64` alone is insufficient |
+| Plan | ordered bounded candidate paths/identities, observer provenance and completeness |
+| Policy | schema, idle window, batch limit, expiry policy, canonical policy digest |
+| Journal | validated prefix digest, byte length and sequence observed under lock |
+| Cancellation | current durable epoch and operation status |
+| Lifetime | bounded monotonic deadline and boot identity; restart invalidates the capability |
 
-Cancellation must be checked before each new `prepared` row and before each
-delete. A cancellation observed after `prepared` never hides that row or reports
-completion while recovery debt remains.
+The caller must persist its request key before submission. The store durably
+maps `(installation, request_key, batch_sequence)` to one admission ID before
+any filesystem effect. Matching retries find that operation; the same key with
+a changed plan, root, or policy is a conflict, never a new admission. A new
+batch uses a new sequence only after the preceding batch is terminal.
 
-## Replay algorithm
+Journal digest/length bind an observed prefix, not the final length: the
+operation's own validated append sequence advances that prefix. An unrelated
+append, truncation, generation mismatch, or conflicting duplicate fails closed.
 
-1. Open the descriptor-bound store and acquire its non-blocking lock.
-2. Read and validate the journal binding, terminal receipt, current cancellation
-   epoch, root/store generations, and journal digest.
-3. If a matching terminal receipt exists, return it with `terminal=replayed`;
-   perform no filesystem mutation.
-4. Recover pending rows under the lock. Any unresolved row is a hard admission
-   veto and is returned in the recovery receipt.
-5. Validate the fresh observer plan, lease deadline, cancellation epoch, and
-   candidate identities.
-6. For each candidate, re-observe immediately before stage, after stage, before
-   delete, and after delete. Append and sync each journal phase before the next
-   filesystem effect.
-7. Append the terminal receipt, sync the journal and parent, then return the
-   exact receipt. A retry follows step 3.
+## Durable records and receipt publication
 
-The adapter should expose one replay-safe operation, not separate public
-`stage`, `delete`, or journal-writing methods. The store owns the lock and
-durability; the adapter owns the typed admission and cancellation policy.
+Use a versioned tagged journal format, bounded record/candidate sizes, strict
+phase validation and checked sequence/epoch arithmetic. The existing unversioned
+item journal cannot silently become this format. Legacy pending rows block new
+admission until reviewed recovery; no automatic rewrite grants ownership.
 
-## Acceptance matrix before enabling live apply
+Proposed records are:
 
-- unit tests for epoch monotonicity, deadline expiry, duplicate terminal replay,
-  phase regression, foreign admission rows, and journal digest drift;
-- managed Mac crash/restart runs at prepared, staged, delete-intent, and
-  projected boundaries;
-- cancellation tests for every phase, including an open staged file;
-- exact source/tree and binary receipts for each managed run;
-- fresh post-action process/root/journal evidence with no pending recovery;
-- a candidate → soak → promotion receipt for one explicitly enrolled runner;
-- an independent review confirming that `apply_live` is still closed until all
-  rows are green.
+```text
+admission_opened(operation_key, admission_id, exact_bindings, candidates)
+item_prepared(admission_id, item_index, transaction_id, source_identity, stage_name)
+item_staged(admission_id, item_index, staged_identity)
+item_delete_intent(admission_id, item_index)
+item_projected(admission_id, item_index, outcome)
+admission_terminal(admission_id, canonical_receipt, receipt_digest)
+```
 
-Until those receipts exist, the synthetic matrix remains the accepted evidence
-for benchmark ergonomics only; it is not production deletion authorization.
+Persist transaction ID, candidate index and stage name before rename. Recovery
+reuses those IDs; it never mints another transaction for an unresolved item.
+Existing prepared rows with an ambiguous stage remain refusals until separately
+proven recoverable. New journal vocabulary does not resolve that ambiguity.
+
+Each authority-bearing append is synced before the next effect. The terminal
+record stores the bounded canonical receipt bytes, not just a digest pointing
+to unavailable data. Sync the journal and required parent directory before
+returning completion. If publication or sync is ambiguous, return an uncertain
+progress result; recovery must validate and complete publication before replay.
+Torn/invalid records block mutation rather than being silently discarded.
+
+The immutable terminal receipt contains the operation binding, recovery result,
+per-item transaction/candidate identities and outcomes, fresh post-action facts,
+journal prefix and zero pending recovery. Terminal outcomes are `applied`,
+`cancelled`, or `refused`. Already completed effects remain in a cancelled
+receipt; cancellation is not rollback.
+
+Replay returns `{ receipt: original_bytes, replayed: true }`. The receipt and
+its outcome remain byte-for-byte identical; `replayed` belongs to the response
+envelope. Progress responses such as `recovery_pending` are not terminal and
+cannot satisfy completion. Conflicting duplicate terminal records are corruption.
+
+Keep bounded tombstones for request-key deduplication. On capacity exhaustion,
+refuse new admissions. Compaction requires atomic publication, crash recovery
+and an explicit key-retention contract; eviction must not turn an old request
+into a fresh deletion. Until that contract exists, do not forget accepted keys.
+
+## Cancellation ordering and locking
+
+A separate process cannot cancel promptly by waiting for the applier's
+batch-wide transaction lock. Use a descriptor-bound cancellation ledger and a
+short control lock, separate from that transaction lock:
+
+- The applier holds the transaction lock; lock ordering is transaction then
+  control. A cancellation writer takes only the control lock and never waits
+  for the transaction lock while holding it.
+- Cancellation appends a checksummed, operation-bound epoch successor to the
+  private control ledger and syncs it before returning `cancel_recorded`.
+  Require expected-epoch compare-and-swap; a repeated request ID returns its
+  existing receipt, and overflow/conflicting requests are refusals.
+- Under the control lock, the applier revalidates aliases, cancellation, expiry,
+  process scope and candidate identity before each prepare/stage/unlink effect.
+  Hold that lock through the effect and its durable phase publication. It may
+  not be released between the final cancellation check and unlink.
+- A cancellation receipt therefore fences subsequent effects. An effect already
+  ordered before cancellation may finish first; its receipt must remain visible.
+  `cancel_recorded` is not `cancelled` completion and does not promise restoration.
+- The writer returns the operation ID, request ID, committed epoch and observed
+  phase/sequence. The applier records that epoch in progress/terminal receipts.
+  Missing, corrupt, foreign or rebound control state vetoes further effects.
+
+The control lock cannot cover the full batch. Each guarded effect has bounded
+observation/I/O budgets; lock contention returns a typed retryable result.
+An I/O stall may delay cancellation acknowledgement, so the API must not promise
+instant cancellation. No success receipt is emitted before durable ordering.
+
+## Cancellation and recovery by phase
+
+| Phase when cancellation is observed | Required behavior |
+| --- | --- |
+| Admitted, no item prepared | stop; terminal cancelled only after post-action verification proves no debt |
+| Prepared, source not staged | stop; durably abort the exact unused prepare after validating source/stage state |
+| Staged or delete-intent, stage present | stop unlinking; preserve exact stage and return recovery pending |
+| Delete-intent, stage absent | project an already completed deletion only with matching durable intent; never infer from source absence alone |
+| Projected | preserve completed item result; cancellation prevents the next item effect |
+| Terminal | return the immutable original result; a late cancel cannot rewrite success |
+
+Recovery reads cancellation before touching pending files and uses the same
+control lock at effect boundaries. It must not call the current deletion-capable
+`recover` unchanged on a cancelled admission. Cancellation permits accounting
+for prior effects, not deleting a retained stage. Restoring a stage, if offered,
+requires a separately reviewed no-overwrite compensation policy; otherwise
+preserve debt for explicit recovery and never report terminal cancellation.
+
+## Apply/replay sequence
+
+1. Open and validate the enrolled root/state/control bindings; acquire the
+   transaction lock. Public plan/inspection remains read-only; recovery is a
+   separately classified mutation with explicit authority.
+2. Resolve the persisted operation key. If terminal, verify the stored receipt
+   and return the original bytes without fresh filesystem effects. Expired
+   admission deadlines do not prevent retrieving a historical result.
+3. For a nonterminal operation, inspect pending phases and the cancellation
+   ledger. Perform only recovery authorized by that phase and cancellation
+   state; unresolved debt blocks new work.
+4. Re-observe report/root/policy/process bindings, cancellation and deadline;
+   sync admission before minting the consuming capability. Restart/boot changes
+   require fresh admission to the same operation, not a new request key.
+5. Run bounded item effects with durable phases and control-lock fencing.
+   Incomplete process scope, open identity, busy runner, expiry or drift stops
+   new effects. Validate the staged identity separately from rename-changed ctime.
+6. Observe actual item/root/process/journal state and recovery debt under the
+   locks. Publish terminal only with complete evidence and zero pending rows;
+   otherwise return typed nonterminal progress with exact recovery requirements.
+7. Sync the complete terminal result before returning. A lost-response retry
+   resolves the same operation and returns it without new effects.
+
+## Falsifying acceptance matrix
+
+The implementation must test these failures, not merely the happy path:
+
+| Injection | Required observation |
+| --- | --- |
+| Lost admission response or retry after prepared | same operation/item IDs; no second rename/unlink |
+| Lost terminal response, expired token, or process restart | identical terminal receipt bytes; replay envelope only |
+| Same request key with changed plan/policy/root | conflict before any effect |
+| Cancel racing prepare, rename, or final unlink | effects ordered before cancel retained; no effect after committed cancel |
+| Cancel writer runs while batch lock held | control path can commit between bounded effects without deadlock |
+| Cancel plus open/rebound stage, crash or recovery | retained stage/debt; no generic recovery delete or false completion |
+| Cancel after terminal | unchanged original terminal outcome |
+| Journal/control torn write, fsync failure, foreign generation | uncertain/refused result, preserved objects, no new authority |
+| Clock rollback, boot change, epoch overflow, budget exhaustion | no new effect; terminal lookup remains available when valid |
+| Malformed or legacy journal and key-retention exhaustion | fail closed; no silent migration or key reuse |
+
+Run phase fault injection and real fresh libproc authority checks on a managed
+Mac at the exact source/tree/artifact, then implementation-independent review.
+The synthetic matrix validates store effects with supplied fixture facts; it
+cannot prove real PID/vnode completeness, cancellation durability or recovery.
+A separately authorized, host-scoped canary may follow the complete isolated
+acceptance matrix. Promotion requires that canary's soak/health receipts; canary
+and promotion are not prerequisites that authorize themselves.
+
+## Next implementation slice
+
+Implement only the strict operation-key/epoch/terminal-receipt reducer and codec
+first, without adding a CLI apply capability. Prove conflict refusal, replay
+identity, bounds and monotonic transitions. Follow with descriptor-bound journal
+and control-ledger persistence plus crash injection; then integrate the consuming
+admission under the locks. Keep live apply disabled throughout those slices.
