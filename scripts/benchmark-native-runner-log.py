@@ -121,6 +121,30 @@ def native_receipts_complete(report: dict[str, Any], *, expected_items: int) -> 
     return post_action.get("observed") is True
 
 
+def validate_managed_adapter_receipt(
+    receipt: dict[str, Any], *, source_commit: str, source_tree: str
+) -> None:
+    """Require the managed adapter artifact to be exact and synthetic-only."""
+    fixture = receipt.get("synthetic_fixture")
+    if (
+        receipt.get("document_type") != "glaeda-managed-mac-admission-build-receipt"
+        or receipt.get("schema_version") != 1
+        or receipt.get("source_commit") != source_commit
+        or receipt.get("source_tree") != source_tree
+        or receipt.get("checked_out_commit") != source_commit
+        or receipt.get("checked_out_tree") != source_tree
+        or receipt.get("build_outcome") != "success"
+        or receipt.get("synthetic_matrix_outcome") != "success"
+        or not isinstance(receipt.get("binary_sha256"), str)
+        or re.fullmatch(r"[a-f0-9]{64}", receipt["binary_sha256"]) is None
+        or not isinstance(fixture, dict)
+        or fixture.get("mode") != "synthetic_fixture"
+        or fixture.get("live_deletion_enabled") is not False
+        or fixture.get("runner_root") is not None
+    ):
+        raise ValueError("managed adapter receipt is not exact, green, and synthetic-only")
+
+
 def classify_status(measurements: list[dict[str, Any]], *, source_matches_checkout: bool | None,
                     native_available: bool) -> tuple[str, list[str]]:
     """Return a conservative status and machine-readable blocking reasons."""
@@ -155,6 +179,7 @@ class Fixture:
         self.root = self.home / "actions-runner-idle"
         self.busy_root = self.home / "actions-runner-busy"
         self.receipts = base / "receipts"
+        self.fake_processes = base / "fake-processes.json"
         self.receipts.mkdir()
         self.stale: list[Path] = []
         self.preserved: list[Path] = []
@@ -201,6 +226,11 @@ class Fixture:
             [str(worker), "300"], cwd=self.busy_root, env={},
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        self.fake_processes.write_text(json.dumps({
+            "commands": [f"{worker} 300"],
+            "open": [str(self.preserved[1])],
+            "busy_runners": [str(self.busy_root)],
+        }))
 
     def close(self):
         self.held.close()
@@ -257,6 +287,7 @@ def measure(args, implementation: str, trial: int) -> dict:
                 ], {"HOME": str(fixture.home), "PATH": "/usr/bin:/bin",
                     "CRUFT_SWEEP_CI_TMP": str(base / "ci-tmp"),
                     "CRUFT_SWEEP_CAPTURE_ROOT": str(base / "capture"),
+                    "CRUFT_SWEEP_FAKE_PS": str(fixture.fake_processes),
                     "CRUFT_SWEEP_APPLY_BUDGET_S": "100"}))
             outcomes = fixture.outcomes()
             worker_alive = fixture.worker.poll() is None
@@ -321,6 +352,8 @@ def main() -> int:
     parser.add_argument("--native-sha256")
     parser.add_argument("--native-receipt", type=Path,
                         help="hosted build receipt for --native-binary")
+    parser.add_argument("--managed-adapter-receipt", type=Path,
+                        help="managed Mac adapter receipt consumed by the benchmark")
     parser.add_argument("--source-commit",
                         help="full source commit recorded by the hosted build receipt")
     parser.add_argument("--source-tree",
@@ -351,11 +384,30 @@ def main() -> int:
     native_available = args.native_binary is not None
     source_matches_checkout: bool | None = None
     native_receipt: dict[str, Any] | None = None
+    managed_adapter_receipt: dict[str, Any] | None = None
+    if args.managed_adapter_receipt:
+        if not args.source_commit or not args.source_tree:
+            parser.error("--managed-adapter-receipt requires --source-commit and --source-tree")
+        if not re.fullmatch(r"[a-f0-9]{40}", args.source_commit):
+            parser.error("source commit must be the full verified build receipt SHA")
+        if not re.fullmatch(r"[a-f0-9]{40}", args.source_tree):
+            parser.error("source tree must be the full verified build receipt SHA")
+        try:
+            managed_adapter_receipt = json.loads(
+                args.managed_adapter_receipt.read_text(encoding="utf-8")
+            )
+            validate_managed_adapter_receipt(
+                managed_adapter_receipt,
+                source_commit=args.source_commit,
+                source_tree=args.source_tree,
+            )
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            parser.error(f"managed adapter receipt invalid: {error}")
     if native_available:
         if not args.native_sha256 or not args.source_commit or not args.source_tree:
             parser.error("--native-binary requires --native-sha256, --source-commit, and --source-tree")
-        if not args.native_receipt:
-            parser.error("--native-binary requires --native-receipt")
+        if not args.native_receipt or not args.managed_adapter_receipt:
+            parser.error("--native-binary requires --native-receipt and --managed-adapter-receipt")
         if not args.checkout_commit or not args.checkout_tree:
             parser.error("--native-binary requires --checkout-commit and --checkout-tree")
         if not re.fullmatch(r"[a-f0-9]{40}", args.source_tree):
@@ -368,8 +420,6 @@ def main() -> int:
             parser.error("native binary must be an existing executable absolute path")
         if digest(args.native_binary) != args.native_sha256:
             parser.error("native binary hash mismatch")
-        if not re.fullmatch(r"[a-f0-9]{40}", args.source_commit):
-            parser.error("source commit must be the full verified build receipt SHA")
         try:
             native_receipt = json.loads(args.native_receipt.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
@@ -402,6 +452,7 @@ def main() -> int:
     output = {"schema": "glaeda-native-runner-log-benchmark/v3",
               "native_sha256": args.native_sha256,
               "native_receipt": native_receipt,
+              "managed_adapter_receipt": managed_adapter_receipt,
               "source_commit": args.source_commit,
               "source_tree": args.source_tree,
               "checkout_commit": args.checkout_commit,
