@@ -281,12 +281,18 @@ def attestation_ok(path: Path) -> bool | None:
     gh = find_gh()
     if not gh:
         return None
-    signed_in = subprocess.run([gh, "auth", "status"], capture_output=True, text=True, timeout=60)
+    try:
+        signed_in = subprocess.run([gh, "auth", "status"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
     if signed_in.returncode != 0:
         return None
-    result = subprocess.run([gh, "attestation", "verify", str(path), "--repo", REPOSITORY,
-                             "--signer-workflow", SIGNER_WORKFLOW, "--source-ref", "refs/heads/main"],
-                            capture_output=True, text=True, timeout=120)
+    try:
+        result = subprocess.run([gh, "attestation", "verify", str(path), "--repo", REPOSITORY,
+                                 "--signer-workflow", SIGNER_WORKFLOW, "--source-ref", "refs/heads/main"],
+                                capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
     return result.returncode == 0
 
 

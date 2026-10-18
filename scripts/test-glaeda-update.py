@@ -146,6 +146,19 @@ class UpdateTest(unittest.TestCase):
         finally:
             gu.find_gh = old_find_gh
 
+    def test_attestation_auth_timeout_is_unavailable(self) -> None:
+        old_find_gh = gu.find_gh
+        old_attestation = gu.attestation_ok
+        gu.find_gh = lambda: "/usr/bin/gh"
+        gu.attestation_ok = self.saved[1]
+        try:
+            with mock.patch.object(gu.subprocess, "run",
+                                   side_effect=subprocess.TimeoutExpired("gh", 60)):
+                self.assertIsNone(gu.attestation_ok(Path("/tmp/archive.tar.gz")))
+        finally:
+            gu.find_gh = old_find_gh
+            gu.attestation_ok = old_attestation
+
     def test_host_profile_mismatch_reports_pending(self) -> None:
         config = {**self.config, "reportStatus": True}
         entry = {"tag": "r-20260925-" + "a" * 12, "source": "a" * 40}
