@@ -485,15 +485,26 @@ pub fn synthetic_fixture_process_evidence(
     }
     let (_, uid) = validate_authority(root, receipt)?;
     let busy = root.join("bin/Runner.Worker").is_file();
+    let mut open_identities = BTreeSet::new();
+    if let Ok(metadata) = fs::symlink_metadata(root.join("_diag/open.log"))
+        && metadata.is_file()
+        && !metadata.file_type().is_symlink()
+    {
+        let identity = identity(&metadata);
+        open_identities.insert(OpenIdentity {
+            device: identity.device,
+            inode: identity.inode,
+        });
+    }
     Ok(ProcessEvidence {
         uid,
         in_scope_pids_seen: u64::from(busy),
         in_scope_pids_complete: !busy,
         unreadable_in_scope_pids: 0,
         busy_processes_observed: u64::from(busy),
-        open_identity_count: 0,
+        open_identity_count: open_identities.len() as u64,
         errors: Vec::new(),
-        open_identities: BTreeSet::new(),
+        open_identities,
     })
 }
 
