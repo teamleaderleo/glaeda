@@ -13,9 +13,8 @@ on:
       soak_hours:
         # An operator's early promotion of a narrow fix for live fleet breakage, after canary hosts
         # reported success (glaeda#1461/#1462, 2026-10-13). Every other check still applies.
-        description: "Soak hours for this run (default 6)"
+        description: "Optional explicit soak override; empty uses each release's signed policy"
         required: false
-        default: "6"
 
 permissions:
   contents: write
