@@ -8,4 +8,4 @@ ExecStart=%h/.local/bin/glaeda-idle-repair --apply
 Environment=PYTHONUNBUFFERED=1
 Nice=10
 IOSchedulingClass=idle
-TimeoutStartSec=5min
+TimeoutStartSec=15min

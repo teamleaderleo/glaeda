@@ -91,27 +91,33 @@ def main(argv: list[str] | None = None) -> int:
             return QUEUED_EXIT
 
         now = int(time.time())
+        previous = read_state()
         disk = load_disk_module()
         busy = disk.host_busy()
         if busy:
-            value = {"state": "queued", "reason": busy, "queuedAt": read_state().get("queuedAt", now),
+            value = {"state": "queued", "reason": busy, "queuedAt": previous.get("queuedAt", now),
                      "lastAttemptAt": now, "nextAttemptAt": now + 60}
             write_state(value)
             append_receipt({"at": now, "outcome": "queued", "reason": busy})
             print(json.dumps({"schema": SCHEMA, **value}, separators=(",", ":")))
             return QUEUED_EXIT
 
+        next_attempt = previous.get("nextAttemptAt")
+        if isinstance(next_attempt, (int, float)) and next_attempt > now:
+            print(json.dumps({"schema": SCHEMA, **previous}, separators=(",", ":")))
+            return 0
+
         python = os.environ.get("GLAEDA_PYTHON", sys.executable)
         disk_path = os.environ.get("GLAEDA_DISK", str(HOME / ".local/bin/glaeda-disk"))
         health_path = os.environ.get("GLAEDA_HEALTH", str(HOME / ".local/bin/glaeda-mini-health"))
         actions: list[dict[str, Any]] = []
         commands = [
-            [python, disk_path, "--refresh", "--pressure", "--idle", "--apply", "--top", "0"],
-            [python, health_path, "--apply"],
+            ([python, disk_path, "--refresh", "--pressure", "--idle", "--apply", "--top", "0"], 660),
+            ([python, health_path, "--apply"], 180),
         ]
         failed = False
-        for command in commands:
-            code, out, err = run(command, 180)
+        for command, timeout in commands:
+            code, out, err = run(command, timeout)
             action = {"argv": command, "exit": code, "stdoutTail": out, "stderrTail": err}
             actions.append(action)
             if code != 0:

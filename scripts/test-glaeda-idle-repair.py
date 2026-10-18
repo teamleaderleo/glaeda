@@ -53,6 +53,17 @@ class IdleRepairTest(unittest.TestCase):
         state = json.loads(idle.STATE.read_text())
         self.assertEqual(state["state"], "idle")
         self.assertEqual([a["exit"] for a in state["actions"]], [0, 0])
+        self.assertEqual([call.args[1] for call in run.call_args_list], [660, 180])
+
+    def test_successful_repair_waits_until_next_attempt(self) -> None:
+        disk = mock.Mock()
+        disk.host_busy.return_value = ""
+        with mock.patch.object(idle, "load_disk_module", return_value=disk), \
+             mock.patch.object(idle, "run", side_effect=[(0, "disk ok", ""), (0, "health ok", "")]) as run, \
+             mock.patch.object(idle.time, "time", side_effect=[1000, 1001]):
+            self.assertEqual(idle.main(["--apply"]), 0)
+            self.assertEqual(idle.main(["--apply"]), 0)
+        self.assertEqual(run.call_count, 2)
 
     def test_status_is_read_only(self) -> None:
         idle.write_state({"state": "queued", "reason": "reservation"})
