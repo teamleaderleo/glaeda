@@ -7,7 +7,9 @@ use glaeda::runner_log_reclaim::{
     Policy, observe_synthetic_fixture, read_enrollment_receipt, reclaim, reclaim_synthetic_fixture,
     synthetic_fixture_process_evidence,
 };
-use glaeda::runner_log_reclaim_store::{StoreError, apply_synthetic_fixture_batch};
+use glaeda::runner_log_reclaim_store::{
+    StoreError, apply_synthetic_fixture_batch, validate_synthetic_fixture_paths,
+};
 use serde_json::json;
 
 #[derive(Debug, Parser)]
@@ -60,6 +62,16 @@ fn main() -> ExitCode {
         eprintln!("glaeda-runner-log-reclaim: synthetic_fixture_required");
         return ExitCode::from(2);
     }
+    if cli.synthetic_fixture {
+        let Some(state_root) = cli.state_root.as_deref() else {
+            eprintln!("glaeda-runner-log-reclaim: synthetic fixture requires --state-root");
+            return ExitCode::from(2);
+        };
+        if let Err(error) = validate_synthetic_fixture_paths(&cli.runner_root, state_root) {
+            eprintln!("glaeda-runner-log-reclaim: {error}");
+            return ExitCode::from(2);
+        }
+    }
     let report = match if cli.synthetic_fixture {
         reclaim_synthetic_fixture(&cli.runner_root, &receipt, policy)
     } else {
@@ -94,13 +106,7 @@ fn main() -> ExitCode {
                 reason: "expired_retention",
             })
             .collect::<Vec<_>>();
-        let state_root = match cli.state_root.as_deref() {
-            Some(path) => path,
-            None => {
-                eprintln!("glaeda-runner-log-reclaim: synthetic fixture requires --state-root");
-                return ExitCode::from(2);
-            }
-        };
+        let state_root = cli.state_root.as_deref().expect("validated above");
         let transaction = apply_synthetic_fixture_batch(
             &cli.runner_root,
             &receipt,

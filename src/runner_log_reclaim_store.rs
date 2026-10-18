@@ -156,6 +156,44 @@ pub struct SyntheticFixtureApplyReceipt {
     pub apply: ApplyReceipt,
 }
 
+/// Require the synthetic transaction to stay inside the benchmark's private temporary fixture.
+/// The install-id prefix is necessary but insufficient: callers must not be able to turn this
+/// test-only mutation path into a general owned-root deletion API.
+pub fn validate_synthetic_fixture_paths(root: &Path, state_root: &Path) -> Result<(), StoreError> {
+    let root = std::fs::canonicalize(root).map_err(|_| StoreError::Invalid("fixture_root"))?;
+    let temp = std::fs::canonicalize(std::env::temp_dir())
+        .map_err(|_| StoreError::Invalid("fixture_temp_root"))?;
+    let base = root
+        .parent()
+        .and_then(Path::parent)
+        .ok_or(StoreError::Invalid("fixture_root"))?;
+    let state_parent = state_root
+        .parent()
+        .ok_or(StoreError::Invalid("fixture_state_root"))?;
+    let state_parent = std::fs::canonicalize(state_parent)
+        .map_err(|_| StoreError::Invalid("fixture_state_root"))?;
+    let root_parent_name = root
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str());
+    let root_name = root.file_name().and_then(|value| value.to_str());
+    let state_name = state_root.file_name().and_then(|value| value.to_str());
+    if !base.starts_with(&temp)
+        || !base
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.starts_with("glaeda-bench-native-"))
+        || state_parent != base
+        || root_parent_name != Some("home")
+        || !root_name.is_some_and(|value| value.starts_with("actions-runner-"))
+        || !state_name
+            .is_some_and(|value| value.starts_with("actions-runner-") && value.ends_with("-state"))
+    {
+        return Err(StoreError::Invalid("fixture_path_scope"));
+    }
+    Ok(())
+}
+
 pub struct RunnerLogStore {
     root: OwnedFd,
     diag: OwnedFd,
@@ -889,6 +927,7 @@ where
     if !receipt.install_id.starts_with("synthetic-") {
         return Err(StoreError::Invalid("synthetic_fixture_required"));
     }
+    validate_synthetic_fixture_paths(root, state_root)?;
     let mut store = RunnerLogStore::open(root, receipt, state_root)?;
     let recovery = store.recover(policy, &mut observe)?;
     if recovery.pending != 0 {
@@ -961,6 +1000,18 @@ mod tests {
         assert!(matches!(
             result,
             Err(StoreError::Invalid("marker_mismatch"))
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn synthetic_fixture_paths_reject_non_fixture_roots() {
+        let (root, _, _) = fixture();
+        let runner = root.join("runner");
+        let state = root.join("state");
+        assert!(matches!(
+            validate_synthetic_fixture_paths(&runner, &state),
+            Err(StoreError::Invalid("fixture_path_scope"))
         ));
         fs::remove_dir_all(root).unwrap();
     }
