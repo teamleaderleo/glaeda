@@ -1009,7 +1009,9 @@ def observe_host(manifest: dict[str, Any], name: str, script: bytes | None = Non
     else:
         code, output = remote_result(proc.stdout, proc.returncode)
     if code != 0:
-        err = proc.stderr.decode(errors="replace").strip().splitlines()
+        raw_err = proc.stderr
+        err = (raw_err.decode(errors="replace") if isinstance(raw_err, bytes) else (raw_err or "")) \
+            .strip().splitlines()
         return {"host": name, "reachable": False, "error": (err[-1] if err else f"ssh exit {code}")[:200]}
     text = output.decode(errors="replace") if isinstance(output, bytes) else (output or "")
     data = parse_probe(text)
@@ -1886,7 +1888,9 @@ def reservation_ssh(name: str, user: str, script: str, args: list[str], stdin: s
     except subprocess.TimeoutExpired:
         return 124, b"", "timed out after 60s; outcome unknown, re-run check"
     code, output = remote_result(proc.stdout, proc.returncode)
-    return code, output, proc.stderr.decode(errors="replace").strip()[-400:]
+    raw_err = proc.stderr
+    err = raw_err.decode(errors="replace") if isinstance(raw_err, bytes) else (raw_err or "")
+    return code, output, err.strip()[-400:]
 
 
 def read_reservation(name: str, user: str, options: tuple[str, ...] = ()) -> dict[str, Any]:
