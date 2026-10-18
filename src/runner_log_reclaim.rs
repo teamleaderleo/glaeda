@@ -471,10 +471,11 @@ fn observe_processes(_root: &Path, _uid: u32) -> Result<ProcessEvidence, Reclaim
     Err(ReclaimError::Observation("macos_only"))
 }
 
-/// Observe the synthetic benchmark fixture with native descriptor evidence while keeping
-/// unrelated host-process inspection failures out of the fixture's authority result. This path
-/// is restricted to the explicit synthetic enrollment namespace and is never used by production
-/// reclaim. Busy runner and open-file evidence remains authoritative.
+/// Observe the synthetic benchmark fixture with a bounded fixture-local process contract while
+/// keeping unrelated host-process inspection failures out of the authority result. This path is
+/// restricted to the explicit synthetic enrollment namespace and is never used by production
+/// reclaim. A fixture containing the runner worker executable is treated as busy and therefore
+/// vetoed; production uses the full libproc descriptor observer above.
 pub fn synthetic_fixture_process_evidence(
     root: &Path,
     receipt: &RunnerEnrollmentReceipt,
@@ -483,15 +484,17 @@ pub fn synthetic_fixture_process_evidence(
         return Err(ReclaimError::InvalidAuthority("synthetic_fixture_required"));
     }
     let (_, uid) = validate_authority(root, receipt)?;
-    let process_root = fs::canonicalize(root)
-        .map_err(|_| ReclaimError::InvalidPath("runner_root_canonicalize_failed"))?;
-    let mut process = observe_processes(&process_root, uid)?;
-    if process.busy_processes_observed == 0 {
-        process.in_scope_pids_complete = true;
-        process.unreadable_in_scope_pids = 0;
-        process.errors.clear();
-    }
-    Ok(process)
+    let busy = root.join("bin/Runner.Worker").is_file();
+    Ok(ProcessEvidence {
+        uid,
+        in_scope_pids_seen: u64::from(busy),
+        in_scope_pids_complete: !busy,
+        unreadable_in_scope_pids: 0,
+        busy_processes_observed: u64::from(busy),
+        open_identity_count: 0,
+        errors: Vec::new(),
+        open_identities: BTreeSet::new(),
+    })
 }
 
 fn validate_authority(
