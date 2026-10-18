@@ -3033,10 +3033,17 @@ ACQUIRE_FAILED = ("[2026-09-28 13:53:13Z ERR  Runner] Caught exception from acqu
 
 class LeakedAppTest(unittest.TestCase):
     def test_orphan_hook_requires_dead_runner_and_no_children(self) -> None:
-        with mock.patch.object(hook, "process_alive", return_value=False):
+        with mock.patch.object(hook, "pid_alive", return_value=False):
             self.assertTrue(hook.orphan_hook_should_exit(42, "ps:start", set()))
             self.assertFalse(hook.orphan_hook_should_exit(42, "ps:start", {99}))
-        with mock.patch.object(hook, "process_alive", return_value=True):
+        with mock.patch.object(hook, "pid_alive", return_value=True), \
+                mock.patch.object(hook, "process_identity", return_value=None):
+            self.assertFalse(hook.orphan_hook_should_exit(42, "ps:start", set()))
+        with mock.patch.object(hook, "pid_alive", return_value=True), \
+                mock.patch.object(hook, "process_identity", return_value="ps:new"):
+            self.assertTrue(hook.orphan_hook_should_exit(42, "ps:start", set()))
+        with mock.patch.object(hook, "pid_alive", return_value=True), \
+                mock.patch.object(hook, "process_identity", return_value="ps:start"):
             self.assertFalse(hook.orphan_hook_should_exit(42, "ps:start", set()))
 
     def test_orphaned_test_app_is_selected_but_live_job_app_is_protected(self) -> None:

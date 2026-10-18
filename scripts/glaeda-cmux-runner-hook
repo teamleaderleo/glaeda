@@ -1115,7 +1115,12 @@ def direct_child_pids(pid: int) -> set[int]:
 
 def orphan_hook_should_exit(worker_pid: int, worker_identity: str, children: set[int]) -> bool:
     """Only reap a hook after its original Runner.Worker is gone and it has no child work."""
-    return not process_alive(worker_pid, worker_identity) and not children
+    if children or pid_alive(worker_pid):
+        # A live PID with an unreadable start token is unknown, not orphaned.
+        # This avoids killing a real job during a transient /bin/ps failure.
+        current = process_identity(worker_pid)
+        return current is not None and current != worker_identity
+    return True
 
 
 def start_runner_parent_watchdog(worker_pid: int | None) -> None:
