@@ -111,8 +111,12 @@ def main(argv: list[str] | None = None) -> int:
         disk_path = os.environ.get("GLAEDA_DISK", str(HOME / ".local/bin/glaeda-disk"))
         health_path = os.environ.get("GLAEDA_HEALTH", str(HOME / ".local/bin/glaeda-mini-health"))
         actions: list[dict[str, Any]] = []
+        disk_command = [python, disk_path]
+        if role := os.environ.get("GLAEDA_ROLE"):
+            disk_command.extend(["--role", role])
+        disk_command.extend(["--refresh", "--pressure", "--idle", "--apply", "--top", "0"])
         commands = [
-            ([python, disk_path, "--refresh", "--pressure", "--idle", "--apply", "--top", "0"], 660),
+            (disk_command, 660),
             ([python, health_path, "--apply"], 180),
         ]
         failed = False

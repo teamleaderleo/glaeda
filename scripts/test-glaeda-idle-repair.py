@@ -46,10 +46,12 @@ class IdleRepairTest(unittest.TestCase):
     def test_idle_host_runs_disk_then_health_and_records_receipt(self) -> None:
         disk = mock.Mock()
         disk.host_busy.return_value = ""
-        with mock.patch.object(idle, "load_disk_module", return_value=disk), \
+        with mock.patch.dict(idle.os.environ, {"GLAEDA_ROLE": "devbox"}), \
+             mock.patch.object(idle, "load_disk_module", return_value=disk), \
              mock.patch.object(idle, "run", side_effect=[(0, "disk ok", ""), (0, "health ok", "")]) as run:
             self.assertEqual(idle.main(["--apply"]), 0)
         self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args[0][2:4], ["--role", "devbox"])
         state = json.loads(idle.STATE.read_text())
         self.assertEqual(state["state"], "idle")
         self.assertEqual([a["exit"] for a in state["actions"]], [0, 0])

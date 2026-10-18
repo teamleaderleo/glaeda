@@ -6,6 +6,7 @@ Documentation=https://github.com/teamleaderleo/glaeda/blob/main/scripts/glaeda-i
 Type=oneshot
 ExecStart=%h/.local/bin/glaeda-idle-repair --apply
 Environment=PYTHONUNBUFFERED=1
+Environment=GLAEDA_ROLE=@GLAEDA_ROLE@
 Nice=10
 IOSchedulingClass=idle
 TimeoutStartSec=15min

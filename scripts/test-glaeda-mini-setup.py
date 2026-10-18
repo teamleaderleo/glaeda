@@ -247,6 +247,7 @@ class MiniSetupTest(unittest.TestCase):
         repair = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.idle-repair.plist").read_bytes())
         self.assertEqual(repair["ProgramArguments"], ["/usr/bin/python3", os.fspath(bin_dir / "glaeda-idle-repair"), "--apply"])
         self.assertEqual(repair["StartInterval"], 60)
+        self.assertEqual(repair["EnvironmentVariables"]["GLAEDA_ROLE"], "fleet-mini")
         self.assertEqual(warm["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-idle-warm"), "--apply"])
         self.assertIsNone(warm.get("ProcessType"), "its build runs only while the mini is idle and should be fast")
         self.assertEqual((bin_dir / "glaeda-idle-warm").read_bytes(), (ROOT / "scripts/glaeda-idle-warm").read_bytes())

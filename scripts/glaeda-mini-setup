@@ -703,6 +703,7 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "ProcessType": "Background",
             "LowPriorityIO": True,
             "Nice": 10,
+            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk, "GLAEDA_ROLE": ctx.role},
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-idle-repair.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-idle-repair.err"),
         },
