@@ -56,8 +56,8 @@ jobs:
           fi
           # releases newest first, down to stable; soaking ones count too, since their canary failures
           # block promoting anything older
-          gh release list --limit 40 --json tagName,createdAt \
-            --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | "\(.tagName) \(.createdAt)"' \
+          gh release list --limit 40 --json tagName,publishedAt \
+            --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | "\(.tagName) \(.publishedAt)"' \
             > channels/releases.txt
           : > channels/candidates.jsonl
           considered=0

@@ -365,17 +365,21 @@ def restore(state_dir: Path, bin_dir: Path) -> bool:
     return True
 
 
-def report(config: dict, entry: dict, ok: bool, detail: str) -> str:
+def report(config: dict, entry: dict, ok: bool | None, detail: str) -> str:
     if config["ring"] != "canary" or not config["reportStatus"]:
         return "not reported (not a reporting canary)"
     gh = find_gh()
     if not gh:
         return "not reported (no gh)"
-    result = subprocess.run(
-        [gh, "api", "-X", "POST", f"repos/{REPOSITORY}/statuses/{entry['source']}",
-         "-f", f"state={'success' if ok else 'failure'}", "-f", f"context={STATUS_PREFIX}{config['host']}",
-         "-f", f"description={entry['tag']}: {detail}"[:140]],
-        capture_output=True, text=True, timeout=60)
+    state = "success" if ok is True else "failure" if ok is False else "pending"
+    try:
+        result = subprocess.run(
+            [gh, "api", "-X", "POST", f"repos/{REPOSITORY}/statuses/{entry['source']}",
+             "-f", f"state={state}", "-f", f"context={STATUS_PREFIX}{config['host']}",
+             "-f", f"description={entry['tag']}: {detail}"[:140]],
+            capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"not reported ({type(e).__name__})"
     return "reported" if result.returncode == 0 else f"not reported (gh exited {result.returncode})"
 
 
@@ -686,12 +690,12 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         detail = (f"target {entry['tag']} is {order} than installed {state['current']}; refusing to replace it")
         # This is a channel or host-configuration mismatch, not a failed artifact.
         # Re-evaluate it after the channel advances or setup flags change.
-        return {**out, "result": "refused", "detail": detail, "status": report(config, entry, False, detail)}
+        return {**out, "result": "refused", "detail": detail, "status": report(config, entry, None, detail)}
     supported, detail = setup_args_supported(gen, config["setupArgs"])
     if not supported:
         # An older release can be valid for another host profile. Do not turn a
         # persisted setup flag mismatch into an operator-cleared release gate.
-        return {**out, "result": "refused", "detail": detail, "status": report(config, entry, False, detail)}
+        return {**out, "result": "refused", "detail": detail, "status": report(config, entry, None, detail)}
     if state["current"] is None:
         snapshot(state_dir, bin_dir)
     ok, log = run_setup(gen, config["setupArgs"])
