@@ -4270,6 +4270,12 @@ def read_eviction_contention(receipt: Path) -> dict[str, Any] | None:
         owner = record.get("owner")
         if not isinstance(owner, dict):
             owner = {}
+        owner_pid = owner.get("pid")
+        if isinstance(owner_pid, int) and not isinstance(owner_pid, bool) and owner_pid > 0 and not _pid_alive(owner_pid):
+            # A completed or crashed sweep can leave its last skip receipt behind.  A dead
+            # owner is no longer contention; retaining it makes mini-health report a live
+            # blocker until the age timeout even though the lock is free.
+            return None
         bounded_owner = {key: owner[key] for key in ("state", "pid", "owner", "started_at", "age_s")
                          if key in owner}
         return {"at": record.get("at"), "at_epoch": at_epoch, "owner": bounded_owner}

@@ -1814,6 +1814,14 @@ class GlaedaDiskTest(unittest.TestCase):
                 gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])
             survey.assert_called_once()
 
+    def test_dead_eviction_owner_does_not_keep_contention_health_stale(self) -> None:
+        receipt = self.receipt()
+        receipt.write_text(json.dumps({"at": "now", "at_epoch": time.time(), "family": "eviction",
+                                       "outcome": "skipped", "reason": "another eviction running",
+                                       "owner": {"pid": 12345, "owner": "cmux", "state": "live"}}) + "\n")
+        with mock.patch.object(gd, "_pid_alive", return_value=False):
+            self.assertIsNone(gd.read_eviction_contention(receipt))
+
     def test_measurement_busy_json_is_not_a_completed_empty_report(self) -> None:
         lock = self.root / "measurement.lock"
         with mock.patch.object(gd, "MEASURE_LOCK", lock), \
