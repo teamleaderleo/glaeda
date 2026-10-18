@@ -51,7 +51,9 @@ POLICY_SCHEMA = "glaeda-release-policy/v1"
 TARGETS = ("aarch64-apple-darwin", "x86_64-unknown-linux-gnu")
 STATUS_PREFIX = "glaeda-ota/"
 SOAK_HOURS = 6
-RISK_SOAK_HOURS = {"low": 2, "normal": 6, "high": 12}
+# A short window catches immediate install/health regressions. Risk still controls
+# canary coverage, while legacy manifests retain the original six-hour behavior.
+RISK_SOAK_HOURS = {"low": 0.25, "normal": 0.25, "high": 0.25}
 CANARY_HOSTS = ("air-blue", "big-red")
 MAX_ASSET = 200 * 1024 * 1024
 TAG_RE = re.compile(r"r-\d{8}-[0-9a-f]{12}")

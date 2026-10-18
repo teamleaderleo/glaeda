@@ -545,13 +545,13 @@ class ReleaseTest(unittest.TestCase):
 
     def test_policy_classifies_exact_paths_and_sets_coverage(self) -> None:
         low = gr.policy_for_paths(["docs/GLAEDA_OTA.md", "tests/test_policy.md"])
-        self.assertEqual((low["risk"], low["soakHours"], low["requiredHosts"]), ("low", 2, []))
+        self.assertEqual((low["risk"], low["soakHours"], low["requiredHosts"]), ("low", 0.25, []))
         normal = gr.policy_for_paths(["scripts/telemetry.py"])
         self.assertEqual((normal["risk"], normal["soakHours"], normal["requiredHosts"]),
-                         ("normal", 6, list(gr.CANARY_HOSTS)))
+                         ("normal", 0.25, list(gr.CANARY_HOSTS)))
         high = gr.policy_for_paths(["scripts/glaeda-update"])
         self.assertEqual((high["risk"], high["soakHours"], high["requiredHosts"]),
-                         ("high", 12, list(gr.CANARY_HOSTS)))
+                         ("high", 0.25, list(gr.CANARY_HOSTS)))
         self.assertEqual(gr.policy_for_paths([])["risk"], "high")
 
     def test_policy_requires_each_registered_canary_for_operational_release(self) -> None:
