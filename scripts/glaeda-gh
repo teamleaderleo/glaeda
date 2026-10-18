@@ -639,8 +639,11 @@ class Daemon:
                 path.unlink(missing_ok=True)
                 continue
             requested_sha = str(doc.get("sha") or "").lower() or None
-            out.append({"key": key, "jobs": bool(doc.get("jobs")), "sha": requested_sha,
-                        "cache": cached, "touched": self.now - age})
+            entry = {"key": key, "jobs": bool(doc.get("jobs")), "cache": cached,
+                     "touched": self.now - age}
+            if requested_sha:
+                entry["sha"] = requested_sha
+            out.append(entry)
         return out
 
     def due(self, kind: str, entries: list[dict]) -> list[dict]:
