@@ -34,6 +34,7 @@ import gzip
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import subprocess
@@ -352,6 +353,9 @@ def main(argv: list[str] | None = None) -> int:
     k.add_argument("--paused", choices=("true", "false"), required=True)
     a = ap.parse_args(argv)
     try:
+        if a.command == "promote" and a.soak_hours is not None \
+                and (not math.isfinite(a.soak_hours) or a.soak_hours < 0):
+            raise ReleaseError("--soak-hours must be finite and non-negative")
         if a.command == "hygiene":
             raw = hygiene_archive(Path(__file__).resolve().parents[1], a.source, a.reclaim)
             a.output.mkdir(parents=True, exist_ok=True)

@@ -125,6 +125,10 @@ class UpdateError(RuntimeError):
     pass
 
 
+class UpdateInconclusive(UpdateError):
+    """A transient or host-observability condition that must not quarantine a release."""
+
+
 def local_target() -> str:
     system, machine = platform.system(), platform.machine().lower()
     if system == "Darwin" and machine in ("arm64", "aarch64"):
@@ -425,10 +429,12 @@ def download(state_dir: Path, entry: dict, target: str, ring: str, source: str =
     archive = partial / name
     archive.write_bytes(raw)
     attested = attestation_ok(archive)
-    if attested is False or (attested is None and ring == "canary"):
+    if attested is False:
         shutil.rmtree(partial, ignore_errors=True)
-        raise UpdateError("build-provenance attestation did not verify" if attested is False else
-                          "a canary must verify the attestation: install gh and sign in")
+        raise UpdateError("build-provenance attestation did not verify")
+    if attested is None and ring == "canary":
+        shutil.rmtree(partial, ignore_errors=True)
+        raise UpdateInconclusive("a canary must verify the attestation: install gh and sign in")
     safe_extract(archive, partial)
     archive.unlink()
     (partial / "release.json").write_bytes(release_raw)
@@ -673,6 +679,11 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         return {**out, "result": "plan", "why": f"would install {entry['tag']}"}
     try:
         gen = download(state_dir, entry, local_target(), config["ring"], source)
+    except UpdateInconclusive as e:
+        return {**out, "result": "inconclusive", "detail": str(e), "status": report(config, entry, None, str(e))}
+    except (urllib.error.URLError, TimeoutError) as e:
+        detail = f"transient update fetch: {e}"
+        return {**out, "result": "inconclusive", "detail": detail, "status": report(config, entry, None, detail)}
     except UpdateError as e:
         # The release failed verification (digest, attestation, archive): that is the release's fault
         # or a real attack, never a blip, so it counts against it. Network errors are not UpdateError

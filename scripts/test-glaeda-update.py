@@ -15,6 +15,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -157,6 +158,17 @@ class UpdateTest(unittest.TestCase):
                 self.assertIn("state=pending", run.call_args.args[0])
         finally:
             gu.find_gh = old_find_gh
+
+    def test_fetch_timeout_is_inconclusive_and_does_not_quarantine(self) -> None:
+        entry = self.server.publish(SOURCES[0])
+        old_fetch = gu.fetch
+        gu.fetch = mock.Mock(side_effect=urllib.error.URLError("offline"))
+        try:
+            result = self.run_update()
+        finally:
+            gu.fetch = old_fetch
+        self.assertEqual(result["result"], "inconclusive")
+        self.assertNotIn(entry["tag"], gu.load_state(self.state)["quarantined"])
 
     def run_update(self, apply: bool = True) -> dict:
         return gu.update(apply, self.config, self.state, self.server.channel(self.config["ring"]), self.bin)
@@ -375,7 +387,10 @@ class UpdateTest(unittest.TestCase):
         # a canary that cannot check refuses; stable, which only names canary-verified releases, installs
         self.server.publish(SOURCES[1])
         gu.attestation_ok = lambda path: None
-        self.assertIn("canary must verify", self.run_update()["detail"])
+        inconclusive = self.run_update()
+        self.assertEqual(inconclusive["result"], "inconclusive")
+        self.assertIn("canary must verify", inconclusive["detail"])
+        self.assertNotIn(self.server.rings["canary"]["tag"], gu.load_state(self.state)["quarantined"])
         self.assertFalse(self.bin.exists())
         self.config["ring"] = "stable"
         self.state = self.root / "stable-host-state"  # another host, which has quarantined nothing
@@ -520,6 +535,13 @@ class ReleaseTest(unittest.TestCase):
         self.assertTrue(gr.promotion(candidate, None, both, self.NOW)[0])
         pending = one + [self.status("big-red", "pending", "2026-09-25T02:00:00Z")]
         self.assertIn("inconclusive", gr.promotion(candidate, None, pending, self.NOW)[1])
+
+    def test_soak_override_rejects_non_finite_or_negative_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "candidates.jsonl"
+            path.write_text("")
+            for value in ("-1", "nan", "inf"):
+                self.assertEqual(gr.main(["promote", "--candidates", str(path), "--soak-hours", value]), 1)
 
     def test_promotion_needs_soak_success_and_no_failure(self) -> None:
         ok = [self.status("air-blue", "success", "2026-09-25T01:00:00Z")]
