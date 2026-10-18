@@ -4764,7 +4764,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         with receipt.open("a") as f:
             f.write(json.dumps(rec) + "\n")
         print(f"  {outcome:16s} {gib(i.bytes)}  {i.path.replace(str(HOME), '~')}")
-    print(f"logical released {gib(released).strip()}; physical df delta is measured in the run summary; "
+    print(f"logical released {released} bytes ({gib(released).strip()}); physical df delta is measured in the run summary; "
           f"receipt {receipt}")
     return released
 
@@ -5533,9 +5533,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
                                          before_fs_receipt, after_fs_receipt,
                                          receipt_accounting_before, after_accounting)
         physical = summary["physical_df_delta_bytes"]
-        physical_text = (gib(physical).strip() if isinstance(physical, int)
+        physical_text = (f"{physical} bytes ({physical / GIB:+.1f}G)" if isinstance(physical, int)
                          else "unknown (post-sweep observation incomplete)")
-        print(f"eviction summary: logical released {gib(logical_released).strip()}; "
+        print(f"eviction summary: logical released {logical_released} bytes ({gib(logical_released).strip()}); "
               f"physical df delta {physical_text}; blocked {gib(summary['blocked_bytes']).strip()} "
               f"(unchecked {gib(summary['unchecked_bytes']).strip()}); "
               f"accounting gap {gib(summary['accounting_gap_bytes']).strip()}; receipt {a.receipt}")
