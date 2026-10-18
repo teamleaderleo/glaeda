@@ -187,9 +187,10 @@ class Fixture:
         for root in (self.root, self.busy_root):
             (root / "_diag").mkdir(parents=True)
             (root / ".runner").write_text("{}")
-            (root / ".glaeda-cmux-runner").write_text(root.name + "\n")
+            (root / ".glaeda-cmux-runner").write_text(f"synthetic-{root.name}\n")
             (self.receipts / (root.name + ".json")).write_text(json.dumps({
-                "runnerDirOwned": True, "runnerDir": str(root), "installId": root.name,
+                "runnerDirOwned": True, "runnerDir": str(root),
+                "installId": f"synthetic-{root.name}",
             }))
         for index in range(count):
             path = self.root / "_diag" / f"stale-{index:04}.log"
@@ -273,7 +274,7 @@ def measure(args, implementation: str, trial: int) -> dict:
                         "--enrollment-receipt", str(fixture.receipts / (root.name + ".json")),
                         "--minimum-idle-seconds", str(7 * 86400), "--batch-size", "64",
                         "--state-root", str(base / (root.name + "-state")),
-                        "--output", "json", "--apply",
+                        "--output", "json", "--apply", "--synthetic-fixture",
                     ], {})
                     try:
                         run["report"] = json.loads(run.pop("stdout"))

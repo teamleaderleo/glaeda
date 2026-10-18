@@ -14,10 +14,13 @@ managed receipt must report a successful synthetic matrix and
 `live_deletion_enabled=false`; the benchmark rejects a receipt that is not bound
 to the same source/tree. `--checkout-commit` and
 `--checkout-tree` bind that receipt to the checkout being benchmarked. The
-current observer intentionally returns
+ordinary observer intentionally returns
 `reclaim_not_ready` for `--apply`; the harness records that as
-`blocked_native_effect_comparison` and does not permit a speedup claim. A
-missing binary likewise runs the Python baseline and emits a blocked receipt.
+`blocked_native_effect_comparison` and does not permit a speedup claim. The
+isolated fixture lane passes the explicit `--synthetic-fixture` flag; that
+enrollment-gated path can delete only the private temporary fixture and does
+not enable live runner deletion. A missing binary likewise runs the Python
+baseline and emits a blocked receipt.
 
 Example using the existing optimized Python baseline:
 

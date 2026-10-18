@@ -147,6 +147,15 @@ pub struct ApplyReceipt {
     pub receipts: Vec<String>,
 }
 
+/// Result of the explicitly synthetic fixture transaction. This is the only public mutation
+/// helper exposed by the store; production callers still use the typed adapter, whose live apply
+/// backend remains disabled.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SyntheticFixtureApplyReceipt {
+    pub recovery: RecoveryReceipt,
+    pub apply: ApplyReceipt,
+}
+
 pub struct RunnerLogStore {
     root: OwnedFd,
     diag: OwnedFd,
@@ -860,6 +869,33 @@ impl RunnerLogStore {
         }
         Ok(receipt)
     }
+}
+
+/// Apply an already-observed synthetic fixture batch through the descriptor-bound transaction
+/// store. The enrollment namespace is deliberately reserved so this cannot be used for a live
+/// runner root. The closure is still called before recovery and every candidate, preserving the
+/// same fail-closed process checks as the underlying transaction path.
+pub fn apply_synthetic_fixture_batch<F>(
+    root: &Path,
+    receipt: &RunnerEnrollmentReceipt,
+    state_root: &Path,
+    candidates: &[LogItem],
+    policy: Policy,
+    mut observe: F,
+) -> Result<SyntheticFixtureApplyReceipt, StoreError>
+where
+    F: FnMut() -> Result<ProcessEvidence, StoreError>,
+{
+    if !receipt.install_id.starts_with("synthetic-") {
+        return Err(StoreError::Invalid("synthetic_fixture_required"));
+    }
+    let mut store = RunnerLogStore::open(root, receipt, state_root)?;
+    let recovery = store.recover(policy, &mut observe)?;
+    if recovery.pending != 0 {
+        return Err(StoreError::ObservationIncomplete);
+    }
+    let apply = store.apply_batch(candidates, policy, &mut observe)?;
+    Ok(SyntheticFixtureApplyReceipt { recovery, apply })
 }
 
 #[cfg(test)]
