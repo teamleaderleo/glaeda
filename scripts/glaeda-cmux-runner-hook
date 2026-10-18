@@ -1101,21 +1101,29 @@ def runner_worker_pid() -> int | None:
 def direct_child_pids(pid: int) -> set[int]:
     """Return direct children without trusting the job's PATH or following a process tree."""
     try:
-        out = subprocess.run(["/bin/ps", "-axo", "pid=,ppid="], stdin=subprocess.DEVNULL,
+        out = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,comm="], stdin=subprocess.DEVNULL,
                              capture_output=True, text=True, timeout=5, check=True).stdout
     except (OSError, subprocess.SubprocessError):
         return {pid}  # fail closed: an unreadable process table is not proof of an orphan
     children: set[int] = set()
     for line in out.splitlines():
         fields = line.split()
-        if len(fields) == 2 and fields[0].isdigit() and fields[1].isdigit() and int(fields[1]) == pid:
+        if (len(fields) >= 3 and fields[0].isdigit() and fields[1].isdigit()
+                and os.path.basename(fields[2]) != "ps" and int(fields[1]) == pid):
             children.add(int(fields[0]))
     return children
 
 
-def orphan_hook_should_exit(worker_pid: int, worker_identity: str, children: set[int]) -> bool:
+def orphan_hook_should_exit(worker_pid: int, worker_identity: str, children: set[int], parent_pid: int | None = None) -> bool:
     """Only reap a hook after its original Runner.Worker is gone and it has no child work."""
-    if children or pid_alive(worker_pid):
+    if children:
+        return False
+    # Runner.Worker execs the hook wrapper, so a crashed runner reparents the
+    # hook directly to launchd. This avoids macOS `ps lstart`'s one-second
+    # resolution and cannot confuse a same-second PID reuse for our parent.
+    if parent_pid == 1:
+        return True
+    if pid_alive(worker_pid):
         # A live PID with an unreadable start token is unknown, not orphaned.
         # This avoids killing a real job during a transient /bin/ps failure.
         current = process_identity(worker_pid)
@@ -1140,7 +1148,7 @@ def start_runner_parent_watchdog(worker_pid: int | None) -> None:
     def watch() -> None:
         while True:
             time.sleep(ORPHAN_HOOK_POLL_S)
-            if orphan_hook_should_exit(worker_pid, identity, direct_child_pids(os.getpid())):
+            if orphan_hook_should_exit(worker_pid, identity, direct_child_pids(os.getpid()), os.getppid()):
                 print(f"{PREFIX}: orphaned job-started hook; Runner.Worker {worker_pid} is gone, releasing admission", flush=True)
                 os.kill(os.getpid(), signal.SIGTERM)
                 return
