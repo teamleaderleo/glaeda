@@ -159,6 +159,20 @@ class UpdateTest(unittest.TestCase):
             gu.find_gh = old_find_gh
             gu.attestation_ok = old_attestation
 
+    def test_attestation_api_failure_is_unavailable(self) -> None:
+        old_find_gh = gu.find_gh
+        old_attestation = gu.attestation_ok
+        gu.find_gh = lambda: "/usr/bin/gh"
+        gu.attestation_ok = self.saved[1]
+        try:
+            responses = [subprocess.CompletedProcess([], 0, "", ""),
+                         subprocess.CompletedProcess([], 1, "", "HTTP 403: API rate limit")]
+            with mock.patch.object(gu.subprocess, "run", side_effect=responses):
+                self.assertIsNone(gu.attestation_ok(Path("/tmp/archive.tar.gz")))
+        finally:
+            gu.find_gh = old_find_gh
+            gu.attestation_ok = old_attestation
+
     def test_host_profile_mismatch_reports_pending(self) -> None:
         config = {**self.config, "reportStatus": True}
         entry = {"tag": "r-20260925-" + "a" * 12, "source": "a" * 40}

@@ -293,6 +293,11 @@ def attestation_ok(path: Path) -> bool | None:
                                 capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired):
         return None
+    diagnostic = (result.stdout + result.stderr).lower()
+    if any(marker in diagnostic for marker in ("http 401", "http 403", "http 429", "api rate",
+                                                 "timeout", "timed out", "connection", "network",
+                                                 "temporarily unavailable", "permission denied")):
+        return None
     return result.returncode == 0
 
 
