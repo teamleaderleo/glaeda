@@ -68,8 +68,9 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    - the release's signed `policy` is valid and its publication timestamp is older than that policy's
      soak floor: new releases use a 15-minute window. Risk still controls canary coverage: low-risk
      documentation/test-only changes need one canary, while normal, high-risk, and ambiguous changes
-     need explicit success from both Air Blue and Big Red. Legacy manifests retain the original
-     6-hour behavior;
+     need explicit success from both Air Blue and Big Red. Historical signed 2/6/12-hour policies
+     remain readable during the transition; manifests without a policy retain the original 6-hour
+     fallback;
    - low-risk releases have an explicit success from at least one canary; normal and high-risk
      releases have explicit success from both registered canaries, Air Blue and Big Red;
    - no required canary host's newest status is a failure, pending, or otherwise inconclusive;

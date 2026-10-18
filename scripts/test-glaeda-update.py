@@ -563,6 +563,14 @@ class ReleaseTest(unittest.TestCase):
         pending = one + [self.status("big-red", "pending", "2026-09-25T02:00:00Z")]
         self.assertIn("inconclusive", gr.promotion(candidate, None, pending, self.NOW)[1])
 
+    def test_historical_signed_policy_remains_promotable_alongside_new_policy(self) -> None:
+        historical = {**self.canary(), "policy": {**gr.policy_for_paths(["scripts/glaeda-update"]),
+                                                    "soakHours": 12}}
+        parsed = gr.parse_policy(historical["policy"])
+        self.assertEqual(parsed["soakHours"], 12)
+        current = gr.policy_for_paths(["scripts/glaeda-update"])
+        self.assertEqual(current["soakHours"], 0.25)
+
     def test_soak_override_rejects_non_finite_or_negative_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "candidates.jsonl"
