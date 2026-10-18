@@ -2931,7 +2931,6 @@ class DarwinEvidenceTest(unittest.TestCase):
             opened, commands = gd.process_evidence()
         self.assertEqual(opened, ["/Users/cmux/cache"])
         self.assertEqual(commands, "launchd\n")
-        self.assertEqual(commands, "launchd\n")
 
 
 @unittest.skipUnless(sys.platform == "darwin", "APFS clones are macOS only")
