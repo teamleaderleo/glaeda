@@ -4384,7 +4384,7 @@ def leaked_media_app_pids(table: dict[int, tuple[int, str]], ignored_workers: se
     return result
 
 
-def cleanup_leaked_media_apps(ignored_workers: set[int] | None = None) -> list[str]:
+def cleanup_leaked_media_apps(ignored_workers: set[int] | None = None, host_lock: str | None = None) -> list[str]:
     """Reap generated media helpers under admission, with process-instance checks.
 
     The host lock excludes new runner and fleet admissions between observation
@@ -4393,8 +4393,9 @@ def cleanup_leaked_media_apps(ignored_workers: set[int] | None = None) -> list[s
     """
     if os.geteuid() == 0:
         return []  # job-owned cleanup runs as the build user, never as root
+    host_lock = host_lock or HOST_LOCK
     try:
-        fd = os.open(HOST_LOCK, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(host_lock, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return []
     try:
@@ -4873,7 +4874,7 @@ def main(argv: list[str] | None = None) -> int:
         current_worker = runner_worker_pid()
         for note in cleanup_leaked_test_apps({current_worker} if current_worker else set()):
             print(f"{PREFIX}: {note}", flush=True)
-        for note in cleanup_leaked_media_apps({current_worker} if current_worker else set()):
+        for note in cleanup_leaked_media_apps({current_worker} if current_worker else set(), args.host_lock):
             print(f"{PREFIX}: {note}", flush=True)
         for note in cleanup_job_leftovers():
             print(f"{PREFIX}: {note}", flush=True)
