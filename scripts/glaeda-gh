@@ -217,11 +217,19 @@ def read_cache(key: str) -> dict | None:
     return doc if isinstance(doc, dict) and doc.get("key") == key else None
 
 
-def register(key: str, jobs: bool = False) -> None:
-    """Record interest in `key`. Wanting jobs is sticky while any reader wants them."""
+def register(key: str, jobs: bool = False, sha: str | None = None) -> None:
+    """Record interest in `key`. Wanting jobs is sticky while any reader wants them.
+
+    A SHA is sticky for the same reason: status readers share the watch file with a wait, and
+    clearing its requested head would let the daemon keep serving a stale PR cache.
+    """
     path = watch_dir() / file_name(key)
     prior = read_json(path) or {}
-    write_json(path, {"key": key, "jobs": bool(jobs or prior.get("jobs"))})
+    requested_sha = str(sha or prior.get("sha") or "").lower() or None
+    doc = {"key": key, "jobs": bool(jobs or prior.get("jobs"))}
+    if requested_sha:
+        doc["sha"] = requested_sha
+    write_json(path, doc)
 
 
 def terminal(kind: str, data: dict | None) -> bool:
@@ -630,7 +638,9 @@ class Daemon:
             if age > IDLE_EXPIRY or (done and age > TERMINAL_GRACE):
                 path.unlink(missing_ok=True)
                 continue
-            out.append({"key": key, "jobs": bool(doc.get("jobs")), "cache": cached, "touched": self.now - age})
+            requested_sha = str(doc.get("sha") or "").lower() or None
+            out.append({"key": key, "jobs": bool(doc.get("jobs")), "sha": requested_sha,
+                        "cache": cached, "touched": self.now - age})
         return out
 
     def due(self, kind: str, entries: list[dict]) -> list[dict]:
@@ -645,6 +655,16 @@ class Daemon:
         out = []
         for e in mine:
             c = e["cache"]
+            requested_sha = e.get("sha")
+            cached_head = str(((c or {}).get("data") or {}).get("headRefOid") or "").lower()
+            sha_mismatch = kind == "pr" and bool(requested_sha and cached_head)
+            sha_mismatch = sha_mismatch and not cached_head.startswith(requested_sha)
+            # A wait for a new head must not wait for the normal cycle when the cache was just
+            # observed for an older head. Once that one immediate refresh runs, the normal cycle
+            # still bounds retries while GitHub has not seen the requested push yet.
+            if sha_mismatch and (full or e["touched"] > (c.get("fetchedAt") or 0)):
+                out.append(e)
+                continue
             if (kind == "pr" and c is not None and e["key"] in self.nudged
                     and self.now - self.attempted.get(e["key"], float("-inf")) >= NUDGE_MIN):
                 self.nudged.discard(e["key"])  # a check event on its head: re-read now, not at the cycle
@@ -1515,7 +1535,7 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
             warned = True
         now = time.monotonic()
         if now - touched >= TOUCH_EVERY:
-            register(key, jobs)
+            register(key, jobs, sha=sha)
             touched = now
         entry = read_cache(key)
         fresh = entry is not None and (entry.get("fetchedAt") or 0) >= began
