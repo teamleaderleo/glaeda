@@ -41,7 +41,7 @@ jobs:
           fetch-depth: 0  # stable only moves forward: the ancestry check needs history
       - name: Promote the newest healthy soaked release
         env:
-          SOAK_HOURS: ${{ inputs.soak_hours || '6' }}
+          SOAK_HOURS: ${{ inputs.soak_hours }}
         run: |
           mkdir -p channels
           stable=()
@@ -80,8 +80,11 @@ jobs:
             if [ "$tag" = "$stable_tag" ] || [ "$considered" -ge 20 ]; then break; fi
           done < channels/releases.txt
           set +e
-          python3 scripts/glaeda_release.py promote --candidates channels/candidates.jsonl "${stable[@]}" \
-            --soak-hours "$SOAK_HOURS" > channels/next.json 2> channels/why.txt
+          promote_args=(--candidates channels/candidates.jsonl "${stable[@]}")
+          if [ -n "$SOAK_HOURS" ]; then
+            promote_args+=(--soak-hours "$SOAK_HOURS")
+          fi
+          python3 scripts/glaeda_release.py promote "${promote_args[@]}" > channels/next.json 2> channels/why.txt
           code=$?
           set -e
           cat channels/why.txt >> "$GITHUB_STEP_SUMMARY"
