@@ -5,15 +5,15 @@ does not authorize a merge, promotion, or live fleet deletion.
 
 ## Primary review verdict
 
-The exact managed Mac artifact from workflow run `39089301431`, requested for
-PR head `656a86f16ab0c1c908fc1bcb2ddefee820f53f92`, is bound to merge commit
-`9b0c64e8d28fda0e2af690f806e8cd255670dd05` and tree
-`d8d4e595a38a7386606a7b1a5fd589413565b5fc`. Its managed-adapter receipt reports
+The exact managed Mac artifact from workflow run `39090421264`, requested for
+PR head `66a259947fd4cd4f57c1623326bf309aa5486749`, is bound to merge commit
+`b0a545286c095b7625c849176884e48649c862e8` and tree
+`e591c76909367a93d279a741c8c72b6fe10c7513`. Its managed-adapter receipt reports
 successful build and synthetic matrix outcomes and explicitly records
 `live_deletion_enabled=false` and `runner_root=null`.
 
 The benchmark receipt at
-`/Users/leoli/Projects/briefs/agentic-skunkworks-20261016/fleet-audit/native-verification/native-python-benchmark-pr1507-exact-656a86f1-39089301431.json`
+`/Users/leoli/Projects/briefs/agentic-skunkworks-20261016/fleet-audit/native-verification/native-python-benchmark-pr1507-green-66a25994-39090421264.json`
 contains six valid rows: native and Python at stale counts 1, 16, and 64.
 Each row observed the expected stale-file effect and preserved the busy,
 open, recent, and warm fixtures. Native rows include complete recovery,
