@@ -309,19 +309,29 @@ def measure(args, implementation: str, trial: int) -> dict:
                 busy_typed = "runner_process_busy" in json.dumps(busy_report)
                 exits_valid = exits_valid and runs[1]["exit"] in (0, 1) and busy_typed
                 exits_valid = exits_valid and all(not run["report"].get("parse_error") for run in runs)
-                for run in runs:
+                for index, run in enumerate(runs):
                     report = run.get("report", {})
+                    # The busy fixture is an intentional refusal case. Its typed veto is
+                    # evidence of protection, not a failed apply receipt.
+                    if index == 1 and report.get("observation", {}).get("process", {}).get(
+                        "busy_processes_observed", 0
+                    ) > 0:
+                        continue
                     native_errors.extend(str(error) for error in report.get("errors", [])
                                          if isinstance(error, str))
                 # Apply must have been admitted and must have produced the
                 # expected effect. A plan or reclaim_not_ready is not a result.
                 idle_report = runs[0].get("report", {})
-                native_receipts_ok = all(
-                    native_receipts_complete(run.get("report", {}), expected_items=(
-                        args.stale_count if index == 0 else 0
-                    ))
-                    for index, run in enumerate(runs)
+                busy_receipt_ok = (
+                    busy_report.get("observation", {}).get("process", {}).get(
+                        "busy_processes_observed", 0
+                    ) > 0
+                    and not busy_report.get("actions")
+                    and busy_report.get("reclaimed_count") == 0
                 )
+                native_receipts_ok = native_receipts_complete(
+                    runs[0].get("report", {}), expected_items=args.stale_count
+                ) and busy_receipt_ok
                 effect_valid = (effects_match and exits_valid and not native_errors
                                 and idle_report.get("operation") == "apply"
                                 and idle_report.get("reclaimed_count") == args.stale_count
