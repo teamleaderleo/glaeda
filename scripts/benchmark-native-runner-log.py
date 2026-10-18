@@ -254,8 +254,8 @@ def timed(argv: list[str], env: dict) -> dict:
         capture_output=True, text=True, timeout=120,
     )
     return {"exit": result.returncode, "wall_seconds": time.monotonic() - started,
-            **time_metrics(result.stderr), "stdout": redact_output(result.stdout),
-            "stderr": redact_output(result.stderr)}
+            **time_metrics(result.stderr), "stdout": result.stdout,
+            "stderr": result.stderr}
 
 
 def measure(args, implementation: str, trial: int) -> dict:
@@ -279,7 +279,9 @@ def measure(args, implementation: str, trial: int) -> dict:
                     try:
                         run["report"] = json.loads(run.pop("stdout"))
                     except ValueError:
+                        run["stdout_tail"] = redact_output(run.pop("stdout", ""))
                         run["report"] = {"parse_error": True}
+                    run["stderr"] = redact_output(run["stderr"])
                     runs.append(run)
             else:
                 # Redirect *all* configurable global candidate roots; no fleet or shared paths.
@@ -290,6 +292,7 @@ def measure(args, implementation: str, trial: int) -> dict:
                     "CRUFT_SWEEP_CAPTURE_ROOT": str(base / "capture"),
                     "CRUFT_SWEEP_FAKE_PS": str(fixture.fake_processes),
                     "CRUFT_SWEEP_APPLY_BUDGET_S": "100"}))
+                runs[-1]["stderr"] = redact_output(runs[-1]["stderr"])
             outcomes = fixture.outcomes()
             worker_alive = fixture.worker.poll() is None
             metrics_present = all(all(run[key] is not None for key in
