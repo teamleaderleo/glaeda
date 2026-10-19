@@ -42,8 +42,9 @@ VERSION_RE = r"[0-9][0-9.]*"
 # mini's last runners its gui-role runners. The last of them is the console gui runner: it carries the gui pool
 # label (gui_label), so GitHub hands each mini at most one GUI job, the one its single gui token allows, and a
 # second GUI job waits in GitHub's queue for another mini's gui runner instead of on a root runner here
-# (cmuxterm-hq#661). Every gui-role runner carries the session pool label (session_label), for jobs that need a
-# logged-in session but not the console token, and the others carry only that one. None is a root or side runner.
+# (cmuxterm-hq#661). The other gui-role runners (session runners) carry only the session pool label (session_label),
+# for jobs that need a logged-in session but not the console token; the console runner carries it too only with
+# guiRunners 1, when it has no session runner beside it. None is a root or side runner.
 # fastRunners (0 or 1, default 0) makes the mini's last runner its fast runner: it carries only the fast pool
 # label (fast_label), and cmux-next's fast-tier job runs on it with the mini's two fast tokens instead of the
 # shared capacity units, so it never queues behind the side lane. With guiRunners as well, the gui-role runners
@@ -224,8 +225,10 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         compile_slots, roots, gui, fast = 1, 1, 0, 0
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
-    if not (isinstance(units, int) and not isinstance(units, bool) and 2 <= units <= 4 * MAX_RUNNERS):
-        return None, f"runner.classes.{klass}.capacityUnits must be 2 to {4 * MAX_RUNNERS} (cores)"
+    # every mini holds at least one compile slot, so it needs a compile's cores; glaeda-route checks the same
+    if not (isinstance(units, int) and not isinstance(units, bool) and COMPILE_CORES <= units <= 4 * MAX_RUNNERS):
+        return None, (f"runner.classes.{klass}.capacityUnits must be {COMPILE_CORES} to {4 * MAX_RUNNERS} (cores; "
+                      f"a compile is {COMPILE_CORES})")
     if not (isinstance(compile_slots, int) and not isinstance(compile_slots, bool)
             and 1 <= compile_slots <= max(1, units // COMPILE_CORES)):
         return None, (f"runner.classes.{klass}.compileSlots must be 1 to {max(1, units // COMPILE_CORES)} "

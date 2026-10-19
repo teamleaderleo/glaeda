@@ -277,7 +277,7 @@ class ClassAndPoolTests(unittest.TestCase):
         resource = mf.pools(data, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
         self.assertEqual(resource["simulatorHosts"], 1)
         # guiRunners counts consoles: a mini with a session runner beside its gui runner still has one gui token
-        data["defaults"]["runner"] = {"classes": {"std": {"runners": 4, "capacityUnits": 4, "guiRunners": 2}}}
+        data["defaults"]["runner"] = {"classes": {"std": {"runners": 4, "capacityUnits": 6, "guiRunners": 2}}}
         resource = mf.pools(data, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
         self.assertEqual(resource["guiRunners"], 1)
 

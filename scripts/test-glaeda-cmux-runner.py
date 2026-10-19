@@ -6167,7 +6167,7 @@ class ManifestLabelsTest(unittest.TestCase):
             del manifest["defaults"]["runner"]["classes"]["std"]["canonicalRoots"]
             manifest["defaults"]["runner"]["classes"]["std"]["compileSlots"] = 4  # 15 cores hold 3 5-core compiles
             self.assertIn("compileSlots must be 1 to 3 (a compile is 5 units)", cr.member_labels(manifest, "mini-std")[1])
-            for bad in ({"runners": 0}, {"runners": True}, {"capacityUnits": 1}, "four"):
+            for bad in ({"runners": 0}, {"runners": True}, {"capacityUnits": 1}, {"capacityUnits": 4}, "four"):
                 with self.subTest(bad=bad):
                     manifest["defaults"]["runner"] = {"classes": {"std": bad}}
                     member, why = cr.member_labels(manifest, "mini-std")
