@@ -255,7 +255,10 @@ class MiniSetupTest(unittest.TestCase):
             if label == "disk-pressure":
                 self.assertEqual(doc["ProgramArguments"], [os.fspath(bin_dir / "disk-pressure.sh"), "--once"])
             else:
-                for arg in doc["ProgramArguments"][1:2]:
+                program = doc["ProgramArguments"]
+                if program[:len(ms.LAN_PARENT)] == ms.LAN_PARENT:
+                    program = program[len(ms.LAN_PARENT):]
+                for arg in program[1:2]:
                     self.assertTrue(arg.startswith(os.fspath(bin_dir)), arg)
             self.assertTrue(doc["StandardOutPath"].startswith(os.fspath(self.home / "Library/Logs")))
             # dedupe is never urgent; pressure must still free space while a build fills the disk
