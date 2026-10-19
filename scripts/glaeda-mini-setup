@@ -357,6 +357,8 @@ def apple_python(platform_name: str = HOST_PLATFORM) -> str | None:
 # on cmux14, macOS 27.0.1, 2026-10-19). No `exec`: the shell must stay the job's process. `launchctl kill`
 # signals only the shell, so it forwards TERM/HUP/INT to the python3 and waits for it, then exits with its
 # status; launchd keeps tracking the job until the python3 is gone (and keeps its SIGKILL backstop).
+# A group signal (bootout) therefore reaches the python3 twice, so its TERM handlers must be idempotent.
+# As an `&` job of a non-interactive shell it starts with SIGINT and SIGQUIT ignored; INT is forwarded as TERM.
 LAN_PARENT = ["/bin/sh", "-c",
               '"$@" & p=$!; trap "kill -TERM $p 2>/dev/null" TERM HUP INT; s=0; wait $p || s=$?; '
               'while kill -0 $p 2>/dev/null; do wait $p; s=$?; done; exit $s', "glaeda-lan"]

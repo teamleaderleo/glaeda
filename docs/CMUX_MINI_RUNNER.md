@@ -997,8 +997,8 @@ seed from R2. That took 108-158 s idle and up to 760 s paced beside a job, one d
 
 cmux-lawrence runs no jobs and has TBs of SSD. It keeps every seed cmux15 keeps, and the PR minis read from it:
 
-- **Fill.** The `glaeda-seed-archive` LaunchAgent runs every 15 seconds with `/usr/bin/python3`, so Local
-  Network Privacy lets its `/usr/bin/ssh` through. Lawrence is a seed-lan client of cmux15. Each run asks for
+- **Fill.** The `glaeda-seed-archive` LaunchAgent runs every 15 seconds as `/bin/sh` running `/usr/bin/python3`
+  (`LAN_PARENT`), so Local Network Privacy lets its `/usr/bin/ssh` through. Lawrence is a seed-lan client of cmux15. Each run asks for
   `seed-list-v1` and streams every seed the archive lacks, newest first, so a seed is here about a minute
   after cmux15 keeps it. At every 5 minutes, PR minis that prefetched in between missed here and fell back
   to R2. Runs that fetch and prune nothing are not logged.
