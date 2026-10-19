@@ -123,19 +123,24 @@ What `--apply` does:
      lock. It holds a shared `flock` on `host.lock` (so `with-host-lock`'s `LOCK_EX`,
      the build worker, waits for every PR job, and a held worker lock refuses them),
      plus units and tokens under `/Users/Shared/cmux-build-fleet/capacity`, all as
-     `flock`s held by the job's detached holder, so a crash frees them. The cost comes
-     from `GITHUB_JOB`: `macos-compile-admission` 2 units plus the `persistent-dd`
+     `flock`s held by the job's detached holder, so a crash frees them. Units are cores:
+     `--capacity-units` is the mini's core count (14 on a std M4 Pro) and a job costs the
+     cores it is measured to use, the p75 of its own CPU over the job, rounded up (the
+     hook's `CLASS_COST` by class and `JOB_CORES` for a job far from its class, from a week
+     of `glaeda-cmux-jobs.jsonl`; the numbers below are the class costs). The cost comes
+     from `GITHUB_JOB`: `macos-compile-admission` 5 units plus the `persistent-dd`
      token (one writer of the kept DerivedData at a time), `tests-build-and-lag` 1 unit
      plus the `gui` token (one console session), `app-host-unit-tests` 1 unit (on a mini
      with more than one root it takes the `gui` token itself with take-gui in the step
      before its restore, so its product fetch leaves the console session to other GUI
      jobs; a one-root mini gives it the token at job start),
-     test-e2e's `build` (compile, then the selected tests in the console session) 2 units
+     test-e2e's `build` (compile, then the selected tests in the console session) 4 units
      (it takes the `gui` token itself before its tests, with take-gui), test-e2e's `test` 1
      unit plus the `gui` token, `cli-product-tests` 1 unit plus the `gui` token (its XCTest
      run shares the user's testmanagerd with the GUI jobs, see 2h2),
-     `swift-package-tests` and the side lanes `cli-pipe-regressions`,
-     `remote-daemon-macos-tests` and `claude-wrapper` 1 unit, and any other job counts
+     `swift-package-tests` 4 units, the side lanes `cli-pipe-regressions` 3 and
+     `remote-daemon-macos-tests` and `claude-wrapper` 1, an isolated job 4 (cmux-next's
+     generated files and action exports 6, the media tour 2), and any other job counts
      as a compile. When units or a token are taken a cmux job waits for them, with no
      time limit, and never fails for capacity: GitHub has already handed the job to this
      runner and cannot move it. Every 2 s it tries again; it logs what it waits for and who
@@ -243,7 +248,7 @@ What `--apply` does:
        none, and holding for it kept second roots idle while roots were the bottleneck.
        An app-host shard that meets a taken gui token waits for it instead of refusing.
        (cmuxterm-hq#661, Workstream 7.) A side runner listens with one unit free, so
-       a 2-unit side lane (cmux's release-build, reload-build, cmux-tui) that finds
+       a costlier side lane (cmux's release-build, reload-build, cmux-tui) that finds
        fewer units than it needs waits for them instead of refusing, as does a root
        runner that lost a race for its units.
      - Every runner stops while a job already admitted to this mini waits for units
@@ -255,8 +260,8 @@ What `--apply` does:
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
        mini's gui runner instead.
      - A session runner (`--session-runner`, `guiRunners` above 1) carries only the session
-       pool label and stops only while fewer than 2 units are free (`--fit-units 2`: each of
-       its jobs costs 2), a job here waits for units, or the console is locked. Its jobs (cmux-next daemon tests, generated files, action exports,
+       pool label and stops only while fewer than 6 units are free (`--fit-units 6`, the
+       costliest of its jobs: generated files and action exports), a job here waits for units, or the console is locked. Its jobs (cmux-next daemon tests, generated files, action exports,
        the pr-media tour) need the logged-in session but neither the gui token nor a root, so
        a console job holding them is no reason to idle it. It never gets a console job: the
        gui label is the console gui runner's alone. Tours are `isolated` like the rest: each
@@ -503,7 +508,8 @@ or pass `--name` with the existing name to relabel it in place.
 ## 2d. Several runners per mini
 
 A manifest class carries a runner count and the capacity units they share
-(defaults: `std` 4 runners and 4 units, `light` 2 and 2, `xl` 8 and 8). Override
+(defaults: `std` 4 runners and 14 units, `light` 2 and 10, `xl` 8 and 22; units are
+cores, so a class's units are its machines' core count). Override
 them with `defaults.runner.classes.<class>` `{"runners": N, "capacityUnits": U,
 "compileSlots": C}`, or per host under `overrides.runner.classes.<class>`. A
 dedicated pool can set `runner.poolPrefix` to a lowercase prefix such as
@@ -511,7 +517,7 @@ dedicated pool can set `runner.poolPrefix` to a lowercase prefix such as
 `glaeda-aws-std-xcode-26.3`, `glaeda-aws-root-std-xcode-26.3`, and their
 corresponding role labels. Keep that namespace in the CI pool allowlist so
 ordinary `glaeda-std-*` jobs cannot select it accidentally.
-`compileSlots` (default 1, at most U/2) is how many compiles run at once, one
+`compileSlots` (default 1, at most U/5, a compile's 5 cores) is how many compiles run at once, one
 `persistent-dd` token each (`persistent-dd.token`, `persistent-dd-1.token`, ...).
 Raise it only once cmux's compile admission keeps its canonical root and kept
 state per runner; with shared paths two compiles would clobber each other. Re-apply
@@ -668,7 +674,7 @@ the pools, register them at org scope into a runner group and allow that reposit
 At org scope the hook admits any repository of the org (`--allowed-owner`) under the same event, fork
 and disk rules. Job ids in the hook's table are cmux's (`--home-repo`, default `manaflow-ai/cmux`); a
 guest repository's job never takes a canonical root or the persistent-DerivedData token, whatever its
-id. It costs 2 units (isolated), or 1 unit when its id ends in `-light`, or 1 unit plus the one
+id. It costs 4 units (isolated), or 3 units when its id ends in `-light`, or 1 unit plus the one
 simulator token when its id ends in `-sim` or `simulator`. A repository the hook cannot identify is a
 guest. cmux jobs wait for room with no time limit (its rescue workflow moves one that waits too long); a
 guest has no rescue, so it waits up to `--guest-wait` (600 s) for room before it is refused. Guests share
@@ -691,11 +697,11 @@ in at the producer's root. So one root job per root per mini:
   Each also takes an exclusive `capacity/root-k.token` (k = 1 to `canonicalRoots`), and the hook writes `CMUX_CI_CANONICAL_ROOT=<root k>` to `$GITHUB_ENV` and
   `$RUNNER_TEMP/glaeda-canonical-root`. The root follows the token, never the runner instance.
 - Light jobs take no root.
-- Seed jobs (seed-derived-data.yml's `seed`, trusted runners only) take 2 units and no token: the seed
+- Seed jobs (seed-derived-data.yml's `seed`, trusted runners only) take 5 units and no token: the seed
   key names the root, so the job holds that root itself with `glaeda-canonical-root take <root>` before
-  it clears it. On a trusted mini with 2 runners, 4 units and `canonicalRoots` 2, two seeds (one per
+  it clears it. On a trusted mini with 2 runners, 14 units and `canonicalRoots` 2, two seeds (one per
   root) run at once; with one runner nothing changes.
-- The nightly app build (nightly.yml's `build-nightly-app`, trusted runners only) is isolated: 2 units,
+- The nightly app build (nightly.yml's `build-nightly-app`, trusted runners only) is isolated: 4 units,
   no token. It compiles into its own workspace, so it never holds a root a seed on the same mini waits for.
 - `defaults.runner.classes.<class>.canonicalRoots` (default 1, at most `runners`) runners per mini
   (instances 0 and up) also carry the root pool label `glaeda-root-<class>-xcode-<version>`. Root jobs
@@ -738,8 +744,8 @@ in at the producer's root. So one root job per root per mini:
   gui token (an app-host shard in the step before its restore instead), and the producer's root in its
   restore step. Every gui-role runner also carries the session pool label `glaeda-session-<class>-xcode-<version>`,
   and the others (session runners, `--session-runner`) carry only that one. Session-only jobs, which need a
-  logged-in session but not the console token, target the session label: with `guiRunners` 2 (std: `runners`
-  6, `capacityUnits` 5) two of them run at once, or one beside a console job, while console jobs (classes
+  logged-in session but not the console token, target the session label: with `guiRunners` 2 (cmux7s: `runners`
+  6, `capacityUnits` 10) two of them run at once, or one beside a console job, while console jobs (classes
   `gui`, `gui-step`, `product`) still reach only the console gui runner, one at a time. Rolling it out is a
   cmux change pointing those jobs at the session label, an hq `build-fleet/mini-fleet.json` change, and
   `glaeda-cmux-runner-fleet --apply` per mini. `resource.guiRunners` in the route document still counts one
@@ -823,9 +829,9 @@ on the label, or a job could wait for a label no online runner has.
 
 Hook classes:
 
-- `mobile-core-package` and `ios-simulator-build` are `isolated` (2 units, own DerivedData or SwiftPM
+- `mobile-core-package` and `ios-simulator-build` are `isolated` (3 units each, `JOB_CORES`; own DerivedData or SwiftPM
   `.build`, no canonical root).
-- `ios-simulator` and `screenshots` are `simulator` (1 unit, p75 0.15 cores per job,
+- `ios-simulator` and `screenshots` are `simulator` (1 unit, p75 0.28 cores per job,
   plus the per-mini `simulator` token: they
   reuse, erase and boot named devices in the user's one CoreSimulator service). A job refused only for
   that token waits for it at job start, as any capacity wait does.

@@ -267,7 +267,7 @@ class ClassAndPoolTests(unittest.TestCase):
     def test_pools_publish_manifest_resources_without_host_identity(self) -> None:
         obs = observed(**{"build-mini-1": probe_text()})
         resource = mf.pools(self.manifest, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
-        self.assertEqual(resource, {"cpuCores": 14, "capacityUnits": 4, "compileSlots": 1,
+        self.assertEqual(resource, {"cpuCores": 14, "capacityUnits": 14, "compileSlots": 1,
                                     "canonicalRoots": 1, "guiRunners": 0, "simulatorHosts": 0})
 
         data = copy.deepcopy(self.manifest)

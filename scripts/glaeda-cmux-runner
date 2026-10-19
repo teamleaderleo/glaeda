@@ -131,6 +131,11 @@ PUBLIC_API = "https://api.github.com/"
 TOKEN_RE = r"[A-Za-z0-9_.\-]+"
 LISTENING = "Listening for Jobs"
 IOS_SIM_JOB_LABEL = "glaeda-ios-sim"  # glaeda_fleet_labels.IOS_SIM_LABEL
+# The cores (capacity units) a listener on these labels waits for: the costliest job each brings, in the hook's
+# CLASS_COST and JOB_CORES (a test keeps them equal). glaeda-ios-sim: ios-simulator-build and mobile-core-package, 3
+# each. A session runner: generated-files and action-exports, 6 each.
+IOS_SIM_FIT_UNITS = 3
+SESSION_FIT_UNITS = 6
 GATE_HELD = "glaeda-cmux-runner-gate: holding the listener off"  # the gate's line while the fleet has the host
 # Stale-copy check: the OTA install (glaeda-update) and the runner files a staged copy carries
 # (glaeda-cmux-runner-fleet STAGED). The stamp says where a staged copy came from.
@@ -535,11 +540,14 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     )
     gate = (f"{python} {hook} listen --runner-dir {shlex.quote(os.fspath(ctx.runner_dir))}"
             + ("" if ctx.capacity_units else " --no-waiters"))
-    if ctx.capacity_units and (IOS_SIM_JOB_LABEL in ctx.labels or getattr(ctx, "session_runner", False) is True):
-        # the iOS picker sends 2-unit isolated builds (mobile-core-package, ios-simulator-build) to this label: listening with one
-        # free unit only takes one to refuse it (cmuxterm-hq#661 Workstream 7). A session runner's jobs (isolated)
-        # cost 2 units as well, and one taken with a single unit free would wait and hold every runner here.
-        gate += " --fit-units 2"
+    # Listening with fewer free units (cores) than the label's costliest job only takes one to wait for units, and
+    # a job waiting here holds every runner on the mini (cmuxterm-hq#661 Workstream 7). The iOS picker sends
+    # isolated builds (mobile-core-package, ios-simulator-build) to glaeda-ios-sim; a session runner takes cmux-next's
+    # daemon tests, generated files, both autofix workflows' action exports and the media tour.
+    fit = max([IOS_SIM_FIT_UNITS] * (IOS_SIM_JOB_LABEL in ctx.labels)
+              + [SESSION_FIT_UNITS] * (getattr(ctx, "session_runner", False) is True), default=0)
+    if ctx.capacity_units and fit:
+        gate += f" --fit-units {fit}"
     listen = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner listener gate (generated, receipt-owned): the runner LaunchAgent's program. The\n"
