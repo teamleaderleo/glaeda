@@ -215,8 +215,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         roots = declared.get("canonicalRoots", 1)
         gui = declared.get("guiRunners", 0)
         fast = declared.get("fastRunners", 0)
+        tours = declared.get("tourSlots", 1)
     else:
-        compile_slots, roots, gui, fast = 1, 1, 0, 0
+        compile_slots, roots, gui, fast, tours = 1, 1, 0, 0, 1
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
     if not (isinstance(units, int) and not isinstance(units, bool) and 2 <= units <= 4 * MAX_RUNNERS):
@@ -233,6 +234,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     if not (isinstance(fast, int) and not isinstance(fast, bool) and 0 <= fast <= 1 and roots + gui + fast <= runners):
         return None, (f"runner.classes.{klass}.fastRunners must be 0 or 1, and canonicalRoots plus guiRunners plus "
                       f"fastRunners at most runners ({runners}): the fast runner is the last instance")
+    if not (isinstance(tours, int) and not isinstance(tours, bool) and 1 <= tours <= 4):
+        return None, (f"runner.classes.{klass}.tourSlots must be 1 to 4: cmux pr-media tours at once on a mini, each "
+                      "in its own DerivedData slot")
     if compile_slots > roots:
         return None, (f"runner.classes.{klass}.compileSlots {compile_slots} needs canonicalRoots {compile_slots} "
                       "(every compile holds a root)")
@@ -240,7 +244,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
-            "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
+            "runners": runners, "capacityUnits": units, "compileSlots": compile_slots, "tourSlots": tours,
             "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "trustedNextNightly": next_nightly,
             "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)],
             "sidePools": [side_label(label) for label in dict.fromkeys(pools)],

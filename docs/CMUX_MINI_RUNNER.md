@@ -260,8 +260,9 @@ What `--apply` does:
        the pr-media tour) need the logged-in session but neither the gui token nor a root, so
        a console job holding them is no reason to idle it. It never gets a console job: the
        gui label is the console gui runner's alone. The tour (class `tour`) builds into fixed
-       per-tag DerivedData, so it also takes the mini's one `tour` token: a second tour on the
-       same mini waits for it rather than racing on a tag directory. A waiting second tour holds
+       per-tag DerivedData, so it also takes one of the mini's `tour` tokens (`tourSlots`,
+       default 1): a tour beyond them waits rather than racing on a tag directory. Raise
+       `tourSlots` only once cmux pr-media gives each concurrent tour its own DerivedData slot. A waiting second tour holds
        no runner's gate. With `guiRunners` 2 it can still park on the console gui runner, which
        carries the session label too, so the console runner is busy for that wait.
      - A fast runner (`--fast-runner`, below) looks only at the two fast tokens

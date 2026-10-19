@@ -247,6 +247,9 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
 # behind side-lane jobs for a unit and no other class, gate or ci-step ever counts them. The same job on any other
 # runner keeps its WORKFLOW_JOB_CLASSES cost.
 FAST_TOKENS = ("fast-0", "fast-1")
+# tour: how many tour tokens (tour, tour-1, ...) this mini has, from --tour-slots (glaeda_fleet_labels tourSlots,
+# default 1). cmux pr-media builds each concurrent tour into its own DerivedData slot, so this many can run at once.
+TOUR_SLOTS = 1
 FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
@@ -2265,7 +2268,9 @@ def token_holders(capacity_dir: Path, wants: list[str], compile_slots: int, root
             names += [f"root-{k}" for k in range(1, max(1, roots) + 1)]
         elif kind == "persistent-dd":
             names += ["persistent-dd"] + [f"persistent-dd-{c}" for c in range(1, max(1, compile_slots))]
-        elif kind in ("gui", "simulator", "tour") or kind in FAST_TOKENS:
+        elif kind == "tour":
+            names += ["tour"] + [f"tour-{c}" for c in range(1, max(1, TOUR_SLOTS))]
+        elif kind in ("gui", "simulator") or kind in FAST_TOKENS:
             names.append(kind)
     notes = []
     deadline = time.monotonic() + HOLDERS_BUDGET_S
@@ -2385,7 +2390,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             # persistent-dd comes in compile_slots copies once compile admission keeps its state per
             # runner; copy 0 keeps the original file name. A mini whose runners disagree on the count runs
             # as many compiles as the highest one allows, so re-apply every instance on a mini together.
-            copies = {"persistent-dd": max(1, compile_slots), "root": 1 if pinned else max(1, roots)}.get(token, 1)
+            copies = {"persistent-dd": max(1, compile_slots), "root": 1 if pinned else max(1, roots),
+                      "tour": max(1, TOUR_SLOTS)}.get(token, 1)
             order = list(range(copies))
             if token == "root" and copies > 1 and klass != "compile-gui":
                 # this runner's own root first (instance i -> root i+1), then any free one: its kept build and
@@ -4732,6 +4738,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="weighted capacity shared by this mini's runners (0: one job holds the host lock alone)")
     p.add_argument("--compile-slots", type=int, default=1,
                    help="compiles at once on this mini (persistent-dd tokens; >1 needs per-runner compile state)")
+    p.add_argument("--tour-slots", type=int, default=1,
+                   help="pr-media tours at once on this mini (tour tokens; each needs its own DerivedData slot)")
     p.add_argument("--canonical-roots", type=int, default=1,
                    help="canonical roots on this mini (root-N tokens; one compile or app-host consumer per root)")
     p.add_argument("--instance", type=int, default=0,
@@ -4757,6 +4765,8 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", args.gui_token):
         p.error("--gui-token must be a simple capacity token name")
+    global TOUR_SLOTS
+    TOUR_SLOTS = max(1, args.tour_slots)
     if args.parse_only:
         return 0
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
