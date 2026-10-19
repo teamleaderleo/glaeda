@@ -104,6 +104,7 @@ def load_labels() -> Any:
     return module
 
 
+@functools.cache
 def load_runner() -> Any:
     """glaeda-cmux-runner beside this script, as a module: its release parsing and pinned fallback."""
     path = SCRIPT_DIR / "glaeda-cmux-runner"
@@ -184,7 +185,7 @@ def latest_release() -> tuple[str, str, str]:
     fallback in glaeda-cmux-runner when that read fails. Every instance gets the answer on its command line."""
     with _RELEASE_LOCK:
         if not _RELEASE:
-            runner = load_runner()
+            runner = load_runner()  # main() loaded it once already, so this cannot fail here
             code, out, _ = run(["gh", "api", f"{runner.RUNNER_RELEASE_API}/latest"], 60)
             try:
                 found = runner.release_from_doc(json.loads(out)) if code == 0 else {"state": "blocked"}
@@ -703,6 +704,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"glaeda-cmux-runner-fleet: --allow-downgrade needs a reason, at most {MAX_REASON} characters",
                   file=sys.stderr)
             return 2
+    try:  # its release parsing and pin: a broken copy fails here, before any token is minted
+        load_runner()
+    except Exception as error:  # noqa: BLE001
+        print(f"glaeda-cmux-runner-fleet: cannot load glaeda-cmux-runner beside this script "
+              f"({type(error).__name__})", file=sys.stderr)
+        return 2
     if args.migrate_from_repo:
         args.jobs = 1  # one member at a time, so the rest keep serving the old scope
     only = [h for h in (args.hosts or "").split(",") if h] or None

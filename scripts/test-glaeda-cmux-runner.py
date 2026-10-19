@@ -6055,6 +6055,12 @@ print(json.dumps({{"actions": [{{"kind": "register", "labels": {labels!r}}}]}}))
         self.assertEqual((same["version"], same["resolvedBy"], same.get("reused")), ("2.400.0", "operator", "installed"))
         self.assertEqual(self.release_reads(calls), [])
 
+        # a folder others can write to vouches for nothing
+        ctx = cr.Context(cr.parser().parse_args([]))
+        self.assertIsNotNone(cr.cached_release(ctx, VERSION))
+        cache.chmod(0o777)
+        self.assertIsNone(cr.cached_release(ctx, VERSION))
+        cache.chmod(0o755)
         # a cached tarball that no longer hashes to its marker is a miss, never trusted
         (cache / f"actions-runner-osx-arm64-{VERSION}.tar.gz").write_bytes(b"truncated")
         self.assertIsNone(cr.cached_release(cr.Context(cr.parser().parse_args([])), VERSION))
