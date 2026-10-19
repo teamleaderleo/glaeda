@@ -646,6 +646,28 @@ class DaemonTest(Base):
         self.daemon.tick(NOW + gg.CYCLE)
         self.assertEqual(len(self.gh.gql_calls()), 3)
 
+    def test_requested_sha_forces_a_refresh_of_an_older_pr_cache(self) -> None:
+        key = "pr:o/r#1"
+        old = pr_node(1)
+        self.gh.prs[("o", "r", 1)] = old
+        gg.register(key)
+        self.daemon.tick(NOW)
+        self.assertEqual(gg.read_cache(key)["data"]["headRefOid"], "a" * 40)
+
+        new = {**pr_node(1), "headRefOid": "b" * 40}
+        self.gh.prs[("o", "r", 1)] = new
+        gg.register(key, sha="B" * 40)
+        watch = gg.watch_dir() / gg.file_name(key)
+        self.assertEqual(gg.read_json(watch)["sha"], "b" * 40)
+        # The request arrives just after a normal cycle. Its requested head must bypass that cycle's
+        # suppression, while a still-mismatched cache is not fetched on every two-second tick.
+        os.utime(watch, (NOW + 1,) * 2)
+        self.daemon.tick(NOW + 2)
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+        self.assertEqual(gg.read_cache(key)["data"]["headRefOid"], "b" * 40)
+        self.daemon.tick(NOW + 3)
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+
     def test_interest_expiry(self) -> None:
         self.gh.prs[("o", "r", 1)] = pr_node(1)
         self.gh.prs[("o", "r", 2)] = pr_node(2, state="MERGED", rollup="SUCCESS")
@@ -1525,6 +1547,13 @@ class ClientTest(Base):
             self.assertEqual(gg.main(["wait", "pr", "o/r#1", "--author", "x"]), 64)
             self.assertEqual(gg.main(["wait", "run", "o/r/1", "--rescue-grace", "-1"]), 64)
         self.assertIn("--sha must be a commit id", err.getvalue())
+
+    def test_wait_sha_is_persisted_in_watch_metadata(self) -> None:
+        green = gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")]))
+        code, _ = self.wait("pr", "o/r#1", fill=(green, {}), sha="b" * 40, timeout=0.2)
+        self.assertEqual(code, gg.EXIT_TIMEOUT)
+        watch = gg.read_json(gg.watch_dir() / gg.file_name("pr:o/r#1"))
+        self.assertEqual(watch["sha"], "b" * 40)
 
 
 if __name__ == "__main__":
