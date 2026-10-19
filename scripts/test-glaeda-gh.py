@@ -1866,7 +1866,7 @@ class OverloadTest(Base):
             self.assertIsNotNone(entry["data"], key)  # every PR read on this tick, none left stale
             self.assertIsNone(entry["error"], key)
         self.assertLessEqual(self.daemon.batch["pr"], 6)
-        self.assertLessEqual(max(sizes[1:]), 6 * 2)
+        self.assertLessEqual(max(sizes[1:]), 5)  # 10 failed: halves of 5, then batches of 5
         self.assertEqual(self.daemon.status["batch"]["pr"], self.daemon.batch["pr"])
 
     def test_the_batch_starts_small_and_grows_back_slowly(self) -> None:
@@ -1899,6 +1899,71 @@ class OverloadTest(Base):
         for cycle in range(2, 12):
             self.daemon.tick(NOW + cycle * gg.CYCLE)
         self.assertGreater(self.daemon.batch["pr"], 5)  # it grows back while #7 keeps failing alone
+
+    def transport(self, answer):
+        """Answer PR queries with `answer(prs)` -> (status, body) or None for the fake's normal answer."""
+        sizes = []
+
+        def transport(method, url, headers, body):
+            if url.endswith("/graphql"):
+                doc = json.loads(body)
+                if "pullRequest(number:" in doc["query"]:
+                    prs = [v for k, v in doc["variables"].items() if k.startswith("n")]
+                    sizes.append(len(prs))
+                    out = answer(prs)
+                    if out is not None:
+                        return out[0], {}, out[1]
+            return self.gh(method, url, headers, body)
+        self.daemon.transport = transport
+        return sizes
+
+    def test_a_timeout_reported_as_200_with_null_data_halves_too(self) -> None:
+        keys = self.watch(20)
+        timeout = json.dumps({"data": None, "errors": [{"message": "Something went wrong while executing your "
+                                                         "query. This may be the result of a timeout"}]}).encode()
+        self.transport(lambda prs: (200, timeout) if len(prs) > 5 else None)
+        self.daemon.tick(NOW)
+        self.assertLessEqual(self.daemon.batch["pr"], 5)
+        self.assertTrue(all(gg.read_cache(k)["data"] for k in keys))
+
+    def test_a_timeout_on_a_short_tail_batch_halves_the_batch_not_the_tail(self) -> None:
+        self.watch(23)  # batches of 10, 10, 3
+        failed = []
+        self.transport(lambda prs: None if len(prs) != 3 or failed else (failed.append(1) or (504, b"{}")))
+        self.daemon.tick(NOW)
+        self.assertEqual(self.daemon.batch["pr"], 5)
+
+    def test_a_502_is_split_and_retried_without_shrinking(self) -> None:
+        keys = self.watch(10)
+        failed = []
+        self.transport(lambda prs: None if failed else (failed.append(1) or (502, b"{}")))
+        self.daemon.tick(NOW)
+        self.assertEqual(self.daemon.batch["pr"], gg.GQL_BATCH_START)
+        self.assertTrue(all(gg.read_cache(k)["data"] for k in keys))
+
+    def test_a_heavy_pr_backs_off_and_rejoins_once_it_answers(self) -> None:
+        self.watch(6)
+        poison = [3]
+        sizes = self.transport(lambda prs: (504, b"{}") if poison and poison[0] in prs else None)
+        lone = []
+        for cycle in range(0, 12):
+            sizes.clear()
+            self.daemon.tick(NOW + cycle * gg.CYCLE)
+            lone.append(sizes.count(1))
+        self.assertEqual(self.daemon.heavy["pr:o/r#3"]["fails"] >= gg.HEAVY_AFTER, True)
+        # read alone on each of the first cycles, then only every LEAN_FACTOR cycles
+        self.assertLess(sum(lone[gg.HEAVY_AFTER + 1:]), len(lone) - gg.HEAVY_AFTER - 1)
+        poison.clear()  # it answers again: two lone answers put it back into the batches
+        for cycle in range(12, 12 + 2 * gg.LEAN_FACTOR + 2):
+            self.daemon.tick(NOW + cycle * gg.CYCLE)
+        self.assertNotIn("pr:o/r#3", self.daemon.heavy)
+
+    def test_a_pr_never_read_counts_in_the_oldest_data(self) -> None:
+        self.watch(1)
+        self.overloaded(poison=1)
+        self.daemon.tick(NOW)
+        self.daemon.tick(NOW + 5 * gg.CYCLE)
+        self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["oldestData"]["pr"], 5 * gg.CYCLE)
 
     def test_the_oldest_data_age_is_reported(self) -> None:
         keys = self.watch(3)
