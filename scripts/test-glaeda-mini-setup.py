@@ -143,17 +143,35 @@ class MiniSetupTest(unittest.TestCase):
                 self.invoke("--apply", "--python", "/opt/x/python3")
                 seed = plistlib.loads((agents / "com.teamleaderleo.glaeda.seed-prefetch.plist").read_bytes())
                 disk = plistlib.loads((agents / "com.teamleaderleo.glaeda.disk-pressure.plist").read_bytes())
-                self.assertEqual(seed["ProgramArguments"][0], wanted)
+                self.assertEqual(seed["ProgramArguments"],
+                                 [*ms.LAN_PARENT, wanted, os.fspath(self.home / ".local/bin/glaeda-seed-prefetch"), "--apply"])
                 self.assertEqual(disk["ProgramArguments"], [os.fspath(self.home / ".local/bin/disk-pressure.sh"), "--once"])
                 self.assertEqual(disk["EnvironmentVariables"]["GLAEDA_PYTHON"], "/opt/x/python3")
         self.assertIsNone(ms.apple_python("linux"))
+
+    def test_the_lan_parent_stays_the_jobs_process_and_passes_argv_and_status(self) -> None:
+        # Local Network Privacy judges the job's own process, so the shell must outlive the python3 it starts
+        # (no exec), hand it every argument unchanged and return its exit status to launchd.
+        child = self.home / "child.py"
+        child.write_text("import os, subprocess, sys\n"
+                         "parent = subprocess.run(['ps', '-o', 'comm=', '-p', str(os.getppid())],\n"
+                         "                        capture_output=True, text=True).stdout.strip()\n"
+                         "print(repr(sys.argv[1:]), os.path.basename(parent))\n"
+                         "sys.exit(7)\n")
+        argv = ms.lan_program(sys.executable, "-I", os.fspath(child), "a b", "$HOME", "--apply")
+        self.assertEqual(argv[0], "/bin/sh")
+        run = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 7, run.stderr)
+        self.assertEqual(run.stdout.rsplit(" ", 1)[-1].strip(), "sh")
+        self.assertIn("['a b', '$HOME', '--apply']", run.stdout)
 
     def test_the_lan_fetch_broker_runs_apples_python_and_asks_for_a_root_owned_copy(self) -> None:
         with mock.patch.object(ms, "apple_python", return_value="/usr/bin/python3"):
             self.invoke("--apply")
         agent = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.lan-fetch.plist").read_bytes())
         self.assertEqual(agent["ProgramArguments"],
-                         ["/usr/bin/python3", "-I", os.fspath(self.home / ".local/bin/glaeda-lan-fetch"), "serve-local"])
+                         [*ms.LAN_PARENT, "/usr/bin/python3", "-I", os.fspath(self.home / ".local/bin/glaeda-lan-fetch"),
+                          "serve-local"])
         self.assertTrue(agent["KeepAlive"])
         self.assertEqual((self.home / ".local/bin/glaeda-lan-fetch").read_bytes(),
                          (ROOT / "scripts/glaeda-lan-fetch").read_bytes())
