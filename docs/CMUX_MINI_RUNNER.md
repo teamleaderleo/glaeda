@@ -138,10 +138,14 @@ What `--apply` does:
      (it takes the `gui` token itself before its tests, with take-gui), test-e2e's `test` 1
      unit plus the `gui` token, `cli-product-tests` 1 unit plus the `gui` token (its XCTest
      run shares the user's testmanagerd with the GUI jobs, see 2h2),
-     `swift-package-tests` 4 units, the side lanes `cli-pipe-regressions` 3 and
-     `remote-daemon-macos-tests` and `claude-wrapper` 1, an isolated job 4 (cmux-next's
-     generated files and action exports 6, the media tour 2), and any other job counts
-     as a compile. When units or a token are taken a cmux job waits for them, with no
+     `swift-package-tests` 4 units, the side lanes `cli-pipe-regressions` and the other light
+     ids 2 and `remote-daemon-macos-tests` and `claude-wrapper` 1, an isolated job 4, and any
+     other job counts as a compile. The hook's `JOB_CORES` table gives a job its own measured
+     cost where it is far from its class's: cmux-next's generated files, both autofix
+     workflows' action exports and cmux-tui's `macos` 6, cmux-next's `fast-tier` (off the fast
+     runner) and `daemon-test` 5, `cmux-scheme-compile`, the iOS builds, cmux-tui's `macos-relay`
+     and `lint` and CI's `release-build` 3, the media tour and cmux-tui's `build` 2, CI's
+     `cli-regressions` and hq's Go `test` 1. When units or a token are taken a cmux job waits for them, with no
      time limit, and never fails for capacity: GitHub has already handed the job to this
      runner and cannot move it. Every 2 s it tries again; it logs what it waits for and who
      holds it (`waiting (N s so far): all 2 canonical root tokens are taken (...); held by
@@ -674,7 +678,7 @@ the pools, register them at org scope into a runner group and allow that reposit
 At org scope the hook admits any repository of the org (`--allowed-owner`) under the same event, fork
 and disk rules. Job ids in the hook's table are cmux's (`--home-repo`, default `manaflow-ai/cmux`); a
 guest repository's job never takes a canonical root or the persistent-DerivedData token, whatever its
-id. It costs 4 units (isolated), or 3 units when its id ends in `-light`, or 1 unit plus the one
+id. It costs 4 units (isolated), or 2 units when its id ends in `-light`, or 1 unit plus the one
 simulator token when its id ends in `-sim` or `simulator`. A repository the hook cannot identify is a
 guest. cmux jobs wait for room with no time limit (its rescue workflow moves one that waits too long); a
 guest has no rescue, so it waits up to `--guest-wait` (600 s) for room before it is refused. Guests share
@@ -742,11 +746,14 @@ in at the producer's root. So one root job per root per mini:
   refused (10 of 17 refusals in the hour to 2026-09-26 03:40Z). It is never a root runner, so
   `canonicalRoots + guiRunners` is at most `runners`. Admission is unchanged: a GUI job takes 1 unit, the
   gui token (an app-host shard in the step before its restore instead), and the producer's root in its
-  restore step. Every gui-role runner also carries the session pool label `glaeda-session-<class>-xcode-<version>`,
-  and the others (session runners, `--session-runner`) carry only that one. Session-only jobs, which need a
-  logged-in session but not the console token, target the session label: with `guiRunners` 2 (cmux7s: `runners`
-  6, `capacityUnits` 10) two of them run at once, or one beside a console job, while console jobs (classes
-  `gui`, `gui-step`, `product`) still reach only the console gui runner, one at a time. Rolling it out is a
+  restore step. The other gui-role runners (session runners, `--session-runner`) carry only the session pool
+  label `glaeda-session-<class>-xcode-<version>`; the console gui runner carries it too only with `guiRunners` 1,
+  where it is the mini's one gui-role runner. Session-only jobs, which need a logged-in session but not the
+  console token, target the session label. A session runner listens only with 6 free units (`--fit-units`, its
+  costliest job: generated files, action exports), while the console gui runner listens with 1 (an app-host
+  shard's cost), so with session runners it leaves session jobs to them. With `guiRunners` 2 one session job runs
+  beside a console job, while console jobs (classes `gui`, `gui-step`, `product`) still reach only the console gui
+  runner, one at a time. Rolling it out is a
   cmux change pointing those jobs at the session label, an hq `build-fleet/mini-fleet.json` change, and
   `glaeda-cmux-runner-fleet --apply` per mini. `resource.guiRunners` in the route document still counts one
   per mini (gui tokens).

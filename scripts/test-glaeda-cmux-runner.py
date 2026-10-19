@@ -5447,9 +5447,9 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual([roles(l) for l in labels],
                          [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"]] * 2
                          + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"]] * 2
-                         + [["glaeda-session-std-xcode-26.6"],
-                            ["glaeda-gui-std-xcode-26.6", "glaeda-session-std-xcode-26.6"]],
-                         "only the last carries the gui label, so no console job lands where its token is held")
+                         + [["glaeda-session-std-xcode-26.6"], ["glaeda-gui-std-xcode-26.6"]],
+                         "only the last carries the gui label, so no console job lands where its token is held, and "
+                         "with a session runner beside it the console runner leaves session jobs to that one")
         self.assertEqual(["--gui-runner" in h for h in hooks], [False] * 5 + [True])
         self.assertEqual(["--session-runner" in h for h in hooks], [False] * 4 + [True, False])
         self.assertFalse([l for l in labels[4] if l == "glaeda-ios-sim" or l.startswith("glaeda-runner-")])
@@ -6480,6 +6480,12 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertIsNone(decide(200, 120, 2, 5, 0.8, 85, 0, 1, False))
         self.assertIsNone(decide(200, 120, 2, 5, 0.8, 55, 1, 1, False))
         self.assertIsNone(decide(200, 120, 2, 5, 0.8, 55, 0, 2, False))
+        # units are cores: a 6-core job quiet after warmup gives back one core at a time, down to half its admission
+        self.assertEqual(decide(200, 120, 6, 14, 1.0, 55, 0, 1, False, admitted=6), (5, "sustained low job CPU with host headroom"))
+        self.assertEqual(decide(200, 120, 4, 14, 1.0, 55, 0, 1, False, admitted=6)[0], 3)
+        self.assertIsNone(decide(200, 120, 3, 14, 1.0, 55, 0, 1, False, admitted=6), "3 is half of 6: it keeps them")
+        self.assertIsNone(decide(200, 120, 3, 14, 1.0, 55, 0, 1, False, admitted=5), "ceil(5 / 2) is 3")
+        self.assertEqual(decide(200, 120, 2, 14, 0.8, 55, 0, 1, False, admitted=2)[0], 1, "a 2-core job still may go to 1")
 
     def test_reparented_test_app_cpu_belongs_to_exact_live_job(self) -> None:
         first = "/Users/cmux/actions-runner-glaeda"

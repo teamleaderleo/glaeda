@@ -165,7 +165,7 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # matrix names (the root is part of the seed key), so no token may pick it: the job holds that root itself
 # with glaeda-canonical-root take (cmux "seed far main pushes in their own lane") before it clears it. It
 # never touches compile admission's kept DerivedData, so no persistent-dd either. Two seed jobs then fit
-# on one trusted mini with two runners, four units and two canonical roots.
+# on one trusted mini with two runners, ten units (cores) and two canonical roots.
 # nightly.yml's `build-nightly-app` (trusted runners only, cmux "build the nightly app on the trusted owned
 # minis first") compiles the universal Release app into its own workspace (build-universal, cleared at job
 # start) and restores its own compile cache lineage: no canonical root, no kept DerivedData, no GUI. As an
@@ -242,7 +242,9 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
 # estimated cores fill its cores. Costs are the p75 of cores.job (the job's own processes, mean cores over the job)
 # in glaeda-cmux-jobs.jsonl, rounded up, from 14,421 jobs on the 11 std PR minis, 2026-10-12 20:24Z to 10-19 20:24Z,
 # each job re-classed by these tables. By class (n, p50/p75/p90 cores): compile (3611) 3.96/4.53/5.20: 5;
-# isolated (8597) 2.45/3.85/4.68: 4; compile-gui (415) 0.52/3.50/4.12: 4; light (304) 0.69/2.58/3.75: 3;
+# isolated (8597) 2.45/3.85/4.68: 4; compile-gui (415) 0.52/3.50/4.12: 4; light (304) 0.69/2.58/3.75, but
+# every light job on a std mini has its own JOB_CORES cost, and the side-lane jobs left to the class run on the
+# light minis (glaeda-side-*, p75 1.33 there): 2;
 # gui-step (852) 0.45/0.58/0.69, simulator (378) 0.18/0.28/0.42, product (195) 0.17/0.28/0.35 and gui (69)
 # 0.23/0.32/0.60: 1. seed has no PR-mini telemetry (trusted minis only) and compiles a whole DerivedData: a
 # compile's 5. The simulator and gui tokens, not units, keep those jobs one per mini. isolated is also the class
@@ -261,7 +263,7 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (5, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
     "compile-gui": (4, ("root",)), "gui-step": (1, ("gui", "root")),
-    "isolated": (4, ()), "simulator": (1, ("simulator",)), "light": (3, ()), "seed": (5, ()),
+    "isolated": (4, ()), "simulator": (1, ("simulator",)), "light": (2, ()), "seed": (5, ()),
     "fast": (0, FAST_TOKENS)}
 # A job's own cost in cores, where it is far enough from its class's: keyed by (workflow file, job id) for the home
 # repository, (repository, workflow file, job id) for a guest. Only units change: the job keeps its class's tokens
@@ -4019,9 +4021,13 @@ def memory_pressure_level() -> int | None:
 
 def dynamic_release_decision(elapsed: float, low_since: float | None, units: int, total: int,
                              job_cores: float | None, host_busy: float | None, blocked: int,
-                             memory: int | None, thermal: bool | None) -> tuple[int, str] | None:
-    """Pure safety decision: release one unit only after warmup and sustained low, safe headroom."""
-    if units <= 1 or total <= 1 or elapsed < DYNAMIC_WARMUP_S or low_since is None:
+                             memory: int | None, thermal: bool | None,
+                             admitted: int | None = None) -> tuple[int, str] | None:
+    """Pure safety decision: release one unit only after warmup and sustained low, safe headroom. A job keeps at
+    least half the units it was admitted with (rounded up): units are its estimated cores, and a 6-core job quiet
+    through a slow checkout or cache fetch must not drop to one core and then compile on cores others were given."""
+    floor = max(1, math.ceil(admitted / 2)) if admitted else 1
+    if units <= floor or total <= 1 or elapsed < DYNAMIC_WARMUP_S or low_since is None:
         return None
     if elapsed - low_since < DYNAMIC_LOW_S or job_cores is None:
         return None
@@ -4317,7 +4323,7 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         samples = JobSamples(meta, os.cpu_count() or 1, started, interval)
         deadline = time.monotonic() + HOLDER_MAX_S
         tick = 0
-        dynamic_units = int(meta.get("units") or 0)
+        dynamic_units = admitted_units = int(meta.get("units") or 0)
         dynamic_total = int(meta.get("units_total") or dynamic_units)
         dynamic_warmup = DYNAMIC_WARMUP_S + (300.0 if meta.get("class") == "compile-gui" else 0.0)
         low_since: float | None = None
@@ -4350,7 +4356,8 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                              and blocked == 0 and (memory is None or memory < 2) and not thermal)
                     low_since = now if quiet and low_since is None else (low_since if quiet else None)
                     decision = dynamic_release_decision(now - started_mono, low_since, dynamic_units, dynamic_total,
-                                                        job_cores, host_busy, blocked, memory, thermal)
+                                                        job_cores, host_busy, blocked, memory, thermal,
+                                                        admitted=admitted_units)
                     if decision:
                         keep, release_reason = decision
                         request_dynamic_release(state_dir, keep, {"reason": release_reason,
