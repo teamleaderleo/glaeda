@@ -13,6 +13,7 @@ import plistlib
 import pwd
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -164,6 +165,31 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(run.returncode, 7, run.stderr)
         self.assertEqual(run.stdout.rsplit(" ", 1)[-1].strip(), "sh")
         self.assertIn("['a b', '$HOME', '--apply']", run.stdout)
+
+    def test_the_lan_parent_forwards_term_and_waits_for_the_python(self) -> None:
+        # `launchctl kill SIGTERM` reaches only the shell: the python3 must still get TERM, finish its handler,
+        # and the shell must outlive it and report its status, or launchd loses track of a live agent.
+        child = self.home / "child.py"
+        done = self.home / "handled"
+        child.write_text("import signal, sys, time\n"
+                         "def term(*_):\n"
+                         "    time.sleep(0.5)\n"
+                         f"    open({os.fspath(done)!r}, 'w').write('TERM')\n"
+                         "    sys.exit(3)\n"
+                         "signal.signal(signal.SIGTERM, term)\n"
+                         "print('ready', flush=True)\n"
+                         "time.sleep(60)\n")
+        shell = subprocess.Popen(ms.lan_program(sys.executable, "-I", os.fspath(child)), stdout=subprocess.PIPE,
+                                 text=True)
+        try:
+            self.assertEqual(shell.stdout.readline().strip(), "ready")
+            shell.send_signal(signal.SIGTERM)
+            self.assertEqual(shell.wait(timeout=30), 3)
+        finally:
+            if shell.poll() is None:
+                shell.kill()
+            shell.stdout.close()
+        self.assertEqual(done.read_text(), "TERM")
 
     def test_the_lan_fetch_broker_runs_apples_python_and_asks_for_a_root_owned_copy(self) -> None:
         with mock.patch.object(ms, "apple_python", return_value="/usr/bin/python3"):
