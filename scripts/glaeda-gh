@@ -155,6 +155,8 @@ BALANCED = ("pr", "run")  # kinds either bucket can read; comment watches stay o
 RICH_WINDOW_MIN = 60  # seconds: a bucket about to reset is rich, but not infinitely so
 FULL_WINDOW = 3600  # a bucket not seen yet, or past its reset, counts as a full hour's quota
 SWITCH_MARGIN = 1.25  # a kind moves to the other bucket only when that one is this much richer
+REST_CHECK_PAGES = 5  # check-run pages (100 each) one PR read over REST takes at most
+REST_STEPS_MAX = 10  # failed or cancelled jobs whose steps one PR read over REST looks up at most
 
 # NUM is the alias's PR-number variable: isRequired needs it
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeStateStatus headRefOid
@@ -516,10 +518,14 @@ def rest_pr_node(pull: dict, checks: dict, statuses: list[dict], runs: list[dict
         results = [n.get("conclusion") if n["__typename"] == "CheckRun" else n.get("state") for n in nodes]
         pending = any(n["__typename"] == "CheckRun" and n.get("status") != "COMPLETED" or
                       n["__typename"] == "StatusContext" and n.get("state") in {"PENDING", "EXPECTED"} for n in nodes)
-        state = "FAILURE" if any(r in FAILED for r in results) else "PENDING" if pending else "SUCCESS"
+        truncated = (checks.get("total_count") or 0) > len(checks.get("check_runs") or [])
+        # GraphQL's rollup state covers every check; ours covers only what was read, so a truncated
+        # list is never called green
+        state = ("FAILURE" if any(r in FAILED for r in results) else "PENDING" if pending or truncated
+                 else "SUCCESS")
         total = (checks.get("total_count") or 0) + len(statuses)
-        rollup = {"state": state, "contexts": {"totalCount": max(total, len(nodes)), "pageInfo": {
-            "hasNextPage": (checks.get("total_count") or 0) > len(checks.get("check_runs") or [])}, "nodes": nodes}}
+        rollup = {"state": state, "contexts": {"totalCount": max(total, len(nodes)),
+                                               "pageInfo": {"hasNextPage": truncated}, "nodes": nodes}}
     head = pull.get("head") or {}
     state = "OPEN" if pull.get("state") == "open" else "MERGED" if pull.get("merged") else "CLOSED"
     mergeable = {True: "MERGEABLE", False: "CONFLICTING"}.get(pull.get("mergeable"), "UNKNOWN")
@@ -617,6 +623,16 @@ def parse_pr(node: dict) -> dict:
         "checksTotal": contexts.get("totalCount", len(checks)),
         "checksTruncated": bool((contexts.get("pageInfo") or {}).get("hasNextPage")),
     }
+
+
+def known_steps(pairs: list[tuple[dict, dict]]) -> dict[str, list]:
+    """Check node id -> [failedSteps, stepCount] from the cached data: a completed check keeps them."""
+    known: dict[str, list] = {}
+    for e, _ in pairs:
+        for c in (((e["cache"] or {}).get("data") or {}).get("checks") or []):
+            if c.get("id") and isinstance(c.get("failedSteps"), list):
+                known[c["id"]] = [c["failedSteps"], c.get("stepCount")]
+    return known
 
 
 def slim_run(doc: dict) -> dict:
@@ -954,7 +970,9 @@ class Daemon:
             self.fill_steps([(entries[i], d) for i, d in parsed.items()])
         for i, e in enumerate(entries):
             if i in parsed:
-                self.store(e["key"], e["cache"], dataAt=self.now, data=parsed[i])
+                # a REST read's kept answers are dead weight in a file clients re-read every 3 s
+                extra = {"restParts": None} if kind == "pr" else {}
+                self.store(e["key"], e["cache"], dataAt=self.now, data=parsed[i], **extra)
                 continue
             err = problems.get(f"{alias}{i}") or {}
             what = "pull request" if kind == "pr" else "issue or pull request"
@@ -972,11 +990,7 @@ class Daemon:
         """Name the failed steps of each failed check run. A completed check does not change, so a
         check whose steps an earlier fetch read keeps them and costs nothing; the rest share one
         small query. When that query fails the checks go without, and the next cycle tries again."""
-        known: dict[str, list] = {}
-        for e, _ in pairs:
-            for c in (((e["cache"] or {}).get("data") or {}).get("checks") or []):
-                if c.get("id") and isinstance(c.get("failedSteps"), list):
-                    known[c["id"]] = [c["failedSteps"], c.get("stepCount")]
+        known = known_steps(pairs)
         want: dict[str, list[dict]] = {}
         for _, data in pairs:
             for c in data.get("checks") or []:
@@ -1043,10 +1057,13 @@ class Daemon:
         if doc is None:
             return self.fail(entries, error or "graphql: no response")
         data = doc.get("data") or {}
+        problems = {str((err.get("path") or [""])[0]): err for err in doc.get("errors") or [] if isinstance(err, dict)}
+        if not data and problems:  # the whole query failed (a schema change, say): say what GitHub said
+            return self.fail(entries, "graphql: " + str(next(iter(problems.values())).get("message"))[:200])
         for i, e in enumerate(entries):
             node = data.get(f"w{i}")
             if not isinstance(node, dict) or node.get("__typename") != "WorkflowRun":
-                message = "graphql: no workflow run at this URL"
+                message = "graphql: " + str((problems.get(f"w{i}") or {}).get("message") or "no workflow run at this URL")[:200]
                 self.errors.append(f"{e['key']}: {message}")
                 self.store(e["key"], e["cache"], error=message)
                 continue
@@ -1083,11 +1100,15 @@ class Daemon:
                 self.errors.append(f"{e['key']} jobs: {jdoc}")
         self.store(e["key"], e["cache"], **fields)
 
-    def rest_part(self, old: dict, new: dict, path: str, slim: Callable[[Any], Any]) -> Any:
+    def rest_part(self, old: dict, new: dict, path: str, slim: Callable[[Any], Any], absent: Any = None) -> Any:
         """A conditional GET whose slimmed answer is kept with its ETag: an unchanged resource answers
-        304, which costs nothing, and its kept answer is reused. Raises WatchError on an error."""
+        304, which costs nothing, and its kept answer is reused. Raises WatchError on an error, except
+        a 404 when `absent` is given: then the last answer stands, or `absent` without one."""
         kept = old.get(path) or {}
         state, doc, etag = self.get(path, kept.get("etag") if "doc" in kept else None)
+        if state == "error" and absent is not None and str(doc).startswith("HTTP 404"):
+            new[path] = {"doc": kept["doc"]} if "doc" in kept else {"doc": absent}
+            return new[path]["doc"]
         if state == "error":
             raise WatchError(doc)
         new[path] = kept if state == "same" else {"etag": etag, "doc": slim(doc)}
@@ -1096,8 +1117,8 @@ class Daemon:
     def fetch_pr_rest(self, e: dict) -> None:
         """One PR over REST, for when GraphQL is the poorer bucket: the pull, its head's check runs,
         statuses and workflow runs (for superseded runs), the repo's workflow names, and the base
-        branch's required checks from its rulesets and classic protection. All seven reads are conditional, so a
-        quiet PR costs nothing. A failed read keeps the cached data and says why."""
+        branch's required checks from its rulesets and classic protection. Every read is conditional,
+        so a quiet PR costs nothing. A failed read keeps the cached data and says why."""
         _, owner, repo, number = split_key(e["key"])
         prior = e["cache"] or {}
         self.reads.append((self.now, "pr", "rest"))
@@ -1107,12 +1128,19 @@ class Daemon:
             pull = self.rest_part(old, parts, f"{root}/pulls/{number}", slim_pull)
             sha = (pull.get("head") or {}).get("sha") or ""
             base = urllib.parse.quote(str((pull.get("base") or {}).get("ref") or ""), safe="/")
-            checks = self.rest_part(old, parts, f"{root}/commits/{sha}/check-runs?per_page=100", slim_check_runs)
+            # filter=all: every attempt, as GraphQL's rollup lists them, so parse_pr dedupes both alike
+            path = f"{root}/commits/{sha}/check-runs?filter=all&per_page=100"
+            checks = self.rest_part(old, parts, path, slim_check_runs)
+            listed = list(checks.get("check_runs") or [])
+            for page in range(2, min(REST_CHECK_PAGES, -(-(checks.get("total_count") or 0) // 100)) + 1):
+                listed += self.rest_part(old, parts, f"{path}&page={page}", slim_check_runs).get("check_runs") or []
+            checks = {"total_count": checks.get("total_count"), "check_runs": listed}
             statuses = self.rest_part(old, parts, f"{root}/commits/{sha}/status?per_page=100", slim_statuses)
             runs = self.rest_part(old, parts, f"{root}/actions/runs?head_sha={sha}&per_page=100", slim_head_runs)
             workflows = self.rest_part(old, parts, f"{root}/actions/workflows?per_page=100", slim_workflows)
-            required = set(self.rest_part(old, parts, f"{root}/rules/branches/{base}", slim_rules))
-            required |= set(self.rest_part(old, parts, f"{root}/branches/{base}", slim_branch))
+            # a deleted base (a stacked PR's, after its merge) has no requirements left to read
+            required = set(self.rest_part(old, parts, f"{root}/rules/branches/{base}?per_page=100", slim_rules, []))
+            required |= set(self.rest_part(old, parts, f"{root}/branches/{base}", slim_branch, []))
         except WatchError as error:
             message = f"rest: {error}"
             self.errors.append(f"{e['key']}: {message}")
@@ -1121,8 +1149,32 @@ class Daemon:
                               missing=not parts and str(error).startswith("HTTP 404"))
         review = (prior.get("data") or {}).get("reviewDecision")  # REST has none: keep GraphQL's last
         data = parse_pr(rest_pr_node(pull, checks, statuses, runs, required, review, workflows))
-        self.fill_steps([(e, data)])
+        self.fill_steps_rest(e, data, root, {c.get("node_id"): c.get("id") for c in listed})
         self.store(e["key"], e["cache"], dataAt=self.now, data=data, restParts=parts)
+
+    def fill_steps_rest(self, e: dict, data: dict, root: str, job_ids: dict[str, Any]) -> None:
+        """fill_steps over REST, for a PR read over REST (GraphQL is the poorer bucket, or stopped).
+        An Actions check run's id is its job's id, and GET .../actions/jobs/ID lists the steps. A
+        completed job does not change, so each is read once; at most REST_STEPS_MAX per read, and
+        the rest on the next one. Without its steps a refused or never-started check cannot be held."""
+        known = known_steps([(e, data)])
+        left = REST_STEPS_MAX
+        for c in data.get("checks") or []:
+            if not wants_steps(c):
+                continue
+            if c["id"] in known:
+                c["failedSteps"], c["stepCount"] = known[c["id"]]
+                continue
+            job_id = job_ids.get(c["id"])
+            if not job_id or not c.get("runId") or left <= 0 or self.mode("rest") == "stop":
+                continue
+            left -= 1
+            state, doc, _ = self.get(f"{root}/actions/jobs/{job_id}", None)
+            if state != "fresh" or not isinstance(doc, dict):
+                self.errors.append(f"{e['key']} steps: {doc}")
+                continue
+            steps = doc.get("steps")
+            c["failedSteps"], c["stepCount"] = failed_steps(steps), len(steps) if isinstance(steps, list) else None
 
     def controller_down(self, error: Exception, site: str | None = None) -> None:
         """Leave the controller alone for a while; REST serves meanwhile. The cursor is kept, so the
