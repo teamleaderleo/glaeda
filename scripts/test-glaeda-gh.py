@@ -1882,7 +1882,7 @@ class OverloadTest(Base):
 
     def test_one_heavy_pr_does_not_keep_the_others_stale(self) -> None:
         keys = self.watch(12)
-        self.overloaded(poison=7)
+        sizes = self.overloaded(poison=7)
         self.daemon.tick(NOW)
         for key in keys:
             entry = gg.read_cache(key)
@@ -1890,9 +1890,15 @@ class OverloadTest(Base):
                 self.assertIn("HTTP 504", entry["error"])
             else:
                 self.assertIsNotNone(entry["data"], key)
-        before = self.daemon.batch["pr"]
+        self.assertEqual(set(self.daemon.heavy), {"pr:o/r#7"})
+        self.assertEqual(self.daemon.batch["pr"], 5)  # halved once on this tick, not once per split
+        # from now on #7 is read alone and the rest batch normally: one query, not a cascade of splits
+        sizes.clear()
         self.daemon.tick(NOW + gg.CYCLE)
-        self.assertGreaterEqual(self.daemon.batch["pr"], min(before, 2))  # a lone heavy PR does not shrink it to 1
+        self.assertEqual(sizes, [1, 5, 5, 1])  # #7 alone, then the other 11 in batches of 5
+        for cycle in range(2, 12):
+            self.daemon.tick(NOW + cycle * gg.CYCLE)
+        self.assertGreater(self.daemon.batch["pr"], 5)  # it grows back while #7 keeps failing alone
 
     def test_the_oldest_data_age_is_reported(self) -> None:
         keys = self.watch(3)
