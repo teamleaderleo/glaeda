@@ -1827,6 +1827,93 @@ class ClientTest(Base):
         self.assertIn("--sha must be a commit id", err.getvalue())
 
 
+class OverloadTest(Base):
+    """GitHub answers 504 when one GraphQL query takes over ~10 s. Measured on cosmic-gray
+    (2026-10-19, 89 watched PRs): 25 PRs per query took 10-11 s and one of two answered 504; 10 took
+    4-6 s and 5 took 2-3 s, all 200, every one costing 1 point. Latency, not cost, sets the limit."""
+
+    def overloaded(self, limit: int | None = None, poison: int | None = None):
+        """A transport that answers 504 to a PR query with more than `limit` PRs, or that includes
+        PR `poison` (one PR heavy enough to time out alone)."""
+        sizes = []
+
+        def transport(method, url, headers, body):
+            if url.endswith("/graphql"):
+                doc = json.loads(body)
+                prs = [v for k, v in doc["variables"].items() if k.startswith("n")]
+                if "pullRequest(number:" in doc["query"]:
+                    sizes.append(len(prs))
+                    if (limit is not None and len(prs) > limit) or (poison is not None and poison in prs):
+                        return 504, {}, b'{"message": "We couldn\'t respond to your request in time."}'
+            return self.gh(method, url, headers, body)
+        self.daemon.transport = transport
+        return sizes
+
+    def watch(self, count: int) -> list[str]:
+        keys = []
+        for n in range(1, count + 1):
+            self.gh.prs[("o", "r", n)] = pr_node(n)
+            keys.append(f"pr:o/r#{n}")
+            gg.register(keys[-1])
+        return keys
+
+    def test_a_504_halves_the_batch_and_retries_the_halves(self) -> None:
+        keys = self.watch(30)
+        sizes = self.overloaded(limit=6)
+        self.daemon.tick(NOW)
+        for key in keys:
+            entry = gg.read_cache(key)
+            self.assertIsNotNone(entry["data"], key)  # every PR read on this tick, none left stale
+            self.assertIsNone(entry["error"], key)
+        self.assertLessEqual(self.daemon.batch["pr"], 6)
+        self.assertLessEqual(max(sizes[1:]), 6 * 2)
+        self.assertEqual(self.daemon.status["batch"]["pr"], self.daemon.batch["pr"])
+
+    def test_the_batch_starts_small_and_grows_back_slowly(self) -> None:
+        self.watch(40)
+        sizes = self.overloaded()
+        self.daemon.tick(NOW)
+        self.assertLessEqual(max(sizes), 10)  # 25 PRs per query took 10-11 s: too close to the limit
+        self.daemon.batch["pr"] = 2
+        for cycle in range(1, 4):
+            self.daemon.tick(NOW + cycle * gg.CYCLE)
+        self.assertGreater(self.daemon.batch["pr"], 2)
+        self.assertLessEqual(self.daemon.batch["pr"], gg.GQL_BATCH)
+
+    def test_one_heavy_pr_does_not_keep_the_others_stale(self) -> None:
+        keys = self.watch(12)
+        self.overloaded(poison=7)
+        self.daemon.tick(NOW)
+        for key in keys:
+            entry = gg.read_cache(key)
+            if key == "pr:o/r#7":
+                self.assertIn("HTTP 504", entry["error"])
+            else:
+                self.assertIsNotNone(entry["data"], key)
+        before = self.daemon.batch["pr"]
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertGreaterEqual(self.daemon.batch["pr"], min(before, 2))  # a lone heavy PR does not shrink it to 1
+
+    def test_the_oldest_data_age_is_reported(self) -> None:
+        keys = self.watch(3)
+        self.daemon.tick(NOW)
+        self.overloaded(limit=0)  # every PR query fails from now on
+        self.daemon.tick(NOW + 5 * gg.CYCLE)
+        status = gg.read_json(gg.BASE / "daemon.json")
+        self.assertEqual(status["oldestData"]["pr"], 5 * gg.CYCLE)
+        self.assertIsNone(status["oldestData"]["run"])
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(gg, "daemon_stale", return_value=None):
+                gg.cmd_budget(False)
+            self.assertIn("oldest data of an open watch: PRs 5m", out.getvalue())
+        finally:
+            lock.close()
+
+
 class BudgetOutputTest(Base):
     def test_budget_shows_both_buckets_the_paths_and_the_split(self) -> None:
         self.gh.prs[("o", "r", 1)] = pr_node(1)
