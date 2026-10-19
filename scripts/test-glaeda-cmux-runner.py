@@ -719,22 +719,22 @@ class HookTest(unittest.TestCase):
     def test_capacity_admits_by_weight_and_refuses_fast_when_full(self) -> None:
         self.fleet()
         try:
-            first = self.job("macos-compile-admission", "r0", 11)
+            first = self.job("macos-compile-admission", "r0", 9)
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-            self.assertIn("holding 5/11 units+persistent-dd+root-1 for macos-compile-admission (compile", first.stdout)
-            second = self.job("macos-compile-admission", "r1", 11)
+            self.assertIn("holding 5/9 units+persistent-dd+root-1 for macos-compile-admission (compile", first.stdout)
+            second = self.job("macos-compile-admission", "r1", 9)
             self.assertEqual(second.returncode, 1)
             self.assertIn("refused: capacity: the persistent-dd token is taken", second.stdout)
-            self.assertIn("3/11 units for swift-package-tests (light", self.job("swift-package-tests", "r2", 11).stdout)
-            self.assertEqual(self.job("cli-pipe-regressions", "r3", 11).returncode, 0)
+            self.assertIn("2/9 units for swift-package-tests (light", self.job("swift-package-tests", "r2", 9).stdout)
+            self.assertEqual(self.job("cli-pipe-regressions", "r3", 9).returncode, 0)
             start = time.monotonic()
-            full = self.job("swift-package-tests", "r4", 11)
+            full = self.job("swift-package-tests", "r4", 9)
             self.assertLess(time.monotonic() - start, 10, "a full mini refuses, it never waits")
             self.assertEqual(full.returncode, 1)
-            self.assertIn("refused: capacity: 0 of 11 units free", full.stdout)
+            self.assertIn("refused: capacity: 0 of 9 units free", full.stdout)
             self.assertTrue(self.shared_lock_blocks_exclusive(), "with-host-lock's LOCK_EX must wait for our jobs")
             self.assertIn("released", self.finish("r0"))
-            self.assertIn("persistent-dd", self.job("macos-compile-admission", "r5", 11).stdout)
+            self.assertIn("persistent-dd", self.job("macos-compile-admission", "r5", 9).stdout)
         finally:
             for runner in ("r0", "r2", "r3", "r5"):
                 self.finish(runner)
@@ -1714,7 +1714,7 @@ class HookTest(unittest.TestCase):
             other = self.job("tests-build-and-lag", "g1", 4, None, "--gui-wait", "0")
             self.assertIn("refused: capacity: the gui token is taken", other.stdout)
             ci = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/ci.yml@refs/heads/main"}
-            for n, (lane, cores) in enumerate((("cli-pipe-regressions", 3), ("remote-daemon-macos-tests", 1),
+            for n, (lane, cores) in enumerate((("cli-pipe-regressions", 2), ("remote-daemon-macos-tests", 1),
                                                ("claude-wrapper", 1))):
                 side = self.job(lane, f"s{n}", 8, None, env=ci)
                 self.assertIn(f"{cores}/8 units for {lane} (light", side.stdout, "light, or its JOB_CORES")
@@ -1924,16 +1924,16 @@ time.sleep(60)
         capacity = self.dir / "capacity"
         runners = [f"f{n}" for n in range(5)]
         try:
-            self.assertEqual(self.job("swift-package-tests", "f0", 12).returncode, 0)
-            self.assertIsNone(hook.mini_full(capacity, 12), "9 of 12 units are still free")
+            self.assertEqual(self.job("swift-package-tests", "f0", 8).returncode, 0)
+            self.assertIsNone(hook.mini_full(capacity, 8), "6 of 8 units are still free")
             for runner in runners[1:4]:
-                self.assertEqual(self.job("swift-package-tests", runner, 12).returncode, 0)
-            self.assertEqual(hook.mini_full(capacity, 12), "all 12 capacity units on this mini are taken")
+                self.assertEqual(self.job("swift-package-tests", runner, 8).returncode, 0)
+            self.assertEqual(hook.mini_full(capacity, 8), "all 8 capacity units on this mini are taken")
             # the probe took and gave back nothing: the holders keep every unit, and a job is still refused
-            refused = self.job("swift-package-tests", "f4", 12)
-            self.assertIn("refused: capacity: 0 of 12 units free", refused.stdout)
+            refused = self.job("swift-package-tests", "f4", 8)
+            self.assertIn("refused: capacity: 0 of 8 units free", refused.stdout)
             self.finish("f2")
-            self.assertIsNone(hook.mini_full(capacity, 12))
+            self.assertIsNone(hook.mini_full(capacity, 8))
         finally:
             for runner in runners:
                 self.finish(runner)
@@ -2229,22 +2229,22 @@ time.sleep(60)
         self.fleet()
         release = None
         try:
-            self.assertEqual(self.job("macos-compile-admission", "u0", 10).returncode, 0)
-            self.assertEqual(self.job("claude-wrapper", "u1", 10).returncode, 0)
+            self.assertEqual(self.job("macos-compile-admission", "u0", 9).returncode, 0)
+            self.assertEqual(self.job("claude-wrapper", "u1", 9).returncode, 0)
             waited = time.monotonic()
-            root = self.job("release-build", "u2", 10, None, "--gui-wait", "2")
+            root = self.job("release-build", "u2", 9, None, "--gui-wait", "2")
             self.assertEqual(root.returncode, 1, root.stdout)
-            self.assertIn("refused: capacity: 2 of 10 units free", root.stdout)
+            self.assertIn("refused: capacity: 2 of 9 units free", root.stdout)
             self.assertGreaterEqual(time.monotonic() - waited, 2, "a root runner waits for units too")
             release = threading.Timer(2.0, self.finish, args=("u1",))
             release.start()
-            side = self.job("release-build", "u3", 10, None, "--instance", "1", "--gui-wait", "30")
+            side = self.job("release-build", "u3", 9, None, "--instance", "1", "--gui-wait", "30")
             release.join()
             self.assertEqual(side.returncode, 0, side.stdout)
-            self.assertIn("holding 4/10 units for release-build (isolated", side.stdout)
+            self.assertIn("holding 4/9 units for release-build (isolated", side.stdout)
             # the wait ends at its deadline
             waited = time.monotonic()
-            late = self.job("release-build", "u4", 10, None, "--instance", "1", "--gui-wait", "2")
+            late = self.job("release-build", "u4", 9, None, "--instance", "1", "--gui-wait", "2")
             self.assertEqual(late.returncode, 1, late.stdout)
             self.assertGreaterEqual(time.monotonic() - waited, 2)
             self.assertLess(time.monotonic() - waited, 20, "a 2 s wait, then a refusal")
@@ -2493,7 +2493,7 @@ time.sleep(60)
             same = guest("macos-compile-admission", "n1")
             self.assertIn("(isolated", same.stdout)
             self.assertNotIn("root-", same.stdout)
-            self.assertIn("3/20 units for lint-light (light", guest("lint-light", "n2").stdout)
+            self.assertIn("2/20 units for lint-light (light", guest("lint-light", "n2").stdout)
             self.assertIn("+simulator for ui-tests-sim (simulator", guest("ui-tests-sim", "n3").stdout)
             waited = time.monotonic()
             busy = self.job("ios-simulator", "n4", 20, None, "--allowed-repo", "manaflow-ai/newapp",
@@ -2507,8 +2507,8 @@ time.sleep(60)
     # ------------------------------------------------------------ ci-step admission (cmuxterm-hq#794)
 
     def ci_step(self, phase: str, *extra: str, units: int = 7) -> tuple[int, dict]:
-        """Run admit, release or fits as the build worker does: one JSON line on stdout. 7 units: a light step (3)
-        and an isolated one (4)."""
+        """Run admit, release or fits as the build worker does: one JSON line on stdout. 7 units: a light step (2),
+        an isolated one (4) and one more."""
         result = self.run_hook(phase, None, None, "--capacity-units", str(units),
                                "--capacity-dir", os.fspath(self.dir / "capacity"),
                                "--state-dir", os.fspath(self.dir / "state"), *extra)
@@ -2537,21 +2537,21 @@ time.sleep(60)
             status, first = self.ci_step("admit", "--class", "light", "--job-key", "r1-100-1", *watch)
             self.assertEqual(status, 0, first)
             self.assertEqual((first["schema"], first["admitted"], first["units"], first["units_total"],
-                              first["tokens"]), ("glaeda-ci-step-admission/v1", True, 3, 7, []))
+                              first["tokens"]), ("glaeda-ci-step-admission/v1", True, 2, 7, []))
             self.assertIsInstance(first["holder_pid"], int)
             self.assertTrue(self.shared_lock_blocks_exclusive(), "a dev build's exclusive host lock waits for steps")
-            self.assertEqual(self.fits(), ["light", "isolated"], "four of seven units are free")
+            self.assertEqual(self.fits(), ["light", "isolated"], "five of seven units are free")
             status, second = self.ci_step("admit", "--class", "isolated", "--job-key", "r1-101-1", *watch)
             self.assertEqual((status, second["units"]), (0, 4), second)
-            self.assertEqual(self.fits(), [], "every unit is held")
+            self.assertEqual(self.fits(), [], "one unit is left: too few for any step")
             start = time.monotonic()
             status, full = self.ci_step("admit", "--class", "light", "--job-key", "r1-102-1", *watch)
             self.assertLess(time.monotonic() - start, 25, "a full mini refuses, it never waits")
             self.assertEqual((status, full["admitted"]), (1, False))
-            self.assertIn("capacity: 0 of 7 units free", full["reason"])
+            self.assertIn("capacity: 1 of 7 units free", full["reason"])
             runner = self.job("swift-package-tests", "r0", 7)
             self.assertEqual(runner.returncode, 1, "a runner job sees the units the steps hold")
-            self.assertIn("refused: capacity: 0 of 7 units free", runner.stdout)
+            self.assertIn("refused: capacity: 1 of 7 units free", runner.stdout)
             status, released = self.ci_step("release", "--job-key", "r1-100-1")
             self.assertEqual((status, released["released"]), (0, "released the fleet host lock"))
             self.assertEqual(self.fits(), ["light"], "three units are free again: too few for an isolated step")
