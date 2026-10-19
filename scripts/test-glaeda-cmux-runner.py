@@ -1278,6 +1278,26 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
+    def test_capacity_runs_tour_slots_tours_per_mini(self) -> None:
+        """With --tour-slots 2 (cmux pr-media gives each tour slot its own DerivedData), two tours run at once on one
+        mini, each on its own tour token, and a third waits."""
+        self.fleet()
+        tour = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next-media.yml@refs/heads/main"}
+        two = ("--canonical-roots", "2", "--compile-slots", "2", "--tour-slots", "2")
+        try:
+            first = self.job("tour", "t0", 8, None, *two, env=tour)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            second = self.job("tour", "t1", 8, None, *two, env=tour)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("holding 2/8 units+tour-1 for tour (tour", second.stdout)
+            third = self.job("tour", "t2", 8, None, *two, "--gui-wait", "0", env=tour)
+            self.assertEqual(third.returncode, 1)
+            self.assertIn("refused: capacity: all 2 tour tokens are taken", third.stdout)
+        finally:
+            for runner in ("t0", "t1", "t2"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
     def test_take_root_refuses_bad_roots_and_non_jobs(self) -> None:
         for bad in ("/tmp/elsewhere", "/private/tmp/cmux-ci-1", "0", "cmux-ci-2x", "02", "/private/tmp/cmux-ci-02"):
             with self.subTest(bad=bad):
@@ -5284,14 +5304,15 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--state-dir", shim)
         self.assertTrue(os.access(hooks / "glaeda-canonical-root", os.X_OK))
         self.assertNotIn("--compile-slots", (hooks / "job-started.sh").read_text())  # 1 is the hook's default
+        self.assertNotIn("--tour-slots", (hooks / "job-started.sh").read_text())
         # one root: no --canonical-roots, but --instance still tells the gate a root runner from a side one
         self.assertNotIn("--canonical-roots", (hooks / "job-started.sh").read_text())
         self.assertIn("--capacity-units 4 --instance 0\n", (hooks / "job-started.sh").read_text())
-        manifest["defaults"]["runner"] = {"classes": {"std": {"compileSlots": 2, "canonicalRoots": 2}}}
+        manifest["defaults"]["runner"] = {"classes": {"std": {"compileSlots": 2, "canonicalRoots": 2, "tourSlots": 2}}}
         path.write_text(json.dumps(manifest))
         with mock.patch.object(cr, "xcode_present", return_value=True):
             self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
-        self.assertIn("--capacity-units 4 --compile-slots 2 --canonical-roots 2 --instance 0",
+        self.assertIn("--capacity-units 4 --compile-slots 2 --tour-slots 2 --canonical-roots 2 --instance 0",
                       (hooks / "job-started.sh").read_text())  # instance 0 prefers root 1
         self.assertNotIn("--trusted-ref", (hooks / "job-started.sh").read_text())
         self.assertIn("--test-keychain --recycle-testmanagerd", (hooks / "job-started.sh").read_text())
@@ -6032,6 +6053,12 @@ class ManifestLabelsTest(unittest.TestCase):
             self.assertEqual(cr.member_labels(manifest, "override")[0]["runners"], 1)
             self.assertEqual(cr.member_labels(manifest, "override")[0]["capacityUnits"], 6)
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["compileSlots"], 1)
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["tourSlots"], 1, "one tour per mini by default")
+            for bad in (0, 5, True, "2"):
+                manifest["defaults"]["runner"]["classes"]["std"]["tourSlots"] = bad
+                self.assertIn("tourSlots must be 1 to 4", cr.member_labels(manifest, "mini-std")[1], bad)
+            manifest["defaults"]["runner"]["classes"]["std"]["tourSlots"] = 2
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["tourSlots"], 2)
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["canonicalRoots"], 1)
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["rootPools"], ["glaeda-root-std-xcode-26.6"])
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["sidePools"], ["glaeda-side-std-xcode-26.6"])
