@@ -192,8 +192,8 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # cmux-next-media.yml's `tour` (cmux pr-media, on the mini's gui runner) builds the merge base and head as tagged
 # dev apps, each into its own ~/Library/Developer/Xcode/DerivedData/cmux-<tag>, and captures them through the
 # app's own window snapshot driven by the bundled CLI: no canonical root, no kept DerivedData, no XCTest. As an
-# unknown job it held persistent-dd and a root for its whole run (p50 17 min, 34 a day, ci-dash 2026-10-15..17),
-# so no compile admission could start on that mini. It takes no gui token today either.
+# unknown job it was pinned compile: one persistent-dd copy and root 1 for its whole run (p50 17 min, 34 a day,
+# ci-dash 2026-10-15..17), so its mini had one compile slot left. It takes no gui token today either.
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("cmux-tui.yml", "macos-relay"): "isolated",
