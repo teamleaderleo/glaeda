@@ -535,9 +535,10 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     )
     gate = (f"{python} {hook} listen --runner-dir {shlex.quote(os.fspath(ctx.runner_dir))}"
             + ("" if ctx.capacity_units else " --no-waiters"))
-    if ctx.capacity_units and IOS_SIM_JOB_LABEL in ctx.labels:
+    if ctx.capacity_units and (IOS_SIM_JOB_LABEL in ctx.labels or getattr(ctx, "session_runner", False) is True):
         # the iOS picker sends 2-unit isolated builds (mobile-core-package, ios-simulator-build) to this label: listening with one
-        # free unit only takes one to refuse it (cmuxterm-hq#661 Workstream 7)
+        # free unit only takes one to refuse it (cmuxterm-hq#661 Workstream 7). A session runner's jobs (isolated, tour)
+        # cost 2 units as well, and one taken with a single unit free would wait and hold every runner here.
         gate += " --fit-units 2"
     listen = (
         "#!/bin/bash\n"

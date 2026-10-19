@@ -3954,7 +3954,7 @@ class GateTest(unittest.TestCase):
         self.assertEqual(hook.mini_full(capacity, 5, one), "the canonical root is taken")
         os.close(held)
 
-    def test_a_session_runner_holds_only_for_units_and_a_waiting_tour(self) -> None:
+    def test_a_session_runner_holds_only_for_units(self) -> None:
         """A session runner (guiRunners 2: the gui-role runner beside the console one) takes only session-only jobs
         (daemon tests, generated files, action exports, the tour): no gui token or root, so a console job holding
         them is no reason to idle it. The console gui runner keeps its gate."""
@@ -3970,9 +3970,9 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(hook.mini_full(capacity, 5, session), "a console job waiting is the console runner's business")
         (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(
             json.dumps({"since": time.time(), "wants": ["tour"], "who": "t1 tour (run 4)"}) + "\n")
-        for scope in (session, console):
-            self.assertEqual(hook.mini_full(capacity, 5, scope), "t1 tour (run 4) waits here for tour",
-                             "a second tour waiting here holds both: their next job could be a tour")
+        # a second tour waiting for the tour token idles neither: their next job is rarely a tour
+        self.assertIsNone(hook.mini_full(capacity, 5, session))
+        self.assertEqual(hook.mini_full(capacity, 5, console), "the gui token is taken", "only its own gate")
         self.assertIsNone(hook.mini_full(capacity, 5, hook.RunnerScope(5, 2, 2)), "side runners take no tour")
         (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").unlink()
         for fd in [held, *roots]:
@@ -4306,6 +4306,10 @@ class GateTest(unittest.TestCase):
         self.assertNotIn("--fit-units", self.listen_sh(sys.executable).read_text())
         script = self.listen_sh(sys.executable, ["glaeda-mini", "glaeda-side-std-xcode-26.6", "glaeda-ios-sim"])
         self.assertIn(f"listen --runner-dir {self.runner} --fit-units 2 &", script.read_text())
+        # a session runner's jobs (isolated, tour) all cost 2 units too
+        script = self.listen_sh(sys.executable, ["glaeda-mini", "glaeda-session-std-xcode-26.6"], session=True)
+        self.assertIn(f"listen --runner-dir {self.runner} --fit-units 2 &", script.read_text())
+        self.assertEqual(hook.CLASS_COST["isolated"][0], hook.CLASS_COST["tour"][0])
         self.assertEqual(max(hook.CLASS_COST[hook.JOB_CLASSES[job]][0] for job in
                              ("mobile-core-package", "ios-simulator-build", "ios-simulator", "screenshots")), 2,
                          "--fit-units 2 is the costliest class glaeda-ios-sim brings")
@@ -4493,9 +4497,10 @@ class GateTest(unittest.TestCase):
             gate.step(); gate.step()
             stop.assert_called_once_with("a fleet build holds the host lock")
 
-    def listen_sh(self, python: str, labels: list[str] | None = None) -> Path:
+    def listen_sh(self, python: str, labels: list[str] | None = None, session: bool = False) -> Path:
         ctx = mock.Mock(python=python, hook_dir=HOOK.parent, runner_dir=self.runner, org=None, repo="manaflow-ai/cmux",
-                        min_free_gib=0, member=None, capacity_units=4, labels=labels or ["glaeda-mini"])
+                        min_free_gib=0, member=None, capacity_units=4, labels=labels or ["glaeda-mini"],
+                        session_runner=session)
         script = self.tmp / "listen.sh"
         script.write_bytes(cr.hook_wrappers(ctx)["listen.sh"])
         script.chmod(0o755)

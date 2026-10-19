@@ -255,13 +255,15 @@ What `--apply` does:
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
        mini's gui runner instead.
      - A session runner (`--session-runner`, `guiRunners` above 1) carries only the session
-       pool label and stops only while every unit is taken or a job here waits for units or
-       the `tour` token. Its jobs (cmux-next daemon tests, generated files, action exports,
+       pool label and stops only while fewer than 2 units are free (`--fit-units 2`: each of
+       its jobs costs 2), a job here waits for units, or the console is locked. Its jobs (cmux-next daemon tests, generated files, action exports,
        the pr-media tour) need the logged-in session but neither the gui token nor a root, so
        a console job holding them is no reason to idle it. It never gets a console job: the
        gui label is the console gui runner's alone. The tour (class `tour`) builds into fixed
        per-tag DerivedData, so it also takes the mini's one `tour` token: a second tour on the
-       same mini waits for it rather than racing on a tag directory.
+       same mini waits for it rather than racing on a tag directory. A waiting second tour holds
+       no runner's gate. With `guiRunners` 2 it can still park on the console gui runner, which
+       carries the session label too, so the console runner is busy for that wait.
      - A fast runner (`--fast-runner`, below) looks only at the two fast tokens
        (`capacity/fast-0.token`, `fast-1.token`): it stops while either is taken or a job
        here waits for one, and listens with every shared unit taken. No other runner,
@@ -725,7 +727,7 @@ in at the producer's root. So one root job per root per mini:
   `glaeda-side-<class>-xcode-<version>` instead. cmux's light side-lane jobs run on it
   (`vars.CI_SIDE_LANE_RUNNER`, cmux#14391), so they never hold a root runner. A class whose
   `canonicalRoots` equals `runners` has no side runner, so do not point that variable at it.
-- `guiRunners` (0 to `runners - canonicalRoots`, default 0) makes the last instances (`runners - 1` down) the
+- `guiRunners` (0 to `runners - canonicalRoots - fastRunners`, default 0) makes the last instances (`runners - 1` down) the
   mini's gui-role runners. The last of them is the console gui runner. It carries
   the gui pool label `glaeda-gui-<class>-xcode-<version>` and neither the pool, root, side nor
   `glaeda-ios-sim` label, and its job-started hook passes `--gui-runner`. cmux's GUI jobs (app-host shards,

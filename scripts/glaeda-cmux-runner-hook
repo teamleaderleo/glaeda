@@ -2823,14 +2823,15 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
     runner carries the label, so holding it never keeps a compile off the mini.
 
     With the scope of a session runner (scope.session, guiRunners above 1: the gui runners other than the console
-    one carry only the session pool label), full means only that units are taken or a job here waits for units or
-    the tour token. Its jobs (cmux-next daemon tests, generated files, action exports, the tour) need a logged-in
-    session but neither the gui token nor a canonical root, so a console job's token is no reason to hold it, and
-    no console job reaches it: the gui label it lacks is the console runner's alone.
+    one carry only the session pool label), full means only that units are taken or a job here waits for units
+    (Gate.locked also holds it while the console is locked). Its jobs (cmux-next daemon tests, generated files,
+    action exports, the tour) need a logged-in session but neither the gui token nor a canonical root, so a console
+    job's token is no reason to hold it, and no console job reaches it: the gui label it lacks is the console
+    runner's alone. It listens only with 2 units free (--fit-units 2): every job it takes costs 2.
 
     Full also means a job admitted to this mini is waiting (CAPACITY_WAIT, its admit.want marker) for units or
     for a token this runner's next job would take (a root runner: a canonical root or persistent-dd; a gui
-    runner: the gui token, a root or the tour token; a session runner: the tour token). That job goes first, so a
+    runner: the gui token or a root). A second tour waiting for the tour token holds no runner. That job goes first, so a
     job this runner took now would only queue behind it here, while GitHub could hand it to a mini with room.
 
     With the scope of a fast runner (scope.fast, the fast pool label: cmux-next's fast-tier), full means only that a
@@ -2878,9 +2879,9 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             return (f"only {free} of {total} capacity units on this mini are free; "
                     f"{'a compile' if root else 'its next job'} needs {need}")
         # a job already here waits for what this runner's next job would take (CAPACITY_WAIT): it goes first
+        # A tour waiting for the tour token holds no runner: their next job is rarely a second tour.
         compete = {"units"} | ({"root", "persistent-dd"} if root else set()) | (
-            {scope.gui_token, "root", "tour"} if scope is not None and scope.gui else set()) | (
-            {"tour"} if scope is not None and scope.session else set())
+            {scope.gui_token, "root"} if scope is not None and scope.gui else set())
         for waiter in admission_waiters(capacity_dir):
             shared = compete & set(waiter["wants"])
             if shared:
@@ -4743,7 +4744,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--session-runner", action="store_true",
                    help="this is one of the mini's session runners (only the session pool label, guiRunners above "
                         "1): its jobs need the logged-in session but no gui token or root, so the listener gate "
-                        "holds it only while every unit is taken or a job here waits for units or the tour token")
+                        "holds it only while units are short, a job here waits for units, or the console is locked")
     p.add_argument("--fast-runner", action="store_true",
                    help="this is the mini's fast runner (the fast pool label): a FAST_JOBS job here takes the fast "
                         "tokens instead of shared units, and the listener gate holds it while a fast token is taken")
