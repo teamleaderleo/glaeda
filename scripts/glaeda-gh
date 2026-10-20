@@ -144,7 +144,8 @@ DOWN_GRACE = 5.0  # clients look this long for the daemon before calling it down
 # exited in that window had its session kickstart the daemon again, killing the one just started.
 DOWN_PATIENCE = 90
 RESTART_COOLDOWN = 180  # `glaeda-gh restart` within this long of the last one waits instead of restarting again
-RESTART_SETTLE = 45  # how long `restart` waits for the new daemon to take its lock
+RESTART_SETTLE = 45  # how long `restart` waits for a new daemon's heartbeat
+BOOTSTRAP_RETRY = 10  # launchctl bootstrap is retried this long after bootout
 HEARTBEAT_EVERY = 30  # the daemon rewrites daemon.json at least this often
 # A request's socket timeout bounds each read, not the request: a server that trickles bytes, or a tick
 # of many slow reads, kept one 10-20 daemon silent for 20 minutes. So every request also has a hard
@@ -1907,9 +1908,10 @@ def restart_record() -> dict | None:
 
 
 def recent_restart(now: float | None = None) -> float | None:
-    """Seconds since the last `glaeda-gh restart`, while that is under RESTART_COOLDOWN."""
+    """Seconds since the last `glaeda-gh restart`, while that is under RESTART_COOLDOWN. A restart that
+    failed does not count: sessions must not be told to wait on a restart that did not happen."""
     record = restart_record()
-    if record is None:
+    if record is None or record.get("ok") is False:
         return None
     ago = (time.time() if now is None else now) - record["at"]
     return ago if 0 <= ago < RESTART_COOLDOWN else None
@@ -2547,6 +2549,8 @@ def launchd_state() -> str | None:
 def restart_service(hung: bool) -> tuple[bool, str]:
     """Restart (hung) or start the service once. (started, what was run)."""
     if sys.platform != "darwin":
+        # a unit that hit its start limit refuses start and restart until this
+        run_bounded(["systemctl", "--user", "reset-failed", SYSTEMD_UNIT], SUBPROCESS_DEADLINE)
         argv = ["systemctl", "--user", "restart" if hung else "start", SYSTEMD_UNIT]
         result = run_bounded(argv, SUBPROCESS_DEADLINE)
         return result.returncode == 0, " ".join(argv)
@@ -2560,7 +2564,13 @@ def restart_service(hung: bool) -> tuple[bool, str]:
     # 5 (launchd reported "spawn failed") or 113 (not loaded): unload and load it, once, here
     plist = os.fspath(Path.home() / "Library/LaunchAgents" / f"{LAUNCH_LABEL}.plist")
     run_bounded(["launchctl", "bootout", target], SUBPROCESS_DEADLINE)
-    loaded = run_bounded(["launchctl", "bootstrap", f"gui/{os.getuid()}", plist], SUBPROCESS_DEADLINE)
+    # bootout can return before the job is torn down, and bootstrap answers 5 while it is still loaded
+    deadline = time.monotonic() + BOOTSTRAP_RETRY
+    while True:
+        loaded = run_bounded(["launchctl", "bootstrap", f"gui/{os.getuid()}", plist], SUBPROCESS_DEADLINE)
+        if loaded.returncode == 0 or time.monotonic() >= deadline:
+            break
+        time.sleep(1)
     how = f"{' '.join(argv)} (exit {result.returncode}), then launchctl bootout and bootstrap"
     return loaded.returncode == 0, how + ("" if loaded.returncode == 0 else f" (bootstrap exit {loaded.returncode})")
 
@@ -2594,28 +2604,65 @@ def cmd_restart(force: bool = False) -> int:
         hung = running  # running but silent: restart; not running: start
         holder = lock_holder() if hung else None
         killed = None
+        began = time.time()
+        write_json(BASE / "restart.json", {"at": began, "by": os.getpid(), "how": "starting"})
         if holder is not None and holder["silent"] > STALE_HEARTBEAT and is_serve(holder["pid"]):
             # Stop the hung holder itself: when it is a serve outside the service, kickstart cannot
             # reach it and the service's daemon waits behind it. When it is the service's own, launchd
             # respawns it (KeepAlive), so the start below must not kill that respawn again (no -k).
-            with contextlib.suppress(OSError):
-                os.kill(holder["pid"], signal.SIGTERM)
+            if stop_process(holder["pid"]):
                 killed = holder["pid"]
-        write_json(BASE / "restart.json", {"at": time.time(), "by": os.getpid(), "how": "starting"})
         try:
             started, how = restart_service(hung and killed is None)
         except (OSError, subprocess.TimeoutExpired) as error:
             started, how = False, f"failed: {type(error).__name__}"
         if killed is not None:
             how = f"SIGTERM to the hung lock holder pid {killed}, then {how}"
-        write_json(BASE / "restart.json", {"at": time.time(), "by": os.getpid(), "how": how})
-        log_to = sys.stdout if started else sys.stderr
-        if started and daemon_running(grace=RESTART_SETTLE):
-            print(f"glaeda-gh: restarted the daemon ({how}); it holds its lock again. Re-run your wait.", file=log_to)
+        # Success is a heartbeat written after the restart began (a new daemon writes one as soon as
+        # it holds the lock), not merely a held lock: a hung holder that survived holds it too.
+        ok = started and new_heartbeat(began, RESTART_SETTLE)
+        write_json(BASE / "restart.json", {"at": began, "by": os.getpid(), "how": how, "ok": ok})
+        if ok:
+            print(f"glaeda-gh: restarted the daemon ({how}); a new daemon holds its lock and wrote its heartbeat. "
+                  "Re-run your wait.")
             return EXIT_OK
-        print(f"glaeda-gh: tried to {'restart' if hung else 'start'} the daemon ({how}), but it does not hold its lock "
-              f"after {RESTART_SETTLE}s. Tell the user. By hand: {start_hint(restart=hung)}", file=sys.stderr)
+        print(f"glaeda-gh: tried to {'restart' if hung else 'start'} the daemon ({how}), but no new daemon wrote a "
+              f"heartbeat within {RESTART_SETTLE}s. Tell the user. By hand: {start_hint(restart=hung)}", file=sys.stderr)
         return EXIT_DOWN
+
+
+def stop_process(pid: int) -> bool:
+    """SIGTERM, then SIGKILL after TAKEOVER_GRACE (as take_over does). True once `pid` is gone."""
+    for sig, grace in ((signal.SIGTERM, TAKEOVER_GRACE), (signal.SIGKILL, 5)):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            except OSError:
+                return False
+            time.sleep(0.2)
+    return False
+
+
+def new_heartbeat(since: float, grace: float) -> bool:
+    """Whether, within `grace` seconds, the lock is held and daemon.json has a heartbeat newer than `since`."""
+    deadline = time.monotonic() + grace
+    while True:
+        status = read_json(BASE / "daemon.json")
+        at = status.get("at") if isinstance(status, dict) else None
+        if isinstance(at, (int, float)) and at >= since and lock_held():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
 
 
 def parser() -> argparse.ArgumentParser:
