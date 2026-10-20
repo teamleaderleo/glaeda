@@ -2758,7 +2758,7 @@ class HeadChecksTest(Base):
         self.assertTrue(entry["data"]["settled"])
         self.daemon.tick(NOW + gg.CYCLE)  # settled data is not read again within its TTL
         self.assertEqual(len(self.gh.gql_calls()), 1)
-        ttl, gg.HEAD_SETTLED_TTL = gg.HEAD_SETTLED_TTL, 30  # a rerun can change a settled head: read after the TTL
+        ttl, gg.HEAD_SETTLED_TTL = gg.HEAD_SETTLED_TTL, 70  # a rerun can change a settled head: read after the TTL
         self.addCleanup(setattr, gg, "HEAD_SETTLED_TTL", ttl)
         self.daemon.tick(NOW + gg.HEAD_SETTLED_TTL + gg.TICK)
         self.assertEqual(len(self.gh.gql_calls()), 2)
@@ -2824,6 +2824,47 @@ class HeadChecksTest(Base):
         self.daemon.tick(NOW)
         self.assertEqual(len(gg.read_cache(self.key(SHA_A))["data"]["found"]), 130)
         self.assertEqual(len(self.gh.gql_calls()), 2)
+
+    def test_reads_that_fail_or_find_nothing_are_not_charged(self) -> None:
+        self.policy(reserved={"autoland": 5}, limit=5, pool=5)
+        gg.register(self.key("d" * 40), consumer="session-1")  # no such commit
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.daemon.head_spend.get("session-1", [])), 0)
+        gg.register(self.key(SHA_A), consumer="session-1")
+        self.gh.heads[("o", "r", SHA_A)] = [check_run("CI / build")] * 1
+        self.daemon.transport = lambda *a: (502, {}, b"{}")
+        self.daemon.tick(NOW + 5)
+        self.assertEqual(len(self.daemon.head_spend.get("session-1", [])), 0)
+        self.daemon.transport = self.gh
+        self.daemon.tick(NOW + 5 + 2 * gg.CYCLE)
+        self.assertEqual(len(self.daemon.head_spend["session-1"]), 1)
+
+    def test_a_missing_commit_is_asked_about_rarely(self) -> None:
+        gg.register(self.key("d" * 40), consumer="autoland")
+        self.daemon.tick(NOW)
+        before = len(self.gh.gql_calls())
+        self.daemon.tick(NOW + 3 * gg.CYCLE)
+        self.assertEqual(len(self.gh.gql_calls()), before)
+
+    def test_a_rerun_in_progress_is_not_settled(self) -> None:
+        failed = check_run("CI / test", "COMPLETED", "FAILURE")
+        rerun = {**check_run("CI / test", "IN_PROGRESS", None), "databaseId": 9}
+        failed["databaseId"] = 1
+        self.gh.heads[("o", "r", SHA_A)] = [failed, rerun]
+        gg.register(self.key(SHA_A), consumer="autoland")
+        self.daemon.tick(NOW)
+        self.assertFalse(gg.read_cache(self.key(SHA_A))["data"]["settled"])
+
+    def test_a_cut_off_head_is_an_error_not_a_green_verdict(self) -> None:
+        self.gh.heads[("o", "r", SHA_A)] = [check_run(f"CI / job {i}") for i in range(130)]
+        orig = gg.HEAD_BATCH_MAX_CONTEXTS_PAGES
+        gg.HEAD_BATCH_MAX_CONTEXTS_PAGES = 1
+        self.addCleanup(setattr, gg, "HEAD_BATCH_MAX_CONTEXTS_PAGES", orig)
+        gg.register(self.key(SHA_A), consumer="autoland")
+        self.daemon.tick(NOW)
+        entry = gg.read_cache(self.key(SHA_A))
+        self.assertIsNone(entry["data"])
+        self.assertIn("more than", entry["error"])
 
     def test_an_unknown_commit_is_missing_not_pending(self) -> None:
         gg.register(self.key("d" * 40), consumer="autoland")

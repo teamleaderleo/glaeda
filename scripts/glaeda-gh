@@ -221,7 +221,8 @@ NUDGE_MIN = 20  # a PR a check event nudged is re-read at most this often (Graph
 HEAD_SETTLED_TTL = 600  # a head whose checks all finished is re-read this rarely (a rerun can change it)
 HEAD_PENDING_TTL = 90  # a head with checks still running is re-read this often while someone wants it
 HEAD_INTEREST = 600  # a consumer that asked this recently still wants the head read
-HEAD_BATCH_MAX_CONTEXTS_PAGES = 5  # pages of 100 checks one head is followed through at most
+HEAD_BATCH_MAX_CONTEXTS_PAGES = 20  # pages of 100 checks one head is followed through; more is an error, not a verdict
+HEAD_MISSING_RETRY = 600  # a commit GitHub does not know is asked about this rarely
 CONSUMER_WINDOW = 3600
 CONSUMER_DEFAULTS = {"reserved": {"autoland": 1500}, "limit": 240, "pool": 600}  # head reads an hour
 CONSUMERS_CONFIG = Path.home() / ".config/glaeda/gh-consumers.json"  # same keys as CONSUMER_DEFAULTS
@@ -331,6 +332,13 @@ def register(key: str, jobs: bool = False, consumer: str | None = None) -> None:
     """Record interest in `key`. Wanting jobs is sticky while any reader wants them. A head's readers
     are named consumers, each with the time it last asked."""
     path = watch_dir() / file_name(key)
+    watch_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(watch_dir() / ".register.lock", "a+") as lock:  # read-modify-write: two sessions must not lose each other
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _register_locked(path, key, jobs, consumer)
+
+
+def _register_locked(path: Path, key: str, jobs: bool, consumer: str | None) -> None:
     prior = read_json(path) or {}
     doc: dict[str, Any] = {"key": key, "jobs": bool(jobs or prior.get("jobs"))}
     if consumer:
@@ -872,7 +880,8 @@ def head_data(sha: str, runs: dict, statuses: dict, ids: dict) -> dict:
     found = {key: list(newest_verdict(rs)) for key, rs in runs.items()}
     found.update({key: list(value) for key, value in statuses.items()})
     # no check yet is not "all finished": a push's checks appear a few seconds later
-    settled = bool(found) and all(status == "completed" for status, _ in found.values())
+    running = any(st != "completed" for rs in runs.values() for _, st, _ in rs)
+    settled = bool(found) and not running and all(status == "completed" for status, _ in found.values())
     return {"sha": sha, "found": found, "ids": ids, "settled": settled}
 
 
@@ -935,6 +944,7 @@ class Daemon:
         self.head_spend: dict[str, list[float]] = {
             str(k): [float(t) for t in v if isinstance(t, (int, float))]
             for k, v in (spends or {}).items() if isinstance(v, list)}
+        self.payer: dict[str, tuple[str, float]] = {}  # head key -> (consumer, time) charged for a read in flight
         self.denied: dict[str, float] = {}  # consumer -> when a head read it needed was refused for budget
         self.saved_consumers: str = ""
 
@@ -1042,7 +1052,7 @@ class Daemon:
             cached = read_cache(key)
             kind = split_key(key)[0]
             # a comment watch only serves a wait that is running: it touches the file every 30 s
-            done = kind == "comment" or (cached is not None and terminal(kind, cached.get("data")))
+            done = kind == "comment" or (kind != "head" and cached is not None and terminal(kind, cached.get("data")))
             if age > IDLE_EXPIRY or (done and age > TERMINAL_GRACE):
                 path.unlink(missing_ok=True)
                 continue
@@ -1114,12 +1124,21 @@ class Daemon:
         pool = sum(len(v) for k, v in self.head_spend.items() if k not in policy["reserved"])
         return spent < policy["limit"] and pool < policy["pool"]
 
+    def refund(self, key: str) -> None:
+        """A head read that deferred or failed costs its consumer nothing."""
+        paid = self.payer.pop(key, None)
+        if paid and paid[1] in self.head_spend.get(paid[0], []):
+            self.head_spend[paid[0]].remove(paid[1])
+
     def due_heads(self, mine: list[dict], mode: str) -> list[dict]:
         """Heads somebody asked for recently whose answer is missing or older than its TTL. One read serves
         every consumer of the head; it is charged to the first consumer (reserved ones first) that may pay.
         A head nobody may pay for is left to the cache, and the refused consumers are marked denied."""
         policy = consumer_policy()
         self.head_spend = {k: [t for t in v if self.now - t < CONSUMER_WINDOW] for k, v in self.head_spend.items()}
+        for key, (_, at) in list(self.payer.items()):
+            if self.now - at > 2 * CYCLE:  # a read that raised never reported back
+                self.refund(key)
         out = []
         for e in mine:
             asked = {n: t for n, t in e["consumers"].items() if self.now - t < HEAD_INTEREST}
@@ -1130,8 +1149,11 @@ class Daemon:
                 ttl = HEAD_SETTLED_TTL if c["data"].get("settled") else HEAD_PENDING_TTL
                 if self.now - (c.get("dataAt") or 0) < ttl:
                     continue
-            if c.get("error") and self.now - self.attempted.get(e["key"], float("-inf")) < CYCLES["head"]:
-                continue  # a failed or deferred read waits a cycle
+            retry = HEAD_MISSING_RETRY if c.get("missing") else CYCLES["head"]
+            if e["key"] in self.deferred:
+                self.deferred.discard(e["key"])  # the last tick ran out of time for it: no cycle to wait
+            elif self.now - self.attempted.get(e["key"], float("-inf")) < retry:
+                continue  # a read that failed, found nothing or is still running waits a cycle
             payer = next((n for n in sorted(asked, key=lambda n: (n not in policy["reserved"], n))
                           if self.head_allowed(n, mode, policy)), None)
             if payer is None:
@@ -1139,6 +1161,7 @@ class Daemon:
                     self.denied[n] = self.now
                 continue
             self.head_spend.setdefault(payer, []).append(self.now)
+            self.payer[e["key"]] = (payer, self.now)
             self.attempted[e["key"]] = self.now
             out.append(e)
         return out
@@ -1158,6 +1181,8 @@ class Daemon:
 
     def defer(self, entries: list[dict]) -> None:
         self.deferred.update(e["key"] for e in entries)
+        for e in entries:
+            self.refund(e["key"])
 
     def tick(self, now: float | None = None) -> dict:
         self.now = time.time() if now is None else now
@@ -1389,23 +1414,30 @@ class Daemon:
         doc, error = self.graphql("query{rateLimit{limit remaining resetAt cost}\n" + "\n".join(parts) + "}", {})
         if doc is None:
             self.fail(entries, error or "graphql: no response")
+            for e in entries:
+                self.refund(e["key"])
             return error or "graphql: no response"
         data = doc.get("data") or {}
         if not data and doc.get("errors"):
             message = "graphql: " + str((doc["errors"][0] or {}).get("message"))[:200]
             self.fail(entries, message)
+            for e in entries:
+                self.refund(e["key"])
             return message
         for i, e in enumerate(entries):
             _, owner, repo, sha = split_key(e["key"])
             node = ((data.get(f"h{i}") or {}).get("object") or {}).get("statusCheckRollup")
             if not (data.get(f"h{i}") or {}).get("object"):
                 self.store(e["key"], e["cache"], error="no such commit", missing=True)
+                self.refund(e["key"])
                 continue
             result = self.head_pages(owner, repo, sha, (node or {}).get("contexts") or {})
             if isinstance(result, str):
                 self.store(e["key"], e["cache"], error=result)
+                self.refund(e["key"])
             else:
                 self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=result)
+                self.payer.pop(e["key"], None)  # answered: the charge stands
 
     def head_pages(self, owner: str, repo: str, sha: str, contexts: dict) -> dict | str:
         """A head's data from its first page of contexts, following the rest page by page; an error message
@@ -1417,13 +1449,15 @@ class Daemon:
             fold_contexts(contexts.get("nodes"), runs, statuses, ids)
             page = contexts.get("pageInfo") or {}
             if not page.get("hasNextPage"):
-                break
+                return head_data(sha, runs, statuses, ids)
             more, error = self.graphql("query{" + head_query(owner, repo, sha, page.get("endCursor")) + "}", {})
             if more is None:
                 return error or "graphql: no response"
-            contexts = ((((more.get("data") or {}).get("repository") or {}).get("object") or {})
-                        .get("statusCheckRollup") or {}).get("contexts") or {}
-        return head_data(sha, runs, statuses, ids)
+            rollup = ((((more.get("data") or {}).get("repository") or {}).get("object") or {}).get("statusCheckRollup"))
+            if more.get("errors") or not rollup:  # a partial page would read as a smaller, greener head
+                return "graphql: " + str(((more.get("errors") or [{}])[0] or {}).get("message") or "no further page")[:200]
+            contexts = rollup.get("contexts") or {}
+        return f"more than {HEAD_BATCH_MAX_CONTEXTS_PAGES * 100} checks on one commit"
 
     def fill_steps(self, pairs: list[tuple[dict, dict]]) -> None:
         """Name the failed steps of each failed check run. A completed check does not change, so a
@@ -2590,6 +2624,8 @@ def file_ready(pattern: str, mode: str, contains: re.Pattern | None) -> str | No
     if mode == "gone":
         return pattern if not matches else None
     for found in sorted(matches):
+        if mode == "exists" and contains is None:
+            return found  # even a dangling symlink exists
         try:
             size = os.stat(found).st_size
             if mode == "nonempty" and size == 0 and not os.path.isdir(found):
@@ -2606,7 +2642,12 @@ def cmd_wait_file(target: str, timeout: float, as_json: bool, mode: str = "nonem
                   contains: str | None = None) -> int:
     """Block until a file exists and is not empty (`[ -s FILE ]`), exists (--exists), or is gone (--gone),
     optionally with a line matching --contains. PATH may be a glob. Local stat calls only; no GitHub."""
-    pattern = re.compile(contains) if contains else None
+    try:
+        pattern = re.compile(contains, re.M) if contains else None
+    except re.error as error:
+        raise WatchError(f"--contains {contains!r} is not a regular expression: {error}")
+    if contains and mode == "gone":
+        raise WatchError("--contains does not apply to --gone")
     start = time.monotonic()
     while True:
         found = file_ready(target, mode, pattern)
@@ -2638,7 +2679,7 @@ def pid_alive(pid: int) -> bool:
 
 def cmd_wait_pid(target: str, timeout: float, as_json: bool) -> int:
     """Block until the process exits (the `while kill -0 PID` loop). Exit 0 when it is gone, 2 on timeout."""
-    if not target.isdigit() or int(target) <= 0:
+    if not target.isdigit() or not 0 < int(target) < 2 ** 31:
         raise WatchError(f"wait pid takes a process id, not {target!r}")
     pid, start = int(target), time.monotonic()
     while pid_alive(pid):
@@ -2661,7 +2702,7 @@ def head_served(entry: dict | None, now: float, max_age: float) -> tuple[dict | 
     if not data:
         return None, False
     age = now - ((entry or {}).get("dataAt") or 0)
-    return data, age < (HEAD_SETTLED_TTL * 2 if data.get("settled") else max_age)
+    return data, age < (HEAD_SETTLED_TTL + 2 * CYCLE if data.get("settled") else max_age)
 
 
 def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: float, as_json: bool) -> int:
@@ -3087,7 +3128,7 @@ def parser() -> argparse.ArgumentParser:
                    "hourly head-read budget")
     c.add_argument("--max-age", type=float, default=HEAD_PENDING_TTL * 2, metavar="S",
                    help=f"checks still running are served from the cache if read this recently (default {HEAD_PENDING_TTL * 2}s); "
-                        "finished heads are good for 20 minutes")
+                        "finished heads are good for 12 minutes")
     c.add_argument("--wait", type=float, default=30, metavar="S",
                    help="seconds to wait for the daemon's read (default 30; 0 serves the cache as it is)")
     c.add_argument("--json", action="store_true")
