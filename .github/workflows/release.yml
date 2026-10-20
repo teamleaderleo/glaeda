@@ -49,6 +49,10 @@ jobs:
           cargo build --locked --release --bin glaeda-worktree-reclaim --target "$TARGET"
           python3 scripts/glaeda_release.py hygiene --source "$GITHUB_SHA" --target "$TARGET" \
             --reclaim "target/$TARGET/release/glaeda-worktree-reclaim" --output release-assets
+      - name: Smoke the hygiene archive (promotion's evidence when no canary host can report)
+        env:
+          TARGET: ${{ matrix.target }}
+        run: python3 scripts/glaeda_release.py smoke --source "$GITHUB_SHA" --target "$TARGET" --output release-assets
       - name: Assemble release assets
         run: |
           mkdir -p release-assets
