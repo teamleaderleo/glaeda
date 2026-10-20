@@ -250,7 +250,7 @@ What `--apply` does:
        reading.
    - **When the mini cannot fit the runner's next job** (weighted capacity only).
      - A side runner stops when every capacity unit is taken.
-     - A root runner stops unless the mini could admit a compile: at least 2 free
+     - A root runner stops unless the mini could admit a compile: at least 5 free
        units, and a free persistent-dd token and canonical root. GitHub hands a root
        label's job to any idle root runner, so before this a root runner beside one
        running compile and a light job took the next compile and refused it (90 of about
