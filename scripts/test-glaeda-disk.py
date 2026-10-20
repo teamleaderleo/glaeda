@@ -418,6 +418,37 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(fam.reclaimable and fam.git_disposable and not fam.bulk_sizes)
         self.assertIn("com.apple.", fam.skip_prefixes)
 
+    def test_code_sign_clones_family(self) -> None:
+        user_tmp, clones = self.root / "T", self.root / "X"
+        user_tmp.mkdir()
+        bundle = clones / "com.cmuxterm.app.debug.ci.media.pr.1.head.code_sign_clone"
+        (bundle / "code_sign_clone.AbC123" / "cmux DEV.app.bundle").mkdir(parents=True)
+        (bundle / "code_sign_clone.XyZ789").mkdir()
+        (bundle / "stray").mkdir()
+        (clones / "com.apple.Safari.code_sign_clone" / "code_sign_clone.Q1").mkdir(parents=True)
+        saved = (gd.DARWIN, gd.darwin_user_tmp)
+        gd.DARWIN, gd.darwin_user_tmp = True, lambda: user_tmp
+        try:
+            fam = next(f for f in gd.default_families() if f.id == "code-sign-clones")
+        finally:
+            gd.DARWIN, gd.darwin_user_tmp = saved
+        self.assertEqual(fam.root, clones)
+        self.assertTrue(fam.reclaimable)
+        self.assertGreaterEqual(fam.min_idle_hours, 2.0)
+        self.assertEqual(sorted(p.name for p in gd.candidates(fam)),
+                         ["code_sign_clone.AbC123", "code_sign_clone.XyZ789"])
+
+    def test_no_code_sign_clones_family_without_the_directory(self) -> None:
+        user_tmp = self.root / "T"
+        user_tmp.mkdir()
+        saved = (gd.DARWIN, gd.darwin_user_tmp)
+        gd.DARWIN, gd.darwin_user_tmp = True, lambda: user_tmp
+        try:
+            ids = {f.id for f in gd.default_families()}
+        finally:
+            gd.DARWIN, gd.darwin_user_tmp = saved
+        self.assertNotIn("code-sign-clones", ids)
+
     def test_default_user_tmp_sizes_children_without_bulk_root_walk(self) -> None:
         saved = (gd.DARWIN, gd.darwin_user_tmp)
         gd.DARWIN, gd.darwin_user_tmp = True, lambda: self.root
