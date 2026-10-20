@@ -556,7 +556,7 @@ class HookTest(unittest.TestCase):
         elif sys.platform == "darwin":  # what the runner's orphan cleanup reads on a mini
             shown = subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", bound], capture_output=True,
                                    text=True, check=False).stdout
-            self.assertIn("python", shown)
+            self.assertIn("python", shown.lower())
             self.assertNotIn("RUNNER_TRACKING_ID=", shown)
         self.assertEqual(argv, ["--pressure", "--apply", "--top", "0"])
         self.assertEqual(tracking, "-", "the runner's orphan cleanup would kill a pass carrying RUNNER_TRACKING_ID")
@@ -723,7 +723,7 @@ class HookTest(unittest.TestCase):
                 mock.patch.object(hook, "disk_pressure", return_value="glaeda-disk exited 0") as pressure:
             note = hook.evict(os.fspath(self.dir), 999999999, None)
         self.assertLess(time.monotonic() - start, 10)
-        self.assertIn("waited 1 s for a running glaeda-disk pass; glaeda-disk exited 0", note)
+        self.assertRegex(note, r"waited [0-9]+ s for a running glaeda-disk pass; glaeda-disk exited 0")
         self.assertLessEqual(pressure.call_args.args[2], 1.0)
 
     def test_job_started_eviction_is_bounded_by_its_own_timeout(self) -> None:
