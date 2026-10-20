@@ -287,21 +287,85 @@ class UpdateTest(unittest.TestCase):
             self.assertNotIn("redelivered", self.run_update())
         report.assert_not_called()
 
+    def test_rate_limit_reset_reads_the_core_quota(self) -> None:
+        def answer(code: int, out: str):
+            return mock.patch.object(gu.subprocess, "run", return_value=subprocess.CompletedProcess([], code, out, ""))
+        with answer(0, "0\t1792463616\n"):
+            self.assertEqual(gu.rate_limit_reset("gh"), 1792463616.0)
+        for code, out in ((0, "3086\t1792463616\n"), (1, "0\t1792463616\n"), (0, ""), (0, "x y")):
+            with answer(code, out):
+                self.assertIsNone(gu.rate_limit_reset("gh"), (code, out))
+
+    def test_a_forbidden_attestation_read_is_unavailable_not_failed(self) -> None:
+        run = self.gh((0, ""), (1, "HTTP 403: Resource not accessible by integration"))
+        with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                mock.patch.object(gu, "rate_limit_reset", return_value=None), \
+                mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep") as sleep:
+            verdict, why = self.saved[1](Path("/tmp/a.tar.gz"))
+        self.assertIsNone(verdict)
+        self.assertIn("cannot read attestations", why)
+        sleep.assert_not_called()
+
+    def test_a_failure_waits_out_a_spent_quota_a_success_does_not(self) -> None:
+        # a failure that is not posted lets another canary's success promote the release 15 minutes later
+        config = {**self.config, "reportStatus": True}
+        entry = {"tag": "r-20260925-" + "a" * 12, "source": "a" * 40}
+        for ok, waited in ((False, True), (True, False)):
+            reset = gu.time.time() + 40 * 60
+            resets = iter([reset, None])
+            run = self.gh((0, ""))
+            with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                    mock.patch.object(gu, "rate_limit_reset", side_effect=lambda gh: next(resets)), \
+                    mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep") as sleep:
+                status = gu.report(config, entry, ok, "x")
+            self.assertEqual(status == "reported", waited, status)
+            self.assertEqual(sleep.called, waited)
+            if waited:
+                self.assertLessEqual(sleep.call_args.args[0], gu.FAILURE_WAIT_MAX + 5)
+
+    def test_redelivery_stops_at_the_first_report_that_fails_and_drops_debts_of_a_former_canary(self) -> None:
+        config = {**self.config, "reportStatus": True}
+        owed = [{"tag": "r-20260925-" + c * 12, "source": c * 40, "ok": True, "detail": "x"} for c in "ab"]
+        state = {"unreported": list(owed)}
+        with mock.patch.object(gu, "report", return_value="not reported (transient: x)") as report:
+            self.assertEqual(list(gu.redeliver(state, config)), [owed[0]["tag"]])
+        self.assertEqual(report.call_count, 1)
+        self.assertEqual(state["unreported"], owed)
+        with mock.patch.object(gu, "report", return_value="not reported (not a reporting canary)"):
+            gu.redeliver(state, {**config, "ring": "stable"})
+        self.assertNotIn("unreported", state)
+
+    def test_a_report_is_owed_before_it_is_posted(self) -> None:
+        # a run killed during the retries must not lose the verdict
+        self.config = {**self.config, "reportStatus": True}
+        entry = self.server.publish(SOURCES[0])
+        seen = []
+        def report(config, e, ok, detail):
+            seen.append([o["tag"] for o in gu.load_state(self.state).get("unreported", [])])
+            return "reported"
+        with mock.patch.object(gu, "report", side_effect=report):
+            self.run_update()
+        self.assertEqual(seen, [[entry["tag"]]])
+        self.assertNotIn("unreported", gu.load_state(self.state))
+
     def test_only_a_verdict_is_owed_and_a_stable_host_owes_nothing(self) -> None:
         config = {**self.config, "reportStatus": True}
         entry = {"tag": "r-20260925-" + "a" * 12, "source": "a" * 40}
         state: dict = {}
-        gu.owe_report(state, config, entry, None, "inconclusive", "not reported (rate-limited: x)")
-        gu.owe_report(state, config, entry, True, "installed", "reported")
-        gu.owe_report(state, {**config, "ring": "stable"}, entry, True, "installed", "not reported (no gh)")
+        self.assertFalse(gu.owe_report(state, config, entry, None, "inconclusive"))
+        self.assertFalse(gu.owe_report(state, {**config, "ring": "stable"}, entry, True, "installed"))
         self.assertEqual(state, {})
-        gu.owe_report(state, config, entry, False, "setup failed", "not reported (transient: TimeoutExpired)")
-        gu.owe_report(state, config, entry, True, "installed", "not reported (transient: TimeoutExpired)")
+        self.assertTrue(gu.owe_report(state, config, entry, False, "setup failed"))
+        self.assertTrue(gu.owe_report(state, config, entry, True, "installed"))
         self.assertEqual(state["unreported"], [{"tag": entry["tag"], "source": entry["source"], "ok": True,
                                                 "detail": "installed"}])  # one per tag, the newest
         (self.state).mkdir(parents=True, exist_ok=True)
         (self.state / "state.json").write_text(json.dumps({"current": None, "previous": None, "quarantined": [],
                                                             "unreported": [{"tag": 1}]}))
+        self.assertNotIn("unreported", gu.load_state(self.state))
+        bad_source = {"tag": entry["tag"], "source": "../../x", "ok": True, "detail": "x"}
+        (self.state / "state.json").write_text(json.dumps({"current": None, "previous": None, "quarantined": [],
+                                                            "unreported": [bad_source]}))
         self.assertNotIn("unreported", gu.load_state(self.state))  # a malformed debt never blocks an update
 
     def run_update(self, apply: bool = True) -> dict:
@@ -658,6 +722,30 @@ class ReleaseTest(unittest.TestCase):
         high = gr.policy_for_paths(["scripts/glaeda-update"])
         self.assertEqual((high["risk"], high["soakHours"], high["requiredHosts"]), ("high", 0.25, []))
         self.assertEqual(gr.policy_for_paths([])["risk"], "high")
+
+    def test_soak_override_rejects_non_finite_or_negative_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "candidates.jsonl"
+            path.write_text("")
+            for value in ("-1", "nan", "inf"):
+                self.assertEqual(gr.main(["promote", "--candidates", str(path), "--soak-hours", value]), 1)
+
+    def test_promotion_needs_soak_success_and_no_failure(self) -> None:
+        ok = [self.status("air-blue", "success", "2026-09-25T01:00:00Z")]
+        self.assertFalse(gr.promotion(self.canary("2026-09-25T10:00:00Z"), None, ok, self.NOW)[0])
+        self.assertEqual(gr.promotion(self.canary(), None, [], self.NOW),
+                         (False, "no canary host reported success"))
+        failed = ok + [self.status("big-red", "failure", "2026-09-25T02:00:00Z")]
+        self.assertFalse(gr.promotion(self.canary(), None, failed, self.NOW)[0])
+        # a host's newest status counts: a later success clears its earlier failure
+        recovered = failed + [self.status("big-red", "success", "2026-09-25T03:00:00Z")]
+        self.assertTrue(gr.promotion(self.canary(), None, recovered, self.NOW)[0])
+        # unrelated contexts are ignored
+        noise = ok + [{"context": "ci/verify", "state": "failure", "updated_at": "2026-09-25T04:00:00Z"}]
+        self.assertTrue(gr.promotion(self.canary(), None, noise, self.NOW)[0])
+        self.assertFalse(gr.promotion(self.canary(), {**self.canary(), "ring": "stable"}, ok, self.NOW)[0])
+        self.assertEqual(gr.promotion(None, None, ok, self.NOW), (False, "no canary release"))
+
 
     def test_one_canary_success_promotes_and_any_failure_blocks(self) -> None:
         # Leo, 2026-10-19: "why does it need literally everybody to report success". No host is required.

@@ -44,8 +44,9 @@ What one run does, and what it refuses:
 5. On a canary host with reportStatus and an authenticated `gh`, the outcome is posted as the commit
    status `glaeda-ota/<host>` on the release's source commit. Promotion to stable needs one canary's
    success and no canary's failure. gh calls survive a spent REST quota: a reset within five minutes
-   is waited for, a rate limit or transient error is retried with backoff (GH_BACKOFF), and a success
-   or failure that still is not delivered is kept in state.json and posted again by the next run.
+   is waited for (a failure's up to an hour), a rate limit or transient error is retried with backoff
+   (GH_BACKOFF), and a success or failure is recorded in state.json before it is posted, so one that
+   is not delivered is posted again by the next run.
 
 6. A mini that runs GitHub runners keeps the copy of glaeda-cmux-runner it is re-registered from in
    ~/glaeda-runner/scripts (glaeda-cmux-runner-fleet stages it). After an update, and on every run that
@@ -128,6 +129,9 @@ CHILD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 # failed with it, the next try was an hour away, and stable sat on one build for 15 hours.
 GH_BACKOFF = (20, 60, 180)  # seconds slept before each retry of a rate-limited or transient gh call
 RATE_WAIT_MAX = 5 * 60  # a spent quota that resets this soon is waited for; a later reset gives up
+# A failure is waited out to the reset (at most an hour): unposted, another canary's success would
+# promote the release after the 15-minute soak, before the next run could post it.
+FAILURE_WAIT_MAX = 60 * 60
 RATE_MARKERS = ("api rate limit", "rate limit exceeded", "secondary rate limit", "http 429")
 TRANSIENT_MARKERS = ("http 500", "http 502", "http 503", "http 504", "timeout", "timed out", "connection",
                      "network", "temporarily unavailable", "eof")
@@ -199,7 +203,8 @@ def load_state(state_dir: Path = STATE_DIR) -> dict:
         raise UpdateError("state.json has the wrong shape; fix or remove it")
     owed = doc.get("unreported")
     if owed is not None and not (isinstance(owed, list) and all(
-            isinstance(o, dict) and isinstance(o.get("tag"), str) and isinstance(o.get("source"), str)
+            isinstance(o, dict) and isinstance(o.get("tag"), str) and TAG_RE.fullmatch(o["tag"])
+            and isinstance(o.get("source"), str) and SHA_RE.fullmatch(o["source"])
             and isinstance(o.get("ok"), bool) and isinstance(o.get("detail"), str) for o in owed)):
         doc.pop("unreported")  # only a report owed to GitHub: never worth refusing to update over
     return doc
@@ -315,7 +320,8 @@ def gh_kind(text: str) -> str | None:
     return None
 
 
-def gh_call(gh: str, args: list[str], timeout: int) -> tuple[subprocess.CompletedProcess | None, str]:
+def gh_call(gh: str, args: list[str], timeout: int,
+            max_wait: float = RATE_WAIT_MAX) -> tuple[subprocess.CompletedProcess | None, str]:
     """Run gh, riding out a spent quota or a transient error: (result, "") when it ran to a verdict,
     else (None, why), where why starts with "rate-limited" or "transient". A real error (exit 1 with
     any other message) is returned as is, never retried."""
@@ -326,7 +332,7 @@ def gh_call(gh: str, args: list[str], timeout: int) -> tuple[subprocess.Complete
         reset = rate_limit_reset(gh)
         if reset is not None:
             wait = reset - time.time()
-            if wait > RATE_WAIT_MAX:
+            if wait > max_wait:
                 return None, "rate-limited until " + time.strftime("%H:%MZ", time.gmtime(reset))
             if wait > 0:
                 time.sleep(wait + 5)
@@ -459,7 +465,8 @@ def report(config: dict, entry: dict, ok: bool | None, detail: str) -> str:
     # Commit statuses have no GraphQL mutation, so a spent REST quota is ridden out, not routed around.
     result, why = gh_call(gh, ["api", "-X", "POST", f"repos/{REPOSITORY}/statuses/{entry['source']}",
                                "-f", f"state={state}", "-f", f"context={STATUS_PREFIX}{config['host']}",
-                               "-f", f"description={entry['tag']}: {detail}"[:140]], 60)
+                               "-f", f"description={entry['tag']}: {detail}"[:140]], 60,
+                         FAILURE_WAIT_MAX if ok is False else RATE_WAIT_MAX)
     if result is None:
         return f"not reported ({why})"
     if result.returncode != 0:
@@ -467,30 +474,36 @@ def report(config: dict, entry: dict, ok: bool | None, detail: str) -> str:
     return "reported"
 
 
-def owe_report(state: dict, config: dict, entry: dict, ok: bool | None, detail: str, status: str) -> None:
-    """Keep a success or failure that did not reach GitHub, for the next run to post (redeliver)."""
-    if ok is None or status == "reported" or config["ring"] != "canary" or not config["reportStatus"]:
-        return
+def owe_report(state: dict, config: dict, entry: dict, ok: bool | None, detail: str) -> bool:
+    """Record a success or failure as owed to GitHub before posting it, so a run killed during the
+    retries still leaves it for the next run (redeliver). False when nothing is owed."""
+    if ok is None or config["ring"] != "canary" or not config["reportStatus"]:
+        return False
     owed = [o for o in state.get("unreported", []) if o["tag"] != entry["tag"]]
     owed.append({"tag": entry["tag"], "source": entry["source"], "ok": ok, "detail": detail})
     state["unreported"] = owed[-MAX_UNREPORTED:]
+    return True
+
+
+def paid(state: dict, tag: str) -> None:
+    owed = [o for o in state.get("unreported", []) if o["tag"] != tag]
+    if owed:
+        state["unreported"] = owed
+    else:
+        state.pop("unreported", None)
 
 
 def redeliver(state: dict, config: dict) -> dict[str, str]:
-    """Post the reports earlier runs could not; keep the ones that still fail."""
-    owed = state.get("unreported") or []
-    if not owed:
-        return {}
-    statuses, kept = {}, []
-    for item in owed:
+    """Post the reports earlier runs could not, oldest first. The first that still fails stops it,
+    keeping it and the rest: GitHub is still out, and each try can take minutes of backoff."""
+    statuses = {}
+    for item in list(state.get("unreported") or []):
         status = report(config, item, item["ok"], item["detail"])
         statuses[item["tag"]] = status
-        if status != "reported" and config["ring"] == "canary" and config["reportStatus"]:
-            kept.append(item)
-    if kept:
-        state["unreported"] = kept
-    else:
-        state.pop("unreported", None)
+        if status == "reported" or config["ring"] != "canary" or not config["reportStatus"]:
+            paid(state, item["tag"])
+        else:
+            break
     return statuses
 
 
@@ -758,9 +771,11 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
            "currentSource": current_source}
 
     def post(ok: bool | None, detail: str) -> str:
+        if owe_report(state, config, entry, ok, detail):
+            save_state(state, state_dir)
         status = report(config, entry, ok, detail)
-        owe_report(state, config, entry, ok, detail, status)
-        if state.get("unreported"):
+        if status == "reported" and any(o["tag"] == entry["tag"] for o in state.get("unreported", [])):
+            paid(state, entry["tag"])
             save_state(state, state_dir)
         return status
 

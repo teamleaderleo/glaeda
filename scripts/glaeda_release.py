@@ -187,7 +187,8 @@ def parse_policy(value: object, *, legacy: bool = False) -> dict:
     paths = value.get("paths")
     valid_hours = {RISK_SOAK_HOURS[risk], HISTORICAL_RISK_SOAK_HOURS[risk]} if risk in RISK_SOAK_HOURS else set()
     if risk not in RISK_SOAK_HOURS or hours not in valid_hours or not isinstance(hosts, list) \
-            or hosts and (risk == "low" or sorted(hosts) != sorted(LEGACY_REQUIRED_HOSTS)) \
+            or hosts and (risk == "low" or not all(isinstance(host, str) for host in hosts)
+                          or sorted(hosts) != sorted(LEGACY_REQUIRED_HOSTS)) \
             or not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
         raise ReleaseError("release policy is malformed")
     return {"schema": POLICY_SCHEMA, "risk": risk, "soakHours": hours,

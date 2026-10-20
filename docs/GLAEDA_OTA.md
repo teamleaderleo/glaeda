@@ -63,7 +63,8 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
 4. **Canary health.** A canary host with an authenticated `gh` posts the commit status
    `glaeda-ota/<host>` (success or failure) on the release commit. Its gh calls ride out a spent
    REST quota: a reset within five minutes is waited for, rate limits and transient errors are
-   retried with backoff, and a success or failure that still is not delivered is kept in the host's
+   retried with backoff, a failure waits out the reset (up to an hour) so it lands before another
+   canary's success can promote, and a success or failure that still is not delivered is kept in the host's
    state.json and posted again by the next run (commit statuses have no GraphQL mutation to fall
    back to). "Signed in" is the local `gh auth token`, not `gh auth status`, which spends quota.
 5. **Stable.** `.github/workflows/promote.yml` runs hourly, and each canary run also dispatches it,
@@ -74,8 +75,8 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
      readable during the transition; manifests without a policy retain the original 6-hour fallback;
    - at least one canary host's newest status is success, and no canary host's newest status is a
      failure. No host is required, whatever the risk: a canary that is silent or pending holds
-     nothing once the soak is over. Policies signed before 2026-10-19 list Air Blue and Big Red in
-     `requiredHosts`; they still parse, and the list is not enforced. (On 2026-10-19 a spent quota
+     nothing once the soak is over. Policies above low risk signed before 2026-10-19 list Air Blue and
+     Big Red in `requiredHosts`; they still parse, and the list is not enforced. (On 2026-10-19 a spent quota
      kept Air Blue from reporting, and requiring it held stable on one build for 15 hours.);
    - it descends from the current stable;
    - no newer release has a canary failure. A release's own updater installs its successor, so a
