@@ -151,6 +151,10 @@ TICK_BUDGET = 90  # seconds a tick may spend starting requests
 WATCHDOG_CYCLES = 5
 WATCHDOG_AFTER = WATCHDOG_CYCLES * CYCLE  # the loop silent this long is hung: exit EXIT_WATCHDOG
 EXIT_WATCHDOG = 75  # EX_TEMPFAIL: the service manager restarts the daemon
+# The watchdog thread logs before it exits, so a main thread stuck inside a write to stdout or stderr
+# (a full pipe, a hung disk) holds the stream lock it needs. faulthandler's own C thread needs neither
+# the GIL nor that lock: it ends the process (status 1) this long after the watchdog should have.
+WATCHDOG_BACKSTOP = 60
 STALE_HEARTBEAT = 2 * WATCHDOG_AFTER  # a lock holder silent this long is hung; a waiting daemon takes over
 LOCK_RETRY = 15  # a daemon waiting for the lock looks at its holder this often
 TAKEOVER_GRACE = 10  # after SIGTERM, how long a hung holder has before SIGKILL
@@ -382,6 +386,8 @@ def run_bounded(argv: list[str], timeout: float | None = None) -> subprocess.Com
         except subprocess.TimeoutExpired:
             with contextlib.suppress(OSError):
                 os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(OSError):  # a child that left its group; Popen.__exit__ waits for it
+                proc.kill()
             with contextlib.suppress(subprocess.TimeoutExpired, OSError, ValueError):
                 proc.communicate(timeout=2)
             for stream in (proc.stdout, proc.stderr):  # a grandchild that left the group still holds them
@@ -1189,7 +1195,8 @@ class Daemon:
         small query. When that query fails the checks go without, and the next cycle tries again."""
         known = known_steps(pairs)
         want: dict[str, list[dict]] = {}
-        for _, data in pairs:
+        owners: dict[str, set[str]] = {}  # check id -> the keys of the PRs that show it
+        for e, data in pairs:
             for c in data.get("checks") or []:
                 if not wants_steps(c):
                     continue
@@ -1197,14 +1204,17 @@ class Daemon:
                     c["failedSteps"], c["stepCount"] = known[c["id"]]
                 else:
                     want.setdefault(c["id"], []).append(c)
+                    owners.setdefault(c["id"], set()).add(e["key"])
         ids = list(want)[:2 * STEPS_BATCH]  # the rest wait a cycle (failed and cancelled checks; each is read once)
         for i in range(0, len(ids), STEPS_BATCH):
             if self.mode("graphql") == "stop":
                 return
             try:
                 doc, error = self.graphql(STEPS_QUERY, {"ids": ids[i:i + STEPS_BATCH]})
-            except OutOfTime:
-                return  # the checks go without their steps until a later read
+            except OutOfTime:  # the checks go without their steps; their PRs go first next tick
+                for check_id in ids[i:]:
+                    self.deferred.update(owners[check_id])
+                return
             if doc is None:
                 self.errors.append(f"steps: {error}")
                 return
@@ -1379,8 +1389,9 @@ class Daemon:
             left -= 1
             try:
                 state, doc, _ = self.get(f"{root}/actions/jobs/{job_id}", None)
-            except OutOfTime:
-                return  # the PR's checks and statuses are read; the steps wait for a later read
+            except OutOfTime:  # the PR's checks and statuses are read; it goes first next tick for the steps
+                self.deferred.add(e["key"])
+                return
             if state != "fresh" or not isinstance(doc, dict):
                 self.errors.append(f"{e['key']} steps: {doc}")
                 continue
@@ -1583,12 +1594,14 @@ class Watchdog:
     exits it prints where every thread was (file, line, function; no values) to stderr."""
 
     def __init__(self, limit: float, clock: Callable[[], float] = time.monotonic,
-                 exit: Callable[[int], Any] = os._exit) -> None:
-        self.limit, self.clock, self.exit = limit, clock, exit
+                 exit: Callable[[int], Any] = os._exit, backstop: float | None = None) -> None:
+        self.limit, self.clock, self.exit, self.backstop = limit, clock, exit, backstop
         self.last = clock()
 
     def beat(self) -> None:
         self.last = self.clock()
+        if self.backstop is not None:  # re-arming cancels the previous timer
+            faulthandler.dump_traceback_later(self.limit + self.backstop, exit=True)
 
     def check(self) -> bool:
         """True (after calling exit) when the loop is overdue."""
@@ -1606,11 +1619,16 @@ class Watchdog:
 
     def start(self) -> threading.Thread:
         def run() -> None:
+            # hard_deadline's SIGALRM is meant for the main thread's blocking read. A process-directed
+            # signal goes to any thread that does not block it, and taken here it interrupts nothing.
+            if hasattr(signal, "pthread_sigmask"):
+                signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
             while not self.check():
                 time.sleep(max(0.05, min(15.0, self.limit / 10)))
 
         thread = threading.Thread(target=run, name="glaeda-gh-watchdog", daemon=True)
         thread.start()
+        self.beat()
         return thread
 
 
@@ -1711,7 +1729,7 @@ def serve(foreground_ok: bool = False) -> int:
     stamp = me.stat().st_mtime
     daemon = Daemon()
     log({"event": "start", "pid": os.getpid()})
-    watchdog = Watchdog(WATCHDOG_AFTER)
+    watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP)
     watchdog.start()
     last = None
     while True:
@@ -1755,7 +1773,9 @@ def under_service() -> bool:
 def service_loaded() -> bool:
     """Whether this user's glaeda-gh service is loaded (launchd) or enabled or running (systemd)."""
     if sys.platform == "darwin":
-        probes = [["launchctl", "print", f"gui/{os.getuid()}/{LAUNCH_LABEL}"]]
+        # the LaunchAgent, or the same label as a system LaunchDaemon on a headless Mac
+        probes = [["launchctl", "print", f"gui/{os.getuid()}/{LAUNCH_LABEL}"],
+                  ["launchctl", "print", f"system/{LAUNCH_LABEL}"]]
     else:
         probes = [["systemctl", "--user", "--quiet", "is-enabled", SYSTEMD_UNIT],
                   ["systemctl", "--user", "--quiet", "is-active", SYSTEMD_UNIT]]

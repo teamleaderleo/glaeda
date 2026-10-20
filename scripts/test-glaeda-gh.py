@@ -2183,6 +2183,23 @@ class TickBudgetTest(Base):
         self.assertEqual(status["fetched"]["pr"], 20)
         self.assertTrue(all(gg.read_cache(k)["data"] for k in keys))
 
+    def test_failed_steps_left_unread_put_their_pr_first_next_tick(self) -> None:
+        failed = {**check_run("build", conclusion="FAILURE"), "id": "CR_1"}
+        self.gh.prs[("o", "r", 1)] = pr_node(1, rollup="FAILURE", checks=[failed])
+        self.gh.prs[("o", "r", 2)] = pr_node(2)
+        self.gh.steps["CR_1"] = [{"name": "Run selected tests", "conclusion": "FAILURE"}]
+        gg.register("pr:o/r#1")
+        gg.register("pr:o/r#2")
+        self.spend_budget_after(1)  # the PR query answers; the steps query is never started
+        status = self.daemon.tick(NOW)
+        self.assertEqual(self.gh.step_queries, [])
+        self.assertNotIn("failedSteps", gg.read_cache("pr:o/r#1")["data"]["checks"][0])
+        self.assertEqual(status["deferred"], 1, "only the PR whose steps went unread")
+        self.daemon.transport = self.gh
+        self.daemon.tick(NOW + gg.TICK)  # not a full cycle: the deferred PR is read again, with its steps
+        self.assertEqual(self.gh.step_queries, [["CR_1"]])
+        self.assertEqual(gg.read_cache("pr:o/r#1")["data"]["checks"][0]["failedSteps"], ["Run selected tests"])
+
 
 CHILD_PRELUDE = """
 import importlib.machinery, importlib.util, json, os, signal, sys, time
@@ -2209,6 +2226,43 @@ class WatchdogTest(unittest.TestCase):
             clock[0] += 1.5
             self.assertTrue(dog.check())
         self.assertEqual(exits, [gg.EXIT_WATCHDOG])
+
+    def test_the_watchdog_thread_never_takes_the_deadline_signal(self) -> None:
+        """SIGALRM must reach the main thread's blocking read; the watchdog thread blocks it."""
+        seen: list[set] = []
+
+        class Probe(gg.Watchdog):
+            def check(self) -> bool:
+                seen.append(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+                return True
+        Probe(300).start().join(5)
+        self.assertEqual(len(seen), 1)
+        self.assertIn(signal.SIGALRM, seen[0])
+        self.assertNotIn(signal.SIGALRM, signal.pthread_sigmask(signal.SIG_BLOCK, []))
+
+    def test_a_loop_stuck_holding_stdout_still_ends(self) -> None:
+        """End to end: the tick blocks inside a write to a pipe nobody reads, so it holds the stdout
+        lock the watchdog's own log line needs. The faulthandler backstop ends the process anyway."""
+        with tempfile.TemporaryDirectory() as tmp:
+            code = CHILD_PRELUDE + """
+gg.WATCHDOG_AFTER = 1.0
+gg.WATCHDOG_BACKSTOP = 1.0
+class Stuck:
+    def tick(self):
+        while True:
+            print("x" * 65536, flush=True)  # blocks once the pipe is full, holding the stream lock
+gg.Daemon = Stuck
+gg.serve(foreground_ok=True)
+"""
+            began = time.monotonic()
+            with subprocess.Popen([sys.executable, "-c", code, os.fspath(ROOT / "scripts" / "glaeda-gh"), "serve", tmp],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as child:
+                try:
+                    code_ = child.wait(timeout=30)
+                finally:
+                    child.kill()
+            self.assertLess(time.monotonic() - began, 20)
+            self.assertEqual(code_, 1, "faulthandler's exit, not a hang")
 
     def test_a_hung_tick_ends_the_process_and_frees_the_lock(self) -> None:
         """End to end: serve() with a tick stuck in a blocking call exits EXIT_WATCHDOG on its own,
@@ -2362,6 +2416,15 @@ class ServeGuardTest(unittest.TestCase):
             env = self.fake_service_tools(rc)
             with mock.patch.dict(os.environ, {"PATH": env["PATH"]}):
                 self.assertEqual(gg.service_loaded(), loaded, rc)
+
+    def test_a_headless_launch_daemon_counts_as_loaded(self) -> None:
+        bin_dir = Path(self.tmp.name) / "headless"
+        bin_dir.mkdir()
+        (bin_dir / "launchctl").write_text('#!/bin/sh\ncase "$2" in system/*) exit 0;; esac\nexit 113\n')
+        (bin_dir / "launchctl").chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": os.fspath(bin_dir) + os.pathsep + os.environ["PATH"]}), \
+                mock.patch.object(gg.sys, "platform", "darwin"):
+            self.assertTrue(gg.service_loaded())
 
     def test_serve_from_a_shell_is_refused_while_the_service_is_loaded(self) -> None:
         """End to end: the real script, a loaded service, a plain shell."""
