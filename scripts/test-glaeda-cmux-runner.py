@@ -5367,6 +5367,58 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(done["state"], "updated", done)
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
 
+    def test_a_busy_runner_gets_its_hook_staged_and_job_completed_installs_it_between_jobs(self) -> None:
+        """A runner with a job at every refresh still goes idle between jobs, and that is when its old gate runs. So
+        a refresh that finds a job stages the checked new hook beside the old one (.<name>.next, with a record of the
+        hook it replaces), and the job's own job-completed installs it: the next job-started runs the new file whole,
+        and the gate sees the change and reloads."""
+        hooks = self.installed_with_an_older_hook()
+        older = (hooks / cr.HOOK_NAME).read_bytes()
+        clock = {"t": 0.0}
+        with mock.patch.object(cr, "worker_running", return_value=True), \
+                mock.patch.object(cr.time, "sleep", side_effect=lambda s: clock.__setitem__("t", clock["t"] + s)), \
+                mock.patch.object(cr.time, "monotonic", side_effect=lambda: clock["t"]):
+            deferred = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(deferred["state"], "deferred")
+        self.assertTrue(deferred.get("staged"), deferred)
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), older, "never swapped under a running job")
+        staged = hooks / f".{cr.HOOK_NAME}{cr.NEXT_SUFFIX}"
+        self.assertEqual(staged.read_bytes(), HOOK.read_bytes())
+        self.assertEqual(os.stat(staged).st_mode & 0o777, 0o755)
+        self.assertEqual((cr.NEXT_SUFFIX, cr.NEXT_RECORD), (hook.NEXT_SUFFIX, hook.NEXT_RECORD), "one name on both sides")
+        # job-completed, at the end of that job
+        note = hook.install_staged_hook(hooks)
+        self.assertIn("installed", note)
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+        self.assertEqual(os.stat(hooks / cr.HOOK_NAME).st_mode & 0o777, 0o755)
+        self.assertFalse(staged.exists())
+        self.assertFalse((hooks / cr.NEXT_RECORD).exists())
+        self.assertIsNone(hook.install_staged_hook(hooks), "nothing staged: nothing to do")
+        self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "unchanged")
+
+    def test_a_staged_hook_never_replaces_a_hook_that_changed_since(self) -> None:
+        hooks = self.installed_with_an_older_hook()
+        with mock.patch.object(cr, "worker_running", side_effect=[True] + [False] * 8), \
+                mock.patch.object(cr, "REFRESH_GAP_WAIT_S", 0):
+            self.assertTrue(self.invoke("--refresh-hooks", "--apply")["runners"][0].get("staged"))
+        staged = hooks / f".{cr.HOOK_NAME}{cr.NEXT_SUFFIX}"
+        self.assertTrue(staged.is_file())
+        # an --apply from a newer copy wrote another hook in the meantime: job-completed drops the stale stage
+        newer = HOOK.read_text() + "\n# from main, newer than this release\n"
+        (hooks / cr.HOOK_NAME).write_text(newer)
+        self.assertIn("dropped", hook.install_staged_hook(hooks))
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), newer)
+        self.assertFalse(staged.exists())
+        self.assertFalse((hooks / cr.NEXT_RECORD).exists())
+        # a refresh that finds the runner idle installs directly and clears any stage
+        (hooks / cr.HOOK_NAME).write_text(self.OLDER_HOOK)
+        with mock.patch.object(cr, "worker_running", return_value=True), mock.patch.object(cr, "REFRESH_GAP_WAIT_S", 0):
+            self.invoke("--refresh-hooks", "--apply")
+        self.assertTrue(staged.is_file())
+        self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
+        self.assertFalse(staged.exists())
+        self.assertFalse((hooks / cr.NEXT_RECORD).exists())
+
     def test_refresh_hooks_waits_for_a_job_and_refuses_what_it_cannot_prove(self) -> None:
         hooks = self.installed_with_an_older_hook()
         older = (hooks / cr.HOOK_NAME).read_bytes()
