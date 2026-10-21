@@ -63,7 +63,8 @@ inputs remain visible to accounting but are never deleted by this family.
 
 Each enrolled GitHub runner's checkout (~/actions-runner*/_work/<repo>/<repo>) has two families.
 runner-checkout-build is SwiftPM's Packages/*/.build and Packages/*/*/.build plus cargo-tagged target
-directories (cmux-tui/target); it goes only under pressure, only while that runner has no Runner.Worker,
+directories (cmux-tui/target), plus DerivedData a workflow keeps in $RUNNER_WORKSPACE/.glaeda-state
+(_work/<repo>/.glaeda-state/*derived-data*); it goes only under pressure, only while that runner has no Runner.Worker,
 an hour idle, least recently modified first. runner-git-garbage is git's tmp_pack_*/tmp_obj_* temp files an
 interrupted fetch left; one an hour old goes whenever nothing holds it open. The checkout itself stays.
 
@@ -1390,6 +1391,9 @@ GIT_GARBAGE_IDLE_HOURS = 1.0
 # odb_mkstemp's names (tmp_pack_, tmp_idx_, tmp_rev_, tmp_obj_, tmp_bitmap_, tmp_mtimes_) and repack's .tmp-<pid>-pack-*
 GIT_GARBAGE_NAME = re.compile(r"tmp_[a-z]+_[A-Za-z0-9]{6,}|\.tmp-[0-9]+-pack-.+")
 CARGO_TAG = re.compile(rb"^# This file is a cache directory tag created by cargo\.?\s*$", re.M)
+# Workflows keep DerivedData, SourcePackages and compilation caches in $RUNNER_WORKSPACE/.glaeda-state
+# (hq NEW-REPO-CI.md); only the DerivedData is build output (ios-e2e-mac-derived-data: 9.5 GiB on one runner).
+RUNNER_STATE_DERIVED_DATA = re.compile(r"(?i)derived-?data")
 
 
 def enrolled_runners(home: Path | None = None) -> list[Path]:
@@ -1418,8 +1422,17 @@ def runner_checkouts(work: Path) -> list[Path]:
 
 def runner_checkout_builds(work: Path) -> list[Path]:
     """SwiftPM .build directories below Packages/ and cargo target directories (tagged by cargo) at the top
-    of each checkout or one level down (cmux-tui/target). Fixed places, so no source tree is walked."""
+    of each checkout or one level down (cmux-tui/target), and DerivedData directories in each runner
+    workspace's .glaeda-state (never its SourcePackages or compilation cache). Fixed places, so no source
+    tree is walked."""
     found: list[Path] = []
+    for workspace in _children(work):
+        state = workspace / ".glaeda-state"
+        if (workspace.name.startswith("_") or workspace.is_symlink() or not workspace.is_dir()
+                or state.is_symlink() or not state.is_dir()):
+            continue
+        found += [d for d in _children(state)
+                  if RUNNER_STATE_DERIVED_DATA.search(d.name) and d.is_dir() and not d.is_symlink()]
     for checkout in runner_checkouts(work):
         packages = checkout / "Packages"
         if packages.is_dir() and not packages.is_symlink():

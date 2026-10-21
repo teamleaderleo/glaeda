@@ -2657,6 +2657,10 @@ class GlaedaDiskTest(unittest.TestCase):
                         ".git/objects/pack/pack-1234.pack"):
                 (co / rel).write_bytes(b"\0" * (2 * 1024 * 1024))
             make(runner / "_work/_temp/cmux-derived-data-tests-1")  # the runner's own scratch is not a checkout
+            # $RUNNER_WORKSPACE/.glaeda-state: its DerivedData is build output; SourcePackages and cas are kept
+            for name in ("ios-e2e-mac-derived-data", "SourcePackages", "cas"):
+                make(runner / "_work/cmux/.glaeda-state" / name)
+            make(runner / "_work/_temp/.glaeda-state/DerivedData")  # not a workspace
             self._age(runner / "_work", hours=3)
         unenrolled = home / "actions-runner-old/_work/cmux/cmux"
         (unenrolled / ".git").mkdir(parents=True)
@@ -2674,6 +2678,7 @@ class GlaedaDiskTest(unittest.TestCase):
         build = next(f for f in fams if f.id == gd.RUNNER_BUILD_FAMILY and f.root == work)
         garbage = next(f for f in fams if f.id == gd.RUNNER_GIT_GARBAGE_FAMILY and f.root == work)
         self.assertEqual(sorted(str(p.relative_to(work)) for p in gd.candidates(build)), [
+            "cmux/.glaeda-state/ios-e2e-mac-derived-data",
             "cmux/cmux/Packages/Shared/.build", "cmux/cmux/Packages/macOS/CmuxNext/.build",
             "cmux/cmux/cmux-tui/target"])
         self.assertEqual(sorted(str(p.relative_to(work)) for p in gd.candidates(garbage)), [
@@ -2692,6 +2697,12 @@ class GlaedaDiskTest(unittest.TestCase):
         for rel in ("Packages/macOS/CmuxNext/.build", "Packages/Shared/.build", "cmux-tui/target"):
             self.assertEqual(v[idle + rel][0], "reclaimable", rel)  # three hours idle, no Runner.Worker
             self.assertEqual(v[live + rel], ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]))
+        state = "actions-runner-glaeda/_work/cmux/.glaeda-state/"
+        self.assertEqual(v[state + "ios-e2e-mac-derived-data"][0], "reclaimable")
+        self.assertEqual(v["actions-runner-glaeda-2/_work/cmux/.glaeda-state/ios-e2e-mac-derived-data"],
+                         ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]))
+        self.assertNotIn(state + "SourcePackages", v)
+        self.assertNotIn(state + "cas", v)
         # an hour-old temp pack is garbage even while that runner has a job
         self.assertEqual(v[live + ".git/objects/pack/tmp_pack_Ab12Cd"][0], "reclaimable")
         self.assertNotIn(live + ".git/objects/pack/pack-1234.pack", v)
@@ -2744,6 +2755,10 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((other / ".git/objects/pack/pack-1234.pack").exists())
         self.assertTrue((idle / "Sources/target").exists())
         self.assertTrue((idle / ".git").is_dir())
+        self.assertFalse((idle.parent / ".glaeda-state/ios-e2e-mac-derived-data").exists())
+        self.assertTrue((idle.parent / ".glaeda-state/SourcePackages").exists())
+        self.assertTrue((idle.parent / ".glaeda-state/cas").exists())
+        self.assertTrue((other.parent / ".glaeda-state/ios-e2e-mac-derived-data").exists())
 
     def test_job_busy_ignores_wide_runner_build_trees(self) -> None:
         home, fams = self._runner_checkouts()
