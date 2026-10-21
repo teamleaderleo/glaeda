@@ -353,20 +353,29 @@ def launchctl(*args: str) -> tuple[int, str]:
 
 def install(policy_path: Path, apply: bool, expect_sha256: str | None = None,
             expect_policy_sha256: str | None = None) -> dict[str, Any]:
-    status = install_status(policy_path)
-    if not apply or status["current"] and status["loaded"] and status["reportFresh"]:
-        return {**status, "state": "unchanged" if status["current"] else "planned"}
     want = desired_install(policy_path)
-    # These bytes become root's: check exactly them against the hashes the operator took from the release.
+    # These bytes become root's: check exactly them against the hashes the operator took from the release
+    # (first, so a wrong pin says so even when nothing would change).
     script_bytes = want["files"][INSTALL_DIR / SCRIPT_NAME][0]
     policy_bytes = want["files"][INSTALL_DIR / POLICY_NAME][0]
     for what, data, expected in (("script", script_bytes, expect_sha256), ("policy", policy_bytes, expect_policy_sha256)):
-        if expected is not None and sha256(data) != expected.lower():
-            raise HealError(f"{what} sha256 {sha256(data)} is not the expected {expected}; refusing to install")
+        if expected is None:
+            continue
+        pin = (expected.split() or [""])[0].lower()  # `shasum -a 256` prints "<hash>  -"
+        if not re.fullmatch(r"[0-9a-f]{64}", pin):
+            raise HealError(f"--expect-{what if what == 'policy' else 'script'} sha256 {expected!r} is not 64 hex digits")
+        if sha256(data) != pin:
+            raise HealError(f"{what} sha256 {sha256(data)} is not the expected {pin}; refusing to install")
+    status = install_status(policy_path)
+    if not apply or status["current"] and status["loaded"] and status["reportFresh"]:
+        return {**status, "state": "unchanged" if status["current"] else "planned"}
     if os.geteuid() != 0:
         raise HealError("--install --apply needs root: the snapshot and the LaunchDaemon are root-owned")
     for d in (INSTALL_DIR, want["state_dir"]):
         d.mkdir(mode=0o755, parents=True, exist_ok=True)
+        check_root_dir(d.parent)  # before chown/chmod: never follow a planted link with root's chown
+        if os.path.islink(d):
+            raise HealError(f"{d} is a symlink")
         os.chown(d, 0, 0)
         os.chmod(d, 0o755)
     check_root_dir(want["state_dir"])

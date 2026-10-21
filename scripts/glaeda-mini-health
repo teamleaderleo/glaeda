@@ -614,8 +614,8 @@ def daemon_heal_command(mini: Mini) -> str:
     """The operator's root step. The hashes come from the release, not this host: the runner user can edit these files."""
     policy = mini.daemon_policy()
     return (f"sudo {SYSTEM_PYTHON} -I {DAEMON_HEAL} --install --policy {policy} --apply "
-            "--expect-sha256 <git show origin/main:scripts/glaeda-daemon-heal | shasum -a 256> "
-            "--expect-policy-sha256 <the same for config/macos-daemons.json>")
+            "--expect-sha256 $(git show <release commit this host runs>:scripts/glaeda-daemon-heal | shasum -a 256) "
+            "--expect-policy-sha256 $(git show <that commit>:config/macos-daemons.json | shasum -a 256)")
 
 
 def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
@@ -630,7 +630,7 @@ def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
         why = "the root daemon-heal LaunchDaemon is not this release's copy: " + ", ".join(status.get("stale") or [])
     elif status.get("loaded") is False:
         why = "the root daemon-heal LaunchDaemon is installed but not loaded"
-    elif status.get("loaded") and not status.get("reportFresh"):
+    elif not status.get("reportFresh"):  # loaded, or launchctl could not say: an old report alone means no passes
         age = status.get("reportAgeS")
         why = ("the root daemon-heal LaunchDaemon is loaded but its report is "
                + ("missing" if age is None else f"{age} s old") + ": its passes are not running")

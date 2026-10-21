@@ -226,6 +226,11 @@ class Guards(Base):
             heal.install(POLICY_PATH, True, expect_sha256="0" * 64)
         with self.assertRaisesRegex(heal.HealError, "policy sha256 .* is not the expected"):
             heal.install(POLICY_PATH, True, expect_policy_sha256="0" * 64)
+        good = heal.sha256((ROOT / "scripts" / "glaeda-daemon-heal").read_bytes())
+        with self.assertRaisesRegex(heal.HealError, "not 64 hex digits"):
+            heal.install(POLICY_PATH, True, expect_sha256="nothex")
+        with self.assertRaisesRegex(heal.HealError, "policy sha256"):  # shasum's "<hash>  -" is accepted for the script
+            heal.install(POLICY_PATH, True, expect_sha256=good + "  -", expect_policy_sha256="0" * 64)
 
 
 class Install(unittest.TestCase):
