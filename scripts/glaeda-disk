@@ -2617,6 +2617,8 @@ HOME_CLONE_GC_WAIT_S = 900.0  # a pass waits this long for its gc; a slower gc r
 HOME_CLONE_GC_PRUNE = "1.day.ago"
 HOME_CLONE_GC_PID_STALE_S = 12 * 3600  # git itself ignores a gc.pid this old
 HOME_CLONE_GC_LOG = HOME / ".cache/glaeda-disk/home-clone-gc.log"
+HOME_CLONE_GC_FAILED = HOME / ".cache/glaeda-disk/home-clone-gc-failed.json"  # git dir -> time of its last failed gc
+HOME_CLONE_GC_RETRY_S = 24 * 3600
 HOME_CLONE_GIT_LOCKS = ("index.lock", "HEAD.lock", "packed-refs.lock", "shallow.lock", "config.lock",
                         "FETCH_HEAD.lock", "ORIG_HEAD.lock", "MERGE_HEAD", "REBASE_HEAD", "rebase-merge",
                         "rebase-apply", "CHERRY_PICK_HEAD", "BISECT_LOG")
@@ -2773,8 +2775,9 @@ def home_clone_gc_veto(tree: Path, gitdir: Path, opened: frozenset[str], cmds: s
 def gc_home_clones(receipt: Path, home: Path | None = None, halt=None) -> int:
     """Repack the home clone with the most packs once it has HOME_CLONE_GC_PACKS of them, when no git
     operation, process or command uses it or its work trees and it saw no git activity for an hour.
-    `git gc` keeps its default prune window; nothing is deleted by hand. One clone per pass; a gc that
-    outlasts HOME_CLONE_GC_WAIT_S keeps running in its own session and is never killed."""
+    Unreachable objects older than HOME_CLONE_GC_PRUNE go; nothing is deleted by hand. One clone per pass;
+    a gc that outlasts HOME_CLONE_GC_WAIT_S keeps running in its own session and is never killed; a gc that
+    failed is not retried for HOME_CLONE_GC_RETRY_S."""
     home = HOME if home is None else home
     if not enrolled_runners(home):  # only a CI runner account's home: never a person's or a dev box's clones
         return 0
@@ -2790,9 +2793,14 @@ def gc_home_clones(receipt: Path, home: Path | None = None, halt=None) -> int:
         print(f"refusing to gc home clones: {e}", file=sys.stderr)
         return 0
     index = open_index(opened)
+    failed: dict[str, float] = {}
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        failed = {k: float(v) for k, v in json.loads(HOME_CLONE_GC_FAILED.read_text()).items()}
     released = 0
     for packs, tree, gitdir in clones:
         why = home_clone_gc_veto(tree, gitdir, index, cmds, time.time())
+        if not why and time.time() - failed.get(os.fspath(gitdir), 0.0) < HOME_CLONE_GC_RETRY_S:
+            why = f"its last gc failed within {HOME_CLONE_GC_RETRY_S // 3600}h"
         rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "family": HOME_CLONE_GC_FAMILY,
                "path": os.fspath(tree), "packs": packs}
         if not why:  # lsof can take minutes: judge again on fresh evidence right before git starts
@@ -2811,16 +2819,17 @@ def gc_home_clones(receipt: Path, home: Path | None = None, halt=None) -> int:
             nice = shutil.which("nice")
             argv = [*([nice, "-n", "15"] if nice else []), git, "-c", "gc.worktreePruneExpire=never",
                     "-C", os.fspath(tree), "gc", "--quiet", f"--prune={HOME_CLONE_GC_PRUNE}"]
-            HOME_CLONE_GC_LOG.parent.mkdir(parents=True, exist_ok=True)
-            with HOME_CLONE_GC_LOG.open("a") as log:
-                log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {' '.join(argv)}\n")
-                log.flush()
-                try:  # its own session: the pass's timers and group kills never reach a running gc
+            proc = None
+            try:
+                HOME_CLONE_GC_LOG.parent.mkdir(parents=True, exist_ok=True)
+                with HOME_CLONE_GC_LOG.open("a") as log:
+                    log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {' '.join(argv)}\n")
+                    log.flush()
+                    # its own session: the pass's timers and group kills never reach a running gc
                     proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                             start_new_session=True)
-                except OSError as e:
-                    proc = None
-                    rec.update(outcome=f"incomplete:{e.__class__.__name__}", bytes=0)
+            except OSError as e:
+                rec.update(outcome=f"incomplete:{e.__class__.__name__}", bytes=0)
             if proc is not None:
                 try:
                     code = proc.wait(timeout=HOME_CLONE_GC_WAIT_S)
@@ -2834,7 +2843,13 @@ def gc_home_clones(receipt: Path, home: Path | None = None, halt=None) -> int:
                     if code == 0:
                         print(f"  reclaimed {gib(size).strip():>8s}  {tree} (git gc of {packs} packs)")
             rec.update(verdict={"reclaimed": "reclaimable", "running": "running"}.get(rec["outcome"], "failed"),
-                       reasons=[f"{packs} packs", "no git activity or process"])
+                       reasons=[f"{packs} packs"] + (["no git activity or process"] if rec["outcome"] == "reclaimed"
+                                                     else [f"gc {rec['outcome']}"]))
+            if rec["verdict"] == "failed":  # an unchanged clone would otherwise be retried every pass
+                failed[os.fspath(gitdir)] = time.time()
+                with contextlib.suppress(OSError):
+                    HOME_CLONE_GC_FAILED.parent.mkdir(parents=True, exist_ok=True)
+                    HOME_CLONE_GC_FAILED.write_text(json.dumps(failed))
         with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
             f.write(json.dumps(rec) + "\n")
         if not why:

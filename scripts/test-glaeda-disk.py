@@ -3156,8 +3156,11 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.git_pack_count(clone / ".git"), packs)
         return home, clone, wt
 
+    @contextlib.contextmanager
     def _gc_log(self):
-        return mock.patch.object(gd, "HOME_CLONE_GC_LOG", self.root / "gc.log")
+        with mock.patch.object(gd, "HOME_CLONE_GC_LOG", self.root / "gc.log"), \
+                mock.patch.object(gd, "HOME_CLONE_GC_FAILED", self.root / "gc-failed.json"):
+            yield
 
     def test_home_clones_are_clones_directly_under_home(self) -> None:
         home, clone, wt = self._home_clone(1)
@@ -3208,6 +3211,8 @@ class GlaedaDiskTest(unittest.TestCase):
                 os.utime(c / ".git/refs/heads/feat", (time.time() - 7200,) * 2)),
             "writing a pack": lambda c, w: (c / ".git/objects/pack/tmp_pack_abc123").write_text(""),
             "a linked work tree is missing": lambda c, w: shutil.rmtree(w),
+            "holds MERGE_HEAD": lambda c, w: (c / ".git/MERGE_HEAD").write_text("0" * 40),
+            "holds rebase-merge": lambda c, w: (c / ".git/worktrees/cmux-wt/rebase-merge").mkdir(),
             "open or a working directory": lambda c, w: setattr(
                 gd, "process_evidence", lambda: ([os.fspath(w / "f0")], "")),
             "named by a running command": lambda c, w: setattr(
@@ -3267,6 +3272,30 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual((rec["outcome"], rec["verdict"], rec["pid"]), ("running", "running", 4242))
         self.assertIn("--prune=1.day.ago", SlowGc.argv)
         self.assertIn("gc.worktreePruneExpire=never", SlowGc.argv)
+
+    def test_home_clone_gc_failure_backs_off_for_a_day(self) -> None:
+        home, clone, _ = self._home_clone(3)
+
+        class FailingGc:
+            pid = 99
+            calls = 0
+
+            def __init__(self, argv, **kw):
+                FailingGc.calls += 1
+
+            def wait(self, timeout=None):
+                return 128
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 3), self._gc_log(), \
+                mock.patch.object(gd, "git_object_bytes", return_value=0), \
+                mock.patch.object(gd.subprocess, "Popen", FailingGc):
+            gd.gc_home_clones(receipt, home)
+            gd.gc_home_clones(receipt, home)
+        self.assertEqual(FailingGc.calls, 1)
+        first, second = (json.loads(line) for line in receipt.read_text().splitlines())
+        self.assertEqual((first["outcome"], first["verdict"], first["reasons"][-1]),
+                         ("failed:exit-128", "failed", "gc failed:exit-128"))
+        self.assertIn("its last gc failed within 24h", second["reasons"][0])
 
     def test_home_clone_gc_runs_on_pressure_and_sweeps_of_fleet_minis_only(self) -> None:
         dev = gd.HOME.stat().st_dev
