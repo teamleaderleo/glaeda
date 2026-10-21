@@ -411,6 +411,9 @@ def attestation(path: Path) -> tuple[bool | None, str]:
     message = (result.stderr or result.stdout).strip()[:200]
     if any(marker in message.lower() for marker in ("http 401", "http 403", "permission denied")):
         return None, f"gh cannot read attestations: {message}"
+    if 'unknown command "attestation"' in message:
+        # gh before 2.49 (Ubuntu 24.04's apt gh is 2.45): it cannot ask, which is not a failed verification
+        return None, "gh is too old to verify attestations (needs 2.49 or later)"
     return False, message
 
 
