@@ -3677,11 +3677,15 @@ class AuditTest(BrokerBase):
         return out.getvalue()
 
     def test_a_graphql_call_is_counted_however_the_endpoint_was_typed(self) -> None:
-        """One endpoint, three spellings, and the log keeps whichever the caller typed. Counted as
+        """One endpoint, four spellings, and the log keeps whichever the caller typed. Counted as
         one category, or the count is wrong for a caller writing a shape this file's own brake test
         pins as plausible (`api /graphql`), and a host writing only that spelling gets no summary
-        line at all. `BROKER_FREE_RE` already normalises the same three shapes for rate_limit, and
-        `audit_category` was matching that one by equality too."""
+        line at all.
+
+        Both endpoints, through one `endpoint_re`: `BROKER_FREE_RE` had the same api.github.com
+        pin, and it gates the broker's free-call exemption as well as this category, so a GHE
+        host's `rate_limit` read was counted in a category of its own *and* held behind the repeat
+        delay -- a free call, slowed by the brake meant for calls that spend the quota."""
         path = self.write_log([(0, "api graphql"), (5, "api /graphql"),
                                (10, "api https://api.github.com/graphql"),
                                # A GHE host, which this file handles deliberately elsewhere: its
@@ -3689,40 +3693,56 @@ class AuditTest(BrokerBase):
                                # a category of its own, so the count undercounted on exactly the
                                # hosts whose remotes this tool goes out of its way to support.
                                (12, "api https://ghe.example/api/graphql"),
-                               (15, "api /rate_limit"), (20, "pr view pr:o/r#7")])
+                               # The same four spellings for the endpoint beside it, which shares
+                               # the pattern -- and whose GHE spelling the broker also charges a
+                               # repeat delay for (see the brake test).
+                               (15, "api /rate_limit"), (16, "api rate_limit"),
+                               (17, "api https://api.github.com/rate_limit"),
+                               (18, "api https://ghe.example/api/rate_limit"),
+                               (20, "pr view pr:o/r#7")])
         doc = self.audit_json(path)
         self.assertEqual(doc["categories"]["raw gh api graphql"], 4, doc["categories"])
-        self.assertEqual(doc["categories"]["rate_limit (free)"], 1, doc["categories"])
-        # And not so wide that an unrelated path under a host reads as the endpoint.
-        for other in ("api https://ghe.example/api/v3/repos/o/r", "api repos/o/graphql-tools"):
+        self.assertEqual(doc["categories"]["rate_limit (free)"], 4, doc["categories"])
+        # And not so wide that an unrelated path under a host reads as either endpoint.
+        for other in ("api https://ghe.example/api/v3/repos/o/r", "api repos/o/graphql-tools",
+                      "api https://ghe.example/api/rate_limit/history"):
             with self.subTest(other):
                 doc = self.audit_json(self.write_log([(0, other)]))
                 self.assertNotIn("raw gh api graphql", doc["categories"], doc["categories"])
+                self.assertNotIn("rate_limit (free)", doc["categories"], doc["categories"])
 
     def test_the_hidden_reads_move_a_share_in_both_directions(self) -> None:
         """The sentence's one directional claim, held by measurement instead of by review.
 
-        It says a share can go up, down or stay where it is, and three rounds of this PR each
-        asserted a direction the log cannot see -- the last of them "grows the numerator and the
-        denominator", which reads as both always growing. Nothing in the suite could tell: the only
-        guard was `assertIn` on the whole sentence, so a wrong direction *inside* the pinned string
-        was green.
+        It says a share can go up, down or stay where it is, and four rounds of this PR each
+        asserted a direction the log cannot see -- "grows the numerator and the denominator", which
+        reads as both always growing, and then "can grow the numerator and *does* grow the
+        denominator", which a review broke by writing the hidden read out in *place* of the batched
+        call that carried it: 33.3% to 33.3%, with the denominator flat. Nothing in the suite could
+        tell: the only guard was `assertIn` on the whole sentence, so a wrong direction *inside*
+        the pinned string was green, and every fixture here added lines to the log, which makes a
+        growing denominator the fixture's property rather than a measurement.
 
-        So the property is driven. Each case is the same traffic counted twice: as the audit sees
-        it, and with the objects the `graphql` calls carried counted as the reads they are. The
-        repeat count never falls -- that is what "floor" means, and it is asserted in every case --
-        while the share goes whichever way the two counts take it."""
+        So the property is driven, under both counterfactuals -- the hidden reads written out
+        beside the batched call, and written out in place of it, which is the honest one when the
+        call carried exactly those reads. Each case is the same traffic counted twice. The repeat
+        count never falls under insertion -- that is what "floor" means, and it is asserted in
+        every case -- while the share goes whichever way the two counts take it.
+
+        Times go forwards in every fixture: `at - seen <= AUDIT_WINDOW` counts a negative delta as
+        a repeat, which is a shape no writer produces, and a fixture that relies on it is measuring
+        the test rather than the tool."""
         hidden = "the objects inside the graphql call, counted"
+        visible = [(0, "api graphql"), (10, "pr view pr:o/r#1"), (20, "pr view pr:o/r#1")]
         for name, batched, want in (
                 # One hidden read of an object nothing re-reads: denominator up, numerator flat.
-                ("a share that falls", [(1, "pr view pr:o/r#9")], "down"),
+                ("a share that falls", [(21, "pr view pr:o/r#9")], "down"),
                 # The hidden read repeats a visible one: both parts up, and the share with it.
-                ("a share that rises", [(1, "pr view pr:o/r#1")], "up"),
+                ("a share that rises", [(21, "pr view pr:o/r#1")], "up"),
                 # Three hidden reads carrying one repeat between them, against 1/3 before: 2/6.
-                ("a share that does not move", [(1, "pr view pr:o/r#2"), (2, "pr view pr:o/r#2"),
-                                                (3, "pr view pr:o/r#3")], "flat")):
+                ("a share that does not move", [(21, "pr view pr:o/r#2"), (22, "pr view pr:o/r#2"),
+                                                (23, "pr view pr:o/r#3")], "flat")):
             with self.subTest(name):
-                visible = [(0, "api graphql"), (10, "pr view pr:o/r#1"), (20, "pr view pr:o/r#1")]
                 before = self.audit_json(self.write_log(visible))
                 after = self.audit_json(self.write_log(visible + batched))
                 self.assertGreaterEqual(after["repeatsWithin"]["calls"],
@@ -3737,6 +3757,15 @@ class AuditTest(BrokerBase):
                     self.assertLess(shares[0], shares[1], shares)
                 else:
                     self.assertEqual(shares[0], shares[1], shares)
+        # The replacement counterfactual: the batched call stood for the one read it carried, so
+        # writing that read out takes the graphql line away with it. Nothing moves -- which is why
+        # the sentence says a share can stay where it is and claims no direction for either half.
+        before = self.audit_json(self.write_log(visible))
+        swapped = self.audit_json(self.write_log([(1, "pr view pr:o/r#9")] + visible[1:]))
+        self.assertEqual(swapped["calls"], before["calls"], "the denominator was supposed to be flat")
+        self.assertEqual(swapped["repeatsWithin"]["calls"] / swapped["calls"],
+                         before["repeatsWithin"]["calls"] / before["calls"],
+                         "a share that does not move when a hidden read replaces its own call")
 
     def test_a_graphql_call_hides_reads_from_the_repeat_figure_and_the_report_says_so(self) -> None:
         """Coverage, not cost. An earlier version of this line said a batching caller "looks
@@ -3773,12 +3802,27 @@ class AuditTest(BrokerBase):
                       "none of the objects inside them is, so none of them is counted as a "
                       "cacheable read or as a repeat. That makes the repeat count a floor on the "
                       "same-target re-reads a cache could have been asked for in this report, not "
-                      "an estimate. The shares beside it are not floors: writing the hidden reads "
-                      "out can grow the numerator and does grow the denominator, so a share can go "
-                      "up, down or stay where it is.", text)
-        # The table above the sentence is what makes "the calls are counted above" true, and what
-        # made the earlier "None of them is counted above" false in the same report.
+                      "an estimate. The shares beside it are not floors: a hidden read written out "
+                      "can land on either side of a share, so a share can go up, down or stay "
+                      "where it is.", text)
+        # The *total* is what makes "the calls are counted above" true, and what made the earlier
+        # "None of them is counted above" false in the same report. Not the category row: the
+        # table is the top 20 by count, so on a host with more than twenty distinct categories
+        # there is no graphql row and the sentence still holds -- which is why the row is asserted
+        # here as a nicety and the total is asserted as the reason.
+        self.assertIn("3 gh calls logged", text)
         self.assertIn("raw gh api graphql", text)
+        crowded = self.audit_text(self.write_log(
+            [(0, "api graphql"), (1, "pr view pr:o/r#7")]
+            # Twenty-one categories of two calls each, so the single graphql call sorts below
+            # every one of them and the top-20 table has no room for it.
+            + [(2 + i, f"api repos/o/r/thing{i // 2}") for i in range(42)]))
+        self.assertNotIn("raw gh api graphql", crowded,
+                         "the premise: twenty-one bigger categories push the row out of the table")
+        self.assertEqual(sum(1 for i in range(21) if f"api repos/o/r/thing{i}" in crowded), 20,
+                         "the table is the top twenty by count, which is the premise above")
+        self.assertIn("1 of those calls were `gh api graphql`", crowded, crowded)
+        self.assertIn("44 gh calls logged", crowded, crowded)
         self.assertEqual(cost_claims(text), [], "the report is making a claim about cost again")
 
     def test_the_cost_ban_fires_on_a_priced_sentence_and_only_in_the_last_paragraph(self) -> None:
@@ -3800,6 +3844,18 @@ class AuditTest(BrokerBase):
                          priced)
         self.assertEqual(cost_claims("2 points per call\n\nclean tail"), [],
                          "the ban reads the last paragraph, and that is what it costs")
+        # And the whole of it. The sample above is a one-liner, so it pins the patterns and not the
+        # extent: `[-1]` -> `[-1][:200]` stayed green against it while the real last paragraph is
+        # over 500 characters, i.e. a price smuggled into the *tail* of the shipped sentence would
+        # not be caught. So the sample is a real report with a price spliced into its last
+        # sentence, which is the shape a rewrite actually takes.
+        real_report = self.audit_text(self.write_log([(0, "api graphql"), (5, "api graphql"),
+                                                      (10, "pr view pr:o/r#7")]))
+        self.assertEqual(cost_claims(real_report), [], "the premise: the shipped report is clean")
+        tail_priced = real_report.rstrip("\n") + " And one batched call costs about 1 point.\n"
+        self.assertGreater(len(tail_priced.split("\n\n")[-1]), 300,
+                           "the paragraph has to be long enough for its tail to be cut off")
+        self.assertEqual(cost_claims(tail_priced), [r"\bpoints?\b"], tail_priced)
 
     def test_the_word_ban_does_not_fire_on_an_ordinary_logged_path(self) -> None:
         """Both halves of the scoping, demonstrated rather than asserted away.
@@ -3839,12 +3895,22 @@ class AuditTest(BrokerBase):
         """The conditionality is what makes it safe to print at all: a host with none of these
         calls gets no sentence about them. Nothing held it until a mutation (`if batched:` ->
         `if True:`) stayed green."""
-        path = self.write_log([(0, "pr view pr:o/r#7"), (5, "pr merge")])
+        path = self.write_log([(0, "pr view pr:o/floorplan#7"), (5, "pr view pr:o/floorplan#7"),
+                               (10, "pr merge")])
         text = self.audit_text(path)
         self.assertNotIn("gh api graphql", text)
-        # The sentence, not the word: a repo called `floorplan` would put "floor" in the
-        # hottest-targets line of a report that still has no graphql sentence in it.
-        self.assertNotIn("is a floor on what a cache", text)
+        # The sentence, not the word, and the word really is in this report: the repo is called
+        # `floorplan`, so "floor" reaches the hottest-targets line of a report with no graphql
+        # sentence in it. The banned substring is taken from the shipped sentence and proved
+        # present in a report that does have graphql calls -- an earlier version pinned a draft's
+        # wording, which no mutation could have put in `text` at all, so the assertion could not
+        # fail. A guard needs a positive sample.
+        floor = "a floor on the same-target re-reads"
+        self.assertIn("floor", text, "without this the assertion below proves nothing")
+        self.assertNotIn(floor, text)
+        self.assertIn(floor, self.audit_text(self.write_log([(0, "api graphql"),
+                                                             (5, "pr view pr:o/r#1")])),
+                      "the banned substring is not one this report can print")
 
     def test_an_old_logs_lines_are_counted_but_not_quoted_back(self) -> None:
         """The guard kept the value of a flag it did not know took one until 2026-10-21, and an
@@ -3964,18 +4030,29 @@ class BrokerRepeatTest(BrokerBase):
     def test_a_read_that_spends_nothing_is_never_delayed(self) -> None:
         """`GET /rate_limit` costs neither pool -- this file says so itself (`request(free=True)`,
         audit_category's "rate_limit (free)"). Holding it for 30 s punished the session doing the
-        right thing: reading the budget around a batch of calls. `--web` opens a browser."""
+        right thing: reading the budget around a batch of calls. `--web` opens a browser.
+
+        The GHE spelling too, since `BROKER_FREE_RE` pinned api.github.com: on a GHE remote -- a
+        shape this file handles deliberately -- the free call was held 30 s by the brake for calls
+        that spend the quota."""
         for args in (["api", "rate_limit"], ["api", "/rate_limit"],
                      ["api", "https://api.github.com/rate_limit"],
+                     ["api", "https://ghe.example/api/rate_limit"],
                      ["pr", "view", "9", "-R", "o/r", "--web"]):
             with self.subTest(args=args):
                 self.run_gh(args)
                 self.run_gh(args)
         self.assertEqual(self.slept, [])
-        # The point of contrast: an api GET that does spend a request is still held.
-        self.run_gh(["api", "repos/o/r/pulls/9"])
-        self.run_gh(["api", "repos/o/r/pulls/9"])
-        self.assertEqual(len(self.slept), 1)
+        # The point of contrast: an api GET that does spend a request is still held -- including a
+        # path *under* the free endpoint on a GHE host, so the widening is a spelling of one
+        # endpoint and not a hole.
+        for args in (["api", "repos/o/r/pulls/9"],
+                     ["api", "https://ghe.example/api/rate_limit/history"]):
+            with self.subTest(args=args):
+                before = len(self.slept)
+                self.run_gh(args)
+                self.run_gh(args)
+                self.assertEqual(len(self.slept), before + 1)
 
     def test_a_working_batched_graphql_read_is_never_held_in_any_shape(self) -> None:
         """The caller that batches is the one this must not punish, and it is the one the delay

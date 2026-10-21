@@ -4312,10 +4312,21 @@ def broker_caller() -> str:
 # drained the pool three times in a day, not a toll on reading.
 BROKER_THROTTLED = {("pr", "view"), ("pr", "checks"), ("pr", "list"),
                     ("run", "view"), ("run", "list"), ("issue", "list")}
+def endpoint_re(name: str) -> "re.Pattern[str]":
+    """One top-level API endpoint, however `gh api` was given it: bare, rooted, or an absolute URL.
+
+    Any host, not `api.github.com` alone: this file handles GHE remotes deliberately, and a GHE
+    endpoint lives under `/api/`. Pinning the one host meant `https://ghe.example/api/graphql` read
+    as an ordinary path -- undercounting the audit's category, and (through `BROKER_FREE_RE`)
+    holding a GHE host's free `rate_limit` read behind the repeat delay. One function, so widening
+    one endpoint's spellings cannot leave the other behind again."""
+    return re.compile(rf"^(?:https?://[^/]+/(?:api/)?)?/?{name}/?$")
+
+
 # `GET /rate_limit` is documented as costing neither pool, and this file already treats it as free
 # (`request(free=True)`, audit_category's "rate_limit (free)"). Holding it punishes the session
 # doing the right thing: checking the budget around a batch of calls. `--web` opens a browser.
-BROKER_FREE_RE = re.compile(r"^(?:https?://api\.github\.com/)?/?rate_limit/?$")
+BROKER_FREE_RE = endpoint_re("rate_limit")
 
 
 def broker_repeat_wait(args: list[str], words: list[str], method: str, seen: set[str],
@@ -4671,11 +4682,11 @@ AUDIT_READS = {("pr", "view"), ("pr", "checks"), ("pr", "list"), ("pr", "diff"),
 # could not be resolved) is counted, but never as a repeat: `pr view 7` in two repositories is two
 # different reads, and treating them as one would overstate what a cache can do.
 AUDIT_BARE = re.compile(r"^(?:pr|run|issue|search|label) [\w-]+(?: \d+)?$")
-# The GraphQL endpoint, however it was typed: `graphql`, `/graphql`, or an absolute URL. Any host,
-# not `api.github.com` alone: this file handles GHE remotes deliberately, and a GHE host's
-# `https://ghe.example/api/graphql` landed in a category of its own, so the count undercounted and
-# the sentence below it could go missing altogether.
-AUDIT_GRAPHQL_RE = re.compile(r"^(?:https?://[^/]+/(?:api/)?)?/?graphql/?$")
+# The GraphQL endpoint, however it was typed -- four spellings: `graphql`, `/graphql`, and an
+# absolute URL on either kind of host. See `endpoint_re`, which `BROKER_FREE_RE` shares: pinning
+# api.github.com put a GHE host's `https://ghe.example/api/graphql` in a category of its own, so
+# the count undercounted and the sentence below it could go missing altogether.
+AUDIT_GRAPHQL_RE = endpoint_re("graphql")
 # A logged line of the shape the broker and today's guard write: subcommand words, then an
 # identifier (a cache key, an api path, or a number), then the guard's `-R owner/repo`. Anything
 # else is counted but never printed back (see cmd_audit).
@@ -4690,10 +4701,10 @@ def audit_category(words: list[str]) -> tuple[str, bool]:
     if first == "api":
         if re.search(r"/(contents|git/blobs|git/trees|git/commits|git/refs)", " ".join(words)):
             return "source read through the API", False
-        # One endpoint, three spellings, and the log keeps whichever the caller typed. Counted as
-        # one category each, because a category split three ways is three small rows that no
+        # One endpoint, four spellings, and the log keeps whichever the caller typed. Counted as
+        # one category each, because a category split four ways is four small rows that no
         # summary line covers -- and `api /graphql` is a shape this file's own brake test pins as
-        # one a script would write. `BROKER_FREE_RE` already does this for rate_limit.
+        # one a script would write. `BROKER_FREE_RE` is the same pattern for rate_limit.
         if AUDIT_GRAPHQL_RE.match(second):
             return "raw gh api graphql", False
         if BROKER_FREE_RE.match(second):
@@ -4812,20 +4823,23 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
         # the right unit for GraphQL points. What a `graphql` line really hides is *reads*: the
         # category is not cacheable, so none of the objects inside it reaches `cacheableReads`,
         # `repeatsWithin` or `perRead`, and the repeat *count* is a floor rather than an estimate.
-        # The count and not the shares beside it. Writing the hidden reads out can only grow the
-        # count, and grows the denominator of each share while it *may* grow the numerator, so a
-        # share can go up, down or stay put -- all three are in AuditGraphqlTest, which is what
-        # finally made the sentence checkable rather than reviewable. Three earlier drafts each
-        # inferred a direction instead: "both *fall*" from the denominator alone, "either
-        # direction" said of the two counts rather than the share, and then "grows the numerator
-        # and the denominator" -- which reads as both always growing, and a review measured
-        # 33.3% -> 25.0% where only the denominator did. Say what is measured, nothing about
-        # mechanism, and let a test hold it.
-        # "The calls are counted above" because they are: in the total, in their own category row
-        # with a share, and in the denominator of the repeat percentage. An earlier draft said
-        # "None of them is counted above", which the table ten lines up contradicts. What is not
-        # counted is the *objects* inside them, and what follows from that is only that no graphql
-        # call is a cacheable read or a repeat.
+        # The count and not the shares beside it. A hidden read written out can land on either
+        # side of a share, so a share can go up, down or stay put -- all three are in
+        # AuditGraphqlTest, which is what finally made the sentence checkable rather than
+        # reviewable. Four earlier drafts each inferred a direction instead: "both *fall*" from the
+        # denominator alone, "either direction" said of the two counts rather than the share,
+        # "grows the numerator and the denominator" -- which reads as both always growing, and a
+        # review measured 33.3% -> 25.0% where only the denominator did -- and then "can grow the
+        # numerator and does grow the denominator", where a review measured 33.3% -> 33.3% by
+        # writing the hidden read out in place of the batched call it was carried by. Say what is
+        # measured, nothing about mechanism, and let a test hold it.
+        # "The calls are counted above" because the total line counts them, and the repeat
+        # percentage's denominator is that total. Not "in their own category row": the category
+        # table is the top 20 by count, so on a host with more than twenty distinct categories
+        # this row is not in it -- measured, 21 distinct `api` paths and the graphql row gone, with
+        # the sentence still true. An earlier draft said "None of them is counted above", which the
+        # total contradicts. What is not counted is the *objects* inside them, and what follows
+        # from that is only that no graphql call is a cacheable read or a repeat.
         # "however many ... asked for" covers zero, which is the only thing needed: the log keeps
         # the path and never the document, so a batched read of forty and a call that reads nothing
         # are the same line here, and a floor needs the hidden reads to be >= 0. Earlier drafts
@@ -4852,8 +4866,8 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
               f"the objects inside them is, so none of them is counted as a cacheable read or as a "
               f"repeat. That makes the repeat count a floor on the same-target re-reads a cache "
               f"could have been asked for in this report, not an estimate. The shares beside it "
-              f"are not floors: writing the hidden reads out can grow the numerator and does grow "
-              f"the denominator, so a share can go up, down or stay where it is.")
+              f"are not floors: a hidden read written out can land on either side of a share, so "
+              f"a share can go up, down or stay where it is.")
     return EXIT_OK
 
 
