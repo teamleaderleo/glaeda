@@ -61,6 +61,31 @@ or dev-daily Release root.  Those children require a conservative 72-hour idle
 window plus a fresh process/lock/lease check; unknown children and all preserved
 inputs remain visible to accounting but are never deleted by this family.
 
+Each enrolled GitHub runner's checkout (~/actions-runner*/_work/<repo>/<repo>) has two families.
+runner-checkout-build is SwiftPM's Packages/*/.build and Packages/*/*/.build plus cargo-tagged target
+directories (cmux-tui/target), plus DerivedData a workflow keeps in $RUNNER_WORKSPACE/.glaeda-state
+(_work/<repo>/.glaeda-state/*derived-data*); it goes only under pressure, only while that runner has no Runner.Worker,
+an hour idle, least recently modified first. runner-git-garbage is git's tmp_pack_*/tmp_obj_* temp files an
+interrupted fetch left; one an hour old goes whenever nothing holds it open. The checkout itself stays,
+except as the last resort of a pressure run still under the runner gate's disk floor after everything else
+(runner-idle-checkout): then the whole checkout of a runner with no Runner.Worker, unused for an hour and
+held open by nothing, goes, least recently used first, until free space reaches the floor plus
+target_margin_gib. The runner's next job clones it again. Before that, on every pressure or sweep pass of a
+fleet mini, runner-checkout-repack folds a checkout's packs with `git repack -a -d -k -l` (keeps every object) once
+it has 40 or more, while its runner has no Runner.Worker and its git dir was quiet for 10 minutes: jobs fetch
+into it with gc.auto=0 (cmux's nightly.yml writes it), so git never consolidates them itself.
+
+Tests leave one small scratch entry per case in the runner user's $TMPDIR (cmux-cli-socket-<uuid>,
+git-pr-<uuid>, TemporaryDirectory.<rand>, ...): tens of thousands, each under the 50 MiB item floor, so no
+family reclaims them. user-tmp-test-residue removes entries named by TMP_TEST_RESIDUE on every apply (not only
+under pressure) once nothing in the whole entry changed for 48 hours and no process holds or names it.
+
+A clone directly in a CI runner account's home (~/cmux) that is fetched branch after branch gains a pack per
+fetch and git consolidates only at 50: home-clone-gc runs `git gc --prune=1.day.ago` (work trees never pruned)
+on the clone with the most packs once it has ten, at most one per idle sweep or pressure pass and after the
+eviction lock is released, when no lock, missing work tree, process, command or hour-old git activity touches
+it or its linked work trees. Only a home with enrolled runners. A slow gc runs on; it is never killed.
+
 The runner-account profile is intentionally narrower than the normal user profile:
 it covers only DerivedData, cmux reload/GhosttyKit caches, and CUA recordings/frame
 caches, with a seven-day minimum idle age. Git index refreshes are ignored for that
@@ -116,6 +141,7 @@ import ast
 import atexit
 import bisect
 import calendar
+import collections
 import contextlib
 import fcntl
 import gzip
@@ -516,6 +542,9 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "03f136d9e6a76f80604f2135e8e47a7e40d877db39b906f797c3e5a0acfd7151",
     "694ee3bb3d82debb8e0bf289d5b0d3807cd6c33ddf3528254339008992846c5e",
     "86742e876b31f978f0d1f4c14f9648859cd45067e42396da2586bb6199cba596",
+    "7e2c4f9cf204d9f08b4183bc8e9dc1ea7e63ad6b7792b26a04751e4f096cbf37",
+    "11804783ada8238ec5acc80a6df81d9f53b191826dbdcc6cfbe6afd4e76ac8cb",
+    "df2beefff1a544aecaa065f5bfdb17961ca0e22e414996af5ffca6f9a64b8021",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -1368,6 +1397,370 @@ def checkout_build_family(projects: Path, role: str = "fleet-mini") -> Family:
                   platform="shared")
 
 
+# A GitHub runner's checkout (~/actions-runner*/_work/<repo>/<repo>) keeps build output between jobs: SwiftPM's
+# Packages/<platform>/<package>/.build (~9 GiB per runner) and cmux-tui's cargo target (~20 GiB), plus git's temp
+# packs from fetches a cancelled job interrupted (up to 5 GiB). With 10-12 runners per mini that was 134-338 GiB
+# no family counted ("accounting gap") while glaeda-disk found 0.0G reclaimable under the 30 GiB runner floor
+# (cmux CI minis, 2026-10-20). Build output goes only under pressure and only while that runner has no
+# Runner.Worker (no job), least recently modified first; the next job on that runner rebuilds it. A temp pack an
+# hour old is garbage whatever the runner does: git writes it continuously and renames it when the fetch ends,
+# and a fetch still holding one open keeps it (open by a process).
+RUNNER_BUILD_FAMILY = "runner-checkout-build"
+RUNNER_GIT_GARBAGE_FAMILY = "runner-git-garbage"
+RUNNER_CHECKOUT_FAMILIES = frozenset({RUNNER_BUILD_FAMILY, RUNNER_GIT_GARBAGE_FAMILY})
+RUNNER_BUILD_IDLE_HOURS = 1.0
+GIT_GARBAGE_IDLE_HOURS = 1.0
+# odb_mkstemp's names (tmp_pack_, tmp_idx_, tmp_rev_, tmp_obj_, tmp_bitmap_, tmp_mtimes_) and repack's .tmp-<pid>-pack-*
+GIT_GARBAGE_NAME = re.compile(r"tmp_[a-z]+_[A-Za-z0-9]{6,}|\.tmp-[0-9]+-pack-.+")
+CARGO_TAG = re.compile(rb"^# This file is a cache directory tag created by cargo\.?\s*$", re.M)
+# Workflows keep DerivedData, SourcePackages and compilation caches in $RUNNER_WORKSPACE/.glaeda-state
+# (hq NEW-REPO-CI.md); only the DerivedData is build output (ios-e2e-mac-derived-data: 9.5 GiB on one runner).
+RUNNER_STATE_DERIVED_DATA = re.compile(r"(?i)derived-?data")
+
+
+def enrolled_runners(home: Path | None = None) -> list[Path]:
+    """The runner directories glaeda-cmux-runner installed: a .runner config and the glaeda hooks beside it."""
+    home = HOME if home is None else home
+    try:
+        found = sorted(home.glob("actions-runner*"))
+    except OSError:
+        return []
+    return [r for r in found if not r.is_symlink() and (r / ".runner").is_file() and (r / "glaeda-hooks").is_dir()]
+
+
+def runner_checkouts(work: Path) -> list[Path]:
+    """Each repository checkout in a runner's _work (_work/<repo>/<repo>); the runner's own _temp, _actions,
+    _tool and friends start with an underscore and are never checkouts."""
+    out = []
+    for repo in _children(work):
+        if repo.name.startswith("_") or repo.is_symlink() or not repo.is_dir():
+            continue
+        for checkout in _children(repo):
+            git = checkout / ".git"
+            if (not checkout.name.startswith("_") and not checkout.is_symlink() and not git.is_symlink()
+                    and git.is_dir() and contained_directory(checkout, work)):
+                out.append(checkout)
+    return sorted(out)
+
+
+def runner_checkout_builds(work: Path) -> list[Path]:
+    """SwiftPM .build directories below Packages/ and cargo target directories (tagged by cargo) at the top
+    of each checkout or one level down (cmux-tui/target), and DerivedData directories in each runner
+    workspace's .glaeda-state (never its SourcePackages or compilation cache). Fixed places, so no source
+    tree is walked."""
+    found: list[Path] = []
+    for workspace in _children(work):
+        state = workspace / ".glaeda-state"
+        if (workspace.name.startswith("_") or workspace.is_symlink() or not workspace.is_dir()
+                or state.is_symlink() or not state.is_dir()):
+            continue
+        found += [d for d in _children(state)
+                  if RUNNER_STATE_DERIVED_DATA.search(d.name) and d.is_dir() and not d.is_symlink()]
+    for checkout in runner_checkouts(work):
+        packages = checkout / "Packages"
+        if packages.is_dir() and not packages.is_symlink():
+            for pattern in ("*/.build", "*/*/.build"):
+                found += [b for b in packages.glob(pattern) if b.is_dir() and not b.is_symlink()]
+        for parent in [checkout, *(c for c in _children(checkout) if not c.name.startswith(".") and c.is_dir())]:
+            target = parent / "target"
+            if target.is_dir() and not target.is_symlink() and CARGO_TAG.search(_head(os.fspath(target / "CACHEDIR.TAG"), 256)):
+                found.append(target)
+    return sorted({p for p in found if contained_directory(p, work)})
+
+
+def runner_git_garbage(work: Path) -> list[Path]:
+    """Temp files git leaves in a checkout's object store when a fetch or repack dies: objects/pack/tmp_pack_*
+    and friends, and tmp_obj_* loose-object temp files in objects/ or one fan-out directory down."""
+    found: list[Path] = []
+    for checkout in runner_checkouts(work):
+        objects = checkout / ".git/objects"
+        if objects.is_symlink() or not objects.is_dir():
+            continue
+        dirs = [objects, objects / "pack", *(d for d in _children(objects) if len(d.name) == 2)]
+        for d in dirs:
+            if d.is_symlink() or not contained_directory(d, work):  # a git object store outside this runner's _work
+                continue
+            for e in _entries(d):
+                if GIT_GARBAGE_NAME.fullmatch(e.name) and e.is_file(follow_symlinks=False):
+                    found.append(Path(e.path))
+    return sorted(found)
+
+
+def runner_job_live(runner: Path, cmds: str) -> str:
+    """Why a runner's checkout is in use, or "": its Runner.Worker runs only while it has a job."""
+    # either spelling of the runner's path (a symlinked home, /private) counts, so a mismatch never reads as idle
+    names = {os.fspath(runner), os.fspath(runner.resolve())}
+    pattern = "(?:" + "|".join(map(re.escape, sorted(names))) + r")/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)"
+    return f"{runner.name} is running a job (Runner.Worker)" if re.search(pattern, cmds, re.M) else ""
+
+
+def runner_checkout_families(home: Path | None = None) -> list[Family]:
+    fams = []
+    for runner in enrolled_runners(home):
+        work = runner / "_work"
+        if not work.is_dir() or work.is_symlink():
+            continue
+        fams.append(Family(RUNNER_BUILD_FAMILY, work, True,
+                           "the runner's next job rebuilds it (SwiftPM .build, cargo target)",
+                           checkout_builds=True, build_output=True, pressure_only=True,
+                           max_idle_hours=RUNNER_BUILD_IDLE_HOURS,
+                           owner="GitHub Actions jobs in this runner's checkout", rebuild_minutes=10,
+                           platform="macos"))
+        fams.append(Family(RUNNER_GIT_GARBAGE_FAMILY, work, True,
+                           "garbage: an interrupted fetch's temp pack, never read again",
+                           checkout_builds=True, build_output=True, min_bytes=1024**2,
+                           min_idle_hours=GIT_GARBAGE_IDLE_HOURS, max_idle_hours=GIT_GARBAGE_IDLE_HOURS,
+                           owner="git fetch in this runner's checkout", rebuild_minutes=0.1,
+                           platform="macos"))
+    return fams
+
+
+# The last resort for the runner gate's disk hold. With 10-12 runners on a mini, each runner's own checkout
+# (_work/<repo>/<repo>: a 7.5 GiB .git plus sources and what build output survives) adds up to 70-170 GiB,
+# and build-output eviction alone left cmuxs-mac-mini-3, -6 and cmux11s under the 32 GiB floor with every
+# listener held (2026-10-21; removing idle runners' checkouts by hand freed 116 GiB on three minis and the
+# gate reopened). So a pressure run that is still under the gate's floor after every other family removes
+# whole checkouts of runners with no job, least recently used first, until free space reaches the floor
+# plus target_margin_gib. The next job on that runner clones again (actions/checkout). Never _work/_tool,
+# _actions, _temp or the workspace's .glaeda-state.
+RUNNER_IDLE_CHECKOUT_FAMILY = "runner-idle-checkout"
+RUNNER_IDLE_CHECKOUT_HOURS = 1.0
+
+
+def runner_checkout_last_use(runner: Path, checkout: Path) -> float:
+    """When the runner last used a checkout: its git bookkeeping (a job's checkout step rewrites the index,
+    HEAD and FETCH_HEAD) or the runner's Worker logs, which a job writes from start to end."""
+    times = [0.0]
+    for p in (checkout, checkout / ".git", *(checkout / ".git" / n for n in ("index", "HEAD", "FETCH_HEAD", "logs/HEAD"))):
+        with contextlib.suppress(OSError):
+            times.append(p.lstat().st_mtime)
+    with contextlib.suppress(OSError), os.scandir(runner / "_diag") as logs:
+        for e in logs:
+            if e.name.startswith("Worker_"):
+                with contextlib.suppress(OSError):  # a log rotated away mid-scan drops only itself
+                    times.append(e.stat(follow_symlinks=False).st_mtime)
+    return max(times)
+
+
+def idle_runner_checkout_veto(runner: Path, checkout: Path, opened: frozenset[str], cmds: str) -> str:
+    """Why an idle runner's checkout must stay, or "" when it may go."""
+    path = os.fspath(checkout)
+    if (checkout.is_symlink() or checkout.name != checkout.parent.name
+            or not contained_directory(checkout, runner / "_work")):
+        return "not actions/checkout's _work/<repo>/<repo> inside the runner's _work"
+    if why := runner_job_live(runner, cmds):
+        return why
+    resolved = os.fspath(checkout.resolve())
+    if in_cwd(path, opened) or in_cwd(resolved, opened):
+        return "open or a working directory of a process"
+    if named_by(path, cmds) or named_by(resolved, cmds):
+        return "named by a running command"
+    if (time.time() - runner_checkout_last_use(runner, checkout)) / 3600 < RUNNER_IDLE_CHECKOUT_HOURS:
+        return f"used within {RUNNER_IDLE_CHECKOUT_HOURS:g}h"
+    return ""
+
+
+def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | None = None) -> int:
+    """Under the runner gate's disk floor only: remove idle runners' whole checkouts, least recently used
+    first, each after fresh process evidence, until free space is back at the floor plus target_margin_gib."""
+    home = HOME if home is None else home
+    if floor_gib <= 0:
+        return 0
+    try:
+        free, total = free_bytes(home)
+    except OSError:
+        return 0
+    if free >= floor_gib * GIB:  # the gate is not holding for disk: whole checkouts stay
+        return 0
+    target = min(int((floor_gib + POLICY["target_margin_gib"]) * GIB), total // 2)  # as filesystems() sets it
+    now = time.time()
+    found = []
+    for runner in enrolled_runners(home):
+        work = runner / "_work"
+        if work.is_symlink() or not work.is_dir():
+            continue
+        for checkout in runner_checkouts(work):
+            if checkout.name != checkout.parent.name:  # only actions/checkout's default _work/<repo>/<repo>
+                continue
+            used = runner_checkout_last_use(runner, checkout)
+            if (now - used) / 3600 >= RUNNER_IDLE_CHECKOUT_HOURS:
+                found.append((used, runner, checkout))
+    released = 0
+    for used, runner, checkout in sorted(found, key=lambda t: t[0]):
+        try:
+            if free_bytes(home)[0] >= target:
+                break
+            opened, cmds = process_evidence()  # a job may have started since the last deletion
+        except OSError:
+            break
+        except NoEvidence as e:
+            print(f"refusing to delete idle runner checkouts: {e}", file=sys.stderr)
+            break
+        why = idle_runner_checkout_veto(runner, checkout, open_index(opened), cmds)
+        size = 0
+        if why:
+            outcome = "changed:modified" if why.startswith("used within") else "changed:in-use"
+        else:
+            try:
+                before = free_bytes(home)[0]
+                remove(checkout)
+                outcome = "reclaimed"
+                size = max(0, free_bytes(home)[0] - before)  # what the free space shows, without a du walk
+                released += size
+            except OSError as e:
+                outcome = f"incomplete:{e.__class__.__name__}"
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "outcome": outcome,
+               "family": RUNNER_IDLE_CHECKOUT_FAMILY, "path": os.fspath(checkout), "bytes": size,
+               "verdict": "reclaimable" if not why else "blocked",
+               "reasons": [why] if why else ["under the runner disk floor", "runner has no job"],
+               "idle_hours": round((now - used) / 3600, 2)}
+        with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
+            f.write(json.dumps(rec) + "\n")
+        if outcome == "reclaimed":
+            print(f"  reclaimed {gib(size).strip():>8s}  {checkout} (idle runner checkout, under the disk floor)")
+    return released
+
+
+
+# Test runs leave one small scratch entry per test case in the runner user's $TMPDIR and never remove it:
+# 88k entries and 22.6 GiB on cmux14, 36k and 11.9 GiB on cmuxs-mac-mini-6 (2026-10-21), almost all of
+# them under the 50 MiB item floor, so the user-tmp family never sized or reclaimed one. Named here by the
+# prefixes those tests use, each followed by its random suffix; anything else in $TMPDIR stays with
+# user-tmp. Measured on the minis: cmux-cli-socket-<uuid> (a ~48 MiB copy of the DEV app per CLI socket
+# test), cnd-bin-<n>, git-{pr,pr-merge,stage,hunk}-<uuid>, Foundation's TemporaryDirectory.<rand>.
+TMP_TEST_RESIDUE_FAMILY = "user-tmp-test-residue"
+TMP_TEST_RESIDUE = re.compile(
+    r"(?:cmux-cli-socket|cnd-bin|git-pr-merge|git-pr|git-stage|git-hunk|cmux-home-attach-tests|cmux-file-pages"
+    r"|floating-chat|header-pr|picker-listing|swift-package-test\.XXXXXX|TemporaryDirectory|cmux-claude-hooks"
+    r"|swift-crash-reproducer|cmux-shortcut-routing|cmux-agent-journal-test|cmux-git-active-pwd"
+    r"|cmux-ssh-pty-replay)[-.][0-9A-Za-z]")
+TMP_TEST_RESIDUE_IDLE_HOURS = 48.0  # nothing in the entry changed for two days: no test run still uses it
+TMP_TEST_RESIDUE_WALK_BUDGET = 20_000  # entries walked per candidate; a bigger tree is not proven idle
+TMP_TEST_RESIDUE_EVIDENCE_S = 60.0  # process evidence is re-read at least this often during a pass
+TMP_TEST_RESIDUE_BUDGET_S = 600.0  # one pass stops here and holds the eviction lock no longer; the next continues
+
+
+def tree_newest(path: Path, budget: int | None = None, deadline: float | None = None) -> tuple[float, int] | None:
+    """Newest mtime of path and of everything below it, and the bytes allocated to it, without following
+    symlinks. None when the walk would visit more than budget entries, passes deadline (time.time()), meets
+    a directory it cannot read or another filesystem mounted below path: such a tree is not proven idle."""
+    budget = TMP_TEST_RESIDUE_WALK_BUDGET if budget is None else budget
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    newest, used, dev = st.st_mtime, st.st_blocks * 512, st.st_dev
+    stack = [os.fspath(path)] if stat.S_ISDIR(st.st_mode) else []
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    budget -= 1
+                    if budget < 0 or (deadline is not None and time.time() > deadline):
+                        return None
+                    try:
+                        est = e.stat(follow_symlinks=False)
+                    except OSError:
+                        return None
+                    if est.st_dev != dev:  # rmtree would descend into a mount below the entry
+                        return None
+                    newest = max(newest, est.st_mtime)
+                    used += est.st_blocks * 512
+                    if stat.S_ISDIR(est.st_mode):
+                        stack.append(e.path)
+        except OSError:
+            return None
+    return newest, used
+
+
+def tmp_test_residue_veto(entry: Path, opened: frozenset[str], cmds: str, now: float,
+                          deadline: float | None = None) -> tuple[str, int]:
+    """Why a test-scratch entry in $TMPDIR must stay ("" when it may go), and its allocated bytes."""
+    if entry.is_symlink():
+        return "a symlink", 0
+    seen = tree_newest(entry, deadline=deadline)
+    if seen is None:
+        return (f"not proven idle (unreadable, a mount below it, over {TMP_TEST_RESIDUE_WALK_BUDGET} entries"
+                " or past the pass budget)"), 0
+    newest, used = seen
+    if (now - newest) / 3600 < TMP_TEST_RESIDUE_IDLE_HOURS:
+        return f"changed within {TMP_TEST_RESIDUE_IDLE_HOURS:g}h", used
+    path, resolved = os.fspath(entry), os.fspath(entry.resolve())
+    if in_cwd(path, opened) or in_cwd(resolved, opened):
+        return "open or a working directory of a process", used
+    if named_by(path, cmds) or named_by(resolved, cmds):
+        return "named by a running command", used
+    return "", used
+
+
+def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None) -> int:
+    """Remove test scratch the runner user's tests left in $TMPDIR: entries named by TMP_TEST_RESIDUE, whole
+    trees unchanged for TMP_TEST_RESIDUE_IDLE_HOURS, held open and named by no process. Every candidate is
+    walked and judged right before its own deletion; process evidence is never older than
+    TMP_TEST_RESIDUE_EVIDENCE_S, and missing evidence stops the pass. One summary receipt line per pass."""
+    tmp = (darwin_user_tmp() if DARWIN else None) if tmp is None else tmp
+    if tmp is None or tmp.is_symlink() or not tmp.is_dir():
+        return 0
+    start = now = time.time()
+    names = []
+    try:
+        with os.scandir(tmp) as it:
+            for e in it:
+                if not TMP_TEST_RESIDUE.match(e.name):
+                    continue
+                with contextlib.suppress(OSError):  # an entry a test removed mid-scan drops only itself
+                    # an entry whose own mtime is recent cannot be idle; skip it without walking it
+                    if (now - e.stat(follow_symlinks=False).st_mtime) / 3600 >= TMP_TEST_RESIDUE_IDLE_HOURS:
+                        names.append(e.name)
+    except OSError:
+        return 0
+    names.sort()
+    released, removed, kept, stopped = 0, collections.Counter(), collections.Counter(), ""
+    evidence: tuple[frozenset[str], str] | None = None
+    read_at = 0.0
+    for name in names:
+        now = time.time()
+        if now - start > TMP_TEST_RESIDUE_BUDGET_S:
+            stopped = f"pass budget {TMP_TEST_RESIDUE_BUDGET_S:g}s reached"
+            break
+        if evidence is None or now - read_at > TMP_TEST_RESIDUE_EVIDENCE_S:
+            if halt is not None and (why := halt()):
+                stopped = f"halted: {why}"
+                break
+            try:
+                opened, cmds = process_evidence()
+            except NoEvidence as e:
+                stopped = f"no process evidence: {e}"
+                print(f"refusing to reap $TMPDIR test scratch: {e}", file=sys.stderr)
+                break
+            evidence, read_at = (open_index(opened), cmds), time.time()
+        entry = tmp / name
+        why, used = tmp_test_residue_veto(entry, evidence[0], evidence[1], time.time(),
+                                          deadline=start + TMP_TEST_RESIDUE_BUDGET_S)
+        prefix = TMP_TEST_RESIDUE.match(name).group(0)[:-2]
+        if why:
+            kept[why.split(" (")[0]] += 1
+            continue
+        try:
+            remove(entry)
+        except OSError as e:
+            kept[f"incomplete:{e.__class__.__name__}"] += 1
+            continue
+        removed[prefix] += 1
+        released += used
+    rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
+           "outcome": "reclaimed" if removed else "none", "family": TMP_TEST_RESIDUE_FAMILY,
+           "path": os.fspath(tmp), "bytes": released, "items": sum(removed.values()),
+           "by_prefix": dict(removed), "kept": dict(kept), "candidates": len(names),
+           **({"stopped": stopped} if stopped else {})}
+    if names:
+        with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
+            f.write(json.dumps(rec) + "\n")
+    if removed:
+        print(f"  reclaimed {gib(released).strip():>8s}  {sum(removed.values())} test scratch entries in {tmp}")
+    return released
+
+
 def apple_build_verdict(path: Path) -> str:
     """Why a glaeda-apple cache generation stays whatever its age, or "": a run is in flight or holds the
     build lock. Xcode writes deeper than the idle check looks, so the lock is what shows a build."""
@@ -1651,6 +2044,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                                reference_root=FLEET_ROOT, owner="cmux browser fleet", rebuild_minutes=20,
                                platform="macos"))
         fams += fleet_families()
+        fams += runner_checkout_families()
         for runner in HOME.glob("actions-runner*"):
             temp = runner / "_work/_temp"
             if (runner / ".runner").is_file() and (runner / "glaeda-hooks").is_dir() and temp.is_dir():
@@ -2213,6 +2607,311 @@ def command_lines() -> str:
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return command_text(ps.stdout) if ps.returncode == 0 else ""
+
+
+# A clone in the runner user's home that a person or agent fetches branch after branch: each shallow fetch
+# writes a pack of its own, and git consolidates only at gc.autoPackLimit (50) packs. ~/cmux on
+# cmuxs-mac-mini-3 held 23 packs, 35 GiB, that one `git gc` turned into 1.7 GiB (2026-10-21).
+HOME_CLONE_GC_FAMILY = "home-clone-gc"
+HOME_CLONE_GC_PACKS = 10  # a home clone with this many packs is repacked
+HOME_CLONE_GC_IDLE_HOURS = 1.0  # no fetch, checkout, commit or ref update in it or its work trees for this long
+HOME_CLONE_GC_WAIT_S = 900.0  # a pass waits this long for its gc; a slower gc runs on and is never killed
+# Unreachable objects (no ref, reflog, index or work tree HEAD names them) older than this go: a fetch
+# of a branch that only FETCH_HEAD named. Git's own default keeps them two weeks, which would not have
+# freed mini-3's 23 packs; "now" would race a writer. A day is far beyond the hour-idle veto.
+HOME_CLONE_GC_PRUNE = "1.day.ago"
+HOME_CLONE_GC_PID_STALE_S = 12 * 3600  # git itself ignores a gc.pid this old
+HOME_CLONE_GC_LOG = HOME / ".cache/glaeda-disk/home-clone-gc.log"
+HOME_CLONE_GC_FAILED = HOME / ".cache/glaeda-disk/home-clone-gc-failed.json"  # git dir -> time of its last failed gc
+HOME_CLONE_GC_RETRY_S = 24 * 3600
+HOME_CLONE_GIT_LOCKS = ("index.lock", "HEAD.lock", "packed-refs.lock", "shallow.lock", "config.lock",
+                        "FETCH_HEAD.lock", "ORIG_HEAD.lock", "MERGE_HEAD", "REBASE_HEAD", "rebase-merge",
+                        "rebase-apply", "CHERRY_PICK_HEAD", "BISECT_LOG")
+HOME_CLONE_ACTIVITY = ("FETCH_HEAD", "index", "HEAD", "ORIG_HEAD", "logs/HEAD", "packed-refs", "shallow",
+                       "objects/pack")
+HOME_CLONE_REF_BUDGET = 20_000  # entries read below refs/ and logs/refs/ for locks and activity
+# A runner's own checkout (_work/<repo>/<repo>) that every job fetches into. cmux's nightly-next step writes
+# gc.auto=0 into it and folds packs only on its own runs, so the other jobs' fetches pile up packs that git
+# never consolidates: on 2026-10-21 cmux13s-mac-mini's glaeda-2 checkout held 3935 packs, cmux9s 2970, and
+# minis sat under the runner gate's 30 GiB floor with ~10 GiB of .git per runner. `git repack -a -d -k -l`
+# folds them and keeps unreachable objects (-k): a job can start after the veto, and its fetch's objects are
+# unreachable until it moves its refs, so plain -a -d could delete them with the old packs.
+RUNNER_CHECKOUT_REPACK_FAMILY = "runner-checkout-repack"
+RUNNER_CHECKOUT_REPACK_PACKS = 40  # nightly.yml's own threshold
+RUNNER_CHECKOUT_REPACK_IDLE_HOURS = 10 / 60  # busy runners are rarely idle an hour; its job is checked directly
+
+
+def _git_common_dir(gitdir: Path) -> Path | None:
+    """The main clone's git dir of a linked work tree's git dir (<clone>/.git/worktrees/<name>)."""
+    with contextlib.suppress(OSError, ValueError):
+        common = (gitdir / "commondir").read_text().strip()
+        return Path(os.path.normpath(gitdir / common)) if common else None
+    return None
+
+
+def linked_work_trees(gitdir: Path) -> list[Path]:
+    """The work trees linked to a clone, from <gitdir>/worktrees/<name>/gitdir (each names <tree>/.git)."""
+    trees = []
+    with contextlib.suppress(OSError), os.scandir(gitdir / "worktrees") as it:
+        for e in it:
+            with contextlib.suppress(OSError, ValueError):
+                dotgit = Path((Path(e.path) / "gitdir").read_text().strip())
+                if dotgit.name == ".git":
+                    trees.append(dotgit.parent)
+    return trees
+
+
+def home_clones(home: Path) -> list[tuple[Path, Path]]:
+    """(work tree, git dir) of each clone whose work tree sits directly under home: a directory with a
+    .git directory, or the main clone of a linked work tree there when that clone is under home too.
+    Runner checkouts (~/actions-runner*/_work/...) are never directly under home."""
+    try:
+        with os.scandir(home) as it:
+            dirs = sorted(Path(e.path) for e in it if e.is_dir(follow_symlinks=False))
+    except OSError:
+        return []
+    found: dict[str, tuple[Path, Path]] = {}
+    for d in dirs:
+        dotgit = d / ".git"
+        if dotgit.is_symlink():
+            continue
+        if dotgit.is_dir():
+            gitdir = dotgit
+        elif dotgit.is_file():  # a linked work tree: "gitdir: <clone>/.git/worktrees/<name>"
+            try:
+                text = dotgit.read_text().strip()
+            except (OSError, ValueError):
+                continue
+            if not text.startswith("gitdir:"):
+                continue
+            common = _git_common_dir(Path(os.path.normpath(d / text.split(":", 1)[1].strip())))
+            if common is None:
+                continue
+            gitdir = common
+        else:
+            continue
+        tree = gitdir.parent
+        if (gitdir.name != ".git" or tree.parent != home or tree.is_symlink() or gitdir.is_symlink()
+                or not gitdir.is_dir()):
+            continue
+        found[os.fspath(gitdir)] = (tree, gitdir)
+    return list(found.values())
+
+
+def git_pack_count(gitdir: Path) -> int:
+    with contextlib.suppress(OSError):
+        return sum(1 for p in (gitdir / "objects/pack").iterdir() if p.suffix == ".pack")
+    return 0
+
+
+def git_object_bytes(gitdir: Path) -> int:
+    """Bytes of the clone's object store: packs, loose objects and garbage, as `git count-objects -v` says."""
+    git = shutil.which("git") or "git"
+    try:
+        out = subprocess.run([git, "--git-dir", os.fspath(gitdir), "count-objects", "-v"], capture_output=True,
+                             text=True, timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    kib = 0
+    for line in out.stdout.splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() in ("size", "size-pack", "size-garbage"):
+            with contextlib.suppress(ValueError):
+                kib += int(value.strip())
+    return kib * 1024
+
+
+def _ref_tree_state(root: Path) -> tuple[float, str] | None:
+    """Newest mtime below a refs/ or logs/refs/ tree and the first *.lock in it; None past the budget."""
+    newest, budget, stack = 0.0, HOME_CLONE_REF_BUDGET, [os.fspath(root)]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    budget -= 1
+                    if budget < 0:
+                        return None
+                    if e.name.endswith(".lock"):
+                        return newest, e.path
+                    with contextlib.suppress(OSError):
+                        st = e.stat(follow_symlinks=False)
+                        newest = max(newest, st.st_mtime)
+                        if stat.S_ISDIR(st.st_mode):
+                            stack.append(e.path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+    return newest, ""
+
+
+def home_clone_gc_veto(tree: Path, gitdir: Path, opened: frozenset[str], cmds: str, now: float,
+                       idle_hours: float = HOME_CLONE_GC_IDLE_HOURS) -> str:
+    """Why a home clone must not be repacked now, or "" when `git gc` may run on it."""
+    trees = [tree, *linked_work_trees(gitdir)]
+    gitdirs = [gitdir, *(p for p in (gitdir / "worktrees").glob("*") if p.is_dir() and not p.is_symlink())]
+    for t in trees[1:]:  # gc would prune a missing work tree's metadata once old enough; never risk it
+        if not (t / ".git").is_file():
+            return f"a linked work tree is missing or unreadable: {t}"
+    with contextlib.suppress(OSError):
+        if now - (gitdir / "gc.pid").lstat().st_mtime < HOME_CLONE_GC_PID_STALE_S:
+            return "a git operation holds gc.pid"
+    for g in gitdirs:
+        for lock in HOME_CLONE_GIT_LOCKS:
+            if os.path.lexists(g / lock):
+                return f"a git operation holds {lock}"
+    with contextlib.suppress(OSError), os.scandir(gitdir / "objects/pack") as it:
+        for e in it:
+            if e.name.startswith(("tmp_", ".tmp-")):
+                return "a git operation is writing a pack"
+    newest = 0.0
+    for g in gitdirs:
+        for name in HOME_CLONE_ACTIVITY:
+            with contextlib.suppress(OSError):
+                newest = max(newest, (g / name).lstat().st_mtime)
+    for root in (gitdir / "refs", gitdir / "logs/refs"):
+        state = _ref_tree_state(root)
+        if state is None:
+            return f"not proven idle ({root.name}/ unreadable or over {HOME_CLONE_REF_BUDGET} entries)"
+        newest = max(newest, state[0])
+        if state[1]:
+            return f"a git operation holds {os.path.relpath(state[1], gitdir)}"
+    if (now - newest) / 3600 < idle_hours:
+        return f"git activity within {idle_hours:g}h"
+    for path in (*trees, gitdir):
+        p, resolved = os.fspath(path), os.fspath(path.resolve())
+        if in_cwd(p, opened) or in_cwd(resolved, opened):
+            return f"open or a working directory of a process: {p}"
+        if named_by(p, cmds) or named_by(resolved, cmds):
+            return f"named by a running command: {p}"
+    return ""
+
+
+def gc_home_clones(receipt: Path, home: Path | None = None, halt=None) -> int:
+    """Repack the home clone with the most packs once it has HOME_CLONE_GC_PACKS of them, when no git
+    operation, process or command uses it or its work trees and it saw no git activity for an hour.
+    Unreachable objects older than HOME_CLONE_GC_PRUNE go; nothing is deleted by hand. One clone per pass;
+    a gc that outlasts HOME_CLONE_GC_WAIT_S keeps running in its own session and is never killed; a gc that
+    failed is not retried for HOME_CLONE_GC_RETRY_S."""
+    home = HOME if home is None else home
+    if not enrolled_runners(home):  # only a CI runner account's home: never a person's or a dev box's clones
+        return 0
+    clones = [(git_pack_count(g), t, g) for t, g in home_clones(home)]
+    clones = sorted((c for c in clones if c[0] >= HOME_CLONE_GC_PACKS), key=lambda c: -c[0])
+    return _gc_clones(receipt, clones, HOME_CLONE_GC_FAMILY,
+                      lambda tree: ["gc", "--quiet", f"--prune={HOME_CLONE_GC_PRUNE}"],
+                      lambda tree, gitdir, index, cmds, now: home_clone_gc_veto(tree, gitdir, index, cmds, now),
+                      halt)
+
+
+def runner_checkout_repack_veto(runner: Path, tree: Path, gitdir: Path, opened: frozenset[str], cmds: str,
+                                now: float) -> str:
+    """Why a runner's checkout must not be repacked now: its runner runs a job, or home_clone_gc_veto's
+    reasons with RUNNER_CHECKOUT_REPACK_IDLE_HOURS of git quiet."""
+    if why := runner_job_live(runner, cmds):
+        return why
+    return home_clone_gc_veto(tree, gitdir, opened, cmds, now, idle_hours=RUNNER_CHECKOUT_REPACK_IDLE_HOURS)
+
+
+def repack_runner_checkouts(receipt: Path, home: Path | None = None, halt=None) -> int:
+    """Fold the packs of the runner checkout with the most of them once it has RUNNER_CHECKOUT_REPACK_PACKS,
+    when its runner runs no job and nothing uses it: `git repack -a -d -k -l`, which keeps every object. One
+    per pass, with gc_home_clones' slow-run and failure rules; with a home clone gc in the same pass, the pass
+    can wait up to twice HOME_CLONE_GC_WAIT_S."""
+    home = HOME if home is None else home
+    runner_of: dict[str, Path] = {}
+    clones = []
+    for runner in enrolled_runners(home):
+        work = runner / "_work"
+        if work.is_symlink() or not work.is_dir():
+            continue
+        for tree in runner_checkouts(work):
+            packs = git_pack_count(tree / ".git")
+            if packs >= RUNNER_CHECKOUT_REPACK_PACKS:
+                runner_of[os.fspath(tree)] = runner
+                clones.append((packs, tree, tree / ".git"))
+    clones.sort(key=lambda c: -c[0])
+    return _gc_clones(receipt, clones, RUNNER_CHECKOUT_REPACK_FAMILY,
+                      lambda tree: ["repack", "-a", "-d", "-k", "-l", "-q"],
+                      lambda tree, gitdir, index, cmds, now: runner_checkout_repack_veto(
+                          runner_of[os.fspath(tree)], tree, gitdir, index, cmds, now),
+                      halt)
+
+
+def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str, git_args, veto, halt) -> int:
+    """Run `git <git_args(tree)>` on the first of clones (packs, tree, git dir) that veto clears."""
+    if not clones:
+        return 0
+    if halt is not None and (why := halt()):
+        return 0
+    try:
+        opened, cmds = process_evidence()
+    except NoEvidence as e:
+        print(f"refusing to {family}: {e}", file=sys.stderr)
+        return 0
+    index = open_index(opened)
+    failed: dict[str, float] = {}
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        failed = {k: float(v) for k, v in json.loads(HOME_CLONE_GC_FAILED.read_text()).items()}
+    released = 0
+    for packs, tree, gitdir in clones:
+        why = veto(tree, gitdir, index, cmds, time.time())
+        if not why and time.time() - failed.get(os.fspath(gitdir), 0.0) < HOME_CLONE_GC_RETRY_S:
+            why = f"its last gc failed within {HOME_CLONE_GC_RETRY_S // 3600}h"
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "family": family,
+               "path": os.fspath(tree), "packs": packs}
+        if not why:  # lsof can take minutes: judge again on fresh evidence right before git starts
+            try:
+                opened, cmds = process_evidence()
+            except NoEvidence as e:
+                print(f"refusing to {family}: {e}", file=sys.stderr)
+                break
+            index = open_index(opened)
+            why = veto(tree, gitdir, index, cmds, time.time())
+        if why:
+            rec.update(outcome="changed:in-use", verdict="blocked", reasons=[why], bytes=0)
+        else:
+            before = git_object_bytes(gitdir)
+            git = shutil.which("git") or "git"
+            nice = shutil.which("nice")
+            argv = [*([nice, "-n", "15"] if nice else []), git, "-c", "gc.worktreePruneExpire=never",
+                    "-C", os.fspath(tree), *git_args(tree)]
+            proc = None
+            try:
+                HOME_CLONE_GC_LOG.parent.mkdir(parents=True, exist_ok=True)
+                with HOME_CLONE_GC_LOG.open("a") as log:
+                    log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {' '.join(argv)}\n")
+                    log.flush()
+                    # its own session: the pass's timers and group kills never reach a running gc
+                    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                            start_new_session=True)
+            except OSError as e:
+                rec.update(outcome=f"incomplete:{e.__class__.__name__}", bytes=0)
+            if proc is not None:
+                try:
+                    code = proc.wait(timeout=HOME_CLONE_GC_WAIT_S)
+                except subprocess.TimeoutExpired:
+                    rec.update(outcome="running", pid=proc.pid, bytes=0)
+                else:
+                    size = max(0, before - git_object_bytes(gitdir)) if code == 0 else 0
+                    released += size
+                    rec.update(outcome="reclaimed" if code == 0 else f"failed:exit-{code}", bytes=size,
+                               packs_after=git_pack_count(gitdir))
+                    if code == 0:
+                        print(f"  reclaimed {gib(size).strip():>8s}  {tree} (git {git_args(tree)[0]} of {packs} packs)")
+            rec.update(verdict={"reclaimed": "reclaimable", "running": "running"}.get(rec["outcome"], "failed"),
+                       reasons=[f"{packs} packs"] + (["no git activity or process"] if rec["outcome"] == "reclaimed"
+                                                     else [f"gc {rec['outcome']}"]))
+            if rec["verdict"] == "failed":  # an unchanged clone would otherwise be retried every pass
+                failed[os.fspath(gitdir)] = time.time()
+                with contextlib.suppress(OSError):
+                    HOME_CLONE_GC_FAILED.parent.mkdir(parents=True, exist_ok=True)
+                    HOME_CLONE_GC_FAILED.write_text(json.dumps(failed))
+        with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
+            f.write(json.dumps(rec) + "\n")
+        if not why:
+            break  # one gc per pass
+    return released
 
 
 def cleanup_paused_runner_work(receipt: Path) -> int:
@@ -3422,6 +4121,8 @@ def job_busy(fam: Family, path: Path) -> bool:
     # the runner's root token and process/socket evidence are the live-use checks there.
     if fam.id in FLEET_FAMILY_IDS or fam.id == "tmp":
         return False
+    if fam.id in RUNNER_CHECKOUT_FAMILIES:  # a cargo target is wider than the budget; Runner.Worker is its signal
+        return False
     if fam.id == SPM_SCRATCH:  # dozens of package builds within three levels; its lock is its in-use signal
         return False
     if fam.id == INTERRUPTED:  # renamed away from every job's path; its deleter's pid is its in-use signal
@@ -3501,10 +4202,12 @@ def candidates(fam: Family) -> list[Path]:
             _DISCOVERED[key] = discover_caches(fam.root)
         level = list(_DISCOVERED[key])
     elif fam.checkout_builds:
-        key = "checkout-builds:" + os.fspath(fam.root)
+        key = f"checkout-builds:{fam.id}:" + os.fspath(fam.root)
         if key not in _DISCOVERED:
-            _DISCOVERED[key] = (cmux_next_ci_generated_paths(fam.root)
-                                if fam.id == CMUX_NEXT_CI_FAMILY else checkout_builds(fam.root))
+            _DISCOVERED[key] = (cmux_next_ci_generated_paths(fam.root) if fam.id == CMUX_NEXT_CI_FAMILY
+                                else runner_checkout_builds(fam.root) if fam.id == RUNNER_BUILD_FAMILY
+                                else runner_git_garbage(fam.root) if fam.id == RUNNER_GIT_GARBAGE_FAMILY
+                                else checkout_builds(fam.root))
         level = list(_DISCOVERED[key])
     elif fam.match:
         level = _search(fam)
@@ -3833,6 +4536,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
         if fam.id == CMUX_NEXT_CI_FAMILY and not blind:
             if busy_reason := cmux_next_ci_busy(fam, path, opened, cmds):
                 reasons.append(busy_reason)
+        if fam.id == RUNNER_BUILD_FAMILY and not blind and (why := runner_job_live(fam.root.parent, cmds)):
+            reasons.append(why)
         if in_cwd(sp, opened):
             reasons.append("open by a process")
         if named_by(sp, cmds):
@@ -3848,7 +4553,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
         if fam.pressure_only and ACTIVITY_MODE != "pressure":
-            reasons.append("package cache: pressure-only policy")
+            reasons.append(("runner build output" if fam.id == RUNNER_BUILD_FAMILY else "package cache")
+                           + ": pressure-only policy")
         if fam.git_disposable and (reference := referenced_main_checkout(path, nested=fam.nested_git)):
             reasons.append(reference)
         policy_note = ""
@@ -4869,7 +5575,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     archived = archived_seeds() if any(i.family == "cmux-seeds" for i in items) else frozenset()
     # Among pressure hot-tier items, evict greatest reuse distance, then oldest use.
     def order(i):
-        if ACTIVITY_MODE == "pressure" and i.family in FLEET_FAMILY_IDS:
+        if i.family == RUNNER_GIT_GARBAGE_FAMILY:  # garbage nothing reads goes before anything that costs a rebuild
+            return (2, 0, i.idle_hours, i.bytes)
+        if ACTIVITY_MODE == "pressure" and (i.family in FLEET_FAMILY_IDS or i.family == RUNNER_BUILD_FAMILY):
             return (1, i.jobs_since if i.jobs_since is not None else -1, i.idle_hours, i.bytes)
         return (0, value(i, families[i.family]), 0, 0)
     for i in sorted(items, key=order, reverse=True):
@@ -4911,6 +5619,12 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             cwds = open_index(opened)
         if fam.build_output and fam.root.is_relative_to(FLEET_CI):
             cmds = command_lines() or cmds
+        if fam.id == RUNNER_BUILD_FAMILY:
+            # the runner may have taken a job since the survey: its Runner.Worker shows in a fresh ps
+            cmds = command_lines()
+            if not cmds:
+                print("refusing to delete the rest: ps failed", file=sys.stderr)
+                break
         fresh_layout = ""
         if fam.discover:
             # a discovered cache is deleted only on its own layout, so both are re-read now: the layout,
@@ -4937,6 +5651,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         elif fam.discover and not fresh_layout:
             outcome = "changed:layout"
         elif (cmux_next_ci_busy(fam, p, cwds, cmds)
+                or (fam.id == RUNNER_BUILD_FAMILY and runner_job_live(fam.root.parent, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))):
@@ -5839,6 +6554,21 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # are absent, its disposable checkout can be cleared under this same eviction lock.
         if not RUNNER_CACHE_PROFILE:
             logical_released += cleanup_paused_runner_work(a.receipt)
+        # test scratch left in $TMPDIR, two days untouched: too small per entry for any family's size floor
+        if not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
+                and (not a.family or TMP_TEST_RESIDUE_FAMILY in a.family):
+            logical_released += reap_tmpdir_test_residue(a.receipt, halt=halt)
+        # still under the runner gate's floor after every family: idle runners' whole checkouts, last
+        if a.pressure and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
+                and (not a.family or RUNNER_IDLE_CHECKOUT_FAMILY in a.family):
+            logical_released += evict_idle_runner_checkouts(a.receipt, floor_gib)
+        # a home clone that fetch after fetch left in many packs: repacked at most hourly or under pressure,
+        # after the eviction lock is released, so a gc of many minutes never holds back another eviction
+        home_clone_gc_due = ((sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
+                             and not a.cmux_next_drain and (not a.family or HOME_CLONE_GC_FAMILY in a.family))
+        runner_repack_due = ((sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
+                             and not a.cmux_next_drain
+                             and (not a.family or RUNNER_CHECKOUT_REPACK_FAMILY in a.family))
         remaining = []
         for fs in shown:
             try:
@@ -5880,6 +6610,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if maintenance_handle is not None:
             fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
             maintenance_handle.close()
+        if home_clone_gc_due:
+            gc_home_clones(a.receipt, halt=halt)
+        if runner_repack_due:
+            repack_runner_checkouts(a.receipt, halt=halt)
     return 0
 
 
