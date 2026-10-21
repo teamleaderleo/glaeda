@@ -3178,6 +3178,10 @@ BROKER_MAX_HOPS = 2  # this broker, plus one wrapper it could not recognise. Pas
 BROKER_DEPTH = "GLAEDA_GH_DEPTH"
 BROKER_MAX_DEPTH = 8
 BROKER_REPOS_TTL = 600.0
+# How long the checkout scan behind the refusal may take. It is the one thing here that walks the
+# filesystem, it runs in front of a real gh call, and 2.4 s cold on 6566 directories is the good
+# case -- a root on a hung mount is the bad one. Generous enough that the scan normally finishes.
+BROKER_SCAN_DEADLINE = 5.0
 BROKER_ROOTS = ("~/Projects", "~/wt", "~/.cmux/worktrees")
 # Long flags that take a separate value. Only needed to keep that value out of the positional
 # words; a flag not on the safe list below stops the call from being served either way.
@@ -3253,9 +3257,17 @@ BROKER_RAW_RE = re.compile(rf"^https?://raw\.githubusercontent\.com/({NAME})/({N
 # upstream repository's, which is the one thing broker_repo's one-remote rule exists to prevent.
 # The two forms are a URL with a scheme and git's scp-like `[user@]host:path`; a userinfo part
 # (`https://user:token@github.com/o/r`) belongs to either.
-BROKER_REMOTE_RE = re.compile(
-    rf"^(?:(?:https?|git|ssh)://(?:[^/@\s]*@)?github\.com(?::\d+)?/|(?:[^/@\s]*@)?github\.com:)"
-    rf"({NAME})/({NAME}?)(?:\.git)?/?\s*$")
+# Split in two, because matching the whole URL in one pattern could only answer "understood" or
+# "not mine", and those are different answers: a github URL whose shape is not understood has to
+# poison the whole config (see broker_remotes), while another forge's is simply skipped.
+BROKER_URL_HOST_RE = re.compile(r"^(?:https?|git|ssh)://(?:[^/@\s]*@)?([^/:\s]+)(?::\d+)?(/.*)?$",
+                                re.IGNORECASE)
+BROKER_SCP_HOST_RE = re.compile(r"^(?:[^/@\s]*@)?([^/:\s]+):(.*)$")
+BROKER_REPO_PATH_RE = re.compile(rf"^({NAME})/({NAME}?)(?:\.git)?/?$")
+# Hosts whose `OWNER/REPO` the daemon's github.com cache answers for. `api.github.com` is in
+# BROKER_GITHUB_HOSTS because gh's hosts.yml names it; it is not a clone host, so a remote
+# pointing there is a shape we do not understand rather than one we serve.
+BROKER_REMOTE_HOSTS = {"github.com", "www.github.com"}
 # A git config is read by section, not scanned: see git_config_remote_urls. git accepts a key on
 # the header's own line (`[remote "origin"] url = ...`), so group 3 is whatever follows the header,
 # and the subsection may be quoted (`[remote "origin"]`) or dotted (`[remote.origin]`).
@@ -3356,17 +3368,30 @@ def broker_local_repos(now: float | None = None) -> dict[str, str]:
     roots = [Path(p).expanduser() for p in
              (os.environ.get("GLAEDA_GH_REPO_ROOTS") or os.pathsep.join(BROKER_ROOTS)).split(os.pathsep) if p]
     found: dict[str, str] = {}
-    for root in roots:
-        for depth in (1, 2):
-            try:
-                candidates = list(root.glob("/".join(["*"] * depth)))
-            except OSError:
-                continue
-            for d in candidates:
-                for owner_repo in broker_remotes(d):
-                    if broker_better_checkout(d, found.get(owner_repo), owner_repo):
-                        found[owner_repo] = str(d)
-    write_json(broker_repos_path(), {"at": now, "repos": found})
+    # Bounded, because this runs in front of a real gh call. Two levels under three roots is 6566
+    # candidate directories on this host and 2.4 s cold, each one a config read, and the TTL cache
+    # bounds how *often* that happens but not how long it takes: a root on a hung mount hung the
+    # call. This was the only step in the brokered path with no deadline, in a file that bounds
+    # everything else. On expiry the partial map is used and not cached, so the next call tries
+    # again -- and a map that is missing a repo only means the refusal declines and gh runs, which
+    # is the safe direction.
+    complete = True
+    try:
+        with hard_deadline(BROKER_SCAN_DEADLINE):
+            for root in roots:
+                for depth in (1, 2):
+                    try:
+                        candidates = list(root.glob("/".join(["*"] * depth)))
+                    except OSError:
+                        continue
+                    for d in candidates:
+                        for owner_repo in broker_remotes(d):
+                            if broker_better_checkout(d, found.get(owner_repo), owner_repo):
+                                found[owner_repo] = str(d)
+    except DeadlineTimeout:
+        complete = False
+    if complete:
+        write_json(broker_repos_path(), {"at": now, "repos": found})
     return found
 
 
@@ -3391,7 +3416,15 @@ def git_config_text(checkout: Path) -> str | None:
             gitdir = dot.read_text(errors="replace").strip()
             if not gitdir.startswith("gitdir:"):
                 return None
-            config = Path(re.sub(r"/worktrees/[^/]+/?$", "", gitdir.split(":", 1)[1].strip())) / "config"
+            target = Path(re.sub(r"/worktrees/[^/]+/?$", "", gitdir.split(":", 1)[1].strip()))
+            # git resolves a relative gitdir against the directory holding the `.git` file, not
+            # against the process's cwd -- and relative is the shape it writes for a submodule and
+            # for `git worktree add --relative-paths`. Resolving it against cwd read another
+            # checkout's config: `gitdir: ../real/.git` from `a/inner` answered `wrong/repo` where
+            # git answers `right/repo`, so the broker could serve a different repository's PR.
+            if not target.is_absolute():
+                target = checkout / target
+            config = target / "config"
         else:
             return None
         return config.read_text(errors="replace")
@@ -3406,6 +3439,12 @@ def git_config_value(raw: str) -> str | None:
     next physical line), an unterminated quote, an escape git has and this does not. See
     git_config_remote_urls for why that is not the same as an empty value."""
     out: list[str] = []
+    # Whether each character came from inside quotes or from an escape. git trims the whitespace
+    # around a value but keeps what quotes protect, and a flat `.strip()` kept neither apart:
+    # `url = "  https://github.com/me/cli"` read as `me/cli` and was served, where git's value
+    # keeps the spaces and gh does not recognise it as a github remote at all -- the broker
+    # answering where gh would not, which is the one direction that matters here.
+    protected: list[bool] = []
     quoted = False
     i = 0
     while i < len(raw):
@@ -3415,6 +3454,7 @@ def git_config_value(raw: str) -> str | None:
             if mapped is None:
                 return None
             out.append(mapped)
+            protected.append(True)
             i += 2
             continue
         if char == '"':
@@ -3423,8 +3463,16 @@ def git_config_value(raw: str) -> str | None:
             break
         else:
             out.append(char)
+            protected.append(quoted)
         i += 1
-    return None if quoted else "".join(out).strip()
+    if quoted:
+        return None
+    start, end = 0, len(out)
+    while start < end and not protected[start] and out[start].isspace():
+        start += 1
+    while end > start and not protected[end - 1] and out[end - 1].isspace():
+        end -= 1
+    return "".join(out[start:end])
 
 
 def git_config_remote_urls(text: str) -> list[str] | None:
@@ -3491,19 +3539,61 @@ def git_config_remote_urls(text: str) -> list[str] | None:
     return urls
 
 
+def broker_remote_target(url: str) -> tuple[str, str] | None:
+    """(host lowercased, path without its leading slash) for a remote URL that names a host, or
+    None for one that does not -- a local path, a relative remote, `file://`, anything unparseable.
+
+    git reads `host:path` as scp-like syntax only when there is no `://` and nothing before the
+    first colon is a slash, so `/srv/mirrors/a:b` is a path and `git@github.com:o/r` is a host."""
+    # Not stripped here: git_config_value already trims the whitespace git trims and keeps what
+    # quotes protect, and stripping again would undo exactly that distinction. The old pattern
+    # ended `\s*$`, which is how a quoted trailing space got in.
+    if "://" in url:
+        match = BROKER_URL_HOST_RE.match(url)
+        if match is None:
+            return None
+        path = match.group(2) or ""
+    else:
+        match = BROKER_SCP_HOST_RE.match(url)
+        if match is None or "/" in url.split(":", 1)[0]:
+            return None
+        path = match.group(2)
+    # Exactly one leading slash, never `lstrip`: `https://github.com//cli/cli` is not a URL whose
+    # repository we can claim to know, and stripping both slashes would have turned it into one.
+    return match.group(1).lower(), path[1:] if path.startswith("/") else path
+
+
 def broker_remotes(checkout: Path) -> list[str]:
     """The owner/repo of every github.com remote of `checkout`, lowercased, in config order.
 
-    Empty for a config git_config_remote_urls could not read in full, which is the same answer as
-    "no github remotes here" on purpose: both callers decline on it."""
+    Empty for a config this cannot read *in full*, which is the same answer as "no github remotes
+    here" on purpose: both callers decline on it.
+
+    "In full" includes every github remote's URL, not only the file's syntax. An earlier cut read
+    the config all-or-nothing and then silently skipped any URL its one pattern missed, which left
+    a strict *subset* of the remotes git lists -- and a subset of two is one, which is exactly what
+    broker_repo's one-remote rule acts on. Measured: a checkout with `git@github.com:me/cli.git`
+    and `https://www.github.com/cli/cli` left `['me/cli']`, so the broker served the fork's PR 7
+    from cache where gh resolves the base repository and answers the parent's. Same for
+    `https://GITHUB.COM/cli/cli`, a query string, a doubled slash and an extra path segment. So a
+    URL whose host is github's and whose shape is not understood now poisons the whole config."""
     text = git_config_text(checkout)
     if text is None:
         return []
-    found = []
-    for url in git_config_remote_urls(text) or []:
-        match = BROKER_REMOTE_RE.search(url)
-        if match is None:
-            continue
+    urls = git_config_remote_urls(text)
+    if urls is None:
+        return []
+    found: list[str] = []
+    for url in urls:
+        target = broker_remote_target(url)
+        if target is None:
+            continue  # not a URL with a host at all: another kind of remote, never ours
+        host, path = target
+        if host != "github.com" and not host.endswith(".github.com"):
+            continue  # another forge, and `notgithub.com` is one of them
+        match = BROKER_REPO_PATH_RE.match(path)
+        if host not in BROKER_REMOTE_HOSTS or match is None:
+            return []
         name = f"{match.group(1).lower()}/{match.group(2).lower()}"
         if name not in found:
             found.append(name)
@@ -3514,11 +3604,14 @@ def gh_hosts_file() -> Path | None:
     """gh's own hosts.yml, where `gh auth login` records the hosts it has credentials for, or None
     when there is nowhere it could be.
 
-    `Path.home()` raises with no HOME at all -- a launchd job, a systemd unit, `env -u HOME` -- and
-    on the way to deciding which *host* a call is for, that would have been an exception thrown
-    across the whole decision. The same bug, in the same week, took the cmuxterm-hq PATH guard out
-    entirely. No HOME means gh has no config to read either, so gh's built-in default is the honest
-    answer and the caller uses it."""
+    This reads `$HOME` rather than calling `Path.home()`, but not for the reason an earlier version
+    of this docstring gave: it claimed `Path.home()` *raises* with no HOME, and on Linux and macOS
+    it does not -- it falls back to the password database, so `env -u HOME glaeda-gh gh pr view 7
+    -R o/r --json state` runs fine, and `BASE` at import time would have been the first casualty if
+    it really raised. The reason is that a job with no HOME -- a launchd job, a systemd unit --
+    also has no gh config to read, and answering with *some other* home's hosts.yml on the way to
+    deciding which host a call is for is worse than not answering: gh's built-in default is the
+    honest answer, and the caller uses it."""
     directory = os.environ.get("GH_CONFIG_DIR")
     if not directory:
         base = os.environ.get("XDG_CONFIG_HOME") or os.environ.get("HOME")
@@ -3786,7 +3879,16 @@ def broker_note(event: dict) -> None:
         if (path.parent.stat().st_mode & 0o077) != 0:
             path.parent.chmod(0o700)  # mode= misses a directory an earlier run already created
         if path.exists() and path.stat().st_size > BROKER_LOG_MAX:
-            path.replace(path.with_suffix(".jsonl.1"))
+            # Under a lock, and measured again inside it -- the same race the call log's rotation
+            # fixed, still here 170 lines above it. Two callers straddling the threshold both
+            # `stat` then both `replace`, and the second rotation overwrote the full `.1` with the
+            # handful of bytes the first had just started: the whole decision history in neither
+            # file. Reproduced with two real processes and a 2 s deschedule between one caller's
+            # stat and its replace. Not rotating when the lock is held is safe: the log grows a
+            # little past the cap and the next call rotates it.
+            with bounded_lock(path.parent / ".broker-log-rotate.lock") as held:
+                if held and path.exists() and path.stat().st_size > BROKER_LOG_MAX:
+                    path.replace(path.with_name(path.name + ".1"))
         with path.open("a") as stream:
             stream.write(json.dumps({"at": round(time.time()), **event}, sort_keys=True) + "\n")
     except Exception:  # noqa: BLE001  not even an unserialisable event may fail a gh call
@@ -4271,12 +4373,21 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
     if not total:
         raise WatchError(f"no gh calls logged in {path}")
     served = {}
-    try:
-        for line in broker_log().read_text(errors="replace").splitlines():
-            route = (json.loads(line) or {}).get("route")
+    # Both files, newest last, for the same reason the call log reads its predecessor: these counts
+    # are the broker's before/after number, and reading only the live file truncated them at every
+    # rotation. Each line is self-contained JSON, so unlike the call log there is nothing to glue.
+    decisions = broker_log()
+    for source in (decisions.with_name(decisions.name + ".1"), decisions):
+        try:
+            text = source.read_text(errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            try:
+                route = (json.loads(line) or {}).get("route")
+            except ValueError:
+                continue  # a torn last line at a rotation boundary is one record, not the file
             served[route] = served.get(route, 0) + 1
-    except (OSError, ValueError):
-        pass
     if as_json:
         print(json.dumps({"calls": total, "categories": counts, "cacheableReads": reads,
                           "repeatsWithin": {"seconds": AUDIT_WINDOW, "calls": repeats},

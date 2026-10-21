@@ -4682,5 +4682,189 @@ class BrokerThirdReviewTest(BrokerBase):
         self.assertLess(waited, max(2 * gg.DOWN_GRACE, 1.0), f"paid the grace twice: {waited:.1f}s")
 
 
+class BrokerFourthReviewTest(BrokerBase):
+    """What a fourth independent review found by running it, 2026-10-21.
+
+    Finding 1 is the one that matters, and it is this suite's own blind spot: the round these tests
+    are named for made the config *parser* all-or-nothing, and the claim was true of the parser and
+    false of `broker_remotes`, its only consumer, which went on silently skipping any URL its one
+    pattern missed. A subset of two remotes is one, and one is what broker_repo acts on -- the same
+    wrong-repository bug the round fixed, one layer out, which 288 passing tests did not see."""
+
+    def remotes(self, config: str) -> list[str]:
+        where = self.home / "roots" / "probe"
+        (where / ".git").mkdir(parents=True, exist_ok=True)
+        (where / ".git" / "config").write_text(config)
+        return gg.broker_remotes(where)
+
+    def test_a_github_url_this_cannot_read_declines_the_whole_config(self) -> None:
+        """Measured against git 2.53.0 and gh 2.98.0: git lists both remotes and gh, with two
+        github remotes and no `gh-resolved`, resolves the base repository through the API and
+        answers the *parent's* PR 7. Dropping the second URL left `['me/cli']`, so the broker
+        answered the fork's from cache -- confidently, and for a different repository."""
+        fork = "git@github.com:me/cli.git"
+        for name, url in (
+                ("a query string", "https://github.com/cli/cli?x=1"),
+                ("a doubled slash", "https://github.com//cli/cli"),
+                ("an extra path segment", "https://github.com/cli/cli/extra"),
+                # Quoted, because an unquoted `#` is a comment to git: it reads the URL as
+                # `https://github.com/cli/cli` and so does gh, so that one resolves (below).
+                ("a quoted fragment", '"https://github.com/cli/cli#frag"'),
+                ("a trailing space inside quotes", '"https://github.com/cli/cli "'),
+                # api.github.com is in BROKER_GITHUB_HOSTS because gh's hosts.yml names it. It is
+                # not a clone host, so a remote pointing there is a shape we do not understand.
+                ("the api host", "https://api.github.com/repos/cli/cli"),
+                ("a github subdomain", "https://codeload.github.com/cli/cli"),
+                ("no repository at all", "https://github.com/cli")):
+            with self.subTest(url=name):
+                config = f'[remote "origin"]\n\turl = {fork}\n[remote "upstream"]\n\turl = {url}\n'
+                self.assertEqual(self.remotes(config), [],
+                                 "a github URL this cannot read leaves a subset of the remotes git lists")
+                where = self.home / "roots" / "probe"
+                with mock.patch.object(gg.Path, "cwd", staticmethod(lambda: where)):
+                    self.assertIsNone(gg.broker_repo({}),
+                                      "served one repository for a checkout that has two")
+
+    def test_a_github_url_gh_does_resolve_is_read_rather_than_dropped(self) -> None:
+        """The other half: these are github remotes gh resolves to `github.com/cli/cli`, and the
+        old pattern dropped them for being spelled differently. Declining everything is not the
+        fix -- a checkout the broker cannot resolve is one it cannot serve."""
+        for name, url in (("www", "https://www.github.com/cli/cli"),
+                          ("an upper-case host", "https://GITHUB.COM/cli/cli"),
+                          ("a mixed-case host", "https://GitHub.com/cli/cli.git"),
+                          ("www over ssh", "ssh://git@www.github.com/cli/cli.git"),
+                          ("an upper-case scp host", "git@GITHUB.COM:cli/cli.git"),
+                          ("an absolute scp path", "git@github.com:/cli/cli.git"),
+                          # An unquoted `#` ends the value: git's remote URL is the part before it.
+                          ("an unquoted fragment, which git reads as a comment",
+                           "https://github.com/cli/cli#frag")):
+            with self.subTest(url=name):
+                self.assertEqual(self.remotes(f'[remote "origin"]\n\turl = {url}\n'), ["cli/cli"])
+
+    def test_another_forge_beside_a_github_remote_is_skipped_not_poisonous(self) -> None:
+        """Only a *github* URL this cannot read poisons the config. A remote on another forge, a
+        local path or a relative one is not ours to understand, and treating it as unreadable would
+        decline every checkout that has an alternate or a vendored mirror."""
+        fork = "git@github.com:me/cli.git"
+        for name, url in (("gitlab", "https://gitlab.com/mirror/github.com/cli/cli"),
+                          ("a local path", "/srv/mirrors/github.com/cli/cli"),
+                          ("a relative remote", "../sibling"),
+                          ("a file url", "file:///srv/mirrors/cli"),
+                          ("a path with a colon in it", "/srv/a:b/cli"),
+                          ("a host that only looks like github", "https://notgithub.com/cli/cli"),
+                          ("a host github.com is a prefix of", "https://github.com.evil.example/cli/cli")):
+            with self.subTest(url=name):
+                config = f'[remote "origin"]\n\turl = {fork}\n[remote "other"]\n\turl = {url}\n'
+                self.assertEqual(self.remotes(config), ["me/cli"])
+
+    def test_a_relative_gitdir_is_read_from_beside_the_git_file(self) -> None:
+        """git resolves a relative `gitdir:` against the directory holding the `.git` file, not the
+        process cwd -- and relative is the shape git writes for a submodule and for
+        `git worktree add --relative-paths`. Resolved against cwd, `gitdir: ../real/.git` read a
+        *different* checkout's config: git answers `right/repo` there and this answered
+        `wrong/repo`, which is a wrong repository, not a decline."""
+        root = self.home / "roots"
+        for where, owner_repo in ((root / "real", "right/repo"), (root / "a" / "real", "wrong/repo")):
+            (where / ".git").mkdir(parents=True)
+            (where / ".git" / "config").write_text(
+                f'[remote "origin"]\n\turl = https://github.com/{owner_repo}\n')
+        inner = root / "a" / "inner"
+        inner.mkdir(parents=True)
+        (root / "a" / ".git").write_text("gitdir: ../real/.git\n")
+        with mock.patch.object(gg.Path, "cwd", staticmethod(lambda: inner)):
+            self.assertEqual(gg.broker_remotes(root / "a"), ["right/repo"])
+        # An absolute gitdir, and a worktree's `gitdir: .../worktrees/NAME`, still resolve as before
+        (root / "b").mkdir()
+        (root / "b" / ".git").write_text(f"gitdir: {root / 'real' / '.git'}\n")
+        self.assertEqual(gg.broker_remotes(root / "b"), ["right/repo"])
+        (root / "c").mkdir()
+        (root / "c" / ".git").write_text(f"gitdir: {root / 'real' / '.git' / 'worktrees' / 'wt'}\n")
+        self.assertEqual(gg.broker_remotes(root / "c"), ["right/repo"])
+
+    def test_a_quoted_value_keeps_the_spaces_git_keeps(self) -> None:
+        """`.strip()` on the whole value stripped what quotes protect. git keeps them, so git's
+        remote URL is `  https://github.com/me/cli`, which gh does not recognise as a github remote
+        at all -- the broker answering where gh would not."""
+        self.assertEqual(self.remotes('[remote "origin"]\n\turl = "  https://github.com/me/cli"\n'), [])
+        self.assertEqual(self.remotes('[remote "origin"]\n\turl = "https://github.com/me/cli  "\n'), [])
+        # and unquoted whitespace around a value is still trimmed, as git trims it
+        self.assertEqual(
+            self.remotes('[remote "origin"]\n\turl =    https://github.com/me/cli   \n'), ["me/cli"])
+        # a quoted value with no stray space is unchanged
+        self.assertEqual(
+            self.remotes('[remote "origin"]\n\turl = "https://github.com/me/cli"\n'), ["me/cli"])
+
+    def test_two_callers_at_the_threshold_cannot_rotate_the_decisions_away(self) -> None:
+        """The same `stat`-then-`replace` race the call log's rotation fixed, still in broker_note
+        170 lines above it. Two callers straddling the cap both rotated, and the second overwrote
+        the full `.1` with the handful of bytes the first had just started: the decision history --
+        the broker's own before/after number -- in neither file."""
+        log = gg.broker_log()
+        log.parent.mkdir(parents=True, exist_ok=True)
+        history = json.dumps({"at": 1, "route": "serve"}) + "\n"
+        log.write_text(history + "x" * gg.BROKER_LOG_MAX)
+        with open(log.parent / ".broker-log-rotate.lock", "a+") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)  # the sibling that is mid-rotation
+            gg.broker_note({"route": "pass"})
+        self.assertFalse(log.with_name(log.name + ".1").exists(), "rotated behind another rotation")
+        self.assertIn(history, log.read_text(), "the decision history was dropped, not kept")
+        gg.broker_note({"route": "pass"})  # nobody holding it: the rotation happens and keeps it
+        self.assertIn(history, log.with_name(log.name + ".1").read_text())
+        self.assertLess(log.stat().st_size, 1024, "the new log starts empty")
+
+    def test_the_audit_counts_the_decisions_the_rotated_file_holds(self) -> None:
+        """`brokerDecisions` is the number the broker is judged by, and it was read from the live
+        file only, so every rotation truncated it -- with or without the race above."""
+        calls = Path(os.environ["CMUX_GH_LOG"])
+        calls.parent.mkdir(parents=True, exist_ok=True)
+        calls.write_text("2026-10-20T00:00:05Z session-b api repos/o/r/pulls\n")
+        log = gg.broker_log()
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(json.dumps({"at": 2, "route": "serve"}) + "\n")
+        log.with_name(log.name + ".1").write_text(
+            json.dumps({"at": 1, "route": "serve"}) + "\n" + json.dumps({"at": 1, "route": "refuse"}) + "\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_audit(calls, 0, True), gg.EXIT_OK)
+        self.assertEqual(json.loads(out.getvalue())["brokerDecisions"], {"serve": 2, "refuse": 1})
+
+    def test_a_torn_line_in_the_rotated_decisions_loses_one_record_not_the_file(self) -> None:
+        calls = Path(os.environ["CMUX_GH_LOG"])
+        calls.parent.mkdir(parents=True, exist_ok=True)
+        calls.write_text("2026-10-20T00:00:05Z session-b api repos/o/r/pulls\n")
+        log = gg.broker_log()
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(json.dumps({"at": 2, "route": "serve"}) + "\n")
+        log.with_name(log.name + ".1").write_text(
+            json.dumps({"at": 1, "route": "refuse"}) + "\n" + '{"at": 1, "rou')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_audit(calls, 0, True), gg.EXIT_OK)
+        self.assertEqual(json.loads(out.getvalue())["brokerDecisions"], {"serve": 1, "refuse": 1})
+
+    def test_the_checkout_scan_is_bounded_and_does_not_cache_a_partial_answer(self) -> None:
+        """The one step in the brokered path with no deadline, in a file that bounds everything
+        else: two levels under three roots is 6566 directories and 2.4 s cold here, and a root on a
+        hung mount hung the gh call. On expiry the partial map is used and not written, so the next
+        call tries again -- and a map missing a repo only means the refusal declines and gh runs."""
+        self.checkout("manaflow-ai/cmux")
+
+        @contextlib.contextmanager
+        def expired(_seconds):
+            raise gg.DeadlineTimeout("no complete answer")
+            yield  # pragma: no cover - never reached, keeps this a generator
+
+        with mock.patch.object(gg, "hard_deadline", expired):
+            self.assertEqual(gg.broker_local_repos(now=time.time()), {})
+        self.assertFalse(gg.broker_repos_path().exists(), "cached a partial scan")
+        # unbounded again, the scan finishes and is cached
+        self.assertEqual(sorted(gg.broker_local_repos(now=time.time())), ["manaflow-ai/cmux"])
+        self.assertTrue(gg.broker_repos_path().exists())
+
+    def test_the_scan_deadline_is_small_enough_to_bound_a_gh_call(self) -> None:
+        # A bound is only a bound if a person waiting on `gh pr view` would accept it.
+        self.assertLessEqual(gg.BROKER_SCAN_DEADLINE, 10.0)
+
+
 if __name__ == "__main__":
     unittest.main()
