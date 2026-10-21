@@ -183,6 +183,7 @@ DEVBOX_LINUX_UNITS = frozenset({"glaeda-projects-tidy.service", "glaeda-projects
 # --gh-only: the shared GitHub watcher and the updater that keeps it on its release ring, nothing else.
 # For a host that runs agent lanes but no glaeda hygiene (no disk or worktree reclaim of its own).
 GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh")
+PROFILE_FLAGS = ("--gh-only", "--hygiene-only")
 GH_ONLY_LINUX_UNITS = frozenset({"glaeda-update.service", "glaeda-update.timer", "glaeda-gh.service"})
 # long-running Linux services with no timer: enabled and started themselves
 DAEMON_UNITS = frozenset({"glaeda-gh.service"})
@@ -254,10 +255,13 @@ class Context:
                  xcode_app: str, min_free_gib: int, hygiene_only: bool = False,
                  platform_name: str | None = None, ota_ring: str | None = None,
                  ota_source: str | None = None, role: str = "devbox",
-                 role_explicit: bool = False, headless: bool = False, gh_only: bool = False) -> None:
+                 role_explicit: bool = False, headless: bool = False, gh_only: bool = False,
+                 profile_flag: str | None = None) -> None:
         self.home = home
         self.platform = platform_name or HOST_PLATFORM
         self.gh_only = gh_only
+        # --gh-only or --hygiene-only as given on the command line: it replaces the profile in update.json
+        self.profile_flag = profile_flag
         # gh-only is a narrower hygiene profile: build-host checks and defaults never apply
         self.hygiene_only = hygiene_only or gh_only
         self.apply = apply
@@ -1028,8 +1032,15 @@ def update_config_action(ctx: Context) -> dict[str, Any]:
     # be treated as equivalent to the default when --ota-source was supplied.
     if ctx.ota_source and current.get("source") != ctx.ota_source:
         value["source"] = ctx.ota_source
+    if ctx.profile_flag:
+        # A profile asked for by name is what OTA reruns from now on (a missing setupArgs is glaeda-update's
+        # ["--hygiene-only"]), so a host moved to --gh-only stays there, and back.
+        setup_args = value.get("setupArgs", ["--hygiene-only"])
+        if not isinstance(setup_args, list) or not all(isinstance(arg, str) for arg in setup_args):
+            return {**act, "state": "blocked", "note": "invalid setupArgs; fix or remove it"}
+        value["setupArgs"] = [ctx.profile_flag, *(a for a in setup_args if a not in PROFILE_FLAGS)]
     if ctx.role_explicit:
-        setup_args = current.get("setupArgs", ["--hygiene-only"])
+        setup_args = value.get("setupArgs", ["--hygiene-only"])
         if not isinstance(setup_args, list) or not all(isinstance(arg, str) for arg in setup_args):
             return {**act, "state": "blocked", "note": "invalid setupArgs; fix or remove it"}
         retained = []
@@ -2018,7 +2029,8 @@ def main(argv: list[str] | None = None) -> int:
                 recorded_role = "fleet-mini"
     except (OSError, ValueError, TypeError):
         pass
-    role = args.role or recorded_role or ("devbox" if args.hygiene_only or HOST_PLATFORM == "linux" else "fleet-mini")
+    role = args.role or recorded_role or (
+        "devbox" if args.hygiene_only or args.gh_only or HOST_PLATFORM == "linux" else "fleet-mini")
     ctx = Context(home, args.apply, args.python,
                   args.skip_launchctl, args.reclaim_binary,
                   args.cmux_root.expanduser().resolve() if args.cmux_root else None,
@@ -2026,7 +2038,8 @@ def main(argv: list[str] | None = None) -> int:
                   args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring,
                   ota_source=args.ota_source, role=role,
                   role_explicit=args.role is not None,
-                  headless=args.headless, gh_only=args.gh_only)
+                  headless=args.headless, gh_only=args.gh_only,
+                  profile_flag="--gh-only" if args.gh_only else "--hygiene-only" if args.hygiene_only else None)
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
         blocking_checks = HYGIENE_BLOCKING | ({"headlessSudo"} if args.headless else set())

@@ -889,6 +889,23 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(kinds - {"dir", "tool", "agent", "config"}, set())  # no git, gitpkg, python, marker
         self.assertEqual(self.states(self.invoke("--gh-only", "--apply")), {"unchanged"})
 
+    def test_naming_a_profile_moves_an_enrolled_host_to_it_for_ota(self) -> None:
+        """update.json is otherwise never overwritten, so without this OTA would rerun the old profile."""
+        self.linux()
+        config_path = self.home / ".config/glaeda/update.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"ring": "stable", "setupArgs": ["--hygiene-only", "--headless"]}))
+        self.invoke("--gh-only", "--apply")
+        self.assertEqual(json.loads(config_path.read_text())["setupArgs"], ["--gh-only", "--headless"])
+        self.invoke("--hygiene-only", "--apply")
+        self.assertEqual(json.loads(config_path.read_text())["setupArgs"], ["--hygiene-only", "--headless"])
+        config_path.write_text(json.dumps({"ring": "canary", "note": "hand edit"}))  # no setupArgs: hygiene
+        self.invoke("--gh-only", "--apply")
+        self.assertEqual(json.loads(config_path.read_text()),
+                         {"ring": "canary", "note": "hand edit", "setupArgs": ["--gh-only"]})
+        self.invoke("--apply")  # no profile named: the recorded one stays
+        self.assertEqual(json.loads(config_path.read_text())["setupArgs"], ["--gh-only"])
+
     def test_gh_only_on_a_mac_keeps_two_agents(self) -> None:
         receipt = self.invoke("--gh-only", "--apply")
         self.assertEqual(receipt["profile"], "gh")

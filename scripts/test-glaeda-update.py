@@ -842,6 +842,17 @@ class UpdateTest(unittest.TestCase):
         self.assertTrue(self.converge()["converged"])
         self.assertEqual(self.converge()["running"]["tools"]["drift"], [])
 
+    def test_a_gh_only_host_does_not_repair_tools_it_no_longer_installs(self) -> None:
+        self.server.publish(SOURCES[0])
+        now = 1_800_000_000.0
+        self.assertEqual(self.apply(now)["result"], "updated")
+        (self.bin / "glaeda-worktree-reclaim").write_text("#!/bin/sh\n# left from the hygiene profile\nexit 0\n")
+        self.config = {**self.config, "setupArgs": ["--gh-only"]}
+        self.assertEqual(gu.observe(self.state, self.bin, self.root, self.root / "x", gh_only=True)["tools"]["drift"], [])
+        result = self.apply(now + 1)
+        self.assertEqual(result["result"], "current", result)
+        self.assertNotIn("repair", result)
+
     def test_a_run_that_dies_still_records_why(self) -> None:
         self.server.publish(SOURCES[0])
         with mock.patch.object(gu, "update", side_effect=RuntimeError("boom")):
