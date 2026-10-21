@@ -3853,6 +3853,30 @@ class BrokerFieldTableTest(unittest.TestCase):
                       "headRefOid", "status", "conclusion", "attempt"):
             self.assertIn(field, gg.BROKER_LIVE_FIELDS, field)
 
+    def test_every_served_field_is_classified_live_or_stable(self) -> None:
+        """The assertion above names the ten fields that are live today, so it says nothing about
+        the eleventh. A review added `merged` to BROKER_PR_FIELDS and `checksTotal` to it -- both
+        mutable, both filled by every writer, neither classified -- and all 91 broker tests stayed
+        green while a merged PR was served as open from a ten-minute-old entry. The obligation has
+        to be on the tables, not on a list of names: a new served field belongs to exactly one of
+        the two sets, and adding it without deciding which fails here."""
+        served = set(gg.BROKER_PR_FIELDS) | set(gg.BROKER_RUN_FIELDS)
+        self.assertEqual(served, gg.BROKER_LIVE_FIELDS | gg.BROKER_STABLE_FIELDS,
+                         "a served field is live or stable; this one is neither")
+        self.assertEqual(gg.BROKER_LIVE_FIELDS & gg.BROKER_STABLE_FIELDS, set(),
+                         "a field cannot be both")
+
+    def test_a_stable_field_is_not_one_a_lane_could_act_on(self) -> None:
+        """What 'stable' is allowed to mean: fixed for the life of the object, or a value whose
+        being a few minutes old is not an answer anything acts on. A field that decides a merge,
+        a rerun or a wait is live, whatever its name suggests."""
+        for field in ("state", "mergeable", "mergeStateStatus", "conclusion", "status",
+                      "headRefOid", "mergedAt", "isDraft"):
+            self.assertNotIn(field, gg.BROKER_STABLE_FIELDS, field)
+        self.assertEqual(gg.BROKER_STABLE_FIELDS - {"number", "url", "title", "headRefName",
+                                                    "databaseId", "headSha", "event"}, set(),
+                         "a new stable field needs the comment above it to say why it is stable")
+
 
 class BrokerLogTest(BrokerBase):
     def test_a_host_without_the_path_guard_writes_the_guards_log_itself(self) -> None:
@@ -4114,6 +4138,209 @@ class BrokerLoopTest(BrokerBase):
             with mock.patch.object(gg.Path, "home", staticmethod(lambda: self.home)):
                 found = gg.broker_real_gh()
         self.assertEqual(found, str(installed))
+
+
+class BrokerReviewTest(BrokerBase):
+    """What a second independent review of the broker found by running it, 2026-10-21."""
+
+    def test_only_a_real_remote_puts_a_repository_in_the_local_index(self) -> None:
+        """The remotes were regexed out of the config text, so a `[submodule]` url, an `[url]`
+        insteadOf rewrite rule and a commented-out line all counted as remotes. On big-red that
+        indexed 81 repositories -- every submodule and vendored dependency of the cmux checkout --
+        so `gh api /repos/manaflow-ai/homebrew-cmux/contents/Formula/cmux.rb` was refused and the
+        reader was pointed at a cmux worktree whose submodules are not initialised, where the
+        advised `git show` answers `path does not exist`. It also meant the cmux checkout looked
+        like it had ten remotes, so the repository the fleet reads most was never served."""
+        where = self.home / "roots" / "cmux"
+        (where / ".git").mkdir(parents=True)
+        (where / ".git" / "config").write_text(
+            '[remote "origin"]\n'
+            "\turl = git@github.com:manaflow-ai/cmux.git\n"
+            '[submodule "ghostty"]\n'
+            "\turl = https://github.com/manaflow-ai/ghostty\n"
+            '[submodule "vendor/fmt"]\n'
+            "\turl = https://github.com/fmtlib/fmt.git\n"
+            '[url "ssh://git@github.com/acme/mirror"]\n'
+            "\tinsteadOf = https://gitlab.com/acme/mirror\n"
+            "# url = https://github.com/o/oldname\n"
+            "; url = https://github.com/o/older\n")
+        self.assertEqual(gg.broker_remotes(where), ["manaflow-ai/cmux"])
+        self.assertEqual(sorted(gg.broker_local_repos(now=time.time())), ["manaflow-ai/cmux"])
+        # and so the refusal only speaks for the one repository that is really here
+        code, _out, _err, passed = self.run_gh(["api", "repos/manaflow-ai/ghostty/contents/x"])
+        self.assertIsNone(code, "a submodule's URL is not a checkout of it")
+        self.assertIsNotNone(passed)
+
+    def test_a_checkout_with_a_fork_and_an_upstream_is_still_resolved(self) -> None:
+        """Two real remotes stay two: the one-remote rule is what makes a served answer safe, and
+        the fix must not buy its accuracy by making every checkout look single-remote."""
+        where = self.home / "roots" / "cli"
+        (where / ".git").mkdir(parents=True)
+        (where / ".git" / "config").write_text(
+            '[remote "origin"] url = git@github.com:me/cli.git\n'
+            '[remote "upstream"]\n\turl = https://github.com/cli/cli\n')
+        self.assertEqual(gg.broker_remotes(where), ["me/cli", "cli/cli"])
+        with mock.patch.object(gg.Path, "cwd", staticmethod(lambda: where)):
+            self.assertIsNone(gg.broker_repo({}), "two remotes is a guess, so it declines")
+
+    def test_a_url_a_remote_section_does_not_own_is_not_a_remote(self) -> None:
+        for config, want in (
+                ('[remote "origin"]\n\tpushurl = git@github.com:o/push.git\n', []),
+                ('[remote "origin"]\n\turl = git@github.com:o/r.git # a comment\n', ["o/r"]),
+                ('[remote "origin"]\n\turl = "git@github.com:o/r.git"\n', ["o/r"]),
+                ('[remote "origin"] url = git@github.com:o/r.git\n', ["o/r"]),
+                ("[REMOTE \"origin\"]\n\tURL = git@github.com:o/r.git\n", ["o/r"]),
+                ('[remote "origin"]\n\turl = https://gitlab.com/o/r.git\n', []),
+                ('[branch "main"]\n\tremote = origin\n\turl = github.com/o/wrong\n', [])):
+            with self.subTest(config=config):
+                where = self.home / "roots" / "probe"
+                (where / ".git").mkdir(parents=True, exist_ok=True)
+                (where / ".git" / "config").write_text(config)
+                self.assertEqual(gg.broker_remotes(where), want)
+
+    def test_the_refusal_says_nothing_about_another_github_host(self) -> None:
+        """`repos/acme/thing` on an enterprise host is not `acme/thing` on github.com.
+        broker_repo() always declined these; the refusal did not, so it offered a github.com
+        clone's bytes as the enterprise repository's."""
+        self.checkout("acme/thing")
+        args = ["api", "repos/acme/thing/contents/README.md"]
+        for extra, env in ((["--hostname", "ghe.example.com"], {}),
+                           ([], {"GH_HOST": "ghe.example.com"}),
+                           ([], {"GH_ENTERPRISE_TOKEN": "x"}),
+                           ([], {"GITHUB_ENTERPRISE_TOKEN": "x"})):
+            with self.subTest(extra=extra, env=env):
+                with mock.patch.dict(os.environ, env):
+                    code, _out, _err, passed = self.run_gh([*args, *extra])
+                self.assertIsNone(code, "refused a repository it cannot know is the same one")
+                self.assertEqual(passed, [*args, *extra])
+        # github.com itself is unaffected, named or not
+        for extra in ([], ["--hostname", "github.com"], ["--hostname", "api.github.com"]):
+            with self.subTest(extra=extra):
+                code, _out, _err, _passed = self.run_gh([*args, *extra])
+                self.assertEqual(code, gg.BROKER_EXIT_REFUSED)
+
+    def test_a_held_lock_is_never_the_reason_gh_does_not_run(self) -> None:
+        """Three read-modify-writes took LOCK_EX with no deadline, on paths every gh call on the
+        host touches. With `.broker-seen.lock` held by a stuck process, `gh pr view 7 -R o/r
+        --json state` was still blocked past a 20 s kill, having never reached the real gh. What
+        these protect is bookkeeping; a gh call is not."""
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        # A non-zero delay for the repeat lock: with CMUX_GH_MIN_REPEAT_SECONDS=0 the function
+        # returns before it ever opens the lock, so the subtest would pass against the unbounded
+        # version. (It did; the mutation found it.)
+        for name, call in ((".broker-seen.lock", lambda: gg.broker_seen_count("pr:o/r#7", time.time())),
+                           (".broker-repeat.lock",
+                            lambda: gg.broker_repeat_wait(["api", "repos/o/r/pulls"],
+                                                          ["api", "repos/o/r/pulls"],
+                                                          "GET", set(), time.time())),
+                           (".register.lock", lambda: gg.register("pr:o/r#7"))):
+            with self.subTest(lock=name):
+                path = gg.BASE / name if name != ".register.lock" else gg.watch_dir() / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, "a+") as holder:
+                    fcntl.flock(holder, fcntl.LOCK_EX)  # stands in for a wedged sibling
+                    began = time.monotonic()
+                    with mock.patch.dict(os.environ, {"CMUX_GH_MIN_REPEAT_SECONDS": "30"}):
+                        call()
+                    waited = time.monotonic() - began
+                self.assertLess(waited, gg.LOCK_WAIT + 2.0, f"{name} waited {waited:.1f}s")
+
+    def test_a_repeat_delay_is_still_applied_when_the_lock_is_free(self) -> None:
+        # The other half: giving up on a held lock must not mean giving up on the bookkeeping.
+        with mock.patch.dict(os.environ, {"CMUX_GH_MIN_REPEAT_SECONDS": "30"}):
+            args = ["api", "repos/o/r/pulls"]
+            words, method, seen, _values = gg.broker_words(args)
+            now = time.time()
+            self.assertEqual(gg.broker_repeat_wait(args, words, method, seen, now), 0.0)
+            self.assertGreater(gg.broker_repeat_wait(args, words, method, seen, now + 1), 0.0)
+
+    def test_the_horizon_override_cannot_cover_a_live_field(self) -> None:
+        """GLAEDA_GH_MAX_AGE was read before the live-field rule, so one export in a shell profile
+        silently turned off the only protection the merge path has: a two-hour-old
+        `{"state":"MERGED","mergeable":"MERGEABLE"}` was served as the answer."""
+        for value in ("999999", "inf", "1e9"):
+            with self.subTest(GLAEDA_GH_MAX_AGE=value):
+                with mock.patch.dict(os.environ, {"GLAEDA_GH_MAX_AGE": value}):
+                    self.assertEqual(gg.broker_max_age(["state"]), gg.BROKER_MAX_AGE)
+                    self.assertEqual(gg.broker_max_age(["conclusion"]), gg.BROKER_MAX_AGE)
+                    self.assertGreater(gg.broker_max_age(["title"]), gg.BROKER_MAX_AGE)
+        self.cache_pr(8, {"state": "MERGED"}, age=7200)
+        with mock.patch.dict(os.environ, {"GLAEDA_GH_MAX_AGE": "999999"}):
+            _code, out, _err, passed = self.run_gh(["pr", "view", "8", "-R", "o/r", "--json", "state"])
+        self.assertEqual(out, "", "a two-hour-old state is not an answer")
+        self.assertIsNotNone(passed)
+
+    def test_a_persons_switch_hands_the_call_straight_to_the_real_gh(self) -> None:
+        """The fatal loop message advertises CMUX_GH_BROKER_DISABLE=1, and nothing here read it:
+        the only documented way out of a wedged chain was a no-op."""
+        self.cache_pr(7, {"state": "OPEN"})
+        with mock.patch.dict(os.environ, {"CMUX_GH_BROKER_DISABLE": "1"}):
+            code, out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+            self.assertEqual((code, out), (None, ""), "served nothing, ran gh")
+            self.assertEqual(passed, ["pr", "view", "7", "-R", "o/r", "--json", "state"])
+            # and it is honoured past the point where the chain would otherwise be refused
+            with mock.patch.dict(os.environ, {gg.BROKER_DEPTH: str(gg.BROKER_MAX_DEPTH + 5)}):
+                code, _out, err, passed = self.run_gh(["pr", "view", "7"], keep_mark=True)
+            self.assertIsNone(code, err)
+            self.assertEqual(passed, ["pr", "view", "7"])
+
+    def test_a_person_at_a_terminal_gets_ghs_own_output(self) -> None:
+        """gh indents and colours `--json` on a tty and this prints compact json.dumps, so serving
+        an interactive call would answer it in a different shape than gh does. A tty is a person,
+        not the polling this exists to cut."""
+        self.cache_pr(7, {"state": "OPEN"})
+        plan = gg.broker_plan(["pr", "view", "7", "-R", "o/r", "--json", "state"], time.time())
+        self.assertEqual(plan[0], "serve")
+        with mock.patch.object(gg.sys, "stdout", mock.Mock(isatty=lambda: True)):
+            route, payload, key = gg.broker_plan(["pr", "view", "7", "-R", "o/r", "--json", "state"],
+                                                 time.time())
+        self.assertEqual((route, payload), ("pass", None))
+        self.assertEqual(key, "pr:o/r#7", "still worth watching for the next reader")
+
+    def test_a_git_env_var_stops_the_walk_rather_than_guessing(self) -> None:
+        """Hooks set GIT_DIR, and under it the walk up from cwd lands on a different repository
+        than gh would: in a checkout of one repo with GIT_DIR naming another's, real gh answers
+        the second and the walk answers the first. No test covered this -- deleting the bail-out
+        left the whole suite green."""
+        where = self.checkout("o/r")
+        with mock.patch.object(gg.Path, "cwd", staticmethod(lambda: where)):
+            self.assertEqual(gg.broker_repo({}), "o/r")
+            for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES",
+                         "GIT_DISCOVERY_ACROSS_FILESYSTEM"):
+                with self.subTest(env=name):
+                    with mock.patch.dict(os.environ, {name: str(where / ".git")}):
+                        self.assertIsNone(gg.broker_repo({}))
+
+    def test_a_missing_field_is_declined_on_purpose_not_crashed_into_the_fallback(self) -> None:
+        """`test_a_field_missing_from_this_entry_is_passed_through` passes against a broker that
+        raises KeyError here: cmd_gh's fail-open catches it, gh still runs, and its one assertion
+        holds. The route it logs is `error`, not `pass`. The decision is what has to be pinned."""
+        key = self.cache_pr(7, {"state": "OPEN"})
+        self.assertEqual(gg.broker_plan(["pr", "view", "7", "-R", "o/r", "--json", "state,mergedAt"],
+                                        time.time()), ("pass", None, key))
+        self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state,mergedAt"])
+        routes = [json.loads(line)["route"] for line in
+                  gg.broker_log().read_text().splitlines() if "route" in line]
+        self.assertEqual(routes[-1], "pass", "a declined field is a decision, not an error")
+
+    def test_the_hop_cap_stays_small_enough_to_bound_a_loop(self) -> None:
+        # Raising it to 40 changed nothing in the suite, and a cap is only a bound if it is small:
+        # one wrapper this broker could not recognise, and no more.
+        self.assertLessEqual(gg.BROKER_MAX_HOPS, 3)
+        self.assertLessEqual(gg.BROKER_MAX_DEPTH, 12)
+
+    def test_the_call_log_is_rotated_and_the_audit_reads_across_it(self) -> None:
+        """One line per gh call per host, and this was the one append here with no cap at all:
+        117 MB on cosmic-gray. The audit's window must not end at the rotation."""
+        log = Path(os.environ["CMUX_GH_LOG"])
+        log.write_text("x" * (gg.GUARD_LOG_MAX + 1))
+        self.run_gh(["pr", "view", "7", "-R", "o/r"])
+        self.assertTrue(log.with_name(log.name + ".1").exists(), "not rotated")
+        self.assertLess(log.stat().st_size, 1024, "the new log starts empty")
+        older = "2026-10-20T00:00:00Z session-a api repos/o/r/pulls\n"
+        log.with_name(log.name + ".1").write_text(older)
+        code = gg.cmd_audit(log, 0, True)
+        self.assertEqual(code, gg.EXIT_OK)
 
 
 if __name__ == "__main__":
