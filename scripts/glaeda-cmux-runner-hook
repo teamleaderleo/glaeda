@@ -3873,6 +3873,8 @@ class Gate:
             if self.streak < GATE_CONFIRM:
                 return None
             if self.stopped_one and time.monotonic() - self.free_since < GATE_RESTART_FREE_S:
+                if self.streak == GATE_CONFIRM:
+                    gate_log(f"the host is free; listening again after {GATE_RESTART_FREE_S:g} s free, since a stop")
                 return None
             gate_log("the host is free again")
             self.held, self.free_since = None, None

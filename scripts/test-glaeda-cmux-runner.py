@@ -5000,9 +5000,10 @@ class GateTest(unittest.TestCase):
 
     def run_listen(self, *extra: str) -> tuple[subprocess.Popen, Path]:
         # The hook runs in its own process, so the setUp patch of the thermal level does not reach it.
-        # No first-poll hold (GATE_FIRST_POLL_S): these tests stop a listener the moment a claim confirms.
+        # No first-poll hold (GATE_FIRST_POLL_S) and no free span after a stop (GATE_RESTART_FREE_S): these tests
+        # stop a listener the moment a claim confirms and restart it once two polls are free.
         env = {**os.environ, "GLAEDA_RUNNER_GATE_POLL_S": "0.1", "GLAEDA_RUNNER_THERMAL_HOLD": "0",
-               "GLAEDA_RUNNER_GATE_FIRST_POLL_S": "0"}
+               "GLAEDA_RUNNER_GATE_FIRST_POLL_S": "0", "GLAEDA_RUNNER_GATE_RESTART_FREE_S": "0"}
         log = self.tmp / "runner.log"
         with log.open("wb") as out:
             proc = subprocess.Popen([*extra] if extra else
