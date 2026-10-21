@@ -3104,6 +3104,18 @@ class PostTest(unittest.TestCase):
         # each retry after a 502 looked first: a POST that 502s often landed
         self.assertEqual([c[0] for c in t.calls[2:6]], ["POST", "GET", "POST", "GET"])
 
+    def test_a_failed_look_never_sends(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "receipt")
+        d, t = self.daemon(gg.WatchError("request failed: TimeoutError"), (502, {}, {}),
+                           (200, {}, [{"body": "receipt", "html_url": "landed"}]))
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_RETRY)  # the look gets a 502: no send, still uncertain
+        self.assertEqual([c[0] for c in t.calls], ["POST", "GET"])
+        self.assertTrue(gg.read_json(gg.outbox_dir() / f"{item['id']}.json")["uncertain"])
+        self.step(d, NOW + 3 * gg.POST_RETRY)
+        self.assertEqual([c[0] for c in t.calls], ["POST", "GET", "GET"])
+        self.assertEqual(gg.post_state(item["id"])["url"], "landed")
+
     def test_a_5xx_that_landed_is_not_posted_again(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "receipt")
         d, t = self.daemon((502, {}, {}), (200, {}, [{"body": "receipt", "html_url": "landed"}]))

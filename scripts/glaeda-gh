@@ -1094,11 +1094,14 @@ class Daemon:
 
     def post_between(self) -> None:
         """post_tick between read batches: a read phase can take TICK_BUDGET, far longer than POST_SPACING."""
-        self.now = time.time() if self.clock_real else self.now
+        tick_now = self.now
+        self.now = time.time() if self.clock_real else self.now  # the outbox's own clock; the reads keep theirs
         try:
             self.post_tick()
         except Exception as error:  # noqa: BLE001
             self.errors.append(f"outbox: {describe(error)} at {error_site(error)}")
+        finally:
+            self.now = tick_now
 
     def post_hold_for(self, h: dict, path: Path, item: dict) -> None:
         try:
@@ -1116,10 +1119,15 @@ class Daemon:
 
     def post_one(self, path: Path, item: dict) -> None:
         if item.get("uncertain"):
-            # The last attempt's answer was lost: it may have landed. Look before writing twice.
-            found = self.post_find(item)
+            # The last attempt's answer was lost: it may have landed. Look before writing twice, and send only
+            # when the look answered "not there"; a look that failed leaves it uncertain for the next try.
+            found, looked = self.post_find(item)
             if found:
                 self.post_finish(path, item, url=found, note="found after a lost answer")
+                return
+            if not looked:
+                self.post_at = self.now
+                self.post_retry(path, item, "could not look for an earlier attempt", uncertain=True)
                 return
         method, api, body = post_request(item)
         write_json(path, {**item, "uncertain": True})  # a daemon that dies mid-request looks it up first
@@ -1148,7 +1156,7 @@ class Daemon:
         elif status == 401:
             self.post_retry(path, item, f"HTTP {status}")
         elif item["kind"] == "pr" and status == 422 and "already exists" in text:
-            found = self.post_find(item)
+            found, _ = self.post_find(item)
             self.post_finish(path, item, url=found, note="a pull request for this head is already open",
                              error=None if found else f"HTTP 422: {doc.get('message') or 'already exists'}")
         else:
@@ -1170,9 +1178,9 @@ class Daemon:
             return None
         return f"reviewers not requested: HTTP {status} {(answer or {}).get('message', '') if isinstance(answer, dict) else ''}".strip()
 
-    def post_find(self, item: dict) -> str | None:
-        """The URL of this write if it already landed: the open PR for its head, or a comment or review with the
-        same body posted since it was queued. None when nothing matches or the read fails."""
+    def post_find(self, item: dict) -> tuple[str | None, bool]:
+        """(the URL of this write if it already landed, whether the look got an answer): the open PR for its head,
+        or a comment or review with the same body posted since it was queued."""
         repo, since = item["repo"], dt.datetime.fromtimestamp(item["queuedAt"] - 60, dt.timezone.utc)
         if item["kind"] == "pr":
             head = item["head"] if ":" in item["head"] else f"{repo.split('/')[0]}:{item['head']}"
@@ -1187,13 +1195,13 @@ class Daemon:
             if status == 200 and last and last.group(1).startswith(API + "/"):
                 status, _, doc = self.request("GET", last.group(1)[len(API):])
         except WatchError:
-            return None
+            return None, False
         if status != 200 or not isinstance(doc, list):
-            return None
+            return None, False
         for found in reversed(doc):
             if isinstance(found, dict) and (item["kind"] == "pr" or (found.get("body") or "") == item["body"]):
-                return found.get("html_url")
-        return None
+                return found.get("html_url"), True
+        return None, True
 
     def post_retry(self, path: Path, item: dict, error: str, uncertain: bool = False) -> None:
         item["attempts"] = int(item.get("attempts") or 0) + 1
