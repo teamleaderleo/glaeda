@@ -27,6 +27,8 @@ class ReclaimDiscoveryTest(unittest.TestCase):
             "GLAEDA_PROJECTS_ROOT": str(self.projects),
             "GLAEDA_WORKTREE_RECLAIM": str(self.reclaim),
             "CAPTURE": str(self.capture),
+            # The real disk's fullness must not change the argv the tests compare.
+            "GLAEDA_RECLAIM_PRESSURE_PERCENT": "101",
         }
 
     def git(self, repo, *args):
@@ -98,8 +100,9 @@ class ReclaimDiscoveryTest(unittest.TestCase):
         self.git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
                  "commit", "-qm", "initial", "--allow-empty")
         self.git(repo, "worktree", "add", "-qb", "lane", str(nested / "lane"))
+        (self.projects / "alias").symlink_to(nested)
         argv = self.sweep()
-        self.assertIn(str(repo), argv)
+        self.assertEqual(argv.count(str(repo)), 1)
         self.assertNotIn(str(nested / "lane"), argv)
 
     def test_disk_pressure_shortens_the_unfinished_window(self):
