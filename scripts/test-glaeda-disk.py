@@ -2912,10 +2912,11 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((home / "actions-runner-glaeda/_work/_actions/actions/checkout").is_dir())
 
     def test_idle_runner_checkout_used_since_the_survey_stays(self) -> None:
-        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5})
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5})
 
         def evidence():  # a job's checkout step rewrites the index between the survey and the delete
-            os.utime(cos["actions-runner-glaeda"] / ".git")
+            for co in cos.values():
+                os.utime(co / ".git")
             return [], ""
         gd.process_evidence = evidence
         patches, removed = self._floor_disk(10.0)
@@ -2923,7 +2924,8 @@ class GlaedaDiskTest(unittest.TestCase):
         with patches[0], patches[1]:
             gd.evict_idle_runner_checkouts(receipt, 30.0, home)
         self.assertEqual(removed, [])
-        self.assertEqual(json.loads(receipt.read_text())["outcome"], "changed:modified")
+        self.assertEqual({json.loads(line)["outcome"] for line in receipt.read_text().splitlines()},
+                         {"changed:modified"})
 
     def test_idle_runner_checkout_pass_runs_only_in_a_pressure_apply(self) -> None:
         dev = gd.HOME.stat().st_dev
