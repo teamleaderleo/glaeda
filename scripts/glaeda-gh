@@ -4809,30 +4809,29 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
         # the right unit for GraphQL points. What a `graphql` line really hides is *reads*: the
         # category is not cacheable, so none of the objects inside it reaches `cacheableReads`,
         # `repeatsWithin` or `perRead`, and the repeat *count* is a floor rather than an estimate.
-        # The count and not the shares beside it. The count can only grow when the hidden reads
-        # are written out; the shares can move either way, because that writing grows their
-        # numerator as well as their denominator -- measured both directions on one fixture,
-        # 45.5% -> 10.0% and 0.0% -> 33.3%. So the printed sentence says only that they are not
-        # floors. An earlier draft of this comment inferred "so both *fall*" from the denominator
-        # alone, which is a valid observation and a conclusion that does not follow: it was the
-        # same overreach, one round later, as the "figure" that covered all three numbers.
-        # "however many ... asked for" and not "more": the log keeps the path and never the
-        # document, so a mutation (which reads no object at all) and a batched read of forty are
-        # the same line here. A floor needs the hidden reads to be >= 0, which holds either way.
-        # A single-object probe is not in that clause: it carries one object, and if that object
-        # was read nearby it hides a repeat -- so "hides nothing" would be false of it.
+        # The count and not the shares beside it. Writing the hidden reads out can only grow the
+        # count and can only grow both parts of each share, so a share can go up, down or stay put
+        # -- measured 45.5% -> 10.0%, 0.0% -> 33.3% and 33.3% -> 33.3% on three fixtures. Two
+        # earlier drafts of this line each inferred a direction instead: "both *fall*" from the
+        # denominator alone, then "either direction" said of the two counts rather than the share.
+        # Say what is measured and nothing about mechanism.
+        # "however many ... asked for" covers zero, which is the only thing needed: the log keeps
+        # the path and never the document, so a batched read of forty and a call that reads nothing
+        # are the same line here, and a floor needs the hidden reads to be >= 0. Earlier drafts
+        # named the mutation and the one-object probe as carrying nothing, and both were claims
+        # about GitHub's API that this log cannot see -- a mutation selects its payload, and a probe
+        # of an object read nearby hides a repeat.
         # The floor is over the calls in *this report*. With `--last N` the window is the last N
-        # lines, so writing hidden reads out as separate lines would push older ones out and the
-        # comparison is over two different sets of calls; held to one set, inserting a read into a
-        # gap turns one pair into two and never fewer.
+        # lines, so writing hidden reads out as separate lines pushes older ones out and the
+        # comparison runs over two different sets of calls. Held to one set it is monotone: a review
+        # found no counterexample in 4000 random insertions, for repeats, reads and calls alike.
         # No pricing claim here on purpose -- this file is read as durable output, and a price is
         # the part that goes stale.
         print(f"\n{batched} of those calls were `gh api graphql`, each one request carrying however many "
-              f"objects the caller asked for -- or none at all, for a mutation, which this cannot tell "
-              f"apart from a read. None of those objects is counted above, so the repeat count is a "
-              f"floor on the calls in this report, not an estimate. The shares beside it are not "
-              f"floors: counting the hidden reads would move their numerator and their denominator "
-              f"both, in either direction.")
+              f"objects the caller asked for, which this cannot see. None of them is counted above, so "
+              f"the repeat count is a floor on what a cache could have answered for the calls in this "
+              f"report, not an estimate. The shares beside it are not floors: counting the hidden reads "
+              f"grows the numerator and the denominator, so a share can move either way, or not at all.")
     return EXIT_OK
 
 

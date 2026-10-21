@@ -3718,12 +3718,27 @@ class AuditTest(BrokerBase):
         self.assertEqual(doc["repeatsWithin"]["calls"], 0)
         text = self.audit_text(path)
         self.assertIn("2 of those calls were `gh api graphql`, each one request carrying however many "
-                      "objects the caller asked for -- or none at all, for a mutation, which this "
-                      "cannot tell apart from a read. None of those objects is counted above, so the "
-                      "repeat count is a floor on the calls in this report, not an estimate. The "
-                      "shares beside it are not floors: counting the hidden reads would move their "
-                      "numerator and their denominator both, in either direction.", text)
+                      "objects the caller asked for, which this cannot see. None of them is counted "
+                      "above, so the repeat count is a floor on what a cache could have answered for "
+                      "the calls in this report, not an estimate. The shares beside it are not floors: "
+                      "counting the hidden reads grows the numerator and the denominator, so a share "
+                      "can move either way, or not at all.", text)
         self.assertEqual(cost_claims(text), [], "the report is making a claim about cost again")
+
+    def test_the_cost_ban_fires_on_a_priced_sentence_and_only_in_the_last_paragraph(self) -> None:
+        """The guard from the side that can fail. Every other assertion on it is
+        `cost_claims(...) == []`, so a mutation gutting it (`return []`, or reading the *first*
+        paragraph) left all 334 green: a guard that cannot fail when disabled is not a guard.
+        This also exercises the three patterns no fixture reaches, and pins the cost the scoping
+        was accepted for -- a priced paragraph printed before the graphql one is not caught."""
+        priced = "head\n\nthe cheapest call is 2 points per call, at any price"
+        # The patterns by name, not `list(STALE_COST)`: that adapts to whatever the tuple holds,
+        # so cutting it down to one pattern stayed green (measured).
+        self.assertEqual(cost_claims(priced),
+                         [r"\bpoints?\b", r"\bprices?\b", r"\bcheap(er|est)?\b", r"\bper call\b"],
+                         priced)
+        self.assertEqual(cost_claims("2 points per call\n\nclean tail"), [],
+                         "the ban reads the last paragraph, and that is what it costs")
 
     def test_the_word_ban_does_not_fire_on_an_ordinary_logged_path(self) -> None:
         """Both halves of the scoping, demonstrated rather than asserted away.
