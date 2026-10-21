@@ -3716,10 +3716,12 @@ AUDIT_READS = {("pr", "view"), ("pr", "checks"), ("pr", "list"), ("pr", "diff"),
 # could not be resolved) is counted, but never as a repeat: `pr view 7` in two repositories is two
 # different reads, and treating them as one would overstate what a cache can do.
 AUDIT_BARE = re.compile(r"^(?:pr|run|issue|search|label) [\w-]+(?: \d+)?$")
-# A logged line of the shape the broker and today's guard write: subcommand words, then one
-# identifier. Anything else is counted but never printed back (see cmd_audit).
+# A logged line of the shape the broker and today's guard write: subcommand words, then an
+# identifier (a cache key, an api path, or a number), then the guard's `-R owner/repo`. Anything
+# else is counted but never printed back (see cmd_audit).
 AUDIT_SAFE = re.compile(r"[a-z][a-z0-9-]{0,30}(?: [a-z][a-z0-9-]{0,30})?"
-                        r"(?: (?:https?://)?/?[A-Za-z0-9_][A-Za-z0-9_./:#@~-]{0,199})?")
+                        r"(?: (?:https?://)?/?[A-Za-z0-9_][A-Za-z0-9_./:#@~-]{0,199})?"
+                        r"(?: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?")
 
 
 def audit_category(words: list[str]) -> tuple[str, bool]:

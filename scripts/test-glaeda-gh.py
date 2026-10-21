@@ -3583,7 +3583,19 @@ class AuditTest(BrokerBase):
         self.assertIn("4 gh calls logged", text, "every line is still counted")
         self.assertIn("pr:o/r#7 x2", text)
         self.assertNotIn("Bearer", text)
+        self.assertNotIn("Bearer", text)
         self.assertNotIn("ghp_", text)
+
+    def test_the_guards_own_line_shape_is_quoted_back(self) -> None:
+        """The PATH guard writes `pr view 7 owner/repo` where this writes a resolved cache key:
+        both are identifiers, and an audit that dropped one would under-report every Mac."""
+        path = self.write_log([(0, "pr view 7 manaflow-ai/cmux"), (5, "pr view 7 manaflow-ai/cmux"),
+                               (0, "run view 12 o/r"), (5, "run view 12 o/r")])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.main(["audit", "--log", str(path)])
+        self.assertIn("pr view 7 manaflow-ai/cmux x2", out.getvalue())
+        self.assertIn("run view 12 o/r x2", out.getvalue())
 
     def test_a_read_outside_the_window_is_not_a_repeat(self) -> None:
         path = self.write_log([(0, "run view run:o/r/12"),
