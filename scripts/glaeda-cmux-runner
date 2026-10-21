@@ -1669,6 +1669,11 @@ SHELL_ENDS = {"&", "&&", "||", "|", ";", ";;"}
 SHELL_SAMPLES = {"$root": "1", "$@": None}
 # glaeda_release.HOOK_HISTORY at the release root, two levels above this copy (generations/<tag>/glaeda/scripts)
 HOOK_HISTORY = SCRIPT_DIR.parent.parent / "hook-history.json"
+# A runner with a job when --refresh-hooks looks is watched this long for the gap between two jobs, and swapped in
+# it. One look per run left runners that ran jobs back to back on a hook two releases old for hours (2026-10-21).
+REFRESH_GAP_WAIT_S = 240.0
+REFRESH_GAP_POLL_S = 0.5
+JOB_RUNNING = "the runner has a job; a later run installs it"
 RUNNER_LOCK = "runner.lock"
 STAGE_SUFFIX = ".cmux-runner.tmp"
 
@@ -1808,7 +1813,7 @@ def refresh_hook_dir(runner_dir: Path, receipt: Any, apply: bool, sources: dict[
     # gate takes a swap mid-job (it re-execs in place and adopts its runner), but the job hooks are only ever
     # swapped between jobs. A job that starts after the last look runs one whole file or the other.
     if worker_running(runner_dir):
-        return {**entry, "state": "deferred", "note": "the runner has a job; a later run installs it"}
+        return {**entry, "state": "deferred", "note": JOB_RUNNING}
     calls = hook_calls(hook_dir)
     if not any(wrapper == "job-started.sh" for wrapper, _ in calls):
         return {**entry, "state": "blocked", "note": "no job-started.sh call to check the new hook against; "
@@ -1827,7 +1832,7 @@ def refresh_hook_dir(runner_dir: Path, receipt: Any, apply: bool, sources: dict[
         if why:
             return {**entry, "state": "blocked", "note": why + "; re-run glaeda-cmux-runner --apply"}
         if worker_running(runner_dir):  # a job took the runner during the checks
-            return {**entry, "state": "deferred", "note": "the runner has a job; a later run installs it"}
+            return {**entry, "state": "deferred", "note": JOB_RUNNING}
         # the module first: the hook, which the gate watches and reloads, lands only beside the module it reads
         try:
             if RESERVATION_NAME in stale:
@@ -1858,6 +1863,7 @@ def refresh_hooks(home: Path, apply: bool) -> dict[str, Any]:
     with runner_lock(home, wait=False) as held:
         if not held:
             return {**doc, "error": "an --apply or --uninstall holds the runner lock; a later run refreshes"}
+        waiting: list[tuple[int, Any, Path]] = []
         for path in receipts:
             try:
                 receipt = json.loads(path.read_text())
@@ -1869,6 +1875,20 @@ def refresh_hooks(home: Path, apply: bool) -> dict[str, Any]:
             runner_dir = Path(str(receipt.get("runnerDir") or "")) if isinstance(receipt, dict) else Path()
             doc["runners"].append({"receipt": os.fspath(path),
                                    **refresh_hook_dir(runner_dir, receipt, apply, sources, history)})
+            if apply and doc["runners"][-1].get("note") == JOB_RUNNING:
+                waiting.append((len(doc["runners"]) - 1, receipt, runner_dir))
+        # a busy runner is swapped in the gap between its jobs, not only if a run happens to land in one
+        deadline = time.monotonic() + REFRESH_GAP_WAIT_S
+        while waiting and time.monotonic() < deadline:
+            time.sleep(REFRESH_GAP_POLL_S)
+            for item in list(waiting):
+                index, receipt, runner_dir = item
+                if worker_running(runner_dir):
+                    continue
+                entry = refresh_hook_dir(runner_dir, receipt, apply, sources, history)
+                doc["runners"][index] = {"receipt": doc["runners"][index]["receipt"], **entry}
+                if entry.get("note") != JOB_RUNNING:
+                    waiting.remove(item)
     return doc
 
 
