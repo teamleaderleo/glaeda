@@ -984,7 +984,7 @@ class DaemonTest(Base):
         self.daemon.tick(NOW + 100)
         self.daemon.tick(NOW + 100 + gg.CYCLE)
         hour = gg.read_json(gg.BASE / "daemon.json")["lastHour"]
-        self.assertEqual(hour, {"rest": 1, "rest304": 1, "graphql": 0})
+        self.assertEqual(hour, {"rest": 1, "rest304": 1, "graphql": 0, "free": 0})
         self.gh.runs[7] = {"id": 7, "status": "queued"}
         self.daemon.tick(NOW + 100 + 3700)
         self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["lastHour"]["rest304"], 0)  # an hour later
@@ -3029,7 +3029,8 @@ class BudgetRefreshTest(Base):
     def test_the_free_read_is_not_counted_as_a_request_the_daemon_spent(self) -> None:
         status = self.daemon.tick(NOW)
         self.assertEqual(self.gh.rate_limit_calls, 1)
-        self.assertEqual(status["lastHour"], {"rest": 0, "rest304": 0, "graphql": 0})
+        self.assertEqual(status["lastHour"], {"rest": 0, "rest304": 0, "graphql": 0, "free": 1},
+                         "the refresh is counted, and not as a request that spent anything")
 
     def test_a_refusal_is_reported_and_leaves_the_last_view_alone(self) -> None:
         self.daemon.tick(NOW)
@@ -3085,9 +3086,13 @@ class BrokerBase(Base):
                        "data": data, "error": None})
         return key
 
-    def run_gh(self, args: list[str]) -> tuple[int, str, str, list[str] | None]:
+    def run_gh(self, args: list[str], keep_mark: bool = False) -> tuple[int, str, str, list[str] | None]:
         """(exit code, stdout, stderr, the arguments the real gh got, or None when it was not run)."""
         out, err, execed = io.StringIO(), io.StringIO(), []
+        # Each call is its own process in life; BROKER_MARK is set to survive the exec, so a test
+        # that calls cmd_gh twice in one process has to drop it the way a fresh shell would.
+        if not keep_mark:
+            os.environ.pop(gg.BROKER_MARK, None)
 
         def execv(path: str, argv: list[str]) -> None:
             execed.append((path, argv))
@@ -3158,10 +3163,11 @@ class BrokerRouteTest(BrokerBase):
                        "data": {"id": 12, "name": "CI", "status": "completed", "conclusion": "success",
                                 "head_sha": "b" * 40, "html_url": "https://x/12", "run_attempt": 2}})
         code, out, _err, passed = self.run_gh(
-            ["run", "view", "12", "-R", "o/r", "--json", "attempt,conclusion,databaseId,headSha,status,workflowName"])
+            ["run", "view", "12", "-R", "o/r", "--json", "attempt,conclusion,databaseId,headSha,status,url"])
         self.assertEqual((code, passed), (0, None))
         self.assertEqual(json.loads(out), {"attempt": 2, "conclusion": "success", "databaseId": 12,
-                                           "headSha": "b" * 40, "status": "completed", "workflowName": "CI"})
+                                           "headSha": "b" * 40, "status": "completed",
+                                           "url": "https://x/12"})
 
     def test_a_mutation_is_never_touched(self) -> None:
         for args in (["pr", "merge", "7", "-R", "o/r", "--squash"],
@@ -3171,6 +3177,122 @@ class BrokerRouteTest(BrokerBase):
                 _code, out, _err, passed = self.run_gh(args)
                 self.assertEqual(out, "")
                 self.assertEqual(passed, args)
+
+
+class BrokerWrongAnswerTest(BrokerBase):
+    """Every way the broker could answer a question other than the one that was asked. A spent
+    request is cheap; a wrong answer sends a lane to merge the wrong thing."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.here = self.checkout("o/r", name="here")
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.here)
+        self.cache_pr(100, {"state": "MERGED"})
+
+    def test_a_glued_repo_flag_is_not_read_as_this_checkouts_repo(self) -> None:
+        """`gh pr view 100 -Rother/elsewhere` once served o/r's PR 100 as if it were theirs: the
+        glued shorthand never reached `values`, so the repository fell back to the cwd's remote."""
+        _code, out, _err, passed = self.run_gh(["pr", "view", "100", "-Rother/elsewhere", "--json", "state"])
+        self.assertEqual(out, "")
+        self.assertEqual(passed, ["pr", "view", "100", "-Rother/elsewhere", "--json", "state"])
+
+    def test_gh_repo_in_the_environment_is_honoured(self) -> None:
+        with mock.patch.dict(os.environ, {"GH_REPO": "other/elsewhere"}):
+            _code, out, _err, passed = self.run_gh(["pr", "view", "100", "--json", "state"])
+        self.assertEqual(out, "")
+        self.assertIsNotNone(passed)
+
+    def test_the_cwd_answers_only_when_it_names_one_github_remote(self) -> None:
+        code, out, _err, _passed = self.run_gh(["pr", "view", "100", "--json", "state"])
+        self.assertEqual((code, out), (0, '{"state":"MERGED"}\n'))
+        (self.here / ".git" / "config").write_text(
+            '[remote "origin"]\n\turl = git@github.com:o/r.git\n'
+            '[remote "fork"]\n\turl = git@github.com:someone/r.git\n')
+        _code, out, _err, passed = self.run_gh(["pr", "view", "100", "--json", "state"])
+        self.assertEqual(out, "", "two remotes: gh's choice is not this one's to guess")
+        self.assertIsNotNone(passed)
+
+    def test_a_default_set_with_gh_repo_set_default_is_not_second_guessed(self) -> None:
+        (self.here / ".git" / "config").write_text(
+            '[remote "origin"]\n\turl = git@github.com:o/r.git\n\tgh-resolved = base\n')
+        _code, out, _err, passed = self.run_gh(["pr", "view", "100", "--json", "state"])
+        self.assertEqual(out, "")
+        self.assertIsNotNone(passed)
+
+    def test_a_flag_the_broker_does_not_know_is_never_answered(self) -> None:
+        """`run view ID --attempt 2` wants an attempt the cache does not hold, `--job ID` reads a
+        job as a run, and `--exit-status` makes gh exit 1 on a failed run. None can be served, and
+        neither can the next flag gh adds."""
+        key = "run:o/r/12"
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "fetchedAt": time.time(), "dataAt": time.time(), "error": None,
+                       "data": {"id": 12, "status": "completed", "conclusion": "failure"}})
+        served = ["run", "view", "12", "-R", "o/r", "--json", "conclusion"]
+        code, out, _err, _passed = self.run_gh(served)
+        self.assertEqual((code, out), (0, '{"conclusion":"failure"}\n'), "the plain form is served")
+        for extra in (["--attempt", "2"], ["--job", "99"], ["--exit-status"], ["--some-flag-gh-adds-later"]):
+            with self.subTest(extra=extra):
+                _code, out, _err, passed = self.run_gh([*served, *extra])
+                self.assertEqual(out, "")
+                self.assertIsNotNone(passed)
+
+    def test_a_null_string_field_is_printed_as_gh_prints_it(self) -> None:
+        """gh unmarshals into Go structs: a null string comes out "" and a null time stays null.
+        Checked against real gh on 2026-10-21: reviewDecision "" on an unreviewed PR, mergedAt
+        null on an open one, conclusion "" on a run still going."""
+        self.cache_pr(101, {"state": "OPEN", "reviewDecision": None, "mergedAt": None})
+        code, out, _err, _passed = self.run_gh(
+            ["pr", "view", "101", "-R", "o/r", "--json", "mergedAt,reviewDecision,state"])
+        self.assertEqual((code, out), (0, '{"mergedAt":null,"reviewDecision":"","state":"OPEN"}\n'))
+        key = "run:o/r/13"
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "fetchedAt": time.time(), "dataAt": time.time(), "error": None,
+                       "data": {"id": 13, "status": "in_progress", "conclusion": None}})
+        code, out, _err, _passed = self.run_gh(["run", "view", "13", "-R", "o/r", "--json", "conclusion,status"])
+        self.assertEqual((code, out), (0, '{"conclusion":"","status":"in_progress"}\n'))
+
+    def test_a_null_where_a_number_belongs_is_not_guessed_at(self) -> None:
+        key = "run:o/r/14"
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "fetchedAt": time.time(), "dataAt": time.time(), "error": None,
+                       "data": {"id": 14, "run_attempt": None}})
+        _code, out, _err, passed = self.run_gh(["run", "view", "14", "-R", "o/r", "--json", "attempt"])
+        self.assertEqual(out, "")
+        self.assertIsNotNone(passed)
+
+    def test_a_runs_name_is_never_served(self) -> None:
+        """REST's `name` is the run-name when a workflow sets one, GraphQL's is the workflow name,
+        and the daemon moves runs between the two by budget: neither could be answered twice the
+        same way, so both gh fields pass through."""
+        key = "run:o/r/15"
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "fetchedAt": time.time(), "dataAt": time.time(), "error": None,
+                       "data": {"id": 15, "name": "CI"}})
+        for field in ("name", "workflowName"):
+            with self.subTest(field=field):
+                _code, out, _err, passed = self.run_gh(["run", "view", "15", "-R", "o/r", "--json", field])
+                self.assertEqual(out, "")
+                self.assertIsNotNone(passed)
+
+    def test_two_json_flags_union_in_gh_so_they_are_not_served(self) -> None:
+        _code, out, _err, passed = self.run_gh(
+            ["pr", "view", "100", "-R", "o/r", "--json", "state", "--json", "url"])
+        self.assertEqual(out, "")
+        self.assertIsNotNone(passed)
+
+    def test_a_live_field_never_gets_the_lean_horizon(self) -> None:
+        """A ten-minute-old headRefOid means waiting on a head that was superseded, and a spent
+        quota is exactly when a lane is hammering gh to find out whether its push is green."""
+        gg.write_json(gg.BASE / "budget.json",
+                      {"graphql": {"limit": 5000, "remaining": 50, "reset": time.time() + 600,
+                                   "seenAt": time.time()}})
+        self.cache_pr(102, {"state": "OPEN", "headRefOid": "a" * 40}, age=gg.BROKER_MAX_AGE + 30)
+        _code, out, _err, passed = self.run_gh(["pr", "view", "102", "-R", "o/r", "--json", "headRefOid"])
+        self.assertEqual(out, "", "headRefOid is what a lane pivots on")
+        self.assertIsNotNone(passed)
+        code, out, _err, _passed = self.run_gh(["pr", "view", "102", "-R", "o/r", "--json", "state"])
+        self.assertEqual((code, out), (0, '{"state":"OPEN"}\n'), "state is slow enough to widen")
 
 
 class BrokerRefusalTest(BrokerBase):
@@ -3193,6 +3315,21 @@ class BrokerRefusalTest(BrokerBase):
         code, _out, _err, passed = self.run_gh(args)
         self.assertIsNone(code)
         self.assertEqual(passed, args)
+
+    def test_the_checkout_named_is_the_one_the_reader_means(self) -> None:
+        """A host has many copies of a repository. Glob order is arbitrary, so without a rule the
+        refusal pointed at /home/leo/Projects/cmux-history rather than .../cmux (seen live)."""
+        self.checkout("o/cmux", name="cmux-history")
+        self.checkout("o/cmux", name="cmux")
+        self.checkout("o/cmux", name="cmux-scratch")
+        _code, _out, err, _passed = self.run_gh(["api", "repos/o/cmux/contents/x"])
+        self.assertIn(str(self.home / "roots" / "cmux") + ":", err)
+
+    def test_the_shortest_path_wins_when_no_name_matches(self) -> None:
+        self.checkout("o/r", name="a-very-long-checkout-name")
+        self.checkout("o/r", name="short")
+        _code, _out, err, _passed = self.run_gh(["api", "repos/o/r/contents/x"])
+        self.assertIn(str(self.home / "roots" / "short") + ":", err)
 
     def test_a_worktree_counts_as_a_checkout(self) -> None:
         common = self.home / "clone" / ".git"
@@ -3257,10 +3394,10 @@ class BrokerWatchTest(BrokerBase):
 
 class BrokerBudgetTest(BrokerBase):
     def test_the_cache_horizon_widens_as_the_shared_quota_drains(self) -> None:
-        self.assertEqual(gg.broker_max_age(), gg.BROKER_MAX_AGE)
+        self.assertEqual(gg.broker_max_age(["state"]), gg.BROKER_MAX_AGE)
         gg.write_json(gg.BASE / "budget.json",
                       {"rest": {"limit": 5000, "remaining": 90, "reset": time.time() + 600, "seenAt": time.time()}})
-        self.assertEqual(gg.broker_max_age(), gg.BROKER_LEAN_AGE)
+        self.assertEqual(gg.broker_max_age(["state"]), gg.BROKER_LEAN_AGE)
 
     def test_a_spent_bucket_lets_an_older_entry_answer(self) -> None:
         self.cache_pr(7, {"state": "OPEN"}, age=gg.BROKER_MAX_AGE + 30)
@@ -3274,11 +3411,11 @@ class BrokerBudgetTest(BrokerBase):
     def test_a_reset_that_has_passed_is_not_treated_as_lean(self) -> None:
         gg.write_json(gg.BASE / "budget.json",
                       {"rest": {"limit": 5000, "remaining": 0, "reset": time.time() - 1, "seenAt": time.time()}})
-        self.assertEqual(gg.broker_max_age(), gg.BROKER_MAX_AGE)
+        self.assertEqual(gg.broker_max_age(["state"]), gg.BROKER_MAX_AGE)
 
     def test_the_horizon_can_be_set_for_one_call(self) -> None:
         with mock.patch.dict(os.environ, {"GLAEDA_GH_MAX_AGE": "3600"}):
-            self.assertEqual(gg.broker_max_age(), 3600)
+            self.assertEqual(gg.broker_max_age(["state"]), 3600)
 
 
 class BrokerFailOpenTest(BrokerBase):
@@ -3336,9 +3473,9 @@ class AuditTest(BrokerBase):
         return path
 
     def test_it_counts_what_a_cache_would_have_answered(self) -> None:
-        path = self.write_log([(0, "pr view 7 o/r"), (10, "pr view 7 o/r"), (20, "pr view 7 o/r"),
-                               (0, "pr merge 7 o/r"), (0, "api repos/o/r/contents/x"),
-                               (0, "api graphql query=")])
+        path = self.write_log([(0, "pr view pr:o/r#7"), (10, "pr view pr:o/r#7"), (20, "pr view pr:o/r#7"),
+                               (0, "pr merge"), (0, "api repos/o/r/contents/x"),
+                               (0, "api graphql")])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(gg.main(["audit", "--log", str(path), "--json"]), 0)
@@ -3351,11 +3488,24 @@ class AuditTest(BrokerBase):
         self.assertEqual(doc["categories"]["pr merge"], 1)
 
     def test_a_read_outside_the_window_is_not_a_repeat(self) -> None:
-        path = self.write_log([(0, "run view 12 o/r"), (int(gg.AUDIT_WINDOW) + 1, "run view 12 o/r")])
+        path = self.write_log([(0, "run view run:o/r/12"),
+                               (int(gg.AUDIT_WINDOW) + 1, "run view run:o/r/12")])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             gg.main(["audit", "--log", str(path), "--json"])
         self.assertEqual(json.loads(out.getvalue())["repeatsWithin"]["calls"], 0)
+
+    def test_a_line_with_no_repository_is_counted_but_never_as_a_repeat(self) -> None:
+        """The guard logged `pr view 7` before 2026-10-21, and still does where the repository
+        came from -R. Two repositories' PR 7 are two reads, and a cache would have served
+        neither: calling them a repeat would overstate what the broker can do."""
+        path = self.write_log([(0, "pr view 7"), (10, "pr view 7"), (20, "pr view 7")])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.main(["audit", "--log", str(path), "--json"])
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["cacheableReads"], 3)
+        self.assertEqual(doc["repeatsWithin"]["calls"], 0)
 
     def test_it_reports_the_brokers_own_decisions(self) -> None:
         gg.broker_note({"route": "serve"})
@@ -3380,7 +3530,7 @@ class BrokerLogTest(BrokerBase):
     def test_a_host_without_the_path_guard_writes_the_guards_log_itself(self) -> None:
         self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
         line = Path(os.environ["CMUX_GH_LOG"]).read_text().strip()
-        self.assertRegex(line, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ \S+ pr view 7$")
+        self.assertRegex(line, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ \S+ pr view pr:o/r#7$")
 
     def test_a_host_with_the_guard_does_not_log_the_call_twice(self) -> None:
         with mock.patch.dict(os.environ, {"CMUX_GH_GUARD_LOGGED": "1"}):
@@ -3389,7 +3539,71 @@ class BrokerLogTest(BrokerBase):
 
     def test_a_query_string_never_reaches_the_log(self) -> None:
         self.run_gh(["api", "repos/o/r/actions/runs?head_sha=" + "d" * 40])
-        self.assertNotIn("head_sha", Path(os.environ["CMUX_GH_LOG"]).read_text())
+        self.assertEqual(Path(os.environ["CMUX_GH_LOG"]).read_text().split()[2:],
+                         ["api", "repos/o/r/actions/runs"])
+
+    def test_a_secret_in_a_positional_slot_never_reaches_the_log(self) -> None:
+        """The log is a long-lived plain file every session appends to (117 MB on cosmic-gray).
+        `gh secret set NAME --body VALUE` and `gh pr create --title T BODY` both put text worth
+        hiding where an unparsed command line's tail would be, so only an identifier is kept."""
+        token = "ghp_" + "z" * 36
+        for args in (["secret", "set", "MY_TOKEN", token],
+                     ["variable", "set", "V", "another-secret"],
+                     ["pr", "create", "--title", "t", "a body nobody asked to keep"],
+                     ["api", "repos/o/r/issues/7/comments", "-f", f"body=here is {token}"]):
+            with self.subTest(args=args):
+                Path(os.environ["CMUX_GH_LOG"]).unlink(missing_ok=True)
+                self.run_gh(args)
+                text = Path(os.environ["CMUX_GH_LOG"]).read_text()
+                self.assertNotIn(token, text)
+                self.assertNotIn("secret", text.split()[3:])
+                self.assertLessEqual(len(text.split()), 5)
+
+    def test_a_logged_read_carries_its_repository(self) -> None:
+        """`pr view 7` in two repositories is two reads; counting them as one would overstate
+        what a cache can do, and the audit's numbers are what justifies the broker."""
+        self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+        self.run_gh(["pr", "view", "7", "-R", "other/elsewhere", "--json", "state"])
+        logged = [line.split()[2:] for line in Path(os.environ["CMUX_GH_LOG"]).read_text().splitlines()]
+        self.assertEqual(logged, [["pr", "view", "pr:o/r#7"], ["pr", "view", "pr:other/elsewhere#7"]])
+
+
+class BrokerLoopTest(BrokerBase):
+    """Nothing the broker does may become an endless exec between two wrappers. Every gh call on
+    every machine goes through here."""
+
+    def test_a_call_is_marked_so_it_is_never_brokered_twice(self) -> None:
+        self.cache_pr(7, {"state": "OPEN"})
+        with mock.patch.dict(os.environ, {gg.BROKER_MARK: "1"}):
+            _code, out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"],
+                                                   keep_mark=True)
+        self.assertEqual(out, "", "a second pass would have served it")
+        self.assertIsNotNone(passed)
+
+    def test_the_mark_is_set_before_handing_the_call_on(self) -> None:
+        self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+        self.assertEqual(os.environ.get(gg.BROKER_MARK), "1")
+
+    def test_a_wrapper_on_path_is_stepped_over_rather_than_run(self) -> None:
+        shim = self.home / "shim"
+        shim.mkdir()
+        (shim / "gh").write_text(f"#!/bin/sh\n# {gg.BROKER_MARK} shim\nexit 9\n")
+        (shim / "gh").chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": f"{shim}:{self.home / 'bin'}"}):
+            os.environ.pop("GLAEDA_GH_REAL", None)
+            self.assertEqual(gg.broker_real_gh(), str(self.home / "bin" / "gh"))
+
+    def test_a_gh_nowhere_on_path_is_still_found_where_it_is_installed(self) -> None:
+        """A LaunchAgent's PATH is nearly empty; /usr/bin/gh is where the host actually has it."""
+        installed = self.home / ".local/bin" / "gh"
+        installed.parent.mkdir(parents=True)
+        installed.write_text("#!/bin/sh\nexit 0\n")
+        installed.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": ""}):
+            os.environ.pop("GLAEDA_GH_REAL", None)
+            with mock.patch.object(gg.Path, "home", staticmethod(lambda: self.home)):
+                found = gg.broker_real_gh()
+        self.assertEqual(found, str(installed))
 
 
 if __name__ == "__main__":
