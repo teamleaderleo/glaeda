@@ -5350,14 +5350,41 @@ class RunnerTest(unittest.TestCase):
         with mock.patch.object(cr, "HOOK_HISTORY", self.state / "absent.json"):
             self.assertIn("error", self.invoke("--refresh-hooks", "--apply", expect=1))
 
+    def test_refresh_hooks_swaps_a_busy_runner_in_the_gap_between_two_jobs(self) -> None:
+        """2026-10-21: four runners (cmux10s and cmux11s glaeda-11, cmux12s glaeda-3 and -4) ran jobs back to back and
+        had one at every 10-minute refresh, so they kept a hook two releases old for hours: each run looked once and
+        deferred. A deferred runner is now watched for REFRESH_GAP_WAIT_S and swapped in its first gap between jobs."""
+        hooks = self.installed_with_an_older_hook()
+        looks = {"n": 0}
+
+        def busy_for_three_looks(_runner_dir):
+            looks["n"] += 1
+            return looks["n"] <= 3  # the run's first look and two more polls see a job; then the gap
+
+        with mock.patch.object(cr, "worker_running", side_effect=busy_for_three_looks), \
+                mock.patch.object(cr.time, "sleep"):
+            done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "updated", done)
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+
     def test_refresh_hooks_waits_for_a_job_and_refuses_what_it_cannot_prove(self) -> None:
         hooks = self.installed_with_an_older_hook()
         older = (hooks / cr.HOOK_NAME).read_bytes()
-        with mock.patch.object(cr, "worker_running", return_value=True):
-            self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
+        clock = {"t": 0.0}
+
+        def tick(seconds: float) -> None:
+            clock["t"] += seconds
+
+        with mock.patch.object(cr, "worker_running", return_value=True), \
+                mock.patch.object(cr.time, "sleep", side_effect=tick), \
+                mock.patch.object(cr.time, "monotonic", side_effect=lambda: clock["t"]):
+            deferred = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(deferred["state"], "deferred")
+        self.assertGreaterEqual(clock["t"], cr.REFRESH_GAP_WAIT_S, "a runner busy the whole window is left for a later run")
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), older, "never swapped under a running job")
-        # a job that starts during the checks: still deferred, nothing written
-        with mock.patch.object(cr, "worker_running", side_effect=[False, True]):
+        # a job that starts during the checks: still deferred, nothing written (no gap wait: one look only)
+        with mock.patch.object(cr, "worker_running", side_effect=[False, True]), \
+                mock.patch.object(cr, "REFRESH_GAP_WAIT_S", 0):
             self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), older)
         with mock.patch.object(cr, "run", return_value=(127, "")):  # pgrep cannot tell: busy
