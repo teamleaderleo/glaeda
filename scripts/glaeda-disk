@@ -68,7 +68,7 @@ directories (cmux-tui/target), plus DerivedData a workflow keeps in $RUNNER_WORK
 an hour idle, least recently modified first. runner-git-garbage is git's tmp_pack_*/tmp_obj_* temp files an
 interrupted fetch left; one an hour old goes whenever nothing holds it open. The checkout itself stays,
 except as the last resort of a pressure run still under the runner gate's disk floor after everything else
-(runner-idle-checkout): then the whole checkout of a runner with no Runner.Worker, unused for an hour and
+(runner-idle-checkout): then the whole checkout of a runner with no Runner.Worker, unused for 10 minutes and
 held open by nothing, goes, least recently used first, until free space reaches the floor plus
 target_margin_gib. The runner's next job clones it again. Before that, on every pressure or sweep pass of a
 fleet mini, runner-checkout-repack folds a checkout's packs with `git repack -a -d -k -l` (keeps every object) once
