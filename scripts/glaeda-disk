@@ -1517,17 +1517,20 @@ def runner_checkout_last_use(runner: Path, checkout: Path) -> float:
     for p in (checkout, checkout / ".git", *(checkout / ".git" / n for n in ("index", "HEAD", "FETCH_HEAD", "logs/HEAD"))):
         with contextlib.suppress(OSError):
             times.append(p.lstat().st_mtime)
-    with contextlib.suppress(OSError):
-        times += [e.stat(follow_symlinks=False).st_mtime for e in os.scandir(runner / "_diag")
-                  if e.name.startswith("Worker_")]
+    with contextlib.suppress(OSError), os.scandir(runner / "_diag") as logs:
+        for e in logs:
+            if e.name.startswith("Worker_"):
+                with contextlib.suppress(OSError):  # a log rotated away mid-scan drops only itself
+                    times.append(e.stat(follow_symlinks=False).st_mtime)
     return max(times)
 
 
 def idle_runner_checkout_veto(runner: Path, checkout: Path, opened: frozenset[str], cmds: str) -> str:
     """Why an idle runner's checkout must stay, or "" when it may go."""
     path = os.fspath(checkout)
-    if checkout.is_symlink() or not contained_directory(checkout, runner / "_work"):
-        return "not a directory inside the runner's _work"
+    if (checkout.is_symlink() or checkout.name != checkout.parent.name
+            or not contained_directory(checkout, runner / "_work")):
+        return "not actions/checkout's _work/<repo>/<repo> inside the runner's _work"
     if why := runner_job_live(runner, cmds):
         return why
     resolved = os.fspath(checkout.resolve())
@@ -1560,6 +1563,8 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
         if work.is_symlink() or not work.is_dir():
             continue
         for checkout in runner_checkouts(work):
+            if checkout.name != checkout.parent.name:  # only actions/checkout's default _work/<repo>/<repo>
+                continue
             used = runner_checkout_last_use(runner, checkout)
             if (now - used) / 3600 >= RUNNER_IDLE_CHECKOUT_HOURS:
                 found.append((used, runner, checkout))
@@ -1577,7 +1582,7 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
         why = idle_runner_checkout_veto(runner, checkout, open_index(opened), cmds)
         size = 0
         if why:
-            outcome = "changed:in-use"
+            outcome = "changed:modified" if why.startswith("used within") else "changed:in-use"
         else:
             try:
                 before = free_bytes(home)[0]
@@ -1592,7 +1597,7 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
                "verdict": "reclaimable" if not why else "blocked",
                "reasons": [why] if why else ["under the runner disk floor", "runner has no job"],
                "idle_hours": round((now - used) / 3600, 2)}
-        with receipt.open("a") as f:
+        with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
             f.write(json.dumps(rec) + "\n")
         if outcome == "reclaimed":
             print(f"  reclaimed {gib(size).strip():>8s}  {checkout} (idle runner checkout, under the disk floor)")

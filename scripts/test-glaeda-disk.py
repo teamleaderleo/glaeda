@@ -2886,6 +2886,45 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertEqual(gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home), 0)
         self.assertEqual(removed, [])
 
+    def test_idle_runner_checkout_never_follows_symlinks_or_leaves_the_checkout(self) -> None:
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5,
+                                          "actions-runner-glaeda-3": 5})
+        outside = self.root / "main-clone"
+        (outside / ".git").mkdir(parents=True)
+        linked = cos["actions-runner-glaeda-2"]
+        shutil.rmtree(linked)
+        linked.symlink_to(outside)  # a checkout that is a symlink to a clone outside _work
+        work3 = home / "actions-runner-glaeda-3/_work"
+        shutil.rmtree(work3)
+        work3.symlink_to(self.root / "main-clone")  # a symlinked _work
+        other = home / "actions-runner-glaeda/_work/cmux/other"  # a checkout outside the default layout
+        (other / ".git").mkdir(parents=True)
+        for keep in ("_tool/node", "_actions/actions/checkout"):
+            make(home / "actions-runner-glaeda/_work" / keep)
+        self._age(home / "actions-runner-glaeda", hours=5)
+        patches, removed = self._floor_disk(10.0)
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home)
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda"])])
+        self.assertTrue((outside / ".git").is_dir())
+        self.assertTrue(other.is_dir())
+        self.assertTrue((home / "actions-runner-glaeda/_work/_tool/node").is_dir())
+        self.assertTrue((home / "actions-runner-glaeda/_work/_actions/actions/checkout").is_dir())
+
+    def test_idle_runner_checkout_used_since_the_survey_stays(self) -> None:
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5})
+
+        def evidence():  # a job's checkout step rewrites the index between the survey and the delete
+            os.utime(cos["actions-runner-glaeda"] / ".git")
+            return [], ""
+        gd.process_evidence = evidence
+        patches, removed = self._floor_disk(10.0)
+        receipt = self.receipt()
+        with patches[0], patches[1]:
+            gd.evict_idle_runner_checkouts(receipt, 30.0, home)
+        self.assertEqual(removed, [])
+        self.assertEqual(json.loads(receipt.read_text())["outcome"], "changed:modified")
+
     def test_idle_runner_checkout_pass_runs_only_in_a_pressure_apply(self) -> None:
         dev = gd.HOME.stat().st_dev
         under = {dev: gd.Fs(dev, "/", 10 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
