@@ -4808,12 +4808,22 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
         # skills/github-ci-wait/SKILL.md says so, and this contradicted it. Per-call shares are
         # the right unit for GraphQL points. What a `graphql` line really hides is *reads*: the
         # category is not cacheable, so none of the objects inside it reaches `cacheableReads`,
-        # `repeatsWithin` or `perRead`, and the repeat figure is a floor rather than an estimate.
+        # `repeatsWithin` or `perRead`, and the repeat *count* is a floor rather than an estimate.
+        # The count and not the shares beside it: writing the hidden reads out grows the
+        # denominator too, so both percentages *fall* (measured on one fixture, 50% -> 10% and
+        # 45.5% -> 10.0%) while the count can only grow. Saying "figure" covered all three and was
+        # wrong about two of them.
+        # "however many ... asked for" and not "more": a mutation or a one-object probe is a
+        # `graphql` line that hides nothing at all, and the log keeps only the path, so this cannot
+        # tell those apart from a batched read. A floor needs the hidden reads to be >= 0, which
+        # holds either way.
         # No pricing claim here on purpose -- this file is read as durable output, and a price is
         # the part that goes stale.
         print(f"\n{batched} of those calls were `gh api graphql`, each one request carrying however many "
-              f"objects the caller asked for. None of those objects is counted above, so the repeat "
-              f"figure is a floor on what a cache could have answered, not an estimate.")
+              f"objects the caller asked for -- or none, for a mutation or a one-object probe, which "
+              f"this cannot tell apart. None of those objects is counted above, so the repeat count "
+              f"is a floor on what a cache could have answered, not an estimate. The shares beside it "
+              f"are not floors: counting the hidden reads would grow their denominator too.")
     return EXIT_OK
 
 

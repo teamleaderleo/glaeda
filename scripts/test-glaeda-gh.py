@@ -3685,17 +3685,44 @@ class AuditTest(BrokerBase):
 
         What a `graphql` line does hide is *reads*: the category is not cacheable, so nothing
         inside it reaches `cacheableReads`, `repeatsWithin` or `perRead`, which makes the repeat
-        figure a floor rather than an estimate. The sentence makes no claim about cost, because
-        the cost is the part that goes stale -- and that is asserted here, not just intended."""
+        *count* a floor rather than an estimate -- the count and not the shares printed beside it,
+        which fall when the hidden reads are written out because the denominator grows too. The
+        sentence makes no claim about cost, because the cost is the part that goes stale -- and
+        that is asserted here, not just intended.
+
+        The primary guard is the sentence itself, asserted whole: a rewrite that smuggles a price
+        back in has to change it. The word ban is the backstop, and it is scoped to that last
+        paragraph with word boundaries -- over the whole report it has a live false positive, since
+        a logged path like `repos/o/end` + `point-registry` lands in the hottest-targets line and
+        `\\bpoints?\\b` does not read it (nor would `checkpoint`, `pointer` or a future line about
+        "the GraphQL endpoint")."""
         path = self.write_log([(0, "api graphql"), (5, "api graphql"), (10, "pr view pr:o/r#7")])
         doc = self.audit_json(path)
         self.assertEqual(doc["cacheableReads"], 1, "a graphql line was counted as a cacheable read")
         self.assertEqual(doc["repeatsWithin"]["calls"], 0)
         text = self.audit_text(path)
-        self.assertIn("2 of those calls were `gh api graphql`", text)
-        self.assertIn("floor", text)
-        for stale in ("point", "price", "cheap", "per call"):
-            self.assertNotIn(stale, text, "the report is making a claim about cost again")
+        self.assertIn("2 of those calls were `gh api graphql`, each one request carrying however many "
+                      "objects the caller asked for -- or none, for a mutation or a one-object probe, "
+                      "which this cannot tell apart. None of those objects is counted above, so the "
+                      "repeat count is a floor on what a cache could have answered, not an estimate. "
+                      "The shares beside it are not floors: counting the hidden reads would grow "
+                      "their denominator too.", text)
+        para = text.split("\n\n")[-1]
+        for stale in (r"\bpoints?\b", r"\bprices?\b", r"\bcheap(er|est)?\b", r"\bper call\b"):
+            self.assertIsNone(re.search(stale, para),
+                              f"the report is making a claim about cost again ({stale})")
+
+    def test_the_word_ban_does_not_fire_on_an_ordinary_logged_path(self) -> None:
+        """The false positive the scoping exists for, demonstrated rather than asserted away: a
+        repository path ending in `-endpoint-registry` reaches the hottest-targets line, and a ban
+        on the bare substring `point` over the whole report would turn an innocent log into "the
+        report is making a claim about cost again"."""
+        path = self.write_log([(0, "api graphql"), (5, "api repos/o/endpoint-registry"),
+                               (10, "api repos/o/endpoint-registry")])
+        text = self.audit_text(path)
+        self.assertIn("endpoint-registry", text, "the path was supposed to reach the report")
+        self.assertIn("point", text, "without this the test proves nothing")
+        self.assertIsNone(re.search(r"\bpoints?\b", text.split("\n\n")[-1]))
 
     def test_the_graphql_line_is_absent_when_there_are_no_graphql_calls(self) -> None:
         """The conditionality is what makes it safe to print at all: a host with none of these
@@ -3704,7 +3731,9 @@ class AuditTest(BrokerBase):
         path = self.write_log([(0, "pr view pr:o/r#7"), (5, "pr merge")])
         text = self.audit_text(path)
         self.assertNotIn("gh api graphql", text)
-        self.assertNotIn("floor", text)
+        # The sentence, not the word: a repo called `floorplan` would put "floor" in the
+        # hottest-targets line of a report that still has no graphql sentence in it.
+        self.assertNotIn("is a floor on what a cache", text)
 
     def test_an_old_logs_lines_are_counted_but_not_quoted_back(self) -> None:
         """The guard kept the value of a flag it did not know took one until 2026-10-21, and an
