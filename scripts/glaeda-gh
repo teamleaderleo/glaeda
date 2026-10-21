@@ -18,6 +18,8 @@
                                                         can be, refused when it reads local source through the
                                                         API, otherwise passed to the real gh unchanged
     glaeda-gh gh --install-shim                         put that in front of `gh` on PATH (--print-shim to look)
+    glaeda-gh gh --probe                                whether this glaeda-gh has the broker, for a wrapper
+                                                        deciding whether to hand its calls over
     glaeda-gh audit [--log PATH] [--last N] [--json]    this host's gh traffic, and what a cache would answer
 
 Many sessions share one GitHub account and so one REST quota (5000 requests an hour). Each
@@ -3050,7 +3052,10 @@ def cmd_budget(as_json: bool) -> int:
 # attempt and always exits 0, so answering either would be wrong, and they pass through instead.
 #
 # A second read of the same target within BROKER_REPEAT seconds registers a watch, so the daemon
-# starts covering it and the third read is free; a target read once is never watched. Every path
+# starts covering it and the third read is free; a target read once is never watched. A read that
+# is about to spend a request on something this caller just read is held for
+# CMUX_GH_MIN_REPEAT_SECONDS first -- the cmuxterm-hq PATH guard's rule, applied here because only
+# this side knows whether the call costs anything; a served read never waits. Every path
 # fails open: an error anywhere in the broker execs the real `gh`, because a wrapper around `gh` is
 # never allowed to be the reason a call fails. A refusal exits 2, and GLAEDA_GH_ALLOW_API_SOURCE=1
 # passes one of those through; the one other non-zero exit is 127, when there is no real gh at all.
@@ -3062,7 +3067,12 @@ BROKER_SEEN_KEEP = 2000  # targets remembered for repeat detection
 BROKER_LOG_MAX = 8 * 1024 * 1024  # the decision log is rotated once past this
 BROKER_EXIT_REFUSED = 2
 BROKER_EXIT_NO_GH = 127
+# What `glaeda-gh gh --probe` answers with. A wrapper in front of gh delegates only to a broker
+# that passes the probe, so everything in this block is part of one contract: serving, the
+# refusal, the hop count, the shared log line, and the repeat delay below.
+BROKER_CONTRACT = 1
 BROKER_MARK = "GLAEDA_GH_BROKERED"  # how many times this call has been through here
+BROKER_MIN_REPEAT = 30.0  # seconds between two identical reads that would each spend quota
 BROKER_MAX_HOPS = 2  # this broker, plus one wrapper it could not recognise. Past that, refuse.
 BROKER_REPOS_TTL = 600.0
 BROKER_ROOTS = ("~/Projects", "~/wt", "~/.cmux/worktrees")
@@ -3465,6 +3475,66 @@ def broker_logged_target(words: list[str], values: dict[str, str]) -> str:
     return ""
 
 
+def broker_caller() -> str:
+    """Who is making this call, by the same rule the PATH guard uses, so one log has one notion
+    of a caller: the agent session if there is one, else the parent process."""
+    return os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or f"ppid-{os.getppid()}"
+
+
+# A read worth holding when the same caller repeats it: the ones whose answer the daemon could
+# have, named as (subcommand, verb). `gh api` GET joins them, by method rather than by name.
+BROKER_THROTTLED = {("pr", "view"), ("pr", "checks"), ("pr", "list"),
+                    ("run", "view"), ("run", "list"), ("issue", "list")}
+
+
+def broker_repeat_wait(args: list[str], words: list[str], method: str, now: float) -> float:
+    """How long to hold this call before it spends the shared quota on something this caller just
+    read. Nothing else in the broker sleeps.
+
+    The rule is the cmuxterm-hq PATH guard's (2026-10-04: no agent polls GitHub faster than every
+    30 s, after Lawrence's REST pool ran out three times in a day), but applied here instead of
+    there, because only this side knows whether the call is about to cost a request at all. In the
+    guard it also delayed the reads the cache answers for nothing -- the 22% of all traffic this
+    broker exists to serve, made slower by the thing meant to protect the quota they do not spend.
+
+    The slot is stamped before the sleep, so a burst of identical reads queues up rather than all
+    waking at the same moment."""
+    try:
+        delay = float(os.environ.get("CMUX_GH_MIN_REPEAT_SECONDS") or BROKER_MIN_REPEAT)
+    except ValueError:
+        delay = BROKER_MIN_REPEAT
+    if delay <= 0:
+        return 0.0
+    first, second = (words + ["", ""])[:2]
+    if (first, second) not in BROKER_THROTTLED and not (first == "api" and method == "GET"):
+        return 0.0
+    digest = hashlib.sha256("\0".join([broker_caller(), *args]).encode()).hexdigest()[:32]
+    path = BASE / "broker-repeat.json"
+    BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(BASE / ".broker-repeat.lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        doc = read_json(path)
+        seen = {k: v for k, v in (doc if isinstance(doc, dict) else {}).items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and now - v < 2 * delay}
+        wait = max(0.0, min(delay, (seen.get(digest) or 0.0) + delay - now))
+        seen[digest] = now + wait
+        if len(seen) > BROKER_SEEN_KEEP:
+            seen = dict(sorted(seen.items(), key=lambda kv: -kv[1])[:BROKER_SEEN_KEEP])
+        write_json(path, seen)
+    return wait
+
+
+def broker_hold(seconds: float) -> None:
+    """The one place the broker sleeps, and the only one: a test replaces this rather than the
+    clock, because the daemon's own waits are built on that."""
+    if seconds <= 0:
+        return
+    print(f"glaeda-gh: this caller read the same thing moments ago and the cache cannot answer it; "
+          f"waiting {int(round(seconds))} s before spending a request on it again "
+          f"(CMUX_GH_MIN_REPEAT_SECONDS)", file=sys.stderr)
+    time.sleep(seconds)
+
+
 def broker_log_call(words: list[str], values: dict[str, str]) -> None:
     """Append this call to the shared log: time, caller, the subcommand, and an identifier.
 
@@ -3472,7 +3542,7 @@ def broker_log_call(words: list[str], values: dict[str, str]) -> None:
     reads one format from every host."""
     if os.environ.get("CMUX_GH_GUARD_LOGGED") == "1":
         return
-    caller = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or f"ppid-{os.getppid()}"
+    caller = broker_caller()
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     # `api` carries its path in words[1], and the target is that path with its query cut: one or
     # the other, never both, or the query comes back in through the subcommand.
@@ -3579,7 +3649,7 @@ def cmd_gh(args: list[str]) -> int:
             # Already been through here: a `gh` on PATH that this did not recognise as a wrapper
             # would otherwise be an endless exec between the two.
             raise WatchError("already brokered")
-        words, _method, _seen, values = broker_words(args)
+        words, method, _seen, values = broker_words(args)
         broker_log_call(words, values)
         route, payload, key = broker_plan(args, now)
         if route == "refuse":
@@ -3590,6 +3660,7 @@ def cmd_gh(args: list[str]) -> int:
             broker_note({"route": "serve", "key": key})
             print(payload)
             return EXIT_OK
+        broker_hold(broker_repeat_wait(args, words, method, now))
         if key is not None and daemon_running(grace=DOWN_GRACE) and broker_seen_count(key, now) >= 2:
             # read twice in BROKER_REPEAT: worth a watch, so the next read of it is free. A target
             # read once is never watched, or a sweep over fifty PRs would cost more than it saves.
@@ -3954,6 +4025,13 @@ def main(argv: list[str] | None = None) -> int:
         # Everything after `gh` belongs to the real gh, flags and all: argparse must not see it.
         if raw[1:2] == ["--install-shim"] or raw[1:2] == ["--print-shim"]:
             return cmd_gh_install_shim(raw[1] == "--print-shim")
+        if raw[1:2] == ["--probe"]:
+            # Whether this glaeda-gh has the broker at all, for a wrapper deciding whether to hand
+            # a call to it. An older one answers with an argparse error, which is the point: a
+            # wrapper that exec'd it would break every gh call on the host. Nothing else happens
+            # here, so it is cheap enough for a caller to run once per build of this file.
+            print(f"broker {BROKER_CONTRACT}")
+            return EXIT_OK
         return cmd_gh(raw[1:])
     args = parser().parse_args(argv)
     try:

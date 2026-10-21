@@ -3061,6 +3061,9 @@ class BrokerBase(Base):
         self.addCleanup(self.env.stop)
         for name in ("GLAEDA_GH_ALLOW_API_SOURCE", "GLAEDA_GH_MAX_AGE", "CMUX_GH_GUARD_LOGGED"):
             os.environ.pop(name, None)
+        # The repeat delay is real time, and most of these tests make the same call twice on
+        # purpose. BrokerRepeatTest turns it back on and replaces the hold.
+        os.environ["CMUX_GH_MIN_REPEAT_SECONDS"] = "0"
 
     def fake_gh(self) -> Path:
         """A stand-in for the real gh that records the arguments it was handed."""
@@ -3619,6 +3622,87 @@ class AuditTest(BrokerBase):
         empty.write_text("")
         with self.assertRaises(gg.WatchError):
             gg.cmd_audit(empty, 10, False)
+
+
+class BrokerRepeatTest(BrokerBase):
+    """The 30 s repeat delay lives here rather than in the PATH guard, because only this side knows
+    whether a call is about to spend a request."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ["CMUX_GH_MIN_REPEAT_SECONDS"] = str(gg.BROKER_MIN_REPEAT)
+        self.slept: list[float] = []
+        # broker_hold, not the clock: the daemon's own waits are built on time.sleep, and a test
+        # that replaces that spins through every one of them.
+        patch = mock.patch.object(gg, "broker_hold",
+                                  lambda s: self.slept.append(s) if s > 0 else None)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_a_served_read_never_waits(self) -> None:
+        """The whole point: the 22% of calls the cache answers were the ones the guard's delay hit
+        hardest, and they spend nothing."""
+        self.cache_pr(7, {"state": "OPEN"})
+        args = ["pr", "view", "7", "-R", "o/r", "--json", "state"]
+        for _ in range(3):
+            code, out, _err, passed = self.run_gh(args)
+            self.assertEqual((code, out, passed), (0, '{"state":"OPEN"}\n', None))
+        self.assertEqual(self.slept, [])
+
+    def test_the_same_read_twice_waits_before_spending_a_request(self) -> None:
+        args = ["pr", "view", "9", "-R", "o/r", "--json", "state"]
+        self.run_gh(args)
+        self.assertEqual(self.slept, [], "the first read of it costs nothing extra")
+        _code, _out, _err, passed = self.run_gh(args)
+        self.assertEqual(len(self.slept), 1)
+        self.assertGreater(self.slept[0], 25)
+        self.assertLessEqual(self.slept[0], gg.BROKER_MIN_REPEAT)
+        self.assertIsNotNone(passed, "it is held, then made: never refused")
+
+    def test_a_different_caller_or_a_different_call_is_not_a_repeat(self) -> None:
+        self.run_gh(["pr", "view", "9", "-R", "o/r", "--json", "state"])
+        self.run_gh(["pr", "view", "10", "-R", "o/r", "--json", "state"])
+        with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ID": "another-session"}):
+            self.run_gh(["pr", "view", "9", "-R", "o/r", "--json", "state"])
+        self.assertEqual(self.slept, [])
+
+    def test_a_write_is_never_delayed(self) -> None:
+        for args in (["pr", "merge", "9", "--squash"], ["api", "repos/o/r/issues/9/comments", "-f", "body=hi"],
+                     ["pr", "edit", "9", "--add-label", "x"]):
+            with self.subTest(args=args):
+                self.run_gh(args)
+                self.run_gh(args)
+        self.assertEqual(self.slept, [], "a merge held for 30 s is a lane held for 30 s")
+
+    def test_the_delay_can_be_turned_off(self) -> None:
+        with mock.patch.dict(os.environ, {"CMUX_GH_MIN_REPEAT_SECONDS": "0"}):
+            self.run_gh(["pr", "view", "9", "-R", "o/r", "--json", "state"])
+            self.run_gh(["pr", "view", "9", "-R", "o/r", "--json", "state"])
+        self.assertEqual(self.slept, [])
+
+    def test_the_probe_says_the_whole_contract_is_here(self) -> None:
+        """A wrapper in front of gh delegates only to a broker that passes this, because exec'ing
+        an older glaeda-gh -- which answers `gh` with an argparse error -- would break every gh
+        call on the host."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.main(["gh", "--probe"]), 0)
+        self.assertEqual(out.getvalue(), f"broker {gg.BROKER_CONTRACT}\n")
+
+
+class BrokerHoldTest(Base):
+    """The hold itself, outside BrokerRepeatTest, which replaces it."""
+
+    def test_the_hold_says_what_it_is_waiting_for(self) -> None:
+        err = io.StringIO()
+        with mock.patch.object(gg.time, "sleep") as slept, contextlib.redirect_stderr(err):
+            gg.broker_hold(0.0)
+            self.assertEqual(slept.call_count, 0, "nothing to wait for, nothing printed")
+            self.assertEqual(err.getvalue(), "")
+            gg.broker_hold(7.0)
+            slept.assert_called_once_with(7.0)
+        self.assertIn("waiting 7 s", err.getvalue())
+        self.assertIn("CMUX_GH_MIN_REPEAT_SECONDS", err.getvalue())
 
 
 class BrokerLogTest(BrokerBase):
