@@ -3097,6 +3097,7 @@ class BrokerBase(Base):
         # that calls cmd_gh twice in one process has to drop it the way a fresh shell would.
         if not keep_mark:
             os.environ.pop(gg.BROKER_MARK, None)
+            os.environ.pop(gg.BROKER_DEPTH, None)
 
         def execv(path: str, argv: list[str]) -> None:
             execed.append((path, argv))
@@ -3985,6 +3986,50 @@ class BrokerLoopTest(BrokerBase):
         self.assertEqual((code, out, passed), (0, '{"state":"OPEN"}\n', None))
         self.assertIn("pr view", (self.home / "calls.log").read_text())
 
+    def test_a_wrapper_that_forks_gh_instead_of_execing_it_still_ends(self) -> None:
+        """The pid-scoped mark fixed a spawned `gh` being refused for a loop that did not exist,
+        but it is scoped precisely so a new pid starts at zero -- and a wrapper that *forks* `gh`
+        gets a new pid every generation, so the scoped count resets to 1 forever. That turned one
+        call exiting 127 into a host forking until something kills it, with a call-log line per
+        generation. BROKER_DEPTH is unscoped for exactly this shape."""
+        self.assertEqual(gg.broker_depth(), 0)
+        with mock.patch.dict(os.environ, {gg.BROKER_DEPTH: str(gg.BROKER_MAX_DEPTH)}):
+            # a fork resets the pid, so hops is 0 here -- depth is what has to end it
+            with mock.patch.dict(os.environ, {gg.BROKER_MARK: "1:999999"}):
+                self.assertEqual(gg.broker_hops(), 0)
+                code, _out, err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r"], keep_mark=True)
+        self.assertEqual(code, gg.BROKER_EXIT_NO_GH)
+        self.assertIsNone(passed, "the chain ends instead of forking another generation")
+        self.assertIn(gg.BROKER_DEPTH, err)
+        # and the depth is carried on, unscoped, so the next generation counts from here
+        with mock.patch.dict(os.environ, {gg.BROKER_DEPTH: "3"}):
+            self.run_gh(["pr", "view", "7", "-R", "o/r"], keep_mark=True)
+            self.assertEqual(os.environ.get(gg.BROKER_DEPTH), "4")
+
+    def test_a_real_extension_chain_is_well_under_the_depth_limit(self) -> None:
+        # The bound only exists to end a loop. A gh extension that calls gh, whose $EDITOR calls
+        # gh, is three deep; it must never see this.
+        self.assertGreaterEqual(gg.BROKER_MAX_DEPTH, 6)
+        self.cache_pr(7, {"state": "OPEN"})
+        for depth in range(gg.BROKER_MAX_DEPTH - 1):
+            with mock.patch.dict(os.environ, {gg.BROKER_DEPTH: str(depth)}):
+                code, out, _err, _passed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+                self.assertEqual((code, out), (0, '{"state":"OPEN"}\n'), f"depth {depth}")
+
+    def test_an_unreadable_depth_ends_the_chain_rather_than_extending_it(self) -> None:
+        with mock.patch.dict(os.environ, {gg.BROKER_DEPTH: "not-a-number"}):
+            self.assertEqual(gg.broker_depth(), gg.BROKER_MAX_DEPTH)
+
+    def test_the_brokers_hand_back_does_not_disable_the_persons_own_switch(self) -> None:
+        """The broker used to set CMUX_GH_BROKER_DISABLE=1 for the hand-back, which every
+        descendant inherited -- so the broker was off for a whole subtree, and once inherited, a
+        person's own export of it did nothing. The hand-back is GLAEDA_GH_BROKER_PID's job."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CMUX_GH_BROKER_DISABLE", None)
+            self.run_gh(["pr", "view", "7", "-R", "o/r"])
+            self.assertIsNone(os.environ.get("CMUX_GH_BROKER_DISABLE"))
+            self.assertEqual(os.environ.get("GLAEDA_GH_BROKER_PID"), str(os.getpid()))
+
     def test_an_older_bare_mark_still_reads_as_a_hop(self) -> None:
         # Mid-rollout a host can have a broker that wrote the count with no pid.
         with mock.patch.dict(os.environ, {gg.BROKER_MARK: "1"}):
@@ -4015,10 +4060,16 @@ class BrokerLoopTest(BrokerBase):
             self.assertEqual(gg.broker_hops(), 1, "older versions wrote 1")
 
     def test_the_path_guard_is_told_not_to_hand_the_call_back(self) -> None:
+        """By pid, not by a blanket switch: GLAEDA_GH_BROKER_PID names the process that has been
+        through here, and the guard compares it to its own $$. CMUX_GH_BROKER_DISABLE is left
+        alone because it belongs to a person -- setting it here turned the broker off for every
+        descendant of the call, and once inherited, a person's own export of it did nothing."""
         os.environ.pop("CMUX_GH_BROKER_DISABLE", None)
         self.addCleanup(os.environ.pop, "CMUX_GH_BROKER_DISABLE", None)
+        self.addCleanup(os.environ.pop, "GLAEDA_GH_BROKER_PID", None)
         self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
-        self.assertEqual(os.environ.get("CMUX_GH_BROKER_DISABLE"), "1")
+        self.assertEqual(os.environ.get("GLAEDA_GH_BROKER_PID"), str(os.getpid()))
+        self.assertIsNone(os.environ.get("CMUX_GH_BROKER_DISABLE"))
 
     def test_a_guard_that_names_a_wrapper_as_the_real_gh_is_not_believed(self) -> None:
         """Mid-rollout a host has two generations of the PATH guard on PATH, and the older one's

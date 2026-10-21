@@ -3074,10 +3074,24 @@ BROKER_EXIT_NO_GH = 127
 # those changes in a way a wrapper can see: the log line's shape, the meaning of an exit code, the
 # env vars read or exported across the hand-off, or the probe's own output. Adding a served field
 # or a refused path does not need a bump -- a wrapper cannot tell.
-BROKER_CONTRACT = 1
-BROKER_MARK = "GLAEDA_GH_BROKERED"  # how many times this call has been through here
+BROKER_CONTRACT = 2  # 2: the hand-off env changed (see BROKER_MARK, BROKER_DEPTH)
+BROKER_MARK = "GLAEDA_GH_BROKERED"  # "count:pid" -- this call's own history, across an exec
 BROKER_MIN_REPEAT = 30.0  # seconds between two identical reads that would each spend quota
 BROKER_MAX_HOPS = 2  # this broker, plus one wrapper it could not recognise. Past that, refuse.
+# Two counters, because a wrapper loop comes in two shapes and one counter cannot bound both.
+#
+# BROKER_MARK is scoped to a pid: an exec keeps the pid, so a call handed straight back here still
+# carries its own history, while a `gh` that gh *spawns* (an extension, an alias, a $EDITOR hook)
+# starts a fresh call rather than inheriting its parent's count and eventually being refused for a
+# loop that does not exist. That is what it is for, and it is why it cannot bound the other shape:
+# a wrapper that *forks* `gh` instead of exec'ing it gets a new pid every generation, so a
+# pid-scoped count resets to one forever and the chain never ends.
+#
+# BROKER_DEPTH is therefore unscoped and counts generations whatever the wrapper does. The bound is
+# loose on purpose: a real extension or editor chain is two or three deep and must never notice it,
+# while a loop reaches it in under a second.
+BROKER_DEPTH = "GLAEDA_GH_DEPTH"
+BROKER_MAX_DEPTH = 8
 BROKER_REPOS_TTL = 600.0
 BROKER_ROOTS = ("~/Projects", "~/wt", "~/.cmux/worktrees")
 # Long flags that take a separate value. Only needed to keep that value out of the positional
@@ -3349,6 +3363,12 @@ def broker_repo(values: dict[str, str]) -> str | None:
         if len(parts) > 2 and parts[-3].lower() not in BROKER_GITHUB_HOSTS:
             return None
         return f"{parts[-2].lower()}/{parts[-1].lower()}" if len(parts) >= 2 else None
+    if any(os.environ.get(name) for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES",
+                                             "GIT_DISCOVERY_ACROSS_FILESYSTEM")):
+        # These change where git -- and so gh -- starts or stops looking. Hooks set GIT_DIR, and
+        # under it this walk can land on a different repository than gh would, which since the
+        # walk was added is a wrong answer rather than a wasted request.
+        return None
     checkout = broker_checkout(Path.cwd())
     if checkout is None:
         return None
@@ -3477,6 +3497,8 @@ def broker_note(event: dict) -> None:
     path = broker_log()
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if (path.parent.stat().st_mode & 0o077) != 0:
+            path.parent.chmod(0o700)  # mode= misses a directory an earlier run already created
         if path.exists() and path.stat().st_size > BROKER_LOG_MAX:
             path.replace(path.with_suffix(".jsonl.1"))
         with path.open("a") as stream:
@@ -3531,7 +3553,8 @@ BROKER_THROTTLED = {("pr", "view"), ("pr", "checks"), ("pr", "list"),
 BROKER_FREE_RE = re.compile(r"^(?:https?://api\.github\.com/)?/?rate_limit/?$")
 
 
-def broker_repeat_wait(args: list[str], words: list[str], method: str, now: float) -> float:
+def broker_repeat_wait(args: list[str], words: list[str], method: str, seen: set[str],
+                       now: float) -> float:
     """How long to hold this call before it spends the shared quota on something this caller just
     read. Nothing else in the broker sleeps.
 
@@ -3543,10 +3566,11 @@ def broker_repeat_wait(args: list[str], words: list[str], method: str, now: floa
 
     The bound is per call, not per target: the slot is stamped before the sleep, so a serial
     polling loop is held `delay` apart each time around, but a parallel fan-out of n identical
-    reads is held once and then released over the following moments (the wait is capped at
-    `delay`, so the n-th does not wait n*delay). That is deliberate -- queueing fifty lanes
-    behind each other would be an outage, not a rate limit -- and it means this is a brake on a
-    loop, not a quota. What actually keeps a fan-out off GitHub is the cache above it."""
+    reads is held once and then released *together*, one `delay` later -- the wait is capped at
+    `delay`, so the n-th does not wait n*delay, and every lane after the first wakes at the same
+    moment. A thundering herd, on purpose: queueing fifty lanes behind each other would be an
+    outage, not a rate limit. So this is a brake on a loop, not a quota. What actually keeps a
+    fan-out off GitHub is the cache above it."""
     try:
         delay = float(os.environ.get("CMUX_GH_MIN_REPEAT_SECONDS") or BROKER_MIN_REPEAT)
     except ValueError:
@@ -3558,8 +3582,12 @@ def broker_repeat_wait(args: list[str], words: list[str], method: str, now: floa
         return 0.0
     if first == "api" and any(BROKER_FREE_RE.match(word) for word in words[1:2]):
         return 0.0  # costs no quota, so there is nothing to protect by waiting
-    if "--web" in args:
-        return 0.0  # opens a browser; it reads nothing
+    if "--web" in seen:
+        # Not free -- the argument-less forms resolve the PR or run over the API before opening a
+        # URL -- but a person opening a browser twice is not the polling loop this delay is for,
+        # and holding an interactive command 30 s is worse than the request. Read from `seen`, not
+        # from a scan of args, or a flag whose *value* is "--web" would exempt the call.
+        return 0.0
     digest = hashlib.sha256("\0".join([broker_caller(), *args]).encode()).hexdigest()[:32]
     path = BASE / "broker-repeat.json"
     BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -3647,6 +3675,21 @@ def broker_hops() -> int:
         return 1
 
 
+def broker_depth() -> int:
+    """How many brokered `gh` generations deep this process is, however it got here.
+
+    Unscoped, unlike broker_hops: a wrapper that forks `gh` rather than exec'ing it gets a new pid
+    each time, so only a counter that ignores the pid can end that chain. Anything unreadable
+    counts as the limit, which ends it sooner rather than later."""
+    raw = os.environ.get(BROKER_DEPTH) or ""
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return BROKER_MAX_DEPTH
+
+
 def broker_is_wrapper(candidate: Path) -> bool:
     """Whether this `gh` is something that would come back here: this broker's own shim, or the
     cmuxterm-hq PATH guard. The marker is also why a brokered call carries BROKER_MARK across the
@@ -3721,7 +3764,7 @@ def cmd_gh(args: list[str]) -> int:
             # Already been through here: a `gh` on PATH that this did not recognise as a wrapper
             # would otherwise be an endless exec between the two.
             raise WatchError("already brokered")
-        words, method, _seen, values = broker_words(args)
+        words, method, seen, values = broker_words(args)
         broker_log_call(words, values)
         route, payload, key = broker_plan(args, now)
         if route == "refuse":
@@ -3732,7 +3775,7 @@ def cmd_gh(args: list[str]) -> int:
             broker_note({"route": "serve", "key": key})
             print(payload)
             return EXIT_OK
-        broker_hold(broker_repeat_wait(args, words, method, now))
+        broker_hold(broker_repeat_wait(args, words, method, seen, now))
         if key is not None and daemon_running(grace=DOWN_GRACE) and broker_seen_count(key, now) >= 2:
             # read twice in BROKER_REPEAT: worth a watch, so the next read of it is free. A target
             # read once is never watched, or a sweep over fifty PRs would cost more than it saves.
@@ -3749,25 +3792,31 @@ def cmd_gh(args: list[str]) -> int:
             except Exception:  # noqa: BLE001
                 print("glaeda-gh: no real gh on PATH", file=sys.stderr)
                 return BROKER_EXIT_NO_GH
-    if hops >= BROKER_MAX_HOPS:
+    depth = broker_depth()
+    if hops >= BROKER_MAX_HOPS or depth >= BROKER_MAX_DEPTH:
         # The marks only stop this broker from *working* twice on one call; they cannot stop a
-        # wrapper from handing it back, and `exec` leaves nothing to unwind. Counting the hops is
-        # what makes the chain finite, so a wrapper this does not recognise costs an error rather
-        # than a hang. Named in full because whoever sees it has a loop to find.
-        print(f"glaeda-gh: {' '.join(['gh', *args][:3])} has been through this broker {hops} times "
-              f"({BROKER_MARK}={hops}); something on PATH hands `gh` back here. Not running {real} "
-              f"again -- run the real gh by path, and CMUX_GH_BROKER_DISABLE=1 keeps the guard out.",
-              file=sys.stderr)
+        # wrapper from handing it back, and `exec` leaves nothing to unwind. Counting is what makes
+        # the chain finite, so a wrapper this does not recognise costs an error rather than a hang:
+        # hops ends an exec chain at the second pass, depth ends a chain that forks (where every
+        # generation is a new pid and hops can never climb). Named in full because whoever sees
+        # this has a loop to find.
+        reached = (f"{BROKER_MARK}={hops}" if hops >= BROKER_MAX_HOPS else f"{BROKER_DEPTH}={depth}")
+        print(f"glaeda-gh: {' '.join(['gh', *args][:3])} has been through this broker "
+              f"{max(hops, depth)} times ({reached}); something on PATH hands `gh` back here. Not "
+              f"running {real} again -- run the real gh by path, and CMUX_GH_BROKER_DISABLE=1 keeps "
+              f"the guard out.", file=sys.stderr)
         return BROKER_EXIT_NO_GH
     try:
         # Survives the exec, so this call is not brokered twice; tagged with the pid so it means
         # nothing to anything gh goes on to spawn (see broker_hops). execv keeps the pid, which is
         # why the tag is written before it and not after.
         os.environ[BROKER_MARK] = f"{hops + 1}:{os.getpid()}"
+        os.environ[BROKER_DEPTH] = str(depth + 1)  # unscoped: survives a fork as well as an exec
         # If `real` turns out to be the cmuxterm-hq PATH guard after all, this is what stops it
-        # delegating the call straight back here. Scoped the same way: a guard that gh spawns
-        # later is guarding a different call and must broker it normally.
-        os.environ["CMUX_GH_BROKER_DISABLE"] = "1"
+        # delegating the call straight back here. Scoped to this pid, so a guard that gh spawns
+        # later is guarding a different call and brokers it normally. CMUX_GH_BROKER_DISABLE is
+        # deliberately NOT set: it is a person's unconditional switch, and setting it here turned
+        # it off for every descendant -- including, once it was inherited, for the person.
         os.environ["GLAEDA_GH_BROKER_PID"] = str(os.getpid())
         os.execv(real, [real, *args])
     except OSError as error:
