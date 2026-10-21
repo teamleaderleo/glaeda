@@ -539,7 +539,8 @@ def redeliver(state: dict, config: dict) -> dict[str, str]:
 
 
 def nudge_due(result: dict, entry: dict | None, nudged: str | None, now: float) -> bool:
-    """Dispatch promote.yml after an install, and once more per release when its soak has passed. Runs every
+    """Dispatch promote.yml after an install, and once more per release when its soak has passed (`nudged`
+    names the release that post-soak nudge was sent for; the install's nudge, mid-soak, never sets it). Runs every
     ten minutes would otherwise spend one call of the shared API quota each just to say "still current"."""
     if result.get("result") == "updated":
         return True
@@ -845,7 +846,9 @@ def runner_hook_dirs(home: Path) -> list[tuple[str, Path | None]]:
         except (OSError, ValueError):
             out.append((os.fspath(path), None))
             continue
-        runner = receipt.get("runnerDir") if isinstance(receipt, dict) else None
+        if not isinstance(receipt, dict) or not receipt.get("runnerDirOwned"):
+            continue  # a runner directory glaeda-cmux-runner does not own: --refresh-hooks never touches it
+        runner = receipt.get("runnerDir")
         out.append((os.fspath(path), Path(runner) if isinstance(runner, str) and runner else None))
     return out
 
@@ -889,7 +892,10 @@ def convergence(result: dict, running: dict, wants: dict | None, hook_states: li
     why: list[str] = []
     blocking = False
     if wants is None:
-        return True, ([str(result.get("why"))] if result.get("why") else []), False
+        if result.get("result") == "idle":  # paused, or nothing on the ring: nothing is wanted
+            return True, ([str(result.get("why"))] if result.get("why") else []), False
+        # the channel was never read (a first run that cannot fetch): unknown is not converged
+        return False, [f"{result.get('result')}: {result.get('why') or result.get('detail') or 'no channel read yet'}"[:300]], False
     if running.get("tag") != wants.get("tag"):
         kind = str(result.get("result"))
         detail = str(result.get("detail") or result.get("why") or "")
@@ -1117,8 +1123,8 @@ def apply_once(config: dict, state_dir: Path = STATE_DIR, bin_dir: Path = BIN, h
         result = update(True, config, state_dir, channel, bin_dir)
         if nudge_due(result, entry, previous.get("nudged"), now):
             result["promotion"] = nudge_promotion(config)
-            if entry is not None:
-                previous["nudged"] = entry["tag"]
+            if entry is not None and result.get("result") == "current":
+                previous["nudged"] = entry["tag"]  # the post-soak nudge; the install's own does not count
         if result["result"] in ("updated", "current"):
             result.update(runner_steps(state_dir, staged, home, hook_states))
     except Exception as e:  # noqa: BLE001  (recorded below, then re-raised for the one JSON line)

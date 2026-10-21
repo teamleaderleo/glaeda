@@ -843,6 +843,35 @@ class UpdateTest(unittest.TestCase):
         [f] = self.health_findings(now + gu.STALE_AFTER_S)
         self.assertEqual(f["id"], "ota_stale")
 
+    def test_the_canary_that_installed_a_release_still_nudges_after_its_soak(self) -> None:
+        entry = self.server.publish(SOURCES[0])
+        published = gu.parse_utc(entry["published"])
+        soak = float(entry["policy"]["soakHours"]) * 3600
+        self.assertGreater(soak, 120)
+        with mock.patch.object(gu, "nudge_promotion", return_value="dispatched") as nudge:
+            self.assertEqual(self.apply(published + 60)["promotion"], "dispatched")  # the install's nudge
+            self.assertNotIn("nudged", self.converge())
+            self.assertNotIn("promotion", self.apply(published + 120))  # current, still soaking
+            self.assertEqual(self.apply(published + soak + 3600)["promotion"], "dispatched")  # after the soak
+            self.assertEqual(self.converge()["nudged"], entry["tag"])
+            self.assertNotIn("promotion", self.apply(published + soak + 7200))  # once per release
+        self.assertEqual(nudge.call_count, 2)
+
+    def test_a_first_run_that_never_read_the_channel_is_not_converged(self) -> None:
+        with mock.patch.object(gu, "fetch_channel", side_effect=urllib.error.URLError("offline")):
+            with self.assertRaises(urllib.error.URLError):
+                gu.apply_once(self.config, self.state, self.bin, self.root, self.root / "x", now=1_800_000_000.0)
+        doc = self.converge()
+        self.assertFalse(doc["converged"])
+        self.assertIsNone(doc["wants"])
+        self.paused_is_converged()
+
+    def paused_is_converged(self) -> None:
+        self.server.publish(SOURCES[0])
+        self.server.paused = True
+        self.assertEqual(self.apply(1_800_000_100.0)["result"], "idle")
+        self.assertTrue(self.converge()["converged"])
+
     def test_a_current_canary_nudges_promotion_once_per_release_after_its_soak(self) -> None:
         entry = {"tag": "r-20260925-" + "a" * 12, "published": "2026-09-25T00:00:00Z", "policy": {"soakHours": 0.25}}
         soaked = gu.parse_utc("2026-09-25T00:15:00Z")

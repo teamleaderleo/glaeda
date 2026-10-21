@@ -128,7 +128,7 @@ def smoke_asset(target: str) -> str:
     return f"smoke-{target}.json"
 
 
-def smoke(archive: Path, target: str, source: str) -> dict:
+def smoke(archive: Path, target: str, source: str, python: str = sys.executable) -> dict:
     """Extract a hygiene archive into a scratch home and run what glaeda-update's health() runs after an
     install: the tools answer --help and the release's glaeda-update plans from a channel offline."""
     import shutil
@@ -137,19 +137,22 @@ def smoke(archive: Path, target: str, source: str) -> dict:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         with tarfile.open(archive, "r:gz") as tar:
-            tar.extractall(root / "gen", filter="data")
+            if hasattr(tarfile, "data_filter"):  # 3.12 (and backports); older Pythons have no filter argument
+                tar.extractall(root / "gen", filter="data")
+            else:
+                tar.extractall(root / "gen")  # our own just-built archive
         scripts, home, channel = root / "gen/glaeda/scripts", root / "home", root / "channel"
         home.mkdir()
         channel.mkdir()
         (channel / "control.json").write_bytes(canonical(control(False)))
         (channel / "stable.json").write_bytes(b"")
         env = {"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
-        runs = [[sys.executable, str(scripts / name), "--help"]
-                for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-gh")]
+        runs = [[python, str(scripts / name), "--help"]
+                for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-gh", "glaeda-mini-health")]
         runs += [[str(root / "gen/bin/glaeda-worktree-reclaim"), "--help"],
-                 [sys.executable, str(scripts / "glaeda-update"), "--channel-dir", str(channel)]]
+                 [python, str(scripts / "glaeda-update"), "--channel-dir", str(channel)]]
         for argv in runs:
-            name = Path(argv[1] if argv[0] == sys.executable else argv[0]).name
+            name = Path(argv[1] if argv[0] == python else argv[0]).name
             result = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env,
                                     stdin=subprocess.DEVNULL)
             if result.returncode != 0:
@@ -160,7 +163,9 @@ def smoke(archive: Path, target: str, source: str) -> dict:
                     raise ReleaseError(f"smoke: glaeda-update planned {planned}")
             checks.append(name)
         shutil.rmtree(root / "gen", ignore_errors=True)
-    return {"schema": SMOKE_SCHEMA, "target": target, "source": source, "checks": checks}
+    version = subprocess.run([python, "-c", "import platform; print(platform.python_version())"],
+                             capture_output=True, text=True, timeout=60).stdout.strip()
+    return {"schema": SMOKE_SCHEMA, "target": target, "source": source, "checks": checks, "python": version}
 
 
 def smoked(doc: dict) -> bool:
@@ -398,6 +403,7 @@ def main(argv: list[str] | None = None) -> int:
     sm.add_argument("--source", required=True)
     sm.add_argument("--target", required=True, choices=TARGETS)
     sm.add_argument("--output", type=Path, required=True, help="the directory holding the archive")
+    sm.add_argument("--python", default=sys.executable, help="the interpreter hosts run the tools with")
     t = sub.add_parser("tag", help="print the release tag for a source commit")
     t.add_argument("--source", required=True)
     m = sub.add_parser("manifest", help="write release.json over the assets in a directory")
@@ -428,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
             (a.output / hygiene_asset(a.target)).write_bytes(raw)
             print(json.dumps({"asset": hygiene_asset(a.target), "sha256": sha256(raw), "size": len(raw)}))
         elif a.command == "smoke":
-            receipt = smoke(a.output / hygiene_asset(a.target), a.target, a.source)
+            receipt = smoke(a.output / hygiene_asset(a.target), a.target, a.source, a.python)
             (a.output / smoke_asset(a.target)).write_bytes(canonical(receipt))
             print(json.dumps(receipt))
         elif a.command == "tag":
