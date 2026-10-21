@@ -3058,7 +3058,8 @@ def cmd_budget(as_json: bool) -> int:
 # this side knows whether the call costs anything; a served read never waits. Every path
 # fails open: an error anywhere in the broker execs the real `gh`, because a wrapper around `gh` is
 # never allowed to be the reason a call fails. A refusal exits 2, and GLAEDA_GH_ALLOW_API_SOURCE=1
-# passes one of those through; the one other non-zero exit is 127, when there is no real gh at all.
+# passes one of those through. Exit 127 is the broker's own refusal to run: no real gh on PATH,
+# a chain that has been through here BROKER_MAX_HOPS times, or an exec that failed.
 
 BROKER_MAX_AGE = 90.0  # cache entries older than this are not served (the daemon's cycle is 60 s)
 BROKER_LEAN_AGE = 600.0  # below the floor, stale data beats spending the last of the quota
@@ -3069,7 +3070,10 @@ BROKER_EXIT_REFUSED = 2
 BROKER_EXIT_NO_GH = 127
 # What `glaeda-gh gh --probe` answers with. A wrapper in front of gh delegates only to a broker
 # that passes the probe, so everything in this block is part of one contract: serving, the
-# refusal, the hop count, the shared log line, and the repeat delay below.
+# refusal, the hop count, the shared log line, and the repeat delay below. Bump it when any of
+# those changes in a way a wrapper can see: the log line's shape, the meaning of an exit code, the
+# env vars read or exported across the hand-off, or the probe's own output. Adding a served field
+# or a refused path does not need a bump -- a wrapper cannot tell.
 BROKER_CONTRACT = 1
 BROKER_MARK = "GLAEDA_GH_BROKERED"  # how many times this call has been through here
 BROKER_MIN_REPEAT = 30.0  # seconds between two identical reads that would each spend quota
@@ -3099,10 +3103,10 @@ BROKER_GITHUB_HOSTS = {"github.com", "www.github.com", "api.github.com"}
 # gh `pr view --json FIELD` -> (key in a cached PR entry, the Go type gh prints it as). gh renders a
 # null string field as "", and a null time as null.
 #
-# A field is here only when every source the daemon reads a PR from fills it. The cache has one
-# shape but three writers, and two of them leave a key None to mean "this source does not carry
-# it", which is not the same as GitHub answering null: serving the second as the first prints a
-# confident wrong answer. `reviewDecision` is the dangerous one -- fetch_pr_rest keeps GraphQL's
+# A field is here only when every source the daemon reads a PR from fills it. A PR entry has two
+# writers (fetch_pr_rest and the GraphQL read behind fetch_aliased) and a run entry has three, and
+# some of them leave a key None to mean "this source does not carry it", which is not the same as
+# GitHub answering null: serving the second as the first prints a confident wrong answer. `reviewDecision` is the dangerous one -- fetch_pr_rest keeps GraphQL's
 # last value (REST has no equivalent), so it is None until some GraphQL read fills it, and stale
 # afterwards however fresh `dataAt` looks. Printing "" there says "nobody has reviewed this" for a
 # PR that is CHANGES_REQUESTED, which is exactly the answer a lane must not get wrong.
@@ -3126,10 +3130,12 @@ BROKER_RUN_FIELDS = {
     "attempt": ("run_attempt", "int"),
     "updatedAt": ("updated_at", "time"),
 }
-# What automation pivots on: a push, a rerun or a merge changes these, and acting on a stale one
-# means waiting on a superseded head or calling a run green. The lean horizon never covers them.
+# What automation pivots on: a push, a rerun, a merge or a ready-for-review changes these, and
+# acting on a stale one means waiting on a superseded head, calling a run green, or reading a
+# merged PR as open. The lean horizon never covers them. `updatedAt` is the mutation clock itself,
+# so anything using it as a change detector would be told "nothing changed" for the whole horizon.
 BROKER_LIVE_FIELDS = {"headRefOid", "conclusion", "status", "state", "attempt",
-                      "mergeStateStatus", "mergeable"}
+                      "mergeStateStatus", "mergeable", "mergedAt", "isDraft", "updatedAt"}
 BROKER_SOURCE_RE = re.compile(
     rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/(contents/|git/(?:blobs|trees)/)")
 BROKER_RAW_RE = re.compile(rf"^https?://raw\.githubusercontent\.com/({NAME})/({NAME})/")
@@ -3182,9 +3188,14 @@ def broker_words(args: list[str]) -> tuple[list[str], str, set[str], dict[str, s
         elif arg.startswith("--"):
             name = BROKER_FLAG_ALIAS.get(arg, arg)
             seen.add(name)
-            if arg in BROKER_VALUE_FLAGS and i + 1 < len(args):
-                values[name] = args[i + 1]
-                i += 1
+            if arg in BROKER_VALUE_FLAGS:
+                if i + 1 < len(args):
+                    values[name] = args[i + 1]
+                    i += 1
+                else:
+                    # No value at all, so gh exits 1. An earlier occurrence's value must not stand
+                    # in for it (`--json state ... --json`), or the broker answers a line gh rejects.
+                    values.pop(name, None)
         elif arg.startswith("-") and arg != "-":
             short, glued = arg[:2], arg[2:]
             name = BROKER_FLAG_ALIAS.get(short, short)
@@ -3193,9 +3204,12 @@ def broker_words(args: list[str]) -> tuple[list[str], str, set[str], dict[str, s
                 values[name] = glued
             elif glued:
                 seen.update(BROKER_FLAG_ALIAS.get(f"-{c}", f"-{c}") for c in glued)  # `-abc`
-            elif short in BROKER_VALUE_FLAGS and i + 1 < len(args):
-                values[name] = args[i + 1]
-                i += 1
+            elif short in BROKER_VALUE_FLAGS:
+                if i + 1 < len(args):
+                    values[name] = args[i + 1]
+                    i += 1
+                else:
+                    values.pop(name, None)  # `-R o/r ... -R`: gh exits 1, so never serve it
         else:
             words.append(arg)
         i += 1
@@ -3204,13 +3218,6 @@ def broker_words(args: list[str]) -> tuple[list[str], str, set[str], dict[str, s
     elif {"-f", "--raw-field", "-F", "--field", "--input"} & seen:
         method = "POST"  # gh POSTs when it is given fields or a body, with no -X on the line
     return words, method.upper(), seen, values
-
-
-def broker_flag(values: dict[str, str], *names: str) -> str | None:
-    for name in names:
-        if name in values:
-            return values[name]
-    return None
 
 
 def broker_local_repos(now: float | None = None) -> dict[str, str]:
@@ -3300,14 +3307,35 @@ def broker_source_refusal(words: list[str]) -> str | None:
     return None
 
 
+def broker_checkout(start: Path) -> Path | None:
+    """The checkout `start` is in: the nearest directory at or above it holding a `.git`.
+
+    gh resolves a repository the way git does, by walking up from the working directory, so this
+    has to as well. Looking only in the working directory itself meant that `gh pr view 7` run
+    from `repo/src` -- which is most of how agents run it -- resolved no repository, took the
+    `pass` route, and spent a request on something the cache was holding."""
+    try:
+        here = start.resolve()
+    except OSError:
+        return None
+    for candidate in [here, *here.parents]:
+        dot = candidate / ".git"
+        try:
+            if dot.is_dir() or dot.is_file():
+                return candidate
+        except OSError:
+            return None
+    return None
+
+
 def broker_repo(values: dict[str, str]) -> str | None:
     """OWNER/REPO for this call, or None when it cannot be known beyond doubt.
 
-    `-R`/`--repo` first, then $GH_REPO, then the current checkout -- the process's own working
-    directory, which is the caller's, because the broker execs in place -- but only when that
-    checkout names exactly one GitHub remote and has no `gh-resolved` entry (`gh repo set-default`,
-    which would point gh somewhere this cannot see). Guessing here answers one repository's
-    question with another's.
+    `-R`/`--repo` first, then $GH_REPO, then the current checkout -- found by walking up from the
+    process's own working directory, which is the caller's, because the broker execs in place --
+    but only when that checkout names exactly one GitHub remote and has no `gh-resolved` entry
+    (`gh repo set-default`, which would point gh somewhere this cannot see). Guessing here answers
+    one repository's question with another's.
 
     Anything aimed at another GitHub host is None: gh takes `[HOST/]OWNER/REPO` and reads $GH_HOST,
     and an enterprise host's PR 7 is not the PR 7 in this cache."""
@@ -3321,10 +3349,13 @@ def broker_repo(values: dict[str, str]) -> str | None:
         if len(parts) > 2 and parts[-3].lower() not in BROKER_GITHUB_HOSTS:
             return None
         return f"{parts[-2].lower()}/{parts[-1].lower()}" if len(parts) >= 2 else None
-    text = git_config_text(Path.cwd())
+    checkout = broker_checkout(Path.cwd())
+    if checkout is None:
+        return None
+    text = git_config_text(checkout)
     if text is None or BROKER_RESOLVED_RE.search(text):
         return None
-    here = broker_remotes(Path.cwd())
+    here = broker_remotes(checkout)
     return here[0] if len(here) == 1 else None
 
 
@@ -3477,14 +3508,27 @@ def broker_logged_target(words: list[str], values: dict[str, str]) -> str:
 
 def broker_caller() -> str:
     """Who is making this call, by the same rule the PATH guard uses, so one log has one notion
-    of a caller: the agent session if there is one, else the parent process."""
-    return os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or f"ppid-{os.getppid()}"
+    of a caller: the agent session if there is one, else the parent process.
+
+    Shape-checked, because this is an environment variable going into a line-oriented log that
+    AUDIT_LINE reads as three whitespace-separated fields. The subcommand slot is checked the same
+    way; leaving this one open would just move the hole."""
+    named = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or ""
+    if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", named):
+        return named
+    return f"ppid-{os.getppid()}"
 
 
-# A read worth holding when the same caller repeats it: the ones whose answer the daemon could
-# have, named as (subcommand, verb). `gh api` GET joins them, by method rather than by name.
+# A read worth holding when the same caller repeats it: the ones a polling loop is written out of,
+# named as (subcommand, verb). `gh api` GET joins them, by method rather than by name. Reads that
+# are not poll shapes (`pr diff`, `issue view`) are left alone -- the delay is for the loop that
+# drained the pool three times in a day, not a toll on reading.
 BROKER_THROTTLED = {("pr", "view"), ("pr", "checks"), ("pr", "list"),
                     ("run", "view"), ("run", "list"), ("issue", "list")}
+# `GET /rate_limit` is documented as costing neither pool, and this file already treats it as free
+# (`request(free=True)`, audit_category's "rate_limit (free)"). Holding it punishes the session
+# doing the right thing: checking the budget around a batch of calls. `--web` opens a browser.
+BROKER_FREE_RE = re.compile(r"^(?:https?://api\.github\.com/)?/?rate_limit/?$")
 
 
 def broker_repeat_wait(args: list[str], words: list[str], method: str, now: float) -> float:
@@ -3497,8 +3541,12 @@ def broker_repeat_wait(args: list[str], words: list[str], method: str, now: floa
     guard it also delayed the reads the cache answers for nothing -- the 22% of all traffic this
     broker exists to serve, made slower by the thing meant to protect the quota they do not spend.
 
-    The slot is stamped before the sleep, so a burst of identical reads queues up rather than all
-    waking at the same moment."""
+    The bound is per call, not per target: the slot is stamped before the sleep, so a serial
+    polling loop is held `delay` apart each time around, but a parallel fan-out of n identical
+    reads is held once and then released over the following moments (the wait is capped at
+    `delay`, so the n-th does not wait n*delay). That is deliberate -- queueing fifty lanes
+    behind each other would be an outage, not a rate limit -- and it means this is a brake on a
+    loop, not a quota. What actually keeps a fan-out off GitHub is the cache above it."""
     try:
         delay = float(os.environ.get("CMUX_GH_MIN_REPEAT_SECONDS") or BROKER_MIN_REPEAT)
     except ValueError:
@@ -3508,6 +3556,10 @@ def broker_repeat_wait(args: list[str], words: list[str], method: str, now: floa
     first, second = (words + ["", ""])[:2]
     if (first, second) not in BROKER_THROTTLED and not (first == "api" and method == "GET"):
         return 0.0
+    if first == "api" and any(BROKER_FREE_RE.match(word) for word in words[1:2]):
+        return 0.0  # costs no quota, so there is nothing to protect by waiting
+    if "--web" in args:
+        return 0.0  # opens a browser; it reads nothing
     digest = hashlib.sha256("\0".join([broker_caller(), *args]).encode()).hexdigest()[:32]
     path = BASE / "broker-repeat.json"
     BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -3561,7 +3613,9 @@ def broker_log_call(words: list[str], values: dict[str, str]) -> None:
     line = BROKER_SECRET_RE.sub("[redacted]", line)
     path = guard_log()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        # 0700 like every other state path here: credentials are stripped, but this is every repo,
+        # PR, run and API path every session on the host reads, and no other local account needs it.
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with path.open("a") as stream:
             stream.write(f"{stamp} {caller} {line}\n")
     except OSError:
@@ -3569,11 +3623,26 @@ def broker_log_call(words: list[str], values: dict[str, str]) -> None:
 
 
 def broker_hops() -> int:
-    """How many times this call has already been through the broker. Carried across the exec in
-    BROKER_MARK; anything unreadable there counts as one hop, which only ever ends the chain
-    sooner. Older versions set it to "1", which still reads as one hop."""
+    """How many times *this* call has already been through the broker. Carried across the exec in
+    BROKER_MARK as "count:pid", and honoured only in the process the mark was written for.
+
+    The pid is what makes the mark about one call rather than one environment. A PATH loop is a
+    chain of execs, and an exec keeps the pid, so a call that really is coming back here still
+    carries its own mark and the chain stays finite. A `gh` that *spawns* `gh` -- an extension,
+    an alias, an $EDITOR hook -- is a new process, so it starts at zero: it gets brokered, served
+    and logged like any other call, instead of inheriting its parent's hop count and eventually
+    being refused for a loop that does not exist.
+
+    Anything unreadable in the mark counts as one hop, which only ever ends the chain sooner.
+    Older versions wrote a bare count, which still reads as one hop in any process."""
+    raw = os.environ.get(BROKER_MARK) or ""
+    if not raw:
+        return 0
+    count, _, owner = raw.partition(":")
+    if owner and owner != str(os.getpid()):
+        return 0  # another process's mark: it is not this call's history
     try:
-        return max(0, int(os.environ.get(BROKER_MARK) or 0))
+        return max(0, int(count))
     except ValueError:
         return 1
 
@@ -3586,7 +3655,10 @@ def broker_is_wrapper(candidate: Path) -> bool:
         with candidate.open("rb") as stream:
             head = stream.read(4096)
     except OSError:
-        return True
+        # A gh that cannot be read is not a Python or bash wrapper; it is a binary, or a file this
+        # account may execute but not read. Calling it a wrapper steps over a perfectly runnable
+        # gh, and if no fallback path exists the broker is then the reason the call failed.
+        return False
     return BROKER_MARK.encode() in head or b"gh guard" in head
 
 
@@ -3688,10 +3760,15 @@ def cmd_gh(args: list[str]) -> int:
               file=sys.stderr)
         return BROKER_EXIT_NO_GH
     try:
-        os.environ[BROKER_MARK] = str(hops + 1)  # survives the exec: this call is not brokered twice
+        # Survives the exec, so this call is not brokered twice; tagged with the pid so it means
+        # nothing to anything gh goes on to spawn (see broker_hops). execv keeps the pid, which is
+        # why the tag is written before it and not after.
+        os.environ[BROKER_MARK] = f"{hops + 1}:{os.getpid()}"
         # If `real` turns out to be the cmuxterm-hq PATH guard after all, this is what stops it
-        # delegating the call straight back here.
+        # delegating the call straight back here. Scoped the same way: a guard that gh spawns
+        # later is guarding a different call and must broker it normally.
         os.environ["CMUX_GH_BROKER_DISABLE"] = "1"
+        os.environ["GLAEDA_GH_BROKER_PID"] = str(os.getpid())
         os.execv(real, [real, *args])
     except OSError as error:
         print(f"glaeda-gh: cannot run {real}: {describe(error)}", file=sys.stderr)
