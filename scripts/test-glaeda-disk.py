@@ -3185,15 +3185,23 @@ class GlaedaDiskTest(unittest.TestCase):
         # 2026-10-21: gc.auto=0 from nightly.yml left 3935 packs in one runner's checkout; no pass repacked it
         home, _, tree = self._runner_checkout_packs(3)
         heads = self._git("-C", os.fspath(tree), "rev-list", "--all").split()
+        # a fetch's objects are unreachable until it moves its refs: a packed object no ref names must stay
+        (self.root / "in-flight").write_text("in flight\n")
+        loose = self._git("-C", os.fspath(tree), "hash-object", "-w", os.fspath(self.root / "in-flight")).strip()
+        subprocess.run(["git", "-C", os.fspath(tree), "pack-objects", "-q", ".git/objects/pack/pack"],
+                       input=loose + "\n", text=True, check=True, capture_output=True)
+        (tree / ".git/objects" / loose[:2] / loose[2:]).unlink()  # only in that pack now, as a fetch leaves it
+        self._age(home, hours=5)
         receipt = self.receipt()
         gd.process_evidence = lambda: ([], "")
-        with mock.patch.object(gd, "RUNNER_CHECKOUT_REPACK_PACKS", 3), self._gc_log(), \
+        with mock.patch.object(gd, "RUNNER_CHECKOUT_REPACK_PACKS", 4), self._gc_log(), \
                 contextlib.redirect_stdout(io.StringIO()):
             gd.repack_runner_checkouts(receipt, home)
         self.assertEqual(gd.git_pack_count(tree / ".git"), 1)
         rec = json.loads(receipt.read_text())
         self.assertEqual((rec["family"], rec["outcome"], rec["packs"], rec["packs_after"]),
-                         (gd.RUNNER_CHECKOUT_REPACK_FAMILY, "reclaimed", 3, 1))
+                         (gd.RUNNER_CHECKOUT_REPACK_FAMILY, "reclaimed", 4, 1))
+        self.assertEqual(self._git("-C", os.fspath(tree), "cat-file", "-t", loose).strip(), "blob")
         self.assertEqual(self._git("-C", os.fspath(tree), "rev-list", "--all").split(), heads)
         self._git("-C", os.fspath(tree), "fsck", "--no-progress")
 
