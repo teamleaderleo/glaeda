@@ -747,6 +747,27 @@ class TailscaleRouteRestart(Base):
         self.broken_twice()
         self.assertEqual(self.mini.did, [])
 
+    def test_a_wait_older_than_6_h_alerts(self) -> None:
+        # a stranded host lock or a stuck jobs/ entry looks busy forever: past 6 h it is no short wait
+        self.mini.busy = "a dev-build worker job is in /Users/Shared/cmux-build-fleet/jobs"
+        report = self.broken_twice()
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending")
+        report = self.run_once(NOW + SIX_H - 1)
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending")
+        report = self.run_once(NOW + SIX_H)
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible")
+        self.assertIn(f"waiting for an idle mini since {health.iso(NOW)}", f["note"])
+        self.assertIn("jobs", f["note"])
+        self.assertEqual(self.restarts(), 0)
+
+    def test_a_held_lock_older_than_6_h_alerts(self) -> None:
+        self.mini.lock_why = "a job or a fleet build holds the fleet host lock"
+        self.broken_twice()
+        report = self.run_once(NOW + SIX_H + 600)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("host lock", report["findings"][0]["note"])
+
     def test_a_host_gate_that_cannot_answer_alerts(self) -> None:
         self.mini.busy = health.NoAnswer("glaeda-disk's host gate could not answer (RuntimeError)")
         report = self.broken_twice()
@@ -1025,7 +1046,7 @@ class TailscaleRestartReads(unittest.TestCase):
 
     def disk(self, body: str) -> health.Mini:
         path = self.dir / "glaeda-disk"
-        path.write_text(body)
+        path.write_text(body + "\ndef host_busy_unreadable(reason):\n    return reason == 'cannot list processes'\n")
         mini = health.Mini(self.home)
         mini.disk_path = lambda: path
         return mini
@@ -1047,6 +1068,42 @@ class TailscaleRestartReads(unittest.TestCase):
         self.assertIsInstance(self.disk("X = 1\n").host_busy(), health.NoAnswer)
         busy = self.disk("def host_busy(fleet=None, now=None):\n    return 'a CI job is running (x)'\n").host_busy()
         self.assertNotIsInstance(busy, health.NoAnswer)
+        (self.dir / "old-disk").write_text("def host_busy(fleet=None, now=None):\n    return 'the host lock is unreadable'\n")
+        mini = health.Mini(self.home)
+        mini.disk_path = lambda: self.dir / "old-disk"
+        self.assertIsInstance(mini.host_busy(), health.NoAnswer, "a glaeda-disk without host_busy_unreadable")
+
+    def test_the_real_glaeda_disk_loads(self) -> None:
+        # its dataclasses need it in sys.modules while it loads; without that every restart read "could not answer"
+        disk = health.Mini(self.home).disk_module()
+        self.assertTrue(callable(disk.host_busy) and callable(disk.host_busy_unreadable))
+
+    def glaeda_disk_says(self, reason: str) -> str:
+        """Mini.host_busy over the real glaeda-disk, its host_busy answering reason."""
+        mini = health.Mini(self.home)
+        disk = mini.disk_module()
+        disk.host_busy = lambda fleet=None, now=None: reason
+        return mini.host_busy()
+
+    def test_glaeda_disk_cannot_list_processes_is_no_answer(self) -> None:
+        self.assertIsInstance(self.glaeda_disk_says("cannot list processes"), health.NoAnswer)
+
+    def test_glaeda_disk_cannot_read_jobs_is_no_answer(self) -> None:
+        self.assertIsInstance(self.glaeda_disk_says("cannot read /Users/Shared/cmux-build-fleet/jobs"), health.NoAnswer)
+
+    def test_glaeda_disk_unreadable_reservation_is_no_answer(self) -> None:
+        self.assertIsInstance(self.glaeda_disk_says("the host reservation is unreadable"), health.NoAnswer)
+
+    def test_glaeda_disk_unreadable_host_lock_is_no_answer(self) -> None:
+        self.assertIsInstance(self.glaeda_disk_says("the host lock is unreadable"), health.NoAnswer)
+
+    def test_glaeda_disk_busy_reasons_are_a_wait(self) -> None:
+        for reason in ("a CI job is running (Runner.Worker)", "a build is running (xcodebuild)", "the host is reserved",
+                       "a dev-build worker job is in /Users/Shared/cmux-build-fleet/jobs",
+                       "a fleet build holds the host lock"):
+            got = self.glaeda_disk_says(reason)
+            self.assertEqual(got, reason)
+            self.assertNotIsInstance(got, health.NoAnswer, reason)
 
     def test_the_host_lock_is_taken_exclusively_and_refused_while_a_job_holds_it(self) -> None:
         mini = health.Mini(self.home)

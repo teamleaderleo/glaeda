@@ -586,7 +586,12 @@ class Mini:
             sys.dont_write_bytecode = True
             loader = importlib.machinery.SourceFileLoader("glaeda_disk_for_health", os.fspath(self.disk_path()))
             module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
-            loader.exec_module(module)
+            sys.modules[loader.name] = module  # its dataclasses look their module up there while it loads
+            try:
+                loader.exec_module(module)
+            except BaseException:
+                sys.modules.pop(loader.name, None)
+                raise
             self._disk = module
         return self._disk
 
@@ -594,10 +599,14 @@ class Mini:
         """glaeda-disk's host_busy (a CI job or build, a dev-build worker job, a reservation, the host lock held), or
         why it could not answer: anything it cannot read is busy."""
         try:
-            busy = self.disk_module().host_busy(FLEET_DIR)
+            disk = self.disk_module()
+            busy = disk.host_busy(FLEET_DIR)
+            unreadable = disk.host_busy_unreadable(busy) if isinstance(busy, str) and busy else False
         except Exception as error:  # noqa: BLE001  (no answer is not idle)
             return NoAnswer(f"glaeda-disk's host gate could not answer ({type(error).__name__})")
-        return busy if isinstance(busy, str) else NoAnswer("glaeda-disk's host gate gave no answer")
+        if not isinstance(busy, str):
+            return NoAnswer("glaeda-disk's host gate gave no answer")
+        return NoAnswer(busy) if unreadable else busy
 
     def jobs_running(self) -> str:
         """After the host lock is held: a CI job or build that started before it was, by glaeda-disk's patterns."""
@@ -1188,7 +1197,7 @@ def route_ok(state: str | None, via: str | None) -> bool:
 
 
 def heal_tailscale_route(mini: Mini, f: dict[str, Any], now: float, runs: int, apply: bool, heal_ok: bool,
-                         path: Path) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
+                         path: Path, since: float | None = None) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
     """tailscale_no_route's restart behind every gate: (the finding as reported, the heal it ran or None, fixed).
     auto_fix stays pending only while a restart is still possible and none has failed: a restart that did not fix it
     (or an unreadable restart state) is impossible, the state ci-dash's health_alerts raises to an operator."""
@@ -1212,6 +1221,11 @@ def heal_tailscale_route(mini: Mini, f: dict[str, Any], now: float, runs: int, a
         return f, None, False
 
     def wait(why: str) -> tuple[dict[str, Any], None, bool]:
+        # busy for 6 h is no short wait (a stranded host lock, a stuck jobs/ entry): it alerts
+        stuck = (isinstance(since, (int, float)) and not isinstance(since, bool) and math.isfinite(since)
+                 and 0 <= since and now - since >= TAILSCALE_RESTART_EVERY_S)
+        if not isinstance(why, NoAnswer) and stuck and not failed:  # a failed restart's note already alerts
+            return stop("impossible", f"waiting for an idle mini since {iso(since)} (6 h or more): {why}")
         return stop("impossible" if isinstance(why, NoAnswer) else "pending", f"waiting for an idle mini: {why}")
 
     if not heal_ok:
@@ -1380,7 +1394,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         f["since"] = iso(s["since"])
         if f["code"] == "tailscale_no_route":  # its own gates and 6 h window, not HEALS' tries
             f, done_heal, fixed = heal_tailscale_route(mini, f, now, s["runs"], apply, heal_ok,
-                                                       restart_state_path(state_path))
+                                                       restart_state_path(state_path), s["since"])
             if done_heal:
                 heals.append(done_heal)
             if fixed:
