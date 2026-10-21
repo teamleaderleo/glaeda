@@ -2373,11 +2373,29 @@ time.sleep(60)
         try:
             self.assertEqual(self.job("macos-compile-admission", "u0", 9).returncode, 0)
             self.assertEqual(self.job("claude-wrapper", "u1", 9).returncode, 0)
-            threading.Timer(3.0, lambda: (worker.kill(), worker.wait())).start()  # reaped: no zombie lingers
+            # the hook's own output says when it is queued; only then does its Worker go (reaped: no zombie)
             began = time.monotonic()
-            gone = self.job("release-build", "u2", 9, worker.pid, "--gui-wait", "60")
+            env = {"GITHUB_JOB": "release-build", "RUNNER_NAME": "u2"}
+            push = event(self.dir, "push", {"repository": CMUX})
+            hook_run = subprocess.Popen(
+                [sys.executable, os.fspath(HOOK), "job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                 "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(worker.pid),
+                 "--capacity-units", "9", "--capacity-dir", os.fspath(self.dir / "capacity"), "--gui-wait", "60"],
+                env={"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                     "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+                     "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push),
+                     "GITHUB_REPOSITORY": "manaflow-ai/cmux", **env},
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            lines = []
+            for line in hook_run.stdout:
+                lines.append(line)
+                if "waiting (" in line and worker.poll() is None:
+                    worker.kill()
+                    worker.wait()
+            hook_run.wait(timeout=60)
             elapsed = time.monotonic() - began
-            out = gone.stdout + gone.stderr
+            out = "".join(lines)
+            gone = hook_run
             self.assertNotEqual(gone.returncode, 0, out)
             self.assertIn("waiting (", out, "it was waiting for units when its Worker went")
             self.assertTrue("Runner.Worker is gone" in out or "orphaned job-started hook" in out, out)

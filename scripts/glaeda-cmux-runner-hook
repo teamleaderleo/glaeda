@@ -1942,11 +1942,12 @@ class JobOwner(NamedTuple):
 
 
 def job_owner(explicit: int = 0) -> JobOwner | None:
-    """Pin this hook's job owner: the --watch-pid it was given, else the Runner.Worker above it (the wrapper execs
-    the hook, so that is normally the parent), else the observed parent. None once the parent is launchd."""
+    """Pin this hook's job owner: the --watch-pid it was given, else the parent it starts under (the wrapper execs
+    the hook, so that is the job's Runner.Worker), else the Runner.Worker above it. None once the parent is
+    launchd and no Worker is left above it."""
     if explicit:
         return JobOwner.of(explicit)
-    return JobOwner.of(runner_worker_pid() or 0) or JobOwner.of(os.getppid())
+    return JobOwner.of(os.getppid()) or JobOwner.of(runner_worker_pid() or 0)
 
 
 # Idle catch-up (glaeda-idle-warm): while a mini is idle and a root's kept build is far from main, it holds that
