@@ -1246,7 +1246,7 @@ runners) looks for what stopped runner minis on 2026-09-25 and 26 without anythi
 | `autologin_locks` (loginwindow `autoLoginUserScreenLocked`), `display_sleep` | none: root |
 | `testmanagerd_wedged`: the newest session line of this user's testmanagerd is `XCIDESession is responsible for cleaning up its socket`, 90 s old, nothing after it | the hook's `recycle_testmanagerd` (#1281) while no test runs; a hook without it gets the finding only |
 | `tailscale_down`: a BackendState other than `Running`, two runs in a row | `tailscale up` when Stopped, else `scutil --nc stop/start` of the Tailscale VPN service; a standalone tailscaled or a logged-out node is reported only |
-| `tailscale_no_route`: BackendState `Running`, but `route -n get 100.100.100.100` leaves by a non-utun interface (the tailnet route is gone), two runs in a row | reported only: a stop and start of the Tailscale VPN service (a `launchctl kickstart` of a standalone tailscaled) is its owner's |
+| `tailscale_no_route`: BackendState `Running`, but `route -n get 100.100.100.100` leaves by a non-utun interface (the tailnet route is gone), two runs in a row | a restart of Tailscale (never a config, auth or flag change), only on an idle CI runner mini and at most once every 6 h per mini (below); elsewhere reported only |
 | `tailscale_cli_missing`: a host with runner LaunchAgents has neither `/usr/local/bin/tailscale` (standalone) nor the Tailscale app's CLI | reported only (warn): the tunnel is not checked, so it is not counted healthy |
 | `tailscale_probe_error`: the Tailscale CLI gave no BackendState (timeout, error, no JSON) | reported only: the check could not look, so the tunnel is not judged down |
 | `runner_stopped:<agent>`: a runner LaunchAgent loaded but not running, two runs in a row | `launchctl kickstart` (nothing runs in it, so no job is cut) |
@@ -1259,6 +1259,38 @@ then the finding reads `impossible`. The report,
 sighting, evidence, `auto_fix` pending or impossible, and the heals of the last day), is what ci-dash's probe
 reads; ci-dash's Health section names the operator command for the rest. `glaeda-mini-health` alone prints
 the report without healing; `touch ~/.config/glaeda/mini-health.disabled` keeps it reporting but stops heals.
+
+**`tailscale_no_route`'s restart** (Leo, 2026-10-21) has its own gates instead of the 10-minute, 3-a-day rule,
+all of them failing closed (`heal_tailscale_route` in the script):
+
+1. **A CI runner mini only.** Registered glaeda runners (`actions-runner-glaeda*` with `.runner` and
+   `glaeda-hooks`), `~/.config/glaeda/update.json` setupArgs without `--hygiene-only`, `--gh-only` or
+   `--headless` and with no role but `fleet-mini`, and mini-setup's receipt role `fleet-mini`. A hard deny list
+   in the code, not in any config, refuses whatever the rest says when any name the host goes by (hostname,
+   LocalHostName, ComputerName, update.json's `host`, the tailnet name) is cmux-lawrence or holds "lawrence",
+   is air-blue, cosmic-gray, big-red, huge-blue, cmux16 or cmux-mac-mini, or looks like an AWS Mac (`aws`,
+   `ec2`, `ip-a-b-c-d`). A name or fact that cannot be read refuses.
+2. **Persistent.** The two-runs rule has reported it; by hand (no `--apply`) it never restarts.
+3. **Idle.** glaeda-disk's `host_busy` (the gate glaeda-idle-repair uses: no Runner.Worker or build, no
+   dev-build worker job, no reservation, the host lock free) says idle. Then it takes
+   `/Users/Shared/cmux-build-fleet/host.lock` exclusively, as with-host-lock and a fleet build do, so the runner
+   hook admits no job and idle listeners stop listening for the restart and its re-check (about 35 s), and
+   rechecks that no Runner.Worker or build started meanwhile. A job dispatched to a listener in that window is
+   refused by job-started (and re-run elsewhere), as during any fleet build.
+4. **Once per 6 h per mini.** `~/.local/state/glaeda/mini-health/tailscale-restart.json` records the attempt
+   before the restart runs, so a crash mid-restart still counts; an unreadable file refuses.
+5. **The flavor's restart, nothing else.** The Tailscale app (App Store or the System Extension build):
+   `scutil --nc stop` and `start` of its VPN service, as this user (what `tailscale_down`'s heal already does).
+   A standalone tailscaled: `sudo -n /bin/launchctl kickstart -k system/com.tailscale.tailscaled`, only where
+   sudoers allows exactly that without a password (checked with `sudo -n -l`, which runs nothing). The runner
+   user has no such rule by default, so there it stays reported with the rule it needs:
+   `<user> ALL=(root) NOPASSWD: /bin/launchctl kickstart -k system/com.tailscale.tailscaled`, which
+   `glaeda-mini-fleet sudo-plan --sudoers` installs when the host's manifest lists `com.tailscale.tailscaled`
+   under `launchd.running`. No `tailscale up`/`down`, `set`, login or flag change ever runs.
+6. **Verified once.** One 30 s wait, then one re-check of BackendState and the route. Fixed is a heal in the
+   report (`healed`); still broken stays a finding naming the result and the time the next restart is allowed.
+7. **Kill switch.** `touch ~/.config/glaeda/tailscale-restart-off`, or `GLAEDA_TAILSCALE_RESTART=off` in the
+   agent's environment (as glaeda-disk's `disk-off`); `mini-health.disabled` stops it too.
 
 ## 2m. Build mesh: the fleet index and kept state between PR minis
 

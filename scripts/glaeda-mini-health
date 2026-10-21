@@ -26,9 +26,24 @@ Each run checks, as the runner user and without sudo:
                                      non-utun interface (en0 to the LAN gateway), so no tailnet host reaches
                                      ssh here while `tailscale ping --tsmp` still answers (cmuxs-mac-mini-5,
                                      2026-10-21: 100.64/10 gone from the routing table). Reported after two
-                                     runs in a row (one when run by hand), never healed: the fix is a stop and
-                                     start of the Tailscale VPN service (a kickstart of a standalone tailscaled),
-                                     which its owner does.
+                                     runs in a row (one when run by hand). Healed under --apply by a restart of
+                                     Tailscale, never a config, auth or flag change, behind every one of these
+                                     gates (heal_tailscale_route): a CI runner mini (registered glaeda runners,
+                                     update.json setupArgs and mini-setup role fleet-mini, not --hygiene-only,
+                                     --gh-only or --headless) whose names miss the hard deny list
+                                     NEVER_RESTART_HOSTS/WORDS (cmux-lawrence, Leo's Macs, cmux16, cmux-mac-mini,
+                                     AWS Macs); the two-runs rule met; glaeda-disk's host_busy idle, then the
+                                     fleet host.lock held exclusively for the restart so no job is admitted, and
+                                     no Runner.Worker or build under it; no attempt in the last 6 h (the attempt
+                                     is written to tailscale-restart.json beside STATE before the restart runs;
+                                     an unreadable file refuses). The app (App Store or System Extension) gets
+                                     `scutil --nc stop/start` of its VPN service as this user; a standalone
+                                     tailscaled gets `sudo -n launchctl kickstart -k system/com.tailscale.tailscaled`
+                                     only where one exact NOPASSWD sudoers rule allows it (glaeda-mini-fleet
+                                     sudo-plan --sudoers), else it is reported with that rule. One 30 s wait, one
+                                     re-check of BackendState and the route; still broken is reported and not
+                                     retried for 6 h. Off with TAILSCALE_RESTART_OFF
+                                     (~/.config/glaeda/tailscale-restart-off) or GLAEDA_TAILSCALE_RESTART=off.
   tailscale_cli_missing              a host with runner LaunchAgents has no Tailscale CLI at all (neither the
                                      standalone /usr/local/bin/tailscale nor the app bundle's): the tunnel is not
                                      checked, which is no answer, not a healthy tunnel. Reported only.
@@ -67,7 +82,7 @@ Each run checks, as the runner user and without sudo:
                                      daemon restarts it at hot_hours (wait_idle daemons when the host is idle, or at
                                      busy_hot_hours). Reported here so ci-dash sees the wait; the heal is root's.
 
-A heal is tried at most every HEAL_EVERY_S and HEAL_TRIES times a day per finding, counting heals that worked
+A heal (other than tailscale_no_route's, above) is tried at most every HEAL_EVERY_S and HEAL_TRIES times a day per finding, counting heals that worked
 but did not last (a runner that exits again), so nothing loops. Each finding reads
 {id, code, severity, since, evidence, auto_fix, note}: auto_fix is "pending" while a heal will be tried,
 "impossible" when this user cannot fix it or the tries ran out. A fixed finding leaves the report and its heal is
@@ -82,6 +97,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import fcntl
 import importlib.machinery
 import importlib.util
 import json
@@ -90,6 +106,7 @@ import plistlib
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -136,6 +153,27 @@ XCTEST_RUNNING = re.compile(r"(?:^|/)xctest(?:\s|$)|(?:^|/)xcodebuild\s(?:.*\s)?
 LEAKED_TEST_APP = re.compile(r"^\s*'?(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+/Build/Products/Debug/cmux DEV\.app)(?:/Contents/MacOS/[^ ]+)?'?(?:\s|$)")
 LEAKED_APP_TERM_S = 1.0
 OTA_CONVERGE = ".local/state/glaeda/update/converge.json"  # glaeda-update's CONVERGE, under this home
+
+# tailscale_no_route's self-heal (Leo, 2026-10-21): a restart of Tailscale, only on an idle CI runner mini, at most
+# once every TAILSCALE_RESTART_EVERY_S per mini, never on cmux-lawrence, the AWS Macs or a person's Mac.
+TAILSCALE_RESTART_EVERY_S = 6 * 3600
+TAILSCALE_RESTART_SETTLE_S = 30  # the one bounded wait between the restart and its re-check
+TAILSCALE_RESTART_STATE = "tailscale-restart.json"  # beside STATE: the last attempt, written before it runs
+TAILSCALE_RESTART_SCHEMA = "glaeda-mini-health-tailscale-restart/v1"
+# The kill switch, as glaeda-disk's disk-off: this file, or GLAEDA_TAILSCALE_RESTART=off|0|false|no in the agent's env.
+TAILSCALE_RESTART_OFF = HOME / ".config/glaeda/tailscale-restart-off"
+TAILSCALE_RESTART_ENV = "GLAEDA_TAILSCALE_RESTART"
+TAILSCALED_LABEL = "com.tailscale.tailscaled"  # the standalone tailscaled's LaunchDaemon (tailscaled install-system-daemon)
+# Never restarted, whatever their runners, setup or a config says: hostnames (lowercase, no domain, spaces as
+# dashes) and words in them. cmux-lawrence is Lawrence's controller and the subrouter every session streams
+# through; air-blue, cosmic-gray, big-red and huge-blue are Leo's; cmux16 is Leo's builder and session host;
+# cmux-mac-mini holds production iOS credentials; the AWS Macs are no-touch (their EC2 names: ip-a-b-c-d).
+NEVER_RESTART_HOSTS = ("cmux-lawrence", "cmux-lawrences-mac-mini", "air-blue", "cosmic-gray", "big-red", "huge-blue",
+                       "cmux16", "cmux-mac-mini")
+NEVER_RESTART_WORDS = ("lawrence", "aws", "ec2")
+NEVER_RESTART_PATTERN = re.compile(r"ip-\d+-\d+-\d+-\d+|aws-.*|ec2-.*")
+# What the runner hook's FLEET_DIR is: its host.lock is the lock every job's admission takes (glaeda-cmux-runner-hook).
+FLEET_DIR = Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet")
 
 
 def sh(argv: list[str], timeout: float = 15, env: dict[str, str] | None = None) -> tuple[int, str]:
@@ -448,6 +486,120 @@ class Mini:
         path = self.home / ".local/state/glaeda/disk/summary.json"
         return load_json(path)
 
+    # ---- tailscale_no_route's restart: its gates' reads and the restart itself
+
+    def tailscale_restart_off(self) -> str:
+        return restart_switch_off(os.environ, os.path.lexists(TAILSCALE_RESTART_OFF))
+
+    def host_names(self) -> list[str]:
+        """Every name this host goes by: hostname, LocalHostName, ComputerName, update.json's host and its tailnet
+        name. A deny-listed name in any of them refuses the restart."""
+        names = [socket.gethostname()]
+        for key in ("LocalHostName", "ComputerName"):
+            names.append(sh(["/usr/sbin/scutil", "--get", key], timeout=5)[1].strip())
+        host = load_json(self.home / ".config/glaeda/update.json").get("host")
+        names.append(host if isinstance(host, str) else "")
+        cli = TAILSCALE_STANDALONE if os.path.exists(TAILSCALE_STANDALONE) else TAILSCALE_APP
+        try:
+            me = json.loads(sh([cli, "status", "--json"], env={**os.environ, **TAILSCALE_CLI_ENV})[1]).get("Self") or {}
+            names += [str(me.get("HostName") or ""), str(me.get("DNSName") or "").split(".")[0]]
+        except (ValueError, AttributeError):
+            pass
+        return [name for name in names if name]
+
+    def ci_mini_facts(self) -> dict[str, Any]:
+        """What makes this a CI runner mini, as glaeda set it up: registered glaeda runners (a .runner beside the
+        hooks), update.json's setupArgs (None when missing or unreadable: no answer) and mini-setup's role."""
+        try:
+            runners: int | None = sum(1 for d in self.runner_dirs() if (d / ".runner").is_file())
+        except OSError:
+            runners = None
+        setup_args: list[str] | None = None
+        try:
+            doc = json.loads((self.home / ".config/glaeda/update.json").read_text())
+            args = doc.get("setupArgs", ["--hygiene-only"]) if isinstance(doc, dict) else None  # glaeda-update's default
+            if isinstance(args, list) and all(isinstance(a, str) for a in args):
+                setup_args = args
+        except (OSError, ValueError):
+            pass
+        receipt = load_json(self.home / ".local/state/glaeda/mini-setup/receipt.json")
+        role = receipt.get("role") if receipt.get("role") in {"fleet-mini", "devbox"} else (
+            "fleet-mini" if receipt.get("profile") == "build-host" else None)  # mini-setup's reading of old receipts
+        return {"platform": sys.platform, "runners": runners, "setup_args": setup_args, "role": role}
+
+    def disk_path(self) -> Path:
+        return Path(os.environ.get("GLAEDA_DISK") or SCRIPT_DIR / "glaeda-disk")
+
+    def disk_module(self) -> Any:
+        """glaeda-disk, for its host gate (host_busy) and job patterns: the idle check glaeda-idle-repair uses."""
+        if getattr(self, "_disk", None) is None:
+            sys.dont_write_bytecode = True
+            loader = importlib.machinery.SourceFileLoader("glaeda_disk_for_health", os.fspath(self.disk_path()))
+            module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+            loader.exec_module(module)
+            self._disk = module
+        return self._disk
+
+    def host_busy(self) -> str:
+        """glaeda-disk's host_busy (a CI job or build, a dev-build worker job, a reservation, the host lock held), or
+        why it could not answer: anything it cannot read is busy."""
+        try:
+            busy = self.disk_module().host_busy(FLEET_DIR)
+        except Exception as error:  # noqa: BLE001  (no answer is not idle)
+            return f"glaeda-disk's host gate could not answer ({type(error).__name__})"
+        return busy if isinstance(busy, str) else "glaeda-disk's host gate gave no answer"
+
+    def jobs_running(self) -> str:
+        """After the host lock is held: a CI job or build that started before it was, by glaeda-disk's patterns."""
+        try:
+            disk = self.disk_module()
+            patterns = (disk.CI_WORKER, disk.BUILD_PROCESS)
+        except Exception as error:  # noqa: BLE001
+            return f"glaeda-disk's job patterns could not be read ({type(error).__name__})"
+        rows = self.processes()
+        if not rows:
+            return "cannot list processes"
+        for _pid, _uid, _stat, command in rows:
+            if any(p.search(command) for p in patterns):
+                return f"a CI job or build is running ({command[:120]})"
+        return ""
+
+    @contextlib.contextmanager
+    def hold_host_lock(self):
+        """Hold the fleet host lock exclusively, as with-host-lock and a fleet build do, so no job is admitted (the
+        runner hook refuses or waits, and idle listeners stop) while Tailscale restarts. Yields "" when held, else why
+        not; never waits."""
+        if not FLEET_DIR.is_dir() or FLEET_DIR.is_symlink():
+            yield f"no fleet dir {FLEET_DIR}: nothing would hold jobs off during the restart"
+            return
+        try:
+            fd = os.open(FLEET_DIR / "host.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+        except OSError as error:
+            yield f"cannot open the fleet host lock ({type(error).__name__})"
+            return
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                yield "a job or a fleet build holds the fleet host lock"
+                return
+            yield ""
+        finally:
+            os.close(fd)  # closing the only fd drops the flock
+
+    def sudo_allows(self, argv: list[str]) -> bool:
+        """Whether sudoers lets this user run exactly argv (after `sudo -n`) without a password; runs nothing."""
+        return sh(["/usr/bin/sudo", "-n", "-l", *argv[2:]], timeout=10)[0] == 0
+
+    def run_restart(self, commands: list[list[str]]) -> tuple[bool, str]:
+        said = []
+        for i, argv in enumerate(commands):
+            if i:
+                self.sleep(3)
+            code = sh(argv, timeout=30)[0]
+            said.append(f"{' '.join(argv)}: exit {code}")
+        return all(s.endswith(": exit 0") for s in said), "; ".join(said)
+
 
 # ---------------------------------------------------------------- checks
 
@@ -608,11 +760,11 @@ def check_tailscale(mini: Mini) -> list[dict[str, Any]]:
         via = mini.tailnet_route()
         if via is None or via.startswith("utun"):
             return []
-        fix = ("root: sudo launchctl kickstart -k system/com.tailscale.tailscaled" if got[0] == "standalone"
-               else "stop and start the Tailscale VPN service (scutil --nc)")
-        return [finding("tailscale_no_route", "error", f"Tailscale ({got[0]}) BackendState Running, but the OS "
-                        f"routes {TAILNET_PROBE_IP} out of {via}, not the tunnel: no tailnet host reaches ssh here",
-                        "impossible", f"{fix}; its owner does that")]
+        f = finding("tailscale_no_route", "error", f"Tailscale ({got[0]}) BackendState Running, but the OS "
+                    f"routes {TAILNET_PROBE_IP} out of {via}, not the tunnel: no tailnet host reaches ssh here",
+                    "pending", restart_fix(got[0]))
+        f["flavor"] = got[0]  # which restart heal_tailscale_route runs
+        return [f]
     flavor, state, said = got
     if state is None:  # the check could not look: never a tailscale_down, a heal or an unstick on a guess
         return [finding("tailscale_probe_error", "warn", said, "impossible",
@@ -781,6 +933,178 @@ def heal_tailscale(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
     return False, f"{what}: still {state or 'no BackendState'}"
 
 
+def restart_fix(flavor: str) -> str:
+    """What restarts this flavor of Tailscale (the finding's note before any gate speaks)."""
+    if flavor == "standalone":
+        return f"root: sudo launchctl kickstart -k system/{TAILSCALED_LABEL}"
+    return "stop and start the Tailscale VPN service (scutil --nc)"
+
+
+def restart_switch_off(env: Any, switch_exists: bool) -> str:
+    """Why the Tailscale restart's kill switch is on, or "": TAILSCALE_RESTART_OFF exists, or the env says off."""
+    if switch_exists:
+        return f"{TAILSCALE_RESTART_OFF} exists"
+    value = str(env.get(TAILSCALE_RESTART_ENV, "")).strip().lower()
+    if value in {"0", "off", "false", "no"}:
+        return f"{TAILSCALE_RESTART_ENV}={value}"
+    return ""
+
+
+def host_key(name: str) -> str:
+    return (name.strip().lower().split(".")[0].replace(" ", "-")
+            .replace("’", "").replace("'", ""))
+
+
+def ci_mini_refusal(names: list[str], facts: dict[str, Any]) -> str:
+    """Why this host is not a CI runner mini whose Tailscale may be restarted, or "" when it is. Fails closed: no
+    name, an unreadable fact or an unknown role refuses. The deny list is code, not configuration."""
+    if not names:
+        return "this host's name cannot be read"
+    for name in names:
+        host = host_key(name)
+        if (host in NEVER_RESTART_HOSTS or any(word in host for word in NEVER_RESTART_WORDS)
+                or NEVER_RESTART_PATTERN.fullmatch(host)):
+            return f"{host} never has its Tailscale restarted by mini-health"
+    if facts.get("platform") != "darwin":
+        return "not a macOS mini"
+    runners = facts.get("runners")
+    if runners is None:
+        return "its glaeda runners cannot be read"
+    if not runners:
+        return "no registered glaeda runner here"
+    args = facts.get("setup_args")
+    if args is None:
+        return "~/.config/glaeda/update.json's setupArgs cannot be read"
+    for flag in ("--hygiene-only", "--gh-only", "--headless"):
+        if flag in args:
+            return f"set up {flag} (not a CI runner mini)"
+    for i, arg in enumerate(args):
+        role = arg.split("=", 1)[1] if arg.startswith("--role=") else (
+            args[i + 1] if arg == "--role" and i + 1 < len(args) else None)
+        if role is not None and role != "fleet-mini":
+            return f"set up --role={role}, not fleet-mini"
+    if facts.get("role") != "fleet-mini":
+        return f"mini-setup's role is {facts.get('role') or 'unknown'}, not fleet-mini"
+    return ""
+
+
+def restart_state_path(state_path: Path) -> Path:
+    return state_path.with_name(TAILSCALE_RESTART_STATE)
+
+
+def load_restart_state(path: Path) -> dict[str, Any] | None:
+    """The restart state: {} when there was never an attempt, None when it cannot be read (fail closed)."""
+    try:
+        doc = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def restart_window_refusal(doc: dict[str, Any] | None, now: float) -> str:
+    """Why the once-per-TAILSCALE_RESTART_EVERY_S window forbids a restart now, or "" when it allows one."""
+    if doc is None:
+        return f"the restart state ({TAILSCALE_RESTART_STATE}) is unreadable, so the 6 h window cannot be checked"
+    if "last_attempt_at" not in doc:
+        return ""
+    at = doc.get("last_attempt_at")
+    if not isinstance(at, (int, float)) or isinstance(at, bool):
+        return f"the restart state's last attempt is unreadable ({at!r}), so the 6 h window cannot be checked"
+    if at > now:  # a clock step back: the attempt still happened, so the window starts from now
+        return f"the last restart is stamped in the future ({iso(at)}); none before {iso(now + TAILSCALE_RESTART_EVERY_S)}"
+    if now - at < TAILSCALE_RESTART_EVERY_S:
+        result = f" ({doc['result']})" if isinstance(doc.get("result"), str) else ""
+        return (f"restarted at {iso(at)}{result}; at most once per 6 h, next after "
+                f"{iso(at + TAILSCALE_RESTART_EVERY_S)}")
+    return ""
+
+
+def restart_commands(flavor: str, service: str | None) -> list[list[str]]:
+    """The restart for this flavor, and nothing else: no config, auth or flag changes. A standalone tailscaled is
+    its LaunchDaemon's kickstart -k (root, through one exact NOPASSWD sudoers rule); the app (the App Store app or
+    the standalone System Extension app) is a stop and start of its VPN service, as tailscale_down's heal does."""
+    if flavor == "standalone":
+        return [["/usr/bin/sudo", "-n", "/bin/launchctl", "kickstart", "-k", f"system/{TAILSCALED_LABEL}"]]
+    if service is None:
+        return []
+    return [["/usr/sbin/scutil", "--nc", "stop", service], ["/usr/sbin/scutil", "--nc", "start", service]]
+
+
+def route_ok(state: str | None, via: str | None) -> bool:
+    return state == "Running" and via is not None and via.startswith("utun")
+
+
+def heal_tailscale_route(mini: Mini, f: dict[str, Any], now: float, runs: int, apply: bool, heal_ok: bool,
+                         path: Path) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
+    """tailscale_no_route's restart behind every gate: (the finding as reported, the heal it ran or None, fixed)."""
+    f = dict(f)
+    flavor = f.pop("flavor", None) or ("standalone" if "(standalone)" in f["evidence"] else "app")
+    fix = restart_fix(flavor)
+
+    def stop(auto_fix: str, why: str) -> tuple[dict[str, Any], None, bool]:
+        f["auto_fix"], f["note"] = auto_fix, f"{fix}; {why}"[:300]
+        return f, None, False
+
+    if not heal_ok:
+        return stop("pending", f"healing is off ({KILL_SWITCH})")
+    off = mini.tailscale_restart_off()
+    if off:
+        return stop("pending", f"the Tailscale restart is off ({off})")
+    refused = ci_mini_refusal(mini.host_names(), mini.ci_mini_facts())
+    if refused:
+        return stop("impossible", f"not restarted here: {refused}; its owner does that")
+    commands = restart_commands(flavor, mini.vpn_service() if flavor == "app" else None)
+    if not commands:
+        return stop("impossible", "no Tailscale VPN service (scutil --nc list) to restart")
+    if flavor == "standalone" and not mini.sudo_allows(commands[0]):
+        user = os.environ.get("USER") or "the runner user"
+        return stop("impossible", f"needs the sudoers rule `{user} ALL=(root) NOPASSWD: /bin/launchctl kickstart -k "
+                    f"system/{TAILSCALED_LABEL}` (glaeda-mini-fleet sudo-plan --sudoers)")
+    if not apply or runs < REPORT_AFTER.get("tailscale_no_route", 1):
+        return stop("pending", "mini-health --apply restarts it when the mini is idle, at most once per 6 h")
+    window = restart_window_refusal(load_restart_state(path), now)
+    if window:
+        return stop("pending", window)
+    busy = mini.host_busy()
+    if busy:
+        return stop("pending", f"waiting for an idle mini: {busy}")
+    with mini.hold_host_lock() as held:
+        if held:
+            return stop("pending", f"waiting for an idle mini: {held}")
+        busy = mini.jobs_running()
+        if busy:
+            return stop("pending", f"waiting for an idle mini: {busy}")
+        window = restart_window_refusal(load_restart_state(path), now)  # another pass may have gone first
+        if window:
+            return stop("pending", window)
+        attempt = {"schema": TAILSCALE_RESTART_SCHEMA, "last_attempt_at": now, "at": iso(now), "flavor": flavor,
+                   "commands": commands, "evidence": f["evidence"], "result": "started", "ok": False}
+        try:
+            write_json(path, attempt)  # written before the restart runs: a crash mid-restart still counts
+        except OSError as error:
+            return stop("pending", f"cannot write the restart state ({type(error).__name__}): not restarted")
+        ran, what = mini.run_restart(commands)
+        mini.sleep(TAILSCALE_RESTART_SETTLE_S)  # one bounded wait, then one re-check
+        got = mini.tailscale()
+        state = got[1] if got else None
+        via = mini.tailnet_route() if state == "Running" else None
+        fixed = route_ok(state, via)
+        result = (f"Running, {TAILNET_PROBE_IP} via {via}" if fixed else
+                  f"still {state or 'no BackendState'}, {TAILNET_PROBE_IP} via {via or 'unknown'}")
+        with contextlib.suppress(OSError):
+            write_json(path, {**attempt, "result": result, "ok": fixed, "ran": what[:300], "checked_at": iso(now)})
+    action = f"restarted Tailscale ({flavor}{'' if ran else ', a command failed'}): {result}; {what}"
+    heal = {"id": f["id"], "ok": fixed, "action": action[:200]}
+    if fixed:
+        return f, heal, True
+    f["auto_fix"] = "pending"
+    f["note"] = (f"restarted Tailscale ({flavor}) at {iso(now)}: {result}; no retry before "
+                 f"{iso(now + TAILSCALE_RESTART_EVERY_S)} (once per 6 h); {what}")[:300]
+    return f, heal, False
+
+
 def agent_label(agent: str) -> str:
     return "com.teamleaderleo.glaeda.cmux-runner" + ("" if agent == "0" else f".{agent}")
 
@@ -871,6 +1195,18 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         if apply and s["runs"] < REPORT_AFTER.get(f["code"], 1):
             continue  # seen, not yet reported
         f["since"] = iso(s["since"])
+        if f["code"] == "tailscale_no_route":  # its own gates and 6 h window, not HEALS' tries
+            f, done_heal, fixed = heal_tailscale_route(mini, f, now, s["runs"], apply, heal_ok,
+                                                       restart_state_path(state_path))
+            if done_heal:
+                heals.append(done_heal)
+            if fixed:
+                healed.append({"id": f["id"], "code": f["code"], "t": now, "at": iso(now), "since": f["since"],
+                               "evidence": f["evidence"], "action": done_heal["action"], "auto_fix": "done"})
+                seen.pop(f["id"], None)
+                continue
+            findings.append(f)
+            continue
         heal = HEALS.get(f["code"])
         t = tries.get(f["id"]) or {"n": 0, "at": 0}
         # a heal that worked and did not last (a runner that exits again) counts too, so nothing loops for a day
