@@ -41,11 +41,14 @@ What --apply installs (templated for the current user):
                                                LAN_FETCH_ROOT_COPY, which needs sudo: an operator step
     ~/.local/bin/glaeda-idle-warm              from scripts/glaeda-idle-warm (builds main into a far kept root while an
                                                owned cmux mini is idle; a no-op anywhere else)
+    ~/.local/bin/glaeda-daemon-heal            from scripts/glaeda-daemon-heal (restarts a macOS daemon that holds a core for
+                                               hours; glaeda-mini-health installs its root LaunchDaemon where sudo -n works)
+    ~/.local/share/glaeda/macos-daemons.json   from config/macos-daemons.json (that desired state and its limits)
     ~/.local/bin/glaeda-mini-health            from scripts/glaeda-mini-health (finds what stops a runner mini, heals what
                                                the runner user can, reports the rest for ci-dash; a no-op off a runner)
     ~/.local/bin/glaeda-idle-repair            durable repair queue: records busy hosts and runs disk/health repairs on
                                                the first idle LaunchAgent tick
-    ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
+    ~/.local/bin/glaeda-update                 from scripts/glaeda-update (over-the-air updates every 10 min)
     ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
     ~/.local/bin/glaeda-wallpaper-rotate       from scripts/glaeda-wallpaper-rotate (operator-supplied stills, every 30 minutes)
     ~/.local/bin/glaeda-runner-hygiene         from scripts/glaeda-runner-hygiene (root-installed per-account cache policy)
@@ -148,6 +151,15 @@ DARWIN_REQUIRED = True
 HOST_PLATFORM = "linux" if platform.system() == "Linux" else "macos"
 # Linux: the systemd user units installed verbatim from ops/systemd, which stay their one definition.
 SYSTEMD_UNITS_DIR = REPO / "ops/systemd"
+
+
+def update_every_s() -> int:
+    """glaeda-update's APPLY_EVERY_S, its one definition: the agent runs it that often and its backoff starts
+    there. Read from the source beside this script, so a release's setup schedules that release's updater."""
+    match = re.search(r"^APPLY_EVERY_S = (\d+)\b", (SCRIPT_DIR / "glaeda-update").read_text(), re.M)
+    if not match:
+        raise RuntimeError("scripts/glaeda-update defines no APPLY_EVERY_S")
+    return int(match.group(1))
 LINUX_UNITS = (
     "glaeda-disk-pressure.service",
     "glaeda-disk-pressure.timer",
@@ -166,6 +178,7 @@ DEVBOX_LINUX_UNITS = frozenset({"glaeda-projects-tidy.service", "glaeda-projects
 DAEMON_UNITS = frozenset({"glaeda-gh.service"})
 # the Claude Code skill installed beside the tools
 SKILL_SOURCE = REPO / "skills/github-ci-wait/SKILL.md"
+DAEMON_POLICY_SOURCE = REPO / "config/macos-daemons.json"  # desired state of macOS system daemons
 # glaeda-update runs this command from a release; it sets this so setup never unloads the job running it
 UPDATE_ENV = "GLAEDA_UPDATE_RUNNING"
 OTA_RINGS = ("canary", "stable")
@@ -751,12 +764,12 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-worktree-reclaim.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-worktree-reclaim.err"),
         },
-        # Over-the-air updates (scripts/glaeda-update): hourly, installs this host's release ring and
-        # rolls back when the new tools do not run.
+        # Over-the-air updates (scripts/glaeda-update): every APPLY_EVERY_S, converges this host on its
+        # release ring (backing off while it cannot) and rolls back when the new tools do not run.
         LABEL_PREFIX + "update": {
             "Label": LABEL_PREFIX + "update",
             "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-update"), "--apply"],
-            "StartInterval": 3600,
+            "StartInterval": update_every_s(),
             "ProcessType": "Background",
             "LowPriorityIO": True,
             "Nice": 10,
@@ -946,6 +959,11 @@ def is_gh_agent(label: str) -> bool:
 
 def skill_path(ctx: Context) -> Path:
     return ctx.home / ".claude/skills/github-ci-wait/SKILL.md"
+
+
+def daemon_policy_path(ctx: Context) -> Path:
+    """config/macos-daemons.json, where glaeda-mini-health and glaeda-daemon-heal read it."""
+    return ctx.home / ".local/share/glaeda/macos-daemons.json"
 
 
 def is_update_agent(label: str) -> bool:
@@ -1204,13 +1222,16 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
     for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
                  "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
-                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
+                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
     # a copy, not a link: the release tree it came from is replaced by the next update
     act = file_action(ctx, "tool", skill_path(ctx), SKILL_SOURCE.read_bytes(), 0o644)
     act["source"] = os.fspath(SKILL_SOURCE)
+    actions.append(act)
+    act = file_action(ctx, "tool", daemon_policy_path(ctx), DAEMON_POLICY_SOURCE.read_bytes(), 0o644)
+    act["source"] = os.fspath(DAEMON_POLICY_SOURCE)
     actions.append(act)
     mode, source, note = reclaim_source(ctx)
     dest = ctx.bin / "glaeda-worktree-reclaim"
@@ -1393,9 +1414,10 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
                         "loaded": agent_loaded(ctx, label)})
     for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
                  "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
-                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
+                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
+    actions.append({"kind": "tool", "path": os.fspath(daemon_policy_path(ctx))})
     for marker in scan_exclusion_markers(ctx):
         actions.append({"kind": "marker", "path": os.fspath(marker)})
     for act in actions:

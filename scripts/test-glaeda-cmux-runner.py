@@ -2355,6 +2355,130 @@ time.sleep(60)
             for runner in ("u0", "u1", "u2", "u3", "u4"):
                 self.finish(runner)
 
+    def owner_gone_checks(self, out: str, elapsed: float) -> None:
+        """A job whose Runner.Worker went away mid-wait: the wait ends at once, nothing is held, and the hook never
+        watches launchd (cmux10s 2026-10-20: "the watched process 1 has no stable identity", a refused-1 note)."""
+        self.assertNotIn("no stable identity", out)
+        self.assertNotIn("watching pid 1)", out)
+        self.assertLess(elapsed, 20, "a dead owner ends the wait; it never sits out --gui-wait")
+        state = self.dir / "state"
+        self.assertEqual(sorted(p.name for p in state.glob("refused-*")), [], "no refusal note for a gone job")
+        self.assertFalse(hook.holder_alive(state / "host-lock-holder-u2.pid"), out)
+
+    def test_capacity_a_worker_that_dies_mid_wait_is_abandoned_not_refused(self) -> None:
+        # The job's Runner.Worker (here a sleep the hook is told to watch) exits while its hook waits for units,
+        # as a cancelled job's Worker does. The hook lets go of the wait instead of refusing on a later parent.
+        self.fleet()
+        worker = subprocess.Popen(["/bin/sleep", "60"])
+        try:
+            self.assertEqual(self.job("macos-compile-admission", "u0", 9).returncode, 0)
+            self.assertEqual(self.job("claude-wrapper", "u1", 9).returncode, 0)
+            # the hook's own output says when it is queued; only then does its Worker go (reaped: no zombie)
+            began = time.monotonic()
+            env = {"GITHUB_JOB": "release-build", "RUNNER_NAME": "u2"}
+            push = event(self.dir, "push", {"repository": CMUX})
+            hook_run = subprocess.Popen(
+                [sys.executable, os.fspath(HOOK), "job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                 "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(worker.pid),
+                 "--capacity-units", "9", "--capacity-dir", os.fspath(self.dir / "capacity"), "--gui-wait", "60"],
+                env={"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                     "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+                     "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push),
+                     "GITHUB_REPOSITORY": "manaflow-ai/cmux", **env},
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            lines = []
+            for line in hook_run.stdout:
+                lines.append(line)
+                if "waiting (" in line and worker.poll() is None:
+                    worker.kill()
+                    worker.wait()
+            hook_run.wait(timeout=60)
+            elapsed = time.monotonic() - began
+            out = "".join(lines)
+            gone = hook_run
+            self.assertNotEqual(gone.returncode, 0, out)
+            self.assertIn("waiting (", out, "it was waiting for units when its Worker went")
+            self.assertTrue("Runner.Worker is gone" in out or "orphaned job-started hook" in out, out)
+            self.owner_gone_checks(out, elapsed)
+        finally:
+            worker.kill()
+            worker.wait()
+            for runner in ("u0", "u1", "u2"):
+                self.finish(runner)
+
+    def test_capacity_a_reparented_hook_never_watches_launchd(self) -> None:
+        # No --watch-pid: the hook pins its real parent at start. The parent exits mid-wait and the hook is
+        # reparented (to launchd on a mini); it must not then take os.getppid() as the job.
+        self.fleet()
+        push = event(self.dir, "push", {"repository": CMUX})
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                   "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+                   "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push),
+                   "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_JOB": "release-build", "RUNNER_NAME": "u2"}
+        log = self.dir / "orphan.out"
+        args = [sys.executable, os.fspath(HOOK), "job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                "--state-dir", os.fspath(self.dir / "state"), "--capacity-units", "9",
+                "--capacity-dir", os.fspath(self.dir / "capacity"), "--gui-wait", "60"]
+        try:
+            self.assertEqual(self.job("macos-compile-admission", "u0", 9).returncode, 0)
+            self.assertEqual(self.job("claude-wrapper", "u1", 9).returncode, 0)
+            # the parent starts the hook as a child (no exec), waits until it is queued, then exits
+            script = ('"$@" >"$LOG" 2>&1 & echo $! >"$LOG.pid"; '
+                      'for _ in $(seq 100); do grep -q "waiting (" "$LOG" 2>/dev/null && break; sleep 0.1; done; exit 0')
+            began = time.monotonic()
+            parent = subprocess.run(["/bin/bash", "-c", script, "parent", *args], env={**environ, "LOG": os.fspath(log)},
+                                    timeout=30, check=False)
+            self.assertEqual(parent.returncode, 0)
+            child = int(Path(f"{log}.pid").read_text())
+            deadline = time.monotonic() + 30
+            while hook.pid_alive(child) and time.monotonic() < deadline:
+                time.sleep(0.2)
+            elapsed = time.monotonic() - began
+            out = log.read_text()
+            self.assertFalse(hook.pid_alive(child), "the orphaned hook outlived its parent: " + out)
+            self.assertIn("waiting (", out)
+            self.owner_gone_checks(out, elapsed)
+        finally:
+            for runner in ("u0", "u1", "u2"):
+                self.finish(runner)
+
+    def test_hold_never_hands_locks_to_a_holder_watching_nobody(self) -> None:
+        state = self.dir / "state"
+        for watch in (0, 1):  # launchd, or no pid at all, is never a job
+            self.assertIsNone(hook.JobOwner.of(watch))
+            r, w = os.pipe()
+            os.close(r)
+            ok, why = hook.hold([w], watch, state)
+            self.assertFalse(ok)
+            self.assertIn("no stable identity", why)
+            with self.assertRaises(OSError, msg="the fd went back"):
+                os.fstat(w)
+        dead = subprocess.Popen(["/bin/sleep", "60"])
+        owner = hook.JobOwner.of(dead.pid)
+        self.assertIsNotNone(owner)
+        dead.kill()
+        dead.wait()
+        r, w = os.pipe()
+        os.close(r)
+        ok, why = hook.hold([w], owner, state)
+        self.assertFalse(ok)
+        self.assertIn(hook.OWNER_GONE, why)
+        with self.assertRaises(OSError):
+            os.fstat(w)
+        self.assertFalse(hook.holder_file(state).exists(), "no holder was started")
+        # a pinned owner survives the hook being reparented: job_owner never falls back to launchd
+        with mock.patch.object(hook, "runner_worker_pid", return_value=None), \
+                mock.patch.object(hook.os, "getppid", return_value=1):
+            self.assertIsNone(hook.job_owner())
+        me = hook.job_owner(os.getpid())
+        self.assertEqual(me.pid, os.getpid())
+        self.assertTrue(me.alive())
+        self.assertFalse(me.gone())
+        with mock.patch.object(hook, "process_identity", return_value=None):
+            self.assertFalse(me.gone(), "an unreadable start token is unknown, never a gone owner")
+        with mock.patch.object(hook, "process_identity", return_value="ps:reused"):
+            self.assertTrue(me.gone(), "a reused pid is another process")
+
     def test_capacity_e2e_build_takes_the_gui_token_for_its_tests_only(self) -> None:
         # test-e2e's build compiles, then takes the gui token itself (take-gui) before its console-session tests
         self.fleet()
@@ -5528,7 +5652,8 @@ class RunnerTest(unittest.TestCase):
         prefixes = ("glaeda-std", "glaeda-root", "glaeda-side", "glaeda-gui", "glaeda-session")
         self.assertEqual([[x for x in l if x.startswith(prefixes)] for l in labels],
                          [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"],
-                          ["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"],
+                          ["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6",
+                           "glaeda-side-light-xcode-26.6"],
                           ["glaeda-gui-std-xcode-26.6", "glaeda-session-std-xcode-26.6"]],
                          "the gui runner carries neither the pool label nor a root or side one, and the session label")
         self.assertIn("glaeda-ios-sim", labels[0])
@@ -5547,7 +5672,7 @@ class RunnerTest(unittest.TestCase):
                                                           "glaeda-session"))]
         self.assertEqual([roles(l) for l in labels],
                          [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"]] * 2
-                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"]] * 2
+                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"]] * 2
                          + [["glaeda-session-std-xcode-26.6"], ["glaeda-gui-std-xcode-26.6"]],
                          "only the last carries the gui label, so no console job lands where its token is held, and "
                          "with a session runner beside it the console runner leaves session jobs to that one")
@@ -5592,7 +5717,7 @@ class RunnerTest(unittest.TestCase):
                                                           "glaeda-fast"))]
         self.assertEqual([roles(l) for l in today],
                          [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"]] * 2
-                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"]] * 3)
+                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"]] * 3)
         zero, zero_hooks = self.fast_labels({**base, "fastRunners": 0}, "zero")
         self.assertEqual((zero, zero_hooks), (today, today_hooks), "fastRunners 0 is today's fleet exactly")
         self.assertFalse([h for h in today_hooks if "--fast-runner" in h])
@@ -6343,6 +6468,36 @@ MANIFEST = {
 
 
 class ManifestLabelsTest(unittest.TestCase):
+    def test_side_labels_widen_to_narrower_classes_only(self) -> None:
+        # One rule from the manifest's class order: a side runner carries its own class's side label and every
+        # narrower class's, so GitHub hands a starved light queue to idle std side runners; a light runner never
+        # carries a std label, and root labels never widen.
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["hosts"]["mini-light"]["availability"] = "dedicated"
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            std, _ = cr.member_labels(manifest, "mini-std")
+            light, _ = cr.member_labels(manifest, "mini-light")
+        self.assertEqual(light["sidePools"], ["glaeda-side-light-xcode-26.6"])
+        self.assertEqual(light["rootPools"], ["glaeda-root-light-xcode-26.6"])
+        self.assertFalse([label for label in light["labels"] + light["sidePools"] if "-std-" in label])
+        self.assertEqual(std["sidePools"], ["glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"])
+        self.assertEqual(std["rootPools"], ["glaeda-root-std-xcode-26.6"])
+        self.assertEqual(std["pools"], ["glaeda-std-xcode-26.6"], "the pool count stays the member's own class")
+        self.assertEqual(fleet_labels.side_classes("xl"), ("xl", "std", "light"))
+        self.assertEqual(fleet_labels.side_classes("dev"), ())
+        # A runner registered before the widening converges to what member_labels issues now.
+        self.assertEqual(fleet_labels.widened_labels(["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"]),
+                         ["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"])
+        self.assertEqual(fleet_labels.widened_labels(std["labels"] + std["sidePools"]), std["labels"] + std["sidePools"])
+        once = fleet_labels.widened_labels(["glaeda-aws-side-std-xcode-26.6", "glaeda-side-trusted-std-xcode-26.6"])
+        self.assertEqual(once, ["glaeda-aws-side-std-xcode-26.6", "glaeda-side-trusted-std-xcode-26.6",
+                                "glaeda-aws-side-light-xcode-26.6", "glaeda-side-trusted-light-xcode-26.6"])
+        self.assertEqual(fleet_labels.widened_labels(once), once)
+        for unchanged in (["glaeda-side-light-xcode-26.6"], ["glaeda-root-std-xcode-26.6"], ["glaeda-gui-std-xcode-26.6"],
+                          ["glaeda-session-std-xcode-26.6"], ["glaeda-std-xcode-26.6"], ["self-hosted", "macOS"],
+                          ["glaeda-side-std"], ["x-side-std-xcode-26.6"]):
+            self.assertEqual(fleet_labels.widened_labels(unchanged), unchanged)
+
     def test_runner_capacity_per_class(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
             std, _ = cr.member_labels(MANIFEST, "mini-std")
@@ -6360,7 +6515,10 @@ class ManifestLabelsTest(unittest.TestCase):
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["compileSlots"], 1)
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["canonicalRoots"], 1)
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["rootPools"], ["glaeda-root-std-xcode-26.6"])
-            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["sidePools"], ["glaeda-side-std-xcode-26.6"])
+            # A std side runner also carries the light side label: light jobs spill onto it, never the reverse.
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["sidePools"],
+                             ["glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"])
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["rootPools"], ["glaeda-root-std-xcode-26.6"])
             manifest["defaults"]["runner"]["classes"]["std"]["compileSlots"] = 2
             self.assertIn("compileSlots 2 needs canonicalRoots 2", cr.member_labels(manifest, "mini-std")[1])
             manifest["defaults"]["runner"]["classes"]["std"]["canonicalRoots"] = 2
@@ -6492,7 +6650,7 @@ class ManifestLabelsTest(unittest.TestCase):
         self.assertIsNone(why)
         self.assertIn("glaeda-aws-std-xcode-26.6", member["labels"])
         self.assertEqual(member["rootPools"], ["glaeda-aws-root-std-xcode-26.6"])
-        self.assertEqual(member["sidePools"], ["glaeda-aws-side-std-xcode-26.6"])
+        self.assertEqual(member["sidePools"], ["glaeda-aws-side-std-xcode-26.6", "glaeda-aws-side-light-xcode-26.6"])
         for prefix in ("root-", "side-", "gui-", "trusted-", "std-", "light-", "xl-"):
             invalid = copy.deepcopy(MANIFEST)
             invalid["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"poolPrefix": prefix}
