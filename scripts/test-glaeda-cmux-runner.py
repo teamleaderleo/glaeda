@@ -3922,7 +3922,7 @@ class GateTest(unittest.TestCase):
         for _ in range(3):
             gate.step()
         self.assertEqual(stops, [], "30 s into its first poll a listener may still be getting a job")
-        gate.listening_since -= hook.BROKER_POLL_S - 30.0 + 5.0  # past the whole first poll
+        gate.listening_since -= hook.GATE_FIRST_POLL_S  # past the whole first poll
         gate.step()
         self.assertEqual(stops, ["held"])
         self.assertGreater(hook.GATE_FIRST_POLL_S, hook.BROKER_POLL_S)
@@ -4774,7 +4774,7 @@ class GateTest(unittest.TestCase):
             lsof.assert_not_called()
 
     def test_a_stopped_listener_restarts_after_two_free_polls_and_a_runner_exit_still_exits(self) -> None:
-        gate, stops = self.gate(["held", "held", "held", None, None])
+        gate, stops = self.gate(["held", "held", "held", None, None, None])
         gate.step(); gate.step()
         self.assertEqual(stops, ["held"])
         gate.child.poll.return_value = 0  # the listener exited because the gate asked
@@ -4785,10 +4785,44 @@ class GateTest(unittest.TestCase):
             gate.step()  # free once
             popen.assert_not_called()
             gate.step()  # free twice
+            popen.assert_not_called()  # but not yet free for GATE_RESTART_FREE_S
+            gate.free_since -= hook.GATE_RESTART_FREE_S
+            gate.step()
             popen.assert_called_once()
         gate.child = mock.Mock()
         gate.child.poll.return_value = 3  # the runner exited on its own: launchd decides
         self.assertEqual(gate.step(), 3)
+
+    def test_a_stopped_listener_waits_out_a_whole_poll_of_free_host_before_restarting(self) -> None:
+        # 2026-10-21, cmux7s roots: started at 14:10:14, 14:50:14 and 14:59:10 after two free polls, each stopped
+        # 30 s later by a hold that came back. Every stop of a listener can lose a job GitHub just handed it, so
+        # after a stop the host must stay free a whole broker poll before the listener starts again, and a hold
+        # inside that span starts the count over.
+        gate, stops = self.gate(["held", "held", "held", None, None, "held", None, None, None])
+        gate.step(); gate.step()
+        gate.child.poll.return_value = 0
+        with mock.patch.object(hook.subprocess, "Popen") as popen:
+            gate.step()  # the listener is gone
+            gate.step()  # still held
+            gate.step(); gate.step()  # free twice
+            gate.free_since -= hook.GATE_RESTART_FREE_S - 5
+            gate.step()  # held again: the free span starts over
+            self.assertIsNone(gate.free_since)
+            gate.step(); gate.step()
+            popen.assert_not_called()
+            gate.free_since -= hook.GATE_RESTART_FREE_S
+            gate.step()
+            popen.assert_called_once()
+        self.assertGreaterEqual(hook.GATE_RESTART_FREE_S, hook.BROKER_POLL_S)
+
+    def test_a_gate_held_from_its_start_starts_after_two_free_polls(self) -> None:
+        # The free-hold is for a listener the gate stopped; a gate that starts held (boot, a full mini) has stopped
+        # nothing, so two free polls still start it.
+        gate, _ = self.gate(["held", None, None])
+        gate.child = None
+        with mock.patch.object(hook.subprocess, "Popen") as popen:
+            gate.step(); gate.step(); gate.step()
+            popen.assert_called_once()
 
     def test_a_job_that_slipped_in_is_never_killed_at_the_deadline(self) -> None:
         gate, _ = self.gate([], busy=[True, False])
