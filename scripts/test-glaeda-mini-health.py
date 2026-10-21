@@ -58,6 +58,7 @@ class FakeMini(health.Mini):
         self.opt_in: tuple[dict | None, str] = ({"schema": "glaeda-tailscale-self-heal/v1", "host": "cmux9s-mac-mini",
                                                  "source": "fleet-registry.json"}, "")
         self.restart_ran = True  # every restart command exited 0
+        self.slept = 0.0
         self.facts = {"platform": "darwin", "runners": 2, "setup_args": ["--role=fleet-mini"], "role": "fleet-mini"}
         self.restart_off = ""
         self.busy = ""
@@ -151,7 +152,10 @@ class FakeMini(health.Mini):
         self.agents = [(l, lo, True if l == label else r, x) for l, lo, r, x in self.agents]
 
     def sleep(self, seconds):
-        pass
+        self.slept += seconds
+
+    def clock(self):
+        return self.slept  # only differences are read: the time the sleeps took
 
     def leaked_test_apps(self):
         return self.leaks
@@ -591,6 +595,36 @@ class TailscaleRouteRestart(Base):
         doc = json.loads(self.mini.restart_state.read_text())
         self.assertEqual(doc["last_attempt_at"], NOW + 120)
         self.assertTrue(doc["ok"])
+        self.assertEqual(doc["checked_at"], health.iso(NOW + 120 + health.TAILSCALE_RESTART_SETTLE_S),
+                         "the re-check's time, after the settle wait")
+
+    def test_an_unwritable_restart_state_is_no_restart_and_alerts(self) -> None:
+        real = health.write_json
+
+        def write_json(path, doc):
+            if path == self.mini.restart_state:
+                raise PermissionError(path)
+            real(path, doc)
+
+        self.addCleanup(setattr, health, "write_json", real)
+        health.write_json = write_json
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 0)
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible")
+        self.assertIn("cannot write the restart state", f["note"])
+
+    def test_a_bad_last_attempt_time_is_unreadable_state_never_a_crash(self) -> None:
+        for at in (float("nan"), float("inf"), float("-inf"), 1e300, -1.0, NOW + 10 * SIX_H):
+            for failures in (0, 1, 3):
+                self.mini.restart_state.parent.mkdir(parents=True, exist_ok=True)
+                self.mini.restart_state.write_text(json.dumps({"last_attempt_at": at, "ok": False,
+                                                               "result": "still Running", "failures": failures}))
+                report = self.broken_twice()
+                self.assertEqual(self.restarts(), 0, (at, failures))
+                f = report["findings"][0]
+                self.assertEqual(f["auto_fix"], "impossible", (at, failures))
+                self.assertIn("unreadable", f["note"], (at, failures))
 
     def test_still_broken_after_the_restart_is_reported_and_not_retried_within_6_h(self) -> None:
         self.mini.after_restart = ("Running", "en0")
@@ -686,8 +720,9 @@ class TailscaleRouteRestart(Base):
         report = self.broken_twice(NOW + 3600)
         self.assertEqual(self.restarts(), 1)
         self.assertEqual(self.ids(report), ["tailscale_no_route"])
-        self.assertEqual(report["findings"][0]["auto_fix"], "pending")
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible", "no restart is coming for hours: alert")
         self.assertIn("6 h", report["findings"][0]["note"])
+        self.assertIn(f"next after {health.iso(NOW + 120 + SIX_H)}", report["findings"][0]["note"])
 
     def test_after_6_h_a_restart_is_allowed_again(self) -> None:
         self.mini.after_restart = ("Running", "en0")
@@ -712,11 +747,32 @@ class TailscaleRouteRestart(Base):
         self.broken_twice()
         self.assertEqual(self.mini.did, [])
 
+    def test_a_host_gate_that_cannot_answer_alerts(self) -> None:
+        self.mini.busy = health.NoAnswer("glaeda-disk's host gate could not answer (RuntimeError)")
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("could not answer", report["findings"][0]["note"])
+
     def test_a_held_host_lock_is_not_idle(self) -> None:
         self.mini.lock_why = "the fleet host lock is held"
         report = self.broken_twice()
         self.assertEqual(self.mini.did, [])
         self.assertIn("host lock", report["findings"][0]["note"])
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending", "a short wait")
+
+    def test_no_fleet_dir_alerts(self) -> None:
+        self.mini.lock_why = health.NoAnswer("no fleet dir /Users/Shared/cmux-build-fleet")
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("no fleet dir", report["findings"][0]["note"])
+
+    def test_job_patterns_that_cannot_be_read_alert(self) -> None:
+        self.mini.jobs = health.NoAnswer("glaeda-disk's job patterns could not be read (AttributeError)")
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 0)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
 
     def test_a_job_that_started_before_the_lock_was_taken_stops_the_restart(self) -> None:
         self.mini.jobs = "a CI job is running (Runner.Worker)"
@@ -780,6 +836,7 @@ class TailscaleRouteRestart(Base):
     def test_report_mode_never_restarts(self) -> None:
         report = self.run_once(apply=False)
         self.assertEqual(self.ids(report), ["tailscale_no_route"])
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending", "the LaunchAgent's --apply run restarts it")
         self.run_once(NOW + 120, apply=False)
         self.assertEqual(self.mini.did, [])
         self.assertFalse(self.mini.restart_state.exists())
@@ -789,11 +846,13 @@ class TailscaleRouteRestart(Base):
         report = self.broken_twice()
         self.assertEqual(self.mini.did, [])
         self.assertIn("GLAEDA_TAILSCALE_RESTART=off", report["findings"][0]["note"])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible", "no restart is coming: alert")
 
     def test_mini_health_s_own_kill_switch_stops_it_too(self) -> None:
         report = self.broken_twice(heal_ok=False)
         self.assertEqual(self.mini.did, [])
         self.assertIn("healing is off", report["findings"][0]["note"])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible", "no restart is coming: alert")
 
     def test_an_unreadable_restart_state_is_no_restart(self) -> None:
         self.mini.restart_state.parent.mkdir(parents=True, exist_ok=True)
@@ -906,6 +965,10 @@ class TailscaleRestartGates(unittest.TestCase):
         self.assertNotEqual(health.restart_window_refusal({"last_attempt_at": "x"}, NOW), "")
         self.assertNotEqual(health.restart_window_refusal({"last_attempt_at": NOW + 600}, NOW), "",
                             "a stamp from the future (a clock step) still counts")
+        for at in (float("nan"), float("inf"), float("-inf"), 1e300, -1.0, NOW + 10 * SIX_H, True):
+            self.assertIn("unreadable", health.restart_window_refusal({"last_attempt_at": at}, NOW), at)
+            self.assertIsNone(health.restart_failures({"last_attempt_at": at, "failures": 0}, NOW), at)
+            self.assertIn("did not restore", health.restart_failed_note({"last_attempt_at": at}, 1, NOW))
 
     def test_load_restart_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -980,11 +1043,16 @@ class TailscaleRestartReads(unittest.TestCase):
         mini = health.Mini(self.home)
         mini.disk_path = lambda: self.dir / "missing"
         self.assertNotEqual(mini.host_busy(), "")
+        self.assertIsInstance(mini.host_busy(), health.NoAnswer, "no answer, not a short wait")
+        self.assertIsInstance(self.disk("X = 1\n").host_busy(), health.NoAnswer)
+        busy = self.disk("def host_busy(fleet=None, now=None):\n    return 'a CI job is running (x)'\n").host_busy()
+        self.assertNotIsInstance(busy, health.NoAnswer)
 
     def test_the_host_lock_is_taken_exclusively_and_refused_while_a_job_holds_it(self) -> None:
         mini = health.Mini(self.home)
         with mini.hold_host_lock() as why:
             self.assertIn("no fleet dir", why, "fails closed without the fleet dir jobs lock")
+            self.assertIsInstance(why, health.NoAnswer)
         health.FLEET_DIR.mkdir()
         with mini.hold_host_lock() as why:
             self.assertEqual(why, "")
@@ -997,6 +1065,7 @@ class TailscaleRestartReads(unittest.TestCase):
         try:
             with mini.hold_host_lock() as why:
                 self.assertIn("host lock", why)
+                self.assertNotIsInstance(why, health.NoAnswer, "held is a short wait")
         finally:
             os.close(job)
 

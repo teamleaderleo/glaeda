@@ -1298,9 +1298,13 @@ all of them failing closed (`heal_tailscale_route` in the script):
    under `launchd.running`. No `tailscale up`/`down`, `set`, login or flag change ever runs.
 6. **Verified once.** One 30 s wait, then one re-check of BackendState and the route. Fixed is a heal in the
    report (`healed`); still broken stays a finding naming the result and the time the next restart is allowed.
-   `auto_fix` stays `pending` only while a restart is still possible and none has failed: once a restart left
-   the route broken (or a restart command failed), the finding is `impossible`, so ci-dash's health alert (an
-   `impossible` error) reaches an operator, until the route is fixed; a host not opted in is `impossible` too.
+   `auto_fix` is `pending` only for a short wait: the mini is busy or the host lock is held right now, or the
+   two-runs rule is not met yet. Whenever no restart is coming it is `impossible`, so ci-dash's health alert (an
+   `impossible` error) reaches an operator: a restart that left the route broken or whose command failed (until
+   the route is fixed), the 6 h window after a restart (the note names the next try), either kill switch, a host
+   not opted in, a gate that cannot answer (no fleet dir, glaeda-disk's host gate or job patterns unreadable),
+   or a restart state that cannot be read or written (a `last_attempt_at` that is not a finite time from 0 to 6 h
+   past now is unreadable).
 7. **Kill switch.** `touch ~/.config/glaeda/tailscale-restart-off`, or `GLAEDA_TAILSCALE_RESTART=off` in the
    agent's environment (as glaeda-disk's `disk-off`); `mini-health.disabled` stops it too.
 
