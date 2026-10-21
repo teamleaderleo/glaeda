@@ -268,6 +268,20 @@ class Base(unittest.TestCase):
         path = gg.watch_dir() / gg.file_name(key)
         os.utime(path, (NOW - seconds, NOW - seconds))
 
+    @contextlib.contextmanager
+    def diagnostics_in(self, buffer: io.StringIO):
+        """Route `say_waiting` into `buffer` for a test that asserts on *what* it says.
+
+        `say_waiting` writes file descriptor 2, which `contextlib.redirect_stderr` does not touch
+        (it swaps `sys.stderr`), so an in-process test cannot read it through a `StringIO` -- and
+        must not, because the point of fd 2 is that it survives the stream being gone. The two
+        halves are tested apart: the wording and the call sites here, through this seam; what the
+        body does with fd 2 -- a dead pipe, a closed stream, a full pipe -- through the real CLI,
+        in `WaitLineTest`. Patching the seam here is not a way around that: `WaitLineTest` reads fd
+        2 of a subprocess, where no patch of ours is in effect."""
+        with mock.patch.object(gg, "say_waiting", lambda line: print(line, file=buffer)):
+            yield
+
 
 class FakeController:
     """Stands in for the cmux build controller: /v1/github/runs/<id> and the change feed. A change
@@ -1313,7 +1327,7 @@ class ClientTest(Base):
             writer.start()
         out = io.StringIO()
         try:
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out), self.diagnostics_in(out):
                 code = gg.cmd_wait(kind, target, until, timeout, False, False, sha, grace)
         finally:
             done.set()
@@ -1526,13 +1540,14 @@ class ClientTest(Base):
                            ("o/r/1", lambda: gg.cmd_wait("run", "o/r/1", "green", 0.1, False, False)),
                            ("o/r#1", lambda: gg.cmd_wait_comment("o/r#1", 0.1, False))):
             with self.subTest(want=want):
-                err = io.StringIO()
-                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                said: list[str] = []
+                with mock.patch.object(gg, "say_waiting", said.append), \
+                        contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(call(), gg.EXIT_TIMEOUT)
-                first = err.getvalue().splitlines()[0]
-                self.assertIn("waiting on", first)
-                self.assertIn(want, first)
-                self.assertIn("0.1s", first)
+                self.assertTrue(said, "this kind never said what it was waiting for")
+                self.assertIn("waiting on", said[0])
+                self.assertIn(want, said[0])
+                self.assertIn("0.1s", said[0])
 
     def test_the_line_comes_out_before_a_daemon_wait_can_finish(self) -> None:
         """Before, not after -- for the kinds that block on the daemon, which is where it matters.
@@ -1542,26 +1557,20 @@ class ClientTest(Base):
         case this exists for. Reading `splitlines()[0]` after the call returns cannot tell the two
         apart: it has to be the order of the writes."""
         order: list[str] = []
-
-        class Noting(io.StringIO):
-            def write(self, text):
-                if "waiting on" in text:
-                    order.append("line")
-                return super().write(text)
-
         green = gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")]))
         timer = threading.Timer(0.4, lambda: (order.append("ready"),
                                               self.put("pr:o/r#1", green)))
         timer.start()
         self.addCleanup(timer.cancel)
-        with contextlib.redirect_stderr(Noting()), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch.object(gg, "say_waiting", lambda line: order.append("line")), \
+                contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(gg.cmd_wait("pr", "o/r#1", "green", 5.0, False, False), 0)
         self.assertEqual(order[:1], ["line"], order)
 
     def test_daemon_down(self) -> None:
         self.lock.close()
         err = io.StringIO()
-        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), self.diagnostics_in(err):
             self.assertEqual(gg.cmd_wait("pr", "o/r#1", "green", 5, False, False), 3)
             self.assertEqual(gg.cmd_status("pr", "o/r#1", False, False), 3)
             self.assertEqual(gg.cmd_budget(False), 3)
@@ -1591,7 +1600,7 @@ class ClientTest(Base):
         self.lock.close()
         gg.write_json(gg.BASE / "restart.json", {"at": time.time() - 20, "by": 1, "how": "launchctl kickstart"})
         err = io.StringIO()
-        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), self.diagnostics_in(err):
             self.assertEqual(gg.cmd_budget(False), 3)
         self.assertIn("restarted it 20s ago", err.getvalue())
         self.assertIn("Do not restart it again", err.getvalue())
@@ -1942,7 +1951,7 @@ class ClientTest(Base):
         with self.assertRaisesRegex(gg.WatchError, "a run's commit never changes"):
             self.wait("run", "o/r/2", fill=(self.run_doc(1, "success"), {}), sha="d" * 40)
         err = io.StringIO()
-        with contextlib.redirect_stderr(err):
+        with contextlib.redirect_stderr(err), self.diagnostics_in(err):
             self.assertEqual(gg.main(["wait", "pr", "o/r#1", "--sha", "HEAD"]), 64)
             self.assertEqual(gg.main(["wait", "comment", "o/r#1", "--sha", "a" * 40]), 64)
             self.assertEqual(gg.main(["wait", "pr", "o/r#1", "--author", "x"]), 64)
@@ -2599,7 +2608,7 @@ class RestartTest(Base):
 
     def run_restart(self, force: bool = False) -> tuple[int, str]:
         out = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out), self.diagnostics_in(out):
             code = gg.cmd_restart(force)
         return code, out.getvalue()
 
@@ -2954,6 +2963,189 @@ class HeadChecksTest(Base):
             self.assertEqual(gg.cmd_checks("o/r", [SHA_A], "autoland", 120, 0, True), gg.EXIT_OK)
 
 
+def cli_run(ghdir: Path, *args, stderr=None, shell_prefix=()) -> tuple[subprocess.CompletedProcess, float]:
+    """The real CLI in a subprocess, because fd 2 is the thing under test here.
+
+    `contextlib.redirect_stderr` swaps `sys.stderr` and leaves file descriptor 2 alone, so every
+    in-process test passes whatever fd 2 is doing -- which is exactly how a diagnostic that killed
+    the wait got written in the first place. `GLAEDA_GH_DIR` keeps it off this machine's real
+    daemon: these runs must never register a watch or ask the daemon for anything."""
+    env = {**os.environ, "GLAEDA_GH_DIR": os.fspath(ghdir)}
+    cmd = [*shell_prefix, sys.executable, os.fspath(ROOT / "scripts" / "glaeda-gh"), *args]
+    start = time.monotonic()
+    done = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=stderr, text=True,
+                          stdin=subprocess.DEVNULL, env=env, timeout=120)
+    return done, time.monotonic() - start
+
+
+class DaemonDiagnosticOnFd2Test(unittest.TestCase):
+    """The waiting line is not the only thing a wait prints before it can do any work.
+
+    `down_message`, `failing_message` and `stale_message` are written by the same functions, at the
+    same moment, into the same fd, and they carried both faults the review measured on the waiting
+    line: a closed stderr put them in the `--json` document, and a dead stderr pipe killed the
+    process. They now go through `say_waiting` too, and this is where that is measured -- the
+    in-process tests above route the seam into their own buffer, so a revert to
+    `print(file=sys.stderr)` would leave every one of them green."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.ghdir = self.dir / "ghdir"  # no daemon.lock in it, so the CLI finds the daemon down
+
+    DOWN_COMMANDS = (("wait", "pr", "o/r#1", "--timeout", "0.1"), ("status", "pr", "o/r#1"),
+                     ("budget",))
+
+    def test_a_closed_stderr_does_not_put_the_daemon_down_notice_in_the_json(self) -> None:
+        """Every command that says the daemon is down, not just `wait`: `status` and `budget` write
+        the same notice from their own copies of the check, and a mutation putting any one of them
+        back on `sys.stderr` is a mutation that puts the notice into that command's `--json`."""
+        for args in self.DOWN_COMMANDS:
+            with self.subTest(args[0]):
+                done, _ = cli_run(self.ghdir, *args, "--json",
+                                  shell_prefix=("/bin/sh", "-c", 'exec 2>&-; exec "$@"', "sh"))
+                self.assertEqual(done.returncode, 3, done.stdout)
+                self.assertNotIn("daemon is not running", done.stdout,
+                                 "the daemon-down notice went to stdout")
+                # `budget --json` answers with a document even when the daemon is down, so the
+                # test is that stdout is still *one document* -- which is what the notice landing
+                # in front of it destroyed.
+                if done.stdout:
+                    json.loads(done.stdout)
+
+    def test_a_dead_stderr_pipe_does_not_turn_the_daemon_down_notice_into_exit_120(self) -> None:
+        read, write = os.pipe()
+        os.close(read)
+        try:
+            done, _ = cli_run(self.ghdir, "wait", "pr", "o/r#1", "--timeout", "0.1", "--json",
+                              stderr=write)
+        finally:
+            os.close(write)
+        self.assertEqual(done.returncode, 3, done.stdout)
+
+    def test_the_daemon_down_notice_reaches_fd_2_when_nothing_is_wrong(self) -> None:
+        """The other half: both tests above also pass if the notice is never printed at all."""
+        for args in self.DOWN_COMMANDS:
+            with self.subTest(args[0]):
+                err = self.dir / f"{args[0]}.txt"
+                with err.open("w") as fh:
+                    done, _ = cli_run(self.ghdir, *args, "--json", stderr=fh)
+                self.assertEqual(done.returncode, 3)
+                self.assertIn("daemon is not running", err.read_text())
+
+    def test_the_wait_for_a_restart_line_is_on_fd_2_too(self) -> None:
+        """The fourth sibling, and the one a mutation put back on `sys.stderr` with the whole suite
+        green: `DownWait.patient`'s "the daemon is not running; waiting up to Ns" line, which is
+        what a wait prints while it rides out a `launchctl` respawn.
+
+        It needs a timeout longer than `DOWN_GRACE`, because the first `daemon_running` call spends
+        that long looking for the daemon before anything is said at all -- which is why the shorter
+        down-notice tests above never reach this line."""
+        err = self.dir / "patience.txt"
+        with err.open("w") as fh:
+            done, _ = cli_run(self.ghdir, "wait", "pr", "o/r#1", "--timeout",
+                              f"{gg.DOWN_GRACE + 2:g}", "--json", stderr=fh)
+        self.assertEqual(done.returncode, 3, done.stdout)
+        said = err.read_text()
+        self.assertIn("waiting up to", said, "nothing on fd 2 while it rode out the restart")
+        self.assertIn("daemon is not running", said)
+        closed, _ = cli_run(self.ghdir, "wait", "pr", "o/r#1", "--timeout",
+                            f"{gg.DOWN_GRACE + 2:g}", "--json",
+                            shell_prefix=("/bin/sh", "-c", 'exec 2>&-; exec "$@"', "sh"))
+        self.assertEqual(closed.returncode, 3, closed.stdout)
+        self.assertEqual(closed.stdout, "", "the restart notice went to stdout")
+
+    def with_a_daemon(self, daemon_json: dict) -> None:
+        """A held lock and a `daemon.json`, which is all the CLI reads to decide the daemon is
+        there and what state it is in. The lock is held by this process, so from the subprocess it
+        looks exactly like a running daemon."""
+        self.ghdir.mkdir(parents=True, exist_ok=True)
+        lock = (self.ghdir / "daemon.lock").open("a+")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        (self.ghdir / "daemon.json").write_text(json.dumps(daemon_json))
+
+    def test_the_failing_and_hung_notices_are_on_fd_2_too(self) -> None:
+        """The two siblings of the daemon-down notice, measured the same way.
+
+        They were left on `print(file=sys.stderr)` after the waiting line moved, and mutations
+        putting either of them back survived the whole suite -- because the in-process tests route
+        the seam into their own buffer, which is the right call there and blind to this. Both
+        directions per notice: it is on fd 2, and it is not in the `--json` document when fd 2 is
+        closed."""
+        now = time.time()
+        failing = {"at": now, "heartbeat": 30,
+                   "failing": {"error": "KeyError", "site": "x", "count": 9,
+                               "since": now - gg.FAILING_AFTER - 1}}
+        hung = {"at": now - gg.STALE_HEARTBEAT - 60, "heartbeat": 30}
+        for name, doc, want, code in (("failing", failing, "every cycle since", 3),
+                                      ("hung", hung, "looks hung", gg.EXIT_TIMEOUT)):
+            with self.subTest(name):
+                self.setUp()  # a fresh GLAEDA_GH_DIR and a fresh lock per case
+                self.with_a_daemon(doc)
+                err = self.dir / f"{name}.txt"
+                with err.open("w") as fh:
+                    done, _ = cli_run(self.ghdir, "wait", "run", "o/r/1", "--timeout", "0.3",
+                                      "--json", stderr=fh)
+                self.assertEqual(done.returncode, code, done.stdout)
+                self.assertIn(want, err.read_text(), f"{name}: nothing on fd 2")
+                closed, _ = cli_run(self.ghdir, "wait", "run", "o/r/1", "--timeout", "0.3",
+                                    "--json",
+                                    shell_prefix=("/bin/sh", "-c", 'exec 2>&-; exec "$@"', "sh"))
+                self.assertEqual(closed.returncode, code, closed.stdout)
+                self.assertNotIn(want, closed.stdout, f"{name}: the notice went to stdout")
+                if closed.stdout:
+                    json.loads(closed.stdout)  # and the document is still one document
+
+    def test_a_refused_argument_does_not_look_like_a_wait_that_timed_out(self) -> None:
+        """`argparse` exits **2** on a bad argument and 2 is this tool's "timed out", so
+        `--timeout -5` -- refused before any waiting happened -- was indistinguishable from a wait
+        that ran its course, to the one kind of caller this tool is for. 64 is what every other bad
+        argument here exits with.
+
+        And the usage text is a diagnostic like any other: with stderr closed it used to be
+        `print(file=None)`, which writes to stdout, so a typo became the first lines of a `--json`
+        document."""
+        for bad in ("-5", "nan", "inf", "soon"):
+            with self.subTest(bad=bad):
+                err = self.dir / "usage.txt"
+                with err.open("w") as fh:
+                    done, _ = cli_run(self.ghdir, "wait", "file", str(self.dir / "x"),
+                                      "--timeout", bad, "--json", stderr=fh)
+                self.assertEqual(done.returncode, 64, done.stdout)
+                self.assertEqual(done.stdout, "", "the usage error went to stdout")
+                said = err.read_text()
+                self.assertIn("is not a number of seconds", said)
+                # The usage text as well as the reason: a message naming a flag, with no shape of
+                # the command to put it in, is half an answer -- and dropping it left the suite
+                # green on the reason alone.
+                self.assertIn("usage: glaeda-gh wait", said, said)
+        # The tool's *own* refusals (`WatchError`) take the same path and had the same two faults:
+        # they are not argparse's, so nothing above reaches them.
+        for args, reason in ((["wait", "pr", "o/r#1", "--author", "x"], "for wait comment"),
+                             (["wait", "comment", "o/r#1", "--sha", "a" * 40], "not --sha"),
+                             (["wait", "run", "o/r/1", "--rescue-grace", "-1"], "rescue-grace")):
+            with self.subTest(args=args[1]):
+                err = self.dir / "refused.txt"
+                with err.open("w") as fh:
+                    done, _ = cli_run(self.ghdir, *args, "--json", stderr=fh)
+                self.assertEqual(done.returncode, 64, done.stdout)
+                self.assertEqual(done.stdout, "", "the refusal went to stdout")
+                self.assertIn(reason, err.read_text())
+        for args in (["wait", "file", str(self.dir / "x"), "--timeout", "-5"],
+                     ["wait", "pr", "o/r#1", "--author", "x"]):
+            closed, _ = cli_run(self.ghdir, *args, "--json",
+                                shell_prefix=("/bin/sh", "-c", 'exec 2>&-; exec "$@"', "sh"))
+            self.assertEqual(closed.returncode, 64)
+            self.assertEqual(closed.stdout, "", args)
+        # A timeout that is merely 0 is a legitimate "look once", not a bad argument.
+        with (self.dir / "once.txt").open("w") as fh:
+            once, _ = cli_run(self.ghdir, "wait", "file", str(self.dir / "x"), "--timeout", "0",
+                              "--json", stderr=fh)
+        self.assertEqual(once.returncode, gg.EXIT_TIMEOUT, once.stdout)
+
+
 class FileAndPidWaitTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -2976,43 +3168,33 @@ class FileAndPidWaitTest(unittest.TestCase):
         return timer
 
     def test_the_file_and_pid_waits_say_what_they_wait_for_before_they_block(self) -> None:
-        """What matters is what the line's *absence* means. A wait started from an agent session's
-        foreground shell is reaped with that shell, silently, leaving a zero-byte output file --
-        which is indistinguishable from "blocked and waiting", so the caller waits on something
-        that is gone (three of one lane's waits, in one afternoon). With this line an empty file
-        means it never started. On stderr, so a `--json` consumer still reads exactly one document
-        on stdout, which is asserted here rather than assumed.
+        """Every kind calls `say_waiting`, and calls it *before* it blocks.
 
-        The three kinds that go through the daemon are covered in ClientTest; between the two
-        tests every `wait` the CLI offers is driven, because a printer wired into three call
-        sites out of four is the failure this line exists to rule out."""
+        Through the seam rather than through stderr, because what each call site has to get right
+        is the call and its position; what `say_waiting` then does with fd 2 is its own test
+        below. An earlier version asserted on a captured `sys.stderr` instead, which meant the
+        production path was never the one measured: `say_waiting` grew a branch that only the
+        suite reached, and a mutation deferring the real write to `atexit` -- the line arriving
+        after the wait, which is no use to anyone -- passed all 337 tests."""
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
         for want, call in ((str(self.dir / "nope"), lambda: gg.cmd_wait_file(str(self.dir / "nope"), 0.05, True)),
                            (f"pid {proc.pid}", lambda: gg.cmd_wait_pid(str(proc.pid), 0.05, True))):
             with self.subTest(want=want):
-                err, out = io.StringIO(), io.StringIO()
-                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                said: list[str] = []
+                out = io.StringIO()
+                with mock.patch.object(gg, "say_waiting", said.append), \
+                        contextlib.redirect_stdout(out):
                     self.assertEqual(call(), gg.EXIT_TIMEOUT)
-                first = err.getvalue().splitlines()[0]
-                self.assertIn("waiting on", first)
-                self.assertIn(want, first)
-                self.assertIn("0.05", first)
-                json.loads(out.getvalue())  # one document, nothing of the line in it
+                self.assertEqual(len(said), 1, said)
+                self.assertIn("waiting on", said[0])
+                self.assertIn(want, said[0])
+                self.assertIn("0.05", said[0])
+                json.loads(out.getvalue())  # one document, and the line is not in it
 
     def cli_wait(self, *args, stderr=None, shell_prefix=()) -> tuple[subprocess.CompletedProcess, float]:
-        """The real CLI in a subprocess, because fd 2 is the thing under test here.
-
-        `contextlib.redirect_stderr` swaps `sys.stderr` and leaves file descriptor 2 alone, so
-        every in-process test above passes whatever fd 2 is doing -- which is exactly how a
-        diagnostic that killed the wait got written in the first place."""
-        env = {**os.environ, "GLAEDA_GH_DIR": os.fspath(self.dir / "ghdir")}
-        cmd = [*shell_prefix, sys.executable, os.fspath(ROOT / "scripts" / "glaeda-gh"), *args]
-        start = time.monotonic()
-        done = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=stderr, text=True,
-                              stdin=subprocess.DEVNULL, env=env, timeout=120)
-        return done, time.monotonic() - start
+        return cli_run(self.dir / "ghdir", *args, stderr=stderr, shell_prefix=shell_prefix)
 
     def test_a_dead_stderr_pipe_does_not_kill_the_wait(self) -> None:
         """The line must never become the failure it exists to diagnose. With stderr a pipe whose
@@ -3090,19 +3272,55 @@ class FileAndPidWaitTest(unittest.TestCase):
         """Before, not after: a line printed on the way out would say nothing about a wait that
         was killed while blocked, which is the whole case it exists for."""
         order: list[str] = []
-        err = io.StringIO()
-
-        class Noting(io.StringIO):
-            def write(self, text):
-                if "waiting on" in text:
-                    order.append("line")
-                return super().write(text)
-
         target = self.dir / "appears"
         self.later(0.05, lambda: (order.append("ready"), target.write_text("x")))
-        with contextlib.redirect_stderr(Noting()), contextlib.redirect_stdout(err):
+        with mock.patch.object(gg, "say_waiting", lambda line: order.append("line")), \
+                contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(gg.cmd_wait_file(str(target), 2.0, True), 0)
         self.assertEqual(order[:1], ["line"], order)
+
+    def test_the_line_is_on_fd_2_while_the_wait_is_still_blocked(self) -> None:
+        """The claim the whole PR rests on, measured where it is made: fd 2 of the real CLI, read
+        while the process is still waiting. Asserting after the process exits cannot see the
+        difference -- a mutation deferring the write to `atexit` put the line in the file at exit
+        and left the capture empty for the whole wait, which is the ambiguity this exists to end,
+        and it passed every other test here."""
+        err = self.dir / "while-blocked.txt"
+        with err.open("w") as fh:
+            child = subprocess.Popen([sys.executable, os.fspath(ROOT / "scripts" / "glaeda-gh"),
+                                      "wait", "file", str(self.dir / "never-appears"),
+                                      "--timeout", "4", "--json"],
+                                     stdout=subprocess.PIPE, stderr=fh, stdin=subprocess.DEVNULL,
+                                     text=True, env={**os.environ,
+                                                     "GLAEDA_GH_DIR": os.fspath(self.dir / "ghdir")})
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and "waiting on" not in err.read_text():
+            time.sleep(0.05)
+        self.assertIn("waiting on", err.read_text(), "nothing on fd 2 while it was still blocked")
+        self.assertIsNone(child.poll(), "it was supposed to still be waiting")
+
+    def test_a_full_stderr_pipe_does_not_hang_the_wait(self) -> None:
+        """Errors are not the only way a write can be the problem. With fd 2 a blocking pipe that
+        is already full and a reader that is alive but not reading, `os.write` blocks forever: a
+        1 s wait hung past 5 s, measured, which is worse for the caller than the exit 120 that
+        started all this. So fd 2 is asked whether it can take the line first."""
+        read, write = os.pipe()
+        self.addCleanup(os.close, read)
+        try:
+            os.set_blocking(write, False)
+            with contextlib.suppress(BlockingIOError):
+                while True:
+                    os.write(write, b"x" * 65536)
+            os.set_blocking(write, True)  # full, blocking, and nobody reads it
+            done, waited = self.cli_wait("wait", "file", str(self.dir / "never-appears"),
+                                         "--timeout", "1", "--json", stderr=write)
+        finally:
+            os.close(write)
+        self.assertEqual(done.returncode, gg.EXIT_TIMEOUT, done.stdout)
+        self.assertLess(waited, 4, "the diagnostic blocked instead of being dropped")
+        self.assertEqual(json.loads(done.stdout)["result"], "timeout")
 
     def test_waits_for_a_nonempty_file(self) -> None:
         target = self.dir / "never1.txt"

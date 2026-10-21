@@ -136,7 +136,9 @@ import glob
 import hashlib
 from http.client import HTTPException  # the http() helper below shadows the `http` package
 import json
+import math
 import os
+import select
 import re
 import shlex
 import shutil
@@ -2521,11 +2523,11 @@ class DownWait:
     def patient(self, down_since: float, start: float, timeout: float) -> bool:
         now = time.monotonic()
         if now - down_since >= DOWN_PATIENCE or now - start >= timeout:
-            print(down_message(), file=sys.stderr)
+            say_waiting(down_message())
             return False
         if not self.said:
-            print(f"glaeda-gh: the daemon is not running; waiting up to {DOWN_PATIENCE}s for it to come back "
-                  "(a restart can take that long). Do not restart it from here.", file=sys.stderr)
+            say_waiting(f"glaeda-gh: the daemon is not running; waiting up to {DOWN_PATIENCE}s for it to "
+                        "come back (a restart can take that long). Do not restart it from here.")
             self.said = True
         return True
 
@@ -2866,15 +2868,15 @@ def emit(key: str, entry: dict | None, as_json: bool, extra: dict | None = None,
 def cmd_status(kind: str, target: str, jobs: bool, as_json: bool, first_wait: float = CYCLE + 10) -> int:
     key = parse_key(kind, target)
     if not daemon_running(grace=DOWN_GRACE):
-        print(down_message(), file=sys.stderr)
+        say_waiting(down_message())
         return EXIT_DOWN
     broken = daemon_failing()
     if broken is not None:
-        print(failing_message(broken), file=sys.stderr)
+        say_waiting(failing_message(broken))
         return EXIT_DOWN
     lag = daemon_stale()
     if lag is not None:
-        print(stale_message(lag), file=sys.stderr)
+        say_waiting(stale_message(lag))
     register(key, jobs)
     deadline = time.monotonic() + first_wait
     entry = read_cache(key)
@@ -2930,41 +2932,67 @@ def waiting_line(key: str, until: str, sha: str | None, exact: bool, timeout: fl
             + f", giving up after {timeout:g}s (at {deadline_clock(timeout)})")
 
 
-def deadline_clock(timeout: float, now: float | None = None) -> str:
-    """When this wait gives up, local time, `HH:MM:SS`. "unknown" for a timeout that is not a
-    finite number of seconds -- `--timeout` is a bare `float`, so `inf` and `nan` reach here."""
+def seconds(text: str) -> float:
+    """A timeout `argparse` can refuse, rather than one the wait loop cannot honour.
+
+    `type=float` took `inf` and `nan`. `inf` blocks forever, which is a process nobody is waiting
+    for on purpose; `nan` is worse -- every comparison against it is false, so the loop never
+    reaches its deadline and never exits (measured: killed from outside after 3 s). A formatter
+    printing "unknown" for those was treating the symptom one layer too late."""
     try:
-        return time.strftime("%H:%M:%S", time.localtime((now or time.time()) + timeout))
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number of seconds") from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a number of seconds this can wait for: a finite count, not negative")
+    return value
+
+
+def deadline_clock(timeout: float, now: float | None = None) -> str:
+    """When this wait gives up, local time, `HH:MM:SS`, or "unknown" past what a clock can hold.
+
+    `now if now is None` and not `now or`: a caller passing `0.0` meant the epoch and got the wall
+    clock, which made the parameter a lie in the one case a test would use it."""
+    try:
+        return time.strftime("%H:%M:%S",
+                             time.localtime((time.time() if now is None else now) + timeout))
     except (ValueError, OSError, OverflowError):
         return "unknown"
 
 
 def say_waiting(line: str) -> None:
-    """Put the line on stderr without ever becoming the reason the wait does not happen.
+    """Put a diagnostic on fd 2 without ever becoming the reason the wait does not happen.
 
-    A review found both halves of that, measured, and both turn this diagnostic into the exact
-    failure it exists to diagnose:
+    Three measured ways `print(..., file=sys.stderr)` turned this into the failure it exists to
+    diagnose, each one found by a review round:
 
     - stderr a pipe whose reader is gone -- `wait ... 2>&1 | head -1`, or the `setsid nohup ... &`
-      the skill recommends from a shell that is being reaped. `print` then raised at shutdown and
+      the skill recommends, from a shell being reaped. `print` raised at interpreter shutdown and
       the process died in 0.19 s with exit **120** (CPython's "failed to flush stderr"), where it
-      used to wait its full timeout and exit 2. A diagnostic that kills the wait is worse than no
-      diagnostic.
+      used to wait its full timeout and exit 2.
     - stderr closed (`2>&-`). `sys.stderr` is then `None`, and `print(file=None)` is documented as
-      printing to **stdout** -- so the line became the first line of `--json` output and broke
-      every consumer, which is the one thing this function's docstring promised it would not do.
+      printing to **stdout** -- so the line became the first line of `--json` output.
+    - stderr a *blocking pipe that is already full*, reader alive but not reading (a shared
+      `{ ...; glaeda-gh wait ...; } 2>&1 | slow`, or a stopped reader). `os.write` then blocks
+      forever: a 1 s wait hung past 5 s, which is worse for the caller than exiting 120. Errors are
+      not the only way a write can be the problem; backpressure is the other.
 
-    So: fd 2 directly, with `OSError` suppressed, which restores the old exit code and the old
-    duration byte for byte. A caller that has replaced `sys.stderr` in-process (a test, a wrapper)
-    gets the line there instead, because fd 2 is not where it is looking; the fd contract itself is
-    covered by tests that run the real CLI in a subprocess."""
-    stream = sys.stderr
-    if stream is not None and stream is not sys.__stderr__:
-        with contextlib.suppress(Exception):
-            print(line, file=stream, flush=True)
-        return
-    with contextlib.suppress(OSError):
+    So: fd 2 is asked whether it can take the line, and the line is dropped if it cannot. A regular
+    file always reports writable, a full pipe does not. `OSError` stays suppressed for the shapes
+    `select` admits and `write` then refuses.
+
+    One path, which is the production path: an earlier version printed to `sys.stderr` when a
+    caller had replaced it, so the suite's in-process assertions ran through a branch nothing else
+    reached -- and a mutation deferring the real write to `atexit` (the line arriving *after* the
+    wait, which is exactly no use) passed all 337 tests. The tests read fd 2 of the real CLI now,
+    while it is still blocked."""
+    try:
+        if not select.select([], [2], [], 0)[1]:
+            return
         os.write(2, (line + "\n").encode())
+    except OSError:
+        return
 
 
 def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
@@ -2989,11 +3017,11 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
         down_since = None
         broken = daemon_failing()
         if broken is not None:
-            print(failing_message(broken), file=sys.stderr)
+            say_waiting(failing_message(broken))
             return EXIT_DOWN
         lag = daemon_stale()
         if lag is not None and not warned:
-            print(stale_message(lag), file=sys.stderr)
+            say_waiting(stale_message(lag))
             warned = True
         now = time.monotonic()
         if now - touched >= TOUCH_EVERY:
@@ -3157,7 +3185,7 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
         down_since = None
         broken = daemon_failing()
         if broken is not None:
-            print(failing_message(broken), file=sys.stderr)
+            say_waiting(failing_message(broken))
             return EXIT_DOWN
         now = time.monotonic()
         if now - touched >= TOUCH_EVERY:
@@ -3267,11 +3295,11 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
         down_since = None
         broken = daemon_failing()
         if broken is not None:
-            print(failing_message(broken), file=sys.stderr)
+            say_waiting(failing_message(broken))
             return EXIT_DOWN
         lag = daemon_stale()
         if lag is not None and not warned:
-            print(stale_message(lag), file=sys.stderr)
+            say_waiting(stale_message(lag))
             warned = True
         now = time.monotonic()
         if now - touched >= TOUCH_EVERY:
@@ -3382,13 +3410,13 @@ def cmd_budget(as_json: bool) -> int:
         if status.get("errors"):
             print("last errors: " + "; ".join(status["errors"][:3]))
     if not running:
-        print(down_message(), file=sys.stderr)
+        say_waiting(down_message())
         return EXIT_DOWN
     if broken is not None:
-        print(failing_message(broken), file=sys.stderr)
+        say_waiting(failing_message(broken))
         return EXIT_DOWN
     if lag is not None:
-        print(stale_message(lag), file=sys.stderr)
+        say_waiting(stale_message(lag))
         return EXIT_DOWN
     return EXIT_OK
 
@@ -4931,7 +4959,7 @@ def cmd_restart(force: bool = False) -> int:
         running = daemon_running(grace=DOWN_GRACE)
         broken = daemon_failing() if running else None
         if broken is not None:
-            print(failing_message(broken), file=sys.stderr)
+            say_waiting(failing_message(broken))
             return EXIT_DOWN
         lag = daemon_stale() if running else None
         if running and lag is None and not force:
@@ -5129,9 +5157,25 @@ def cmd_post_status(post_id: str | None, wait: float, as_json: bool, queued: boo
     return 0 if state["state"] == "posted" else 1 if state["state"] == "failed" else 2 if wait > 0 else 0
 
 
+class Parser(argparse.ArgumentParser):
+    """`argparse`'s parser, with a bad argument exiting 64 instead of 2.
+
+    2 is this tool's "timed out", and a caller that branches on exit codes -- which is the whole
+    point of `wait` -- read a refused `--timeout -5` as a wait that had run its course. 64 is what
+    every other bad argument here already exits with (`WatchError` in `main`).
+
+    Both lines go through `say_waiting`, for its reason: with stderr closed, `print(file=None)`
+    writes to **stdout**, so a usage error became the first lines of a `--json` document."""
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        say_waiting(self.format_usage().rstrip("\n"))
+        say_waiting(f"{self.prog}: error: {message}")
+        raise SystemExit(64)
+
+
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="glaeda-gh", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = p.add_subparsers(dest="command", required=True)
+    p = Parser(prog="glaeda-gh", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True, parser_class=Parser)
     sv = sub.add_parser("serve", help="run the daemon (the only process that polls GitHub); launchd or systemd runs it")
     sv.add_argument("--foreground-ok", action="store_true",
                     help="start even though the LaunchAgent or systemd unit is loaded (debugging only)")
@@ -5146,7 +5190,8 @@ def parser() -> argparse.ArgumentParser:
                            help="PRs: green (every check passes; fail fast), done (every check finished), "
                                 "required (only the checks GitHub requires decide; fail fast) or merged; "
                                 "all but merged exit 4 once the PR conflicts with its base")
-            s.add_argument("--timeout", type=float, default=3600, help="seconds (default 3600); exit 2 after")
+            s.add_argument("--timeout", type=seconds, default=3600,
+                           help="seconds (default 3600); exit 2 after")
             s.add_argument("--sha", help="the commit you pushed (git rev-parse HEAD): other heads count as pending")
             s.add_argument("--rescue-grace", type=float, default=RESCUE_GRACE, metavar="S",
                            help=f"hold a failure caused only by a glaeda runner refusing a job at setup this long "
@@ -5261,7 +5306,11 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_wait(args.kind, args.target, args.until, args.timeout, args.jobs, args.json, args.sha,
                         args.rescue_grace)
     except WatchError as error:
-        print(f"glaeda-gh: {error}", file=sys.stderr)
+        # Through say_waiting for its stdout reason: this handler covers `wait --json`, so with
+        # stderr closed `print(file=None)` made a bad-argument message the first line of the
+        # document. The other stderr prints in this file are outside the wait paths and keep
+        # `print`; see the PR.
+        say_waiting(f"glaeda-gh: {error}")
         return 64
     except KeyboardInterrupt:
         return 130
