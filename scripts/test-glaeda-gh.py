@@ -2968,5 +2968,171 @@ class FileAndPidWaitTest(unittest.TestCase):
 
 
 
+class Scripted:
+    """A transport that answers each request from a list of (status, headers, doc) or an exception, in order."""
+
+    def __init__(self, *answers) -> None:
+        self.answers, self.calls = list(answers), []
+
+    def __call__(self, method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
+        self.calls.append((method, url.replace(gg.API, ""), json.loads(body) if body else None))
+        answer = self.answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        status, h, doc = answer
+        return status, h, json.dumps(doc).encode()
+
+
+class PostTest(unittest.TestCase):
+    """`post`: sessions queue writes; the daemon sends them one at a time, paced, and holds on GitHub's
+    secondary limit ("was submitted too quickly" refused PR comments and PR creation for four lanes at
+    once on 2026-10-21, each retrying on its own)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        saved = gg.BASE
+        gg.BASE = Path(self.tmp.name) / "gh"
+        self.addCleanup(setattr, gg, "BASE", saved)
+
+    def daemon(self, *answers) -> tuple[Any, Scripted]:
+        transport = Scripted(*answers)
+        return gg.Daemon(transport=transport, token=lambda: TOKEN, controller=None), transport
+
+    def queue(self, *argv: str, stdin: str = "hello `x` $HOME") -> dict:
+        args = gg.parser().parse_args(["post", *argv])
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin)):
+            item = gg.post_item(args)
+        gg.write_json(gg.outbox_dir() / f"{item['id']}.json", item)
+        return item
+
+    def step(self, daemon: Any, at: float) -> None:
+        daemon.now = at
+        daemon.post_tick()
+
+    def test_comment_is_posted_and_its_url_kept(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body-file", "-")
+        d, t = self.daemon((201, {}, {"html_url": "https://github.com/o/r/pull/7#issuecomment-1"}))
+        self.step(d, NOW)
+        self.assertEqual(t.calls, [("POST", "/repos/o/r/issues/7/comments", {"body": "hello `x` $HOME"})])
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["state"], state["url"]), ("posted", "https://github.com/o/r/pull/7#issuecomment-1"))
+        self.assertNotIn("body", state)
+        self.assertEqual(list(gg.outbox_dir().glob("*.json")), [])
+
+    def test_writes_are_spaced_and_oldest_first(self) -> None:
+        first = self.queue("comment", "o/r#1", "--body", "one")
+        second = self.queue("review", "https://github.com/o/r/pull/2", "--event", "approve", "--body", "two")
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok)
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_SPACING - 1)  # too soon: nothing sent
+        self.assertEqual(len(t.calls), 1)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues/1/comments", "/repos/o/r/pulls/2/reviews"])
+        self.assertEqual(t.calls[1][2], {"body": "two", "event": "APPROVE"})
+        self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["posted", "posted"])
+
+    def test_secondary_limit_holds_the_outbox_not_the_reads(self) -> None:
+        item = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "T", "--body", "b",
+                          "--reviewer", "lawrencecchen")
+        too_quick = (422, {}, {"message": "Validation Failed",
+                               "errors": [{"message": "was submitted too quickly"}]})
+        d, t = self.daemon(too_quick, (403, {"retry-after": "120"}, {"message": "You have exceeded a secondary rate limit"}),
+                           (201, {}, {"html_url": "https://github.com/o/r/pull/9", "number": 9}), (201, {}, {}))
+        self.step(d, NOW)
+        self.assertEqual(d.post_hold, NOW + gg.POST_BACKOFF)
+        self.assertEqual(d.mode("rest"), "normal")
+        self.step(d, NOW + gg.POST_BACKOFF - 1)
+        self.assertEqual(len(t.calls), 1)
+        self.step(d, NOW + gg.POST_BACKOFF)  # Retry-After wins over the backoff
+        self.assertEqual(d.post_hold, NOW + gg.POST_BACKOFF + 120)
+        self.assertEqual(d.mode("rest"), "normal")
+        self.assertEqual(gg.post_state(item["id"])["state"], "queued")
+        self.step(d, NOW + gg.POST_BACKOFF + 120)
+        self.assertEqual(t.calls[2], ("POST", "/repos/o/r/pulls",
+                                      {"title": "T", "head": "lane/x", "base": "main", "body": "b", "draft": False}))
+        self.assertEqual(t.calls[3], ("POST", "/repos/o/r/pulls/9/requested_reviewers", {"reviewers": ["lawrencecchen"]}))
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["state"], state["url"], state["number"], state["throttled"]),
+                         ("posted", "https://github.com/o/r/pull/9", 9, 2))
+        self.assertEqual(d.post_backoff, gg.POST_BACKOFF)
+
+    def test_a_lost_answer_is_looked_up_before_writing_again(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "receipt")
+        d, t = self.daemon(gg.WatchError("request failed: TimeoutError"),
+                           (200, {}, [{"body": "other", "html_url": "a"}, {"body": "receipt", "html_url": "landed"}]))
+        self.step(d, NOW)
+        queued = gg.post_state(item["id"])
+        self.assertEqual((queued["state"], queued["attempts"], queued["uncertain"]), ("queued", 1, True))
+        self.step(d, NOW + gg.POST_RETRY)
+        self.assertEqual(t.calls[1][0], "GET")
+        self.assertIn("/repos/o/r/issues/7/comments?per_page=100&since=", t.calls[1][1])
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["state"], state["url"]), ("posted", "landed"))
+        self.assertEqual(len(t.calls), 2)  # never posted twice
+
+    def test_an_open_pr_for_the_head_is_the_answer(self) -> None:
+        item = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "T", "--body", "b")
+        d, t = self.daemon((422, {}, {"message": "Validation Failed",
+                                      "errors": [{"message": "A pull request already exists for o:lane/x."}]}),
+                           (200, {}, [{"html_url": "https://github.com/o/r/pull/3"}]))
+        self.step(d, NOW)
+        self.assertEqual(t.calls[1][1], "/repos/o/r/pulls?state=open&head=o%3Alane/x&base=main")
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["state"], state["url"]), ("posted", "https://github.com/o/r/pull/3"))
+
+    def test_a_refusal_fails_and_transient_errors_give_up(self) -> None:
+        bad = self.queue("comment", "o/r#404", "--body", "x")
+        d, _ = self.daemon((404, {}, {"message": "Not Found"}), *[(502, {}, {})] * gg.POST_ATTEMPTS)
+        self.step(d, NOW)
+        self.assertEqual(gg.post_state(bad["id"])["error"], "HTTP 404: Not Found")
+        flaky = self.queue("comment", "o/r#5", "--body", "y")
+        at = NOW
+        for _ in range(gg.POST_ATTEMPTS):
+            at += gg.POST_RETRY * gg.POST_ATTEMPTS
+            self.step(d, at)
+        state = gg.post_state(flaky["id"])
+        self.assertEqual(state["state"], "failed")
+        self.assertIn(f"gave up after {gg.POST_ATTEMPTS} attempts: HTTP 502", state["error"])
+
+    def test_cli_queues_and_returns_without_the_daemon_posting(self) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(gg, "daemon_running", return_value=True), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err), mock.patch.object(sys, "stdin", io.StringIO("body")):
+            code = gg.main(["post", "comment", "o/r#7", "--body-file", "-"])
+        self.assertEqual(code, 0)
+        self.assertRegex(out.getvalue(), r"^queued as \d{13}-\d+-[0-9a-f]{6}; 0 ahead\n$")
+        self.assertIn("glaeda-gh post status", err.getvalue())
+        with mock.patch.object(gg, "daemon_running", return_value=False), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gg.main(["post", "comment", "o/r#8", "--body", "b"]), 3)
+        self.assertEqual(len(list(gg.outbox_dir().glob("*.json"))), 2)  # kept for when the daemon runs
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gg.main(["post", "pr", "o/r", "--body", "b"]), 64)
+            self.assertEqual(gg.main(["post", "comment", "o/r#7", "--body", "b", "--body-file", "-"]), 64)
+
+    def test_status_waits_for_the_url(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "x")
+        poll = gg.WAIT_FILE_POLL
+        gg.WAIT_FILE_POLL = 0.02
+        self.addCleanup(setattr, gg, "WAIT_FILE_POLL", poll)
+        d, _ = self.daemon((201, {}, {"html_url": "posted-url"}))
+        timer = threading.Timer(0.1, lambda: self.step(d, NOW))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = gg.cmd_post_status(item["id"], 2, False)
+        self.assertEqual((code, out.getvalue()), (0, "posted-url\n"))
+
+    def test_tick_posts_first_and_reports_the_outbox(self) -> None:
+        self.queue("comment", "o/r#7", "--body", "x")
+        self.queue("comment", "o/r#8", "--body", "y")
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        status = d.tick(now=NOW)
+        self.assertEqual(len(t.calls), 1)
+        self.assertEqual(status["outbox"], {"queued": 1, "holdUntil": None})
+
+
 if __name__ == "__main__":
     unittest.main()
