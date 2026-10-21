@@ -3084,9 +3084,15 @@ class PostTest(unittest.TestCase):
 
     def test_a_refusal_fails_and_transient_errors_give_up(self) -> None:
         bad = self.queue("comment", "o/r#404", "--body", "x")
-        d, _ = self.daemon((404, {}, {"message": "Not Found"}), *[(502, {}, {})] * gg.POST_ATTEMPTS)
+        forbidden = self.queue("comment", "o/r#403", "--body", "x")
+        d, t = self.daemon((404, {}, {"message": "Not Found"}),
+                           (403, {}, {"message": "Resource not accessible by integration"}),
+                           (502, {}, {}), *[(200, {}, []), (502, {}, {})] * (gg.POST_ATTEMPTS - 1))
         self.step(d, NOW)
         self.assertEqual(gg.post_state(bad["id"])["error"], "HTTP 404: Not Found")
+        self.step(d, NOW + gg.POST_SPACING)  # a permission refusal fails; it does not hold the queue
+        self.assertEqual(gg.post_state(forbidden["id"])["state"], "failed")
+        self.assertEqual(d.post_hold, 0.0)
         flaky = self.queue("comment", "o/r#5", "--body", "y")
         at = NOW
         for _ in range(gg.POST_ATTEMPTS):
@@ -3095,6 +3101,62 @@ class PostTest(unittest.TestCase):
         state = gg.post_state(flaky["id"])
         self.assertEqual(state["state"], "failed")
         self.assertIn(f"gave up after {gg.POST_ATTEMPTS} attempts: HTTP 502", state["error"])
+        # each retry after a 502 looked first: a POST that 502s often landed
+        self.assertEqual([c[0] for c in t.calls[2:6]], ["POST", "GET", "POST", "GET"])
+
+    def test_a_5xx_that_landed_is_not_posted_again(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "receipt")
+        d, t = self.daemon((502, {}, {}), (200, {}, [{"body": "receipt", "html_url": "landed"}]))
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_RETRY)
+        self.assertEqual([c[0] for c in t.calls], ["POST", "GET"])
+        self.assertEqual(gg.post_state(item["id"])["url"], "landed")
+
+    def test_a_daemon_that_died_mid_send_looks_first(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "receipt")
+
+        def die(*a):
+            raise SystemExit  # the watchdog or launchd stopped the daemon mid-request
+        d, _ = self.daemon()
+        d.transport = die
+        with self.assertRaises(SystemExit):
+            self.step(d, NOW)
+        d, t = self.daemon((200, {}, [{"body": "receipt", "html_url": "landed"}]))
+        self.step(d, NOW + 10)
+        self.assertEqual([c[0] for c in t.calls], ["GET"])
+        self.assertEqual(gg.post_state(item["id"])["url"], "landed")
+
+    def test_a_bad_entry_fails_alone(self) -> None:
+        broken = self.queue("comment", "o/r#7", "--body", "x")
+        doc = gg.read_json(gg.outbox_dir() / f"{broken['id']}.json")
+        doc["kind"] = "issue"
+        gg.write_json(gg.outbox_dir() / f"{broken['id']}.json", doc)
+        good = self.queue("comment", "o/r#8", "--body", "y")
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        self.step(d, NOW)
+        self.assertIn("unknown write kind", gg.post_state(broken["id"])["error"])
+        self.step(d, NOW + 1)
+        self.assertEqual(gg.post_state(good["id"])["state"], "posted")
+
+    def test_review_lookup_reads_the_last_page(self) -> None:
+        item = self.queue("review", "o/r#7", "--body", "LGTM")
+        link = {"link": f'<{gg.API}/repos/o/r/pulls/7/reviews?per_page=100&page=2>; rel="next", '
+                        f'<{gg.API}/repos/o/r/pulls/7/reviews?per_page=100&page=3>; rel="last"'}
+        d, t = self.daemon(gg.WatchError("request failed: TimeoutError"), (200, link, [{"body": "old"}]),
+                           (200, {}, [{"body": "LGTM", "html_url": "review-url"}]))
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_RETRY)
+        self.assertEqual(t.calls[2][1], "/repos/o/r/pulls/7/reviews?per_page=100&page=3")
+        self.assertEqual(gg.post_state(item["id"])["url"], "review-url")
+
+    def test_a_restarted_daemon_keeps_githubs_hold(self) -> None:
+        self.queue("comment", "o/r#7", "--body", "x")
+        d, _ = self.daemon((403, {"retry-after": "600"}, {"message": "You have exceeded a secondary rate limit"}))
+        d.tick(now=NOW)
+        again, t = self.daemon()
+        self.assertEqual(again.post_hold, NOW + 600)
+        self.step(again, NOW + 10)
+        self.assertEqual(t.calls, [])
 
     def test_cli_queues_and_returns_without_the_daemon_posting(self) -> None:
         out, err = io.StringIO(), io.StringIO()
@@ -3110,6 +3172,7 @@ class PostTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(gg.main(["post", "pr", "o/r", "--body", "b"]), 64)
             self.assertEqual(gg.main(["post", "comment", "o/r#7", "--body", "b", "--body-file", "-"]), 64)
+            self.assertEqual(gg.main(["post", "status", "../../etc/x"]), 64)
 
     def test_status_waits_for_the_url(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "x")
