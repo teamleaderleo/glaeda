@@ -5396,6 +5396,24 @@ class RunnerTest(unittest.TestCase):
         self.assertIsNone(hook.install_staged_hook(hooks), "nothing staged: nothing to do")
         self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "unchanged")
 
+    def test_the_gap_wait_is_one_budget_per_run_however_many_runners_are_busy(self) -> None:
+        """glaeda-update runs --refresh-hooks every 10 minutes: busy runners share one REFRESH_GAP_WAIT_S, watched
+        together, so a mini with N busy runners never stretches a run to N x 240 s."""
+        hooks = self.installed_with_an_older_hook()
+        self.invoke("--apply", "--labels", "cmux-extra", "--instance", "1")
+        self.invoke("--apply", "--labels", "cmux-extra", "--instance", "2")
+        for k in (1, 2):
+            (self.home / f"actions-runner-glaeda-{k}" / cr.HOOK_DIR / cr.HOOK_NAME).write_text(self.OLDER_HOOK)
+        clock = {"t": 0.0}
+        with mock.patch.object(cr, "worker_running", return_value=True), \
+                mock.patch.object(cr.time, "sleep", side_effect=lambda s: clock.__setitem__("t", clock["t"] + s)), \
+                mock.patch.object(cr.time, "monotonic", side_effect=lambda: clock["t"]):
+            done = self.invoke("--refresh-hooks", "--apply")
+        self.assertEqual([r["state"] for r in done["runners"]], ["deferred"] * 3)
+        self.assertGreaterEqual(clock["t"], cr.REFRESH_GAP_WAIT_S)
+        self.assertLess(clock["t"], cr.REFRESH_GAP_WAIT_S + 2 * cr.REFRESH_GAP_POLL_S, "one budget, not one per runner")
+        self.assertTrue((hooks / f".{cr.HOOK_NAME}{cr.NEXT_SUFFIX}").is_file())
+
     def test_a_staged_hook_never_replaces_a_hook_that_changed_since(self) -> None:
         hooks = self.installed_with_an_older_hook()
         with mock.patch.object(cr, "worker_running", side_effect=[True] + [False] * 8), \
