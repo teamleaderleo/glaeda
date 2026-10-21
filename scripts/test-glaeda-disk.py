@@ -1908,6 +1908,9 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.apply(reclaim, families, self.root / "r1.jsonl", None, 6)
             late.close()
             self.assertTrue((two / "derived-data-compile-admission").exists())
+            # apply marks what it refused blocked, so the next pass starts from a fresh survey
+            reclaim = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+            self.assertEqual(len(reclaim), 2)
             gd.apply(reclaim, families, self.root / "r2.jsonl", None, 6)
             # the delete itself takes the token: a job that arrives after every re-check still keeps its root
             make(two / "derived-data-raced", age_hours=50)
