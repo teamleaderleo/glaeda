@@ -23,6 +23,12 @@ from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, os.fspath(ROOT / "scripts"))
+import glaeda_hook_pin  # noqa: E402
+
+# pin a changed runner hook before glaeda-disk loads, so its drain tests see the pin on the first run (CI only checks)
+if not glaeda_hook_pin.under_ci():
+    glaeda_hook_pin.ensure(check=False)
 loader = importlib.machinery.SourceFileLoader("glaeda_disk", os.fspath(ROOT / "scripts" / "glaeda-disk"))
 spec = importlib.util.spec_from_loader("glaeda_disk", loader)
 gd = importlib.util.module_from_spec(spec)
@@ -3393,10 +3399,8 @@ class GlaedaDiskTest(unittest.TestCase):
         drain refuses every runner that installed it ("runner hook enrollment is not proven"). #1561 missed it
         and the three drain tests below went red on main with a message that did not say why (#1553 before it).
         On a checkout this pins it (scripts/glaeda_hook_pin.py); under CI it only checks."""
-        sys.path.insert(0, os.fspath(ROOT / "scripts"))
-        import glaeda_hook_pin
         self.assertIsNone(glaeda_hook_pin.ensure(check=glaeda_hook_pin.under_ci()))
-        self.assertIn(glaeda_hook_pin.hook_sha(), glaeda_hook_pin.pinned((ROOT / "scripts/glaeda-disk").read_text()))
+        self.assertIn(glaeda_hook_pin.hook_sha(), gd.CMUX_NEXT_DRAIN_HOOK_SHA256)
 
     def test_cmux_next_drain_requires_enrollment_and_holds_host_lock(self) -> None:
         fleet = self.root / "fleet"
