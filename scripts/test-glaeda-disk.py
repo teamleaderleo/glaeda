@@ -2760,6 +2760,31 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((idle.parent / ".glaeda-state/cas").exists())
         self.assertTrue((other.parent / ".glaeda-state/ios-e2e-mac-derived-data").exists())
 
+    def test_runner_git_garbage_stays_inside_the_runners_work(self) -> None:
+        home, _ = self._runner_checkouts()
+        outside = self.root / "main-clone/.git"
+        (outside / "objects/pack").mkdir(parents=True)
+        (outside / "objects/pack/tmp_pack_Zz12Yy").write_bytes(b"\0" * 1024)
+        co = home / "actions-runner-glaeda/_work/cmux/cmux"
+        shutil.rmtree(co / ".git")
+        (co / ".git").symlink_to(outside)  # a .git that points at a clone outside _work
+        other = home / "actions-runner-glaeda-2/_work/cmux/cmux/.git/objects"
+        shutil.rmtree(other / "pack")
+        (other / "pack").symlink_to(outside / "objects/pack")
+        found = [str(p) for w in ("actions-runner-glaeda", "actions-runner-glaeda-2")
+                 for p in gd.runner_git_garbage(home / w / "_work")]
+        self.assertFalse([f for f in found if "Zz12Yy" in f or f.startswith(str(co))], found)
+        self.assertIn(str(other / "ab/tmp_obj_Xy98Zw"), found)
+
+    def test_runner_job_live_matches_either_spelling_of_the_runner_path(self) -> None:
+        real = self.root / "real-home/actions-runner-glaeda"
+        real.mkdir(parents=True)
+        (self.root / "home-link").symlink_to(self.root / "real-home")
+        runner = self.root / "home-link/actions-runner-glaeda"
+        self.assertIn("running a job", gd.runner_job_live(runner, f"{real.resolve()}/bin/Runner.Worker spawnclient 1 2\n"))
+        self.assertIn("running a job", gd.runner_job_live(runner, f"{runner}/bin/Runner.Worker spawnclient 1 2\n"))
+        self.assertEqual(gd.runner_job_live(runner, f"{runner}-2/bin/Runner.Worker spawnclient 1 2\n"), "")
+
     def test_job_busy_ignores_wide_runner_build_trees(self) -> None:
         home, fams = self._runner_checkouts()
         target = home / "actions-runner-glaeda/_work/cmux/cmux/cmux-tui/target"

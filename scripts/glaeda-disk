@@ -1415,8 +1415,9 @@ def runner_checkouts(work: Path) -> list[Path]:
         if repo.name.startswith("_") or repo.is_symlink() or not repo.is_dir():
             continue
         for checkout in _children(repo):
-            if (not checkout.name.startswith("_") and not checkout.is_symlink() and (checkout / ".git").is_dir()
-                    and contained_directory(checkout, work)):
+            git = checkout / ".git"
+            if (not checkout.name.startswith("_") and not checkout.is_symlink() and not git.is_symlink()
+                    and git.is_dir() and contained_directory(checkout, work)):
                 out.append(checkout)
     return sorted(out)
 
@@ -1456,6 +1457,8 @@ def runner_git_garbage(work: Path) -> list[Path]:
             continue
         dirs = [objects, objects / "pack", *(d for d in _children(objects) if len(d.name) == 2)]
         for d in dirs:
+            if d.is_symlink() or not contained_directory(d, work):  # a git object store outside this runner's _work
+                continue
             for e in _entries(d):
                 if GIT_GARBAGE_NAME.fullmatch(e.name) and e.is_file(follow_symlinks=False):
                     found.append(Path(e.path))
@@ -1464,7 +1467,9 @@ def runner_git_garbage(work: Path) -> list[Path]:
 
 def runner_job_live(runner: Path, cmds: str) -> str:
     """Why a runner's checkout is in use, or "": its Runner.Worker runs only while it has a job."""
-    pattern = re.escape(os.fspath(runner)) + r"/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)"
+    # either spelling of the runner's path (a symlinked home, /private) counts, so a mismatch never reads as idle
+    names = {os.fspath(runner), os.fspath(runner.resolve())}
+    pattern = "(?:" + "|".join(map(re.escape, sorted(names))) + r")/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)"
     return f"{runner.name} is running a job (Runner.Worker)" if re.search(pattern, cmds, re.M) else ""
 
 
