@@ -3907,6 +3907,26 @@ class GateTest(unittest.TestCase):
         gate.step()
         self.assertEqual(stops, ["held"], "once its first poll has had time to deliver, the hold stops it")
 
+    def test_a_listener_keeps_a_whole_broker_long_poll(self) -> None:
+        # 2026-10-21, cmux7s: the gate started both root listeners at 14:59:10 (sessions at 14:59:11) and stopped
+        # them at 14:59:40, the moment the first-poll hold ran out, for a fleet waiter ("swift-test waits here
+        # for units"). GitHub had queued mobile-core-package (run 39621070398) at 14:59:36, 25 s into that first
+        # message poll, and handed it to one of those sessions; the SIGINT cancelled the poll before the message
+        # came, and the job failed at 15:04 "not acquired by Runner of type self-hosted". The broker holds a
+        # message poll open for up to 50 s, so a job given to a new session can arrive any time in that span.
+        full = "cmux7s-mac-mini-glaeda-4 swift-test (run 39589203114) waits here for units"
+        gate, stops = self.gate([full] * 8)
+        with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child):
+            gate.start()
+        gate.listening_since -= 30.0  # 14:59:40
+        for _ in range(3):
+            gate.step()
+        self.assertEqual(stops, [], "30 s into its first poll a listener may still be getting a job")
+        gate.listening_since -= hook.BROKER_POLL_S - 30.0 + 5.0  # past the whole first poll
+        gate.step()
+        self.assertEqual(stops, ["held"])
+        self.assertGreater(hook.GATE_FIRST_POLL_S, hook.BROKER_POLL_S)
+
     def units(self, held: int) -> Path:
         """A capacity ledger an admission has used, with its first `held` units taken."""
         capacity = Path(tempfile.mkdtemp(dir=self.tmp))
