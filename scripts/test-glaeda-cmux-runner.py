@@ -5374,11 +5374,15 @@ class RunnerTest(unittest.TestCase):
         and the gate sees the change and reloads."""
         hooks = self.installed_with_an_older_hook()
         older = (hooks / cr.HOOK_NAME).read_bytes()
+        (hooks / cr.RESERVATION_NAME).chmod(0o600)  # the module is stale too: it is staged and installed with the hook
         clock = {"t": 0.0}
         with mock.patch.object(cr, "worker_running", return_value=True), \
                 mock.patch.object(cr.time, "sleep", side_effect=lambda s: clock.__setitem__("t", clock["t"] + s)), \
                 mock.patch.object(cr.time, "monotonic", side_effect=lambda: clock["t"]):
             deferred = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(sorted(deferred["files"]), sorted([cr.HOOK_NAME, cr.RESERVATION_NAME]))
+        self.assertTrue((hooks / f".{cr.RESERVATION_NAME}{cr.NEXT_SUFFIX}").is_file())
+        self.assertIn("module", json.loads((hooks / cr.NEXT_RECORD).read_text()))
         self.assertEqual(deferred["state"], "deferred")
         self.assertTrue(deferred.get("staged"), deferred)
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), older, "never swapped under a running job")
@@ -5393,6 +5397,8 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(os.stat(hooks / cr.HOOK_NAME).st_mode & 0o777, 0o755)
         self.assertFalse(staged.exists())
         self.assertFalse((hooks / cr.NEXT_RECORD).exists())
+        self.assertEqual(os.stat(hooks / cr.RESERVATION_NAME).st_mode & 0o777, 0o644, "the staged module went in too")
+        self.assertFalse((hooks / f".{cr.RESERVATION_NAME}{cr.NEXT_SUFFIX}").exists())
         self.assertIsNone(hook.install_staged_hook(hooks), "nothing staged: nothing to do")
         self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "unchanged")
 
@@ -5426,7 +5432,7 @@ class RunnerTest(unittest.TestCase):
         # an --apply from a newer copy wrote another hook in the meantime: job-completed drops the stale stage
         newer = HOOK.read_text() + "\n# from main, newer than this release\n"
         (hooks / cr.HOOK_NAME).write_text(newer)
-        self.assertIn("dropped", hook.install_staged_hook(hooks))
+        self.assertIn("changed since it was staged", hook.install_staged_hook(hooks))
         self.assertEqual((hooks / cr.HOOK_NAME).read_text(), newer)
         self.assertFalse(staged.exists())
         self.assertFalse((hooks / cr.NEXT_RECORD).exists())
