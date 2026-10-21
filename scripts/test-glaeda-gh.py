@@ -3117,6 +3117,9 @@ class PostTest(unittest.TestCase):
         gg.WAIT_FILE_POLL = 0.02
         self.addCleanup(setattr, gg, "WAIT_FILE_POLL", poll)
         d, _ = self.daemon((201, {}, {"html_url": "posted-url"}))
+        quiet = mock.patch.object(gg, "log")  # the daemon's log line would land in the captured stdout
+        quiet.start()
+        self.addCleanup(quiet.stop)
         timer = threading.Timer(0.1, lambda: self.step(d, NOW))
         timer.start()
         self.addCleanup(timer.cancel)
