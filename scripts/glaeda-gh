@@ -4671,8 +4671,11 @@ AUDIT_READS = {("pr", "view"), ("pr", "checks"), ("pr", "list"), ("pr", "diff"),
 # could not be resolved) is counted, but never as a repeat: `pr view 7` in two repositories is two
 # different reads, and treating them as one would overstate what a cache can do.
 AUDIT_BARE = re.compile(r"^(?:pr|run|issue|search|label) [\w-]+(?: \d+)?$")
-# The GraphQL endpoint, however it was typed: `graphql`, `/graphql`, or the absolute URL.
-AUDIT_GRAPHQL_RE = re.compile(r"^(?:https?://api\.github\.com/)?/?graphql/?$")
+# The GraphQL endpoint, however it was typed: `graphql`, `/graphql`, or an absolute URL. Any host,
+# not `api.github.com` alone: this file handles GHE remotes deliberately, and a GHE host's
+# `https://ghe.example/api/graphql` landed in a category of its own, so the count undercounted and
+# the sentence below it could go missing altogether.
+AUDIT_GRAPHQL_RE = re.compile(r"^(?:https?://[^/]+/(?:api/)?)?/?graphql/?$")
 # A logged line of the shape the broker and today's guard write: subcommand words, then an
 # identifier (a cache key, an api path, or a number), then the guard's `-R owner/repo`. Anything
 # else is counted but never printed back (see cmd_audit).
@@ -4810,28 +4813,47 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
         # category is not cacheable, so none of the objects inside it reaches `cacheableReads`,
         # `repeatsWithin` or `perRead`, and the repeat *count* is a floor rather than an estimate.
         # The count and not the shares beside it. Writing the hidden reads out can only grow the
-        # count and can only grow both parts of each share, so a share can go up, down or stay put
-        # -- measured 45.5% -> 10.0%, 0.0% -> 33.3% and 33.3% -> 33.3% on three fixtures. Two
-        # earlier drafts of this line each inferred a direction instead: "both *fall*" from the
-        # denominator alone, then "either direction" said of the two counts rather than the share.
-        # Say what is measured and nothing about mechanism.
+        # count, and grows the denominator of each share while it *may* grow the numerator, so a
+        # share can go up, down or stay put -- all three are in AuditGraphqlTest, which is what
+        # finally made the sentence checkable rather than reviewable. Three earlier drafts each
+        # inferred a direction instead: "both *fall*" from the denominator alone, "either
+        # direction" said of the two counts rather than the share, and then "grows the numerator
+        # and the denominator" -- which reads as both always growing, and a review measured
+        # 33.3% -> 25.0% where only the denominator did. Say what is measured, nothing about
+        # mechanism, and let a test hold it.
+        # "The calls are counted above" because they are: in the total, in their own category row
+        # with a share, and in the denominator of the repeat percentage. An earlier draft said
+        # "None of them is counted above", which the table ten lines up contradicts. What is not
+        # counted is the *objects* inside them, and what follows from that is only that no graphql
+        # call is a cacheable read or a repeat.
         # "however many ... asked for" covers zero, which is the only thing needed: the log keeps
         # the path and never the document, so a batched read of forty and a call that reads nothing
         # are the same line here, and a floor needs the hidden reads to be >= 0. Earlier drafts
         # named the mutation and the one-object probe as carrying nothing, and both were claims
         # about GitHub's API that this log cannot see -- a mutation selects its payload, and a probe
-        # of an object read nearby hides a repeat.
+        # of an object read nearby hides a repeat. "each carrying", not "each one request": with
+        # `--paginate` one command line is several HTTP requests, and the log keeps neither the
+        # flags (broker_logged_target drops them) nor the request count.
+        # "the same-target re-reads a cache could have been asked for", not "what a cache could
+        # have answered": this broker's cache keys on the target, and the repeat count is
+        # flag-blind in the other direction -- `pr view X --json state` and `pr view X --json
+        # files` log the same target and score as one repeat, while the broker would have to fetch
+        # the second field set. So the figure is a floor against hidden GraphQL reads and can
+        # overcount against the cache's own hit rate; naming same-target re-reads is the part that
+        # holds both ways.
         # The floor is over the calls in *this report*. With `--last N` the window is the last N
         # lines, so writing hidden reads out as separate lines pushes older ones out and the
         # comparison runs over two different sets of calls. Held to one set it is monotone: a review
         # found no counterexample in 4000 random insertions, for repeats, reads and calls alike.
         # No pricing claim here on purpose -- this file is read as durable output, and a price is
         # the part that goes stale.
-        print(f"\n{batched} of those calls were `gh api graphql`, each one request carrying however many "
-              f"objects the caller asked for, which this cannot see. None of them is counted above, so "
-              f"the repeat count is a floor on what a cache could have answered for the calls in this "
-              f"report, not an estimate. The shares beside it are not floors: counting the hidden reads "
-              f"grows the numerator and the denominator, so a share can move either way, or not at all.")
+        print(f"\n{batched} of those calls were `gh api graphql`, each carrying however many objects "
+              f"the caller asked for, which this cannot see. The calls are counted above; none of "
+              f"the objects inside them is, so none of them is counted as a cacheable read or as a "
+              f"repeat. That makes the repeat count a floor on the same-target re-reads a cache "
+              f"could have been asked for in this report, not an estimate. The shares beside it "
+              f"are not floors: writing the hidden reads out can grow the numerator and does grow "
+              f"the denominator, so a share can go up, down or stay where it is.")
     return EXIT_OK
 
 

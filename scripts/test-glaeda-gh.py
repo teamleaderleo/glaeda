@@ -3684,10 +3684,59 @@ class AuditTest(BrokerBase):
         `audit_category` was matching that one by equality too."""
         path = self.write_log([(0, "api graphql"), (5, "api /graphql"),
                                (10, "api https://api.github.com/graphql"),
+                               # A GHE host, which this file handles deliberately elsewhere: its
+                               # endpoint lives under /api/, and pinning api.github.com put it in
+                               # a category of its own, so the count undercounted on exactly the
+                               # hosts whose remotes this tool goes out of its way to support.
+                               (12, "api https://ghe.example/api/graphql"),
                                (15, "api /rate_limit"), (20, "pr view pr:o/r#7")])
         doc = self.audit_json(path)
-        self.assertEqual(doc["categories"]["raw gh api graphql"], 3, doc["categories"])
+        self.assertEqual(doc["categories"]["raw gh api graphql"], 4, doc["categories"])
         self.assertEqual(doc["categories"]["rate_limit (free)"], 1, doc["categories"])
+        # And not so wide that an unrelated path under a host reads as the endpoint.
+        for other in ("api https://ghe.example/api/v3/repos/o/r", "api repos/o/graphql-tools"):
+            with self.subTest(other):
+                doc = self.audit_json(self.write_log([(0, other)]))
+                self.assertNotIn("raw gh api graphql", doc["categories"], doc["categories"])
+
+    def test_the_hidden_reads_move_a_share_in_both_directions(self) -> None:
+        """The sentence's one directional claim, held by measurement instead of by review.
+
+        It says a share can go up, down or stay where it is, and three rounds of this PR each
+        asserted a direction the log cannot see -- the last of them "grows the numerator and the
+        denominator", which reads as both always growing. Nothing in the suite could tell: the only
+        guard was `assertIn` on the whole sentence, so a wrong direction *inside* the pinned string
+        was green.
+
+        So the property is driven. Each case is the same traffic counted twice: as the audit sees
+        it, and with the objects the `graphql` calls carried counted as the reads they are. The
+        repeat count never falls -- that is what "floor" means, and it is asserted in every case --
+        while the share goes whichever way the two counts take it."""
+        hidden = "the objects inside the graphql call, counted"
+        for name, batched, want in (
+                # One hidden read of an object nothing re-reads: denominator up, numerator flat.
+                ("a share that falls", [(1, "pr view pr:o/r#9")], "down"),
+                # The hidden read repeats a visible one: both parts up, and the share with it.
+                ("a share that rises", [(1, "pr view pr:o/r#1")], "up"),
+                # Three hidden reads carrying one repeat between them, against 1/3 before: 2/6.
+                ("a share that does not move", [(1, "pr view pr:o/r#2"), (2, "pr view pr:o/r#2"),
+                                                (3, "pr view pr:o/r#3")], "flat")):
+            with self.subTest(name):
+                visible = [(0, "api graphql"), (10, "pr view pr:o/r#1"), (20, "pr view pr:o/r#1")]
+                before = self.audit_json(self.write_log(visible))
+                after = self.audit_json(self.write_log(visible + batched))
+                self.assertGreaterEqual(after["repeatsWithin"]["calls"],
+                                        before["repeatsWithin"]["calls"],
+                                        f"{hidden}: the repeat count fell, so it is no floor")
+                self.assertGreater(after["calls"], before["calls"], hidden)
+                shares = (before["repeatsWithin"]["calls"] / before["calls"],
+                          after["repeatsWithin"]["calls"] / after["calls"])
+                if want == "down":
+                    self.assertGreater(shares[0], shares[1], shares)
+                elif want == "up":
+                    self.assertLess(shares[0], shares[1], shares)
+                else:
+                    self.assertEqual(shares[0], shares[1], shares)
 
     def test_a_graphql_call_hides_reads_from_the_repeat_figure_and_the_report_says_so(self) -> None:
         """Coverage, not cost. An earlier version of this line said a batching caller "looks
@@ -3700,9 +3749,11 @@ class AuditTest(BrokerBase):
         What a `graphql` line does hide is *reads*: the category is not cacheable, so nothing
         inside it reaches `cacheableReads`, `repeatsWithin` or `perRead`, which makes the repeat
         *count* a floor rather than an estimate -- the count and not the shares printed beside it,
-        which fall when the hidden reads are written out because the denominator grows too. The
-        sentence makes no claim about cost, because the cost is the part that goes stale -- and
-        that is asserted here, not just intended.
+        which can go up, down or stay put (the three fixtures below). An earlier version of this
+        docstring said they "fall ... because the denominator grows too", fifteen lines above its
+        own assertion that a share can move either way: one of the two had to be wrong, and a
+        review measured that it was this one. The sentence makes no claim about cost, because the
+        cost is the part that goes stale -- and that is asserted here, not just intended.
 
         The primary guard is the sentence itself, asserted whole: a rewrite that smuggles a price
         back in has to change it. The word ban is the backstop, and it is scoped to that last
@@ -3717,12 +3768,17 @@ class AuditTest(BrokerBase):
         self.assertEqual(doc["cacheableReads"], 1, "a graphql line was counted as a cacheable read")
         self.assertEqual(doc["repeatsWithin"]["calls"], 0)
         text = self.audit_text(path)
-        self.assertIn("2 of those calls were `gh api graphql`, each one request carrying however many "
-                      "objects the caller asked for, which this cannot see. None of them is counted "
-                      "above, so the repeat count is a floor on what a cache could have answered for "
-                      "the calls in this report, not an estimate. The shares beside it are not floors: "
-                      "counting the hidden reads grows the numerator and the denominator, so a share "
-                      "can move either way, or not at all.", text)
+        self.assertIn("2 of those calls were `gh api graphql`, each carrying however many objects "
+                      "the caller asked for, which this cannot see. The calls are counted above; "
+                      "none of the objects inside them is, so none of them is counted as a "
+                      "cacheable read or as a repeat. That makes the repeat count a floor on the "
+                      "same-target re-reads a cache could have been asked for in this report, not "
+                      "an estimate. The shares beside it are not floors: writing the hidden reads "
+                      "out can grow the numerator and does grow the denominator, so a share can go "
+                      "up, down or stay where it is.", text)
+        # The table above the sentence is what makes "the calls are counted above" true, and what
+        # made the earlier "None of them is counted above" false in the same report.
+        self.assertIn("raw gh api graphql", text)
         self.assertEqual(cost_claims(text), [], "the report is making a claim about cost again")
 
     def test_the_cost_ban_fires_on_a_priced_sentence_and_only_in_the_last_paragraph(self) -> None:
@@ -3731,7 +3787,12 @@ class AuditTest(BrokerBase):
         paragraph) left all 334 green: a guard that cannot fail when disabled is not a guard.
         This also exercises the three patterns no fixture reaches, and pins the cost the scoping
         was accepted for -- a priced paragraph printed before the graphql one is not caught."""
-        priced = "head\n\nthe cheapest call is 2 points per call, at any price"
+        # With a trailing newline, because `print` leaves one and nothing the ban is ever
+        # shown ends without it: on a sample without it, `split("\n")[-1]` -- a mutation of
+        # the paragraph split -- read the priced text and looked like a working guard, while
+        # on a real report that same mutation reads the empty string after the last newline
+        # and returns nothing for any price at all. Measured: all 335 tests green with it.
+        priced = "head\n\nthe cheapest call is 2 points per call, at any price\n"
         # The patterns by name, not `list(STALE_COST)`: that adapts to whatever the tuple holds,
         # so cutting it down to one pattern stayed green (measured).
         self.assertEqual(cost_claims(priced),
