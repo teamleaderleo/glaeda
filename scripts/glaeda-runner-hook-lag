@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""glaeda-runner-hook-lag: report every fleet runner whose installed hook lags glaeda main. Read-only.
+
+    glaeda-runner-hook-lag                     every runner member of the manifest
+    glaeda-runner-hook-lag --hosts a,b         only these members
+    glaeda-runner-hook-lag --output json
+
+The gate settings are the hook's module-level values that read a GLAEDA_RUNNER_* environment variable and
+fall back to a code default (GATE_FIRST_POLL_S, GATE_CPU_PAUSE, ...). No runner sets those variables, so a
+runner runs the default its installed copy of the hook has, and a hook that lags main keeps the old value: a
+GATE_FIRST_POLL_S of 30 s after glaeda#1572 made it 60 s cost test-ios jobs ("not acquired by Runner of type
+self-hosted"), and nothing reported it. The list is read from this checkout's hook, so a new setting is
+compared without a change here.
+
+Run from a worktree at origin's main (HEAD is checked against `git ls-remote origin main`, as
+glaeda-cmux-runner-fleet does), with SSH to every member. Each member gets one SSH: a short Python program on
+stdin loads every ~/actions-runner-glaeda*/glaeda-hooks/glaeda-cmux-runner-hook there with the GLAEDA_RUNNER_*
+variables cleared and prints its SHA-256 and settings. Nothing is written on the member or here.
+
+Each runner reads current (the same bytes as main's hook), differs (other bytes, the same settings), lags (a
+setting differs from main or is missing) or unreadable. Exit 0 when no runner lags and every member answered,
+1 when a runner lags or a member or hook could not be read, 2 when the check cannot run (bad arguments, no
+manifest, HEAD is not origin's main). The heal is a hook rollout (glaeda-update --refresh-hooks, or
+glaeda-cmux-runner-fleet --apply); this tool only reports.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import concurrent.futures
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+HOOK = SCRIPT_DIR / "glaeda-cmux-runner-hook"
+ENV_PREFIX = "GLAEDA_RUNNER_"
+REMOTE_HOOKS = "~/actions-runner-glaeda*/glaeda-hooks/glaeda-cmux-runner-hook"
+PROBE_TIMEOUT_S = 120
+# Sent on stdin and run by the system python with -I: argv is the hooks' glob, then the setting names. One JSON
+# line per hook. A hook that cannot load prints its error, never a traceback the parser would have to skip.
+PROBE = r"""
+import glob, hashlib, importlib.machinery, importlib.util, json, os, sys
+sys.dont_write_bytecode = True  # never a __pycache__ in a runner's glaeda-hooks
+for key in [k for k in os.environ if k.startswith("GLAEDA_RUNNER_")]:
+    del os.environ[key]
+names = sys.argv[2:]
+for path in sorted(glob.glob(os.path.expanduser(sys.argv[1]))):
+    row = {"runner": os.path.basename(os.path.dirname(os.path.dirname(path)))}
+    try:
+        with open(path, "rb") as handle:
+            row["sha256"] = hashlib.sha256(handle.read()).hexdigest()
+        loader = importlib.machinery.SourceFileLoader("glaeda_hook_lag_probe", path)
+        spec = importlib.util.spec_from_loader("glaeda_hook_lag_probe", loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["glaeda_hook_lag_probe"] = module
+        loader.exec_module(module)
+        row["settings"] = {name: repr(getattr(module, name)) for name in names if hasattr(module, name)}
+    except (Exception, SystemExit) as error:  # a hook that exits on import is unreadable, not the probe's end
+        row["error"] = type(error).__name__
+    print(json.dumps(row), flush=True)
+"""
+
+
+def load(name: str) -> Any:
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), os.fspath(SCRIPT_DIR / name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def _env_read(node: ast.AST) -> str | None:
+    """The GLAEDA_RUNNER_* variable an os.environ.get(...) or os.getenv(...) call reads, else None."""
+    if not isinstance(node, ast.Call) or not node.args or not isinstance(node.args[0], ast.Constant):
+        return None
+    func = ast.unparse(node.func)
+    value = node.args[0].value
+    if func in ("os.environ.get", "os.getenv") and isinstance(value, str) and value.startswith(ENV_PREFIX):
+        return value
+    return None
+
+
+def gate_settings(source: str) -> dict[str, str]:
+    """{name: variable} for every module-level value that reads a GLAEDA_RUNNER_* variable, directly or through
+    an earlier private name (GATE_THERMAL_HOLD reads it through _hold). Private names themselves are left out."""
+    found: dict[str, str] = {}
+    for node in ast.parse(source).body:
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)):
+            continue
+        reads = [v for v in map(_env_read, ast.walk(node.value)) if v]
+        reads += [found[n.id] for n in ast.walk(node.value) if isinstance(n, ast.Name) and n.id in found]
+        if reads:
+            found[node.targets[0].id] = reads[0]
+    return {name: var for name, var in found.items() if not name.startswith("_")}
+
+
+def parse_probe(out: str) -> list[dict[str, Any]]:
+    rows = []
+    for line in out.splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and isinstance(row.get("runner"), str):
+            rows.append(row)
+    return rows
+
+
+def probe_main(names: list[str]) -> dict[str, Any] | None:
+    """This checkout's hook, read by the same probe the members run."""
+    fleet = load("glaeda-cmux-runner-fleet")
+    code, out, _ = fleet.run([sys.executable, "-I", "-", os.fspath(HOOK), *names], PROBE_TIMEOUT_S, stdin=PROBE)
+    rows = parse_probe(out) if code == 0 else []
+    return rows[0] if rows and "settings" in rows[0] else None
+
+
+def probe_member(fleet: Any, member: str, names: list[str]) -> tuple[list[dict[str, Any]] | None, str | None]:
+    remote = "/usr/bin/python3 -I - " + " ".join(fleet._quote(a) for a in (REMOTE_HOOKS, *names))
+    code, out, err = fleet.run(["ssh", *fleet.SSH_OPTIONS, member, remote], PROBE_TIMEOUT_S, stdin=PROBE)
+    if code != 0:
+        return None, f"unreachable (exit {code}): {err.strip()[-200:]}"
+    return parse_probe(out), None
+
+
+def judge(row: dict[str, Any], main: dict[str, Any]) -> dict[str, Any]:
+    """The runner's state against main's hook, and each setting that differs: {name, main, installed|None}."""
+    if "settings" not in row:
+        return {**row, "state": "unreadable", "lags": []}
+    lags = [{"name": name, "main": value, "installed": row["settings"].get(name)}
+            for name, value in sorted(main["settings"].items()) if row["settings"].get(name) != value]
+    state = "lags" if lags else "current" if row.get("sha256") == main["sha256"] else "differs"
+    return {**row, "state": state, "lags": lags}
+
+
+def check(fleet: Any, members: list[str], names: list[str], main: dict[str, Any], jobs: int) -> list[dict[str, Any]]:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        answers = dict(zip(members, pool.map(lambda m: probe_member(fleet, m, names), members)))
+    result = []
+    for member in members:
+        rows, why = answers[member]
+        if rows is None:
+            result.append({"member": member, "state": "unreachable", "note": why, "runners": []})
+        elif not rows:
+            result.append({"member": member, "state": "no_runners", "note": "no runner hook installed",
+                           "runners": []})
+        else:
+            runners = [judge(r, main) for r in rows]
+            worst = next((s for s in ("lags", "unreadable", "differs") if any(r["state"] == s for r in runners)),
+                         "current")
+            result.append({"member": member, "state": worst, "runners": runners})
+    return result
+
+
+def setting_text(lag: dict[str, Any]) -> str:
+    installed = "missing" if lag["installed"] is None else lag["installed"]
+    return f"{lag['name']} {installed} (main {lag['main']})"
+
+
+def render(report: dict[str, Any]) -> str:
+    lines = [f"glaeda-runner-hook-lag: against origin/main {report['main'][:12]}, "
+             f"{len(report['settings'])} gate settings: {', '.join(sorted(report['settings']))}"]
+    for row in report["members"]:
+        if not row["runners"]:
+            lines.append(f"  {row['member']:<22} {row['state']}: {row['note']}")
+            continue
+        groups: dict[str, list[str]] = {}
+        for runner in row["runners"]:
+            detail = "; ".join(map(setting_text, runner["lags"])) or runner.get("error") or ""
+            groups.setdefault(f"{runner['state']:<10} {detail}".rstrip(), []).append(runner["runner"])
+        for text, runners in sorted(groups.items()):
+            lines.append(f"  {row['member']:<22} {len(runners):>2} runners  {text}")
+    lagging = sum(1 for m in report["members"] for r in m["runners"] if r["state"] == "lags")
+    lines.append(f"runners lagging main: {lagging}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="glaeda-runner-hook-lag", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--manifest", type=Path, default=Path.home() / ".config/glaeda/mini-fleet.json")
+    p.add_argument("--hosts", help="comma-separated members (default: every runner member)")
+    p.add_argument("--exclude", default="", help="comma-separated members to leave out")
+    p.add_argument("--jobs", type=int, default=16, help="members at once")
+    p.add_argument("--output", choices=("human", "json"), default="human")
+    args = p.parse_args(argv)
+    try:
+        manifest = json.loads(args.manifest.expanduser().read_text())
+    except (OSError, ValueError) as error:
+        print(f"glaeda-runner-hook-lag: cannot read the manifest: {type(error).__name__}", file=sys.stderr)
+        return 2
+    fleet = load("glaeda-cmux-runner-fleet")
+    source = fleet.checkout_source()
+    if source["refusal"]:
+        print(f"glaeda-runner-hook-lag: {source['refusal']}; nothing checked", file=sys.stderr)
+        return 2
+    only = [h for h in (args.hosts or "").split(",") if h] or None
+    unknown = [h for h in only or [] if h not in (manifest.get("hosts") or {})]
+    if unknown:
+        print(f"glaeda-runner-hook-lag: not in the manifest: {', '.join(unknown)}", file=sys.stderr)
+        return 2
+    settings = gate_settings(HOOK.read_text(encoding="utf-8"))
+    names = sorted(settings)
+    main_hook = probe_main(names)
+    if main_hook is None:
+        print("glaeda-runner-hook-lag: cannot load this checkout's hook; nothing checked", file=sys.stderr)
+        return 2
+    chosen, skipped = fleet.members(manifest, fleet.load_labels(), only, [h for h in args.exclude.split(",") if h])
+    report = {"main": source["head"], "settings": settings, "mainSettings": main_hook["settings"],
+              "mainSha256": main_hook["sha256"], "skipped": skipped,
+              "members": check(fleet, sorted(chosen), names, main_hook, args.jobs)}
+    print(json.dumps(report, indent=2, sort_keys=True) if args.output == "json" else render(report))
+    bad = any(m["state"] in ("lags", "unreadable", "unreachable") for m in report["members"])
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

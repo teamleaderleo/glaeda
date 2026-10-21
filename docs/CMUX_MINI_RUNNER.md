@@ -522,6 +522,14 @@ changed; reloading the gate"). Wrapper, label or LaunchAgent changes still need
 `--apply`. From an operator Mac, cmuxterm-hq's `fleet runner relabel HOST` stages glaeda's
 `origin/main` in a temporary directory and does the whole relabel.
 
+**Which runners lag main.** `scripts/glaeda-runner-hook-lag` (read-only, from a worktree at
+`origin/main`, with SSH to the members) loads every runner's installed hook on its mini and
+compares its gate settings with main's: each module-level value that reads a `GLAEDA_RUNNER_*`
+variable with a code default (`GATE_FIRST_POLL_S`, `GATE_RESTART_FREE_S`, `GATE_CPU_PAUSE`, ...).
+No runner sets those variables, so a hook that lags main runs main's old defaults. A runner
+`lags` when a setting differs or is missing, `differs` when only its bytes do; exit 1 when one
+lags or a member cannot be read. It only reports: the heal is the refresh above or `--apply`.
+
 Relabelling keeps the runner's name. Moving an existing `<hostname>-glaeda` runner
 to a member whose name `<member>-glaeda` differs is a different install: the
 command refuses it as a conflict until `--uninstall --apply` removes the old one,
