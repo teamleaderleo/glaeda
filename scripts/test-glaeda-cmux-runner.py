@@ -3571,11 +3571,11 @@ class JobLeftoverTest(unittest.TestCase):
             110: (1, "/usr/local/bin/claude --resume"), 111: (110, "node helper.js"),
             120: (1, "/var/folders/x/T/cnd-bin-1/cmux-tui --headless"),  # has a terminal: someone's session
             130: (1, "/var/folders/x/T/cnd-bin-2/cmux-tui --headless"), 131: (130, "tmux -L inner"),
-            132: (131, "/bin/zsh"),
+            132: (131, "/bin/zsh"), 133: (130, "/bin/zsh -l"), 134: (133, "vim notes"), 135: (130, "cat"),
         }
         cwds = {pid: self.WORK + "/cmux" for pid in (100, 110, 120, 130)}
-        found = hook.work_leftover_pids(table, self.WORK, set(), cwds, ttys={120})
-        self.assertEqual([pid for pid, _ in found], [130])  # 131's tmux and everything under it stay
+        found = hook.work_leftover_pids(table, self.WORK, set(), cwds, ttys={120, 133})
+        self.assertEqual([pid for pid, _ in found], [130, 135])  # 131's tmux, 133's terminal and all under them stay
 
     def test_glaedas_detached_disk_bound_is_spared(self) -> None:
         bound = f"{sys.executable} -c {hook.DISK_BOUND} 120 {sys.executable} /Users/cmux/.local/bin/glaeda-disk --pressure"

@@ -4809,8 +4809,8 @@ def work_leftover_pids(table: dict[int, tuple[int, str]], work: str, protected: 
                        cwds: dict[int, str] | None = None, orphans_only: bool = False,
                        ttys: set[int] | None = None) -> list[tuple[int, str]]:
     """Processes whose command runs from `work`, or orphans (ppid 1) without a terminal (`ttys`) whose cwd (from
-    `cwds`) is inside it, and their descendants, minus `protected` (the hook and its ancestors) and leftover_spared
-    ones with everything under them. orphans_only takes command roots only when launchd adopted them too. Roots
+    `cwds`) is inside it, and their descendants, minus `protected` (the hook and its ancestors), processes with a
+    terminal and leftover_spared ones, with everything under them. orphans_only takes command roots only when launchd adopted them too. Roots
     come before their descendants."""
     prefixes = tuple({work.rstrip("/") + "/", os.path.realpath(work).rstrip("/") + "/"})
     roots = {pid for pid, (ppid, cmd) in table.items()
@@ -4825,8 +4825,9 @@ def work_leftover_pids(table: dict[int, tuple[int, str]], work: str, protected: 
         for pid in [root, *descendants(root, table)]:
             if pid in seen or pid in skipped:
                 continue
-            if pid in protected or leftover_spared(table[pid][1]) or table[pid][0] in skipped:
-                skipped.add(pid)  # nothing under a spared process is a leftover either
+            if (pid in protected or pid in (ttys or set()) or leftover_spared(table[pid][1])
+                    or table[pid][0] in skipped):
+                skipped.add(pid)  # nothing under a spared process (or one with a terminal) is a leftover either
                 continue
             seen.add(pid)
             found.append((pid, table[pid][1]))
