@@ -342,6 +342,35 @@ def read_cache(key: str) -> dict | None:
 
 
 LOCK_WAIT = 2.0  # how long a read-modify-write waits for a sibling before giving up on the lock
+LOCK_BUDGET = 2.0  # how long one gh call may spend waiting on all of these locks together
+_lock_deadline: float | None = None
+
+
+@contextlib.contextmanager
+def lock_budget(seconds: float = LOCK_BUDGET):
+    """Bound every bounded_lock inside this block to `seconds` *in total*.
+
+    One brokered gh call takes three of these in sequence, so per-lock bounds multiplied: with all
+    three held by a wedged sibling a call waited 6.16 s, measured. The waits are each individually
+    reasonable and together are not, and what a caller cares about is when `gh` runs, which is one
+    number. Nested blocks keep the tighter deadline; outside any block there is no budget, so the
+    daemon's own use of these locks is unaffected."""
+    global _lock_deadline
+    previous = _lock_deadline
+    _lock_deadline = time.monotonic() + seconds
+    try:
+        yield
+    finally:
+        _lock_deadline = previous
+
+
+def extend_lock_budget(seconds: float) -> None:
+    """Give the budget back time a deliberate wait spent. What it bounds is waiting on a sibling's
+    lock; the repeat brake's 30 s is the broker working as intended, and spending the budget on it
+    would leave the bookkeeping after it unlocked for no reason."""
+    global _lock_deadline
+    if _lock_deadline is not None:
+        _lock_deadline += seconds
 
 
 @contextlib.contextmanager
@@ -362,6 +391,8 @@ def bounded_lock(path: Path, seconds: float = LOCK_WAIT):
         return
     held = False
     deadline = time.monotonic() + seconds
+    if _lock_deadline is not None:
+        deadline = min(deadline, _lock_deadline)
     try:
         while True:
             try:
@@ -3216,11 +3247,23 @@ BROKER_STABLE_FIELDS = {"number", "url", "title", "headRefName", "databaseId", "
 BROKER_SOURCE_RE = re.compile(
     rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/(contents/|git/(?:blobs|trees)/)")
 BROKER_RAW_RE = re.compile(rf"^https?://raw\.githubusercontent\.com/({NAME})/({NAME})/")
-BROKER_REMOTE_RE = re.compile(rf"github\.com[:/]({NAME})/({NAME}?)(?:\.git)?/?\s*$")
+# github.com has to be the *host* of the URL, not a substring of it. Unanchored, this read
+# `https://notgithub.com/o/r`, `https://gitlab.com/mirror/github.com/o/r` and
+# `/srv/mirrors/github.com/o/r` as github.com's `o/r` -- a mirror's checkout offered as the
+# upstream repository's, which is the one thing broker_repo's one-remote rule exists to prevent.
+# The two forms are a URL with a scheme and git's scp-like `[user@]host:path`; a userinfo part
+# (`https://user:token@github.com/o/r`) belongs to either.
+BROKER_REMOTE_RE = re.compile(
+    rf"^(?:(?:https?|git|ssh)://(?:[^/@\s]*@)?github\.com(?::\d+)?/|(?:[^/@\s]*@)?github\.com:)"
+    rf"({NAME})/({NAME}?)(?:\.git)?/?\s*$")
 # A git config is read by section, not scanned: see git_config_remote_urls. git accepts a key on
-# the header's own line (`[remote "origin"] url = ...`), so group 2 is whatever follows the header.
-GIT_CONFIG_SECTION_RE = re.compile(r'^\[\s*([A-Za-z0-9.-]+)(?:\s+"(?:[^"\\]|\\.)*")?\s*\]\s*(.*)$')
-GIT_CONFIG_KEY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)\s*=\s*(.*)$")
+# the header's own line (`[remote "origin"] url = ...`), so group 3 is whatever follows the header,
+# and the subsection may be quoted (`[remote "origin"]`) or dotted (`[remote.origin]`).
+GIT_CONFIG_HEADER_RE = re.compile(r'^\[([^]"]*?)(?:\s+"((?:[^"\\]|\\.)*)")?\]\s*(.*)$')
+GIT_CONFIG_SECTION_NAME_RE = re.compile(r"[A-Za-z0-9-]+")
+# A key with no value is valid git (`[core] bare`), and is never a url.
+GIT_CONFIG_KEY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*(.*))?$")
+GIT_CONFIG_ESCAPES = {"n": "\n", "t": "\t", "b": "\b", '"': '"', "\\": "\\"}
 # GitHub's own credential shapes, never written to the shared log whatever slot they arrived in
 BROKER_SECRET_RE = re.compile(r"gh[posur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}", re.IGNORECASE)
 BROKER_RESOLVED_RE = re.compile(r"^\s*gh-resolved\s*=", re.MULTILINE)
@@ -3356,8 +3399,37 @@ def git_config_text(checkout: Path) -> str | None:
         return None
 
 
-def git_config_remote_urls(text: str) -> list[str]:
-    """The `remote.*.url` values of a git config, in file order.
+def git_config_value(raw: str) -> str | None:
+    """One git config value: quoted runs, backslash escapes, and an unquoted `#` or `;` ending it.
+
+    None for text this cannot finish reading -- a trailing backslash (the value continues on the
+    next physical line), an unterminated quote, an escape git has and this does not. See
+    git_config_remote_urls for why that is not the same as an empty value."""
+    out: list[str] = []
+    quoted = False
+    i = 0
+    while i < len(raw):
+        char = raw[i]
+        if char == "\\":
+            mapped = GIT_CONFIG_ESCAPES.get(raw[i + 1:i + 2])
+            if mapped is None:
+                return None
+            out.append(mapped)
+            i += 2
+            continue
+        if char == '"':
+            quoted = not quoted
+        elif not quoted and char in "#;":
+            break
+        else:
+            out.append(char)
+        i += 1
+    return None if quoted else "".join(out).strip()
+
+
+def git_config_remote_urls(text: str) -> list[str] | None:
+    """The `remote.*.url` values of a git config, in file order, or None for a config this cannot
+    read in full.
 
     Read by section, because scanning the text for a github.com URL matched things that are not
     remotes: `[submodule "x"] url = ...`, an `[url "..."] insteadOf = ...` rewrite rule, and a
@@ -3368,39 +3440,67 @@ def git_config_remote_urls(text: str) -> list[str]:
     It also meant `broker_repo()` saw ten "remotes" in any cmux checkout and so served nothing
     there, in the repository the fleet reads most.
 
-    Deliberately conservative: an exotic config this does not understand yields no remote, and
-    both callers treat "no remote" as "do not serve and do not refuse", which is the safe
-    direction for each. git's own parser accepts a key on the section-header line, so this does."""
+    All-or-nothing, because the dangerous failure is not missing every remote, it is missing *one*.
+    This used to claim that a config it did not understand "yields no remote, which is the safe
+    direction"; the review that followed showed the claim was false, by construction: broker_repo()
+    serves when it sees exactly one remote, so a parser that drops one of two remotes turns a
+    decline into answering one repository's question with another's. A fork+upstream config written
+    `[remote.upstream]`, or one byte-order mark in front of `[remote "origin"]`, did exactly that --
+    the BOM case served the *upstream* as the checkout's repository. So anything not understood here
+    -- an unclassifiable line, an `[include]` this would have to follow, a value that continues on
+    the next line -- returns None, and both callers read None as "no remote at all", which is
+    genuinely safe for each: broker_repo() declines to serve and broker_local_repos() declines to
+    refuse. git's own parser accepts a key on the section-header line and skips a UTF-8 BOM, so this
+    does both."""
     urls: list[str] = []
-    section = ""
-    for raw in text.splitlines():
+    section, subsection = "", ""
+    for raw in text.removeprefix("\ufeff").splitlines():  # git skips one; without this the first [ is not a header
         line = raw.strip()
-        while line and line[0] not in "#;":
-            header = GIT_CONFIG_SECTION_RE.match(line)
-            if header:
-                section = header.group(1).lower()
-                line = header.group(2).strip()
+        while True:
+            if not line or line[0] in "#;":
+                break
+            if line[0] == "[":
+                header = GIT_CONFIG_HEADER_RE.match(line)
+                if header is None:
+                    return None
+                name, quoted_sub, line = header.group(1).strip(), header.group(2), header.group(3).strip()
+                if quoted_sub is not None:
+                    section, subsection = name, quoted_sub
+                else:  # the deprecated `[section.subsection]` form, which git still reads
+                    section, _, subsection = name.partition(".")
+                section, subsection = section.strip().lower(), subsection.strip()
+                if not GIT_CONFIG_SECTION_NAME_RE.fullmatch(section):
+                    return None
+                if section in ("include", "includeif"):
+                    # git reads the named file in here, so the remotes of this checkout are not all
+                    # in this text. Reproduced: with an `[include]`d upstream remote, `git remote -v`
+                    # shows two and this showed one, so the broker served the fork for both.
+                    return None
                 continue
             key = GIT_CONFIG_KEY_RE.match(line)
-            if key and section == "remote" and key.group(1).lower() == "url":
-                value = key.group(2).strip()
-                if value[:1] == '"':
-                    value = value[1:].split('"', 1)[0]
-                else:
-                    value = re.split(r"[\s#;]", value, maxsplit=1)[0]
-                if value:
-                    urls.append(value)
+            if key is None:
+                return None
+            if key.group(2) is None:
+                break  # a valueless key, which git reads as true and is never a url
+            value = git_config_value(key.group(2))
+            if value is None:
+                return None  # including a continuation, whose next line is this value, not a key
+            if section == "remote" and subsection and key.group(1).lower() == "url" and value:
+                urls.append(value)
             break
     return urls
 
 
 def broker_remotes(checkout: Path) -> list[str]:
-    """The owner/repo of every github.com remote of `checkout`, lowercased, in config order."""
+    """The owner/repo of every github.com remote of `checkout`, lowercased, in config order.
+
+    Empty for a config git_config_remote_urls could not read in full, which is the same answer as
+    "no github remotes here" on purpose: both callers decline on it."""
     text = git_config_text(checkout)
     if text is None:
         return []
     found = []
-    for url in git_config_remote_urls(text):
+    for url in git_config_remote_urls(text) or []:
         match = BROKER_REMOTE_RE.search(url)
         if match is None:
             continue
@@ -3410,15 +3510,68 @@ def broker_remotes(checkout: Path) -> list[str]:
     return found
 
 
+def gh_hosts_file() -> Path | None:
+    """gh's own hosts.yml, where `gh auth login` records the hosts it has credentials for, or None
+    when there is nowhere it could be.
+
+    `Path.home()` raises with no HOME at all -- a launchd job, a systemd unit, `env -u HOME` -- and
+    on the way to deciding which *host* a call is for, that would have been an exception thrown
+    across the whole decision. The same bug, in the same week, took the cmuxterm-hq PATH guard out
+    entirely. No HOME means gh has no config to read either, so gh's built-in default is the honest
+    answer and the caller uses it."""
+    directory = os.environ.get("GH_CONFIG_DIR")
+    if not directory:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.environ.get("HOME")
+        if not base:
+            return None
+        directory = str(Path(base) / "gh" if os.environ.get("XDG_CONFIG_HOME")
+                        else Path(base) / ".config/gh")
+    return Path(directory) / "hosts.yml"
+
+
+def gh_default_host() -> str | None:
+    """The host real gh uses when neither the command line nor the environment names one, or None
+    for a hosts.yml this cannot read as a list of hosts.
+
+    gh does not simply default to github.com: with exactly one host logged in, that host is its
+    default, so on an enterprise-only machine every unqualified call goes there. Found by running
+    it -- with GH_CONFIG_DIR naming a config whose only host was `ghe.invalid.example`, gh 2.98.0
+    tried to connect there while this still printed the github.com source refusal and still served
+    `pr view 7 -R acme/thing --json state` out of the github.com cache. Same wrong-answer shape as
+    an explicit `--hostname`, through the one channel broker_elsewhere did not read.
+
+    The parse is top-level YAML keys and nothing else, because that is all the question needs; a
+    file it cannot read that way is None, and broker_elsewhere reads None as "not github.com",
+    which declines instead of answering for a host it cannot identify."""
+    path = gh_hosts_file()
+    if path is None:
+        return "github.com"
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return "github.com"  # no hosts.yml at all: gh's built-in default, and the normal case
+    hosts: list[str] = []
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#") or line[:1].isspace():
+            continue  # blank, a comment, or indented: a value under some host, not a host
+        match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9.:-]*):\s*(?:#.*)?", line.rstrip())
+        if match is None:
+            return None
+        hosts.append(match.group(1).lower())
+    if len(hosts) == 1 and hosts[0] not in BROKER_GITHUB_HOSTS:
+        return hosts[0]
+    return "github.com"
+
+
 def broker_elsewhere(values: dict[str, str]) -> bool:
-    """True when the call names a GitHub host that is not github.com.
+    """True when the call names, or gh would resolve, a GitHub host that is not github.com.
 
     `repos/acme/thing` on an enterprise host is not the same repository as `acme/thing` on
     github.com, so neither the cache nor the local-checkout refusal has anything to say about it.
     broker_repo() always declined these; the refusal did not, and sent
     `gh api --hostname ghe.example.com /repos/acme/thing/contents/README.md` to read a github.com
     clone of that path -- a different repository's bytes, offered as the same ones."""
-    host = (values.get("--hostname") or os.environ.get("GH_HOST") or "github.com").lower()
+    host = (values.get("--hostname") or os.environ.get("GH_HOST") or gh_default_host() or "").lower()
     if host not in BROKER_GITHUB_HOSTS:
         return True
     return bool(os.environ.get("GH_ENTERPRISE_TOKEN") or os.environ.get("GITHUB_ENTERPRISE_TOKEN"))
@@ -3721,6 +3874,13 @@ def broker_repeat_wait(args: list[str], words: list[str], method: str, seen: set
         # and holding an interactive command 30 s is worse than the request. Read from `seen`, not
         # from a scan of args, or a flag whose *value* is "--web" would exempt the call.
         return 0.0
+    if sys.stdout.isatty():
+        # The same exemption, for the same reason, and the review that asked for broker_plan's tty
+        # branch is what found this: that branch returns "pass" *before* cmd_gh reaches this brake,
+        # so a person's second interactive `gh pr view 7 -R o/r --json state` went from served
+        # instantly to held 30 s. Measured on a real pty: 0.12 s, then 30.00 s. A tty is a person,
+        # and what this brake is for is a loop. Agents' calls are piped, so they still get it.
+        return 0.0
     digest = hashlib.sha256("\0".join([broker_caller(), *args]).encode()).hexdigest()[:32]
     path = BASE / "broker-repeat.json"
     BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -3747,6 +3907,7 @@ def broker_hold(seconds: float) -> None:
           f"waiting {int(round(seconds))} s before spending a request on it again "
           f"(CMUX_GH_MIN_REPEAT_SECONDS)", file=sys.stderr)
     time.sleep(seconds)
+    extend_lock_budget(seconds)
 
 
 def broker_log_call(words: list[str], values: dict[str, str]) -> None:
@@ -3778,12 +3939,29 @@ def broker_log_call(words: list[str], values: dict[str, str]) -> None:
         # 0700 like every other state path here: credentials are stripped, but this is every repo,
         # PR, run and API path every session on the host reads, and no other local account needs it.
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # The same for the file, which said 0700 above and came out 0664 under a normal umask --
+        # and so did the world-readable `.1` it was rotated into. Repaired rather than only set at
+        # creation, because the loose copies already exist on every host this has run on. Never
+        # through a symlink: chmod follows one, so a CMUX_GH_LOG pointing at a link would narrow
+        # whatever the link names instead.
+        if path.exists() and not path.is_symlink() and (path.stat().st_mode & 0o077):
+            path.chmod(0o600)
         # Rotated like the decision log. One line per gh call per host is 117 MB on cosmic-gray
         # already, and this is the one append here that had no cap at all. `audit` reads the
         # rotated file too, so nothing is lost until the next rotation past it.
         if path.exists() and path.stat().st_size > GUARD_LOG_MAX:
-            path.replace(path.with_name(path.name + ".1"))
-        with path.open("a") as stream:
+            # Under a lock, and measured again inside it: `stat` then `replace` with two callers
+            # straddling the threshold rotated twice, and the second rotation replaced the full
+            # `.1` with the 51-byte log the first one had just started -- the entire audit history
+            # in neither file, which is the one thing rotation exists to keep. Driven directly to
+            # confirm it. Not rotating when the lock is held is safe: the log grows a little past
+            # the cap and the next call rotates it.
+            with bounded_lock(path.parent / ".guard-log-rotate.lock") as held:
+                if held and path.exists() and path.stat().st_size > GUARD_LOG_MAX:
+                    path.replace(path.with_name(path.name + ".1"))
+        # Created 0600 rather than created loose and repaired on the next call, so the window in
+        # which it is readable by other local accounts is no window at all.
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "a") as stream:
             stream.write(f"{stamp} {caller} {line}\n")
     except OSError:
         pass
@@ -3921,29 +4099,36 @@ def cmd_gh(args: list[str]) -> int:
             # would otherwise be an endless exec between the two.
             raise WatchError("already brokered")
         words, method, seen, values = broker_words(args)
-        broker_log_call(words, values)
-        route, payload, key = broker_plan(args, now)
-        if route == "refuse":
-            broker_note({"route": "refuse"})
-            print(payload, file=sys.stderr)
-            return BROKER_EXIT_REFUSED
-        if route == "serve":
-            broker_note({"route": "serve", "key": key})
-            print(payload)
-            return EXIT_OK
-        broker_hold(broker_repeat_wait(args, words, method, seen, now))
-        # No grace here, unlike every other caller. DOWN_GRACE exists so a client waiting on the
-        # daemon rides out a re-exec; this answer only decides whether to register a watch, which
-        # is worthless if the daemon really is down. Polling for it cost 5.20 s on the hottest read
-        # shape on the host (measured: `gh pr view 7 -R o/r --json state` with no daemon, 26x plain
-        # gh's startup), per call, exactly when none of the cache's value exists to pay for it.
-        if key is not None and daemon_running() and broker_seen_count(key, now) >= 2:
-            # read twice in BROKER_REPEAT: worth a watch, so the next read of it is free. A target
-            # read once is never watched, or a sweep over fifty PRs would cost more than it saves.
-            register(key)
-            broker_note({"route": "pass", "key": key, "watched": True})
-        else:
-            broker_note({"route": "pass", "key": key})
+        # One budget for every lock this call takes, so the bound is the number the caller cares
+        # about -- when gh runs -- and not three bounds that add up behind their own backs. The
+        # repeat hold inside gives its own time back (see broker_hold): the budget bounds waiting
+        # on a sibling, and a deliberate 30 s brake is not that.
+        with lock_budget():
+            broker_log_call(words, values)
+            route, payload, key = broker_plan(args, now)
+            if route == "refuse":
+                broker_note({"route": "refuse"})
+                print(payload, file=sys.stderr)
+                return BROKER_EXIT_REFUSED
+            if route == "serve":
+                broker_note({"route": "serve", "key": key})
+                print(payload)
+                return EXIT_OK
+            broker_hold(broker_repeat_wait(args, words, method, seen, now))
+            # No grace here, unlike every other caller. DOWN_GRACE exists so a client waiting on
+            # the daemon rides out a re-exec; this answer only decides whether to register a watch,
+            # which is worthless if the daemon really is down. Polling for it cost 5.20 s on the
+            # hottest read shape on the host (measured: `gh pr view 7 -R o/r --json state` with no
+            # daemon, 26x plain gh's startup), per call, exactly when none of the cache's value
+            # exists to pay for it.
+            if key is not None and daemon_running() and broker_seen_count(key, now) >= 2:
+                # read twice in BROKER_REPEAT: worth a watch, so the next read of it is free. A
+                # target read once is never watched, or a sweep over fifty PRs would cost more
+                # than it saves.
+                register(key)
+                broker_note({"route": "pass", "key": key, "watched": True})
+            else:
+                broker_note({"route": "pass", "key": key})
     except Exception as error:  # noqa: BLE001  the broker never fails a call: that is the whole contract
         if not isinstance(error, WatchError) or str(error) != "already brokered":
             broker_note({"route": "error", "error": describe(error), "site": error_site(error)})
@@ -4046,7 +4231,12 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
     # The log is rotated once past GUARD_LOG_MAX, so without its predecessor the window this
     # reports would end at the rotation. Optional: there is none until the first one.
     with contextlib.suppress(OSError):
-        text = (path.with_name(path.name + ".1")).read_text(errors="replace") + text
+        older = (path.with_name(path.name + ".1")).read_text(errors="replace")
+        # One newline between them, because concatenating them bare glued a rotated file's last
+        # line to the current log's first and lost *both* records: a truncated `.1` turned two
+        # calls into one counted as `api repos/o/r/pulls2026-10-20T00:00:05Z`.
+        if older:
+            text = older.rstrip("\n") + "\n" + text
     lines = text.splitlines()
     if last:
         lines = lines[-last:]
