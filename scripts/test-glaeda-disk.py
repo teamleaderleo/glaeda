@@ -33,6 +33,9 @@ loader.exec_module(gd)
 _reap_tmpdir_test_residue = gd.reap_tmpdir_test_residue
 gd.reap_tmpdir_test_residue = (lambda receipt, tmp=None, halt=None:
                                0 if tmp is None else _reap_tmpdir_test_residue(receipt, tmp, halt))
+# Nor git gc the clones in the real home of the host running the suite: only a test's own home is gc'd.
+_gc_home_clones = gd.gc_home_clones
+gd.gc_home_clones = lambda receipt, home=None, halt=None: 0 if home is None else _gc_home_clones(receipt, home, halt)
 
 
 def make(path: Path, mib: int = 1, age_hours: float = 48) -> Path:
@@ -3131,6 +3134,141 @@ class GlaedaDiskTest(unittest.TestCase):
         build = next(f for f in fams if f.id == gd.RUNNER_BUILD_FAMILY)
         with mock.patch.object(gd, "cmux_active", return_value=True):
             self.assertFalse(gd.job_busy(build, target))
+
+    def _home_clone(self, packs: int = 3) -> tuple[Path, Path, Path]:
+        """A fake runner home with ~/cmux (packs packs) and a linked work tree ~/cmux-wt beside it."""
+        home = self.root / "home"
+        clone = home / "cmux"
+        clone.mkdir(parents=True)
+        self._git("init", "-q", "-b", "main", os.fspath(clone))
+        for n in range(packs):  # each repack without -a writes the new loose objects to a pack of their own
+            (clone / f"f{n}").write_text(str(n) * 100)
+            self._git("-C", os.fspath(clone), "add", f"f{n}")
+            self._git("-C", os.fspath(clone), "commit", "-q", "-m", f"c{n}")
+            self._git("-C", os.fspath(clone), "repack", "-q")
+        wt = home / "cmux-wt"
+        self._git("-C", os.fspath(clone), "worktree", "add", "-q", "-b", "wt", os.fspath(wt))
+        self._age(home, hours=5)
+        self.assertEqual(gd.git_pack_count(clone / ".git"), packs)
+        return home, clone, wt
+
+    def _gc_log(self):
+        return mock.patch.object(gd, "HOME_CLONE_GC_LOG", self.root / "gc.log")
+
+    def test_home_clones_are_clones_directly_under_home(self) -> None:
+        home, clone, wt = self._home_clone(1)
+        (home / "plain").mkdir()
+        (home / "link-to-clone").symlink_to(clone)
+        runner = home / "actions-runner-glaeda/_work/cmux/cmux"
+        runner.mkdir(parents=True)
+        self._git("init", "-q", os.fspath(runner))
+        self._git("-C", os.fspath(runner), "commit", "-q", "--allow-empty", "-m", "x")
+        self._git("-C", os.fspath(runner), "worktree", "add", "-q", "-b", "o", os.fspath(home / "runner-wt"))
+        # ~/cmux once, also through its linked work tree; never the symlink or a runner checkout's tree
+        self.assertEqual(gd.home_clones(home), [(clone, clone / ".git")])
+        self.assertEqual(gd.linked_work_trees(clone / ".git"), [wt])
+
+    def test_home_clone_gc_repacks_the_clone_with_many_packs(self) -> None:
+        home, clone, wt = self._home_clone(3)
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 3), self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.gc_home_clones(receipt, home)
+        self.assertEqual(gd.git_pack_count(clone / ".git"), 1)
+        rec = json.loads(receipt.read_text())
+        self.assertEqual((rec["family"], rec["outcome"], rec["packs"], rec["packs_after"]),
+                         (gd.HOME_CLONE_GC_FAMILY, "reclaimed", 3, 1))
+        self.assertEqual(self._git("-C", os.fspath(wt), "rev-parse", "--abbrev-ref", "HEAD").strip(), "wt")
+        self._git("-C", os.fspath(clone), "fsck", "--no-progress")  # nothing reachable was lost
+
+    def test_home_clone_gc_below_the_pack_threshold_does_nothing(self) -> None:
+        home, clone, _ = self._home_clone(2)
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 3), self._gc_log():
+            self.assertEqual(gd.gc_home_clones(receipt, home), 0)
+        self.assertEqual(gd.git_pack_count(clone / ".git"), 2)
+        self.assertFalse(receipt.exists())
+
+    def test_home_clone_gc_vetoes(self) -> None:
+        cases = {
+            "a git operation holds gc.pid": lambda c, w: (c / ".git/gc.pid").write_text("1 host"),
+            "a git operation holds index.lock": lambda c, w: (c / ".git/worktrees/cmux-wt/index.lock").write_text(""),
+            "git activity within 1h": lambda c, w: (c / ".git/FETCH_HEAD").write_text("x"),
+            "open or a working directory": lambda c, w: setattr(
+                gd, "process_evidence", lambda: ([os.fspath(w / "f0")], "")),
+            "named by a running command": lambda c, w: setattr(
+                gd, "process_evidence", lambda: ([], f"git -C {c} fetch origin\n")),
+        }
+        for reason, make_busy in cases.items():
+            with self.subTest(reason):
+                shutil.rmtree(self.root / "home", ignore_errors=True)
+                gd.process_evidence = lambda: ([], "")
+                home, clone, wt = self._home_clone(3)
+                make_busy(clone, wt)
+                receipt = self.receipt()
+                receipt.unlink(missing_ok=True)
+                with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 3), self._gc_log():
+                    self.assertEqual(gd.gc_home_clones(receipt, home), 0)
+                self.assertEqual(gd.git_pack_count(clone / ".git"), 3)
+                self.assertIn(reason, json.loads(receipt.read_text())["reasons"][0])
+
+    def test_home_clone_gc_fails_closed_and_never_kills_a_slow_gc(self) -> None:
+        home, clone, _ = self._home_clone(3)
+
+        def no_evidence():
+            raise gd.NoEvidence("ps failed (exit 1)")
+        gd.process_evidence = no_evidence
+        with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 3), self._gc_log(), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gd.gc_home_clones(self.receipt(), home), 0)
+            gd.process_evidence = lambda: ([], "")
+            self.assertEqual(gd.gc_home_clones(self.receipt(), home, halt=lambda: "a CI job runs"), 0)
+        self.assertEqual(gd.git_pack_count(clone / ".git"), 3)
+
+        class SlowGc:
+            pid = 4242
+            killed = False
+
+            def __init__(self, argv, **kw):
+                self.kw = kw
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("git gc", timeout)
+
+            def kill(self):
+                SlowGc.killed = True
+            terminate = kill
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 3), self._gc_log(), \
+                mock.patch.object(gd, "git_object_bytes", return_value=0), \
+                mock.patch.object(gd.subprocess, "Popen", SlowGc), mock.patch.object(gd.os, "killpg") as killpg:
+            gd.gc_home_clones(receipt, home)
+        self.assertFalse(SlowGc.killed)
+        killpg.assert_not_called()
+        rec = json.loads(receipt.read_text())
+        self.assertEqual((rec["outcome"], rec["pid"]), ("running", 4242))
+
+    def test_home_clone_gc_runs_on_pressure_and_sweeps_of_fleet_minis_only(self) -> None:
+        dev = gd.HOME.stat().st_dev
+        under = {dev: gd.Fs(dev, "/", 10 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+        receipt = ["--receipt", os.fspath(self.receipt())]
+        with mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                mock.patch.object(gd, "default_families", return_value=[]), \
+                mock.patch.object(gd, "filesystems", return_value=under), \
+                mock.patch.object(gd, "survey", return_value=[]), \
+                mock.patch.object(gd, "apply", return_value=0), \
+                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
+                mock.patch.object(gd, "notify_disk"), \
+                mock.patch.object(gd, "gc_home_clones", return_value=0) as gc, \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--no-snapshot", "--top", "0", *receipt])  # a report
+            gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])  # neither a sweep nor pressure
+            gd.main(["--pressure", "--apply", "--role", "devbox", "--no-snapshot", "--top", "0", *receipt])
+            gc.assert_not_called()
+            gd.main(["--pressure", "--apply", "--no-snapshot", "--top", "0", *receipt])
+            gc.assert_called_once()
 
     def test_idle_sweep_windows_follow_reuse(self) -> None:
         ci = self.root / "ci"

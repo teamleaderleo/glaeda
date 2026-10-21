@@ -77,6 +77,11 @@ git-pr-<uuid>, TemporaryDirectory.<rand>, ...): tens of thousands, each under th
 family reclaims them. user-tmp-test-residue removes entries named by TMP_TEST_RESIDUE on every apply (not only
 under pressure) once nothing in the whole entry changed for 48 hours and no process holds or names it.
 
+A clone directly in the runner user's home (~/cmux) that is fetched branch after branch gains a pack per
+fetch and git consolidates only at 50: home-clone-gc runs `git gc` (default prune window) on the clone with
+the most packs once it has ten, at most one per idle sweep or pressure pass, when no lock, process, command
+or hour-old git activity touches it or its linked work trees. A slow gc runs on; it is never killed.
+
 The runner-account profile is intentionally narrower than the normal user profile:
 it covers only DerivedData, cmux reload/GhosttyKit caches, and CUA recordings/frame
 caches, with a seven-day minimum idle age. Git index refreshes are ignored for that
@@ -2596,6 +2601,184 @@ def command_lines() -> str:
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return command_text(ps.stdout) if ps.returncode == 0 else ""
+
+
+# A clone in the runner user's home that a person or agent fetches branch after branch: each shallow fetch
+# writes a pack of its own, and git consolidates only at gc.autoPackLimit (50) packs. ~/cmux on
+# cmuxs-mac-mini-3 held 23 packs, 35 GiB, that one `git gc` turned into 1.7 GiB (2026-10-21).
+HOME_CLONE_GC_FAMILY = "home-clone-gc"
+HOME_CLONE_GC_PACKS = 10  # a home clone with this many packs is repacked
+HOME_CLONE_GC_IDLE_HOURS = 1.0  # no fetch, checkout, commit or ref update in it or its work trees for this long
+HOME_CLONE_GC_WAIT_S = 900.0  # a pass waits this long for its gc; a slower gc runs on and is never killed
+HOME_CLONE_GC_LOG = HOME / ".cache/glaeda-disk/home-clone-gc.log"
+HOME_CLONE_GIT_LOCKS = ("gc.pid", "gc.log", "index.lock", "HEAD.lock", "packed-refs.lock", "shallow.lock",
+                        "config.lock", "FETCH_HEAD.lock", "ORIG_HEAD.lock")
+HOME_CLONE_ACTIVITY = ("FETCH_HEAD", "index", "HEAD", "ORIG_HEAD", "logs/HEAD", "packed-refs", "shallow",
+                       "objects/pack", "refs/heads", "refs/remotes")
+
+
+def _git_common_dir(gitdir: Path) -> Path | None:
+    """The main clone's git dir of a linked work tree's git dir (<clone>/.git/worktrees/<name>)."""
+    with contextlib.suppress(OSError, ValueError):
+        common = (gitdir / "commondir").read_text().strip()
+        return Path(os.path.normpath(gitdir / common)) if common else None
+    return None
+
+
+def linked_work_trees(gitdir: Path) -> list[Path]:
+    """The work trees linked to a clone, from <gitdir>/worktrees/<name>/gitdir (each names <tree>/.git)."""
+    trees = []
+    with contextlib.suppress(OSError), os.scandir(gitdir / "worktrees") as it:
+        for e in it:
+            with contextlib.suppress(OSError, ValueError):
+                dotgit = Path((Path(e.path) / "gitdir").read_text().strip())
+                if dotgit.name == ".git":
+                    trees.append(dotgit.parent)
+    return trees
+
+
+def home_clones(home: Path) -> list[tuple[Path, Path]]:
+    """(work tree, git dir) of each clone whose work tree sits directly under home: a directory with a
+    .git directory, or the main clone of a linked work tree there when that clone is under home too.
+    Runner checkouts (~/actions-runner*/_work/...) are never directly under home."""
+    try:
+        with os.scandir(home) as it:
+            dirs = sorted(Path(e.path) for e in it if e.is_dir(follow_symlinks=False))
+    except OSError:
+        return []
+    found: dict[str, tuple[Path, Path]] = {}
+    for d in dirs:
+        dotgit = d / ".git"
+        if dotgit.is_symlink():
+            continue
+        if dotgit.is_dir():
+            gitdir = dotgit
+        elif dotgit.is_file():  # a linked work tree: "gitdir: <clone>/.git/worktrees/<name>"
+            try:
+                text = dotgit.read_text().strip()
+            except (OSError, ValueError):
+                continue
+            if not text.startswith("gitdir:"):
+                continue
+            common = _git_common_dir(Path(os.path.normpath(d / text.split(":", 1)[1].strip())))
+            if common is None:
+                continue
+            gitdir = common
+        else:
+            continue
+        tree = gitdir.parent
+        if (gitdir.name != ".git" or tree.parent != home or tree.is_symlink() or gitdir.is_symlink()
+                or not gitdir.is_dir()):
+            continue
+        found[os.fspath(gitdir)] = (tree, gitdir)
+    return list(found.values())
+
+
+def git_pack_count(gitdir: Path) -> int:
+    with contextlib.suppress(OSError):
+        return sum(1 for p in (gitdir / "objects/pack").iterdir() if p.suffix == ".pack")
+    return 0
+
+
+def git_object_bytes(gitdir: Path) -> int:
+    """Bytes of the clone's object store: packs, loose objects and garbage, as `git count-objects -v` says."""
+    git = shutil.which("git") or "git"
+    try:
+        out = subprocess.run([git, "--git-dir", os.fspath(gitdir), "count-objects", "-v"], capture_output=True,
+                             text=True, timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    kib = 0
+    for line in out.stdout.splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() in ("size", "size-pack", "size-garbage"):
+            with contextlib.suppress(ValueError):
+                kib += int(value.strip())
+    return kib * 1024
+
+
+def home_clone_gc_veto(tree: Path, gitdir: Path, opened: frozenset[str], cmds: str, now: float) -> str:
+    """Why a home clone must not be repacked now, or "" when `git gc` may run on it."""
+    trees = [tree, *linked_work_trees(gitdir)]
+    gitdirs = [gitdir, *(p for p in (gitdir / "worktrees").glob("*") if p.is_dir() and not p.is_symlink())]
+    for g in gitdirs:
+        for lock in HOME_CLONE_GIT_LOCKS:
+            if os.path.lexists(g / lock):
+                return f"a git operation holds {lock}"
+    newest = 0.0
+    for g in gitdirs:
+        for name in HOME_CLONE_ACTIVITY:
+            with contextlib.suppress(OSError):
+                newest = max(newest, (g / name).lstat().st_mtime)
+    if (now - newest) / 3600 < HOME_CLONE_GC_IDLE_HOURS:
+        return f"git activity within {HOME_CLONE_GC_IDLE_HOURS:g}h"
+    for path in (*trees, gitdir):
+        p, resolved = os.fspath(path), os.fspath(path.resolve())
+        if in_cwd(p, opened) or in_cwd(resolved, opened):
+            return f"open or a working directory of a process: {p}"
+        if named_by(p, cmds) or named_by(resolved, cmds):
+            return f"named by a running command: {p}"
+    return ""
+
+
+def gc_home_clones(receipt: Path, home: Path | None = None, halt=None) -> int:
+    """Repack the home clone with the most packs once it has HOME_CLONE_GC_PACKS of them, when no git
+    operation, process or command uses it or its work trees and it saw no git activity for an hour.
+    `git gc` keeps its default prune window; nothing is deleted by hand. One clone per pass; a gc that
+    outlasts HOME_CLONE_GC_WAIT_S keeps running in its own session and is never killed."""
+    home = HOME if home is None else home
+    clones = [(git_pack_count(g), t, g) for t, g in home_clones(home)]
+    clones = sorted((c for c in clones if c[0] >= HOME_CLONE_GC_PACKS), key=lambda c: -c[0])
+    if not clones:
+        return 0
+    if halt is not None and (why := halt()):
+        return 0
+    try:
+        opened, cmds = process_evidence()
+    except NoEvidence as e:
+        print(f"refusing to gc home clones: {e}", file=sys.stderr)
+        return 0
+    index = open_index(opened)
+    released = 0
+    for packs, tree, gitdir in clones:
+        why = home_clone_gc_veto(tree, gitdir, index, cmds, time.time())
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "family": HOME_CLONE_GC_FAMILY,
+               "path": os.fspath(tree), "packs": packs}
+        if why:
+            rec.update(outcome="changed:in-use", verdict="blocked", reasons=[why], bytes=0)
+        else:
+            before = git_object_bytes(gitdir)
+            git = shutil.which("git") or "git"
+            nice = shutil.which("nice")
+            argv = [*([nice, "-n", "15"] if nice else []), git, "-C", os.fspath(tree), "gc", "--quiet"]
+            HOME_CLONE_GC_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with HOME_CLONE_GC_LOG.open("a") as log:
+                log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {' '.join(argv)}\n")
+                log.flush()
+                try:  # its own session: the pass's timers and group kills never reach a running gc
+                    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                            start_new_session=True)
+                except OSError as e:
+                    proc = None
+                    rec.update(outcome=f"incomplete:{e.__class__.__name__}", bytes=0)
+            if proc is not None:
+                try:
+                    code = proc.wait(timeout=HOME_CLONE_GC_WAIT_S)
+                except subprocess.TimeoutExpired:
+                    rec.update(outcome="running", pid=proc.pid, bytes=0)
+                else:
+                    size = max(0, before - git_object_bytes(gitdir)) if code == 0 else 0
+                    released += size
+                    rec.update(outcome="reclaimed" if code == 0 else f"failed:exit-{code}", bytes=size,
+                               packs_after=git_pack_count(gitdir))
+                    if code == 0:
+                        print(f"  reclaimed {gib(size).strip():>8s}  {tree} (git gc of {packs} packs)")
+            rec.update(verdict="reclaimable", reasons=[f"{packs} packs", "no git activity or process"])
+        with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
+            f.write(json.dumps(rec) + "\n")
+        if not why:
+            break  # one gc per pass
+    return released
 
 
 def cleanup_paused_runner_work(receipt: Path) -> int:
@@ -6246,6 +6429,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if a.pressure and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
                 and (not a.family or RUNNER_IDLE_CHECKOUT_FAMILY in a.family):
             logical_released += evict_idle_runner_checkouts(a.receipt, floor_gib)
+        # a home clone that fetch after fetch left in many packs: repack it, at most hourly or under pressure
+        if (sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
+                and (not a.family or HOME_CLONE_GC_FAMILY in a.family):
+            logical_released += gc_home_clones(a.receipt, halt=halt)
         remaining = []
         for fs in shown:
             try:
