@@ -6370,7 +6370,8 @@ class ManifestLabelsTest(unittest.TestCase):
                                 "glaeda-aws-side-light-xcode-26.6", "glaeda-side-trusted-light-xcode-26.6"])
         self.assertEqual(fleet_labels.widened_labels(once), once)
         for unchanged in (["glaeda-side-light-xcode-26.6"], ["glaeda-root-std-xcode-26.6"], ["glaeda-gui-std-xcode-26.6"],
-                          ["glaeda-session-std-xcode-26.6"], ["glaeda-std-xcode-26.6"], ["self-hosted", "macOS"]):
+                          ["glaeda-session-std-xcode-26.6"], ["glaeda-std-xcode-26.6"], ["self-hosted", "macOS"],
+                          ["glaeda-side-std"], ["x-side-std-xcode-26.6"]):
             self.assertEqual(fleet_labels.widened_labels(unchanged), unchanged)
 
     def test_runner_capacity_per_class(self) -> None:

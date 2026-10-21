@@ -123,7 +123,8 @@ def widened_labels(labels: list[str]) -> list[str]:
     for label in list(out):
         parts = label.split("-")
         index = next((i for i, part in enumerate(parts) if part in RUNNER_CLASSES), None)
-        if index is None or "side" not in parts[1:index]:
+        if (index is None or parts[0] != "glaeda" or "side" not in parts[1:index]
+                or parts[index + 1:index + 2] != ["xcode"] or not re.fullmatch(VERSION_RE, "-".join(parts[index + 2:]))):
             continue
         pool = "-".join(part for i, part in enumerate(parts) if not (part == "side" and 0 < i < index))
         if side_label(pool) != label:
