@@ -5405,8 +5405,10 @@ class RunnerTest(unittest.TestCase):
         for k in (1, 2):
             (self.home / f"actions-runner-glaeda-{k}" / cr.HOOK_DIR / cr.HOOK_NAME).write_text(self.OLDER_HOOK)
         clock = {"t": 0.0}
+        # only the gap poll moves the clock: a subprocess wait's own short sleeps (the --parse-only checks) do not
+        poll = lambda s: clock.__setitem__("t", clock["t"] + s) if s == cr.REFRESH_GAP_POLL_S else None  # noqa: E731
         with mock.patch.object(cr, "worker_running", return_value=True), \
-                mock.patch.object(cr.time, "sleep", side_effect=lambda s: clock.__setitem__("t", clock["t"] + s)), \
+                mock.patch.object(cr.time, "sleep", side_effect=poll), \
                 mock.patch.object(cr.time, "monotonic", side_effect=lambda: clock["t"]):
             done = self.invoke("--refresh-hooks", "--apply")
         self.assertEqual([r["state"] for r in done["runners"]], ["deferred"] * 3)

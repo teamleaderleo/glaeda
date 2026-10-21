@@ -5537,7 +5537,11 @@ def install_staged_hook(hook_dir: Path) -> str | None:
             return drop("it is not the file the refresh checked")
         if hashlib.sha256(hook.read_bytes()).hexdigest() != record.get("replaces"):
             return drop("the installed hook changed since it was staged")
-        if staged_module.is_file() and not staged_module.is_symlink():
+        if record.get("module"):
+            st = os.lstat(staged_module)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() \
+                    or hashlib.sha256(staged_module.read_bytes()).hexdigest() != record["module"]:
+                return drop("the staged module is not the file the refresh wrote")
             os.replace(staged_module, module)  # the module first: the hook lands only beside the module it reads
         os.replace(staged, hook)
         record_path.unlink()
