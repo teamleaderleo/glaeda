@@ -50,6 +50,8 @@ class FakeMini(health.Mini):
         self.disk: dict = {}
         self.refusal: str | None = None
         self.toolchain_installs: list[str] = []
+        self.fsev: tuple[int, float, int] | None = (105, 600.0, 20 * 1024**2)
+        self.mdutil: dict[str, str] = {}
 
     def console(self):
         return self.console_state
@@ -110,6 +112,12 @@ class FakeMini(health.Mini):
 
     def node_refusal(self):
         return self.refusal
+
+    def fseventsd(self):
+        return self.fsev
+
+    def spotlight(self, volume):
+        return self.mdutil.get(volume, f"{volume}:\n\tIndexing disabled.\n")
 
     def install_rust_toolchain(self, toolchain):
         self.toolchain_installs.append(toolchain)
@@ -407,6 +415,54 @@ class Tailscale(Base):
         self.assertEqual(self.mini.did, [])
 
 
+class Fseventsd(Base):
+    """cmux CI minis 10-20: fseventsd at 8-25 GB resident and one core for 13-20 h until restarted."""
+
+    def test_a_bloated_daemon_is_reported_at_once_with_the_root_command(self) -> None:
+        self.mini.fsev = (105, 5101 * 60.0, 25 * 1024**3)
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["fseventsd_runaway"])
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible")
+        self.assertIn("25.0 GiB", f["evidence"])
+        self.assertIn("killall fseventsd", f["note"])
+
+    def test_a_sustained_core_is_reported_only_after_a_full_window(self) -> None:
+        self.mini.fsev = (105, 1000.0, 20 * 1024**2)
+        self.assertEqual(self.ids(self.run_once(NOW)), [])
+        self.mini.fsev = (105, 1000.0 + 600 * 0.95, 20 * 1024**2)
+        self.assertEqual(self.ids(self.run_once(NOW + 600)), [])  # ten busy minutes are a build, not a runaway
+        self.mini.fsev = (105, 1000.0 + 1800 * 0.95, 20 * 1024**2)
+        report = self.run_once(NOW + 1800)
+        self.assertEqual(self.ids(report), ["fseventsd_runaway"])
+        self.assertIn("0.95 cores over the last 30 min", report["findings"][0]["evidence"])
+
+    def test_a_quiet_daemon_or_a_restart_clears_it(self) -> None:
+        self.mini.fsev = (105, 1000.0, 20 * 1024**2)
+        self.run_once(NOW)
+        self.mini.fsev = (105, 1000.0 + 1800 * 0.1, 20 * 1024**2)
+        self.assertEqual(self.ids(self.run_once(NOW + 1800)), [])
+        self.mini.fsev = (4915, 2.0, 5 * 1024**2)  # a new pid: the old samples do not count against it
+        self.assertEqual(self.ids(self.run_once(NOW + 3600)), [])
+        self.assertEqual([s[1] for s in json.loads(self.state.read_text())["fseventsd"]], [4915])
+
+    def test_a_malformed_sample_state_is_ignored(self) -> None:
+        self.state.write_text(json.dumps({"fseventsd": {"bad": 1}}))
+        self.assertEqual(self.ids(self.run_once()), [])
+        self.state.write_text(json.dumps({"fseventsd": [["x", 105, 1.0], [NOW - 3600, 105]]}))
+        self.assertEqual(self.ids(self.run_once(NOW + 1)), [])
+
+    def test_no_daemon_is_no_finding(self) -> None:
+        self.mini.fsev = None
+        self.assertEqual(self.ids(self.run_once()), [])
+
+    def test_spotlight_on_the_data_volume_is_reported(self) -> None:
+        self.mini.mdutil = {"/System/Volumes/Data": "/System/Volumes/Data:\n\tIndexing enabled. \n"}
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["spotlight_indexing"])
+        self.assertIn("sudo mdutil -i off /System/Volumes/Data", report["findings"][0]["note"])
+
+
 class TailscaleCli(unittest.TestCase):
     """Mini.tailscale against a stand-in CLI: which binary it runs, with what environment, and what it makes of it."""
 
@@ -496,6 +552,12 @@ class Runners(Base):
 
 
 class Parsing(unittest.TestCase):
+    def test_cpu_time_forms(self) -> None:
+        self.assertEqual(health.cpu_seconds("5105:44.41"), 5105 * 60 + 44.41)
+        self.assertEqual(health.cpu_seconds("1-02:03:04"), ((24 + 2) * 60 + 3) * 60 + 4)
+        self.assertEqual(health.cpu_seconds("0:02.38"), 2.38)
+        self.assertIsNone(health.cpu_seconds("-"))
+
     def test_no_runner_is_a_no_op(self) -> None:
         with tempfile.TemporaryDirectory() as home:
             self.assertEqual(health.Mini(Path(home)).runner_dirs(), [])

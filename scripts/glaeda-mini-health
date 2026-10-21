@@ -38,6 +38,13 @@ Each run checks, as the runner user and without sudo:
                                      (--require-eligible --fleet-class), names a reason, so job-started refuses every
                                      job here (a missing staged generation, a receipt that does not validate, a node
                                      that is not eligible). Restaging or re-enrolling is an operator's: reported only.
+  fseventsd_runaway                  the root fseventsd holds over FSEVENTSD_RSS_BYTES resident or burned
+                                     FSEVENTSD_CORES cores or more across the last FSEVENTSD_WINDOW_S (CPU time
+                                     between this run and a sample kept from an earlier one). A healthy one holds a
+                                     few MB; after days of CI churn on 26.x it was seen at 8-25 GB and one core for
+                                     13-20 h, and only a restart cleared it. Root: reported only, with the command.
+  spotlight_indexing                 mdutil says Spotlight indexing is enabled on / or the Data volume, so mds walks
+                                     every build tree a job writes. Root: reported only, with the command.
 
 A heal is tried at most every HEAL_EVERY_S and HEAL_TRIES times a day per finding, counting heals that worked
 but did not last (a runner that exits again), so nothing loops. Each finding reads
@@ -101,6 +108,14 @@ SESSION_LINES = (WEDGE_SIGNATURE, "Closing session", "Tearing down", "Created se
 XCTEST_RUNNING = re.compile(r"(?:^|/)xctest(?:\s|$)|(?:^|/)xcodebuild\s(?:.*\s)?(?:test|test-without-building)(?:\s|$)")
 LEAKED_TEST_APP = re.compile(r"^\s*'?(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+/Build/Products/Debug/cmux DEV\.app)(?:/Contents/MacOS/[^ ]+)?'?(?:\s|$)")
 LEAKED_APP_TERM_S = 1.0
+FSEVENTSD = "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd"
+FSEVENTSD_RSS_BYTES = 1024**3  # a healthy daemon holds 5-25 MB; the runaway ones held 8-25 GB
+FSEVENTSD_CORES = 0.8
+FSEVENTSD_WINDOW_S = 1800  # a build can push it near a core for minutes; half an hour of it is the runaway
+FSEVENTSD_KEEP_S = 7200
+FSEVENTSD_FIX = ("root: sudo killall fseventsd (launchd starts a fresh one at once and it trims its own log; "
+                 "never delete .fseventsd or touch no_log on the Data volume)")
+SPOTLIGHT_VOLUMES = ("/", "/System/Volumes/Data")
 
 
 def sh(argv: list[str], timeout: float = 15, env: dict[str, str] | None = None) -> tuple[int, str]:
@@ -132,6 +147,15 @@ def leaked_test_app_pids(table: dict[int, tuple[int, int, str, str]]) -> list[tu
         if not owned:
             result.append((pid, match.group(1)))
     return result
+
+
+def cpu_seconds(text: str) -> float | None:
+    """ps TIME ([[dd-]hh:]mm:ss[.cc], macOS also mmm:ss.cc) in seconds."""
+    m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)", text.strip())
+    if not m:
+        return None
+    d, h, mi = (int(x or 0) for x in m.groups()[:3])
+    return ((d * 24 + h) * 60 + mi) * 60 + float(m.group(4))
 
 
 def finding(fid: str, severity: str, evidence: str, auto_fix: str, note: str = "") -> dict[str, Any]:
@@ -357,6 +381,20 @@ class Mini:
             return False, f"rustup installed {toolchain} but it is not listed afterward"
         return True, f"installed Rust toolchain {toolchain}"
 
+    def fseventsd(self) -> tuple[int, float, int] | None:
+        """(pid, CPU seconds, resident bytes) of the root fseventsd, or None when ps does not show it."""
+        for line in sh(["/bin/ps", "-Aww", "-o", "pid=,uid=,time=,rss=,comm="])[1].splitlines():
+            parts = line.split(None, 4)
+            if len(parts) != 5 or parts[1] != "0" or parts[4].strip() not in (FSEVENTSD, "fseventsd"):
+                continue
+            cpu = cpu_seconds(parts[2])
+            if parts[0].isdigit() and parts[3].isdigit() and cpu is not None:
+                return int(parts[0]), cpu, int(parts[3]) * 1024
+        return None
+
+    def spotlight(self, volume: str) -> str:
+        return sh(["/usr/bin/mdutil", "-s", volume], timeout=20)[1]
+
     def disk_summary(self) -> dict[str, Any]:
         path = self.home / ".local/state/glaeda/disk/summary.json"
         return load_json(path)
@@ -556,6 +594,34 @@ def check_node_eligibility(mini: Mini) -> list[dict[str, Any]]:
                     "(docs/CMUX_FLEET_ENROLLMENT.md)")]
 
 
+def check_fseventsd(mini: Mini, now: float, samples: list[Any]) -> tuple[list[dict[str, Any]], list[list[float]]]:
+    """(findings, samples to keep). Samples are [at, pid, cpu seconds] from earlier runs of this daemon."""
+    got = mini.fseventsd()
+    if got is None:
+        return [], []
+    pid, cpu, rss = got
+    samples = samples if isinstance(samples, list) else []  # a hand-edited or older state file
+    kept = [s for s in samples if isinstance(s, list) and all(isinstance(x, (int, float)) for x in s) and len(s) == 3 and s[1] == pid
+            and 0 < now - s[0] <= FSEVENTSD_KEEP_S and s[2] <= cpu]
+    window = [s for s in kept if now - s[0] >= FSEVENTSD_WINDOW_S]
+    cores = (cpu - window[-1][2]) / (now - window[-1][0]) if window else None
+    kept = (kept + [[now, pid, cpu]])[-64:]
+    if rss < FSEVENTSD_RSS_BYTES and (cores is None or cores < FSEVENTSD_CORES):
+        return [], kept
+    rate = f"{cores:.2f} cores over the last {(now - window[-1][0]) / 60:.0f} min" if cores is not None else "rate not yet sampled"
+    return [finding("fseventsd_runaway", "warn", f"fseventsd pid {pid}: {rss / 1024**3:.1f} GiB resident, {rate}, "
+                    f"{cpu / 3600:.1f} CPU-hours since it started", "impossible", FSEVENTSD_FIX)], kept
+
+
+def check_spotlight(mini: Mini) -> list[dict[str, Any]]:
+    on = [v for v in SPOTLIGHT_VOLUMES if "Indexing enabled" in mini.spotlight(v)]
+    if not on:
+        return []
+    return [finding("spotlight_indexing", "warn", f"Spotlight indexing is enabled on {', '.join(on)}; mds walks "
+                    "every build tree a job writes", "impossible",
+                    "root: " + "; ".join(f"sudo mdutil -i off {v}" for v in on))]
+
+
 # ---------------------------------------------------------------- heals
 
 
@@ -651,7 +717,10 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
     previous = {f["id"]: f for f in (load_json(report_path).get("findings") or []) if isinstance(f, dict)}
 
     found = (check_console(mini) + check_power(mini) + check_tailscale(mini) + check_runners(mini)
-             + check_node_eligibility(mini) + check_leaked_test_apps(mini) + check_disk_accounting(mini))
+             + check_node_eligibility(mini) + check_leaked_test_apps(mini) + check_disk_accounting(mini)
+             + check_spotlight(mini))
+    fsev, fsev_samples = check_fseventsd(mini, now, state.get("fseventsd") or [])
+    found += fsev
     tm = check_testmanagerd(mini, now)
     carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal now
     found += [previous["testmanagerd_wedged"]] if carried else tm or []
@@ -693,7 +762,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
     tries = {k: v for k, v in tries.items() if k in ids}
     report = {"schema": SCHEMA, "at": iso(now), "findings": findings, "healed": healed[-HEALED_MAX:]}
     if apply:
-        write_json(state_path, {"seen": seen, "tries": tries, "healed": healed[-HEALED_MAX:]})
+        write_json(state_path, {"seen": seen, "tries": tries, "healed": healed[-HEALED_MAX:], "fseventsd": fsev_samples})
         write_json(report_path, report)
     report["heals"] = heals
     report["changed"] = sorted(ids) != sorted(previous)
