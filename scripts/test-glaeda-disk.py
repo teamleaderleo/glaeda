@@ -2635,6 +2635,121 @@ class GlaedaDiskTest(unittest.TestCase):
                          {str(projects / "app"): 2, str(projects / "wts/feature"): 3})
 
 
+    def _runner_checkouts(self) -> tuple[Path, list[gd.Family]]:
+        """Two enrolled runners, each with a cmux checkout holding SwiftPM and cargo output and git temp packs."""
+        home = self.root / "home"
+        for name in ("actions-runner-glaeda", "actions-runner-glaeda-2"):
+            runner = home / name
+            (runner / "glaeda-hooks").mkdir(parents=True)
+            (runner / ".runner").write_text("{}")
+            co = runner / "_work/cmux/cmux"
+            (co / ".git/objects/pack").mkdir(parents=True)
+            (co / ".git/objects/ab").mkdir()
+            (co / "Sources").mkdir()
+            make(co / "Packages/macOS/CmuxNext/.build")
+            make(co / "Packages/Shared/.build")
+            make(co / "cmux-tui/target")
+            (co / "cmux-tui/target/CACHEDIR.TAG").write_text(
+                "Signature: 8a477f597d28d172789f06886806bc55\n"
+                "# This file is a cache directory tag created by cargo.\n")
+            make(co / "Sources/target")  # no cargo tag: someone's source directory, not cargo's
+            for rel in (".git/objects/pack/tmp_pack_Ab12Cd", ".git/objects/ab/tmp_obj_Xy98Zw",
+                        ".git/objects/pack/pack-1234.pack"):
+                (co / rel).write_bytes(b"\0" * (2 * 1024 * 1024))
+            make(runner / "_work/_temp/cmux-derived-data-tests-1")  # the runner's own scratch is not a checkout
+            self._age(runner / "_work", hours=3)
+        unenrolled = home / "actions-runner-old/_work/cmux/cmux"
+        (unenrolled / ".git").mkdir(parents=True)
+        make(unenrolled / "Packages/macOS/X/.build")
+        return home, gd.runner_checkout_families(home)
+
+    def test_runner_checkout_families_find_build_output_and_git_garbage(self) -> None:
+        home, fams = self._runner_checkouts()
+        self.assertEqual(sorted({(f.id, str(f.root.relative_to(home))) for f in fams}), [
+            ("runner-checkout-build", "actions-runner-glaeda-2/_work"),
+            ("runner-checkout-build", "actions-runner-glaeda/_work"),
+            ("runner-git-garbage", "actions-runner-glaeda-2/_work"),
+            ("runner-git-garbage", "actions-runner-glaeda/_work")])
+        work = home / "actions-runner-glaeda/_work"
+        build = next(f for f in fams if f.id == gd.RUNNER_BUILD_FAMILY and f.root == work)
+        garbage = next(f for f in fams if f.id == gd.RUNNER_GIT_GARBAGE_FAMILY and f.root == work)
+        self.assertEqual(sorted(str(p.relative_to(work)) for p in gd.candidates(build)), [
+            "cmux/cmux/Packages/Shared/.build", "cmux/cmux/Packages/macOS/CmuxNext/.build",
+            "cmux/cmux/cmux-tui/target"])
+        self.assertEqual(sorted(str(p.relative_to(work)) for p in gd.candidates(garbage)), [
+            "cmux/cmux/.git/objects/ab/tmp_obj_Xy98Zw", "cmux/cmux/.git/objects/pack/tmp_pack_Ab12Cd"])
+
+    def test_runner_build_output_goes_under_pressure_only_while_its_runner_has_no_job(self) -> None:
+        home, fams = self._runner_checkouts()
+        busy = home / "actions-runner-glaeda-2"
+        gd.process_evidence = lambda: ([], f"{busy}/bin/Runner.Worker spawnclient 151 154\n"
+                                           f"{home}/actions-runner-glaeda/bin/Runner.Listener run\n")
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"):
+            items = gd.survey(fams, 6, 0)
+        v = {str(Path(i.path).relative_to(home)): (i.verdict, i.reasons) for i in items}
+        idle = "actions-runner-glaeda/_work/cmux/cmux/"
+        live = "actions-runner-glaeda-2/_work/cmux/cmux/"
+        for rel in ("Packages/macOS/CmuxNext/.build", "Packages/Shared/.build", "cmux-tui/target"):
+            self.assertEqual(v[idle + rel][0], "reclaimable", rel)  # three hours idle, no Runner.Worker
+            self.assertEqual(v[live + rel], ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]))
+        # an hour-old temp pack is garbage even while that runner has a job
+        self.assertEqual(v[live + ".git/objects/pack/tmp_pack_Ab12Cd"][0], "reclaimable")
+        self.assertNotIn(live + ".git/objects/pack/pack-1234.pack", v)
+        self.assertNotIn("actions-runner-old/_work/cmux/cmux/Packages/macOS/X/.build", v)
+        # outside a pressure run (the idle sweep, a report) build output is kept; temp packs still go
+        with mock.patch.object(gd, "ACTIVITY_MODE", "sweep"):
+            v = {str(Path(i.path).relative_to(home)): (i.verdict, i.reasons) for i in gd.survey(fams, 24, 0)}
+        self.assertEqual(v[idle + "cmux-tui/target"], ("kept", ["runner build output: pressure-only policy"]))
+        self.assertEqual(v[idle + ".git/objects/pack/tmp_pack_Ab12Cd"][0], "reclaimable")
+
+    def test_runner_git_garbage_younger_than_an_hour_or_open_stays(self) -> None:
+        home, fams = self._runner_checkouts()
+        co = home / "actions-runner-glaeda/_work/cmux/cmux"
+        os.utime(co / ".git/objects/pack/tmp_pack_Ab12Cd")  # a fetch is writing it now
+        held = home / "actions-runner-glaeda-2/_work/cmux/cmux/.git/objects/pack/tmp_pack_Ab12Cd"
+        gd.process_evidence = lambda: ([str(held)], "git index-pack --stdin\n")
+        garbage = [f for f in fams if f.id == gd.RUNNER_GIT_GARBAGE_FAMILY]
+        v = {str(Path(i.path).relative_to(home)): i.verdict for i in gd.survey(garbage, 6, 0)}
+        self.assertEqual(v["actions-runner-glaeda/_work/cmux/cmux/.git/objects/pack/tmp_pack_Ab12Cd"], "recent")
+        self.assertEqual(v["actions-runner-glaeda/_work/cmux/cmux/.git/objects/ab/tmp_obj_Xy98Zw"], "reclaimable")
+        self.assertEqual(v["actions-runner-glaeda-2/_work/cmux/cmux/.git/objects/pack/tmp_pack_Ab12Cd"], "in-use")
+
+    def test_apply_evicts_idle_runner_output_oldest_first_and_rechecks_the_runner(self) -> None:
+        home, fams = self._runner_checkouts()
+        idle = home / "actions-runner-glaeda/_work/cmux/cmux"
+        other = home / "actions-runner-glaeda-2/_work/cmux/cmux"
+        self._age(idle / "cmux-tui/target", hours=30)
+        self._age(other / "Packages/Shared/.build", hours=10)
+        gd.process_evidence = lambda: ([], "")
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"):
+            items = gd.survey(fams, 6, 0)
+            receipt = self.receipt()
+            # a job starts on runner 2 after the survey: the fresh ps before each deletion shows its Worker
+            worker = f"{home}/actions-runner-glaeda-2/bin.2.330.0/Runner.Worker spawnclient 1 2\n"
+            with mock.patch.object(gd, "command_lines", return_value=worker):
+                gd.apply(items, {f.id: f for f in fams}, receipt, None, 6, all_families=fams)
+        recs = [json.loads(line) for line in receipt.read_text().splitlines()]
+        build = [r for r in recs if r["family"] == gd.RUNNER_BUILD_FAMILY]
+        self.assertEqual(build[0]["path"], str(idle / "cmux-tui/target"))  # least recently modified first
+        self.assertEqual(build[1]["path"], str(other / "Packages/Shared/.build"))
+        self.assertEqual({r["outcome"] for r in build if r["path"].startswith(str(other) + "/")},
+                         {"changed:in-use"})
+        self.assertEqual({r["outcome"] for r in build if r["path"].startswith(str(idle) + "/")}, {"reclaimed"})
+        self.assertFalse((idle / "cmux-tui/target").exists())
+        self.assertFalse((idle / "Packages/macOS/CmuxNext/.build").exists())
+        self.assertTrue((other / "cmux-tui/target").exists())
+        self.assertFalse((other / ".git/objects/pack/tmp_pack_Ab12Cd").exists())
+        self.assertTrue((other / ".git/objects/pack/pack-1234.pack").exists())
+        self.assertTrue((idle / "Sources/target").exists())
+        self.assertTrue((idle / ".git").is_dir())
+
+    def test_job_busy_ignores_wide_runner_build_trees(self) -> None:
+        home, fams = self._runner_checkouts()
+        target = home / "actions-runner-glaeda/_work/cmux/cmux/cmux-tui/target"
+        build = next(f for f in fams if f.id == gd.RUNNER_BUILD_FAMILY)
+        with mock.patch.object(gd, "cmux_active", return_value=True):
+            self.assertFalse(gd.job_busy(build, target))
+
     def test_idle_sweep_windows_follow_reuse(self) -> None:
         ci = self.root / "ci"
         (ci / "seeds").mkdir(parents=True)
