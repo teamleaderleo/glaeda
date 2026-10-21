@@ -893,6 +893,58 @@ class UpdateTest(unittest.TestCase):
         self.assertGreater(gr.CANARY_SILENT_HOURS * 3600, gu.FAILURE_WAIT_MAX + gu.BACKOFF_MAX_S)
 
 
+class ScheduleReloadTest(unittest.TestCase):
+    """setup writes the agent's new StartInterval but cannot reload the agent of the run that called it, so Macs that
+    never log out kept running hourly after APPLY_EVERY_S became 600 (cosmic-gray, air-blue, cmux16, 2026-10-21)."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        (agents / f"{gu.LABEL}.plist").write_bytes(gu.plistlib.dumps({"Label": gu.LABEL, "StartInterval": 600}))
+
+    def run_it(self, shown: str, config: dict | None = None, platform: str = "darwin"):
+        calls, spawned = [], []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, shown, "")
+
+        with mock.patch.object(gu.sys, "platform", platform), mock.patch.object(gu.subprocess, "run", fake_run), \
+                mock.patch.object(gu.subprocess, "Popen", lambda argv, **kw: spawned.append((argv, kw))):
+            note = gu.schedule_reload(config or {"setupArgs": ["--hygiene-only"]}, home=self.home, pid=4242)
+        return note, calls, spawned
+
+    def test_an_old_interval_is_reloaded_after_this_run(self) -> None:
+        note, calls, spawned = self.run_it("\tstate = running\n\trun interval = 3600 seconds\n")
+        self.assertEqual(note, "reload scheduled: launchd runs every 3600s, the plist says 600s")
+        self.assertEqual(calls, [["/bin/launchctl", "print", f"gui/{os.getuid()}/{gu.LABEL}"]])
+        (argv, kw), = spawned
+        self.assertTrue(kw["start_new_session"])  # outside the job's process group: survives this run's end
+        script = argv[2]
+        self.assertTrue(script.startswith("while /bin/kill -0 4242 "))
+        self.assertIn(f"/bin/launchctl bootout gui/{os.getuid()}/{gu.LABEL};", script)
+        self.assertIn(f"/bin/launchctl bootstrap gui/{os.getuid()} '{self.home}/Library/LaunchAgents/{gu.LABEL}.plist'",
+                      script)
+        self.assertLess(script.index("bootout"), script.index("bootstrap"))
+
+    def test_nothing_to_do(self) -> None:
+        for shown in ("\trun interval = 600 seconds\n", "Could not find service\n"):
+            with self.subTest(shown=shown):
+                note, _, spawned = self.run_it(shown)
+                self.assertIsNone(note)
+                self.assertEqual(spawned, [])
+        note, calls, _ = self.run_it("\trun interval = 3600 seconds\n", platform="linux")
+        self.assertEqual((note, calls), (None, []))  # systemd re-reads its timer on daemon-reload
+
+    def test_a_headless_mac_reloads_its_system_daemon_through_sudo(self) -> None:
+        plist, target, prefix = gu.launchd_job({"setupArgs": ["--hygiene-only", "--headless"]}, self.home)
+        self.assertEqual((plist, target, prefix), (Path(f"/Library/LaunchDaemons/{gu.LABEL}.plist"),
+                                                   f"system/{gu.LABEL}", ["/usr/bin/sudo", "-n"]))
+
+
 class ReleaseTest(unittest.TestCase):
     NOW = dt.datetime(2026, 9, 25, 12, tzinfo=dt.timezone.utc)
 
