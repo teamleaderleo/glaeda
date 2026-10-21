@@ -110,6 +110,33 @@ def side_classes(klass: str) -> tuple[str, ...]:
     return RUNNER_CLASSES[RUNNER_CLASSES.index(klass):] if klass in RUNNER_CLASSES else ()
 
 
+def widened_labels(labels: list[str]) -> list[str]:
+    """`labels` plus every side label side_classes() adds to the side labels among them, in order, each once.
+
+    The registered labels of a runner installed before side_classes() lack the narrower classes' side labels.
+    A reconciler with the organization's runner-label permission (GitHub fixes labels at registration, and a
+    mini holds no admin token) sets a runner's custom labels to this, so a manifest change reaches every
+    registered runner without a relabel by hand. Pure and idempotent: widened_labels(widened_labels(x)) ==
+    widened_labels(x), and it only adds a label member_labels() would itself issue for that runner.
+    """
+    out = list(dict.fromkeys(labels))
+    for label in list(out):
+        parts = label.split("-")
+        index = next((i for i, part in enumerate(parts) if part in RUNNER_CLASSES), None)
+        if index is None or "side" not in parts[1:index]:
+            continue
+        pool = "-".join(part for i, part in enumerate(parts) if not (part == "side" and 0 < i < index))
+        if side_label(pool) != label:
+            continue
+        for klass in side_classes(parts[index])[1:]:
+            narrower = pool.split("-")
+            narrower[narrower.index(parts[index])] = klass
+            wanted = side_label("-".join(narrower))
+            if wanted not in out:
+                out.append(wanted)
+    return out
+
+
 def gui_label(pool: str) -> str:
     """The label of a pool's console gui runner (the last gui-role instance). The GUI jobs (app-host shards,
     tests-build-and-lag, app-host-test-rerun) run on it: each needs the mini's one gui token (one console session),

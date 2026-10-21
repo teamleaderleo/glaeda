@@ -6361,6 +6361,17 @@ class ManifestLabelsTest(unittest.TestCase):
         self.assertEqual(std["pools"], ["glaeda-std-xcode-26.6"], "the pool count stays the member's own class")
         self.assertEqual(fleet_labels.side_classes("xl"), ("xl", "std", "light"))
         self.assertEqual(fleet_labels.side_classes("dev"), ())
+        # A runner registered before the widening converges to what member_labels issues now.
+        self.assertEqual(fleet_labels.widened_labels(["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"]),
+                         ["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"])
+        self.assertEqual(fleet_labels.widened_labels(std["labels"] + std["sidePools"]), std["labels"] + std["sidePools"])
+        once = fleet_labels.widened_labels(["glaeda-aws-side-std-xcode-26.6", "glaeda-side-trusted-std-xcode-26.6"])
+        self.assertEqual(once, ["glaeda-aws-side-std-xcode-26.6", "glaeda-side-trusted-std-xcode-26.6",
+                                "glaeda-aws-side-light-xcode-26.6", "glaeda-side-trusted-light-xcode-26.6"])
+        self.assertEqual(fleet_labels.widened_labels(once), once)
+        for unchanged in (["glaeda-side-light-xcode-26.6"], ["glaeda-root-std-xcode-26.6"], ["glaeda-gui-std-xcode-26.6"],
+                          ["glaeda-session-std-xcode-26.6"], ["glaeda-std-xcode-26.6"], ["self-hosted", "macOS"]):
+            self.assertEqual(fleet_labels.widened_labels(unchanged), unchanged)
 
     def test_runner_capacity_per_class(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
