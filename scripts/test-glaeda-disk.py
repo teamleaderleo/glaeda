@@ -3014,7 +3014,8 @@ class GlaedaDiskTest(unittest.TestCase):
             self.addCleanup(setattr, gd, name, getattr(gd, name))
         fss = {dev: gd.Fs(dev, "/", int(free_gib * gd.GIB), total, 120 * gd.GIB, 170 * gd.GIB)}
         items = over.pop("items", [])
-        with mock.patch.object(gd, "RUN_LOG", log), \
+        apply_effect = over.pop("apply_effect", None)
+        with mock.patch.object(gd, "RUN_LOG", log), mock.patch.object(gd, "OPEN_RUNS", self.root / "open-runs"), \
                 mock.patch.object(gd, "DISK_OFF", over.pop("off", self.root / "disk-off")), \
                 mock.patch.dict(gd.POLICY, over.pop("policy", {})), \
                 mock.patch.object(gd, "MEASURE_LOCK", self.root / "measure.lock"), \
@@ -3027,12 +3028,13 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "free_bytes", return_value=(int(free_gib * gd.GIB), total)), \
                 mock.patch.object(gd, "ci_jobs", return_value=[]), \
                 mock.patch.object(gd, "survey", return_value=items) as survey, \
-                mock.patch.object(gd, "apply", return_value=over.pop("released", 0)) as apply, \
-                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
-                mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
+                mock.patch.object(gd, "apply", return_value=over.pop("released", 0),
+                                  side_effect=apply_effect) as apply, \
+                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0) as self.paused_work, \
+                mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0) as self.idle_checkouts, \
                 mock.patch.object(gd, "clear_stale_build_markers", return_value=0), \
                 mock.patch.object(gd, "repack_runner_checkouts", return_value=0), \
-                mock.patch.object(gd, "notify_disk"), contextlib.redirect_stdout(io.StringIO()):
+                mock.patch.object(gd, "notify_disk"), contextlib.redirect_stdout(io.StringIO()) as self.out:
             status = gd.main(argv + ["--no-snapshot", "--top", "0", "--receipt", os.fspath(self.receipt())])
         rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
         return status, rows, survey, apply
@@ -3044,9 +3046,11 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(len(rows), 1, rows)
         row = rows[0]
         for key in ("at", "host", "mode", "off", "free_gib_before", "free_gib_after", "target_gib", "floor_gib",
-                    "reclaimed_gib", "reached", "blocked", "duration_s", "skipped"):
+                    "reclaimed_gib", "reached", "blocked", "duration_s"):
             self.assertIn(key, row)
-        self.assertEqual((row["mode"], row["off"], row["skipped"]), ("pressure", False, None))
+        self.assertEqual((row["mode"], row["off"]), ("pressure", False))
+        self.assertNotIn("skipped", row)  # #1584 review: only a run that skipped says why, never null
+        self.assertNotIn("stopped", row)
         self.assertEqual((row["free_gib_before"], row["target_gib"], row["floor_gib"]), (20.0, 170.0, 30.0))
         self.assertEqual(row["reclaimed_gib"], 3.0)
         self.assertFalse(row["reached"])
@@ -3082,6 +3086,79 @@ class GlaedaDiskTest(unittest.TestCase):
                 self.assertTrue(rows[0]["off"])
                 self.assertEqual(rows[0]["reclaimed_gib"], 0.0)
         self.assertIn("disk-off", gd.__doc__)
+
+    def test_the_kill_switch_says_so_in_json(self) -> None:
+        off = self.root / "disk-off"
+        off.write_text("")
+        status, rows, survey, _ = self._main_run(["--pressure", "--apply", "--json"], off=off)
+        self.assertEqual(status, 0)
+        doc = json.loads(self.out.getvalue())
+        self.assertEqual((doc["status"], doc["complete"], doc["reason"]), ("off", False, "off"))
+        self.assertIn("disk-off", doc["message"])
+        self.assertEqual(rows[0]["skipped"], "off")
+
+    def test_the_kill_switch_stops_a_run_in_progress(self) -> None:
+        # #1584 review: switching it on mid-run stopped nothing until the next run
+        off = self.root / "disk-off"
+        seen = []
+
+        def apply_effect(items, families, receipt, targets, idle_hours, halt=None, **kw):
+            seen.append(halt())  # the per-candidate check, before the switch
+            off.write_text("")
+            seen.append(halt())  # and after it
+            return 2 * gd.GIB
+        status, rows, _, _ = self._main_run(["--pressure", "--apply"], off=off, apply_effect=apply_effect)
+        self.assertEqual(status, 0)
+        self.assertEqual(seen[0], "")
+        self.assertIn("disk-off", seen[1])
+        self.paused_work.assert_not_called()  # nothing after the candidate it stopped at
+        self.idle_checkouts.assert_not_called()
+        self.assertEqual(len(rows), 1)
+        self.assertIn("off mid-run", rows[0]["stopped"])
+        self.assertEqual(rows[0]["reclaimed_gib"], 2.0)
+        off.unlink()  # the policy's "enabled": false, written mid-run, stops it the same way
+        policy = self.root / "disk-policy.json"
+
+        def by_policy(*a, **kw):
+            policy.write_text(json.dumps({"enabled": False}))
+            seen.append(a[5]())  # halt
+            return 0
+        with mock.patch.object(gd, "DISK_POLICY", policy):
+            self._main_run(["--pressure", "--apply"], off=off, apply_effect=by_policy)
+        self.assertIn('"enabled": false', seen[-1])
+
+    def test_a_killed_run_still_writes_its_line(self) -> None:
+        def term(*a, **kw):
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(5)  # the handler raises before this returns
+            return 0
+        before = signal.getsignal(signal.SIGTERM)
+        status, rows, _, _ = self._main_run(["--pressure", "--apply"], apply_effect=term)
+        self.assertEqual(status, 128 + signal.SIGTERM)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["stopped"], "killed: SIGTERM")
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)  # the handler is the run's only
+        self.assertEqual(list((self.root / "open-runs").glob("*")), [])
+
+    def test_a_run_killed_outright_is_logged_by_the_next_one(self) -> None:
+        # the runner hook's timeout is subprocess.run's SIGKILL: no handler runs, so the run left its open marker
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        opened = self.root / "open-runs"
+        opened.mkdir()
+        (opened / f"{dead.pid}.json").write_text(json.dumps(
+            {"pid": dead.pid, "at": "2026-10-21T10:00:00-0700", "started": time.time() - 90, "mode": "pressure",
+             "free_gib_before": 21.0}))
+        live = opened / f"{os.getppid()}.json"  # a run still going (its pid is alive) is left alone
+        live.write_text(json.dumps({"pid": os.getppid(), "at": "x", "started": time.time(), "mode": "pressure"}))
+        status, rows, _, _ = self._main_run(["--pressure", "--apply"])
+        self.assertEqual(status, 0)
+        self.assertEqual(len(rows), 2, rows)
+        lost, this = rows
+        self.assertEqual((lost["at"], lost["mode"], lost["free_gib_before"]), ("2026-10-21T10:00:00-0700", "pressure", 21.0))
+        self.assertIn("killed or timed out", lost["stopped"])
+        self.assertNotIn("stopped", this)
+        self.assertEqual(sorted(p.name for p in opened.iterdir()), [live.name])
 
     def test_floor_hold_only_below_the_gates_resume_mark(self) -> None:
         dev = self.root.stat().st_dev
