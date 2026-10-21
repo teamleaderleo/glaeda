@@ -3650,24 +3650,61 @@ class AuditTest(BrokerBase):
         self.assertEqual(doc["categories"]["raw gh api graphql"], 1)
         self.assertEqual(doc["categories"]["pr merge"], 1)
 
-    def test_a_batched_graphql_call_is_counted_and_said_to_be_unpriceable(self) -> None:
-        """Every share this prints is per call, and one `gh api graphql` line is not one read: a
-        caller that batches forty PRs into one query appears once, at 1/40th the share of one that
-        loops `gh pr view` forty times for the same answer, while spending comparable GraphQL
-        points (that limit is points per hour). The broker execs the real gh for these, so it never
-        sees the query, the node count or the `rateLimit.cost` that comes back. These numbers are
-        used to argue for and against the broker, so the report says which caller they flatter
-        rather than leaving it to be noticed."""
-        path = self.write_log([(0, "api graphql"), (5, "api graphql"), (10, "pr view pr:o/r#7")])
+    def audit_json(self, path: Path) -> dict:
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(gg.main(["audit", "--log", str(path), "--json"]), 0)
-        self.assertEqual(json.loads(out.getvalue())["opaqueBatched"], 2)
+        return json.loads(out.getvalue())
+
+    def audit_text(self, path: Path) -> str:
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(gg.main(["audit", "--log", str(path)]), 0)
-        self.assertIn("2 of those calls were `gh api graphql`", out.getvalue())
-        self.assertIn("per call", out.getvalue())
+        return out.getvalue()
+
+    def test_a_graphql_call_is_counted_however_the_endpoint_was_typed(self) -> None:
+        """One endpoint, three spellings, and the log keeps whichever the caller typed. Counted as
+        one category, or the count is wrong for a caller writing a shape this file's own brake test
+        pins as plausible (`api /graphql`), and a host writing only that spelling gets no summary
+        line at all. `BROKER_FREE_RE` already normalises the same three shapes for rate_limit, and
+        `audit_category` was matching that one by equality too."""
+        path = self.write_log([(0, "api graphql"), (5, "api /graphql"),
+                               (10, "api https://api.github.com/graphql"),
+                               (15, "api /rate_limit"), (20, "pr view pr:o/r#7")])
+        doc = self.audit_json(path)
+        self.assertEqual(doc["categories"]["raw gh api graphql"], 3, doc["categories"])
+        self.assertEqual(doc["categories"]["rate_limit (free)"], 1, doc["categories"])
+
+    def test_a_graphql_call_hides_reads_from_the_repeat_figure_and_the_report_says_so(self) -> None:
+        """Coverage, not cost. An earlier version of this line said a batching caller "looks
+        cheaper here than its GraphQL points are", which was backwards: GitHub prices a GraphQL
+        call at the requests its connections need divided by 100, rounded, minimum 1, so one
+        aliased query over forty PRs is about 1 point against about 40 for the loop -- and
+        `skills/github-ci-wait/SKILL.md` says exactly that, so the report contradicted this repo's
+        own guidance. Per-call shares are the right unit for GraphQL points.
+
+        What a `graphql` line does hide is *reads*: the category is not cacheable, so nothing
+        inside it reaches `cacheableReads`, `repeatsWithin` or `perRead`, which makes the repeat
+        figure a floor rather than an estimate. The sentence makes no claim about cost, because
+        the cost is the part that goes stale -- and that is asserted here, not just intended."""
+        path = self.write_log([(0, "api graphql"), (5, "api graphql"), (10, "pr view pr:o/r#7")])
+        doc = self.audit_json(path)
+        self.assertEqual(doc["cacheableReads"], 1, "a graphql line was counted as a cacheable read")
+        self.assertEqual(doc["repeatsWithin"]["calls"], 0)
+        text = self.audit_text(path)
+        self.assertIn("2 of those calls were `gh api graphql`", text)
+        self.assertIn("floor", text)
+        for stale in ("point", "price", "cheap", "per call"):
+            self.assertNotIn(stale, text, "the report is making a claim about cost again")
+
+    def test_the_graphql_line_is_absent_when_there_are_no_graphql_calls(self) -> None:
+        """The conditionality is what makes it safe to print at all: a host with none of these
+        calls gets no sentence about them. Nothing held it until a mutation (`if batched:` ->
+        `if True:`) stayed green."""
+        path = self.write_log([(0, "pr view pr:o/r#7"), (5, "pr merge")])
+        text = self.audit_text(path)
+        self.assertNotIn("gh api graphql", text)
+        self.assertNotIn("floor", text)
 
     def test_an_old_logs_lines_are_counted_but_not_quoted_back(self) -> None:
         """The guard kept the value of a flag it did not know took one until 2026-10-21, and an
@@ -3800,7 +3837,7 @@ class BrokerRepeatTest(BrokerBase):
         self.run_gh(["api", "repos/o/r/pulls/9"])
         self.assertEqual(len(self.slept), 1)
 
-    def test_a_batched_graphql_read_is_never_held_whatever_shape_it_is_written_in(self) -> None:
+    def test_a_working_batched_graphql_read_is_never_held_in_any_shape(self) -> None:
         """The caller that batches is the one this must not punish, and it is the one the delay
         would hit hardest: a card that reads forty PRs in one query has one command line, so a
         refresh loop repeats it exactly. It is exempt because gh POSTs a GraphQL query, and the
@@ -3808,7 +3845,15 @@ class BrokerRepeatTest(BrokerBase):
         `--input` each mean POST with no `-X` on the line. Written as a test because `--input -`
         takes its query from *stdin*: two such calls are one digest here and different queries at
         GitHub, so if any of these shapes were read as a GET, the second would be held 30 s for a
-        read the first never made. Asked for by the pr-cards lane, whose path this is."""
+        read the first never made. Asked for by the pr-cards lane, whose path this is.
+
+        *Working* shapes only, which is what the name promises. GitHub's GraphQL endpoint is
+        POST-only, so `gh api graphql` with no fields, or with `-X GET`, gets a 404 rather than an
+        answer and is held like any other repeated GET -- and `-X GET -f a=b` meaning GET is
+        pinned deliberately by `test_fields_or_a_body_make_it_a_post_without_minus_x`. The
+        exemption is also incidental: nothing in `broker_repeat_wait` knows the word `graphql`, it
+        falls out of the method. What this pins is that every way of writing a working one lands
+        on the POST side of that inference."""
         for args in (["api", "graphql", "-f", "query=query{viewer{login}}"],
                      ["api", "graphql", "-F", "query=query{viewer{login}}"],
                      ["api", "graphql", "--field", "query=query{viewer{login}}"],
@@ -3818,7 +3863,7 @@ class BrokerRepeatTest(BrokerBase):
             with self.subTest(args=args):
                 for _ in range(3):
                     _code, _out, _err, passed = self.run_gh(args)
-                    self.assertIsNotNone(passed, "a batched read must reach gh unchanged")
+                    self.assertEqual(passed, args, "a batched read must reach gh unchanged")
                 self.assertEqual(self.slept, [], "a batching caller was held for repeating itself")
 
     def test_the_delay_can_be_turned_off(self) -> None:
