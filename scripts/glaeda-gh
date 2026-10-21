@@ -2917,11 +2917,54 @@ def waiting_line(key: str, until: str, sha: str | None, exact: bool, timeout: fl
     line, an empty file means it never started and a file holding it means it did, which is a
     one-look diagnosis instead of a guess.
 
-    On stderr, so a `--json` consumer still reads exactly one JSON document on stdout."""
+    On stderr, so a `--json` consumer still reads exactly one JSON document on stdout -- and
+    through `say_waiting`, which is where the rules about not becoming the problem live.
+
+    The deadline is a wall-clock time as well as a duration, because the duration alone cannot be
+    compared with anything: a reader looking at a line in a file does not know when the process
+    started, so "giving up after 3600s" says nothing about whether this wait is still inside its
+    timeout. The time does."""
     return (f"glaeda-gh: waiting on {key} until {until}"
             + (f" at {sha}{'' if exact else '... (a prefix: it must match the head GitHub shows)'}"
                if sha else "")
-            + f", giving up after {timeout:g}s")
+            + f", giving up after {timeout:g}s (at {deadline_clock(timeout)})")
+
+
+def deadline_clock(timeout: float, now: float | None = None) -> str:
+    """When this wait gives up, local time, `HH:MM:SS`. "unknown" for a timeout that is not a
+    finite number of seconds -- `--timeout` is a bare `float`, so `inf` and `nan` reach here."""
+    try:
+        return time.strftime("%H:%M:%S", time.localtime((now or time.time()) + timeout))
+    except (ValueError, OSError, OverflowError):
+        return "unknown"
+
+
+def say_waiting(line: str) -> None:
+    """Put the line on stderr without ever becoming the reason the wait does not happen.
+
+    A review found both halves of that, measured, and both turn this diagnostic into the exact
+    failure it exists to diagnose:
+
+    - stderr a pipe whose reader is gone -- `wait ... 2>&1 | head -1`, or the `setsid nohup ... &`
+      the skill recommends from a shell that is being reaped. `print` then raised at shutdown and
+      the process died in 0.19 s with exit **120** (CPython's "failed to flush stderr"), where it
+      used to wait its full timeout and exit 2. A diagnostic that kills the wait is worse than no
+      diagnostic.
+    - stderr closed (`2>&-`). `sys.stderr` is then `None`, and `print(file=None)` is documented as
+      printing to **stdout** -- so the line became the first line of `--json` output and broke
+      every consumer, which is the one thing this function's docstring promised it would not do.
+
+    So: fd 2 directly, with `OSError` suppressed, which restores the old exit code and the old
+    duration byte for byte. A caller that has replaced `sys.stderr` in-process (a test, a wrapper)
+    gets the line there instead, because fd 2 is not where it is looking; the fd contract itself is
+    covered by tests that run the real CLI in a subprocess."""
+    stream = sys.stderr
+    if stream is not None and stream is not sys.__stderr__:
+        with contextlib.suppress(Exception):
+            print(line, file=stream, flush=True)
+        return
+    with contextlib.suppress(OSError):
+        os.write(2, (line + "\n").encode())
 
 
 def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
@@ -2932,7 +2975,7 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
     if sha:
         sha, exact = resolve_sha(sha)
     began, start = time.time(), time.monotonic()
-    print(waiting_line(key, until, sha, exact, timeout), file=sys.stderr, flush=True)
+    say_waiting(waiting_line(key, until, sha, exact, timeout))
     touched = -TOUCH_EVERY
     warned = False
     down, down_since = DownWait(), None
@@ -3032,8 +3075,8 @@ def cmd_wait_file(target: str, timeout: float, as_json: bool, mode: str = "nonem
         raise WatchError(f"--contains {contains!r} is not a regular expression: {error}")
     if contains and mode == "gone":
         raise WatchError("--contains does not apply to --gone")
-    print(waiting_line(target, mode + (f" and matching {contains}" if contains else ""),
-                       None, True, timeout), file=sys.stderr, flush=True)
+    say_waiting(waiting_line(target, mode + (f" and matching {contains}" if contains else ""),
+                             None, True, timeout))
     start = time.monotonic()
     while True:
         found = file_ready(target, mode, pattern)
@@ -3068,7 +3111,7 @@ def cmd_wait_pid(target: str, timeout: float, as_json: bool) -> int:
     if not target.isdigit() or not 0 < int(target) < 2 ** 31:
         raise WatchError(f"wait pid takes a process id, not {target!r}")
     pid, start = int(target), time.monotonic()
-    print(waiting_line(f"pid {pid}", "it exits", None, True, timeout), file=sys.stderr, flush=True)
+    say_waiting(waiting_line(f"pid {pid}", "it exits", None, True, timeout))
     while pid_alive(pid):
         waited = int(time.monotonic() - start)
         if time.monotonic() - start >= timeout:
@@ -3206,9 +3249,8 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
     except re.error as error:
         raise WatchError(f"--match is not a regular expression: {error}") from None
     began, start = time.time(), time.monotonic()
-    print(waiting_line(key, "a comment" + (f" by {author}" if author else "")
-                       + (f" matching {match}" if match else ""), None, True, timeout),
-          file=sys.stderr, flush=True)
+    say_waiting(waiting_line(key, "a comment" + (f" by {author}" if author else "")
+                             + (f" matching {match}" if match else ""), None, True, timeout))
     since_id, since_time = parse_since(since, began)
     touched = -TOUCH_EVERY
     warned = False

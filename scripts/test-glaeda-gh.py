@@ -1534,6 +1534,30 @@ class ClientTest(Base):
                 self.assertIn(want, first)
                 self.assertIn("0.1s", first)
 
+    def test_the_line_comes_out_before_a_daemon_wait_can_finish(self) -> None:
+        """Before, not after -- for the kinds that block on the daemon, which is where it matters.
+        The file wait had this test; `cmd_wait` did not, so a mutation moving its print into the
+        timeout branch (a line on the way *out*) left the whole suite green. A line printed as the
+        process exits says nothing about a wait that was killed while blocked, which is the only
+        case this exists for. Reading `splitlines()[0]` after the call returns cannot tell the two
+        apart: it has to be the order of the writes."""
+        order: list[str] = []
+
+        class Noting(io.StringIO):
+            def write(self, text):
+                if "waiting on" in text:
+                    order.append("line")
+                return super().write(text)
+
+        green = gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")]))
+        timer = threading.Timer(0.4, lambda: (order.append("ready"),
+                                              self.put("pr:o/r#1", green)))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        with contextlib.redirect_stderr(Noting()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.cmd_wait("pr", "o/r#1", "green", 5.0, False, False), 0)
+        self.assertEqual(order[:1], ["line"], order)
+
     def test_daemon_down(self) -> None:
         self.lock.close()
         err = io.StringIO()
@@ -2976,6 +3000,91 @@ class FileAndPidWaitTest(unittest.TestCase):
                 self.assertIn(want, first)
                 self.assertIn("0.05", first)
                 json.loads(out.getvalue())  # one document, nothing of the line in it
+
+    def cli_wait(self, *args, stderr=None, shell_prefix=()) -> tuple[subprocess.CompletedProcess, float]:
+        """The real CLI in a subprocess, because fd 2 is the thing under test here.
+
+        `contextlib.redirect_stderr` swaps `sys.stderr` and leaves file descriptor 2 alone, so
+        every in-process test above passes whatever fd 2 is doing -- which is exactly how a
+        diagnostic that killed the wait got written in the first place."""
+        env = {**os.environ, "GLAEDA_GH_DIR": os.fspath(self.dir / "ghdir")}
+        cmd = [*shell_prefix, sys.executable, os.fspath(ROOT / "scripts" / "glaeda-gh"), *args]
+        start = time.monotonic()
+        done = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=stderr, text=True,
+                              stdin=subprocess.DEVNULL, env=env, timeout=120)
+        return done, time.monotonic() - start
+
+    def test_a_dead_stderr_pipe_does_not_kill_the_wait(self) -> None:
+        """The line must never become the failure it exists to diagnose. With stderr a pipe whose
+        reader is gone -- `wait ... 2>&1 | head -1`, or the `setsid nohup ... &` the skill
+        recommends, from a shell that is being reaped -- `print` raised at interpreter shutdown and
+        the process died in 0.19 s with exit **120**, CPython's "failed to flush stderr", which is
+        not even in this tool's documented exit codes. It used to wait its whole timeout and exit
+        2. Measured through the real CLI: `say_waiting` writes fd 2 directly and suppresses
+        `OSError`, so both the exit code and the duration come back."""
+        read, write = os.pipe()
+        os.close(read)  # nobody will ever read it: the next write is EPIPE
+        try:
+            done, waited = self.cli_wait("wait", "file", str(self.dir / "never-appears"),
+                                         "--timeout", "1", "--json", stderr=write)
+        finally:
+            os.close(write)
+        self.assertEqual(done.returncode, gg.EXIT_TIMEOUT, done.stdout)
+        self.assertGreater(waited, 0.9, "it gave up early instead of waiting out the timeout")
+        self.assertEqual(json.loads(done.stdout)["result"], "timeout")
+
+    def test_a_closed_stderr_does_not_put_the_line_in_the_json(self) -> None:
+        """`2>&-` makes `sys.stderr` None, and `print(file=None)` is documented as printing to
+        **stdout** -- so the line became the first line of `--json` output and broke every consumer
+        of it, which is the one thing the docstring promised could not happen. fd 2 is closed here
+        the way a shell closes it, and the line simply goes nowhere."""
+        done, _ = self.cli_wait("wait", "file", str(self.dir / "never-appears"),
+                                "--timeout", "0.1", "--json",
+                                shell_prefix=("/bin/sh", "-c", 'exec 2>&-; exec "$@"', "sh"))
+        self.assertEqual(done.returncode, gg.EXIT_TIMEOUT, done.stdout)
+        self.assertNotIn("waiting on", done.stdout)
+        self.assertEqual(json.loads(done.stdout)["result"], "timeout")
+
+    def test_the_line_reaches_fd_2_when_nothing_is_wrong(self) -> None:
+        """The other half: the two tests above would also pass if the line were never printed at
+        all. Through the real CLI, with stderr a file, which is how a caller captures it."""
+        err = self.dir / "err.txt"
+        with err.open("w") as fh:
+            done, _ = self.cli_wait("wait", "file", str(self.dir / "never-appears"),
+                                    "--timeout", "0.1", "--json", stderr=fh)
+        self.assertEqual(done.returncode, gg.EXIT_TIMEOUT)
+        self.assertIn("waiting on", err.read_text())
+        self.assertEqual(json.loads(done.stdout)["result"], "timeout")
+
+    def test_the_line_says_what_each_kind_is_waiting_for_and_until_when(self) -> None:
+        """`waiting_line`'s content, which nothing pinned: a mutation hardcoding `until` to
+        "green" left the suite green, so a `pid` wait could have reported "until green". And the
+        sha clause -- the only branching in the function -- had no coverage at all.
+
+        The deadline is a wall-clock time as well as a duration because the duration alone cannot
+        be compared with anything: a reader looking at a line in a file does not know when the
+        process started."""
+        at = time.mktime((2026, 10, 21, 13, 0, 0, 0, 0, -1))
+        self.assertEqual(gg.deadline_clock(90, at), "13:01:30")
+        for timeout in (float("inf"), float("nan"), 1e300):
+            self.assertEqual(gg.deadline_clock(timeout, at), "unknown", timeout)
+        full, short = "a" * 40, "abc1234"
+        for want, line in (
+                ("until green", gg.waiting_line("pr:o/r#1", "green", None, True, 60)),
+                ("until it exits", gg.waiting_line("pid 7", "it exits", None, True, 60)),
+                ("until nonempty", gg.waiting_line("/tmp/x", "nonempty", None, True, 60)),
+                ("until a comment by bot", gg.waiting_line("comment:o/r#1", "a comment by bot",
+                                                           None, True, 60)),
+                (f"at {full},", gg.waiting_line("pr:o/r#1", "green", full, True, 60)),
+                (f"at {short}... (a prefix", gg.waiting_line("pr:o/r#1", "green", short, False, 60))):
+            with self.subTest(want=want):
+                self.assertIn(want, line)
+                # Every kind carries the deadline, not just the helper that formats it: a mutation
+                # dropping the `(at ...)` clause from the line left the suite green while
+                # `deadline_clock`'s own assertions above still passed.
+                self.assertRegex(line, r"giving up after 60s \(at \d\d:\d\d:\d\d\)")
+        self.assertNotIn(" at ", gg.waiting_line("pid 7", "it exits", None, True, 60).split(" (at ")[0],
+                         "a wait with no sha claimed one")
 
     def test_the_line_is_printed_before_the_wait_can_finish(self) -> None:
         """Before, not after: a line printed on the way out would say nothing about a wait that
