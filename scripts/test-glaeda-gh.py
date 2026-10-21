@@ -1516,6 +1516,24 @@ class ClientTest(Base):
             self.assertEqual(gg.cmd_status("pr", "o/r#1", False, True, first_wait=0), 0)
         self.assertEqual(json.loads(out.getvalue())["data"]["checkState"], "PENDING")
 
+    def test_the_daemon_waits_say_what_they_wait_for_before_they_block(self) -> None:
+        """The pr, run and comment kinds, the three that go through the daemon; the file and pid
+        kinds are covered in FileAndPidWaitTest. A line wired into some of the four call sites and
+        not the others is exactly the failure it exists to rule out, so every kind is driven.
+        The deadline is in it too: a reader comparing it with the clock can tell a wait that is
+        still inside its timeout from one whose process is gone."""
+        for want, call in (("o/r#1", lambda: gg.cmd_wait("pr", "o/r#1", "green", 0.1, False, False)),
+                           ("o/r/1", lambda: gg.cmd_wait("run", "o/r/1", "green", 0.1, False, False)),
+                           ("o/r#1", lambda: gg.cmd_wait_comment("o/r#1", 0.1, False))):
+            with self.subTest(want=want):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(call(), gg.EXIT_TIMEOUT)
+                first = err.getvalue().splitlines()[0]
+                self.assertIn("waiting on", first)
+                self.assertIn(want, first)
+                self.assertIn("0.1s", first)
+
     def test_daemon_down(self) -> None:
         self.lock.close()
         err = io.StringIO()
@@ -2933,22 +2951,31 @@ class FileAndPidWaitTest(unittest.TestCase):
         self.addCleanup(timer.cancel)
         return timer
 
-    def test_every_wait_says_what_it_is_waiting_for_before_it_blocks(self) -> None:
+    def test_the_file_and_pid_waits_say_what_they_wait_for_before_they_block(self) -> None:
         """What matters is what the line's *absence* means. A wait started from an agent session's
         foreground shell is reaped with that shell, silently, leaving a zero-byte output file --
         which is indistinguishable from "blocked and waiting", so the caller waits on something
         that is gone (three of one lane's waits, in one afternoon). With this line an empty file
         means it never started. On stderr, so a `--json` consumer still reads exactly one document
-        on stdout, which is asserted here rather than assumed."""
-        err = io.StringIO()
-        out = io.StringIO()
-        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
-            gg.cmd_wait_file(str(self.dir / "nope"), 0.05, True)
-        first = err.getvalue().splitlines()[0]
-        self.assertIn("waiting on", first)
-        self.assertIn("nope", first)
-        self.assertIn("0.05", first)
-        json.loads(out.getvalue())  # one document, nothing of the line in it
+        on stdout, which is asserted here rather than assumed.
+
+        The three kinds that go through the daemon are covered in ClientTest; between the two
+        tests every `wait` the CLI offers is driven, because a printer wired into three call
+        sites out of four is the failure this line exists to rule out."""
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        for want, call in ((str(self.dir / "nope"), lambda: gg.cmd_wait_file(str(self.dir / "nope"), 0.05, True)),
+                           (f"pid {proc.pid}", lambda: gg.cmd_wait_pid(str(proc.pid), 0.05, True))):
+            with self.subTest(want=want):
+                err, out = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                    self.assertEqual(call(), gg.EXIT_TIMEOUT)
+                first = err.getvalue().splitlines()[0]
+                self.assertIn("waiting on", first)
+                self.assertIn(want, first)
+                self.assertIn("0.05", first)
+                json.loads(out.getvalue())  # one document, nothing of the line in it
 
     def test_the_line_is_printed_before_the_wait_can_finish(self) -> None:
         """Before, not after: a line printed on the way out would say nothing about a wait that
