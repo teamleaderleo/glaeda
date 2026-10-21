@@ -4147,6 +4147,48 @@ class GateTest(unittest.TestCase):
                                         self.state).confirmed(), "a root runner's compiles need no console")
             read.assert_not_called()
 
+    def test_a_require_eligible_runner_holds_while_its_node_would_be_refused(self) -> None:
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai --require-eligible "
+                          "--fleet-class m6-16 --toolchain-xcode /Applications/Xcode_26.6.app --instance 1\n")
+        self.assertEqual(hook.eligibility_scope(self.runner), ("m6-16", "/Applications/Xcode_26.6.app"))
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        for name in ("saturated", "hot"):  # this host's own load and heat are not what this test is about
+            patch = mock.patch.object(gate, name, return_value=None)
+            patch.start()
+            self.addCleanup(patch.stop)
+        why = "node not eligible (rust toolchain 1.99.1-aarch64-apple-darwin is not installed)"
+
+        def settle() -> None:
+            if gate.eligible_look is not None:
+                gate.eligible_look.join(5)
+
+        with mock.patch.object(hook, "eligibility_refusal", return_value=why) as look:
+            gate.claimed()  # the first poll starts the look; its answer is used from the next poll on
+            settle()
+            self.assertEqual(gate.claimed(), f"ineligible: {why}")
+            self.assertEqual(gate.confirmed(), f"ineligible: {why}")
+            self.assertEqual(look.call_count, 1, "looked at most every GATE_ELIGIBLE_EVERY_S")
+            look.assert_called_with("m6-16", "/Applications/Xcode_26.6.app")
+        gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
+        with mock.patch.object(hook, "eligibility_refusal", return_value=None):
+            gate.claimed()
+            settle()
+            self.assertIsNone(gate.claimed(), "eligible again: listening again")
+        gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
+        with mock.patch.object(hook, "eligibility_refusal", side_effect=RuntimeError("probe")):
+            gate.claimed()
+            settle()
+            self.assertIsNone(gate.claimed(), "a look that crashes never holds the runner")
+        script.write_text("exec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai --fleet-class m6-16 "
+                          "--instance 1\n")
+        self.assertIsNone(hook.eligibility_scope(self.runner))
+        with mock.patch.object(hook, "eligibility_refusal", return_value=why) as look:
+            gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
+            self.assertIsNone(gate.claimed(), "no --require-eligible: never held for eligibility")
+            look.assert_not_called()
+
     def test_every_runner_holds_while_free_disk_is_under_its_floor(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
         script.parent.mkdir(parents=True, exist_ok=True)
