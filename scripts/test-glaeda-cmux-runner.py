@@ -3504,9 +3504,12 @@ class JobLeftoverTest(unittest.TestCase):
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
         self.addCleanup(kill_if_left)
-        notes = hook.cleanup_job_leftovers(str(work))
+        with mock.patch.object(hook, "process_cwds", return_value=None), \
+             mock.patch.object(hook, "git_repair_protected", return_value=set()):
+            notes = hook.cleanup_job_leftovers(str(work))
         self.assertFalse(hook.pid_alive(pid))
         self.assertTrue(notes and "ended 1 leftover" in notes[0], notes)
+        self.assertTrue(notes[0].endswith(": daemon"), notes)  # the executable's name, never its arguments
 
     def test_orphan_working_in_work_from_a_copied_binary_is_a_leftover(self) -> None:
         # cmuxs-mac-mini-6, 2026-10-21: copies of cmux-tui outside _work, cwd still in this runner's checkout
@@ -3562,6 +3565,35 @@ class JobLeftoverTest(unittest.TestCase):
         kill.assert_not_called()
 
 
+    def test_sessions_with_a_terminal_and_spared_trees_are_never_leftovers(self) -> None:
+        table = {
+            100: (1, "tmux new -s agent"), 101: (100, "/bin/zsh"), 102: (101, "/usr/bin/python3 x.py"),
+            110: (1, "/usr/local/bin/claude --resume"), 111: (110, "node helper.js"),
+            120: (1, "/var/folders/x/T/cnd-bin-1/cmux-tui --headless"),  # has a terminal: someone's session
+            130: (1, "/var/folders/x/T/cnd-bin-2/cmux-tui --headless"), 131: (130, "tmux -L inner"),
+            132: (131, "/bin/zsh"),
+        }
+        cwds = {pid: self.WORK + "/cmux" for pid in (100, 110, 120, 130)}
+        found = hook.work_leftover_pids(table, self.WORK, set(), cwds, ttys={120})
+        self.assertEqual([pid for pid, _ in found], [130])  # 131's tmux and everything under it stay
+
+    def test_glaedas_detached_disk_bound_is_spared(self) -> None:
+        bound = f"{sys.executable} -c {hook.DISK_BOUND} 120 {sys.executable} /Users/cmux/.local/bin/glaeda-disk --pressure"
+        self.assertTrue(hook.leftover_spared(bound))
+        self.assertTrue(hook.leftover_spared("/usr/bin/python3 /Users/cmux/.local/bin/glaeda-disk --pressure --apply"))
+        self.assertFalse(hook.leftover_spared("/Users/cmux/actions-runner-glaeda-3/_work/cmux/x/cmux-tui --headless"))
+
+    def test_cwd_rule_matches_the_resolved_work_path(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "real" / "_work").mkdir(parents=True)
+        (tmp / "link").symlink_to(tmp / "real")
+        work = os.fspath(tmp / "link" / "_work")
+        resolved = os.path.realpath(work)
+        table = {140: (1, "/tmp/x/cmux-tui --headless")}
+        self.assertEqual([pid for pid, _ in hook.work_leftover_pids(table, work, set(), {140: resolved + "/cmux"})],
+                         [140])
+
     def test_work_dir_comes_from_runner_temp_only(self) -> None:
         with mock.patch.dict(os.environ, {"RUNNER_TEMP": self.WORK + "/_temp"}):
             self.assertEqual(hook.job_work_dir(), self.WORK)
@@ -3585,6 +3617,7 @@ class IdleLeftoverSweepTest(unittest.TestCase):
                         mock.patch.object(hook, "pid_alive", side_effect=lambda pid: pid in self.alive),
                         mock.patch.object(hook.os, "geteuid", return_value=501),
                         mock.patch.object(hook, "git_repair_protected", return_value=set()),
+                        mock.patch.object(hook, "tty_pids", return_value=set()),
                         mock.patch.object(hook, "LEFTOVER_TERM_S", 0.0)):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -3639,6 +3672,15 @@ class IdleLeftoverSweepTest(unittest.TestCase):
                 hook.sweep_idle_leftovers(self.RUNNER)
         self.assertEqual(self.alive, {60, 61})
 
+    def test_no_terminal_evidence_or_a_terminal_ends_nothing(self) -> None:
+        self.alive = {60, 61}
+        for ttys in (None, {60}):
+            with mock.patch.object(hook, "processes", side_effect=lambda: self.table()), \
+                 mock.patch.object(hook, "process_cwds", return_value=self.cwds()), \
+                 mock.patch.object(hook, "tty_pids", return_value=ttys):
+                self.assertEqual(hook.sweep_idle_leftovers(self.RUNNER), [])
+        self.assertEqual(self.alive, {60, 61})
+
     def test_root_never_sweeps(self) -> None:
         self.alive = {60, 61}
         with mock.patch.object(hook.os, "geteuid", return_value=0), \
@@ -3670,8 +3712,12 @@ class IdleLeftoverSweepTest(unittest.TestCase):
             gate.sweep()  # never raises
         self.assertIn("leftover sweep failed", log.call_args[0][0])
 
+
 class GateTest(unittest.TestCase):
     def setUp(self) -> None:
+        sweep = mock.patch.object(hook, "sweep_idle_leftovers", return_value=[])  # IdleLeftoverSweepTest covers it
+        sweep.start()
+        self.addCleanup(sweep.stop)
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.lock = self.tmp / "host.lock"

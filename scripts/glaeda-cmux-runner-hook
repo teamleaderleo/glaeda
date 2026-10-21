@@ -4719,7 +4719,10 @@ LEFTOVER_TERM_S = 3.0
 GATE_SWEEP_S = 600.0
 GIT_REPAIR_PROTECTED = Path.home() / ".cache/git-repair/protected"
 LEFTOVER_SPARED_NAMES = frozenset({"Runner.Listener", "Runner.Worker", "run.sh", "run-helper.sh", "listen.sh",
-                                   "job-started.sh", "job-completed.sh"})
+                                   "job-started.sh", "job-completed.sh",
+                                   # people's and agents' sessions, which a dropped ssh hands to launchd
+                                   "tmux", "screen", "zellij", "abduco", "dtach", "mosh-server", "sshd",
+                                   "sshd-session", "login", "claude", "codex", "acpmux", "opencode", "gemini"})
 GIT_MAINTENANCE = frozenset({"fetch", "clone", "gc", "repack", "rev-list", "pack-objects", "index-pack", "backfill",
                              "fsck", "maintenance", "prune", "upload-pack", "remote-http", "remote-https"})
 
@@ -4734,17 +4737,36 @@ def job_work_dir() -> str | None:
 
 
 def leftover_spared(command: str) -> bool:
-    """The runner's and glaeda's own processes and git maintenance, by executable or script name, never a path
-    (every runner path contains "glaeda")."""
+    """The runner's and glaeda's own processes (glaeda-disk's detached bound runs as `python -c ... glaeda-disk`),
+    git maintenance, and people's or agents' sessions (a tmux server or an agent left running from a checkout), by
+    executable or script name, never by a path's directories (every runner path contains "glaeda")."""
     argv = command.split()
     if not argv:
         return True
-    names = [os.path.basename(arg.strip("'\"")) for arg in argv[:2]]
-    if any(name in LEFTOVER_SPARED_NAMES or name.startswith("glaeda") for name in names):
+    names = [os.path.basename(arg.strip("'\"")) for arg in argv]
+    if any(name.startswith("glaeda") for name in names):
+        return True
+    if any(name in LEFTOVER_SPARED_NAMES for name in names[:2]):
         return True
     if names[0] == "git" or names[0].startswith("git-"):
         return names[0][4:] in GIT_MAINTENANCE or any(arg in GIT_MAINTENANCE for arg in argv[1:8])
     return False
+
+
+def tty_pids() -> set[int] | None:
+    """Processes with a controlling terminal: someone's session, never a job's (runner jobs have none). None when
+    ps cannot tell."""
+    try:
+        out = subprocess.run([PS, "-axo", "pid=,tty="], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                             timeout=10, check=True, env={"LC_ALL": "C"}).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found: set[int] = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1] not in ("??", "?", "-"):
+            found.add(int(parts[0]))
+    return found
 
 
 def git_repair_protected(table: dict[int, tuple[int, str]], path: Path | None = None) -> set[int] | None:
@@ -4784,22 +4806,27 @@ def process_cwds() -> dict[int, str] | None:
 
 
 def work_leftover_pids(table: dict[int, tuple[int, str]], work: str, protected: set[int],
-                       cwds: dict[int, str] | None = None, orphans_only: bool = False) -> list[tuple[int, str]]:
-    """Processes whose command runs from `work`, or orphans (ppid 1) whose cwd (from `cwds`) is inside it, and
-    their descendants, minus `protected` (the hook and its ancestors) and leftover_spared ones. orphans_only
-    takes command roots only when launchd adopted them too. Roots come before their descendants."""
-    prefix = work.rstrip("/") + "/"
+                       cwds: dict[int, str] | None = None, orphans_only: bool = False,
+                       ttys: set[int] | None = None) -> list[tuple[int, str]]:
+    """Processes whose command runs from `work`, or orphans (ppid 1) without a terminal (`ttys`) whose cwd (from
+    `cwds`) is inside it, and their descendants, minus `protected` (the hook and its ancestors) and leftover_spared
+    ones with everything under them. orphans_only takes command roots only when launchd adopted them too. Roots
+    come before their descendants."""
+    prefixes = tuple({work.rstrip("/") + "/", os.path.realpath(work).rstrip("/") + "/"})
     roots = {pid for pid, (ppid, cmd) in table.items()
-             if pid not in protected and cmd.lstrip("'\"").startswith(prefix) and (ppid == 1 or not orphans_only)}
+             if pid not in protected and cmd.lstrip("'\"").startswith(prefixes) and (ppid == 1 or not orphans_only)}
     roots |= {pid for pid, cwd in (cwds or {}).items()
-              if pid in table and pid not in protected and table[pid][0] == 1 and (cwd + "/").startswith(prefix)}
+              if pid in table and pid not in protected and table[pid][0] == 1 and pid not in (ttys or set())
+              and (cwd + "/").startswith(prefixes)}
     found: list[tuple[int, str]] = []
     seen: set[int] = set()
     for root in sorted(roots):
-        if leftover_spared(table[root][1]):
-            continue
+        skipped: set[int] = set()
         for pid in [root, *descendants(root, table)]:
-            if pid in seen or pid in protected or leftover_spared(table[pid][1]):
+            if pid in seen or pid in skipped:
+                continue
+            if pid in protected or leftover_spared(table[pid][1]) or table[pid][0] in skipped:
+                skipped.add(pid)  # nothing under a spared process is a leftover either
                 continue
             seen.add(pid)
             found.append((pid, table[pid][1]))
@@ -4866,15 +4893,26 @@ def cleanup_job_leftovers(work: str | None = None) -> list[str]:
     keep = git_repair_protected(table)
     if keep is None:
         return []  # a protected list we cannot read protects everything
-    # Without lsof the cwd rule finds nothing, and the command rule works as before.
-    found = work_leftover_pids(table, work, protected_pids(table) | keep, process_cwds())
+    # Without lsof or a terminal list the cwd rule finds nothing, and the command rule works as before.
+    ttys = tty_pids()
+    cwds = process_cwds() if ttys is not None else None
+    found = work_leftover_pids(table, work, protected_pids(table) | keep, cwds, ttys=ttys)
     if not found:
         return []
     ended = end_leftovers(found, command_table)
     if not ended:
         return []
-    sample = "; ".join(cmd[:120] for _pid, cmd in ended)[:600]
-    return [f"ended {len(ended)} leftover process(es) from {work}: {sample}"]
+    names = ", ".join(sorted({executable_name(cmd) for _pid, cmd in ended}))[:300]
+    return [f"ended {len(ended)} leftover process(es) from {home_relative(work)}: {names}"]
+
+
+def executable_name(command: str) -> str:
+    return os.path.basename(command.split(None, 1)[0].strip("'\"")) if command.strip() else "?"
+
+
+def home_relative(path: str) -> str:
+    home = os.fspath(Path.home()).rstrip("/")
+    return "~" + path[len(home):] if home and (path == home or path.startswith(home + "/")) else path
 
 
 def sweep_idle_leftovers(runner_dir: Path) -> list[str]:
@@ -4893,11 +4931,12 @@ def sweep_idle_leftovers(runner_dir: Path) -> list[str]:
     table = processes()
     if not idle(table):
         return []
+    ttys = tty_pids()
     cwds = process_cwds()
     keep = git_repair_protected(table)
-    if cwds is None or keep is None:
+    if ttys is None or cwds is None or keep is None:
         return []
-    found = work_leftover_pids(table, work, protected_pids(table) | keep, cwds, orphans_only=True)
+    found = work_leftover_pids(table, work, protected_pids(table) | keep, cwds, orphans_only=True, ttys=ttys)
     if not found:
         return []
 
@@ -4906,12 +4945,12 @@ def sweep_idle_leftovers(runner_dir: Path) -> list[str]:
         return {pid: command for pid, (_ppid, command) in now.items()} if idle(now) else None
 
     notes = []
-    prefix = work.rstrip("/") + "/"
+    prefixes = (work.rstrip("/") + "/", os.path.realpath(work).rstrip("/") + "/")
     for pid, command in end_leftovers(found[:32], current):
-        name = os.path.basename(command.split(None, 1)[0].strip("'\"")) if command.strip() else "?"
         cwd = cwds.get(pid, "")
-        where = "_work/" + cwd[len(prefix):] if cwd.startswith(prefix) else "outside _work"
-        notes.append(f"ended leftover pid {pid} ({name}, cwd {where})")
+        prefix = next((p for p in prefixes if cwd.startswith(p)), None)
+        where = "_work/" + cwd[len(prefix):] if prefix else "outside _work"
+        notes.append(f"ended leftover pid {pid} ({executable_name(command)}, cwd {where})")
     return notes
 
 
@@ -4964,7 +5003,8 @@ def disk_pressure(explicit: str | None, floor_gib: float = 0.0, timeout: float =
         return f"glaeda-disk skipped: {type(error).__name__}"
 
 
-DISK_BOUND = """import subprocess, sys
+DISK_BOUND = """# glaeda-disk-bound (leftover_spared reads this name)
+import subprocess, sys
 try:
     subprocess.run(sys.argv[2:], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                    timeout=float(sys.argv[1]), check=False)

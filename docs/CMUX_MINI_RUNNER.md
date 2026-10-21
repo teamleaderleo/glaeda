@@ -215,8 +215,9 @@ What `--apply` does:
      (or the capacity share), kills orphaned `cmux DEV.app` processes whose executable was
      under a finished runner `_work/_temp/cmux-derived-data-tests-*` directory, ends this runner's
      leftovers (a process whose command runs from its `_work`, or a launchd-adopted orphan whose
-     working directory is inside it, plus their descendants; the runner's and glaeda's own
-     processes, git maintenance and `~/.cache/git-repair/protected` are spared), runs the same
+     working directory is inside it and that has no terminal, plus their descendants; the
+     runner's and glaeda's own processes, git maintenance, multiplexer and agent sessions with
+     everything under them, and `~/.cache/git-repair/protected` are spared), runs the same
      disk pressure pass and always exits 0. The two-minute `glaeda-mini-health` agent repeats
      that ownership check when a post-job hook was skipped, and the listener gate sweeps its
      own idle runner's `_work` for such orphans every ten minutes (never while that runner has
