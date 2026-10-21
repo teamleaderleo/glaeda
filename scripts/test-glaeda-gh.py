@@ -3765,10 +3765,15 @@ class BrokerLogTest(BrokerBase):
         self.assertIn("[redacted]", text)
 
     def test_a_newline_in_a_subcommand_slot_cannot_forge_a_log_line(self) -> None:
-        self.run_gh(["pr", "view\n2026-10-21T00:00:00Z other-session pr view pr:o/r#1", "7"])
+        forged = "2026-10-21T00:00:00Z other-session pr view pr:o/r#1"
+        self.run_gh(["pr", f"view\n{forged}", "7"])
         text = Path(os.environ["CMUX_GH_LOG"]).read_text()
         self.assertEqual(len(text.splitlines()), 1, text)
-        self.assertRegex(text, r" pr\n$")
+        self.assertNotIn("other-session", text)
+        # `view\n...` is not a subcommand word, so the head stops at `pr`. What may follow is an
+        # identifier, and whether `7` resolves to one depends on the checkout this runs in: under
+        # CI the cwd is a clone with one GitHub remote, in a worktree with two it is not.
+        self.assertRegex(text, r"^\S+ \S+ pr( \S+)?\n$")
 
     def test_a_logged_read_carries_its_repository(self) -> None:
         """`pr view 7` in two repositories is two reads; counting them as one would overstate
