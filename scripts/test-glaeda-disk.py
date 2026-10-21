@@ -2102,6 +2102,8 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(status, 3)
         self.assertIn("measurement_busy", out)
         survey.assert_not_called()
+        # A deferred run lets go of the eviction lock it took, not only at exit.
+        self.assertIsNone(gd._EVICT_HANDLE)
         # Nearly empty: it goes on.
         status, out, survey = run(0.9)
         self.assertNotIn("measurement_busy", out)
