@@ -96,6 +96,7 @@ class FakeGitHub:
         self.job_steps: dict[int, list] = {}  # job (check run) database id -> steps, for GET .../actions/jobs/ID
         self.base_gone = False  # the base branch was deleted: its rules and protection answer 404
         self.heads: dict[tuple[str, str, str], list] = {}  # (owner, repo, sha) -> that commit's check contexts
+        self.rate_limit_calls = 0  # GET /rate_limit: free, so it is counted separately
 
     def rate(self, resource: str, remaining: int) -> dict:
         return {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": str(remaining),
@@ -152,6 +153,14 @@ class FakeGitHub:
             return 200, self.rate("graphql", self.graphql_remaining), json.dumps(out).encode()
         path = url.split("api.github.com", 1)[1]
         parts = path.split("?")[0].split("/")
+        if path == "/rate_limit":
+            # Free: GitHub does not charge this against either primary limit, so neither does the fake.
+            self.rate_limit_calls += 1
+            body = {"resources": {"core": {"limit": 5000, "remaining": self.rest_remaining,
+                                           "reset": int(NOW + 1800)},
+                                  "graphql": {"limit": 5000, "remaining": self.graphql_remaining,
+                                              "reset": int(NOW + 1800)}}}
+            return 200, self.rate("core", self.rest_remaining), json.dumps(body).encode()
         if parts[4] == "actions" and parts[5] == "jobs":
             steps = self.job_steps.get(int(parts[6]))
             payload = None if steps is None else {"id": int(parts[6]), "steps": steps}
@@ -239,16 +248,19 @@ class Base(unittest.TestCase):
         global NOW
         NOW = float(int(time.time()))
         self.tmp = tempfile.TemporaryDirectory()
-        self.saved = (gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.DOWN_PATIENCE)
+        self.saved = (gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.DOWN_PATIENCE, gg.BUDGET_REFRESH)
         gg.BASE = Path(self.tmp.name) / "gh"
         gg.WAIT_POLL = 0.05
         gg.DOWN_GRACE = 0.3
         gg.DOWN_PATIENCE = 0.6
+        # An idle tick ends with a free GET /rate_limit; these tests count the daemon's requests, so
+        # it is off here and BudgetRefreshTest turns it back on.
+        gg.BUDGET_REFRESH = 0
         self.gh = FakeGitHub()
         self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
 
     def tearDown(self) -> None:
-        gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.DOWN_PATIENCE = self.saved
+        gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.DOWN_PATIENCE, gg.BUDGET_REFRESH = self.saved
         self.tmp.cleanup()
 
     def age_watch(self, key: str, seconds: float) -> None:
@@ -2966,6 +2978,418 @@ class FileAndPidWaitTest(unittest.TestCase):
             self.assertEqual(gg.main(["wait", "file", str(target), "--timeout", "2"]), 0)
             self.assertEqual(gg.main(["wait", "file", str(target), "--gone", "--timeout", "0.1"]), gg.EXIT_TIMEOUT)
 
+
+class BudgetRefreshTest(Base):
+    """The quota is one pool per account, so every host needs a view of it that is not old. The
+    daemon used to learn it only from its own responses' headers, which left an idle host working
+    from a figure days out of date. GET /rate_limit is free, so a stale view is refreshed from it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        gg.BUDGET_REFRESH = 120.0
+
+    def test_an_idle_tick_refreshes_a_view_it_never_had(self) -> None:
+        self.gh.rest_remaining, self.gh.graphql_remaining = 1057, 67
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.rate_limit_calls, 1)
+        self.assertEqual(self.daemon.budget["rest"]["remaining"], 1057)
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 67)
+        self.assertEqual(self.daemon.budget["rest"]["seenAt"], NOW)
+
+    def test_a_recent_view_is_not_read_again(self) -> None:
+        self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.BUDGET_REFRESH - 1)
+        self.assertEqual(self.gh.rate_limit_calls, 1)
+        self.daemon.tick(NOW + gg.BUDGET_REFRESH + 1)
+        self.assertEqual(self.gh.rate_limit_calls, 2)
+
+    def test_a_tick_whose_views_are_both_recent_pays_nothing(self) -> None:
+        """A busy daemon's own responses carry x-ratelimit headers, so there is nothing to refresh."""
+        self.gh.prs[("o", "r", 7)] = pr_node(7)
+        gg.register("pr:o/r#7")
+        self.daemon.tick(NOW)  # the first tick has no view of either bucket yet
+        self.assertEqual(self.gh.rate_limit_calls, 1)
+        self.daemon.tick(NOW + gg.BUDGET_REFRESH / 2)
+        self.assertEqual(self.gh.rate_limit_calls, 1)
+        self.assertEqual(self.daemon.budget["graphql"]["seenAt"], NOW + gg.BUDGET_REFRESH / 2)
+
+    def test_the_bucket_this_host_is_not_using_is_kept_current_for_nothing(self) -> None:
+        """The point of the refresh: a daemon reading only GraphQL still has to know what REST has
+        left, because another machine on the same account is spending it."""
+        self.gh.prs[("o", "r", 7)] = pr_node(7)
+        gg.register("pr:o/r#7")
+        self.daemon.tick(NOW)
+        self.gh.rest_remaining = 1057
+        self.daemon.tick(NOW + 10 * gg.BUDGET_REFRESH)
+        self.assertEqual(self.daemon.budget["rest"], {"limit": 5000, "remaining": 1057,
+                                                      "reset": int(NOW + 1800),
+                                                      "seenAt": NOW + 10 * gg.BUDGET_REFRESH})
+        self.assertEqual(self.daemon.status["lastHour"]["rest"], 0, "the refresh spends no REST")
+
+    def test_the_free_read_is_not_counted_as_a_request_the_daemon_spent(self) -> None:
+        status = self.daemon.tick(NOW)
+        self.assertEqual(self.gh.rate_limit_calls, 1)
+        self.assertEqual(status["lastHour"], {"rest": 0, "rest304": 0, "graphql": 0})
+
+    def test_a_refusal_is_reported_and_leaves_the_last_view_alone(self) -> None:
+        self.daemon.tick(NOW)
+        kept = dict(self.daemon.budget["rest"])
+
+        def fail(*_args: Any, **_kwargs: Any) -> tuple[int, dict, bytes]:
+            return 403, {}, b'{"message": "rate limited"}'
+
+        self.daemon.transport = fail
+        status = self.daemon.tick(NOW + 10 * gg.BUDGET_REFRESH)
+        self.assertEqual(self.daemon.budget["rest"], kept)
+        self.assertTrue(any("rate_limit: HTTP 403" in e for e in status["errors"]))
+
+
+class BrokerBase(Base):
+    """`glaeda-gh gh ARG...` in front of one real gh call."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.home = Path(self.tmp.name) / "home"
+        (self.home / "roots").mkdir(parents=True)
+        self.env = mock.patch.dict(os.environ, {
+            "GLAEDA_GH_REPO_ROOTS": str(self.home / "roots"),
+            "CMUX_GH_LOG": str(self.home / "calls.log"),
+            "GLAEDA_GH_REAL": str(self.fake_gh()),
+        }, clear=False)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        for name in ("GLAEDA_GH_ALLOW_API_SOURCE", "GLAEDA_GH_MAX_AGE", "CMUX_GH_GUARD_LOGGED"):
+            os.environ.pop(name, None)
+
+    def fake_gh(self) -> Path:
+        """A stand-in for the real gh that records the arguments it was handed."""
+        path = self.home / "bin" / "gh"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.passed = self.home / "passed.txt"
+        path.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" >> " + str(self.passed) + "\n")
+        path.chmod(0o755)
+        return path
+
+    def checkout(self, owner_repo: str, name: str | None = None) -> Path:
+        """A checkout of `owner_repo` under the configured root, as the refusal looks for."""
+        where = self.home / "roots" / (name or owner_repo.split("/")[1])
+        (where / ".git").mkdir(parents=True)
+        (where / ".git" / "config").write_text(
+            f'[remote "origin"]\n\turl = git@github.com:{owner_repo}.git\n')
+        return where
+
+    def cache_pr(self, number: int, data: dict, age: float = 0.0) -> str:
+        key = f"pr:o/r#{number}"
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "fetchedAt": time.time() - age, "dataAt": time.time() - age,
+                       "data": data, "error": None})
+        return key
+
+    def run_gh(self, args: list[str]) -> tuple[int, str, str, list[str] | None]:
+        """(exit code, stdout, stderr, the arguments the real gh got, or None when it was not run)."""
+        out, err, execed = io.StringIO(), io.StringIO(), []
+
+        def execv(path: str, argv: list[str]) -> None:
+            execed.append((path, argv))
+            raise SystemExit(0)
+
+        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            try:
+                code = gg.cmd_gh(args)
+            except SystemExit:
+                code = None
+        return code, out.getvalue(), err.getvalue(), (execed[0][1][1:] if execed else None)
+
+
+class BrokerRouteTest(BrokerBase):
+    def test_a_fresh_cache_entry_answers_pr_view_byte_for_byte(self) -> None:
+        self.cache_pr(7, {"number": 7, "state": "MERGED", "isDraft": False, "mergeable": "UNKNOWN",
+                          "headRefOid": "a" * 40, "updatedAt": "2026-10-21T04:33:12Z"})
+        code, out, _err, passed = self.run_gh(
+            ["pr", "view", "7", "-R", "o/r", "--json", "headRefOid,isDraft,mergeable,number,state,updatedAt"])
+        self.assertEqual(code, 0)
+        self.assertIsNone(passed, "a served read never reaches GitHub")
+        # gh prints compact JSON with its keys sorted and one trailing newline
+        self.assertEqual(out, '{"headRefOid":"' + "a" * 40 + '","isDraft":false,"mergeable":"UNKNOWN",'
+                              '"number":7,"state":"MERGED","updatedAt":"2026-10-21T04:33:12Z"}\n')
+
+    def test_a_pr_url_carries_its_own_repository(self) -> None:
+        self.cache_pr(7, {"state": "OPEN"})
+        code, out, _err, passed = self.run_gh(["pr", "view", "https://github.com/o/r/pull/7", "--json", "state"])
+        self.assertEqual((code, out, passed), (0, '{"state":"OPEN"}\n', None))
+
+    def test_a_stale_entry_is_not_served(self) -> None:
+        self.cache_pr(7, {"state": "OPEN"}, age=gg.BROKER_MAX_AGE + 5)
+        _code, out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+        self.assertEqual(out, "")
+        self.assertEqual(passed, ["pr", "view", "7", "-R", "o/r", "--json", "state"])
+
+    def test_a_field_the_daemon_does_not_hold_is_passed_through(self) -> None:
+        self.cache_pr(7, {"state": "OPEN"})
+        _code, out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state,body"])
+        self.assertEqual(out, "")
+        self.assertIsNotNone(passed)
+
+    def test_a_field_missing_from_this_entry_is_passed_through(self) -> None:
+        """Serving a null gh would have filled in is worse than spending one request."""
+        self.cache_pr(7, {"state": "OPEN"})
+        _code, _out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state,mergedAt"])
+        self.assertIsNotNone(passed)
+
+    def test_jq_and_template_are_passed_through(self) -> None:
+        self.cache_pr(7, {"state": "OPEN"})
+        for shape in (["-q", ".state"], ["--jq", ".state"], ["--template", "{{.state}}"]):
+            with self.subTest(shape=shape):
+                _code, out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state", *shape])
+                self.assertEqual(out, "")
+                self.assertIsNotNone(passed)
+
+    def test_human_output_is_passed_through(self) -> None:
+        self.cache_pr(7, {"state": "OPEN"})
+        _code, out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r"])
+        self.assertEqual(out, "")
+        self.assertIsNotNone(passed)
+
+    def test_a_run_is_served_from_the_rest_shape_the_daemon_stores(self) -> None:
+        key = "run:o/r/12"
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "fetchedAt": time.time(), "dataAt": time.time(), "error": None,
+                       "data": {"id": 12, "name": "CI", "status": "completed", "conclusion": "success",
+                                "head_sha": "b" * 40, "html_url": "https://x/12", "run_attempt": 2}})
+        code, out, _err, passed = self.run_gh(
+            ["run", "view", "12", "-R", "o/r", "--json", "attempt,conclusion,databaseId,headSha,status,workflowName"])
+        self.assertEqual((code, passed), (0, None))
+        self.assertEqual(json.loads(out), {"attempt": 2, "conclusion": "success", "databaseId": 12,
+                                           "headSha": "b" * 40, "status": "completed", "workflowName": "CI"})
+
+    def test_a_mutation_is_never_touched(self) -> None:
+        for args in (["pr", "merge", "7", "-R", "o/r", "--squash"],
+                     ["pr", "comment", "7", "-R", "o/r", "--body", "hi"],
+                     ["api", "-X", "POST", "repos/o/r/issues/7/comments", "-f", "body=hi"]):
+            with self.subTest(args=args):
+                _code, out, _err, passed = self.run_gh(args)
+                self.assertEqual(out, "")
+                self.assertEqual(passed, args)
+
+
+class BrokerRefusalTest(BrokerBase):
+    def test_reading_source_through_the_api_is_refused_when_the_repo_is_here(self) -> None:
+        where = self.checkout("o/r")
+        for path in ("repos/o/r/contents/.github/workflows/ci.yml",
+                     "repos/o/r/git/blobs/" + "c" * 40,
+                     "repos/o/r/git/trees/main?recursive=1",
+                     "https://raw.githubusercontent.com/o/r/main/README.md"):
+            with self.subTest(path=path):
+                code, out, err, passed = self.run_gh(["api", path])
+                self.assertEqual(code, gg.BROKER_EXIT_REFUSED)
+                self.assertEqual((out, passed), ("", None))
+                self.assertIn(str(where), err)
+                self.assertIn("git -C", err)
+
+    def test_a_repo_that_is_not_checked_out_here_is_passed_through(self) -> None:
+        self.checkout("o/r")
+        args = ["api", "repos/other/elsewhere/contents/README.md"]
+        code, _out, _err, passed = self.run_gh(args)
+        self.assertIsNone(code)
+        self.assertEqual(passed, args)
+
+    def test_a_worktree_counts_as_a_checkout(self) -> None:
+        common = self.home / "clone" / ".git"
+        (common / "worktrees" / "lane").mkdir(parents=True)
+        (common / "config").write_text('[remote "origin"]\n\turl = https://github.com/o/r\n')
+        where = self.home / "roots" / "lane"
+        where.mkdir(parents=True)
+        (where / ".git").write_text(f"gitdir: {common}/worktrees/lane\n")
+        code, _out, err, _passed = self.run_gh(["api", "repos/o/r/contents/x"])
+        self.assertEqual(code, gg.BROKER_EXIT_REFUSED)
+        self.assertIn(str(where), err)
+
+    def test_an_escape_hatch_passes_one_call_through(self) -> None:
+        self.checkout("o/r")
+        with mock.patch.dict(os.environ, {"GLAEDA_GH_ALLOW_API_SOURCE": "1"}):
+            args = ["api", "repos/o/r/contents/x"]
+            code, _out, _err, passed = self.run_gh(args)
+        self.assertIsNone(code)
+        self.assertEqual(passed, args)
+
+    def test_a_write_to_a_contents_path_is_not_a_read(self) -> None:
+        self.checkout("o/r")
+        args = ["api", "-X", "PUT", "repos/o/r/contents/x", "-f", "message=x"]
+        code, _out, _err, passed = self.run_gh(args)
+        self.assertIsNone(code)
+        self.assertEqual(passed, args)
+
+
+class BrokerWatchTest(BrokerBase):
+    def setUp(self) -> None:
+        super().setUp()
+        gg.write_json(gg.BASE / "daemon.json", {"pid": os.getpid(), "at": time.time(),
+                                                "heartbeat": gg.HEARTBEAT_EVERY})
+        self.lock = (gg.BASE / "serve.lock")
+        self.held = mock.patch.object(gg, "daemon_running", lambda grace=0.0: True)
+        self.held.start()
+        self.addCleanup(self.held.stop)
+
+    def watched(self) -> list[str]:
+        return sorted((gg.read_json(p) or {}).get("key") for p in gg.watch_dir().glob("*.json"))
+
+    def test_one_read_of_a_target_never_starts_a_watch(self) -> None:
+        """A sweep over fifty PRs would otherwise cost the daemon more than the sweep saved."""
+        self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+        self.assertEqual(self.watched(), [])
+
+    def test_a_second_read_within_the_window_starts_one(self) -> None:
+        self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+        self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+        self.assertEqual(self.watched(), ["pr:o/r#7"])
+
+    def test_different_targets_do_not_add_up(self) -> None:
+        self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+        self.run_gh(["pr", "view", "8", "-R", "o/r", "--json", "state"])
+        self.assertEqual(self.watched(), [])
+
+    def test_a_read_the_cache_could_not_have_answered_is_not_worth_watching(self) -> None:
+        for _ in range(3):
+            self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state,body"])
+        self.assertEqual(self.watched(), [])
+
+
+class BrokerBudgetTest(BrokerBase):
+    def test_the_cache_horizon_widens_as_the_shared_quota_drains(self) -> None:
+        self.assertEqual(gg.broker_max_age(), gg.BROKER_MAX_AGE)
+        gg.write_json(gg.BASE / "budget.json",
+                      {"rest": {"limit": 5000, "remaining": 90, "reset": time.time() + 600, "seenAt": time.time()}})
+        self.assertEqual(gg.broker_max_age(), gg.BROKER_LEAN_AGE)
+
+    def test_a_spent_bucket_lets_an_older_entry_answer(self) -> None:
+        self.cache_pr(7, {"state": "OPEN"}, age=gg.BROKER_MAX_AGE + 30)
+        _code, out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+        self.assertEqual((out, passed), ("", ["pr", "view", "7", "-R", "o/r", "--json", "state"]))
+        gg.write_json(gg.BASE / "budget.json",
+                      {"graphql": {"limit": 5000, "remaining": 67, "reset": time.time() + 600, "seenAt": time.time()}})
+        code, out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+        self.assertEqual((code, out, passed), (0, '{"state":"OPEN"}\n', None))
+
+    def test_a_reset_that_has_passed_is_not_treated_as_lean(self) -> None:
+        gg.write_json(gg.BASE / "budget.json",
+                      {"rest": {"limit": 5000, "remaining": 0, "reset": time.time() - 1, "seenAt": time.time()}})
+        self.assertEqual(gg.broker_max_age(), gg.BROKER_MAX_AGE)
+
+    def test_the_horizon_can_be_set_for_one_call(self) -> None:
+        with mock.patch.dict(os.environ, {"GLAEDA_GH_MAX_AGE": "3600"}):
+            self.assertEqual(gg.broker_max_age(), 3600)
+
+
+class BrokerFailOpenTest(BrokerBase):
+    def test_an_error_anywhere_in_the_broker_still_runs_the_real_gh(self) -> None:
+        with mock.patch.object(gg, "broker_plan", side_effect=RuntimeError("boom")):
+            args = ["pr", "view", "7", "-R", "o/r", "--json", "state"]
+            code, _out, _err, passed = self.run_gh(args)
+        self.assertIsNone(code)
+        self.assertEqual(passed, args)
+        noted = [json.loads(line) for line in gg.broker_log().read_text().splitlines()]
+        self.assertEqual(noted[-1]["route"], "error")
+
+    def test_a_cache_entry_that_is_not_a_dict_is_passed_through(self) -> None:
+        key = "pr:o/r#7"
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "data": "nonsense", "dataAt": time.time()})
+        _code, out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+        self.assertEqual(out, "")
+        self.assertIsNotNone(passed)
+
+    def test_an_entry_the_daemon_marked_failed_is_passed_through(self) -> None:
+        key = "pr:o/r#7"
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "data": {"state": "OPEN"}, "dataAt": time.time(), "error": "graphql: HTTP 502"})
+        _code, out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+        self.assertEqual(out, "")
+        self.assertIsNotNone(passed)
+
+
+class BrokerArgumentTest(unittest.TestCase):
+    def test_a_flags_value_is_never_read_as_a_target(self) -> None:
+        words, method, seen, values = gg.broker_words(
+            ["pr", "view", "7", "-R", "o/r", "--json", "state", "--jq", ".state"])
+        self.assertEqual(words, ["pr", "view", "7"])
+        self.assertEqual(method, "GET")
+        self.assertEqual(values["-R"], "o/r")
+        self.assertEqual(values["--json"], "state")
+        self.assertIn("--jq", seen)
+
+    def test_the_method_is_found_in_each_spelling(self) -> None:
+        for args, expect in ((["api", "x"], "GET"), (["api", "-X", "post", "x"], "POST"),
+                             (["api", "-XDELETE", "x"], "DELETE"), (["api", "--method=patch", "x"], "PATCH"),
+                             (["api", "--method", "put", "x"], "PUT")):
+            with self.subTest(args=args):
+                self.assertEqual(gg.broker_words(args)[1], expect)
+
+    def test_everything_after_a_bare_double_dash_is_positional(self) -> None:
+        self.assertEqual(gg.broker_words(["pr", "view", "--", "-R"])[0], ["pr", "view", "-R"])
+
+
+class AuditTest(BrokerBase):
+    def write_log(self, lines: list[tuple[int, str]]) -> Path:
+        path = self.home / "audit.log"
+        path.write_text("".join(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(NOW + at))} s1 {text}\n"
+                                for at, text in lines))
+        return path
+
+    def test_it_counts_what_a_cache_would_have_answered(self) -> None:
+        path = self.write_log([(0, "pr view 7 o/r"), (10, "pr view 7 o/r"), (20, "pr view 7 o/r"),
+                               (0, "pr merge 7 o/r"), (0, "api repos/o/r/contents/x"),
+                               (0, "api graphql query=")])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.main(["audit", "--log", str(path), "--json"]), 0)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["calls"], 6)
+        self.assertEqual(doc["cacheableReads"], 3)
+        self.assertEqual(doc["repeatsWithin"], {"seconds": gg.AUDIT_WINDOW, "calls": 2})
+        self.assertEqual(doc["categories"]["source read through the API"], 1)
+        self.assertEqual(doc["categories"]["raw gh api graphql"], 1)
+        self.assertEqual(doc["categories"]["pr merge"], 1)
+
+    def test_a_read_outside_the_window_is_not_a_repeat(self) -> None:
+        path = self.write_log([(0, "run view 12 o/r"), (int(gg.AUDIT_WINDOW) + 1, "run view 12 o/r")])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.main(["audit", "--log", str(path), "--json"])
+        self.assertEqual(json.loads(out.getvalue())["repeatsWithin"]["calls"], 0)
+
+    def test_it_reports_the_brokers_own_decisions(self) -> None:
+        gg.broker_note({"route": "serve"})
+        gg.broker_note({"route": "refuse"})
+        gg.broker_note({"route": "serve"})
+        path = self.write_log([(0, "pr view 7 o/r")])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.main(["audit", "--log", str(path), "--json"])
+        self.assertEqual(json.loads(out.getvalue())["brokerDecisions"], {"serve": 2, "refuse": 1})
+
+    def test_an_empty_or_missing_log_says_so(self) -> None:
+        with self.assertRaises(gg.WatchError):
+            gg.cmd_audit(self.home / "nope.log", 10, False)
+        empty = self.home / "empty.log"
+        empty.write_text("")
+        with self.assertRaises(gg.WatchError):
+            gg.cmd_audit(empty, 10, False)
+
+
+class BrokerLogTest(BrokerBase):
+    def test_a_host_without_the_path_guard_writes_the_guards_log_itself(self) -> None:
+        self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+        line = Path(os.environ["CMUX_GH_LOG"]).read_text().strip()
+        self.assertRegex(line, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ \S+ pr view 7$")
+
+    def test_a_host_with_the_guard_does_not_log_the_call_twice(self) -> None:
+        with mock.patch.dict(os.environ, {"CMUX_GH_GUARD_LOGGED": "1"}):
+            self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
+        self.assertFalse(Path(os.environ["CMUX_GH_LOG"]).exists())
+
+    def test_a_query_string_never_reaches_the_log(self) -> None:
+        self.run_gh(["api", "repos/o/r/actions/runs?head_sha=" + "d" * 40])
+        self.assertNotIn("head_sha", Path(os.environ["CMUX_GH_LOG"]).read_text())
 
 
 if __name__ == "__main__":

@@ -14,6 +14,11 @@
                                                         every check of those commits, read once for all sessions
     glaeda-gh budget [--json]                           REST and GraphQL quota as last seen
     glaeda-gh restart [--force]                         restart a down or hung daemon, once for every session
+    glaeda-gh gh ARG...                                 one `gh` call, brokered: served from the cache when it
+                                                        can be, refused when it reads local source through the
+                                                        API, otherwise passed to the real gh unchanged
+    glaeda-gh gh --install-shim                         put that in front of `gh` on PATH (--print-shim to look)
+    glaeda-gh audit [--log PATH] [--last N] [--json]    this host's gh traffic, and what a cache would answer
 
 Many sessions share one GitHub account and so one REST quota (5000 requests an hour). Each
 session polling its own PRs and runs used it up while the separate GraphQL quota sat idle. Here
@@ -118,6 +123,7 @@ from http.client import HTTPException  # the http() helper below shadows the `ht
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -142,6 +148,10 @@ TERMINAL_REFRESH = 600  # a terminal entry still watched is re-read this rarely 
 CACHE_KEEP = 3600  # unwatched cache files are removed after this long
 LEAN_FACTOR = 4  # below the floor, poll this many times less often
 FLOORS = {"rest": (500, 100), "graphql": (500, 100)}  # (floor, reserve) per quota
+# How stale this host's view of the shared quota may get before GET /rate_limit refreshes it. That
+# endpoint reports every family at once and costs no primary quota, so the only cost of a short
+# interval is the secondary limit, which one call every two minutes is nowhere near. 0 turns it off.
+BUDGET_REFRESH = 120.0
 GQL_BATCH = 15  # most PRs (or runs, or comment watches) per GraphQL query
 # GitHub answers 504 when a query runs past ~10 s. Measured 2026-10-19 on cosmic-gray: 25 PRs per
 # query took 10-11 s (half answered 504), 10 took 4-6 s, 5 took 2-3 s; each cost 1 point. So each
@@ -992,9 +1002,46 @@ class Daemon:
         except (TypeError, ValueError):
             pass
 
+    def refresh_budget(self) -> None:
+        """Read the quota from GitHub when this host's view has gone stale.
+
+        The quota is one pool per account, not per machine, so the glaeda daemons on cosmic-gray,
+        huge-blue, cmux16, air-blue and big-red are spending the same 5000/h. They need no ledger
+        between them: they need a view that is not old. Until now the budget was learned only as a
+        side effect of the daemon's own requests, so a host that was not polling worked from
+        whatever it last happened to see -- big-red believed a REST figure 124 hours old while the
+        account was in fact nearly spent (2026-10-21).
+
+        GET /rate_limit reports every resource family at once and does not count against either
+        primary limit (only against the secondary limit, which one call per BUDGET_REFRESH is
+        nowhere near), so this costs nothing and every host is at most that far behind the truth.
+        """
+        if BUDGET_REFRESH <= 0:
+            return  # off
+        seen = [(self.budget.get(b) or {}).get("seenAt") for b in FLOORS]
+        ages = [self.now - t for t in seen if isinstance(t, (int, float))]
+        if len(ages) == len(FLOORS) and max(ages) < BUDGET_REFRESH:
+            return  # every bucket's view is recent enough; a bucket never seen always refreshes
+        try:
+            status, _, doc = self.request("GET", "/rate_limit", free=True)
+        except OutOfTime:
+            return  # the tick ran long; the next one refreshes
+        except (WatchError, OSError) as error:
+            return self.errors.append(f"rate_limit: {describe(error)}")
+        if status != 200 or not isinstance(doc, dict):
+            return self.errors.append(f"rate_limit: HTTP {status}")
+        resources = doc.get("resources")
+        if not isinstance(resources, dict):
+            return
+        for bucket, family in (("rest", "core"), ("graphql", "graphql")):
+            seen = resources.get(family)
+            if isinstance(seen, dict):
+                self.note_budget(bucket, seen.get("limit"), seen.get("remaining"), seen.get("reset"))
+
     # -- requests
 
-    def request(self, method: str, path: str, body: dict | None = None, etag: str | None = None) -> tuple[int, dict, Any]:
+    def request(self, method: str, path: str, body: dict | None = None, etag: str | None = None,
+                free: bool = False) -> tuple[int, dict, Any]:
         if time.monotonic() >= self.tick_deadline:
             raise OutOfTime
         if self.token is None:
@@ -1008,7 +1055,9 @@ class Daemon:
             headers["Content-Type"] = "application/json"
         status, h, raw = self.transport(method, API + path, headers, raw_body)
         bucket = "graphql" if path == "/graphql" else "rest"
-        self.sent.append((self.now, "rest304" if bucket == "rest" and status == 304 else bucket))
+        # `free` is /rate_limit, which costs no quota: counting it as a REST request would overstate
+        # what the daemon spends.
+        self.sent.append((self.now, "free" if free else "rest304" if bucket == "rest" and status == 304 else bucket))
         if status == 401:
             self.token = None  # re-read from gh next time
         if "x-ratelimit-remaining" in h and h.get("x-ratelimit-resource", "core") in {"core", "graphql"}:
@@ -1213,6 +1262,9 @@ class Daemon:
                 break
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']}: {describe(error)}")
+        # After the reads, so a busy daemon never pays for it: its own responses' x-ratelimit
+        # headers have already brought the view up to date, and only an idle one goes stale.
+        self.refresh_budget()
         self.tick_deadline = float("inf")
         self.deferred &= {e["key"] for e in entries}
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
@@ -2960,6 +3012,496 @@ def cmd_budget(as_json: bool) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------- the gh broker
+#
+# `glaeda-gh gh ARG...` stands in front of the real `gh`. Every agent session on the account shares
+# one 5000/h REST pool and one 5000/h GraphQL pool, and `gh` itself has no cache and no idea what
+# the other sessions are doing: measured over 95,991 logged calls on one host, 22% of them re-read
+# something another session had read within the previous 90 seconds and 7.6% read repository source
+# through the API. The broker does three things and nothing else:
+#
+#   serve   `pr view --json` and `run view --json` from the daemon's cache when it is fresh enough
+#           and covers every field asked for. The daemon already reads those in one batched query
+#           for every watched PR at once, over whichever bucket is richer.
+#   refuse  reading a repository's source through the API (contents, git/blobs, git/trees) when
+#           that repository is checked out on this host. `git show` answers for nothing.
+#   pass    everything else, unchanged: mutations, logs, anything unrecognised, and any read the
+#           cache cannot cover completely.
+#
+# A second read of the same target within BROKER_REPEAT seconds registers a watch, so the daemon
+# starts covering it and the third read is free; a target read once is never watched. Every path
+# fails open: an error anywhere in the broker execs the real `gh`, because a wrapper around `gh` is
+# never allowed to be the reason a call fails. Only a refusal exits non-zero (2), and
+# GLAEDA_GH_ALLOW_API_SOURCE=1 passes one of those through.
+
+BROKER_MAX_AGE = 90.0  # cache entries older than this are not served (the daemon's cycle is 60 s)
+BROKER_LEAN_AGE = 600.0  # below the floor, stale data beats spending the last of the quota
+BROKER_REPEAT = 600.0  # a target read twice this far apart is worth watching
+BROKER_SEEN_KEEP = 2000  # targets remembered for repeat detection
+BROKER_LOG_MAX = 8 * 1024 * 1024  # the decision log is rotated once past this
+BROKER_EXIT_REFUSED = 2
+BROKER_REPOS_TTL = 600.0
+BROKER_ROOTS = ("~/Projects", "~/wt", "~/.cmux/worktrees")
+# gh flags that take a separate value: without these, `-R owner/repo` reads as a positional word
+BROKER_VALUE_FLAGS = {
+    "-R", "--repo", "-X", "--method", "-H", "--header", "-F", "--field", "-f", "--raw-field",
+    "-q", "--jq", "-t", "--template", "--json", "--input", "--cache", "--hostname", "--interval",
+    "-L", "--limit", "-B", "--base", "--head", "-S", "--search", "--state", "--author",
+    "--assignee", "--label", "-l",
+}
+# the ones that mean the output is not plain --json, so the cache cannot reproduce it
+BROKER_SHAPE_FLAGS = {"-q", "--jq", "-t", "--template", "--web", "-w", "--comments", "--paginate", "--slurp"}
+# gh `pr view --json FIELD` -> the key in a cached PR entry (glaeda's parse_pr)
+BROKER_PR_FIELDS = {f: f for f in ("number", "url", "title", "state", "isDraft", "mergeable",
+                                   "mergeStateStatus", "headRefOid", "headRefName", "reviewDecision",
+                                   "updatedAt", "mergedAt")}
+# gh `run view --json FIELD` -> the key in a cached run entry (glaeda's slim_run, REST names)
+BROKER_RUN_FIELDS = {"databaseId": "id", "name": "name", "workflowName": "name",
+                     "displayTitle": "display_title", "status": "status", "conclusion": "conclusion",
+                     "url": "html_url", "headSha": "head_sha", "headBranch": "head_branch",
+                     "event": "event", "attempt": "run_attempt", "createdAt": "created_at",
+                     "updatedAt": "updated_at"}
+BROKER_SOURCE_RE = re.compile(rf"^/?repos/({NAME})/({NAME})/(contents/|git/(?:blobs|trees)/)")
+BROKER_RAW_RE = re.compile(rf"^https?://raw\.githubusercontent\.com/({NAME})/({NAME})/")
+BROKER_REMOTE_RE = re.compile(rf"github\.com[:/]({NAME})/({NAME}?)(?:\.git)?\s*$", re.MULTILINE)
+
+
+def guard_log() -> Path:
+    """The PATH guard's call log (cmuxterm-hq tools/local-build-guards/gh), so one audit covers
+    every host: the guard writes it on the Macs, the broker on hosts that have no guard."""
+    return Path(os.environ.get("CMUX_GH_LOG") or Path.home() / ".local/state/cmux-gh/calls.log")
+
+
+def broker_log() -> Path:
+    return BASE / "broker.jsonl"
+
+
+def broker_seen_path() -> Path:
+    return BASE / "broker-seen.json"
+
+
+def broker_repos_path() -> Path:
+    return BASE / "broker-repos.json"
+
+
+def broker_words(args: list[str]) -> tuple[list[str], str, set[str], dict[str, str]]:
+    """(positional words, HTTP method, flags present, flag values). Flags that take a value consume
+    the next argument, so `-R owner/repo` does not look like a target."""
+    words, method, seen, values = [], "GET", set(), {}
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            words.extend(args[i + 1:])
+            break
+        if arg.startswith("--") and "=" in arg:
+            name, value = arg.split("=", 1)
+            seen.add(name)
+            values[name] = value
+            if name in ("--method",):
+                method = value
+        elif arg.startswith("-") and arg != "-":
+            seen.add(arg)
+            if arg in BROKER_VALUE_FLAGS and i + 1 < len(args):
+                values[arg] = args[i + 1]
+                if arg in ("-X", "--method"):
+                    method = args[i + 1]
+                i += 1
+            elif arg.startswith("-X") and len(arg) > 2:
+                method = arg[2:]
+        else:
+            words.append(arg)
+        i += 1
+    return words, method.upper(), seen, values
+
+
+def broker_flag(values: dict[str, str], *names: str) -> str | None:
+    for name in names:
+        if name in values:
+            return values[name]
+    return None
+
+
+def broker_local_repos(now: float | None = None) -> dict[str, str]:
+    """owner/repo (lowercased) -> a checkout of it on this host. Built from the GitHub remote in each
+    checkout's config under BROKER_ROOTS, at most two levels deep, and cached for BROKER_REPOS_TTL."""
+    now = time.time() if now is None else now
+    cached = read_json(broker_repos_path())
+    if isinstance(cached, dict) and now - (cached.get("at") or 0) < BROKER_REPOS_TTL:
+        found = cached.get("repos")
+        if isinstance(found, dict):
+            return found
+    roots = [Path(p).expanduser() for p in
+             (os.environ.get("GLAEDA_GH_REPO_ROOTS") or os.pathsep.join(BROKER_ROOTS)).split(os.pathsep) if p]
+    found: dict[str, str] = {}
+    for root in roots:
+        for depth in (1, 2):
+            try:
+                candidates = list(root.glob("/".join(["*"] * depth)))
+            except OSError:
+                continue
+            for d in candidates:
+                for owner_repo in broker_remotes(d):
+                    found.setdefault(owner_repo, str(d))
+    write_json(broker_repos_path(), {"at": now, "repos": found})
+    return found
+
+
+def broker_remotes(checkout: Path) -> list[str]:
+    """The owner/repo of every github.com remote of `checkout`, lowercased. A worktree's `.git` is a
+    file naming the common directory, where the config actually lives."""
+    dot = checkout / ".git"
+    try:
+        if dot.is_dir():
+            config = dot / "config"
+        elif dot.is_file():
+            gitdir = dot.read_text(errors="replace").strip()
+            if not gitdir.startswith("gitdir:"):
+                return []
+            common = re.sub(r"/worktrees/[^/]+/?$", "", gitdir.split(":", 1)[1].strip())
+            config = Path(common) / "config"
+        else:
+            return []
+        text = config.read_text(errors="replace")
+    except (OSError, ValueError):
+        return []
+    return [f"{owner.lower()}/{repo.lower()}" for owner, repo in BROKER_REMOTE_RE.findall(text)]
+
+
+def broker_source_refusal(words: list[str]) -> str | None:
+    """The message for an API read of repository source, when that repository is on this host."""
+    for word in words[1:]:
+        match = BROKER_SOURCE_RE.match(word) or BROKER_RAW_RE.match(word)
+        if not match:
+            continue
+        owner, repo = match.group(1).lower(), match.group(2).lower()
+        where = broker_local_repos().get(f"{owner}/{repo}")
+        if where is None:
+            return None
+        return (f"glaeda-gh: reading {owner}/{repo} source through the GitHub API spends the quota every agent "
+                f"on this account shares (5000/h, and 7.6% of all gh calls were doing this).\n"
+                f"  {owner}/{repo} is checked out at {where}:\n"
+                f"    git -C {where} fetch origin <ref>\n"
+                f"    git -C {where} show <ref>:<path>\n"
+                f"  GLAEDA_GH_ALLOW_API_SOURCE=1 passes one call through, for a path git really cannot answer.")
+    return None
+
+
+def broker_repo(values: dict[str, str]) -> str | None:
+    """OWNER/REPO from -R/--repo, else the current checkout's GitHub remote."""
+    named = broker_flag(values, "-R", "--repo")
+    if named:
+        parts = named.rstrip("/").split("/")
+        return f"{parts[-2].lower()}/{parts[-1].lower()}" if len(parts) >= 2 else None
+    here = broker_remotes(Path.cwd())
+    return here[0] if here else None
+
+
+def broker_target(words: list[str], values: dict[str, str], kind: str) -> str | None:
+    """The cache key for a `pr view N` or `run view ID`, or None when it is not that exact shape."""
+    if len(words) < 3:
+        return None
+    target = words[2]
+    if re.fullmatch(r"\d+", target):
+        repo = broker_repo(values)
+        return None if repo is None else parse_key(kind, f"{repo}{'#' if kind == 'pr' else '/'}{target}")
+    try:
+        return parse_key(kind, target)  # a full PR or run URL carries its own repository
+    except WatchError:
+        return None
+
+
+def broker_fields(values: dict[str, str], table: dict[str, str]) -> list[str] | None:
+    """The --json field list, if every field asked for is one the cache holds."""
+    raw = broker_flag(values, "--json")
+    if not raw:
+        return None
+    wanted = [f for f in raw.split(",") if f]
+    return wanted if wanted and all(f in table for f in wanted) else None
+
+
+def broker_seen_count(key: str, now: float) -> int:
+    """How many times this host has read `key` within BROKER_REPEAT, counting this read."""
+    doc = read_json(broker_seen_path())
+    seen = doc if isinstance(doc, dict) else {}
+    seen = {k: v for k, v in seen.items() if isinstance(v, list) and now - (v[0] or 0) < BROKER_REPEAT}
+    at, count = seen.get(key, [now, 0])[0], seen.get(key, [now, 0])[1]
+    count += 1
+    seen[key] = [now, count]
+    if len(seen) > BROKER_SEEN_KEEP:
+        seen = dict(sorted(seen.items(), key=lambda kv: kv[1][0], reverse=True)[:BROKER_SEEN_KEEP])
+    write_json(broker_seen_path(), seen)
+    return count
+
+
+def broker_max_age() -> float:
+    """The cache horizon, widened as the shared quota drains: spending the last of it on a read the
+    daemon already made a few minutes ago is the worst trade available."""
+    try:
+        age = float(os.environ["GLAEDA_GH_MAX_AGE"])
+        return age if age >= 0 else BROKER_MAX_AGE
+    except (KeyError, ValueError):
+        pass
+    budget = read_json(BASE / "budget.json")
+    if not isinstance(budget, dict):
+        return BROKER_MAX_AGE
+    now = time.time()
+    for bucket, (floor, _reserve) in FLOORS.items():
+        seen = budget.get(bucket)
+        if not isinstance(seen, dict) or (seen.get("reset") or 0) <= now:
+            continue
+        remaining = seen.get("remaining")
+        if isinstance(remaining, int) and remaining < floor:
+            return BROKER_LEAN_AGE
+    return BROKER_MAX_AGE
+
+
+def broker_serve(kind: str, key: str, fields: list[str], table: dict[str, str], now: float) -> str | None:
+    """The `gh --json` line for `key`, or None when the cache cannot answer it."""
+    entry = read_cache(key)
+    if not isinstance(entry, dict) or entry.get("error"):
+        return None
+    data, at = entry.get("data"), entry.get("dataAt")
+    if not isinstance(data, dict) or not isinstance(at, (int, float)) or now - at > broker_max_age():
+        return None
+    out = {}
+    for field in fields:
+        value = data.get(table[field])
+        if value is None and table[field] not in data:
+            return None  # the daemon did not store it: do not invent a null gh would not print
+        out[field] = value
+    return json.dumps(out, sort_keys=True, separators=(",", ":"))
+
+
+def broker_note(event: dict) -> None:
+    """One line per decision, for the before/after numbers. Never raises."""
+    path = broker_log()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if path.exists() and path.stat().st_size > BROKER_LOG_MAX:
+            path.replace(path.with_suffix(".jsonl.1"))
+        with path.open("a") as stream:
+            stream.write(json.dumps({"at": round(time.time()), **event}, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def broker_log_call(words: list[str]) -> None:
+    """Append to the PATH guard's call log in its own format, on a host with no guard (every Linux
+    lane). The guard sets CMUX_GH_GUARD_LOGGED when it has already written the line itself."""
+    if os.environ.get("CMUX_GH_GUARD_LOGGED") == "1":
+        return
+    caller = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or f"ppid-{os.getppid()}"
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path = guard_log()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as stream:
+            stream.write(f"{stamp} {caller} {' '.join(w.split('?')[0] for w in words[:4])}\n")
+    except OSError:
+        pass
+
+
+def broker_real_gh() -> str:
+    """The next `gh` on PATH that is not this broker's shim or another wrapper around it. A guard
+    that delegates here names the real binary in GLAEDA_GH_REAL, which is exact."""
+    named = os.environ.get("GLAEDA_GH_REAL")
+    if named and os.access(named, os.X_OK):
+        return named
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        candidate = Path(entry) / "gh"
+        if not os.access(candidate, os.X_OK) or candidate.is_dir():
+            continue
+        try:
+            head = candidate.open("rb").read(4096)
+        except OSError:
+            continue
+        if b"GLAEDA_GH_BROKER" in head or b"gh guard" in head:
+            continue  # this broker's shim, or the cmuxterm-hq PATH guard: both end up back here
+        return str(candidate)
+    raise WatchError("no real gh found on PATH")
+
+
+def broker_plan(args: list[str], now: float) -> tuple[str, str | None, str | None]:
+    """(route, payload, key). route is 'serve', 'refuse' or 'pass'. Pure: no watch is registered and
+    nothing is written, so a test can read the decision without touching the daemon's state."""
+    words, method, seen, values = broker_words(args)
+    head = " ".join(words[:2])
+    if words and words[0] == "api" and method == "GET" and not os.environ.get("GLAEDA_GH_ALLOW_API_SOURCE"):
+        refusal = broker_source_refusal(words)
+        if refusal:
+            return "refuse", refusal, None
+    if head not in ("pr view", "run view") or seen & BROKER_SHAPE_FLAGS:
+        return "pass", None, None
+    kind = "pr" if head == "pr view" else "run"
+    table = BROKER_PR_FIELDS if kind == "pr" else BROKER_RUN_FIELDS
+    fields = broker_fields(values, table)
+    key = broker_target(words, values, kind)
+    if fields is None or key is None:
+        # Nothing to gain from watching a target the cache could not have answered anyway.
+        return "pass", None, None
+    line = broker_serve(kind, key, fields, table, now)
+    return ("serve", line, key) if line is not None else ("pass", None, key)
+
+
+def cmd_gh(args: list[str]) -> int:
+    """Stand in front of one `gh` invocation. Fails open: anything unexpected runs the real gh."""
+    now = time.time()
+    real = None
+    try:
+        real = broker_real_gh()
+        broker_log_call(broker_words(args)[0])
+        route, payload, key = broker_plan(args, now)
+        if route == "refuse":
+            broker_note({"route": "refuse"})
+            print(payload, file=sys.stderr)
+            return BROKER_EXIT_REFUSED
+        if route == "serve":
+            broker_note({"route": "serve", "key": key})
+            print(payload)
+            return EXIT_OK
+        if key is not None and daemon_running(grace=DOWN_GRACE) and broker_seen_count(key, now) >= 2:
+            # read twice in BROKER_REPEAT: worth a watch, so the next read of it is free. A target
+            # read once is never watched, or a sweep over fifty PRs would cost more than it saves.
+            register(key)
+            broker_note({"route": "pass", "key": key, "watched": True})
+        else:
+            broker_note({"route": "pass", "key": key})
+    except Exception as error:  # noqa: BLE001  the broker never fails a call: that is the whole contract
+        broker_note({"route": "error", "error": describe(error), "site": error_site(error)})
+        if real is None:
+            try:
+                real = broker_real_gh()
+            except Exception:  # noqa: BLE001
+                print("glaeda-gh: no real gh on PATH", file=sys.stderr)
+                return 127
+    os.execv(real, [real, *args])
+
+
+BROKER_SHIM = """#!/usr/bin/env bash
+# GLAEDA_GH_BROKER shim: every `gh` call on this host goes through the broker, which serves what
+# glaeda's daemon already holds, refuses reading repository source through the API, and passes
+# everything else to the real gh unchanged. It fails open. Written by `glaeda-gh gh --install-shim`.
+exec {broker} gh "$@"
+"""
+
+
+AUDIT_LINE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) (\S+) (.*)$")
+AUDIT_WINDOW = 90.0  # a read this soon after the same target was read is one a cache would serve
+AUDIT_READS = {("pr", "view"), ("pr", "checks"), ("pr", "list"), ("pr", "diff"),
+               ("run", "view"), ("run", "list"), ("issue", "view"), ("issue", "list"),
+               ("search", "prs"), ("label", "list")}
+
+
+def audit_category(words: list[str]) -> tuple[str, bool]:
+    """(category, whether repeating it would be a cache hit) for one logged call."""
+    first, second = (words + ["", ""])[:2]
+    if first == "api":
+        if re.search(r"/(contents|git/blobs|git/trees|git/commits|git/refs)", " ".join(words)):
+            return "source read through the API", False
+        if second == "graphql":
+            return "raw gh api graphql", False
+        if second == "rate_limit":
+            return "rate_limit (free)", False
+        if re.search(r"/actions/runs/\d+/jobs", " ".join(words)):
+            return "api .../actions/runs/N/jobs", True
+        return f"api {second}".rstrip(), False
+    if (first, second) in AUDIT_READS:
+        return f"{first} {second}", True
+    return f"{first} {second}".strip() or "(none)", False
+
+
+def cmd_audit(path: Path, last: int, as_json: bool) -> int:
+    """What this host's gh traffic is, and how much of it a cache would have answered.
+
+    Reads the PATH guard's call log (the broker writes it on a host with no guard). The guard logs
+    positional words only -- never a query string or a flag's value -- so this never reads a token
+    or a path out of anyone's command line."""
+    try:
+        lines = path.read_text(errors="replace").splitlines()[-last:] if last else \
+            path.read_text(errors="replace").splitlines()
+    except OSError as error:
+        raise WatchError(f"cannot read {path}: {describe(error)}") from error
+    total = 0
+    counts: dict[str, int] = {}
+    reads, repeats = 0, 0
+    per_read: dict[str, list[int]] = {}
+    seen: dict[str, float] = {}
+    hot: dict[str, int] = {}
+    for line in lines:
+        match = AUDIT_LINE.match(line)
+        if not match:
+            continue
+        stamp, _caller, text = match.groups()
+        words = text.split()
+        at = iso_epoch(stamp)
+        total += 1
+        category, cacheable = audit_category(words)
+        counts[category] = counts.get(category, 0) + 1
+        if not cacheable or at is None:
+            continue
+        reads += 1
+        bucket = per_read.setdefault(category, [0, 0])
+        bucket[0] += 1
+        hot[text] = hot.get(text, 0) + 1
+        if at - seen.get(text, float("-inf")) <= AUDIT_WINDOW:
+            repeats += 1
+            bucket[1] += 1
+        seen[text] = at
+    if not total:
+        raise WatchError(f"no gh calls logged in {path}")
+    served = {}
+    try:
+        for line in broker_log().read_text(errors="replace").splitlines():
+            route = (json.loads(line) or {}).get("route")
+            served[route] = served.get(route, 0) + 1
+    except (OSError, ValueError):
+        pass
+    if as_json:
+        print(json.dumps({"calls": total, "categories": counts, "cacheableReads": reads,
+                          "repeatsWithin": {"seconds": AUDIT_WINDOW, "calls": repeats},
+                          "perRead": {k: {"reads": v[0], "repeats": v[1]} for k, v in per_read.items()},
+                          "brokerDecisions": served}, sort_keys=True))
+        return EXIT_OK
+    print(f"{total} gh calls logged in {path}\n")
+    print(f"{'category':<34}{'calls':>8}{'share':>8}")
+    for category, n in sorted(counts.items(), key=lambda kv: -kv[1])[:20]:
+        print(f"{category:<34}{n:>8}{100 * n / total:>7.1f}%")
+    print(f"\n{'read':<34}{'calls':>8}{'repeat within ' + str(int(AUDIT_WINDOW)) + 's':>22}")
+    for category, (n, again) in sorted(per_read.items(), key=lambda kv: -kv[1][0]):
+        print(f"{category:<34}{n:>8}{f'{again} ({100 * again / n:.0f}%)':>22}")
+    print(f"{'all cacheable reads':<34}{reads:>8}"
+          f"{f'{repeats} ({100 * repeats / max(reads, 1):.0f}%)':>22}")
+    print(f"\n{repeats} calls ({100 * repeats / total:.1f}% of all of them) re-read something this host had read "
+          f"within {int(AUDIT_WINDOW)} seconds.")
+    if hot:
+        print("hottest targets: " + "; ".join(f"{text} x{n}" for text, n in
+                                              sorted(hot.items(), key=lambda kv: -kv[1])[:5]))
+    if served:
+        print("\nbroker decisions so far: " + ", ".join(f"{k} {v}" for k, v in sorted(served.items())))
+    return EXIT_OK
+
+
+def cmd_gh_install_shim(print_only: bool) -> int:
+    broker = Path(__file__).resolve()
+    text = BROKER_SHIM.format(broker=shlex.quote(str(broker)))
+    if print_only:
+        print(text, end="")
+        return EXIT_OK
+    target = Path.home() / ".local/lib/glaeda-gh/bin"
+    target.mkdir(parents=True, exist_ok=True)
+    shim = target / "gh"
+    shim.write_text(text)
+    shim.chmod(0o755)
+    print(f"glaeda-gh: wrote {shim}. Put it in front of the real gh:\n"
+          f"    export PATH={shlex.quote(str(target))}:$PATH\n"
+          f"  Then `gh pr view N -R OWNER/REPO --json state` is served from glaeda's cache when it is "
+          f"fresh. Undo by removing that line and the file.")
+    return EXIT_OK
+
+
 def launchd_state() -> str | None:
     """The LaunchAgent's `state = ...` line (running, spawn scheduled, not running), or None."""
     try:
@@ -3134,12 +3676,23 @@ def parser() -> argparse.ArgumentParser:
     c.add_argument("--json", action="store_true")
     b = sub.add_parser("budget", help="REST and GraphQL quota as the daemon last saw it")
     b.add_argument("--json", action="store_true")
+    a = sub.add_parser("audit", help="what this host's gh traffic is, and how much of it a cache would answer")
+    a.add_argument("--log", type=Path, default=None, help="the call log to read (default the PATH guard's)")
+    a.add_argument("--last", type=int, default=200000, metavar="N",
+                   help="only the last N lines (default 200000; 0 reads all of it)")
+    a.add_argument("--json", action="store_true")
     r = sub.add_parser("restart", help="restart a down or hung daemon once, however many sessions ask at the same time")
     r.add_argument("--force", action="store_true", help="restart even if it looks healthy or was just restarted")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "gh":
+        # Everything after `gh` belongs to the real gh, flags and all: argparse must not see it.
+        if raw[1:2] == ["--install-shim"] or raw[1:2] == ["--print-shim"]:
+            return cmd_gh_install_shim(raw[1] == "--print-shim")
+        return cmd_gh(raw[1:])
     args = parser().parse_args(argv)
     try:
         if args.command == "serve":
@@ -3148,6 +3701,10 @@ def main(argv: list[str] | None = None) -> int:
             return serve(args.foreground_ok)
         if args.command == "budget":
             return cmd_budget(args.json)
+        if args.command == "audit":
+            if args.last < 0:
+                raise WatchError("--last must be 0 (all of it) or more lines")
+            return cmd_audit(args.log or guard_log(), args.last, args.json)
         if args.command == "restart":
             return cmd_restart(args.force)
         if args.command == "checks":
