@@ -299,6 +299,7 @@ jobs:
           bash -n scripts/cmux_mini_fix.sh
           # Every suite runs and reports on its own: one red suite no longer skips the rest (glaeda#1562's
           # tests never ran while test-glaeda-disk was red). Each failure is an annotation and a summary row.
+          # Add a new test suite as `suite python3 scripts/test-x.py`: a bare line stops the step at its failure.
           failed=()
           suite() {
             echo "::group::$*"
@@ -369,6 +370,7 @@ jobs:
           suite python3 scripts/test-unittest-shard.py
           # a test that leaves files in the checkout fails, as it did before the split
           dirty=$(git status --porcelain=v1 --untracked-files=all)
+          dirty=${dirty//%/%25}
           if [ -n "$dirty" ]; then echo "::error title=A suite left files in the checkout::${dirty//$'\n'/%0A}"; failed+=("clean checkout"); fi
           {
             echo "### Script suites: ${#failed[@]} failed"
