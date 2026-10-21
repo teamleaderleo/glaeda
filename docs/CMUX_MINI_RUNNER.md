@@ -528,10 +528,14 @@ compares its gate settings with main's: each module-level value that reads a `GL
 variable with a code default (`GATE_FIRST_POLL_S`, `GATE_RESTART_FREE_S`, `GATE_CPU_PAUSE`, ...).
 No runner sets those variables, so a hook that lags main runs main's old defaults. A runner
 `lags` when a setting differs or is missing, `differs` when only its bytes do. A lagging runner
-is `converging` while main's hook change is still on its way (docs/GLAEDA_OTA.md step 3): not
-yet on stable and younger than the soak, promote.yml's hourly schedule and two glaeda-update
-runs, or on stable for less than those two runs. Exit 1 when one lags or a member cannot be
-read. It only reports: the heal is the refresh above or `--apply`.
+is `converging` when it has exactly the settings of the hook before main's last hook change
+and that change is still on its way (docs/GLAEDA_OTA.md step 3): not yet on stable and younger
+than the soak, a silent canary's wait, promote.yml's hourly schedule and two glaeda-update runs,
+or on stable for less than those two runs. A runner further behind lags. It asks only the
+members that leo-workspace `machines/fleet-registry.json` names as machines agents may ssh to:
+a `no_touch` machine or one whose approval policy says never ssh (the AWS Macs), or one the
+registry does not name, is skipped without any probe. Exit 1 when one lags or a member cannot
+be read. It only reports: the heal is the refresh above or `--apply`.
 
 Relabelling keeps the runner's name. Moving an existing `<hostname>-glaeda` runner
 to a member whose name `<member>-glaeda` differs is a different install: the

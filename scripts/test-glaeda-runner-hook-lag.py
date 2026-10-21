@@ -26,6 +26,21 @@ MANIFEST = {
         "mini-a": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"], "hardware": "m4pro-48"},
         "mini-b": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"], "hardware": "m4pro-48"},
         "cache": {"class": "std", "availability": "dedicated", "roles": ["cache-host"], "hardware": "m4pro-48"},
+        "aws-a": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"], "hardware": "m4pro-48"},
+        "aws-b": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"], "hardware": "m4pro-48"},
+        "stranger": {"class": "std", "availability": "dedicated", "roles": ["ci-runner"], "hardware": "m4pro-48"},
+    },
+}
+# The shape of leo-workspace machines/fleet-registry.json: aws-a is marked no_touch, aws-b's policy says never
+# ssh, mini-b is known by an alias, and stranger is not named at all.
+REGISTRY = {
+    "approval_policies": {"manaflow-fleet": {"auto": ["inspect"], "never": ["passwords: keys only"]},
+                          "lawrence-no-touch": {"auto": [], "never": ["ssh", "passwords of any kind"]}},
+    "machines": {
+        "mini-a": {"approval": "manaflow-fleet", "roles": ["ci-runner"]},
+        "mini-b-long-name": {"aliases": ["mini-b"], "approval": "manaflow-fleet", "roles": ["ci-runner"]},
+        "aws-a": {"approval": "manaflow-fleet", "no_touch": True},
+        "aws-b": {"approval": "lawrence-no-touch"},
     },
 }
 # Runs the remote command's probe with this python, as the member's user: HOME is FAKE_HOMES/<host>.
@@ -100,12 +115,18 @@ class HookLagTest(unittest.TestCase):
         origin = self.dir / "origin.git"
         self.git("init", "-q", "--bare", "-b", "main", os.fspath(origin), cwd=self.dir)
         self.git("init", "-q", "-b", "main")
+        # Two hook commits: the pre-#1572 hook, then main's. The second is the change on its way.
+        self.hook = (ROOT / "scripts" / "glaeda-cmux-runner-hook").read_text()
+        (self.repo / "scripts" / "glaeda-cmux-runner-hook").write_text(old_hook(self.hook))
         self.git("add", "-A")
         self.git("commit", "-q", "-m", "one")
+        (self.repo / "scripts" / "glaeda-cmux-runner-hook").write_text(self.hook)
+        self.git("commit", "-q", "-am", "two")
         self.git("remote", "add", "origin", os.fspath(origin))
         self.git("push", "-q", "origin", "main")
         self.head = self.git("rev-parse", "HEAD")
-        self.hook = (ROOT / "scripts" / "glaeda-cmux-runner-hook").read_text()
+        self.registry = self.dir / "fleet-registry.json"
+        self.registry.write_text(json.dumps(REGISTRY))
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -131,7 +152,7 @@ class HookLagTest(unittest.TestCase):
         stable = stable or self.stable(self.head, LONG_AGO)  # main's hook on stable long ago: a lag is a lag
         return subprocess.run([sys.executable, os.fspath(self.repo / "scripts" / "glaeda-runner-hook-lag"),
                                "--manifest", os.fspath(self.manifest), "--output", "json",
-                               "--stable-json", os.fspath(stable), *args],
+                               "--stable-json", os.fspath(stable), "--registry", os.fspath(self.registry), *args],
                               capture_output=True, text=True, timeout=300, env={**self.env, **env})
 
     def test_an_old_hook_lags_by_setting_and_a_current_one_does_not(self) -> None:
@@ -167,6 +188,39 @@ class HookLagTest(unittest.TestCase):
                 self.assertEqual(report["rollout"]["state"], state)
                 members = {m["member"]: m["state"] for m in report["members"]}
                 self.assertEqual(members, {"mini-a": "converging", "mini-b": "current"})
+
+    def test_a_runner_two_changes_behind_lags_inside_the_window(self) -> None:
+        pause = 'GLAEDA_RUNNER_GATE_CPU_PAUSE") or '
+        older = old_hook(self.hook).replace(pause + "85.0", pause + "70.0")  # a change released before #1572
+        self.assertNotEqual(older, old_hook(self.hook))
+        self.install("mini-a", "actions-runner-glaeda", older)
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        out = self.lag(stable=self.stable(self.head, now))
+        self.assertEqual(out.returncode, 1, out.stderr)
+        report = json.loads(out.stdout)
+        self.assertIsNotNone(report["rollout"]["until"])  # the window is open, and still this runner lags
+        self.assertEqual(report["members"][0]["state"], "lags")
+        self.assertIn("GATE_CPU_PAUSE", [lag["name"] for lag in report["members"][0]["runners"][0]["lags"]])
+
+    def test_no_touch_and_unregistered_members_are_never_probed(self) -> None:
+        for host in ("mini-a", "mini-b", "aws-a", "aws-b", "stranger"):
+            self.install(host, "actions-runner-glaeda", self.hook)
+        out = self.lag()
+        self.assertEqual(out.returncode, 0, out.stderr)
+        report = json.loads(out.stdout)
+        self.assertEqual([m["member"] for m in report["members"]], ["mini-a", "mini-b"])
+        self.assertIn("no-touch", report["skipped"]["aws-a"])
+        self.assertIn("no-touch", report["skipped"]["aws-b"])
+        self.assertIn("not in the fleet registry", report["skipped"]["stranger"])
+        asked = {json.loads(line)["host"] for line in self.log.read_text().splitlines()}
+        self.assertEqual(asked, {"mini-a", "mini-b"})  # not even a read-only probe of the others
+
+    def test_no_registry_checks_nothing(self) -> None:
+        self.registry.unlink()
+        out = self.lag()
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("fleet registry", out.stderr)
+        self.assertFalse(self.log.exists())
 
     def test_an_unreadable_channel_gives_no_window(self) -> None:
         self.install("mini-a", "actions-runner-glaeda", old_hook(self.hook))

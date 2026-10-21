@@ -15,19 +15,25 @@ compared without a change here.
 Run from a worktree at origin's main (HEAD is checked against `git ls-remote origin main`, as
 glaeda-cmux-runner-fleet does), with SSH to every member. Each member gets one SSH: a short Python program on
 stdin loads every ~/actions-runner-glaeda*/glaeda-hooks/glaeda-cmux-runner-hook there with the GLAEDA_RUNNER_*
-variables cleared and prints its SHA-256 and settings. Nothing is written on the member or here.
+variables cleared and prints its SHA-256 and settings. Nothing is written on the member.
+
+A member is asked only when the fleet registry (machines/fleet-registry.json, the file reach routes by; --registry
+or the first of REGISTRIES) names it, by name or alias, as a machine agents may ssh to. One marked no_touch, or
+whose approval policy says never ssh (the AWS Macs), is skipped without a probe, even a read-only one, and so is
+a member the registry does not name. With no readable registry nothing is checked.
 
 Each runner reads current (the same bytes as main's hook), differs (other bytes, the same settings), lags (a
 setting differs from main or is missing), converging (it lags, but main's hook change is still on its way) or
 unreadable. A hook change reaches the runners by OTA (docs/GLAEDA_OTA.md step 3): a release soaks, stable is
 promoted, then glaeda-update refreshes the hooks on its next run, or the run after when a job holds the runner.
-So a lagging runner is converging while main's last hook commit is not on stable yet and is younger than the
-soak, promote.yml's hourly schedule and that refresh window, or while stable has it and was promoted less than
-the refresh window ago. stable.json is read anonymously from the ota-channels release, as glaeda-update does;
-an unreadable channel gives no window. Exit 0 when no runner lags and every member answered, 1 when a runner
-lags or a member or hook could not be read, 2 when the check cannot run (bad arguments, no manifest, HEAD is
-not origin's main). The heal is a hook rollout (glaeda-update --refresh-hooks, or
-glaeda-cmux-runner-fleet --apply); this tool only reports.
+So a lagging runner is converging when it has exactly the settings of the hook before main's last hook commit,
+while that commit is not on stable yet and is younger than the soak, a silent canary's wait, promote.yml's hourly
+schedule and that refresh window, or while stable has it and was promoted less than the refresh window ago. A
+runner further behind lags: its own change was released earlier. stable.json is read anonymously from the
+ota-channels release, as glaeda-update does; an unreadable channel gives no window. Exit 0 when no runner lags
+and every member answered, 1 when a runner lags or a member or hook could not be read, 2 when the check cannot
+run (bad arguments, no manifest or registry, HEAD is not origin's main). The heal is a hook rollout
+(glaeda-update --refresh-hooks, or glaeda-cmux-runner-fleet --apply); this tool only reports.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -51,6 +58,9 @@ ENV_PREFIX = "GLAEDA_RUNNER_"
 REMOTE_HOOKS = "~/actions-runner-glaeda*/glaeda-hooks/glaeda-cmux-runner-hook"
 PROBE_TIMEOUT_S = 120
 HOOK_FILES = ("scripts/glaeda-cmux-runner-hook", "scripts/glaeda_reservation.py")  # what --refresh-hooks installs
+# The fleet registry, from leo-workspace: a checkout first, then the copy reach installs beside the ssh config.
+REGISTRIES = (Path.home() / "Projects/leo-workspace/machines/fleet-registry.json",
+              Path.home() / ".ssh/config.d/fleet-registry.json")
 PROMOTE_EVERY_S = 3600  # promote.yml's schedule; a canary run also dispatches it, so this is the slow case
 # Sent on stdin and run by the system python with -I: argv is the hooks' glob, then the setting names. One JSON
 # line per hook. A hook that cannot load prints its error, never a traceback the parser would have to skip.
@@ -111,6 +121,37 @@ def gate_settings(source: str) -> dict[str, str]:
     return {name: var for name, var in found.items() if not name.startswith("_")}
 
 
+def ssh_refusals(registry: dict[str, Any]) -> tuple[set[str], set[str]]:
+    """(every name and alias the registry knows, those of machines agents never ssh to)."""
+    machines = registry.get("machines") if isinstance(registry.get("machines"), dict) else {}
+    policies = registry.get("approval_policies") if isinstance(registry.get("approval_policies"), dict) else {}
+    known, refused = set(), set()
+    for name, machine in machines.items():
+        if not isinstance(machine, dict):
+            continue
+        names = {name, *(a for a in machine.get("aliases") or [] if isinstance(a, str))}
+        known |= names
+        policy = policies.get(machine.get("approval"))
+        never = policy.get("never") if isinstance(policy, dict) else None
+        if machine.get("no_touch") or (isinstance(never, list) and "ssh" in never):
+            refused |= names
+    return known, refused
+
+
+def reachable(chosen: dict[str, Any], registry: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
+    """(the members the check may ssh to, {member: why not})."""
+    known, refused = ssh_refusals(registry)
+    allowed, skipped = [], {}
+    for member in sorted(chosen):
+        if member in refused:
+            skipped[member] = "no-touch in the fleet registry: never probed"
+        elif member not in known:
+            skipped[member] = "not in the fleet registry: never probed"
+        else:
+            allowed.append(member)
+    return allowed, skipped
+
+
 def parse_probe(out: str) -> list[dict[str, Any]]:
     rows = []
     for line in out.splitlines():
@@ -123,10 +164,10 @@ def parse_probe(out: str) -> list[dict[str, Any]]:
     return rows
 
 
-def probe_main(names: list[str]) -> dict[str, Any] | None:
-    """This checkout's hook, read by the same probe the members run."""
+def probe_main(names: list[str], hook: Path = HOOK) -> dict[str, Any] | None:
+    """This checkout's hook (or another version of it), read by the same probe the members run."""
     fleet = load("glaeda-cmux-runner-fleet")
-    code, out, _ = fleet.run([sys.executable, "-I", "-", os.fspath(HOOK), *names], PROBE_TIMEOUT_S, stdin=PROBE)
+    code, out, _ = fleet.run([sys.executable, "-I", "-", os.fspath(hook), *names], PROBE_TIMEOUT_S, stdin=PROBE)
     rows = parse_probe(out) if code == 0 else []
     return rows[0] if rows and "settings" in rows[0] else None
 
@@ -139,15 +180,30 @@ def probe_member(fleet: Any, member: str, names: list[str]) -> tuple[list[dict[s
     return parse_probe(out), None
 
 
-def rollout(fleet: Any, stable_json: Path | None, now: float) -> dict[str, Any]:
-    """Where main's last hook change is in the OTA rollout: {commit, state, until, note}. state: released (on
-    stable), soaking (not yet) or unknown (no stable channel or commit); a lagging runner converges until `until`."""
+def previous_settings(fleet: Any, commit: str, names: list[str]) -> dict[str, str] | None:
+    """The settings of the hook just before `commit`, or None (no parent, or it does not load)."""
+    code, out, _ = fleet.git("show", f"{commit}^:scripts/glaeda-cmux-runner-hook")
+    if code != 0:
+        return None
+    with tempfile.TemporaryDirectory(prefix="glaeda-hook-lag-") as tmp:
+        path = Path(tmp) / "glaeda-cmux-runner-hook"
+        path.write_text(out, encoding="utf-8")
+        found = probe_main(names, path)
+    return found["settings"] if found else None
+
+
+def rollout(fleet: Any, stable_json: Path | None, now: float, names: list[str]) -> dict[str, Any]:
+    """Where main's last hook change is in the OTA rollout: {commit, state, until, previous, note}. state:
+    released (on stable), soaking (not yet) or unknown (no stable channel or commit). A runner with exactly the
+    settings of the hook before that change (previous) converges until `until`; one further behind lags, since
+    its own change was released earlier."""
     update, release = load("glaeda-update"), load("glaeda_release.py")
     window = 2 * update.APPLY_EVERY_S  # the next glaeda-update run, and the one after for a runner with a job
     code, out, _ = fleet.git("log", "-1", "--format=%H %ct", "HEAD", "--", *HOOK_FILES)
     parts = out.split() if code == 0 else []
     if len(parts) != 2:
-        return {"commit": None, "state": "unknown", "until": None, "note": "no commit changed the hook"}
+        return {"commit": None, "state": "unknown", "until": None, "previous": None,
+                "note": "no commit changed the hook"}
     commit, committed = parts[0], float(parts[1])
     try:
         raw = stable_json.read_bytes() if stable_json else update.fetch(
@@ -155,36 +211,40 @@ def rollout(fleet: Any, stable_json: Path | None, now: float) -> dict[str, Any]:
         stable = json.loads(raw)
         source, promoted = str(stable["source"]), update.parse_utc(str(stable["promoted"]))
     except Exception as error:  # noqa: BLE001  (no channel: every lag is a lag)
-        return {"commit": commit, "state": "unknown", "until": None,
+        return {"commit": commit, "state": "unknown", "until": None, "previous": None,
                 "note": f"cannot read the stable channel ({type(error).__name__})"}
     if fleet.git("merge-base", "--is-ancestor", commit, source)[0] == 0:
         until = promoted + window
         note = f"stable {source[:12]} has it since {stable['promoted']}"
         state = "released"
     else:
-        until = committed + max(release.RISK_SOAK_HOURS.values()) * 3600 + PROMOTE_EVERY_S + window
+        # A release with no canary report is promoted CANARY_SILENT_HOURS past its soak, and promote.yml runs
+        # hourly: the slow case, so a change on its way never reads as a lag.
+        soak = max(release.RISK_SOAK_HOURS.values()) + release.CANARY_SILENT_HOURS
+        until = committed + soak * 3600 + PROMOTE_EVERY_S + window
         note = f"stable {source[:12]} does not have it yet"
         state = "soaking"
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until))
     return {"commit": commit, "state": state, "until": stamp if until > now else None,
+            "previous": previous_settings(fleet, commit, names) if until > now else None,
             "note": f"{note}; runners {'converge until ' + stamp if until > now else 'should have it since ' + stamp}"}
 
 
-def judge(row: dict[str, Any], main: dict[str, Any], converging: bool) -> dict[str, Any]:
+def judge(row: dict[str, Any], main: dict[str, Any], previous: dict[str, str] | None) -> dict[str, Any]:
     """The runner's state against main's hook, and each setting that differs: {name, main, installed|None}."""
     if "settings" not in row:
         return {**row, "state": "unreadable", "lags": []}
     lags = [{"name": name, "main": value, "installed": row["settings"].get(name)}
             for name, value in sorted(main["settings"].items()) if row["settings"].get(name) != value]
     if lags:
-        state = "converging" if converging else "lags"
+        state = "converging" if previous is not None and row["settings"] == previous else "lags"
     else:
         state = "current" if row.get("sha256") == main["sha256"] else "differs"
     return {**row, "state": state, "lags": lags}
 
 
 def check(fleet: Any, members: list[str], names: list[str], main: dict[str, Any], jobs: int,
-          converging: bool) -> list[dict[str, Any]]:
+          previous: dict[str, str] | None) -> list[dict[str, Any]]:
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
         answers = dict(zip(members, pool.map(lambda m: probe_member(fleet, m, names), members)))
     result = []
@@ -196,7 +256,7 @@ def check(fleet: Any, members: list[str], names: list[str], main: dict[str, Any]
             result.append({"member": member, "state": "no_runners", "note": "no runner hook installed",
                            "runners": []})
         else:
-            runners = [judge(r, main, converging) for r in rows]
+            runners = [judge(r, main, previous) for r in rows]
             states = {r["state"] for r in runners}
             worst = next((s for s in ("lags", "unreadable", "converging", "differs") if s in states), "current")
             result.append({"member": member, "state": worst, "runners": runners})
@@ -222,6 +282,8 @@ def render(report: dict[str, Any]) -> str:
             groups.setdefault(f"{runner['state']:<10} {detail}".rstrip(), []).append(runner["runner"])
         for text, runners in sorted(groups.items()):
             lines.append(f"  {row['member']:<22} {len(runners):>2} runners  {text}")
+    for member, why in sorted(report["skipped"].items()):
+        lines.append(f"  {member:<22} skipped: {why}")
     lagging = sum(1 for m in report["members"] for r in m["runners"] if r["state"] == "lags")
     converging = sum(1 for m in report["members"] for r in m["runners"] if r["state"] == "converging")
     lines.append(f"runners lagging main: {lagging}; converging: {converging}")
@@ -236,12 +298,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--exclude", default="", help="comma-separated members to leave out")
     p.add_argument("--jobs", type=int, default=16, help="members at once")
     p.add_argument("--output", choices=("human", "json"), default="human")
+    p.add_argument("--registry", type=Path, help="the fleet registry (default: the first of REGISTRIES)")
     p.add_argument("--stable-json", type=Path, help="read the stable channel from this file, not the release")
     args = p.parse_args(argv)
     try:
         manifest = json.loads(args.manifest.expanduser().read_text())
     except (OSError, ValueError) as error:
         print(f"glaeda-runner-hook-lag: cannot read the manifest: {type(error).__name__}", file=sys.stderr)
+        return 2
+    try:
+        path = args.registry or next(r for r in REGISTRIES if r.is_file())
+        registry = json.loads(path.expanduser().read_text())
+        if not isinstance(registry, dict):
+            raise ValueError("not an object")
+    except (StopIteration, OSError, ValueError) as error:
+        print(f"glaeda-runner-hook-lag: cannot read the fleet registry ({type(error).__name__}), so no member can "
+              "be told from a no-touch one; nothing checked", file=sys.stderr)
         return 2
     fleet = load("glaeda-cmux-runner-fleet")
     source = fleet.checkout_source()
@@ -259,11 +331,13 @@ def main(argv: list[str] | None = None) -> int:
     if main_hook is None:
         print("glaeda-runner-hook-lag: cannot load this checkout's hook; nothing checked", file=sys.stderr)
         return 2
-    plan = rollout(fleet, args.stable_json, time.time())
+    plan = rollout(fleet, args.stable_json, time.time(), names)
     chosen, skipped = fleet.members(manifest, fleet.load_labels(), only, [h for h in args.exclude.split(",") if h])
+    allowed, untouched = reachable(chosen, registry)
+    skipped.update(untouched)
     report = {"main": source["head"], "settings": settings, "mainSettings": main_hook["settings"],
               "mainSha256": main_hook["sha256"], "skipped": skipped, "rollout": plan,
-              "members": check(fleet, sorted(chosen), names, main_hook, args.jobs, plan["until"] is not None)}
+              "members": check(fleet, allowed, names, main_hook, args.jobs, plan["previous"])}
     print(json.dumps(report, indent=2, sort_keys=True) if args.output == "json" else render(report))
     bad = any(m["state"] in ("lags", "unreadable", "unreachable") for m in report["members"])
     return 1 if bad else 0
