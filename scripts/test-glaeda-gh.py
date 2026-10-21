@@ -25,6 +25,20 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Words that would turn the audit's graphql sentence back into a claim about price. The *last
+# paragraph* only, for two measured reasons: over the whole report the bare substring `point` fires
+# on a logged path (`repos/o/endpoint-registry`, which reaches the category rows) or on a future
+# summary line about "the GraphQL endpoint", and word boundaries alone still fire on a repository
+# actually named `points`, which reaches the hottest-targets line. The cost is that a priced
+# paragraph printed *before* that one is not caught; the whole-sentence assertion covers a rewrite
+# of the sentence itself, which is the likelier way a price comes back.
+STALE_COST = (r"\bpoints?\b", r"\bprices?\b", r"\bcheap(er|est)?\b", r"\bper call\b")
+
+
+def cost_claims(text: str) -> list[str]:
+    para = text.split("\n\n")[-1]
+    return [pat for pat in STALE_COST if re.search(pat, para)]
 loader = importlib.machinery.SourceFileLoader("glaeda_gh", os.fspath(ROOT / "scripts" / "glaeda-gh"))
 spec = importlib.util.spec_from_loader("glaeda_gh", loader)
 gg = importlib.util.module_from_spec(spec)
@@ -3692,37 +3706,58 @@ class AuditTest(BrokerBase):
 
         The primary guard is the sentence itself, asserted whole: a rewrite that smuggles a price
         back in has to change it. The word ban is the backstop, and it is scoped to that last
-        paragraph with word boundaries -- over the whole report it has a live false positive, since
-        a logged path like `repos/o/end` + `point-registry` lands in the hottest-targets line and
-        `\\bpoints?\\b` does not read it (nor would `checkpoint`, `pointer` or a future line about
-        "the GraphQL endpoint")."""
+        paragraph with word boundaries, which takes two faults out of it: over the whole report
+        the bare substring `point` fires on a logged path (`repos/o/endpoint-registry`, which
+        reaches the category rows, or a future summary line about "the GraphQL endpoint"), and word
+        boundaries alone would still fire on a repository actually named `points`. The cost of
+        scoping is that a priced paragraph printed *before* this one is no longer caught; the
+        sentence assertion is what covers a rewrite of this one."""
         path = self.write_log([(0, "api graphql"), (5, "api graphql"), (10, "pr view pr:o/r#7")])
         doc = self.audit_json(path)
         self.assertEqual(doc["cacheableReads"], 1, "a graphql line was counted as a cacheable read")
         self.assertEqual(doc["repeatsWithin"]["calls"], 0)
         text = self.audit_text(path)
         self.assertIn("2 of those calls were `gh api graphql`, each one request carrying however many "
-                      "objects the caller asked for -- or none, for a mutation or a one-object probe, "
-                      "which this cannot tell apart. None of those objects is counted above, so the "
-                      "repeat count is a floor on what a cache could have answered, not an estimate. "
-                      "The shares beside it are not floors: counting the hidden reads would grow "
-                      "their denominator too.", text)
-        para = text.split("\n\n")[-1]
-        for stale in (r"\bpoints?\b", r"\bprices?\b", r"\bcheap(er|est)?\b", r"\bper call\b"):
-            self.assertIsNone(re.search(stale, para),
-                              f"the report is making a claim about cost again ({stale})")
+                      "objects the caller asked for -- or none at all, for a mutation, which this "
+                      "cannot tell apart from a read. None of those objects is counted above, so the "
+                      "repeat count is a floor on the calls in this report, not an estimate. The "
+                      "shares beside it are not floors: counting the hidden reads would move their "
+                      "numerator and their denominator both, in either direction.", text)
+        self.assertEqual(cost_claims(text), [], "the report is making a claim about cost again")
 
     def test_the_word_ban_does_not_fire_on_an_ordinary_logged_path(self) -> None:
-        """The false positive the scoping exists for, demonstrated rather than asserted away: a
-        repository path ending in `-endpoint-registry` reaches the hottest-targets line, and a ban
-        on the bare substring `point` over the whole report would turn an innocent log into "the
-        report is making a claim about cost again"."""
-        path = self.write_log([(0, "api graphql"), (5, "api repos/o/endpoint-registry"),
-                               (10, "api repos/o/endpoint-registry")])
-        text = self.audit_text(path)
-        self.assertIn("endpoint-registry", text, "the path was supposed to reach the report")
-        self.assertIn("point", text, "without this the test proves nothing")
-        self.assertIsNone(re.search(r"\bpoints?\b", text.split("\n\n")[-1]))
+        """Both halves of the scoping, demonstrated rather than asserted away.
+
+        `api repos/o/endpoint-registry` is not a cacheable read, so it never reaches the
+        hottest-targets line -- it arrives on a *category* row, which no filter touches. The bare
+        substring `point` fires on it and word boundaries do not, which is the first half.
+
+        `pr view pr:o/points#7` is the second half, and the one that makes the paragraph scoping
+        load-bearing rather than decorative: it is a cacheable read, it goes through `AUDIT_SAFE`
+        into the hottest-targets line, and `\\bpoints?\\b` matches it. Over the whole report that
+        would fail the ban; over the last paragraph it does not. Without this fixture, dropping
+        `split("\\n\\n")[-1]` left the suite green."""
+        for name, line in (("a category row", "api repos/o/endpoint-registry"),
+                           ("the hottest-targets line", "pr view pr:o/points#7")):
+            with self.subTest(name):
+                path = self.write_log([(0, "api graphql"), (5, line), (10, line)])
+                text = self.audit_text(path)
+                self.assertIn("point", text, "without this the test proves nothing")
+                self.assertEqual(cost_claims(text), [], text)
+        # The claim about where each one lands, so the docstring above is checked too.
+        hot = self.audit_text(self.write_log([(0, "api graphql"), (5, "pr view pr:o/points#7"),
+                                              (10, "pr view pr:o/points#7")]))
+        self.assertIn("hottest targets: pr view pr:o/points#7", hot)
+        rows = self.audit_text(self.write_log([(0, "api graphql"),
+                                               (5, "api repos/o/endpoint-registry"),
+                                               (10, "api repos/o/endpoint-registry")]))
+        self.assertNotIn("hottest targets", rows, "an api path is not a cacheable read")
+        self.assertIn("api repos/o/endpoint-registry", rows)
+        # What makes the scoping load-bearing rather than decorative: over the *whole* report this
+        # fixture does trip the ban, and `cost_claims` reads the last paragraph only. Unscope it
+        # and this test goes red, which is the only way a guard can be covered at all.
+        self.assertTrue([pat for pat in STALE_COST if re.search(pat, hot)], hot)
+        self.assertEqual(cost_claims(hot), [], hot)
 
     def test_the_graphql_line_is_absent_when_there_are_no_graphql_calls(self) -> None:
         """The conditionality is what makes it safe to print at all: a host with none of these
