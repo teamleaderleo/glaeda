@@ -75,7 +75,9 @@ taken, or the mini is saturated (sampled host CPU at least GATE_CPU_PAUSE or ele
 runner's listener so GitHub routes the job to another runner instead of here to be refused or slowed
 down (Gate). A --require-eligible runner also stops listening while job-started would refuse every job for
 eligibility (Gate.ineligible: the node status or the class receipt's toolchain, looked at in a thread at most
-every GATE_ELIGIBLE_EVERY_S), so its label's jobs go to an eligible runner instead of failing in "Set up job". A gui runner also stops listening while the console session is locked or nobody is logged in there
+every GATE_ELIGIBLE_EVERY_S; a new refusal holds once a recheck agrees, and a held answer survives a hook reload),
+so its label's jobs go to an eligible runner, or wait in GitHub's queue when none is, instead of failing in "Set up
+job". A gui runner also stops listening while the console session is locked or nobody is logged in there
 (console_refusal). A fast runner (--fast-runner) runs cmux-next's fast-tier on the fast tokens (FAST_TOKENS)
 instead of the shared units, and its gate looks at those tokens, never at the units. Every runner also stops listening while free disk is under its job-started hook's --min-free-gib,
 and starts the same eviction in the background, listening again once it made room (Gate.low_disk). Full means every
@@ -97,6 +99,7 @@ import os
 import plistlib
 import re
 import select
+import shlex
 import shutil
 import signal
 import stat
@@ -814,6 +817,12 @@ GATE_CONSOLE_EVERY_S = 30.0
 # off, GitHub hands the job to an eligible runner on the same label. The look runs in a thread (its probes take up
 # to 2 x ELIGIBILITY_BUDGET_S) at most every GATE_ELIGIBLE_EVERY_S, and the gate uses the last answer.
 GATE_ELIGIBLE_EVERY_S = float(os.environ.get("GLAEDA_RUNNER_GATE_ELIGIBLE_EVERY_S") or 300.0)
+# A new refusal is looked at once more this soon, and holds only when that look agrees: a probe that timed out on a
+# busy mini reads as a refusal (an empty xcodebuild or node status) and must not hold a good runner for 300 s.
+GATE_ELIGIBLE_RECHECK_S = 30.0
+# The held answer across a reload's exec (as GATE_LISTENING_SINCE_ENV), so a hook --apply does not start every
+# held runner listening while the new gate's first look runs.
+GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -2922,11 +2931,19 @@ def eligibility_scope(runner_dir: Path) -> tuple[str, str | None] | None:
         text = (runner_dir / RUNNER_HOOK_SCRIPT).read_text()
     except (OSError, UnicodeDecodeError):
         return None
-    klass = re.search(r"\s--fleet-class\s+([A-Za-z0-9._-]+)(?:\s|$)", text)
-    if re.search(r"\s--require-eligible(?:\s|$)", text) is None or klass is None:
+    line = next((ln for ln in text.splitlines() if ln.startswith("exec ")), "")
+    try:
+        words = shlex.split(line)  # the wrapper shlex.quotes its paths
+    except ValueError:
         return None
-    xcode = re.search(r"\s--toolchain-xcode\s+(\S+)(?:\s|$)", text)
-    return klass.group(1), xcode.group(1) if xcode else None
+
+    def value(flag: str) -> str | None:
+        return words[words.index(flag) + 1] if flag in words[:-1] else None
+
+    klass = value("--fleet-class")
+    if "--require-eligible" not in words or not klass:
+        return None
+    return klass, value("--toolchain-xcode")
 
 
 def eligibility_refusal(fleet_class: str, xcode_app: str | None) -> str | None:
@@ -3369,7 +3386,8 @@ class Gate:
         self.memory_at = -GATE_CPU_EVERY_S
         self.console_why: str | None = None  # the last console_refusal, read at most every GATE_CONSOLE_EVERY_S
         self.console_at = -GATE_CONSOLE_EVERY_S
-        self.eligible_why: str | None = None  # the last eligibility_refusal, from the look thread
+        self.eligible_why: str | None = os.environ.pop(GATE_INELIGIBLE_ENV, None) or None  # the held answer
+        self.eligible_new: str | None = None  # a first refusal, held only once a recheck agrees
         self.eligible_at = -GATE_ELIGIBLE_EVERY_S
         self.eligible_look: threading.Thread | None = None
         self.disk_since: float | None = None  # when the current disk hold began
@@ -3389,6 +3407,8 @@ class Gate:
         now = source_identity()
         if now is None or now == self.source:
             return
+        if self.eligible_look is not None and self.eligible_look.is_alive():
+            return  # the next poll: the look thread does not block SIGTERM, and its probes would be orphaned
         self.source = now
         argv = [a for a in sys.argv if not a.startswith("--adopt=")]
         if self.child is not None:
@@ -3415,10 +3435,13 @@ class Gate:
             return
         if self.listening_since is not None:
             os.environ[GATE_LISTENING_SINCE_ENV] = repr(self.listening_since)
+        if self.eligible_why:
+            os.environ[GATE_INELIGIBLE_ENV] = self.eligible_why
         try:
             os.execv(sys.executable, [sys.executable, *argv])
         except OSError:
             os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
+            os.environ.pop(GATE_INELIGIBLE_ENV, None)
             signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
             gate_log("the reload failed; keeping this gate")
 
@@ -3629,6 +3652,11 @@ class Gate:
                 except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
                     why = None
                     gate_log(f"the eligibility look failed ({type(error).__name__}); not holding for it")
+                if why and not self.eligible_why and not self.eligible_new:
+                    self.eligible_new = why  # look again soon; hold only if that look refuses too
+                    self.eligible_at = time.monotonic() - GATE_ELIGIBLE_EVERY_S + GATE_ELIGIBLE_RECHECK_S
+                    return
+                self.eligible_new = None
                 if why != self.eligible_why:
                     gate_log(f"eligibility: {why}; held off so another runner takes the job" if why
                              else "eligible again")

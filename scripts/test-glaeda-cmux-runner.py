@@ -4165,12 +4165,36 @@ class GateTest(unittest.TestCase):
                 gate.eligible_look.join(5)
 
         with mock.patch.object(hook, "eligibility_refusal", return_value=why) as look:
-            gate.claimed()  # the first poll starts the look; its answer is used from the next poll on
+            self.assertIsNone(gate.claimed(), "the first poll starts the look")
+            settle()
+            self.assertIsNone(gate.claimed(), "a first refusal holds only once a recheck agrees")
+            settle()
+            self.assertEqual(look.call_count, 1, "the recheck waits GATE_ELIGIBLE_RECHECK_S")
+            gate.eligible_at -= hook.GATE_ELIGIBLE_RECHECK_S
+            gate.claimed()
             settle()
             self.assertEqual(gate.claimed(), f"ineligible: {why}")
             self.assertEqual(gate.confirmed(), f"ineligible: {why}")
-            self.assertEqual(look.call_count, 1, "looked at most every GATE_ELIGIBLE_EVERY_S")
+            self.assertEqual(look.call_count, 2, "looked at most every GATE_ELIGIBLE_EVERY_S once held")
             look.assert_called_with("m6-16", "/Applications/Xcode_26.6.app")
+        with mock.patch.dict(os.environ, {hook.GATE_INELIGIBLE_ENV: why}):
+            reloaded = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+            self.assertNotIn(hook.GATE_INELIGIBLE_ENV, os.environ)
+        self.assertEqual(reloaded.eligible_why, why, "a reload keeps the held answer")
+        with mock.patch.object(hook, "eligibility_refusal", return_value="node not eligible (state x)"):
+            fresh = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+            fresh.ineligible()
+            fresh.eligible_look.join(5)
+            fresh.eligible_at -= hook.GATE_ELIGIBLE_RECHECK_S
+            with mock.patch.object(hook, "eligibility_refusal", return_value=None):
+                fresh.ineligible()
+                fresh.eligible_look.join(5)
+            self.assertIsNone(fresh.ineligible(), "a refusal the recheck does not repeat never holds")
+        script.write_text("exec /usr/bin/python3 /hook job-started --require-eligible --fleet-class m6-16 "
+                          "--toolchain-xcode '/Applications/Xcode 26.app'\n")
+        self.assertEqual(hook.eligibility_scope(self.runner), ("m6-16", "/Applications/Xcode 26.app"))
+        script.write_text("exec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai --require-eligible "
+                          "--fleet-class m6-16 --toolchain-xcode /Applications/Xcode_26.6.app --instance 1\n")
         gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
         with mock.patch.object(hook, "eligibility_refusal", return_value=None):
             gate.claimed()
