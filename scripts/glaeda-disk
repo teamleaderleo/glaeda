@@ -1629,27 +1629,29 @@ TMP_TEST_RESIDUE_EVIDENCE_S = 60.0  # process evidence is re-read at least this 
 TMP_TEST_RESIDUE_BUDGET_S = 600.0  # one pass stops here and holds the eviction lock no longer; the next continues
 
 
-def tree_newest(path: Path, budget: int | None = None) -> tuple[float, int] | None:
+def tree_newest(path: Path, budget: int | None = None, deadline: float | None = None) -> tuple[float, int] | None:
     """Newest mtime of path and of everything below it, and the bytes allocated to it, without following
-    symlinks. None when the walk would visit more than budget entries or a directory cannot be read:
-    such a tree is not proven idle."""
+    symlinks. None when the walk would visit more than budget entries, passes deadline (time.time()), meets
+    a directory it cannot read or another filesystem mounted below path: such a tree is not proven idle."""
     budget = TMP_TEST_RESIDUE_WALK_BUDGET if budget is None else budget
     try:
         st = path.lstat()
     except OSError:
         return None
-    newest, used = st.st_mtime, st.st_blocks * 512
+    newest, used, dev = st.st_mtime, st.st_blocks * 512, st.st_dev
     stack = [os.fspath(path)] if stat.S_ISDIR(st.st_mode) else []
     while stack:
         try:
             with os.scandir(stack.pop()) as it:
                 for e in it:
                     budget -= 1
-                    if budget < 0:
+                    if budget < 0 or (deadline is not None and time.time() > deadline):
                         return None
                     try:
                         est = e.stat(follow_symlinks=False)
                     except OSError:
+                        return None
+                    if est.st_dev != dev:  # rmtree would descend into a mount below the entry
                         return None
                     newest = max(newest, est.st_mtime)
                     used += est.st_blocks * 512
@@ -1660,13 +1662,15 @@ def tree_newest(path: Path, budget: int | None = None) -> tuple[float, int] | No
     return newest, used
 
 
-def tmp_test_residue_veto(entry: Path, opened: frozenset[str], cmds: str, now: float) -> tuple[str, int]:
+def tmp_test_residue_veto(entry: Path, opened: frozenset[str], cmds: str, now: float,
+                          deadline: float | None = None) -> tuple[str, int]:
     """Why a test-scratch entry in $TMPDIR must stay ("" when it may go), and its allocated bytes."""
     if entry.is_symlink():
         return "a symlink", 0
-    seen = tree_newest(entry)
+    seen = tree_newest(entry, deadline=deadline)
     if seen is None:
-        return f"not proven idle (unreadable or over {TMP_TEST_RESIDUE_WALK_BUDGET} entries)", 0
+        return (f"not proven idle (unreadable, a mount below it, over {TMP_TEST_RESIDUE_WALK_BUDGET} entries"
+                " or past the pass budget)"), 0
     newest, used = seen
     if (now - newest) / 3600 < TMP_TEST_RESIDUE_IDLE_HOURS:
         return f"changed within {TMP_TEST_RESIDUE_IDLE_HOURS:g}h", used
@@ -1720,7 +1724,8 @@ def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None) 
                 break
             evidence, read_at = (open_index(opened), cmds), time.time()
         entry = tmp / name
-        why, used = tmp_test_residue_veto(entry, evidence[0], evidence[1], time.time())
+        why, used = tmp_test_residue_veto(entry, evidence[0], evidence[1], time.time(),
+                                          deadline=start + TMP_TEST_RESIDUE_BUDGET_S)
         prefix = TMP_TEST_RESIDUE.match(name).group(0)[:-2]
         if why:
             kept[why.split(" (")[0]] += 1

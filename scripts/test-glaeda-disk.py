@@ -3083,6 +3083,48 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])  # not under pressure: still runs
             reap.assert_called_once()
 
+    def test_tmpdir_test_residue_walk_stops_at_the_deadline_and_at_mounts(self) -> None:
+        tmp, e = self._tmp_residue()
+        self.assertIsNotNone(gd.tree_newest(e["socket"]))
+        self.assertIsNone(gd.tree_newest(e["socket"], deadline=time.time() - 1))
+        real_scandir = os.scandir
+
+        class Other:  # an entry below the scratch that reports another device
+            def __init__(self, entry):
+                self.entry, self.name, self.path = entry, entry.name, entry.path
+
+            def stat(self, follow_symlinks=True):
+                st = self.entry.stat(follow_symlinks=follow_symlinks)
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1, *tuple(st)[3:]))
+
+        @contextlib.contextmanager
+        def scandir(path):
+            with real_scandir(path) as it:
+                yield [Other(x) for x in it]
+        with mock.patch.object(gd.os, "scandir", scandir):
+            self.assertIsNone(gd.tree_newest(e["socket"]))
+
+    def test_tmpdir_test_residue_main_apply_reaps_the_user_tmp(self) -> None:
+        tmp, e = self._tmp_residue()
+        dev = gd.HOME.stat().st_dev
+        fss = {dev: gd.Fs(dev, "/", 300 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+        with mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                mock.patch.object(gd, "default_families", return_value=[]), \
+                mock.patch.object(gd, "filesystems", return_value=fss), \
+                mock.patch.object(gd, "survey", return_value=[]), \
+                mock.patch.object(gd, "apply", return_value=0), \
+                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                mock.patch.object(gd, "notify_disk"), \
+                mock.patch.object(gd, "DARWIN", True), \
+                mock.patch.object(gd, "darwin_user_tmp", return_value=tmp), \
+                mock.patch.object(gd, "reap_tmpdir_test_residue", _reap_tmpdir_test_residue), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--apply", "--no-snapshot", "--top", "0", "--receipt", os.fspath(self.receipt())])
+        self.assertFalse(e["socket"].exists())
+        self.assertTrue(e["recent"].is_dir())
+
     def test_job_busy_ignores_wide_runner_build_trees(self) -> None:
         home, fams = self._runner_checkouts()
         target = home / "actions-runner-glaeda/_work/cmux/cmux/cmux-tui/target"
