@@ -2730,6 +2730,8 @@ class GlaedaDiskTest(unittest.TestCase):
                 gd.apply(items, {f.id: f for f in fams}, receipt, None, 6, all_families=fams)
         recs = [json.loads(line) for line in receipt.read_text().splitlines()]
         build = [r for r in recs if r["family"] == gd.RUNNER_BUILD_FAMILY]
+        # git garbage goes before any build output that costs a rebuild
+        self.assertEqual({r["family"] for r in recs[:4]}, {gd.RUNNER_GIT_GARBAGE_FAMILY})
         self.assertEqual(build[0]["path"], str(idle / "cmux-tui/target"))  # least recently modified first
         self.assertEqual(build[1]["path"], str(other / "Packages/Shared/.build"))
         self.assertEqual({r["outcome"] for r in build if r["path"].startswith(str(other) + "/")},
