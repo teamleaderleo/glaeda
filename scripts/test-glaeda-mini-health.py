@@ -54,7 +54,10 @@ class FakeMini(health.Mini):
         self.refusal: str | None = None
         self.toolchain_installs: list[str] = []
         # the tailscale_no_route restart's gates: an idle CI runner mini unless a test says otherwise
-        self.names = ["cmux9s-mac-mini"]
+        self.names: list[str] | None = ["cmux9s-mac-mini"]
+        self.opt_in: tuple[dict | None, str] = ({"schema": "glaeda-tailscale-self-heal/v1", "host": "cmux9s-mac-mini",
+                                                 "source": "fleet-registry.json"}, "")
+        self.restart_ran = True  # every restart command exited 0
         self.facts = {"platform": "darwin", "runners": 2, "setup_args": ["--role=fleet-mini"], "role": "fleet-mini"}
         self.restart_off = ""
         self.busy = ""
@@ -71,6 +74,9 @@ class FakeMini(health.Mini):
 
     def ci_mini_facts(self):
         return self.facts
+
+    def tailscale_opt_in(self):
+        return self.opt_in
 
     def tailscale_restart_off(self):
         return self.restart_off
@@ -96,7 +102,7 @@ class FakeMini(health.Mini):
         self.did.append("restart " + self.ts[0])
         state, self.route = self.after_restart
         self.ts = (self.ts[0], state, "")
-        return True, " ; ".join(" ".join(c) for c in commands)
+        return self.restart_ran, " ; ".join(" ".join(c) for c in commands)
 
     def console(self):
         return self.console_state
@@ -479,6 +485,7 @@ class Tailscale(Base):
         # cmuxs-mac-mini-5, 2026-10-21: Running, but 100.64/10 gone, so tailnet ssh timed out all afternoon.
         self.mini.route = "en0"
         self.mini.names = ["cosmic-gray"]
+        self.mini.opt_in = (None, "no ~/.config/glaeda/tailscale-self-heal.json")
         first = self.run_once()
         self.assertEqual(first["findings"], [], "one sighting can be a reconnect's gap")
         second = self.run_once(NOW + 120)
@@ -595,10 +602,82 @@ class TailscaleRouteRestart(Base):
         self.assertIn("still", f["note"])
         self.assertIn("en0", f["note"])
         self.assertIn(health.iso(NOW + 120 + SIX_H), f["note"], "names when the next try is allowed")
+        self.assertEqual(f["auto_fix"], "impossible", "a restart that did not fix it alerts (ci-dash health_alerts)")
         for i in range(1, 20):  # every two minutes for the next 40 minutes, then hours later
-            self.run_once(NOW + 120 + i * 120)
-        self.run_once(NOW + 120 + SIX_H - 60)
+            report = self.run_once(NOW + 120 + i * 120)
+            self.assertEqual(report["findings"][0]["auto_fix"], "impossible", i)
+        report = self.run_once(NOW + 120 + SIX_H - 60)
         self.assertEqual(self.restarts(), 1)
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible")
+        self.assertIn(f"Tailscale restart at {health.iso(NOW + 120)} did not restore the route", f["note"])
+        self.assertIn(f"next try after {health.iso(NOW + 120 + SIX_H)}", f["note"])
+
+    def test_a_restart_command_that_failed_alerts(self) -> None:
+        self.mini.restart_ran = False
+        self.mini.after_restart = ("Running", "en0")
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 1)
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible")
+        self.assertIn("a command failed", f["note"])
+        self.assertEqual(json.loads(self.mini.restart_state.read_text())["failures"], 1)
+
+    def test_after_a_failed_restart_every_wait_still_alerts(self) -> None:
+        self.mini.after_restart = ("Running", "en0")
+        self.broken_twice()
+        self.mini.busy = "a CI job is running (Runner.Worker)"  # the window is over, but the mini is busy
+        report = self.run_once(NOW + 120 + SIX_H)
+        self.assertEqual(self.restarts(), 1)
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible", "pending only while no restart has failed")
+        self.assertIn("did not restore the route", f["note"])
+        self.assertIn("Runner.Worker", f["note"])
+
+    def test_a_crash_mid_restart_counts_as_a_failed_restart(self) -> None:
+        self.mini.restart_state.parent.mkdir(parents=True, exist_ok=True)
+        self.mini.restart_state.write_text(json.dumps({"schema": health.TAILSCALE_RESTART_SCHEMA,
+                                                       "last_attempt_at": NOW - 60, "result": "started",
+                                                       "ok": False, "failures": 1}))
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 0)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("did not restore the route", report["findings"][0]["note"])
+
+    def test_three_failed_restarts_in_a_row_stop_restarting_until_the_route_is_seen_clear(self) -> None:
+        self.mini.after_restart = ("Running", "en0")
+        self.broken_twice()
+        for i in range(1, 6):  # every 6 h: the second and third restarts, then no more
+            report = self.run_once(NOW + 120 + i * SIX_H)
+        self.assertEqual(self.restarts(), health.TAILSCALE_RESTART_GIVE_UP)
+        self.assertEqual(json.loads(self.mini.restart_state.read_text())["failures"], 3)
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible")
+        self.assertIn("3 Tailscale restarts in a row", f["note"])
+        # the route comes back (an operator fixed it): the count resets, and a later break is restarted again
+        self.mini.ts, self.mini.route = ("app", "Running", ""), "utun4"
+        self.assertEqual(self.run_once(NOW + 120 + 6 * SIX_H)["findings"], [])
+        self.assertEqual(json.loads(self.mini.restart_state.read_text())["failures"], 0)
+        self.mini.route = "en0"
+        self.broken_twice(NOW + 120 + 7 * SIX_H)
+        self.assertEqual(self.restarts(), health.TAILSCALE_RESTART_GIVE_UP + 1)
+
+    def test_a_restart_that_worked_resets_the_failure_count(self) -> None:
+        self.mini.restart_state.parent.mkdir(parents=True, exist_ok=True)
+        self.mini.restart_state.write_text(json.dumps({"last_attempt_at": NOW - 2 * SIX_H, "ok": False,
+                                                       "result": "still Running, 100.100.100.100 via en0",
+                                                       "failures": 2}))
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 1)
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(json.loads(self.mini.restart_state.read_text())["failures"], 0)
+
+    def test_an_unreadable_failure_count_gives_up(self) -> None:
+        self.mini.restart_state.parent.mkdir(parents=True, exist_ok=True)
+        self.mini.restart_state.write_text(json.dumps({"last_attempt_at": NOW - 2 * SIX_H, "failures": "many"}))
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 0)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
 
     def test_a_second_sighting_within_6_h_does_not_restart_again(self) -> None:
         self.broken_twice()
@@ -645,19 +724,41 @@ class TailscaleRouteRestart(Base):
         self.assertEqual(self.mini.did, ["lock"])
         self.assertFalse(self.mini.restart_state.exists())
 
-    def test_cmux_lawrence_is_never_restarted(self) -> None:
+    def test_cmux_lawrence_is_never_restarted_even_opted_in(self) -> None:
         for names in (["cmux-lawrence"], ["Cmux Lawrence’s Mac mini"], ["cmux9s-mac-mini", "cmux-lawrences-mac-mini"]):
             self.mini.names = names
+            self.mini.opt_in = ({"schema": health.TAILSCALE_OPT_IN_SCHEMA, "host": names[0]}, "")
             report = self.broken_twice()
             self.assertEqual(self.mini.did, [], names)
             self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
             self.assertIn("never", report["findings"][0]["note"])
 
-    def test_hosts_that_are_not_ci_minis_are_never_restarted(self) -> None:
-        for name in ("air-blue", "Air Blue", "cosmic-gray", "aws-m4pro-3", "ip-10-0-3-17", "cmux16", "big-red"):
-            self.mini.names = [name]
-            self.broken_twice()
-            self.assertEqual(self.mini.did, [], name)
+    def test_a_host_without_the_opt_in_is_never_restarted(self) -> None:
+        # which hosts restart is declared in leo-workspace's fleet-registry.json and arrives as the opt-in file
+        self.mini.opt_in = (None, "no ~/.config/glaeda/tailscale-self-heal.json")
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible")
+        self.assertIn("tailscale-self-heal.json", f["note"])
+
+    def test_an_opt_in_for_another_host_or_of_another_schema_is_no_opt_in(self) -> None:
+        for doc in ({"schema": health.TAILSCALE_OPT_IN_SCHEMA, "host": "cmuxs-mac-mini-5"},
+                    {"schema": "glaeda-tailscale-self-heal/v2", "host": "cmux9s-mac-mini"},
+                    {"host": "cmux9s-mac-mini"},
+                    {"schema": health.TAILSCALE_OPT_IN_SCHEMA, "host": ["cmux9s-mac-mini"]},
+                    {"schema": health.TAILSCALE_OPT_IN_SCHEMA, "host": ""}):
+            self.mini.opt_in = (doc, "")
+            report = self.broken_twice()
+            self.assertEqual(self.mini.did, [], doc)
+            self.assertEqual(report["findings"][0]["auto_fix"], "impossible", doc)
+
+    def test_an_unreadable_tailnet_name_is_no_restart(self) -> None:
+        self.mini.names = None
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("tailnet name", report["findings"][0]["note"])
 
     def test_an_unknown_role_is_never_restarted(self) -> None:
         for facts in ({"platform": "darwin", "runners": 2, "setup_args": None, "role": "fleet-mini"},
@@ -731,14 +832,12 @@ class TailscaleRestartGates(unittest.TestCase):
     def test_ci_mini_refusal(self) -> None:
         self.assertEqual(health.ci_mini_refusal(["cmux9s-mac-mini"], self.CI), "")
         self.assertEqual(health.ci_mini_refusal(["cmuxs-Mac-mini-5", "cmuxs-mac-mini-5"], self.CI), "")
+        self.assertIn("tailnet name", health.ci_mini_refusal(None, self.CI))
         refused = {
             "no names": ([], self.CI),
+            "tailnet name unreadable": (None, self.CI),
             "lawrence": (["cmux-lawrence"], self.CI),
             "lawrence word": (["Cmux Lawrence's Mac mini"], self.CI),
-            "air-blue": (["Air Blue"], self.CI),
-            "cosmic-gray": (["cosmic-gray.local"], self.CI),
-            "aws": (["aws-m4pro-1"], self.CI),
-            "ec2": (["ip-172-31-4-9"], self.CI),
             "linux": (["cmux9s-mac-mini"], self.CI | {"platform": "linux"}),
             "no runner": (["cmux9s-mac-mini"], self.CI | {"runners": 0}),
             "runners unreadable": (["cmux9s-mac-mini"], self.CI | {"runners": None}),
@@ -753,10 +852,51 @@ class TailscaleRestartGates(unittest.TestCase):
         for what, (names, facts) in refused.items():
             self.assertNotEqual(health.ci_mini_refusal(names, facts), "", what)
 
-    def test_the_deny_list_is_not_configurable(self) -> None:
-        self.assertIsInstance(health.NEVER_RESTART_HOSTS, tuple)
-        self.assertIn("cmux-lawrence", health.NEVER_RESTART_HOSTS)
-        self.assertIn("lawrence", health.NEVER_RESTART_WORDS)
+    def test_opt_in_refusal(self) -> None:
+        doc = {"schema": "glaeda-tailscale-self-heal/v1", "host": "cmuxs-mac-mini-5", "source": "fleet-registry.json"}
+        names = ["cmuxs-Mac-mini-5", "cmuxs-mac-mini-5.local", "cmuxs-mac-mini-5"]
+        self.assertEqual(health.opt_in_refusal((doc, ""), names), "")
+        self.assertEqual(health.opt_in_refusal(({**doc, "host": "CMUXS-MAC-MINI-5"}, ""), names), "")
+        refused = {
+            "missing": ((None, "no ~/.config/glaeda/tailscale-self-heal.json"), names),
+            "another host": (({**doc, "host": "cmux9s-mac-mini"}, ""), names),
+            "no schema": (({"host": "cmuxs-mac-mini-5"}, ""), names),
+            "another schema": (({**doc, "schema": "glaeda-tailscale-self-heal/v0"}, ""), names),
+            "host not a string": (({**doc, "host": {"name": "cmuxs-mac-mini-5"}}, ""), names),
+            "empty host": (({**doc, "host": " "}, ""), names),
+            "no names": ((doc, ""), []),
+        }
+        for what, (opt_in, host_names) in refused.items():
+            self.assertNotEqual(health.opt_in_refusal(opt_in, host_names), "", what)
+        self.assertIn("no ~/.config", health.opt_in_refusal((None, "no ~/.config/glaeda/tailscale-self-heal.json"), names))
+
+    def test_sudo_nopasswd(self) -> None:
+        kick = "/bin/launchctl kickstart -k system/com.tailscale.tailscaled"
+        head = ("Matching Defaults entries for cmux on cmuxs-mac-mini-5:\n    env_reset, env_keep+=BLOCKSIZE\n\n"
+                "User cmux may run the following commands on cmuxs-mac-mini-5:\n")
+        allowed = {
+            "exact": f"    (root) NOPASSWD: {kick}\n",
+            "ALL under NOPASSWD": "    (ALL) NOPASSWD: ALL\n",
+            "ALL : ALL runas": f"    (ALL : ALL) NOPASSWD: {kick}\n",
+            "listed among others": f"    (root) NOPASSWD: /usr/bin/true, {kick}\n",
+            "the later rule wins": f"    (ALL) ALL\n    (root) NOPASSWD: {kick}\n",
+            "tags carry": f"    (root) NOPASSWD: SETENV: /usr/bin/true, {kick}\n",
+        }
+        for what, rules in allowed.items():
+            self.assertTrue(health.sudo_nopasswd(head + rules, kick), what)
+        refused = {
+            "password needed": "    (ALL) ALL\n",
+            "a later password rule wins": f"    (root) NOPASSWD: {kick}\n    (ALL) ALL\n",
+            "another command": "    (root) NOPASSWD: /bin/launchctl kickstart -k system/com.example\n",
+            "another runas user": f"    (_tailscale) NOPASSWD: {kick}\n",
+            "PASSWD after NOPASSWD": f"    (root) NOPASSWD: /usr/bin/true, PASSWD: {kick}\n",
+            "negated": f"    (root) NOPASSWD: ALL, !{kick}\n",
+            "a prefix only": "    (root) NOPASSWD: /bin/launchctl kickstart\n",
+        }
+        for what, rules in refused.items():
+            self.assertFalse(health.sudo_nopasswd(head + rules, kick), what)
+        self.assertFalse(health.sudo_nopasswd("", kick))
+        self.assertFalse(health.sudo_nopasswd(f"    (root) NOPASSWD: {kick}\n", kick), "no rules header: no answer")
 
     def test_restart_window(self) -> None:
         self.assertEqual(health.restart_window_refusal({}, NOW), "")
@@ -888,6 +1028,48 @@ class TailscaleRestartReads(unittest.TestCase):
         self.assertEqual(mini.ci_mini_facts()["role"], "fleet-mini", "mini-setup's own reading of an older receipt")
         (self.home / ".config/glaeda/update.json").write_text("{bad")
         self.assertIsNone(mini.ci_mini_facts()["setup_args"])
+        for receipt in ({"role": ["fleet-mini"]}, {"role": {"fleet-mini": 1}, "profile": "build-host"}):
+            (self.home / ".local/state/glaeda/mini-setup/receipt.json").write_text(json.dumps(receipt))
+            self.assertIsNone(mini.ci_mini_facts()["role"], f"{receipt} is no role, and no crash")
+
+    def test_the_opt_in_file(self) -> None:
+        mini = health.Mini(self.home)
+        doc, why = mini.tailscale_opt_in()
+        self.assertIsNone(doc)
+        self.assertIn("tailscale-self-heal.json", why)
+        path = self.home / ".config/glaeda/tailscale-self-heal.json"
+        path.parent.mkdir(parents=True)
+        for body in ("{not json", "[1]", ""):
+            path.write_text(body)
+            doc, why = mini.tailscale_opt_in()
+            self.assertIsNone(doc, body)
+            self.assertIn("unreadable", why, body)
+        want = {"schema": "glaeda-tailscale-self-heal/v1", "host": "cmuxs-mac-mini-5", "source": "fleet-registry.json"}
+        path.write_text(json.dumps(want))
+        self.assertEqual(mini.tailscale_opt_in(), (want, ""))
+
+    def test_sudo_allows_reads_the_rules_not_the_exit_code(self) -> None:
+        # `sudo -n -l <cmd>` exits 0 for a rule that still asks for a password; the listing says which it is
+        mini = health.Mini(self.home)
+        argv = health.restart_commands("standalone", None)[0]
+        kick = " ".join(argv[2:])
+        calls = []
+
+        def fake_sh(cmd, timeout=15, env=None):
+            calls.append(cmd)
+            return self.sudo
+
+        saved = health.sh
+        self.addCleanup(setattr, health, "sh", saved)
+        health.sh = fake_sh
+        header = "User cmux may run the following commands on cmux9s-mac-mini:\n"
+        self.sudo = (0, header + "    (ALL) ALL\n")
+        self.assertFalse(mini.sudo_allows(argv))
+        self.sudo = (0, header + f"    (root) NOPASSWD: {kick}\n")
+        self.assertTrue(mini.sudo_allows(argv))
+        self.sudo = (1, header + f"    (root) NOPASSWD: {kick}\n")
+        self.assertFalse(mini.sudo_allows(argv), "a listing sudo refused is no answer")
+        self.assertTrue(all(c[:3] == ["/usr/bin/sudo", "-n", "-l"] for c in calls), calls)
 
     def test_the_switch_reads_the_environment_and_the_file(self) -> None:
         mini = health.Mini(self.home)
@@ -901,6 +1083,44 @@ class TailscaleRestartReads(unittest.TestCase):
         switch.parent.mkdir(parents=True)
         switch.touch()
         self.assertNotEqual(mini.tailscale_restart_off(), "")
+
+
+class TailnetNames(unittest.TestCase):
+    """Mini.tailnet_names and host_names against a stand-in Tailscale CLI: no Self name is no answer."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.saved = (health.TAILSCALE_APP, health.TAILSCALE_STANDALONE)
+        health.TAILSCALE_APP, health.TAILSCALE_STANDALONE = str(self.dir / "app"), str(self.dir / "standalone")
+
+    def tearDown(self) -> None:
+        health.TAILSCALE_APP, health.TAILSCALE_STANDALONE = self.saved
+        self.tmp.cleanup()
+
+    def cli(self, body: str) -> None:
+        Path(health.TAILSCALE_APP).write_text("#!/bin/sh\n" + body + "\n")
+        os.chmod(health.TAILSCALE_APP, 0o755)
+
+    def test_the_self_names(self) -> None:
+        self.cli("echo '{\"Self\": {\"HostName\": \"cmuxs-Mac-mini-5\", \"DNSName\": \"cmuxs-mac-mini-5.tail1.ts.net.\"}}'")
+        self.assertEqual(health.Mini(self.dir).tailnet_names(), ["cmuxs-Mac-mini-5", "cmuxs-mac-mini-5"])
+
+    def test_no_self_name_is_no_answer(self) -> None:
+        for body in ("exit 1", "echo 'not json'", "echo '{}'", "echo '{\"Self\": []}'",
+                     "echo '{\"Self\": {\"HostName\": \"\", \"DNSName\": \"\"}}'",
+                     "echo '{\"Self\": {\"HostName\": \"cmux9s-mac-mini\"}}'; exit 1"):
+            self.cli(body)
+            self.assertIsNone(health.Mini(self.dir).tailnet_names(), body)
+        os.unlink(health.TAILSCALE_APP)
+        self.assertIsNone(health.Mini(self.dir).tailnet_names(), "no CLI")
+
+    def test_host_names_refuses_without_the_tailnet_name(self) -> None:
+        mini = health.Mini(self.dir)
+        mini.tailnet_names = lambda: None
+        self.assertIsNone(mini.host_names())
+        mini.tailnet_names = lambda: ["cmuxs-mac-mini-5"]
+        self.assertIn("cmuxs-mac-mini-5", mini.host_names())
 
 
 class TailscaleCli(unittest.TestCase):
