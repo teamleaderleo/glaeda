@@ -3880,6 +3880,23 @@ def broker_add_remote(url: str, found: list[str]) -> bool:
     return True
 
 
+def git_remote_repo(url: str) -> str | None:
+    """`owner/repo`, lowercased, for a remote URL that is a github.com clone URL this understands,
+    or None for every other URL -- another forge, another GitHub host, a local path, a shape it
+    cannot read.
+
+    git_remotes declines the whole checkout on a None (see there); only broker_remotes' index,
+    where being approximate costs a request and nothing else, skips them."""
+    target = broker_remote_target(url)
+    if target is None:
+        return None
+    host, path = target
+    match = BROKER_REPO_PATH_RE.match(path)
+    if host not in BROKER_REMOTE_HOSTS or match is None:
+        return None
+    return f"{match.group(1).lower()}/{match.group(2).lower()}"
+
+
 def git_remotes(where: Path) -> list[str] | None:
     """The owner/repo of every github.com remote git lists for the repository at or above `where`,
     lowercased, or None when that cannot be known exactly -- no repository there, a config git
@@ -3914,7 +3931,10 @@ def git_remotes(where: Path) -> list[str] | None:
         resolved = run_bounded([*args, "config", "--get-regexp", r"^remote\..*\.gh-resolved$"],
                                timeout=BROKER_GIT_DEADLINE)
         listed = run_bounded([*args, "remote", "-v"], timeout=BROKER_GIT_DEADLINE)
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError, UnicodeDecodeError):
+        # UnicodeDecodeError because a remote URL that is not UTF-8 makes run_bounded(text=True)
+        # raise, and this answers "cannot be known exactly" for that the same way it does for a
+        # config git refuses. cmd_gh's catch-all would exec gh anyway; declining here says it.
         return None
     # `--get-regexp` exits 1 for "asked, and no key matches"; anything else non-zero (128) is a
     # config or a repository git will not read, and neither will gh.
@@ -3927,18 +3947,44 @@ def git_remotes(where: Path) -> list[str] | None:
         fields = line.split()
         if not fields:
             continue
-        # `NAME<TAB>URL (fetch|push)`, and both lines of a remote are read: a `pushurl` to another
-        # repository is a second answer, not a detail. A remote with only a pushurl prints
-        # `NAME<TAB>` with no URL and no marker for its fetch line (measured), which is a shape we
-        # know rather than one we cannot read. Anything else -- a URL with whitespace in it, which
-        # git keeps inside quotes and this output cannot express -- is unknown, and gh, which
-        # splits this same text, cannot read it either.
+        # `NAME<TAB>URL (fetch|push)`. A remote with only a pushurl prints `NAME<TAB>` with no URL
+        # and no marker for its fetch line (measured), which is a shape we know rather than one we
+        # cannot read; its push line is then the URL gh resolves (also measured: `gh browse -n` in
+        # such a checkout asks for `repos/cli/cli`, because gh falls back to the push URL when a
+        # remote has no fetch URL). Anything else -- a URL with whitespace in it, which git keeps
+        # inside quotes and this output cannot express -- is unknown, and gh, which splits this
+        # same text, cannot read it either.
         if len(fields) == 1:
             continue
         if len(fields) != 3 or fields[2] not in ("(fetch)", "(push)"):
             return None
-        if not broker_add_remote(fields[1], found):
+        # Every URL of every remote, fetch and push, and a URL this cannot read as a github.com
+        # repository ends the answer rather than being skipped. That is what makes the one-name
+        # answer sound: when exactly one name comes out, every URL in the checkout names that one
+        # repository, so it does not matter which remote gh prefers or which of its URLs gh reads.
+        # Skipping instead was a wrong answer twice over, both measured against gh 2.98.0:
+        #   - `url = https://gitlab.com/a/b.git` with `pushurl = https://github.com/cli/cli.git`:
+        #     gh exits 1 ("none of the git remotes ... point to a known GitHub host") because it
+        #     resolves the *fetch* URL and falls back to the push URL only when there is no fetch
+        #     URL at all. Reading the push line as an answer left one GitHub remote, and the broker
+        #     served `cli/cli` from cache with exit 0 -- inventing success where gh refuses.
+        #   - `origin = https://github.com/o/r` with `upstream = https://ghe.example/acme/thing`
+        #     and both hosts in gh's hosts.yml: gh resolves `acme/thing` **on ghe.example**
+        #     (measured: `gh pr view 7` posts to `https://ghe.example/api/graphql`), because it
+        #     picks a remote by name across every host it has credentials for -- `upstream`, then
+        #     `github`, then `origin`, then the rest alphabetically. Skipping the enterprise remote
+        #     as "another forge" left `o/r` and answered another host's repository out of
+        #     github.com's cache.
+        # Deciding which foreign hosts gh really ignores means reproducing gh's set of known hosts
+        # (hosts.yml, $GH_HOST, enterprise tokens) exactly, and being wrong there is that second
+        # case again. So any remote that is not github.com's declines: a checkout with a GitLab
+        # mirror alongside its GitHub remote costs one request, where gh does resolve the GitHub
+        # one.
+        name = git_remote_repo(fields[1])
+        if name is None:
             return None
+        if name not in found:
+            found.append(name)
     return found
 
 
@@ -4072,9 +4118,13 @@ def broker_repo(values: dict[str, str]) -> str | None:
     # Still exactly one, now that the remotes are read the way git reads them. The cmux checkout
     # really does have five (the fork a lane pushes from, and contributors' forks), so this
     # declines there and `gh pr view 7` without `-R` costs a request. Picking `origin` instead
-    # would be wrong, not just bolder: with several remotes and no `gh-resolved`, gh resolves the
-    # base repository through the API and lands on the *parent*, so in a fork checkout `origin`
-    # answers the fork's PR 7 where gh would answer the upstream's. Declining costs a request;
+    # would be wrong, not just bolder: with several remotes and no `gh-resolved`, gh picks a remote
+    # **by name** -- `upstream`, then `github`, then `origin`, then the rest alphabetically, with no
+    # request of its own (measured: in a checkout with `origin = me/cli` and `upstream = cli/cli`,
+    # `gh browse -n` asks for `repos/cli/cli`; with `aaa` and `zzz`, for `aowner/arepo`). So in a
+    # fork checkout `origin` answers the fork's PR 7 where gh answers the upstream's. An earlier
+    # version of this comment said gh resolved the base repository through the API and landed on
+    # the parent; the conclusion was right and the mechanism was not. Declining costs a request;
     # guessing answers one repository's question with another's.
     return here[0] if len(here) == 1 else None
 

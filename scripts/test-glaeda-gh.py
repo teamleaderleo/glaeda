@@ -3107,6 +3107,14 @@ class BrokerBase(Base):
         (where / ".git" / "config").write_text(config)
         return where
 
+    def repo(self, local: str, global_config: str = "") -> str | None:
+        """What broker_repo resolves for a real checkout with this local config and this global
+        scope. The global scope is a file git really reads: GIT_CONFIG_GLOBAL, set in setUp."""
+        (self.home / "gitconfig").write_text(global_config)
+        where = self.git_checkout(self.home / "roots" / "probe", local)
+        with mock.patch.object(gg.Path, "cwd", staticmethod(lambda: where)):
+            return gg.broker_repo({})
+
     def cache_pr(self, number: int, data: dict, age: float = 0.0) -> str:
         key = f"pr:o/r#{number}"
         gg.write_json(gg.cache_dir() / gg.file_name(key),
@@ -4946,14 +4954,6 @@ class BrokerFifthReviewTest(BrokerBase):
     asks git (git_remotes) and the text parser is the local index's, where being approximate only
     costs a request."""
 
-    def repo(self, local: str, global_config: str = "") -> str | None:
-        """What broker_repo resolves for a real checkout with this local config and this global
-        scope. The global scope is a file git really reads: GIT_CONFIG_GLOBAL, set in setUp."""
-        (self.home / "gitconfig").write_text(global_config)
-        where = self.git_checkout(self.home / "roots" / "probe", local)
-        with mock.patch.object(gg.Path, "cwd", staticmethod(lambda: where)):
-            return gg.broker_repo({})
-
     def test_a_remote_written_in_another_config_scope_is_still_a_remote(self) -> None:
         """`remote.upstream.url` in `~/.gitconfig` is a remote git lists and gh resolves. Reading
         only the checkout's own file left `['me/cli']` -- one remote, so served -- for a checkout
@@ -4981,9 +4981,9 @@ class BrokerFifthReviewTest(BrokerBase):
 
     def test_a_remote_with_only_a_pushurl_is_a_remote_git_lists(self) -> None:
         """`git remote -v` lists it -- `NAME<TAB>` for the fetch line and the pushurl on the push
-        line -- and gh resolves it. The text reader looked at `url` only, so this was one remote of
-        two again. Both lines of a remote are read for the same reason: a `pushurl` aimed at
-        another repository is a second answer, not a detail."""
+        line -- and gh resolves it (it falls back to the push URL when a remote has no fetch URL).
+        The text reader looked at `url` only, so this was one remote of two again. Both lines of
+        every remote are read now, which is what BrokerSixthReviewTest is about."""
         self.assertIsNone(self.repo(f'[remote "origin"]\n\turl = {FORK}\n'
                                     f'[remote "upstream"]\n\tpushurl = {UPSTREAM}\n'))
 
@@ -5076,6 +5076,86 @@ class BrokerFifthReviewTest(BrokerBase):
         self.assertTrue(calls, "asked git nothing")
         self.assertTrue(all(t == gg.BROKER_GIT_DEADLINE for t in calls), calls)
         self.assertLessEqual(gg.BROKER_GIT_DEADLINE, 10.0)
+
+
+class BrokerSixthReviewTest(BrokerBase):
+    """What a sixth independent review found by running the new git-backed serve path, 2026-10-21.
+
+    Both findings are the same shape as the one the path was written for -- the broker serving a
+    repository gh would not -- and both come from *skipping* a remote URL instead of declining on
+    it. Every case is measured against gh 2.98.0 and git 2.53.0, with gh's requests pointed at a
+    refused proxy so no quota is spent and the host it would have asked is still visible."""
+
+    def test_a_github_push_url_behind_another_forges_fetch_url_is_not_an_answer(self) -> None:
+        """gh resolves a remote's *fetch* URL and falls back to its push URL only when there is no
+        fetch URL at all. So with `url = https://gitlab.com/a/b.git` and
+        `pushurl = https://github.com/cli/cli.git`, gh exits 1 -- "none of the git remotes ...
+        point to a known GitHub host" (measured) -- and reading the push line as an answer left
+        exactly one GitHub remote, which the broker served from cache with exit 0. A wrapper
+        inventing success where gh refuses is the worst answer here: nothing downstream corrects
+        it."""
+        for fetch in ("https://gitlab.com/a/b.git", "git@gitlab.com:mirror/thing.git",
+                      "https://ghe.example/acme/thing.git"):
+            with self.subTest(fetch=fetch):
+                self.assertIsNone(self.repo(f'[remote "origin"]\n\turl = {fetch}\n'
+                                            f'\tpushurl = {UPSTREAM}\n'))
+
+    def test_an_enterprise_remote_is_not_answered_out_of_github_coms_cache(self) -> None:
+        """gh picks a remote by name across every host it has credentials for, so with
+        `origin = https://github.com/o/r` and `upstream = https://ghe.example/acme/thing` it
+        resolves `acme/thing` **on ghe.example** -- measured: `gh pr view 7` posts to
+        `https://ghe.example/api/graphql`. Skipping the enterprise remote as "another forge" left
+        `o/r` and answered another host's repository out of github.com's cache."""
+        self.assertIsNone(self.repo('[remote "origin"]\n\turl = https://github.com/o/r\n'
+                                    '[remote "upstream"]\n\turl = https://ghe.example/acme/thing\n'))
+
+    def test_a_remote_this_cannot_read_as_github_coms_ends_the_answer(self) -> None:
+        """The rule that makes the one-name answer sound: every URL of every remote is read, and
+        one this cannot place on github.com declines the checkout. Deciding which foreign hosts gh
+        really ignores means reproducing gh's own set of known hosts, and being wrong there is the
+        enterprise case above -- so a GitLab mirror or a local-path remote beside the GitHub remote
+        costs one request, where gh does resolve the GitHub one."""
+        for name, extra in (("another forge", '[remote "mirror"]\n\turl = https://gitlab.com/a/b\n'),
+                            ("a local path", '[remote "local"]\n\turl = /srv/mirrors/thing\n'),
+                            ("a github URL with no repository",
+                             '[remote "two"]\n\turl = https://github.com/cli\n')):
+            with self.subTest(name):
+                self.assertIsNone(self.repo('[remote "origin"]\n\turl = https://github.com/o/r\n'
+                                            + extra))
+        self.assertEqual(self.repo('[remote "origin"]\n\turl = https://github.com/o/r\n'), "o/r")
+
+    def test_a_lone_remote_on_another_host_is_never_this_caches_repository(self) -> None:
+        """The sharp case for reading the host at all, and the one the first cut of this fix had no
+        test for: a checkout whose *only* remote is somewhere else. `acme/thing` on ghe.example and
+        `a/b` on gitlab.com are owner/repo-shaped, so a reader that took the path and ignored the
+        host would answer them out of github.com's cache -- a different repository's JSON, offered
+        as this one's -- and with one remote there is no second name to decline on."""
+        for url in ("https://ghe.example/acme/thing", "https://gitlab.com/a/b",
+                    "git@gitlab.com:a/b.git", "/srv/mirrors/a/b"):
+            with self.subTest(url=url):
+                self.assertIsNone(self.repo(f'[remote "origin"]\n\turl = {url}\n'))
+
+    def test_the_same_repository_under_both_urls_of_one_remote_is_still_one_answer(self) -> None:
+        """A fetch and a push URL naming the same repository, and a `pushurl`-only remote, which
+        `git remote -v` prints as `NAME<TAB>` with no URL: gh falls back to the push URL there
+        (measured: `gh browse -n` asks for `repos/cli/cli`), so it is an answer and not a
+        decline."""
+        self.assertEqual(self.repo('[remote "origin"]\n\turl = https://github.com/o/r\n'
+                                   '\tpushurl = https://github.com/o/r.git\n'), "o/r")
+        self.assertEqual(self.repo('[remote "origin"]\n\tpushurl = https://github.com/o/r\n'), "o/r")
+
+    def test_a_remote_url_that_is_not_utf8_declines_rather_than_raising(self) -> None:
+        """`git remote -v` hands back the bytes the config holds, and `run_bounded(text=True)`
+        raises UnicodeDecodeError on them. cmd_gh's catch-all would exec gh anyway, so the contract
+        held; declining here says so instead of relying on it."""
+        where = self.git_checkout(self.home / "roots" / "probe",
+                                  '[remote "origin"]\n\turl = https://github.com/o/r\n')
+
+        def raising(argv, timeout=None):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+        with mock.patch.object(gg, "run_bounded", raising):
+            self.assertIsNone(gg.git_remotes(where))
 
 
 class Scripted:
