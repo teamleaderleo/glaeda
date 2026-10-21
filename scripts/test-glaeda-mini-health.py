@@ -446,6 +446,12 @@ class Fseventsd(Base):
         self.assertEqual(self.ids(self.run_once(NOW + 3600)), [])
         self.assertEqual([s[1] for s in json.loads(self.state.read_text())["fseventsd"]], [4915])
 
+    def test_a_malformed_sample_state_is_ignored(self) -> None:
+        self.state.write_text(json.dumps({"fseventsd": {"bad": 1}}))
+        self.assertEqual(self.ids(self.run_once()), [])
+        self.state.write_text(json.dumps({"fseventsd": [["x", 105, 1.0], [NOW - 3600, 105]]}))
+        self.assertEqual(self.ids(self.run_once(NOW + 1)), [])
+
     def test_no_daemon_is_no_finding(self) -> None:
         self.mini.fsev = None
         self.assertEqual(self.ids(self.run_once()), [])

@@ -600,7 +600,8 @@ def check_fseventsd(mini: Mini, now: float, samples: list[Any]) -> tuple[list[di
     if got is None:
         return [], []
     pid, cpu, rss = got
-    kept = [s for s in samples if isinstance(s, list) and len(s) == 3 and s[1] == pid
+    samples = samples if isinstance(samples, list) else []  # a hand-edited or older state file
+    kept = [s for s in samples if isinstance(s, list) and all(isinstance(x, (int, float)) for x in s) and len(s) == 3 and s[1] == pid
             and 0 < now - s[0] <= FSEVENTSD_KEEP_S and s[2] <= cpu]
     window = [s for s in kept if now - s[0] >= FSEVENTSD_WINDOW_S]
     cores = (cpu - window[-1][2]) / (now - window[-1][0]) if window else None
