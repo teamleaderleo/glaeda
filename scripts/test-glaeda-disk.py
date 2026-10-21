@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from unittest import mock
 from pathlib import Path
 
@@ -1872,6 +1873,112 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(gd.remove_spm_scratch(scratch / "raced"))
         self.assertFalse((scratch / "raced").exists())
 
+    def test_canonical_root_admission_goes_under_its_root_token(self) -> None:
+        """cmux7s, cmux12s, cmux13s, 2026-10-21: 8-9 GiB of admission DerivedData per idle canonical root stayed,
+        because the tmp family judged the whole root and its src/ checkout holds untracked build inputs."""
+        tmp, capacity = self.root / "tmp", self.root / "capacity"
+        capacity.mkdir()
+        for k in (1, 2):
+            (capacity / f"root-{k}.token").touch()
+        one, two = tmp / "cmux-ci", tmp / "cmux-ci-2"
+        make(one / "derived-data-compile-admission", age_hours=50)  # root 1: a job holds it
+        make(two / "derived-data-compile-admission", age_hours=50)
+        make(two / "compile-admission-cas", age_hours=50)
+        make(two / "derived-data-rerun-resolve", age_hours=2)
+        make(two / "src", age_hours=50)  # the root's checkout stays the tmp family's to judge
+        make(tmp / "cmux-ci-next" / "derived-data-x", age_hours=50)  # not a canonical root
+        for odd in ("cmux-ci-\u00b2", "cmux-ci-0", "cmux-ci-02", "cmux-ci-100"):  # not roots the runner hook takes
+            make(tmp / odd / "derived-data-x", age_hours=50)
+        job = open(capacity / "root-1.token")
+        self.addCleanup(job.close)
+        fcntl.flock(job, fcntl.LOCK_EX)  # glaeda-cmux-runner-hook take-root holds it for the whole job
+        with mock.patch.object(gd, "CANONICAL_CAPACITY", capacity):
+            fams = gd.canonical_admission_families(tmp)
+            self.assertEqual([f.root for f in fams], [one, two])
+            self.assertFalse(gd.job_busy(fams[1], two / "derived-data-compile-admission"),
+                             "the root's token, not a slot marker search, decides")
+            items = gd.survey(fams, 6, 0)
+            self.assertEqual({os.path.relpath(i.path, tmp): i.verdict for i in items},
+                             {"cmux-ci/derived-data-compile-admission": "in-use",
+                              "cmux-ci-2/derived-data-compile-admission": "reclaimable",
+                              "cmux-ci-2/compile-admission-cas": "reclaimable",
+                              "cmux-ci-2/derived-data-rerun-resolve": "recent"})
+            reclaim = [i for i in items if i.verdict == "reclaimable"]
+            families = {f.id: f for f in fams}
+            # a job takes root 2 between the survey and the delete: apply re-checks the token and keeps it all
+            late = open(capacity / "root-2.token")
+            fcntl.flock(late, fcntl.LOCK_EX)
+            gd.apply(reclaim, families, self.root / "r1.jsonl", None, 6)
+            late.close()
+            self.assertTrue((two / "derived-data-compile-admission").exists())
+            # apply marks what it refused blocked, so the next pass starts from a fresh survey
+            reclaim = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+            self.assertEqual(len(reclaim), 2)
+            gd.apply(reclaim, families, self.root / "r2.jsonl", None, 6)
+            # the delete itself takes the token: a job that arrives after every re-check still keeps its root
+            make(two / "derived-data-raced", age_hours=50)
+            late = open(capacity / "root-2.token")
+            fcntl.flock(late, fcntl.LOCK_SH)
+            self.assertFalse(gd.remove_canonical_admission(two / "derived-data-raced"))
+            late.close()
+            self.assertTrue(gd.remove_canonical_admission(two / "derived-data-raced"))
+        self.assertEqual(sorted(p.name for p in two.iterdir()), ["derived-data-rerun-resolve", "src"],
+                         "nothing renamed aside is left behind")
+        self.assertTrue((one / "derived-data-compile-admission").exists())
+        for receipt, want in (("r1.jsonl", "changed:in-use"), ("r2.jsonl", "reclaimed")):
+            outcomes = {r["outcome"] for r in map(json.loads, (self.root / receipt).read_text().splitlines())}
+            self.assertEqual(outcomes, {want}, receipt)
+        # no token yet: no job ever took the root; a path outside a canonical root is never this family's to delete
+        with mock.patch.object(gd, "CANONICAL_CAPACITY", self.root / "none"):
+            self.assertFalse(gd.canonical_root_held(two / "src"))
+        self.assertTrue(gd.canonical_root_held(tmp / "cmux-ci-next" / "derived-data-x"))
+        self.assertFalse(gd.remove_canonical_admission(tmp / "cmux-ci-next" / "derived-data-x"))
+
+    def test_the_tmp_family_deletes_a_whole_canonical_root_only_under_its_root_token(self) -> None:
+        """The tmp family judges /private/tmp/cmux-ci and cmux-ci-<k> as one item each and may delete a whole one
+        after an hour idle. A compile job holds its root's token (glaeda-cmux-runner-hook take-root) for the whole
+        job, and a job's tree can sit an hour unwritten (a long test phase), so only the token tells a root in use:
+        it is in use while held, re-checked at apply, and the delete takes it exclusive as cmux-ci-admission does."""
+        tmp, capacity = self.root / "tmp", self.root / "capacity"
+        capacity.mkdir()
+        for k in (1, 2):
+            (capacity / f"root-{k}.token").touch()
+        one, two = make(tmp / "cmux-ci", 8, age_hours=50), make(tmp / "cmux-ci-2", 8, age_hours=50)
+        other = make(tmp / "cmux-ci-next", 8, age_hours=50)  # not a canonical root: the tmp family's as before
+        fam = replace(next(f for f in gd.default_families() if f.id == "tmp"), root=tmp, skip=(), min_bytes=None)
+        job = open(capacity / "root-1.token")
+        self.addCleanup(job.close)
+        fcntl.flock(job, fcntl.LOCK_EX)  # a job holds root 1 for its whole run
+        with mock.patch.object(gd, "CANONICAL_CAPACITY", capacity):
+            items = gd.survey([fam], 6, 0)
+            self.assertEqual({os.path.relpath(i.path, tmp): i.verdict for i in items},
+                             {"cmux-ci": "in-use", "cmux-ci-2": "reclaimable", "cmux-ci-next": "reclaimable"})
+            self.assertIn("a job holds this canonical root (root token)",
+                          next(i for i in items if i.path == os.fspath(one)).reasons)
+            reclaim = [i for i in items if i.verdict == "reclaimable"]
+            # a job takes root 2 between the survey and the delete: apply re-checks the token and keeps the root
+            late = open(capacity / "root-2.token")
+            fcntl.flock(late, fcntl.LOCK_EX)
+            gd.apply(reclaim, {fam.id: fam}, self.root / "r1.jsonl", None, 6)
+            late.close()
+            self.assertTrue(two.exists())
+            self.assertFalse(other.exists())
+            outcomes = {Path(r["path"]).name: r["outcome"]
+                        for r in map(json.loads, (self.root / "r1.jsonl").read_text().splitlines())}
+            self.assertEqual(outcomes, {"cmux-ci-2": "changed:in-use", "cmux-ci-next": "reclaimed"})
+            # the delete itself takes the token: a job that arrives after every re-check still keeps its root
+            late = open(capacity / "root-2.token")
+            fcntl.flock(late, fcntl.LOCK_SH)
+            self.assertFalse(gd.remove_canonical_root(two))
+            late.close()
+            self.assertTrue(two.exists())
+            reclaim = [i for i in gd.survey([fam], 6, 0) if i.verdict == "reclaimable"]
+            self.assertEqual([Path(i.path).name for i in reclaim], ["cmux-ci-2"])
+            gd.apply(reclaim, {fam.id: fam}, self.root / "r2.jsonl", None, 6)
+        self.assertFalse(two.exists())
+        self.assertTrue(one.exists())
+        self.assertEqual(sorted(p.name for p in tmp.iterdir()), ["cmux-ci"], "nothing renamed aside is left behind")
+
     def test_the_emergency_floor_names_its_filesystems(self) -> None:
         total = 460 * gd.GIB  # emergency 10%:30-60 is 46 GiB; a 30 GiB runner floor lifts it to 50 on HOME's volume
         home = gd.HOME.stat().st_dev
@@ -2961,9 +3068,22 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((work / "cmux/.glaeda-state/SourcePackages").is_dir())
         self.assertTrue((work / "_temp/cmux-derived-data-tests-1").is_dir())
 
+    def test_idle_runner_checkouts_of_busy_runners_go_between_jobs(self) -> None:
+        """cmuxs-mac-mini-6, 2026-10-21: light jobs kept every runner busy at least hourly, so under the floor
+        no checkout was ever an hour quiet; runners with no job, last used 23-32 minutes before, held 20 GiB."""
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 0.54, "actions-runner-glaeda-2": 0.39,
+                                          "actions-runner-glaeda-3": 0.06})
+        gd.process_evidence = lambda: ([], "")
+        patches, removed = self._floor_disk(10.0, freed_gib=6.5)
+        receipt = self.receipt()
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            self.assertGreater(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda"]), str(cos["actions-runner-glaeda-2"])])
+        self.assertTrue(cos["actions-runner-glaeda-3"].is_dir(), "used minutes ago: its job may be finishing")
+
     def test_idle_runner_checkout_vetoes(self) -> None:
         home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5,
-                                          "actions-runner-glaeda-3": 5, "actions-runner-glaeda-4": 0.2})
+                                          "actions-runner-glaeda-3": 5, "actions-runner-glaeda-4": 0.1})
         live = home / "actions-runner-glaeda"
         opened = cos["actions-runner-glaeda-2"] / "Sources/x.swift"
         named = cos["actions-runner-glaeda-3"]
@@ -2974,7 +3094,7 @@ class GlaedaDiskTest(unittest.TestCase):
         receipt = self.receipt()
         with patches[0], patches[1]:
             self.assertEqual(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
-        self.assertEqual(removed, [])  # the used-within-the-hour runner is not even a candidate
+        self.assertEqual(removed, [])  # the runner used within the quiet window is not even a candidate
         why = {Path(r["path"]).parts[-4]: r["reasons"][0] for r in map(json.loads, receipt.read_text().splitlines())}
         self.assertIn("running a job", why["actions-runner-glaeda"])
         self.assertIn("open or a working directory", why["actions-runner-glaeda-2"])

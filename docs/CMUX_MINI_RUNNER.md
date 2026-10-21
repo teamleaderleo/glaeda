@@ -496,7 +496,7 @@ older) fails the `scriptCopy` preflight: the plan is not ready, `--apply` is ref
 note names the release's own copy to run, and the release's plan labels are shown as
 `label drift (release ...)`. `--allow-stale` overrides. `glaeda-cmux-runner-fleet`
 writes the stamp when it stages; `glaeda-update` refreshes an older staged copy from the
-installed release every hour, and keeps a copy an operator staged on the release's day
+installed release on every run (every 10 minutes), and keeps a copy an operator staged on the release's day
 or later unless the release descends from the stamp's commit.
 
 Job completion also considers detached `cmux-ci-media-*` TUI and screen-detection
@@ -506,24 +506,47 @@ is live, and rechecks the complete command and process start identity before
 each signal. It runs as the build user and handles at most 16 processes per
 completed job; a busy host defers cleanup to a later completion.
 
-**Hook fixes roll out without `--apply`.** Every hour `glaeda-update` also runs the
-installed release's `glaeda-cmux-runner --refresh-hooks --apply`. In each runner directory
+**Hook fixes roll out without `--apply`.** Every `glaeda-update` run that installs or finds its
+release current (every 10 minutes, its `APPLY_EVERY_S`) also runs the installed release's `glaeda-cmux-runner --refresh-hooks --apply`. In each runner directory
 a receipt owns, it writes `glaeda-hooks/glaeda-cmux-runner-hook` and
 `glaeda_reservation.py` atomically and synced (0755 and 0644, the module first) and nothing
 else, so no registration token or org-admin access is needed. It replaces only a file whose
 bytes are a version the release descends from (the release's `hook-history.json`); a hook
 installed from a newer main, or edited, is `kept`. A runner with a `Runner.Worker` (or
-where pgrep cannot tell) is `deferred` to the next run, checked again right before the
-swap. The new hook is staged in `glaeda-hooks/` and must `--parse-only` every hook call in
+where pgrep cannot tell) is watched for up to 4 minutes (`REFRESH_GAP_WAIT_S`) and swapped
+in the first gap between two jobs, checked again right before the swap. One still busy after
+that is `deferred`, and the checked new files are staged beside the old ones
+(`.glaeda-cmux-runner-hook.next`, `.glaeda_reservation.py.next` and `.hook-next.json`, which
+names the hook they replace): that job's own job-completed installs them as its last step, so
+the next job-started runs the new file whole and the gate reloads it. A stage that would replace
+another hook (an `--apply` wrote one since) is dropped. (One look per run left runners that ran
+jobs back to back on a hook two releases old for hours, and such a runner's old gate still runs
+in the gaps between its jobs.) While it waits, the refresh holds the runner lock, so an
+`--apply` can wait up to 4 minutes. The new hook is staged in `glaeda-hooks/` and must `--parse-only` every hook call in
 the installed wrappers (job-started, job-completed, listen, take-root, take-gui) under the
 wrapper's own interpreter, or the runner is `blocked`, since a rejected job-started would
 fail every job. `--apply`, `--uninstall` and `--refresh-hooks` share one lock
 (`~/.local/state/glaeda/cmux-runner/runner.lock`); a refresh that finds it held waits for
-the next hour. The listener
+the next run. The listener
 gate notices the new file and re-execs it, adopting its running `run.sh` ("the hook
 changed; reloading the gate"). Wrapper, label or LaunchAgent changes still need
 `--apply`. From an operator Mac, cmuxterm-hq's `fleet runner relabel HOST` stages glaeda's
 `origin/main` in a temporary directory and does the whole relabel.
+
+**Which runners lag main.** `scripts/glaeda-runner-hook-lag` (read-only, from a worktree at
+`origin/main`, with SSH to the members) loads every runner's installed hook on its mini and
+compares its gate settings with main's: each module-level value that reads a `GLAEDA_RUNNER_*`
+variable with a code default (`GATE_FIRST_POLL_S`, `GATE_RESTART_FREE_S`, `GATE_CPU_PAUSE`, ...).
+No runner sets those variables, so a hook that lags main runs main's old defaults. A runner
+`lags` when a setting differs or is missing, `differs` when only its bytes do. A lagging runner
+is `converging` when it has exactly the settings of the hook before main's last hook change
+and that change is still on its way (docs/GLAEDA_OTA.md step 3): not yet on stable and younger
+than the soak, a silent canary's wait, promote.yml's hourly schedule and two glaeda-update runs,
+or on stable for less than those two runs. A runner further behind lags. It asks only the
+members that leo-workspace `machines/fleet-registry.json` names as machines agents may ssh to:
+a `no_touch` machine or one whose approval policy says never ssh (the AWS Macs), or one the
+registry does not name, is skipped without any probe. Exit 1 when one lags or a member cannot
+be read. It only reports: the heal is the refresh above or `--apply`.
 
 Relabelling keeps the runner's name. Moving an existing `<hostname>-glaeda` runner
 to a member whose name `<member>-glaeda` differs is a different install: the
@@ -1223,6 +1246,8 @@ runners) looks for what stopped runner minis on 2026-09-25 and 26 without anythi
 | `autologin_locks` (loginwindow `autoLoginUserScreenLocked`), `display_sleep` | none: root |
 | `testmanagerd_wedged`: the newest session line of this user's testmanagerd is `XCIDESession is responsible for cleaning up its socket`, 90 s old, nothing after it | the hook's `recycle_testmanagerd` (#1281) while no test runs; a hook without it gets the finding only |
 | `tailscale_down`: a BackendState other than `Running`, two runs in a row | `tailscale up` when Stopped, else `scutil --nc stop/start` of the Tailscale VPN service; a standalone tailscaled or a logged-out node is reported only |
+| `tailscale_no_route`: BackendState `Running`, but `route -n get 100.100.100.100` leaves by a non-utun interface (the tailnet route is gone), two runs in a row | reported only: a stop and start of the Tailscale VPN service (a `launchctl kickstart` of a standalone tailscaled) is its owner's |
+| `tailscale_cli_missing`: a host with runner LaunchAgents has neither `/usr/local/bin/tailscale` (standalone) nor the Tailscale app's CLI | reported only (warn): the tunnel is not checked, so it is not counted healthy |
 | `tailscale_probe_error`: the Tailscale CLI gave no BackendState (timeout, error, no JSON) | reported only: the check could not look, so the tunnel is not judged down |
 | `runner_stopped:<agent>`: a runner LaunchAgent loaded but not running, two runs in a row | `launchctl kickstart` (nothing runs in it, so no job is cut) |
 | `runner_unloaded:<agent>` (not one `cmux_mini_fix.sh` holds) | none: `glaeda-cmux-runner-fleet --apply` |
