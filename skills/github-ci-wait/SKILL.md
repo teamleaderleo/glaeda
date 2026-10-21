@@ -36,6 +36,12 @@ glaeda-gh budget                                 # REST and GraphQL left, the da
   PR conflicts with its base, 64 on bad arguments.
 - Run one background `wait` per PR, run or comment (Bash `run_in_background`), not one wait
   looping over several: each then notifies you on its own when it exits, and you carry on meanwhile.
+- Every `wait` prints one line on **stderr** before it blocks, naming what it is waiting for and
+  its deadline. Read it as the proof the wait started: a `wait` launched from a session's
+  foreground shell is reaped with that shell, silently, and an output file holding nothing at all
+  looks exactly like one that is still waiting. Empty file means it never started; that line means
+  it did. (`--json` still writes exactly one document on stdout.) A bare `&` from inside a tool
+  call is what gets reaped — use the harness's background mode, or `setsid nohup … </dev/null &`.
 - Exit 1 is a red, not a merge verdict. Where the repo's merge bar excuses base reds (cmux
   `feat-cmux-next`), compare the failed check with the base before holding the PR.
 - The summary names what failed and the failed step, e.g.

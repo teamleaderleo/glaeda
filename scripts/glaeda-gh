@@ -2907,6 +2907,23 @@ def resolve_sha(sha: str) -> tuple[str, bool]:
     return (full, True) if full else (sha, False)
 
 
+def waiting_line(key: str, until: str, sha: str | None, exact: bool, timeout: float) -> str:
+    """What this wait is about, printed before it blocks.
+
+    The point is what its *absence* means. A `wait` started from an agent session's foreground
+    shell is reaped with that shell, silently, leaving a zero-byte output file -- which looks
+    exactly like "blocked and still waiting", so the caller goes on waiting for something that is
+    gone. Three of one lane's waits died that way in an afternoon before anyone noticed. With this
+    line, an empty file means it never started and a file holding it means it did, which is a
+    one-look diagnosis instead of a guess.
+
+    On stderr, so a `--json` consumer still reads exactly one JSON document on stdout."""
+    return (f"glaeda-gh: waiting on {key} until {until}"
+            + (f" at {sha}{'' if exact else '... (a prefix: it must match the head GitHub shows)'}"
+               if sha else "")
+            + f", giving up after {timeout:g}s")
+
+
 def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
              sha: str | None = None, grace: float = RESCUE_GRACE) -> int:
     """Rules only on data the daemon fetched after this wait began, never on an older cache."""
@@ -2915,6 +2932,7 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
     if sha:
         sha, exact = resolve_sha(sha)
     began, start = time.time(), time.monotonic()
+    print(waiting_line(key, until, sha, exact, timeout), file=sys.stderr, flush=True)
     touched = -TOUCH_EVERY
     warned = False
     down, down_since = DownWait(), None
@@ -3014,6 +3032,8 @@ def cmd_wait_file(target: str, timeout: float, as_json: bool, mode: str = "nonem
         raise WatchError(f"--contains {contains!r} is not a regular expression: {error}")
     if contains and mode == "gone":
         raise WatchError("--contains does not apply to --gone")
+    print(waiting_line(target, mode + (f" and matching {contains}" if contains else ""),
+                       None, True, timeout), file=sys.stderr, flush=True)
     start = time.monotonic()
     while True:
         found = file_ready(target, mode, pattern)
@@ -3048,6 +3068,7 @@ def cmd_wait_pid(target: str, timeout: float, as_json: bool) -> int:
     if not target.isdigit() or not 0 < int(target) < 2 ** 31:
         raise WatchError(f"wait pid takes a process id, not {target!r}")
     pid, start = int(target), time.monotonic()
+    print(waiting_line(f"pid {pid}", "it exits", None, True, timeout), file=sys.stderr, flush=True)
     while pid_alive(pid):
         waited = int(time.monotonic() - start)
         if time.monotonic() - start >= timeout:
@@ -3185,6 +3206,9 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
     except re.error as error:
         raise WatchError(f"--match is not a regular expression: {error}") from None
     began, start = time.time(), time.monotonic()
+    print(waiting_line(key, "a comment" + (f" by {author}" if author else "")
+                       + (f" matching {match}" if match else ""), None, True, timeout),
+          file=sys.stderr, flush=True)
     since_id, since_time = parse_since(since, began)
     touched = -TOUCH_EVERY
     warned = False

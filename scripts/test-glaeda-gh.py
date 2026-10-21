@@ -2933,6 +2933,41 @@ class FileAndPidWaitTest(unittest.TestCase):
         self.addCleanup(timer.cancel)
         return timer
 
+    def test_every_wait_says_what_it_is_waiting_for_before_it_blocks(self) -> None:
+        """What matters is what the line's *absence* means. A wait started from an agent session's
+        foreground shell is reaped with that shell, silently, leaving a zero-byte output file --
+        which is indistinguishable from "blocked and waiting", so the caller waits on something
+        that is gone (three of one lane's waits, in one afternoon). With this line an empty file
+        means it never started. On stderr, so a `--json` consumer still reads exactly one document
+        on stdout, which is asserted here rather than assumed."""
+        err = io.StringIO()
+        out = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            gg.cmd_wait_file(str(self.dir / "nope"), 0.05, True)
+        first = err.getvalue().splitlines()[0]
+        self.assertIn("waiting on", first)
+        self.assertIn("nope", first)
+        self.assertIn("0.05", first)
+        json.loads(out.getvalue())  # one document, nothing of the line in it
+
+    def test_the_line_is_printed_before_the_wait_can_finish(self) -> None:
+        """Before, not after: a line printed on the way out would say nothing about a wait that
+        was killed while blocked, which is the whole case it exists for."""
+        order: list[str] = []
+        err = io.StringIO()
+
+        class Noting(io.StringIO):
+            def write(self, text):
+                if "waiting on" in text:
+                    order.append("line")
+                return super().write(text)
+
+        target = self.dir / "appears"
+        self.later(0.05, lambda: (order.append("ready"), target.write_text("x")))
+        with contextlib.redirect_stderr(Noting()), contextlib.redirect_stdout(err):
+            self.assertEqual(gg.cmd_wait_file(str(target), 2.0, True), 0)
+        self.assertEqual(order[:1], ["line"], order)
+
     def test_waits_for_a_nonempty_file(self) -> None:
         target = self.dir / "never1.txt"
         target.write_text("")
