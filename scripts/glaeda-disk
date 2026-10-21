@@ -629,8 +629,9 @@ CANONICAL_CAPACITY = FLEET_ROOT / "capacity"
 def canonical_root_number(root: Path) -> int | None:
     if root.name == "cmux-ci":
         return 1
-    k = root.name[len("cmux-ci-"):] if root.name.startswith("cmux-ci-") else ""
-    return int(k) if k.isdigit() else None
+    # the runner hook's own root spec: roots 2-99, ASCII digits only (/private/tmp is world-writable)
+    m = re.fullmatch(r"cmux-ci-([2-9]|[1-9][0-9])", root.name)
+    return int(m.group(1)) if m else None
 
 
 def canonical_admission_families(tmp: Path | None = None) -> list[Family]:
@@ -685,7 +686,7 @@ def remove_canonical_admission(path: Path) -> bool:
     fd = os.open(token, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+    except OSError:
         os.close(fd)
         return False
     held = [fd]

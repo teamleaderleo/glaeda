@@ -1886,6 +1886,8 @@ class GlaedaDiskTest(unittest.TestCase):
         make(two / "derived-data-rerun-resolve", age_hours=2)
         make(two / "src", age_hours=50)  # the root's checkout stays the tmp family's to judge
         make(tmp / "cmux-ci-next" / "derived-data-x", age_hours=50)  # not a canonical root
+        for odd in ("cmux-ci-\u00b2", "cmux-ci-0", "cmux-ci-02", "cmux-ci-100"):  # not roots the runner hook takes
+            make(tmp / odd / "derived-data-x", age_hours=50)
         job = open(capacity / "root-1.token")
         self.addCleanup(job.close)
         fcntl.flock(job, fcntl.LOCK_EX)  # glaeda-cmux-runner-hook take-root holds it for the whole job
