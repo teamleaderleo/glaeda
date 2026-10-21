@@ -155,7 +155,7 @@ jobs:
           --component clippy,rustfmt
           --no-self-update
 
-      # The gui and session runners hold cmux's tour floor, vendored in glaeda_fleet_labels.py at a pinned cmux
+      # The gui and session runners hold cmux's tour floor, vendored in glaeda-cmux-runner-hook at a pinned cmux
       # commit: a different file at the pin or on feat-cmux-next fails here, and a failed read is a warning.
       - name: Check the vendored cmux tour floor against cmux
         env:

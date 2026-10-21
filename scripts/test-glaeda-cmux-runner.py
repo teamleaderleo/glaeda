@@ -676,6 +676,8 @@ class HookTest(unittest.TestCase):
                                           side_effect=lambda _path, gib: floors.append(gib) or "1.0 GiB free"), \
                         contextlib.redirect_stdout(io.StringIO()):
                     code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                                      "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
+                                      "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"),
                                       "--min-free-gib", f"{tour - 10:g}", "--state-dir", os.fspath(self.dir / "state"),
                                       "--watch-pid", str(os.getpid()), "--gui-wait", "0", *role])
                 self.assertEqual(code, 1)
@@ -4310,6 +4312,8 @@ class GateTest(unittest.TestCase):
                 self.assertEqual(hook.runner_scope(self.runner).min_free_gib, floor)
         script.write_text(f"exec python3 /hook job-started --min-free-gib {tour + 10:g} --gui-runner\n")
         self.assertEqual(hook.runner_scope(self.runner).min_free_gib, tour + 10, "a higher fleet floor stays")
+        script.write_text("exec python3 /hook job-started --gui-runner\n")
+        self.assertEqual(hook.runner_scope(self.runner).min_free_gib, 0, "a runner with no floor keeps none")
         script.write_text(base + " --session-runner\n")
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
         usage = lambda _path: mock.Mock(free=int((tour - 5) * 1024**3))  # noqa: E731

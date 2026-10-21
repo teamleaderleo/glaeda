@@ -2963,8 +2963,11 @@ def eligibility_refusal(fleet_class: str, xcode_app: str | None) -> str | None:
 
 
 def runner_floor_gib(min_free_gib: float, takes_tours: bool) -> float:
-    """A runner's disk floor: its --min-free-gib, raised to a cmux-next tour's floor on a gui or session runner."""
-    return max(min_free_gib, float(CMUX_TOUR_REQUIREMENTS["min_free_gib"])) if takes_tours else min_free_gib
+    """A runner's disk floor: its --min-free-gib, raised to a cmux-next tour's floor on a gui or session runner. A
+    runner with no floor (0) keeps none: only the fleet's wrappers pass one, and a fleet runner is the one tours reach."""
+    if takes_tours and min_free_gib > 0:
+        return max(min_free_gib, float(CMUX_TOUR_REQUIREMENTS["min_free_gib"]))
+    return min_free_gib
 
 
 def min_free_gib(text: str) -> float:
