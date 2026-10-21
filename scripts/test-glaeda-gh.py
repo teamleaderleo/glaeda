@@ -3061,6 +3061,14 @@ class BrokerBase(Base):
             # gh_default_host). Pointed at an empty directory here: these tests are about
             # github.com, and none of them should depend on what this machine is logged in to.
             "GH_CONFIG_DIR": str(self.home / "gh-config"),
+            # The broker asks git what a checkout's remotes are (git_remotes), and git composes
+            # every config scope -- so without these the answers would depend on whoever's
+            # `~/.gitconfig` the suite happens to run under, and an `insteadOf` there would change
+            # what these tests measure. Pointed at an empty file, which is also what lets a test
+            # write a global scope of its own and mean it.
+            "GIT_CONFIG_GLOBAL": str(self.home / "gitconfig"),
+            "GIT_CONFIG_SYSTEM": str(self.home / "gitconfig-system"),
+            "GIT_CONFIG_NOSYSTEM": "1",
         }, clear=False)
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -3081,10 +3089,22 @@ class BrokerBase(Base):
 
     def checkout(self, owner_repo: str, name: str | None = None) -> Path:
         """A checkout of `owner_repo` under the configured root, as the refusal looks for."""
-        where = self.home / "roots" / (name or owner_repo.split("/")[1])
-        (where / ".git").mkdir(parents=True)
-        (where / ".git" / "config").write_text(
-            f'[remote "origin"]\n\turl = git@github.com:{owner_repo}.git\n')
+        return self.git_checkout(self.home / "roots" / (name or owner_repo.split("/")[1]),
+                                 f'[remote "origin"]\n\turl = git@github.com:{owner_repo}.git\n')
+
+    def git_checkout(self, where: Path, config: str) -> Path:
+        """A real git repository at `where` whose config is exactly `config`.
+
+        Real, because the broker asks git what the remotes are rather than reading the file
+        (git_remotes), and a handcrafted `.git` directory is not a repository git answers about.
+        The config is written afterwards rather than through `git remote add` so that a test can
+        still pin an exact config *form* -- a dotted section, a BOM, a continuation -- and have
+        real git read it, which is the only way to know what gh would see."""
+        where.mkdir(parents=True, exist_ok=True)
+        if not (where / ".git").is_dir():  # a probe directory a subtest before this one set up
+            done = subprocess.run(["git", "init", "-q", str(where)], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, f"git init failed: {done.stderr}")
+        (where / ".git" / "config").write_text(config)
         return where
 
     def cache_pr(self, number: int, data: dict, age: float = 0.0) -> str:
@@ -3433,12 +3453,18 @@ class BrokerRefusalTest(BrokerBase):
         self.assertIn(str(self.home / "roots" / "short") + ":", err)
 
     def test_a_worktree_counts_as_a_checkout(self) -> None:
-        common = self.home / "clone" / ".git"
-        (common / "worktrees" / "lane").mkdir(parents=True)
-        (common / "config").write_text('[remote "origin"]\n\turl = https://github.com/o/r\n')
+        # A real `git worktree add`, not a handcrafted `.git` file: the worktree layout is what
+        # both halves have to agree about -- the index reads the common directory's config text,
+        # and git_remotes asks git from inside the worktree.
+        clone = self.home / "clone"
         where = self.home / "roots" / "lane"
-        where.mkdir(parents=True)
-        (where / ".git").write_text(f"gitdir: {common}/worktrees/lane\n")
+        for argv in (["init", "-q", str(clone)],
+                     ["-C", str(clone), "remote", "add", "origin", "https://github.com/o/r"],
+                     ["-C", str(clone), "-c", "user.email=t@example.invalid", "-c", "user.name=t",
+                      "commit", "-q", "--allow-empty", "-m", "x"],
+                     ["-C", str(clone), "worktree", "add", "-q", "--detach", str(where)]):
+            done = subprocess.run(["git", *argv], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, f"git {argv[0]} failed: {done.stderr}")
         code, _out, err, _passed = self.run_gh(["api", "repos/o/r/contents/x"])
         self.assertEqual(code, gg.BROKER_EXIT_REFUSED)
         self.assertIn(str(where), err)
@@ -4155,9 +4181,8 @@ class BrokerReviewTest(BrokerBase):
         reader was pointed at a cmux worktree whose submodules are not initialised, where the
         advised `git show` answers `path does not exist`. It also meant the cmux checkout looked
         like it had ten remotes, so the repository the fleet reads most was never served."""
-        where = self.home / "roots" / "cmux"
-        (where / ".git").mkdir(parents=True)
-        (where / ".git" / "config").write_text(
+        where = self.git_checkout(
+            self.home / "roots" / "cmux",
             '[remote "origin"]\n'
             "\turl = git@github.com:manaflow-ai/cmux.git\n"
             '[submodule "ghostty"]\n'
@@ -4178,9 +4203,8 @@ class BrokerReviewTest(BrokerBase):
     def test_a_checkout_with_a_fork_and_an_upstream_is_still_resolved(self) -> None:
         """Two real remotes stay two: the one-remote rule is what makes a served answer safe, and
         the fix must not buy its accuracy by making every checkout look single-remote."""
-        where = self.home / "roots" / "cli"
-        (where / ".git").mkdir(parents=True)
-        (where / ".git" / "config").write_text(
+        where = self.git_checkout(
+            self.home / "roots" / "cli",
             '[remote "origin"] url = git@github.com:me/cli.git\n'
             '[remote "upstream"]\n\turl = https://github.com/cli/cli\n')
         self.assertEqual(gg.broker_remotes(where), ["me/cli", "cli/cli"])
@@ -4353,10 +4377,7 @@ class BrokerThirdReviewTest(BrokerBase):
     which is why each one here is a case the suite did not have."""
 
     def remotes(self, config: str) -> list[str]:
-        where = self.home / "roots" / "probe"
-        (where / ".git").mkdir(parents=True, exist_ok=True)
-        (where / ".git" / "config").write_text(config)
-        return gg.broker_remotes(where)
+        return gg.broker_remotes(self.git_checkout(self.home / "roots" / "probe", config))
 
     def test_a_config_read_in_part_declines_instead_of_naming_one_remote(self) -> None:
         """The dangerous direction is not missing every remote, it is missing *one*: broker_repo()
@@ -4380,7 +4401,13 @@ class BrokerThirdReviewTest(BrokerBase):
           - **one remote in this text**: `[include]` and `[includeIf]`, whose other file is not in
             this text. One remote in part of a config is not one remote, which is the point.
           - **none at all**: `[remote]` with no name. `remote.url` is a key git stores and not a
-            remote git has, so reading it as one serves a repository the checkout does not have."""
+            remote git has, so reading it as one serves a repository the checkout does not have.
+
+        Which of these the *serve* path answers is no longer this parser's business: it asks git
+        (git_remotes), so for the two `[include]` forms -- where the included file does not exist
+        and git therefore lists exactly the one remote the file holds -- the broker now resolves
+        `me/cli`, which is what gh resolves there too. Following git is the whole point; this
+        parser's all-or-nothing rule keeps the local index honest, not a served answer."""
         fork, upstream = "git@github.com:me/cli.git", "https://github.com/cli/cli"
         for name, config, want in (
                 ("dotted section", f'[remote.origin]\n\turl = {fork}\n'
@@ -4423,9 +4450,14 @@ class BrokerThirdReviewTest(BrokerBase):
             with self.subTest(config=name):
                 self.assertEqual(self.remotes(config), want)
                 where = self.home / "roots" / "probe"
+                # git lists one remote for the two `[include]` forms -- the included file is not
+                # there, so there is nothing to compose in -- and refuses the four configs with
+                # `fatal: bad config line N`, both measured on git 2.53.0. So the serve path
+                # declines everything here except those two, where it answers what gh answers.
                 with mock.patch.object(gg.Path, "cwd", staticmethod(lambda: where)):
-                    self.assertIsNone(gg.broker_repo({}),
-                                      "named one repository out of a config it did not read in full")
+                    self.assertEqual(gg.broker_repo({}),
+                                     "me/cli" if name in ("include", "includeIf") else None,
+                                     "did not resolve this checkout the way git does")
 
     def test_a_config_form_this_does_understand_still_resolves(self) -> None:
         # The decline must not be bought by declining everything: these are the shapes real configs
@@ -4692,10 +4724,7 @@ class BrokerFourthReviewTest(BrokerBase):
     wrong-repository bug the round fixed, one layer out, which 288 passing tests did not see."""
 
     def remotes(self, config: str) -> list[str]:
-        where = self.home / "roots" / "probe"
-        (where / ".git").mkdir(parents=True, exist_ok=True)
-        (where / ".git" / "config").write_text(config)
-        return gg.broker_remotes(where)
+        return gg.broker_remotes(self.git_checkout(self.home / "roots" / "probe", config))
 
     def test_a_github_url_this_cannot_read_declines_the_whole_config(self) -> None:
         """Measured against git 2.53.0 and gh 2.98.0: git lists both remotes and gh, with two
@@ -4842,19 +4871,55 @@ class BrokerFourthReviewTest(BrokerBase):
             self.assertEqual(gg.cmd_audit(calls, 0, True), gg.EXIT_OK)
         self.assertEqual(json.loads(out.getvalue())["brokerDecisions"], {"serve": 1, "refuse": 1})
 
-    def test_the_checkout_scan_is_bounded_and_does_not_cache_a_partial_answer(self) -> None:
-        """The one step in the brokered path with no deadline, in a file that bounds everything
-        else: two levels under three roots is 6566 directories and 2.4 s cold here, and a root on a
-        hung mount hung the gh call. On expiry the partial map is used and not written, so the next
-        call tries again -- and a map missing a repo only means the refusal declines and gh runs."""
+    def test_a_read_that_never_returns_trips_the_scan_deadline_rather_than_reading_as_empty(self) -> None:
+        """The hung mount this bound exists for, in the form a test can make: a `.git/config` that
+        is a FIFO nobody writes to.
+
+        The bound did not exist. DeadlineTimeout is a TimeoutError, which *is* an OSError, so the
+        alarm raised into the scan landed in git_config_text's `except (OSError, ValueError)` and
+        was read as "no config here" -- and setitimer is one-shot, so the rest of the scan then ran
+        with no deadline at all. Worse than unbounded: the interrupted checkout was silently
+        dropped and the incomplete map was cached as complete for the whole TTL. Measured on the
+        head that added it: git_config_text returned None 0.30s after the alarm, and a
+        20 000-checkout scan under a 0.05s deadline took 0.76s and cached 19 999 of 20 000.
+
+        The previous test for this could not see any of that: it replaced hard_deadline with a
+        context manager that raised before yielding, i.e. in broker_local_repos's own frame,
+        outside both handlers. It pinned the `except` clause, not the bound.
+
+        The hung checkout is the *last* candidate the scan reaches -- the only one at the second
+        level, under a first-level directory that is not a checkout -- so that nothing runs after
+        the interrupted read. That is what makes this test see the alarm: with any candidate left,
+        the clock check in the loop body catches the overrun on the next iteration and the answer
+        comes out the same, so the first cut of this test passed against a swallowed alarm. Here a
+        swallowed alarm leaves `complete` true and writes the map, which is the harm itself."""
+        self.assertFalse(issubclass(gg.ScanDeadline, OSError),
+                         "an OSError here is caught by the frames this has to escape")
+        root = self.home / "hung-root"
+        hung = root / "parent" / "checkout"
+        (hung / ".git").mkdir(parents=True)
+        os.mkfifo(hung / ".git" / "config")  # read_text blocks here until the deadline
+        with mock.patch.dict(os.environ, {"GLAEDA_GH_REPO_ROOTS": str(root)}), \
+                mock.patch.object(gg, "BROKER_SCAN_DEADLINE", 0.3):
+            began = time.monotonic()
+            self.assertEqual(gg.broker_local_repos(now=time.time()), {})
+            waited = time.monotonic() - began
+        self.assertLess(waited, 5.0, f"the scan was not bounded: {waited:.1f}s")
+        self.assertFalse(gg.broker_repos_path().exists(),
+                         "cached a scan that gave up in the middle of a read")
+        # and with nothing hung the scan finishes, so the cache is still written
         self.checkout("manaflow-ai/cmux")
+        self.assertEqual(sorted(gg.broker_local_repos(now=time.time())), ["manaflow-ai/cmux"])
+        self.assertTrue(gg.broker_repos_path().exists())
 
-        @contextlib.contextmanager
-        def expired(_seconds):
-            raise gg.DeadlineTimeout("no complete answer")
-            yield  # pragma: no cover - never reached, keeps this a generator
-
-        with mock.patch.object(gg, "hard_deadline", expired):
+    def test_the_scan_is_bounded_where_the_alarm_does_nothing_at_all(self) -> None:
+        """hard_deadline is a no-op off the main thread and on a platform without `setitimer`, and
+        a scan runs wherever a gh call is brokered. The clock check in the loop body is the half of
+        the bound that holds there, and it is the only half that holds for a scan that is merely
+        slow rather than blocked."""
+        self.checkout("manaflow-ai/cmux")
+        with mock.patch.object(gg, "hard_deadline", lambda *_a, **_k: contextlib.nullcontext()), \
+                mock.patch.object(gg, "BROKER_SCAN_DEADLINE", 0.0):
             self.assertEqual(gg.broker_local_repos(now=time.time()), {})
         self.assertFalse(gg.broker_repos_path().exists(), "cached a partial scan")
         # unbounded again, the scan finishes and is cached
@@ -4864,6 +4929,153 @@ class BrokerFourthReviewTest(BrokerBase):
     def test_the_scan_deadline_is_small_enough_to_bound_a_gh_call(self) -> None:
         # A bound is only a bound if a person waiting on `gh pr view` would accept it.
         self.assertLessEqual(gg.BROKER_SCAN_DEADLINE, 10.0)
+
+
+FORK, UPSTREAM = "git@github.com:me/cli.git", "https://github.com/cli/cli"
+
+
+class BrokerFifthReviewTest(BrokerBase):
+    """What a fifth independent review found by running it, 2026-10-21.
+
+    One finding, five more doors to it, and they are not about URL shapes at all: a checkout's
+    remotes are not in `<checkout>/.git/config`. gh runs `git remote -v` and
+    `git config --get-regexp '^remote\\..*\\.gh-resolved$'`, and both compose every config scope and
+    apply `url.<base>.insteadOf` rewriting. Every case here is measured against git 2.53.0 and
+    gh 2.98.0, and every one of them served a repository's answer for a different repository --
+    which is what broker_repo exists to prevent, two rounds of parser work later. So the serve path
+    asks git (git_remotes) and the text parser is the local index's, where being approximate only
+    costs a request."""
+
+    def repo(self, local: str, global_config: str = "") -> str | None:
+        """What broker_repo resolves for a real checkout with this local config and this global
+        scope. The global scope is a file git really reads: GIT_CONFIG_GLOBAL, set in setUp."""
+        (self.home / "gitconfig").write_text(global_config)
+        where = self.git_checkout(self.home / "roots" / "probe", local)
+        with mock.patch.object(gg.Path, "cwd", staticmethod(lambda: where)):
+            return gg.broker_repo({})
+
+    def test_a_remote_written_in_another_config_scope_is_still_a_remote(self) -> None:
+        """`remote.upstream.url` in `~/.gitconfig` is a remote git lists and gh resolves. Reading
+        only the checkout's own file left `['me/cli']` -- one remote, so served -- for a checkout
+        where gh resolves the upstream and answers the parent's PR 7."""
+        self.assertIsNone(self.repo(f'[remote "origin"]\n\turl = {FORK}\n',
+                                    f'[remote "upstream"]\n\turl = {UPSTREAM}\n'))
+
+    def test_an_insteadof_rewrite_in_another_scope_moves_the_host(self) -> None:
+        """`url.<base>.insteadOf` is applied by `git remote -v` (measured, not assumed), and it
+        normally lives in `~/.gitconfig`. Two directions, and the second is the sharper one:
+
+        `gh:cli/cli` looks like another forge's `gh` host to a reader of the text, so it was
+        skipped, leaving one remote of two.
+
+        With `https://github.com/` rewritten to a mirror, gh exits 1 -- "none of the git remotes
+        ... point to a known GitHub host" -- and the broker answered `cli/cli` with exit 0. A
+        wrapper in front of gh inventing success where gh refuses is worse than a wrong
+        repository: there is no later call that corrects it."""
+        self.assertIsNone(self.repo(f'[remote "origin"]\n\turl = {FORK}\n'
+                                    '[remote "upstream"]\n\turl = gh:cli/cli\n',
+                                    '[url "https://github.com/"]\n\tinsteadOf = gh:\n'))
+        self.assertIsNone(self.repo('[remote "origin"]\n\turl = https://github.com/cli/cli\n',
+                                    '[url "https://mirror.invalid/gh/"]\n'
+                                    '\tinsteadOf = https://github.com/\n'))
+
+    def test_a_remote_with_only_a_pushurl_is_a_remote_git_lists(self) -> None:
+        """`git remote -v` lists it -- `NAME<TAB>` for the fetch line and the pushurl on the push
+        line -- and gh resolves it. The text reader looked at `url` only, so this was one remote of
+        two again. Both lines of a remote are read for the same reason: a `pushurl` aimed at
+        another repository is a second answer, not a detail."""
+        self.assertIsNone(self.repo(f'[remote "origin"]\n\turl = {FORK}\n'
+                                    f'[remote "upstream"]\n\tpushurl = {UPSTREAM}\n'))
+
+    def test_gh_resolved_is_found_however_git_would_read_the_key(self) -> None:
+        """`gh repo set-default` writes `remote.<name>.gh-resolved`, and gh resolves through it to
+        a repository this cannot see, so a checkout that has one is never served. The pattern over
+        the text was line-anchored and case-sensitive: it missed the key on the section-header line
+        -- the very form the header regex has a group for -- and missed `GH-Resolved`, though git
+        config keys are case-insensitive. `git config --get-regexp` finds both (measured)."""
+        for name, local in (("on the header line", f'[remote "origin"] gh-resolved = base\n'
+                                                   f'\turl = {FORK}\n'),
+                            ("spelled in capitals", f'[remote "origin"]\n\tGH-Resolved = base\n'
+                                                    f'\turl = {FORK}\n'),
+                            ("as git writes it", f'[remote "origin"]\n\turl = {FORK}\n'
+                                                 "\tgh-resolved = base\n")):
+            with self.subTest(form=name):
+                self.assertIsNone(self.repo(local))
+
+    def test_a_credential_in_a_remote_url_does_not_move_the_host(self) -> None:
+        """The userinfo part runs to the *last* `@`: git hands the whole authority to ssh or curl
+        and gh parses it with net/url, all of which do. With the userinfo stopping at the first
+        `@`, `https://user@name@github.com/cli/cli` read its host as `name@github.com`, was skipped
+        as another forge's, and left a subset -- a password with an `@` in it is all it takes."""
+        self.assertIsNone(self.repo(f'[remote "origin"]\n\turl = {FORK}\n'
+                                    '[remote "upstream"]\n'
+                                    '\turl = https://user@name@github.com/cli/cli\n'))
+        # and the other direction: alone, it is the github remote gh resolves, so it is served
+        self.assertEqual(self.repo('[remote "origin"]\n'
+                                   '\turl = https://user@name@github.com/cli/cli\n'), "cli/cli")
+
+    def test_the_scp_form_splits_at_the_first_colon_the_way_git_does(self) -> None:
+        """`user:pw@github.com:o/r` is not github's `o/r`: git runs
+        `ssh user git-upload-pack 'pw@github.com:o/r'` (measured), so the host is `user` and
+        github.com is part of a path. The old pattern let the userinfo cross a colon and read the
+        host as github.com, so a remote git does not even clone from GitHub with was served as
+        GitHub's."""
+        self.assertEqual(
+            gg.broker_remotes(self.git_checkout(self.home / "roots" / "probe",
+                                                '[remote "origin"]\n\turl = user:pw@github.com:o/r\n')),
+            [], "read a path as a host")
+        self.assertIsNone(self.repo('[remote "origin"]\n\turl = user:pw@github.com:o/r\n'))
+
+    def test_a_checkout_git_resolves_differently_is_not_named_in_a_refusal(self) -> None:
+        """The refusal tells the reader to run `git show` in the checkout it names, so an index
+        entry that points at a checkout of some other repository hands back the wrong bytes. The
+        index is text, and text misses the scopes above -- so the one entry a refusal is about is
+        confirmed with git first. Declining costs one request; naming the wrong checkout costs the
+        reader a wrong answer they have no reason to doubt."""
+        self.git_checkout(self.home / "roots" / "r",
+                          '[remote "origin"]\n\turl = https://github.com/o/r\n')
+        self.assertEqual(sorted(gg.broker_local_repos(now=time.time())), ["o/r"])
+        (self.home / "gitconfig").write_text('[url "https://mirror.invalid/gh/"]\n'
+                                             '\tinsteadOf = https://github.com/\n')
+        code, _out, _err, passed = self.run_gh(["api", "repos/o/r/contents/x"])
+        self.assertIsNone(code, "named a checkout git does not say is o/r")
+        self.assertIsNotNone(passed)
+        # and with nothing rewriting it, the same call is refused and names that checkout
+        (self.home / "gitconfig").write_text("")
+        code, _out, err, _passed = self.run_gh(["api", "repos/o/r/contents/x"])
+        self.assertEqual(code, gg.BROKER_EXIT_REFUSED)
+        self.assertIn(str(self.home / "roots" / "r"), err)
+
+    def test_git_itself_being_unrunnable_declines_rather_than_guessing(self) -> None:
+        """A wrapper in front of gh is never allowed to be the reason a call fails, and it must not
+        answer from a worse source when the good one is unavailable: no git means no answer, which
+        is also gh's position -- gh resolves repositories by running git too."""
+        where = self.git_checkout(self.home / "roots" / "probe",
+                                  '[remote "origin"]\n\turl = https://github.com/o/r\n')
+        with mock.patch.object(gg.Path, "cwd", staticmethod(lambda: where)):
+            self.assertEqual(gg.broker_repo({}), "o/r")
+            for name, failure in (("git is not installed", FileNotFoundError("git")),
+                                  ("git never returns", subprocess.TimeoutExpired("git", 5.0))):
+                with self.subTest(failure=name):
+                    with mock.patch.object(gg, "run_bounded", side_effect=failure):
+                        self.assertIsNone(gg.broker_repo({}))
+
+    def test_asking_git_is_bounded_like_everything_else_here(self) -> None:
+        # Two forks in front of a real gh call: a checkout on a hung mount has to decline, not hang
+        # the call. Both questions are asked with a deadline, and it is a short one.
+        calls: list[float | None] = []
+
+        def record(argv, timeout=None):
+            calls.append(timeout)
+            return subprocess.CompletedProcess(argv, 1, "", "")
+
+        where = self.git_checkout(self.home / "roots" / "probe",
+                                  '[remote "origin"]\n\turl = https://github.com/o/r\n')
+        with mock.patch.object(gg, "run_bounded", record):
+            gg.git_remotes(where)
+        self.assertTrue(calls, "asked git nothing")
+        self.assertTrue(all(t == gg.BROKER_GIT_DEADLINE for t in calls), calls)
+        self.assertLessEqual(gg.BROKER_GIT_DEADLINE, 10.0)
 
 
 class Scripted:

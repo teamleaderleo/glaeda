@@ -516,18 +516,34 @@ class DeadlineTimeout(TimeoutError):
     """A hard deadline passed (hard_deadline). A TimeoutError, so callers treat it as a slow answer."""
 
 
+class ScanDeadline(Exception):
+    """A hard deadline passed in a block whose own frames catch OSError (broker_local_repos's scan).
+
+    Deliberately not a TimeoutError, because TimeoutError *is* an OSError: raised from SIGALRM into
+    the scan, DeadlineTimeout landed in `except OSError: continue` around the glob and in
+    git_config_text's `except (OSError, ValueError): return None`, which read it as "no config
+    here" -- and setitimer is one-shot, so the rest of the scan then ran with no deadline at all.
+    Measured with `.git/config` a FIFO nobody writes to, which is the hung-mount case the deadline
+    was added for: git_config_text returned None 0.30s after the alarm, and a 20 000-checkout scan
+    under a 0.05s deadline took 0.76s, silently dropped the one checkout whose read the alarm
+    interrupted, and cached that incomplete map as complete for the whole TTL."""
+
+
 @contextlib.contextmanager
-def hard_deadline(seconds: float):
-    """Raise DeadlineTimeout in the block once `seconds` of wall-clock time pass, even in the middle of a
+def hard_deadline(seconds: float, error: type[BaseException] = DeadlineTimeout):
+    """Raise `error` in the block once `seconds` of wall-clock time pass, even in the middle of a
     blocking read: a socket timeout only bounds each read, so a server that trickles bytes never
     trips it. Uses SIGALRM, so only on the main thread (the daemon's loop); elsewhere it does
-    nothing and the watchdog still applies."""
+    nothing and the watchdog still applies.
+
+    `error` is a parameter because the exception has to be one the block's own handlers do not
+    catch; see ScanDeadline."""
     if threading.current_thread() is not threading.main_thread() or not hasattr(signal, "setitimer"):
         yield
         return
 
     def expire(signum: int, frame: Any) -> None:
-        raise DeadlineTimeout(f"no complete answer within {seconds:g}s")
+        raise error(f"no complete answer within {seconds:g}s")
 
     previous = signal.signal(signal.SIGALRM, expire)
     signal.setitimer(signal.ITIMER_REAL, seconds)
@@ -3471,9 +3487,21 @@ BROKER_RAW_RE = re.compile(rf"^https?://raw\.githubusercontent\.com/({NAME})/({N
 # Split in two, because matching the whole URL in one pattern could only answer "understood" or
 # "not mine", and those are different answers: a github URL whose shape is not understood has to
 # poison the whole config (see broker_remotes), while another forge's is simply skipped.
-BROKER_URL_HOST_RE = re.compile(r"^(?:https?|git|ssh)://(?:[^/@\s]*@)?([^/:\s]+)(?::\d+)?(/.*)?$",
+# The userinfo part runs to the *last* `@` of the authority, and the host holds none: with the
+# userinfo stopping at the first `@` and the host group permitting one,
+# `https://user@name@github.com/cli/cli` read its host as `name@github.com`, which is not github's,
+# so the remote was skipped -- and a skipped remote is a subset, which is what broker_remotes
+# exists to prevent. An embedded-credential remote whose password contains `@` is all it takes.
+# git hands the whole authority to curl or to ssh, both of which take the last `@` (measured: git
+# 2.53.0 runs `ssh ... a@b@github.com` for `ssh://a@b@github.com/o/r`), and gh parses it with
+# net/url, which does the same.
+BROKER_URL_HOST_RE = re.compile(r"^(?:https?|git|ssh)://(?:[^/\s]*@)?([^/:@\s]+)(?::\d+)?(/.*)?$",
                                 re.IGNORECASE)
-BROKER_SCP_HOST_RE = re.compile(r"^(?:[^/@\s]*@)?([^/:\s]+):(.*)$")
+# The scp-like form splits at the first colon, so its userinfo cannot cross one: for
+# `user:pw@github.com:o/r` git runs `ssh user git-upload-pack 'pw@github.com:o/r'` -- the host is
+# `user` and github.com is part of the path. Reading that as github's `o/r` would serve a
+# repository git does not even clone from.
+BROKER_SCP_HOST_RE = re.compile(r"^(?:[^/:\s]*@)?([^/:@\s]+):(.*)$")
 BROKER_REPO_PATH_RE = re.compile(rf"^({NAME})/({NAME}?)(?:\.git)?/?$")
 # Hosts whose `OWNER/REPO` the daemon's github.com cache answers for. `api.github.com` is in
 # BROKER_GITHUB_HOSTS because gh's hosts.yml names it; it is not a clone host, so a remote
@@ -3489,7 +3517,11 @@ GIT_CONFIG_KEY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*(.*))?$")
 GIT_CONFIG_ESCAPES = {"n": "\n", "t": "\t", "b": "\b", '"': '"', "\\": "\\"}
 # GitHub's own credential shapes, never written to the shared log whatever slot they arrived in
 BROKER_SECRET_RE = re.compile(r"gh[posur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}", re.IGNORECASE)
-BROKER_RESOLVED_RE = re.compile(r"^\s*gh-resolved\s*=", re.MULTILINE)
+# How long git may take to say what this checkout's remotes are. Two forks in front of a real gh
+# call, so it is bounded like everything else here: a checkout on a hung mount declines, which
+# costs one request, rather than hanging the call. Tighter than SUBPROCESS_DEADLINE because nothing
+# is waiting on the answer except a decision to decline.
+BROKER_GIT_DEADLINE = 5.0
 
 
 def guard_log() -> Path:
@@ -3587,8 +3619,14 @@ def broker_local_repos(now: float | None = None) -> dict[str, str]:
     # again -- and a map that is missing a repo only means the refusal declines and gh runs, which
     # is the safe direction.
     complete = True
+    # Two bounds for one deadline, because each covers what the other cannot. The clock check
+    # bounds the *loop* and works everywhere, including off the main thread where hard_deadline is
+    # a documented no-op; SIGALRM is what interrupts a single read that is already blocked on a
+    # hung mount, which no amount of checking between reads can reach. ScanDeadline rather than
+    # DeadlineTimeout because this block's own frames catch OSError -- see ScanDeadline.
+    deadline = time.monotonic() + BROKER_SCAN_DEADLINE
     try:
-        with hard_deadline(BROKER_SCAN_DEADLINE):
+        with hard_deadline(BROKER_SCAN_DEADLINE, ScanDeadline):
             for root in roots:
                 for depth in (1, 2):
                     try:
@@ -3596,10 +3634,12 @@ def broker_local_repos(now: float | None = None) -> dict[str, str]:
                     except OSError:
                         continue
                     for d in candidates:
+                        if time.monotonic() >= deadline:
+                            raise ScanDeadline(f"no complete scan within {BROKER_SCAN_DEADLINE:g}s")
                         for owner_repo in broker_remotes(d):
                             if broker_better_checkout(d, found.get(owner_repo), owner_repo):
                                 found[owner_repo] = str(d)
-    except DeadlineTimeout:
+    except ScanDeadline:
         complete = False
     if complete:
         write_json(broker_repos_path(), {"at": now, "repos": found})
@@ -3651,10 +3691,18 @@ def git_config_value(raw: str) -> str | None:
     git_config_remote_urls for why that is not the same as an empty value."""
     out: list[str] = []
     # Whether each character came from inside quotes or from an escape. git trims the whitespace
-    # around a value but keeps what quotes protect, and a flat `.strip()` kept neither apart:
-    # `url = "  https://github.com/me/cli"` read as `me/cli` and was served, where git's value
-    # keeps the spaces and gh does not recognise it as a github remote at all -- the broker
-    # answering where gh would not, which is the one direction that matters here.
+    # around a value but keeps what quotes protect, and a flat `.strip()` kept neither apart, so
+    # `url = "  https://github.com/me/cli"` read as `me/cli` where git's own value is
+    # `  https://github.com/me/cli`.
+    #
+    # An earlier version of this comment said gh "does not recognise it as a github remote at all",
+    # and that is false: measured, `git config --get remote.origin.url` keeps the spaces and gh
+    # resolves `me/cli` anyway, because gh reads remotes from `git remote -v`, whose output is
+    # whitespace-split -- the leading spaces are field separators gh never sees. So this is not a
+    # case of the broker answering where gh would not. It is simply the value git holds, which is
+    # what a reader of this text is entitled to, and the serve path no longer reads this text at
+    # all (git_remotes). What it costs is one entry in the local index, so a refusal declines and
+    # the call goes to gh: the safe direction, for a shape no real config has.
     protected: list[bool] = []
     quoted = False
     i = 0
@@ -3707,10 +3755,15 @@ def git_config_remote_urls(text: str) -> list[str] | None:
     `[remote.upstream]`, or one byte-order mark in front of `[remote "origin"]`, did exactly that --
     the BOM case served the *upstream* as the checkout's repository. So anything not understood here
     -- an unclassifiable line, an `[include]` this would have to follow, a value that continues on
-    the next line -- returns None, and both callers read None as "no remote at all", which is
-    genuinely safe for each: broker_repo() declines to serve and broker_local_repos() declines to
-    refuse. git's own parser accepts a key on the section-header line and skips a UTF-8 BOM, so this
-    does both."""
+    the next line -- returns None, and the caller reads None as "no remote at all", so the local
+    index declines to refuse. git's own parser accepts a key on the section-header line and skips a
+    UTF-8 BOM, so this does both.
+
+    All-or-nothing is still the rule here, but it is no longer what makes a *served* answer safe:
+    being exact about a config this reads in full says nothing about the scopes it never opens, and
+    the round that followed measured five more ways to a subset through this file alone. That is
+    git_remotes' job now, and the index is allowed to be approximate because a wrong entry there
+    only costs a request (broker_source_refusal confirms the one it is about to name)."""
     urls: list[str] = []
     section, subsection = "", ""
     for raw in text.removeprefix("\ufeff").splitlines():  # git skips one; without this the first [ is not a header
@@ -3775,10 +3828,17 @@ def broker_remote_target(url: str) -> tuple[str, str] | None:
 
 
 def broker_remotes(checkout: Path) -> list[str]:
-    """The owner/repo of every github.com remote of `checkout`, lowercased, in config order.
+    """The owner/repo of every github.com remote in `checkout`'s config text, lowercased, in config
+    order.
+
+    For the local index only (broker_local_repos), which is a scan of thousands of candidate
+    directories and so cannot afford a fork each. What a checkout's remotes *are* is git's answer,
+    not this file's -- see git_remotes, which is what the serve path asks, and what confirms an
+    index entry before a refusal names it. The two differ wherever a scope this text does not hold
+    has something to say, and only the one that can serve a cached answer has to be exact.
 
     Empty for a config this cannot read *in full*, which is the same answer as "no github remotes
-    here" on purpose: both callers decline on it.
+    here" on purpose: the caller declines on it.
 
     "In full" includes every github remote's URL, not only the file's syntax. An earlier cut read
     the config all-or-nothing and then silently skipped any URL its one pattern missed, which left
@@ -3796,18 +3856,89 @@ def broker_remotes(checkout: Path) -> list[str]:
         return []
     found: list[str] = []
     for url in urls:
-        target = broker_remote_target(url)
-        if target is None:
-            continue  # not a URL with a host at all: another kind of remote, never ours
-        host, path = target
-        if host != "github.com" and not host.endswith(".github.com"):
-            continue  # another forge, and `notgithub.com` is one of them
-        match = BROKER_REPO_PATH_RE.match(path)
-        if host not in BROKER_REMOTE_HOSTS or match is None:
+        if not broker_add_remote(url, found):
             return []
-        name = f"{match.group(1).lower()}/{match.group(2).lower()}"
-        if name not in found:
-            found.append(name)
+    return found
+
+
+def broker_add_remote(url: str, found: list[str]) -> bool:
+    """Add the owner/repo of `url` to `found` when it is a github.com remote. False for a github URL
+    whose shape is not understood, which the caller must answer for with "no remotes known" -- never
+    with the subset it did read (see broker_remotes)."""
+    target = broker_remote_target(url)
+    if target is None:
+        return True  # not a URL with a host at all: another kind of remote, never ours
+    host, path = target
+    if host != "github.com" and not host.endswith(".github.com"):
+        return True  # another forge, and `notgithub.com` is one of them
+    match = BROKER_REPO_PATH_RE.match(path)
+    if host not in BROKER_REMOTE_HOSTS or match is None:
+        return False
+    name = f"{match.group(1).lower()}/{match.group(2).lower()}"
+    if name not in found:
+        found.append(name)
+    return True
+
+
+def git_remotes(where: Path) -> list[str] | None:
+    """The owner/repo of every github.com remote git lists for the repository at or above `where`,
+    lowercased, or None when that cannot be known exactly -- no repository there, a config git
+    refuses, a shape this does not understand, or a `gh-resolved` entry pointing gh at a repository
+    this cannot see.
+
+    Asked of git, because `<checkout>/.git/config` is not where the answer lives. gh resolves
+    remotes by running `git remote -v` and `git config --get-regexp '^remote\\..*\\.gh-resolved$'`
+    (observed under GH_DEBUG=api), and both compose every config scope and apply
+    `url.<base>.insteadOf` rewriting. Reading the one file left a strict *subset* of the remotes git
+    lists, and a subset of two is one, which is exactly what broker_repo's one-remote rule acts on.
+    Measured against git 2.53.0 and gh 2.98.0, each one serving a fork's PR 7 where gh answers the
+    upstream's:
+      - `remote.upstream.url` set in `~/.gitconfig`, a scope this text read nothing of;
+      - `url.<base>.insteadOf` in `~/.gitconfig`, which changes the host git uses. With
+        `insteadOf = https://github.com/` pointing at a mirror, gh exits 1 ("none of the git remotes
+        ... point to a known GitHub host") and the broker answered `cli/cli` with exit 0 -- inventing
+        success where gh refuses, which is worse than a wrong repository;
+      - `gh:cli/cli` with a global `insteadOf` making it a github URL, which this read as another
+        forge's and skipped;
+      - a remote with a `pushurl` and no `url`, which `git remote -v` lists and gh resolves;
+      - `gh-resolved` written on the section-header line, or spelled `GH-Resolved`: git config keys
+        are case-insensitive and a line-anchored case-sensitive pattern over the text saw neither.
+    Two forks of git, weighed against one request out of the 5000/h every agent on this account
+    shares, is the right trade. git missing or unrunnable is None, which is also what gh would have
+    to answer: gh resolves repositories by running git too."""
+    args = ["git", "-C", str(where)]
+    try:
+        # git walks up from here exactly as gh does. Looking only at the directory itself meant
+        # `gh pr view 7` run from `repo/src` -- which is most of how agents run it -- resolved no
+        # repository and spent a request on something the cache was holding.
+        resolved = run_bounded([*args, "config", "--get-regexp", r"^remote\..*\.gh-resolved$"],
+                               timeout=BROKER_GIT_DEADLINE)
+        listed = run_bounded([*args, "remote", "-v"], timeout=BROKER_GIT_DEADLINE)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    # `--get-regexp` exits 1 for "asked, and no key matches"; anything else non-zero (128) is a
+    # config or a repository git will not read, and neither will gh.
+    if resolved.returncode not in (0, 1) or listed.returncode != 0:
+        return None
+    if resolved.stdout.strip():
+        return None  # `gh repo set-default`: gh resolves through it, and this cannot see where to
+    found: list[str] = []
+    for line in listed.stdout.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        # `NAME<TAB>URL (fetch|push)`, and both lines of a remote are read: a `pushurl` to another
+        # repository is a second answer, not a detail. A remote with only a pushurl prints
+        # `NAME<TAB>` with no URL and no marker for its fetch line (measured), which is a shape we
+        # know rather than one we cannot read. Anything else -- a URL with whitespace in it, which
+        # git keeps inside quotes and this output cannot express -- is unknown, and gh, which
+        # splits this same text, cannot read it either.
+        if len(fields) == 1:
+            continue
+        if len(fields) != 3 or fields[2] not in ("(fetch)", "(push)"):
+            return None
+        if not broker_add_remote(fields[1], found):
+            return None
     return found
 
 
@@ -3891,6 +4022,16 @@ def broker_source_refusal(words: list[str]) -> str | None:
         where = broker_local_repos().get(f"{owner}/{repo}")
         if where is None:
             return None
+        # The index is built from config *text*, which is not where the answer lives (git_remotes):
+        # a remote rewritten by an `insteadOf` in a scope that text does not hold, or one written
+        # in another scope entirely, puts an entry here that names a checkout of some other
+        # repository -- and this message tells the reader to run `git show` in it, so a wrong entry
+        # hands back another repository's bytes as these. Confirmed with git before it is named.
+        # Declining costs one request and says nothing untrue; the scan itself stays a cheap text
+        # read, because one fork per candidate directory is not affordable and a miss there only
+        # declines.
+        if f"{owner}/{repo}" not in (git_remotes(Path(where)) or []):
+            return None
         return (f"glaeda-gh: reading {owner}/{repo} source through the GitHub API spends the quota every agent "
                 f"on this account shares (5000/h between all of them), and git has the same bytes for nothing.\n"
                 f"  {owner}/{repo} is checked out at {where}:\n"
@@ -3900,35 +4041,14 @@ def broker_source_refusal(words: list[str]) -> str | None:
     return None
 
 
-def broker_checkout(start: Path) -> Path | None:
-    """The checkout `start` is in: the nearest directory at or above it holding a `.git`.
-
-    gh resolves a repository the way git does, by walking up from the working directory, so this
-    has to as well. Looking only in the working directory itself meant that `gh pr view 7` run
-    from `repo/src` -- which is most of how agents run it -- resolved no repository, took the
-    `pass` route, and spent a request on something the cache was holding."""
-    try:
-        here = start.resolve()
-    except OSError:
-        return None
-    for candidate in [here, *here.parents]:
-        dot = candidate / ".git"
-        try:
-            if dot.is_dir() or dot.is_file():
-                return candidate
-        except OSError:
-            return None
-    return None
-
-
 def broker_repo(values: dict[str, str]) -> str | None:
     """OWNER/REPO for this call, or None when it cannot be known beyond doubt.
 
-    `-R`/`--repo` first, then $GH_REPO, then the current checkout -- found by walking up from the
-    process's own working directory, which is the caller's, because the broker execs in place --
-    but only when that checkout names exactly one GitHub remote and has no `gh-resolved` entry
-    (`gh repo set-default`, which would point gh somewhere this cannot see). Guessing here answers
-    one repository's question with another's.
+    `-R`/`--repo` first, then $GH_REPO, then the checkout the process's own working directory is in
+    -- the caller's, because the broker execs in place -- but only when git lists exactly one
+    GitHub remote there and no `gh-resolved` entry (`gh repo set-default`, which would point gh
+    somewhere this cannot see). git does the walking up, as it does for gh (git_remotes). Guessing
+    here answers one repository's question with another's.
 
     Anything aimed at another GitHub host is None: gh takes `[HOST/]OWNER/REPO` and reads $GH_HOST,
     and an enterprise host's PR 7 is not the PR 7 in this cache."""
@@ -3946,13 +4066,9 @@ def broker_repo(values: dict[str, str]) -> str | None:
         # under it this walk can land on a different repository than gh would, which since the
         # walk was added is a wrong answer rather than a wasted request.
         return None
-    checkout = broker_checkout(Path.cwd())
-    if checkout is None:
+    here = git_remotes(Path.cwd())
+    if here is None:
         return None
-    text = git_config_text(checkout)
-    if text is None or BROKER_RESOLVED_RE.search(text):
-        return None
-    here = broker_remotes(checkout)
     # Still exactly one, now that the remotes are read the way git reads them. The cmux checkout
     # really does have five (the fork a lane pushes from, and contributors' forks), so this
     # declines there and `gh pr view 7` without `-R` costs a request. Picking `origin` instead
