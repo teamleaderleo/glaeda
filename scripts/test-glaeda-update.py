@@ -637,6 +637,21 @@ class UpdateTest(unittest.TestCase):
                          self.server.rings["canary"]["tag"])
         self.assertFalse((self.state / "pre-ota").exists())  # snapshot dropped after the first success
 
+    def test_a_gh_only_host_checks_only_the_tools_it_installs(self) -> None:
+        ran = []
+
+        def fake_run(argv, **kw):
+            ran.append(Path(argv[1] if argv[0] == sys.executable else argv[0]).name)
+            return subprocess.CompletedProcess(argv, 0, '{"result": "current"}\n', "")
+
+        with mock.patch.object(gu.subprocess, "run", fake_run):
+            self.assertEqual(gu.health(self.bin, self.root, gh_only=True), (True, "tools run"))
+            self.assertEqual(ran, ["glaeda-gh", "glaeda-update"])
+            ran.clear()
+            gu.health(self.bin, self.root)
+        self.assertEqual(ran, ["glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-worktree-reclaim",
+                               "glaeda-gh", "glaeda-update"])
+
     def test_real_updater_plans_from_a_channel_dir_without_network(self) -> None:
         entry = self.server.publish(SOURCES[0])
         channel_dir = self.root / "channel"

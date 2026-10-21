@@ -871,6 +871,33 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(self.states(again), {"unchanged"})
         self.assertFalse(any("systemctl" in os.path.basename(c[0]) for c in self.calls))
 
+    def test_gh_only_installs_the_watcher_and_its_updater_and_nothing_else(self) -> None:
+        """A lane host with no glaeda hygiene (huge-blue): glaeda-gh on the release ring, nothing that reclaims."""
+        self.linux()
+        receipt = self.invoke("--gh-only", "--ota-ring", "stable", "--apply")
+        self.assertEqual((receipt["platform"], receipt["profile"]), ("linux", "gh"))
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        units = self.home / ".config/systemd/user"
+        self.assertEqual(sorted(p.name for p in units.iterdir()),
+                         ["glaeda-gh.service", "glaeda-update.service", "glaeda-update.timer"])
+        self.assertEqual(sorted(p.name for p in (self.home / ".local/bin").iterdir()), ["glaeda-gh", "glaeda-update"])
+        config = json.loads((self.home / ".config/glaeda/update.json").read_text())
+        self.assertEqual((config["ring"], config["setupArgs"]), ("stable", ["--gh-only"]))
+        self.assertTrue((self.home / ".claude/skills/github-ci-wait/SKILL.md").is_file())
+        self.assertFalse((self.home / "Projects").exists())
+        kinds = {a["kind"] for a in receipt["actions"]}
+        self.assertEqual(kinds - {"dir", "tool", "agent", "config"}, set())  # no git, gitpkg, python, marker
+        self.assertEqual(self.states(self.invoke("--gh-only", "--apply")), {"unchanged"})
+
+    def test_gh_only_on_a_mac_keeps_two_agents(self) -> None:
+        receipt = self.invoke("--gh-only", "--apply")
+        self.assertEqual(receipt["profile"], "gh")
+        labels = sorted(a["label"] for a in receipt["actions"] if a["kind"] == "agent")
+        self.assertEqual(labels, sorted(l for l in ms.agent_plists(self.ctx_for_steps())
+                                        if ms.is_update_agent(l) or ms.is_gh_agent(l)))
+        self.assertEqual(len(labels), 2)
+        self.assertFalse(any(a["kind"] == "marker" for a in receipt["actions"]))
+
     def test_linux_fleet_role_does_not_install_devbox_tidy_units(self) -> None:
         self.linux()
         out = io.StringIO()

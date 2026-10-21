@@ -15,7 +15,9 @@ written once by setup and never overwritten:
      "reportStatus": true, "source": "teamleaderleo/glaeda"}
 
 For a GUI-less macOS host, setupArgs also contains `--headless`; this keeps OTA reinstalls in
-the system launchd domain instead of silently returning to a GUI-only agent.
+the system launchd domain instead of silently returning to a GUI-only agent. A lane host with no glaeda
+hygiene has `["--gh-only"]`: setup installs only glaeda-gh and this updater, and the health check runs only
+those two.
 
 `source` is where releases and channel files are downloaded from: this repository, or its read-only
 mirror manaflow-ai/glaeda, which the Manaflow minis use (docs/GLAEDA_OTA.md, Fleet mirror). The mirror
@@ -429,14 +431,17 @@ def run_setup(gen: Path, args: list[str]) -> tuple[bool, str]:
     return result.returncode == 0, (result.stdout + result.stderr)[-2000:]
 
 
-def health(bin_dir: Path, channel_dir: Path) -> tuple[bool, str]:
+def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[bool, str]:
     """The installed tools run, and the installed glaeda-update plans from the channel files this
-    run already fetched, so a network blip cannot fail (and quarantine) a good release."""
-    checks = [
+    run already fetched, so a network blip cannot fail (and quarantine) a good release. A --gh-only
+    host installs only glaeda-gh and glaeda-update, so only those are checked there."""
+    hygiene = [] if gh_only else [
         [sys.executable, str(bin_dir / "glaeda-disk"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-worktree"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-projects"), "--help"],
         [str(bin_dir / "glaeda-worktree-reclaim"), "--help"],
+    ]
+    checks = hygiene + [
         [sys.executable, str(bin_dir / "glaeda-gh"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-update"), "--channel-dir", str(channel_dir)],
     ]
@@ -1082,7 +1087,7 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         channel_dir.mkdir(parents=True, exist_ok=True)
         (channel_dir / "control.json").write_bytes(control_raw)
         (channel_dir / f"{config['ring']}.json").write_bytes(ring_raw or b"")
-        ok, detail = health(bin_dir, channel_dir)
+        ok, detail = health(bin_dir, channel_dir, gh_only="--gh-only" in config["setupArgs"])
     if ok:
         state.update(previous=state["current"], current=entry["tag"])
         save_state(state, state_dir)
