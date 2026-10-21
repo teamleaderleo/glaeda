@@ -5528,7 +5528,8 @@ class RunnerTest(unittest.TestCase):
         prefixes = ("glaeda-std", "glaeda-root", "glaeda-side", "glaeda-gui", "glaeda-session")
         self.assertEqual([[x for x in l if x.startswith(prefixes)] for l in labels],
                          [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"],
-                          ["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"],
+                          ["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6",
+                           "glaeda-side-light-xcode-26.6"],
                           ["glaeda-gui-std-xcode-26.6", "glaeda-session-std-xcode-26.6"]],
                          "the gui runner carries neither the pool label nor a root or side one, and the session label")
         self.assertIn("glaeda-ios-sim", labels[0])
@@ -5547,7 +5548,7 @@ class RunnerTest(unittest.TestCase):
                                                           "glaeda-session"))]
         self.assertEqual([roles(l) for l in labels],
                          [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"]] * 2
-                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"]] * 2
+                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"]] * 2
                          + [["glaeda-session-std-xcode-26.6"], ["glaeda-gui-std-xcode-26.6"]],
                          "only the last carries the gui label, so no console job lands where its token is held, and "
                          "with a session runner beside it the console runner leaves session jobs to that one")
@@ -5592,7 +5593,7 @@ class RunnerTest(unittest.TestCase):
                                                           "glaeda-fast"))]
         self.assertEqual([roles(l) for l in today],
                          [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"]] * 2
-                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"]] * 3)
+                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"]] * 3)
         zero, zero_hooks = self.fast_labels({**base, "fastRunners": 0}, "zero")
         self.assertEqual((zero, zero_hooks), (today, today_hooks), "fastRunners 0 is today's fleet exactly")
         self.assertFalse([h for h in today_hooks if "--fast-runner" in h])
@@ -6343,6 +6344,24 @@ MANIFEST = {
 
 
 class ManifestLabelsTest(unittest.TestCase):
+    def test_side_labels_widen_to_narrower_classes_only(self) -> None:
+        # One rule from the manifest's class order: a side runner carries its own class's side label and every
+        # narrower class's, so GitHub hands a starved light queue to idle std side runners; a light runner never
+        # carries a std label, and root labels never widen.
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["hosts"]["mini-light"]["availability"] = "dedicated"
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            std, _ = cr.member_labels(manifest, "mini-std")
+            light, _ = cr.member_labels(manifest, "mini-light")
+        self.assertEqual(light["sidePools"], ["glaeda-side-light-xcode-26.6"])
+        self.assertEqual(light["rootPools"], ["glaeda-root-light-xcode-26.6"])
+        self.assertFalse([label for label in light["labels"] + light["sidePools"] if "-std-" in label])
+        self.assertEqual(std["sidePools"], ["glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"])
+        self.assertEqual(std["rootPools"], ["glaeda-root-std-xcode-26.6"])
+        self.assertEqual(std["pools"], ["glaeda-std-xcode-26.6"], "the pool count stays the member's own class")
+        self.assertEqual(fleet_labels.side_classes("xl"), ("xl", "std", "light"))
+        self.assertEqual(fleet_labels.side_classes("dev"), ())
+
     def test_runner_capacity_per_class(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
             std, _ = cr.member_labels(MANIFEST, "mini-std")
@@ -6360,7 +6379,10 @@ class ManifestLabelsTest(unittest.TestCase):
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["compileSlots"], 1)
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["canonicalRoots"], 1)
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["rootPools"], ["glaeda-root-std-xcode-26.6"])
-            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["sidePools"], ["glaeda-side-std-xcode-26.6"])
+            # A std side runner also carries the light side label: light jobs spill onto it, never the reverse.
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["sidePools"],
+                             ["glaeda-side-std-xcode-26.6", "glaeda-side-light-xcode-26.6"])
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["rootPools"], ["glaeda-root-std-xcode-26.6"])
             manifest["defaults"]["runner"]["classes"]["std"]["compileSlots"] = 2
             self.assertIn("compileSlots 2 needs canonicalRoots 2", cr.member_labels(manifest, "mini-std")[1])
             manifest["defaults"]["runner"]["classes"]["std"]["canonicalRoots"] = 2
@@ -6492,7 +6514,7 @@ class ManifestLabelsTest(unittest.TestCase):
         self.assertIsNone(why)
         self.assertIn("glaeda-aws-std-xcode-26.6", member["labels"])
         self.assertEqual(member["rootPools"], ["glaeda-aws-root-std-xcode-26.6"])
-        self.assertEqual(member["sidePools"], ["glaeda-aws-side-std-xcode-26.6"])
+        self.assertEqual(member["sidePools"], ["glaeda-aws-side-std-xcode-26.6", "glaeda-aws-side-light-xcode-26.6"])
         for prefix in ("root-", "side-", "gui-", "trusted-", "std-", "light-", "xl-"):
             invalid = copy.deepcopy(MANIFEST)
             invalid["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"poolPrefix": prefix}
