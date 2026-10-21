@@ -3391,11 +3391,12 @@ class GlaedaDiskTest(unittest.TestCase):
     def test_the_repo_runner_hook_is_allowlisted_for_drain(self) -> None:
         """Every change to scripts/glaeda-cmux-runner-hook must pin its sha256 in CMUX_NEXT_DRAIN_HOOK_SHA256, or
         drain refuses every runner that installed it ("runner hook enrollment is not proven"). #1561 missed it
-        and the three drain tests below went red on main with a message that did not say why (#1553 before it)."""
-        import hashlib
-        sha = hashlib.sha256((ROOT / "scripts/glaeda-cmux-runner-hook").read_bytes()).hexdigest()
-        self.assertIn(sha, gd.CMUX_NEXT_DRAIN_HOOK_SHA256,
-                      f'add "{sha}" to CMUX_NEXT_DRAIN_HOOK_SHA256 in scripts/glaeda-disk')
+        and the three drain tests below went red on main with a message that did not say why (#1553 before it).
+        On a checkout this pins it (scripts/glaeda_hook_pin.py); under CI it only checks."""
+        sys.path.insert(0, os.fspath(ROOT / "scripts"))
+        import glaeda_hook_pin
+        self.assertIsNone(glaeda_hook_pin.ensure(check=glaeda_hook_pin.under_ci()))
+        self.assertIn(glaeda_hook_pin.hook_sha(), glaeda_hook_pin.pinned((ROOT / "scripts/glaeda-disk").read_text()))
 
     def test_cmux_next_drain_requires_enrollment_and_holds_host_lock(self) -> None:
         fleet = self.root / "fleet"
