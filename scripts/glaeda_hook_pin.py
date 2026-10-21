@@ -29,8 +29,8 @@ BLOCK = re.compile(r"^CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset\(\{\n(?P<body>(?: 
 COMMAND = "python3 scripts/glaeda_hook_pin.py"
 
 
-def hook_sha(hook: Path = HOOK) -> str:
-    return hashlib.sha256(hook.read_bytes()).hexdigest()
+def hook_sha(hook: Path | None = None) -> str:
+    return hashlib.sha256((hook or HOOK).read_bytes()).hexdigest()
 
 
 def pinned(text: str) -> list[str]:
@@ -48,8 +48,9 @@ def pin(text: str, sha: str) -> str:
     return text[:match.end("body")] + f'    "{sha}",\n' + text[match.end("body"):]
 
 
-def ensure(check: bool, hook: Path = HOOK, disk: Path = DISK) -> str | None:
+def ensure(check: bool, hook: Path | None = None, disk: Path | None = None) -> str | None:
     """None when the hook's sha is pinned (after pinning it, unless check); else what is wrong."""
+    hook, disk = hook or HOOK, disk or DISK
     sha, text = hook_sha(hook), disk.read_text()
     if sha in pinned(text):
         return None
