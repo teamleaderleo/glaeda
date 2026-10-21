@@ -66,6 +66,7 @@ class GlaedaDiskTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         gd.process_evidence = self.gd_evidence
+        gd.FLOOR_HOLD = {}  # a main() pressure run in a test sets it
         gd.NESTED_KEEP.unlink(missing_ok=True)
         gd.NESTED_KEEP = self.gd_keep
         self.tmp.cleanup()
@@ -2743,7 +2744,7 @@ class GlaedaDiskTest(unittest.TestCase):
         home, fams = self._runner_checkouts()
         fams = [f for f in fams if f.id == gd.RUNNER_BUILD_FAMILY]
         for name in ("actions-runner-glaeda", "actions-runner-glaeda-2"):
-            self._age(home / name / "_work", hours=0.2)  # built minutes ago, then the gate held the runner
+            self._age(home / name / "_work", hours=0.2)  # built minutes ago, then the disk went under the floor
         worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
         gd.process_evidence = lambda: ([], worker)
         dev = home.stat().st_dev

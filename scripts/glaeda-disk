@@ -683,11 +683,12 @@ def remove_spm_scratch(path: Path) -> bool:
 # the SwiftPM scratch no job holds goes whatever its age: it rebuilds in minutes, and the runner floor is near.
 EMERGENCY_DEVS: frozenset[int] = frozenset()
 
-# Filesystems (device -> free bytes to stop at) where the runner gate holds every listener for disk in this
-# pressure run: free is under the hooks' --min-free-gib plus GATE_DISK_RESUME_GIB. No job can start there, so idle
-# runners' build output need not wait out RUNNER_BUILD_IDLE_HOURS: it goes at once (each delete still re-reads ps
-# for that runner's Runner.Worker), but only up to the floor plus target_margin_gib, so the rest of the idle
-# runners keep warm builds. cmux11s and cmux9s sat at 8-25 GiB under a 30 GiB floor with 25-40 GiB of it
+# Filesystems (device -> free bytes to stop at) where the runner gate holds runners for disk in this pressure
+# run: free is under the hooks' --min-free-gib plus GATE_DISK_RESUME_GIB (a held runner resumes only above that).
+# Idle runners' build output need not wait out RUNNER_BUILD_IDLE_HOURS there: it goes at once, after everything
+# else apply would take, and only up to the floor plus target_margin_gib, so the rest keep warm builds. What
+# keeps a job's output is the fresh ps before each delete (a Runner.Worker exists before the job's checkout),
+# not the gate: a runner that was never held can still take a job between the floor and the resume mark. cmux11s and cmux9s sat at 8-25 GiB under a 30 GiB floor with 25-40 GiB of it
 # "recent" while the gate held every runner idle (2026-10-21).
 FLOOR_HOLD: dict[int, int] = {}
 GATE_DISK_RESUME_GIB = 2.0  # glaeda-cmux-runner-hook's: a disk hold ends only this far above the floor
@@ -5605,6 +5606,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     archived = archived_seeds() if any(i.family == "cmux-seeds" for i in items) else frozenset()
     # Among pressure hot-tier items, evict greatest reuse distance, then oldest use.
     def order(i):
+        if i.family == RUNNER_BUILD_FAMILY and i.idle_hours < idle_window(family_of(i), idle_hours):
+            return (-1, 0, i.idle_hours, i.bytes)  # reclaimable only by FLOOR_HOLD: warm builds go last
         if i.family == RUNNER_GIT_GARBAGE_FAMILY:  # garbage nothing reads goes before anything that costs a rebuild
             return (2, 0, i.idle_hours, i.bytes)
         if ACTIVITY_MODE == "pressure" and (i.family in FLEET_FAMILY_IDS or i.family == RUNNER_BUILD_FAMILY):
