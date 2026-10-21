@@ -1783,9 +1783,9 @@ def stage_next(hook_dir: Path, staged: Path, stale: list[str], sources: dict[str
     if RESERVATION_NAME in stale:
         write_atomic(hook_dir / f".{RESERVATION_NAME}{NEXT_SUFFIX}", *sources[RESERVATION_NAME], make_parent=False)
     record = {"replaces": hashlib.sha256((hook_dir / HOOK_NAME).read_bytes()).hexdigest(),
-              "hook": sha256_bytes(sources[HOOK_NAME][0])}
+              "hook": hashlib.sha256(sources[HOOK_NAME][0]).hexdigest()}  # bare hex digests, as the hook compares
     if RESERVATION_NAME in stale:
-        record["module"] = sha256_bytes(sources[RESERVATION_NAME][0])
+        record["module"] = hashlib.sha256(sources[RESERVATION_NAME][0]).hexdigest()
     os.replace(staged, hook_dir / f".{HOOK_NAME}{NEXT_SUFFIX}")
     write_atomic(hook_dir / NEXT_RECORD, (json.dumps(record, sort_keys=True) + "\n").encode(), 0o644, make_parent=False)
     sync_dir(hook_dir)
