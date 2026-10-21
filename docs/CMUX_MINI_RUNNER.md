@@ -527,8 +527,11 @@ changed; reloading the gate"). Wrapper, label or LaunchAgent changes still need
 compares its gate settings with main's: each module-level value that reads a `GLAEDA_RUNNER_*`
 variable with a code default (`GATE_FIRST_POLL_S`, `GATE_RESTART_FREE_S`, `GATE_CPU_PAUSE`, ...).
 No runner sets those variables, so a hook that lags main runs main's old defaults. A runner
-`lags` when a setting differs or is missing, `differs` when only its bytes do; exit 1 when one
-lags or a member cannot be read. It only reports: the heal is the refresh above or `--apply`.
+`lags` when a setting differs or is missing, `differs` when only its bytes do. A lagging runner
+is `converging` while main's hook change is still on its way (docs/GLAEDA_OTA.md step 3): not
+yet on stable and younger than the soak, promote.yml's hourly schedule and two glaeda-update
+runs, or on stable for less than those two runs. Exit 1 when one lags or a member cannot be
+read. It only reports: the heal is the refresh above or `--apply`.
 
 Relabelling keeps the runner's name. Moving an existing `<hostname>-glaeda` runner
 to a member whose name `<member>-glaeda` differs is a different install: the

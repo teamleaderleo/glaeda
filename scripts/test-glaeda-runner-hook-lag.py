@@ -11,12 +11,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKOUT_FILES = ("glaeda-runner-hook-lag", "glaeda-cmux-runner-fleet", "glaeda-cmux-runner",
-                  "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py")
+                  "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py", "glaeda-update",
+                  "glaeda_release.py")
+LONG_AGO = "2026-01-01T00:00:00Z"
 MANIFEST = {
     "defaults": {"xcode": {"apps": [{"path": "/Applications/Xcode_26.6.app", "version": "26.6", "build": "17F113"}]}},
     "hosts": {
@@ -101,6 +104,7 @@ class HookLagTest(unittest.TestCase):
         self.git("commit", "-q", "-m", "one")
         self.git("remote", "add", "origin", os.fspath(origin))
         self.git("push", "-q", "origin", "main")
+        self.head = self.git("rev-parse", "HEAD")
         self.hook = (ROOT / "scripts" / "glaeda-cmux-runner-hook").read_text()
 
     def tearDown(self) -> None:
@@ -118,9 +122,16 @@ class HookLagTest(unittest.TestCase):
         hooks.mkdir(parents=True)
         (hooks / "glaeda-cmux-runner-hook").write_text(text)
 
-    def lag(self, *args: str, **env: str) -> subprocess.CompletedProcess:
+    def stable(self, source: str, promoted: str) -> Path:
+        path = self.dir / "stable.json"
+        path.write_text(json.dumps({"ring": "stable", "source": source, "promoted": promoted}))
+        return path
+
+    def lag(self, *args: str, stable: Path | None = None, **env: str) -> subprocess.CompletedProcess:
+        stable = stable or self.stable(self.head, LONG_AGO)  # main's hook on stable long ago: a lag is a lag
         return subprocess.run([sys.executable, os.fspath(self.repo / "scripts" / "glaeda-runner-hook-lag"),
-                               "--manifest", os.fspath(self.manifest), "--output", "json", *args],
+                               "--manifest", os.fspath(self.manifest), "--output", "json",
+                               "--stable-json", os.fspath(stable), *args],
                               capture_output=True, text=True, timeout=300, env={**self.env, **env})
 
     def test_an_old_hook_lags_by_setting_and_a_current_one_does_not(self) -> None:
@@ -142,6 +153,29 @@ class HookLagTest(unittest.TestCase):
             {"name": "GATE_RESTART_FREE_S", "main": "60.0", "installed": None}])
         self.assertFalse(list(self.homes.rglob("__pycache__")))  # nothing written on a member
 
+    def test_a_lag_converges_while_the_release_reaches_the_runners(self) -> None:
+        self.install("mini-a", "actions-runner-glaeda", old_hook(self.hook))
+        self.install("mini-b", "actions-runner-glaeda", self.hook)
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        cases = {"released": self.stable(self.head, now),  # promoted just now: inside the refresh window
+                 "soaking": self.stable("0" * 40, LONG_AGO)}  # stable lacks the (fresh) hook commit
+        for state, stable in cases.items():
+            with self.subTest(state):
+                out = self.lag(stable=stable)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                report = json.loads(out.stdout)
+                self.assertEqual(report["rollout"]["state"], state)
+                members = {m["member"]: m["state"] for m in report["members"]}
+                self.assertEqual(members, {"mini-a": "converging", "mini-b": "current"})
+
+    def test_an_unreadable_channel_gives_no_window(self) -> None:
+        self.install("mini-a", "actions-runner-glaeda", old_hook(self.hook))
+        out = self.lag(stable=self.dir / "missing.json")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        report = json.loads(out.stdout)
+        self.assertEqual(report["rollout"]["state"], "unknown")
+        self.assertEqual(report["members"][0]["state"], "lags")
+
     def test_other_bytes_with_the_same_settings_differ_but_do_not_lag(self) -> None:
         self.install("mini-a", "actions-runner-glaeda", self.hook + "\n# a comment\n")
         self.install("mini-b", "actions-runner-glaeda", self.hook)
@@ -151,7 +185,8 @@ class HookLagTest(unittest.TestCase):
         self.assertEqual(members, {"mini-a": "differs", "mini-b": "current"})
 
     def test_an_unreachable_member_or_a_broken_hook_fails_the_check(self) -> None:
-        self.install("mini-a", "actions-runner-glaeda", "raise SystemExit('broken')\n" + self.hook)
+        future = "from __future__ import annotations\n"  # a hook that exits on import, after its first statement
+        self.install("mini-a", "actions-runner-glaeda", self.hook.replace(future, future + "raise SystemExit(3)\n", 1))
         out = self.lag(FAKE_DOWN="mini-b")
         self.assertEqual(out.returncode, 1, out.stderr)
         members = {m["member"]: m for m in json.loads(out.stdout)["members"]}
