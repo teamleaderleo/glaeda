@@ -2941,6 +2941,7 @@ class GlaedaDiskTest(unittest.TestCase):
         receipt = ["--receipt", os.fspath(self.receipt())]
         with mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
                 mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "MEASURE_LOCK", self.root / "measure.lock"), \
                 mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
                 mock.patch.object(gd, "default_families", return_value=[]), \
                 mock.patch.object(gd, "runner_floor_gib", return_value=30.0), \
@@ -3148,6 +3149,9 @@ class GlaedaDiskTest(unittest.TestCase):
             self._git("-C", os.fspath(clone), "repack", "-q")
         wt = home / "cmux-wt"
         self._git("-C", os.fspath(clone), "worktree", "add", "-q", "-b", "wt", os.fspath(wt))
+        runner = home / "actions-runner-glaeda"  # a CI runner account's home
+        (runner / "glaeda-hooks").mkdir(parents=True, exist_ok=True)
+        (runner / ".runner").write_text("{}")
         self._age(home, hours=5)
         self.assertEqual(gd.git_pack_count(clone / ".git"), packs)
         return home, clone, wt
@@ -3175,15 +3179,20 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.gc_home_clones(receipt, home)
         self.assertEqual(gd.git_pack_count(clone / ".git"), 1)
         rec = json.loads(receipt.read_text())
-        self.assertEqual((rec["family"], rec["outcome"], rec["packs"], rec["packs_after"]),
-                         (gd.HOME_CLONE_GC_FAMILY, "reclaimed", 3, 1))
+        self.assertEqual((rec["family"], rec["outcome"], rec["verdict"], rec["packs"], rec["packs_after"]),
+                         (gd.HOME_CLONE_GC_FAMILY, "reclaimed", "reclaimable", 3, 1))
         self.assertEqual(self._git("-C", os.fspath(wt), "rev-parse", "--abbrev-ref", "HEAD").strip(), "wt")
         self._git("-C", os.fspath(clone), "fsck", "--no-progress")  # nothing reachable was lost
 
-    def test_home_clone_gc_below_the_pack_threshold_does_nothing(self) -> None:
+    def test_home_clone_gc_below_the_pack_threshold_or_without_runners_does_nothing(self) -> None:
         home, clone, _ = self._home_clone(2)
         receipt = self.receipt()
         with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 3), self._gc_log():
+            self.assertEqual(gd.gc_home_clones(receipt, home), 0)
+        self.assertEqual(gd.git_pack_count(clone / ".git"), 2)
+        self.assertFalse(receipt.exists())
+        shutil.rmtree(home / "actions-runner-glaeda")  # a person's or a dev box's home: never
+        with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 2), self._gc_log():
             self.assertEqual(gd.gc_home_clones(receipt, home), 0)
         self.assertEqual(gd.git_pack_count(clone / ".git"), 2)
         self.assertFalse(receipt.exists())
@@ -3193,6 +3202,12 @@ class GlaedaDiskTest(unittest.TestCase):
             "a git operation holds gc.pid": lambda c, w: (c / ".git/gc.pid").write_text("1 host"),
             "a git operation holds index.lock": lambda c, w: (c / ".git/worktrees/cmux-wt/index.lock").write_text(""),
             "git activity within 1h": lambda c, w: (c / ".git/FETCH_HEAD").write_text("x"),
+            "holds refs/heads/feat/x.lock": lambda c, w: (
+                (c / ".git/refs/heads/feat").mkdir(parents=True), (c / ".git/refs/heads/feat/x.lock").write_text(""),
+                os.utime(c / ".git/refs/heads/feat/x.lock", (time.time() - 7200,) * 2),
+                os.utime(c / ".git/refs/heads/feat", (time.time() - 7200,) * 2)),
+            "writing a pack": lambda c, w: (c / ".git/objects/pack/tmp_pack_abc123").write_text(""),
+            "a linked work tree is missing": lambda c, w: shutil.rmtree(w),
             "open or a working directory": lambda c, w: setattr(
                 gd, "process_evidence", lambda: ([os.fspath(w / "f0")], "")),
             "named by a running command": lambda c, w: setattr(
@@ -3223,13 +3238,17 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.process_evidence = lambda: ([], "")
             self.assertEqual(gd.gc_home_clones(self.receipt(), home, halt=lambda: "a CI job runs"), 0)
         self.assertEqual(gd.git_pack_count(clone / ".git"), 3)
+        # a gc.pid git itself would ignore (12 h old) does not veto
+        (clone / ".git/gc.pid").write_text("1 elsewhere")
+        os.utime(clone / ".git/gc.pid", (time.time() - 13 * 3600,) * 2)
+        self.assertEqual(gd.home_clone_gc_veto(clone, clone / ".git", frozenset(), "", time.time()), "")
 
         class SlowGc:
             pid = 4242
             killed = False
 
             def __init__(self, argv, **kw):
-                self.kw = kw
+                SlowGc.argv, self.kw = argv, kw
 
             def wait(self, timeout=None):
                 raise subprocess.TimeoutExpired("git gc", timeout)
@@ -3245,14 +3264,24 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertFalse(SlowGc.killed)
         killpg.assert_not_called()
         rec = json.loads(receipt.read_text())
-        self.assertEqual((rec["outcome"], rec["pid"]), ("running", 4242))
+        self.assertEqual((rec["outcome"], rec["verdict"], rec["pid"]), ("running", "running", 4242))
+        self.assertIn("--prune=1.day.ago", SlowGc.argv)
+        self.assertIn("gc.worktreePruneExpire=never", SlowGc.argv)
 
     def test_home_clone_gc_runs_on_pressure_and_sweeps_of_fleet_minis_only(self) -> None:
         dev = gd.HOME.stat().st_dev
         under = {dev: gd.Fs(dev, "/", 10 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
         receipt = ["--receipt", os.fspath(self.receipt())]
+        order: list[str] = []
+        real_release = gd.release_evict_lock
+
+        def release(handle):
+            if handle is not None:
+                order.append("release")
+            real_release(handle)
         with mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
                 mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "MEASURE_LOCK", self.root / "measure.lock"), \
                 mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
                 mock.patch.object(gd, "default_families", return_value=[]), \
                 mock.patch.object(gd, "filesystems", return_value=under), \
@@ -3261,7 +3290,8 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
                 mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
                 mock.patch.object(gd, "notify_disk"), \
-                mock.patch.object(gd, "gc_home_clones", return_value=0) as gc, \
+                mock.patch.object(gd, "release_evict_lock", side_effect=release), \
+                mock.patch.object(gd, "gc_home_clones", side_effect=lambda *a, **k: order.append("gc") or 0) as gc, \
                 contextlib.redirect_stdout(io.StringIO()):
             gd.main(["--no-snapshot", "--top", "0", *receipt])  # a report
             gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])  # neither a sweep nor pressure
@@ -3269,6 +3299,7 @@ class GlaedaDiskTest(unittest.TestCase):
             gc.assert_not_called()
             gd.main(["--pressure", "--apply", "--no-snapshot", "--top", "0", *receipt])
             gc.assert_called_once()
+        self.assertEqual(order[-2:], ["release", "gc"])  # a long gc never holds the eviction lock
 
     def test_idle_sweep_windows_follow_reuse(self) -> None:
         ci = self.root / "ci"
