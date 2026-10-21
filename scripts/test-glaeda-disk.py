@@ -2073,6 +2073,10 @@ class GlaedaDiskTest(unittest.TestCase):
         lock = self.root / "measurement.lock"
         dev = gd.HOME.stat().st_dev
         total = 460 * gd.GIB
+        # main() sets these module globals for the run; later tests read them.
+        for name in ("EMERGENCY_DEVS", "ACTIVITY_MODE", "FLOOR_HOLD", "ROLE", "RUNNER_CACHE_PROFILE",
+                     "_REFRESH_DEADLINE_ACTIVE", "_MEASURE_BUDGET_REACHED"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
 
         def run(free_gib: float) -> tuple[int, str, mock.MagicMock]:
             fss = {dev: gd.Fs(dev, "/", int(free_gib * gd.GIB), total, 128 * gd.GIB, 170 * gd.GIB)}
