@@ -3650,6 +3650,25 @@ class AuditTest(BrokerBase):
         self.assertEqual(doc["categories"]["raw gh api graphql"], 1)
         self.assertEqual(doc["categories"]["pr merge"], 1)
 
+    def test_a_batched_graphql_call_is_counted_and_said_to_be_unpriceable(self) -> None:
+        """Every share this prints is per call, and one `gh api graphql` line is not one read: a
+        caller that batches forty PRs into one query appears once, at 1/40th the share of one that
+        loops `gh pr view` forty times for the same answer, while spending comparable GraphQL
+        points (that limit is points per hour). The broker execs the real gh for these, so it never
+        sees the query, the node count or the `rateLimit.cost` that comes back. These numbers are
+        used to argue for and against the broker, so the report says which caller they flatter
+        rather than leaving it to be noticed."""
+        path = self.write_log([(0, "api graphql"), (5, "api graphql"), (10, "pr view pr:o/r#7")])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.main(["audit", "--log", str(path), "--json"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["opaqueBatched"], 2)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.main(["audit", "--log", str(path)]), 0)
+        self.assertIn("2 of those calls were `gh api graphql`", out.getvalue())
+        self.assertIn("per call", out.getvalue())
+
     def test_an_old_logs_lines_are_counted_but_not_quoted_back(self) -> None:
         """The guard kept the value of a flag it did not know took one until 2026-10-21, and an
         audit is read, pasted into reports and committed. Those lines stay in the counts; the
@@ -3780,6 +3799,27 @@ class BrokerRepeatTest(BrokerBase):
         self.run_gh(["api", "repos/o/r/pulls/9"])
         self.run_gh(["api", "repos/o/r/pulls/9"])
         self.assertEqual(len(self.slept), 1)
+
+    def test_a_batched_graphql_read_is_never_held_whatever_shape_it_is_written_in(self) -> None:
+        """The caller that batches is the one this must not punish, and it is the one the delay
+        would hit hardest: a card that reads forty PRs in one query has one command line, so a
+        refresh loop repeats it exactly. It is exempt because gh POSTs a GraphQL query, and the
+        method is read from the whole command line -- `-f`, `-F`, `--field`, `--raw-field` and
+        `--input` each mean POST with no `-X` on the line. Written as a test because `--input -`
+        takes its query from *stdin*: two such calls are one digest here and different queries at
+        GitHub, so if any of these shapes were read as a GET, the second would be held 30 s for a
+        read the first never made. Asked for by the pr-cards lane, whose path this is."""
+        for args in (["api", "graphql", "-f", "query=query{viewer{login}}"],
+                     ["api", "graphql", "-F", "query=query{viewer{login}}"],
+                     ["api", "graphql", "--field", "query=query{viewer{login}}"],
+                     ["api", "graphql", "--raw-field", "query=query{viewer{login}}"],
+                     ["api", "graphql", "--input", "-"],
+                     ["api", "/graphql", "-f", "query=query{viewer{login}}"]):
+            with self.subTest(args=args):
+                for _ in range(3):
+                    _code, _out, _err, passed = self.run_gh(args)
+                    self.assertIsNotNone(passed, "a batched read must reach gh unchanged")
+                self.assertEqual(self.slept, [], "a batching caller was held for repeating itself")
 
     def test_the_delay_can_be_turned_off(self) -> None:
         with mock.patch.dict(os.environ, {"CMUX_GH_MIN_REPEAT_SECONDS": "0"}):

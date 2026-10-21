@@ -4765,11 +4765,12 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
             except ValueError:
                 continue  # a torn last line at a rotation boundary is one record, not the file
             served[route] = served.get(route, 0) + 1
+    batched = counts.get("raw gh api graphql", 0)
     if as_json:
         print(json.dumps({"calls": total, "categories": counts, "cacheableReads": reads,
                           "repeatsWithin": {"seconds": AUDIT_WINDOW, "calls": repeats},
                           "perRead": {k: {"reads": v[0], "repeats": v[1]} for k, v in per_read.items()},
-                          "brokerDecisions": served}, sort_keys=True))
+                          "brokerDecisions": served, "opaqueBatched": batched}, sort_keys=True))
         return EXIT_OK
     print(f"{total} gh calls logged in {path}\n")
     print(f"{'category':<34}{'calls':>8}{'share':>8}")
@@ -4791,6 +4792,19 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
                                               sorted(hot.items(), key=lambda kv: -kv[1])[:5]))
     if served:
         print("\nbroker decisions so far: " + ", ".join(f"{k} {v}" for k, v in sorted(served.items())))
+    if batched:
+        # Every share above is per *call*, and one of these lines is not one read. A caller that
+        # batches forty PRs into one `gh api graphql` appears here once, at 1/40th the share of a
+        # caller that loops `gh pr view` forty times for the same answer -- and spends comparable
+        # GraphQL points doing it, because that limit is points per hour and a 40-node query costs
+        # roughly 40 nodes' worth. The broker execs the real gh for these, so it never sees the
+        # query, the node count or the `rateLimit.cost` that comes back: it cannot price them, and
+        # a guess from parsing someone's query would be worse than this sentence. Said out loud
+        # because the numbers above are used to argue for and against the broker, and they read
+        # the frugal caller as the cheap one.
+        print(f"\n{batched} of those calls were `gh api graphql`, which this cannot price: each is one "
+              f"request carrying however many objects the caller asked for. Shares above are per call, "
+              f"so a batching caller looks cheaper here than its GraphQL points are.")
     return EXIT_OK
 
 
