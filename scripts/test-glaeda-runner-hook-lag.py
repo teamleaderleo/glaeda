@@ -144,7 +144,7 @@ class HookLagTest(unittest.TestCase):
         (hooks / "glaeda-cmux-runner-hook").write_text(text)
 
     def stable(self, source: str, promoted: str) -> Path:
-        path = self.dir / "stable.json"
+        path = self.dir / f"stable-{source[:12]}-{promoted}.json"  # one file per channel state, never overwritten
         path.write_text(json.dumps({"ring": "stable", "source": source, "promoted": promoted}))
         return path
 
