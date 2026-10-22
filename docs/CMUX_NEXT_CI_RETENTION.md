@@ -22,9 +22,27 @@ Both report and apply paths fail closed when a validated state root is named by
 a process, holds a socket, has a `.cmux-active`, `.build.active`, `.lock`,
 `lease.json`, or `reservation.json` marker, or contains an unknown direct
 child. Apply re-collects process evidence immediately before each rename. The
-family never deletes a whole runner root or source checkout. Use the normal
-`glaeda-disk` report first; `--apply` writes the standard JSONL receipt and
-rechecks every candidate.
+family never deletes a source checkout, nor a whole state root except a stale one
+under the size cap below. Use the normal `glaeda-disk` report first; `--apply`
+writes the standard JSONL receipt and rechecks every candidate.
+
+## Size cap
+
+A pressure run (`--pressure`, or `keepup --apply` under pressure) measures the
+whole cache, inputs included, with one `du`. While it is over
+`cmux_next_ci_cap_gib` (default 40 GiB; set it in
+`~/.config/glaeda/disk-policy.json` or with `--cmux-next-cap-gib`, 0 turns it
+off), the 72-hour window gives way: candidates go least recently used first,
+until the cache is back under the cap or the free target is met. Over the cap a
+stale state root is listed whole instead of its generated children: in
+`dev-daily-release` and `release-compile` every state root but the most recently
+used of its kind (a superseded fingerprint), and in `cmux-scheme` a state named
+after no runner enrolled on the host (only where runners are enrolled). Each
+enrolled runner's state and each kind's newest state keep `SourcePackages` and
+the module caches. Every veto above still holds, and an enrolled runner with a
+`Runner.Worker` keeps its state. An unmeasurable cache keeps the 72-hour window.
+cmux11s refused jobs at 21 GiB free under a 40 GiB floor with 78 GiB here and
+nothing reclaimable (2026-10-21).
 
 The ordinary `--dedupe` pass visits only reusable package/module/SDK inputs. Build
 output is write-heavy, so it is excluded from the periodic WatchPaths agent. An
