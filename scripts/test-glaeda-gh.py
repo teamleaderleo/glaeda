@@ -3701,7 +3701,7 @@ class FileAndPidWaitTest(unittest.TestCase):
     def test_a_long_line_on_a_nearly_full_pipe_does_not_hang_the_wait(self) -> None:
         """Writable promises room for PIPE_BUF bytes, not for the whole line. A pipe with 8 KiB free
         reports writable, and a 100 KB `--contains` line then blocked a 1 s wait past 3 s. The line
-        goes out in `DIAGNOSTIC_CHUNK` pieces while fd 2 has room, and the rest is dropped."""
+        goes out as far as fd 2 takes it without blocking, and the rest is dropped."""
         read, write = os.pipe()
         self.addCleanup(os.close, read)
         try:
@@ -3725,6 +3725,25 @@ class FileAndPidWaitTest(unittest.TestCase):
         line = spill.lstrip(b"x")
         self.assertTrue(line.startswith(b"glaeda-gh: waiting on"), line[:80])
         self.assertLess(len(line), 100_000)  # what the pipe had room for, not the whole line
+
+    def test_a_full_stderr_socket_does_not_hang_the_wait(self) -> None:
+        """A socket reports writable without room for a whole write: 512-byte writes blocked a
+        0.1 s wait past 3 s on a full one. The write is non-blocking, so the line is dropped."""
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        try:
+            theirs.setblocking(False)
+            with contextlib.suppress(BlockingIOError):
+                while True:
+                    theirs.send(b"x" * 65536)
+            theirs.setblocking(True)  # full, blocking, and nobody reads it
+            done, waited = self.cli_wait("wait", "file", str(self.dir / "never-appears"),
+                                         "--timeout", "1", "--json", stderr=theirs.fileno())
+        finally:
+            theirs.close()
+        self.assertEqual(done.returncode, gg.EXIT_TIMEOUT, done.stdout)
+        self.assertLess(waited, 4, "the diagnostic blocked on a full socket")
+        self.assertEqual(json.loads(done.stdout)["result"], "timeout")
 
     def test_a_filename_that_is_not_utf8_does_not_kill_the_wait(self) -> None:
         """A surrogate-escaped filename byte raised `UnicodeEncodeError` in the diagnostic: exit 1 and
