@@ -4574,39 +4574,107 @@ class GatewayGate(Gate):
 BARRIER_WAIT_S = 10.0
 
 
-def process_name(pid: int) -> str | None:
-    """The executable name /bin/ps gives for pid (basename of comm), or None."""
+def process_observation(pid: int) -> tuple[int, str, str] | None:
+    """(ppid, executable name, start token) of pid from one read: /proc/PID/stat, else one /bin/ps call, so the
+    name and the token always describe the same process. None when it cannot be read: a gone pid or a failed or
+    timed-out probe (pid_alive tells them apart)."""
+    if pid <= 1:
+        return None
+    with contextlib.suppress(OSError, UnicodeDecodeError, IndexError, ValueError):
+        head, tail = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace").rsplit(")", 1)
+        fields = tail.split()
+        return int(fields[1]), head.split("(", 1)[1], "proc:" + fields[19]
     try:
-        out = subprocess.run(["/bin/ps", "-o", "comm=", "-p", str(pid)], stdin=subprocess.DEVNULL,
-                             capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+        out = subprocess.run(["/bin/ps", "-o", "ppid=,lstart=,comm=", "-p", str(pid)], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=5, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
-    return os.path.basename(out) if out else None
+    parts = out.stdout.split()  # ppid, the five words of lstart, then comm (a path that may hold spaces)
+    if out.returncode != 0 or len(parts) < 7 or not parts[0].isdigit():
+        return None
+    return int(parts[0]), os.path.basename(" ".join(parts[6:])), "ps:" + " ".join(parts[1:6])
+
+
+def _same_start(a: str, b: str) -> bool:
+    return a.split() == b.split()  # ps pads lstart's day with a space; compare the words
+
+
+def _worker_target(owner: JobOwner | None) -> tuple[int, str] | str | None:
+    """The Runner.Worker to end as (pid, start token), its name and token from one observation; a str when there
+    provably is none; None when a probe could not tell (never read as "none")."""
+    if owner is not None:
+        seen = process_observation(owner.pid)
+        if seen is None and pid_alive(owner.pid):
+            return None
+        if seen is not None and seen[1] == "Runner.Worker" and _same_start(seen[2], owner.identity):
+            return owner.pid, seen[2]
+    pid = os.getppid()
+    for _ in range(64):
+        if pid <= 1:
+            return "no Runner.Worker above this hook; nothing to end"
+        seen = process_observation(pid)
+        if seen is None:
+            return None  # a failed probe, or an ancestor that just exited: walk again from the new parent
+        if seen[1] == "Runner.Worker":
+            return pid, seen[2]
+        pid = seen[0]
+    return "no Runner.Worker within 64 ancestors of this hook; nothing to end"
+
+
+def _pidfd(pid: int) -> int | None:
+    """A Linux pidfd for pid: a handle that keeps naming the same process, so a signal cannot hit a reused pid."""
+    with contextlib.suppress(AttributeError, OSError):
+        return os.pidfd_open(pid)
+    return None
 
 
 def end_worker(owner: JobOwner | None, wait_s: float = BARRIER_WAIT_S) -> str:
     """The execution barrier after a refusal: SIGKILL this job's Runner.Worker (the pinned owner when it is one,
     else the Runner.Worker above this hook) and wait until it is gone. Only a process named Runner.Worker is ever
-    signalled, and only one with the pinned start token. Returns what happened, for the log."""
-    worker = owner if owner is not None and process_name(owner.pid) == "Runner.Worker" else None
-    if worker is None:
-        found = runner_worker_pid()
-        worker = JobOwner.of(found) if found else None
-    if worker is None:
-        return "no Runner.Worker above this hook; nothing to end"
-    if not worker.alive():
-        return f"Runner.Worker {worker.pid} is already gone"
-    with contextlib.suppress(OSError):
-        os.kill(worker.pid, signal.SIGKILL)
-    # Never return while it lives: it awaits this hook, so a hook that waits keeps every later step from starting.
+    signalled, and only the one first observed (name and start token re-checked right before each signal).
+    Fails closed: a probe that cannot tell (ps failed or timed out) is retried, never read as gone, so this never
+    returns while the Worker may live. On Linux the signal goes through a pidfd opened before that check; macOS
+    has no pidfd, so a pid freed and reused between the check and kill(2) (microseconds) is the residual window.
+    Returns what happened, for the log."""
     deadline: float | None = time.monotonic() + wait_s
-    while not worker.gone() and not Gate._zombie(worker.pid):  # a zombie runs nothing; its parent reaps it
+
+    def wait(why: str) -> None:
+        nonlocal deadline
         if deadline is not None and time.monotonic() > deadline:
-            print(f"{PREFIX}: Runner.Worker {worker.pid} has not exited {wait_s:g} s after SIGKILL; waiting for it",
-                  file=sys.stderr, flush=True)
+            print(f"{PREFIX}: {why} after {wait_s:g} s; still waiting", file=sys.stderr, flush=True)
             deadline = None
         time.sleep(0.05)
-    return f"ended Runner.Worker {worker.pid}, so no later step of this job runs here"
+
+    while (target := _worker_target(owner)) is None:
+        wait("cannot read the process tree to find this job's Runner.Worker")
+    if isinstance(target, str):
+        return target
+    pid, identity = target
+    killed = False
+    # Never return while it lives: it awaits this hook, so a hook that waits keeps every later step from starting.
+    while True:
+        fd = _pidfd(pid)
+        try:
+            seen = process_observation(pid)
+            if seen is None and not pid_alive(pid) or seen is not None and (
+                    seen[1] != "Runner.Worker" or not _same_start(seen[2], identity)):
+                break
+            if seen is not None:
+                if Gate._zombie(pid):  # a zombie runs nothing; its parent reaps it
+                    break
+                with contextlib.suppress(OSError):
+                    if fd is not None:
+                        signal.pidfd_send_signal(fd, signal.SIGKILL)
+                    else:
+                        os.kill(pid, signal.SIGKILL)
+                killed = True
+        finally:
+            if fd is not None:
+                os.close(fd)
+        wait(f"Runner.Worker {pid} has not exited" if killed else f"cannot read Runner.Worker {pid}")
+    if not killed:
+        return f"Runner.Worker {pid} is already gone"
+    return f"ended Runner.Worker {pid}, so no later step of this job runs here"
 
 
 def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, waiters: bool,

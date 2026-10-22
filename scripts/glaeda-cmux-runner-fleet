@@ -601,8 +601,9 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
     return result
 
 
-GATEWAY_RECEIPTS = ("for f in ~/.local/state/glaeda/cmux-runner/instance-gateway-*/receipt.json; do "
-                    "[ -f \"$f\" ] && echo \"$f\"; done; true")  # read-only
+# Read-only, and no glob for the login shell to expand: zsh's NOMATCH fails a glob with no match (no slots).
+GATEWAY_RECEIPTS = ("find ~/.local/state/glaeda/cmux-runner -maxdepth 2 -type f "
+                    "-path '*/instance-gateway-*/receipt.json' 2>/dev/null; true")
 GATEWAY_RECEIPT_RE = re.compile(r"/instance-gateway-([0-9])/receipt\.json$")
 
 

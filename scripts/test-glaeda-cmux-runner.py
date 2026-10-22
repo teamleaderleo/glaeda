@@ -8485,14 +8485,9 @@ class GatewayTest(unittest.TestCase):
             "pull_request_target", same_pr, "manaflow-ai/cmux", GATEWAY_REF))
 
     def run_started(self, name: str, ref: str = GATEWAY_REF, *extra: str) -> subprocess.CompletedProcess:
-        event_name, payload, _ = SAMPLE_EVENTS[name]
-        path = event(self.dir, name, payload)
-        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
-               "GITHUB_EVENT_NAME": event_name, "GITHUB_EVENT_PATH": os.fspath(path),
-               "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_WORKFLOW_REF": ref}
-        return subprocess.run([sys.executable, os.fspath(HOOK), "job-started", "--gateway", "--allowed-repo",
-                               "manaflow-ai/cmux", "--no-disk", "--no-telemetry", *extra],
-                              env=env, capture_output=True, text=True, timeout=60, check=False)
+        """job-started under a Runner.Worker stand-in this test made: never as a child of the test itself, whose
+        ancestors may include a real Runner.Worker (a GitHub-hosted job) that a refusal's barrier would end."""
+        return self.job_under_runner_worker(name, ref, *extra)[0]
 
     def test_job_started_holds_nothing_and_refuses_before_any_step(self) -> None:
         fleet = self.dir / "fleet"
@@ -8501,7 +8496,7 @@ class GatewayTest(unittest.TestCase):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)  # a fleet build holds the host: a build job would wait or be refused
             result = self.run_started("same-repo-pr")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("hook exited 0", result.stdout, result.stdout + result.stderr)
             self.assertIn("admitted: gateway client cmux-next.yml pull_request", result.stdout)
         finally:
             os.close(lock)
@@ -8512,7 +8507,7 @@ class GatewayTest(unittest.TestCase):
                                ("other-repository", GATEWAY_REF, "evil/cmux")):
             with self.subTest(name):
                 result = self.run_started(name, ref)
-                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertEqual(result.returncode, -signal.SIGKILL, result.stdout)
                 self.assertIn(f"::error::glaeda-cmux-runner-hook: refused: gateway", result.stdout)
                 self.assertIn(why, result.stdout)
         now = int(time.time())
@@ -8520,18 +8515,20 @@ class GatewayTest(unittest.TestCase):
             "schema": "glaeda-reservation/v1", "owner": "soak", "purpose": "a soak", "since": now - 5,
             "until": now + 600}))
         result = self.run_started("push")
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, -signal.SIGKILL)
         self.assertIn("host reserved by soak", result.stdout)
         (fleet / "reservation.json").unlink()
         result = self.run_started("push", GATEWAY_REF, "--min-free-gib", "1e9")
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, -signal.SIGKILL)
         self.assertIn("GiB required", result.stdout, "the disk floor still applies")
 
-    def job_under_runner_worker(self, name: str, ref: str = GATEWAY_REF) -> tuple[subprocess.CompletedProcess, Path]:
+    def job_under_runner_worker(self, name: str, ref: str = GATEWAY_REF, *extra: str,
+                                via_shell: bool = False) -> tuple[subprocess.CompletedProcess, Path]:
         """Run a job the way actions/runner v2.338.0 does (JobExtension.cs, StepsRunner.cs): a process named
         Runner.Worker runs the job-started hook as a pre-job step (the wrapper execs the hook, so the hook's parent
         is the Worker), awaits it, and then runs the job's next step whatever the hook returned, as a step with
-        `if: always()` does. That step writes a marker; it must never exist after a refusal."""
+        `if: always()` does. That step writes a marker; it must never exist after a refusal. The Worker prints its
+        pid first. via_shell keeps a shell between the Worker and the hook, so the barrier has to walk up to it."""
         cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
         worker = self.dir / "bin" / "Runner.Worker"
         worker.parent.mkdir(exist_ok=True)
@@ -8542,20 +8539,22 @@ class GatewayTest(unittest.TestCase):
                           "  if (p == 0) { execl(\"/bin/sh\", \"sh\", \"-c\", cmd, (char *)0); _exit(127); }\n"
                           "  int s = 0; waitpid(p, &s, 0); return WIFEXITED(s) ? WEXITSTATUS(s) : 1; }\n"
                           "int main(int c, char **v) {\n"
+                          "  printf(\"worker %d\\n\", (int)getpid()); fflush(stdout);\n"
                           "  int hook = step(v[1]);\n"  # the job-started hook: its failure never stops the loop
                           "  printf(\"hook exited %d\\n\", hook); fflush(stdout);\n"
                           "  step(v[2]);\n"  # the next step, `if: always()`
                           "  return 100; }\n")
-        if cc is None or subprocess.run([cc, "-o", os.fspath(worker), os.fspath(source)],
-                                        capture_output=True).returncode != 0:
+        if not worker.exists() and (cc is None or subprocess.run([cc, "-o", os.fspath(worker), os.fspath(source)],
+                                                                 capture_output=True).returncode != 0):
             self.skipTest("no C compiler to build a Runner.Worker stand-in")
         event_name, payload, _ = SAMPLE_EVENTS[name]
         path = event(self.dir, name, payload)
         marker = self.dir / f"always-step-ran-{name}"
         marker.unlink(missing_ok=True)
-        hook_cmd = " ".join(shlex.quote(a) for a in ["exec", sys.executable, os.fspath(HOOK), "job-started",
+        hook_cmd = " ".join(shlex.quote(a) for a in [sys.executable, os.fspath(HOOK), "job-started",
                                                      "--gateway", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
-                                                     "--no-telemetry"])
+                                                     "--no-telemetry", *extra])
+        hook_cmd = f"{hook_cmd}; exit $?" if via_shell else f"exec {hook_cmd}"  # a later command stops sh's exec
         env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
                "GITHUB_EVENT_NAME": event_name, "GITHUB_EVENT_PATH": os.fspath(path),
                "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_WORKFLOW_REF": ref}
@@ -8577,12 +8576,94 @@ class GatewayTest(unittest.TestCase):
                 self.assertFalse(marker.exists(), "an `if: always()` step ran after the refusal")
                 self.assertIn("refused: gateway", refused.stderr, "the reason reaches the Worker's stderr")
 
+    def test_a_refusal_ends_only_the_worker_this_test_made(self) -> None:
+        """Whatever runs this suite may sit under a real Runner.Worker (a GitHub-hosted job). With a shell between
+        the stand-in and the hook, the barrier walks up: it must stop at the stand-in and leave every ancestor of
+        this test as it was."""
+        ancestors, pid = [], os.getpid()
+        while pid > 1 and len(ancestors) < 64 and (seen := hook.process_observation(pid)) is not None:
+            ancestors.append((pid, seen[2]))
+            pid = seen[0]
+        self.assertTrue(ancestors)
+        refused, marker = self.job_under_runner_worker("fork-pr", via_shell=True)
+        self.assertEqual(refused.returncode, -signal.SIGKILL, refused.stdout + refused.stderr)
+        worker = int(re.search(r"^worker (\d+)$", refused.stdout, re.M).group(1))
+        self.assertIn(f"ended Runner.Worker {worker},", refused.stderr)
+        self.assertFalse(marker.exists())
+        for pid, identity in ancestors:
+            seen = hook.process_observation(pid)
+            self.assertIsNotNone(seen, f"ancestor {pid} of this test is gone")
+            self.assertTrue(hook._same_start(seen[2], identity), f"ancestor {pid} of this test was replaced")
+
+    def no_signal(self) -> contextlib.ExitStack:
+        """No real signal and no real ancestry: the walk above the hook ends at once."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(hook.os, "getppid", return_value=1))
+        stack.enter_context(mock.patch.object(hook, "_pidfd", return_value=None))
+        stack.enter_context(mock.patch.object(hook.os, "kill", side_effect=AssertionError("signalled")))
+        return stack
+
     def test_the_barrier_never_signals_a_process_that_is_not_a_runner_worker(self) -> None:
         me = hook.JobOwner.of(os.getpid())
-        with mock.patch.object(hook, "runner_worker_pid", return_value=None), \
-                mock.patch.object(hook.os, "kill", side_effect=AssertionError("signalled a non-Worker")):
+        with self.no_signal(), mock.patch.object(hook, "process_observation", return_value=(1, "python3", "ps:x")):
             self.assertIn("no Runner.Worker", hook.end_worker(me))
             self.assertIn("no Runner.Worker", hook.end_worker(None))
+        # the pinned pid now names another Runner.Worker (pid reuse): not the owner, so not signalled
+        with self.no_signal(), mock.patch.object(hook, "process_observation",
+                                                 return_value=(1, "Runner.Worker", "ps:a later start")):
+            self.assertIn("no Runner.Worker", hook.end_worker(hook.JobOwner(4242, "ps:the pinned start")))
+
+    def test_the_barrier_rechecks_name_and_start_right_before_the_signal(self) -> None:
+        """Discovery reads the Worker's name and start token in one observation; if the pid is reused before the
+        signal (by another program, or by another Worker), the re-check sees it and nothing is signalled."""
+        for later in ((1, "zsh", "ps:Wed Oct 21 10:00:01 2026"), (1, "Runner.Worker", "ps:Wed Oct 21 10:00:01 2026")):
+            with self.subTest(later=later):
+                looks = {"worker": 0}
+
+                def observe(pid: int) -> tuple[int, str, str] | None:
+                    if pid == 777:  # the hook's parent: a shell under the Worker
+                        return 4242, "sh", "ps:Wed Oct 21 09:00:00 2026"
+                    looks["worker"] += 1
+                    return (1, "Runner.Worker", "ps:Wed Oct 21  9:00:00 2026") if looks["worker"] == 1 else later
+
+                with self.no_signal(), mock.patch.object(hook.os, "getppid", return_value=777), \
+                        mock.patch.object(hook, "process_observation", side_effect=observe), \
+                        mock.patch.object(hook, "pid_alive", return_value=True):
+                    self.assertEqual(hook.end_worker(None), "Runner.Worker 4242 is already gone")
+                self.assertEqual(looks["worker"], 2)
+
+    def test_the_barrier_fails_closed_while_a_probe_cannot_tell(self) -> None:
+        """A ps that fails or times out is never read as "gone": end_worker keeps the Worker blocked (it awaits
+        this hook) until a probe answers, then ends it. Both before the Worker is found and after."""
+        real = hook.process_observation
+        for failing_from in (0, 1):  # every look fails; or discovery works and the look before the signal fails
+            with self.subTest(failing_from=failing_from):
+                sleeper = subprocess.Popen(["/bin/sleep", "60"])
+                self.addCleanup(sleeper.wait)
+                self.addCleanup(lambda p=sleeper: p.poll() is None and p.kill())
+                owner = hook.JobOwner.of(sleeper.pid)
+                answering = threading.Event()
+                looks = {"n": 0}
+
+                def observe(pid: int, sleeper: subprocess.Popen = sleeper) -> tuple[int, str, str] | None:
+                    looks["n"] += 1
+                    if looks["n"] > failing_from and not answering.is_set():
+                        return None  # ps failed or timed out
+                    seen = real(pid)
+                    return (seen[0], "Runner.Worker", seen[2]) if seen and pid == sleeper.pid else seen
+
+                done: list[str] = []
+                with mock.patch.object(hook.os, "getppid", return_value=1), \
+                        mock.patch.object(hook, "process_observation", side_effect=observe):
+                    thread = threading.Thread(target=lambda: done.append(hook.end_worker(owner, wait_s=0.2)))
+                    thread.start()
+                    time.sleep(0.8)
+                    self.assertEqual(done, [], "returned while the Worker could still be alive")
+                    self.assertIsNone(sleeper.poll(), "signalled without a confirmed name and start token")
+                    answering.set()
+                    thread.join(30)
+                self.assertEqual(done, [f"ended Runner.Worker {sleeper.pid}, so no later step of this job runs here"])
+                self.assertEqual(sleeper.wait(10), -signal.SIGKILL)
 
     def gate(self, slot: int = 0, slots: int = 3, hosts: int = 2) -> hook.GatewayGate:
         runner = self.dir / f"actions-runner-gateway-{slot}"

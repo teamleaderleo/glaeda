@@ -55,10 +55,17 @@ fcntl.flock(slots_lock, fcntl.LOCK_EX)  # the slots of one member apply at once:
 slots = json.load(open(slots_path)) if os.path.exists(slots_path) else {{}}
 def save_slots():
     json.dump(slots, open(slots_path, "w"))
-if "instance-gateway-*/receipt.json" in remote:
-    for k in sorted(slots.get(host, [])):
-        print("/Users/cmux/.local/state/glaeda/cmux-runner/instance-gateway-" + str(k) + "/receipt.json")
-    sys.exit(0)
+if "instance-gateway-" in remote and "receipt.json" in remote and "--apply" not in remote:
+    # run it as sshd would, through a login shell (zsh, the minis' default, where there is one) over a home that
+    # holds this member's receipts, so a command a real shell refuses (zsh NOMATCH) fails here too
+    import shutil, subprocess
+    home = log + ".home." + host
+    shutil.rmtree(home, ignore_errors=True)
+    for k in slots.get(host, []):
+        os.makedirs(home + "/.local/state/glaeda/cmux-runner/instance-gateway-" + str(k))
+        open(home + "/.local/state/glaeda/cmux-runner/instance-gateway-" + str(k) + "/receipt.json", "w").write("{{}}")
+    shell = shutil.which("zsh") or "/bin/sh"
+    sys.exit(subprocess.run([shell, "-c", remote], env={{**os.environ, "HOME": home}}).returncode)
 if "--uninstall --apply" in remote and "--gateway " in remote:
     k = int(remote.split("--gateway ")[1].split()[0])
     if data.strip() != "{token}":
