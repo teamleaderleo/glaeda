@@ -315,7 +315,11 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
 
 def gateway_hosts(manifest: Any) -> int:
     """How many members declare gateway slots (the declared view: every manifest Xcode counts). The gateway gate
-    divides the label's demand across them."""
+    divides the label's demand across them. A trimmed manifest (glaeda-cmux-runner-fleet stages one per member)
+    holds only its own member, so it carries the full manifest's count as gatewayHosts."""
+    carried = manifest.get("gatewayHosts") if isinstance(manifest, dict) else None
+    if isinstance(carried, int) and not isinstance(carried, bool) and carried >= 1:
+        return carried
     hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
     count = 0
     for member in hosts if isinstance(hosts, dict) else {}:

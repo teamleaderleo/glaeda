@@ -35,6 +35,11 @@ The gate checks the manifest's first Xcode for the member; if that app is missin
 not eligible even when a later one would do (safe side). A member that SSH cannot reach is "unreachable", which
 fails an --apply run. Nothing here routes a job: pool variables stay with whoever owns routing.
 
+Gateway slots. A member whose runner.classes.<class>.gatewayRunners is N also gets N gateway slots after its
+instances (glaeda-cmux-runner --gateway K), always registered to manaflow-ai/cmux with a repository token, whatever
+--org says; --gateway-only applies those alone. The trimmed manifest carries gatewayHosts, the full manifest's
+count of members with slots, which the gateway gate divides the label's demand by.
+
 Runner release. The minis share one public IP, so they must not each ask GitHub's unauthenticated API for the
 latest actions/runner. The first instance that applies reads "latest" here, once per run, through this
 machine's gh, and every instance gets it as --latest-runner-version/--latest-runner-sha256 (the pinned
@@ -148,7 +153,8 @@ def members(manifest: dict[str, Any], labels: Any, only: list[str] | None,
 def trimmed(manifest: dict[str, Any], member: str) -> dict[str, Any]:
     defaults = manifest.get("defaults") if isinstance(manifest.get("defaults"), dict) else {}
     return {"defaults": {k: defaults[k] for k in TRIMMED_DEFAULTS if k in defaults},
-            "hosts": {member: manifest["hosts"][member]}}
+            "hosts": {member: manifest["hosts"][member]},
+            "gatewayHosts": load_labels().gateway_hosts(manifest)}  # a count, never other hosts' names
 
 
 def check(member: str, summary: dict[str, Any]) -> tuple[bool | None, str]:
@@ -544,7 +550,8 @@ def uninstall_instance(member: str, instance: int, repo: str) -> str | None:
 
 
 def apply_instance(member: str, instance: int, repo: str | None, extra: list[str], org: str | None = None,
-                   group: str | None = None, migrate_from: str | None = None) -> dict[str, Any]:
+                   group: str | None = None, migrate_from: str | None = None, gateway: bool = False) -> dict[str, Any]:
+    """Apply --instance K, or with gateway, gateway slot K (repo-scoped to repo, never --org)."""
     # The registration token comes first, so a missing permission never strips a runner it cannot replace.
     token = mint(scope_api(repo, org))
     if token is None:
@@ -566,7 +573,8 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
     scope = f"--org {_quote(org)}" + (f" --group {_quote(group)}" if group else "") if org else f"--repo {_quote(repo)}"
     version, sha, _ = latest_release()
     remote = (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --apply --token-stdin {scope} "
-              f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --instance {instance} "
+              f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} "
+              f"{'--gateway' if gateway else '--instance'} {instance} "
               f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} "
               "--output json " + " ".join(_quote(a) for a in extra))
     code, out, err = run(["ssh", *SSH_OPTIONS, member, remote], APPLY_TIMEOUT_S, stdin=token + "\n")
@@ -582,7 +590,7 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
         # A failure before register (staging, launchctl) leaves register/verify
         # as "?": name the step that failed so the operator need not ssh in.
         state = f"{state} ({_failed_note(out, err, code)})"
-    result = {"instance": instance, "exit": code, "state": state, "name": name}
+    result = {"instance": f"gateway-{instance}" if gateway else instance, "exit": code, "state": state, "name": name}
     if deregistered:
         result["deregistered"] = deregistered
         if code != 0:  # the old runner is gone and the new one did not come up: say so loudly
@@ -623,9 +631,13 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     extra = ["--headless"] if ((manifest.get("hosts") or {}).get(member) or {}).get("gui") is False else []
     if args.skip_launchctl:
         extra.append("--skip-launchctl")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=row["runners"]) as pool:
-        results = list(pool.map(lambda k: apply_instance(member, k, args.repo, extra, args.org, args.group,
-                                                         args.migrate_from_repo), range(row["runners"])))
+    gateways = int(summary.get("gatewayRunners") or 0)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=row["runners"] + gateways) as pool:
+        results = [] if args.gateway_only else list(pool.map(
+            lambda k: apply_instance(member, k, args.repo, extra, args.org, args.group, args.migrate_from_repo),
+            range(row["runners"])))
+        results += list(pool.map(lambda k: apply_instance(member, k, load_labels().GATEWAY_REPO, extra, gateway=True),
+                                 range(gateways)))
     row["instances"] = results
     row["action"] = "applied" if all(r["exit"] == 0 for r in results) else "failed"
     row["seconds"] = round(time.monotonic() - started, 1)
@@ -668,6 +680,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--allow-downgrade", metavar="REASON",
                    help="deploy although HEAD is not origin/main or a member's stamp is not an ancestor of HEAD; "
                         "the reason is printed and recorded in the stamp")
+    p.add_argument("--gateway-only", action="store_true",
+                   help="apply only the members' gateway slots (runner.classes.<class>.gatewayRunners), repo-scoped")
     p.add_argument("--jobs", type=int, default=16, help="members at once")
     p.add_argument("--output", choices=("human", "json"), default="human")
     args = p.parse_args(argv)

@@ -69,10 +69,11 @@ if "--apply" in remote and "--uninstall" not in remote and host in os.environ.ge
     sys.exit(1)
 if "--apply" in remote:
     time.sleep(float(os.environ.get("FAKE_APPLY_S", "0")))
-    k = remote.split("--instance ")[1].split()[0]
+    gateway = "--gateway " in remote
+    k = remote.split("--gateway " if gateway else "--instance ")[1].split()[0]
     ok = data.strip() == "{token}"
-    print(json.dumps({{"actions": [{{"kind": "register", "state": "create" if ok else "failed",
-                                    "name": host + "-glaeda" + ("" if k == "0" else "-" + k)}},
+    name = host + "-gateway-" + k if gateway else host + "-glaeda" + ("" if k == "0" else "-" + k)
+    print(json.dumps({{"actions": [{{"kind": "register", "state": "create" if ok else "failed", "name": name}},
                                    {{"kind": "verify", "state": "ok" if ok else "failed"}}]}}))
     sys.exit(0 if ok else 1)
 sys.exit(0)
@@ -231,6 +232,32 @@ class FleetTest(unittest.TestCase):
                                "--format=%H %cd", "--date=format-local:%Y-%m-%d"],
                               capture_output=True, text=True, check=True).stdout.split()
         self.assertEqual((stamp["by"], stamp["source"], stamp["date"]), ("glaeda-cmux-runner-fleet", *head))
+
+    def test_gateway_slots_register_repo_scoped_and_carry_the_gateway_host_count(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"gatewayRunners": 2}}}
+        self.manifest.write_text(json.dumps(manifest))
+        result = self.fleet("--apply", "--gateway-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = {r["member"]: r for r in json.loads(result.stdout)["members"]}
+        self.assertEqual([(i["instance"], i["name"]) for i in rows["mini-a"]["instances"]],
+                         [("gateway-0", "mini-a-gateway-0"), ("gateway-1", "mini-a-gateway-1")])
+        applies = [c for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
+        self.assertEqual(len(applies), 4, "--gateway-only: the build instances are left alone")
+        self.assertTrue(all("--repo manaflow-ai/cmux" in c["remote"] and "--instance" not in c["remote"]
+                            and c["stdin"].strip() == TOKEN for c in applies))
+        staged = json.loads((self.dir / "calls.jsonl.mini-a.manifest").read_text())
+        self.assertEqual((set(staged["hosts"]), staged["gatewayHosts"]), ({"mini-a"}, 2),
+                         "a count of the members with slots, never their names")
+        # an org apply still registers the gateway slots to the repository, after the build instances
+        self.log.unlink()
+        result = self.fleet("--apply", "--org", "manaflow-ai", "--group", "glaeda-minis", FAKE_GROUPS=GROUP)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        applies = [c["remote"] for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
+        self.assertEqual(sum("--org manaflow-ai" in r and "--instance" in r for r in applies), 8)
+        self.assertEqual(sum("--repo manaflow-ai/cmux" in r and "--gateway" in r for r in applies), 4)
+        gh = [c["argv"][3] for c in self.calls() if c["tool"] == "gh" and len(c["argv"]) > 3]
+        self.assertEqual(gh.count("repos/manaflow-ai/cmux/actions/runners/registration-token"), 4)
 
     def test_org_migration_goes_one_member_at_a_time_and_skips_trusted(self) -> None:
         manifest = json.loads(json.dumps(MANIFEST))

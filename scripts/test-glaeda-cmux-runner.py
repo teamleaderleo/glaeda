@@ -8638,6 +8638,8 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(member["gatewayRunners"], 3)
         self.assertNotIn(fleet_labels.GATEWAY_LABEL, member["labels"] + member["pools"])
         self.assertEqual(fleet_labels.gateway_hosts(manifest), 1)
+        self.assertEqual(fleet_labels.gateway_hosts({**manifest, "gatewayHosts": 9}), 9, "a trimmed manifest's count")
+        self.assertEqual(fleet_labels.gateway_hosts({**manifest, "gatewayHosts": True}), 1)
         manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
                                                                  "trustedRepo": "manaflow-ai/cmux"}}
         self.assertEqual(fleet_labels.member_labels(manifest, "mini-std", ok)[0]["gatewayRunners"], 0,
