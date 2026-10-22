@@ -537,8 +537,14 @@ fn skip_unlisted_names_a_broken_checkout_and_sweeps_the_rest() {
     let document = document(&output);
     let repositories = document["repositories"].as_array().expect("repositories");
     assert_eq!(repositories.len(), 3);
-    assert_eq!(repositories[1]["result"], "listed", "the good checkout is swept");
-    assert_eq!(repositories[1]["path"], fixture.main.to_str().expect("UTF-8"));
+    assert_eq!(
+        repositories[1]["result"], "listed",
+        "the good checkout is swept"
+    );
+    assert_eq!(
+        repositories[1]["path"],
+        fixture.main.to_str().expect("UTF-8")
+    );
     assert_eq!(repositories[1]["summary"]["linked"], 1);
     let stderr = String::from_utf8_lossy(&output.stderr);
     // Git reads the commit-graph only where it reads commits, so the broken checkout may fail at
@@ -554,7 +560,11 @@ fn skip_unlisted_names_a_broken_checkout_and_sweeps_the_rest() {
         };
         assert_eq!(failed["result"], "unlisted", "{path}: {entry}");
         assert!(failed["code"].as_str().is_some_and(|code| !code.is_empty()));
-        assert!(failed["problem"].as_str().is_some_and(|text| !text.is_empty()));
+        assert!(
+            failed["problem"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
         assert!(
             stderr
                 .lines()

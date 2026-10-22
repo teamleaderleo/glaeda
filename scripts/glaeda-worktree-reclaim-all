@@ -81,4 +81,9 @@ case " $* " in
     fi
     ;;
 esac
-exec "$reclaim" --branches --skip-unlisted ${window[@]+"${window[@]}"} ${workers[@]+"${workers[@]}"} "$@" "${repositories[@]}"
+# A command older than --skip-unlisted (a host whose build of it failed) would refuse the flag and
+# sweep nothing; it gets the old argv and still exits 2 on an unreadable checkout.
+skip=()
+help=$("$reclaim" --help 2>/dev/null || true)
+[[ "$help" == *--skip-unlisted* ]] && skip=(--skip-unlisted)
+exec "$reclaim" --branches ${skip[@]+"${skip[@]}"} ${window[@]+"${window[@]}"} ${workers[@]+"${workers[@]}"} "$@" "${repositories[@]}"

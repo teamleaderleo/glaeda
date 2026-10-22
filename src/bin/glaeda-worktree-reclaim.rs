@@ -529,7 +529,9 @@ fn main() -> ExitCode {
     let mut any_unlisted = false;
     for repository in &report.repositories {
         let unlisted = match (&repository.result, &repository.branches) {
-            (RepositoryResult::Unlisted { code, problem }, _) => Some(("repository", code, problem)),
+            (RepositoryResult::Unlisted { code, problem }, _) => {
+                Some(("repository", code, problem))
+            }
             (_, Some(BranchSection::Unlisted { code, problem })) => {
                 Some(("branches of", code, problem))
             }
