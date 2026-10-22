@@ -4762,9 +4762,14 @@ def broker_caller() -> str:
     AUDIT_LINE reads as three whitespace-separated fields. The subcommand slot is checked the same
     way; leaving this one open would just move the hole."""
     named = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or ""
-    if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", named):
-        return named
-    return f"ppid-{os.getppid()}"
+    caller = named if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", named) else f"ppid-{os.getppid()}"
+    # The acpmux session's name goes first, because a ppid means nothing once its process is gone:
+    # a 250-call `actions/runs/N` + `/jobs` sweep on air-blue (2026-10-22, 07:00-07:07Z) was logged
+    # as `ppid-29348` and could not be traced to anyone. First, so the 64-character cap cuts the id.
+    session = os.environ.get("ACPMUX_SESSION_NAME") or ""
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,40}", session):
+        caller = f"{session}.{caller}"[:64]
+    return caller
 
 
 # A read worth holding when the same caller repeats it: the ones a polling loop is written out of,
@@ -5060,7 +5065,10 @@ def broker_plan(args: list[str], now: float) -> tuple[str, str | None, str | Non
 # session. The client resolves GH_REPO from its checkout the way gh would.
 RELAY_SOCK_ENV = "GLAEDA_GH_RELAY_SOCK"
 RELAYED = "GLAEDA_GH_RELAYED"  # set on the daemon's gh, so nothing below it relays again
+RELAY_EXIT_NO_TOKEN = 4  # not run: no token here, and the daemon could not or would not run it
+RELAY_EXIT_LOST = 5  # run, but the daemon went away before saying how it ended
 RELAY_MAX_REQUEST = 1 << 20  # argv and a few environment variables
+RELAY_PROBE_TIMEOUT = 10.0  # `gh auth token`, normally 0.1 s
 RELAY_TIMEOUT = 900.0  # the daemon's bound on one relayed gh (a `pr merge` or a big log)
 RELAY_SLOTS = 8  # relayed calls the daemon runs at once; the rest wait for a slot
 RELAY_SLOT_WAIT = 120.0
@@ -5095,6 +5103,16 @@ RELAY_COMMANDS: dict[str, set[str] | None] = {
     "cache": {"list", "delete"},
     "status": None,
 }
+# Never relayed, because they need no token: the call runs here as it always did.
+# Extensions are checked: `gh ext search`, and an extension itself, call the API.
+RELAY_SKIP = {"auth", "help", "version", "completion", "config", "alias", "--version", "-h", "--help"}
+# Only these authenticate github.com; the GH_ENTERPRISE_ pair does not.
+TOKEN_ENV = ("GH_TOKEN", "GITHUB_TOKEN")
+# A remote's URL as gh reads one: scheme://[user@]host[:port]/OWNER/REPO or [user@]host:OWNER/REPO.
+REMOTE_URL_RE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]+@)?([^/:]+)(?::[0-9]*)?/|(?:[^@/:]+@)?([^/:]+):)"
+                           r"([^/?#]+/[^/?#]+?)(?:\.git)?/?$")
+REMOTE_PRIORITY = {"upstream": 3, "github": 2, "origin": 1}  # gh's, by the lowercased name
+OWNER_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 # A whole argument that is a URL, and a HOST/OWNER/REPO (gh reads a 3-part repository as one).
 URL_HOST_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/\s]*@)?\[?([^/\s?#@\]]*?)\]?(?::[0-9]*)?(?:[/?#]\S*)?")
 REPO_HOST_RE = re.compile(r"([^/\s]+)/[^/\s]+/[^/\s]+")
@@ -5114,6 +5132,37 @@ def kill_group(proc: subprocess.Popen) -> None:
     start_new_session, so it holds nothing of anyone else's."""
     with contextlib.suppress(OSError):
         os.killpg(proc.pid, signal.SIGKILL)
+
+
+def broker_token_missing(real: str, args: list[str]) -> str | None:
+    """Why this call would go out unauthenticated, or None when it would not.
+
+    macOS only: elsewhere gh's token is in hosts.yml and readable from any process. Asked of the
+    real gh itself (`gh auth token`, 0.03-0.12 s measured on the Macs), because that is what will or
+    will not find a token -- a hosts.yml `oauth_token` and the keychain both answer there -- and
+    because guessing from the environment is how the anonymous calls went unnoticed. Everything
+    but RELAY_SKIP is checked, however it is spelled: a command line this cannot read is relayed,
+    and refused there, rather than let out unchecked."""
+    if sys.platform != "darwin" or os.environ.get(RELAYED) == "1":
+        return None
+    if not args or args[0] in RELAY_SKIP:
+        return None
+    hosts = relay_hosts(args, os.environ)
+    if not os.environ.get("GH_HOST"):  # gh's own default: the sole host its config names, if not github.com
+        hosts.add(gh_default_host() or "(a hosts.yml this cannot read)")
+    if not os.environ.get("GH_REPO"):  # the checkout's repository, when it is not on github.com
+        try:
+            hosts |= relay_hosts([], {"GH_REPO": relay_repo() or ""})
+        except WatchError as error:
+            return describe(error)
+    hosts.discard("github.com")
+    if not hosts and any(os.environ.get(name) for name in TOKEN_ENV):
+        return None
+    for host in ["github.com", *sorted(hosts)]:  # github.com's token does not authenticate another host
+        why = broker_probe_token(real, host)
+        if why:
+            return why
+    return None
 
 
 def relay_hosts(args: list[str], env: Any) -> set[str]:
@@ -5155,6 +5204,84 @@ def relay_hosts(args: list[str], env: Any) -> set[str]:
     return {re.sub(r"^.*\.github\.com$", "github.com", host.lower()) for host in hosts} - {"github.com"}
 
 
+def broker_probe_token(real: str, host: str) -> str | None:
+    """Why the real gh has no token for `host`, or None when it has one."""
+    # The probe keeps the loop guards: RELAYED stops a wrapper that hands it back from probing
+    # again, the depth count ends the chain, and the whole group goes if it overruns.
+    env = {k: v for k, v in os.environ.items() if k != "CMUX_GH_BROKER_DISABLE"}
+    env.update({RELAYED: "1", BROKER_DEPTH: str(broker_depth() + 1), "GH_PROMPT_DISABLED": "1"})
+    try:
+        proc = subprocess.Popen([real, "auth", "token", "--hostname", host], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, start_new_session=True)
+    except OSError as error:
+        return f"`gh auth token` could not run ({describe(error)})"
+    try:
+        out, err = proc.communicate(timeout=RELAY_PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        kill_group(proc)
+        proc.communicate()
+        return f"`gh auth token` did not answer in {RELAY_PROBE_TIMEOUT:.0f} s"
+    finally:
+        kill_group(proc)
+    token = out.decode(errors="replace").strip()
+    if proc.returncode == 0 and TOKEN_RE.fullmatch(token):
+        return None
+    said = err.decode(errors="replace").strip().splitlines()[-1:] or [f"exit {proc.returncode}"]
+    return f"`gh auth token --hostname {host[:60]}` says {said[0][:120]!r}"
+
+
+def relay_repo() -> str | None:
+    """The repository gh would resolve from this checkout: `gh repo set-default`'s choice, else the
+    remote named upstream, github or origin in any case, else the first remote, each by its fetch
+    URL or, without one, its push URL. OWNER/REPO on github.com, HOST/OWNER/REPO elsewhere (which the
+    relay refuses: it has github.com's token only). None outside a checkout or with no such remote.
+    Raises WatchError when the remote gh would rank first has a URL this cannot read (gh decodes
+    `%69`, for one): guessing past it could send the call to the next remote's repository."""
+    def git(*argv: str) -> str:
+        done = subprocess.run(["git", *argv], capture_output=True, text=True, errors="replace",
+                              stdin=subprocess.DEVNULL, timeout=10)
+        return done.stdout if done.returncode == 0 else ""
+
+    try:
+        urls: dict[str, dict[str, str]] = {}
+        for line in git("remote", "-v").splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                urls.setdefault(parts[0], {}).setdefault(parts[2], parts[1])
+        remotes: dict[str, str | None] = {}
+        for name, url in urls.items():  # its fetch URL, else its push URL, as gh reads a remote
+            url = url.get("(fetch)") or url.get("(push)", "")
+            if url.startswith(("/", ".", "file:")) or ":" not in url:
+                continue  # a local path: gh reads no repository from it either
+            match = REMOTE_URL_RE.match(url)
+            repo = urllib.parse.unquote(match.group(3)) if match else ""
+            if not OWNER_REPO_RE.fullmatch(repo):
+                remotes[name] = None
+                continue
+            host = re.sub(r"^(?:.*\.)?github\.com$", "github.com", (match.group(1) or match.group(2)).lower())
+            remotes[name] = repo if host == "github.com" else f"{host}/{repo}"
+        for line in git("config", "--get-regexp", r"^remote\..*\.gh-resolved$").splitlines():
+            key, _, value = line.partition(" ")
+            name = key[len("remote."):-len(".gh-resolved")]
+            if value == "base" and name in remotes:
+                ranked = [name]
+                break
+            if OWNER_REPO_RE.fullmatch(value):
+                return value
+        else:  # a stable sort over git's order, as gh's: equal priorities keep their order
+            ranked = sorted(remotes, key=lambda name: -REMOTE_PRIORITY.get(name.lower(), 0))
+        if ranked and remotes[ranked[0]] is None:
+            raise WatchError(f"gh would use remote `{ranked[0][:40]}`, whose URL this cannot read as "
+                             f"a repository: pass -R OWNER/REPO")
+        return remotes[ranked[0]] if ranked else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def relay_fds() -> list[int]:
+    return [0, 1, 2]
+
+
 class RelayStarted(Exception):
     """The daemon failed after starting gh: the call's ending is unknown, never "not run"."""
 
@@ -5192,6 +5319,56 @@ def relay_exchange(path: Path, request: dict, fds: list[int], timeout: float) ->
         except (OSError, ValueError):  # a reset, a timeout or a torn line: its ending is unknown
             raise RelayLost() from None
         raise RelayLost()
+
+
+def relay_relative_file(args: list[str]) -> str | None:
+    """An argument naming a file here by a relative path, which the relayed gh, run in a directory
+    of its own, would not find: `--input body.json`, `-F x=@notes.md`, `--field=x=@notes.md`,
+    `--body-file=r.md`, `-Fr.md`. Read wide: every tail after an `=` or `@`, and in a short flag."""
+    for arg in args:
+        tails = [arg, *(arg[i + 1:] for i, c in enumerate(arg) if c in "=@")]
+        if re.match(r"-[^-]", arg):  # a short flag's value, in a cluster too: `-sFbody.md`
+            tails += [arg[i:] for i in range(2, len(arg))]
+        for value in tails:
+            if value and value != "-" and not os.path.isabs(value) and os.path.isfile(value):
+                return value
+    return None
+
+
+def broker_relay(args: list[str], why: str) -> int:
+    """Run this call through the daemon's relay; on any failure, refuse it loudly."""
+    path = relay_socket()
+    relative = relay_relative_file(args)
+    if relative:
+        broker_note({"route": "relay", "ok": False, "error": "relative file"})
+        print(f"glaeda-gh: `gh {' '.join(args[:2])}` has no GitHub token in this process ({why}), so it "
+              f"would be run by glaeda's daemon, which does not run it in this directory: `{relative[:80]}` "
+              f"would not be found there. Not run: pass its absolute path.", file=sys.stderr)
+        return RELAY_EXIT_NO_TOKEN
+    env = {name: os.environ[name] for name in RELAY_ENV if name in os.environ}
+    try:
+        if "GH_REPO" not in env:
+            repo = relay_repo()  # an explicit -R still wins over it, as it would here
+            if repo:
+                env["GH_REPO"] = repo
+        rc = relay_exchange(path, {"argv": args, "env": env}, relay_fds(), RELAY_TIMEOUT + RELAY_SLOT_WAIT + 30)
+    except RelayLost:
+        broker_note({"route": "relay", "ok": False, "error": "lost"})
+        print(f"glaeda-gh: `gh {' '.join(args[:2])}` was handed to glaeda's daemon (no GitHub token in this "
+              f"process: {why}), and the daemon went away before saying how it ended. It may have "
+              f"taken effect: check before running it again.", file=sys.stderr)
+        return RELAY_EXIT_LOST
+    except (OSError, ValueError, WatchError) as error:
+        broker_note({"route": "relay", "ok": False, "error": describe(error)})
+        print(f"glaeda-gh: `gh {' '.join(args[:2])}` has no GitHub token in this process: {why}. That is "
+              f"the macOS login keychain refusing a process outside the GUI login session. It was "
+              f"to be run by glaeda's daemon instead, which can read it, but the relay at {path} did "
+              f"not run it ({describe(error)}). Not sending it unauthenticated. Check the daemon "
+              f"with `glaeda-gh budget`, or run it on a host whose gh token is in a file "
+              f"(`reach huge-blue gh ...`).", file=sys.stderr)
+        return RELAY_EXIT_NO_TOKEN
+    broker_note({"route": "relay", "ok": True, "rc": rc})
+    return rc
 
 
 def relay_refusal(argv: list[str], env: dict) -> str | None:
@@ -5528,6 +5705,12 @@ def cmd_gh(args: list[str]) -> int:
               f"again -- run the real gh by path, and CMUX_GH_BROKER_DISABLE=1 keeps this broker "
               f"out.", file=sys.stderr)
         return BROKER_EXIT_NO_GH
+    try:
+        why = broker_token_missing(real, args)
+    except Exception as error:  # noqa: BLE001  fail closed: an unchecked call may go out anonymous
+        why = f"the token check failed ({describe(error)})"
+    if why is not None:
+        return broker_relay(args, why)
     try:
         # Survives the exec, so this call is not brokered twice; tagged with the pid so it means
         # nothing to anything gh goes on to spawn (see broker_hops). execv keeps the pid, which is
