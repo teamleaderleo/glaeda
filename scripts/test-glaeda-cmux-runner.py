@@ -8638,6 +8638,12 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(member["gatewayRunners"], 3)
         self.assertNotIn(fleet_labels.GATEWAY_LABEL, member["labels"] + member["pools"])
         self.assertEqual(fleet_labels.gateway_hosts(manifest), 1)
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
+                                                                 "trustedRepo": "manaflow-ai/cmux"}}
+        self.assertEqual(fleet_labels.member_labels(manifest, "mini-std", ok)[0]["gatewayRunners"], 0,
+                         "a trusted member holds a secret: never a gateway slot, which runs PR jobs")
+        self.assertEqual(fleet_labels.gateway_hosts(manifest), 0)
+        del manifest["hosts"]["mini-std"]["overrides"]
         for bad in (9, -1, True, "2"):
             with self.subTest(bad=bad):
                 manifest["defaults"]["runner"]["classes"]["std"]["gatewayRunners"] = bad

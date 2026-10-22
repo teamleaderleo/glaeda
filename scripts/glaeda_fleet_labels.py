@@ -309,7 +309,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else [],
             "sessionPools": [session_label(label) for label in dict.fromkeys(pools)] if gui else [],
             "fastRunners": fast, "fastPools": [fast_label(label) for label in dict.fromkeys(pools)] if fast else [],
-            "gatewayRunners": gateway}, None
+            # a trusted member holds a secret and never runs PR code: a gateway slot runs same-repository PR jobs
+            "gatewayRunners": 0 if trusted_ref else gateway}, None
 
 
 def gateway_hosts(manifest: Any) -> int:
