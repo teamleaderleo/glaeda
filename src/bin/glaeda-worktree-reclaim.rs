@@ -317,6 +317,8 @@ fn main() -> ExitCode {
     let mut budget_exhausted = false;
     let mut circuit_breaker_tripped = false;
     let mut mutation_performed = false;
+    // The process listing is the host's, not one checkout's: --skip-unlisted never hides it.
+    let mut host_evidence_failed = false;
     let mut repositories = Vec::with_capacity(cli.repositories.len());
 
     for (index, repository) in cli.repositories.iter().enumerate() {
@@ -344,6 +346,7 @@ fn main() -> ExitCode {
             let evidence = match ProcessUseEvidence::collect(&executor) {
                 Ok(evidence) => evidence,
                 Err(error) => {
+                    host_evidence_failed = true;
                     repositories.push(RepositoryReport {
                         ordinal: index + 1,
                         path: repository.clone(),
@@ -549,7 +552,7 @@ fn main() -> ExitCode {
     }
     if circuit_breaker_tripped {
         ExitCode::from(3)
-    } else if any_unlisted && !cli.skip_unlisted {
+    } else if host_evidence_failed || (any_unlisted && !cli.skip_unlisted) {
         // A mistyped or invalid repository must not pass silently in an unattended run.
         ExitCode::from(2)
     } else {
