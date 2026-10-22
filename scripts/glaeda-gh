@@ -5070,6 +5070,13 @@ RELAY_CONNECTIONS = 16  # calls the daemon holds at once, running or waiting; pa
 RELAY_DRAIN = RELAY_SLOT_WAIT + RELAY_TIMEOUT + 30
 # Passed through from the caller; nothing else of its environment is.
 RELAY_ENV = ("GH_REPO", "GH_HOST", "NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE")
+# All the daemon's relayed gh gets of the daemon's own environment: what gh needs to find its config,
+# keychain and network. Nothing else, so no token or other secret there can be read back through
+# `--jq env.X`, which gh's jq evaluates with the process environment.
+RELAY_DAEMON_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM", "GH_CONFIG_DIR",
+                    "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "SSL_CERT_FILE",
+                    "SSL_CERT_DIR", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY",
+                    "no_proxy", "ALL_PROXY", "all_proxy")
 # What the daemon runs for a caller, by command and subcommand (None: any). Left out: anything that
 # prints the credential (`auth`), runs a program (`alias`, extensions, `config`), or needs the
 # caller's checkout or files to mean anything (`repo clone`, `pr checkout`, `run download`, gist,
@@ -5113,8 +5120,10 @@ def relay_hosts(args: list[str], env: Any) -> set[str]:
     """The hosts other than github.com this call names. Read wide, not the way gh parses: a URL that
     is a whole argument, a whole `--flag=` value or GH_REPO; GH_HOST and --hostname; a -R/--repo
     value however spelled (`-R X`, `-RX`, `--repo=X`, `-sRX`, `-sR X`) or GH_REPO, as HOST/OWNER/REPO;
-    and an argument of HOST/OWNER/REPO whose host has a dot. A host read where gh reads none costs
-    the call a refusal; one missed would send it out unauthenticated."""
+    any argument of A/B/C outside `gh api` (gh takes a one-word host: `repo view ghe/o/r`), and a
+    `--flag=` value or `gh api` argument of HOST/OWNER/REPO whose host has a dot. A host read where gh
+    reads none costs the call a refusal; one missed would send it out unauthenticated. The host gh
+    picks when none is named is the caller's to check and the daemon's to pin (GH_HOST)."""
     hosts = {env["GH_HOST"]} if env.get("GH_HOST") else set()
     repos = [env["GH_REPO"]] if env.get("GH_REPO") else []
     values = list(repos)
@@ -5137,12 +5146,17 @@ def relay_hosts(args: list[str], env: Any) -> set[str]:
         match = REPO_HOST_RE.fullmatch(value)
         if match:
             hosts.add(match.group(1))
+    whole = set(args) if args[:1] != ["api"] else set()
     for value in values:
         match = REPO_HOST_RE.fullmatch(value)
-        if match and "." in match.group(1) and not URL_HOST_RE.fullmatch(value):
+        if match and ("." in match.group(1) or value in whole) and not URL_HOST_RE.fullmatch(value):
             hosts.add(match.group(1))
     # gh's own normalising: api.github.com and the like are github.com.
     return {re.sub(r"^.*\.github\.com$", "github.com", host.lower()) for host in hosts} - {"github.com"}
+
+
+class RelayStarted(Exception):
+    """The daemon failed after starting gh: the call's ending is unknown, never "not run"."""
 
 
 class RelayLost(Exception):
@@ -5323,7 +5337,9 @@ class GhRelay(threading.Thread):
                     return
                 try:
                     message = self.answer(conn, request, fds)
-                except Exception as error:  # noqa: BLE001
+                except RelayStarted:
+                    return  # no answer at all, which the caller reports as a call that may have run
+                except Exception as error:  # noqa: BLE001  only what fails before gh starts gets here
                     message = {"refused": describe(error)}
                 with contextlib.suppress(OSError):
                     conn.settimeout(60)
@@ -5345,13 +5361,13 @@ class GhRelay(threading.Thread):
             refusal = relay_refusal(argv, given)
             if refusal:
                 raise WatchError(refusal)
-            # CMUX_GH_BROKER_DISABLE is taken out, not put in: with it, a `gh` that hands the call back
-            # to this broker is exec'd unconditionally, before the hop and depth counts that end such a
-            # loop. RELAYED keeps the call from coming back here; the depth count keeps it finite. No
-            # pager, browser or editor of anyone's choosing runs in this session.
-            env = {k: v for k, v in os.environ.items()
-                   if k not in ("CMUX_GH_BROKER_DISABLE", "GIT_DIR", "GIT_WORK_TREE")}
+            # RELAY_DAEMON_ENV only: CMUX_GH_BROKER_DISABLE, GIT_DIR and any token stay out. RELAYED
+            # keeps the call from coming back here; the depth count keeps it finite. No pager, browser
+            # or editor of anyone's choosing runs in this session. GH_HOST is pinned to github.com, the
+            # one host this checked: unset, gh would pick the sole host its config names.
+            env = {k: v for k, v in os.environ.items() if k in RELAY_DAEMON_ENV or k.startswith("LC_")}
             env.update(given)
+            env["GH_HOST"] = "github.com"
             env.update({RELAYED: "1", BROKER_DEPTH: str(broker_depth() + 1), "GH_PAGER": "cat", "PAGER": "cat",
                         "GH_BROWSER": "true", "BROWSER": "true", "GH_EDITOR": "false", "EDITOR": "false",
                         "VISUAL": "false", "GIT_EDITOR": "false", "GIT_TERMINAL_PROMPT": "0",
@@ -5359,7 +5375,8 @@ class GhRelay(threading.Thread):
             if not self.slots.acquire(timeout=RELAY_SLOT_WAIT):
                 raise WatchError(f"{RELAY_SLOTS} relayed gh calls already running")
             try:
-                with tempfile.TemporaryDirectory(prefix="gh-relay-", dir=self.path.parent) as cwd:
+                with tempfile.TemporaryDirectory(prefix="gh-relay-", dir=self.path.parent,
+                                                 ignore_cleanup_errors=True) as cwd:
                     rc, note = self.spawn(conn, [self.gh(), *argv], fds, env, cwd)
             finally:
                 self.slots.release()
@@ -5367,8 +5384,9 @@ class GhRelay(threading.Thread):
             for fd in fds:
                 with contextlib.suppress(OSError):
                     os.close(fd)
-        log({"event": "relay", "words": " ".join(w for w in argv[:2] if re.fullmatch(r"[a-z][a-z-]{0,30}", w)),
-             "rc": rc})
+        with contextlib.suppress(Exception):  # gh has run: nothing after it may turn into a refusal
+            log({"event": "relay", "words": " ".join(w for w in argv[:2] if re.fullmatch(r"[a-z][a-z-]{0,30}", w)),
+                 "rc": rc})
         return {"rc": rc, "note": note} if note else {"rc": rc}
 
     def spawn(self, conn: socket.socket, command: list[str], fds: list[int], env: dict[str, str],
@@ -5381,6 +5399,18 @@ class GhRelay(threading.Thread):
             proc = subprocess.Popen(command, stdin=fds[0], stdout=fds[1], stderr=fds[2], env=env, cwd=cwd,
                                     start_new_session=True)
             self.running.add(proc)
+        try:
+            return self.finish(conn, proc, command, fds)
+        except Exception as error:
+            kill_group(proc)  # untracked from here on, so not left running on the caller's descriptors
+            with contextlib.suppress(Exception), self.idle:
+                self.running.discard(proc)
+            with contextlib.suppress(Exception):
+                proc.wait(5)
+            raise RelayStarted(describe(error)) from error
+
+    def finish(self, conn: socket.socket, proc: subprocess.Popen, command: list[str],
+             fds: list[int]) -> tuple[int, str | None]:
         for fd in fds:  # gh has its own copies; the caller sees EOF once gh and its children are done
             with contextlib.suppress(OSError):
                 os.close(fd)

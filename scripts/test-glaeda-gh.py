@@ -4591,7 +4591,8 @@ class GhRelayTest(RelayBase):
                           (["pr", "view", "--comments", f"https://{ghe}/o/r/pull/7"], {}),
                           (["pr", "merge", "7", f"-sR{ghe}/o/r"], {}), (["pr", "merge", "7", "-sR", f"{ghe}/o/r"], {}),
                           (["pr", "view", "7", "-R", "ghe/o/r"], {}), (["pr", "view", "7", f"--repo={ghe}/o/r"], {}),
-                          (["repo", "view", f"{ghe}/o/r"], {}), (["api", "x", f"--url=https://{ghe}/o/r"], {})):
+                          (["repo", "view", f"{ghe}/o/r"], {}), (["api", "x", f"--url=https://{ghe}/o/r"], {}),
+                          (["repo", "view", "ghe/acme/private"], {})):
             with self.subTest(argv=argv, env=env), self.assertRaisesRegex(gg.WatchError, "github.com only"):
                 self.call(argv, env)
         self.assertFalse(self.ran.exists(), "gh ran for a refused call")
@@ -4628,13 +4629,27 @@ class GhRelayTest(RelayBase):
     def test_the_daemon_runs_gh_with_nothing_of_the_callers_choosing(self) -> None:
         self.relay('echo "pager=$GH_PAGER editor=$GH_EDITOR browser=$GH_BROWSER '
                    'disable=${CMUX_GH_BROKER_DISABLE-unset} depth=$GLAEDA_GH_DEPTH '
-                   'tty=${GH_FORCE_TTY-unset} gitdir=${GIT_DIR-unset}"\n')
-        with mock.patch.dict(os.environ, {"CMUX_GH_BROKER_DISABLE": "1"}):
+                   'tty=${GH_FORCE_TTY-unset} gitdir=${GIT_DIR-unset} host=$GH_HOST '
+                   'token=${GH_TOKEN-unset}${GITHUB_TOKEN-unset}${GH_ENTERPRISE_TOKEN-unset}${OTHER_SECRET-unset}"\n')
+        # A token in the daemon's environment would come back through `--jq env.GH_TOKEN`.
+        with mock.patch.dict(os.environ, {"CMUX_GH_BROKER_DISABLE": "1", "GH_TOKEN": "s1", "GITHUB_TOKEN": "s2",
+                                          "GH_ENTERPRISE_TOKEN": "s3", "OTHER_SECRET": "s4"}):
             rc, out, _ = self.call(["pr", "view", "7"], {"GH_PAGER": "sh -c evil", "GH_FORCE_TTY": "1",
                                                          "GIT_DIR": "/elsewhere", "GH_EDITOR": "sh"})
         self.assertEqual(rc, 0)
         self.assertEqual(out.split(), ["pager=cat", "editor=false", "browser=true", "disable=unset",
-                                       "depth=1", "tty=unset", "gitdir=unset"])
+                                       "depth=1", "tty=unset", "gitdir=unset", "host=github.com",
+                                       "token=unsetunsetunsetunset"])
+
+    def test_once_gh_has_started_no_failure_reads_as_not_run(self) -> None:
+        """A refusal tells the caller it may run the call again; after gh started, that could do it twice."""
+        self.relay("exit 0\n")
+        with mock.patch.object(gg, "log", side_effect=OSError("disk full")):
+            self.assertEqual(self.call(["issue", "close", "7"])[0], 0, "a failed log line keeps the result")
+        with mock.patch.object(gg.GhRelay, "finish", side_effect=OSError("boom")), \
+                self.assertRaises(gg.RelayLost):
+            self.call(["issue", "close", "7"])
+        self.assertTrue(self.ran.exists())
 
     def test_a_relayed_call_that_overruns_is_stopped_with_what_it_started(self) -> None:
         pidfile = self.home / "child"
