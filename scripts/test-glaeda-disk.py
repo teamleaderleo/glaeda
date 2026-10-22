@@ -3015,9 +3015,16 @@ class GlaedaDiskTest(unittest.TestCase):
         fss = {dev: gd.Fs(dev, "/", int(free_gib * gd.GIB), total, 120 * gd.GIB, 170 * gd.GIB)}
         items = over.pop("items", [])
         apply_effect = over.pop("apply_effect", None)
-        with mock.patch.object(gd, "RUN_LOG", log), mock.patch.object(gd, "OPEN_RUNS", self.root / "open-runs"), \
-                mock.patch.object(gd, "DISK_OFF", over.pop("off", self.root / "disk-off")), \
-                mock.patch.dict(gd.POLICY, over.pop("policy", {})), \
+        with contextlib.ExitStack() as paths:  # one with of 21 managers is past CI Python's 20 nested blocks
+            for name, value in (("RUN_LOG", log), ("OPEN_RUNS", self.root / "open-runs"),
+                                ("DISK_OFF", over.pop("off", self.root / "disk-off"))):
+                paths.enter_context(mock.patch.object(gd, name, value))
+            self._main_run_patched(argv, fss, free_gib, total, items, apply_effect, over)
+        rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+        return self._status, rows, self._survey, self._apply
+
+    def _main_run_patched(self, argv, fss, free_gib, total, items, apply_effect, over):
+        with mock.patch.dict(gd.POLICY, over.pop("policy", {})), \
                 mock.patch.object(gd, "MEASURE_LOCK", self.root / "measure.lock"), \
                 mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
                 mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
@@ -3035,9 +3042,8 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "clear_stale_build_markers", return_value=0), \
                 mock.patch.object(gd, "repack_runner_checkouts", return_value=0), \
                 mock.patch.object(gd, "notify_disk"), contextlib.redirect_stdout(io.StringIO()) as self.out:
-            status = gd.main(argv + ["--no-snapshot", "--top", "0", "--receipt", os.fspath(self.receipt())])
-        rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
-        return status, rows, survey, apply
+            self._status = gd.main(argv + ["--no-snapshot", "--top", "0", "--receipt", os.fspath(self.receipt())])
+        self._survey, self._apply = survey, apply
 
     def test_every_applying_run_writes_one_run_line(self) -> None:
         blocked = gd.Item("code-sign-clones", "/x/c", 12 * gd.GIB, 1.0, "recent", [])
