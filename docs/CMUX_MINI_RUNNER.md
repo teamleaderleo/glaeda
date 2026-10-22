@@ -331,9 +331,9 @@ What `--apply` does:
      and goes whatever its age below the emergency floor, deleted only under that lock (cmux9s,
      2026-09-30: 31 GiB of it unheld while glaeda-disk found 0.0 GiB to free and every job was
      refused at 21.9 GiB free). The cmux-next workflow's `~/Library/Caches/cmux-next-ci` has an
-     LRU size cap (`cmux_next_ci_cap_gib`, default 40 GiB): over it, a pressure run takes its least
-     recently used generated output and stale state roots whatever their age, back down to the cap,
-     keeping every in-use veto ([CMUX_NEXT_CI_RETENTION.md](CMUX_NEXT_CI_RETENTION.md); cmux11s,
+     LRU size cap (`cmux_next_ci_cap_gib`, default 40 GiB, hosts with enrolled runners): over it, a
+     pressure run takes its least recently used generated output, and whole states no enrolled runner
+     owns, whatever their age, back down to the cap, keeping every in-use veto ([CMUX_NEXT_CI_RETENTION.md](CMUX_NEXT_CI_RETENTION.md); cmux11s,
      2026-10-21: jobs refused at 21 GiB free with 78 GiB there and nothing reclaimable).
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`. Under the disk

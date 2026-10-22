@@ -4,8 +4,15 @@
 `~/Library/Caches/cmux-next-ci`:
 
 - `cmux-scheme/<runner>`;
-- `dev-daily-release/<hex fingerprint>/Release/<hex Xcode hash>`;
-- `release-compile/<hex fingerprint>/Release/<hex Xcode hash>`.
+- `dev-daily-release/<hex key>/Release/<hex Xcode hash>`;
+- `release-compile/<hex key>/Release/<hex Xcode hash>`.
+
+The key is one per runner and workspace, not a source fingerprint: cmux's
+`scripts/cmux-next/release-derived-data-path.sh` names it
+`sha256("$RUNNER_NAME\n$GITHUB_WORKSPACE\n")[:16]`. glaeda-disk computes it for
+each enrolled runner (its `_work/cmux/cmux`, as given and resolved), so a release
+state's owner is known like a `cmux-scheme/<runner>` state's: a runner with a
+`Runner.Worker` keeps its output, and the runner floor hold covers it.
 
 The Xcode state component may be the historical bare hash or the production
 `xcode-<hash>` form. The family rejects symlinked layout parents and state
@@ -28,21 +35,22 @@ writes the standard JSONL receipt and rechecks every candidate.
 
 ## Size cap
 
-A pressure run (`--pressure`, or `keepup --apply` under pressure) measures the
-whole cache, inputs included, with one `du`. While it is over
-`cmux_next_ci_cap_gib` (default 40 GiB; set it in
+On a host with enrolled glaeda runners, a report or pressure run measures the
+whole cache, inputs included, with one `du` (a probe: its timeout records no
+`eviction_stuck` and no cooldown). Reports and `keepup` without `--apply` show
+it against `cmux_next_ci_cap_gib` (default 40 GiB; set it in
 `~/.config/glaeda/disk-policy.json` or with `--cmux-next-cap-gib`, 0 turns it
-off), the 72-hour window gives way: candidates go least recently used first,
-until the cache is back under the cap or the free target is met. Over the cap a
-stale state root is listed whole instead of its generated children: in
-`dev-daily-release` and `release-compile` every state root but the most recently
-used of its kind (a superseded fingerprint), and in `cmux-scheme` a state named
-after no runner enrolled on the host (only where runners are enrolled). Each
-enrolled runner's state and each kind's newest state keep `SourcePackages` and
-the module caches. Every veto above still holds, and an enrolled runner with a
-`Runner.Worker` keeps its state. An unmeasurable cache keeps the 72-hour window.
-cmux11s refused jobs at 21 GiB free under a 40 GiB floor with 78 GiB here and
-nothing reclaimable (2026-10-21).
+off), and every `--apply` run line records `cmux_next_ci_over_gib`. Only a
+pressure run (`--pressure`, or `keepup --apply` under pressure) acts: while the
+cache is over the cap, the 72-hour window gives way, and candidates go least
+recently used first until the cache is back under the cap or the free target is
+met. Over the cap a state root no enrolled runner owns (a `cmux-scheme` state by
+name, a release state by key) is listed whole, inputs included, and leaves no
+empty `<key>/Release` behind. Every enrolled runner's states lose only generated
+output and keep `SourcePackages` and the module caches. Every veto above still
+holds, and a runner with a `Runner.Worker` keeps its states. An unmeasurable
+cache keeps the 72-hour window. cmux11s refused jobs at 21 GiB free under a
+40 GiB floor with 78 GiB here and nothing reclaimable (2026-10-21).
 
 The ordinary `--dedupe` pass visits only reusable package/module/SDK inputs. Build
 output is write-heavy, so it is excluded from the periodic WatchPaths agent. An
