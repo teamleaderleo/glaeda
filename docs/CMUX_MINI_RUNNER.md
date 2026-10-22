@@ -88,7 +88,10 @@ What `--apply` does:
      `until`, active while now is before `until`, whoever owns it; an unreadable or
      invalid marker also refuses, an expired one is ignored; parsed by
      `glaeda_reservation.py`, which the installer puts next to the hook), when free disk is below `--min-free-gib` (from the manifest's
-     `disk.min_free_gib` with `--manifest`), or when another build holds `host.lock`, the
+     `disk.min_free_gib` with `--manifest`; the gui and session runners, which take cmux-next
+     tours, use at least cmux's `scripts/cmux-next/tour-requirements.json` floor, vendored in
+     the hook and checked against cmux by `glaeda-cmux-tour-floor-check` in CI),
+     or when another build holds `host.lock`, the
      `flock` that `with-host-lock` and the build worker take. Otherwise the job takes that
      lock: a small detached holder keeps it until job-completed releases it or the job's
      `Runner.Worker` exits, so fleet builds wait for the PR job and a crash cannot leave
@@ -124,6 +127,44 @@ What `--apply` does:
      rustup change). The check takes about a second and runs
      on every job, so a mini that drifts or loses eligibility stops taking PR jobs at
      once, and refusal recovery re-runs the job elsewhere.
+   - Jobs build with the pool Xcode (`--toolchain-xcode`), never past it. On cmux21
+     (macOS 27, 2026-10-21) Command Line Tools 27 made `xcrun --show-sdk-path` answer
+     `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk` (Swift 6.4) even with
+     `xcode-select` and `DEVELOPER_DIR` on Xcode_26.6, and the gate, started through the
+     `/usr/bin/python3` xcrun shim, passed the shim's `SDKROOT` to `Runner.Listener` and so
+     to every job: cmux-next's fast tier failed "this SDK is not supported by the
+     compiler", and once the CLT were moved aside the job-started hook itself could not
+     start until the runners restarted. So:
+     - `listen.sh` runs `unset SDKROOT TOOLCHAINS` and exports
+       `DEVELOPER_DIR=<pool Xcode>/Contents/Developer`; the gate scrubs its own
+       environment the same way and starts `run.sh` with it (`listener_env`). A listener a
+       reloaded gate adopts from an older gate with another environment is stopped once
+       idle and started clean. The hooks run under a python3 that is not the shim
+       (`glaeda-cmux-runner` prefers PATH's python3, then Homebrew's; the shim last).
+     - job-started refuses when the runner's environment still sets `TOOLCHAINS` or an
+       `SDKROOT` outside the pool Xcode, and pins an admitted job's later steps to
+       `DEVELOPER_DIR` through `$GITHUB_ENV` when the runner's environment does not.
+     - With `--require-eligible`, job-started (and the gate's eligibility look, which then
+       holds the listener off) runs `xcrun --show-sdk-path` and `xcrun swiftc --version` in
+       that clean environment and refuses with `toolchain: xcrun resolves <path> outside
+       Xcode_26.6; ...` when the SDK is not inside the Xcode's `MacOSX.platform`, when the
+       Swift version differs from the Xcode's own `XcodeDefault.xctoolchain` swiftc, or when
+       the SDK's `SDKSettings` major is newer than the Xcode's. It also refuses when `xcrun
+       --find` fails for a tool cmux jobs use (swift, swiftc, clang, git, make, ld,
+       xcodebuild, python3), or when `python3 -c 'import sys'` fails for PATH's python3 or
+       the `/usr/bin/python3` shim: on cmux21, once the CLT were moved aside, a stale
+       `SDKROOT` made the shim exit 72 ("xcode-select: Failed to locate 'python3'") and
+       app-compile, fast-tier and web-bundles failed as infra. The probes run after the
+       receipt probes (which keep their 20 s), as one shell batch in its own process group
+       under its own 15 s deadline, killed whole at the deadline;
+       a probe that did not finish, or printed nothing, is no answer and refuses nothing,
+       so a loaded mini never leaves the fleet for it (the exact receipt check still
+       compares `xcrun --show-sdk-version`). A pass that saw the SDK path and both Swift
+       versions is cached for 10 minutes in
+       `~/.local/state/glaeda/cmux-runner/xcode-probe.json`; a refusal or a partial answer
+       never is. An `SDKROOT` that is an SDK name (`macosx`) is not a leak; only a path is.
+     - glaeda-mini-health reports the same mismatch as `toolchain_mismatch` (error, root's
+       fix: move `/Library/Developer/CommandLineTools` aside), so ci-dash alerts.
    - With weighted capacity (`--capacity-units N`, baked in from the manifest class for
      every member, see 2d), the job takes a share of the mini instead of the whole host
      lock. It holds a shared `flock` on `host.lock` (so `with-host-lock`'s `LOCK_EX`,
@@ -267,14 +308,40 @@ What `--apply` does:
        a costlier side lane (cmux's release-build, reload-build, cmux-tui) that finds
        fewer units than it needs waits for them instead of refusing, as does a root
        runner that lost a race for its units.
-     - Every runner stops while a job already admitted to this mini waits for units
-       (`admit.want-<pid>`), a root runner also while one waits for a canonical root or
+     - Every runner but the gui runner (its reserve, below) stops while a job already
+       admitted to this mini waits for units (`admit.want-<pid>`), a root runner also while one waits for a canonical root or
        persistent-dd, and a gui runner while one waits for the gui token or a root. That
        job goes first, so a job taken now would only queue behind it.
      - A gui runner (`--gui-runner`, below) stops while the gui token is taken, every
        canonical root is taken, or every unit is. Only it carries the gui pool label, so
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
        mini's gui runner instead.
+     - **The gui runner's reserve.** While the gui runner has no job and nothing but
+       units holds it (not the fleet, heat, memory pressure, a locked console, the gui
+       token or the canonical roots), its gate holds an flock on
+       `capacity/<gui token>.reserve`. Every other admission (runner jobs, ci-step
+       `admit` and `fits`) and every other runner's gate then leaves one unit free
+       (`GUI_RESERVE_UNITS`): a root runner listens with 6 units free instead of 5, a
+       session runner with 7 instead of 6. The gui runner's own job takes the unit: one
+       that fits in the reserve goes ahead of a side job waiting here for units, which
+       could not have taken that unit, and a job waiting for units is no reason to hold
+       the gui runner. The gate keeps the reserve through its new job's admission (until
+       the job's holder runs) and then lets it go, so the other lanes get the unit back
+       while the job runs. A costlier gui-label job (cmux-next's `swift-test`, isolated at
+       4) waits its turn for its 4 units like any job, the reserved one out of other
+       lanes' reach meanwhile; what helps it most is that its runner now listens through
+       CPU saturation and through other lanes' waiters, so it queues on a mini, ahead of
+       later jobs, instead of in GitHub's queue. A reserve never makes a job unfittable
+       (one that needs the whole mini ignores it, and the fast tier, which takes no unit,
+       keeps none), and a flock dies with its gate, so a mini with no gui runner, or a
+       stopped one, keeps nothing. Before it, side and root jobs filled every unit on the
+       minis and the gui runners sat held as full: on 2026-10-21 about 6 of 13 gui
+       runners listened and gui-label jobs queued 1.5 to 3 h.
+     - The gui runner is never held for CPU saturation (85% busy), only for memory
+       pressure: its jobs come one per mini and are admitted by units like any other,
+       and the CPU mark held it whenever the other lanes kept the mini busy. Nothing
+       local says whether gui jobs are queued, and the gate polls no GitHub API, so the
+       exemption is unconditional.
      - A session runner (`--session-runner`, `guiRunners` above 1) carries only the session
        pool label and stops only while fewer than 6 units are free (`--fit-units 6`, the
        costliest of its jobs: generated files and action exports), a job here waits for units, or the console is locked. Its jobs (cmux-next daemon tests, generated files, action exports,
@@ -327,7 +394,11 @@ What `--apply` does:
      a directory a job holds by its `<fingerprint>.lock` flock stays, the rest ages like any cache
      and goes whatever its age below the emergency floor, deleted only under that lock (cmux9s,
      2026-09-30: 31 GiB of it unheld while glaeda-disk found 0.0 GiB to free and every job was
-     refused at 21.9 GiB free).
+     refused at 21.9 GiB free). The cmux-next workflow's `~/Library/Caches/cmux-next-ci` has an
+     LRU size cap (`cmux_next_ci_cap_gib`, default 40 GiB, hosts with enrolled runners): over it, a
+     pressure run takes its least recently used generated output, and whole states no enrolled runner
+     owns, whatever their age, back down to the cap, keeping every in-use veto ([CMUX_NEXT_CI_RETENTION.md](CMUX_NEXT_CI_RETENTION.md); cmux11s,
+     2026-10-21: jobs refused at 21 GiB free with 78 GiB there and nothing reclaimable).
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`. Under the disk
      floor the first idle poll is enough, ahead of any other hold, and while a job runs
@@ -1243,10 +1314,13 @@ runners) looks for what stopped runner minis on 2026-09-25 and 26 without anythi
 | `autologin_locks` (loginwindow `autoLoginUserScreenLocked`), `display_sleep` | none: root |
 | `testmanagerd_wedged`: the newest session line of this user's testmanagerd is `XCIDESession is responsible for cleaning up its socket`, 90 s old, nothing after it | the hook's `recycle_testmanagerd` (#1281) while no test runs; a hook without it gets the finding only |
 | `tailscale_down`: a BackendState other than `Running`, two runs in a row | `tailscale up` when Stopped, else `scutil --nc stop/start` of the Tailscale VPN service; a standalone tailscaled or a logged-out node is reported only |
+| `tailscale_no_route`: BackendState `Running`, but `route -n get 100.100.100.100` leaves by a non-utun interface (the tailnet route is gone), two runs in a row | a restart of Tailscale (never a config, auth or flag change), only on an idle CI runner mini the fleet registry opted in, at most once every 6 h per mini (below); elsewhere reported only |
+| `tailscale_cli_missing`: a host with runner LaunchAgents has neither `/usr/local/bin/tailscale` (standalone) nor the Tailscale app's CLI | reported only (warn): the tunnel is not checked, so it is not counted healthy |
 | `tailscale_probe_error`: the Tailscale CLI gave no BackendState (timeout, error, no JSON) | reported only: the check could not look, so the tunnel is not judged down |
 | `runner_stopped:<agent>`: a runner LaunchAgent loaded but not running, two runs in a row | `launchctl kickstart` (nothing runs in it, so no job is cut) |
 | `runner_unloaded:<agent>` (not one `cmux_mini_fix.sh` holds) | none: `glaeda-cmux-runner-fleet --apply` |
 | `node_ineligible`: the runner hook's eligibility check, for the fleet class its job-started hook requires, refuses (for example the class receipt's staged generation is gone) | none: restage the generation or re-enroll ([enrollment](CMUX_FLEET_ENROLLMENT.md)) |
+| `toolchain_mismatch`: in the env the runner gives its jobs, xcrun resolves an SDK outside the job-started hook's `--toolchain-xcode`, a swiftc of another Swift than that Xcode's, a newer-major SDK, a cmux tool `xcrun --find` cannot find, or a python3 (PATH's or the `/usr/bin/python3` shim) that does not start (Command Line Tools past the pool Xcode, cmux21 2026-10-21) | none: root moves `/Library/Developer/CommandLineTools` aside or `xcode-select -s` the pool Xcode; the next look admits the host |
 
 A heal runs at most every 10 minutes and 3 times a day per finding (a heal that worked but did not last counts),
 then the finding reads `impossible`. The report,
@@ -1254,6 +1328,62 @@ then the finding reads `impossible`. The report,
 sighting, evidence, `auto_fix` pending or impossible, and the heals of the last day), is what ci-dash's probe
 reads; ci-dash's Health section names the operator command for the rest. `glaeda-mini-health` alone prints
 the report without healing; `touch ~/.config/glaeda/mini-health.disabled` keeps it reporting but stops heals.
+
+**`tailscale_no_route`'s restart** (Leo, 2026-10-21) has its own gates instead of the 10-minute, 3-a-day rule,
+all of them failing closed (`heal_tailscale_route` in the script):
+
+1. **An opted-in CI runner mini only.** Which hosts may restart is declared in leo-workspace's
+   `machines/fleet-registry.json`, not in glaeda: the registry side writes
+   `~/.config/glaeda/tailscale-self-heal.json`
+   (`{"schema": "glaeda-tailscale-self-heal/v1", "host": "<registry name>", "source": "fleet-registry.json"}`)
+   on each host it allows, and nothing in glaeda writes it. The file must exist, parse, carry that schema and
+   name one of the names the host goes by (hostname, LocalHostName, ComputerName, update.json's `host`, the
+   tailnet name); missing, unreadable or another host's refuses. On top of it, glaeda's own facts: registered
+   glaeda runners (`actions-runner-glaeda*` with `.runner` and `glaeda-hooks`), `~/.config/glaeda/update.json`
+   setupArgs without `--hygiene-only`, `--gh-only` or `--headless` and with no role but `fleet-mini`, and
+   mini-setup's receipt role `fleet-mini`. A name holding "lawrence" (cmux-lawrence) refuses whatever the
+   opt-in says. A name (the tailnet name from `tailscale status --json` included) or fact that cannot be read
+   refuses.
+2. **Persistent.** The two-runs rule has reported it; by hand (no `--apply`) it never restarts.
+3. **Idle.** glaeda-disk's `host_busy` (the gate glaeda-idle-repair uses: no Runner.Worker or build, no
+   dev-build worker job, no reservation, the host lock free) says idle. Then it takes
+   `/Users/Shared/cmux-build-fleet/host.lock` exclusively, as with-host-lock and a fleet build do, so the runner
+   hook admits no job and idle listeners stop listening for the restart and its re-check (about 35 s), and
+   rechecks that no Runner.Worker or build started meanwhile. A job dispatched to a listener in that window is
+   refused by job-started (and re-run elsewhere), as during any fleet build.
+4. **Once per 6 h per mini, 3 failures and it stops.** `~/.local/state/glaeda/mini-health/tailscale-restart.json`
+   records the attempt, counted as failed, before the restart runs, so a crash mid-restart still counts; an
+   unreadable file refuses. After 3 failed restarts in a row (`failures`) it restarts no more until a run sees the
+   route on the tunnel again, which resets the count (as does a restart that fixed it).
+5. **The flavor's restart, nothing else.** The Tailscale app (App Store or the System Extension build):
+   `scutil --nc stop` and `start` of its VPN service, as this user (what `tailscale_down`'s heal already does).
+   A standalone tailscaled: `sudo -n /bin/launchctl kickstart -k system/com.tailscale.tailscaled`, only where
+   sudoers allows exactly that without a password: `sudo -n -l` (which runs nothing) must list it, or `ALL`,
+   under `NOPASSWD` for root as the last rule that matches it (a later password rule wins, as in sudoers; the
+   exit code of `sudo -n -l <cmd>` is 0 for a rule that still asks for one, so it is not used). The runner
+   user has no such rule by default, so there it stays reported with the rule it needs:
+   `<user> ALL=(root) NOPASSWD: /bin/launchctl kickstart -k system/com.tailscale.tailscaled`, which
+   `glaeda-mini-fleet sudo-plan --sudoers` installs when the host's manifest lists `com.tailscale.tailscaled`
+   under `launchd.running`. No `tailscale up`/`down`, `set`, login or flag change ever runs.
+6. **Verified once.** One 30 s wait, then one re-check of BackendState and the route. Fixed is a heal in the
+   report (`healed`); still broken stays a finding naming the result and the time the next restart is allowed.
+   `auto_fix` is `pending` only for a short wait: the mini is busy or the host lock is held right now (for less
+   than 6 h since the finding was first seen: a stranded host lock or a stuck `jobs/` entry then alerts), or the
+   two-runs rule is not met yet. Whenever no restart is coming it is `impossible`, so ci-dash's health alert (an
+   `impossible` error) reaches an operator: a restart that left the route broken or whose command failed (until
+   the route is fixed), the 6 h window after a restart (the note names the next try), either kill switch, a host
+   not opted in, a gate that cannot answer (no fleet dir; glaeda-disk's host gate or job patterns unreadable, or
+   a reason its `host_busy_unreadable` marks as could-not-read: no process list, `jobs/`, the reservation or the
+   host lock unreadable),
+   or a restart state that cannot be read or written (a `last_attempt_at` that is not a finite time from 0 to 6 h
+   past now is unreadable).
+7. **Not with claude_route.** While `tailscale_down` or `tailscale_no_route` is seen, `claude_route` runs no
+   `claude -p` (a probe through a broken tunnel hangs up to 60 s every run): a fresh cached answer stands, else
+   it reports `not probed: the Tailscale tunnel is down`, so capture-host stays closed. It keeps no probe and
+   reroutes nothing, so Claude's settings never change in the run that restarts Tailscale; the first run after
+   the tunnel is back probes the route in use.
+8. **Kill switch.** `touch ~/.config/glaeda/tailscale-restart-off`, or `GLAEDA_TAILSCALE_RESTART=off` in the
+   agent's environment (as glaeda-disk's `disk-off`); `mini-health.disabled` stops it too.
 
 ## 2m. Build mesh: the fleet index and kept state between PR minis
 

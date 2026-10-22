@@ -1544,6 +1544,10 @@ class Daemon:
         self.clock_real = now is None
         self.tick_deadline = time.monotonic() + TICK_BUDGET
         self.errors = []
+        if self.failing is None:
+            # and again in serve_waits: a long read phase must not look like a dead daemon; ticks that
+            # keep raising stop marking, so their blockers hand the wait back (resume_wait says why)
+            mark_waits_served()
         try:
             self.post_tick()  # first, so a long read phase never delays a write
         except Exception as error:  # noqa: BLE001  a bad queue entry must not stop the reads
@@ -1578,6 +1582,11 @@ class Daemon:
         # headers have already brought the view up to date, and only an idle one goes stale.
         self.refresh_budget()
         self.tick_deadline = float("inf")
+        try:
+            waiting = self.serve_waits()
+        except Exception as error:  # noqa: BLE001  the waits are the clients' business; the reads go on
+            waiting = None
+            self.errors.append(f"waits: {describe(error)} at {error_site(error)}")
         self.deferred &= {e["key"] for e in entries}
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
@@ -1593,7 +1602,8 @@ class Daemon:
         self.reads = [r for r in self.reads if self.now - r[0] < 3600]
         reads = {kind: {b: sum(1 for _, k, w in self.reads if k == kind and w == b) for b in ("graphql", "rest")}
                  for kind in CYCLES}
-        status = {"pid": os.getpid(), "at": self.now, "watching": len(entries),
+        status = {"pid": os.getpid(), "at": self.now, "watching": len(entries), "waits": WAITS_CONTRACT,
+                  "waiting": waiting,
                   "fetched": {"pr": len(prs), "run": len(runs), "comment": len(comments), "head": len(heads)},
                   "controller": {**self.controller_status, "runs": len(self.controller_filled)},
                   "modes": {b: self.mode(b) for b in ("rest", "graphql")}, "errors": self.errors[:10],
@@ -1609,6 +1619,76 @@ class Daemon:
             self.beat = self.now
         self.status = status
         return status
+
+    def serve_waits(self) -> int:
+        """Rule on the `wait pr|run` requests clients left in waits/ (subscribe_wait): keep their interest
+        registered, and when one is decided or out of time write what it prints and its exit code, then
+        wake its blocker with the code. waits/.served tells the blockers waits are being ruled on. A
+        request whose blocker is gone, or that cannot be read, is dropped. Returns how many are pending."""
+        d = waits_dir()
+        if not d.is_dir():
+            return 0
+        mark_waits_served()
+        now = time.time()  # requests carry wall-clock times, whatever clock a tick was given
+        pending, touch = 0, {}
+        for path in sorted(d.glob("*.json")):
+            rid = path.stem
+            try:
+                req = read_json(path)
+                decided = self.serve_wait(d, rid, req, now, touch)
+            except OSError:  # a full disk, say: the request stays, and the next tick tries again
+                pending += 1
+                continue
+            except Exception:  # noqa: BLE001  a request that cannot be ruled on must not stop the others
+                drop_wait(rid)  # its blocker sees the FIFO gone and hands the wait back (BLOCKER)
+                continue
+            if decided is None:
+                pending += 1
+        # One registration per key, all under one bound: a wedged holder of .register.lock costs a tick
+        # LOCK_WAIT, not LOCK_WAIT per waiter.
+        with lock_budget(LOCK_WAIT):
+            for key, jobs in touch.items():
+                register(key, jobs)
+        # What a blocker killed after its wake, or a wait handed back to Python, left behind.
+        for left in d.glob("*.*"):
+            rid = left.name.split(".", 1)[0]
+            pid = rid.split("-", 1)[0]
+            if rid and not (d / f"{rid}.json").exists() and not (pid.isdigit() and waiter_alive(int(pid))):
+                drop_wait(rid)
+        return pending
+
+    def serve_wait(self, d: Path, rid: str, req: Any, now: float, touch: dict[str, bool]) -> bool | None:
+        """One request: None while pending, else whether its blocker was woken. Raises on a bad one."""
+        if (not isinstance(req, dict) or not waiter_alive(req.get("pid")) or not (d / f"{rid}.fifo").exists()
+                or now > float(req["began"]) + float(req["timeout"]) + WAITS_LEFTOVER):
+            drop_wait(rid)
+            return False
+        if req.get("code") is None:
+            before = dict(req)
+            if now - float(req.get("touched") or 0) >= TOUCH_EVERY:
+                touch[req["key"]] = touch.get(req["key"], False) or bool(req.get("jobs"))
+                req["touched"] = now
+            try:
+                done, err = wait_step(req, now), ""
+            except WatchError as error:
+                done, err = (64, ""), f"glaeda-gh: {error}\n"
+            except Exception as error:  # noqa: BLE001  said to the waiter, not raised into the tick
+                done, err = (64, ""), f"glaeda-gh: the daemon could not rule on this wait: {describe(error)}\n"
+            if done is not None:
+                if err:
+                    (d / f"{rid}.out.err").write_text(err)
+                (d / f"{rid}.out").write_text(done[1])
+                (d / f"{rid}.out.rc").write_text(f"{done[0]}\n")
+                req["code"] = done[0]
+            if req != before:
+                write_json(d / f"{rid}.json", req)
+            if req.get("code") is None:
+                return None
+        if wake_waiter(d / f"{rid}.fifo", int(req["code"])):
+            with contextlib.suppress(OSError):
+                (d / f"{rid}.json").unlink()  # the blocker prints .out and removes the rest
+            return True
+        return False
 
     def batched(self, kind: str, entries: list[dict], fetch: Callable[[list[dict]], str | None]) -> None:
         """Read `entries` over GraphQL in queries of self.batch[kind]. A query that times out (504)
@@ -2855,14 +2935,17 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
     return "\n".join(lines)
 
 
+def render(key: str, entry: dict | None, as_json: bool, extra: dict | None = None, until: str = "done",
+           grace: float = RESCUE_GRACE) -> str:
+    if as_json:
+        return json.dumps({"key": key, **(entry or {}), **(extra or {})}, sort_keys=True) + "\n"
+    return "".join(f"{line}\n" for line in [summary(key, entry, until, grace)]
+                   + [f"{k}: {v}" for k, v in (extra or {}).items()])
+
+
 def emit(key: str, entry: dict | None, as_json: bool, extra: dict | None = None, until: str = "done",
          grace: float = RESCUE_GRACE) -> None:
-    if as_json:
-        print(json.dumps({"key": key, **(entry or {}), **(extra or {})}, sort_keys=True))
-    else:
-        print(summary(key, entry, until, grace))
-        for k, v in (extra or {}).items():
-            print(f"{k}: {v}")
+    sys.stdout.write(render(key, entry, as_json, extra, until, grace))
 
 
 def cmd_status(kind: str, target: str, jobs: bool, as_json: bool, first_wait: float = CYCLE + 10) -> int:
@@ -2995,15 +3078,82 @@ def say_waiting(line: str) -> None:
         return
 
 
+def wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
+                 sha: str | None, exact: bool, grace: float) -> dict:
+    """What a `wait pr|run` is ruled on: the same fields whether the client polls (cmd_wait) or the
+    daemon rules on it (subscribe_wait). `began` is wall-clock time: only data fetched after it counts."""
+    return {"key": parse_key(kind, target), "kind": kind, "target": target, "until": until, "timeout": timeout,
+            "jobs": jobs, "json": as_json, "sha": sha, "exact": exact, "grace": grace, "began": time.time()}
+
+
+def wait_step(req: dict, now: float) -> tuple[int, str] | None:
+    """One look at a `wait pr|run` (wait_request): (exit code, what it prints) once it is decided or out
+    of time, else None. Rules only on data the daemon fetched after the wait began, never on an older
+    cache. A short --sha that GitHub's head resolves is written back into REQ. Raises WatchError."""
+    key, kind, until, grace, began = req["key"], req["kind"], req["until"], req["grace"], req["began"]
+    sha, exact, as_json = req.get("sha"), req.get("exact", True), req.get("json", False)
+    entry = read_cache(key)
+    fresh = entry is not None and (entry.get("fetchedAt") or 0) >= began
+    waited = int(max(0.0, now - began))
+    if fresh and not entry.get("data") and entry.get("missing"):
+        # GitHub says NOT_FOUND; transport errors and 5xx stay pending
+        return EXIT_FAIL, render(key, entry, as_json, {"result": "failure", "waited_s": waited}, until, grace)
+    data = (entry or {}).get("data")
+    # only a merge is final; a completed run can be rerun and a closed PR reopened
+    final = kind == "pr" and data and data.get("state") == "MERGED"
+    usable = data and ((entry.get("dataAt") or 0) >= began or final)
+    if usable and sha:
+        head = str(data.get("headRefOid" if kind == "pr" else "head_sha") or "").lower()
+        if head and not head.startswith(sha):
+            if kind == "run":
+                raise WatchError(f"run {req['target']} is for commit {head[:12]}, not {sha[:12]}; a run's commit never changes")
+            if not exact:
+                raise WatchError(f"--sha {sha} is not a commit in this checkout and is not the head GitHub shows "
+                                 f"({head[:12]}); pass the full id (git rev-parse HEAD) to wait for a push "
+                                 "GitHub has not seen yet")
+        elif head and not exact:
+            # resolved: a later push now counts as pending, as for a full id
+            req["sha"], req["exact"] = sha, exact = head, True
+    result = verdict(kind, data, until, sha, (entry or {}).get("jobs"), time.time(), grace) if usable else None
+    if result is not None:
+        outcome_name = {EXIT_OK: "success", EXIT_CONFLICT: "conflict"}.get(result, "failure")
+        extra: dict[str, Any] = {"result": outcome_name, "waited_s": waited}
+        if kind == "pr" and result == EXIT_CONFLICT:
+            extra["note"] = ("PR conflicts with its base (mergeable CONFLICTING): no checks run until you "
+                             "merge or rebase onto the base and push")
+        elif kind == "pr" and data.get("state") == "CLOSED":
+            extra["note"] = "PR was closed without being merged"
+        if kind == "run" and result == EXIT_FAIL and grace > 0 and run_hold(data, entry.get("jobs"), time.time(), float("inf")):
+            extra["note"] = f"a glaeda runner refused this attempt at setup and no rescue attempt followed within {int(grace)}s"
+        return result, render(key, entry, as_json, extra, until, grace)
+    if now - began >= req["timeout"]:
+        extra = {"result": "timeout", "waited_s": waited}
+        if sha and entry and entry.get("data"):
+            head = entry["data"].get("headRefOid") or entry["data"].get("head_sha") or ""
+            if not str(head).startswith(sha):
+                extra["note"] = f"GitHub still shows head {str(head)[:10]}, not {sha[:10]}"
+        return EXIT_TIMEOUT, render(key, entry, as_json, extra, until, grace)
+    return None
+
+
 def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
              sha: str | None = None, grace: float = RESCUE_GRACE) -> int:
-    """Rules only on data the daemon fetched after this wait began, never on an older cache."""
-    key = parse_key(kind, target)
+    """The polling wait: this process re-reads the cache until wait_step decides. `wait pr|run` uses it
+    only when the daemon cannot rule on the wait itself (subscribe_wait). Says the waiting line once,
+    before it blocks; poll_wait does not, so a wait handed back to it (resume_wait) is not said twice."""
+    key = parse_key(kind, target)  # a bad target is the first thing said
     exact = True
     if sha:
         sha, exact = resolve_sha(sha)
-    began, start = time.time(), time.monotonic()
     say_waiting(waiting_line(key, until, sha, exact, timeout))
+    return poll_wait(wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace))
+
+
+def poll_wait(req: dict) -> int:
+    """Re-read the cache until wait_step decides REQ, saying what a down, failing or stale daemon means.
+    A wait the daemon stopped ruling on (resume_wait) carries on here, from when it began."""
+    timeout, jobs = req["timeout"], req["jobs"]
+    start = time.monotonic() - max(0.0, time.time() - req["began"])
     touched = -TOUCH_EVERY
     warned = False
     down, down_since = DownWait(), None
@@ -3025,51 +3175,183 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
             warned = True
         now = time.monotonic()
         if now - touched >= TOUCH_EVERY:
-            register(key, jobs)
+            register(req["key"], jobs)
             touched = now
-        entry = read_cache(key)
-        fresh = entry is not None and (entry.get("fetchedAt") or 0) >= began
-        waited = int(now - start)
-        if fresh and not entry.get("data") and entry.get("missing"):
-            emit(key, entry, as_json, {"result": "failure", "waited_s": waited}, until, grace)
-            return EXIT_FAIL  # GitHub says NOT_FOUND; transport errors and 5xx stay pending
-        data = (entry or {}).get("data")
-        # only a merge is final; a completed run can be rerun and a closed PR reopened
-        final = kind == "pr" and data and data.get("state") == "MERGED"
-        usable = data and ((entry.get("dataAt") or 0) >= began or final)
-        if usable and sha:
-            head = str(data.get("headRefOid" if kind == "pr" else "head_sha") or "").lower()
-            if head and not head.startswith(sha):
-                if kind == "run":
-                    raise WatchError(f"run {target} is for commit {head[:12]}, not {sha[:12]}; a run's commit never changes")
-                if not exact:
-                    raise WatchError(f"--sha {sha} is not a commit in this checkout and is not the head GitHub shows "
-                                     f"({head[:12]}); pass the full id (git rev-parse HEAD) to wait for a push "
-                                     "GitHub has not seen yet")
-            elif head and not exact:
-                sha, exact = head, True  # resolved: a later push now counts as pending, as for a full id
-        result = verdict(kind, data, until, sha, (entry or {}).get("jobs"), time.time(), grace) if usable else None
-        if result is not None:
-            outcome_name = {EXIT_OK: "success", EXIT_CONFLICT: "conflict"}.get(result, "failure")
-            extra: dict[str, Any] = {"result": outcome_name, "waited_s": waited}
-            if kind == "pr" and result == EXIT_CONFLICT:
-                extra["note"] = ("PR conflicts with its base (mergeable CONFLICTING): no checks run until you "
-                                 "merge or rebase onto the base and push")
-            elif kind == "pr" and data.get("state") == "CLOSED":
-                extra["note"] = "PR was closed without being merged"
-            if kind == "run" and result == EXIT_FAIL and grace > 0 and run_hold(data, entry.get("jobs"), time.time(), float("inf")):
-                extra["note"] = f"a glaeda runner refused this attempt at setup and no rescue attempt followed within {int(grace)}s"
-            emit(key, entry, as_json, extra, until, grace)
-            return result
-        if now - start >= timeout:
-            extra = {"result": "timeout", "waited_s": waited}
-            if sha and entry and entry.get("data"):
-                head = entry["data"].get("headRefOid") or entry["data"].get("head_sha") or ""
-                if not str(head).startswith(sha):
-                    extra["note"] = f"GitHub still shows head {str(head)[:10]}, not {sha[:10]}"
-            emit(key, entry, as_json, extra, until, grace)
-            return EXIT_TIMEOUT
-        time.sleep(min(WAIT_POLL, max(0.1, timeout - (now - start))))
+        done = wait_step(req, time.time())
+        if done is not None:
+            sys.stdout.write(done[1])
+            return done[0]
+        time.sleep(min(WAIT_POLL, max(0.1, req["began"] + timeout - time.time())))
+
+
+WAITS_CONTRACT = 1  # daemon.json "waits": this daemon rules on `wait pr|run` requests (Daemon.serve_waits)
+WAITS_CHECK = 60  # a blocker hands its wait back to Python when no tick has ruled on waits for this long
+WAITS_LEFTOVER = 600  # a request this far past its deadline has no blocker left (a reused pid): dropped
+WAITS_MAX_TIMEOUT = 1e8  # longer (or inf) waits poll, as before: bash keeps time in whole seconds
+BASH = "/bin/bash"
+# The whole waiter once the request is written: bash blocked reading the FIFO until the daemon writes
+# the exit code (Daemon.serve_waits), then what the wait prints. `3<>` opens without waiting for a
+# writer. Every WAITS_CHECK it looks at waits/.served, which each tick touches; at the wait's deadline,
+# once no tick has served waits since its last look (the daemon is down, failing, hung, or an older
+# one), or once its FIFO is gone (the daemon dropped the request), it execs "$@": `glaeda-gh
+# wait-resume ID` (resume_wait). That argument list is a contract with every live blocker: keep it.
+BLOCKER = r"""fifo=$1 out=$2 limit=$3 served=$4 check=$5
+shift 5
+mark=$out.mark
+exec 3<>"$fifo" || exec "$@"
+: > "$mark"
+end=$((SECONDS + limit))
+rc=
+while :; do
+  left=$((end - SECONDS))
+  [ "$left" -gt 0 ] || break
+  [ "$left" -gt "$check" ] && left=$check
+  IFS= read -r -t "$left" rc <&3 && break
+  rc=
+  [ -p "$fifo" ] && [ "$served" -nt "$mark" ] || break
+  : > "$mark"
+done
+exec 3<&-
+rm -f "$mark"
+case "$rc" in ''|*[!0-9]*) exec "$@" ;; esac
+[ -f "$out.err" ] && cat "$out.err" >&2
+[ -f "$out" ] && cat "$out"
+rm -f "$fifo" "$out" "$out.err" "$out.rc"
+exit "$rc"
+"""
+WAIT_FILES = (".json", ".fifo", ".out", ".out.err", ".out.rc", ".out.mark")
+
+
+def mark_waits_served() -> None:
+    """Tell the blockers a daemon that rules on waits is ticking (BLOCKER reads waits/.served)."""
+    with contextlib.suppress(OSError):
+        if waits_dir().is_dir():
+            (waits_dir() / ".served").touch()
+
+
+def waits_dir() -> Path:
+    return BASE / "waits"  # `wait pr|run` requests the daemon rules on: <id>.json, .fifo, .out, .out.rc, ...
+
+
+def write_wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
+                       sha: str | None, exact: bool, grace: float, pid: int) -> str:
+    """Leave a wait for the daemon: its FIFO first, then the request, so the daemon never sees a request
+    without one. Interest is registered at once, as a polling wait does. Returns the request's id."""
+    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace)
+    rid = f"{pid}-{os.urandom(4).hex()}"
+    waits_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.mkfifo(waits_dir() / f"{rid}.fifo", 0o600)
+    register(req["key"], jobs)
+    write_json(waits_dir() / f"{rid}.json", {**req, "pid": pid, "touched": req["began"]})
+    return rid
+
+
+def serving_waits() -> bool:
+    """Whether the daemon runs, rules on waits (WAITS_CONTRACT), and is neither failing nor hung."""
+    status = read_json(BASE / "daemon.json") or {}
+    return (isinstance(status.get("waits"), int) and status["waits"] >= WAITS_CONTRACT and lock_held()
+            and daemon_failing() is None and daemon_stale() is None)
+
+
+def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
+                   sha: str | None = None, grace: float = RESCUE_GRACE) -> int:
+    """`wait pr|run` as a request the daemon rules on: this process writes it and becomes BLOCKER, a bash
+    asleep on a FIFO, instead of a Python interpreter re-reading the cache every WAIT_POLL (89 of those
+    held 1.6 GB on cosmic-gray, 2026-10-21). Same arguments, output and exit codes as cmd_wait, which it
+    falls back to when the daemon is not serving waits (down, failing, hung or older than WAITS_CONTRACT),
+    there is no bash, or the timeout is not a finite number of seconds bash can count. (The CLI's
+    `seconds` already refuses inf, nan and negative timeouts; the range check here is for direct callers
+    and for finite timeouts past WAITS_MAX_TIMEOUT.)
+
+    The waiting line is said exactly once: by cmd_wait on the first fallback, here before BLOCKER
+    otherwise -- say_waiting writes fd 2 directly, so nothing is left buffered across the exec -- and
+    not again on the late fallback, which goes straight to poll_wait."""
+    if not (0 <= timeout <= WAITS_MAX_TIMEOUT) or not os.access(BASH, os.X_OK) or not serving_waits():
+        return cmd_wait(kind, target, until, timeout, jobs, as_json, sha, grace)
+    key = parse_key(kind, target)
+    exact = True
+    if sha:
+        sha, exact = resolve_sha(sha)
+    say_waiting(waiting_line(key, until, sha, exact, timeout))
+    try:
+        rid = write_wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, os.getpid())
+    except OSError:
+        return poll_wait(wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace))
+    block(rid, timeout)
+    return EXIT_DOWN  # not reached
+
+
+def block(rid: str, left: float) -> None:
+    """Become BLOCKER for request RID, with LEFT seconds to its deadline. The same pid carries on: the
+    daemon tells a gone waiter by it."""
+    d = waits_dir()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(BASH, [BASH, "-c", BLOCKER, "glaeda-gh-wait", os.fspath(d / f"{rid}.fifo"), os.fspath(d / f"{rid}.out"),
+                    str(max(1, int(left + 0.999))), os.fspath(d / ".served"), str(WAITS_CHECK),
+                    sys.executable, os.path.abspath(__file__), "wait-resume", rid])
+
+
+def resume_wait(rid: str) -> int:
+    """Where BLOCKER hands a wait back: at its deadline, or once no tick has ruled on waits for WAITS_CHECK.
+    The daemon's answer if it left one; else back to sleep while the daemon serves waits and time is left;
+    else on as the polling wait (poll_wait), which says what a down, failing or stale daemon means and
+    rules on the timeout itself."""
+    d = waits_dir()
+    with contextlib.suppress(OSError, ValueError):
+        code = int((d / f"{rid}.out.rc").read_text())
+        with contextlib.suppress(OSError):
+            sys.stderr.write((d / f"{rid}.out.err").read_text())
+        with contextlib.suppress(OSError):
+            sys.stdout.write((d / f"{rid}.out").read_text())
+        drop_wait(rid)
+        return code
+    req = read_json(d / f"{rid}.json")
+    if not isinstance(req, dict) or not all(k in req for k in ("key", "kind", "began", "timeout", "until", "grace")):
+        drop_wait(rid)
+        say_waiting("glaeda-gh: this wait's request is gone; run the wait again")
+        return EXIT_DOWN
+    left = float(req["began"]) + float(req["timeout"]) - time.time()
+    if left > 0 and serving_waits():
+        register(req["key"], bool(req.get("jobs")))
+        block(rid, left)
+    drop_wait(rid)
+    return poll_wait(req)
+
+
+def waiter_alive(pid: Any) -> bool:
+    """Whether a wait's blocker still runs: one signal-0 per request, no `ps` (a tick may hold many)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def wake_waiter(fifo: Path, code: int) -> bool:
+    """Write the exit code to a blocker's FIFO. False while no blocker has it open (not started yet, or
+    handing the wait back to Python), or if it went away mid-write."""
+    try:
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        os.write(fd, f"{code}\n".encode())
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def drop_wait(rid: str) -> None:
+    for suffix in WAIT_FILES:
+        with contextlib.suppress(OSError):
+            (waits_dir() / f"{rid}{suffix}").unlink()
 
 
 def file_ready(pattern: str, mode: str, contains: re.Pattern | None) -> str | None:
@@ -3427,7 +3709,7 @@ def cmd_budget(as_json: bool) -> int:
 # one 5000/h REST pool and one 5000/h GraphQL pool, and `gh` itself has no cache and no idea what
 # the other sessions are doing: measured over 96,102 logged calls on one host, 22% of them re-read
 # something another session had read within the previous 90 seconds and 7.5% read repository source
-# through the API. The broker does three things and nothing else:
+# through the API. The broker does four things and nothing else:
 #
 #   serve   `pr view --json` and `run view --json` from the daemon's cache when it is fresh enough
 #           and covers every field asked for. The daemon already reads those in one batched query
@@ -3436,6 +3718,9 @@ def cmd_budget(as_json: bool) -> int:
 #           that repository is checked out on this host. `git show` answers for nothing.
 #   pass    everything else, unchanged: mutations, logs, anything unrecognised, and any read the
 #           cache cannot cover completely.
+#   route   a `pr view`/`run view` miss whose own bucket (GraphQL for pr view, REST for run view) is
+#           spent while the other is not: registered with the daemon, which reads it over the
+#           other bucket, and served from that read if it lands within BROKER_SPENT_WAIT.
 #
 # Serving is deliberately timid, because a wrong answer is far worse than a spent request. A call
 # is served only when every flag on it is one of a short per-subcommand list: an unknown flag means
@@ -3456,6 +3741,13 @@ def cmd_budget(as_json: bool) -> int:
 BROKER_MAX_AGE = 90.0  # cache entries older than this are not served (the daemon's cycle is 60 s)
 BROKER_LEAN_AGE = 600.0  # below the floor, stale data beats spending the last of the quota
 BROKER_REPEAT = 600.0  # a target read twice this far apart is worth watching
+# The API gh itself spends on each brokered read: `pr view` is GraphQL, `run view` is REST. When
+# that bucket is spent, a cache miss passed to gh is a 403, while the daemon can still read the same
+# target over the other bucket (it reads each kind from whichever is richer). So the miss is handed
+# to the daemon instead, and the call waits up to BROKER_SPENT_WAIT for its first read: a new watch
+# is filled within one TICK.
+BROKER_GH_BUCKET = {"pr": "graphql", "run": "rest"}
+BROKER_SPENT_WAIT = 15.0
 BROKER_SEEN_KEEP = 2000  # targets remembered for repeat detection
 BROKER_LOG_MAX = 8 * 1024 * 1024  # the decision log is rotated once past this
 # The call log is rotated too, and far later: it is the audit's whole input, and the audit reads
@@ -4309,6 +4601,41 @@ def broker_max_age(fields: list[str]) -> float:
     return BROKER_MAX_AGE
 
 
+def broker_bucket_spent(key: str, now: float) -> bool:
+    """True when the bucket gh would spend on `key` is below its reserve until a reset that has not
+    come yet, and the other bucket is not: then the daemon can read what gh cannot."""
+    budget = read_json(BASE / "budget.json")
+    if not isinstance(budget, dict):
+        return False
+
+    def spent(bucket: str) -> bool:
+        seen = budget.get(bucket)
+        if not isinstance(seen, dict) or (seen.get("reset") or 0) <= now:
+            return False
+        remaining = seen.get("remaining")
+        return isinstance(remaining, int) and remaining < FLOORS[bucket][1]
+
+    mine = BROKER_GH_BUCKET.get(key.split(":", 1)[0])
+    return mine is not None and spent(mine) and not spent(OTHER[mine])
+
+
+def broker_await(args: list[str], key: str) -> str | None:
+    """Register `key` and wait up to BROKER_SPENT_WAIT for the daemon to read it; the `--json` line
+    once the cache answers every field asked for, else None (the call then goes to gh as before)."""
+    register(key)
+    started = time.monotonic()
+    try:
+        while True:
+            route, line, _key = broker_plan(args, time.time())
+            if route == "serve":
+                return line
+            if time.monotonic() - started >= BROKER_SPENT_WAIT:
+                return None
+            time.sleep(0.5)
+    finally:
+        extend_lock_budget(time.monotonic() - started)  # a deliberate wait, as broker_hold's is
+
+
 def broker_value(stored: Any, kind: str) -> Any:
     """What gh prints for a stored value. gh unmarshals into Go structs, so a null string field
     comes out "" (an unreviewed PR's reviewDecision, a running job's conclusion) while a null time
@@ -4406,10 +4733,33 @@ def broker_caller() -> str:
 # drained the pool three times in a day, not a toll on reading.
 BROKER_THROTTLED = {("pr", "view"), ("pr", "checks"), ("pr", "list"),
                     ("run", "view"), ("run", "list"), ("issue", "list")}
+
+
+def endpoint_re(name: str) -> "re.Pattern[str]":
+    """One top-level API endpoint, however `gh api` was given it: bare, rooted, or an absolute URL.
+
+    Any host, not `api.github.com` alone: this file handles GHE remotes deliberately. Pinning the
+    one host meant `https://ghe.example/api/graphql` read as an ordinary path -- undercounting the
+    audit's category, and (through `BROKER_FREE_RE`) holding a GHE host's free `rate_limit` read
+    behind the repeat delay. One function, so widening one endpoint's spellings cannot leave the
+    other behind again.
+
+    Both of a GHE host's bases, because they are not the same one and an earlier version of this
+    said they were: GraphQL is at `/api/graphql` and REST is under `/api/v3/`, so
+    `https://ghe.example/api/v3/rate_limit` is the spelling a GHE host actually serves for the free
+    call -- and with `/api/` alone it was still filed as an ordinary path and still held 30 s, which
+    is the defect this helper claimed to have removed (measured by a review: 0.0 s then 29.9 s).
+    `/api/rate_limit` stays matched too; it 404s on GHE, so matching it costs nothing.
+
+    `re.escape`, because this reads as the general helper and a name with a `.` or a `+` in it
+    would quietly widen the pattern."""
+    return re.compile(rf"^(?:https?://[^/]+/(?:api/(?:v3/)?)?)?/?{re.escape(name)}/?$")
+
+
 # `GET /rate_limit` is documented as costing neither pool, and this file already treats it as free
 # (`request(free=True)`, audit_category's "rate_limit (free)"). Holding it punishes the session
 # doing the right thing: checking the budget around a batch of calls. `--web` opens a browser.
-BROKER_FREE_RE = re.compile(r"^(?:https?://api\.github\.com/)?/?rate_limit/?$")
+BROKER_FREE_RE = endpoint_re("rate_limit")
 
 
 def broker_repeat_wait(args: list[str], words: list[str], method: str, seen: set[str],
@@ -4687,6 +5037,13 @@ def cmd_gh(args: list[str]) -> int:
                 broker_note({"route": "serve", "key": key})
                 print(payload)
                 return EXIT_OK
+            if key is not None and not sys.stdout.isatty() and broker_bucket_spent(key, now) \
+                    and daemon_running():
+                line = broker_await(args, key)
+                if line is not None:
+                    broker_note({"route": "serve", "key": key, "spent": True})
+                    print(line)
+                    return EXIT_OK
             broker_hold(broker_repeat_wait(args, words, method, seen, now))
             # No grace here, unlike every other caller. DOWN_GRACE exists so a client waiting on
             # the daemon rides out a re-exec; this answer only decides whether to register a watch,
@@ -4765,6 +5122,11 @@ AUDIT_READS = {("pr", "view"), ("pr", "checks"), ("pr", "list"), ("pr", "diff"),
 # could not be resolved) is counted, but never as a repeat: `pr view 7` in two repositories is two
 # different reads, and treating them as one would overstate what a cache can do.
 AUDIT_BARE = re.compile(r"^(?:pr|run|issue|search|label) [\w-]+(?: \d+)?$")
+# The GraphQL endpoint, however it was typed -- four spellings: `graphql`, `/graphql`, and an
+# absolute URL on either kind of host. See `endpoint_re`, which `BROKER_FREE_RE` shares: pinning
+# api.github.com put a GHE host's `https://ghe.example/api/graphql` in a category of its own, so
+# the count undercounted and the sentence below it could go missing altogether.
+AUDIT_GRAPHQL_RE = endpoint_re("graphql")
 # A logged line of the shape the broker and today's guard write: subcommand words, then an
 # identifier (a cache key, an api path, or a number), then the guard's `-R owner/repo`. Anything
 # else is counted but never printed back (see cmd_audit).
@@ -4773,18 +5135,30 @@ AUDIT_SAFE = re.compile(r"[a-z][a-z0-9-]{0,30}(?: [a-z][a-z0-9-]{0,30})?"
                         r"(?: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?")
 
 
+AUDIT_ENDPOINT_RE = re.compile(r"/?[A-Za-z0-9_.~-]+(?:/[A-Za-z0-9_.~:@-]+)*/?")
+AUDIT_TOKEN_RE = re.compile(r"gh[pousr]_|github_pat_", re.IGNORECASE)
+
+
 def audit_category(words: list[str]) -> tuple[str, bool]:
     """(category, whether repeating it would be a cache hit) for one logged call."""
     first, second = (words + ["", ""])[:2]
     if first == "api":
         if re.search(r"/(contents|git/blobs|git/trees|git/commits|git/refs)", " ".join(words)):
             return "source read through the API", False
-        if second == "graphql":
+        # One endpoint, four spellings, and the log keeps whichever the caller typed. Counted as
+        # one category each, because a category split four ways is four small rows that no
+        # summary line covers -- and `api /graphql` is a shape this file's own brake test pins as
+        # one a script would write. `BROKER_FREE_RE` is the same pattern for rate_limit.
+        if AUDIT_GRAPHQL_RE.match(second):
             return "raw gh api graphql", False
-        if second == "rate_limit":
+        if BROKER_FREE_RE.match(second):
             return "rate_limit (free)", False
         if re.search(r"/actions/runs/\d+/jobs", " ".join(words)):
             return "api .../actions/runs/N/jobs", True
+        # A category is printed back, so only an endpoint of a path's shape is. A log written before
+        # the guard cut query strings and flag values can hold anything in this word, a token included.
+        if second and not (AUDIT_ENDPOINT_RE.fullmatch(second) and not AUDIT_TOKEN_RE.search(second)):
+            return "api (endpoint not shown)", False
         return f"api {second}".rstrip(), False
     if (first, second) in AUDIT_READS:
         return f"{first} {second}", True
@@ -4837,7 +5211,11 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
         if AUDIT_BARE.fullmatch(text):
             continue  # no repository in the line: cannot tell one repo's PR 7 from another's
         hot[text] = hot.get(text, 0) + 1
-        if at - seen.get(text, float("-inf")) <= AUDIT_WINDOW:
+        # Not below zero: concurrent writers can append out of order, and a line stamped before the
+        # one it follows is not a re-read of it. With that, every line counted here has an earlier
+        # read of the same target within the window, so it is a repeat in time order too, and the
+        # figure stays a floor whatever order the log was written in.
+        if 0 <= at - seen.get(text, float("-inf")) <= AUDIT_WINDOW:
             repeats += 1
             bucket[1] += 1
         seen[text] = at
@@ -4855,10 +5233,16 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
             continue
         for line in text.splitlines():
             try:
-                route = (json.loads(line) or {}).get("route")
+                record = json.loads(line)
             except ValueError:
                 continue  # a torn last line at a rotation boundary is one record, not the file
+            route = record.get("route") if isinstance(record, dict) else None
+            if not isinstance(route, str):
+                continue  # a record of some other shape is not a decision
             served[route] = served.get(route, 0) + 1
+    # Not a second JSON field: this is `categories["raw gh api graphql"]` by construction, and a
+    # count under two names is a count that can disagree with itself.
+    batched = counts.get("raw gh api graphql", 0)
     if as_json:
         print(json.dumps({"calls": total, "categories": counts, "cacheableReads": reads,
                           "repeatsWithin": {"seconds": AUDIT_WINDOW, "calls": repeats},
@@ -4885,6 +5269,66 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
                                               sorted(hot.items(), key=lambda kv: -kv[1])[:5]))
     if served:
         print("\nbroker decisions so far: " + ", ".join(f"{k} {v}" for k, v in sorted(served.items())))
+    if batched:
+        # Coverage, not cost. An earlier version of this line said a batching caller "looks
+        # cheaper here than its GraphQL points are", which was backwards: GitHub prices a GraphQL
+        # call at the requests needed for its connections divided by 100, rounded, minimum 1, so
+        # one aliased query over forty PRs is about 1 point against about 40 for the loop --
+        # skills/github-ci-wait/SKILL.md says so, and this contradicted it. Per-call shares are
+        # the right unit for GraphQL points. What a `graphql` line really hides is *reads*: the
+        # category is not cacheable, so none of the objects inside it reaches `cacheableReads`,
+        # `repeatsWithin` or `perRead`, and the repeat *count* is a floor rather than an estimate.
+        # The count and not the shares beside it. A hidden read written out can land on either
+        # side of a share, so a share can go up, down or stay put -- all three are in
+        # AuditGraphqlTest, which is what finally made the sentence checkable rather than
+        # reviewable. Four earlier drafts each inferred a direction instead: "both *fall*" from the
+        # denominator alone, "either direction" said of the two counts rather than the share,
+        # "grows the numerator and the denominator" -- which reads as both always growing, and a
+        # review measured 33.3% -> 25.0% where only the denominator did -- and then "can grow the
+        # numerator and does grow the denominator", where a review measured 33.3% -> 33.3% by
+        # writing the hidden read out in place of the batched call it was carried by. Say what is
+        # measured, nothing about mechanism, and let a test hold it.
+        # "The calls are counted above" because the total line counts them, and the repeat
+        # percentage's denominator is that total. Not "in their own category row": the category
+        # table is the top 20 by count, so on a host with more than twenty distinct categories
+        # this row is not in it -- measured, 21 distinct `api` paths and the graphql row gone, with
+        # the sentence still true. An earlier draft said "None of them is counted above", which the
+        # total contradicts. What is not counted is the *objects* inside them, and what follows
+        # from that is only that no graphql call is a cacheable read or a repeat.
+        # "however many ... asked for" covers zero, which is the only thing needed: the log keeps
+        # the path and never the document, so a batched read of forty and a call that reads nothing
+        # are the same line here, and a floor needs the hidden reads to be >= 0. Earlier drafts
+        # named the mutation and the one-object probe as carrying nothing, and both were claims
+        # about GitHub's API that this log cannot see -- a mutation selects its payload, and a probe
+        # of an object read nearby hides a repeat. "each carrying", not "each one request": with
+        # `--paginate` one command line is several HTTP requests, and the log keeps neither the
+        # flags (broker_logged_target drops them) nor the request count.
+        # "the same-target re-reads a cache could have been asked for", not "what a cache could
+        # have answered": this broker's cache keys on the target, and the repeat count is
+        # flag-blind in the other direction -- `pr view X --json state` and `pr view X --json
+        # files` log the same target and score as one repeat, while the broker would have to fetch
+        # the second field set. So the figure is a floor against hidden GraphQL reads and can
+        # overcount against the cache's own hit rate; naming same-target re-reads is the part that
+        # holds both ways.
+        # The floor is over the calls in *this report*. With `--last N` the window is the last N
+        # lines, so writing hidden reads out as separate lines pushes older ones out and the
+        # comparison runs over two different sets of calls -- measured, and pinned as a known limit
+        # by test_the_floor_is_over_one_set_of_calls: 1 repeat becomes 0 under `--last 3`. Held to
+        # one set it cannot fall, because at most one repeat is counted per line per target, so the
+        # figure can never exceed the true same-target re-read count; two reviews found no
+        # counterexample, in 4000 and in 1800 random insertions, for repeats, reads and calls alike.
+        # No pricing claim here on purpose -- this file is read as durable output, and a price is
+        # the part that goes stale.
+        # "was" for one call: N=1 is the common case on a host that batches rarely, and it is what
+        # the crowded-table fixture prints.
+        print(f"\n{batched} of those calls {'was' if batched == 1 else 'were'} `gh api graphql`, "
+              f"each carrying however many objects "
+              f"the caller asked for, which this cannot see. The calls are counted above; none of "
+              f"the objects inside them is, so none of them is counted as a cacheable read or as a "
+              f"repeat. That makes the repeat count a floor on the same-target re-reads a cache "
+              f"could have been asked for in this report, not an estimate. The shares beside it "
+              f"are not floors: a hidden read written out can land on either side of a share, so "
+              f"a share can go up, down or stay where it is.")
     return EXIT_OK
 
 
@@ -5255,6 +5699,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"broker {BROKER_CONTRACT}")
             return EXIT_OK
         return cmd_gh(raw[1:])
+    if raw[:1] == ["wait-resume"] and len(raw) == 2:
+        # Not a command anyone types: BLOCKER hands a `wait pr|run` back here (resume_wait).
+        try:
+            return resume_wait(raw[1])
+        except WatchError as error:
+            say_waiting(f"glaeda-gh: {error}")  # a wait path: see the handler below
+            return 64
+        except KeyboardInterrupt:
+            return 130
     args = parser().parse_args(argv)
     try:
         if args.command == "serve":
@@ -5303,8 +5756,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_wait_comment(args.target, args.timeout, args.json, args.author, args.match, args.since)
         if args.author or args.match or args.since:
             raise WatchError("--author, --match and --since are for wait comment")
-        return cmd_wait(args.kind, args.target, args.until, args.timeout, args.jobs, args.json, args.sha,
-                        args.rescue_grace)
+        return subscribe_wait(args.kind, args.target, args.until, args.timeout, args.jobs, args.json, args.sha,
+                              args.rescue_grace)
     except WatchError as error:
         # Through say_waiting for its stdout reason: this handler covers `wait --json`, so with
         # stderr closed `print(file=None)` made a bad-argument message the first line of the

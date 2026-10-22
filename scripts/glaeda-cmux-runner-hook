@@ -38,6 +38,13 @@ re-runs it elsewhere) when:
     staged generation's cmux_fleet.py (state eligible, routingCandidateEligible true), and the enrollment
     must reference ~/.config/glaeda/cmux-fleet/class-acceptance/<class>.json. The toolchain check runs
     rustc, cargo, zig, xcodebuild and xcrun and compares them with that receipt's strings, exactly.
+  * with --toolchain-xcode APP (the pool Xcode): the runner's environment sets TOOLCHAINS or an SDKROOT outside APP
+    (leaked_toolchain_env; the xcrun shim's own SDKROOT does not count), or, with --require-eligible, xcrun in the
+    job's clean env resolves an SDK outside APP, a swiftc of another Swift than APP's toolchain, or an SDK of a newer
+    major than APP's, cannot `xcrun --find` a tool cmux uses (CMUX_TOOLS), or the PATH's python3 or the
+    /usr/bin/python3 xcrun shim does not start (xcode_refusal, one probe batch: "toolchain: xcrun resolves ...
+    outside Xcode_26.6"). Only a definite mismatch refuses; a probe that times out or prints nothing is no answer. An admitted job's later steps get
+    DEVELOPER_DIR=APP/Contents/Developer through $GITHUB_ENV when the runner's env does not already set it.
 Otherwise it takes that lock for the job: a small detached holder keeps it until job-completed releases
 it or the job's Runner.Worker exits, so fleet builds wait for the PR job and a crash cannot strand it.
 With --capacity-units N (several runners on one mini, docs/CMUX_MINI_RUNNER.md 2d) it takes a weighted
@@ -77,12 +84,19 @@ down (Gate). A --require-eligible runner also stops listening while job-started 
 eligibility (Gate.ineligible: the node status or the class receipt's toolchain, looked at in a thread at most
 every GATE_ELIGIBLE_EVERY_S; a new refusal holds once a recheck agrees, and a held answer survives a hook reload),
 so its label's jobs go to an eligible runner, or wait in GitHub's queue when none is, instead of failing in "Set up
-job". A gui runner also stops listening while the console session is locked or nobody is logged in there
-(console_refusal). A fast runner (--fast-runner) runs cmux-next's fast-tier on the fast tokens (FAST_TOKENS)
-instead of the shared units, and its gate looks at those tokens, never at the units. Every runner also stops listening while free disk is under its job-started hook's --min-free-gib,
+job"; that look includes the pool Xcode's toolchain (xcode_refusal), so a host whose xcrun resolves past its Xcode
+leaves admission. The gate starts run.sh with listener_env (no SDKROOT or TOOLCHAINS, DEVELOPER_DIR on the job-started
+hook's --toolchain-xcode) and scrubs its own environment the same way; a listener it adopted on a reload whose env
+was not that (adopted_env_stale) is stopped once idle and started clean.
+A gui runner also stops listening while the console session is locked or nobody is logged in there
+(console_refusal). A gui runner is never held for CPU saturation, only memory pressure (Gate.saturated), and while it
+is idle its gate holds the gui runner's reserve (GUI_RESERVE: capacity/<gui token>.reserve): every other job on the
+mini, and every other runner's gate, leaves one unit free for its next job, so the side and root lanes cannot fill
+the mini and keep the gui label queued. A fast runner (--fast-runner) runs cmux-next's fast-tier on the fast tokens
+(FAST_TOKENS) instead of the shared units, and its gate looks at those tokens, never at the units. Every runner also stops listening while free disk is under its job-started hook's --min-free-gib,
 and starts the same eviction in the background, listening again once it made room (Gate.low_disk). Full means every
-unit this runner's own --capacity-units scans, read from its job-started hook; for a root runner it also means the
-mini cannot admit a compile or an app-host shard (mini_full).
+unit this runner's own --capacity-units scans, read from its job-started hook, is taken or kept for an idle gui
+runner's reserve; for a root runner it also means the mini cannot admit a compile or an app-host shard (mini_full).
 """
 
 from __future__ import annotations
@@ -105,6 +119,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -322,6 +337,41 @@ ADMIT_WANT = "admit.want-"
 # a preempted fleet build, lsof and ps timeouts), so a marker counts until it is this old or its pid is gone.
 ADMIT_FRESH_S = 180.0
 HOLDERS_BUDGET_S = 10.0  # token_holders stops looking after this long: the log line is not worth more
+# The gui runner's reserve: one unit per gui runner that no other job takes while that runner is idle. Side and root
+# jobs (compiles, daemon tests, fast-tier off the fast runner, isolated builds: 3 to 6 units each) filled every unit
+# on a mini, so its one gui runner's gate held the listener off as full, and the gui label's jobs (app-host shards,
+# cmux-next's swift test) queued 1.5 to 3 h with 13 gui runners online (2026-10-21 ~23:00Z: about 6 listening). The
+# gui runner's listener gate holds an flock on capacity/<gui token>.reserve while its runner has no job and nothing
+# but capacity holds it off (Gate.reserve); every other admission (take_capacity, ci-step admit and fits) and every
+# other runner's gate (mini_full) then leaves GUI_RESERVE_UNITS units free, and the gui runner's own job takes them.
+# A flock dies with its gate, so a mini without a gui runner, or with a stopped one, reserves nothing, and no host
+# list or flag says which minis have one. A reserve never makes a job unfittable: one that needs the whole mini
+# ignores it (reserve_for).
+GUI_RESERVE = ".reserve"
+GUI_RESERVE_UNITS = 1
+UNITS_FULL = "capacity units on this mini"  # in mini_full's answers that are about units (Gate.reserves)
+
+
+def gui_reserved(capacity_dir: Path, own_token: str | None = None) -> int:
+    """The units this mini keeps for idle gui runners: GUI_RESERVE_UNITS for each <gui token>.reserve an idle gui
+    runner's gate holds, except own_token's (a gui runner's own job takes its own reserve). Never raises: an
+    unreadable ledger reserves nothing."""
+    try:
+        paths = sorted(capacity_dir.glob(f"*{GUI_RESERVE}"))
+    except OSError:
+        return 0
+    own = f"{own_token}{GUI_RESERVE}" if own_token is not None else None
+    return sum(GUI_RESERVE_UNITS for path in paths if path.name != own and not probe(path))
+
+
+def reserve_for(reserved: int, units: int, total: int) -> int:
+    """The reserved units a job of `units` must leave free on a mini of `total`: at most what is left beside it, and
+    none for a job that takes no unit (the fast runner's fast-tier listens and admits with every unit taken)."""
+    return max(0, min(reserved, total - units)) if units > 0 else 0
+
+
+def kept_note(kept: int) -> str:
+    return f" and {kept} {'is' if kept == 1 else 'are'} kept for the gui runner" if kept else ""
 
 
 def is_guest(repo: str | None, home_repo: str = DEFAULT_HOME_REPO) -> bool:
@@ -834,6 +884,8 @@ GATE_ELIGIBLE_RECHECK_S = 30.0
 # The held answer across a reload's exec (as GATE_LISTENING_SINCE_ENV), so a hook --apply does not start every
 # held runner listening while the new gate's first look runs.
 GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
+# Across a reload: "clean" when this gate started its listener with listener_env, else why its env is stale.
+GATE_LISTENER_ENV = "GLAEDA_RUNNER_GATE_LISTENER_ENV"
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -1118,9 +1170,275 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
         fields.append("diffRustcVersion")
     drift = [f"{field} {have[field]!r} != {str(want[field])!r}" for field in fields
              if have.get(field) != str(want[field])]
+    if xcode_app:
+        # after the receipt probes and on its own budget, so slow Xcode probes never starve them into a '' drift;
+        # its refusal is the clearer reason for what drift may also see
+        why = xcode_refusal(xcode_app, env, deadline=time.monotonic() + XCODE_PROBE_BUDGET_S)
+        if why:
+            return why, note
     if drift:
         return f"node not eligible (toolchain drifted from the {fleet_class} class receipt: {'; '.join(drift)})", note
     return None, note
+
+
+# ---------------------------------------------------------------- the pool Xcode's toolchain
+# A runner's pool Xcode is its job-started hook's --toolchain-xcode (glaeda-cmux-runner: the member's first verified
+# Xcode, the one its xcode-26.6 label names). cmux21 (macOS 27, 2026-10-21): Command Line Tools 27 in
+# /Library/Developer/CommandLineTools made xcrun resolve their MacOSX27 SDK and Swift 6.4 even with xcode-select and
+# DEVELOPER_DIR on Xcode_26.6, and the /usr/bin/python3 xcrun shim the gate ran under exported that SDKROOT into the
+# listener's environment, so every job built against an SDK its compiler rejects ("this SDK is not supported by the
+# compiler"). So the listener starts with SDKROOT and TOOLCHAINS removed and DEVELOPER_DIR on the pool Xcode
+# (listener_env), and a host whose xcrun still resolves outside that Xcode, or cannot find or start what cmux jobs
+# run (CMUX_TOOLS, both python3s), is refused (xcode_refusal): job-started
+# refuses its jobs, the gate holds its listener off (Gate.ineligible, through toolchain_refusal) and
+# glaeda-mini-health reports toolchain_mismatch. Only a definite mismatch refuses: a probe that times out or prints
+# nothing is no answer, and the exact-string drift check after it still compares xcrun's SDK version.
+TOOLCHAIN_ENV = ("SDKROOT", "TOOLCHAINS")  # each points xcrun past DEVELOPER_DIR
+XCODE_PROBE_BUDGET_S = 15.0
+# A pass is reused this long (a probe runs xcrun twice and swiftc once); a refusal is never cached, so a fixed host
+# is admitted at the next look and a broken one is refused on fresh evidence each time.
+XCODE_PROBE_TTL_S = float(os.environ.get("GLAEDA_RUNNER_XCODE_PROBE_TTL_S") or 600.0)
+XCODE_PROBE_CACHE = "xcode-probe.json"  # under the runner state dir
+SWIFT_VERSION = re.compile(r"\bSwift version (\d+(?:\.\d+)+)")
+# The tools cmux's macOS jobs run through xcrun or the developer dir: each must resolve (`xcrun --find`). And both
+# python3s must start: the job PATH's, and the xcrun shim, which cmux scripts reach as /usr/bin/python3 and which
+# fails outright (exit 72, "xcode-select: Failed to locate 'python3'") under an SDKROOT whose SDK is gone (cmux21,
+# 2026-10-21: app-compile, fast-tier and web-bundles failed as infra).
+CMUX_TOOLS = ("swift", "swiftc", "clang", "git", "make", "ld", "xcodebuild", "python3")
+SHIM_PYTHON = os.environ.get("GLAEDA_RUNNER_SHIM_PYTHON") or "/usr/bin/python3"
+# By absolute path: a PATH without xcrun would exit 127 for every probe and refuse a healthy host.
+XCRUN = os.environ.get("GLAEDA_RUNNER_XCRUN") or "/usr/bin/xcrun"
+BATCH_REAP_S = 2.0  # after the deadline's SIGKILL, how long the batch's pipe may take to close
+MACOS_PLATFORM = "Platforms/MacOSX.platform"
+
+
+def listener_env(environ: Any, xcode_app: str | None) -> dict[str, str]:
+    """A copy of environ for the runner (and every job it runs): no SDKROOT or TOOLCHAINS, and DEVELOPER_DIR on the
+    pool Xcode when the runner has one."""
+    env = {key: value for key, value in environ.items() if key not in TOOLCHAIN_ENV}
+    if xcode_app:
+        env["DEVELOPER_DIR"] = os.fspath(Path(xcode_app) / "Contents" / "Developer")
+    return env
+
+
+def _xcode_name(xcode_app: str | None) -> str:
+    return Path(xcode_app).name.removesuffix(".app") if xcode_app else "the pool Xcode"
+
+
+def _under(path: str, parent: Path) -> bool:
+    """path is inside parent, as written or once both are resolved."""
+    return any(os.path.normpath(p).startswith(os.path.normpath(d) + os.sep)
+               for p, d in ((path, os.fspath(parent)), (os.path.realpath(path), os.path.realpath(parent))))
+
+
+def leaked_toolchain_env(environ: Any, xcode_app: str | None) -> str | None:
+    """Why this environment points xcrun outside the pool Xcode (an SDKROOT path outside it, any TOOLCHAINS), or None.
+    Under the /usr/bin/python3 shim SDKROOT is the shim's own (under_xcrun_shim): the caller leaves it out."""
+    leaked = []
+    sdkroot = environ.get("SDKROOT")  # a name (macosx) resolves through DEVELOPER_DIR; only a path is a leak
+    if sdkroot and os.path.isabs(sdkroot) and not (xcode_app and _under(sdkroot, Path(xcode_app) / "Contents" /
+                                                                        "Developer")):
+        leaked.append(f"SDKROOT={sdkroot}")
+    if environ.get("TOOLCHAINS"):
+        leaked.append(f"TOOLCHAINS={environ['TOOLCHAINS']}")
+    if not leaked:
+        return None
+    return f"toolchain: the runner's environment sets {', '.join(leaked)}, outside {_xcode_name(xcode_app)}"
+
+
+def under_xcrun_shim(executable: str) -> bool:
+    """This interpreter is a developer directory's python, which /usr/bin/python3 (the xcrun shim) runs with SDKROOT
+    set to what xcrun resolved for it: that SDKROOT is the shim's, not the environment the hook was given."""
+    real = os.path.realpath(executable)
+    return "/Contents/Developer/" in real or real.startswith("/Library/Developer/CommandLineTools/")
+
+
+def swift_version(text: str) -> str | None:
+    """'6.3.3' from `swiftc --version` ("Apple Swift version 6.3.3 (swiftlang-...)"), or None."""
+    match = SWIFT_VERSION.search(text or "")
+    return match.group(1) if match else None
+
+
+def _sdk_version(sdk: str | os.PathLike[str]) -> str | None:
+    """SDKSettings' Version of an SDK directory (json, else the plist), or None."""
+    doc = _json_file(Path(sdk) / "SDKSettings.json")
+    if not isinstance(doc, dict):
+        try:
+            doc = plistlib.loads((Path(sdk) / "SDKSettings.plist").read_bytes())
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            return None
+    version = str(doc.get("Version") or "") if isinstance(doc, dict) else ""
+    return version if re.fullmatch(r"\d+(?:\.\d+)*", version) else None
+
+
+def xcode_mismatch(xcode_app: str, facts: dict[str, Any]) -> str | None:
+    """Pure: why a host whose xcrun reports facts (xcode_facts) does not build with the pool Xcode, or None. Only
+    what was seen counts: an empty sdkPath or a missing version is no answer (a probe that timed out), never a
+    mismatch. Refused: an SDK outside the Xcode's macOS platform, an xcrun swiftc of another Swift than the Xcode's
+    own toolchain, an SDK of a newer major than the Xcode's (its compiler rejects it), and every probe that ran and
+    failed (broken: a CMUX_TOOLS tool xcrun cannot find, a python3 that does not start)."""
+    name = _xcode_name(xcode_app)
+    why = []
+    sdk = str(facts.get("sdkPath") or "")
+    if os.path.isabs(sdk) and not _under(sdk, Path(xcode_app) / "Contents" / "Developer" / MACOS_PLATFORM):
+        why.append(f"xcrun resolves {sdk} outside {name}")
+    swift, xcode_swift = facts.get("swift"), facts.get("xcodeSwift")
+    if swift and xcode_swift and swift != xcode_swift:
+        why.append(f"xcrun swiftc is Swift {swift}, {name}'s is {xcode_swift}")
+    sdk_version, xcode_sdk = str(facts.get("sdkVersion") or ""), str(facts.get("xcodeSdkVersion") or "")
+    if sdk_version and xcode_sdk and int(sdk_version.split(".")[0]) > int(xcode_sdk.split(".")[0]):
+        why.append(f"SDK {sdk_version} is newer than {name}'s SDK {xcode_sdk}")
+    why += [str(b) for b in facts.get("broken") or []]
+    return f"toolchain: {'; '.join(why)}" if why else None
+
+
+# One shell batch runs every probe (xcode_facts): probe KEY CMD... prints "KEY<tab>EXIT<tab>STDOUT<tab>STDERR" once
+# CMD ends, each field on one line. Last the probes most likely to hang (xcrun resolving the SDK), so a batch killed
+# at its deadline has already said what it saw. $1 is the stderr scratch file _batch made (and removes).
+XCODE_PROBE_SCRIPT = r"""err=$1
+probe() {
+    key=$1; shift
+    out=$("$@" 2>"$err" </dev/null); code=$?
+    printf '%s\t%s\t%s\t%s\n' "$key" "$code" "$(printf '%s' "$out" | tr '\t\n' '  ' | cut -c1-400)" \
+        "$(tr '\t\n' '  ' <"$err" | cut -c1-200)"
+}
+"""
+
+
+def _batch(script: str, env: dict[str, str], cwd: Path, deadline: float) -> dict[str, tuple[int, str, str]]:
+    """{key: (exit, stdout, stderr)} for each probe the batch finished before deadline. The batch runs in its own
+    process group, killed whole at the deadline, so a hung xcrun never outlives it; its finished lines still count.
+    Its stderr scratch file is made and removed here, so a killed batch leaves nothing behind."""
+    try:
+        fd, err = tempfile.mkstemp(prefix="glaeda-xcode-probe-")
+        os.close(fd)
+    except OSError:
+        return {}
+    try:
+        try:
+            proc = subprocess.Popen(["/bin/sh", "-c", script, "glaeda-xcode-probe", err], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=cwd,
+                                    start_new_session=True)
+        except OSError:
+            return {}
+        try:
+            out, _ = proc.communicate(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as timeout:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            try:
+                out, _ = proc.communicate(timeout=BATCH_REAP_S)
+            except subprocess.TimeoutExpired:  # something outside the group holds the pipe: keep what was read
+                out = timeout.stdout or b""
+                proc.kill()
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(err)
+    seen = {}
+    for line in out.decode("utf-8", "replace").splitlines():
+        fields = line.split("\t")
+        if len(fields) == 4 and fields[1].isdigit():
+            seen[fields[0]] = (int(fields[1]), fields[2].strip(), fields[3].strip())
+    return seen
+
+
+def xcode_facts(xcode_app: str, environ: Any, deadline: float) -> dict[str, Any]:
+    """What xcrun resolves in the runner's clean env (listener_env) and what the pool Xcode itself ships, from one
+    probe batch bounded by deadline. A probe that did not finish leaves its fact empty; broken lists the probes that
+    finished and failed."""
+    env = listener_env(environ, xcode_app)
+    developer = Path(xcode_app) / "Contents" / "Developer"
+    own = developer / "Toolchains" / "XcodeDefault.xctoolchain" / "usr" / "bin" / "swiftc"
+    pythons = ("python3", SHIM_PYTHON)
+    q = shlex.quote
+    script = XCODE_PROBE_SCRIPT + "".join(
+        [f"probe xcodeSwift {q(os.fspath(own))} --version\n"]
+        + [f"probe python:{q(python)} {q(python)} -c 'import sys'\n" for python in pythons]
+        + [f"probe find:{tool} {q(XCRUN)} --find {tool}\n" for tool in CMUX_TOOLS]
+        + [f"probe swift {q(XCRUN)} swiftc --version\n", f"probe sdk {q(XCRUN)} --show-sdk-path\n"])
+    seen = _batch(script, env, Path.home(), deadline)
+
+    def ok(key: str) -> str:
+        code, out, _ = seen.get(key, (1, "", ""))
+        return out if code == 0 else ""
+
+    broken = []
+    for python in dict.fromkeys(pythons):
+        if f"python:{python}" in seen and seen[f"python:{python}"][0] != 0:
+            code, out, err = seen[f"python:{python}"]
+            broken.append(f"{python} does not run (exit {code}: {(err or out or 'no output')[:160]})")
+    for tool in CMUX_TOOLS:
+        if f"find:{tool}" in seen and seen[f"find:{tool}"][0] != 0:
+            code, out, err = seen[f"find:{tool}"]
+            broken.append(f"xcrun --find {tool} fails (exit {code}: {(err or out or 'no output')[:160]})")
+    sdk = ok("sdk")
+    return {"sdkPath": sdk, "swift": swift_version(ok("swift")), "xcodeSwift": swift_version(ok("xcodeSwift")),
+            "sdkVersion": _sdk_version(sdk) if os.path.isabs(sdk) else None,
+            "xcodeSdkVersion": _sdk_version(developer / MACOS_PLATFORM / "Developer" / "SDKs" / "MacOSX.sdk"),
+            "broken": broken}
+
+
+def xcode_refusal(xcode_app: str, environ: Any, cache: Path | None = None, ttl: float | None = None,
+                  deadline: float | None = None) -> str | None:
+    """xcode_mismatch for this host, probed (xcode_facts) unless a pass for the same Xcode is younger than ttl
+    (XCODE_PROBE_TTL_S) in cache (XCODE_PROBE_CACHE in the runner state dir, shared by the mini's runners). Only a
+    pass that saw the SDK path and both Swift versions is written: no answer is never cached."""
+    cache = cache if cache is not None else Path.home() / ".local/state/glaeda/cmux-runner" / XCODE_PROBE_CACHE
+    ttl = XCODE_PROBE_TTL_S if ttl is None else ttl
+    seen = _json_file(cache)
+    if (isinstance(seen, dict) and seen.get("xcode") == xcode_app and isinstance(seen.get("at"), (int, float))
+            and 0 <= time.time() - seen["at"] < ttl):
+        return None
+    facts = xcode_facts(xcode_app, environ, deadline if deadline is not None
+                        else time.monotonic() + XCODE_PROBE_BUDGET_S)
+    why = xcode_mismatch(xcode_app, facts)
+    if why is None and facts.get("sdkPath") and facts.get("swift") and facts.get("xcodeSwift"):
+        with contextlib.suppress(OSError):
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            stage = cache.with_name(f".{cache.name}.{os.getpid()}")
+            stage.write_text(json.dumps({"xcode": xcode_app, "at": time.time()}))
+            os.replace(stage, cache)
+    return why
+
+
+def export_developer_dir(xcode_app: str) -> str:
+    """Pin the job's later steps to the pool Xcode through $GITHUB_ENV when the runner's env does not already
+    (a listener started before listener_env). Returns a note, or ''."""
+    developer = os.fspath(Path(xcode_app) / "Contents" / "Developer")
+    target = os.environ.get("GITHUB_ENV")
+    if not target or os.environ.get("DEVELOPER_DIR") == developer:
+        return ""
+    with contextlib.suppress(OSError):
+        with open(target, "a", encoding="utf-8") as env_file:
+            env_file.write(f"DEVELOPER_DIR={developer}\n")
+        return f"DEVELOPER_DIR={developer} for the job"
+    return ""
+
+
+def runner_xcode(runner_dir: Path) -> str | None:
+    """The pool Xcode: the --toolchain-xcode this runner's job-started hook passes, or None."""
+    try:
+        line = next((ln for ln in (runner_dir / RUNNER_HOOK_SCRIPT).read_text().splitlines()
+                     if ln.startswith("exec ")), "")
+        words = shlex.split(line)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    return words[words.index("--toolchain-xcode") + 1] if "--toolchain-xcode" in words[:-1] else None
+
+
+def adopted_env_stale(marker: str | None, environ: Any, xcode_app: str | None) -> str | None:
+    """Why a listener this gate adopted (a reload) runs with an environment listener_env would not give it, or None.
+    A gate that started it says so across the reload (GATE_LISTENER_ENV: "clean", or why not); a gate from before
+    listener_env started it with its own environment, which is environ."""
+    if marker:
+        return None if marker == "clean" else marker
+    leaked = leaked_toolchain_env(environ, xcode_app)
+    if leaked:
+        return leaked
+    developer = os.fspath(Path(xcode_app) / "Contents" / "Developer") if xcode_app else None
+    if developer and environ.get("DEVELOPER_DIR") != developer:
+        return f"the listener started before the gate set DEVELOPER_DIR={developer}"
+    return None
 
 
 def free_gib(path: str) -> float:
@@ -2069,9 +2387,11 @@ def yield_idle_warm(capacity_dir: Path, name: str = WARM_HOLDER) -> str:
         return ""
 
 
-def holder_file(state_dir: Path) -> Path:
-    """One pid file per runner (RUNNER_NAME comes from the runner, not the job)."""
-    name = "".join(c for c in os.environ.get("RUNNER_NAME", "") if c.isalnum() or c in "-_.")
+def holder_file(state_dir: Path, runner: str | None = None) -> Path:
+    """One pid file per runner (RUNNER_NAME comes from the runner, not the job; the listener gate, which has none,
+    passes its runner's name)."""
+    name = "".join(c for c in (os.environ.get("RUNNER_NAME", "") if runner is None else runner)
+                   if c.isalnum() or c in "-_.")
     return state_dir / (f"{HOLDER_FILE}-{name}.pid" if name else f"{HOLDER_FILE}.pid")
 
 
@@ -2453,7 +2773,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   instance: int = 0, workflow: str = "", warm_keys: tuple[str, ...] = (),
                   owned_state_dir: str = "", taken_out: dict[str, Any] | None = None,
                   warm_target: tuple[Any, ...] = ("", None, 0), klass: str | None = None,
-                  one_holder: bool = False, since: float | None = None, gui_token: str = "gui") -> tuple[bool, str]:
+                  one_holder: bool = False, since: float | None = None, gui_token: str = "gui",
+                  gui_runner: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
@@ -2462,6 +2783,11 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     needs a kind it needs (fair_turn); None is a newcomer. klass, when given,
     is the class itself (a ci-step names it, step_admit) instead of one looked up from the job id. one_holder
     refuses, under admission.lock, when this holder file's holder is still alive (a ci-step key admits once).
+    Every job but the gui runner's own (gui_runner: job-started --gui-runner) leaves the units idle gui runners
+    reserve free (gui_reserved, GUI_RESERVE). The gui runner's job takes them, and one that fits in the reserve its
+    gate holds never queues behind another lane's job waiting for units: that job could not have taken the
+    reserved unit. A costlier one waits its turn (fair_turn) like any job; its gate keeps the reserve until it is
+    admitted (Gate.admitted), so the reserved unit stays out of other lanes' reach meanwhile.
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
     takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
     the job class's tokens. Everything is a flock, so a holder that dies releases all of it."""
@@ -2501,7 +2827,11 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             return False, f"{job or 'this job'} is already admitted"
         if taken_out is not None:
             taken_out["wants"] = list(tokens)
-        behind = fair_turn(capacity_dir, {*tokens, *(("units",) if units else ())},
+        # the gui runner's job that fits in the reserve its gate holds takes the reserved unit, which no waiter here
+        # could take
+        in_reserve = (gui_runner and 0 < units <= GUI_RESERVE_UNITS
+                      and not probe(capacity_dir / f"{gui_token}{GUI_RESERVE}"))
+        behind = fair_turn(capacity_dir, {*tokens, *(("units",) if units and not in_reserve else ())},
                            time.time() if since is None else since)
         if behind:
             return False, behind
@@ -2578,20 +2908,28 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 if taken_out is not None:
                     taken_out["wants"] = [token]
                 return False, f"capacity: {held} ({job or 'unknown job'} is {klass})"
-        got = 0
+        # every job but the gui runner's own leaves the idle gui runners' reserve free (GUI_RESERVE)
+        kept = reserve_for(gui_reserved(capacity_dir, gui_token if gui_runner else None), units, total)
+        got = spare = 0
         unit_fds: list[int] = []
         for slot in range(total):
-            if got == units:
+            if got == units and spare >= kept:
                 break
             fd = lock_file(capacity_dir / f"unit-{slot}", fcntl.LOCK_EX)
-            if fd is not None:
+            if fd is None:
+                continue
+            if got < units:
                 fds.append(fd)
                 unit_fds.append(fd)
                 got += 1
-        if got < units:
+            else:  # free beside this job's units: one the reserve keeps (under admission.lock, so it stays free)
+                os.close(fd)
+                spare += 1
+        if got < units or spare < kept:
             if taken_out is not None:
                 taken_out["wants"] = ["units"]
-            return False, (f"capacity: {got} of {total} units free, {job or 'an unknown job'} ({klass}) needs {units}")
+            return False, (f"capacity: {got + spare} of {total} units free, {job or 'an unknown job'} ({klass}) "
+                           f"needs {units}{kept_note(kept)}")
         root = next((name for name in taken if name.startswith("root-")), None)
         split = named[root] if root and klass in ROOT_SWITCHERS else None
         if split is not None:  # its own holder (ROOT_SWITCHERS); the main holder must not inherit it
@@ -2795,7 +3133,8 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
     would hand back), and under
     admission.lock, held without waiting so no admission meets a unit the probe holds, enough unit files and one
     free copy of each token are free (an idle catch-up's locks count as free: it yields them to the next job), and
-    no job admitted here waits for units or one of those tokens (CAPACITY_WAIT: it goes first)."""
+    no job admitted here waits for units or one of those tokens (CAPACITY_WAIT: it goes first). The units an idle gui
+    runner reserves (GUI_RESERVE) are not free to a step."""
     if total <= 0 or host_held(host_lock, reservation, now, state_dir) or host_waiters(host_lock, state_dir):
         return []
     try:
@@ -2819,11 +3158,13 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
             return name in yielding or probe(capacity_dir / name)
 
         units = sum(1 for slot in range(total) if free(f"unit-{slot}"))
+        reserved = gui_reserved(capacity_dir)  # a step is never the gui runner's job: it leaves the reserve free
         waited = {kind for waiter in admission_waiters(capacity_dir) for kind in waiter["wants"]}
         fits = []
         for klass in STEP_CLASSES:
             need, tokens = CLASS_COST[klass]
-            if units < min(need, total) or waited & {*tokens, "units"}:  # a waiting job goes first (fair_turn)
+            need = min(need, total)
+            if units < need + reserve_for(reserved, need, total) or waited & {*tokens, "units"}:  # fair_turn
                 continue
             copies = {"persistent-dd": max(1, compile_slots), "root": max(1, roots)}
             if all(any(free((f"root-{c + 1}" if token == "root" else token if c == 0 else f"{token}-{c}")
@@ -2931,7 +3272,8 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
     gui_match = re.search(r"\s--gui-token\s+([A-Za-z0-9._-]+)(?:\s|$)", text)
     gui_token = gui_match.group(1) if gui_match else "gui"
     return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots,
-                       instance < roots and not gui and not fast and not session, gui, min_free_gib(text), gui_token,
+                       instance < roots and not gui and not fast and not session, gui,
+                       runner_floor_gib(min_free_gib(text), gui or session), gui_token,
                        fast, session)
 
 
@@ -2965,6 +3307,14 @@ def eligibility_refusal(fleet_class: str, xcode_app: str | None) -> str | None:
     return why
 
 
+def runner_floor_gib(min_free_gib: float, takes_tours: bool) -> float:
+    """A runner's disk floor: its --min-free-gib, raised to a cmux-next tour's floor on a gui or session runner. A
+    runner with no floor (0) keeps none: only the fleet's wrappers pass one, and a fleet runner is the one tours reach."""
+    if takes_tours and min_free_gib > 0:
+        return max(min_free_gib, float(CMUX_TOUR_REQUIREMENTS["min_free_gib"]))
+    return min_free_gib
+
+
 def min_free_gib(text: str) -> float:
     """The last unquoted --min-free-gib in a job-started hook script, as glaeda-cmux-runner writes it (:g, so 1e+03
     is a valid form), or 0 without one or when it is not a finite number. glaeda-disk's runner_floor_gib reads the
@@ -2978,6 +3328,14 @@ def min_free_gib(text: str) -> float:
 
 
 MIN_FREE_GIB_RE = r"\s--min-free-gib[\s=]+([0-9.eE+-]+)(?=\s|$)"
+# The free space a cmux-next tour needs: manaflow-ai/cmux scripts/cmux-next/tour-requirements.json, vendored as is at
+# CMUX_TOUR_REQUIREMENTS_PIN (reload.sh reads its floor from that file). The gui and session runners take tours, so
+# the hook holds them to at least this whatever --min-free-gib their wrapper passes: with the fleet floor alone, a
+# runner took tours reload.sh then refused, and since the hook applies it, glaeda-update's hook refresh rolls it out
+# without re-applying a runner. CI's glaeda-cmux-tour-floor-check fails when cmux's file says otherwise: vendor it and
+# move the pin to the cmux commit that changed it.
+CMUX_TOUR_REQUIREMENTS = {"min_free_gib": 40}
+CMUX_TOUR_REQUIREMENTS_PIN = "becb28033f69367e00aec1a1bd23737a1cd74968"
 
 
 # A root runner's jobs (compile admission, app-host shards, cli-product, lag) cost up to this many units, and
@@ -3028,7 +3386,14 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
 
     With the scope of a fast runner (scope.fast, the fast pool label: cmux-next's fast-tier), full means only that a
     fast token is taken or a job here waits for one: its job takes the fast tokens and none of the shared units,
-    so a mini whose units the side lane fills still takes it. Every other scope ignores the fast tokens."""
+    so a mini whose units the side lane fills still takes it. Every other scope ignores the fast tokens.
+
+    The gui runner's reserve (GUI_RESERVE): while an idle gui runner's gate holds it, every other scope counts
+    GUI_RESERVE_UNITS fewer units free (but never so many that its next job could not fit the mini at all), so a
+    root, side or session runner that would take the gui runner's unit stops listening first. The gui runner counts
+    its reserve as its own, and a job waiting here for units is no reason to hold it: a job that fits in the
+    reserve takes the reserved unit, which that waiter could not have taken, and a costlier one waits its turn
+    here instead of in GitHub's queue (take_capacity)."""
     if capacity_dir is None or total <= 0:
         return None
     try:
@@ -3059,21 +3424,26 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
         # fit_units: a side runner whose label brings costlier jobs (listen --fit-units: glaeda-ios-sim's isolated
         # builds, a session runner's jobs)
         need = min(max(ROOT_FIT_UNITS if root else 1, fit_units), total)
+        gui = scope is not None and scope.gui
+        # every runner but the gui runner leaves the idle gui runners' reserve free (GUI_RESERVE); the gui runner's
+        # own reserve is its next job's
+        kept = reserve_for(gui_reserved(capacity_dir, scope.gui_token if gui else None), need, total)
         free = 0
         for slot in range(total):
             if not open_to_jobs(f"unit-{slot}", capacity_dir / f"unit-{slot}"):
                 continue
             free += 1
-            if free >= need:
+            if free >= need + kept:
                 break
         if free == 0:
-            return f"all {total} capacity units on this mini are taken"
-        if free < need:
-            return (f"only {free} of {total} capacity units on this mini are free; "
-                    f"{'a compile' if root else 'its next job'} needs {need}")
-        # a job already here waits for what this runner's next job would take (CAPACITY_WAIT): it goes first
-        compete = {"units"} | ({"root", "persistent-dd"} if root else set()) | (
-            {scope.gui_token, "root"} if scope is not None and scope.gui else set())
+            return f"all {total} {UNITS_FULL} are taken"
+        if free < need + kept:
+            return (f"only {free} of {total} {UNITS_FULL} are free; "
+                    f"{'a compile' if root else 'its next job'} needs {need}{kept_note(kept)}")
+        # a job already here waits for what this runner's next job would take (CAPACITY_WAIT): it goes first. Not
+        # for units on the gui runner: its next job takes the reserved unit, which the waiter could not have taken
+        compete = ({"units"} if not gui else set()) | ({"root", "persistent-dd"} if root else set()) | (
+            {scope.gui_token, "root"} if gui else set())
         for waiter in admission_waiters(capacity_dir):
             shared = compete & set(waiter["wants"])
             if shared:
@@ -3403,6 +3773,7 @@ class Gate:
         self.eligible_new: str | None = None  # a first refusal, held only once a recheck agrees
         self.eligible_at = -GATE_ELIGIBLE_EVERY_S
         self.eligible_look: threading.Thread | None = None
+        self.stale_env: str | None = None  # why an adopted listener's env is not listener_env's (listen())
         self.disk_since: float | None = None  # when the current disk hold began
         self.disk_noted = False  # the hold ran past GATE_DISK_NOTE_S and said so once
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
@@ -3413,6 +3784,7 @@ class Gate:
         self.listening_since: float | None = None  # when start() last started run.sh (GATE_FIRST_POLL_S)
         self.first_poll_noted = False
         self.swept_at = time.monotonic() - GATE_SWEEP_S + GATE_POLL_S  # first sweep on the second poll
+        self.reserve_fd: int | None = None  # a gui runner's capacity/<gui token>.reserve flock while it is idle
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -3450,11 +3822,14 @@ class Gate:
             os.environ[GATE_LISTENING_SINCE_ENV] = repr(self.listening_since)
         if self.eligible_why:
             os.environ[GATE_INELIGIBLE_ENV] = self.eligible_why
+        if self.child is not None:
+            os.environ[GATE_LISTENER_ENV] = self.stale_env or "clean"
         try:
             os.execv(sys.executable, [sys.executable, *argv])
         except OSError:
             os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
             os.environ.pop(GATE_INELIGIBLE_ENV, None)
+            os.environ.pop(GATE_LISTENER_ENV, None)
             signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
             gate_log("the reload failed; keeping this gate")
 
@@ -3489,9 +3864,18 @@ class Gate:
         return why
 
     def saturated(self) -> str | None:
-        """Use sampled host CPU and VM pressure with hysteresis; unreadable probes never hold a listener."""
+        """Use sampled host CPU and VM pressure with hysteresis; unreadable probes never hold a listener.
+
+        The gui runner is held for memory pressure only. Its label brings the console jobs (app-host shards, lag,
+        cmux-next's swift test), one at a time per mini, and their units are admitted like any other job's; the
+        CPU mark held it whenever the side and root lanes kept the mini busy, which they did for hours
+        (2026-10-21: about 6 of 13 gui runners listening, gui-label jobs queued 1.5 to 3 h). Nothing local says
+        whether gui jobs are queued (the gate reads no GitHub API), so the exemption is unconditional."""
         now = time.monotonic()
-        if now - self.cpu_at >= GATE_CPU_EVERY_S:
+        gui = runner_scope(self.runner_dir).gui
+        if gui:
+            self.cpu_busy = None
+        elif now - self.cpu_at >= GATE_CPU_EVERY_S:
             _, self.cpu_busy = host_io()
             self.cpu_at = now
         if now - self.memory_at >= GATE_CPU_EVERY_S:
@@ -3650,7 +4034,12 @@ class Gate:
         """For a --require-eligible runner: why job-started would refuse every job for eligibility (GATE_ELIGIBLE_EVERY_S),
         from the last look. A look starts in a thread when the last one is older than GATE_ELIGIBLE_EVERY_S and none
         is running, so no poll waits on its probes. A look that crashes counts as eligible: job-started still checks
-        every job itself, so a wrong "eligible" only costs the refusal this hold avoids."""
+        every job itself, so a wrong "eligible" only costs the refusal this hold avoids. An adopted listener whose env
+        is stale (adopted_env_stale) is held the same way, for any runner: stopped once idle, it starts clean."""
+        if self.child is None:
+            self.stale_env = None  # the next start() gives it listener_env
+        elif self.stale_env:
+            return f"listener env: {self.stale_env}; restarting it on the pool Xcode's env"
         scope = eligibility_scope(self.runner_dir)
         if scope is None:
             self.eligible_why = None
@@ -3689,6 +4078,44 @@ class Gate:
             return None if fresh else self.full_why
         self.full_why = why
         return why
+
+    def reserve(self, want: bool) -> None:
+        """Hold or let go of this gui runner's reserve (GUI_RESERVE: capacity/<gui token>.reserve), which keeps
+        GUI_RESERVE_UNITS units from every other job and runner on the mini. step() holds it while the runner is
+        idle and reserves() agrees, keeps it through a new job's admission, and lets it go once that job is
+        admitted (admitted()). Only a gui runner with a capacity ledger reserves. The flock is the gate's own fd (not inherited by run.sh, closed by a reload's exec, which
+        takes it again on its next poll), so a gate that dies reserves nothing. Never raises: a reserve it cannot
+        take is tried again on the next poll."""
+        if want and self.reserve_fd is None:
+            scope = runner_scope(self.runner_dir)
+            if not scope.gui or scope.units <= 0 or self.capacity_dir is None or not self.capacity_dir.is_dir():
+                return
+            with contextlib.suppress(OSError):
+                self.reserve_fd = lock_file(self.capacity_dir / f"{scope.gui_token}{GUI_RESERVE}", fcntl.LOCK_EX)
+        elif not want and self.reserve_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self.reserve_fd)
+            self.reserve_fd = None
+
+    def reserves(self, why: str | None) -> bool:
+        """Whether an idle gui runner keeps its reserve, given claimed()'s answer: only while nothing holds it or
+        only units do (full(), UNITS_FULL), and its console can run a GUI job. Held off for the fleet, heat, memory
+        pressure, a locked console, the gui token or the canonical roots, it could take no job, so the unit would
+        only sit idle."""
+        return (why is None or (why == self.full_why and UNITS_FULL in why)) and self.locked() is None
+
+    def admitted(self) -> bool:
+        """Whether this runner's job holds its admission: the holder job-started leaves (holder_file, named for the
+        runner in its .runner file) is alive. Until then a busy gui runner keeps its reserve, so a job waiting here
+        for units cannot take the reserved unit in the seconds between the listener taking the job and its
+        job-started admitting it. Unreadable counts as admitted: the reserve goes back, as before it existed."""
+        try:
+            name = json.loads((self.runner_dir / ".runner").read_text(encoding="utf-8-sig")).get("agentName")
+        except (OSError, ValueError, AttributeError):
+            return True
+        if not isinstance(name, str) or not name:
+            return True
+        return holder_alive(holder_file(self.state_dir, name))
 
     def tree(self) -> tuple[list[int], dict[int, tuple[int, str]]]:
         table = processes()
@@ -3741,7 +4168,8 @@ class Gate:
     def start(self) -> None:
         gate_log("starting the listener")
         self.child = subprocess.Popen([os.fspath(self.runner_dir / "run.sh")], cwd=self.runner_dir,
-                                      stdin=subprocess.DEVNULL)
+                                      stdin=subprocess.DEVNULL, env=listener_env(os.environ, runner_xcode(self.runner_dir)))
+        self.stale_env = None
         self.streak, self.stopped_one = 0, False
         self.listening_since, self.first_poll_noted = time.monotonic(), False
 
@@ -3853,8 +4281,11 @@ class Gate:
                     self.fast_until = time.monotonic() + 5.0
                 self.streak = 0  # a claim must hold for two idle polls, not carry over from the job
                 self.load_since = None  # the hold limit times a pause, never a job
+                if self.reserve_fd is not None and self.admitted():
+                    self.reserve(False)  # its job has its units: the reserve goes back to the other lanes
                 return None
             why = self.claimed()
+            self.reserve(self.reserves(why))
             self.streak = self.streak + 1 if why else 0
             if why and self.streak >= GATE_CONFIRM and not self.first_poll(why):
                 why = self.confirmed()
@@ -3865,6 +4296,7 @@ class Gate:
             return 0
         self.reload()
         why = self.claimed()
+        self.reserve(self.reserves(why))
         if why:
             if why != self.held:
                 gate_log(f"holding the listener off: {why}")
@@ -3946,11 +4378,20 @@ class Gate:
 def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, waiters: bool,
            adopt: int = 0, capacity_dir: Path | None = None, fit_units: int = 1) -> int:
     gate = Gate(runner_dir, host_lock, reservation, state_dir, waiters, capacity_dir, fit_units)
+    marker = os.environ.pop(GATE_LISTENER_ENV, None)
+    xcode = runner_xcode(runner_dir)
     if adopt:
         gate.child = Adopted(adopt)  # type: ignore[assignment]
         with contextlib.suppress(ValueError):  # the adopted listener keeps its first poll (GATE_FIRST_POLL_S)
             gate.listening_since = float(os.environ.get(GATE_LISTENING_SINCE_ENV, ""))
+        gate.stale_env = adopted_env_stale(marker, os.environ, xcode)
+        if gate.stale_env:
+            gate_log(f"the adopted listener's env is stale ({gate.stale_env}); restarting it once it is idle")
     os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
+    # The gate's own env too (the /usr/bin/python3 shim exports SDKROOT): its eligibility probes see the job's env.
+    clean = listener_env(os.environ, xcode)
+    os.environ.clear()
+    os.environ.update(clean)
     signal.signal(signal.SIGTERM, gate.terminate)
     signal.signal(signal.SIGINT, gate.terminate)
     # reload() blocks both before its exec, so a stop that arrives across it stays pending until here.
@@ -5248,6 +5689,7 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--gui-token must be a simple capacity token name")
     if args.parse_only:
         return 0
+    args.min_free_gib = runner_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
     telemetry = not args.no_telemetry and os.environ.get("GLAEDA_RUNNER_TELEMETRY", "1") != "0"
 
@@ -5353,6 +5795,11 @@ def main(argv: list[str] | None = None) -> int:
             why, want = node_refusal(args.fleet_class)
             if why:
                 return refused(why)
+        if args.toolchain_xcode:  # the listener's env, which every step inherits (listener_env)
+            given = {k: v for k, v in os.environ.items() if k != "SDKROOT" or not under_xcrun_shim(sys.executable)}
+            why = leaked_toolchain_env(given, args.toolchain_xcode)
+            if why:
+                return refused(why)
         why = reservation_refusal(args.reservation, time.time())
         disk_path = os.path.dirname(args.host_lock)
         if not why and not args.no_disk and disk_refusal(disk_path, args.min_free_gib):
@@ -5404,7 +5851,8 @@ def main(argv: list[str] | None = None) -> int:
                                                workflow=job_workflow(),
                                                warm_keys=job_warm_keys(event), taken_out=taken,
                                                warm_target=job_warm_target(event), since=since,
-                                               gui_token=args.gui_token, klass=admit_class)
+                                               gui_token=args.gui_token, klass=admit_class,
+                                               gui_runner=args.gui_runner)
                     if held or not note.startswith("capacity:"):
                         break
                     waited = time.monotonic() - start
@@ -5441,6 +5889,8 @@ def main(argv: list[str] | None = None) -> int:
                 return refused(why)
             if aligned:
                 note += f"; {aligned}"
+        if args.toolchain_xcode and (pinned := export_developer_dir(args.toolchain_xcode)):
+            note += f"; {pinned}"
         for root in held_roots(args.state_dir):
             settled = settle_root(int(root.rsplit("-", 1)[1]))
             if settled:

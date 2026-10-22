@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import contextlib
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -2923,6 +2924,424 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(all(r.startswith(str(home / idle)) for r in removed))
         self.assertTrue((home / live / "cmux-tui/target").exists())
 
+    def test_code_sign_clones_go_at_once_under_the_runner_floor(self) -> None:
+        # cmux7s, 2026-10-21: 21 GiB free under a 30 GiB floor with 40 GiB of media CI's cmux DEV copies
+        # "recent" (min_idle_hours 2): every launch copies the bundle again, so two hours of jobs filled it
+        user_tmp, clones = self._clone_tree()
+        bundle = clones / "com.cmuxterm.app.debug.ci.media.pr.1.head.code_sign_clone"
+        for name, age_h in (("code_sign_clone.Old1", 1.5), ("code_sign_clone.Old2", 1.0), ("code_sign_clone.New", 0.5)):
+            self._age(bundle / name, hours=age_h)
+        fam = self._clone_family(user_tmp)
+        dev = clones.stat().st_dev
+
+        def not_newest(level, commands=None):
+            return [p for p in level if p.name != "code_sign_clone.New"]
+
+        def verdicts(hold):
+            with mock.patch.object(gd, "keep_live_app_clones", side_effect=not_newest), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", hold):
+                return {Path(i.path).name: i.verdict for i in gd.survey([fam], 6, 0)}
+        self.assertEqual(verdicts({}), {"code_sign_clone.Old1": "recent", "code_sign_clone.Old2": "recent"})
+        self.assertEqual(verdicts({dev: 50 * gd.GIB}),
+                         {"code_sign_clone.Old1": "reclaimable", "code_sign_clone.Old2": "reclaimable"})
+        # apply: an app that started from a copy since the survey keeps it; else they go, down to the hold's stop
+        patches, removed = self._floor_disk(25.0)
+        running = "/x/cmux DEV.app/Contents/MacOS/cmux\n"
+        with patches[0], patches[1], mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), \
+                mock.patch.object(gd, "keep_live_app_clones", side_effect=not_newest), \
+                contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey([fam], 6, 0)
+            with mock.patch.object(gd, "command_lines", return_value=running), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], running)):
+                gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+            self.assertEqual(removed, [])
+            items = gd.survey([fam], 6, 0)  # apply marks what it held back: the next pass surveys again
+            with mock.patch.object(gd, "command_lines", return_value="/bin/zsh\n"):
+                gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertEqual(sorted(Path(r).name for r in removed), ["code_sign_clone.Old1", "code_sign_clone.Old2"])
+        self.assertTrue((bundle / "code_sign_clone.New").is_dir())
+
+    def _cmux_next_runners(self) -> tuple[Path, "gd.Family"]:
+        """Two enrolled runners named mini-glaeda and mini-glaeda-2, each with its cmux-next scheme state, and
+        a state no enrolled runner owns, all built an hour ago."""
+        home = self.root / "home"
+        for runner, name in (("actions-runner-glaeda", "mini-glaeda"), ("actions-runner-glaeda-2", "mini-glaeda-2")):
+            (home / runner / "glaeda-hooks").mkdir(parents=True)
+            # the runner writes .runner as UTF-8 with a byte order mark
+            (home / runner / ".runner").write_text(json.dumps({"agentName": name}), encoding="utf-8-sig")
+        root = home / "Library/Caches/cmux-next-ci"
+        for name in ("mini-glaeda", "mini-glaeda-2", "gone-runner"):
+            make(root / "cmux-scheme" / name / "Build", age_hours=1)
+            (root / "cmux-scheme" / name / "SourcePackages").mkdir()
+        return home, gd.cmux_next_ci_family(root)
+
+    def test_idle_runners_cmux_next_build_output_goes_at_once_under_the_runner_floor(self) -> None:
+        # cmux7s, 2026-10-21: 19.9 GiB of per-runner cmux-next Build "recent" (72 h window) under the floor
+        home, fam = self._cmux_next_runners()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+        dev = home.stat().st_dev
+
+        def verdicts(hold):
+            with mock.patch.object(gd, "HOME", home), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", hold):
+                return {Path(i.path).parent.name: (i.verdict, i.reasons) for i in gd.survey([fam], 6, 0)}
+        v = verdicts({})
+        self.assertEqual(v["mini-glaeda"][0], "recent")
+        self.assertEqual(v["mini-glaeda-2"], ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]))
+        v = verdicts({dev: 50 * gd.GIB})
+        self.assertEqual(v["mini-glaeda"][0], "reclaimable")
+        self.assertEqual(v["mini-glaeda-2"][0], "in-use")  # a runner with a job keeps its output
+        self.assertEqual(v["gone-runner"][0], "recent")  # no enrolled runner to ask: its window stands
+        patches, removed = self._floor_disk(25.0)
+        with patches[0], patches[1], mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                mock.patch.object(gd, "command_lines", return_value=worker), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey([fam], 6, 0)
+            gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertEqual(removed, [str(fam.root / "cmux-scheme/mini-glaeda/Build")])
+        self.assertTrue((fam.root / "cmux-scheme/mini-glaeda/SourcePackages").is_dir())  # inputs stay
+
+    @staticmethod
+    def _release_key(name: str, runner: Path) -> str:
+        """cmux scripts/cmux-next/release-derived-data-path.sh: sha256("$RUNNER_NAME\n$GITHUB_WORKSPACE\n")[:16]."""
+        return hashlib.sha256(f"{name}\n{runner}/_work/cmux/cmux\n".encode()).hexdigest()[:16]
+
+    def _cmux_next_cap_tree(self, runners: bool = True) -> tuple[Path, "gd.Family", dict[str, Path]]:
+        """cmux11s's layout, 2026-10-21: two enrolled runners' scheme states and a scheme state no enrolled
+        runner owns; release-compile states keyed by runner 2 and by a runner no longer enrolled, and a dev-daily
+        state keyed by runner 1; all younger than the family's 72 h window. Each state keeps its SourcePackages
+        input beside a 1 MiB Build."""
+        home = self.root / "home"
+        if runners:
+            for runner, name in (("actions-runner-glaeda", "mini-glaeda"),
+                                 ("actions-runner-glaeda-2", "mini-glaeda-2")):
+                (home / runner / "glaeda-hooks").mkdir(parents=True)
+                (home / runner / ".runner").write_text(json.dumps({"agentName": name}), encoding="utf-8-sig")
+        root = home / "Library/Caches/cmux-next-ci"
+        xcode = "Release/xcode-2c2299e9015ce0c8"
+        key1 = self._release_key("mini-glaeda", home / "actions-runner-glaeda")
+        key2 = self._release_key("mini-glaeda-2", home / "actions-runner-glaeda-2")
+        states = {
+            "mini-glaeda": (root / "cmux-scheme/mini-glaeda", 5),
+            "mini-glaeda-2": (root / "cmux-scheme/mini-glaeda-2", 4),
+            "gone-runner": (root / "cmux-scheme/gone-runner", 7),
+            "release-old": (root / "release-compile/aaaaaaaaaaaaaaaa" / xcode, 8),  # no enrolled runner's key
+            "release-new": (root / "release-compile" / key2 / xcode, 1),
+            "daily": (root / "dev-daily-release" / key1 / xcode, 3),
+        }
+        for state, hours in states.values():
+            make(state / "Build", age_hours=hours)
+            (state / "SourcePackages").mkdir()
+            (state / "info.plist").write_text("{}")
+            self._age(state, hours=hours)
+        return home, gd.cmux_next_ci_family(root), {k: s for k, (s, _) in states.items()}
+
+    def test_cmux_next_ci_cap_policy_default_and_override(self) -> None:
+        self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_cap_gib"], 40.0)
+        policy = self.root / "disk-policy.json"
+        policy.write_text('{"cmux_next_ci_cap_gib": 25}')
+        self.assertEqual(gd.disk_policy(policy)["cmux_next_ci_cap_gib"], 25.0)
+
+    def test_cmux_next_ci_cap_state_measures_the_whole_cache(self) -> None:
+        home, fam, _ = self._cmux_next_cap_tree()
+        other = gd.Family("tmp", self.root, True, "x")
+        record = self.root / "cmux-next-cap.json"
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "CMUX_NEXT_CAP_RECORD", record):
+            # a report reads the last pressure run's measurement and never walks the cache itself
+            with mock.patch.object(gd, "du_bytes", return_value=78 * gd.GIB) as du:
+                self.assertIsNone(gd.cmux_next_ci_cap_state([other, fam], 40.0, measure=False))
+                du.assert_not_called()
+                got = gd.cmux_next_ci_cap_state([other, fam], 40.0, measure=True)
+                self.assertEqual({k: got[k] for k in ("used", "cap", "over")},
+                                 {"used": 78 * gd.GIB, "cap": 40 * gd.GIB, "over": 38 * gd.GIB})
+                # a size probe, not an eviction measurement: no eviction_stuck or cooldown from its timeout
+                du.assert_called_once_with(fam.root, record_timeout=False)
+                du.reset_mock()
+                seen = gd.cmux_next_ci_cap_state([other, fam], 25.0, measure=False)
+                du.assert_not_called()
+                self.assertEqual((seen["used"], seen["over"]), (78 * gd.GIB, 53 * gd.GIB))
+                self.assertLessEqual(time.time() - seen["at"], 60)
+                du.reset_mock()
+                self.assertIsNone(gd.cmux_next_ci_cap_state([other, fam], 0.0, measure=True))  # 0 turns the cap off
+                self.assertIsNone(gd.cmux_next_ci_cap_state([other], 40.0, measure=True))  # family not in this run
+                du.assert_not_called()
+                self.assertIsNone(gd.cmux_next_ci_cap_state([other, fam], 0.0))  # 0 turns the cap off
+                self.assertIsNone(gd.cmux_next_ci_cap_state([other], 40.0))  # the family is not in this run
+            with mock.patch.object(gd, "du_bytes", return_value=30 * gd.GIB):
+                self.assertEqual(gd.cmux_next_ci_cap_state([fam], 40.0, measure=True)["over"], 0)
+            with mock.patch.object(gd, "du_bytes", return_value=None):  # an unsized cache keeps the 72 h window
+                self.assertIsNone(gd.cmux_next_ci_cap_state([fam], 40.0, measure=True))
+        # a host with no enrolled glaeda runner is no CI host: the cap never applies there
+        with mock.patch.object(gd, "HOME", self.root / "bare"), mock.patch.object(gd, "CMUX_NEXT_CAP_RECORD", record), \
+                mock.patch.object(gd, "du_bytes", return_value=78 * gd.GIB) as du:
+            self.assertIsNone(gd.cmux_next_ci_cap_state([fam], 40.0, measure=True))
+            self.assertIsNone(gd.cmux_next_ci_cap_state([fam], 40.0, measure=False))
+            du.assert_not_called()
+
+    def test_cmux_next_ci_unowned_states_go_whole_only_past_the_job_timeout(self) -> None:
+        # a state no enrolled runner owns but used within a job's timeout may still be a job's (a runner renamed
+        # or re-enrolled mid-job): it keeps its inputs until it has been idle for GitHub's default job timeout
+        self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_unowned_idle_hours"], 6.0)
+        home, fam, st = self._cmux_next_cap_tree()
+        with mock.patch.object(gd, "HOME", home):
+            self.assertEqual(sorted(gd.cmux_next_ci_stale_roots(fam.root)),
+                             sorted([st["gone-runner"], st["release-old"]]))  # 7 h and 8 h idle
+            self._age(st["gone-runner"], hours=2)
+            self.assertEqual(gd.cmux_next_ci_stale_roots(fam.root), [st["release-old"]])
+            with mock.patch.dict(gd.POLICY, {"cmux_next_ci_unowned_idle_hours": 1.0}):
+                self.assertIn(st["gone-runner"], gd.cmux_next_ci_stale_roots(fam.root))
+
+    def test_cmux_next_ci_release_key_uses_the_runner_work_folder(self) -> None:
+        # .runner's workFolder: relative to the runner directory, or absolute
+        home, fam, _ = self._cmux_next_cap_tree()
+        runner = home / "actions-runner-glaeda"
+        elsewhere = self.root / "work-elsewhere"
+        (runner / ".runner").write_text(json.dumps({"agentName": "mini-glaeda", "workFolder": os.fspath(elsewhere)}),
+                                        encoding="utf-8-sig")
+        (home / "actions-runner-glaeda-2/.runner").write_text(
+            json.dumps({"agentName": "mini-glaeda-2", "workFolder": "w"}), encoding="utf-8-sig")
+        with mock.patch.object(gd, "HOME", home):
+            keys = gd.cmux_next_ci_release_keys()
+        self.assertEqual(keys[gd.cmux_next_ci_release_key("mini-glaeda", f"{elsewhere}/cmux/cmux")], runner)
+        self.assertEqual(keys[gd.cmux_next_ci_release_key("mini-glaeda-2", f"{home}/actions-runner-glaeda-2/w/cmux/cmux")],
+                         home / "actions-runner-glaeda-2")
+        self.assertNotIn(self._release_key("mini-glaeda", runner), keys)
+
+    def test_cmux_next_ci_release_states_are_keyed_by_runner(self) -> None:
+        # cmux11s, 2026-10-21: release-compile/3c965dbc3ce04dc2 is cmux11s-mac-mini-glaeda-1's
+        self.assertEqual(gd.cmux_next_ci_release_key("cmux11s-mac-mini-glaeda-1",
+                                                     "/Users/cmux/actions-runner-glaeda-1/_work/cmux/cmux"),
+                         "3c965dbc3ce04dc2")
+        home, fam, st = self._cmux_next_cap_tree()
+        with mock.patch.object(gd, "HOME", home):
+            self.assertEqual(gd.cmux_next_ci_runner(st["release-new"] / "Build", fam.root),
+                             home / "actions-runner-glaeda-2")
+            self.assertEqual(gd.cmux_next_ci_runner(st["daily"] / "Build", fam.root), home / "actions-runner-glaeda")
+            self.assertIsNone(gd.cmux_next_ci_runner(st["release-old"] / "Build", fam.root))
+            # so the runner floor hold covers a live runner's Release output too
+            self.assertTrue(gd.floor_hold_family(fam, st["release-new"] / "Build"))
+            self.assertEqual(sorted(gd.cmux_next_ci_stale_roots(fam.root)), sorted([st["gone-runner"], st["release-old"]]))
+        # an aside tree a deletion left is never a state root
+        aside = fam.root / "cmux-scheme" / f"{gd.DELETING_PREFIX}gone-runner-123"
+        aside.mkdir()
+        self.assertNotIn(aside, gd.cmux_next_ci_state_roots(fam.root))
+
+    def test_cmux_next_ci_over_its_cap_lists_stale_roots_whole_and_drops_the_idle_window(self) -> None:
+        # cmux11s, 2026-10-21: 78 GiB of cmux-next-ci, "reclaimable 0.0G", jobs refused at 21 GiB under a 40 GiB floor
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+
+        def verdicts(over, mode="pressure"):
+            gd._DISCOVERED.clear()
+            with mock.patch.object(gd, "HOME", home), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", mode), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over):
+                return {Path(i.path): (i.verdict, i.reasons) for i in gd.survey([fam], 6, 0)}
+        # within the cap: the generated children alone, each waiting out the 72 h window
+        v = verdicts(0)
+        self.assertEqual(set(v), {s / "Build" for s in st.values()})
+        self.assertEqual(v[st["mini-glaeda"] / "Build"][0], "recent")
+        self.assertEqual(v[st["release-old"] / "Build"][0], "recent")
+        # over the cap: states of runners no longer enrolled (scheme by name, Release by key) go whole; every
+        # enrolled runner's states keep their inputs, and a runner with a job keeps its output too
+        v = verdicts(5 * gd.GIB)
+        self.assertEqual(set(v), {st["release-old"], st["gone-runner"], st["mini-glaeda"] / "Build",
+                                  st["mini-glaeda-2"] / "Build", st["release-new"] / "Build",
+                                  st["daily"] / "Build"})
+        for key in ("release-old", "gone-runner"):
+            self.assertEqual(v[st[key]][0], "reclaimable", key)
+        for key in ("mini-glaeda", "daily"):
+            self.assertEqual(v[st[key] / "Build"][0], "reclaimable", key)
+        self.assertTrue(any("cap" in r for r in v[st["release-old"]][1]))
+        for key in ("mini-glaeda-2", "release-new"):
+            self.assertEqual(v[st[key] / "Build"],
+                             ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]), key)
+        # the cap is a pressure rule: an idle sweep or a report keeps the window
+        v = verdicts(5 * gd.GIB, mode="sweep")
+        self.assertEqual(set(v), {s / "Build" for s in st.values()})
+        self.assertTrue(all(verdict != "reclaimable" for verdict, _ in v.values()))
+
+    def test_cmux_next_ci_cap_keeps_every_in_use_guard(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        (st["release-old"] / ".build.active").write_text("pid=1\n")  # an active marker in an unowned state
+        self._age(st["release-old"], hours=8)
+        (st["gone-runner"] / "unknown-owner-state").mkdir()  # an unknown child: someone else's state
+        self._age(st["gone-runner"], hours=7)  # still past the job timeout
+        xcodebuild = f"xcodebuild -derivedDataPath {st['daily']} build\n"  # a process naming a root
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "process_evidence", return_value=([os.fspath(st["release-new"])], xcodebuild)), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB):
+            v = {Path(i.path): (i.verdict, i.reasons) for i in gd.survey([fam], 6, 0)}
+        self.assertEqual(v[st["release-old"]][0], "in-use")
+        self.assertIn("active or ambiguous marker", v[st["release-old"]][1][0])
+        self.assertEqual(v[st["gone-runner"]][0], "in-use")
+        self.assertIn("unknown children", v[st["gone-runner"]][1][0])
+        self.assertEqual(v[st["daily"] / "Build"][0], "in-use")  # named by a running command
+        self.assertEqual(v[st["release-new"] / "Build"][0], "in-use")  # a process's cwd
+        self.assertEqual(v[st["mini-glaeda"] / "Build"][0], "reclaimable")
+
+    def test_cmux_next_ci_states_stay_partial_without_enrolled_runners(self) -> None:
+        # with no enrolled runner to ask, no state (scheme or release) can be called a gone runner's
+        home, fam, st = self._cmux_next_cap_tree(runners=False)
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB):
+            paths = {Path(i.path) for i in gd.survey([fam], 6, 0)}
+        for key in ("gone-runner", "release-old"):
+            self.assertIn(st[key] / "Build", paths)
+            self.assertNotIn(st[key], paths)
+
+    def test_cmux_next_ci_cap_evicts_least_recently_used_until_under_the_cap(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        over = int(2.5 * 1024 * 1024)  # three 1 MiB entries bring it under
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            items = gd.survey([fam], 6, 0)
+            # a job starts on the unowned release state after the survey: the fresh recheck keeps it
+            named = f"xcodebuild -derivedDataPath {st['release-old']}\n"
+            with mock.patch.object(gd, "process_evidence", return_value=([], named)):
+                gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records],
+                         [(st["release-old"], "changed:in-use"),  # 8 h, the oldest, but in use now
+                          (st["gone-runner"], "reclaimed"),  # 6 h
+                          (st["mini-glaeda"] / "Build", "reclaimed"),  # 5 h
+                          (st["mini-glaeda-2"] / "Build", "reclaimed")])  # 4 h: now under the cap
+        self.assertTrue(st["release-old"].is_dir())
+        self.assertFalse(st["gone-runner"].exists())
+        # with nothing naming it, the unowned Release state goes whole, leaving no empty <key>/Release behind
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["release-old"]]
+            gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        self.assertFalse((fam.root / "release-compile/aaaaaaaaaaaaaaaa").exists())
+        self.assertTrue((fam.root / "release-compile").is_dir())
+        self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())  # an enrolled runner's inputs stay
+        for key in ("daily", "release-new"):
+            self.assertTrue((st[key] / "Build").is_dir(), key)
+
+    def test_main_shows_the_cmux_next_cap_and_records_it_in_the_run_line(self) -> None:
+        self.addCleanup(setattr, gd, "CMUX_NEXT_CI_OVER", gd.CMUX_NEXT_CI_OVER)
+        state = {"used": 47 * gd.GIB, "cap": 25 * gd.GIB, "over": 22 * gd.GIB, "at": time.time() - 600}
+        with mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=state) as cap:
+            _, rows, _, _ = self._main_run(["--pressure", "--apply", "--cmux-next-cap-gib", "25"])
+            self.assertEqual(cap.call_args[0][1], 25.0)
+            self.assertIs(cap.call_args[1]["measure"], True)  # only a pressure run walks the cache
+            self.assertEqual(gd.CMUX_NEXT_CI_OVER, 22 * gd.GIB)
+            self.assertEqual(rows[-1]["cmux_next_ci_over_gib"], 22.0)
+            # a report and a keepup without --apply show the last measurement; only a pressure run acts on it
+            for argv in (["report"], ["keepup"]):
+                cap.reset_mock()
+                printed = io.StringIO()
+                with mock.patch.object(gd, "print", create=True,
+                                          side_effect=lambda *x, **k: printed.write(" ".join(map(str, x)) + "\n")):
+                    self._main_run(argv)
+                cap.assert_called_once()
+                self.assertIs(cap.call_args[1]["measure"], False, argv)
+                self.assertRegex(printed.getvalue(),
+                                 r"cmux-next-ci: 47\.0G of its 25 GiB cap \(22\.0G over\), measured 1\d min ago", argv)
+                self.assertEqual(gd.cmux_next_ci_over(), 0)  # no pressure run: the 72 h window stands
+            # glaeda-fleet-status's `--json --top 0 --max-age 1000000` on every mini neither measures nor prints it
+            cap.reset_mock()
+            self._main_run(["--json", "--max-age", "1000000"])
+            cap.assert_not_called()
+        with mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None) as cap:
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"])
+            self.assertEqual(cap.call_args[0][1], gd.POLICY["cmux_next_ci_cap_gib"])
+            self.assertEqual(gd.CMUX_NEXT_CI_OVER, 0)
+            self.assertIsNone(rows[-1]["cmux_next_ci_over_gib"])
+
+    def _main_run(self, argv: list[str], free_gib: float = 20.0, **over):
+        """One main() run on a fake 460 GiB HOME volume; returns (status, run log rows, survey and apply mocks)."""
+        log = self.root / "runs.jsonl"
+        dev = gd.HOME.stat().st_dev
+        total = 460 * gd.GIB
+        for name in ("EMERGENCY_DEVS", "ACTIVITY_MODE", "FLOOR_HOLD", "ROLE", "RUNNER_CACHE_PROFILE",
+                     "_REFRESH_DEADLINE_ACTIVE", "_MEASURE_BUDGET_REACHED"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
+        fss = {dev: gd.Fs(dev, "/", int(free_gib * gd.GIB), total, 120 * gd.GIB, 170 * gd.GIB)}
+        items = over.pop("items", [])
+        with mock.patch.object(gd, "RUN_LOG", log), \
+                mock.patch.object(gd, "DISK_OFF", over.pop("off", self.root / "disk-off")), \
+                mock.patch.dict(gd.POLICY, over.pop("policy", {})), \
+                mock.patch.object(gd, "MEASURE_LOCK", self.root / "measure.lock"), \
+                mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                mock.patch.object(gd, "default_families", return_value=[]), \
+                mock.patch.object(gd, "runner_floor_gib", return_value=30.0), \
+                mock.patch.object(gd, "filesystems", return_value=fss), \
+                mock.patch.object(gd, "free_bytes", return_value=(int(free_gib * gd.GIB), total)), \
+                mock.patch.object(gd, "ci_jobs", return_value=[]), \
+                mock.patch.object(gd, "survey", return_value=items) as survey, \
+                mock.patch.object(gd, "apply", return_value=over.pop("released", 0)) as apply, \
+                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
+                mock.patch.object(gd, "clear_stale_build_markers", return_value=0), \
+                mock.patch.object(gd, "repack_runner_checkouts", return_value=0), \
+                mock.patch.object(gd, "notify_disk"), contextlib.redirect_stdout(io.StringIO()):
+            status = gd.main(argv + ["--no-snapshot", "--top", "0", "--receipt", os.fspath(self.receipt())])
+        rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+        return status, rows, survey, apply
+
+    def test_every_applying_run_writes_one_run_line(self) -> None:
+        blocked = gd.Item("code-sign-clones", "/x/c", 12 * gd.GIB, 1.0, "recent", [])
+        status, rows, survey, apply = self._main_run(["--pressure", "--apply"], items=[blocked], released=3 * gd.GIB)
+        self.assertEqual(status, 0)
+        self.assertEqual(len(rows), 1, rows)
+        row = rows[0]
+        for key in ("at", "host", "mode", "off", "free_gib_before", "free_gib_after", "target_gib", "floor_gib",
+                    "reclaimed_gib", "reached", "blocked", "duration_s", "skipped"):
+            self.assertIn(key, row)
+        self.assertEqual((row["mode"], row["off"], row["skipped"]), ("pressure", False, None))
+        self.assertEqual((row["free_gib_before"], row["target_gib"], row["floor_gib"]), (20.0, 170.0, 30.0))
+        self.assertEqual(row["reclaimed_gib"], 3.0)
+        self.assertFalse(row["reached"])
+        self.assertEqual(row["blocked"], {"code-sign-clones": 12.0})
+        # no pressure: still one line, nothing reclaimed, the target already met
+        status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=200.0)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[1]["skipped"], rows[1]["reached"]), ("no pressure", True))
+        # a report writes none
+        self._main_run(["report"])
+        self.assertEqual(len((self.root / "runs.jsonl").read_text().splitlines()), 2)
+
+    def test_a_deferred_run_writes_its_reason(self) -> None:
+        lock = self.root / "measure.lock"
+        with lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        survey.assert_not_called()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["skipped"], "measurement_busy")
+
+    def test_the_kill_switch_deletes_nothing_and_says_so(self) -> None:
+        off = self.root / "disk-off"
+        off.write_text("")
+        for over in ({"off": off}, {"policy": {"enabled": False}}):
+            with self.subTest(over=list(over)):
+                (self.root / "runs.jsonl").unlink(missing_ok=True)
+                status, rows, survey, apply = self._main_run(["--pressure", "--apply"], **over)
+                self.assertEqual(status, 0)
+                survey.assert_not_called()
+                apply.assert_not_called()
+                self.assertEqual(len(rows), 1)
+                self.assertTrue(rows[0]["off"])
+                self.assertEqual(rows[0]["reclaimed_gib"], 0.0)
+        self.assertIn("disk-off", gd.__doc__)
+
     def test_floor_hold_only_below_the_gates_resume_mark(self) -> None:
         dev = self.root.stat().st_dev
 
@@ -3681,6 +4100,44 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertIn("build", gd.host_busy(fleet))
         with ps(""):
             self.assertIn("cannot list", gd.host_busy(fleet))
+
+    def test_host_busy_marks_its_no_answer_reasons(self) -> None:
+        """glaeda-mini-health tells host_busy's could-not-read reasons (no restart is coming) from a busy host (a short
+        wait) by host_busy_unreadable, not by matching text of its own."""
+        fleet = self.root / "fleet"
+        fleet.mkdir()
+        ps = lambda out: mock.patch.object(gd.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, out, ""))
+        unreadable, busy = [], []
+        with ps(""):
+            unreadable.append(gd.host_busy(fleet))
+        with ps("/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"):
+            busy.append(gd.host_busy(fleet))
+        with ps("/sbin/launchd\n"):
+            (fleet / "jobs").write_text("")  # not a directory: scandir fails
+            unreadable.append(gd.host_busy(fleet))
+            (fleet / "jobs").unlink()
+            (fleet / "jobs").mkdir()
+            (fleet / "jobs/abc").mkdir()
+            busy.append(gd.host_busy(fleet))
+            (fleet / "jobs/abc").rmdir()
+            (fleet / "reservation.json").write_text("{")
+            unreadable.append(gd.host_busy(fleet))
+            (fleet / "reservation.json").write_text(json.dumps({"until": 1}))
+            busy.append(gd.host_busy(fleet))
+            (fleet / "reservation.json").unlink()
+            os.symlink(fleet / "elsewhere", fleet / "host.lock")  # O_NOFOLLOW refuses it
+            unreadable.append(gd.host_busy(fleet))
+            (fleet / "host.lock").unlink()
+            (fleet / "host.lock").touch()
+            with (fleet / "host.lock").open() as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                busy.append(gd.host_busy(fleet))
+        self.assertEqual(len(set(unreadable)), 4, unreadable)
+        for reason in unreadable:
+            self.assertTrue(reason and gd.host_busy_unreadable(reason), reason)
+        for reason in busy:
+            self.assertTrue(reason and not gd.host_busy_unreadable(reason), reason)
+        self.assertFalse(gd.host_busy_unreadable(""))
 
     def test_the_repo_runner_hook_is_allowlisted_for_drain(self) -> None:
         """Every change to scripts/glaeda-cmux-runner-hook must pin its sha256 in CMUX_NEXT_DRAIN_HOOK_SHA256, or

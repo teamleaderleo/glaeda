@@ -25,6 +25,20 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Words that would turn the audit's graphql sentence back into a claim about price. The *last
+# paragraph* only, for two measured reasons: over the whole report the bare substring `point` fires
+# on a logged path (`repos/o/endpoint-registry`, which reaches the category rows) or on a future
+# summary line about "the GraphQL endpoint", and word boundaries alone still fire on a repository
+# actually named `points`, which reaches the hottest-targets line. The cost is that a priced
+# paragraph printed *before* that one is not caught; the whole-sentence assertion covers a rewrite
+# of the sentence itself, which is the likelier way a price comes back.
+STALE_COST = (r"\bpoints?\b", r"\bprices?\b", r"\bcheap(er|est)?\b", r"\bper call\b")
+
+
+def cost_claims(text: str) -> list[str]:
+    para = text.split("\n\n")[-1]
+    return [pat for pat in STALE_COST if re.search(pat, para)]
 loader = importlib.machinery.SourceFileLoader("glaeda_gh", os.fspath(ROOT / "scripts" / "glaeda-gh"))
 spec = importlib.util.spec_from_loader("glaeda_gh", loader)
 gg = importlib.util.module_from_spec(spec)
@@ -259,6 +273,10 @@ class Base(unittest.TestCase):
         gg.BUDGET_REFRESH = 0
         self.gh = FakeGitHub()
         self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        # A `wait pr|run` against a daemon that serves waits execs into bash: never the test runner.
+        execv = mock.patch.object(gg.os, "execv", side_effect=AssertionError("os.execv in a test process"))
+        execv.start()
+        self.addCleanup(execv.stop)
 
     def tearDown(self) -> None:
         gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.DOWN_PATIENCE, gg.BUDGET_REFRESH = self.saved
@@ -3146,6 +3164,364 @@ class DaemonDiagnosticOnFd2Test(unittest.TestCase):
         self.assertEqual(once.returncode, gg.EXIT_TIMEOUT, once.stdout)
 
 
+class WaitSubscriptionTest(Base):
+    """2026-10-21, app-efficiency: 89 `glaeda-gh wait` processes held 1.6 GB on cosmic-gray, a whole
+    interpreter per waiter re-reading the cache every 3 s. A `wait pr|run` is now a request the daemon
+    rules on (Daemon.serve_waits), and the waiter is a few-line bash blocked reading a FIFO."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        gg.BASE.mkdir(parents=True)
+        self.lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)  # stands in for a running daemon
+        self.addCleanup(self.lock.close)
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30, "waits": gg.WAITS_CONTRACT})
+
+    def put(self, key: str, data: dict | None, at: float | None = None) -> None:
+        at = time.time() if at is None else at
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": at, "dataAt": at if data else None,
+                                                          "data": data, "error": None})
+
+    def request(self, kind: str = "pr", target: str = "o/r#1", timeout: float = 60, pid: int | None = None,
+                **kw) -> tuple[str, int]:
+        """A request as subscribe_wait leaves it, and a reader on its FIFO standing in for the blocker."""
+        rid = gg.write_wait_request(kind, target, kw.get("until", "green"), timeout, False, kw.get("as_json", False),
+                                    kw.get("sha"), True, gg.RESCUE_GRACE, pid or os.getpid())
+        reader = os.open(gg.waits_dir() / f"{rid}.fifo", os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        return rid, reader
+
+    def woken(self, reader: int) -> str:
+        try:
+            return os.read(reader, 64).decode()
+        except BlockingIOError:
+            return ""
+
+    def test_the_daemon_rules_and_wakes_the_blocker(self) -> None:
+        rid, reader = self.request()
+        self.assertTrue(gg.read_json(gg.watch_dir() / gg.file_name("pr:o/r#1")), "the wait registered no interest")
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "", "a wait with nothing fetched yet was decided")
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "0\n")
+        out = (gg.waits_dir() / f"{rid}.out").read_text()
+        self.assertIn("result: success", out)
+        self.assertFalse((gg.waits_dir() / f"{rid}.json").exists(), "a decided request stayed")
+
+    def test_a_red_or_a_timeout_says_what_cmd_wait_says(self) -> None:
+        rid, reader = self.request("pr", "o/r#2")
+        self.put("pr:o/r#2", gg.parse_pr(pr_node(2, rollup="FAILURE", checks=[check_run("a", conclusion="FAILURE")])))
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "1\n")
+        self.assertIn("failed: a  https://ci/a", (gg.waits_dir() / f"{rid}.out").read_text())
+
+        rid, reader = self.request("run", "o/r/7", timeout=0)
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "2\n")
+        self.assertIn("result: timeout", (gg.waits_dir() / f"{rid}.out").read_text())
+
+    def test_data_from_before_the_wait_began_never_decides_it(self) -> None:
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])), at=time.time() - 30)
+        _, reader = self.request()
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "")
+
+    def test_a_request_whose_waiter_is_gone_is_dropped(self) -> None:
+        child = subprocess.Popen(["true"])
+        child.wait()
+        rid, _ = self.request(pid=child.pid)
+        self.daemon.serve_waits()
+        self.assertEqual(list(gg.waits_dir().glob(f"{rid}*")), [])
+
+    def test_what_a_killed_blocker_left_is_swept(self) -> None:
+        child = subprocess.Popen(["true"])
+        child.wait()
+        rid = f"{child.pid}-0000beef"
+        gg.waits_dir().mkdir(parents=True, exist_ok=True)
+        os.mkfifo(gg.waits_dir() / f"{rid}.fifo")
+        (gg.waits_dir() / f"{rid}.out").write_text("result: success\n")
+        (gg.waits_dir() / f"{rid}.out.rc").write_text("0\n")
+        live, _ = self.request()  # a live wait of this process is left alone
+        self.daemon.serve_waits()
+        self.assertEqual(sorted(p.name for p in gg.waits_dir().iterdir()), [".served", f"{live}.fifo", f"{live}.json"])
+
+    def test_a_request_long_past_its_deadline_or_unreadable_is_dropped(self) -> None:
+        """A blocker hands its wait back at the deadline, so a request still here WAITS_LEFTOVER later has
+        none (its pid reused); one that cannot be ruled on must not stop the others."""
+        old, _ = self.request(timeout=1)
+        req = gg.read_json(gg.waits_dir() / f"{old}.json")
+        gg.write_json(gg.waits_dir() / f"{old}.json", {**req, "began": time.time() - gg.WAITS_LEFTOVER - 10})
+        bad, _ = self.request("pr", "o/r#3")
+        gg.write_json(gg.waits_dir() / f"{bad}.json", {"pid": os.getpid()})
+        rid, reader = self.request("pr", "o/r#2")
+        self.put("pr:o/r#2", gg.parse_pr(pr_node(2, rollup="SUCCESS", checks=[check_run("a")])))
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "0\n")
+        self.assertEqual(list(gg.waits_dir().glob(f"{old}*")), [])
+        self.assertEqual(list(gg.waits_dir().glob(f"{bad}*")), [])
+
+    def test_ticks_that_keep_raising_stop_telling_blockers_waits_are_served(self) -> None:
+        gg.waits_dir().mkdir(parents=True, exist_ok=True)
+        served = gg.waits_dir() / ".served"
+        self.daemon.tick_failed("boom", "here")
+        with mock.patch.object(self.daemon, "post_tick", side_effect=SystemExit("stop the tick here")):
+            with self.assertRaises(SystemExit):
+                self.daemon.tick()
+        self.assertFalse(served.exists(), "a failing daemon told its blockers it serves waits")
+        self.daemon.failing = None
+        with mock.patch.object(self.daemon, "post_tick", side_effect=SystemExit("stop the tick here")):
+            with self.assertRaises(SystemExit):
+                self.daemon.tick()
+        self.assertTrue(served.exists(), "a healthy tick did not mark waits served before its reads")
+
+    def test_the_tick_rules_on_waits_and_says_it_does(self) -> None:
+        rid, reader = self.request()
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+        status = self.daemon.tick()
+        self.assertEqual(self.woken(reader), "0\n")
+        self.assertEqual((status["waits"], status["waiting"]), (gg.WAITS_CONTRACT, 0))
+        self.assertTrue((gg.waits_dir() / ".served").exists())
+
+    def test_a_blocker_not_listening_yet_is_woken_on_a_later_tick(self) -> None:
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 60, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+        self.daemon.serve_waits()  # decided, but nobody reads the FIFO yet
+        self.assertEqual(gg.read_json(gg.waits_dir() / f"{rid}.json")["code"], 0)
+        reader = os.open(gg.waits_dir() / f"{rid}.fifo", os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "0\n")
+
+    def test_the_cli_waits_as_a_shell_and_exits_with_the_verdict(self) -> None:
+        env = dict(os.environ, GLAEDA_GH_DIR=os.fspath(gg.BASE))
+        child = subprocess.Popen([sys.executable, os.fspath(ROOT / "scripts" / "glaeda-gh"), "wait", "pr", "o/r#1",
+                                  "--timeout", "60"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline, comm = time.monotonic() + 20, ""
+            while time.monotonic() < deadline:
+                comm = subprocess.run(["ps", "-o", "comm=", "-p", str(child.pid)], capture_output=True, text=True).stdout
+                if "bash" in comm:
+                    break
+                time.sleep(0.05)
+            self.assertIn("bash", comm, "the waiter is still a Python process")
+            self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+            self.daemon.serve_waits()
+            out, err = child.communicate(timeout=20)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+        self.assertEqual(child.returncode, 0, out + err)
+        self.assertIn("result: success", out)
+        self.assertEqual([p.name for p in gg.waits_dir().iterdir()], [".served"], "the wait left files behind")
+
+    def test_an_older_daemon_gets_the_polling_wait(self) -> None:
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30})  # no "waits"
+        with mock.patch.object(gg, "cmd_wait", return_value=7) as polling, mock.patch.object(gg.os, "execv") as execv:
+            self.assertEqual(gg.subscribe_wait("pr", "o/r#1", "green", 60, False, False, None, gg.RESCUE_GRACE), 7)
+        polling.assert_called_once()
+        execv.assert_not_called()
+
+    def test_an_unbounded_timeout_gets_the_polling_wait(self) -> None:
+        with mock.patch.object(gg, "cmd_wait", return_value=2) as polling:
+            self.assertEqual(gg.subscribe_wait("pr", "o/r#1", "green", float("inf"), False, False), 2)
+        polling.assert_called_once()
+
+    def blocker(self, rid: str, limit: int, check: int) -> tuple[subprocess.CompletedProcess, float]:
+        """BLOCKER on RID's FIFO, handing back to a stand-in for `wait-resume` that says so and exits 5."""
+        d, began = gg.waits_dir(), time.monotonic()
+        done = subprocess.run([gg.BASH, "-c", gg.BLOCKER, "glaeda-gh-wait", os.fspath(d / f"{rid}.fifo"),
+                               os.fspath(d / f"{rid}.out"), str(limit), os.fspath(d / ".served"), str(check),
+                               sys.executable, "-c", "import sys; print('resumed', sys.argv[1]); sys.exit(5)", rid],
+                              capture_output=True, text=True, timeout=30)
+        return done, time.monotonic() - began
+
+    def test_the_blocker_hands_the_wait_back_at_its_deadline(self) -> None:
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 60, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        done, _ = self.blocker(rid, 1, 60)
+        self.assertEqual((done.returncode, done.stdout), (5, f"resumed {rid}\n"), done.stderr)
+        self.assertFalse((gg.waits_dir() / f"{rid}.out.mark").exists())
+
+    def test_the_blocker_hands_back_once_no_tick_serves_waits(self) -> None:
+        """A daemon that died, fails every tick or is an older one stops touching .served: the wait goes
+        back to Python after one check, not at its deadline an hour later."""
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 600, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        done, took = self.blocker(rid, 600, 1)
+        self.assertEqual(done.returncode, 5, done.stderr)
+        self.assertLess(took, 10)
+
+    def test_the_blocker_hands_back_once_its_request_is_dropped(self) -> None:
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 600, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        stop = threading.Event()
+
+        def ticks() -> None:
+            gg.drop_wait(rid)  # the daemon dropped it; ticks still serve the other waits
+            while not stop.wait(0.2):
+                (gg.waits_dir() / ".served").touch()
+        timer = threading.Timer(0.5, ticks)
+        timer.start()
+        try:
+            done, took = self.blocker(rid, 600, 2)
+        finally:
+            stop.set()
+            timer.join()
+        self.assertEqual(done.returncode, 5, done.stderr)
+        self.assertLess(took, 10)
+
+    def test_a_request_that_cannot_be_written_back_stays_for_the_next_tick(self) -> None:
+        rid, reader = self.request()
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+        with mock.patch.object(gg.Path, "write_text", side_effect=OSError(28, "No space left on device")):
+            self.assertEqual(self.daemon.serve_waits(), 1)
+        self.assertTrue((gg.waits_dir() / f"{rid}.fifo").exists(), "a full disk dropped the wait")
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "0\n")
+
+    def test_the_blocker_sleeps_on_while_ticks_serve_waits(self) -> None:
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 60, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        stop = threading.Event()
+
+        def ticks() -> None:
+            while not stop.wait(0.2):
+                (gg.waits_dir() / ".served").touch()
+        ticker = threading.Thread(target=ticks)
+        ticker.start()
+        try:
+            done, took = self.blocker(rid, 6, 2)  # 2 s: bash 3.2's -nt compares whole seconds
+        finally:
+            stop.set()
+            ticker.join()
+        self.assertEqual(done.returncode, 5, done.stderr)
+        self.assertGreater(took, 5, "handed back before its deadline while waits were served")
+
+    def resume(self, rid: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), self.diagnostics_in(err):
+            code = gg.main(["wait-resume", rid])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_resume_prints_an_answer_the_blocker_missed(self) -> None:
+        """The daemon wrote the code while the blocker was handing back: .out.rc still says it."""
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 60, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        (gg.waits_dir() / f"{rid}.out").write_text("result: failure\n")
+        (gg.waits_dir() / f"{rid}.out.rc").write_text("1\n")
+        self.assertEqual(self.resume(rid), (1, "result: failure\n", ""))
+        self.assertEqual(list(gg.waits_dir().glob(f"{rid}*")), [])
+
+    def test_resume_sleeps_again_while_the_daemon_serves_waits(self) -> None:
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 60, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        with mock.patch.object(gg.os, "execv", side_effect=SystemExit(99)) as execv:
+            with self.assertRaises(SystemExit):
+                self.resume(rid)
+        argv = execv.call_args.args[1]
+        self.assertEqual(argv[:3], [gg.BASH, "-c", gg.BLOCKER])
+        self.assertLessEqual(int(argv[6]), 60)
+        self.assertEqual(argv[-2:], ["wait-resume", rid])
+        self.assertTrue((gg.waits_dir() / f"{rid}.json").exists(), "the request was dropped")
+
+    def test_resume_of_a_failing_daemon_says_what_the_polling_wait_says(self) -> None:
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 60, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        now = time.time()
+        gg.write_json(gg.BASE / "daemon.json", {"at": now, "heartbeat": 30, "waits": gg.WAITS_CONTRACT,
+                                                "failing": {"error": "boom", "since": now - 300, "count": 99}})
+        code, _, err = self.resume(rid)
+        self.assertEqual(code, gg.EXIT_DOWN)
+        self.assertIn("every cycle since", err)
+        self.assertEqual(list(gg.waits_dir().glob(f"{rid}*")), [])
+
+    def test_resume_at_the_deadline_times_out_as_the_polling_wait_does(self) -> None:
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 0, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        code, out, _ = self.resume(rid)
+        self.assertEqual(code, gg.EXIT_TIMEOUT)
+        self.assertIn("result: timeout", out)
+        self.assertEqual(list(gg.waits_dir().glob(f"{rid}*")), [])
+
+    def test_the_subscribed_cli_says_the_waiting_line_once_while_it_blocks(self) -> None:
+        """The waiting line (waiting_line) on the daemon path: on fd 2 of the real CLI, read while the
+        waiter is the bash BLOCKER -- so it was written, and flushed, before the exec -- and said once."""
+        env = dict(os.environ, GLAEDA_GH_DIR=os.fspath(gg.BASE))
+        child = subprocess.Popen([sys.executable, os.fspath(ROOT / "scripts" / "glaeda-gh"), "wait", "pr", "o/r#1",
+                                  "--timeout", "60"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            first = child.stderr.readline()
+            self.assertIn("waiting on pr:o/r#1 until green", first)
+            deadline, comm = time.monotonic() + 20, ""
+            while time.monotonic() < deadline:
+                comm = subprocess.run(["ps", "-o", "comm=", "-p", str(child.pid)], capture_output=True, text=True).stdout
+                if "bash" in comm:
+                    break
+                time.sleep(0.05)
+            self.assertIn("bash", comm, "the waiter never became the blocker")
+            self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+            self.daemon.serve_waits()
+            out, err = child.communicate(timeout=20)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+        self.assertEqual(child.returncode, 0, out + first + err)
+        self.assertEqual((first + err).count("waiting on"), 1, first + err)
+        self.assertNotIn("waiting on", out, "the line went to stdout")
+
+    def test_the_subscribe_path_says_the_line_once_before_it_blocks(self) -> None:
+        said: list[str] = []
+        with mock.patch.object(gg, "say_waiting", said.append), \
+                mock.patch.object(gg, "block", side_effect=lambda rid, left: said.append("block")):
+            gg.subscribe_wait("pr", "o/r#1", "green", 60, False, False, None, gg.RESCUE_GRACE)
+        self.assertEqual(len([s for s in said if "waiting on" in s]), 1, said)
+        self.assertEqual(said[-1], "block", "the line came after the wait blocked")
+
+    def test_every_fallback_says_the_line_once(self) -> None:
+        """Not served (an older daemon), an unbounded timeout, and a request that cannot be written: each
+        polls, and each says the line exactly once -- never once from subscribe_wait and again from cmd_wait."""
+        cases = {
+            "older daemon": lambda: gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30}),
+            "over WAITS_MAX_TIMEOUT": lambda: None,
+            "request not written": lambda: None,
+        }
+        for name, arrange in cases.items():
+            with self.subTest(name):
+                gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30, "waits": gg.WAITS_CONTRACT})
+                arrange()
+                timeout = gg.WAITS_MAX_TIMEOUT * 2 if name == "over WAITS_MAX_TIMEOUT" else 0.1
+                said: list[str] = []
+                patches = [mock.patch.object(gg, "say_waiting", said.append),
+                           mock.patch.object(gg.os, "execv", side_effect=AssertionError("blocked"))]
+                if name == "request not written":
+                    patches.append(mock.patch.object(gg, "write_wait_request", side_effect=OSError(28, "full")))
+                if name == "over WAITS_MAX_TIMEOUT":
+                    patches.append(mock.patch.object(gg, "poll_wait", return_value=gg.EXIT_TIMEOUT))
+                with contextlib.ExitStack() as stack:
+                    for patch in patches:
+                        stack.enter_context(patch)
+                    stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                    self.assertEqual(gg.subscribe_wait("pr", "o/r#1", "green", timeout, False, False), gg.EXIT_TIMEOUT)
+                self.assertEqual(len([s for s in said if "waiting on" in s]), 1, said)
+
+    def test_a_resumed_wait_does_not_say_the_line_again(self) -> None:
+        """BLOCKER handing back (resume_wait), whether it sleeps again or polls, is the same wait: the line
+        was said when it began."""
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 60, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        said: list[str] = []
+        with mock.patch.object(gg, "say_waiting", said.append), \
+                mock.patch.object(gg.os, "execv", side_effect=SystemExit(99)), self.assertRaises(SystemExit):
+            gg.resume_wait(rid)
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 0, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        with mock.patch.object(gg, "say_waiting", said.append), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.resume_wait(rid), gg.EXIT_TIMEOUT)
+        self.assertEqual([s for s in said if "waiting on" in s], [], said)
+
+    def test_seconds_and_the_subscribe_range_agree(self) -> None:
+        """What `seconds` lets through, subscribe_wait either serves or polls; nothing it refuses reaches it."""
+        for bad in ("inf", "-inf", "nan", "-1"):
+            with self.subTest(bad), self.assertRaises(gg.argparse.ArgumentTypeError):
+                gg.seconds(bad)
+        for good in ("0", "1.5", str(gg.WAITS_MAX_TIMEOUT)):
+            with self.subTest(good):
+                self.assertTrue(0 <= gg.seconds(good) <= gg.WAITS_MAX_TIMEOUT)
+
+
 class FileAndPidWaitTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -3943,6 +4319,80 @@ class BrokerBudgetTest(BrokerBase):
             self.assertEqual(gg.broker_max_age(["title"]), 3600)
 
 
+class BrokerSpentBucketTest(BrokerBase):
+    """Leo, 2026-10-21: "just use rest gh then?" A `pr view` gh would answer over a spent GraphQL
+    bucket is read by the daemon over REST instead, and served from that read."""
+
+    ARGS = ["pr", "view", "7", "-R", "o/r", "--json", "title"]
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.running = mock.patch.object(gg, "daemon_running", lambda grace=0.0: True)
+        self.running.start()
+        self.addCleanup(self.running.stop)
+        self.wait = mock.patch.object(gg, "BROKER_SPENT_WAIT", 0.2)
+        self.wait.start()
+        self.addCleanup(self.wait.stop)
+
+    def budget(self, graphql: int, rest: int, reset: float = 600.0) -> None:
+        at = time.time()
+        gg.write_json(gg.BASE / "budget.json", {
+            "graphql": {"limit": 5000, "remaining": graphql, "reset": at + reset, "seenAt": at},
+            "rest": {"limit": 5000, "remaining": rest, "reset": at + reset, "seenAt": at}})
+
+    def watched(self) -> list[str]:
+        return sorted((gg.read_json(p) or {}).get("key") for p in gg.watch_dir().glob("*.json"))
+
+    def test_a_miss_over_spent_graphql_is_served_from_the_daemons_read(self) -> None:
+        self.budget(graphql=0, rest=4000)
+        real_register = gg.register
+
+        def register(key: str, *a, **kw) -> None:  # the daemon's REST read, landing a tick later
+            real_register(key, *a, **kw)
+            self.cache_pr(7, {"title": "a fix"})
+
+        with mock.patch.object(gg, "register", register):
+            code, out, _err, passed = self.run_gh(self.ARGS)
+        self.assertEqual((code, out, passed), (0, '{"title":"a fix"}\n', None))
+        noted = [json.loads(line) for line in gg.broker_log().read_text().splitlines()]
+        self.assertEqual({k: noted[-1].get(k) for k in ("route", "key", "spent")},
+                         {"route": "serve", "key": "pr:o/r#7", "spent": True})
+
+    def test_no_answer_in_time_still_runs_gh(self) -> None:
+        self.budget(graphql=0, rest=4000)
+        _code, out, _err, passed = self.run_gh(self.ARGS)
+        self.assertEqual((out, passed), ("", self.ARGS))
+        self.assertEqual(self.watched(), ["pr:o/r#7"], "the daemon was asked even so")
+
+    def test_a_healthy_bucket_does_not_wait_or_watch(self) -> None:
+        self.budget(graphql=4000, rest=4000)
+        with mock.patch.object(gg, "broker_await", side_effect=AssertionError("waited")):
+            _code, _out, _err, passed = self.run_gh(self.ARGS)
+        self.assertEqual(passed, self.ARGS)
+        self.assertEqual(self.watched(), [])
+
+    def test_both_buckets_spent_goes_straight_to_gh(self) -> None:
+        self.budget(graphql=0, rest=0)
+        self.assertFalse(gg.broker_bucket_spent("pr:o/r#7", time.time()))
+
+    def test_a_reset_that_has_passed_is_not_spent(self) -> None:
+        self.budget(graphql=0, rest=4000, reset=-1)
+        self.assertFalse(gg.broker_bucket_spent("pr:o/r#7", time.time()))
+
+    def test_each_read_is_judged_by_the_bucket_gh_spends_on_it(self) -> None:
+        self.budget(graphql=4000, rest=0)
+        now = time.time()
+        self.assertFalse(gg.broker_bucket_spent("pr:o/r#7", now), "gh pr view is GraphQL")
+        self.assertTrue(gg.broker_bucket_spent("run:o/r/9", now), "gh run view is REST")
+
+    def test_without_the_daemon_nothing_waits(self) -> None:
+        self.budget(graphql=0, rest=4000)
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: False), \
+                mock.patch.object(gg, "broker_await", side_effect=AssertionError("waited")):
+            _code, _out, _err, passed = self.run_gh(self.ARGS)
+        self.assertEqual(passed, self.ARGS)
+
+
 class BrokerFailOpenTest(BrokerBase):
     def test_an_error_anywhere_in_the_broker_still_runs_the_real_gh(self) -> None:
         with mock.patch.object(gg, "broker_plan", side_effect=RuntimeError("boom")):
@@ -4039,6 +4489,310 @@ class AuditTest(BrokerBase):
         self.assertEqual(doc["categories"]["raw gh api graphql"], 1)
         self.assertEqual(doc["categories"]["pr merge"], 1)
 
+    def audit_json(self, path: Path) -> dict:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.main(["audit", "--log", str(path), "--json"]), 0)
+        return json.loads(out.getvalue())
+
+    def audit_text(self, path: Path) -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.main(["audit", "--log", str(path)]), 0)
+        return out.getvalue()
+
+    def test_a_graphql_call_is_counted_however_the_endpoint_was_typed(self) -> None:
+        """One endpoint, four spellings, and the log keeps whichever the caller typed. Counted as
+        one category, or the count is wrong for a caller writing a shape this file's own brake test
+        pins as plausible (`api /graphql`), and a host writing only that spelling gets no summary
+        line at all.
+
+        Both endpoints, through one `endpoint_re`: `BROKER_FREE_RE` had the same api.github.com
+        pin, and it gates the broker's free-call exemption as well as this category, so a GHE
+        host's `rate_limit` read was counted in a category of its own *and* held behind the repeat
+        delay -- a free call, slowed by the brake meant for calls that spend the quota."""
+        path = self.write_log([(0, "api graphql"), (5, "api /graphql"),
+                               (10, "api https://api.github.com/graphql"),
+                               # A GHE host, which this file handles deliberately elsewhere: its
+                               # endpoint lives under /api/, and pinning api.github.com put it in
+                               # a category of its own, so the count undercounted on exactly the
+                               # hosts whose remotes this tool goes out of its way to support.
+                               (12, "api https://ghe.example/api/graphql"),
+                               # The same four spellings for the endpoint beside it, which shares
+                               # the pattern -- and whose GHE spelling the broker also charges a
+                               # repeat delay for (see the brake test).
+                               (15, "api /rate_limit"), (16, "api rate_limit"),
+                               (17, "api https://api.github.com/rate_limit"),
+                               # The two GHE bases, which are not the same one: GraphQL is at
+                               # /api/graphql and REST is under /api/v3/, so this is the spelling a
+                               # GHE host really serves for the free call. With `/api/` alone it
+                               # was filed as an ordinary path and still held 30 s -- the defect the
+                               # helper claimed to have removed, measured by a review.
+                               (18, "api https://ghe.example/api/rate_limit"),
+                               (19, "api https://ghe.example/api/v3/rate_limit"),
+                               (20, "pr view pr:o/r#7")])
+        doc = self.audit_json(path)
+        self.assertEqual(doc["categories"]["raw gh api graphql"], 4, doc["categories"])
+        self.assertEqual(doc["categories"]["rate_limit (free)"], 5, doc["categories"])
+        # And not so wide that an unrelated path under a host reads as either endpoint.
+        for other in ("api https://ghe.example/api/v3/repos/o/r", "api repos/o/graphql-tools",
+                      "api https://ghe.example/api/rate_limit/history",
+                      "api https://ghe.example/api/v3/rate_limit/history"):
+            with self.subTest(other):
+                doc = self.audit_json(self.write_log([(0, other)]))
+                self.assertNotIn("raw gh api graphql", doc["categories"], doc["categories"])
+                self.assertNotIn("rate_limit (free)", doc["categories"], doc["categories"])
+
+    def test_the_hidden_reads_move_a_share_in_both_directions(self) -> None:
+        """The sentence's one directional claim, held by measurement instead of by review.
+
+        It says a share can go up, down or stay where it is, and four rounds of this PR each
+        asserted a direction the log cannot see -- "grows the numerator and the denominator", which
+        reads as both always growing, and then "can grow the numerator and *does* grow the
+        denominator", which a review broke by writing the hidden read out in *place* of the batched
+        call that carried it: 33.3% to 33.3%, with the denominator flat. Nothing in the suite could
+        tell: the only guard was `assertIn` on the whole sentence, so a wrong direction *inside*
+        the pinned string was green, and every fixture here added lines to the log, which makes a
+        growing denominator the fixture's property rather than a measurement.
+
+        So the property is driven, under both counterfactuals -- the hidden reads written out
+        beside the batched call, and written out in place of it, which is the honest one when the
+        call carried exactly those reads. Each case is the same traffic counted twice. The repeat
+        count never falls under insertion -- that is what "floor" means, and it is asserted in
+        every case -- while the share goes whichever way the two counts take it.
+
+        Times go forwards in every fixture: `at - seen <= AUDIT_WINDOW` counts a negative delta as
+        a repeat, and a fixture that relies on that is measuring the test rather than the tool. Not
+        "a shape no writer produces", which a review corrected -- `broker_log_call` stamps the line
+        before it takes the append lock, so two sessions on one host can interleave by up to the
+        lock budget. It changes none of the counts here (recomputed in time order: 1, 2, 2)."""
+        hidden = "the objects inside the graphql call, counted"
+        visible = [(0, "api graphql"), (10, "pr view pr:o/r#1"), (20, "pr view pr:o/r#1")]
+        for name, batched, want in (
+                # One hidden read of an object nothing re-reads: denominator up, numerator flat.
+                ("a share that falls", [(21, "pr view pr:o/r#9")], "down"),
+                # The hidden read repeats a visible one: both parts up, and the share with it.
+                ("a share that rises", [(21, "pr view pr:o/r#1")], "up"),
+                # Three hidden reads carrying one repeat between them, against 1/3 before: 2/6.
+                ("a share that does not move", [(21, "pr view pr:o/r#2"), (22, "pr view pr:o/r#2"),
+                                                (23, "pr view pr:o/r#3")], "flat")):
+            with self.subTest(name):
+                before = self.audit_json(self.write_log(visible))
+                after = self.audit_json(self.write_log(visible + batched))
+                self.assertGreaterEqual(after["repeatsWithin"]["calls"],
+                                        before["repeatsWithin"]["calls"],
+                                        f"{hidden}: the repeat count fell, so it is no floor")
+                self.assertGreater(after["calls"], before["calls"], hidden)
+                shares = (before["repeatsWithin"]["calls"] / before["calls"],
+                          after["repeatsWithin"]["calls"] / after["calls"])
+                if want == "down":
+                    self.assertGreater(shares[0], shares[1], shares)
+                elif want == "up":
+                    self.assertLess(shares[0], shares[1], shares)
+                else:
+                    self.assertEqual(shares[0], shares[1], shares)
+        # The replacement counterfactual: the batched call stood for the one read it carried, so
+        # writing that read out takes the graphql line away with it. Nothing moves -- which is why
+        # the sentence says a share can stay where it is and claims no direction for either half.
+        before = self.audit_json(self.write_log(visible))
+        swapped = self.audit_json(self.write_log([(1, "pr view pr:o/r#9")] + visible[1:]))
+        self.assertEqual(swapped["calls"], before["calls"], "the denominator was supposed to be flat")
+        self.assertEqual(swapped["repeatsWithin"]["calls"] / swapped["calls"],
+                         before["repeatsWithin"]["calls"] / before["calls"],
+                         "a share that does not move when a hidden read replaces its own call")
+        # And the sentence is held to what was just measured, not only pinned as a literal string.
+        # A review rewrote the claim *and* the pinned copy together -- "always grows the
+        # denominator, so a share can only go down", round 5's "None of them is counted above", and
+        # the floor re-scoped to "what a cache could have answered" -- and the suite stayed green
+        # each time. That coupling is how every wrong claim in this PR's history got in.
+        text = self.audit_text(self.write_log(visible))
+        self.assertIn("can go up, down or stay where it is", text, text)
+        for refuted in ("can only go down", "None of them is counted above",
+                        "does grow the denominator", "a floor on what a cache could have answered"):
+            self.assertNotIn(refuted, text, f"a claim three rounds of review refuted: {refuted}")
+        # "the calls are counted above" means counted in the total the share is taken over, which
+        # is arithmetic rather than wording: take the graphql lines out and the total falls by
+        # exactly the number the sentence names.
+        batched = before["categories"]["raw gh api graphql"]
+        self.assertIn(f"{before['calls']} gh calls logged", text, text)
+        self.assertIn(f"{batched} of those calls was `gh api graphql`", text, text)
+        quiet = self.audit_json(self.write_log([line for line in visible if "graphql" not in line[1]]))
+        self.assertEqual(quiet["calls"], before["calls"] - batched)
+
+    def test_the_floor_is_over_one_set_of_calls(self) -> None:
+        """The sentence says "in this report", and this is the measurement that makes those three
+        words load-bearing rather than hedging.
+
+        `--last N` reports on the last N lines, so writing hidden reads out as separate lines
+        pushes older calls out of the window and the two reports are over different sets: the
+        repeat count *falls*, 1 to 0. Held to one set it cannot, because at most one repeat is
+        counted per line per target. Only a comment said so."""
+        visible = [(0, "pr view pr:o/r#1"), (10, "pr view pr:o/r#1"), (20, "api graphql")]
+        self.assertEqual(self.audit_json(self.write_log(visible))["repeatsWithin"]["calls"], 1)
+        written_out = self.write_log(visible + [(21, "pr view pr:o/r#9")])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.main(["audit", "--log", str(written_out), "--last", "3", "--json"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["repeatsWithin"]["calls"], 0,
+                         "the known limit: --last moves the window, so this is a different report")
+        # The whole log, which is one set of calls: it does not fall.
+        self.assertEqual(self.audit_json(written_out)["repeatsWithin"]["calls"], 1)
+
+    def test_a_graphql_call_hides_reads_from_the_repeat_figure_and_the_report_says_so(self) -> None:
+        """Coverage, not cost. An earlier version of this line said a batching caller "looks
+        cheaper here than its GraphQL points are", which was backwards: GitHub prices a GraphQL
+        call at the requests its connections need divided by 100, rounded, minimum 1, so one
+        aliased query over forty PRs is about 1 point against about 40 for the loop -- and
+        `skills/github-ci-wait/SKILL.md` says exactly that, so the report contradicted this repo's
+        own guidance. Per-call shares are the right unit for GraphQL points.
+
+        What a `graphql` line does hide is *reads*: the category is not cacheable, so nothing
+        inside it reaches `cacheableReads`, `repeatsWithin` or `perRead`, which makes the repeat
+        *count* a floor rather than an estimate -- the count and not the shares printed beside it,
+        which can go up, down or stay put (the three fixtures below). An earlier version of this
+        docstring said they "fall ... because the denominator grows too", fifteen lines above its
+        own assertion that a share can move either way: one of the two had to be wrong, and a
+        review measured that it was this one. The sentence makes no claim about cost, because the
+        cost is the part that goes stale -- and that is asserted here, not just intended.
+
+        The primary guard is the sentence itself, asserted whole: a rewrite that smuggles a price
+        back in has to change it. The word ban is the backstop, and it is scoped to that last
+        paragraph with word boundaries, which takes two faults out of it: over the whole report
+        the bare substring `point` fires on a logged path (`repos/o/endpoint-registry`, which
+        reaches the category rows, or a future summary line about "the GraphQL endpoint"), and word
+        boundaries alone would still fire on a repository actually named `points`. The cost of
+        scoping is that a priced paragraph printed *before* this one is no longer caught; the
+        sentence assertion is what covers a rewrite of this one."""
+        path = self.write_log([(0, "api graphql"), (5, "api graphql"), (10, "pr view pr:o/r#7")])
+        doc = self.audit_json(path)
+        self.assertEqual(doc["cacheableReads"], 1, "a graphql line was counted as a cacheable read")
+        self.assertEqual(doc["repeatsWithin"]["calls"], 0)
+        text = self.audit_text(path)
+        self.assertIn("2 of those calls were `gh api graphql`, each carrying however many objects "
+                      "the caller asked for, which this cannot see. The calls are counted above; "
+                      "none of the objects inside them is, so none of them is counted as a "
+                      "cacheable read or as a repeat. That makes the repeat count a floor on the "
+                      "same-target re-reads a cache could have been asked for in this report, not "
+                      "an estimate. The shares beside it are not floors: a hidden read written out "
+                      "can land on either side of a share, so a share can go up, down or stay "
+                      "where it is.", text)
+        # The *total* is what makes "the calls are counted above" true, and what made the earlier
+        # "None of them is counted above" false in the same report. Not the category row: the
+        # table is the top 20 by count, so on a host with more than twenty distinct categories
+        # there is no graphql row and the sentence still holds -- which is why the row is asserted
+        # here as a nicety and the total is asserted as the reason.
+        self.assertIn("3 gh calls logged", text)
+        self.assertIn("raw gh api graphql", text)
+        crowded = self.audit_text(self.write_log(
+            [(0, "api graphql"), (1, "pr view pr:o/r#7")]
+            # Twenty-one categories of two calls each, so the single graphql call sorts below
+            # every one of them and the top-20 table has no room for it.
+            + [(2 + i, f"api repos/o/r/thing{i // 2}") for i in range(42)]))
+        self.assertNotIn("raw gh api graphql", crowded,
+                         "the premise: twenty-one bigger categories push the row out of the table")
+        self.assertEqual(sum(1 for i in range(21) if f"api repos/o/r/thing{i}" in crowded), 20,
+                         "the table is the top twenty by count, which is the premise above")
+        # "was", for the one call: N=1 is the common case on a host that batches rarely.
+        self.assertIn("1 of those calls was `gh api graphql`", crowded, crowded)
+        self.assertIn("44 gh calls logged", crowded, crowded)
+        self.assertEqual(cost_claims(text), [], "the report is making a claim about cost again")
+
+    def test_the_cost_ban_fires_on_a_priced_sentence_and_only_in_the_last_paragraph(self) -> None:
+        """The guard from the side that can fail. Every other assertion on it is
+        `cost_claims(...) == []`, so a mutation gutting it (`return []`, or reading the *first*
+        paragraph) left all 334 green: a guard that cannot fail when disabled is not a guard.
+        This also exercises the three patterns no fixture reaches, and pins the cost the scoping
+        was accepted for -- a priced paragraph printed before the graphql one is not caught."""
+        # With a trailing newline, because `print` leaves one and nothing the ban is ever
+        # shown ends without it: on a sample without it, `split("\n")[-1]` -- a mutation of
+        # the paragraph split -- read the priced text and looked like a working guard, while
+        # on a real report that same mutation reads the empty string after the last newline
+        # and returns nothing for any price at all. Measured: all 335 tests green with it.
+        priced = "head\n\nthe cheapest call is 2 points per call, at any price\n"
+        # The patterns by name, not `list(STALE_COST)`: that adapts to whatever the tuple holds,
+        # so cutting it down to one pattern stayed green (measured).
+        self.assertEqual(cost_claims(priced),
+                         [r"\bpoints?\b", r"\bprices?\b", r"\bcheap(er|est)?\b", r"\bper call\b"],
+                         priced)
+        self.assertEqual(cost_claims("2 points per call\n\nclean tail"), [],
+                         "the ban reads the last paragraph, and that is what it costs")
+        # And the whole of it. The sample above is a one-liner, so it pins the patterns and not the
+        # extent: `[-1]` -> `[-1][:200]` stayed green against it while the real last paragraph is
+        # over 500 characters, i.e. a price smuggled into the *tail* of the shipped sentence would
+        # not be caught. So the sample is a real report with a price spliced into its last
+        # sentence, which is the shape a rewrite actually takes.
+        real_report = self.audit_text(self.write_log([(0, "api graphql"), (5, "api graphql"),
+                                                      (10, "pr view pr:o/r#7")]))
+        self.assertEqual(cost_claims(real_report), [], "the premise: the shipped report is clean")
+        tail_priced = real_report.rstrip("\n") + " And one batched call costs about 1 point.\n"
+        self.assertGreater(len(tail_priced.split("\n\n")[-1]), 300,
+                           "the paragraph has to be long enough for its tail to be cut off")
+        self.assertEqual(cost_claims(tail_priced), [r"\bpoints?\b"], tail_priced)
+        # The word boundaries, which the scoping hides: inside the last paragraph `point` fires on
+        # an ordinary logged path and `\bpoints?\b` does not. Asserted here because no report
+        # fixture can show it -- a category row is never in the last paragraph, so
+        # `test_the_word_ban_does_not_fire_on_an_ordinary_logged_path` passes on the scoping alone
+        # and `\bpoints?\b` -> `point` survived it (measured).
+        self.assertEqual(cost_claims("head\n\napi repos/o/endpoint-registry was read twice\n"), [],
+                         "the boundary is what keeps an endpoint path out of the ban")
+        self.assertEqual(cost_claims("head\n\nthat read cost a point\n"), [r"\bpoints?\b"],
+                         "and the boundary still catches the word itself")
+
+    def test_the_word_ban_does_not_fire_on_an_ordinary_logged_path(self) -> None:
+        """Both halves of the scoping, demonstrated rather than asserted away.
+
+        `api repos/o/endpoint-registry` is not a cacheable read, so it never reaches the
+        hottest-targets line -- it arrives on a *category* row, which no filter touches. The bare
+        substring `point` fires on it and word boundaries do not, which is the first half.
+
+        `pr view pr:o/points#7` is the second half, and the one that makes the paragraph scoping
+        load-bearing rather than decorative: it is a cacheable read, it goes through `AUDIT_SAFE`
+        into the hottest-targets line, and `\\bpoints?\\b` matches it. Over the whole report that
+        would fail the ban; over the last paragraph it does not. Without this fixture, dropping
+        `split("\\n\\n")[-1]` left the suite green."""
+        for name, line in (("a category row", "api repos/o/endpoint-registry"),
+                           ("the hottest-targets line", "pr view pr:o/points#7")):
+            with self.subTest(name):
+                path = self.write_log([(0, "api graphql"), (5, line), (10, line)])
+                text = self.audit_text(path)
+                self.assertIn("point", text, "without this the test proves nothing")
+                self.assertEqual(cost_claims(text), [], text)
+        # The claim about where each one lands, so the docstring above is checked too.
+        hot = self.audit_text(self.write_log([(0, "api graphql"), (5, "pr view pr:o/points#7"),
+                                              (10, "pr view pr:o/points#7")]))
+        self.assertIn("hottest targets: pr view pr:o/points#7", hot)
+        rows = self.audit_text(self.write_log([(0, "api graphql"),
+                                               (5, "api repos/o/endpoint-registry"),
+                                               (10, "api repos/o/endpoint-registry")]))
+        self.assertNotIn("hottest targets", rows, "an api path is not a cacheable read")
+        self.assertIn("api repos/o/endpoint-registry", rows)
+        # What makes the scoping load-bearing rather than decorative: over the *whole* report this
+        # fixture does trip the ban, and `cost_claims` reads the last paragraph only. Unscope it
+        # and this test goes red, which is the only way a guard can be covered at all.
+        self.assertTrue([pat for pat in STALE_COST if re.search(pat, hot)], hot)
+        self.assertEqual(cost_claims(hot), [], hot)
+
+    def test_the_graphql_line_is_absent_when_there_are_no_graphql_calls(self) -> None:
+        """The conditionality is what makes it safe to print at all: a host with none of these
+        calls gets no sentence about them. Nothing held it until a mutation (`if batched:` ->
+        `if True:`) stayed green."""
+        path = self.write_log([(0, "pr view pr:o/floorplan#7"), (5, "pr view pr:o/floorplan#7"),
+                               (10, "pr merge")])
+        text = self.audit_text(path)
+        self.assertNotIn("gh api graphql", text)
+        # The sentence, not the word, and the word really is in this report: the repo is called
+        # `floorplan`, so "floor" reaches the hottest-targets line of a report with no graphql
+        # sentence in it. The banned substring is taken from the shipped sentence and proved
+        # present in a report that does have graphql calls -- an earlier version pinned a draft's
+        # wording, which no mutation could have put in `text` at all, so the assertion could not
+        # fail. A guard needs a positive sample.
+        floor = "a floor on the same-target re-reads"
+        self.assertIn("floor", text, "without this the assertion below proves nothing")
+        self.assertNotIn(floor, text)
+        self.assertIn(floor, self.audit_text(self.write_log([(0, "api graphql"),
+                                                             (5, "pr view pr:o/r#1")])),
+                      "the banned substring is not one this report can print")
+
     def test_an_old_logs_lines_are_counted_but_not_quoted_back(self) -> None:
         """The guard kept the value of a flag it did not know took one until 2026-10-21, and an
         audit is read, pasted into reports and committed. Those lines stay in the counts; the
@@ -4072,6 +4826,32 @@ class AuditTest(BrokerBase):
         with contextlib.redirect_stdout(out):
             gg.main(["audit", "--log", str(path), "--json"])
         self.assertEqual(json.loads(out.getvalue())["repeatsWithin"]["calls"], 0)
+
+    def test_a_line_stamped_before_the_one_it_follows_is_not_a_repeat(self) -> None:
+        """Review of #1581: 00:03:20 then 00:00:00 counted 1 repeat, 200 s apart in time."""
+        path = self.write_log([(200, "run view run:o/r/12"), (0, "run view run:o/r/12"),
+                               (210, "api graphql")])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.main(["audit", "--log", str(path), "--json"])
+        self.assertEqual(json.loads(out.getvalue())["repeatsWithin"]["calls"], 0)
+
+    def test_an_endpoint_that_is_not_a_path_is_never_printed(self) -> None:
+        """Review of #1581: an old line's endpoint word can carry a query or a token."""
+        for word in ("repos/o/r/pulls?access_token=ghp_abc", "ghp_0123456789abcdef", "a=b",
+                     "repos/o/r/github_pat_11AB"):
+            self.assertEqual(gg.audit_category(["api", word]), ("api (endpoint not shown)", False), word)
+        self.assertEqual(gg.audit_category(["api", "repos/o/r/pulls"]), ("api repos/o/r/pulls", False))
+
+    def test_a_decision_record_of_another_shape_is_skipped(self) -> None:
+        """Review of #1581: a JSON list or a non-string route raised out of the audit."""
+        path = self.write_log([(0, "pr view pr:o/r#7")])
+        gg.broker_log().parent.mkdir(parents=True, exist_ok=True)
+        gg.broker_log().write_text('[1]\n"x"\n{"route": ["serve"]}\nnull\n{"route": "serve"}\n')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.main(["audit", "--log", str(path), "--json"])
+        self.assertEqual(json.loads(out.getvalue())["brokerDecisions"], {"serve": 1})
 
     def test_a_line_with_no_repository_is_counted_but_never_as_a_repeat(self) -> None:
         """The guard logged `pr view 7` before 2026-10-21, and still does where the repository
@@ -4157,18 +4937,62 @@ class BrokerRepeatTest(BrokerBase):
     def test_a_read_that_spends_nothing_is_never_delayed(self) -> None:
         """`GET /rate_limit` costs neither pool -- this file says so itself (`request(free=True)`,
         audit_category's "rate_limit (free)"). Holding it for 30 s punished the session doing the
-        right thing: reading the budget around a batch of calls. `--web` opens a browser."""
+        right thing: reading the budget around a batch of calls. `--web` opens a browser.
+
+        The GHE spelling too, since `BROKER_FREE_RE` pinned api.github.com: on a GHE remote -- a
+        shape this file handles deliberately -- the free call was held 30 s by the brake for calls
+        that spend the quota."""
         for args in (["api", "rate_limit"], ["api", "/rate_limit"],
                      ["api", "https://api.github.com/rate_limit"],
+                     ["api", "https://ghe.example/api/rate_limit"],
+                     # GHE's REST base is /api/v3/, so this is the one a GHE session really sends;
+                     # with `/api/` alone it was held 29.9 s on the second call.
+                     ["api", "https://ghe.example/api/v3/rate_limit"],
                      ["pr", "view", "9", "-R", "o/r", "--web"]):
             with self.subTest(args=args):
                 self.run_gh(args)
                 self.run_gh(args)
         self.assertEqual(self.slept, [])
-        # The point of contrast: an api GET that does spend a request is still held.
-        self.run_gh(["api", "repos/o/r/pulls/9"])
-        self.run_gh(["api", "repos/o/r/pulls/9"])
-        self.assertEqual(len(self.slept), 1)
+        # The point of contrast: an api GET that does spend a request is still held -- including a
+        # path *under* the free endpoint on a GHE host, so the widening is a spelling of one
+        # endpoint and not a hole.
+        for args in (["api", "repos/o/r/pulls/9"],
+                     ["api", "https://ghe.example/api/rate_limit/history"],
+                     ["api", "https://ghe.example/api/v3/rate_limit/history"]):
+            with self.subTest(args=args):
+                before = len(self.slept)
+                self.run_gh(args)
+                self.run_gh(args)
+                self.assertEqual(len(self.slept), before + 1)
+
+    def test_a_working_batched_graphql_read_is_never_held_in_any_shape(self) -> None:
+        """The caller that batches is the one this must not punish, and it is the one the delay
+        would hit hardest: a card that reads forty PRs in one query has one command line, so a
+        refresh loop repeats it exactly. It is exempt because gh POSTs a GraphQL query, and the
+        method is read from the whole command line -- `-f`, `-F`, `--field`, `--raw-field` and
+        `--input` each mean POST with no `-X` on the line. Written as a test because `--input -`
+        takes its query from *stdin*: two such calls are one digest here and different queries at
+        GitHub, so if any of these shapes were read as a GET, the second would be held 30 s for a
+        read the first never made. Asked for by the pr-cards lane, whose path this is.
+
+        *Working* shapes only, which is what the name promises. GitHub's GraphQL endpoint is
+        POST-only, so `gh api graphql` with no fields, or with `-X GET`, gets a 404 rather than an
+        answer and is held like any other repeated GET -- and `-X GET -f a=b` meaning GET is
+        pinned deliberately by `test_fields_or_a_body_make_it_a_post_without_minus_x`. The
+        exemption is also incidental: nothing in `broker_repeat_wait` knows the word `graphql`, it
+        falls out of the method. What this pins is that every way of writing a working one lands
+        on the POST side of that inference."""
+        for args in (["api", "graphql", "-f", "query=query{viewer{login}}"],
+                     ["api", "graphql", "-F", "query=query{viewer{login}}"],
+                     ["api", "graphql", "--field", "query=query{viewer{login}}"],
+                     ["api", "graphql", "--raw-field", "query=query{viewer{login}}"],
+                     ["api", "graphql", "--input", "-"],
+                     ["api", "/graphql", "-f", "query=query{viewer{login}}"]):
+            with self.subTest(args=args):
+                for _ in range(3):
+                    _code, _out, _err, passed = self.run_gh(args)
+                    self.assertEqual(passed, args, "a batched read must reach gh unchanged")
+                self.assertEqual(self.slept, [], "a batching caller was held for repeating itself")
 
     def test_the_delay_can_be_turned_off(self) -> None:
         with mock.patch.dict(os.environ, {"CMUX_GH_MIN_REPEAT_SECONDS": "0"}):
