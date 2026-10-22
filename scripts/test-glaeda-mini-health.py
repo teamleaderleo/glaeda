@@ -1523,6 +1523,28 @@ class ClaudeRoute(Base):
         self.assertEqual(self.claude(self.run_once(at=NOW + 240)), [])
         self.assertEqual(self.mini.claude_env["ANTHROPIC_BASE_URL"], SR2)
 
+    def test_a_tunnel_that_is_down_is_never_probed_through(self) -> None:
+        # a `claude -p` through a broken tunnel hangs up to 60 s every 2-minute run and delays the heals after it
+        self.mini.route = "en0"
+        self.mini.opt_in = (None, "no ~/.config/glaeda/tailscale-self-heal.json")
+        for at in (NOW, NOW + 120):
+            found = self.claude(self.run_once(at=at))
+            self.assertEqual([f["evidence"] for f in found], ["not probed: the Tailscale tunnel is down"],
+                             "the finding stays, so capture-host stays closed")
+        self.assertFalse([d for d in self.mini.did if d.startswith("probe ")], "zero claude_probe calls")
+        self.assertEqual(self.mini.probe_memory, {}, "nothing written to the probe cache")
+        self.mini.route = "utun4"
+        self.assertEqual(self.claude(self.run_once(at=NOW + 240)), [])
+        self.assertEqual(self.mini.did, ["probe " + SR2], "the first run after recovery probes at once")
+
+    def test_a_fresh_cached_answer_stands_while_the_tunnel_is_down(self) -> None:
+        self.run_once()
+        self.assertEqual(self.mini.did, ["probe " + SR2])
+        self.mini.route = "en0"
+        self.mini.opt_in = (None, "no ~/.config/glaeda/tailscale-self-heal.json")
+        self.assertEqual(self.claude(self.run_once(at=NOW + 120)), [])
+        self.assertEqual(self.mini.did, ["probe " + SR2], "the window's answer stands; no new probe")
+
     def test_a_tailscale_restart_and_a_claude_reroute_never_share_a_run(self) -> None:
         self.mini.route = "en0"
         self.mini.answers = {SR2: False, POOL: False}

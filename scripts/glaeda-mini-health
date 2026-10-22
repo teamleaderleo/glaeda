@@ -1053,9 +1053,11 @@ def claude_route_settings(mini: Mini) -> tuple[list[str], dict[str, Any]]:
     return routes, env if isinstance(env, dict) else {}
 
 
-def check_claude_route(mini: Mini, now: float, remember: bool = True) -> list[dict[str, Any]]:
+def check_claude_route(mini: Mini, now: float, remember: bool = True,
+                       tunnel_down: bool = False) -> list[dict[str, Any]]:
     """Claude Code goes through a fleet route that answers a real `claude -p`, checked once per probe_every_s
-    (remember=False, a check-only run: the probe's answer is not kept)."""
+    (remember=False, a check-only run: the probe's answer is not kept). tunnel_down (TUNNEL_DOWN seen this run):
+    without a fresh cached answer it is not probed (a probe through a broken tunnel hangs up to 60 s every run)."""
     if mini.claude_bin() is None or not mini.fleet_host():  # a personal Mac's Claude login is its owner's
         return []
     routes, env = claude_route_settings(mini)
@@ -1081,6 +1083,8 @@ def check_claude_route(mini: Mini, now: float, remember: bool = True) -> list[di
     every = mini.claude_routes().get("probe_every_s") or 1800
     if last.get("route") == url and 0 <= now - (last.get("at") or 0) < every:
         ok, detail = bool(last.get("ok")), str(last.get("detail") or "")
+    elif tunnel_down:  # the finding stays (capture-host stays closed); the first run after recovery probes
+        return [finding("claude_route", "error", "not probed: the Tailscale tunnel is down", "pending", note)]
     else:
         ok, detail = mini.claude_probe(url, token)
         if remember:
@@ -1537,7 +1541,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         found = (check_console(mini) + check_power(mini) + tailnet + check_runners(mini)
                  + check_node_eligibility(mini) + check_leaked_test_apps(mini) + check_disk_accounting(mini)
                  + check_daemon_heal(mini) + check_ota(mini, now)
-                 + check_claude_route(mini, now, apply and not tunnel_down))
+                 + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down))
         if apply and mini.tailnet_route_ok:
             clear_restart_failures(restart_state_path(state_path), now)
         tm = check_testmanagerd(mini, now)
