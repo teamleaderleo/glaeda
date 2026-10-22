@@ -3701,7 +3701,7 @@ class FileAndPidWaitTest(unittest.TestCase):
     def test_a_long_line_on_a_nearly_full_pipe_does_not_hang_the_wait(self) -> None:
         """Writable promises room for PIPE_BUF bytes, not for the whole line. A pipe with 8 KiB free
         reports writable, and a 100 KB `--contains` line then blocked a 1 s wait past 3 s. The line
-        is cut to `DIAGNOSTIC_LIMIT` so the one write always fits."""
+        goes out in `DIAGNOSTIC_CHUNK` pieces while fd 2 has room, and the rest is dropped."""
         read, write = os.pipe()
         self.addCleanup(os.close, read)
         try:
@@ -3723,8 +3723,8 @@ class FileAndPidWaitTest(unittest.TestCase):
         self.assertEqual(done.returncode, gg.EXIT_TIMEOUT, done.stdout)
         self.assertLess(waited, 4, "the diagnostic blocked on a pipe that had room for part of it")
         line = spill.lstrip(b"x")
-        self.assertTrue(line.startswith(b"glaeda-gh: waiting on") and line.endswith(b"...\n"), line[:80])
-        self.assertLessEqual(len(line), gg.DIAGNOSTIC_LIMIT)
+        self.assertTrue(line.startswith(b"glaeda-gh: waiting on"), line[:80])
+        self.assertLess(len(line), 100_000)  # what the pipe had room for, not the whole line
 
     def test_a_filename_that_is_not_utf8_does_not_kill_the_wait(self) -> None:
         """A surrogate-escaped filename byte raised `UnicodeEncodeError` in the diagnostic: exit 1 and

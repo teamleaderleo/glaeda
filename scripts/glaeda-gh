@@ -3044,7 +3044,7 @@ def deadline_clock(timeout: float, now: float | None = None) -> str:
         return "unknown"
 
 
-DIAGNOSTIC_LIMIT = 512  # PIPE_BUF's POSIX floor: one write of this size never blocks on a writable pipe
+DIAGNOSTIC_CHUNK = 512  # PIPE_BUF's POSIX floor: one write of this size never blocks on a writable pipe
 
 
 def say_waiting(line: str) -> None:
@@ -3069,7 +3069,9 @@ def say_waiting(line: str) -> None:
     `select` admits and `write` then refuses.
 
     Writable only promises room for PIPE_BUF bytes (512 on macOS, the POSIX floor), so a longer line
-    -- a big `--contains` -- still blocked on a nearly full pipe: the line is cut to fit in one write.
+    -- a big `--contains` -- still blocked on a nearly full pipe. It goes out in chunks of that size,
+    each one only while fd 2 is writable; what a full pipe cannot take is dropped. (Cutting the line
+    to one chunk instead lost the end of the serve refusal, which names `--foreground-ok`.)
     It is encoded with backslashreplace, because a filename's surrogate-escaped bytes raised
     `UnicodeEncodeError` and the wait died with exit 1 and no JSON.
 
@@ -3081,10 +3083,9 @@ def say_waiting(line: str) -> None:
     try:
         if not select.select([], [2], [], 0)[1]:
             return
-        data = line.encode(errors="backslashreplace")
-        if len(data) > DIAGNOSTIC_LIMIT - 1:
-            data = data[:DIAGNOSTIC_LIMIT - 4].decode(errors="ignore").encode() + b"..."
-        os.write(2, data + b"\n")
+        data = (line + "\n").encode(errors="backslashreplace")
+        while data and select.select([], [2], [], 0)[1]:
+            data = data[os.write(2, data[:DIAGNOSTIC_CHUNK]):]
     except OSError:
         return
 
