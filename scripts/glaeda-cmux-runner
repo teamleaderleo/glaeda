@@ -740,6 +740,12 @@ def find_runner(ctx: Context) -> dict[str, Any] | None:
 # ---------------------------------------------------------------- desired state
 
 
+def gateway_slot(ctx: Any) -> int | None:
+    """The gateway slot this install is (--gateway K), or None for a build runner (and for a test's stand-in)."""
+    slot = getattr(ctx, "gateway", None)
+    return slot if isinstance(slot, int) and not isinstance(slot, bool) else None
+
+
 def gateway_hooks(ctx: Context, python: str, hook: str) -> tuple[str, str, str]:
     """A gateway slot's job-started, job-completed and listen gate command: admission that holds no unit, root or
     token (job-started --gateway), and the gateway listen gate (GatewayGate) under the usual listen.sh."""
@@ -763,7 +769,7 @@ def gateway_hooks(ctx: Context, python: str, hook: str) -> tuple[str, str, str]:
 def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     python = shlex.quote(ctx.python or "/usr/bin/python3")
     hook = shlex.quote(os.fspath(ctx.hook_dir / "glaeda-cmux-runner-hook"))
-    gateway = getattr(ctx, "gateway", None)
+    gateway = gateway_slot(ctx)
     gui_token = getattr(ctx, "gui_token", "gui")
     if not isinstance(gui_token, str):
         gui_token = "gui"
@@ -1013,7 +1019,7 @@ def start_agent(ctx: Context, act: dict[str, Any], plist: str) -> str | None:
 def routing(ctx: Context) -> dict[str, Any]:
     repo = shlex.quote(ctx.route_repo)
     member = ctx.member
-    if getattr(ctx, "gateway", None) is not None:
+    if gateway_slot(ctx) is not None:
         names = ("CI_COMPILE_CHECK_GATEWAY", "CI_TEST_COMPILE_GATEWAY")
         return {"route": [f"gh variable set {v} --body {GATEWAY_LABEL} --repo {repo}" for v in names],
                 "rollback": [f"gh variable set {v} --body <the label it had> --repo {repo}" for v in names],
@@ -1415,7 +1421,7 @@ def register(ctx: Context, act: dict[str, Any]) -> None:
     argv = [os.fspath(ctx.runner_dir / "config.sh"), "--unattended", "--url", ctx.scope_url,
             "--name", ctx.name, "--labels", ",".join(l for l in ctx.labels if l not in BASE_LABELS),
             "--work", "_work"]
-    if getattr(ctx, "gateway", None) is not None:  # only glaeda-gateway-client: no job for self-hosted lands here
+    if gateway_slot(ctx) is not None:  # only glaeda-gateway-client: no job for self-hosted lands here
         argv.append("--no-default-labels")
     if ctx.org and ctx.group:
         argv += ["--runnergroup", ctx.group]
