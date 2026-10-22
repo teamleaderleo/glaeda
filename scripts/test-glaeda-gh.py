@@ -3698,6 +3698,44 @@ class FileAndPidWaitTest(unittest.TestCase):
         self.assertLess(waited, 4, "the diagnostic blocked instead of being dropped")
         self.assertEqual(json.loads(done.stdout)["result"], "timeout")
 
+    def test_a_long_line_on_a_nearly_full_pipe_does_not_hang_the_wait(self) -> None:
+        """Writable promises room for PIPE_BUF bytes, not for the whole line. A pipe with 8 KiB free
+        reports writable, and a 100 KB `--contains` line then blocked a 1 s wait past 3 s. The line
+        is cut to `DIAGNOSTIC_LIMIT` so the one write always fits."""
+        read, write = os.pipe()
+        self.addCleanup(os.close, read)
+        try:
+            os.set_blocking(write, False)
+            with contextlib.suppress(BlockingIOError):
+                while True:
+                    os.write(write, b"x" * 65536)
+            os.set_blocking(write, True)
+            os.read(read, 8192)  # some room, far less than the line
+            done, waited = self.cli_wait("wait", "file", str(self.dir / "never-appears"), "--contains",
+                                         "y" * 100_000, "--timeout", "1", "--json", stderr=write)
+            os.set_blocking(read, False)
+            spill = b""
+            with contextlib.suppress(BlockingIOError):
+                while True:
+                    spill += os.read(read, 65536)
+        finally:
+            os.close(write)
+        self.assertEqual(done.returncode, gg.EXIT_TIMEOUT, done.stdout)
+        self.assertLess(waited, 4, "the diagnostic blocked on a pipe that had room for part of it")
+        line = spill.lstrip(b"x")
+        self.assertTrue(line.startswith(b"glaeda-gh: waiting on") and line.endswith(b"...\n"), line[:80])
+        self.assertLessEqual(len(line), gg.DIAGNOSTIC_LIMIT)
+
+    def test_a_filename_that_is_not_utf8_does_not_kill_the_wait(self) -> None:
+        """A surrogate-escaped filename byte raised `UnicodeEncodeError` in the diagnostic: exit 1 and
+        no JSON, where main timed out with exit 2. The line is encoded with backslashreplace."""
+        name = os.fsdecode(b"never-\xff")
+        done, _ = self.cli_wait("wait", "file", str(self.dir / name), "--timeout", "1", "--json",
+                                stderr=subprocess.PIPE)
+        self.assertEqual(done.returncode, gg.EXIT_TIMEOUT, done.stderr)
+        self.assertEqual(json.loads(done.stdout)["result"], "timeout")
+        self.assertIn("never-\\udcff", done.stderr)
+
     def test_waits_for_a_nonempty_file(self) -> None:
         target = self.dir / "never1.txt"
         target.write_text("")

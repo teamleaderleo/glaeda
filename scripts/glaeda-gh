@@ -3044,6 +3044,9 @@ def deadline_clock(timeout: float, now: float | None = None) -> str:
         return "unknown"
 
 
+DIAGNOSTIC_LIMIT = 512  # PIPE_BUF's POSIX floor: one write of this size never blocks on a writable pipe
+
+
 def say_waiting(line: str) -> None:
     """Put a diagnostic on fd 2 without ever becoming the reason the wait does not happen.
 
@@ -3065,6 +3068,11 @@ def say_waiting(line: str) -> None:
     file always reports writable, a full pipe does not. `OSError` stays suppressed for the shapes
     `select` admits and `write` then refuses.
 
+    Writable only promises room for PIPE_BUF bytes (512 on macOS, the POSIX floor), so a longer line
+    -- a big `--contains` -- still blocked on a nearly full pipe: the line is cut to fit in one write.
+    It is encoded with backslashreplace, because a filename's surrogate-escaped bytes raised
+    `UnicodeEncodeError` and the wait died with exit 1 and no JSON.
+
     One path, which is the production path: an earlier version printed to `sys.stderr` when a
     caller had replaced it, so the suite's in-process assertions ran through a branch nothing else
     reached -- and a mutation deferring the real write to `atexit` (the line arriving *after* the
@@ -3073,7 +3081,10 @@ def say_waiting(line: str) -> None:
     try:
         if not select.select([], [2], [], 0)[1]:
             return
-        os.write(2, (line + "\n").encode())
+        data = line.encode(errors="backslashreplace")
+        if len(data) > DIAGNOSTIC_LIMIT - 1:
+            data = data[:DIAGNOSTIC_LIMIT - 4].decode(errors="ignore").encode() + b"..."
+        os.write(2, data + b"\n")
     except OSError:
         return
 
