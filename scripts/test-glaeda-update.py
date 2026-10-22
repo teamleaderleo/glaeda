@@ -606,6 +606,36 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(self.run_update()["result"], "updated")
         self.assertEqual(gu.load_state(self.state)["current"], slow["tag"])
 
+    def test_a_release_that_times_out_every_time_is_quarantined_on_the_third(self) -> None:
+        self.server.publish(SOURCES[0])
+        self.run_update()
+        hangs = self.server.publish(SOURCES[1])
+        timed_out = (None, "glaeda-disk: Command '--help' timed out after 120 seconds")
+        with mock.patch.object(gu, "health", return_value=timed_out):
+            results = [self.run_update()["result"] for _ in range(gu.HEALTH_TIMEOUTS)]
+        self.assertEqual(results, ["inconclusive"] * (gu.HEALTH_TIMEOUTS - 1) + ["rolled-back"])
+        state = gu.load_state(self.state)
+        self.assertIn(hangs["tag"], state["quarantined"])
+        self.assertNotIn("healthTimeouts", state)
+
+    def test_a_timeout_whose_rollback_fails_is_blocking(self) -> None:
+        good = self.server.publish(SOURCES[0])
+        self.run_update()
+        self.server.publish(SOURCES[1])
+        real_setup = gu.run_setup
+        calls = []
+
+        def setup(gen, args):
+            calls.append(gen.name)
+            return real_setup(gen, args) if len(calls) == 1 else (False, "timed out")
+
+        with mock.patch.object(gu, "health", return_value=(None, "glaeda-disk: timed out")), \
+                mock.patch.object(gu, "run_setup", setup):
+            result = self.run_update()
+        self.assertEqual((result["result"], result["rollback"]),
+                         ("rolled-back", f"restoring {good['tag']} failed too"))
+        self.assertNotIn(self.server.rings["canary"]["tag"], gu.load_state(self.state)["quarantined"])
+
     def test_tampered_bytes_are_refused(self) -> None:
         entry = self.server.publish(SOURCES[0])
         url = gu.release_url(entry["tag"], gr.hygiene_asset(TARGET))
