@@ -5877,16 +5877,19 @@ class GateTest(unittest.TestCase):
         self.assertLess(text.index("unset SDKROOT"), text.index("exec ./run.sh"), "the fallback run.sh is clean too")
 
     def test_hooks_prefer_a_python_that_is_not_the_xcrun_shim(self) -> None:
-        brew = self.tmp / "brew-python3"
+        # a stand-in shim, so the test means the same on a Mac (where /usr/bin/python3 is the shim) and on Linux CI
+        brew, shim = self.tmp / "brew-python3", self.tmp / "shim-python3"
         make_executable(brew, "#!/bin/sh\n")
-        with mock.patch.object(cr.shutil, "which", return_value="/usr/bin/python3"), \
-                mock.patch.object(cr, "HOOK_PYTHONS", (os.fspath(brew), "/usr/bin/python3")):
-            self.assertEqual(cr.hook_python(), os.fspath(brew))
-        with mock.patch.object(cr.shutil, "which", return_value="/opt/custom/bin/python3"):
-            self.assertEqual(cr.hook_python(), "/opt/custom/bin/python3", "a python3 on PATH that is not the shim")
-        with mock.patch.object(cr.shutil, "which", return_value=None), \
-                mock.patch.object(cr, "HOOK_PYTHONS", ("/nonexistent/python3", "/usr/bin/python3")):
-            self.assertEqual(cr.hook_python(), "/usr/bin/python3" if os.access("/usr/bin/python3", os.X_OK) else None)
+        make_executable(shim, "#!/bin/sh\n")
+        with mock.patch.object(cr, "XCRUN_SHIM_PYTHON", os.path.realpath(shim)):
+            with mock.patch.object(cr.shutil, "which", return_value=os.fspath(shim)), \
+                    mock.patch.object(cr, "HOOK_PYTHONS", (os.fspath(brew), os.fspath(shim))):
+                self.assertEqual(cr.hook_python(), os.fspath(brew))
+            with mock.patch.object(cr.shutil, "which", return_value="/opt/custom/bin/python3"):
+                self.assertEqual(cr.hook_python(), "/opt/custom/bin/python3", "a python3 on PATH that is not the shim")
+            with mock.patch.object(cr.shutil, "which", return_value=None), \
+                    mock.patch.object(cr, "HOOK_PYTHONS", ("/nonexistent/python3", os.fspath(shim))):
+                self.assertEqual(cr.hook_python(), os.path.realpath(shim), "the shim only when nothing else runs")
 
     def test_listen_sh_runs_the_runner_without_a_gate_that_cannot_start(self) -> None:
         (self.runner / "run.sh").write_text(f"#!/bin/bash\necho plain run.sh > {self.tmp / 'ran'}\nexit 0\n")
