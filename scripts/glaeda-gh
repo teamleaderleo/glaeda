@@ -59,6 +59,12 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   left) it stops that API until the quota resets. The quota is shared, so this also protects
   every other tool on the account.
 - The token comes from `gh auth token` and stays in memory; it is never written or logged.
+- With ~/.config/glaeda/gh-app.json (the cmux-agents GitHub App: app_id, owners, repos, key store
+  names), reads of the repositories that App is installed on use its installation token instead:
+  a 15,000/h bucket of its own, minted from the key in this host's store, kept in memory and
+  re-minted 5 min before its hour is up. Comments and other writes stay on the user token, so their
+  author does not change. A read the App cannot make (not installed, refused, its bucket spent) is
+  made once more as the user, and a failed mint leaves the user token serving for APP_RETRY.
 - The cmux build controller on the tailnet (cmuxterm-hq#675) receives GitHub's workflow_run,
   check_suite and issue_comment webhooks. Each tick the daemon reads its change feed once: free,
   so a finished run shows up within about TICK seconds and costs no quota, a check event on a
@@ -128,6 +134,7 @@ effect without a restart.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import datetime as dt
 import faulthandler
@@ -619,6 +626,241 @@ def gh_token() -> str:
     return token
 
 
+# ---------------------------------------------------------------- GitHub App installation token
+
+APP_CONFIG = Path.home() / ".config" / "glaeda" / "gh-app.json"
+APP_REFRESH_MARGIN = 5 * 60  # mint a new installation token this long before the old one expires
+APP_RETRY = 5 * 60  # after a failed mint, the user token serves this long before the App is tried again
+# What an owner and a repository name must look like; a request naming anything else is the user's.
+OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def decode_pem(raw: str) -> bytes:
+    """The App key however its store returns it: PEM, hex (`security -w` for multi-line data) or base64."""
+    text = raw.strip()
+    if re.fullmatch(r"(?:[0-9a-fA-F]{2})+", text):
+        with contextlib.suppress(ValueError, UnicodeDecodeError):
+            text = bytes.fromhex(text).decode().strip()
+    if not text.startswith("-----BEGIN"):
+        try:
+            text = base64.b64decode(text, validate=True).decode().strip()
+        except (ValueError, UnicodeDecodeError):
+            raise WatchError("the App key is not PEM, hex or base64 PEM") from None
+    if not text.startswith("-----BEGIN"):
+        raise WatchError("the App key is not PEM, hex or base64 PEM")
+    return (text + "\n").encode()
+
+
+def read_app_key(key: dict) -> bytes:
+    """The private key from this platform's store, named by gh-app.json `key`. Never logged."""
+    if sys.platform == "darwin" and key.get("service") and key.get("account"):
+        argv = ["security", "find-generic-password", "-s", key["service"], "-a", key["account"], "-w"]
+    elif key.get("credential") and key.get("path"):  # systemd-creds, encrypted to this host
+        argv = ["systemd-creds", "decrypt", "--user", f"--name={key['credential']}",
+                os.path.expanduser(key["path"]), "-"]
+    elif key.get("file"):
+        path = Path(os.path.expanduser(key["file"]))
+        try:
+            if path.stat().st_mode & 0o077:
+                raise WatchError(f"{path} is readable by others; chmod 600 it")
+            return decode_pem(path.read_text())
+        except OSError as error:
+            raise WatchError(f"App key file: {type(error).__name__}") from None
+    else:
+        raise WatchError("gh-app.json names no key store this platform has")
+    try:
+        result = run_bounded(argv)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise WatchError(f"App key store: {type(error).__name__}") from None
+    if result.returncode != 0 or not result.stdout.strip():  # neither stream is repeated
+        raise WatchError(f"App key store exited {result.returncode}")
+    return decode_pem(result.stdout)
+
+
+def sign_rs256(key_pem: bytes, data: bytes) -> bytes:
+    """RS256 with openssl; the key goes through a pipe, never a file or argv. openssl starts first
+    and the key is written while it reads: a macOS pipe holds only 512 bytes before a reader exists."""
+    r, w = os.pipe()
+    try:
+        try:
+            proc = subprocess.Popen(["openssl", "dgst", "-sha256", "-sign", f"/dev/fd/{r}"], stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, pass_fds=(r,))
+        except OSError as error:
+            raise WatchError(f"cannot run openssl: {type(error).__name__}") from None
+        os.close(r)
+        r = -1
+
+        def feed(fd: int) -> None:
+            with contextlib.suppress(OSError):
+                os.write(fd, key_pem)
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+        writer = threading.Thread(target=feed, args=(w,), daemon=True)
+        w = -1  # the writer closes it
+        writer.start()
+        try:
+            out, _ = proc.communicate(data, timeout=SUBPROCESS_DEADLINE)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise WatchError("openssl did not finish signing") from None
+        writer.join(5)
+    finally:
+        for fd in (r, w):
+            if fd != -1:
+                os.close(fd)
+    if proc.returncode != 0 or not out:
+        raise WatchError("openssl could not sign with the App key")
+    return out
+
+
+def request_repos(path: str, body: dict | None) -> set[tuple[str, str]] | None:
+    """The repositories a request reads, as (owner, name), or None when that cannot be told from
+    the request (a GraphQL query by node id, /rate_limit, a search): such a request is the user's."""
+    if path.startswith("/repos/"):
+        parts = path.split("?")[0].split("/")
+        if len(parts) > 3 and OWNER_RE.match(parts[2]) and REPO_NAME_RE.match(parts[3]):
+            return {(parts[2], parts[3])}
+        return None
+    if path != "/graphql" or not isinstance(body, dict):
+        return None
+    variables = body.get("variables") or {}
+    repos: set[tuple[str, str]] = set()
+    for name, value in variables.items():
+        if not isinstance(value, str):
+            continue
+        if re.fullmatch(r"o\d+", name):
+            repo = variables.get("r" + name[1:])
+            if not (OWNER_RE.match(value) and isinstance(repo, str) and REPO_NAME_RE.match(repo)):
+                return None
+            repos.add((value, repo))
+        elif value.startswith("https://github.com/"):
+            parts = value.split("/")
+            if len(parts) < 5 or not OWNER_RE.match(parts[3]) or not REPO_NAME_RE.match(parts[4]):
+                return None
+            repos.add((parts[3], parts[4]))
+    return repos or None
+
+
+def app_not_found(doc: Any) -> bool:
+    """A GraphQL answer that could not see a repository: what an installation without it gets."""
+    return isinstance(doc, dict) and any(isinstance(e, dict) and e.get("type") in {"NOT_FOUND", "FORBIDDEN"}
+                                         for e in doc.get("errors") or [])
+
+
+class AppTokenSource:
+    """An installation token for one GitHub App (machines/github-apps.json's cmux-agents), for the
+    repository owners it is installed on. Minted from the key in this host's store, kept in memory,
+    reused until APP_REFRESH_MARGIN before its hour is up. Any failure -- no key, openssl, GitHub
+    refusing -- answers None for APP_RETRY, and the caller uses the user token: the App is never
+    the reason a read fails.
+
+    ~/.config/glaeda/gh-app.json: {"app_id": N, "owners": ["manaflow-ai"], "repos": ["manaflow-ai/cmux", ...]
+    (optional: the installation's repositories), "installation_id": N
+    (optional, else looked up per owner), "key": {"service": "github-app", "account": "cmux-agents-pem"}
+    on macOS, {"credential": NAME, "path": PATH} for systemd-creds, or {"file": PATH} (mode 600)}."""
+
+    def __init__(self, config: dict, transport: Callable = http, key_reader: Callable[[dict], bytes] = read_app_key,
+                 signer: Callable[[bytes, bytes], bytes] = sign_rs256, clock: Callable[[], float] = time.time) -> None:
+        self.app_id = int(config["app_id"])
+        self.owners = {o for o in config.get("owners") or [] if isinstance(o, str) and OWNER_RE.match(o)}
+        if not self.owners:
+            raise WatchError("gh-app.json lists no owners")
+        # The repositories the installation was given ("only select repositories"); empty means all of
+        # the owners'. A repository outside it answers the App 404, so it is never asked.
+        self.repos = {r for r in config.get("repos") or [] if isinstance(r, str) and r.split("/")[0] in self.owners}
+        self.key = dict(config.get("key") or {})
+        self.installation: int | None = int(config["installation_id"]) if config.get("installation_id") else None
+        self.transport, self.key_reader, self.signer, self.clock = transport, key_reader, signer, clock
+        self.token: str | None = None
+        self.expires = 0.0
+        self.down_until = 0.0
+        self.error: str | None = None
+        self.minted = 0
+
+    @classmethod
+    def from_config(cls, path: Path | None = None) -> "AppTokenSource | None":
+        doc = read_json(path or APP_CONFIG)
+        if not isinstance(doc, dict) or not doc.get("app_id"):
+            return None
+        try:
+            return cls(doc)
+        except (WatchError, ValueError, TypeError, KeyError) as error:
+            log({"event": "error", "error": f"gh-app.json: {describe(error)}", "site": "AppTokenSource"})
+            return None
+
+    def owns(self, repos: set[tuple[str, str]] | None) -> bool:
+        return bool(repos) and all(o in self.owners and (not self.repos or f"{o}/{r}" in self.repos)
+                                   for o, r in repos)
+
+    def jwt(self) -> str:
+        now = int(self.clock())
+        header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+        claims = b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": str(self.app_id)},
+                                   separators=(",", ":")).encode())
+        signing_input = f"{header}.{claims}".encode()
+        return f"{header}.{claims}.{b64url(self.signer(self.key_reader(self.key), signing_input))}"
+
+    def call(self, method: str, path: str, bearer: str) -> dict:
+        headers = {"Authorization": f"Bearer {bearer}", "Accept": "application/vnd.github+json",
+                   "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
+        status, _, raw = self.transport(method, API + path, headers, b"" if method == "POST" else None)
+        if status not in (200, 201):
+            raise WatchError(f"App {method} {path.split('/')[1]}: HTTP {status}")
+        try:
+            doc = json.loads(raw)
+        except ValueError:
+            raise WatchError(f"App {method}: not JSON") from None
+        if not isinstance(doc, dict):
+            raise WatchError(f"App {method}: not an object")
+        return doc
+
+    def mint(self) -> None:
+        jwt = self.jwt()
+        if self.installation is None:
+            found = self.call("GET", f"/orgs/{sorted(self.owners)[0]}/installation", jwt)
+            self.installation = int(found["id"])
+        doc = self.call("POST", f"/app/installations/{self.installation}/access_tokens", jwt)
+        token, expires = doc.get("token"), iso_epoch(doc.get("expires_at"))
+        if not isinstance(token, str) or not TOKEN_RE.fullmatch(token) or expires is None:
+            raise WatchError("App token answer had no token or expiry")
+        self.token, self.expires, self.minted = token, expires, self.minted + 1
+
+    def __call__(self) -> str | None:
+        now = self.clock()
+        if now < self.down_until:  # held (its bucket spent) or a mint failed: the user token serves
+            return None
+        if self.token and now < self.expires - APP_REFRESH_MARGIN:
+            return self.token
+        try:
+            self.mint()
+            self.error = None
+            return self.token
+        except Exception as error:  # noqa: BLE001  the type and status only: never a key or token
+            self.token, self.expires = None, 0.0
+            self.error, self.down_until = describe(error), now + APP_RETRY
+            log({"event": "app-token", "error": self.error})
+            return None
+
+    def invalidate(self) -> None:
+        self.token, self.expires = None, 0.0
+
+    def hold(self, until: float) -> None:
+        """The App's own bucket is spent: the user token serves until `until`."""
+        self.down_until = max(self.down_until, until)
+        self.error = "rate limited"
+
+    def status(self) -> dict:
+        return {"appId": self.app_id, "owners": sorted(self.owners), "repos": sorted(self.repos), "minted": self.minted,
+                "tokenUntil": self.expires or None, "downUntil": self.down_until or None, "error": self.error}
+
+
 # ---------------------------------------------------------------- cmux build controller
 
 
@@ -1032,8 +1274,12 @@ def consumer_policy() -> dict:
 
 class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
-                 controller: Any = "env") -> None:
+                 controller: Any = "env", app: "AppTokenSource | None" = None) -> None:
         self.transport = transport
+        # Reads of repositories the App is installed on use its installation token, a bucket of
+        # its own; everything else, every content write, and any read while the App cannot mint
+        # stay on the user token.
+        self.app = app
         # "env" (or any callable) is re-read every tick, so a daemon follows a controller move
         # (cmux-fleet-client's client.json repointed) without a restart; an instance stays fixed.
         self.controller_source: Callable[[], Any] | None = (
@@ -1180,7 +1426,7 @@ class Daemon:
     # -- requests
 
     def request(self, method: str, path: str, body: dict | None = None, etag: str | None = None,
-                free: bool = False, content: bool = False) -> tuple[int, dict, Any]:
+                free: bool = False, content: bool = False, user_only: bool = False) -> tuple[int, dict, Any]:
         """One GitHub request.
 
         content: a write from the outbox, whose throttling (GitHub's secondary limit on content
@@ -1189,9 +1435,15 @@ class Daemon:
         would overstate the spend of the very call that reads the spend."""
         if time.monotonic() >= self.tick_deadline:
             raise OutOfTime
-        if self.token is None:
-            self.token = self.token_source()
-        headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
+        bearer = None
+        if self.app is not None and not (content or free or user_only) and self.app.owns(request_repos(path, body)):
+            bearer = self.app()
+        via_app = bearer is not None
+        if bearer is None:
+            if self.token is None:
+                self.token = self.token_source()
+            bearer = self.token
+        headers = {"Authorization": f"Bearer {bearer}", "Accept": "application/vnd.github+json",
                    "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
         if etag:
             headers["If-None-Match"] = etag
@@ -1202,6 +1454,25 @@ class Daemon:
         bucket = "graphql" if path == "/graphql" else "rest"
         # `free` is /rate_limit, which costs no quota: counting it as a REST request would overstate
         # what the daemon spends.
+        if via_app:
+            # The App's own bucket: none of it is the user's spend, budget or backoff.
+            self.sent.append((self.now, "app"))
+            if status == 401:
+                self.app.invalidate()
+            elif status in {403, 429} and (h.get("retry-after") or h.get("x-ratelimit-remaining") == "0"):
+                try:
+                    wait = float(h["retry-after"]) if h.get("retry-after") else float(h.get("x-ratelimit-reset", 0)) - self.now
+                except ValueError:
+                    wait = CYCLE
+                self.app.hold(self.now + max(CYCLE, wait))
+            try:
+                doc = json.loads(raw) if raw else None
+            except ValueError:
+                doc = None
+            if status in {401, 403, 404, 429} or status == 200 and app_not_found(doc):
+                # Not installed there, not granted, or out of quota: the read is the user's, once.
+                return self.request(method, path, body, etag, user_only=True)
+            return status, h, doc
         self.sent.append((self.now, "free" if free else "rest304" if bucket == "rest" and status == 304 else bucket))
         if status == 401:
             self.token = None  # re-read from gh next time
@@ -1597,7 +1868,7 @@ class Daemon:
         self.write_consumers()
         self.sent = [(t, what) for t, what in self.sent if self.now - t < 3600]
         hour = {what: sum(1 for _, w in self.sent if w == what)
-                for what in ("rest", "rest304", "graphql", "free")}
+                for what in ("rest", "rest304", "graphql", "free") + (("app",) if self.app else ())}
         self.reads = [r for r in self.reads if self.now - r[0] < 3600]
         reads = {kind: {b: sum(1 for _, k, w in self.reads if k == kind and w == b) for b in ("graphql", "rest")}
                  for kind in CYCLES}
@@ -1611,6 +1882,8 @@ class Daemon:
                   "batch": dict(self.batch), "oldestData": oldest, "deferred": len(self.deferred),
                   "outbox": {"queued": len(list(outbox_dir().glob("*.json"))) if outbox_dir().is_dir() else 0,
                              "holdUntil": self.post_hold if self.post_hold > self.now else None}}
+        if self.app is not None:  # absent rather than null without an App, so today's daemon.json is unchanged
+            status["app"] = self.app.status()
         # the heartbeat lets clients tell a hung daemon (lock held, nothing written) from an idle one
         recovered, self.failing = self.failing is not None, None
         if recovered or prs or runs or comments or heads or self.errors or self.now - self.beat >= HEARTBEAT_EVERY:
@@ -1705,6 +1978,8 @@ class Daemon:
                 rest.append(e)
             elif h["fails"] < HEAVY_AFTER or self.now - h["at"] >= LEAN_FACTOR * CYCLES[kind]:
                 alone.append([e])
+        if self.app is not None:  # a batch the App can read whole goes over its bucket; a mixed one cannot
+            rest.sort(key=lambda e: not self.app.owns({split_key(e["key"])[1:3]}))
         queue = alone + [rest[i:i + size] for i in range(0, len(rest), size)]
         splits, shrunk = 0, False
         while queue:
@@ -2458,7 +2733,10 @@ def serve(foreground_ok: bool = False) -> int:
     me = Path(__file__).resolve()
     stamp = me.stat().st_mtime
     daemon = Daemon()
-    log({"event": "start", "pid": os.getpid()})
+    app = AppTokenSource.from_config()  # ~/.config/glaeda/gh-app.json; none, and every read is the user's
+    if app is not None:
+        daemon.app = app
+    log({"event": "start", "pid": os.getpid(), "app": app.app_id if app else None})
     watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP)
     watchdog.start()
     last = None
