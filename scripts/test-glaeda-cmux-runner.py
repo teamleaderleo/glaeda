@@ -8527,6 +8527,63 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("GiB required", result.stdout, "the disk floor still applies")
 
+    def job_under_runner_worker(self, name: str, ref: str = GATEWAY_REF) -> tuple[subprocess.CompletedProcess, Path]:
+        """Run a job the way actions/runner v2.338.0 does (JobExtension.cs, StepsRunner.cs): a process named
+        Runner.Worker runs the job-started hook as a pre-job step (the wrapper execs the hook, so the hook's parent
+        is the Worker), awaits it, and then runs the job's next step whatever the hook returned, as a step with
+        `if: always()` does. That step writes a marker; it must never exist after a refusal."""
+        cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+        worker = self.dir / "bin" / "Runner.Worker"
+        worker.parent.mkdir(exist_ok=True)
+        source = self.dir / "worker.c"
+        source.write_text("#include <stdio.h>\n#include <sys/wait.h>\n#include <unistd.h>\n"
+                          "static int step(const char *cmd) {\n"
+                          "  pid_t p = fork();\n"
+                          "  if (p == 0) { execl(\"/bin/sh\", \"sh\", \"-c\", cmd, (char *)0); _exit(127); }\n"
+                          "  int s = 0; waitpid(p, &s, 0); return WIFEXITED(s) ? WEXITSTATUS(s) : 1; }\n"
+                          "int main(int c, char **v) {\n"
+                          "  int hook = step(v[1]);\n"  # the job-started hook: its failure never stops the loop
+                          "  printf(\"hook exited %d\\n\", hook); fflush(stdout);\n"
+                          "  step(v[2]);\n"  # the next step, `if: always()`
+                          "  return 100; }\n")
+        if cc is None or subprocess.run([cc, "-o", os.fspath(worker), os.fspath(source)],
+                                        capture_output=True).returncode != 0:
+            self.skipTest("no C compiler to build a Runner.Worker stand-in")
+        event_name, payload, _ = SAMPLE_EVENTS[name]
+        path = event(self.dir, name, payload)
+        marker = self.dir / f"always-step-ran-{name}"
+        marker.unlink(missing_ok=True)
+        hook_cmd = " ".join(shlex.quote(a) for a in ["exec", sys.executable, os.fspath(HOOK), "job-started",
+                                                     "--gateway", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                                                     "--no-telemetry"])
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+               "GITHUB_EVENT_NAME": event_name, "GITHUB_EVENT_PATH": os.fspath(path),
+               "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_WORKFLOW_REF": ref}
+        result = subprocess.run([os.fspath(worker), hook_cmd, f"touch {shlex.quote(os.fspath(marker))}"], env=env,
+                                capture_output=True, text=True, timeout=60, check=False)
+        return result, marker
+
+    def test_a_refused_job_runs_no_later_step(self) -> None:
+        """A failed job-started does not stop the runner's later steps; the gateway refusal ends the Worker."""
+        admitted, marker = self.job_under_runner_worker("same-repo-pr")
+        self.assertEqual(admitted.returncode, 100, admitted.stdout + admitted.stderr)
+        self.assertTrue(marker.exists(), "the model runs the next step after the hook, as the real runner does")
+        for name, ref in (("fork-pr", GATEWAY_REF), ("teamleaderleo-fork-pr", GATEWAY_REF),
+                          ("push", "manaflow-ai/cmux/.github/workflows/ci.yml@refs/heads/main")):
+            with self.subTest(name):
+                refused, marker = self.job_under_runner_worker(name, ref)
+                self.assertEqual(refused.returncode, -signal.SIGKILL, refused.stdout + refused.stderr)
+                self.assertNotIn("hook exited", refused.stdout, "the Worker never got past the hook")
+                self.assertFalse(marker.exists(), "an `if: always()` step ran after the refusal")
+                self.assertIn("refused: gateway", refused.stderr, "the reason reaches the Worker's stderr")
+
+    def test_the_barrier_never_signals_a_process_that_is_not_a_runner_worker(self) -> None:
+        me = hook.JobOwner.of(os.getpid())
+        with mock.patch.object(hook, "runner_worker_pid", return_value=None), \
+                mock.patch.object(hook.os, "kill", side_effect=AssertionError("signalled a non-Worker")):
+            self.assertIn("no Runner.Worker", hook.end_worker(me))
+            self.assertIn("no Runner.Worker", hook.end_worker(None))
+
     def gate(self, slot: int = 0, slots: int = 3, hosts: int = 2) -> hook.GatewayGate:
         runner = self.dir / f"actions-runner-gateway-{slot}"
         (runner / "glaeda-hooks").mkdir(parents=True, exist_ok=True)

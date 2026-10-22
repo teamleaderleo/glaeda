@@ -813,13 +813,20 @@ the instances (always repo-scoped), and `--gateway-only` applies only them.
 - job-started (`--gateway`) is the trust boundary of a repo-scoped runner on a public repository: it admits only
   `manaflow-ai/cmux`'s own push, workflow_dispatch or same-repository pull_request (never a fork, not even
   `teamleaderleo/cmux`) whose `GITHUB_WORKFLOW_REF` is one of those three files, then only the reservation and a
-  2 GiB disk floor. It takes no host lock, unit, root or token, and samples nothing.
+  2 GiB disk floor. It takes no host lock, unit, root or token, and samples nothing. A refusal is an execution
+  barrier, not only a failed step: the runner (v2.338.0, StepsRunner.cs) still evaluates later steps' `if:` after
+  a failed job-started, so an `if: always()` step would run. The hook SIGKILLs its job's Runner.Worker (pinned by
+  pid and start token, only a process of that name) and returns only once it is gone; the Listener fails the job
+  and keeps listening. The reason is also on stderr, which the Listener attaches for a crashed Worker.
 - The listen gate holds a slot only for a reservation, the disk floor, or a slot index at or above k. k is the
   label's queued plus running jobs on the ci-dash (`data.json` pools, over the tailnet, never GitHub's API), divided
   by the members with slots (`gatewayHosts`, which the fleet tool writes into each trimmed manifest), plus 1, clamped
   to 1 and the declared slots. One gate per mini reads it at most once a minute (`gateway-demand.json` in the runner
   state dir); a failed or stale read keeps the last good value for 30 min, then every slot listens. Slots above k
   stop listening once idle, as any held listener does.
+- Every `glaeda-cmux-runner-fleet` apply (and plan) reconciles downward: slots at or above the declared count whose
+  receipt is on the member (all of them at 0, or on a member that turned trusted) are uninstalled with a repository
+  remove token on stdin. A removal that fails fails the apply and leaves the slot for the next run.
 - Route with `gh variable set CI_COMPILE_CHECK_GATEWAY --body glaeda-gateway-client` (and `CI_TEST_COMPILE_GATEWAY`);
   roll back by setting the label they had before.
 

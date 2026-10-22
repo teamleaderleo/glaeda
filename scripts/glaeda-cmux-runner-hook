@@ -4559,6 +4559,56 @@ class GatewayGate(Gate):
         return self.claimed()
 
 
+# A refused job-started does not stop the job by itself. The runner (actions/runner v2.338.0) runs the hook as a
+# pre-job step with condition always() (JobExtension.cs); a non-zero exit fails that step, and StepsRunner.cs then
+# evaluates every later step's `if:` as usual, so a step with `if: always()` or `if: failure()` still runs on this
+# host: a fork PR that names glaeda-gateway-client would run its own commands after its refusal. So a gateway
+# refusal ends the job's Runner.Worker with SIGKILL and exits only once that process is gone. The Worker is blocked
+# awaiting this hook (JobHookProvider.RunHook awaits the handler), so it cannot start another step first, and a
+# killed Worker cannot run one at all. The Listener sees an exit code that is no TaskResult (JobDispatcher.cs
+# IsValidReturnCode), fails the job (TranslateFromReturnCode: Failed) and keeps listening. SIGTERM is not enough:
+# the Worker's Unloading handler only cancels RunnerShutdownToken, asynchronously, which races the next step's
+# condition. Taking the slot offline would also end the job, but it costs the slot. The cost of SIGKILL is the
+# job's log: the refusal line printed before the kill may not reach GitHub, so it is also written to stderr, which
+# the Listener attaches to the job for a crashed Worker.
+BARRIER_WAIT_S = 10.0
+
+
+def process_name(pid: int) -> str | None:
+    """The executable name /bin/ps gives for pid (basename of comm), or None."""
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "comm=", "-p", str(pid)], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return os.path.basename(out) if out else None
+
+
+def end_worker(owner: JobOwner | None, wait_s: float = BARRIER_WAIT_S) -> str:
+    """The execution barrier after a refusal: SIGKILL this job's Runner.Worker (the pinned owner when it is one,
+    else the Runner.Worker above this hook) and wait until it is gone. Only a process named Runner.Worker is ever
+    signalled, and only one with the pinned start token. Returns what happened, for the log."""
+    worker = owner if owner is not None and process_name(owner.pid) == "Runner.Worker" else None
+    if worker is None:
+        found = runner_worker_pid()
+        worker = JobOwner.of(found) if found else None
+    if worker is None:
+        return "no Runner.Worker above this hook; nothing to end"
+    if not worker.alive():
+        return f"Runner.Worker {worker.pid} is already gone"
+    with contextlib.suppress(OSError):
+        os.kill(worker.pid, signal.SIGKILL)
+    # Never return while it lives: it awaits this hook, so a hook that waits keeps every later step from starting.
+    deadline: float | None = time.monotonic() + wait_s
+    while not worker.gone() and not Gate._zombie(worker.pid):  # a zombie runs nothing; its parent reaps it
+        if deadline is not None and time.monotonic() > deadline:
+            print(f"{PREFIX}: Runner.Worker {worker.pid} has not exited {wait_s:g} s after SIGKILL; waiting for it",
+                  file=sys.stderr, flush=True)
+            deadline = None
+        time.sleep(0.05)
+    return f"ended Runner.Worker {worker.pid}, so no later step of this job runs here"
+
+
 def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, waiters: bool,
            adopt: int = 0, capacity_dir: Path | None = None, fit_units: int = 1,
            gateway: GatewayScope | None = None) -> int:
@@ -5977,7 +6027,11 @@ def main(argv: list[str] | None = None) -> int:
                    or reservation_refusal(args.reservation, time.time())
                    or disk_refusal(os.path.dirname(args.host_lock), args.min_free_gib))
             if why:
-                return refused(why)
+                refuse(why)
+                print(f"{PREFIX}: refused: {why}", file=sys.stderr, flush=True)  # the Listener keeps a crashed Worker's
+                barrier = end_worker(owner)
+                print(f"{PREFIX}: {barrier}", file=sys.stderr, flush=True)
+                return 1
             print(f"{PREFIX}: admitted: gateway client {job_workflow()} {os.environ.get('GITHUB_EVENT_NAME')} on "
                   f"{repo}; holds nothing", flush=True)
             return 0
