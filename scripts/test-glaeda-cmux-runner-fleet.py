@@ -49,6 +49,9 @@ if host in os.environ.get("FAKE_DOWN", "").split(","):
     sys.stderr.write("ssh: connect to host " + host + " port 22: Connection refused\\n"); sys.exit(255)
 # the member's gateway slot receipts: what --gateway K installs and --uninstall --gateway K removes
 slots_path = log + ".gateways.json"
+import fcntl
+slots_lock = open(slots_path + ".lock", "a")
+fcntl.flock(slots_lock, fcntl.LOCK_EX)  # the slots of one member apply at once: one read-modify-write at a time
 slots = json.load(open(slots_path)) if os.path.exists(slots_path) else {{}}
 def save_slots():
     json.dump(slots, open(slots_path, "w"))
@@ -85,7 +88,10 @@ if "--apply" in remote and "--uninstall" not in remote and host in os.environ.ge
     print(json.dumps({{"actions": [{{"kind": "register", "state": "failed"}}, {{"kind": "verify", "state": "skipped"}}]}}))
     sys.exit(1)
 if "--apply" in remote:
+    fcntl.flock(slots_lock, fcntl.LOCK_UN)  # instances must still apply side by side (the parallelism test)
     time.sleep(float(os.environ.get("FAKE_APPLY_S", "0")))
+    fcntl.flock(slots_lock, fcntl.LOCK_EX)
+    slots = json.load(open(slots_path)) if os.path.exists(slots_path) else {{}}
     gateway = "--gateway " in remote
     k = remote.split("--gateway " if gateway else "--instance ")[1].split()[0]
     ok = data.strip() == "{token}"
