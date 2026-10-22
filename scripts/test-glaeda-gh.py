@@ -4002,6 +4002,32 @@ class AuditTest(BrokerBase):
             gg.main(["audit", "--log", str(path), "--json"])
         self.assertEqual(json.loads(out.getvalue())["repeatsWithin"]["calls"], 0)
 
+    def test_a_line_stamped_before_the_one_it_follows_is_not_a_repeat(self) -> None:
+        """Review of #1581: 00:03:20 then 00:00:00 counted 1 repeat, 200 s apart in time."""
+        path = self.write_log([(200, "run view run:o/r/12"), (0, "run view run:o/r/12"),
+                               (210, "api graphql")])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.main(["audit", "--log", str(path), "--json"])
+        self.assertEqual(json.loads(out.getvalue())["repeatsWithin"]["calls"], 0)
+
+    def test_an_endpoint_that_is_not_a_path_is_never_printed(self) -> None:
+        """Review of #1581: an old line's endpoint word can carry a query or a token."""
+        for word in ("repos/o/r/pulls?access_token=ghp_abc", "ghp_0123456789abcdef", "a=b",
+                     "repos/o/r/github_pat_11AB"):
+            self.assertEqual(gg.audit_category(["api", word]), ("api (endpoint not shown)", False), word)
+        self.assertEqual(gg.audit_category(["api", "repos/o/r/pulls"]), ("api repos/o/r/pulls", False))
+
+    def test_a_decision_record_of_another_shape_is_skipped(self) -> None:
+        """Review of #1581: a JSON list or a non-string route raised out of the audit."""
+        path = self.write_log([(0, "pr view pr:o/r#7")])
+        gg.broker_log().parent.mkdir(parents=True, exist_ok=True)
+        gg.broker_log().write_text('[1]\n"x"\n{"route": ["serve"]}\nnull\n{"route": "serve"}\n')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.main(["audit", "--log", str(path), "--json"])
+        self.assertEqual(json.loads(out.getvalue())["brokerDecisions"], {"serve": 1})
+
     def test_a_line_with_no_repository_is_counted_but_never_as_a_repeat(self) -> None:
         """The guard logged `pr view 7` before 2026-10-21, and still does where the repository
         came from -R. Two repositories' PR 7 are two reads, and a cache would have served
