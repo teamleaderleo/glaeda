@@ -2912,6 +2912,138 @@ class HeadChecksTest(Base):
             self.assertEqual(gg.cmd_checks("o/r", [SHA_A], "autoland", 120, 0, True), gg.EXIT_OK)
 
 
+class WaitSubscriptionTest(Base):
+    """2026-10-21, app-efficiency: 89 `glaeda-gh wait` processes held 1.6 GB on cosmic-gray, a whole
+    interpreter per waiter re-reading the cache every 3 s. A `wait pr|run` is now a request the daemon
+    rules on (Daemon.serve_waits), and the waiter is a few-line bash blocked reading a FIFO."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        gg.BASE.mkdir(parents=True)
+        self.lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)  # stands in for a running daemon
+        self.addCleanup(self.lock.close)
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30, "waits": gg.WAITS_CONTRACT})
+
+    def put(self, key: str, data: dict | None, at: float | None = None) -> None:
+        at = time.time() if at is None else at
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": at, "dataAt": at if data else None,
+                                                          "data": data, "error": None})
+
+    def request(self, kind: str = "pr", target: str = "o/r#1", timeout: float = 60, pid: int | None = None,
+                **kw) -> tuple[str, int]:
+        """A request as subscribe_wait leaves it, and a reader on its FIFO standing in for the blocker."""
+        rid = gg.write_wait_request(kind, target, kw.get("until", "green"), timeout, False, kw.get("as_json", False),
+                                    kw.get("sha"), True, gg.RESCUE_GRACE, pid or os.getpid())
+        reader = os.open(gg.waits_dir() / f"{rid}.fifo", os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        return rid, reader
+
+    def woken(self, reader: int) -> str:
+        try:
+            return os.read(reader, 64).decode()
+        except BlockingIOError:
+            return ""
+
+    def test_the_daemon_rules_and_wakes_the_blocker(self) -> None:
+        rid, reader = self.request()
+        self.assertTrue(gg.read_json(gg.watch_dir() / gg.file_name("pr:o/r#1")), "the wait registered no interest")
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "", "a wait with nothing fetched yet was decided")
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "0\n")
+        out = (gg.waits_dir() / f"{rid}.out").read_text()
+        self.assertIn("result: success", out)
+        self.assertFalse((gg.waits_dir() / f"{rid}.json").exists(), "a decided request stayed")
+
+    def test_a_red_or_a_timeout_says_what_cmd_wait_says(self) -> None:
+        rid, reader = self.request("pr", "o/r#2")
+        self.put("pr:o/r#2", gg.parse_pr(pr_node(2, rollup="FAILURE", checks=[check_run("a", conclusion="FAILURE")])))
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "1\n")
+        self.assertIn("failed: a  https://ci/a", (gg.waits_dir() / f"{rid}.out").read_text())
+
+        rid, reader = self.request("run", "o/r/7", timeout=0)
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "2\n")
+        self.assertIn("result: timeout", (gg.waits_dir() / f"{rid}.out").read_text())
+
+    def test_data_from_before_the_wait_began_never_decides_it(self) -> None:
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])), at=time.time() - 30)
+        _, reader = self.request()
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "")
+
+    def test_a_request_whose_waiter_is_gone_is_dropped(self) -> None:
+        child = subprocess.Popen(["true"])
+        child.wait()
+        rid, _ = self.request(pid=child.pid)
+        self.daemon.serve_waits()
+        self.assertEqual(list(gg.waits_dir().glob(f"{rid}*")), [])
+
+    def test_what_a_killed_blocker_left_is_swept(self) -> None:
+        child = subprocess.Popen(["true"])
+        child.wait()
+        rid = f"{child.pid}-0000beef"
+        gg.waits_dir().mkdir(parents=True, exist_ok=True)
+        os.mkfifo(gg.waits_dir() / f"{rid}.fifo")
+        (gg.waits_dir() / f"{rid}.out").write_text("result: success\n")
+        live, _ = self.request()  # a live wait of this process is left alone
+        self.daemon.serve_waits()
+        self.assertEqual(sorted(p.name for p in gg.waits_dir().iterdir()), [f"{live}.fifo", f"{live}.json"])
+
+    def test_a_blocker_not_listening_yet_is_woken_on_a_later_tick(self) -> None:
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 60, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+        self.daemon.serve_waits()  # decided, but nobody reads the FIFO yet
+        self.assertEqual(gg.read_json(gg.waits_dir() / f"{rid}.json")["code"], 0)
+        reader = os.open(gg.waits_dir() / f"{rid}.fifo", os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "0\n")
+
+    def test_the_cli_waits_as_a_shell_and_exits_with_the_verdict(self) -> None:
+        env = dict(os.environ, GLAEDA_GH_DIR=os.fspath(gg.BASE))
+        child = subprocess.Popen([sys.executable, os.fspath(ROOT / "scripts" / "glaeda-gh"), "wait", "pr", "o/r#1",
+                                  "--timeout", "60"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline, comm = time.monotonic() + 20, ""
+            while time.monotonic() < deadline:
+                comm = subprocess.run(["ps", "-o", "comm=", "-p", str(child.pid)], capture_output=True, text=True).stdout
+                if "bash" in comm:
+                    break
+                time.sleep(0.05)
+            self.assertIn("bash", comm, "the waiter is still a Python process")
+            self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+            self.daemon.serve_waits()
+            out, err = child.communicate(timeout=20)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+        self.assertEqual(child.returncode, 0, out + err)
+        self.assertIn("result: success", out)
+        self.assertEqual(list(gg.waits_dir().iterdir()), [], "the wait left files behind")
+
+    def test_an_older_daemon_gets_the_polling_wait(self) -> None:
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30})  # no "waits"
+        with mock.patch.object(gg, "cmd_wait", return_value=7) as polling, mock.patch.object(gg.os, "execv") as execv:
+            self.assertEqual(gg.subscribe_wait("pr", "o/r#1", "green", 60, False, False, None, gg.RESCUE_GRACE), 7)
+        polling.assert_called_once()
+        execv.assert_not_called()
+
+    def test_a_daemon_that_never_answers_ends_the_wait_at_its_deadline(self) -> None:
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 60, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        d = gg.waits_dir()
+        done = subprocess.run([gg.BASH, "-c", gg.BLOCKER, "glaeda-gh-wait", os.fspath(d / f"{rid}.fifo"),
+                               os.fspath(d / f"{rid}.out"), "1", os.fspath(d / f"{rid}.json")],
+                              capture_output=True, text=True, timeout=20)
+        self.assertEqual(done.returncode, gg.EXIT_DOWN, done.stderr)
+        self.assertIn("did not answer", done.stderr)
+        self.assertEqual(list(d.glob(f"{rid}*")), [])
+
+
 class FileAndPidWaitTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
