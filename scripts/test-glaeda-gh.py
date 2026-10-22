@@ -3701,7 +3701,7 @@ class FileAndPidWaitTest(unittest.TestCase):
     def test_a_long_line_on_a_nearly_full_pipe_does_not_hang_the_wait(self) -> None:
         """Writable promises room for PIPE_BUF bytes, not for the whole line. A pipe with 8 KiB free
         reports writable, and a 100 KB `--contains` line then blocked a 1 s wait past 3 s. The line
-        goes out as far as fd 2 takes it without blocking, and the rest is dropped."""
+        write is given `DIAGNOSTIC_WRITE_S` and then left behind."""
         read, write = os.pipe()
         self.addCleanup(os.close, read)
         try:
@@ -3724,11 +3724,10 @@ class FileAndPidWaitTest(unittest.TestCase):
         self.assertLess(waited, 4, "the diagnostic blocked on a pipe that had room for part of it")
         line = spill.lstrip(b"x")
         self.assertTrue(line.startswith(b"glaeda-gh: waiting on"), line[:80])
-        self.assertLess(len(line), 100_000)  # what the pipe had room for, not the whole line
 
     def test_a_full_stderr_socket_does_not_hang_the_wait(self) -> None:
         """A socket reports writable without room for a whole write: 512-byte writes blocked a
-        0.1 s wait past 3 s on a full one. The write is non-blocking, so the line is dropped."""
+        0.1 s wait past 3 s on a full one. The write is given `DIAGNOSTIC_WRITE_S` and then left behind."""
         ours, theirs = socket.socketpair()
         self.addCleanup(ours.close)
         try:
@@ -3744,6 +3743,34 @@ class FileAndPidWaitTest(unittest.TestCase):
         self.assertEqual(done.returncode, gg.EXIT_TIMEOUT, done.stdout)
         self.assertLess(waited, 4, "the diagnostic blocked on a full socket")
         self.assertEqual(json.loads(done.stdout)["result"], "timeout")
+
+    def test_the_diagnostic_never_changes_the_shared_stderr_flags(self) -> None:
+        """O_NONBLOCK belongs to the file description the parent shares with every child, so two
+        overlapping waits that each set it around their write and restored what they had saved
+        left the parent's stderr non-blocking for good (reproduced with two real children). The
+        race is microseconds wide, so this checks the cause: fd 2 is still blocking at every
+        write, and its flags are what they were."""
+        read, write = os.pipe()
+        self.addCleanup(os.close, read)
+        self.addCleanup(os.close, write)
+        saved = os.dup(2)
+        self.addCleanup(os.close, saved)
+        seen = []
+
+        def record(fd, data):
+            seen.append((fd, os.get_blocking(fd)))
+            return len(data)
+
+        os.dup2(write, 2)
+        try:
+            before = fcntl.fcntl(2, fcntl.F_GETFL)
+            with mock.patch.object(gg.os, "write", record):
+                gg.say_waiting("glaeda-gh: waiting on something")
+            after = fcntl.fcntl(2, fcntl.F_GETFL)
+        finally:
+            os.dup2(saved, 2)
+        self.assertEqual(seen, [(2, True)])
+        self.assertEqual(after, before)
 
     def test_a_filename_that_is_not_utf8_does_not_kill_the_wait(self) -> None:
         """A surrogate-escaped filename byte raised `UnicodeEncodeError` in the diagnostic: exit 1 and

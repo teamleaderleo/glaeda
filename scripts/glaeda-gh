@@ -3043,6 +3043,10 @@ def deadline_clock(timeout: float, now: float | None = None) -> str:
         return "unknown"
 
 
+DIAGNOSTIC_WRITE_S = 0.2  # how long a wait lets its own diagnostic hold it up
+_DIAGNOSTIC_WRITING = threading.Lock()
+
+
 def say_waiting(line: str) -> None:
     """Put a diagnostic on fd 2 without ever becoming the reason the wait does not happen.
 
@@ -3060,11 +3064,14 @@ def say_waiting(line: str) -> None:
       forever: a 1 s wait hung past 5 s, which is worse for the caller than exiting 120. Errors are
       not the only way a write can be the problem; backpressure is the other.
 
-    So fd 2 is non-blocking for the length of the write and put back the way it was after it; what
-    it cannot take now is dropped. Asking `select` first was not enough: writable promises room for
-    PIPE_BUF bytes on a pipe (a 100 KB `--contains` line still blocked a nearly full one), and even
-    512-byte writes blocked on a full socket and on a terminal. (Cutting the line to 512 bytes also
-    lost the end of the serve refusal, which names `--foreground-ok`.)
+    So the write runs on a daemon thread and the wait gives it `DIAGNOSTIC_WRITE_S`; a write still
+    blocked after that is left behind (it lands if the reader drains, or dies with the process), and
+    later lines are dropped while it is. Neither earlier answer held. Asking `select` first: writable
+    promises room for PIPE_BUF bytes on a pipe (a 100 KB `--contains` line blocked a nearly full one),
+    and 512-byte writes blocked on a full socket and on a terminal. Making fd 2 non-blocking for the
+    write: O_NONBLOCK belongs to the file description, which the parent and every sibling share, so
+    two overlapping waits left the parent's stderr non-blocking for good. (Cutting the line to 512
+    bytes also lost the end of the serve refusal, which names `--foreground-ok`.)
     It is encoded with backslashreplace, because a filename's surrogate-escaped bytes raised
     `UnicodeEncodeError` and the wait died with exit 1 and no JSON.
 
@@ -3074,19 +3081,26 @@ def say_waiting(line: str) -> None:
     wait, which is exactly no use) passed all 337 tests. The tests read fd 2 of the real CLI now,
     while it is still blocked."""
     data = (line + "\n").encode(errors="backslashreplace")
+    if not _DIAGNOSTIC_WRITING.acquire(blocking=False):
+        return  # the last line is still stuck on fd 2
+
+    def write() -> None:
+        try:
+            rest = data
+            while rest:
+                rest = rest[os.write(2, rest):]
+        except OSError:
+            pass
+        finally:
+            _DIAGNOSTIC_WRITING.release()
+
     try:
-        was_blocking = os.get_blocking(2)
-    except OSError:
+        writer = threading.Thread(target=write, name="say-waiting", daemon=True)
+        writer.start()
+    except RuntimeError:  # no thread to be had: drop the line rather than risk the wait
+        _DIAGNOSTIC_WRITING.release()
         return
-    try:
-        os.set_blocking(2, False)
-        while data:
-            data = data[os.write(2, data):]
-    except OSError:
-        pass
-    finally:
-        with contextlib.suppress(OSError):
-            os.set_blocking(2, was_blocking)
+    writer.join(DIAGNOSTIC_WRITE_S)
 
 
 def wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
