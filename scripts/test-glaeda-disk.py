@@ -4759,7 +4759,9 @@ class _Stat:
         return self._over[name] if name in self._over else getattr(self._st, name)
 
 
-@unittest.skipUnless(sys.platform == "darwin", "APFS clones are macOS only")
+apfs = unittest.skipUnless(sys.platform == "darwin", "APFS clones are macOS only")
+
+
 class CaptureDedupeTest(unittest.TestCase):
     """cmux-mac-mini, 2026-10-18..21: every pressure pass freed 0 GiB while ~/messageslab-26 held 11.2 GiB of
     byte-identical PNG frames (deputy-2 cloned them by hand at a 16 KiB floor). Dedupe looked only at Xcode's
@@ -4845,6 +4847,7 @@ class CaptureDedupeTest(unittest.TestCase):
 
     # -- the pass itself ----------------------------------------------------------------------------
 
+    @apfs
     def test_main_dedupe_clones_capture_frames_down_to_16_kib_and_deletes_nothing(self) -> None:
         frame = os.urandom(32 * self.KIB)
         a = self.blob("messageslab-26/sendw/take1/frames/0001.png", frame)
@@ -4861,7 +4864,7 @@ class CaptureDedupeTest(unittest.TestCase):
         inodes = {p: p.stat().st_ino for p in (a, b, c, t1, t2, x1, x2)}
         before = self.files()
         out = self.run_main()
-        self.assertIn("dedupe captures: 5 files >= 16 KiB", out)
+        self.assertIn("dedupe captures: 3 files >= 16 KiB in 2 roots", out)
         self.assertEqual(self.files(), before)  # never deletes
         self.assertTrue(all(p.read_bytes() == frame for p in (a, b, c)))
         self.assertEqual(sum(p.stat().st_ino != inodes[p] for p in (a, b, c)), 2)
@@ -4870,10 +4873,12 @@ class CaptureDedupeTest(unittest.TestCase):
         state = json.loads((self.root / ".cache/glaeda-disk/dedupe-captures.json").read_text())
         self.assertTrue(all(state[os.fspath(p)]["cloned"] for p in (a, b, c)))
 
+    @apfs
     def test_no_capture_roots_means_no_capture_pass(self) -> None:
         self.policy["dedupe_capture_roots"] = []
         self.assertNotIn("dedupe captures", self.run_main())
 
+    @apfs
     def test_young_capture_files_wait_for_a_later_pass(self) -> None:
         frame = os.urandom(32 * self.KIB)
         a = self.blob("messageslab-26/a.png", frame)
@@ -4885,6 +4890,7 @@ class CaptureDedupeTest(unittest.TestCase):
         self.assertEqual(b.stat().st_ino, ino)
         self.assertEqual(a.read_bytes(), frame)
 
+    @apfs
     def test_files_open_for_writing_are_left_alone(self) -> None:
         frame = os.urandom(32 * self.KIB)
         self.blob("caps/a.png", frame)
@@ -4904,6 +4910,7 @@ class CaptureDedupeTest(unittest.TestCase):
                "p11\nf5\nau\nn/caps/rw.png\nf6\na \nn/caps/none.png\n")
         self.assertEqual(gd.lsof_writers(out), frozenset({"/caps/write.png", "/caps/rw.png"}))
 
+    @apfs
     def test_without_lsof_evidence_the_capture_pass_is_skipped(self) -> None:
         frame = os.urandom(32 * self.KIB)
         self.blob("messageslab-26/a.png", frame)
@@ -4919,6 +4926,7 @@ class CaptureDedupeTest(unittest.TestCase):
         self.assertIn("dedupe captures: skipped (lsof: boom)", out.getvalue())
         self.assertEqual(b.stat().st_ino, ino)
 
+    @apfs
     def test_files_on_different_volumes_are_never_paired(self) -> None:
         frame = os.urandom(32 * self.KIB)
         a = self.blob("caps/a.png", frame)
@@ -4939,6 +4947,7 @@ class CaptureDedupeTest(unittest.TestCase):
 
     # -- safety of each swap ------------------------------------------------------------------------
 
+    @apfs
     def test_a_strict_clone_keeps_mode_times_birthtime_xattrs_and_group(self) -> None:
         frame = os.urandom(32 * self.KIB)
         a = self.blob("caps/a.png", frame)
@@ -4959,6 +4968,7 @@ class CaptureDedupeTest(unittest.TestCase):
         self.assertEqual(gd.file_xattrs(os.fspath(b)), {"com.example.take": b"send-typed"})
         self.assertEqual([p.name for p in self.root.rglob("*glaeda-clone*")], [])
 
+    @apfs
     def test_a_strict_clone_refuses_differing_xattrs_acls_or_flags(self) -> None:
         frame = os.urandom(32 * self.KIB)
 
@@ -4978,6 +4988,7 @@ class CaptureDedupeTest(unittest.TestCase):
         os.chflags(flag_b, 0)
         subprocess.run(["chmod", "-N", os.fspath(acl_b)], check=True)
 
+    @apfs
     def test_a_strict_clone_refuses_a_file_someone_else_owns(self) -> None:
         frame = os.urandom(32 * self.KIB)
         a = self.blob("caps/a.png", frame)
@@ -4994,6 +5005,7 @@ class CaptureDedupeTest(unittest.TestCase):
             self.assertFalse(gd.clone_over(str(a), str(b), key, akey, strict=True))
         self.assertEqual(b.stat().st_ino, ino)
 
+    @apfs
     def test_bytes_are_compared_so_a_hash_collision_is_never_cloned(self) -> None:
         a = self.blob("caps/a.png", os.urandom(32 * self.KIB))
         b = self.blob("caps/b.png", os.urandom(32 * self.KIB))
@@ -5004,6 +5016,7 @@ class CaptureDedupeTest(unittest.TestCase):
         self.assertEqual(b.read_bytes(), want)
         self.assertNotEqual(a.read_bytes(), want)
 
+    @apfs
     def test_files_already_sharing_a_clone_are_left_as_they_are(self) -> None:
         frame = os.urandom(32 * self.KIB)
         a = self.blob("caps/a.png", frame)
@@ -5015,6 +5028,7 @@ class CaptureDedupeTest(unittest.TestCase):
         self.assertEqual((r["cloned_bytes"], r["shared"], r["refused"]), (0, 1, 0))
         self.assertEqual(b.stat().st_ino, ino)
 
+    @apfs
     def test_git_dirs_inside_a_capture_root_are_not_walked(self) -> None:
         data = os.urandom(32 * self.KIB)
         self.blob("caps/.git/objects/pack/a.pack", data)
@@ -5023,6 +5037,7 @@ class CaptureDedupeTest(unittest.TestCase):
 
     # -- a bounded pass -----------------------------------------------------------------------------
 
+    @apfs
     def test_a_zero_budget_does_nothing_and_says_it_is_incomplete(self) -> None:
         frame = os.urandom(32 * self.KIB)
         self.blob("caps/a.png", frame)
@@ -5032,9 +5047,11 @@ class CaptureDedupeTest(unittest.TestCase):
         self.assertEqual((r["complete"], r["cloned_bytes"]), (False, 0))
         self.assertEqual(b.stat().st_ino, ino)
 
+    @apfs
     def test_bounded_passes_each_stop_on_time_and_together_finish_every_root(self) -> None:
-        """A pass stops at its budget (each clock read is one tick here); later passes resume from the hashes
-        it saved and start at the next root, so a tree bigger than one pass cannot starve the others."""
+        """A pass stops at its budget (each clock read is one tick here) and says it is incomplete; later passes
+        resume from the hashes it saved and start at the root it stopped in, so roots bigger than one pass
+        cannot starve the ones after them."""
         roots, frames = [], {}
         for name in ("r1", "r2", "r3", "r4"):
             data = os.urandom(32 * self.KIB)
@@ -5043,18 +5060,19 @@ class CaptureDedupeTest(unittest.TestCase):
             roots.append(self.root / name)
         inodes = {p: p.stat().st_ino for p in frames}
         ticks = iter(range(10**6))
+
+        def changed() -> collections.Counter:
+            return collections.Counter(p.parent.name for p in frames if p.stat().st_ino != inodes[p])
+
         passes = 0
-        while True:
+        while sum(changed().values()) < 8:
             passes += 1
-            r = self.dedupe(roots, budget_s=10, clock=lambda: float(next(ticks)))
-            if passes == 1:
-                self.assertFalse(r["complete"])
-            if r["complete"] and r["cloned_bytes"] == 0:
-                break
             self.assertLess(passes, 40)
+            r = self.dedupe(roots, budget_s=10, clock=lambda: float(next(ticks)))
+            self.assertFalse(r["complete"])  # 12 files never fit one 10-tick pass
+            self.assertGreater(r["hashed_bytes"] + r["cloned_bytes"], 0)  # yet every pass gets somewhere
         self.assertGreater(passes, 2)
-        changed = collections.Counter(p.parent.name for p in frames if p.stat().st_ino != inodes[p])
-        self.assertEqual(changed, {"r1": 2, "r2": 2, "r3": 2, "r4": 2})
+        self.assertEqual(changed(), {"r1": 2, "r2": 2, "r3": 2, "r4": 2})
         self.assertTrue(all(p.read_bytes() == d for p, d in frames.items()))
 
 
