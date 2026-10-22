@@ -120,11 +120,13 @@ cmux7s sat at 21 GiB under a 30 GiB floor with 40 GiB of media CI's cmux DEV clo
 per-runner cmux-next Build "recent" (2026-10-21).
 
 Kill switch: while ~/.config/glaeda/disk-off exists, or disk-policy.json has "enabled": false, an
---apply (or --dedupe) run deletes nothing; it says so and exits 0. Every --apply run, whatever it
+--apply (or --dedupe) run deletes nothing; it says so (with --json, {"status": "off"}) and exits 0.
+Turned on during a run, it stops that run before its next candidate. Every --apply run, whatever it
 did, appends exactly one JSON line to the run log (macOS ~/Library/Logs/glaeda-disk-runs.jsonl, Linux
 ~/.local/state/glaeda/disk-runs.jsonl): free space before and after, target, floor, reclaimed, whether
-the target was reached, the biggest blocked families, and why a run skipped (off, no pressure, a
-lock held, a deferral).
+the target was reached, the biggest blocked families, "skipped" when it skipped (off, no pressure, a
+lock held, a deferral) and "stopped" when it ended early (off mid-run, an error, a SIGTERM; a run
+killed outright, as by a timeout's SIGKILL, gets its line from the next run).
 
 Free space is judged per filesystem. On Linux /tmp is often its own tmpfs, so pressure there
 reclaims only /tmp items, and pressure on the home filesystem never deletes from /tmp.
@@ -950,6 +952,9 @@ DISK_OFF = HOME / ".config/glaeda/disk-off"
 RUN_LOG = HOME / ("Library/Logs/glaeda-disk-runs.jsonl" if sys.platform == "darwin"
                   else ".local/state/glaeda/disk-runs.jsonl")
 RUN: dict[str, Any] = {}  # what this run did, for its run line; _main_impl fills it
+# One marker per --apply run still going (<pid>.json). A run killed outright (the runner hook's timeout is a
+# SIGKILL) cannot write its line; the next run finds its marker with the pid gone and writes the line for it.
+OPEN_RUNS = HOME / ".cache/glaeda-disk/open-runs"
 POLICY_DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "low": "25%:60-200",
@@ -6505,9 +6510,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
         a.idle = bool(a.apply)
     RUN.update(apply=a.apply, mode="keepup" if a.command == "keepup" else "pressure" if a.pressure
                else "idle" if a.idle else "apply")
+    if a.apply:
+        open_run()
     if (a.apply or a.dedupe or a.dedupe_builds) and (why := disk_off()):
-        print(f"glaeda-disk is off ({why}): nothing deleted")
+        message = f"glaeda-disk is off ({why}): nothing deleted"
         RUN.update(off=True, skipped="off")
+        print(json.dumps({"status": "off", "complete": False, "reason": "off", "message": message})
+              if a.json else message)
         return 0
     role = "devbox" if a.role_devbox else (a.role or "fleet-mini")
     global ROLE
@@ -6795,28 +6804,30 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.idle_hours:6.1f}h  {t.family} {t.path} ({', '.join(t.reasons)})")
     if a.apply:
         print()
-        halt = (cmux_next_drain_halt if a.cmux_next_drain
-                else host_busy if sweep and POLICY["defer_during_ci"] else None)
+        halt = run_halt(cmux_next_drain_halt if a.cmux_next_drain
+                        else host_busy if sweep and POLICY["defer_during_ci"] else None)
+        off_now = run_halt()  # the kill switch alone: a busy host still lets the later steps run as before
         logical_released = stale_marker_released + apply(items, {f.id: f for f in fams}, a.receipt,
                                  {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt,
                                  all_families=fams, receipt_sweep=sweep)
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
         # are absent, its disposable checkout can be cleared under this same eviction lock.
-        if not RUNNER_CACHE_PROFILE:
+        # the kill switch turned on mid-run (halt saw it): nothing after the candidate it stopped at
+        if not RUNNER_CACHE_PROFILE and not off_now():
             logical_released += cleanup_paused_runner_work(a.receipt)
         # test scratch left in $TMPDIR, two days untouched: too small per entry for any family's size floor
         if not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
                 and (not a.family or TMP_TEST_RESIDUE_FAMILY in a.family):
             logical_released += reap_tmpdir_test_residue(a.receipt, halt=halt)
         # still under the runner gate's floor after every family: idle runners' whole checkouts, last
-        if a.pressure and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
+        if a.pressure and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not off_now() \
                 and (not a.family or RUNNER_IDLE_CHECKOUT_FAMILY in a.family):
             logical_released += evict_idle_runner_checkouts(a.receipt, floor_gib)
         # a home clone that fetch after fetch left in many packs: repacked at most hourly or under pressure,
         # after the eviction lock is released, so a gc of many minutes never holds back another eviction
-        home_clone_gc_due = ((sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
+        home_clone_gc_due = ((sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not off_now()
                              and not a.cmux_next_drain and (not a.family or HOME_CLONE_GC_FAMILY in a.family))
-        runner_repack_due = ((sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
+        runner_repack_due = ((sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not off_now()
                              and not a.cmux_next_drain
                              and (not a.family or RUNNER_CHECKOUT_REPACK_FAMILY in a.family))
         remaining = []
@@ -6843,7 +6854,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if sweep:
             if not RUNNER_CACHE_PROFILE:
                 # deleting a runtime restarts CoreSimulatorService: never while a job may be using simulators
-                logical_released += apply_runtimes(tooling, a.receipt, host_busy)
+                logical_released += apply_runtimes(tooling, a.receipt, run_halt(host_busy))
             IDLE_STAMP.parent.mkdir(parents=True, exist_ok=True)
             IDLE_STAMP.touch()
         # Re-observe after every destructive operation. The accounting and df delta are
@@ -6873,13 +6884,74 @@ def _main_impl(argv: list[str] | None = None) -> int:
     return 0
 
 
-def disk_off() -> str:
-    """Why the kill switch is on, or "": DISK_OFF exists, or the policy says "enabled": false."""
+def disk_off(live: bool = False) -> str:
+    """Why the kill switch is on, or "": DISK_OFF exists, or the policy says "enabled": false (LIVE: as the
+    policy file says now, not as it said when this run started)."""
     if os.path.lexists(DISK_OFF):
         return f"{DISK_OFF} exists"
-    if not POLICY["enabled"]:
+    if not (disk_policy() if live else POLICY)["enabled"]:
         return f'{DISK_POLICY} has "enabled": false'
     return ""
+
+
+def run_halt(inner=None):
+    """The per-candidate stop check of an --apply run: the kill switch, read again each time (and, once it
+    has fired, for every later step of the run), then INNER's own reason (a CI job, a drain)."""
+    def halt() -> str:
+        if RUN.get("stopped"):
+            return RUN["stopped"]
+        if why := disk_off(live=True):
+            RUN["stopped"] = f"off mid-run: {why}"
+            return RUN["stopped"]
+        return inner() if inner is not None else ""
+    return halt
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # EPERM: someone's process has that pid
+        return True
+    return True
+
+
+def open_run() -> None:
+    """Mark this --apply run as going; first write the lines of runs whose marker outlived their process."""
+    with contextlib.suppress(OSError):
+        for marker in sorted(OPEN_RUNS.glob("*.json")):
+            try:
+                pid = int(marker.stem)
+            except ValueError:
+                continue
+            if pid == os.getpid() or _pid_alive(pid):
+                continue
+            try:
+                doc = json.loads(marker.read_text())
+            except (OSError, ValueError):
+                doc = {}
+            if not isinstance(doc, dict):
+                doc = {}
+            row = {"at": doc.get("at"), "host": platform.node(), "mode": doc.get("mode"), "off": False,
+                   "free_gib_before": doc.get("free_gib_before"), "pid": pid,
+                   "stopped": "killed or timed out: it wrote no line (found by the next run)"}
+            _append_run_row(row)
+            marker.unlink(missing_ok=True)
+    with contextlib.suppress(OSError):
+        OPEN_RUNS.mkdir(parents=True, exist_ok=True)
+        free = RUN.get("free_before")
+        (OPEN_RUNS / f"{os.getpid()}.json").write_text(json.dumps(
+            {"pid": os.getpid(), "at": RUN.get("at"), "started": RUN.get("started"), "mode": RUN.get("mode"),
+             "free_gib_before": None if free is None else round(free / GIB, 1)}))
+        RUN["marker"] = True
+
+
+def _append_run_row(row: dict) -> None:
+    with contextlib.suppress(OSError):
+        RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with RUN_LOG.open("a") as f:
+            f.write(json.dumps(row) + "\n")
 
 
 def _home_free() -> int | None:
@@ -6896,29 +6968,54 @@ def write_run_line(started: float, free_before: int | None) -> None:
 
     def g(b):
         return None if b is None else round(b / GIB, 1)
-    row = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "mode": RUN.get("mode"),
+    row = {"at": RUN.get("at") or time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "mode": RUN.get("mode"),
            "off": bool(RUN.get("off")), "free_gib_before": g(free_before), "free_gib_after": g(after),
            "target_gib": RUN.get("target_gib"), "floor_gib": RUN.get("floor_gib"),
            "reclaimed_gib": round(RUN.get("released", 0) / GIB, 1),
            "reached": None if target is None or after is None else after >= target,
-           "blocked": RUN.get("blocked", {}), "duration_s": round(time.time() - started, 1),
-           "skipped": RUN.get("skipped")}
-    with contextlib.suppress(OSError):
-        RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with RUN_LOG.open("a") as f:
-            f.write(json.dumps(row) + "\n")
+           "blocked": RUN.get("blocked", {}), "duration_s": round(time.time() - started, 1)}
+    for key in ("skipped", "stopped"):  # present only when it happened: never a null
+        if RUN.get(key):
+            row[key] = RUN[key]
+    _append_run_row(row)
+    if RUN.get("marker"):
+        with contextlib.suppress(OSError):
+            (OPEN_RUNS / f"{os.getpid()}.json").unlink(missing_ok=True)
+
+
+class RunKilled(BaseException):
+    """SIGTERM (or SIGHUP) during a run: unwinds it so its line is still written."""
+
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+
+
+def _killed(signum, _frame):
+    raise RunKilled(signum)
 
 
 def _logged_main(args: list[str]) -> int:
     """_main_impl, then one run line when it was an --apply run (whatever it did, or why it skipped)."""
     RUN.clear()
     started, before = time.time(), _home_free()
+    RUN.update(started=started, free_before=before, at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    handlers = {}
+    with contextlib.suppress(ValueError):  # not the main thread: no handlers, the default stands
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            handlers[sig] = signal.signal(sig, _killed)
     try:
         return _main_impl(args)
+    except RunKilled as e:
+        RUN["stopped"] = f"killed: {signal.Signals(e.signum).name}"
+        print(f"glaeda-disk: {RUN['stopped']}", file=sys.stderr)
+        return 128 + e.signum
     except BaseException as e:
-        RUN.setdefault("skipped", f"error: {type(e).__name__}")
+        RUN.setdefault("stopped", f"error: {type(e).__name__}")
         raise
     finally:
+        for sig, old in handlers.items():
+            signal.signal(sig, old)
         if RUN.get("apply"):
             write_run_line(started, before)
 
