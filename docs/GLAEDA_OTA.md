@@ -50,8 +50,8 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    the run already fetched, so a network blip cannot fail a good release. A check that times out
    says the host is too busy, not that the release is bad: the run rolls back the same way but
    quarantines nothing and posts `pending`, and the next run (with backoff) tries the release
-   again. The third timed-out check in a row for one release counts as a failure. A rollback that
-   itself fails is reported as blocking `rolled-back`.
+   again. The fifth timed-out check in a row for one release (over about two hours of backoff)
+   counts as a failure. A rollback that itself fails is reported as blocking `rolled-back`.
 
    A stale or unrelated channel target, or a target whose setup does not support this host's
    persisted flags, is refused before `--apply` and is re-evaluated after the channel or host

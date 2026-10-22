@@ -178,7 +178,7 @@ RATE_MARKERS = ("api rate limit", "rate limit exceeded", "secondary rate limit",
 TRANSIENT_MARKERS = ("http 500", "http 502", "http 503", "http 504", "timeout", "timed out", "connection",
                      "network", "temporarily unavailable", "eof")
 MAX_UNREPORTED = 5
-HEALTH_TIMEOUTS = 3  # consecutive timed-out health checks of one tag (at least ~70 min with backoff) that fail it
+HEALTH_TIMEOUTS = 5  # consecutive timed-out health checks of one tag that fail it: t0, +10, +30, +70, +130 min with backoff
 
 
 class UpdateError(RuntimeError):
@@ -250,6 +250,10 @@ def load_state(state_dir: Path = STATE_DIR) -> dict:
             and isinstance(o.get("source"), str) and SHA_RE.fullmatch(o["source"])
             and isinstance(o.get("ok"), bool) and isinstance(o.get("detail"), str) for o in owed)):
         doc.pop("unreported")  # only a report owed to GitHub: never worth refusing to update over
+    timeouts = doc.get("healthTimeouts")
+    if timeouts is not None and not (isinstance(timeouts, dict) and isinstance(timeouts.get("tag"), str)
+                                     and type(timeouts.get("n")) is int):
+        doc.pop("healthTimeouts")  # only a count of slow checks: restart it rather than refuse to update
     return doc
 
 

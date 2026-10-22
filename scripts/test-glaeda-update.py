@@ -606,7 +606,7 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(self.run_update()["result"], "updated")
         self.assertEqual(gu.load_state(self.state)["current"], slow["tag"])
 
-    def test_a_release_that_times_out_every_time_is_quarantined_on_the_third(self) -> None:
+    def test_a_release_that_times_out_every_time_is_quarantined_in_the_end(self) -> None:
         self.server.publish(SOURCES[0])
         self.run_update()
         hangs = self.server.publish(SOURCES[1])
@@ -617,6 +617,19 @@ class UpdateTest(unittest.TestCase):
         state = gu.load_state(self.state)
         self.assertIn(hangs["tag"], state["quarantined"])
         self.assertNotIn("healthTimeouts", state)
+
+    def test_a_malformed_timeout_count_starts_over(self) -> None:
+        self.server.publish(SOURCES[0])
+        self.run_update()
+        state = gu.load_state(self.state)
+        for bad in ("x", {"tag": "t", "n": "2"}, {"n": 1}):
+            with self.subTest(bad=bad):
+                gu.save_state({**state, "healthTimeouts": bad}, self.state)
+                self.assertNotIn("healthTimeouts", gu.load_state(self.state))
+        hangs = self.server.publish(SOURCES[1])
+        with mock.patch.object(gu, "health", return_value=(None, "glaeda-disk: timed out")):
+            self.assertEqual(self.run_update()["result"], "inconclusive")
+        self.assertEqual(gu.load_state(self.state)["healthTimeouts"], {"tag": hangs["tag"], "n": 1})
 
     def test_a_timeout_whose_rollback_fails_is_blocking(self) -> None:
         good = self.server.publish(SOURCES[0])
