@@ -3698,14 +3698,21 @@ class AuditTest(BrokerBase):
                                # repeat delay for (see the brake test).
                                (15, "api /rate_limit"), (16, "api rate_limit"),
                                (17, "api https://api.github.com/rate_limit"),
+                               # The two GHE bases, which are not the same one: GraphQL is at
+                               # /api/graphql and REST is under /api/v3/, so this is the spelling a
+                               # GHE host really serves for the free call. With `/api/` alone it
+                               # was filed as an ordinary path and still held 30 s -- the defect the
+                               # helper claimed to have removed, measured by a review.
                                (18, "api https://ghe.example/api/rate_limit"),
+                               (19, "api https://ghe.example/api/v3/rate_limit"),
                                (20, "pr view pr:o/r#7")])
         doc = self.audit_json(path)
         self.assertEqual(doc["categories"]["raw gh api graphql"], 4, doc["categories"])
-        self.assertEqual(doc["categories"]["rate_limit (free)"], 4, doc["categories"])
+        self.assertEqual(doc["categories"]["rate_limit (free)"], 5, doc["categories"])
         # And not so wide that an unrelated path under a host reads as either endpoint.
         for other in ("api https://ghe.example/api/v3/repos/o/r", "api repos/o/graphql-tools",
-                      "api https://ghe.example/api/rate_limit/history"):
+                      "api https://ghe.example/api/rate_limit/history",
+                      "api https://ghe.example/api/v3/rate_limit/history"):
             with self.subTest(other):
                 doc = self.audit_json(self.write_log([(0, other)]))
                 self.assertNotIn("raw gh api graphql", doc["categories"], doc["categories"])
@@ -3730,8 +3737,10 @@ class AuditTest(BrokerBase):
         every case -- while the share goes whichever way the two counts take it.
 
         Times go forwards in every fixture: `at - seen <= AUDIT_WINDOW` counts a negative delta as
-        a repeat, which is a shape no writer produces, and a fixture that relies on it is measuring
-        the test rather than the tool."""
+        a repeat, and a fixture that relies on that is measuring the test rather than the tool. Not
+        "a shape no writer produces", which a review corrected -- `broker_log_call` stamps the line
+        before it takes the append lock, so two sessions on one host can interleave by up to the
+        lock budget. It changes none of the counts here (recomputed in time order: 1, 2, 2)."""
         hidden = "the objects inside the graphql call, counted"
         visible = [(0, "api graphql"), (10, "pr view pr:o/r#1"), (20, "pr view pr:o/r#1")]
         for name, batched, want in (
@@ -3766,6 +3775,43 @@ class AuditTest(BrokerBase):
         self.assertEqual(swapped["repeatsWithin"]["calls"] / swapped["calls"],
                          before["repeatsWithin"]["calls"] / before["calls"],
                          "a share that does not move when a hidden read replaces its own call")
+        # And the sentence is held to what was just measured, not only pinned as a literal string.
+        # A review rewrote the claim *and* the pinned copy together -- "always grows the
+        # denominator, so a share can only go down", round 5's "None of them is counted above", and
+        # the floor re-scoped to "what a cache could have answered" -- and the suite stayed green
+        # each time. That coupling is how every wrong claim in this PR's history got in.
+        text = self.audit_text(self.write_log(visible))
+        self.assertIn("can go up, down or stay where it is", text, text)
+        for refuted in ("can only go down", "None of them is counted above",
+                        "does grow the denominator", "a floor on what a cache could have answered"):
+            self.assertNotIn(refuted, text, f"a claim three rounds of review refuted: {refuted}")
+        # "the calls are counted above" means counted in the total the share is taken over, which
+        # is arithmetic rather than wording: take the graphql lines out and the total falls by
+        # exactly the number the sentence names.
+        batched = before["categories"]["raw gh api graphql"]
+        self.assertIn(f"{before['calls']} gh calls logged", text, text)
+        self.assertIn(f"{batched} of those calls was `gh api graphql`", text, text)
+        quiet = self.audit_json(self.write_log([line for line in visible if "graphql" not in line[1]]))
+        self.assertEqual(quiet["calls"], before["calls"] - batched)
+
+    def test_the_floor_is_over_one_set_of_calls(self) -> None:
+        """The sentence says "in this report", and this is the measurement that makes those three
+        words load-bearing rather than hedging.
+
+        `--last N` reports on the last N lines, so writing hidden reads out as separate lines
+        pushes older calls out of the window and the two reports are over different sets: the
+        repeat count *falls*, 1 to 0. Held to one set it cannot, because at most one repeat is
+        counted per line per target. Only a comment said so."""
+        visible = [(0, "pr view pr:o/r#1"), (10, "pr view pr:o/r#1"), (20, "api graphql")]
+        self.assertEqual(self.audit_json(self.write_log(visible))["repeatsWithin"]["calls"], 1)
+        written_out = self.write_log(visible + [(21, "pr view pr:o/r#9")])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.main(["audit", "--log", str(written_out), "--last", "3", "--json"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["repeatsWithin"]["calls"], 0,
+                         "the known limit: --last moves the window, so this is a different report")
+        # The whole log, which is one set of calls: it does not fall.
+        self.assertEqual(self.audit_json(written_out)["repeatsWithin"]["calls"], 1)
 
     def test_a_graphql_call_hides_reads_from_the_repeat_figure_and_the_report_says_so(self) -> None:
         """Coverage, not cost. An earlier version of this line said a batching caller "looks
@@ -3821,7 +3867,8 @@ class AuditTest(BrokerBase):
                          "the premise: twenty-one bigger categories push the row out of the table")
         self.assertEqual(sum(1 for i in range(21) if f"api repos/o/r/thing{i}" in crowded), 20,
                          "the table is the top twenty by count, which is the premise above")
-        self.assertIn("1 of those calls were `gh api graphql`", crowded, crowded)
+        # "was", for the one call: N=1 is the common case on a host that batches rarely.
+        self.assertIn("1 of those calls was `gh api graphql`", crowded, crowded)
         self.assertIn("44 gh calls logged", crowded, crowded)
         self.assertEqual(cost_claims(text), [], "the report is making a claim about cost again")
 
@@ -3856,6 +3903,15 @@ class AuditTest(BrokerBase):
         self.assertGreater(len(tail_priced.split("\n\n")[-1]), 300,
                            "the paragraph has to be long enough for its tail to be cut off")
         self.assertEqual(cost_claims(tail_priced), [r"\bpoints?\b"], tail_priced)
+        # The word boundaries, which the scoping hides: inside the last paragraph `point` fires on
+        # an ordinary logged path and `\bpoints?\b` does not. Asserted here because no report
+        # fixture can show it -- a category row is never in the last paragraph, so
+        # `test_the_word_ban_does_not_fire_on_an_ordinary_logged_path` passes on the scoping alone
+        # and `\bpoints?\b` -> `point` survived it (measured).
+        self.assertEqual(cost_claims("head\n\napi repos/o/endpoint-registry was read twice\n"), [],
+                         "the boundary is what keeps an endpoint path out of the ban")
+        self.assertEqual(cost_claims("head\n\nthat read cost a point\n"), [r"\bpoints?\b"],
+                         "and the boundary still catches the word itself")
 
     def test_the_word_ban_does_not_fire_on_an_ordinary_logged_path(self) -> None:
         """Both halves of the scoping, demonstrated rather than asserted away.
@@ -4038,6 +4094,9 @@ class BrokerRepeatTest(BrokerBase):
         for args in (["api", "rate_limit"], ["api", "/rate_limit"],
                      ["api", "https://api.github.com/rate_limit"],
                      ["api", "https://ghe.example/api/rate_limit"],
+                     # GHE's REST base is /api/v3/, so this is the one a GHE session really sends;
+                     # with `/api/` alone it was held 29.9 s on the second call.
+                     ["api", "https://ghe.example/api/v3/rate_limit"],
                      ["pr", "view", "9", "-R", "o/r", "--web"]):
             with self.subTest(args=args):
                 self.run_gh(args)
@@ -4047,7 +4106,8 @@ class BrokerRepeatTest(BrokerBase):
         # path *under* the free endpoint on a GHE host, so the widening is a spelling of one
         # endpoint and not a hole.
         for args in (["api", "repos/o/r/pulls/9"],
-                     ["api", "https://ghe.example/api/rate_limit/history"]):
+                     ["api", "https://ghe.example/api/rate_limit/history"],
+                     ["api", "https://ghe.example/api/v3/rate_limit/history"]):
             with self.subTest(args=args):
                 before = len(self.slept)
                 self.run_gh(args)

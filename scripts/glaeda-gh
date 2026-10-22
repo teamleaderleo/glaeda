@@ -4312,15 +4312,27 @@ def broker_caller() -> str:
 # drained the pool three times in a day, not a toll on reading.
 BROKER_THROTTLED = {("pr", "view"), ("pr", "checks"), ("pr", "list"),
                     ("run", "view"), ("run", "list"), ("issue", "list")}
+
+
 def endpoint_re(name: str) -> "re.Pattern[str]":
     """One top-level API endpoint, however `gh api` was given it: bare, rooted, or an absolute URL.
 
-    Any host, not `api.github.com` alone: this file handles GHE remotes deliberately, and a GHE
-    endpoint lives under `/api/`. Pinning the one host meant `https://ghe.example/api/graphql` read
-    as an ordinary path -- undercounting the audit's category, and (through `BROKER_FREE_RE`)
-    holding a GHE host's free `rate_limit` read behind the repeat delay. One function, so widening
-    one endpoint's spellings cannot leave the other behind again."""
-    return re.compile(rf"^(?:https?://[^/]+/(?:api/)?)?/?{name}/?$")
+    Any host, not `api.github.com` alone: this file handles GHE remotes deliberately. Pinning the
+    one host meant `https://ghe.example/api/graphql` read as an ordinary path -- undercounting the
+    audit's category, and (through `BROKER_FREE_RE`) holding a GHE host's free `rate_limit` read
+    behind the repeat delay. One function, so widening one endpoint's spellings cannot leave the
+    other behind again.
+
+    Both of a GHE host's bases, because they are not the same one and an earlier version of this
+    said they were: GraphQL is at `/api/graphql` and REST is under `/api/v3/`, so
+    `https://ghe.example/api/v3/rate_limit` is the spelling a GHE host actually serves for the free
+    call -- and with `/api/` alone it was still filed as an ordinary path and still held 30 s, which
+    is the defect this helper claimed to have removed (measured by a review: 0.0 s then 29.9 s).
+    `/api/rate_limit` stays matched too; it 404s on GHE, so matching it costs nothing.
+
+    `re.escape`, because this reads as the general helper and a name with a `.` or a `+` in it
+    would quietly widen the pattern."""
+    return re.compile(rf"^(?:https?://[^/]+/(?:api/(?:v3/)?)?)?/?{re.escape(name)}/?$")
 
 
 # `GET /rate_limit` is documented as costing neither pool, and this file already treats it as free
@@ -4857,11 +4869,17 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
         # holds both ways.
         # The floor is over the calls in *this report*. With `--last N` the window is the last N
         # lines, so writing hidden reads out as separate lines pushes older ones out and the
-        # comparison runs over two different sets of calls. Held to one set it is monotone: a review
-        # found no counterexample in 4000 random insertions, for repeats, reads and calls alike.
+        # comparison runs over two different sets of calls -- measured, and pinned as a known limit
+        # by test_the_floor_is_over_one_set_of_calls: 1 repeat becomes 0 under `--last 3`. Held to
+        # one set it cannot fall, because at most one repeat is counted per line per target, so the
+        # figure can never exceed the true same-target re-read count; two reviews found no
+        # counterexample, in 4000 and in 1800 random insertions, for repeats, reads and calls alike.
         # No pricing claim here on purpose -- this file is read as durable output, and a price is
         # the part that goes stale.
-        print(f"\n{batched} of those calls were `gh api graphql`, each carrying however many objects "
+        # "was" for one call: N=1 is the common case on a host that batches rarely, and it is what
+        # the crowded-table fixture prints.
+        print(f"\n{batched} of those calls {'was' if batched == 1 else 'were'} `gh api graphql`, "
+              f"each carrying however many objects "
               f"the caller asked for, which this cannot see. The calls are counted above; none of "
               f"the objects inside them is, so none of them is counted as a cacheable read or as a "
               f"repeat. That makes the repeat count a floor on the same-target re-reads a cache "
