@@ -3115,8 +3115,10 @@ time.sleep(60)
              valid: bool = True, role: str = "cmux_macos_native_build", receipt_toolchain: dict | None = None,
              hang: str | None = None, default: str = "1.98.1-aarch64-apple-darwin",
              installed: tuple = ("1.88.0-aarch64-apple-darwin", "1.98.1-aarch64-apple-darwin"),
-             python: str = "3.13", gh: bool = True) -> None:
-        """A fake Glaeda node under HOME (self.dir): enrollment, class receipt, staged CLI, toolchain."""
+             python: str = "3.13", gh: bool = True, sdk_path: str | None = None,
+             swiftc: str | None = None) -> None:
+        """A fake Glaeda node under HOME (self.dir): enrollment, class receipt, staged CLI, toolchain. xcrun answers
+        --show-sdk-path with sdk_path and `swiftc --version` with swiftc, and fails both when they are None."""
         config = self.dir / ".config/glaeda/cmux-fleet"
         (config / "class-acceptance").mkdir(parents=True, exist_ok=True)
         (config / "acceptance").mkdir(exist_ok=True)
@@ -3184,6 +3186,11 @@ else:
                 (cargo / name).unlink(missing_ok=True)
                 continue
             body = "sleep 60\n" if name == hang else f"cat <<'OUT'\n{text}\nOUT\n"
+            if name == "xcrun" and name != hang:
+                found = f"echo {shlex.quote(sdk_path)}" if sdk_path is not None else "exit 1"
+                swift = f"echo {shlex.quote(swiftc)}" if swiftc is not None else "exit 1"
+                body = (f'case "$*" in\n*--show-sdk-path*) {found} ;;\n*swiftc*) {swift} ;;\n'
+                        f"*) cat <<'OUT'\n{text}\nOUT\n;;\nesac\n")
             make_executable(cargo / name, f"#!/bin/sh\n{body}")
 
     def eligible_start(self) -> subprocess.CompletedProcess:
@@ -3357,12 +3364,229 @@ else:
         self.assertEqual(result.returncode, 1)
         self.assertIn("no Glaeda enrollment", result.stdout)
 
+    # ------------------------------------------------------------ the pool Xcode's toolchain (cmux21, 2026-10-21)
+
+    def xcode_start(self, **env: str) -> subprocess.CompletedProcess:
+        xcode = fake_xcode(self.dir)
+        return self.started("--require-eligible", "--fleet-class", "m4pro-48", "--toolchain-xcode", os.fspath(xcode),
+                            env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin",
+                                 "GLAEDA_RUNNER_XCODE_PROBE_TTL_S": "0", **env})
+
+    def test_a_host_whose_xcrun_resolves_the_command_line_tools_refuses(self) -> None:
+        """cmux21 (macOS 27): Command Line Tools 27 made xcrun resolve their MacOSX27 SDK and Swift 6.4 even with
+        DEVELOPER_DIR on Xcode_26.6, so cmux-next's fast tier failed "this SDK is not supported by the compiler"
+        (jobs 119519488456, 119553662726). job-started refuses such a host before any step runs."""
+        self.fleet()
+        xcode = fake_xcode(self.dir)
+        good = os.fspath(xcode / "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
+        self.node(sdk_path=good, swiftc=SWIFT_633)
+        github_env = self.dir / "github-env"
+        result = self.xcode_start(GITHUB_ENV=os.fspath(github_env))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"DEVELOPER_DIR={xcode / 'Contents/Developer'}\n", github_env.read_text(),
+                      "every later step of the job runs on the pool Xcode")
+        self.done()
+        clt = fake_clt(self.dir)
+        self.node(sdk_path=os.fspath(clt), swiftc=SWIFT_64)
+        result = self.xcode_start()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(f"refused: toolchain: xcrun resolves {clt} outside Xcode_26.6", result.stdout)
+        self.assertIn("Swift 6.4", result.stdout)
+        self.assertTrue(self.lock_free(), "a refused job never keeps the host lock")
+
+    def test_a_toolchain_probe_that_answers_nothing_does_not_refuse(self) -> None:
+        # a loaded mini's xcrun that times out is no verdict: the exact-string drift check still runs
+        self.fleet()
+        self.node()  # xcrun fails --show-sdk-path and swiftc
+        result = self.xcode_start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.done()
+
+    def test_a_listener_env_that_carries_a_foreign_sdkroot_refuses(self) -> None:
+        """The runner gate ran under the /usr/bin/python3 xcrun shim, which exported SDKROOT, and passed it to
+        Runner.Listener, so every job inherited the Command Line Tools SDK (and, once that was moved aside, the
+        job-started hook itself failed to start: job 119553581129)."""
+        self.fleet()
+        xcode = fake_xcode(self.dir)
+        self.node(sdk_path=os.fspath(xcode / "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"),
+                  swiftc=SWIFT_633)
+        result = self.xcode_start(SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("refused: toolchain: the runner's environment sets "
+                      "SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", result.stdout)
+        inside = os.fspath(xcode / "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
+        result = self.xcode_start(SDKROOT=inside)
+        self.assertEqual(result.returncode, 0, "an SDKROOT inside the pool Xcode is the pool's SDK\n" + result.stdout)
+        self.done()
+
     def test_decide_is_pure_table(self) -> None:
         for name, (event_name, payload, admitted) in SAMPLE_EVENTS.items():
             with self.subTest(name):
                 ok, _ = hook.decide(event_name, payload, (payload.get("repository") or {}).get("full_name"),
                                     ["manaflow-ai/cmux"], None)
                 self.assertEqual(ok, admitted)
+
+
+SWIFT_633 = ("swift-driver version: 1.127.14.1 Apple Swift version 6.3.3 (swiftlang-6.3.3.1.2 clang-1700.6.3.2)\n"
+             "Target: arm64-apple-macosx27.0")
+SWIFT_64 = ("swift-driver version: 1.140.2 Apple Swift version 6.4 (swiftlang-6.4.0.10.4 clang-1800.2.6.1)\n"
+            "Target: arm64-apple-macosx27.0")
+
+
+def fake_xcode(base: Path, swift: str = SWIFT_633, sdk: str = "26.5") -> Path:
+    """BASE/Xcode_26.6.app with a MacOSX SDK (SDKSettings.json Version SDK) and the default toolchain's swiftc."""
+    app = base / "Xcode_26.6.app"
+    developer = app / "Contents/Developer"
+    sdks = developer / "Platforms/MacOSX.platform/Developer/SDKs"
+    (sdks / f"MacOSX{sdk}.sdk").mkdir(parents=True, exist_ok=True)
+    (sdks / f"MacOSX{sdk}.sdk/SDKSettings.json").write_text(json.dumps({"Version": sdk}))
+    if not (sdks / "MacOSX.sdk").exists():
+        (sdks / "MacOSX.sdk").symlink_to(f"MacOSX{sdk}.sdk")
+    swiftc = developer / "Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+    swiftc.parent.mkdir(parents=True, exist_ok=True)
+    make_executable(swiftc, f"#!/bin/sh\ncat <<'OUT'\n{swift}\nOUT\n")
+    return app
+
+
+def fake_clt(base: Path, sdk: str = "27.0") -> Path:
+    """A Command Line Tools MacOSX SDK under BASE (SDKSettings.json Version SDK)."""
+    path = base / "CommandLineTools/SDKs/MacOSX.sdk"
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "SDKSettings.json").write_text(json.dumps({"Version": sdk}))
+    return path
+
+
+class XcodeToolchainTest(unittest.TestCase):
+    """The pool Xcode's toolchain: the listener's env, and the check that a host's xcrun resolves inside it."""
+
+    XCODE = "/Applications/Xcode_26.6.app"
+    CLT_SDK = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+
+    def setUp(self) -> None:
+        self.tmp = Path(os.path.realpath(tempfile.mkdtemp()))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_the_listener_env_drops_sdkroot_and_toolchains_and_pins_the_pool_xcode(self) -> None:
+        environ = {"PATH": "/opt/homebrew/bin:/usr/bin", "SDKROOT": self.CLT_SDK, "TOOLCHAINS": "swift",
+                   "DEVELOPER_DIR": "/Library/Developer/CommandLineTools", "HOME": "/Users/cmux"}
+        self.assertEqual(hook.listener_env(environ, self.XCODE),
+                         {"PATH": "/opt/homebrew/bin:/usr/bin", "HOME": "/Users/cmux",
+                          "DEVELOPER_DIR": "/Applications/Xcode_26.6.app/Contents/Developer"})
+        self.assertEqual(hook.listener_env(environ, None),
+                         {"PATH": "/opt/homebrew/bin:/usr/bin", "HOME": "/Users/cmux",
+                          "DEVELOPER_DIR": "/Library/Developer/CommandLineTools"},
+                         "a runner without a pool Xcode keeps its DEVELOPER_DIR")
+        self.assertIn("SDKROOT", environ, "a copy: the caller's mapping is left alone")
+
+    def test_swift_versions_are_read_from_swiftc(self) -> None:
+        self.assertEqual(hook.swift_version(SWIFT_633), "6.3.3")
+        self.assertEqual(hook.swift_version(SWIFT_64), "6.4")
+        self.assertEqual(hook.swift_version("Apple Swift version 6.3 (swift-6.3-RELEASE)"), "6.3")
+        self.assertIsNone(hook.swift_version(""))
+        self.assertIsNone(hook.swift_version("26.5"))
+
+    def test_mismatch_is_decided_from_the_facts_alone(self) -> None:
+        xcode_sdk = f"{self.XCODE}/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+        good = {"sdkPath": xcode_sdk, "swift": "6.3.3", "xcodeSwift": "6.3.3", "sdkVersion": "26.5",
+                "xcodeSdkVersion": "26.5"}
+        self.assertIsNone(hook.xcode_mismatch(self.XCODE, good))
+        cmux21 = {"sdkPath": self.CLT_SDK, "swift": "6.4", "xcodeSwift": "6.3.3", "sdkVersion": "27.0",
+                  "xcodeSdkVersion": "26.5"}
+        why = hook.xcode_mismatch(self.XCODE, cmux21)
+        self.assertTrue(why.startswith(f"toolchain: xcrun resolves {self.CLT_SDK} outside Xcode_26.6"), why)
+        self.assertIn("xcrun swiftc is Swift 6.4, Xcode_26.6's is 6.3.3", why)
+        self.assertIn("SDK 27.0 is newer than Xcode_26.6's SDK 26.5", why)
+        cases = {
+            "swift only": ({"swift": "6.4"}, "xcrun swiftc is Swift 6.4"),
+            "newer sdk only": ({"sdkVersion": "27.0"}, "SDK 27.0 is newer"),
+            "a point release of the same sdk": ({"sdkVersion": "26.6"}, None),
+            "an older sdk inside xcode": ({"sdkVersion": "26.2"}, None),
+            "a sibling Xcode's sdk": ({"sdkPath": xcode_sdk.replace("Xcode_26.6", "Xcode_26.6-beta")}, "outside"),
+            "no sdk path (a timeout)": ({"sdkPath": ""}, None),
+            "not a path": ({"sdkPath": "26.5"}, None),
+            "no swift version": ({"swift": None}, None),
+            "no xcode swift version": ({"xcodeSwift": None, "swift": "6.4"}, None),
+            "unreadable sdk settings": ({"sdkVersion": None}, None),
+        }
+        for name, (change, want) in cases.items():
+            with self.subTest(name):
+                got = hook.xcode_mismatch(self.XCODE, {**good, **change})
+                if want is None:
+                    self.assertIsNone(got)
+                else:
+                    self.assertIn(want, got or "")
+
+    def test_a_foreign_sdkroot_or_toolchains_in_an_env_is_named(self) -> None:
+        inside = f"{self.XCODE}/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+        self.assertIsNone(hook.leaked_toolchain_env({"PATH": "/usr/bin"}, self.XCODE))
+        self.assertIsNone(hook.leaked_toolchain_env({"SDKROOT": inside}, self.XCODE))
+        self.assertEqual(hook.leaked_toolchain_env({"SDKROOT": self.CLT_SDK}, self.XCODE),
+                         f"toolchain: the runner's environment sets SDKROOT={self.CLT_SDK}, outside Xcode_26.6")
+        self.assertIn("TOOLCHAINS=swift", hook.leaked_toolchain_env({"TOOLCHAINS": "swift"}, self.XCODE))
+        self.assertIn("SDKROOT=", hook.leaked_toolchain_env({"SDKROOT": inside}, None),
+                      "without a pool Xcode any SDKROOT is foreign")
+
+    def probe_env(self, sdk_path: str | None, swiftc: str | None, hang: bool = False) -> dict[str, str]:
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        found = "sleep 30" if hang else f"echo {shlex.quote(sdk_path)}" if sdk_path is not None else "exit 1"
+        swift = f"cat <<'OUT'\n{swiftc}\nOUT" if swiftc is not None else "exit 1"
+        make_executable(bin_dir / "xcrun", f'#!/bin/sh\nenv > {self.tmp / "xcrun.env"}\n'
+                        f'case "$*" in\n*--show-sdk-path*) {found} ;;\n*swiftc*) {swift} ;;\n*) exit 1 ;;\nesac\n')
+        return {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": os.fspath(self.tmp), "SDKROOT": self.CLT_SDK,
+                "TOOLCHAINS": "swift"}
+
+    def test_the_probe_runs_xcrun_in_the_clean_env_and_refuses_a_definite_mismatch(self) -> None:
+        xcode = fake_xcode(self.tmp)
+        sdk = xcode / "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+        cache = self.tmp / "cache.json"
+        env = self.probe_env(os.fspath(sdk), SWIFT_633)
+        self.assertIsNone(hook.xcode_refusal(os.fspath(xcode), env, cache=cache))
+        seen = dict(line.split("=", 1) for line in (self.tmp / "xcrun.env").read_text().splitlines() if "=" in line)
+        self.assertNotIn("SDKROOT", seen)
+        self.assertNotIn("TOOLCHAINS", seen)
+        self.assertEqual(seen["DEVELOPER_DIR"], os.fspath(xcode / "Contents/Developer"))
+        clt = fake_clt(self.tmp)
+        env = self.probe_env(os.fspath(clt), SWIFT_64)
+        self.assertIsNone(hook.xcode_refusal(os.fspath(xcode), env, cache=cache),
+                          "a pass is reused for XCODE_PROBE_TTL_S")
+        why = hook.xcode_refusal(os.fspath(xcode), env, cache=cache, ttl=0)
+        self.assertIn(f"xcrun resolves {clt} outside Xcode_26.6", why)
+        self.assertIn("SDK 27.0 is newer than Xcode_26.6's SDK 26.5", why)
+        cache.unlink()
+        self.assertIsNotNone(hook.xcode_refusal(os.fspath(xcode), env, cache=cache))
+        self.assertFalse(cache.exists(), "a refusal is never cached: every look and recheck probes again")
+
+    def test_a_probe_that_hangs_answers_within_its_budget_and_does_not_refuse(self) -> None:
+        xcode = fake_xcode(self.tmp)
+        env = self.probe_env(None, None, hang=True)
+        start = time.monotonic()
+        self.assertIsNone(hook.xcode_refusal(os.fspath(xcode), env, cache=self.tmp / "cache.json",
+                                             deadline=time.monotonic() + 1.0))
+        self.assertLess(time.monotonic() - start, 10)
+
+    def test_the_runner_xcode_is_the_job_started_hooks_toolchain_xcode(self) -> None:
+        runner = self.tmp / "actions-runner-glaeda-1"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        self.assertIsNone(hook.runner_xcode(runner))
+        script = runner / hook.RUNNER_HOOK_SCRIPT
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai "
+                          "--require-eligible --fleet-class m6-16 --toolchain-xcode '/Applications/Xcode 26.app'\n")
+        self.assertEqual(hook.runner_xcode(runner), "/Applications/Xcode 26.app")
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai\n")
+        self.assertIsNone(hook.runner_xcode(runner))
+
+    def test_an_adopted_listener_is_stale_unless_it_was_started_clean(self) -> None:
+        dev = f"{self.XCODE}/Contents/Developer"
+        self.assertIsNone(hook.adopted_env_stale("clean", {"SDKROOT": self.CLT_SDK}, self.XCODE),
+                          "a gate that started it with the clean env says so across the reload")
+        self.assertEqual(hook.adopted_env_stale("SDKROOT was set", {}, self.XCODE), "SDKROOT was set")
+        self.assertIsNone(hook.adopted_env_stale(None, {"DEVELOPER_DIR": dev}, self.XCODE))
+        self.assertIn("SDKROOT=", hook.adopted_env_stale(None, {"SDKROOT": self.CLT_SDK, "DEVELOPER_DIR": dev},
+                                                        self.XCODE))
+        self.assertIn("DEVELOPER_DIR", hook.adopted_env_stale(None, {}, self.XCODE),
+                      "a listener from before the gate pinned DEVELOPER_DIR")
+        self.assertIsNone(hook.adopted_env_stale(None, {}, None))
 
 
 FAKE_LISTENER = """#!/usr/bin/env python3
@@ -4268,6 +4492,43 @@ class GateTest(unittest.TestCase):
             gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
             self.assertIsNone(gate.claimed(), "no --require-eligible: never held for eligibility")
             look.assert_not_called()
+
+    def test_the_listener_starts_without_sdkroot_and_on_the_pool_xcode(self) -> None:
+        """cmux21: the gate ran under the /usr/bin/python3 xcrun shim, which put SDKROOT in its env, and run.sh
+        inherited it, so every job built against the Command Line Tools SDK."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec /usr/bin/python3 /hook job-started --require-eligible --fleet-class m6-16 "
+                          "--toolchain-xcode /Applications/Xcode_26.6.app --instance 1\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        leaked = {"SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", "TOOLCHAINS": "swift"}
+        with mock.patch.dict(os.environ, leaked), mock.patch.object(hook.subprocess, "Popen") as popen:
+            gate.start()
+        env = popen.call_args.kwargs["env"]
+        self.assertNotIn("SDKROOT", env)
+        self.assertNotIn("TOOLCHAINS", env)
+        self.assertEqual(env["DEVELOPER_DIR"], "/Applications/Xcode_26.6.app/Contents/Developer")
+        self.assertEqual(env["PATH"], os.environ["PATH"])
+        self.assertIsNone(gate.stale_env)
+
+    def test_an_adopted_listener_with_a_stale_env_is_restarted_once_idle(self) -> None:
+        """A gate that reloads from a hook before the clean env adopts a listener that still carries SDKROOT: the
+        stale env holds it like an ineligible node (stopped only while idle, by the usual stop), and the gate
+        starts a clean one. A gate that started its listener clean says so across a reload."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai --instance 1 "
+                          "--toolchain-xcode /Applications/Xcode_26.6.app\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        gate.child = mock.Mock(pid=4242)
+        gate.stale_env = "the runner's environment sets SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+        self.assertEqual(gate.ineligible(), f"listener env: {gate.stale_env}; restarting it on the pool Xcode's env")
+        gate.child = None
+        self.assertIsNone(gate.ineligible(), "a stopped listener is no longer stale: the next start() is clean")
+        with mock.patch.object(hook.subprocess, "Popen"):
+            gate.start()
+        self.assertIsNone(gate.stale_env)
+        self.assertIsNone(gate.ineligible())
 
     def test_every_runner_holds_while_free_disk_is_under_its_floor(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
@@ -5215,6 +5476,30 @@ class GateTest(unittest.TestCase):
         script.write_bytes(cr.hook_wrappers(ctx)["listen.sh"])
         script.chmod(0o755)
         return script
+
+    def test_listen_sh_clears_sdkroot_and_pins_the_pool_xcode(self) -> None:
+        text = self.listen_sh(sys.executable).read_text()
+        self.assertIn("unset SDKROOT TOOLCHAINS\n", text)
+        self.assertNotIn("DEVELOPER_DIR", text, "a runner with no pool Xcode keeps the host's")
+        ctx = mock.Mock(python=sys.executable, hook_dir=HOOK.parent, runner_dir=self.runner, org="manaflow-ai",
+                        repo=None, min_free_gib=0, capacity_units=4, labels=["glaeda-mini"], session_runner=False,
+                        member={"hardware": "m6-16", "xcodeApps": ["/Applications/Xcode_26.6.app"]})
+        text = cr.hook_wrappers(ctx)["listen.sh"].decode()
+        self.assertIn("export DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer\n", text)
+        self.assertLess(text.index("unset SDKROOT"), text.index("listen --runner-dir"))
+        self.assertLess(text.index("unset SDKROOT"), text.index("exec ./run.sh"), "the fallback run.sh is clean too")
+
+    def test_hooks_prefer_a_python_that_is_not_the_xcrun_shim(self) -> None:
+        brew = self.tmp / "brew-python3"
+        make_executable(brew, "#!/bin/sh\n")
+        with mock.patch.object(cr.shutil, "which", return_value="/usr/bin/python3"), \
+                mock.patch.object(cr, "HOOK_PYTHONS", (os.fspath(brew), "/usr/bin/python3")):
+            self.assertEqual(cr.hook_python(), os.fspath(brew))
+        with mock.patch.object(cr.shutil, "which", return_value="/opt/custom/bin/python3"):
+            self.assertEqual(cr.hook_python(), "/opt/custom/bin/python3", "a python3 on PATH that is not the shim")
+        with mock.patch.object(cr.shutil, "which", return_value=None), \
+                mock.patch.object(cr, "HOOK_PYTHONS", ("/nonexistent/python3", "/usr/bin/python3")):
+            self.assertEqual(cr.hook_python(), "/usr/bin/python3" if os.access("/usr/bin/python3", os.X_OK) else None)
 
     def test_listen_sh_runs_the_runner_without_a_gate_that_cannot_start(self) -> None:
         (self.runner / "run.sh").write_text(f"#!/bin/bash\necho plain run.sh > {self.tmp / 'ran'}\nexit 0\n")
