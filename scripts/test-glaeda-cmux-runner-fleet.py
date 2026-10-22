@@ -47,6 +47,39 @@ data = sys.stdin.read()
 open(log, "a").write(json.dumps({{"tool": "ssh", "host": host, "remote": remote, "stdin": data[:40]}}) + "\\n")
 if host in os.environ.get("FAKE_DOWN", "").split(","):
     sys.stderr.write("ssh: connect to host " + host + " port 22: Connection refused\\n"); sys.exit(255)
+# the member's gateway slot receipts: what --gateway K installs and --uninstall --gateway K removes
+slots_path = log + ".gateways.json"
+import fcntl
+slots_lock = open(slots_path + ".lock", "a")
+fcntl.flock(slots_lock, fcntl.LOCK_EX)  # the slots of one member apply at once: one read-modify-write at a time
+slots = json.load(open(slots_path)) if os.path.exists(slots_path) else {{}}
+def save_slots():
+    json.dump(slots, open(slots_path, "w"))
+if "instance-gateway-" in remote and "receipt.json" in remote and "--apply" not in remote:
+    # run it as sshd would, through a login shell (zsh, the minis' default, where there is one) over a home that
+    # holds this member's receipts, so a command a real shell refuses (zsh NOMATCH) fails here too
+    import shutil, subprocess
+    home = log + ".home." + host
+    state = home + "/.local/state/glaeda/cmux-runner"
+    if os.path.isdir(state):
+        os.chmod(state, 0o755)
+    shutil.rmtree(home, ignore_errors=True)
+    for k in slots.get(host, []):
+        os.makedirs(state + "/instance-gateway-" + str(k))
+        open(state + "/instance-gateway-" + str(k) + "/receipt.json", "w").write("{{}}")
+    if host in os.environ.get("FAKE_UNREADABLE", "").split(","):  # a state dir the listing cannot read
+        os.makedirs(state, exist_ok=True)
+        os.chmod(state, 0)
+    shell = shutil.which("zsh") or "/bin/sh"
+    sys.exit(subprocess.run([shell, "-c", remote], env={{**os.environ, "HOME": home}}).returncode)
+if "--uninstall --apply" in remote and "--gateway " in remote:
+    k = int(remote.split("--gateway ")[1].split()[0])
+    if data.strip() != "{token}":
+        print(json.dumps({{"actions": [{{"kind": "deregister", "state": "failed"}}]}})); sys.exit(1)
+    slots[host] = [x for x in slots.get(host, []) if x != k]
+    save_slots()
+    print(json.dumps({{"actions": [{{"kind": "deregister", "state": "removed"}}]}}))
+    sys.exit(0)
 if remote.startswith("head -c") and ".glaeda-source.json" in remote:
     stamps = json.loads(os.environ.get("FAKE_STAMPS", "{{}}"))
     print(stamps[host] if host in stamps else "@no-stamp"); sys.exit(0)
@@ -68,11 +101,18 @@ if "--apply" in remote and "--uninstall" not in remote and host in os.environ.ge
     print(json.dumps({{"actions": [{{"kind": "register", "state": "failed"}}, {{"kind": "verify", "state": "skipped"}}]}}))
     sys.exit(1)
 if "--apply" in remote:
+    fcntl.flock(slots_lock, fcntl.LOCK_UN)  # instances must still apply side by side (the parallelism test)
     time.sleep(float(os.environ.get("FAKE_APPLY_S", "0")))
-    k = remote.split("--instance ")[1].split()[0]
+    fcntl.flock(slots_lock, fcntl.LOCK_EX)
+    slots = json.load(open(slots_path)) if os.path.exists(slots_path) else {{}}
+    gateway = "--gateway " in remote
+    k = remote.split("--gateway " if gateway else "--instance ")[1].split()[0]
     ok = data.strip() == "{token}"
-    print(json.dumps({{"actions": [{{"kind": "register", "state": "create" if ok else "failed",
-                                    "name": host + "-glaeda" + ("" if k == "0" else "-" + k)}},
+    name = host + "-gateway-" + k if gateway else host + "-glaeda" + ("" if k == "0" else "-" + k)
+    if gateway and ok:
+        slots[host] = sorted(set(slots.get(host, [])) | {{int(k)}})
+        save_slots()
+    print(json.dumps({{"actions": [{{"kind": "register", "state": "create" if ok else "failed", "name": name}},
                                    {{"kind": "verify", "state": "ok" if ok else "failed"}}]}}))
     sys.exit(0 if ok else 1)
 sys.exit(0)
@@ -231,6 +271,119 @@ class FleetTest(unittest.TestCase):
                                "--format=%H %cd", "--date=format-local:%Y-%m-%d"],
                               capture_output=True, text=True, check=True).stdout.split()
         self.assertEqual((stamp["by"], stamp["source"], stamp["date"]), ("glaeda-cmux-runner-fleet", *head))
+
+    def test_gateway_slots_register_repo_scoped_and_carry_the_gateway_host_count(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"gatewayRunners": 2}}}
+        self.manifest.write_text(json.dumps(manifest))
+        result = self.fleet("--apply", "--gateway-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = {r["member"]: r for r in json.loads(result.stdout)["members"]}
+        self.assertEqual([(i["instance"], i["name"]) for i in rows["mini-a"]["instances"]],
+                         [("gateway-0", "mini-a-gateway-0"), ("gateway-1", "mini-a-gateway-1")])
+        applies = [c for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
+        self.assertEqual(len(applies), 4, "--gateway-only: the build instances are left alone")
+        self.assertTrue(all("--repo manaflow-ai/cmux" in c["remote"] and "--instance" not in c["remote"]
+                            and c["stdin"].strip() == TOKEN for c in applies))
+        staged = json.loads((self.dir / "calls.jsonl.mini-a.manifest").read_text())
+        self.assertEqual((set(staged["hosts"]), staged["gatewayHosts"]), ({"mini-a"}, 2),
+                         "a count of the members with slots, never their names")
+        # an org apply still registers the gateway slots to the repository, after the build instances
+        self.log.unlink()
+        result = self.fleet("--apply", "--org", "manaflow-ai", "--group", "glaeda-minis", FAKE_GROUPS=GROUP)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        applies = [c["remote"] for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
+        self.assertEqual(sum("--org manaflow-ai" in r and "--instance" in r for r in applies), 8)
+        self.assertEqual(sum("--repo manaflow-ai/cmux" in r and "--gateway" in r for r in applies), 4)
+        gh = [c["argv"][3] for c in self.calls() if c["tool"] == "gh" and len(c["argv"]) > 3]
+        self.assertEqual(gh.count("repos/manaflow-ai/cmux/actions/runners/registration-token"), 4)
+
+    def test_a_lower_gateway_count_removes_the_surplus_slots(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"gatewayRunners": 2}}}
+        self.manifest.write_text(json.dumps(manifest))
+        result = self.fleet("--apply", "--gateway-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        slots = self.dir / "calls.jsonl.gateways.json"
+        self.assertEqual(json.loads(slots.read_text()), {"mini-a": [0, 1], "mini-b": [0, 1]})
+
+        def removals() -> list[dict]:
+            return [c for c in self.calls() if c["tool"] == "ssh" and "--uninstall --apply" in c["remote"]]
+
+        self.assertEqual(removals(), [], "nothing to reconcile at the declared count")
+        # 2 -> 1: only slot 1 goes; a plan says so first and changes nothing
+        manifest["defaults"]["runner"]["classes"]["std"]["gatewayRunners"] = 1
+        self.manifest.write_text(json.dumps(manifest))
+        plan = json.loads(self.fleet().stdout)
+        self.assertEqual({r["member"]: r.get("gatewayRemovals") for r in plan["members"] if r["member"] != "mini-light"},
+                         {m: [{"instance": "gateway-1", "exit": None, "state": "would remove"}]
+                          for m in ("mini-a", "mini-b")})
+        self.assertEqual(removals(), [])
+        result = self.fleet("--apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(slots.read_text()), {"mini-a": [0], "mini-b": [0]})
+        self.assertTrue(all("--gateway 1 " in c["remote"] and c["stdin"].strip() == TOKEN for c in removals()))
+        # 1 -> 0 (removing the key): every slot goes, each with a remove token minted here and sent on stdin only
+        del manifest["defaults"]["runner"]
+        self.manifest.write_text(json.dumps(manifest))
+        self.log.unlink()
+        result = self.fleet("--apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(slots.read_text()), {"mini-a": [], "mini-b": []})
+        rows = {r["member"]: r for r in json.loads(result.stdout)["members"]}
+        self.assertEqual(rows["mini-a"]["gatewayRemovals"], [{"instance": "gateway-0", "exit": 0, "state": "removed"}])
+        gh = [c["argv"][3] for c in self.calls() if c["tool"] == "gh" and len(c["argv"]) > 3]
+        self.assertEqual(gh.count("repos/manaflow-ai/cmux/actions/runners/remove-token"), 2)
+        self.assertNotIn(TOKEN, json.dumps([c.get("argv", c.get("remote")) for c in self.calls()]))
+
+    def test_a_member_that_turns_trusted_loses_its_gateway_slots(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"gatewayRunners": 2}}}
+        self.manifest.write_text(json.dumps(manifest))
+        self.assertEqual(self.fleet("--apply", "--gateway-only").returncode, 0)
+        manifest["hosts"]["mini-a"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
+                                                              "trustedRepo": "manaflow-ai/cmux"}}
+        self.manifest.write_text(json.dumps(manifest))
+        # under --org a trusted member is skipped for its build instances, but its gateway slots still go
+        result = self.fleet("--apply", "--gateway-only", "--org", "manaflow-ai", "--group", "glaeda-minis",
+                            FAKE_GROUPS=GROUP)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads((self.dir / "calls.jsonl.gateways.json").read_text()),
+                         {"mini-a": [], "mini-b": [0, 1]})
+
+    def test_an_unreadable_receipt_listing_fails_the_apply(self) -> None:
+        """No state dir is no slots (the apply above), but a listing that cannot read it never reads as none: a
+        lower count would report success while the surplus slots stay registered."""
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-000 directory")
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"gatewayRunners": 1}}}
+        self.manifest.write_text(json.dumps(manifest))
+        result = self.fleet("--apply", "--gateway-only", FAKE_UNREADABLE="mini-a")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        rows = {r["member"]: r for r in json.loads(result.stdout)["members"]}
+        self.assertIn("cannot list gateway receipts", rows["mini-a"]["gatewayRemovals"][0]["state"])
+        self.assertEqual(rows["mini-a"]["action"], "failed")
+        self.assertNotIn("gatewayRemovals", rows["mini-b"])
+
+    def test_a_failed_removal_fails_the_apply(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"gatewayRunners": 1}}}
+        self.manifest.write_text(json.dumps(manifest))
+        self.assertEqual(self.fleet("--apply", "--gateway-only").returncode, 0)
+        del manifest["defaults"]["runner"]
+        self.manifest.write_text(json.dumps(manifest))
+        tools = self.dir / "bin"
+        real_gh = (tools / "gh").read_text()
+        (tools / "gh").write_text(real_gh.replace('else:\n    print("', 'elif path.endswith("remove-token"):\n'
+                                                  '    sys.exit(1)\nelse:\n    print("', 1))
+        result = self.fleet("--apply")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        rows = {r["member"]: r for r in json.loads(result.stdout)["members"]}
+        self.assertEqual(rows["mini-a"]["action"], "failed")
+        self.assertIn("no remove token", rows["mini-a"]["gatewayRemovals"][0]["state"])
+        self.assertEqual(json.loads((self.dir / "calls.jsonl.gateways.json").read_text())["mini-a"], [0],
+                         "left installed for the next apply")
 
     def test_org_migration_goes_one_member_at_a_time_and_skips_trusted(self) -> None:
         manifest = json.loads(json.dumps(MANIFEST))
