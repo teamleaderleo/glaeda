@@ -1616,49 +1616,71 @@ class Daemon:
 
     def serve_waits(self) -> int:
         """Rule on the `wait pr|run` requests clients left in waits/ (subscribe_wait): keep their interest
-        registered, and when one is decided or out of time write what it prints, then wake its blocker
-        with the exit code. A request whose blocker is gone is dropped. Returns how many are pending."""
+        registered, and when one is decided or out of time write what it prints and its exit code, then
+        wake its blocker with the code. waits/.served tells the blockers waits are being ruled on. A
+        request whose blocker is gone, or that cannot be read, is dropped. Returns how many are pending."""
         d = waits_dir()
         if not d.is_dir():
             return 0
+        with contextlib.suppress(OSError):
+            (d / ".served").touch()
         now = time.time()  # requests carry wall-clock times, whatever clock a tick was given
-        pending = 0
+        pending, touch = 0, {}
         for path in sorted(d.glob("*.json")):
-            rid, req = path.stem, read_json(path)
-            if not isinstance(req, dict) or not waiter_alive(req.get("pid")) or not (d / f"{rid}.fifo").exists():
+            rid = path.stem
+            try:
+                req = read_json(path)
+                decided = self.serve_wait(d, rid, req, now, touch)
+            except Exception:  # noqa: BLE001  a request that cannot be ruled on must not stop the others
                 drop_wait(rid)
                 continue
-            if req.get("code") is None:
-                before = dict(req)
-                if now - float(req.get("touched") or 0) >= TOUCH_EVERY:
-                    register(req["key"], bool(req.get("jobs")))
-                    req["touched"] = now
-                try:
-                    done = wait_step(req, now)
-                    err = ""
-                except WatchError as error:
-                    done, err = (64, ""), f"glaeda-gh: {error}\n"
-                except Exception as error:  # noqa: BLE001  one bad request must not stop the others
-                    done, err = (64, ""), f"glaeda-gh: the daemon could not rule on this wait: {describe(error)}\n"
-                if done is not None:
-                    (d / f"{rid}.out").write_text(done[1])
-                    if err:
-                        (d / f"{rid}.out.err").write_text(err)
-                    req["code"] = done[0]
-                if req != before:
-                    write_json(path, req)
-            if req.get("code") is None:
+            if decided is None:
                 pending += 1
-            elif wake_waiter(d / f"{rid}.fifo", int(req["code"])):
-                with contextlib.suppress(OSError):
-                    path.unlink()  # the blocker prints .out and removes the rest
-        # What a blocker killed after its wake left behind: files with no request, of a gone process.
-        for left in d.glob("*.fifo"):
+        # One registration per key, all under one bound: a wedged holder of .register.lock costs a tick
+        # LOCK_WAIT, not LOCK_WAIT per waiter.
+        with lock_budget(LOCK_WAIT):
+            for key, jobs in touch.items():
+                register(key, jobs)
+        # What a blocker killed after its wake, or a wait handed back to Python, left behind.
+        for left in d.glob("*.*"):
             rid = left.name.split(".", 1)[0]
             pid = rid.split("-", 1)[0]
-            if not (d / f"{rid}.json").exists() and not (pid.isdigit() and waiter_alive(int(pid))):
+            if rid and not (d / f"{rid}.json").exists() and not (pid.isdigit() and waiter_alive(int(pid))):
                 drop_wait(rid)
         return pending
+
+    def serve_wait(self, d: Path, rid: str, req: Any, now: float, touch: dict[str, bool]) -> bool | None:
+        """One request: None while pending, else whether its blocker was woken. Raises on a bad one."""
+        if (not isinstance(req, dict) or not waiter_alive(req.get("pid")) or not (d / f"{rid}.fifo").exists()
+                or now > float(req["began"]) + float(req["timeout"]) + WAITS_LEFTOVER):
+            drop_wait(rid)
+            return False
+        if req.get("code") is None:
+            before = dict(req)
+            if now - float(req.get("touched") or 0) >= TOUCH_EVERY:
+                touch[req["key"]] = touch.get(req["key"], False) or bool(req.get("jobs"))
+                req["touched"] = now
+            try:
+                done, err = wait_step(req, now), ""
+            except WatchError as error:
+                done, err = (64, ""), f"glaeda-gh: {error}\n"
+            except Exception as error:  # noqa: BLE001  said to the waiter, not raised into the tick
+                done, err = (64, ""), f"glaeda-gh: the daemon could not rule on this wait: {describe(error)}\n"
+            if done is not None:
+                if err:
+                    (d / f"{rid}.out.err").write_text(err)
+                (d / f"{rid}.out").write_text(done[1])
+                (d / f"{rid}.out.rc").write_text(f"{done[0]}\n")
+                req["code"] = done[0]
+            if req != before:
+                write_json(d / f"{rid}.json", req)
+            if req.get("code") is None:
+                return None
+        if wake_waiter(d / f"{rid}.fifo", int(req["code"])):
+            with contextlib.suppress(OSError):
+                (d / f"{rid}.json").unlink()  # the blocker prints .out and removes the rest
+            return True
+        return False
 
     def batched(self, kind: str, entries: list[dict], fetch: Callable[[list[dict]], str | None]) -> None:
         """Read `entries` over GraphQL in queries of self.batch[kind]. A query that times out (504)
@@ -3028,8 +3050,14 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
     exact = True
     if sha:
         sha, exact = resolve_sha(sha)
-    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace)
-    start = time.monotonic()
+    return poll_wait(wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace))
+
+
+def poll_wait(req: dict) -> int:
+    """Re-read the cache until wait_step decides REQ, saying what a down, failing or stale daemon means.
+    A wait the daemon stopped ruling on (resume_wait) carries on here, from when it began."""
+    timeout, jobs = req["timeout"], req["jobs"]
+    start = time.monotonic() - max(0.0, time.time() - req["began"])
     touched = -TOUCH_EVERY
     warned = False
     down, down_since = DownWait(), None
@@ -3061,31 +3089,44 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
 
 
 WAITS_CONTRACT = 1  # daemon.json "waits": this daemon rules on `wait pr|run` requests (Daemon.serve_waits)
-WAITS_SLACK = 120  # the blocker gives the daemon this long past the wait's timeout to say so itself
+WAITS_CHECK = 60  # a blocker hands its wait back to Python when no tick has ruled on waits for this long
+WAITS_LEFTOVER = 600  # a request this far past its deadline has no blocker left (a reused pid): dropped
+WAITS_MAX_TIMEOUT = 1e8  # longer (or inf) waits poll, as before: bash keeps time in whole seconds
 BASH = "/bin/bash"
 # The whole waiter once the request is written: bash blocked reading the FIFO until the daemon writes
 # the exit code (Daemon.serve_waits), then what the wait prints. `3<>` opens without waiting for a
-# writer, so `read -t` bounds the whole wait; a daemon that never answers ends it with EXIT_DOWN.
-BLOCKER = r"""fifo=$1 out=$2 limit=$3 req=$4
-exec 3<>"$fifo" || exit 3
+# writer. Every WAITS_CHECK it looks at waits/.served, which each tick's serve_waits touches; at the
+# wait's deadline, or once no tick has served waits since its last look (the daemon is down, failing,
+# stuck in a long tick, or an older one), it execs "$@": `glaeda-gh wait-resume ID` (resume_wait).
+BLOCKER = r"""fifo=$1 out=$2 limit=$3 served=$4 check=$5
+shift 5
+mark=$out.mark
+exec 3<>"$fifo" || exec "$@"
+: > "$mark"
+end=$((SECONDS + limit))
 rc=
-IFS= read -r -t "$limit" rc <&3
+while :; do
+  left=$((end - SECONDS))
+  [ "$left" -gt 0 ] || break
+  [ "$left" -gt "$check" ] && left=$check
+  IFS= read -r -t "$left" rc <&3 && break
+  rc=
+  [ "$served" -nt "$mark" ] || break
+  : > "$mark"
+done
 exec 3<&-
-case "$rc" in
-  ''|*[!0-9]*)
-    rm -f "$req" "$fifo" "$out" "$out.err"
-    echo "glaeda-gh: the daemon did not answer this wait within ${limit}s: it is down or hung (glaeda-gh budget says which; glaeda-gh restart if hung)" >&2
-    exit 3 ;;
-esac
+rm -f "$mark"
+case "$rc" in ''|*[!0-9]*) exec "$@" ;; esac
 [ -f "$out.err" ] && cat "$out.err" >&2
 [ -f "$out" ] && cat "$out"
-rm -f "$fifo" "$out" "$out.err"
+rm -f "$fifo" "$out" "$out.err" "$out.rc"
 exit "$rc"
 """
+WAIT_FILES = (".json", ".fifo", ".out", ".out.err", ".out.rc", ".out.mark")
 
 
 def waits_dir() -> Path:
-    return BASE / "waits"  # `wait pr|run` requests the daemon rules on: <id>.json, .fifo, .out, .out.err
+    return BASE / "waits"  # `wait pr|run` requests the daemon rules on: <id>.json, .fifo, .out, .out.rc, ...
 
 
 def write_wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
@@ -3101,34 +3142,70 @@ def write_wait_request(kind: str, target: str, until: str, timeout: float, jobs:
     return rid
 
 
+def serving_waits() -> bool:
+    """Whether the daemon runs, rules on waits (WAITS_CONTRACT), and is neither failing nor hung."""
+    status = read_json(BASE / "daemon.json") or {}
+    return (isinstance(status.get("waits"), int) and status["waits"] >= WAITS_CONTRACT and lock_held()
+            and daemon_failing() is None and daemon_stale() is None)
+
+
 def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
                    sha: str | None = None, grace: float = RESCUE_GRACE) -> int:
     """`wait pr|run` as a request the daemon rules on: this process writes it and becomes BLOCKER, a bash
     asleep on a FIFO, instead of a Python interpreter re-reading the cache every WAIT_POLL (89 of those
     held 1.6 GB on cosmic-gray, 2026-10-21). Same arguments, output and exit codes as cmd_wait, which it
-    falls back to when the daemon is down, failing or older than WAITS_CONTRACT, or there is no bash."""
-    status = read_json(BASE / "daemon.json") or {}
-    if (not isinstance(status.get("waits"), int) or status["waits"] < WAITS_CONTRACT or not os.access(BASH, os.X_OK)
-            or not daemon_running(grace=DOWN_GRACE) or daemon_failing() is not None):
+    falls back to when the daemon is not serving waits (down, failing, hung or older than WAITS_CONTRACT),
+    there is no bash, or the timeout is not a finite number of seconds bash can count."""
+    if not (0 <= timeout <= WAITS_MAX_TIMEOUT) or not os.access(BASH, os.X_OK) or not serving_waits():
         return cmd_wait(kind, target, until, timeout, jobs, as_json, sha, grace)
     parse_key(kind, target)
     exact = True
     if sha:
         sha, exact = resolve_sha(sha)
-    lag = daemon_stale()
-    if lag is not None:
-        print(stale_message(lag), file=sys.stderr)
     try:
         rid = write_wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, os.getpid())
     except OSError:
         return cmd_wait(kind, target, until, timeout, jobs, as_json, sha, grace)
+    block(rid, timeout)
+    return EXIT_DOWN  # not reached
+
+
+def block(rid: str, left: float) -> None:
+    """Become BLOCKER for request RID, with LEFT seconds to its deadline. The same pid carries on: the
+    daemon tells a gone waiter by it."""
     d = waits_dir()
     sys.stdout.flush()
     sys.stderr.flush()
-    # The same pid carries on as the blocker: the daemon tells a gone waiter by it.
     os.execv(BASH, [BASH, "-c", BLOCKER, "glaeda-gh-wait", os.fspath(d / f"{rid}.fifo"), os.fspath(d / f"{rid}.out"),
-                    str(int(timeout) + 1 + WAITS_SLACK), os.fspath(d / f"{rid}.json")])
-    return EXIT_DOWN  # not reached
+                    str(max(1, int(left + 0.999))), os.fspath(d / ".served"), str(WAITS_CHECK),
+                    sys.executable, os.path.abspath(__file__), "wait-resume", rid])
+
+
+def resume_wait(rid: str) -> int:
+    """Where BLOCKER hands a wait back: at its deadline, or once no tick has ruled on waits for WAITS_CHECK.
+    The daemon's answer if it left one; else back to sleep while the daemon serves waits and time is left;
+    else on as the polling wait (poll_wait), which says what a down, failing or stale daemon means and
+    rules on the timeout itself."""
+    d = waits_dir()
+    with contextlib.suppress(OSError, ValueError):
+        code = int((d / f"{rid}.out.rc").read_text())
+        with contextlib.suppress(OSError):
+            sys.stderr.write((d / f"{rid}.out.err").read_text())
+        with contextlib.suppress(OSError):
+            sys.stdout.write((d / f"{rid}.out").read_text())
+        drop_wait(rid)
+        return code
+    req = read_json(d / f"{rid}.json")
+    if not isinstance(req, dict) or not all(k in req for k in ("key", "kind", "began", "timeout", "until", "grace")):
+        drop_wait(rid)
+        print("glaeda-gh: this wait's request is gone; run the wait again", file=sys.stderr)
+        return EXIT_DOWN
+    left = float(req["began"]) + float(req["timeout"]) - time.time()
+    if left > 0 and serving_waits():
+        register(req["key"], bool(req.get("jobs")))
+        block(rid, left)
+    drop_wait(rid)
+    return poll_wait(req)
 
 
 def waiter_alive(pid: Any) -> bool:
@@ -3145,7 +3222,8 @@ def waiter_alive(pid: Any) -> bool:
 
 
 def wake_waiter(fifo: Path, code: int) -> bool:
-    """Write the exit code to a blocker's FIFO. False while no blocker has it open (not started yet)."""
+    """Write the exit code to a blocker's FIFO. False while no blocker has it open (not started yet, or
+    handing the wait back to Python), or if it went away mid-write."""
     try:
         fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
     except OSError:
@@ -3153,12 +3231,14 @@ def wake_waiter(fifo: Path, code: int) -> bool:
     try:
         os.write(fd, f"{code}\n".encode())
         return True
+    except OSError:
+        return False
     finally:
         os.close(fd)
 
 
 def drop_wait(rid: str) -> None:
-    for suffix in (".json", ".fifo", ".out", ".out.err"):
+    for suffix in WAIT_FILES:
         with contextlib.suppress(OSError):
             (waits_dir() / f"{rid}{suffix}").unlink()
 
@@ -5324,6 +5404,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"broker {BROKER_CONTRACT}")
             return EXIT_OK
         return cmd_gh(raw[1:])
+    if raw[:1] == ["wait-resume"] and len(raw) == 2:
+        # Not a command anyone types: BLOCKER hands a `wait pr|run` back here (resume_wait).
+        try:
+            return resume_wait(raw[1])
+        except WatchError as error:
+            print(f"glaeda-gh: {error}", file=sys.stderr)
+            return 64
+        except KeyboardInterrupt:
+            return 130
     args = parser().parse_args(argv)
     try:
         if args.command == "serve":
