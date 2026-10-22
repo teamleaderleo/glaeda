@@ -3013,6 +3013,20 @@ class WaitSubscriptionTest(Base):
         self.assertEqual(list(gg.waits_dir().glob(f"{old}*")), [])
         self.assertEqual(list(gg.waits_dir().glob(f"{bad}*")), [])
 
+    def test_ticks_that_keep_raising_stop_telling_blockers_waits_are_served(self) -> None:
+        gg.waits_dir().mkdir(parents=True, exist_ok=True)
+        served = gg.waits_dir() / ".served"
+        self.daemon.tick_failed("boom", "here")
+        with mock.patch.object(self.daemon, "post_tick", side_effect=SystemExit("stop the tick here")):
+            with self.assertRaises(SystemExit):
+                self.daemon.tick()
+        self.assertFalse(served.exists(), "a failing daemon told its blockers it serves waits")
+        self.daemon.failing = None
+        with mock.patch.object(self.daemon, "post_tick", side_effect=SystemExit("stop the tick here")):
+            with self.assertRaises(SystemExit):
+                self.daemon.tick()
+        self.assertTrue(served.exists(), "a healthy tick did not mark waits served before its reads")
+
     def test_the_tick_rules_on_waits_and_says_it_does(self) -> None:
         rid, reader = self.request()
         self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
@@ -3088,6 +3102,33 @@ class WaitSubscriptionTest(Base):
         done, took = self.blocker(rid, 600, 1)
         self.assertEqual(done.returncode, 5, done.stderr)
         self.assertLess(took, 10)
+
+    def test_the_blocker_hands_back_once_its_request_is_dropped(self) -> None:
+        rid = gg.write_wait_request("pr", "o/r#1", "green", 600, False, False, None, True, gg.RESCUE_GRACE, os.getpid())
+        stop = threading.Event()
+
+        def ticks() -> None:
+            gg.drop_wait(rid)  # the daemon dropped it; ticks still serve the other waits
+            while not stop.wait(0.2):
+                (gg.waits_dir() / ".served").touch()
+        timer = threading.Timer(0.5, ticks)
+        timer.start()
+        try:
+            done, took = self.blocker(rid, 600, 2)
+        finally:
+            stop.set()
+            timer.join()
+        self.assertEqual(done.returncode, 5, done.stderr)
+        self.assertLess(took, 10)
+
+    def test_a_request_that_cannot_be_written_back_stays_for_the_next_tick(self) -> None:
+        rid, reader = self.request()
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+        with mock.patch.object(gg.Path, "write_text", side_effect=OSError(28, "No space left on device")):
+            self.assertEqual(self.daemon.serve_waits(), 1)
+        self.assertTrue((gg.waits_dir() / f"{rid}.fifo").exists(), "a full disk dropped the wait")
+        self.daemon.serve_waits()
+        self.assertEqual(self.woken(reader), "0\n")
 
     def test_the_blocker_sleeps_on_while_ticks_serve_waits(self) -> None:
         rid = gg.write_wait_request("pr", "o/r#1", "green", 60, False, False, None, True, gg.RESCUE_GRACE, os.getpid())

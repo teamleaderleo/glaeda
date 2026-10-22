@@ -1542,6 +1542,10 @@ class Daemon:
         self.clock_real = now is None
         self.tick_deadline = time.monotonic() + TICK_BUDGET
         self.errors = []
+        if self.failing is None:
+            # and again in serve_waits: a long read phase must not look like a dead daemon; ticks that
+            # keep raising stop marking, so their blockers hand the wait back (resume_wait says why)
+            mark_waits_served()
         try:
             self.post_tick()  # first, so a long read phase never delays a write
         except Exception as error:  # noqa: BLE001  a bad queue entry must not stop the reads
@@ -1622,8 +1626,7 @@ class Daemon:
         d = waits_dir()
         if not d.is_dir():
             return 0
-        with contextlib.suppress(OSError):
-            (d / ".served").touch()
+        mark_waits_served()
         now = time.time()  # requests carry wall-clock times, whatever clock a tick was given
         pending, touch = 0, {}
         for path in sorted(d.glob("*.json")):
@@ -1631,8 +1634,11 @@ class Daemon:
             try:
                 req = read_json(path)
                 decided = self.serve_wait(d, rid, req, now, touch)
+            except OSError:  # a full disk, say: the request stays, and the next tick tries again
+                pending += 1
+                continue
             except Exception:  # noqa: BLE001  a request that cannot be ruled on must not stop the others
-                drop_wait(rid)
+                drop_wait(rid)  # its blocker sees the FIFO gone and hands the wait back (BLOCKER)
                 continue
             if decided is None:
                 pending += 1
@@ -3095,9 +3101,10 @@ WAITS_MAX_TIMEOUT = 1e8  # longer (or inf) waits poll, as before: bash keeps tim
 BASH = "/bin/bash"
 # The whole waiter once the request is written: bash blocked reading the FIFO until the daemon writes
 # the exit code (Daemon.serve_waits), then what the wait prints. `3<>` opens without waiting for a
-# writer. Every WAITS_CHECK it looks at waits/.served, which each tick's serve_waits touches; at the
-# wait's deadline, or once no tick has served waits since its last look (the daemon is down, failing,
-# stuck in a long tick, or an older one), it execs "$@": `glaeda-gh wait-resume ID` (resume_wait).
+# writer. Every WAITS_CHECK it looks at waits/.served, which each tick touches; at the wait's deadline,
+# once no tick has served waits since its last look (the daemon is down, failing, hung, or an older
+# one), or once its FIFO is gone (the daemon dropped the request), it execs "$@": `glaeda-gh
+# wait-resume ID` (resume_wait). That argument list is a contract with every live blocker: keep it.
 BLOCKER = r"""fifo=$1 out=$2 limit=$3 served=$4 check=$5
 shift 5
 mark=$out.mark
@@ -3111,7 +3118,7 @@ while :; do
   [ "$left" -gt "$check" ] && left=$check
   IFS= read -r -t "$left" rc <&3 && break
   rc=
-  [ "$served" -nt "$mark" ] || break
+  [ -p "$fifo" ] && [ "$served" -nt "$mark" ] || break
   : > "$mark"
 done
 exec 3<&-
@@ -3123,6 +3130,13 @@ rm -f "$fifo" "$out" "$out.err" "$out.rc"
 exit "$rc"
 """
 WAIT_FILES = (".json", ".fifo", ".out", ".out.err", ".out.rc", ".out.mark")
+
+
+def mark_waits_served() -> None:
+    """Tell the blockers a daemon that rules on waits is ticking (BLOCKER reads waits/.served)."""
+    with contextlib.suppress(OSError):
+        if waits_dir().is_dir():
+            (waits_dir() / ".served").touch()
 
 
 def waits_dir() -> Path:
