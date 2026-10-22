@@ -52,6 +52,13 @@ VERSION_RE = r"[0-9][0-9.]*"
 # Defaults for a class the manifest does not size: std is an M4 Pro mini (14 cores), light an M4 mini (10); xl kept
 # its old 8 units at the old 2.8 cores a unit.
 CLASS_CAPACITY = {"xl": (8, 22), "std": (4, 14), "light": (2, 10)}
+# gatewayRunners (0 to MAX_GATEWAY_RUNNERS, default 0) declares the member's gateway listener slots: separate runner
+# installs (glaeda-cmux-runner --gateway K) registered to GATEWAY_REPO with GATEWAY_LABEL alone. Gateway jobs are
+# thin clients that wait on the build fleet (`cmux-ci run`), so they take no capacity unit, root or token and never
+# count toward runners; how many slots listen follows the label's measured demand (the hook's gateway_listeners).
+GATEWAY_LABEL = "glaeda-gateway-client"
+GATEWAY_REPO = "manaflow-ai/cmux"
+MAX_GATEWAY_RUNNERS = 8
 COMPILE_CORES = 5  # the hook's CLASS_COST["compile"] units (a test keeps them equal)
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
@@ -263,8 +270,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         roots = declared.get("canonicalRoots", 1)
         gui = declared.get("guiRunners", 0)
         fast = declared.get("fastRunners", 0)
+        gateway = declared.get("gatewayRunners", 0)
     else:
-        compile_slots, roots, gui, fast = 1, 1, 0, 0
+        compile_slots, roots, gui, fast, gateway = 1, 1, 0, 0, 0
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
     # every mini holds at least one compile slot, so it needs a compile's cores; glaeda-route checks the same
@@ -284,6 +292,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     if not (isinstance(fast, int) and not isinstance(fast, bool) and 0 <= fast <= 1 and roots + gui + fast <= runners):
         return None, (f"runner.classes.{klass}.fastRunners must be 0 or 1, and canonicalRoots plus guiRunners plus "
                       f"fastRunners at most runners ({runners}): the fast runner is the last instance")
+    if not (isinstance(gateway, int) and not isinstance(gateway, bool) and 0 <= gateway <= MAX_GATEWAY_RUNNERS):
+        return None, f"runner.classes.{klass}.gatewayRunners must be 0 to {MAX_GATEWAY_RUNNERS}"
     if compile_slots > roots:
         return None, (f"runner.classes.{klass}.compileSlots {compile_slots} needs canonicalRoots {compile_slots} "
                       "(every compile holds a root)")
@@ -298,7 +308,19 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
                                             for v in (versions if pools else []) for k in side_classes(klass))),
             "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else [],
             "sessionPools": [session_label(label) for label in dict.fromkeys(pools)] if gui else [],
-            "fastRunners": fast, "fastPools": [fast_label(label) for label in dict.fromkeys(pools)] if fast else []}, None
+            "fastRunners": fast, "fastPools": [fast_label(label) for label in dict.fromkeys(pools)] if fast else [],
+            "gatewayRunners": gateway}, None
+
+
+def gateway_hosts(manifest: Any) -> int:
+    """How many members declare gateway slots (the declared view: every manifest Xcode counts). The gateway gate
+    divides the label's demand across them."""
+    hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
+    count = 0
+    for member in hosts if isinstance(hosts, dict) else {}:
+        summary, _ = member_labels(manifest, member, lambda app: True)
+        count += bool((summary or {}).get("gatewayRunners"))
+    return count
 
 
 def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool] | None = None) -> dict[str, list[str]]:

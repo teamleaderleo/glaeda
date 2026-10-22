@@ -66,6 +66,16 @@ by the same timeout, so the runner takes its next job at once) and always exits 
 cmux compile admission may leave a bounded `glaeda-compile-telemetry.json` in `RUNNER_TEMP`; the completed
 record embeds its cache and phase counters after validating the run identity.
 
+    glaeda-cmux-runner-hook job-started --gateway --allowed-repo manaflow-ai/cmux [--min-free-gib G]
+    glaeda-cmux-runner-hook listen --runner-dir DIR --gateway-slot K --gateway-slots N --gateway-hosts H
+
+are a gateway runner's (glaeda-cmux-runner --gateway K): a thin client that waits on the build fleet. job-started
+admits only GATEWAY_REPO's own push, workflow_dispatch or same-repository pull_request jobs of a GATEWAY_WORKFLOWS
+file (gateway_refusal: never a fork, another repository or another workflow), then only the reservation and the disk
+floor; it takes no host lock, unit, root or token. The listen gate (GatewayGate) likewise holds the listener only for
+a reservation, the disk floor, or a slot above the k this mini listens on: k follows the gateway label's queued plus
+running jobs on the ci-dash (gateway_listeners), read at most every GATEWAY_DEMAND_EVERY_S per mini.
+
     glaeda-cmux-runner-hook admit   --class C --job-key K --watch-pid PID --capacity-units N
     glaeda-cmux-runner-hook release --job-key K
     glaeda-cmux-runner-hook fits    --capacity-units N
@@ -102,6 +112,7 @@ runner's reserve; for a root runner it also means the mini cannot admit a compil
 from __future__ import annotations
 
 import argparse
+import calendar
 import contextlib
 import fcntl
 import hashlib
@@ -940,6 +951,36 @@ def decide(event_name: str | None, event: Any, repository: str | None,
         if head_name is None or head_name != (repo or _repo_name(event.get("repository"))):
             return False, f"workflow_run triggered from another repository ({head_name})"
     return True, f"{event_name} on {repo or '(unknown)'}"
+
+
+# A gateway runner is repo-scoped on a public repository, so its job-started is the trust boundary: only these.
+GATEWAY_REPO = "manaflow-ai/cmux"
+GATEWAY_EVENTS = ("push", "pull_request", "workflow_dispatch")
+GATEWAY_WORKFLOWS = ("cmux-next.yml", "fleet-test-compile.yml", "fleet-compile-check.yml")
+
+
+def gateway_refusal(event_name: str | None, event: Any, repository: str | None, workflow_ref: str | None) -> str | None:
+    """Why a gateway runner refuses this job, or None. Pure. Admitted: GATEWAY_REPO's own push or workflow_dispatch,
+    or a pull request whose head is GATEWAY_REPO itself (never a fork, not even an approved one), running a workflow
+    file in GATEWAY_WORKFLOWS (GITHUB_WORKFLOW_REF: the top-level workflow, a reusable one's caller)."""
+    why = "gateway: this runner takes only manaflow-ai/cmux's build-fleet gateway jobs"
+    if event_name not in GATEWAY_EVENTS:
+        return f"{why}, not {event_name or '(no event)'}"
+    admit, reason = decide(event_name, event, repository, [GATEWAY_REPO], None)
+    if not admit:
+        return f"{why}: {reason}"
+    repos = {(repository or "").lower(), (_repo_name(event.get("repository")) or "").lower()}
+    if repos != {GATEWAY_REPO}:
+        return f"{why}, not {' / '.join(sorted(r or '(unknown)' for r in repos))}"
+    if event_name == "pull_request":
+        head = event["pull_request"]["head"]["repo"]
+        if head.get("fork") is not False or _repo_name(head) != GATEWAY_REPO:
+            return f"{why}; a pull request from {head.get('full_name')} is not a same-repository one"
+    path = (workflow_ref or "").split("@", 1)[0]
+    prefix = f"{GATEWAY_REPO}/.github/workflows/"
+    if not path.lower().startswith(prefix) or path[len(prefix):] not in GATEWAY_WORKFLOWS:
+        return f"{why}; workflow {path or '(GITHUB_WORKFLOW_REF unset)'} is not one of {', '.join(GATEWAY_WORKFLOWS)}"
+    return None
 
 
 # workflow_dispatch is not here: a dispatched workflow on main can check out any ref from its inputs.
@@ -4375,9 +4416,154 @@ class Gate:
         self.terminating = True  # step() acts on it: a signal handler must not run ps
 
 
+# Gateway sizing. Each mini listens on k of its declared gateway slots: the gateway label's queued plus running jobs
+# fleet-wide (ci-dash's data.json pools, on the tailnet, no token: never GitHub's API from every mini), divided
+# across the members that declare slots, plus GATEWAY_HEADROOM, clamped to [1, declared]. One gate per mini reads it
+# at most every GATEWAY_DEMAND_EVERY_S (a flock on the cache); the others use the cache. A failed or stale read keeps
+# the last good demand for GATEWAY_DEMAND_KEEP_S, then listens on every slot.
+GATEWAY_LABEL = "glaeda-gateway-client"
+GATEWAY_DEMAND_URL = (os.environ.get("GLAEDA_GATEWAY_DEMAND_URL")
+                      or "https://cmux-lawrences-mac-mini.tail137216.ts.net:8444/data.json")
+GATEWAY_DEMAND_CACHE = "gateway-demand.json"  # under the runner state dir, shared by the mini's gateway gates
+GATEWAY_DEMAND_EVERY_S = 60.0
+GATEWAY_DEMAND_STALE_S = 600.0  # a dashboard whose `updated` is older than this is no reading
+GATEWAY_DEMAND_KEEP_S = 1800.0
+GATEWAY_DEMAND_TIMEOUT_S = 5
+GATEWAY_DEMAND_MAX_BYTES = 8 << 20
+GATEWAY_HEADROOM = 1
+GATEWAY_MIN_FREE_GIB = 2.0  # glaeda-cmux-runner's default floor for a gateway runner (a client's _work is tiny)
+
+
+def gateway_demand_from(doc: Any, now: float, label: str = GATEWAY_LABEL) -> int | None:
+    """Queued plus running jobs on `label` in a ci-dash data.json document, or None when it is no reading (not the
+    shape, or `updated` missing or older than GATEWAY_DEMAND_STALE_S). Pure. A label with no pool entry has no jobs."""
+    if not isinstance(doc, dict) or not isinstance(doc.get("pools"), list):
+        return None
+    try:
+        updated = calendar.timegm(time.strptime(str(doc.get("updated")), "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, OverflowError):
+        return None
+    if not -60 <= now - updated <= GATEWAY_DEMAND_STALE_S:
+        return None
+    total = 0
+    for pool in doc["pools"]:
+        if not isinstance(pool, dict) or label not in str(pool.get("pool") or "").split(","):
+            continue
+        for key in ("queued", "running"):
+            value = pool.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                return None
+            total += value
+    return total
+
+
+def gateway_listeners(demand: int | None, slots: int, hosts: int) -> int:
+    """How many of this mini's `slots` gateway slots listen: every slot without a reading (None), else the demand's
+    share per gateway host plus GATEWAY_HEADROOM, clamped to [1, slots]. Pure."""
+    slots = max(1, slots)
+    if demand is None:
+        return slots
+    return max(1, min(slots, math.ceil(max(0, demand) / max(1, hosts)) + GATEWAY_HEADROOM))
+
+
+def fetch_gateway_doc(url: str = GATEWAY_DEMAND_URL) -> Any:
+    """ci-dash's data.json through curl (the system trust store), or None. Bounded by GATEWAY_DEMAND_TIMEOUT_S."""
+    try:
+        out = subprocess.run(["/usr/bin/curl", "-fsS", "--max-time", str(GATEWAY_DEMAND_TIMEOUT_S),
+                              "--max-filesize", str(GATEWAY_DEMAND_MAX_BYTES), url], stdin=subprocess.DEVNULL,
+                             capture_output=True, timeout=GATEWAY_DEMAND_TIMEOUT_S + 5, check=False)
+        return json.loads(out.stdout) if out.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def gateway_demand(state_dir: Path, now: float, fetch: Callable[[], Any] = fetch_gateway_doc) -> int | None:
+    """The gateway label's demand, read through the mini's cache (GATEWAY_DEMAND_CACHE): a fresh read when the last
+    try is GATEWAY_DEMAND_EVERY_S old and no other gate is reading, else the cached answer. None when no good read
+    is younger than GATEWAY_DEMAND_KEEP_S (the caller then listens on every slot). Never raises."""
+    cache = state_dir / GATEWAY_DEMAND_CACHE
+    try:
+        doc = json.loads(cache.read_text())
+        doc = doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        doc = {}
+    tried = doc.get("tried") if isinstance(doc.get("tried"), (int, float)) else None
+    if tried is None or not 0 <= now - tried < GATEWAY_DEMAND_EVERY_S:
+        with contextlib.suppress(OSError):
+            state_dir.mkdir(parents=True, exist_ok=True)
+            fd = lock_file(state_dir / f"{GATEWAY_DEMAND_CACHE}.lock", fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if fd is not None:
+                try:
+                    demand = gateway_demand_from(fetch(), now)
+                    doc["tried"] = now
+                    if demand is not None:
+                        doc["good"] = {"demand": demand, "at": now}
+                    stage = cache.with_name(f".{cache.name}.{os.getpid()}")
+                    stage.write_text(json.dumps(doc, sort_keys=True))
+                    os.replace(stage, cache)
+                finally:
+                    os.close(fd)
+    good = doc.get("good") if isinstance(doc.get("good"), dict) else {}
+    demand, at = good.get("demand"), good.get("at")
+    if not isinstance(demand, int) or not isinstance(at, (int, float)) or not 0 <= now - at <= GATEWAY_DEMAND_KEEP_S:
+        return None
+    return demand
+
+
+class GatewayScope(NamedTuple):
+    slot: int
+    slots: int
+    hosts: int
+
+
+GATEWAY_FLAGS = {"slot": "--gateway-slot", "slots": "--gateway-slots", "hosts": "--gateway-hosts"}
+
+
+def gateway_scope(runner_dir: Path, given: GatewayScope) -> GatewayScope:
+    """The slot, declared slots and gateway hosts the runner's current listen.sh passes, else what this gate was
+    started with: an --apply that changes the manifest counts at once, without restarting a listener."""
+    try:
+        text = (runner_dir / LISTEN_SCRIPT).read_text()
+    except (OSError, UnicodeDecodeError):
+        return given
+    found = {}
+    for key, flag in GATEWAY_FLAGS.items():
+        match = re.search(rf"\s{flag}\s+([0-9]+)(?:\s|$)", text)
+        found[key] = int(match.group(1)) if match else getattr(given, key)
+    return GatewayScope(**found)
+
+
+class GatewayGate(Gate):
+    """A gateway runner's listener gate. Its jobs wait on the build fleet and use no CPU, so it never looks at units,
+    tokens, roots, CPU, heat, the console or eligibility, and never takes or counts a unit: only a reservation, the
+    disk floor (low_disk, with its eviction), and its slot above the k this mini listens on (gateway_listeners)."""
+
+    def __init__(self, runner_dir: Path, host_lock: str, reservation: str, state_dir: Path,
+                 scope: GatewayScope) -> None:
+        super().__init__(runner_dir, host_lock, reservation, state_dir, waiters=False, capacity_dir=None)
+        self.scope = scope
+
+    def surplus(self) -> str | None:
+        scope = gateway_scope(self.runner_dir, self.scope)
+        demand = gateway_demand(self.state_dir, time.time())
+        k = gateway_listeners(demand, scope.slots, scope.hosts)
+        if scope.slot < k:
+            return None
+        seen = "no recent demand reading" if demand is None else f"{demand} gateway jobs on {scope.hosts} hosts"
+        return f"gateway: slot {scope.slot} is above the {k} of {scope.slots} this mini listens on ({seen})"
+
+    def claimed(self) -> str | None:
+        return self.still_reserved() or self.low_disk() or self.surplus()
+
+    def confirmed(self) -> str | None:
+        return self.claimed()
+
+
 def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, waiters: bool,
-           adopt: int = 0, capacity_dir: Path | None = None, fit_units: int = 1) -> int:
-    gate = Gate(runner_dir, host_lock, reservation, state_dir, waiters, capacity_dir, fit_units)
+           adopt: int = 0, capacity_dir: Path | None = None, fit_units: int = 1,
+           gateway: GatewayScope | None = None) -> int:
+    gate = (GatewayGate(runner_dir, host_lock, reservation, state_dir, gateway) if gateway is not None
+            else Gate(runner_dir, host_lock, reservation, state_dir, waiters, capacity_dir, fit_units))
     marker = os.environ.pop(GATE_LISTENER_ENV, None)
     xcode = runner_xcode(runner_dir)
     if adopt:
@@ -5628,6 +5814,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="listen: only an exclusive holder or a reservation stops the listener (one runner per mini)")
     p.add_argument("--adopt", type=int, default=0, help=argparse.SUPPRESS)
     p.add_argument("--parse-only", action="store_true", help=argparse.SUPPRESS)  # the gate's reload check
+    p.add_argument("--gateway", action="store_true",
+                   help="job-started: a gateway runner's admission (gateway_refusal, the reservation and the disk "
+                        "floor only; no host lock, unit, root or token)")
+    p.add_argument("--gateway-slot", type=int, help="listen: this gateway runner's slot (glaeda-cmux-runner --gateway K)")
+    p.add_argument("--gateway-slots", type=int, default=1, help="listen: the gateway slots this mini declares")
+    p.add_argument("--gateway-hosts", type=int, default=1, help="listen: the members that declare gateway slots")
     p.add_argument("--allowed-repo", action="append", default=[])
     p.add_argument("--allowed-owner")
     p.add_argument("--home-repo", default=DEFAULT_HOME_REPO,
@@ -5727,8 +5919,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.phase == "listen":
         if args.runner_dir is None:
             p.error("listen needs --runner-dir")
+        gateway = (None if args.gateway_slot is None else
+                   GatewayScope(args.gateway_slot, args.gateway_slots, args.gateway_hosts))
         return listen(args.runner_dir, args.host_lock, args.reservation, args.state_dir, not args.no_waiters,
-                      args.adopt, args.capacity_dir, args.fit_units)
+                      args.adopt, args.capacity_dir, args.fit_units, gateway)
     if args.phase == "take-root":
         if not args.root:
             p.error("take-root needs --root")
@@ -5777,6 +5971,16 @@ def main(argv: list[str] | None = None) -> int:
                               units=0, roots=[], gui=False, instance=args.instance)
             return 1
 
+        if args.gateway:  # a thin client: the trust boundary, the reservation and the disk floor, nothing held
+            why = (gateway_refusal(os.environ.get("GITHUB_EVENT_NAME"), event, os.environ.get("GITHUB_REPOSITORY"),
+                                   os.environ.get("GITHUB_WORKFLOW_REF"))
+                   or reservation_refusal(args.reservation, time.time())
+                   or disk_refusal(os.path.dirname(args.host_lock), args.min_free_gib))
+            if why:
+                return refused(why)
+            print(f"{PREFIX}: admitted: gateway client {job_workflow()} {os.environ.get('GITHUB_EVENT_NAME')} on "
+                  f"{repo}; holds nothing", flush=True)
+            return 0
         admit, reason = decide(os.environ.get("GITHUB_EVENT_NAME"), event,
                                os.environ.get("GITHUB_REPOSITORY"), args.allowed_repo, args.allowed_owner,
                                tuple(args.allow_event))
