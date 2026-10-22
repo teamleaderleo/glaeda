@@ -149,11 +149,20 @@ What `--apply` does:
        that clean environment and refuses with `toolchain: xcrun resolves <path> outside
        Xcode_26.6; ...` when the SDK is not inside the Xcode's `MacOSX.platform`, when the
        Swift version differs from the Xcode's own `XcodeDefault.xctoolchain` swiftc, or when
-       the SDK's `SDKSettings` major is newer than the Xcode's. Each probe is bounded (15 s
-       in all); a probe that times out or prints nothing is no answer and refuses nothing,
+       the SDK's `SDKSettings` major is newer than the Xcode's. It also refuses when `xcrun
+       --find` fails for a tool cmux jobs use (swift, swiftc, clang, git, make, ld,
+       xcodebuild, python3), or when `python3 -c 'import sys'` fails for PATH's python3 or
+       the `/usr/bin/python3` shim: on cmux21, once the CLT were moved aside, a stale
+       `SDKROOT` made the shim exit 72 ("xcode-select: Failed to locate 'python3'") and
+       app-compile, fast-tier and web-bundles failed as infra. The probes run after the
+       receipt probes (which keep their 20 s), as one shell batch in its own process group
+       under its own 15 s deadline, killed whole at the deadline;
+       a probe that did not finish, or printed nothing, is no answer and refuses nothing,
        so a loaded mini never leaves the fleet for it (the exact receipt check still
-       compares `xcrun --show-sdk-version`). A pass is cached for 10 minutes in
-       `~/.local/state/glaeda/cmux-runner/xcode-probe.json`; a refusal never is.
+       compares `xcrun --show-sdk-version`). A pass that saw the SDK path and both Swift
+       versions is cached for 10 minutes in
+       `~/.local/state/glaeda/cmux-runner/xcode-probe.json`; a refusal or a partial answer
+       never is. An `SDKROOT` that is an SDK name (`macosx`) is not a leak; only a path is.
      - glaeda-mini-health reports the same mismatch as `toolchain_mismatch` (error, root's
        fix: move `/Library/Developer/CommandLineTools` aside), so ci-dash alerts.
    - With weighted capacity (`--capacity-units N`, baked in from the manifest class for
@@ -1311,7 +1320,7 @@ runners) looks for what stopped runner minis on 2026-09-25 and 26 without anythi
 | `runner_stopped:<agent>`: a runner LaunchAgent loaded but not running, two runs in a row | `launchctl kickstart` (nothing runs in it, so no job is cut) |
 | `runner_unloaded:<agent>` (not one `cmux_mini_fix.sh` holds) | none: `glaeda-cmux-runner-fleet --apply` |
 | `node_ineligible`: the runner hook's eligibility check, for the fleet class its job-started hook requires, refuses (for example the class receipt's staged generation is gone) | none: restage the generation or re-enroll ([enrollment](CMUX_FLEET_ENROLLMENT.md)) |
-| `toolchain_mismatch`: in the env the runner gives its jobs, xcrun resolves an SDK outside the job-started hook's `--toolchain-xcode`, a swiftc of another Swift than that Xcode's, or a newer-major SDK (Command Line Tools past the pool Xcode, cmux21 2026-10-21) | none: root moves `/Library/Developer/CommandLineTools` aside or `xcode-select -s` the pool Xcode; the next look admits the host |
+| `toolchain_mismatch`: in the env the runner gives its jobs, xcrun resolves an SDK outside the job-started hook's `--toolchain-xcode`, a swiftc of another Swift than that Xcode's, a newer-major SDK, a cmux tool `xcrun --find` cannot find, or a python3 (PATH's or the `/usr/bin/python3` shim) that does not start (Command Line Tools past the pool Xcode, cmux21 2026-10-21) | none: root moves `/Library/Developer/CommandLineTools` aside or `xcode-select -s` the pool Xcode; the next look admits the host |
 
 A heal runs at most every 10 minutes and 3 times a day per finding (a heal that worked but did not last counts),
 then the finding reads `impossible`. The report,
