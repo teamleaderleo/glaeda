@@ -142,8 +142,10 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -2459,6 +2461,12 @@ def serve(foreground_ok: bool = False) -> int:
     stamp = me.stat().st_mtime
     daemon = Daemon()
     log({"event": "start", "pid": os.getpid()})
+    relay = None
+    if sys.platform == "darwin":  # see RELAY_SOCK_ENV: only a Mac keeps gh's token where a process cannot read it
+        relay = GhRelay()
+        if relay.bind():  # here, before the watchdog's and the relay's threads exist
+            relay.start()
+    reexec_by = None
     watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP)
     watchdog.start()
     last = None
@@ -2480,6 +2488,13 @@ def serve(foreground_ok: bool = False) -> int:
         watchdog.beat()
         try:
             if me.stat().st_mtime != stamp:
+                if reexec_by is None and relay is not None:  # exec would cut held calls off from their callers
+                    relay.close()
+                    reexec_by = time.monotonic() + RELAY_DRAIN
+                if relay is not None and relay.held and time.monotonic() < reexec_by:
+                    continue  # still serving; the next tick looks again
+                if relay is not None:
+                    relay.drain(0)
                 log({"event": "reexec"})
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
         except OSError:
@@ -5023,6 +5038,372 @@ def broker_plan(args: list[str], now: float) -> tuple[str, str | None, str | Non
         # not the polling that drains the quota, so there is nothing to save here anyway.
         return "pass", None, key
     return ("serve", line, key) if line is not None else ("pass", None, key)
+
+
+# The keychain relay. On a Mac, gh keeps its token in the login keychain, and a process outside the
+# GUI login session cannot read it: an agent the acpmux daemon spawns gets "User interaction is not
+# allowed" (security rc 36), `gh auth token` says "no oauth token found", and gh then sends every
+# call *unauthenticated* -- reads of public repos succeed against the anonymous per-IP limit (60/h)
+# and everything else says the token is invalid (cosmic-gray, 2026-10-22). glaeda's daemon is a
+# LaunchAgent in that session and reads the keychain fine, so a call with no usable token is run by
+# the daemon instead. The caller hands its own stdin, stdout and stderr over a socket only this user
+# can reach (SCM_RIGHTS), so gh reads and writes them exactly as it would have -- nothing is parsed
+# for stdin, nothing is buffered or cut -- and the exit code comes back. The token never leaves the
+# daemon's process tree, and nothing about Leo's login or keychain item changes. With no daemon to
+# ask, the call fails loudly (exit 4) rather than going out anonymous.
+#
+# The trust boundary is this user: the socket is 0600, and a process of this user's can already
+# rewrite the daemon's own script. Inside it, the daemon runs only the commands in RELAY_COMMANDS,
+# none of which hands out the credential or runs a program of the caller's choosing, and it runs
+# them in an empty directory of its own with the repository named by GH_REPO: gh never runs git in
+# the caller's checkout, so no repository config, hook or `-c core.sshCommand` reaches the daemon's
+# session. The client resolves GH_REPO from its checkout the way gh would.
+RELAY_SOCK_ENV = "GLAEDA_GH_RELAY_SOCK"
+RELAYED = "GLAEDA_GH_RELAYED"  # set on the daemon's gh, so nothing below it relays again
+RELAY_MAX_REQUEST = 1 << 20  # argv and a few environment variables
+RELAY_TIMEOUT = 900.0  # the daemon's bound on one relayed gh (a `pr merge` or a big log)
+RELAY_SLOTS = 8  # relayed calls the daemon runs at once; the rest wait for a slot
+RELAY_SLOT_WAIT = 120.0
+RELAY_CONNECTIONS = 16  # calls the daemon holds at once, running or waiting; past that, busy
+# How long an update waits for held calls before it re-execs: past every call's own bound, so a call
+# is only stopped by it (and told so) if something is wrong. The daemon keeps serving meanwhile.
+RELAY_DRAIN = RELAY_SLOT_WAIT + RELAY_TIMEOUT + 30
+# Passed through from the caller; nothing else of its environment is.
+RELAY_ENV = ("GH_REPO", "GH_HOST", "NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE")
+# What the daemon runs for a caller, by command and subcommand (None: any). Left out: anything that
+# prints the credential (`auth`), runs a program (`alias`, extensions, `config`), or needs the
+# caller's checkout or files to mean anything (`repo clone`, `pr checkout`, `run download`, gist,
+# secrets). Global flags ahead of the command are refused too, rather than parsed.
+RELAY_COMMANDS: dict[str, set[str] | None] = {
+    "api": None,
+    "pr": {"view", "list", "checks", "diff", "comment", "create", "edit", "merge", "close", "reopen",
+           "ready", "review", "update-branch", "lock", "unlock"},
+    "issue": {"view", "list", "create", "comment", "edit", "close", "reopen", "lock", "unlock"},
+    "run": {"view", "list", "rerun", "cancel", "watch", "delete"},
+    "workflow": {"view", "list", "run", "enable", "disable"},
+    "release": {"view", "list"},
+    "label": {"list", "create", "edit"},
+    "search": None,
+    "repo": {"view", "list"},
+    "cache": {"list", "delete"},
+    "status": None,
+}
+HOST_URL_RE = re.compile(r"https?://([A-Za-z0-9.-]+)(?::[0-9]+)?/[^/\s]+/[^/\s]+(?:/\S*)?")
+
+
+def relay_socket() -> Path:
+    return Path(os.environ.get(RELAY_SOCK_ENV) or BASE / "gh-relay.sock")
+
+
+def relay_signal_rc(rc: int) -> int:
+    """A child killed by a signal is the shell's 128+N, not Python's -N (which exits as 256-N)."""
+    return 128 - rc if rc < 0 else rc
+
+
+def kill_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the process group `proc` leads: only ever one this file started with
+    start_new_session, so it holds nothing of anyone else's."""
+    with contextlib.suppress(OSError):
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
+def relay_hosts(args: list[str], env: Any) -> set[str]:
+    """The hosts other than github.com this call names, read loosely: GH_HOST, --hostname, a
+    -R/--repo HOST/OWNER/REPO or URL, or a URL argument (`pr view URL`) that is no flag's value."""
+    hosts = {env["GH_HOST"]} if env.get("GH_HOST") else set()
+    for before, arg in zip(["", *args], args):
+        if before == "--hostname" or arg.startswith("--hostname="):
+            hosts.add(arg.removeprefix("--hostname="))
+            continue
+        if before in ("-R", "--repo"):
+            value = arg
+        elif arg.startswith("--repo=") or arg.startswith("-R") and len(arg) > 2:
+            value = arg.removeprefix("--repo=").removeprefix("-R").removeprefix("=")
+        elif not before.startswith("-") and HOST_URL_RE.fullmatch(arg):
+            value = arg
+        else:
+            continue
+        match = HOST_URL_RE.fullmatch(value)
+        if match:
+            hosts.add(match.group(1))
+        elif value.count("/") == 2:
+            hosts.add(value.split("/")[0])
+    return {host.lower() for host in hosts} - {"github.com"}
+
+
+class RelayLost(Exception):
+    """The daemon started the call and went away before saying how it ended."""
+
+
+def relay_exchange(path: Path, request: dict, fds: list[int], timeout: float) -> int:
+    """Hand one call and these three descriptors to the daemon; return gh's exit code there.
+    Raises WatchError when the daemon refused it, OSError or ValueError when it never ran, and
+    RelayLost when it ran and its ending is unknown."""
+    body = json.dumps(request).encode()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(30)
+        conn.connect(os.fspath(path))
+        # The write side stays open: the daemon reads its closing as this caller having gone, and
+        # stops the call rather than finish it for no one.
+        socket.send_fds(conn, [len(body).to_bytes(4, "big")], fds)
+        conn.sendall(body)
+        conn.settimeout(timeout)
+        stream = conn.makefile("rb")
+        started = False
+        try:
+            while line := stream.readline(1 << 16):
+                message = json.loads(line)
+                if not isinstance(message, dict):
+                    raise ValueError("the relay answered something that is not an answer")
+                if isinstance(message.get("refused"), str):
+                    raise WatchError(message["refused"][:300])
+                if message.get("started") is True:
+                    started = True
+                elif isinstance(message.get("rc"), int):
+                    if isinstance(message.get("note"), str):
+                        print(f"glaeda-gh relay: {message['note'][:300]}", file=sys.stderr)
+                    return message["rc"]
+        except (OSError, ValueError):
+            if started:  # a reset, a timeout or a torn line after gh began: its ending is unknown
+                raise RelayLost() from None
+            raise
+        if started:
+            raise RelayLost()
+        raise ValueError("the relay closed without an answer")
+
+
+def relay_refusal(argv: list[str], env: dict) -> str | None:
+    """Why the daemon will not run this command line for another process, or None."""
+    others = relay_hosts(argv, env)
+    if others:  # its token is for github.com; another host would get the call unauthenticated
+        return f"the relay calls github.com only, not {sorted(others)[0][:60]}"
+    if not argv or argv[0] not in RELAY_COMMANDS:
+        return f"`gh {argv[0][:40] if argv else ''}` is not run for another process"
+    allowed = RELAY_COMMANDS[argv[0]]
+    if allowed is not None and (len(argv) < 2 or argv[1] not in allowed):
+        return f"`gh {argv[0]} {argv[1][:40] if len(argv) > 1 else ''}` is not run for another process"
+    return None
+
+
+class GhRelay(threading.Thread):
+    """The daemon's side of the keychain relay (see RELAY_SOCK_ENV): one socket, one thread per
+    call, at most RELAY_CONNECTIONS calls held and RELAY_SLOTS gh processes at a time. Never raises
+    into the daemon."""
+
+    def __init__(self, path: Path | None = None, gh: Callable[[], str] | None = None) -> None:
+        super().__init__(name="gh-relay", daemon=True)
+        self.path = path or relay_socket()
+        self.gh = gh or broker_real_gh
+        self.slots = threading.BoundedSemaphore(RELAY_SLOTS)
+        self.held = 0
+        self.idle = threading.Condition()
+        self.closing = False
+        self.stopping = False  # set when a re-exec stops what is still running
+        self.running: set[subprocess.Popen] = set()
+        self.listener: socket.socket | None = None
+
+    def bind(self) -> bool:
+        """Listen at self.path, replacing a socket a previous daemon left. The socket is 0600, so
+        only this user can connect -- the same user whose gh this runs."""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if os.path.lexists(self.path) and not self.path.is_socket():
+                raise FileExistsError(f"{self.path} is not a socket")
+            # Bound in a private directory, made 0600 and then moved into place: no other user can
+            # connect on the way, and no process-wide umask changes under the daemon's other threads.
+            staging = Path(tempfile.mkdtemp(prefix="relay-", dir=self.path.parent))
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(os.fspath(staging / "s"))
+                os.chmod(staging / "s", 0o600)
+                listener.listen(32)
+                os.replace(staging / "s", self.path)
+            except OSError:
+                listener.close()
+                raise
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+        except OSError as error:
+            log({"event": "error", "error": describe(error), "site": "gh-relay bind"})
+            return False
+        self.listener = listener
+        return True
+
+    def run(self) -> None:
+        if self.listener is None and not self.bind():
+            return
+        while True:
+            try:
+                conn, _ = self.listener.accept()
+            except OSError as error:
+                if not self.closing:
+                    log({"event": "error", "error": describe(error), "site": "gh-relay accept"})
+                return
+            with self.idle:  # under the lock that close() takes, so nothing is admitted after it
+                busy = "glaeda-gh is restarting" if self.closing else (
+                    f"{RELAY_CONNECTIONS} relayed calls already held" if self.held >= RELAY_CONNECTIONS else None)
+                if not busy:
+                    self.held += 1
+            if busy:
+                with conn, contextlib.suppress(OSError):
+                    conn.settimeout(5)
+                    self.say(conn, {"refused": busy})
+                continue
+            threading.Thread(target=self.serve_one, args=(conn,), name="gh-relay-call", daemon=True).start()
+
+    def close(self) -> None:
+        """Take no more calls; the ones held run on (see drain)."""
+        with self.idle:
+            self.closing = True
+        if self.listener is not None:
+            # Linux keeps a socket listening while a thread is blocked in accept() on it, even
+            # after close(); shutdown() wakes that accept so the socket really closes.
+            with contextlib.suppress(OSError):
+                self.listener.shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(OSError):
+                self.listener.close()
+
+    def drain(self, timeout: float) -> bool:
+        """Wait up to `timeout` for the held calls to end; then stop the ones left, each caller told
+        it was stopped and may have taken effect, and wait for them to say so. True when none is
+        left, so a re-exec cuts no call off from its caller without a word."""
+        self.close()
+        with self.idle:
+            self.idle.wait_for(lambda: not self.held, timeout)
+            if self.held:
+                self.stopping = True
+                for proc in self.running:
+                    kill_group(proc)
+                self.idle.wait_for(lambda: not self.held, 30)
+            return not self.held
+
+    @staticmethod
+    def say(conn: socket.socket, message: dict) -> None:
+        conn.sendall(json.dumps(message).encode() + b"\n")
+
+    def receive(self, conn: socket.socket) -> tuple[Any, list[int]]:
+        """The request and the caller's three descriptors."""
+        conn.settimeout(30)
+        data, fds, flags, _ = socket.recv_fds(conn, 1 << 16, 3)
+        try:
+            for fd in fds:  # or a re-exec would carry them into the next daemon
+                os.set_inheritable(fd, False)
+            if flags & getattr(socket, "MSG_CTRUNC", 0) or len(fds) != 3:
+                raise WatchError("a relay request carries the caller's stdin, stdout and stderr")
+            while len(data) < 4 or len(data) < 4 + int.from_bytes(data[:4], "big"):
+                if len(data) >= 4 and int.from_bytes(data[:4], "big") > RELAY_MAX_REQUEST:
+                    raise WatchError(f"request over {RELAY_MAX_REQUEST >> 20} MiB")
+                chunk = conn.recv(1 << 16)
+                if not chunk:
+                    raise WatchError("the request ended early")
+                data += chunk
+            return json.loads(data[4:4 + int.from_bytes(data[:4], "big")]), fds
+        except BaseException:
+            for fd in fds:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            raise
+
+    def serve_one(self, conn: socket.socket) -> None:
+        try:
+            with conn:
+                try:
+                    request, fds = self.receive(conn)
+                except Exception as error:  # noqa: BLE001  one bad call must not take the relay down
+                    with contextlib.suppress(OSError):
+                        self.say(conn, {"refused": describe(error)})
+                    return
+                try:
+                    message = self.answer(conn, request, fds)
+                except Exception as error:  # noqa: BLE001
+                    message = {"refused": describe(error)}
+                with contextlib.suppress(OSError):
+                    conn.settimeout(60)
+                    self.say(conn, message)
+        finally:
+            with self.idle:
+                self.held -= 1
+                self.idle.notify_all()
+
+    def answer(self, conn: socket.socket, request: Any, fds: list[int]) -> dict:
+        """Run the call on the caller's descriptors; {"rc": N}. Closes fds either way."""
+        try:
+            if not isinstance(request, dict) or not isinstance(request.get("argv"), list) \
+                    or not all(isinstance(a, str) for a in request["argv"]):
+                raise WatchError("not a relay request")
+            argv = request["argv"]
+            given = request.get("env") if isinstance(request.get("env"), dict) else {}
+            given = {k: v for k, v in given.items() if k in RELAY_ENV and isinstance(v, str)}
+            refusal = relay_refusal(argv, given)
+            if refusal:
+                raise WatchError(refusal)
+            # CMUX_GH_BROKER_DISABLE is taken out, not put in: with it, a `gh` that hands the call back
+            # to this broker is exec'd unconditionally, before the hop and depth counts that end such a
+            # loop. RELAYED keeps the call from coming back here; the depth count keeps it finite. No
+            # pager, browser or editor of anyone's choosing runs in this session.
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("CMUX_GH_BROKER_DISABLE", "GIT_DIR", "GIT_WORK_TREE")}
+            env.update(given)
+            env.update({RELAYED: "1", BROKER_DEPTH: str(broker_depth() + 1), "GH_PAGER": "cat", "PAGER": "cat",
+                        "GH_BROWSER": "true", "BROWSER": "true", "GH_EDITOR": "false", "EDITOR": "false",
+                        "VISUAL": "false", "GIT_EDITOR": "false", "GIT_TERMINAL_PROMPT": "0",
+                        "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1"})
+            if not self.slots.acquire(timeout=RELAY_SLOT_WAIT):
+                raise WatchError(f"{RELAY_SLOTS} relayed gh calls already running")
+            try:
+                with tempfile.TemporaryDirectory(prefix="gh-relay-", dir=self.path.parent) as cwd:
+                    rc, note = self.spawn(conn, [self.gh(), *argv], fds, env, cwd)
+            finally:
+                self.slots.release()
+        finally:
+            for fd in fds:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        log({"event": "relay", "words": " ".join(w for w in argv[:2] if re.fullmatch(r"[a-z][a-z-]{0,30}", w)),
+             "rc": rc})
+        return {"rc": rc, "note": note} if note else {"rc": rc}
+
+    def spawn(self, conn: socket.socket, command: list[str], fds: list[int], env: dict[str, str],
+              cwd: str) -> tuple[int, str | None]:
+        """(exit code, what to tell the caller about how it ended, if anything)."""
+        # Its own process group, so what it leaves behind can be ended with it.
+        with self.idle:
+            if self.stopping:
+                raise WatchError("glaeda-gh is restarting")
+            proc = subprocess.Popen(command, stdin=fds[0], stdout=fds[1], stderr=fds[2], env=env, cwd=cwd,
+                                    start_new_session=True)
+            self.running.add(proc)
+        for fd in fds:  # gh has its own copies; the caller sees EOF once gh and its children are done
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        fds.clear()
+        with contextlib.suppress(OSError):
+            self.say(conn, {"started": True})
+
+        def gone() -> None:
+            # The caller sends nothing more; its side closing means it is gone (killed, interrupted).
+            with contextlib.suppress(OSError):
+                conn.settimeout(None)
+                conn.recv(1)
+            if proc.poll() is None:
+                kill_group(proc)
+
+        threading.Thread(target=gone, name="gh-relay-caller", daemon=True).start()
+        note = None
+        try:
+            rc = proc.wait(timeout=RELAY_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            kill_group(proc)
+            proc.wait()
+            rc, note = 124, f"gh {' '.join(command[1:3])} ran past {RELAY_TIMEOUT:.0f} s and was stopped"
+        finally:
+            kill_group(proc)  # anything it started and left holding the caller's descriptors
+            with self.idle:
+                self.running.discard(proc)
+        if self.stopping and note is None:
+            note = (f"gh {' '.join(command[1:3])} was stopped by a glaeda-gh restart: it may have taken "
+                    f"effect, check before running it again")
+        return relay_signal_rc(rc), note
 
 
 def cmd_gh(args: list[str]) -> int:

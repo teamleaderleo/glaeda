@@ -15,6 +15,7 @@ import signal
 import stat
 import subprocess
 import sys
+import shutil
 import tempfile
 import threading
 import time
@@ -4501,6 +4502,166 @@ class BrokerFailOpenTest(BrokerBase):
         _code, out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
         self.assertEqual(out, "")
         self.assertIsNotNone(passed)
+
+
+def close_quietly(fd: int) -> None:
+    with contextlib.suppress(OSError):
+        os.close(fd)
+
+
+class RelayBase(BrokerBase):
+    """A relay socket of the test's own, and a daemon-side gh that records that it ran."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        for name in (gg.RELAYED, "GH_HOST", "CMUX_GH_BROKER_DISABLE"):
+            os.environ.pop(name, None)
+        # AF_UNIX paths are short (104 bytes on macOS), and this suite's temp dirs are not.
+        self.sockdir = Path(tempfile.mkdtemp(prefix="ggr", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, self.sockdir, True)
+        self.sock = self.sockdir / "s"
+        os.environ[gg.RELAY_SOCK_ENV] = str(self.sock)
+        self.addCleanup(os.environ.pop, gg.RELAY_SOCK_ENV, None)
+        quiet = mock.patch.object(gg, "log", lambda event: None)  # the daemon's log is its stdout
+        quiet.start()
+        self.addCleanup(quiet.stop)
+        self.ran = self.home / "daemon-ran"
+
+    def relay(self, script: str | None = None) -> gg.GhRelay:
+        """Start the daemon's relay. Its gh says what it was asked, where, and with what; or is
+        `script`. Either way it leaves self.ran behind, so a test can tell it never ran."""
+        gh = self.home / "daemon-bin" / "gh"
+        gh.parent.mkdir(parents=True, exist_ok=True)
+        gh.write_text("#!/bin/sh\n" f"echo ran >> {self.ran}\n" + (script if script is not None else
+                      'echo "args: $*"; echo "cwd: $(pwd -P)"; echo "files: $(ls -A | wc -l | tr -d " ")"\n'
+                      'echo "relayed: $GLAEDA_GH_RELAYED repo: $GH_REPO"\n'
+                      'case "$*" in *--input*) echo "stdin: $(cat)";; esac\n'
+                      "echo 'to stderr' >&2; exit 3\n"))
+        gh.chmod(0o755)
+        server = gg.GhRelay(self.sock, gh=lambda: str(gh))
+        self.assertTrue(server.bind())
+        server.start()
+        self.addCleanup(server.close)
+        return server
+
+    def fds(self, stdin: bytes = b"") -> tuple[list[int], Path, Path, Path]:
+        """Three descriptors as a caller would hand over, on files a test can read back."""
+        paths = [self.home / f"fd{n}-{time.monotonic_ns()}" for n in range(3)]
+        paths[0].write_bytes(stdin)
+        fds = [os.open(paths[0], os.O_RDONLY)] + [os.open(p, os.O_WRONLY | os.O_CREAT, 0o600) for p in paths[1:]]
+        for fd in fds:
+            self.addCleanup(close_quietly, fd)
+        return fds, *paths
+
+    def call(self, argv: list[str], env: dict | None = None, stdin: bytes = b"") -> tuple[int, str, str]:
+        fds, _, out, err = self.fds(stdin)
+        rc = gg.relay_exchange(self.sock, {"argv": argv, "env": env or {}}, fds, 30)
+        return rc, out.read_text(), err.read_text()
+
+    def assertProcessGone(self, pid: int) -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        self.fail(f"process {pid} outlived its call")
+
+
+class GhRelayTest(RelayBase):
+    """The daemon's side of the keychain relay: what it runs for another process, how, and for
+    how long."""
+
+    def test_the_daemon_runs_only_what_neither_hands_out_the_token_nor_runs_the_callers_code(self) -> None:
+        self.relay()
+        for argv in (["auth", "token", "--hostname", "github.com"], ["alias", "set", "x", "!sh"],
+                     ["config", "set", "pager", "sh"], ["my-extension"], ["--help=false", "api", "x"],
+                     ["repo", "clone", "git@github.com:o/r.git", "--", "-c", "core.sshCommand=sh"],
+                     ["pr", "checkout", "7"], ["pr", "-R", "o/r", "view", "7"], ["pr"], []):
+            with self.subTest(argv):
+                with self.assertRaisesRegex(gg.WatchError, "not run for another process"):
+                    self.call(argv)
+        # Its token is github.com's: a call to another host would go out unauthenticated.
+        for argv, env in ((["api", "--hostname", "ghe.example.invalid", "x"], {}),
+                          (["pr", "view", "7"], {"GH_HOST": "ghe.example.invalid"})):
+            with self.subTest(argv=argv, env=env), self.assertRaisesRegex(gg.WatchError, "github.com only"):
+                self.call(argv, env)
+        self.assertFalse(self.ran.exists(), "gh ran for a refused call")
+
+    def test_the_daemon_runs_gh_with_nothing_of_the_callers_choosing(self) -> None:
+        self.relay('echo "pager=$GH_PAGER editor=$GH_EDITOR browser=$GH_BROWSER '
+                   'disable=${CMUX_GH_BROKER_DISABLE-unset} depth=$GLAEDA_GH_DEPTH '
+                   'tty=${GH_FORCE_TTY-unset} gitdir=${GIT_DIR-unset}"\n')
+        with mock.patch.dict(os.environ, {"CMUX_GH_BROKER_DISABLE": "1"}):
+            rc, out, _ = self.call(["pr", "view", "7"], {"GH_PAGER": "sh -c evil", "GH_FORCE_TTY": "1",
+                                                         "GIT_DIR": "/elsewhere", "GH_EDITOR": "sh"})
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.split(), ["pager=cat", "editor=false", "browser=true", "disable=unset",
+                                       "depth=1", "tty=unset", "gitdir=unset"])
+
+    def test_a_relayed_call_that_overruns_is_stopped_with_what_it_started(self) -> None:
+        pidfile = self.home / "child"
+        self.relay(f"sleep 30 & echo $! > {pidfile}; wait\n")
+        started = time.monotonic()
+        with mock.patch.object(gg, "RELAY_TIMEOUT", 2):
+            rc, _out, _err = self.call(["pr", "view", "7"])
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(rc, 124)
+        self.assertProcessGone(int(pidfile.read_text()))
+
+    def test_a_child_left_holding_the_callers_output_does_not_hold_the_call(self) -> None:
+        pidfile = self.home / "child"
+        self.relay(f"sleep 30 & echo $! > {pidfile}; exit 0\n")
+        started = time.monotonic()
+        rc, _out, _err = self.call(["pr", "view", "7"])
+        self.assertEqual(rc, 0)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertProcessGone(int(pidfile.read_text()))
+
+    def test_a_signal_ends_the_call_as_the_shell_would_report_it(self) -> None:
+        self.relay("kill -TERM $$\n")
+        self.assertEqual(self.call(["pr", "view", "7"])[0], 128 + signal.SIGTERM)
+
+    def test_a_re_exec_waits_for_running_calls_and_takes_no_new_ones(self) -> None:
+        server = self.relay("sleep 1; echo done\n")
+        result = []
+        caller = threading.Thread(target=lambda: result.append(self.call(["pr", "view", "7"])))
+        caller.start()
+        deadline = time.monotonic() + 5
+        while not self.ran.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(server.drain(10))
+        caller.join(10)
+        self.assertEqual(result[0][:2], (0, "done\n"), "the running call still got its answer")
+        with self.assertRaises(OSError):
+            self.call(["pr", "view", "7"])
+
+    def test_a_call_still_running_when_the_re_exec_is_due_is_stopped_and_told_so(self) -> None:
+        server = self.relay("sleep 30\n")
+        result, said = [], io.StringIO()
+        def run() -> None:
+            with contextlib.redirect_stderr(said):
+                result.append(self.call(["pr", "merge", "7"]))
+        caller = threading.Thread(target=run)
+        caller.start()
+        deadline = time.monotonic() + 5
+        while not self.ran.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        started = time.monotonic()
+        self.assertTrue(server.drain(0.2))
+        caller.join(10)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(result[0][0], 128 + signal.SIGKILL)
+        self.assertIn("stopped by a glaeda-gh restart: it may have taken effect", said.getvalue())
+
+    def test_the_socket_is_this_users_alone(self) -> None:
+        before = os.umask(0o022)
+        self.addCleanup(os.umask, before)
+        self.relay()
+        self.assertEqual(stat.S_IMODE(self.sock.stat().st_mode) & 0o077, 0)
+        self.assertEqual(os.umask(0o022), 0o022, "the process umask is left alone")
+        self.assertEqual(sorted(p.name for p in self.sockdir.iterdir()), ["s"])
 
 
 class BrokerArgumentTest(unittest.TestCase):
