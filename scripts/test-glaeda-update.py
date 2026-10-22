@@ -589,6 +589,23 @@ class UpdateTest(unittest.TestCase):
         kept = sorted(p.name for p in (self.state / "generations").iterdir())
         self.assertEqual(kept, sorted([newer["tag"], good["tag"]]))
 
+    def test_a_health_check_that_times_out_rolls_back_without_quarantine(self) -> None:
+        good = self.server.publish(SOURCES[0])
+        self.run_update()
+        slow = self.server.publish(SOURCES[1])
+        timed_out = (None, "glaeda-disk: Command '--help' timed out after 120 seconds")
+        with mock.patch.object(gu, "health", return_value=timed_out):
+            result = self.run_update()
+        self.assertEqual(result["result"], "inconclusive")
+        self.assertIn("timed out", result["detail"])
+        self.assertEqual(result["rollback"], f"restored {good['tag']}")
+        state = gu.load_state(self.state)
+        self.assertEqual(state["current"], good["tag"])
+        self.assertNotIn(slow["tag"], state["quarantined"])
+        # an idle host tries the same release again and keeps it
+        self.assertEqual(self.run_update()["result"], "updated")
+        self.assertEqual(gu.load_state(self.state)["current"], slow["tag"])
+
     def test_tampered_bytes_are_refused(self) -> None:
         entry = self.server.publish(SOURCES[0])
         url = gu.release_url(entry["tag"], gr.hygiene_asset(TARGET))
@@ -663,6 +680,21 @@ class UpdateTest(unittest.TestCase):
             gu.health(self.bin, self.root)
         self.assertEqual(ran, ["glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-worktree-reclaim",
                                "glaeda-gh", "glaeda-update"])
+
+    def test_a_check_that_times_out_is_inconclusive_not_failed(self) -> None:
+        def slow_run(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+
+        with mock.patch.object(gu.subprocess, "run", slow_run):
+            ok, why = gu.health(self.bin, self.root)
+        self.assertIsNone(ok)
+        self.assertIn("glaeda-disk", why)
+
+        def missing(argv, **kw):
+            raise FileNotFoundError(argv[0])
+
+        with mock.patch.object(gu.subprocess, "run", missing):
+            self.assertIs(gu.health(self.bin, self.root)[0], False)
 
     def test_real_updater_plans_from_a_channel_dir_without_network(self) -> None:
         entry = self.server.publish(SOURCES[0])

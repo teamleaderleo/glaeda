@@ -443,10 +443,12 @@ def gh_only(config: dict) -> bool:
     return "--gh-only" in config["setupArgs"]
 
 
-def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[bool, str]:
+def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[bool | None, str]:
     """The installed tools run, and the installed glaeda-update plans from the channel files this
     run already fetched, so a network blip cannot fail (and quarantine) a good release. A --gh-only
-    host installs only glaeda-gh and glaeda-update, so only those are checked there."""
+    host installs only glaeda-gh and glaeda-update, so only those are checked there. (None, why) when a
+    check timed out: a host too busy to start Python in 120 s says nothing about the release (cosmic-gray
+    at load 200 quarantined r-20261022-e5ce794d9efd on `glaeda-disk --help`, 2026-10-22)."""
     hygiene = [] if gh_only else [
         [sys.executable, str(bin_dir / "glaeda-disk"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-worktree"), "--help"],
@@ -461,7 +463,9 @@ def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[boo
         name = Path(argv[1] if argv[0] == sys.executable else argv[0]).name
         try:
             result = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
-        except (OSError, subprocess.TimeoutExpired) as e:
+        except subprocess.TimeoutExpired as e:
+            return None, f"{name}: {e}"
+        except OSError as e:
             return False, f"{name}: {e}"
         if result.returncode != 0:
             return False, f"{name} exited {result.returncode}"
@@ -1108,7 +1112,8 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         shutil.rmtree(state_dir / "pre-ota", ignore_errors=True)
         prune(state_dir, {t for t in (state["current"], state["previous"]) if t})
         return {**out, "result": "updated", "detail": detail, "status": post(True, detail)}
-    state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
+    if ok is False:
+        state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
     previous = state["current"]
     if previous and (generation(state_dir, previous) / ".complete").is_file():
         back, _ = run_setup(generation(state_dir, previous), config["setupArgs"])
@@ -1118,6 +1123,10 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
     else:
         rolled = "nothing to restore"
     save_state(state, state_dir)
+    if ok is None:
+        # Unproven, not failed: back to what ran, no quarantine and no failure posted; the next run tries again.
+        return {**out, "result": "inconclusive", "detail": f"health check timed out: {detail}", "rollback": rolled,
+                "status": post(None, detail)}
     return {**out, "result": "rolled-back", "detail": detail, "rollback": rolled, "log": log[-600:],
             "status": post(False, detail)}
 
