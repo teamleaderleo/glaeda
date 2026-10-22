@@ -10,7 +10,8 @@
 The key is one per runner and workspace, not a source fingerprint: cmux's
 `scripts/cmux-next/release-derived-data-path.sh` names it
 `sha256("$RUNNER_NAME\n$GITHUB_WORKSPACE\n")[:16]`. glaeda-disk computes it for
-each enrolled runner (its `_work/cmux/cmux`, as given and resolved), so a release
+each enrolled runner (`<workFolder>/cmux/cmux`, the work folder read from its
+`.runner`, as given and resolved), so a release
 state's owner is known like a `cmux-scheme/<runner>` state's: a runner with a
 `Runner.Worker` keeps its output, and the runner floor hold covers it.
 
@@ -35,18 +36,22 @@ writes the standard JSONL receipt and rechecks every candidate.
 
 ## Size cap
 
-On a host with enrolled glaeda runners, a report or pressure run measures the
-whole cache, inputs included, with one `du` (a probe: its timeout records no
-`eviction_stuck` and no cooldown). Reports and `keepup` without `--apply` show
-it against `cmux_next_ci_cap_gib` (default 40 GiB; set it in
+On a host with enrolled glaeda runners, only a pressure run (`--pressure`, or
+`keepup --apply` under pressure) measures the whole cache, inputs included, with
+one `du` (a probe: its timeout records no `eviction_stuck` and no cooldown), and
+keeps the result in `~/.cache/glaeda-disk/cmux-next-cap.json` beside the size
+snapshot. A text report, or `keepup` without `--apply`, shows that last
+measurement against `cmux_next_ci_cap_gib` (default 40 GiB; set it in
 `~/.config/glaeda/disk-policy.json` or with `--cmux-next-cap-gib`, 0 turns it
-off), and every `--apply` run line records `cmux_next_ci_over_gib`. Only a
-pressure run (`--pressure`, or `keepup --apply` under pressure) acts: while the
+off) and never walks the cache; `--json` (glaeda-fleet-status asks every mini)
+neither measures nor shows it. A pressure run line records
+`cmux_next_ci_over_gib`. Only a pressure run acts: while the
 cache is over the cap, the 72-hour window gives way, and candidates go least
 recently used first until the cache is back under the cap or the free target is
 met. Over the cap a state root no enrolled runner owns (a `cmux-scheme` state by
-name, a release state by key) is listed whole, inputs included, and leaves no
-empty `<key>/Release` behind. Every enrolled runner's states lose only generated
+name, a release state by key) and idle at least `cmux_next_ci_unowned_idle_hours`
+(default 6, GitHub's default job timeout) is listed whole, inputs included, and
+leaves no empty `<key>/Release` behind; a younger one loses only generated output. Every enrolled runner's states lose only generated
 output and keep `SourcePackages` and the module caches. Every veto above still
 holds, and a runner with a `Runner.Worker` keeps its states. An unmeasurable
 cache keeps the 72-hour window. cmux11s refused jobs at 21 GiB free under a

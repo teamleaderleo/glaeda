@@ -63,9 +63,10 @@ inputs remain visible to accounting and are kept.  The cache has an LRU size cap
 (cmux_next_ci_cap_gib in disk-policy.json or --cmux-next-cap-gib, default 40 GiB, 0 off): while a
 pressure run measures it over the cap, the window gives way, least recently used first, until it is
 under the cap or the free target is met, and a state root no enrolled runner owns (a scheme state by
-name, a dev-daily/release state by its runner-and-workspace key) goes whole, inputs included. Enrolled
-runners' states lose only generated output, and the process/lock/lease/Runner.Worker vetoes still hold
-(docs/CMUX_NEXT_CI_RETENTION.md). Reports show the cap's state; the run line records how far over it is.
+name, a dev-daily/release state by its runner-and-workspace key) idle past a job's timeout goes whole,
+inputs included. Enrolled runners' states lose only generated output, and the process/lock/lease/
+Runner.Worker vetoes still hold (docs/CMUX_NEXT_CI_RETENTION.md). Only a pressure run walks the cache; a text
+report shows its last measurement, and its run line records how far over the cap it is.
 
 Each enrolled GitHub runner's checkout (~/actions-runner*/_work/<repo>/<repo>) has two families.
 runner-checkout-build is SwiftPM's Packages/*/.build and Packages/*/*/.build plus cargo-tagged target
@@ -186,6 +187,9 @@ from pathlib import Path
 HOME = Path.home()
 SNAPSHOT = HOME / ".cache/glaeda-disk/sizes.json"
 DEDUPE_STATE = HOME / ".cache/glaeda-disk/dedupe.json"
+# The last pressure run's du of ~/Library/Caches/cmux-next-ci (cmux_next_ci_cap_state): reports read it beside
+# the size snapshot and never walk the cache themselves.
+CMUX_NEXT_CAP_RECORD = HOME / ".cache/glaeda-disk/cmux-next-cap.json"
 MEASURE_LOCK = HOME / ".cache/glaeda-disk/measure.lock"
 ACCOUNTING = HOME / ".cache/glaeda-disk/accounting.json"
 HEALTH_SUMMARY = HOME / ".local/state/glaeda/disk/summary.json"
@@ -996,6 +1000,9 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "defer_during_ci": False,
     # LRU size cap on ~/Library/Caches/cmux-next-ci (CMUX_NEXT_CI_OVER); 0 turns it off. --cmux-next-cap-gib.
     "cmux_next_ci_cap_gib": 40.0,
+    # Over the cap, a cmux-next state no enrolled runner owns goes whole (inputs too) only once idle this long:
+    # GitHub's default job timeout (timeout-minutes 360), so no job can still be using it.
+    "cmux_next_ci_unowned_idle_hours": 6.0,
 }
 ACTIVITY_MODE: str | None = None  # "pressure" or "sweep" while main acts; None keeps the wall-clock rule
 ROLE = "fleet-mini"
@@ -6025,14 +6032,26 @@ def cmux_next_ci_state_roots(root: Path) -> list[Path]:
     return roots
 
 
+def runner_config(runner: Path) -> dict:
+    """A runner's .runner (UTF-8 with a byte order mark), or {} when unreadable."""
+    try:
+        doc = json.loads((runner / ".runner").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def runner_work_folder(runner: Path) -> Path:
+    """The runner's work folder: .runner's workFolder, relative to the runner directory or absolute; _work."""
+    work = runner_config(runner).get("workFolder")
+    return runner / (work if isinstance(work, str) and work else "_work")
+
+
 def enrolled_runner_names() -> dict[str, Path]:
-    """agentName -> runner directory for every enrolled runner (its .runner is UTF-8 with a byte order mark)."""
+    """agentName -> runner directory for every enrolled runner."""
     names: dict[str, Path] = {}
     for runner in enrolled_runners():
-        try:
-            name = json.loads((runner / ".runner").read_text(encoding="utf-8-sig")).get("agentName")
-        except (OSError, ValueError, AttributeError):
-            continue
+        name = runner_config(runner).get("agentName")
         if isinstance(name, str):
             names.setdefault(name, runner)
     return names
@@ -6049,10 +6068,11 @@ def cmux_next_ci_release_key(runner_name: str, workspace: str) -> str:
 
 
 def cmux_next_ci_release_keys() -> dict[str, Path]:
-    """Release state key -> enrolled runner, for its cmux checkout's path as given and as resolved."""
+    """Release state key -> enrolled runner, for its cmux checkout ($GITHUB_WORKSPACE: <workFolder>/cmux/cmux)
+    as given and as resolved."""
     keys: dict[str, Path] = {}
     for name, runner in enrolled_runner_names().items():
-        workspace = os.fspath(runner / "_work/cmux/cmux")
+        workspace = os.fspath(runner_work_folder(runner) / "cmux/cmux")
         for ws in {workspace, os.path.realpath(workspace)}:
             keys.setdefault(cmux_next_ci_release_key(name, ws), runner)
     return keys
@@ -6077,11 +6097,15 @@ def cmux_next_ci_runner(path: Path, root: Path) -> Path | None:
 
 def cmux_next_ci_stale_roots(root: Path) -> list[Path]:
     """Validated state roots the size cap may take whole, inputs included: those no runner enrolled here owns
-    (a scheme state by name, a release state by key; cmux_next_ci_owner). Only a host with enrolled runners
-    can say an owner is gone, so elsewhere there are none. An enrolled runner's states keep their inputs."""
+    (a scheme state by name, a release state by key; cmux_next_ci_owner), idle at least a job's timeout
+    (cmux_next_ci_unowned_idle_hours). Only a host with enrolled runners can say an owner is gone, so elsewhere
+    there are none. An enrolled runner's states, and a younger unowned one, keep their inputs."""
     if not enrolled_runner_names():
         return []
-    return [s for s in cmux_next_ci_state_roots(root) if cmux_next_ci_owner(s, root) is None]
+    idle_s = float(POLICY["cmux_next_ci_unowned_idle_hours"]) * 3600
+    now = time.time()
+    return [s for s in cmux_next_ci_state_roots(root)
+            if cmux_next_ci_owner(s, root) is None and now - newest_mtime(s, 2, 3000) >= idle_s]
 
 
 def cmux_next_ci_generated_paths(root: Path, whole_stale: bool = False) -> list[Path]:
@@ -6107,19 +6131,37 @@ def cmux_next_ci_generated_paths(root: Path, whole_stale: bool = False) -> list[
     return found
 
 
-def cmux_next_ci_cap_state(fams: list[Family], cap_gib: float) -> dict[str, int] | None:
-    """The cmux-next-ci cache's size (one du of its whole root, inputs included) against CAP_GIB: used, cap and
-    over bytes. None when the cap does not apply: off (0), the family not in this run, no enrolled glaeda runner
-    (not a CI host), or the size unknown (the 72 h window then stands). The du is a probe, not an eviction
-    measurement, so its timeout records no eviction_stuck and no cooldown."""
+def cmux_next_ci_cap_state(fams: list[Family], cap_gib: float, measure: bool = False) -> dict[str, float] | None:
+    """The cmux-next-ci cache's size against CAP_GIB: used, cap and over bytes, and when it was measured (at).
+
+    With ``measure`` (a pressure run) one du of its whole root, inputs included, which CMUX_NEXT_CAP_RECORD keeps;
+    without, that record alone, so a report never walks the cache (7-10 s on a mini). None when the cap does not
+    apply: off (0), the family not in this run, no enrolled glaeda runner (not a CI host), or the size unknown
+    (the 72 h window then stands). The du is a probe, not an eviction measurement, so its timeout records no
+    eviction_stuck and no cooldown."""
     fam = next((f for f in fams if f.id == CMUX_NEXT_CI_FAMILY), None)
     if fam is None or cap_gib <= 0 or not enrolled_runners():
         return None
-    used = du_bytes(fam.root, record_timeout=False)
+    if measure:
+        used, at = du_bytes(fam.root, record_timeout=False), time.time()
+        if used is not None:
+            with contextlib.suppress(OSError):
+                CMUX_NEXT_CAP_RECORD.parent.mkdir(parents=True, exist_ok=True)
+                tmp = CMUX_NEXT_CAP_RECORD.with_suffix(f".{os.getpid()}.tmp")
+                tmp.write_text(json.dumps({"root": os.fspath(fam.root), "used": used, "at": at}))
+                os.replace(tmp, CMUX_NEXT_CAP_RECORD)
+    else:
+        try:
+            doc = json.loads(CMUX_NEXT_CAP_RECORD.read_text())
+            used, at = int(doc["used"]), float(doc["at"])
+            if doc.get("root") != os.fspath(fam.root):
+                return None
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
     if used is None:
         return None
     cap = int(cap_gib * GIB)
-    return {"used": used, "cap": cap, "over": max(0, used - cap)}
+    return {"used": used, "cap": cap, "over": max(0, used - cap), "at": at}
 
 
 def cmux_next_ci_family(root: Path | None = None) -> Family:
@@ -6771,17 +6813,21 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(why)
             RUN["skipped"] = "defer_during_ci"
             return 0
-    # the cap's state shows in every report and pressure run; only a pressure run acts on it (cmux_next_ci_over)
+    # only a pressure run measures the cap (one du) and acts on it (cmux_next_ci_over); a text report shows the last
+    # measurement, and --json (glaeda-fleet-status asks every mini on every call) neither measures nor shows it
     global CMUX_NEXT_CI_OVER
-    cap = (cmux_next_ci_cap_state(fams, a.cmux_next_cap_gib)
-           if not sweep and not a.cmux_next_drain and not a.refresh else None)
-    CMUX_NEXT_CI_OVER = cap["over"] if cap else 0
-    RUN["cmux_next_ci_over_gib"] = round(cap["over"] / GIB, 1) if cap else None
+    pressure = ACTIVITY_MODE == "pressure" and not a.cmux_next_drain
+    cap = (cmux_next_ci_cap_state(fams, a.cmux_next_cap_gib, measure=True) if pressure
+           else cmux_next_ci_cap_state(fams, a.cmux_next_cap_gib, measure=False)
+           if not sweep and not a.cmux_next_drain and not a.refresh and not a.json else None)
+    CMUX_NEXT_CI_OVER = cap["over"] if cap and pressure else 0
+    RUN["cmux_next_ci_over_gib"] = round(cap["over"] / GIB, 1) if cap and pressure else None
     if cap and not a.json:
+        measured = "" if pressure else f", measured {max(0.0, time.time() - cap['at']) / 60:.0f} min ago"
         print(f"cmux-next-ci: {gib(cap['used']).strip()} of its {cap['cap'] / GIB:g} GiB cap "
-              f"({gib(cap['over']).strip()} over)"
+              f"({gib(cap['over']).strip()} over){measured}"
               + ("; a pressure run takes its least recently used output first, whatever its age"
-                 if cap["over"] and ACTIVITY_MODE == "pressure" else
+                 if cap["over"] and pressure else
                  "; a pressure run would take its least recently used output first" if cap["over"] else ""))
     # Aside trees a killed deletion left, in the directories of the families this run judges (so a pressure
     # run looks only on the filesystems under pressure); `--family interrupted-deletions` alone looks in all.
