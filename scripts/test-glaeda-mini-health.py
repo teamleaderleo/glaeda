@@ -57,6 +57,7 @@ class FakeMini(health.Mini):
         self.claude_env: dict = {}
         self.answers: dict[str, bool] = {}  # route -> whether `claude -p` through it answers
         self.probe_memory: dict = {}
+        self.fleet = True  # a fleet mini, not a personal Mac (--hygiene-only)
 
     def console(self):
         return self.console_state
@@ -136,6 +137,9 @@ class FakeMini(health.Mini):
 
     def sudo_ok(self):
         return self.sudo
+
+    def fleet_host(self):
+        return self.fleet
 
     def claude_bin(self):
         return Path(self.claude) if self.claude else None
@@ -756,13 +760,29 @@ class ClaudeRoute(Base):
         self.assertEqual(self.claude(self.run_once()), [])
         self.assertEqual(self.mini.did, ["probe " + SR2, "probe " + POOL, "route " + POOL])
 
-    def test_the_placeholder_token_is_kept_or_taken_from_the_config(self) -> None:
-        self.mini.claude_env = {"ANTHROPIC_BASE_URL": "http://elsewhere:1", "ANTHROPIC_AUTH_TOKEN": "kept"}
+    def test_a_personal_mac_is_never_checked_or_rerouted(self) -> None:
+        self.mini.fleet = False  # mini-setup --hygiene-only: Leo's Macs, a teammate's laptop
+        self.mini.claude_env = {}
+        self.assertEqual(self.claude(self.run_once()), [])
+        self.assertEqual(self.mini.did, [])
+        self.assertEqual(self.mini.claude_env, {})
+
+    def test_the_token_is_kept_on_a_fleet_route_and_else_the_placeholder(self) -> None:
+        self.mini.answers = {SR2: False, POOL: True}
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "fleet-token"}
         self.run_once()
-        self.assertEqual(self.mini.claude_env["ANTHROPIC_AUTH_TOKEN"], "kept")
-        self.mini.claude_env = {"ANTHROPIC_BASE_URL": "http://elsewhere:1"}
-        self.run_once(at=NOW + 3600)
-        self.assertEqual(self.mini.claude_env["ANTHROPIC_AUTH_TOKEN"], ROUTES["placeholder"])
+        self.assertEqual(self.mini.claude_env, {"ANTHROPIC_BASE_URL": POOL, "ANTHROPIC_AUTH_TOKEN": "fleet-token"})
+        for n, env in enumerate(({"ANTHROPIC_BASE_URL": "http://elsewhere:1", "ANTHROPIC_AUTH_TOKEN": "meant-for-elsewhere"},
+                                 {"ANTHROPIC_BASE_URL": "http://elsewhere:1"}), 1):
+            with self.subTest(env=env):
+                self.mini.claude_env = dict(env)
+                self.run_once(at=NOW + 3600 * n)
+                self.assertEqual(self.mini.claude_env["ANTHROPIC_AUTH_TOKEN"], ROUTES["placeholder"])
+
+    def test_a_settings_finding_reroutes_in_the_config_order(self) -> None:
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2}  # no placeholder: the route itself did not fail
+        self.run_once()
+        self.assertEqual(self.mini.did, ["probe " + SR2, "route " + SR2], "never drifts to a later route")
 
     def test_a_route_outside_the_config_or_a_personal_token_is_a_finding(self) -> None:
         for env, why in (({"ANTHROPIC_BASE_URL": "http://elsewhere:1", "ANTHROPIC_AUTH_TOKEN": "x"}, "elsewhere"),
@@ -830,9 +850,18 @@ class ClaudeRouteOnDisk(unittest.TestCase):
         self.assertEqual(settings.stat().st_mode & 0o777, 0o600)
         backups = list(settings.parent.glob("settings.json.bak-mini-health-*"))
         self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600, "the backup can hold a token")
         self.assertEqual(json.loads(backups[0].read_text()), before)
         self.assertIn(SR2, what)
         self.assertNotIn("personal", what)
+
+    def test_only_a_fleet_mini_counts_as_one(self) -> None:
+        conf = self.home / ".config/glaeda/update.json"
+        self.assertFalse(self.mini.fleet_host(), "no update.json: glaeda-update's default is --hygiene-only")
+        conf.parent.mkdir(parents=True)
+        for args, fleet in ((["--hygiene-only"], False), ([], True), (["--role=builder"], True)):
+            conf.write_text(json.dumps({"setupArgs": args}))
+            self.assertEqual(self.mini.fleet_host(), fleet, args)
 
     def test_set_route_writes_settings_where_there_were_none(self) -> None:
         self.mini.set_claude_route(SR2, "subrouter")
