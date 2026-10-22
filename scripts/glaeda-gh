@@ -5088,7 +5088,9 @@ RELAY_COMMANDS: dict[str, set[str] | None] = {
     "cache": {"list", "delete"},
     "status": None,
 }
-HOST_URL_RE = re.compile(r"https?://([A-Za-z0-9.-]+)(?::[0-9]+)?/[^/\s]+/[^/\s]+(?:/\S*)?")
+# A whole argument that is a URL, and a HOST/OWNER/REPO (gh reads a 3-part repository as one).
+URL_HOST_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/\s]*@)?\[?([^/\s?#@\]]*?)\]?(?::[0-9]*)?(?:[/?#]\S*)?")
+REPO_HOST_RE = re.compile(r"([^/\s]+)/[^/\s]+/[^/\s]+")
 
 
 def relay_socket() -> Path:
@@ -5108,37 +5110,50 @@ def kill_group(proc: subprocess.Popen) -> None:
 
 
 def relay_hosts(args: list[str], env: Any) -> set[str]:
-    """The hosts other than github.com this call names, read loosely: GH_HOST, --hostname, a
-    -R/--repo HOST/OWNER/REPO or URL, or a URL argument (`pr view URL`) that is no flag's value."""
+    """The hosts other than github.com this call names. Read wide, not the way gh parses: a URL that
+    is a whole argument, a whole `--flag=` value or GH_REPO; GH_HOST and --hostname; a -R/--repo
+    value however spelled (`-R X`, `-RX`, `--repo=X`, `-sRX`, `-sR X`) or GH_REPO, as HOST/OWNER/REPO;
+    and an argument of HOST/OWNER/REPO whose host has a dot. A host read where gh reads none costs
+    the call a refusal; one missed would send it out unauthenticated."""
     hosts = {env["GH_HOST"]} if env.get("GH_HOST") else set()
+    repos = [env["GH_REPO"]] if env.get("GH_REPO") else []
+    values = list(repos)
     for before, arg in zip(["", *args], args):
         if before == "--hostname" or arg.startswith("--hostname="):
             hosts.add(arg.removeprefix("--hostname="))
-            continue
-        if before in ("-R", "--repo"):
-            value = arg
-        elif arg.startswith("--repo=") or arg.startswith("-R") and len(arg) > 2:
-            value = arg.removeprefix("--repo=").removeprefix("-R").removeprefix("=")
-        elif not before.startswith("-") and HOST_URL_RE.fullmatch(arg):
-            value = arg
-        else:
-            continue
-        match = HOST_URL_RE.fullmatch(value)
+        short = re.fullmatch(r"-[A-Za-z]*R(.*)", arg)
+        if before == "--repo" or re.fullmatch(r"-[A-Za-z]*R", before):
+            repos.append(arg)
+        elif arg.startswith("--repo="):
+            repos.append(arg.removeprefix("--repo="))
+        elif short and short.group(1):
+            repos.append(short.group(1).removeprefix("="))
+        values += [arg, arg.partition("=")[2]]
+    for value in [*repos, *values]:
+        match = URL_HOST_RE.fullmatch(value)
+        if match:
+            hosts.add(match.group(1) or "(none)")
+    for value in repos:
+        match = REPO_HOST_RE.fullmatch(value)
         if match:
             hosts.add(match.group(1))
-        elif value.count("/") == 2:
-            hosts.add(value.split("/")[0])
-    return {host.lower() for host in hosts} - {"github.com"}
+    for value in values:
+        match = REPO_HOST_RE.fullmatch(value)
+        if match and "." in match.group(1) and not URL_HOST_RE.fullmatch(value):
+            hosts.add(match.group(1))
+    # gh's own normalising: api.github.com and the like are github.com.
+    return {re.sub(r"^.*\.github\.com$", "github.com", host.lower()) for host in hosts} - {"github.com"}
 
 
 class RelayLost(Exception):
-    """The daemon started the call and went away before saying how it ended."""
+    """The daemon had the call and went away before saying how it ended."""
 
 
 def relay_exchange(path: Path, request: dict, fds: list[int], timeout: float) -> int:
     """Hand one call and these three descriptors to the daemon; return gh's exit code there.
-    Raises WatchError when the daemon refused it, OSError or ValueError when it never ran, and
-    RelayLost when it ran and its ending is unknown."""
+    Raises WatchError when the daemon refused it, OSError when it never reached the daemon, and
+    RelayLost when the daemon had it and its ending is unknown: once the request is sent, only a
+    refusal says it did not run, since gh may start before the daemon can say it has."""
     body = json.dumps(request).encode()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(30)
@@ -5149,7 +5164,6 @@ def relay_exchange(path: Path, request: dict, fds: list[int], timeout: float) ->
         conn.sendall(body)
         conn.settimeout(timeout)
         stream = conn.makefile("rb")
-        started = False
         try:
             while line := stream.readline(1 << 16):
                 message = json.loads(line)
@@ -5157,19 +5171,13 @@ def relay_exchange(path: Path, request: dict, fds: list[int], timeout: float) ->
                     raise ValueError("the relay answered something that is not an answer")
                 if isinstance(message.get("refused"), str):
                     raise WatchError(message["refused"][:300])
-                if message.get("started") is True:
-                    started = True
-                elif isinstance(message.get("rc"), int):
+                if isinstance(message.get("rc"), int):
                     if isinstance(message.get("note"), str):
                         print(f"glaeda-gh relay: {message['note'][:300]}", file=sys.stderr)
                     return message["rc"]
-        except (OSError, ValueError):
-            if started:  # a reset, a timeout or a torn line after gh began: its ending is unknown
-                raise RelayLost() from None
-            raise
-        if started:
-            raise RelayLost()
-        raise ValueError("the relay closed without an answer")
+        except (OSError, ValueError):  # a reset, a timeout or a torn line: its ending is unknown
+            raise RelayLost() from None
+        raise RelayLost()
 
 
 def relay_refusal(argv: list[str], env: dict) -> str | None:
@@ -5377,8 +5385,6 @@ class GhRelay(threading.Thread):
             with contextlib.suppress(OSError):
                 os.close(fd)
         fds.clear()
-        with contextlib.suppress(OSError):
-            self.say(conn, {"started": True})
 
         def gone() -> None:
             # The caller sends nothing more; its side closing means it is gone (killed, interrupted).

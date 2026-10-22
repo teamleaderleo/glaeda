@@ -4583,11 +4583,47 @@ class GhRelayTest(RelayBase):
                 with self.assertRaisesRegex(gg.WatchError, "not run for another process"):
                     self.call(argv)
         # Its token is github.com's: a call to another host would go out unauthenticated.
-        for argv, env in ((["api", "--hostname", "ghe.example.invalid", "x"], {}),
-                          (["pr", "view", "7"], {"GH_HOST": "ghe.example.invalid"})):
+        ghe = "ghe.example.invalid"
+        for argv, env in ((["api", "--hostname", ghe, "x"], {}), (["pr", "view", "7"], {"GH_HOST": ghe}),
+                          (["issue", "close", "7"], {"GH_REPO": f"{ghe}/acme/private"}),
+                          (["issue", "close", "7"], {"GH_REPO": f"https://{ghe}/acme/private"}),
+                          (["api", f"https://{ghe}/rate_limit"], {}), (["api", f"https://{ghe}"], {}),
+                          (["pr", "view", "--comments", f"https://{ghe}/o/r/pull/7"], {}),
+                          (["pr", "merge", "7", f"-sR{ghe}/o/r"], {}), (["pr", "merge", "7", "-sR", f"{ghe}/o/r"], {}),
+                          (["pr", "view", "7", "-R", "ghe/o/r"], {}), (["pr", "view", "7", f"--repo={ghe}/o/r"], {}),
+                          (["repo", "view", f"{ghe}/o/r"], {}), (["api", "x", f"--url=https://{ghe}/o/r"], {})):
             with self.subTest(argv=argv, env=env), self.assertRaisesRegex(gg.WatchError, "github.com only"):
                 self.call(argv, env)
         self.assertFalse(self.ran.exists(), "gh ran for a refused call")
+
+    def test_github_coms_own_hosts_and_a_url_inside_a_body_name_no_other_host(self) -> None:
+        for argv, env in ((["api", "https://api.github.com/rate_limit"], {}),
+                          (["pr", "view", "https://github.com/o/r/pull/7"], {"GH_REPO": "o/r"}),
+                          (["pr", "comment", "7", "--body", "see https://example.com/a/b"], {}),
+                          (["api", "repos/o/r/issues", "-f", "title=a/b/c"], {}),
+                          (["pr", "view", "7", "-R", "o/r"], {"GH_REPO": "github.com/o/r"})):
+            with self.subTest(argv=argv, env=env):
+                self.assertEqual(gg.relay_hosts(argv, env), set())
+
+    def test_a_relay_that_goes_away_after_taking_the_call_is_an_unknown_ending(self) -> None:
+        """gh starts before the daemon can say so: once the request is sent, only a refusal says the
+        call did not run, so a connection lost before any answer is not \"not run\"."""
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(str(self.sock))
+        listener.listen(1)
+
+        def take_and_vanish() -> None:
+            conn, _ = listener.accept()
+            with conn:
+                data, fds, _, _ = socket.recv_fds(conn, 1 << 16, 3)
+                for fd in fds:
+                    os.close(fd)
+                while len(data) < 4 or len(data) < 4 + int.from_bytes(data[:4], "big"):
+                    data += conn.recv(1 << 16)  # unread, Linux would answer with a reset, not this
+        threading.Thread(target=take_and_vanish, daemon=True).start()
+        with self.assertRaises(gg.RelayLost):
+            self.call(["issue", "close", "7"])
 
     def test_the_daemon_runs_gh_with_nothing_of_the_callers_choosing(self) -> None:
         self.relay('echo "pager=$GH_PAGER editor=$GH_EDITOR browser=$GH_BROWSER '
