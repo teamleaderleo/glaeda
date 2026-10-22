@@ -1308,7 +1308,10 @@ all of them failing closed (`heal_tailscale_route` in the script):
    host lock unreadable),
    or a restart state that cannot be read or written (a `last_attempt_at` that is not a finite time from 0 to 6 h
    past now is unreadable).
-7. **Kill switch.** `touch ~/.config/glaeda/tailscale-restart-off`, or `GLAEDA_TAILSCALE_RESTART=off` in the
+7. **Not with claude_route.** While `tailscale_down` or `tailscale_no_route` is seen, `claude_route` keeps no
+   probe and reroutes nothing (no route over a broken tunnel answers), so Claude's settings never change in the
+   run that restarts Tailscale; the next run re-probes the route in use.
+8. **Kill switch.** `touch ~/.config/glaeda/tailscale-restart-off`, or `GLAEDA_TAILSCALE_RESTART=off` in the
    agent's environment (as glaeda-disk's `disk-off`); `mini-health.disabled` stops it too.
 
 ## 2m. Build mesh: the fleet index and kept state between PR minis
