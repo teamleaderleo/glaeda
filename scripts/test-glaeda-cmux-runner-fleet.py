@@ -60,10 +60,16 @@ if "instance-gateway-" in remote and "receipt.json" in remote and "--apply" not 
     # holds this member's receipts, so a command a real shell refuses (zsh NOMATCH) fails here too
     import shutil, subprocess
     home = log + ".home." + host
+    state = home + "/.local/state/glaeda/cmux-runner"
+    if os.path.isdir(state):
+        os.chmod(state, 0o755)
     shutil.rmtree(home, ignore_errors=True)
     for k in slots.get(host, []):
-        os.makedirs(home + "/.local/state/glaeda/cmux-runner/instance-gateway-" + str(k))
-        open(home + "/.local/state/glaeda/cmux-runner/instance-gateway-" + str(k) + "/receipt.json", "w").write("{{}}")
+        os.makedirs(state + "/instance-gateway-" + str(k))
+        open(state + "/instance-gateway-" + str(k) + "/receipt.json", "w").write("{{}}")
+    if host in os.environ.get("FAKE_UNREADABLE", "").split(","):  # a state dir the listing cannot read
+        os.makedirs(state, exist_ok=True)
+        os.chmod(state, 0)
     shell = shutil.which("zsh") or "/bin/sh"
     sys.exit(subprocess.run([shell, "-c", remote], env={{**os.environ, "HOME": home}}).returncode)
 if "--uninstall --apply" in remote and "--gateway " in remote:
@@ -344,6 +350,21 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(json.loads((self.dir / "calls.jsonl.gateways.json").read_text()),
                          {"mini-a": [], "mini-b": [0, 1]})
+
+    def test_an_unreadable_receipt_listing_fails_the_apply(self) -> None:
+        """No state dir is no slots (the apply above), but a listing that cannot read it never reads as none: a
+        lower count would report success while the surplus slots stay registered."""
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-000 directory")
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"gatewayRunners": 1}}}
+        self.manifest.write_text(json.dumps(manifest))
+        result = self.fleet("--apply", "--gateway-only", FAKE_UNREADABLE="mini-a")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        rows = {r["member"]: r for r in json.loads(result.stdout)["members"]}
+        self.assertIn("cannot list gateway receipts", rows["mini-a"]["gatewayRemovals"][0]["state"])
+        self.assertEqual(rows["mini-a"]["action"], "failed")
+        self.assertNotIn("gatewayRemovals", rows["mini-b"])
 
     def test_a_failed_removal_fails_the_apply(self) -> None:
         manifest = json.loads(json.dumps(MANIFEST))

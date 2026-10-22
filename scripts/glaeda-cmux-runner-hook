@@ -4552,11 +4552,36 @@ class GatewayGate(Gate):
         seen = "no recent demand reading" if demand is None else f"{demand} gateway jobs on {scope.hosts} hosts"
         return f"gateway: slot {scope.slot} is above the {k} of {scope.slots} this mini listens on ({seen})"
 
+    def paused(self) -> str | None:
+        """Why a stuck refusal barrier paused this slot (pause_gateway_slot), or None. An expired pause is removed."""
+        pause = self.runner_dir / "glaeda-hooks" / GATEWAY_PAUSE_FILE
+        try:
+            age = time.time() - pause.stat().st_mtime
+        except OSError:
+            return None
+        if age >= GATEWAY_PAUSE_S:
+            with contextlib.suppress(OSError):
+                pause.unlink()
+            gate_log(f"gateway: the barrier pause expired after {GATEWAY_PAUSE_S / 60:g} min; listening again")
+            return None
+        return f"gateway: paused by a refusal whose execution barrier could not finish ({pause})"
+
     def claimed(self) -> str | None:
-        return self.still_reserved() or self.low_disk() or self.surplus()
+        return self.paused() or self.still_reserved() or self.low_disk() or self.surplus()
 
     def confirmed(self) -> str | None:
         return self.claimed()
+
+    def step(self) -> int | None:
+        """A pause ends the runner now, job and all: the paused refusal's Worker must not run a later step, and its
+        hook could not prove that it is gone. kill() takes the whole tree, so it repeats each poll until run.sh exits."""
+        if self.child is not None and self.child.poll() is None and (why := self.paused()):
+            if self.stop_deadline is None:
+                gate_log(f"ending the runner, job and all: {why}")
+            self.held, self.stop_deadline = why, time.monotonic() + GATE_STOP_WAIT_S
+            self.kill()
+            return None
+        return super().step()
 
 
 # A refused job-started does not stop the job by itself. The runner (actions/runner v2.338.0) runs the hook as a
@@ -4571,7 +4596,11 @@ class GatewayGate(Gate):
 # condition. Taking the slot offline would also end the job, but it costs the slot. The cost of SIGKILL is the
 # job's log: the refusal line printed before the kill may not reach GitHub, so it is also written to stderr, which
 # the Listener attaches to the job for a crashed Worker.
-BARRIER_WAIT_S = 10.0
+BARRIER_WAIT_S = 30.0
+# A barrier still unfinished after BARRIER_WAIT_S pauses its slot (pause_gateway_slot) this long; the gate removes
+# an older pause, so the slot heals by itself and a fault that persists pauses it again at its next refusal.
+GATEWAY_PAUSE_FILE = "gateway-barrier-paused"
+GATEWAY_PAUSE_S = 3600.0
 
 
 def process_observation(pid: int) -> tuple[int, str, str] | None:
@@ -4628,20 +4657,48 @@ def _pidfd(pid: int) -> int | None:
     return None
 
 
+def gateway_pause_file() -> Path | None:
+    """Where a stuck barrier pauses this slot: the installed hook's own directory (RUNNER/glaeda-hooks, beside the
+    slot's listen.sh), never anything the job's environment names. None for a hook run outside an install."""
+    hooks = Path(__file__).resolve().parent
+    return hooks / GATEWAY_PAUSE_FILE if (hooks / "listen.sh").is_file() else None
+
+
+def pause_gateway_slot(why: str) -> str:
+    """The bounded escalation of a barrier that cannot finish: pause this slot (GatewayGate.paused: the gate SIGKILLs
+    the slot's whole runner tree, Listener and Worker with this hook, and takes no job until the pause expires) and
+    say so in red. The hook itself keeps the Worker blocked meanwhile; it never returns to it."""
+    pause = gateway_pause_file()
+    note = "no installed slot to pause"
+    if pause is not None:
+        try:
+            pause.write_text(f"{why}\n")
+            note = f"paused this slot ({pause}) for {GATEWAY_PAUSE_S / 60:g} min; its gate ends the runner"
+        except OSError as error:
+            note = f"cannot pause this slot ({type(error).__name__}: {error})"
+    print(f"::error::{PREFIX}: execution barrier stuck: {why}; {note}", flush=True)
+    print(f"{PREFIX}: execution barrier stuck: {why}; {note}", file=sys.stderr, flush=True)
+    return note
+
+
 def end_worker(owner: JobOwner | None, wait_s: float = BARRIER_WAIT_S) -> str:
     """The execution barrier after a refusal: SIGKILL this job's Runner.Worker (the pinned owner when it is one,
     else the Runner.Worker above this hook) and wait until it is gone. Only a process named Runner.Worker is ever
-    signalled, and only the one first observed (name and start token re-checked right before each signal).
+    signalled, and only the one first observed: its name and start token are read again as the last thing before
+    each signal, after the zombie probe. On Linux the signal goes through a pidfd opened before that read; macOS
+    has no pidfd (nor Linux when pidfd_open fails), so a pid freed and reused between that read and kill(2), a few
+    Python statements, is the residual window.
+
     Fails closed: a probe that cannot tell (ps failed or timed out) is retried, never read as gone, so this never
-    returns while the Worker may live. On Linux the signal goes through a pidfd opened before that check; macOS
-    has no pidfd, so a pid freed and reused between the check and kill(2) (microseconds) is the residual window.
-    Returns what happened, for the log."""
+    returns while the Worker may live. That wait is bounded: after wait_s it escalates once (pause_gateway_slot),
+    and the slot's gate then kills the whole runner tree, this hook with it. Returning a failure instead would let
+    the Worker run the job's next step. Returns what happened, for the log."""
     deadline: float | None = time.monotonic() + wait_s
 
     def wait(why: str) -> None:
         nonlocal deadline
         if deadline is not None and time.monotonic() > deadline:
-            print(f"{PREFIX}: {why} after {wait_s:g} s; still waiting", file=sys.stderr, flush=True)
+            pause_gateway_slot(f"{why} after {wait_s:g} s")
             deadline = None
         time.sleep(0.05)
 
@@ -4655,13 +4712,12 @@ def end_worker(owner: JobOwner | None, wait_s: float = BARRIER_WAIT_S) -> str:
     while True:
         fd = _pidfd(pid)
         try:
-            seen = process_observation(pid)
+            zombie = Gate._zombie(pid)  # a zombie runs nothing; its parent reaps it
+            seen = process_observation(pid)  # the last read before the signal
             if seen is None and not pid_alive(pid) or seen is not None and (
-                    seen[1] != "Runner.Worker" or not _same_start(seen[2], identity)):
+                    zombie or seen[1] != "Runner.Worker" or not _same_start(seen[2], identity)):
                 break
             if seen is not None:
-                if Gate._zombie(pid):  # a zombie runs nothing; its parent reaps it
-                    break
                 with contextlib.suppress(OSError):
                     if fd is not None:
                         signal.pidfd_send_signal(fd, signal.SIGKILL)

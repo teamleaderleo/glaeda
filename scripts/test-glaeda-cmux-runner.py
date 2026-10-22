@@ -8615,55 +8615,101 @@ class GatewayTest(unittest.TestCase):
 
     def test_the_barrier_rechecks_name_and_start_right_before_the_signal(self) -> None:
         """Discovery reads the Worker's name and start token in one observation; if the pid is reused before the
-        signal (by another program, or by another Worker), the re-check sees it and nothing is signalled."""
-        for later in ((1, "zsh", "ps:Wed Oct 21 10:00:01 2026"), (1, "Runner.Worker", "ps:Wed Oct 21 10:00:01 2026")):
-            with self.subTest(later=later):
-                looks = {"worker": 0}
+        signal (by another program, or by another Worker), even during the zombie probe that comes just before
+        the last read, the re-check sees it and nothing is signalled."""
+        for later, during_probe in (((1, "zsh", "ps:Wed Oct 21 10:00:01 2026"), False),
+                                    ((1, "Runner.Worker", "ps:Wed Oct 21 10:00:01 2026"), False),
+                                    ((1, "zsh", "ps:Wed Oct 21 10:00:01 2026"), True)):
+            with self.subTest(later=later, during_probe=during_probe):
+                looks = {"worker": 0, "reused": False}
 
                 def observe(pid: int) -> tuple[int, str, str] | None:
                     if pid == 777:  # the hook's parent: a shell under the Worker
                         return 4242, "sh", "ps:Wed Oct 21 09:00:00 2026"
                     looks["worker"] += 1
-                    return (1, "Runner.Worker", "ps:Wed Oct 21  9:00:00 2026") if looks["worker"] == 1 else later
+                    if looks["reused"] or not during_probe and looks["worker"] > 1:
+                        return later
+                    return 1, "Runner.Worker", "ps:Wed Oct 21  9:00:00 2026"
+
+                def zombie(pid: int) -> bool:
+                    looks["reused"] = during_probe  # the pid is freed and reused while ps runs
+                    return False
 
                 with self.no_signal(), mock.patch.object(hook.os, "getppid", return_value=777), \
                         mock.patch.object(hook, "process_observation", side_effect=observe), \
+                        mock.patch.object(hook.Gate, "_zombie", side_effect=zombie), \
                         mock.patch.object(hook, "pid_alive", return_value=True):
                     self.assertEqual(hook.end_worker(None), "Runner.Worker 4242 is already gone")
                 self.assertEqual(looks["worker"], 2)
 
     def test_the_barrier_fails_closed_while_a_probe_cannot_tell(self) -> None:
         """A ps that fails or times out is never read as "gone": end_worker keeps the Worker blocked (it awaits
-        this hook) until a probe answers, then ends it. Both before the Worker is found and after."""
+        this hook) until a probe answers, then ends it, both before the Worker is found and after. It runs here in
+        this thread, so every protection (no real ancestry) stays in place until it has returned."""
         real = hook.process_observation
-        for failing_from in (0, 1):  # every look fails; or discovery works and the look before the signal fails
+        for failing_from in (0, 1):  # every look fails at first; or discovery works and the look before the signal
             with self.subTest(failing_from=failing_from):
                 sleeper = subprocess.Popen(["/bin/sleep", "60"])
                 self.addCleanup(sleeper.wait)
                 self.addCleanup(lambda p=sleeper: p.poll() is None and p.kill())
                 owner = hook.JobOwner.of(sleeper.pid)
-                answering = threading.Event()
                 looks = {"n": 0}
 
                 def observe(pid: int, sleeper: subprocess.Popen = sleeper) -> tuple[int, str, str] | None:
                     looks["n"] += 1
-                    if looks["n"] > failing_from and not answering.is_set():
+                    if failing_from < looks["n"] <= failing_from + 5:
+                        self.assertIsNone(sleeper.poll(), "signalled without a confirmed name and start token")
                         return None  # ps failed or timed out
                     seen = real(pid)
                     return (seen[0], "Runner.Worker", seen[2]) if seen and pid == sleeper.pid else seen
 
-                done: list[str] = []
                 with mock.patch.object(hook.os, "getppid", return_value=1), \
                         mock.patch.object(hook, "process_observation", side_effect=observe):
-                    thread = threading.Thread(target=lambda: done.append(hook.end_worker(owner, wait_s=0.2)))
-                    thread.start()
-                    time.sleep(0.8)
-                    self.assertEqual(done, [], "returned while the Worker could still be alive")
-                    self.assertIsNone(sleeper.poll(), "signalled without a confirmed name and start token")
-                    answering.set()
-                    thread.join(30)
-                self.assertEqual(done, [f"ended Runner.Worker {sleeper.pid}, so no later step of this job runs here"])
+                    done = hook.end_worker(owner, wait_s=60)
+                self.assertEqual(done, f"ended Runner.Worker {sleeper.pid}, so no later step of this job runs here")
+                self.assertGreater(looks["n"], failing_from + 5, "returned while a probe could not tell")
                 self.assertEqual(sleeper.wait(10), -signal.SIGKILL)
+
+    def test_a_barrier_that_cannot_finish_pauses_the_slot_and_keeps_blocking(self) -> None:
+        """Bounded: after wait_s the barrier escalates once, in red, and pauses its slot (the gate then ends the whole
+        runner); it still never returns while the Worker may live. A hook outside an install has no slot to pause."""
+        self.assertIsNone(hook.gateway_pause_file(), "the repo's own scripts/ is never paused")
+        pause = self.dir / "glaeda-hooks" / hook.GATEWAY_PAUSE_FILE
+        pause.parent.mkdir()
+        looks = {"n": 0}
+
+        def observe(pid: int) -> tuple[int, str, str] | None:
+            looks["n"] += 1
+            return None if looks["n"] <= 30 else (1, "zsh", "ps:another process")  # the probes recover at last
+
+        out, err = io.StringIO(), io.StringIO()
+        with self.no_signal(), mock.patch.object(hook, "process_observation", side_effect=observe), \
+                mock.patch.object(hook, "pid_alive", return_value=True), \
+                mock.patch.object(hook, "gateway_pause_file", return_value=pause), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            done = hook.end_worker(hook.JobOwner(4242, "ps:the pinned start"), wait_s=0.3)
+        self.assertGreater(looks["n"], 30, "returned while the probes could not tell")
+        self.assertIn("no Runner.Worker", done)
+        self.assertEqual(out.getvalue().count("::error::glaeda-cmux-runner-hook: execution barrier stuck"), 1)
+        self.assertIn("cannot read the process tree", pause.read_text())
+
+    def test_a_pause_ends_the_runner_and_holds_the_slot_until_it_expires(self) -> None:
+        gate = self.gate(0)
+        pause = gate.runner_dir / "glaeda-hooks" / hook.GATEWAY_PAUSE_FILE
+        with mock.patch.object(hook, "gateway_demand", return_value=40), \
+                mock.patch.object(hook, "gate_log"), mock.patch.object(gate, "kill") as kill:
+            self.assertIsNone(gate.claimed())
+            pause.write_text("stuck\n")
+            self.assertIn("paused by a refusal", gate.claimed())
+            gate.child = mock.Mock(**{"poll.return_value": None})  # a runner with a job: ended all the same
+            self.assertIsNone(gate.step())
+            self.assertIsNone(gate.step())
+            self.assertEqual(kill.call_count, 2, "kill repeats each poll until run.sh exits")
+            gate.child = None
+            old = time.time() - hook.GATEWAY_PAUSE_S - 1
+            os.utime(pause, (old, old))
+            self.assertIsNone(gate.claimed())
+            self.assertFalse(pause.exists(), "an expired pause is removed: the slot heals by itself")
 
     def gate(self, slot: int = 0, slots: int = 3, hosts: int = 2) -> hook.GatewayGate:
         runner = self.dir / f"actions-runner-gateway-{slot}"

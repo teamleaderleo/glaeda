@@ -601,9 +601,10 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
     return result
 
 
-# Read-only, and no glob for the login shell to expand: zsh's NOMATCH fails a glob with no match (no slots).
-GATEWAY_RECEIPTS = ("find ~/.local/state/glaeda/cmux-runner -maxdepth 2 -type f "
-                    "-path '*/instance-gateway-*/receipt.json' 2>/dev/null; true")
+# Read-only, and no glob for the login shell to expand: zsh's NOMATCH fails a glob with no match (no slots). No
+# state dir is no slots; any other error (an unreadable dir) fails the listing, so a removal is never skipped.
+GATEWAY_RECEIPTS = ("d=\"$HOME/.local/state/glaeda/cmux-runner\"; [ -e \"$d\" ] || exit 0; "
+                    "find \"$d\" -maxdepth 2 -type f -path '*/instance-gateway-*/receipt.json'")
 GATEWAY_RECEIPT_RE = re.compile(r"/instance-gateway-([0-9])/receipt\.json$")
 
 

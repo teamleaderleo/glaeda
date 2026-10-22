@@ -817,7 +817,10 @@ the instances (always repo-scoped), and `--gateway-only` applies only them.
   barrier, not only a failed step: the runner (v2.338.0, StepsRunner.cs) still evaluates later steps' `if:` after
   a failed job-started, so an `if: always()` step would run. The hook SIGKILLs its job's Runner.Worker (pinned by
   pid and start token, only a process of that name) and returns only once it is gone; the Listener fails the job
-  and keeps listening. The reason is also on stderr, which the Listener attaches for a crashed Worker.
+  and keeps listening. The reason is also on stderr, which the Listener attaches for a crashed Worker. A probe that
+  cannot tell (ps failing or timing out) never counts as gone; if the barrier is still unfinished after 30 s, the hook
+  writes `glaeda-hooks/gateway-barrier-paused` and reports `::error::`, and the slot's gate SIGKILLs the whole runner
+  tree (Listener, Worker, hook) and takes no job for an hour, after which the gate removes the pause.
 - The listen gate holds a slot only for a reservation, the disk floor, or a slot index at or above k. k is the
   label's queued plus running jobs on the ci-dash (`data.json` pools, over the tailnet, never GitHub's API), divided
   by the members with slots (`gatewayHosts`, which the fleet tool writes into each trimmed manifest), plus 1, clamped
