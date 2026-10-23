@@ -1764,6 +1764,8 @@ class ClientTest(Base):
         broken = gg.parse_pr(pr_node(2, rollup="FAILURE", checks=[check_run("lint", conclusion="FAILURE"), running]))
         self.assertEqual(gg.verdict("pr", {**broken, "checksTruncated": True, "checkState": "FAILURE",
                                            "superseded": [cancelled]}, "green"), 1)
+        self.assertEqual(gg.verdict("pr", {**broken, "checksTruncated": True, "checkState": "FAILURE",
+                                           "superseded": [cancelled]}, "required"), 1)
         # with no superseded attempt to explain it, the rollup's FAILURE is a check past the first 100
         self.assertEqual(gg.verdict("pr", {**many, "superseded": []}, "green"), 1)
         # once the shown checks finish, the rollup decides as before
