@@ -2903,11 +2903,11 @@ class LaunchdRestartTest(unittest.TestCase):
         def answer(out: str, code: int = 0) -> Any:
             return lambda argv, timeout=None: subprocess.CompletedProcess(argv, code, out, "")
 
-        now = time.monotonic()
-        entered = int((now - 700) * 1e6)
+        ago = time.monotonic() / 2  # a CI runner may have booted only minutes ago
+        entered = int((time.monotonic() - ago) * 1e6)
         with mock.patch.object(gg.sys, "platform", "linux"):
             with mock.patch.object(gg, "run_bounded", answer(f"ActiveState=active\nActiveEnterTimestampMonotonic={entered}\n")):
-                self.assertAlmostEqual(gg.unit_active_for(), 700, delta=5)
+                self.assertAlmostEqual(gg.unit_active_for(), ago, delta=5)
             with mock.patch.object(gg, "run_bounded", answer(f"ActiveState=inactive\nActiveEnterTimestampMonotonic={entered}\n")):
                 self.assertIsNone(gg.unit_active_for())
             with mock.patch.object(gg, "run_bounded", answer("ActiveState=active\nActiveEnterTimestampMonotonic=0\n")):
