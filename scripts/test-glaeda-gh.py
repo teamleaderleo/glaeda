@@ -2789,16 +2789,30 @@ class RestartTest(Base):
         self.assertIsNotNone(gg.daemon_stale(), "a new holder that stays silent is hung")
 
     def test_a_restart_that_died_midway_holds_nobody_back(self) -> None:
-        gg.write_json(gg.BASE / "restart.json", {"at": time.time() - 5, "by": 999, "how": "starting"})
-        self.assertIsNone(gg.recent_restart(), "nobody holds restart.lock: nothing is restarting it")
-        guard = open(gg.BASE / "restart.lock", "a+")
-        fcntl.flock(guard, fcntl.LOCK_EX)
-        try:
-            self.assertIsNotNone(gg.recent_restart(), "while a session holds it, that restart is under way")
-        finally:
-            guard.close()
-        code, text = self.run_restart()
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait()  # reaped: its pid names no process
+        gg.write_json(gg.BASE / "restart.json", {"at": time.time() - 5, "by": gone.pid, "how": "starting"})
+        self.assertIsNone(gg.recent_restart(), "its writer is gone: nothing is restarting it")
+        gg.write_json(gg.BASE / "restart.json", {"at": time.time() - 5, "by": os.getpid(), "how": "starting"})
+        self.assertIsNotNone(gg.recent_restart(), "while its writer runs, that restart is under way")
+        code, text = self.run_restart()  # holds restart.lock itself: no other restart can be running
         self.assertEqual((code, self.calls), (0, [False]), text)
+
+    def test_a_hung_holder_whose_status_file_is_gone_is_restarted(self) -> None:
+        self.hold(stale=True)
+        (gg.BASE / "daemon.lock").write_text(json.dumps({"pid": 4321, "since": time.time() - gg.STALE_HEARTBEAT - 60}) + "\n")
+        (gg.BASE / "daemon.json").unlink()
+        self.assertIsNotNone(gg.daemon_stale())
+        (gg.BASE / "daemon.json").write_text("{not json")
+        self.assertIsNotNone(gg.daemon_stale(), "an unreadable one says nothing either")
+        with mock.patch.object(gg, "is_serve", return_value=False):
+            code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [True]), text)
+
+    def test_a_holder_that_writes_heartbeats_is_not_stale(self) -> None:
+        self.hold(stale=False)
+        (gg.BASE / "daemon.lock").write_text(json.dumps({"pid": 1, "since": time.time() - 3 * gg.STALE_HEARTBEAT}) + "\n")
+        self.assertIsNone(gg.daemon_stale(), "its own recent heartbeat counts, not when it took the lock")
 
     def test_on_macos_a_restart_without_a_heartbeat_starts_no_cooldown(self) -> None:
         self.hold(stale=True)

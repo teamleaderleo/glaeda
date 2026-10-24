@@ -2652,26 +2652,29 @@ def recent_restart(now: float | None = None, holding: bool = False) -> float | N
     command failed does not count: sessions must not be told to wait on a restart that did not happen.
     One that ran but saw no heartbeat within RESTART_SETTLE does: the daemon it started may just be
     slow, and another session restarting it again would kill that one (the 10-19 kickstart storm).
-    `holding`: the caller holds restart.lock, so no other restart is in progress."""
+    `holding`: the caller holds restart.lock, so no other restart is in progress, whatever pid wrote a
+    "starting" record."""
     record = restart_record()
     if record is None or (record.get("ok") is False and not record.get("ran")):
         return None
-    if record.get("how") == "starting" and (holding or not restart_in_progress()):
+    if record.get("how") == "starting" and (holding or not alive(record.get("by"))):
         return None  # a restart that died before it finished: nothing is starting a daemon
     ago = (time.time() if now is None else now) - record["at"]
     return ago if 0 <= ago < RESTART_COOLDOWN else None
 
 
-def restart_in_progress() -> bool:
-    """Whether some session holds restart.lock (cmd_restart holds it from its first record to its last)."""
-    try:
-        with open(BASE / "restart.lock", "a+") as guard:
-            if not try_lock(guard):
-                return True
-            fcntl.flock(guard, fcntl.LOCK_UN)
-            return False
-    except OSError:
+def alive(pid: Any) -> bool:
+    """Whether `pid` (the restart that wrote a "starting" record) still runs. Never touches restart.lock,
+    so it cannot make a real restart's lock attempt fail."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # another user's: it exists
+        return True
+    return True
 
 
 def down_message() -> str:
@@ -2685,17 +2688,20 @@ def down_message() -> str:
 
 def daemon_stale() -> float | None:
     """Seconds since the daemon's last heartbeat, when that is so long ago that it looks hung."""
-    status = read_json(BASE / "daemon.json")
-    # an older daemon wrote daemon.json only when it fetched something: its silence means nothing
-    at = status.get("at") if isinstance(status, dict) and status.get("heartbeat") else None
-    if not isinstance(at, (int, float)):
-        return None
-    lag = time.time() - at
-    holder = lock_holder()
-    if holder is not None and holder["pid"] != status.get("pid"):
-        # a newer daemon holds the lock and has not written its first heartbeat yet: the last one is
-        # its predecessor's, so count from when this one took the lock
+    holder = lock_holder() if lock_held() else None
+    if holder is not None:
+        # The holder's own record: its silence counts from its last heartbeat, or from when it took
+        # the lock when daemon.json is its predecessor's (before its first heartbeat), missing or
+        # unreadable. One read of daemon.json, so a heartbeat written meanwhile is never missed.
         lag = holder["silent"]
+    else:
+        status = read_json(BASE / "daemon.json")
+        # an older daemon (no holder record) wrote daemon.json only when it fetched something: its
+        # silence means nothing
+        at = status.get("at") if isinstance(status, dict) and status.get("heartbeat") else None
+        if not isinstance(at, (int, float)):
+            return None
+        lag = time.time() - at
     return lag if lag > STALE_HEARTBEAT else None
 
 
