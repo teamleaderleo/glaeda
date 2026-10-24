@@ -6734,5 +6734,222 @@ class PostTest(unittest.TestCase):
         self.assertEqual(status["outbox"], {"queued": 1, "holdUntil": None})
 
 
+APP_TOKEN = "ghs_FakeInstallationToken0000000000000"
+APP_KEY = "-----BEGIN RSA PRIVATE KEY-----\nTUlJRmFrZUtleQ==\n-----END RSA PRIVATE KEY-----\n"
+
+
+class FakeApp:
+    """api.github.com for a GitHub App: the installation lookup and the token mint, plus canned
+    answers for everything else, recording which bearer each request carried."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []  # (method, path, bearer)
+        self.mints = 0
+        self.expires_in = 3600.0
+        self.refuse_mint = 0  # HTTP status for the mint, 0 to answer
+        self.answers: dict[str, tuple[int, dict, Any]] = {}  # path -> (status, headers, doc) for APP_TOKEN reads
+
+    def __call__(self, method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
+        path = url[len(gg.API):]
+        bearer = headers["Authorization"].split(" ", 1)[1]
+        self.calls.append((method, path, bearer))
+        if path == "/orgs/manaflow-ai/installation":
+            assert bearer.count(".") == 2, "the installation lookup is authenticated with the App's JWT"
+            return 200, {}, json.dumps({"id": 77}).encode()
+        if path == "/app/installations/77/access_tokens":
+            assert bearer.count(".") == 2
+            if self.refuse_mint:
+                return self.refuse_mint, {}, b'{"message": "nope"}'
+            self.mints += 1
+            expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now + self.expires_in))
+            return 201, {}, json.dumps({"token": APP_TOKEN, "expires_at": expires}).encode()
+        status, h, doc = self.answers.get((path, bearer), (200, {}, {"ok": bearer}))
+        return status, h, json.dumps(doc).encode()
+
+    now = 0.0
+
+
+def app_source(fake: FakeApp, clock: list[float], **config: Any) -> Any:
+    keys: list[dict] = []
+
+    def reader(key: dict) -> bytes:
+        keys.append(key)
+        return APP_KEY.encode()
+
+    source = gg.AppTokenSource({"app_id": 4242, "owners": ["manaflow-ai"], **config}, transport=fake,
+                               key_reader=reader, signer=lambda key, data: b"sig:" + key[:5],
+                               clock=lambda: clock[0])
+    fake.now = clock[0]
+    return source
+
+
+class AppBase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = gg.BASE
+        gg.BASE = Path(self.tmp.name) / "gh"
+        self.fake = FakeApp()
+        self.clock = [float(int(time.time()))]
+        self.out = io.StringIO()
+        redirect = contextlib.redirect_stdout(self.out)  # log() prints its JSON lines
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+
+    def tearDown(self) -> None:
+        gg.BASE = self.saved
+        self.tmp.cleanup()
+
+
+class AppTokenSourceTest(AppBase):
+    def test_mints_once_and_reuses_the_token_until_five_minutes_before_expiry(self) -> None:
+        source = app_source(self.fake, self.clock)
+        self.assertEqual(source(), APP_TOKEN)
+        self.clock[0] += 3600 - 301
+        self.assertEqual(source(), APP_TOKEN)
+        self.assertEqual(self.fake.mints, 1)
+        self.clock[0] += 2
+        self.fake.now = self.clock[0]
+        self.assertEqual(source(), APP_TOKEN)
+        self.assertEqual(self.fake.mints, 2)
+        lookups = [c for c in self.fake.calls if c[1] == "/orgs/manaflow-ai/installation"]
+        self.assertEqual(len(lookups), 1, "the installation id is looked up once")
+
+    def test_the_jwt_names_the_app_and_lives_under_ten_minutes(self) -> None:
+        source = app_source(self.fake, self.clock)
+        header, claims, _ = source.jwt().split(".")
+        doc = json.loads(gg.base64.urlsafe_b64decode(claims + "=" * (-len(claims) % 4)))
+        self.assertEqual(doc["iss"], "4242")
+        self.assertLessEqual(doc["exp"] - doc["iat"], 600)
+        self.assertEqual(json.loads(gg.base64.urlsafe_b64decode(header + "==="))["alg"], "RS256")
+
+    def test_a_refused_mint_answers_none_and_waits_before_trying_again(self) -> None:
+        self.fake.refuse_mint = 401
+        source = app_source(self.fake, self.clock)
+        self.assertIsNone(source())
+        self.assertIn("HTTP 401", source.status()["error"])
+        self.fake.refuse_mint = 0
+        self.assertIsNone(source(), "within APP_RETRY the App is not asked again")
+        self.assertEqual(self.fake.mints, 0)
+        self.clock[0] += gg.APP_RETRY + 1
+        self.fake.now = self.clock[0]
+        self.assertEqual(source(), APP_TOKEN)
+
+    def test_a_key_store_failure_is_a_none_and_nothing_secret_is_logged(self) -> None:
+        def broken(_key: dict) -> bytes:
+            raise gg.WatchError("App key store exited 44")
+        source = gg.AppTokenSource({"app_id": 1, "owners": ["manaflow-ai"]}, transport=self.fake,
+                                   key_reader=broken, clock=lambda: self.clock[0])
+        self.assertIsNone(source())
+        self.assertIn("exited 44", self.out.getvalue())
+        source = app_source(self.fake, self.clock)
+        source()
+        for secret in (APP_TOKEN, "TUlJRmFrZUtleQ", "sig:"):
+            self.assertNotIn(secret, self.out.getvalue())
+            self.assertNotIn(secret, json.dumps(source.status()))
+
+    def test_decode_pem_reads_every_shape_the_stores_return(self) -> None:
+        for raw in (APP_KEY, gg.base64.b64encode(APP_KEY.encode()).decode(), APP_KEY.encode().hex()):
+            self.assertEqual(gg.decode_pem(raw), APP_KEY.encode())
+        with self.assertRaises(gg.WatchError):
+            gg.decode_pem("not a key")
+
+    def test_request_repos(self) -> None:
+        query, variables = gg.pr_query(["pr:manaflow-ai/cmux#1", "pr:teamleaderleo/glaeda#2"])
+        self.assertEqual(gg.request_repos("/graphql", {"query": query, "variables": variables}),
+                         {("manaflow-ai", "cmux"), ("teamleaderleo", "glaeda")})
+        self.assertEqual(gg.request_repos("/repos/manaflow-ai/cmux/pulls/1?x=1", None), {("manaflow-ai", "cmux")})
+        self.assertEqual(gg.request_repos("/graphql", {"variables": {"u0": "https://github.com/manaflow-ai/cmux/actions/runs/9"}}),
+                         {("manaflow-ai", "cmux")})
+        self.assertIsNone(gg.request_repos("/graphql", {"variables": {"ids": ["X"]}}))
+        self.assertIsNone(gg.request_repos("/rate_limit", None))
+        self.assertIsNone(gg.request_repos("/repos/../x", None))
+
+    def test_from_config(self) -> None:
+        path = Path(self.tmp.name) / "gh-app.json"
+        self.assertIsNone(gg.AppTokenSource.from_config(path))
+        path.write_text(json.dumps({"app_id": 5, "owners": ["manaflow-ai"], "repos": ["manaflow-ai/cmux", "other/x"],
+                                    "key": {"service": "github-app", "account": "cmux-agents-pem"}}))
+        source = gg.AppTokenSource.from_config(path)
+        self.assertEqual((source.app_id, source.repos), (5, {"manaflow-ai/cmux"}))
+        path.write_text(json.dumps({"app_id": 5, "owners": []}))
+        self.assertIsNone(gg.AppTokenSource.from_config(path))
+
+
+class DaemonAppRoutingTest(AppBase):
+    """Daemon.request: App-installed reads go over the App's bucket; everything else, and any read
+    the App cannot make, goes over the user token."""
+
+    def daemon(self, **config: Any) -> Any:
+        self.source = app_source(self.fake, self.clock, **config)
+        d = gg.Daemon(transport=self.fake, token=lambda: TOKEN, controller=None, app=self.source)
+        d.now = self.clock[0]
+        return d
+
+    def bearers(self) -> list[tuple[str, str]]:
+        return [(p, "app" if b == APP_TOKEN else "user" if b == TOKEN else "jwt") for _, p, b in self.fake.calls]
+
+    def test_reads_of_installed_repos_use_the_app_and_the_rest_the_user(self) -> None:
+        d = self.daemon(repos=["manaflow-ai/cmux"])
+        d.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        d.request("GET", "/repos/manaflow-ai/other/pulls/1")
+        d.request("GET", "/repos/teamleaderleo/glaeda/pulls/1")
+        d.request("GET", "/rate_limit", free=True)
+        d.request("POST", "/repos/manaflow-ai/cmux/issues/1/comments", {"body": "x"}, content=True)
+        query, variables = gg.pr_query(["pr:manaflow-ai/cmux#1"])
+        d.request("POST", "/graphql", {"query": query, "variables": variables})
+        query, variables = gg.pr_query(["pr:manaflow-ai/cmux#1", "pr:teamleaderleo/glaeda#2"])
+        d.request("POST", "/graphql", {"query": query, "variables": variables})
+        reads = [x for x in self.bearers() if x[1] != "jwt"]
+        self.assertEqual(reads, [
+            ("/repos/manaflow-ai/cmux/pulls/1", "app"), ("/repos/manaflow-ai/other/pulls/1", "user"),
+            ("/repos/teamleaderleo/glaeda/pulls/1", "user"), ("/rate_limit", "user"),
+            ("/repos/manaflow-ai/cmux/issues/1/comments", "user"), ("/graphql", "app"), ("/graphql", "user")])
+
+    def test_the_apps_rate_headers_never_move_the_user_budget(self) -> None:
+        d = self.daemon()
+        self.fake.answers[("/repos/manaflow-ai/cmux/pulls/1", APP_TOKEN)] = (
+            200, {"x-ratelimit-limit": "15000", "x-ratelimit-remaining": "14999", "x-ratelimit-resource": "core",
+                  "x-ratelimit-reset": str(int(self.clock[0] + 3600))}, {})
+        d.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.assertNotIn("rest", d.budget)
+        self.assertEqual([w for _, w in d.sent], ["app"])
+
+    def test_a_read_the_app_cannot_make_is_made_once_as_the_user(self) -> None:
+        d = self.daemon()
+        self.fake.answers[("/repos/manaflow-ai/secret/pulls/1", APP_TOKEN)] = (404, {}, {"message": "Not Found"})
+        status, _, doc = d.request("GET", "/repos/manaflow-ai/secret/pulls/1")
+        self.assertEqual((status, doc), (200, {"ok": TOKEN}))
+        query, variables = gg.pr_query(["pr:manaflow-ai/secret#1"])
+        self.fake.answers[("/graphql", APP_TOKEN)] = (200, {}, {"data": {"p0": None}, "errors": [{"type": "NOT_FOUND"}]})
+        status, _, doc = d.request("POST", "/graphql", {"query": query, "variables": variables})
+        self.assertEqual(doc, {"ok": TOKEN})
+
+    def test_a_spent_app_bucket_holds_the_app_and_the_user_serves(self) -> None:
+        d = self.daemon()
+        self.fake.answers[("/repos/manaflow-ai/cmux/pulls/1", APP_TOKEN)] = (
+            403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(time.time() + 900))}, {})
+        status, _, doc = d.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.assertEqual(doc, {"ok": TOKEN})
+        self.assertEqual(d.backoff["rest"], 0.0, "the user's bucket is not backed off for the App's")
+        self.assertGreater(self.source.down_until, time.time() + 800)
+        d.request("GET", "/repos/manaflow-ai/cmux/pulls/2")
+        self.assertEqual(self.bearers()[-1], ("/repos/manaflow-ai/cmux/pulls/2", "user"))
+
+    def test_a_401_drops_the_app_token_and_the_next_read_mints_again(self) -> None:
+        d = self.daemon()
+        self.fake.answers[("/repos/manaflow-ai/cmux/pulls/1", APP_TOKEN)] = (401, {}, {})
+        d.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.assertIsNone(self.source.token)
+        del self.fake.answers[("/repos/manaflow-ai/cmux/pulls/1", APP_TOKEN)]
+        d.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.assertEqual(self.fake.mints, 2)
+
+    def test_no_app_config_is_todays_daemon(self) -> None:
+        d = gg.Daemon(transport=self.fake, token=lambda: TOKEN, controller=None)
+        d.now = self.clock[0]
+        d.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.assertEqual(self.bearers(), [("/repos/manaflow-ai/cmux/pulls/1", "user")])
+
+
 if __name__ == "__main__":
     unittest.main()
