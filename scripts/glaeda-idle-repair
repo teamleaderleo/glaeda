@@ -3,8 +3,10 @@
 
 The LaunchAgent invokes this once per minute.  A busy host records a durable
 queued receipt and exits without touching its locks, workers, or console.  The
-next tick revalidates the host and runs the normal disk and mini-health tools
-only after the authoritative host gate is idle.
+next tick revalidates the host and runs the normal disk, worktree and mini-health
+tools only after the authoritative host gate is idle. The worktree command is supplied
+by mini-setup, so a fleet host self-heals the same broad stale checkout policy as its
+hourly agent without racing an active build.
 """
 
 from __future__ import annotations
@@ -119,6 +121,12 @@ def main(argv: list[str] | None = None) -> int:
             (disk_command, 660),
             ([python, health_path, "--apply"], 180),
         ]
+        # The idle gate is the self-heal path for the broad workspace reclaimer
+        # too. It is opt-in through the reconciler so older installations keep
+        # their existing command surface until mini-setup converges them.
+        reclaim = os.environ.get("GLAEDA_WORKTREE_RECLAIM_ALL")
+        if reclaim and Path(reclaim).is_file():
+            commands.append((["/bin/bash", reclaim, "--apply", "--output", "json"], 300))
         failed = False
         for command, timeout in commands:
             code, out, err = run(command, timeout)
