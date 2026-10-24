@@ -2668,31 +2668,6 @@ class RestartTest(Base):
         self.assertEqual((code, self.calls), (0, [False]), text)
         self.assertIn("Do not restart it again", text)
 
-    def test_a_serve_heartbeating_without_a_visible_lock_is_stopped_then_started(self) -> None:
-        """huge-blue, 10-24: a cleanup trashed BASE under a live daemon. It kept writing heartbeats, but no
-        lock is held where clients look, and start does nothing while it runs: stop it, then start."""
-        gg.write_json(gg.BASE / "daemon.json", {"pid": 4321, "at": time.time() - 5, "heartbeat": 30})
-        with mock.patch.object(gg, "is_serve", side_effect=lambda pid: pid == 4321), \
-                mock.patch.object(gg, "stop_process", return_value=True) as stop:
-            code, text = self.run_restart()
-        stop.assert_called_once_with(4321)
-        self.assertEqual((code, self.calls), (0, [False]), text)
-        self.assertIn("held no visible lock", gg.restart_record()["how"])
-
-    def test_orphaned_serve_needs_a_fresh_heartbeat_a_free_lock_and_a_live_serve(self) -> None:
-        now = time.time()
-        gg.write_json(gg.BASE / "daemon.json", {"pid": 4321, "at": now - 5})
-        with mock.patch.object(gg, "is_serve", side_effect=lambda pid: pid == 4321):
-            self.assertEqual(gg.orphaned_serve(now), 4321)
-            self.assertIsNone(gg.orphaned_serve(now + gg.STALE_HEARTBEAT + 10), "a stale heartbeat: just down")
-            self.hold(stale=False)
-            gg.write_json(gg.BASE / "daemon.json", {"pid": 4321, "at": now - 5})
-            self.assertIsNone(gg.orphaned_serve(now), "the lock is held where clients look")
-        with mock.patch.object(gg, "is_serve", return_value=False):
-            self.lock.close()
-            self.lock = None
-            self.assertIsNone(gg.orphaned_serve(now), "that pid is no serve (gone or reused)")
-
     def test_a_daemon_that_waited_on_a_replaced_lock_file_waits_on_the_new_one(self) -> None:
         """The waiter got the old inode once its holder re-executed off it; it must not poll beside the
         daemon that locked the new file."""

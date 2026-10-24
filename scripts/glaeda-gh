@@ -5424,21 +5424,6 @@ def launchd_state() -> str | None:
     return found.group(1).strip() if found else None
 
 
-def orphaned_serve(now: float | None = None) -> int | None:
-    """The pid of a glaeda-gh serve that still writes fresh heartbeats to daemon.json while no process
-    holds BASE/daemon.lock: its lock is on a file that was moved or deleted. A daemon starting up writes
-    its first heartbeat only once it holds the lock, so it never looks like this."""
-    now = time.time() if now is None else now
-    status = read_json(BASE / "daemon.json")
-    pid = status.get("pid") if isinstance(status, dict) else None
-    at = status.get("at") if isinstance(status, dict) else None
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or not isinstance(at, (int, float)):
-        return None
-    if now - at > STALE_HEARTBEAT or lock_held():
-        return None
-    return pid if is_serve(pid) else None
-
-
 def restart_service(hung: bool) -> tuple[bool, str]:
     """Restart (hung) or start the service once. (started, what was run)."""
     if sys.platform != "darwin":
@@ -5496,17 +5481,10 @@ def cmd_restart(force: bool = False) -> int:
             return EXIT_OK
         hung = running  # running but silent: restart; not running: start
         holder = lock_holder() if hung else None
-        orphan = None if running else orphaned_serve()
         killed = None
         began = time.time()
         write_json(BASE / "restart.json", {"at": began, "by": os.getpid(), "how": "starting"})
-        if orphan is not None:
-            # A serve still heartbeats but holds no lock clients can see (its BASE was moved away under
-            # it, huge-blue 10-24): start is a no-op while it runs. Stop it as a hung holder is stopped;
-            # the service manager respawns it or the start below does.
-            if stop_process(orphan):
-                killed = orphan
-        elif holder is not None and holder["silent"] > STALE_HEARTBEAT and is_serve(holder["pid"]):
+        if holder is not None and holder["silent"] > STALE_HEARTBEAT and is_serve(holder["pid"]):
             # Stop the hung holder itself: when it is a serve outside the service, kickstart cannot
             # reach it and the service's daemon waits behind it. When it is the service's own, launchd
             # respawns it (KeepAlive), so the start below must not kill that respawn again (no -k).
@@ -5517,8 +5495,7 @@ def cmd_restart(force: bool = False) -> int:
         except (OSError, subprocess.TimeoutExpired) as error:
             started, how = False, f"failed: {type(error).__name__}"
         if killed is not None:
-            how = (f"SIGTERM to the serve pid {killed} that held no visible lock, then {how}" if orphan is not None
-                   else f"SIGTERM to the hung lock holder pid {killed}, then {how}")
+            how = f"SIGTERM to the hung lock holder pid {killed}, then {how}"
         # Success is a heartbeat written after the restart began (a new daemon writes one as soon as
         # it holds the lock), not merely a held lock: a hung holder that survived holds it too.
         ok = started and new_heartbeat(began, RESTART_SETTLE)
