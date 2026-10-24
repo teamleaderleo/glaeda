@@ -2634,6 +2634,9 @@ class RestartTest(Base):
         patcher = mock.patch.object(gg, "restart_service", side_effect=self.fake_restart)
         patcher.start()
         self.addCleanup(patcher.stop)
+        active = mock.patch.object(gg, "service_active", return_value=False)
+        active.start()
+        self.addCleanup(active.stop)
         self.lock: Any = None
         self.addCleanup(lambda: self.lock and self.lock.close())
 
@@ -2667,6 +2670,25 @@ class RestartTest(Base):
         code, text = self.run_restart()
         self.assertEqual((code, self.calls), (0, [False]), text)
         self.assertIn("Do not restart it again", text)
+
+    def test_an_active_service_whose_lock_is_gone_is_restarted_not_started(self) -> None:
+        """huge-blue, 10-24: a cleanup trashed BASE under a live daemon. No lock is held where clients look,
+        but the unit is active, so start would do nothing: restart it."""
+        with mock.patch.object(gg, "service_active", return_value=True), \
+                mock.patch.object(gg, "lock_holder", return_value=None):
+            code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [True]), text)
+
+    def test_lock_replaced_sees_a_removed_or_swapped_lock_file(self) -> None:
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        self.addCleanup(lock.close)
+        self.assertFalse(gg.lock_replaced(lock))
+        (gg.BASE / "daemon.lock").rename(gg.BASE / "moved.lock")
+        self.assertTrue(gg.lock_replaced(lock), "removed")
+        (gg.BASE / "daemon.lock").write_text("")
+        self.assertTrue(gg.lock_replaced(lock), "another file at the path")
+        os.replace(gg.BASE / "moved.lock", gg.BASE / "daemon.lock")
+        self.assertFalse(gg.lock_replaced(lock), "its own file back")
 
     def test_hung_daemon_is_restarted(self) -> None:
         self.hold(stale=True)

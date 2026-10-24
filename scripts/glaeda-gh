@@ -2482,8 +2482,27 @@ def serve(foreground_ok: bool = False) -> int:
             if me.stat().st_mtime != stamp:
                 log({"event": "reexec"})
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
+            if lock_replaced(lock):
+                # A cleanup moved or deleted BASE (huge-blue, 10-24: a hygiene pass trashed ~/.cache/glaeda):
+                # this daemon still polls, but its lock is on a file nobody can see, so every client reads
+                # "not running" and restart's start is a no-op on the active unit. Start over on the new path.
+                log({"event": "reexec", "why": "daemon.lock was removed or replaced"})
+                os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
         except OSError:
             pass
+
+
+def lock_replaced(lock: Any) -> bool:
+    """Whether BASE/daemon.lock is no longer the file this daemon holds its lock on: removed, or another
+    file now at that path. An unreadable path is not proof, so that answers False."""
+    try:
+        here = os.stat(BASE / "daemon.lock")
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    mine = os.fstat(lock.fileno())
+    return (here.st_dev, here.st_ino) != (mine.st_dev, mine.st_ino)
 
 
 SYSTEMD_UNIT = "glaeda-gh.service"
@@ -5393,6 +5412,17 @@ def launchd_state() -> str | None:
     return found.group(1).strip() if found else None
 
 
+def service_active() -> bool:
+    """Whether the service manager has this user's glaeda-gh up right now (systemd: active; launchd:
+    running), whatever the lock says."""
+    if sys.platform == "darwin":
+        return launchd_state() == "running"
+    try:
+        return run_bounded(["systemctl", "--user", "--quiet", "is-active", SYSTEMD_UNIT], 10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def restart_service(hung: bool) -> tuple[bool, str]:
     """Restart (hung) or start the service once. (started, what was run)."""
     if sys.platform != "darwin":
@@ -5448,7 +5478,9 @@ def cmd_restart(force: bool = False) -> int:
                   f"{record.get('how', '?')}). Do not restart it again: a new daemon writes a heartbeat as soon "
                   f"as it holds its lock. Re-run your wait; after {RESTART_COOLDOWN}s a restart is allowed again.")
             return EXIT_OK
-        hung = running  # running but silent: restart; not running: start
+        # Running but silent: restart. Not running: start, unless the service still has a daemon up that
+        # holds no lock clients can see (its BASE was moved away): start is a no-op on an active unit.
+        hung = running or service_active()
         holder = lock_holder() if hung else None
         killed = None
         began = time.time()
