@@ -2634,9 +2634,6 @@ class RestartTest(Base):
         patcher = mock.patch.object(gg, "restart_service", side_effect=self.fake_restart)
         patcher.start()
         self.addCleanup(patcher.stop)
-        active = mock.patch.object(gg, "service_active", return_value=False)
-        active.start()
-        self.addCleanup(active.stop)
         self.lock: Any = None
         self.addCleanup(lambda: self.lock and self.lock.close())
 
@@ -2671,13 +2668,54 @@ class RestartTest(Base):
         self.assertEqual((code, self.calls), (0, [False]), text)
         self.assertIn("Do not restart it again", text)
 
-    def test_an_active_service_whose_lock_is_gone_is_restarted_not_started(self) -> None:
-        """huge-blue, 10-24: a cleanup trashed BASE under a live daemon. No lock is held where clients look,
-        but the unit is active, so start would do nothing: restart it."""
-        with mock.patch.object(gg, "service_active", return_value=True), \
-                mock.patch.object(gg, "lock_holder", return_value=None):
+    def test_a_serve_heartbeating_without_a_visible_lock_is_stopped_then_started(self) -> None:
+        """huge-blue, 10-24: a cleanup trashed BASE under a live daemon. It kept writing heartbeats, but no
+        lock is held where clients look, and start does nothing while it runs: stop it, then start."""
+        gg.write_json(gg.BASE / "daemon.json", {"pid": 4321, "at": time.time() - 5, "heartbeat": 30})
+        with mock.patch.object(gg, "is_serve", side_effect=lambda pid: pid == 4321), \
+                mock.patch.object(gg, "stop_process", return_value=True) as stop:
             code, text = self.run_restart()
-        self.assertEqual((code, self.calls), (0, [True]), text)
+        stop.assert_called_once_with(4321)
+        self.assertEqual((code, self.calls), (0, [False]), text)
+        self.assertIn("held no visible lock", gg.restart_record()["how"])
+
+    def test_orphaned_serve_needs_a_fresh_heartbeat_a_free_lock_and_a_live_serve(self) -> None:
+        now = time.time()
+        gg.write_json(gg.BASE / "daemon.json", {"pid": 4321, "at": now - 5})
+        with mock.patch.object(gg, "is_serve", side_effect=lambda pid: pid == 4321):
+            self.assertEqual(gg.orphaned_serve(now), 4321)
+            self.assertIsNone(gg.orphaned_serve(now + gg.STALE_HEARTBEAT + 10), "a stale heartbeat: just down")
+            self.hold(stale=False)
+            gg.write_json(gg.BASE / "daemon.json", {"pid": 4321, "at": now - 5})
+            self.assertIsNone(gg.orphaned_serve(now), "the lock is held where clients look")
+        with mock.patch.object(gg, "is_serve", return_value=False):
+            self.lock.close()
+            self.lock = None
+            self.assertIsNone(gg.orphaned_serve(now), "that pid is no serve (gone or reused)")
+
+    def test_a_daemon_that_waited_on_a_replaced_lock_file_waits_on_the_new_one(self) -> None:
+        """The waiter got the old inode once its holder re-executed off it; it must not poll beside the
+        daemon that locked the new file."""
+        old = open(gg.BASE / "daemon.lock", "a+")
+        self.addCleanup(old.close)
+        (gg.BASE / "daemon.lock").rename(gg.BASE / "moved.lock")
+        opened: list[Any] = []
+        real_open = open
+
+        def first_open_is_the_old_file(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if Path(path) == gg.BASE / "daemon.lock" and not opened:
+                opened.append(old)
+                return old  # it opened the file before it was moved
+            handle = real_open(path, *args, **kwargs)
+            opened.append(handle)
+            return handle
+
+        with mock.patch("builtins.open", side_effect=first_open_is_the_old_file):
+            lock = gg.hold_daemon_lock()
+        self.addCleanup(lock.close)
+        self.assertEqual(len(opened), 2)
+        self.assertFalse(gg.lock_replaced(lock))
+        self.assertTrue(old.closed, "the old inode's lock was let go")
 
     def test_lock_replaced_sees_a_removed_or_swapped_lock_file(self) -> None:
         lock = open(gg.BASE / "daemon.lock", "a+")
