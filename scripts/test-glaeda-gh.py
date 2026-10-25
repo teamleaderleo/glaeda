@@ -3021,7 +3021,7 @@ class LaunchdRestartTest(unittest.TestCase):
         with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
                 mock.patch.object(gg, "launchd_state", return_value=state), \
                 mock.patch.object(gg, "launchd_domain", return_value=f"gui/{os.getuid()}"), \
-                mock.patch.object(gg, "drop_background_copy", return_value=""):
+                mock.patch.object(gg, "drop_background_copy", return_value=(True, "")):
             return gg.restart_service(hung), seen
 
     def test_kickstart(self) -> None:
@@ -3127,6 +3127,7 @@ class LaunchdRestartTest(unittest.TestCase):
                 ok, how = gg.restart_service(True)
                 self.assertTrue(ok, how)
                 self.assertEqual(seen[1:], [
+                    ["launchctl", "print", f"system/{gg.LAUNCH_LABEL}"],
                     ["launchctl", "bootout", f"user/{uid}/{gg.LAUNCH_LABEL}"],
                     ["launchctl", "bootstrap", f"user/{uid}", os.fspath(copy)]])
                 with open(copy, "rb") as handle:
@@ -3142,7 +3143,13 @@ class LaunchdRestartTest(unittest.TestCase):
                 seen.clear()
                 ok, how = gg.restart_service(True)
                 self.assertTrue(ok, how)
-                self.assertEqual([a[1] for a in seen], ["print", "bootout", "bootstrap"])
+                self.assertEqual([a[1] for a in seen], ["print", "print", "bootout", "bootstrap"])
+                # a scheduled respawn does not stop the reload either: it would respawn the old copy
+                seen.clear()
+                with mock.patch.object(gg, "launchd_state", return_value="spawn scheduled"):
+                    ok, how = gg.restart_service(False)
+                self.assertTrue(ok, how)
+                self.assertEqual([a[1] for a in seen], ["print", "print", "bootout", "bootstrap"])
                 with open(copy, "rb") as handle:
                     self.assertEqual(gg.plistlib.load(handle), {**updated, "LimitLoadToSessionType": "Background"})
 
@@ -3155,7 +3162,8 @@ class LaunchdRestartTest(unittest.TestCase):
                 (Path(tmp) / "Library/LaunchAgents").mkdir(parents=True)
                 (Path(tmp) / "Library/LaunchAgents" / f"{gg.LAUNCH_LABEL}.plist").write_bytes(body)
                 with mock.patch.object(gg.sys, "platform", "darwin"), \
-                        mock.patch.object(gg, "run_bounded", side_effect=AssertionError("no launchctl")), \
+                        mock.patch.object(gg, "run_bounded", side_effect=lambda argv, timeout=None: subprocess.CompletedProcess(
+                            argv, 113 if argv[1:] == ["print", f"system/{gg.LAUNCH_LABEL}"] else self.fail(argv), "", "")), \
                         mock.patch.object(gg, "launchd_state", return_value=None), \
                         mock.patch.object(gg, "launchd_domain", return_value=f"user/{os.getuid()}"), \
                         mock.patch.object(gg.Path, "home", return_value=Path(tmp)), \
@@ -3163,6 +3171,49 @@ class LaunchdRestartTest(unittest.TestCase):
                     ok, how = gg.restart_service(True)
             self.assertFalse(ok)
             self.assertIn(f"no Background copy for user/{os.getuid()}: {why}", how)
+
+    def test_a_headless_launch_daemon_is_not_doubled_by_a_user_domain_copy(self) -> None:
+        seen: list[list[str]] = []
+
+        def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 125 if argv[2] == f"gui/{os.getuid()}" else 0, "", "")
+
+        with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
+                mock.patch.object(gg, "background_plist", side_effect=AssertionError("no copy")):
+            ok, how = gg.restart_service(True)
+        self.assertFalse(ok)
+        self.assertIn(f"sudo launchctl kickstart -k system/{gg.LAUNCH_LABEL}", how)
+        self.assertEqual([a[1] for a in seen], ["print", "print"])
+
+    def test_a_copy_that_will_not_boot_out_keeps_the_launch_agent_from_starting_beside_it(self) -> None:
+        seen: list[list[str]] = []
+
+        def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 5 if argv[1] == "bootout" else 0, "", "")
+
+        with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
+                mock.patch.object(gg, "launchd_state", return_value="spawn scheduled"):
+            ok, how = gg.restart_service(False)
+        self.assertFalse(ok)
+        self.assertIn("exited 5 and it is still loaded", how)
+        self.assertNotIn("kickstart", [a[1] for a in seen])
+
+    def test_a_scheduled_respawn_in_the_login_session_still_drops_the_copy(self) -> None:
+        uid = os.getuid()
+        seen: list[list[str]] = []
+
+        def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
+                mock.patch.object(gg, "launchd_state", return_value="spawn scheduled"):
+            ok, how = gg.restart_service(False)
+        self.assertTrue(ok, how)
+        self.assertIn(["launchctl", "bootout", f"user/{uid}/{gg.LAUNCH_LABEL}"], seen)
+        self.assertTrue(how.endswith("nothing: launchd has already scheduled the respawn"), how)
 
     def test_a_login_session_restart_boots_out_the_background_copy_first(self) -> None:
         uid = os.getuid()
@@ -3198,7 +3249,7 @@ class LaunchdRestartTest(unittest.TestCase):
     def test_a_missing_launch_agent_fails_the_user_domain_restart_with_a_reason(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
-                return subprocess.CompletedProcess(argv, 113 if argv[1] == "kickstart" else 0, "", "")
+                return subprocess.CompletedProcess(argv, 113 if argv[1] in ("kickstart", "print") else 0, "", "")
 
             with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
                     mock.patch.object(gg, "launchd_state", return_value=None), \

@@ -5627,10 +5627,13 @@ def restart_service(hung: bool) -> tuple[bool, str]:
         return result.returncode == 0, " ".join(argv)
     domain = launchd_domain()
     target = f"{domain}/{LAUNCH_LABEL}"
-    if not hung and launchd_state(domain) == "spawn scheduled":
-        return True, "nothing: launchd has already scheduled the respawn"
     if domain.startswith("user/"):
-        # Always reload, never kickstart: a kickstart of a loaded copy would keep a copy of an older LaunchAgent
+        # A headless Mac's system LaunchDaemon (service_loaded) runs the daemon there: a copy would be a second one
+        if run_bounded(["launchctl", "print", f"system/{LAUNCH_LABEL}"], 10).returncode == 0:
+            return False, (f"nothing: the system LaunchDaemon system/{LAUNCH_LABEL} runs the daemon on this headless "
+                           f"Mac; restart it as root: sudo launchctl kickstart -k system/{LAUNCH_LABEL}")
+        # Always reload, never kickstart and never wait on a scheduled respawn: either would keep running a copy
+        # of an older LaunchAgent
         try:
             plist = background_plist()
         except Exception as error:  # OSError, plistlib's and expat's parse errors, a plist that is not a job
@@ -5641,7 +5644,11 @@ def restart_service(hung: bool) -> tuple[bool, str]:
         return loaded == 0, how + ("" if loaded == 0 else f" (bootstrap exit {loaded})")
     # Logged in again: the copy a logged-out restart loaded would keep a second KeepAlive daemon (waiting on
     # daemon.lock behind this one) and is what a hung-holder stop would hit first, so it goes now
-    dropped = drop_background_copy()
+    gone, dropped = drop_background_copy()
+    if not gone:
+        return False, dropped + f"; not starting {target} beside it"
+    if not hung and launchd_state(domain) == "spawn scheduled":
+        return True, dropped + "nothing: launchd has already scheduled the respawn"
     argv = ["launchctl", "kickstart"] + (["-k"] if hung else []) + [target]
     result = run_bounded(argv, SUBPROCESS_DEADLINE)
     if result.returncode == 0:
@@ -5665,13 +5672,16 @@ def reload_job(target: str, domain: str, plist: str) -> int:
         time.sleep(1)
 
 
-def drop_background_copy() -> str:
-    """Boot out the user-domain copy if one is loaded; what was done, as a prefix for restart's report."""
+def drop_background_copy() -> tuple[bool, str]:
+    """Boot out the user-domain copy if one is loaded. (no copy is left loaded, what was done: a prefix for
+    restart's report, or why the copy is still there)."""
     copy = f"user/{os.getuid()}/{LAUNCH_LABEL}"
     if run_bounded(["launchctl", "print", copy], 10).returncode != 0:
-        return ""
-    run_bounded(["launchctl", "bootout", copy], SUBPROCESS_DEADLINE)
-    return f"launchctl bootout {copy} (the Background copy from a logged-out restart), then "
+        return True, ""
+    out = run_bounded(["launchctl", "bootout", copy], SUBPROCESS_DEADLINE)
+    if out.returncode != 0 and run_bounded(["launchctl", "print", copy], 10).returncode == 0:
+        return False, f"launchctl bootout {copy} (the Background copy from a logged-out restart) exited {out.returncode} and it is still loaded"
+    return True, f"launchctl bootout {copy} (the Background copy from a logged-out restart), then "
 
 
 def cmd_restart(force: bool = False) -> int:
