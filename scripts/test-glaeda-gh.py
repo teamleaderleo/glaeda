@@ -2673,6 +2673,21 @@ class ServeGuardTest(unittest.TestCase):
                 mock.patch.object(gg.sys, "platform", "darwin"):
             self.assertTrue(gg.service_loaded())
 
+    def test_a_launchctl_that_cannot_tell_counts_as_loaded(self) -> None:
+        """Only 113 (or 125 for the gui domain) means not there: a serve from a shell is refused otherwise."""
+        for script, loaded in (('case "$2" in gui/*) exit 125;; esac\nexit 113\n', False),
+                               ('case "$2" in system/*) exit 5;; gui/*) exit 125;; esac\nexit 113\n', True),
+                               ('case "$2" in user/*) exit 1;; esac\nexit 113\n', True)):
+            bin_dir = Path(tempfile.mkdtemp(dir=self.tmp.name))
+            (bin_dir / "launchctl").write_text("#!/bin/sh\n" + script)
+            (bin_dir / "launchctl").chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": os.fspath(bin_dir) + os.pathsep + os.environ["PATH"]}), \
+                    mock.patch.object(gg.sys, "platform", "darwin"):
+                self.assertEqual(gg.service_loaded(), loaded, script)
+        with mock.patch.object(gg.sys, "platform", "darwin"), \
+                mock.patch.object(gg, "run_bounded", side_effect=subprocess.TimeoutExpired(["launchctl"], 10)):
+            self.assertTrue(gg.service_loaded())
+
     def test_the_user_domain_copy_counts_as_loaded(self) -> None:
         bin_dir = Path(self.tmp.name) / "logged-out"
         bin_dir.mkdir()
@@ -3349,6 +3364,14 @@ class RestartHintTest(unittest.TestCase):
             for hint in (gg.start_hint(), gg.start_hint(restart=True)):
                 self.assertIn(f"sudo launchctl kickstart -k system/{gg.LAUNCH_LABEL}", hint)
                 self.assertNotIn("user/$(id -u)", hint)
+
+    def test_a_system_probe_that_fails_gives_a_hint_that_checks_first(self) -> None:
+        with mock.patch.object(gg.sys, "platform", "darwin"), \
+                mock.patch.object(gg, "launchd_domain", return_value=f"user/{os.getuid()}"), \
+                mock.patch.object(gg, "system_daemon_loaded", side_effect=subprocess.TimeoutExpired(["launchctl"], 10)):
+            hint = gg.start_hint(restart=True)
+        self.assertIn(f"sudo launchctl print system/{gg.LAUNCH_LABEL}", hint)
+        self.assertNotIn("launchctl bootstrap user/", hint)
 
     def test_a_logged_out_hint_names_the_user_domain_copy(self) -> None:
         with mock.patch.object(gg.sys, "platform", "darwin"), \

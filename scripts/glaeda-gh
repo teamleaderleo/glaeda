@@ -2550,10 +2550,17 @@ def service_loaded() -> bool:
     """Whether this user's glaeda-gh service is loaded (launchd) or enabled or running (systemd)."""
     if sys.platform == "darwin":
         # the LaunchAgent, the copy restart loads while nobody is logged in (launchd_domain), or the
-        # same label as a system LaunchDaemon on a headless Mac
-        probes = [["launchctl", "print", f"gui/{os.getuid()}/{LAUNCH_LABEL}"],
-                  ["launchctl", "print", f"user/{os.getuid()}/{LAUNCH_LABEL}"],
-                  ["launchctl", "print", f"system/{LAUNCH_LABEL}"]]
+        # same label as a system LaunchDaemon on a headless Mac. Only a definite "not there" (113, or 125 for a
+        # gui domain nobody is logged in to) counts as not loaded: a probe that cannot tell refuses the shell serve
+        for target, absent in ((f"gui/{os.getuid()}/{LAUNCH_LABEL}", (NOT_LOADED, NO_GUI_DOMAIN)),
+                               (f"user/{os.getuid()}/{LAUNCH_LABEL}", (NOT_LOADED,)),
+                               (f"system/{LAUNCH_LABEL}", (NOT_LOADED,))):
+            try:
+                if run_bounded(["launchctl", "print", target], 10).returncode not in absent:
+                    return True
+            except (OSError, subprocess.TimeoutExpired):
+                return True
+        return False
     else:
         probes = [["systemctl", "--user", "--quiet", "is-enabled", SYSTEMD_UNIT],
                   ["systemctl", "--user", "--quiet", "is-active", SYSTEMD_UNIT]]
@@ -2621,10 +2628,15 @@ def start_hint(restart: bool = False, domain: str | None = None) -> str:
     if sys.platform == "darwin":
         if (domain or launchd_domain()).startswith("user/"):
             try:
-                if system_daemon_loaded():
-                    return SYSTEM_DAEMON_HINT[0].upper() + SYSTEM_DAEMON_HINT[1:] + ". Never run glaeda-gh serve yourself"
+                system = system_daemon_loaded()
             except (OSError, subprocess.TimeoutExpired):
-                pass
+                return (f"nobody is logged in here and launchctl could not say whether the system LaunchDaemon "
+                        f"system/{LAUNCH_LABEL} is loaded: check with sudo launchctl print system/{LAUNCH_LABEL} "
+                        f"before starting anything. If it is loaded: sudo launchctl kickstart -k "
+                        f"system/{LAUNCH_LABEL}; if not: glaeda-gh restart, which loads a Background copy in "
+                        f"user/$(id -u). Never run glaeda-gh serve yourself")
+            if system:
+                return SYSTEM_DAEMON_HINT[0].upper() + SYSTEM_DAEMON_HINT[1:] + ". Never run glaeda-gh serve yourself"
             return (f"nobody is logged in here, so gui/$(id -u) does not exist and the daemon runs from a Background "
                     f"copy of its LaunchAgent in user/$(id -u): launchctl bootout user/$(id -u)/{LAUNCH_LABEL}; "
                     f"launchctl bootstrap user/$(id -u) {background_copy_path()} (glaeda-gh restart writes that copy). "
