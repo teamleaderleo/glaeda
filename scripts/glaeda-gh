@@ -2642,6 +2642,18 @@ def start_hint(restart: bool = False, domain: str | None = None) -> str:
                     f"launchctl bootstrap user/$(id -u) {background_copy_path()} (glaeda-gh restart writes that copy). "
                     f"Logging the user in, or a reboot with automatic login, brings the LaunchAgent back. "
                     f"Never run glaeda-gh serve yourself. Its log is ~/Library/Logs/glaeda-gh.err")
+        try:
+            system = system_daemon_loaded()
+            copy = not unloaded(f"user/{os.getuid()}/{LAUNCH_LABEL}")
+        except (OSError, subprocess.TimeoutExpired):
+            system = copy = True
+        if system or copy:
+            return (f"check first that neither the system LaunchDaemon (sudo launchctl print system/{LAUNCH_LABEL}) "
+                    f"nor the Background copy of a logged-out restart (launchctl print "
+                    f"user/$(id -u)/{LAUNCH_LABEL}) is loaded: either runs the daemon, and the LaunchAgent must "
+                    f"not start beside it. Restart a loaded system daemon as root (sudo launchctl kickstart -k "
+                    f"system/{LAUNCH_LABEL}); boot a loaded copy out (launchctl bootout user/$(id -u)/{LAUNCH_LABEL}) "
+                    f"and run glaeda-gh restart again. Never run glaeda-gh serve yourself")
         if restart:
             return f"launchctl kickstart -k gui/$(id -u)/{LAUNCH_LABEL}. {LAUNCHCTL_ERROR_5}"
         return (f"launchctl kickstart gui/$(id -u)/{LAUNCH_LABEL} (if launchctl cannot find the service, load it: "
@@ -5669,10 +5681,11 @@ def restart_service(hung: bool) -> tuple[bool, str]:
         return result.returncode == 0, " ".join(argv)
     domain = launchd_domain()
     target = f"{domain}/{LAUNCH_LABEL}"
+    # A headless Mac's system LaunchDaemon (service_loaded) runs the daemon there: neither a copy nor the
+    # LaunchAgent may start beside it, whether or not someone is logged in
+    if system_daemon_loaded():
+        return False, "nothing: " + SYSTEM_DAEMON_HINT
     if domain.startswith("user/"):
-        # A headless Mac's system LaunchDaemon (service_loaded) runs the daemon there: a copy would be a second one
-        if system_daemon_loaded():
-            return False, "nothing: " + SYSTEM_DAEMON_HINT
         # Always reload, never kickstart and never wait on a scheduled respawn: either would keep running a copy
         # of an older LaunchAgent
         try:

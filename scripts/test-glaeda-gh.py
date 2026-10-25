@@ -3026,6 +3026,20 @@ class RestartTest(Base):
 
 
 class LaunchdRestartTest(unittest.TestCase):
+    # tests that drive the system-daemon probe through their own launchctl fake; the rest have no system daemon
+    REAL_SYSTEM_PROBE = {"test_a_headless_launch_daemon_is_not_doubled_by_a_user_domain_copy",
+                         "test_a_probe_that_cannot_tell_fails_closed",
+                         "test_a_login_session_restart_never_starts_beside_a_system_daemon",
+                         "test_a_logged_out_user_gets_a_background_copy_in_the_user_domain",
+                         "test_a_missing_launch_agent_fails_the_user_domain_restart_with_a_reason",
+                         "test_a_bad_launch_agent_fails_the_user_domain_restart_with_a_reason"}
+
+    def setUp(self) -> None:
+        if self._testMethodName not in self.REAL_SYSTEM_PROBE:
+            patcher = mock.patch.object(gg, "system_daemon_loaded", return_value=False)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def run_with(self, answers: dict[str, int], state: str | None = None, hung: bool = True) -> tuple[tuple, list]:
         seen: list[list[str]] = []
 
@@ -3350,12 +3364,43 @@ class LaunchdRestartTest(unittest.TestCase):
 class RestartHintTest(unittest.TestCase):
     def test_darwin_hints_explain_launchctl_error_5(self) -> None:
         with mock.patch.object(gg.sys, "platform", "darwin"), \
-                mock.patch.object(gg, "launchd_domain", return_value=f"gui/{os.getuid()}"):
+                mock.patch.object(gg, "launchd_domain", return_value=f"gui/{os.getuid()}"), \
+                mock.patch.object(gg, "system_daemon_loaded", return_value=False), \
+                mock.patch.object(gg, "unloaded", return_value=True):
             for hint in (gg.start_hint(), gg.start_hint(restart=True)):
                 self.assertIn("5: Input/output error", hint)
                 self.assertIn("already loaded", hint)
                 self.assertIn(f"launchctl bootout gui/$(id -u)/{gg.LAUNCH_LABEL}", hint)
                 self.assertIn("Never run glaeda-gh serve yourself", hint)
+
+    def test_a_login_session_restart_never_starts_beside_a_system_daemon(self) -> None:
+        seen: list[list[str]] = []
+
+        def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")  # the gui domain exists; system/LABEL is loaded
+
+        with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
+                mock.patch.object(gg, "launchd_state", return_value=None):
+            ok, how = gg.restart_service(True)
+        self.assertFalse(ok)
+        self.assertIn(f"sudo launchctl kickstart -k system/{gg.LAUNCH_LABEL}", how)
+        self.assertNotIn("kickstart", [a[1] for a in seen])
+
+    def test_a_login_session_hint_checks_for_a_copy_or_system_daemon_first(self) -> None:
+        for system, copy in ((True, False), (False, True)):
+            with mock.patch.object(gg.sys, "platform", "darwin"), \
+                    mock.patch.object(gg, "launchd_domain", return_value=f"gui/{os.getuid()}"), \
+                    mock.patch.object(gg, "system_daemon_loaded", return_value=system), \
+                    mock.patch.object(gg, "unloaded", return_value=not copy):
+                hint = gg.start_hint(restart=True)
+            self.assertIn("check first", hint, (system, copy))
+            self.assertNotIn(f"launchctl kickstart -k gui/", hint)
+        with mock.patch.object(gg.sys, "platform", "darwin"), \
+                mock.patch.object(gg, "launchd_domain", return_value=f"gui/{os.getuid()}"), \
+                mock.patch.object(gg, "system_daemon_loaded", return_value=False), \
+                mock.patch.object(gg, "unloaded", return_value=True):
+            self.assertIn(f"launchctl kickstart -k gui/$(id -u)/{gg.LAUNCH_LABEL}", gg.start_hint(restart=True))
 
     def test_a_headless_hint_names_the_system_daemon_not_a_copy(self) -> None:
         with mock.patch.object(gg.sys, "platform", "darwin"), \
