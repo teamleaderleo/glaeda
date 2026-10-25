@@ -2616,9 +2616,15 @@ LAUNCHCTL_ERROR_5 = (f"If launchctl answers \"5: Input/output error\": from boot
                      f"~/Library/LaunchAgents/{LAUNCH_LABEL}.plist. Never run glaeda-gh serve yourself")
 
 
-def start_hint(restart: bool = False) -> str:
+def start_hint(restart: bool = False, domain: str | None = None) -> str:
     """How to (re)start the daemon here, including when its service was never loaded."""
     if sys.platform == "darwin":
+        if (domain or launchd_domain()).startswith("user/"):
+            return (f"nobody is logged in here, so gui/$(id -u) does not exist and the daemon runs from a Background "
+                    f"copy of its LaunchAgent in user/$(id -u): launchctl bootout user/$(id -u)/{LAUNCH_LABEL}; "
+                    f"launchctl bootstrap user/$(id -u) {background_copy_path()} (glaeda-gh restart writes that copy). "
+                    f"Logging the user in, or a reboot with automatic login, brings the LaunchAgent back. "
+                    f"Never run glaeda-gh serve yourself. Its log is ~/Library/Logs/glaeda-gh.err")
         if restart:
             return f"launchctl kickstart -k gui/$(id -u)/{LAUNCH_LABEL}. {LAUNCHCTL_ERROR_5}"
         return (f"launchctl kickstart gui/$(id -u)/{LAUNCH_LABEL} (if launchctl cannot find the service, load it: "
@@ -5578,16 +5584,22 @@ def launchd_domain() -> str:
     return gui
 
 
+def background_copy_path() -> Path:  # read BASE at call time: tests move it
+    return BASE / f"{LAUNCH_LABEL}.background.plist"
+
+
 def background_plist() -> str:
     """The LaunchAgent's plist, as a copy the user domain loads. launchd refuses an Aqua job there
     ("5: Input/output error"); the same job marked Background runs. The LaunchAgent stays the one
-    source: the copy is rewritten from it on every restart and lives only until the next reboot."""
+    source: the copy is rewritten from it on every user-domain restart and lives only until the next reboot."""
     source = Path.home() / "Library/LaunchAgents" / f"{LAUNCH_LABEL}.plist"
     with open(source, "rb") as handle:
         job = plistlib.load(handle)
+    if not isinstance(job, dict):
+        raise ValueError(f"{source} is a plist {type(job).__name__}, not a job")
     job["LimitLoadToSessionType"] = "Background"
     BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    copy = BASE / f"{LAUNCH_LABEL}.background.plist"
+    copy = background_copy_path()
     with open(copy, "wb") as handle:
         plistlib.dump(job, handle)
     return os.fspath(copy)
@@ -5617,28 +5629,49 @@ def restart_service(hung: bool) -> tuple[bool, str]:
     target = f"{domain}/{LAUNCH_LABEL}"
     if not hung and launchd_state(domain) == "spawn scheduled":
         return True, "nothing: launchd has already scheduled the respawn"
+    if domain.startswith("user/"):
+        # Always reload, never kickstart: a kickstart of a loaded copy would keep a copy of an older LaunchAgent
+        try:
+            plist = background_plist()
+        except Exception as error:  # OSError, plistlib's and expat's parse errors, a plist that is not a job
+            return False, f"no Background copy for {domain}: {type(error).__name__}: {error}"
+        loaded = reload_job(target, domain, plist)
+        how = (f"launchctl bootout and bootstrap {target} from {plist} "
+               f"(nobody is logged in, so gui/{os.getuid()} does not exist)")
+        return loaded == 0, how + ("" if loaded == 0 else f" (bootstrap exit {loaded})")
+    # Logged in again: the copy a logged-out restart loaded would keep a second KeepAlive daemon (waiting on
+    # daemon.lock behind this one) and is what a hung-holder stop would hit first, so it goes now
+    dropped = drop_background_copy()
     argv = ["launchctl", "kickstart"] + (["-k"] if hung else []) + [target]
     result = run_bounded(argv, SUBPROCESS_DEADLINE)
     if result.returncode == 0:
-        return True, " ".join(argv)
+        return True, dropped + " ".join(argv)
     # 5 (launchd reported "spawn failed") or 113 (not loaded): unload and load it, once, here
-    if domain.startswith("gui/"):
-        plist = os.fspath(Path.home() / "Library/LaunchAgents" / f"{LAUNCH_LABEL}.plist")
-    else:
-        try:
-            plist = background_plist()
-        except (OSError, ValueError) as error:  # plistlib.InvalidFileException is a ValueError
-            return False, f"{' '.join(argv)} (exit {result.returncode}), then no plist for {domain}: {error}"
+    plist = os.fspath(Path.home() / "Library/LaunchAgents" / f"{LAUNCH_LABEL}.plist")
+    loaded = reload_job(target, domain, plist)
+    how = f"{dropped}{' '.join(argv)} (exit {result.returncode}), then launchctl bootout and bootstrap"
+    return loaded == 0, how + ("" if loaded == 0 else f" (bootstrap exit {loaded})")
+
+
+def reload_job(target: str, domain: str, plist: str) -> int:
+    """launchctl bootout TARGET, then bootstrap PLIST into DOMAIN; bootstrap's exit code."""
     run_bounded(["launchctl", "bootout", target], SUBPROCESS_DEADLINE)
     # bootout can return before the job is torn down, and bootstrap answers 5 while it is still loaded
     deadline = time.monotonic() + BOOTSTRAP_RETRY
     while True:
         loaded = run_bounded(["launchctl", "bootstrap", domain, plist], SUBPROCESS_DEADLINE)
         if loaded.returncode == 0 or time.monotonic() >= deadline:
-            break
+            return loaded.returncode
         time.sleep(1)
-    how = f"{' '.join(argv)} (exit {result.returncode}), then launchctl bootout and bootstrap"
-    return loaded.returncode == 0, how + ("" if loaded.returncode == 0 else f" (bootstrap exit {loaded.returncode})")
+
+
+def drop_background_copy() -> str:
+    """Boot out the user-domain copy if one is loaded; what was done, as a prefix for restart's report."""
+    copy = f"user/{os.getuid()}/{LAUNCH_LABEL}"
+    if run_bounded(["launchctl", "print", copy], 10).returncode != 0:
+        return ""
+    run_bounded(["launchctl", "bootout", copy], SUBPROCESS_DEADLINE)
+    return f"launchctl bootout {copy} (the Background copy from a logged-out restart), then "
 
 
 def cmd_restart(force: bool = False) -> int:

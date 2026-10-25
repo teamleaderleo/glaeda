@@ -3020,7 +3020,8 @@ class LaunchdRestartTest(unittest.TestCase):
 
         with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
                 mock.patch.object(gg, "launchd_state", return_value=state), \
-                mock.patch.object(gg, "launchd_domain", return_value=f"gui/{os.getuid()}"):
+                mock.patch.object(gg, "launchd_domain", return_value=f"gui/{os.getuid()}"), \
+                mock.patch.object(gg, "drop_background_copy", return_value=""):
             return gg.restart_service(hung), seen
 
     def test_kickstart(self) -> None:
@@ -3114,25 +3115,85 @@ class LaunchdRestartTest(unittest.TestCase):
 
             def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
                 seen.append(argv)
-                code = {"print": 125, "kickstart": 113, "bootout": 3}.get(argv[1], 0)
+                code = {"print": 125, "bootout": 3}.get(argv[1], 0)
                 return subprocess.CompletedProcess(argv, code, "", "")
 
+            copy = home / "gh" / f"{gg.LAUNCH_LABEL}.background.plist"
+            agent = home / "Library/LaunchAgents" / f"{gg.LAUNCH_LABEL}.plist"
             with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
                     mock.patch.object(gg, "launchd_state", return_value=None), \
                     mock.patch.object(gg.Path, "home", return_value=home), \
                     mock.patch.object(gg, "BASE", home / "gh"):
                 ok, how = gg.restart_service(True)
-            self.assertTrue(ok, how)
-            copy = home / "gh" / f"{gg.LAUNCH_LABEL}.background.plist"
-            self.assertEqual(seen[1:], [
-                ["launchctl", "kickstart", "-k", f"user/{uid}/{gg.LAUNCH_LABEL}"],
-                ["launchctl", "bootout", f"user/{uid}/{gg.LAUNCH_LABEL}"],
-                ["launchctl", "bootstrap", f"user/{uid}", os.fspath(copy)]])
-            with open(copy, "rb") as handle:
-                self.assertEqual(gg.plistlib.load(handle), {**job, "LimitLoadToSessionType": "Background"})
-            # the LaunchAgent itself is untouched: it is still the one source
-            with open(home / "Library/LaunchAgents" / f"{gg.LAUNCH_LABEL}.plist", "rb") as handle:
-                self.assertEqual(gg.plistlib.load(handle), job)
+                self.assertTrue(ok, how)
+                self.assertEqual(seen[1:], [
+                    ["launchctl", "bootout", f"user/{uid}/{gg.LAUNCH_LABEL}"],
+                    ["launchctl", "bootstrap", f"user/{uid}", os.fspath(copy)]])
+                with open(copy, "rb") as handle:
+                    self.assertEqual(gg.plistlib.load(handle), {**job, "LimitLoadToSessionType": "Background"})
+                # the LaunchAgent itself is untouched: it is still the one source
+                with open(agent, "rb") as handle:
+                    self.assertEqual(gg.plistlib.load(handle), job)
+                # a later restart, with the copy loaded and the LaunchAgent changed, reloads the new job:
+                # a kickstart would have kept running the old copy
+                updated = {**job, "EnvironmentVariables": {"PATH": "/new/bin"}}
+                with open(agent, "wb") as handle:
+                    gg.plistlib.dump(updated, handle)
+                seen.clear()
+                ok, how = gg.restart_service(True)
+                self.assertTrue(ok, how)
+                self.assertEqual([a[1] for a in seen], ["print", "bootout", "bootstrap"])
+                with open(copy, "rb") as handle:
+                    self.assertEqual(gg.plistlib.load(handle), {**updated, "LimitLoadToSessionType": "Background"})
+
+    def test_a_bad_launch_agent_fails_the_user_domain_restart_with_a_reason(self) -> None:
+        """Malformed XML raises expat's error and a plist array a TypeError on assignment: neither may escape
+        to cmd_restart, which catches only OSError and TimeoutExpired."""
+        for body, why in ((b"<?xml version='1.0'?><plist><dict><key>Label", "ExpatError"),
+                          (gg.plistlib.dumps(["not", "a", "job"]), "ValueError")):
+            with tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "Library/LaunchAgents").mkdir(parents=True)
+                (Path(tmp) / "Library/LaunchAgents" / f"{gg.LAUNCH_LABEL}.plist").write_bytes(body)
+                with mock.patch.object(gg.sys, "platform", "darwin"), \
+                        mock.patch.object(gg, "run_bounded", side_effect=AssertionError("no launchctl")), \
+                        mock.patch.object(gg, "launchd_state", return_value=None), \
+                        mock.patch.object(gg, "launchd_domain", return_value=f"user/{os.getuid()}"), \
+                        mock.patch.object(gg.Path, "home", return_value=Path(tmp)), \
+                        mock.patch.object(gg, "BASE", Path(tmp) / "gh"):
+                    ok, how = gg.restart_service(True)
+            self.assertFalse(ok)
+            self.assertIn(f"no Background copy for user/{os.getuid()}: {why}", how)
+
+    def test_a_login_session_restart_boots_out_the_background_copy_first(self) -> None:
+        uid = os.getuid()
+        seen: list[list[str]] = []
+
+        def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
+                mock.patch.object(gg, "launchd_state", return_value=None):
+            ok, how = gg.restart_service(True)
+        self.assertTrue(ok, how)
+        self.assertEqual(seen, [["launchctl", "print", f"gui/{uid}"],
+                                ["launchctl", "print", f"user/{uid}/{gg.LAUNCH_LABEL}"],
+                                ["launchctl", "bootout", f"user/{uid}/{gg.LAUNCH_LABEL}"],
+                                ["launchctl", "kickstart", "-k", f"gui/{uid}/{gg.LAUNCH_LABEL}"]])
+        self.assertTrue(how.startswith(f"launchctl bootout user/{uid}/{gg.LAUNCH_LABEL}"), how)
+        # with no copy loaded, nothing is booted out
+        seen.clear()
+
+        def no_copy(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 113 if argv[2].startswith("user/") else 0, "", "")
+
+        with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", no_copy), \
+                mock.patch.object(gg, "launchd_state", return_value=None):
+            ok, how = gg.restart_service(True)
+        self.assertTrue(ok, how)
+        self.assertEqual([a[1] for a in seen], ["print", "print", "kickstart"])
+        self.assertEqual(how, f"launchctl kickstart -k gui/{uid}/{gg.LAUNCH_LABEL}")
 
     def test_a_missing_launch_agent_fails_the_user_domain_restart_with_a_reason(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3146,16 +3207,26 @@ class LaunchdRestartTest(unittest.TestCase):
                     mock.patch.object(gg, "BASE", Path(tmp) / "gh"):
                 ok, how = gg.restart_service(True)
         self.assertFalse(ok)
-        self.assertIn(f"no plist for user/{os.getuid()}", how)
+        self.assertIn(f"no Background copy for user/{os.getuid()}: FileNotFoundError", how)
 
 
 class RestartHintTest(unittest.TestCase):
     def test_darwin_hints_explain_launchctl_error_5(self) -> None:
-        with mock.patch.object(gg.sys, "platform", "darwin"):
+        with mock.patch.object(gg.sys, "platform", "darwin"), \
+                mock.patch.object(gg, "launchd_domain", return_value=f"gui/{os.getuid()}"):
             for hint in (gg.start_hint(), gg.start_hint(restart=True)):
                 self.assertIn("5: Input/output error", hint)
                 self.assertIn("already loaded", hint)
                 self.assertIn(f"launchctl bootout gui/$(id -u)/{gg.LAUNCH_LABEL}", hint)
+                self.assertIn("Never run glaeda-gh serve yourself", hint)
+
+    def test_a_logged_out_hint_names_the_user_domain_copy(self) -> None:
+        with mock.patch.object(gg.sys, "platform", "darwin"), \
+                mock.patch.object(gg, "launchd_domain", return_value=f"user/{os.getuid()}"):
+            for hint in (gg.start_hint(), gg.start_hint(restart=True)):
+                self.assertIn("nobody is logged in", hint)
+                self.assertIn(f"launchctl bootstrap user/$(id -u) {gg.background_copy_path()}", hint)
+                self.assertNotIn("gui/$(id -u)/", hint)
                 self.assertIn("Never run glaeda-gh serve yourself", hint)
 
     def test_stale_message_names_a_hung_holder(self) -> None:
