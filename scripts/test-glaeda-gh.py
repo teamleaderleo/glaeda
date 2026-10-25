@@ -3116,7 +3116,8 @@ class LaunchdRestartTest(unittest.TestCase):
 
             def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
                 seen.append(argv)
-                code = {"print": 125, "bootout": 3}.get(argv[1], 0)
+                code = ((125 if argv[2] == f"gui/{uid}" else 113) if argv[1] == "print"
+                        else {"bootout": 3}.get(argv[1], 0))
                 return subprocess.CompletedProcess(argv, code, "", "")
 
             copy = home / "gh" / f"{gg.LAUNCH_LABEL}.background.plist"
@@ -3182,6 +3183,28 @@ class LaunchdRestartTest(unittest.TestCase):
                     ok, how = gg.restart_service(True)
             self.assertFalse(ok)
             self.assertIn(f"no Background copy for user/{os.getuid()}: {why}", how)
+
+    def test_a_probe_that_cannot_tell_fails_closed(self) -> None:
+        """Only 113 means not loaded: a print that fails otherwise neither doubles a system daemon nor starts the
+        LaunchAgent beside a copy that may still be there."""
+        uid = os.getuid()
+        for domain in (f"user/{uid}", f"gui/{uid}"):
+            seen: list[list[str]] = []
+
+            def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+                seen.append(argv)
+                return subprocess.CompletedProcess(argv, 5 if argv[1] == "print" else 0, "", "")
+
+            clock = iter(range(0, 1000, 5))
+            with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
+                    mock.patch.object(gg, "launchd_domain", return_value=domain), \
+                    mock.patch.object(gg, "launchd_state", return_value=None), \
+                    mock.patch.object(gg, "background_plist", side_effect=AssertionError("no copy")), \
+                    mock.patch.object(gg.time, "sleep"), mock.patch.object(gg.time, "monotonic", lambda: next(clock)):
+                ok, how = gg.restart_service(True)
+            self.assertFalse(ok, domain)
+            self.assertNotIn("bootstrap", [a[1] for a in seen], domain)
+            self.assertNotIn("kickstart", [a[1] for a in seen], domain)
 
     def test_a_headless_launch_daemon_is_not_doubled_by_a_user_domain_copy(self) -> None:
         seen: list[list[str]] = []

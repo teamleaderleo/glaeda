@@ -5616,9 +5616,19 @@ def background_plist() -> str:
     return os.fspath(copy)
 
 
+# launchctl print's answer for a service its domain does not have (measured on cmux16 and cmux17, macOS 27, in
+# the user, system and gui domains). Any other failure says nothing either way, so callers fail closed on it.
+NOT_LOADED = 113
+
+
+def unloaded(target: str) -> bool:
+    """Whether launchctl says TARGET (domain/label) is not loaded; False when it is, or when it cannot tell."""
+    return run_bounded(["launchctl", "print", target], 10).returncode == NOT_LOADED
+
+
 def system_daemon_loaded() -> bool:
-    """Whether a headless Mac's system LaunchDaemon with the service's label is loaded (service_loaded)."""
-    return run_bounded(["launchctl", "print", f"system/{LAUNCH_LABEL}"], 10).returncode == 0
+    """Whether a headless Mac's system LaunchDaemon with the service's label may be loaded (service_loaded)."""
+    return not unloaded(f"system/{LAUNCH_LABEL}")
 
 
 SYSTEM_DAEMON_HINT = (f"the system LaunchDaemon system/{LAUNCH_LABEL} runs the daemon on this headless Mac; restart "
@@ -5695,12 +5705,13 @@ def drop_background_copy() -> tuple[bool, str]:
     """Boot out the user-domain copy if one is loaded. (no copy is left loaded, what was done: a prefix for
     restart's report, or why the copy is still there)."""
     copy = f"user/{os.getuid()}/{LAUNCH_LABEL}"
-    if run_bounded(["launchctl", "print", copy], 10).returncode != 0:
+    if unloaded(copy):
         return True, ""
     out = run_bounded(["launchctl", "bootout", copy], SUBPROCESS_DEADLINE)
-    # bootout can return before the job is torn down (reload_job): it is gone when print no longer finds it
+    # bootout can return before the job is torn down (reload_job): it is gone when print says it is not loaded,
+    # and a print that cannot tell keeps the LaunchAgent off like a copy still there
     deadline = time.monotonic() + BOOTSTRAP_RETRY
-    while run_bounded(["launchctl", "print", copy], 10).returncode == 0:
+    while not unloaded(copy):
         if time.monotonic() >= deadline:
             return False, (f"launchctl bootout {copy} (the Background copy from a logged-out restart) exited "
                            f"{out.returncode} and it is still loaded after {BOOTSTRAP_RETRY}s")
