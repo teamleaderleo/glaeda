@@ -181,7 +181,8 @@ if argv[:1] == ["remove"]:
 if token != os.environ["FAKE_REG_TOKEN"]:
     print("bad token " + str(token)); sys.exit(1)
 name = argv[argv.index("--name") + 1]
-labels = ["self-hosted", "macOS", "ARM64"] + argv[argv.index("--labels") + 1].split(",")
+labels = ([] if "--no-default-labels" in argv else ["self-hosted", "macOS", "ARM64"]) \
+    + argv[argv.index("--labels") + 1].split(",")
 doc = runners()
 if "--replace" in argv:
     doc["runners"] = [r for r in doc["runners"] if r["name"] != name]
@@ -6730,6 +6731,69 @@ class RunnerTest(unittest.TestCase):
         time.sleep(4)
         self.assertFalse(marker.exists())
 
+    def gateway_manifest(self) -> str:
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"gatewayRunners": 2}}}
+        path = self.state / "gateway.json"
+        path.write_text(json.dumps(manifest))
+        return os.fspath(path)
+
+    def test_gateway_slot_registers_repo_scoped_with_only_the_gateway_label(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            receipt = self.invoke("--apply", "--manifest", self.gateway_manifest(), "--member", "mini-std",
+                                  "--gateway", "1")
+        argv = self.config_argvs()[0]
+        self.assertEqual(argv[argv.index("--name") + 1], "mini-std-gateway-1")
+        self.assertEqual(argv[argv.index("--url") + 1], "https://github.com/manaflow-ai/cmux")
+        self.assertEqual(argv[argv.index("--labels") + 1], "glaeda-gateway-client")
+        self.assertIn("--no-default-labels", argv, "a job for plain self-hosted must never land on a gateway slot")
+        self.assertNotIn("--runnergroup", argv)
+        self.assertEqual(receipt["registration"]["labels"], ["glaeda-gateway-client"])
+        self.assertEqual(receipt["registration"]["scope"], "manaflow-ai/cmux")
+        self.assertEqual(self.by_kind(receipt)["verify"]["state"], "ok")
+        self.assertTrue((self.home / ".local/state/glaeda/cmux-runner/instance-gateway-1/receipt.json").is_file())
+        self.assertFalse((self.home / "actions-runner-glaeda").exists(), "the build runner's install is untouched")
+        hooks = self.home / "actions-runner-gateway-1" / cr.HOOK_DIR
+        started = (hooks / "job-started.sh").read_text()
+        self.assertIn("job-started --gateway --allowed-repo manaflow-ai/cmux --min-free-gib 2 --no-disk "
+                      "--no-telemetry\n", started)
+        for absent in ("--capacity-units", "--require-eligible", "--instance", "--gui-runner", "--trusted-ref"):
+            self.assertNotIn(absent, started)
+        listen = (hooks / "listen.sh").read_text()
+        self.assertIn("--no-waiters --gateway-slot 1 --gateway-slots 2 --gateway-hosts 2 &", listen,
+                      "mini-std and override declare slots (defaults); mini-light's class does not")
+        self.assertNotIn("DEVELOPER_DIR", listen)
+        self.assertNotIn("--fit-units", listen)
+        plist = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.gateway.1.plist")
+                               .read_bytes())
+        self.assertEqual(plist["ProgramArguments"], [os.fspath(hooks / "listen.sh")])
+        self.assertTrue(plist["StandardOutPath"].endswith("glaeda-cmux-runner-gateway-1.log"))
+        self.assertTrue(any("gh variable set CI_COMPILE_CHECK_GATEWAY --body glaeda-gateway-client" in line
+                            for line in receipt["routing"]["route"]))
+        # a re-run changes nothing; uninstall deregisters this slot alone
+        again = self.invoke("--apply", "--manifest", self.gateway_manifest(), "--member", "mini-std", "--gateway", "1")
+        self.assertEqual(self.by_kind(again)["register"]["state"], "unchanged")
+        self.invoke("--uninstall", "--apply", "--gateway", "1")
+        self.assertFalse((self.home / "actions-runner-gateway-1").exists())
+        self.assertNotIn("mini-std-gateway-1",
+                         [r["name"] for r in json.loads((self.state / "runners.json").read_text())["runners"]])
+
+    def test_gateway_flags_are_refused_outside_the_declared_slots(self) -> None:
+        manifest = self.gateway_manifest()
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            self.assertEqual(cr.main(["--manifest", manifest, "--member", "mini-std", "--gateway", "2"]), 2)
+            self.assertEqual(cr.main(["--manifest", self.manifest(), "--member", "mini-std", "--gateway", "0"]), 2,
+                             "no gatewayRunners declared: no slot")
+            for extra in (["--repo", "manaflow-ai/other"], ["--org", "manaflow-ai"], ["--instance", "1"],
+                          ["--gui-runner"], ["--capacity-units", "6"]):
+                with self.subTest(extra=extra):
+                    self.assertEqual(cr.main(["--manifest", manifest, "--member", "mini-std", "--gateway", "0",
+                                              *extra]), 2)
+            self.assertEqual(cr.main(["--labels", "x", "--gateway", "0"]), 2)
+            self.assertEqual(cr.main(["--gateway", "0"]), 2, "installing needs the manifest's declared slots")
+            self.assertEqual(cr.main(["--manifest", manifest, "--member", "mini-std", "--gateway", "8"]), 2)
+        self.assertEqual(self.tree(), {})
+
     def manifest(self) -> str:
         path = self.state / "mini-fleet.json"
         path.write_text(json.dumps(MANIFEST))
@@ -8365,6 +8429,411 @@ class JobTelemetryTest(unittest.TestCase):
     def test_sampler_file_never_looks_like_a_lock_holder(self) -> None:
         name = self.hook.sampler_file(self.dir).name
         self.assertFalse(name.startswith(self.hook.HOLDER_FILE))
+
+GATEWAY_REF = "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/pull/7/merge"
+
+
+class GatewayTest(unittest.TestCase):
+    """A gateway slot (glaeda-cmux-runner --gateway K): admission is the trust boundary of a repo-scoped runner on a
+    public repository, the gate never looks at units, and the slots that listen follow the label's demand."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_constants_match_across_modules(self) -> None:
+        self.assertEqual(cr.GATEWAY_LABEL, fleet_labels.GATEWAY_LABEL)
+        self.assertEqual(hook.GATEWAY_LABEL, fleet_labels.GATEWAY_LABEL)
+        self.assertEqual(cr.GATEWAY_REPO, fleet_labels.GATEWAY_REPO)
+        self.assertEqual(hook.GATEWAY_REPO, fleet_labels.GATEWAY_REPO)
+        self.assertEqual(cr.GATEWAY_MIN_FREE_GIB, hook.GATEWAY_MIN_FREE_GIB)
+        self.assertEqual(hook.GATEWAY_FLAGS["slot"], "--gateway-slot")
+
+    def test_admission_takes_only_cmux_gateway_workflows(self) -> None:
+        admitted = {"same-repo-pr", "push", "workflow-dispatch"}
+        for name, (event_name, payload, _) in SAMPLE_EVENTS.items():
+            with self.subTest(name):
+                repo = (payload.get("repository") or {}).get("full_name")
+                why = hook.gateway_refusal(event_name, payload, repo, GATEWAY_REF)
+                self.assertEqual(why is None, name in admitted, why)
+        same_pr = SAMPLE_EVENTS["same-repo-pr"][1]
+        push = SAMPLE_EVENTS["push"][1]
+        # never a fork, not even the fork the build runners admit
+        self.assertIn("same-repository", hook.gateway_refusal(
+            "pull_request", SAMPLE_EVENTS["teamleaderleo-fork-pr"][1], "manaflow-ai/cmux", GATEWAY_REF))
+        self.assertIn("fork pull request", hook.gateway_refusal(
+            "pull_request", SAMPLE_EVENTS["fork-pr"][1], "manaflow-ai/cmux", GATEWAY_REF))
+        # another repository, by the runner's variable or the payload
+        self.assertIn("not allowed", hook.gateway_refusal("push", push, "evil/cmux", GATEWAY_REF))
+        self.assertIsNotNone(hook.gateway_refusal("push", {"repository": {"full_name": "evil/cmux"}},
+                                                  "manaflow-ai/cmux", GATEWAY_REF))
+        # another workflow, another repository's copy of an allowed one, or none at all
+        for ref in ("manaflow-ai/cmux/.github/workflows/ci.yml@refs/heads/main",
+                    "evil/cmux/.github/workflows/cmux-next.yml@refs/heads/main",
+                    "manaflow-ai/cmux/.github/workflows/sub/cmux-next.yml@refs/heads/main",
+                    "manaflow-ai/cmux/cmux-next.yml@refs/heads/main", "", None):
+            with self.subTest(ref=ref):
+                self.assertIn("workflow", hook.gateway_refusal("pull_request", same_pr, "manaflow-ai/cmux", ref))
+        for workflow in hook.GATEWAY_WORKFLOWS:
+            self.assertIsNone(hook.gateway_refusal(
+                "push", push, "manaflow-ai/cmux", f"manaflow-ai/cmux/.github/workflows/{workflow}@refs/heads/x"))
+        self.assertIn("not schedule", hook.gateway_refusal("schedule", push, "manaflow-ai/cmux", GATEWAY_REF))
+        self.assertIn("not pull_request_target", hook.gateway_refusal(
+            "pull_request_target", same_pr, "manaflow-ai/cmux", GATEWAY_REF))
+
+    def run_started(self, name: str, ref: str = GATEWAY_REF, *extra: str) -> subprocess.CompletedProcess:
+        """job-started under a Runner.Worker stand-in this test made: never as a child of the test itself, whose
+        ancestors may include a real Runner.Worker (a GitHub-hosted job) that a refusal's barrier would end."""
+        return self.job_under_runner_worker(name, ref, *extra)[0]
+
+    def test_job_started_holds_nothing_and_refuses_before_any_step(self) -> None:
+        fleet = self.dir / "fleet"
+        (fleet / "capacity").mkdir(parents=True)
+        lock = os.open(fleet / "host.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # a fleet build holds the host: a build job would wait or be refused
+            result = self.run_started("same-repo-pr")
+            self.assertIn("hook exited 0", result.stdout, result.stdout + result.stderr)
+            self.assertIn("admitted: gateway client cmux-next.yml pull_request", result.stdout)
+        finally:
+            os.close(lock)
+        self.assertEqual(sorted(p.name for p in (fleet / "capacity").iterdir()), [], "no unit, root or token taken")
+        for name, ref, why in (("fork-pr", GATEWAY_REF, "fork pull request"),
+                               ("teamleaderleo-fork-pr", GATEWAY_REF, "same-repository"),
+                               ("push", "manaflow-ai/cmux/.github/workflows/ci.yml@refs/heads/main", "workflow"),
+                               ("other-repository", GATEWAY_REF, "evil/cmux")):
+            with self.subTest(name):
+                result = self.run_started(name, ref)
+                self.assertEqual(result.returncode, -signal.SIGKILL, result.stdout)
+                self.assertIn(f"::error::glaeda-cmux-runner-hook: refused: gateway", result.stdout)
+                self.assertIn(why, result.stdout)
+        now = int(time.time())
+        (fleet / "reservation.json").write_text(json.dumps({
+            "schema": "glaeda-reservation/v1", "owner": "soak", "purpose": "a soak", "since": now - 5,
+            "until": now + 600}))
+        result = self.run_started("push")
+        self.assertEqual(result.returncode, -signal.SIGKILL)
+        self.assertIn("host reserved by soak", result.stdout)
+        (fleet / "reservation.json").unlink()
+        result = self.run_started("push", GATEWAY_REF, "--min-free-gib", "1e9")
+        self.assertEqual(result.returncode, -signal.SIGKILL)
+        self.assertIn("GiB required", result.stdout, "the disk floor still applies")
+
+    def job_under_runner_worker(self, name: str, ref: str = GATEWAY_REF, *extra: str,
+                                via_shell: bool = False) -> tuple[subprocess.CompletedProcess, Path]:
+        """Run a job the way actions/runner v2.338.0 does (JobExtension.cs, StepsRunner.cs): a process named
+        Runner.Worker runs the job-started hook as a pre-job step (the wrapper execs the hook, so the hook's parent
+        is the Worker), awaits it, and then runs the job's next step whatever the hook returned, as a step with
+        `if: always()` does. That step writes a marker; it must never exist after a refusal. The Worker prints its
+        pid first. via_shell keeps a shell between the Worker and the hook, so the barrier has to walk up to it."""
+        cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+        worker = self.dir / "bin" / "Runner.Worker"
+        worker.parent.mkdir(exist_ok=True)
+        source = self.dir / "worker.c"
+        source.write_text("#include <stdio.h>\n#include <sys/wait.h>\n#include <unistd.h>\n"
+                          "static int step(const char *cmd) {\n"
+                          "  pid_t p = fork();\n"
+                          "  if (p == 0) { execl(\"/bin/sh\", \"sh\", \"-c\", cmd, (char *)0); _exit(127); }\n"
+                          "  int s = 0; waitpid(p, &s, 0); return WIFEXITED(s) ? WEXITSTATUS(s) : 1; }\n"
+                          "int main(int c, char **v) {\n"
+                          "  printf(\"worker %d\\n\", (int)getpid()); fflush(stdout);\n"
+                          "  int hook = step(v[1]);\n"  # the job-started hook: its failure never stops the loop
+                          "  printf(\"hook exited %d\\n\", hook); fflush(stdout);\n"
+                          "  step(v[2]);\n"  # the next step, `if: always()`
+                          "  return 100; }\n")
+        if not worker.exists() and (cc is None or subprocess.run([cc, "-o", os.fspath(worker), os.fspath(source)],
+                                                                 capture_output=True).returncode != 0):
+            self.skipTest("no C compiler to build a Runner.Worker stand-in")
+        event_name, payload, _ = SAMPLE_EVENTS[name]
+        path = event(self.dir, name, payload)
+        marker = self.dir / f"always-step-ran-{name}"
+        marker.unlink(missing_ok=True)
+        hook_cmd = " ".join(shlex.quote(a) for a in [sys.executable, os.fspath(HOOK), "job-started",
+                                                     "--gateway", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                                                     "--no-telemetry", *extra])
+        hook_cmd = f"{hook_cmd}; exit $?" if via_shell else f"exec {hook_cmd}"  # a later command stops sh's exec
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+               "GITHUB_EVENT_NAME": event_name, "GITHUB_EVENT_PATH": os.fspath(path),
+               "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_WORKFLOW_REF": ref}
+        result = subprocess.run([os.fspath(worker), hook_cmd, f"touch {shlex.quote(os.fspath(marker))}"], env=env,
+                                capture_output=True, text=True, timeout=60, check=False)
+        return result, marker
+
+    def test_a_refused_job_runs_no_later_step(self) -> None:
+        """A failed job-started does not stop the runner's later steps; the gateway refusal ends the Worker."""
+        admitted, marker = self.job_under_runner_worker("same-repo-pr")
+        self.assertEqual(admitted.returncode, 100, admitted.stdout + admitted.stderr)
+        self.assertTrue(marker.exists(), "the model runs the next step after the hook, as the real runner does")
+        for name, ref in (("fork-pr", GATEWAY_REF), ("teamleaderleo-fork-pr", GATEWAY_REF),
+                          ("push", "manaflow-ai/cmux/.github/workflows/ci.yml@refs/heads/main")):
+            with self.subTest(name):
+                refused, marker = self.job_under_runner_worker(name, ref)
+                self.assertEqual(refused.returncode, -signal.SIGKILL, refused.stdout + refused.stderr)
+                self.assertNotIn("hook exited", refused.stdout, "the Worker never got past the hook")
+                self.assertFalse(marker.exists(), "an `if: always()` step ran after the refusal")
+                self.assertIn("refused: gateway", refused.stderr, "the reason reaches the Worker's stderr")
+
+    def test_a_refusal_ends_only_the_worker_this_test_made(self) -> None:
+        """Whatever runs this suite may sit under a real Runner.Worker (a GitHub-hosted job). With a shell between
+        the stand-in and the hook, the barrier walks up: it must stop at the stand-in and leave every ancestor of
+        this test as it was."""
+        ancestors, pid = [], os.getpid()
+        while pid > 1 and len(ancestors) < 64 and (seen := hook.process_observation(pid)) is not None:
+            ancestors.append((pid, seen[2]))
+            pid = seen[0]
+        self.assertTrue(ancestors)
+        refused, marker = self.job_under_runner_worker("fork-pr", via_shell=True)
+        self.assertEqual(refused.returncode, -signal.SIGKILL, refused.stdout + refused.stderr)
+        worker = int(re.search(r"^worker (\d+)$", refused.stdout, re.M).group(1))
+        self.assertIn(f"ended Runner.Worker {worker},", refused.stderr)
+        self.assertFalse(marker.exists())
+        for pid, identity in ancestors:
+            seen = hook.process_observation(pid)
+            self.assertIsNotNone(seen, f"ancestor {pid} of this test is gone")
+            self.assertTrue(hook._same_start(seen[2], identity), f"ancestor {pid} of this test was replaced")
+
+    def no_signal(self) -> contextlib.ExitStack:
+        """No real signal and no real ancestry: the walk above the hook ends at once."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(hook.os, "getppid", return_value=1))
+        stack.enter_context(mock.patch.object(hook, "_pidfd", return_value=None))
+        stack.enter_context(mock.patch.object(hook.os, "kill", side_effect=AssertionError("signalled")))
+        return stack
+
+    def test_the_barrier_never_signals_a_process_that_is_not_a_runner_worker(self) -> None:
+        me = hook.JobOwner.of(os.getpid())
+        with self.no_signal(), mock.patch.object(hook, "process_observation", return_value=(1, "python3", "ps:x")):
+            self.assertIn("no Runner.Worker", hook.end_worker(me))
+            self.assertIn("no Runner.Worker", hook.end_worker(None))
+        # the pinned pid now names another Runner.Worker (pid reuse): not the owner, so not signalled
+        with self.no_signal(), mock.patch.object(hook, "process_observation",
+                                                 return_value=(1, "Runner.Worker", "ps:a later start")):
+            self.assertIn("no Runner.Worker", hook.end_worker(hook.JobOwner(4242, "ps:the pinned start")))
+
+    def test_the_barrier_rechecks_name_and_start_right_before_the_signal(self) -> None:
+        """Discovery reads the Worker's name and start token in one observation; if the pid is reused before the
+        signal (by another program, or by another Worker), even during the zombie probe that comes just before
+        the last read, the re-check sees it and nothing is signalled."""
+        for later, during_probe in (((1, "zsh", "ps:Wed Oct 21 10:00:01 2026"), False),
+                                    ((1, "Runner.Worker", "ps:Wed Oct 21 10:00:01 2026"), False),
+                                    ((1, "zsh", "ps:Wed Oct 21 10:00:01 2026"), True)):
+            with self.subTest(later=later, during_probe=during_probe):
+                looks = {"worker": 0, "reused": False}
+
+                def observe(pid: int) -> tuple[int, str, str] | None:
+                    if pid == 777:  # the hook's parent: a shell under the Worker
+                        return 4242, "sh", "ps:Wed Oct 21 09:00:00 2026"
+                    looks["worker"] += 1
+                    if looks["reused"] or not during_probe and looks["worker"] > 1:
+                        return later
+                    return 1, "Runner.Worker", "ps:Wed Oct 21  9:00:00 2026"
+
+                def zombie(pid: int) -> bool:
+                    looks["reused"] = during_probe  # the pid is freed and reused while ps runs
+                    return False
+
+                with self.no_signal(), mock.patch.object(hook.os, "getppid", return_value=777), \
+                        mock.patch.object(hook, "process_observation", side_effect=observe), \
+                        mock.patch.object(hook.Gate, "_zombie", side_effect=zombie), \
+                        mock.patch.object(hook, "pid_alive", return_value=True):
+                    self.assertEqual(hook.end_worker(None), "Runner.Worker 4242 is already gone")
+                self.assertEqual(looks["worker"], 2)
+
+    def test_the_barrier_fails_closed_while_a_probe_cannot_tell(self) -> None:
+        """A ps that fails or times out is never read as "gone": end_worker keeps the Worker blocked (it awaits
+        this hook) until a probe answers, then ends it, both before the Worker is found and after. It runs here in
+        this thread, so every protection (no real ancestry) stays in place until it has returned."""
+        real = hook.process_observation
+        for failing_from in (0, 1):  # every look fails at first; or discovery works and the look before the signal
+            with self.subTest(failing_from=failing_from):
+                sleeper = subprocess.Popen(["/bin/sleep", "60"])
+                self.addCleanup(sleeper.wait)
+                self.addCleanup(lambda p=sleeper: p.poll() is None and p.kill())
+                owner = hook.JobOwner.of(sleeper.pid)
+                looks = {"n": 0}
+
+                def observe(pid: int, sleeper: subprocess.Popen = sleeper) -> tuple[int, str, str] | None:
+                    looks["n"] += 1
+                    if failing_from < looks["n"] <= failing_from + 5:
+                        self.assertIsNone(sleeper.poll(), "signalled without a confirmed name and start token")
+                        return None  # ps failed or timed out
+                    seen = real(pid)
+                    return (seen[0], "Runner.Worker", seen[2]) if seen and pid == sleeper.pid else seen
+
+                with mock.patch.object(hook.os, "getppid", return_value=1), \
+                        mock.patch.object(hook, "process_observation", side_effect=observe):
+                    done = hook.end_worker(owner, wait_s=60)
+                self.assertEqual(done, f"ended Runner.Worker {sleeper.pid}, so no later step of this job runs here")
+                self.assertGreater(looks["n"], failing_from + 5, "returned while a probe could not tell")
+                self.assertEqual(sleeper.wait(10), -signal.SIGKILL)
+
+    def test_a_barrier_that_cannot_finish_pauses_the_slot_and_keeps_blocking(self) -> None:
+        """Bounded: after wait_s the barrier escalates once, in red, and pauses its slot (the gate then ends the whole
+        runner); it still never returns while the Worker may live. A hook outside an install has no slot to pause."""
+        self.assertIsNone(hook.gateway_pause_file(), "the repo's own scripts/ is never paused")
+        pause = self.dir / "glaeda-hooks" / hook.GATEWAY_PAUSE_FILE
+        pause.parent.mkdir()
+        looks = {"n": 0}
+
+        def observe(pid: int) -> tuple[int, str, str] | None:
+            looks["n"] += 1
+            return None if looks["n"] <= 30 else (1, "zsh", "ps:another process")  # the probes recover at last
+
+        out, err = io.StringIO(), io.StringIO()
+        with self.no_signal(), mock.patch.object(hook, "process_observation", side_effect=observe), \
+                mock.patch.object(hook, "pid_alive", return_value=True), \
+                mock.patch.object(hook, "gateway_pause_file", return_value=pause), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            done = hook.end_worker(hook.JobOwner(4242, "ps:the pinned start"), wait_s=0.3)
+        self.assertGreater(looks["n"], 30, "returned while the probes could not tell")
+        self.assertIn("no Runner.Worker", done)
+        self.assertEqual(out.getvalue().count("::error::glaeda-cmux-runner-hook: execution barrier stuck"), 1)
+        self.assertIn("cannot read the process tree", pause.read_text())
+
+    def test_a_pause_ends_the_runner_and_holds_the_slot_until_it_expires(self) -> None:
+        gate = self.gate(0)
+        pause = gate.runner_dir / "glaeda-hooks" / hook.GATEWAY_PAUSE_FILE
+        with mock.patch.object(hook, "gateway_demand", return_value=40), \
+                mock.patch.object(hook, "gate_log"), mock.patch.object(gate, "kill") as kill:
+            self.assertIsNone(gate.claimed())
+            pause.write_text("stuck\n")
+            self.assertIn("paused by a refusal", gate.claimed())
+            gate.child = mock.Mock(**{"poll.return_value": None})  # a runner with a job: ended all the same
+            self.assertIsNone(gate.step())
+            self.assertIsNone(gate.step())
+            self.assertEqual(kill.call_count, 2, "kill repeats each poll until run.sh exits")
+            gate.child = None
+            old = time.time() - hook.GATEWAY_PAUSE_S - 1
+            os.utime(pause, (old, old))
+            self.assertIsNone(gate.claimed())
+            self.assertFalse(pause.exists(), "an expired pause is removed: the slot heals by itself")
+
+    def gate(self, slot: int = 0, slots: int = 3, hosts: int = 2) -> hook.GatewayGate:
+        runner = self.dir / f"actions-runner-gateway-{slot}"
+        (runner / "glaeda-hooks").mkdir(parents=True, exist_ok=True)
+        fleet = self.dir / "fleet"
+        fleet.mkdir(exist_ok=True)
+        return hook.GatewayGate(runner, os.fspath(fleet / "host.lock"), os.fspath(fleet / "reservation.json"),
+                                self.dir / "state", hook.GatewayScope(slot, slots, hosts))
+
+    def test_gate_never_looks_at_units_cpu_heat_or_the_host_lock(self) -> None:
+        never = mock.Mock(side_effect=AssertionError("a gateway gate must not look at this"))
+        with mock.patch.multiple(hook.Gate, full=never, saturated=never, hot=never, locked=never, ineligible=never), \
+                mock.patch.multiple(hook, host_held=never, host_waiters=never, mini_full=never, take_capacity=never,
+                                    gateway_demand=mock.Mock(return_value=40)):
+            for slot in range(3):
+                self.assertIsNone(self.gate(slot).claimed())
+                self.assertIsNone(self.gate(slot).confirmed())
+            self.assertFalse(self.gate().waiters)
+            self.assertIsNone(self.gate().capacity_dir)
+
+    def test_gate_holds_slots_above_the_measured_demand(self) -> None:
+        with mock.patch.object(hook, "gateway_demand", return_value=0):
+            self.assertIsNone(self.gate(0).claimed())
+            self.assertIn("gateway: slot 1 is above the 1 of 3", self.gate(1).claimed())
+        with mock.patch.object(hook, "gateway_demand", return_value=3):  # ceil(3 / 2) + 1 = 3
+            self.assertIsNone(self.gate(2).claimed())
+        with mock.patch.object(hook, "gateway_demand", return_value=None):  # no reading: every slot listens
+            self.assertIsNone(self.gate(2).claimed())
+        # a reservation still holds every slot
+        now = int(time.time())
+        gate = self.gate(0)
+        Path(gate.reservation).write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "soak",
+                                                      "purpose": "x", "since": now - 5, "until": now + 600}))
+        with mock.patch.object(hook, "gateway_demand", return_value=40):
+            self.assertIn("host reserved by soak", gate.claimed())
+        Path(gate.reservation).unlink()
+        # an --apply that changes the declared slots counts without a restart (listen.sh is read each look)
+        gate = self.gate(2)
+        (gate.runner_dir / "glaeda-hooks/listen.sh").write_text(
+            "x listen --runner-dir d --no-waiters --gateway-slot 2 --gateway-slots 2 --gateway-hosts 2 &\n")
+        with mock.patch.object(hook, "gateway_demand", return_value=None):
+            self.assertIn("slot 2 is above the 2 of 2", gate.claimed())
+
+    def test_sizing_math(self) -> None:
+        cases = {(None, 4, 3): 4, (0, 4, 3): 1, (1, 4, 3): 2, (5, 4, 3): 3, (100, 4, 3): 4, (7, 1, 1): 1,
+                 (0, 0, 0): 1, (6, 4, 0): 4, (-3, 4, 2): 1}
+        for (demand, slots, hosts), want in cases.items():
+            with self.subTest(demand=demand, slots=slots, hosts=hosts):
+                self.assertEqual(hook.gateway_listeners(demand, slots, hosts), want)
+
+    def dash(self, now: float, pools: list[dict], age: float = 30) -> dict:
+        return {"updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - age)), "pools": pools}
+
+    def test_demand_from_the_dashboard(self) -> None:
+        now = time.time()
+        pools = [{"pool": "glaeda-gateway-client", "queued": 3, "running": 2},
+                 {"pool": "glaeda-side-light-xcode-26.6", "queued": 68, "running": 17},
+                 {"pool": "self-hosted,glaeda-gateway-client", "queued": 1, "running": 0}]
+        self.assertEqual(hook.gateway_demand_from(self.dash(now, pools), now), 6)
+        self.assertEqual(hook.gateway_demand_from(self.dash(now, pools[1:2]), now), 0, "no entry: no jobs")
+        self.assertIsNone(hook.gateway_demand_from(self.dash(now, pools, age=hook.GATEWAY_DEMAND_STALE_S + 1), now))
+        self.assertIsNone(hook.gateway_demand_from(self.dash(now, pools, age=-3600), now), "from the future")
+        self.assertIsNone(hook.gateway_demand_from({"pools": pools}, now), "no updated stamp")
+        self.assertIsNone(hook.gateway_demand_from({**self.dash(now, pools), "pools": {}}, now))
+        self.assertIsNone(hook.gateway_demand_from(None, now))
+        for bad in ("3", None, True, -1):
+            with self.subTest(bad=bad):
+                self.assertIsNone(hook.gateway_demand_from(
+                    self.dash(now, [{"pool": "glaeda-gateway-client", "queued": bad, "running": 0}]), now))
+
+    def test_demand_is_read_once_a_minute_per_mini_and_falls_back(self) -> None:
+        state = self.dir / "state"
+        now = 1_800_000_000.0
+        calls = []
+
+        def good() -> dict:
+            calls.append("good")
+            return self.dash(now, [{"pool": "glaeda-gateway-client", "queued": 4, "running": 1}])
+
+        def broken() -> None:
+            calls.append("broken")
+            return None
+
+        self.assertEqual(hook.gateway_demand(state, now, good), 5)
+        self.assertEqual(hook.gateway_demand(state, now + 30, broken), 5, "the cache answers within a minute")
+        self.assertEqual(calls, ["good"])
+        self.assertEqual(hook.gateway_demand(state, now + 61, broken), 5, "a failed read keeps the last good one")
+        self.assertEqual(calls, ["good", "broken"])
+        self.assertIsNone(hook.gateway_demand(state, now + hook.GATEWAY_DEMAND_KEEP_S + 1, broken),
+                          "too old: the gate listens on every slot")
+        # another gate reading right now: the cache answers, nothing is fetched twice
+        (state / hook.GATEWAY_DEMAND_CACHE).unlink()
+        held = hook.lock_file(state / f"{hook.GATEWAY_DEMAND_CACHE}.lock", fcntl.LOCK_EX)
+        try:
+            self.assertIsNone(hook.gateway_demand(state, now, good))
+            self.assertEqual(calls.count("good"), 1)
+        finally:
+            os.close(held)
+        (state / hook.GATEWAY_DEMAND_CACHE).write_text("{not json")
+        self.assertEqual(hook.gateway_demand(state, now, good), 5, "an unreadable cache is read afresh")
+
+    def test_labels_module_declares_gateway_slots(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        ok = lambda app: True  # noqa: E731
+        self.assertEqual(fleet_labels.member_labels(manifest, "mini-std", ok)[0]["gatewayRunners"], 0)
+        self.assertEqual(fleet_labels.gateway_hosts(manifest), 0)
+        manifest["defaults"]["runner"] = {"classes": {"std": {"gatewayRunners": 3}}}
+        manifest["hosts"]["override"]["overrides"]["runner"] = {"classes": {"std": {"gatewayRunners": 0}}}
+        member = fleet_labels.member_labels(manifest, "mini-std", ok)[0]
+        self.assertEqual(member["gatewayRunners"], 3)
+        self.assertNotIn(fleet_labels.GATEWAY_LABEL, member["labels"] + member["pools"])
+        self.assertEqual(fleet_labels.gateway_hosts(manifest), 1)
+        self.assertEqual(fleet_labels.gateway_hosts({**manifest, "gatewayHosts": 9}), 9, "a trimmed manifest's count")
+        self.assertEqual(fleet_labels.gateway_hosts({**manifest, "gatewayHosts": True}), 1)
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
+                                                                 "trustedRepo": "manaflow-ai/cmux"}}
+        self.assertEqual(fleet_labels.member_labels(manifest, "mini-std", ok)[0]["gatewayRunners"], 0,
+                         "a trusted member holds a secret: never a gateway slot, which runs PR jobs")
+        self.assertEqual(fleet_labels.gateway_hosts(manifest), 0)
+        del manifest["hosts"]["mini-std"]["overrides"]
+        for bad in (9, -1, True, "2"):
+            with self.subTest(bad=bad):
+                manifest["defaults"]["runner"]["classes"]["std"]["gatewayRunners"] = bad
+                self.assertIn("gatewayRunners must be 0 to 8", fleet_labels.member_labels(manifest, "mini-std", ok)[1])
 
 
 if __name__ == "__main__":

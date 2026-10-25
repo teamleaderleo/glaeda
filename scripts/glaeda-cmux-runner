@@ -6,6 +6,7 @@
     glaeda-cmux-runner --uninstall                    plan removal
     glaeda-cmux-runner --uninstall --apply            deregister and remove what --apply installed
     glaeda-mini-setup --runner [...]                  same thing, through the mini setup front door
+    glaeda-cmux-runner --manifest M --member NAME --gateway K [--apply]   gateway listener slot K (below)
 
 Defaults register to --repo manaflow-ai/cmux. Use --org ORG for an organization runner.
 A fleet member passes --manifest M --member NAME instead of --labels: its class, availability and
@@ -50,6 +51,13 @@ A fleet member (--manifest, or a receipt that recorded one) prints no MACOS_RUNN
 pool picker already routes to its pool labels, and those variables would bypass the picker. A trusted
 member prints the nightly variables (CI_SEED_TRUSTED_POOL, CI_NIGHTLY_TRUSTED_RUNNER) instead.
 The receipt lands in ~/.local/state/glaeda/cmux-runner/receipt.json.
+
+A gateway slot (--gateway K, K below the member's runner.classes.<class>.gatewayRunners) is its own runner
+install for the build fleet's gateway jobs, thin clients that wait on `cmux-ci run`: ~/actions-runner-gateway-K,
+LaunchAgent com.teamleaderleo.glaeda.cmux-runner.gateway.K, name <member>-gateway-K, registered to manaflow-ai/cmux
+only (repo-scoped, so --token-stdin with a repo token) with the one label glaeda-gateway-client and no default labels.
+Its hooks take no unit, root or token; job-started admits only manaflow-ai/cmux's own gateway workflows, and the
+listen gate sizes the slots that listen by the label's measured demand (glaeda-cmux-runner-hook GatewayGate).
 
 Stale copies and label drift. On a host with an over-the-air release installed (glaeda-update), a copy
 of this script whose runner files differ from that release's and are older than it (by its
@@ -113,6 +121,9 @@ LABEL = "com.teamleaderleo.glaeda.cmux-runner"
 DEFAULT_REPO = "manaflow-ai/cmux"
 BASE_LABELS = ("self-hosted", "macOS", "ARM64")
 MINI_LABEL = "glaeda-mini"
+GATEWAY_LABEL = "glaeda-gateway-client"  # glaeda_fleet_labels.GATEWAY_LABEL (a test keeps them equal)
+GATEWAY_REPO = "manaflow-ai/cmux"
+GATEWAY_MIN_FREE_GIB = 2.0  # the hook's GATEWAY_MIN_FREE_GIB: a gateway job checks nothing out
 # Fleet membership labels (cmuxterm-hq build-fleet/FLEET-MEMBERSHIP.md) live in glaeda_fleet_labels.py
 # next to this script, shared with glaeda-mini-fleet. Only --manifest needs that file on the mini.
 LABELS_MODULE = "glaeda_fleet_labels.py"
@@ -370,6 +381,26 @@ class Context:
         self.log_path = self.logs / f"glaeda-cmux-runner{self.suffix}.log"
         self.token_stdin = args.token_stdin
         self.stdin_token: str | None = None  # set by main() from stdin; used once, never stored
+        self.gateway: int | None = None  # the gateway slot (--gateway K), set by gateway_context
+        self.gateway_slots = self.gateway_hosts = 1
+
+    def gateway_context(self, slot: int, member: str | None, slots: int, hosts: int, runner_dir: Path | None) -> None:
+        """Make this a gateway slot's install: its own directory, agent, log, receipt, name and the one label."""
+        self.gateway, self.gateway_slots, self.gateway_hosts = slot, max(1, slots), max(1, hosts)
+        self.suffix = f"-gateway-{slot}"
+        self.label = f"{LABEL}.gateway.{slot}"
+        self.runner_dir = (runner_dir or self.home / f"actions-runner-gateway-{slot}").expanduser().absolute()
+        self.hook_dir = self.runner_dir / HOOK_DIR
+        self.state = self.home / ".local/state/glaeda/cmux-runner" / f"instance-gateway-{slot}"
+        self.receipt_path = self.state / "receipt.json"
+        self.plist_path = self.agents / f"{self.label}.plist"
+        self.service_plist_path = (SYSTEM_DAEMON_DIR / f"{self.label}.plist") if self.headless else self.plist_path
+        self.log_path = self.logs / f"glaeda-cmux-runner{self.suffix}.log"
+        if member:
+            self.name = f"{member}-gateway-{slot}"
+        self.labels, self.labels_requested = [GATEWAY_LABEL], True
+        self.capacity_units = 0
+        self.gui_runner = self.fast_runner = self.session_runner = False
 
     def take_token(self, endpoint: str) -> str | None:
         """The stdin token when one was given (single use), otherwise a fresh one from gh."""
@@ -709,9 +740,36 @@ def find_runner(ctx: Context) -> dict[str, Any] | None:
 # ---------------------------------------------------------------- desired state
 
 
+def gateway_slot(ctx: Any) -> int | None:
+    """The gateway slot this install is (--gateway K), or None for a build runner (and for a test's stand-in)."""
+    slot = getattr(ctx, "gateway", None)
+    return slot if isinstance(slot, int) and not isinstance(slot, bool) else None
+
+
+def gateway_hooks(ctx: Context, python: str, hook: str) -> tuple[str, str, str]:
+    """A gateway slot's job-started, job-completed and listen gate command: admission that holds no unit, root or
+    token (job-started --gateway), and the gateway listen gate (GatewayGate) under the usual listen.sh."""
+    floor = f" --min-free-gib {ctx.min_free_gib:g}" if ctx.min_free_gib else ""
+    started = (
+        "#!/bin/bash\n"
+        "# glaeda-cmux-runner gateway job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"
+        "# before any step runs; it admits only manaflow-ai/cmux's own gateway workflows and holds nothing.\n"
+        f"exec {python} {hook} job-started --gateway --allowed-repo {shlex.quote(GATEWAY_REPO)}{floor}"
+        " --no-disk --no-telemetry\n")
+    completed = (
+        "#!/bin/bash\n"
+        "# glaeda-cmux-runner gateway job-completed hook (generated, receipt-owned). Never fails the job.\n"
+        f"{python} {hook} job-completed --no-disk --no-telemetry || true\n"
+        "exit 0\n")
+    gate = (f"{python} {hook} listen --runner-dir {shlex.quote(os.fspath(ctx.runner_dir))} --no-waiters"
+            f" --gateway-slot {ctx.gateway} --gateway-slots {ctx.gateway_slots} --gateway-hosts {ctx.gateway_hosts}")
+    return started, completed, gate
+
+
 def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     python = shlex.quote(ctx.python or "/usr/bin/python3")
     hook = shlex.quote(os.fspath(ctx.hook_dir / "glaeda-cmux-runner-hook"))
+    gateway = gateway_slot(ctx)
     gui_token = getattr(ctx, "gui_token", "gui")
     if not isinstance(gui_token, str):
         gui_token = "gui"
@@ -777,9 +835,11 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
               + [SESSION_FIT_UNITS] * (getattr(ctx, "session_runner", False) is True), default=0)
     if ctx.capacity_units and fit:
         gate += f" --fit-units {fit}"
+    if gateway is not None:
+        started, completed, gate = gateway_hooks(ctx, python, hook)
     # The runner and every job it runs build with the pool Xcode: no SDKROOT or TOOLCHAINS to send xcrun past it
     # (the hook's listener_env does the same for the run.sh the gate starts).
-    xcode_apps = (ctx.member or {}).get("xcodeApps") or []
+    xcode_apps = [] if gateway is not None else (ctx.member or {}).get("xcodeApps") or []
     toolchain_env = "unset SDKROOT TOOLCHAINS\n" + (
         f"export DEVELOPER_DIR={shlex.quote(os.fspath(Path(xcode_apps[0]) / 'Contents/Developer'))}\n"
         if xcode_apps else "")
@@ -959,6 +1019,13 @@ def start_agent(ctx: Context, act: dict[str, Any], plist: str) -> str | None:
 def routing(ctx: Context) -> dict[str, Any]:
     repo = shlex.quote(ctx.route_repo)
     member = ctx.member
+    if gateway_slot(ctx) is not None:
+        names = ("CI_COMPILE_CHECK_GATEWAY", "CI_TEST_COMPILE_GATEWAY")
+        return {"route": [f"gh variable set {v} --body {GATEWAY_LABEL} --repo {repo}" for v in names],
+                "rollback": [f"gh variable set {v} --body <the label it had> --repo {repo}" for v in names],
+                "note": "gateway slot: cmux's build-fleet gateway jobs (cmux-next.yml, fleet-test-compile.yml, "
+                        "fleet-compile-check.yml) run here once those variables name its label; read the old "
+                        "values first (gh variable get)"}
     if not member:
         return {
             "route": [f"gh variable set {v} --body {MINI_LABEL} --repo {repo}" for v in ROUTE_VARIABLES],
@@ -1354,6 +1421,8 @@ def register(ctx: Context, act: dict[str, Any]) -> None:
     argv = [os.fspath(ctx.runner_dir / "config.sh"), "--unattended", "--url", ctx.scope_url,
             "--name", ctx.name, "--labels", ",".join(l for l in ctx.labels if l not in BASE_LABELS),
             "--work", "_work"]
+    if gateway_slot(ctx) is not None:  # only glaeda-gateway-client: no job for self-hosted lands here
+        argv.append("--no-default-labels")
     if ctx.org and ctx.group:
         argv += ["--runnergroup", ctx.group]
     if ctx.replace or act.get("replace"):
@@ -2063,6 +2132,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--instance", type=int, default=0,
                    help="which of this mini's runners (0 keeps the original paths; K > 0 gets its own "
                         "~/actions-runner-glaeda-K, LaunchAgent, receipt and name <member>-glaeda-K)")
+    p.add_argument("--gateway", type=int, metavar="K",
+                   help="install gateway listener slot K instead (needs --manifest and --member to install; K below "
+                        "the member's gatewayRunners): repo-scoped to manaflow-ai/cmux, label glaeda-gateway-client")
     p.add_argument("--gui-runner", action="store_true",
                    help="mark this explicitly managed runner as a GUI desktop session")
     p.add_argument("--gui-token", default="gui",
@@ -2149,7 +2221,21 @@ def main(argv: list[str] | None = None) -> int:
     if bool(args.manifest) != bool(args.member):
         print("glaeda-cmux-runner: --manifest and --member go together", file=sys.stderr)
         return 2
+    if args.gateway is not None:
+        if not 0 <= args.gateway < 8:
+            print("glaeda-cmux-runner: --gateway must be 0 to 7", file=sys.stderr)
+            return 2
+        if args.instance or args.labels or args.org or args.gui_runner or args.capacity_units \
+                or (args.repo or GATEWAY_REPO) != GATEWAY_REPO:
+            print(f"glaeda-cmux-runner: --gateway registers to {GATEWAY_REPO} with its own label; --instance, "
+                  "--labels, --org, --repo, --gui-runner and --capacity-units do not apply", file=sys.stderr)
+            return 2
+        if not args.manifest and not args.uninstall:
+            print("glaeda-cmux-runner: --gateway needs --manifest and --member (the declared slots)", file=sys.stderr)
+            return 2
     ctx = Context(args)
+    if args.gateway is not None:
+        ctx.gateway_context(args.gateway, args.member, 1, 1, args.runner_dir)
     if args.manifest:
         try:
             manifest = json.loads(args.manifest.expanduser().read_text())
@@ -2197,6 +2283,15 @@ def main(argv: list[str] | None = None) -> int:
             # A static handle on this one root runner (cmux's warm affinity): the picker reads which runner
             # kept a warm build and names it in runs-on, so no job ever writes a runner label.
             ctx.labels.append(runner_label(ctx.name))
+        if args.gateway is not None:
+            slots = int(member.get("gatewayRunners") or 0)
+            if args.gateway >= slots:
+                print(f"glaeda-cmux-runner: {args.member} declares {slots} gateway slot(s) (runner.classes."
+                      f"{member['class']}.gatewayRunners); --gateway {args.gateway} is beyond that", file=sys.stderr)
+                return 2
+            hosts = fleet_labels().gateway_hosts(manifest)
+            ctx.gateway_context(args.gateway, args.member, slots, hosts, args.runner_dir)
+            ctx.min_free_gib = args.min_free_gib or GATEWAY_MIN_FREE_GIB
     if args.token_stdin and args.apply:  # a plan previews the stdin path but never reads a token
         token = sys.stdin.readline(4096).strip()
         if not re.fullmatch(TOKEN_RE, token):
