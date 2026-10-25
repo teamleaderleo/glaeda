@@ -5698,8 +5698,13 @@ def drop_background_copy() -> tuple[bool, str]:
     if run_bounded(["launchctl", "print", copy], 10).returncode != 0:
         return True, ""
     out = run_bounded(["launchctl", "bootout", copy], SUBPROCESS_DEADLINE)
-    if out.returncode != 0 and run_bounded(["launchctl", "print", copy], 10).returncode == 0:
-        return False, f"launchctl bootout {copy} (the Background copy from a logged-out restart) exited {out.returncode} and it is still loaded"
+    # bootout can return before the job is torn down (reload_job): it is gone when print no longer finds it
+    deadline = time.monotonic() + BOOTSTRAP_RETRY
+    while run_bounded(["launchctl", "print", copy], 10).returncode == 0:
+        if time.monotonic() >= deadline:
+            return False, (f"launchctl bootout {copy} (the Background copy from a logged-out restart) exited "
+                           f"{out.returncode} and it is still loaded after {BOOTSTRAP_RETRY}s")
+        time.sleep(1)
     return True, f"launchctl bootout {copy} (the Background copy from a logged-out restart), then "
 
 

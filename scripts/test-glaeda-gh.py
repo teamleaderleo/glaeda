@@ -3039,7 +3039,8 @@ class LaunchdRestartTest(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 5 if argv[1] == "kickstart" else 0, "", "")
 
         with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
-                mock.patch.object(gg, "launchd_state", return_value=None), mock.patch.object(gg.time, "sleep"):
+                mock.patch.object(gg, "launchd_state", return_value=None), mock.patch.object(gg.time, "sleep"), \
+                mock.patch.object(gg, "drop_background_copy", return_value=(True, "")):
             ok, how = gg.restart_service(True)
         self.assertTrue(ok)
         self.assertEqual(calls["n"], 3)
@@ -3203,11 +3204,45 @@ class LaunchdRestartTest(unittest.TestCase):
             seen.append(argv)
             return subprocess.CompletedProcess(argv, 5 if argv[1] == "bootout" else 0, "", "")
 
+        clock = iter(range(0, 1000, 5))
         with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
-                mock.patch.object(gg, "launchd_state", return_value="spawn scheduled"):
+                mock.patch.object(gg, "launchd_state", return_value="spawn scheduled"), \
+                mock.patch.object(gg.time, "sleep"), mock.patch.object(gg.time, "monotonic", lambda: next(clock)):
             ok, how = gg.restart_service(False)
         self.assertFalse(ok)
         self.assertIn("exited 5 and it is still loaded", how)
+        self.assertNotIn("kickstart", [a[1] for a in seen])
+
+    def test_a_bootout_that_returns_before_teardown_is_waited_for(self) -> None:
+        """bootout answers 0 while the copy is still loaded; the LaunchAgent starts only once print no longer finds it."""
+        uid = os.getuid()
+        copy = f"user/{uid}/{gg.LAUNCH_LABEL}"
+        prints = {"n": 0}
+        seen: list[list[str]] = []
+
+        def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+            seen.append(argv)
+            if argv[1:] == ["print", copy]:
+                prints["n"] += 1
+                return subprocess.CompletedProcess(argv, 0 if prints["n"] <= 3 else 113, "", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
+                mock.patch.object(gg, "launchd_state", return_value=None), mock.patch.object(gg.time, "sleep"):
+            ok, how = gg.restart_service(True)
+        self.assertTrue(ok, how)
+        self.assertEqual(prints["n"], 4)
+        self.assertEqual(seen[-1], ["launchctl", "kickstart", "-k", f"gui/{uid}/{gg.LAUNCH_LABEL}"])
+        # and one that never goes keeps the LaunchAgent off
+        prints["n"] = -1000
+        seen.clear()
+        clock = iter(range(0, 1000, 5))
+        with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
+                mock.patch.object(gg, "launchd_state", return_value=None), mock.patch.object(gg.time, "sleep"), \
+                mock.patch.object(gg.time, "monotonic", lambda: next(clock)):
+            ok, how = gg.restart_service(True)
+        self.assertFalse(ok)
+        self.assertIn("exited 0 and it is still loaded", how)
         self.assertNotIn("kickstart", [a[1] for a in seen])
 
     def test_a_scheduled_respawn_in_the_login_session_still_drops_the_copy(self) -> None:
@@ -3216,7 +3251,8 @@ class LaunchdRestartTest(unittest.TestCase):
 
         def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
             seen.append(argv)
-            return subprocess.CompletedProcess(argv, 0, "", "")
+            gone = argv[1] == "print" and argv[2].startswith("user/") and ["launchctl", "bootout", argv[2]] in seen
+            return subprocess.CompletedProcess(argv, 113 if gone else 0, "", "")
 
         with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
                 mock.patch.object(gg, "launchd_state", return_value="spawn scheduled"):
@@ -3231,7 +3267,8 @@ class LaunchdRestartTest(unittest.TestCase):
 
         def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
             seen.append(argv)
-            return subprocess.CompletedProcess(argv, 0, "", "")
+            gone = argv[1] == "print" and argv[2].startswith("user/") and ["launchctl", "bootout", argv[2]] in seen
+            return subprocess.CompletedProcess(argv, 113 if gone else 0, "", "")
 
         with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
                 mock.patch.object(gg, "launchd_state", return_value=None):
@@ -3240,6 +3277,7 @@ class LaunchdRestartTest(unittest.TestCase):
         self.assertEqual(seen, [["launchctl", "print", f"gui/{uid}"],
                                 ["launchctl", "print", f"user/{uid}/{gg.LAUNCH_LABEL}"],
                                 ["launchctl", "bootout", f"user/{uid}/{gg.LAUNCH_LABEL}"],
+                                ["launchctl", "print", f"user/{uid}/{gg.LAUNCH_LABEL}"],
                                 ["launchctl", "kickstart", "-k", f"gui/{uid}/{gg.LAUNCH_LABEL}"]])
         self.assertTrue(how.startswith(f"launchctl bootout user/{uid}/{gg.LAUNCH_LABEL}"), how)
         # with no copy loaded, nothing is booted out
