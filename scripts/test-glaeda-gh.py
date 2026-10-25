@@ -3132,6 +3132,16 @@ class LaunchdRestartTest(unittest.TestCase):
                     ["launchctl", "bootstrap", f"user/{uid}", os.fspath(copy)]])
                 with open(copy, "rb") as handle:
                     self.assertEqual(gg.plistlib.load(handle), {**job, "LimitLoadToSessionType": "Background"})
+                # launchctl refuses a job file group or others can write, whatever the umask or an older copy's mode
+                self.assertEqual(copy.stat().st_mode & 0o777, 0o600)
+                copy.chmod(0o666)
+                old_umask = os.umask(0o002)
+                try:
+                    gg.background_plist()
+                finally:
+                    os.umask(old_umask)
+                self.assertEqual(copy.stat().st_mode & 0o777, 0o600)
+                seen.clear()
                 # the LaunchAgent itself is untouched: it is still the one source
                 with open(agent, "rb") as handle:
                     self.assertEqual(gg.plistlib.load(handle), job)
@@ -3271,8 +3281,17 @@ class RestartHintTest(unittest.TestCase):
                 self.assertIn(f"launchctl bootout gui/$(id -u)/{gg.LAUNCH_LABEL}", hint)
                 self.assertIn("Never run glaeda-gh serve yourself", hint)
 
+    def test_a_headless_hint_names_the_system_daemon_not_a_copy(self) -> None:
+        with mock.patch.object(gg.sys, "platform", "darwin"), \
+                mock.patch.object(gg, "launchd_domain", return_value=f"user/{os.getuid()}"), \
+                mock.patch.object(gg, "system_daemon_loaded", return_value=True):
+            for hint in (gg.start_hint(), gg.start_hint(restart=True)):
+                self.assertIn(f"sudo launchctl kickstart -k system/{gg.LAUNCH_LABEL}", hint)
+                self.assertNotIn("user/$(id -u)", hint)
+
     def test_a_logged_out_hint_names_the_user_domain_copy(self) -> None:
         with mock.patch.object(gg.sys, "platform", "darwin"), \
+                mock.patch.object(gg, "system_daemon_loaded", return_value=False), \
                 mock.patch.object(gg, "launchd_domain", return_value=f"user/{os.getuid()}"):
             for hint in (gg.start_hint(), gg.start_hint(restart=True)):
                 self.assertIn("nobody is logged in", hint)

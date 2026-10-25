@@ -2620,6 +2620,11 @@ def start_hint(restart: bool = False, domain: str | None = None) -> str:
     """How to (re)start the daemon here, including when its service was never loaded."""
     if sys.platform == "darwin":
         if (domain or launchd_domain()).startswith("user/"):
+            try:
+                if system_daemon_loaded():
+                    return SYSTEM_DAEMON_HINT[0].upper() + SYSTEM_DAEMON_HINT[1:] + ". Never run glaeda-gh serve yourself"
+            except (OSError, subprocess.TimeoutExpired):
+                pass
             return (f"nobody is logged in here, so gui/$(id -u) does not exist and the daemon runs from a Background "
                     f"copy of its LaunchAgent in user/$(id -u): launchctl bootout user/$(id -u)/{LAUNCH_LABEL}; "
                     f"launchctl bootstrap user/$(id -u) {background_copy_path()} (glaeda-gh restart writes that copy). "
@@ -5600,9 +5605,24 @@ def background_plist() -> str:
     job["LimitLoadToSessionType"] = "Background"
     BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
     copy = background_copy_path()
-    with open(copy, "wb") as handle:
+    # launchctl refuses a job file group or others can write, and a umask of 002 would make it one; a rename
+    # also leaves an older copy's mode behind
+    part = copy.with_name(copy.name + ".part")
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        os.fchmod(handle.fileno(), 0o600)
         plistlib.dump(job, handle)
+    os.replace(part, copy)
     return os.fspath(copy)
+
+
+def system_daemon_loaded() -> bool:
+    """Whether a headless Mac's system LaunchDaemon with the service's label is loaded (service_loaded)."""
+    return run_bounded(["launchctl", "print", f"system/{LAUNCH_LABEL}"], 10).returncode == 0
+
+
+SYSTEM_DAEMON_HINT = (f"the system LaunchDaemon system/{LAUNCH_LABEL} runs the daemon on this headless Mac; restart "
+                      f"it as root: sudo launchctl kickstart -k system/{LAUNCH_LABEL}")
 
 
 def launchd_state(domain: str | None = None) -> str | None:
@@ -5629,9 +5649,8 @@ def restart_service(hung: bool) -> tuple[bool, str]:
     target = f"{domain}/{LAUNCH_LABEL}"
     if domain.startswith("user/"):
         # A headless Mac's system LaunchDaemon (service_loaded) runs the daemon there: a copy would be a second one
-        if run_bounded(["launchctl", "print", f"system/{LAUNCH_LABEL}"], 10).returncode == 0:
-            return False, (f"nothing: the system LaunchDaemon system/{LAUNCH_LABEL} runs the daemon on this headless "
-                           f"Mac; restart it as root: sudo launchctl kickstart -k system/{LAUNCH_LABEL}")
+        if system_daemon_loaded():
+            return False, "nothing: " + SYSTEM_DAEMON_HINT
         # Always reload, never kickstart and never wait on a scheduled respawn: either would keep running a copy
         # of an older LaunchAgent
         try:
