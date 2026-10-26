@@ -7536,14 +7536,16 @@ class RiskReceiptPostTest(unittest.TestCase):
                 self.assertEqual(len(t.calls), 3)
 
     def test_risk_receipt_reconciliation_triggers_without_a_second_comment(self) -> None:
-        body = self.receipt()["body"]
-        item = self.queue("comment", "manaflow-ai/cmux#7", "--body", body)
-        d, t = self.daemon((502, {}, {}), (200, {}, [self.receipt()]),
-                           (200, {}, self.pull()), (200, {}, []))
-        self.step(d, NOW)
-        self.step(d, NOW + gg.POST_RETRY)
-        self.assertEqual([c[0] for c in t.calls], ["POST", "GET", "GET", "DELETE"])
-        self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "triggered")
+        for kind in ("comment", "review"):
+            with self.subTest(kind=kind):
+                body = "\n" + self.receipt()["body"]  # the classifier reads the first nonblank line
+                item = self.queue(kind, "manaflow-ai/cmux#7", "--body", body)
+                d, t = self.daemon((502, {}, {}), (200, {}, [self.receipt(body=body)]),
+                                   (200, {}, self.pull()), (200, {}, []))
+                self.step(d, NOW)
+                self.step(d, NOW + gg.POST_RETRY)
+                self.assertEqual([c[0] for c in t.calls], ["POST", "GET", "GET", "DELETE"])
+                self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "triggered")
 
     def test_risk_receipt_ignores_unrelated_untrusted_self_and_nonfirstline_posts(self) -> None:
         for target, body, posted in (
@@ -7630,6 +7632,33 @@ class RiskReceiptPostTest(unittest.TestCase):
         self.step(d, NOW)
         self.assertEqual(len(t.calls), 1)
         self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "failed")
+
+    def test_risk_receipt_metadata_failure_finishes_delivery_without_label_effect(self) -> None:
+        for answer in ((404, {}, {}), (429, {"retry-after": "120"}, {}),
+                       gg.WatchError("request failed: TimeoutError")):
+            with self.subTest(answer=answer):
+                item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+                d, t = self.daemon((201, {}, self.receipt()), answer)
+                self.step(d, NOW)
+                state = gg.post_state(item["id"])
+                self.assertEqual((state["state"], state["riskRegrade"]["state"]), ("posted", "failed"))
+                self.assertEqual(len(t.calls), 2)
+                if isinstance(answer, tuple) and answer[0] == 429:
+                    self.assertEqual(d.backoff["rest"], NOW + 120)
+
+    def test_risk_receipt_label_throttle_holds_other_writes_without_replaying_delivery(self) -> None:
+        item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+        d, t = self.daemon((201, {}, self.receipt()), (200, {}, self.pull()),
+                           (429, {"retry-after": "120"}, {}), (201, {}, {"html_url": "other"}))
+        self.step(d, NOW)
+        other = self.queue("comment", "o/r#8", "--body", "other")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(len(t.calls), 3)
+        self.assertEqual(d.post_hold, NOW + 120)
+        self.step(d, NOW + 120)
+        self.assertEqual(len(t.calls), 4)
+        self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "failed")
+        self.assertEqual(gg.post_state(other["id"])["url"], "other")
 
 
 if __name__ == "__main__":
