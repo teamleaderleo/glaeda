@@ -5279,15 +5279,28 @@ def runner_floor_gib(home: Path = HOME) -> float:
     return floor
 
 
-# A fleet reservation (leo-workspace machines/fleet-registry.json `reservations`, shipped as
-# config/fleet-reservations.json and installed here by glaeda-mini-setup) hands a host to one person for a while. On a
-# reserved fleet mini only floor-pressure eviction runs: no idle sweep, and a pressure run acts only below the runner
-# floor and works only to the floor plus target_margin_gib, so state its holder keeps idle is not aged out. The
-# host-local fleet reservation (FLEET_ROOT/reservation.json, glaeda-reservation/v1, the one the runner hook reads)
-# counts too. Fails closed: an unreadable or missing list on a fleet mini reads as reserved.
-FLEET_RESERVATIONS = HOME / ".local/share/glaeda/fleet-reservations.json"
+# A fleet reservation hands a host to one person for a while. On a reserved fleet mini only floor-pressure eviction
+# runs: no idle sweep, and a pressure run acts only below the runner floor and works only back to the floor plus
+# target_margin_gib, so state its holder keeps idle is not aged out. The list is never part of this repository: the
+# fleet's own writer puts it on each host, in the home of the user that owns FLEET_ROOT
+# (~/.local/share/glaeda/fleet-reservations.json, schema glaeda-fleet-reservations/v1:
+# {"reservations": [{"id", "owner", "hosts": [...], "from", "until"}], "aliases": {host: [...]}}). The host-local
+# reservation (FLEET_ROOT/reservation.json, glaeda-reservation/v1, the one the runner hook reads) counts too. Fails
+# closed: a missing, unreadable or malformed list reads as reserved, whatever the host-local file says.
+FLEET_RESERVATIONS: Path | None = None  # None: fleet_reservations_path(); tests point it at a fixture
+FLEET_RESERVATIONS_NAME = ".local/share/glaeda/fleet-reservations.json"
 UPDATE_CONFIG = HOME / ".config/glaeda/update.json"
 HOST_RESERVATION_LOCAL = FLEET_ROOT / "reservation.json"
+
+
+def fleet_reservations_path() -> Path:
+    """The list in the home of the user that owns FLEET_ROOT (the fleet account, also when this runs as root);
+    this user's home when FLEET_ROOT or its owner cannot be read."""
+    if FLEET_RESERVATIONS is not None:
+        return FLEET_RESERVATIONS
+    with contextlib.suppress(OSError, KeyError):
+        return Path(pwd.getpwuid(FLEET_ROOT.stat().st_uid).pw_dir) / FLEET_RESERVATIONS_NAME
+    return HOME / FLEET_RESERVATIONS_NAME
 
 
 def reservation_time(value: Any) -> float:
@@ -5312,25 +5325,40 @@ def host_names() -> set[str]:
     return {n for n in names if n}
 
 
+def _str_list(value: Any, what: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+        raise ValueError(f"{what} must be a list of names")
+    return value
+
+
 def host_reservation(now: float | None = None, path: Path | None = None, names: set[str] | None = None,
                      local: Path | None = None) -> str:
     """Why this host is reserved now ("" when it is not): an active fleet reservation naming it (or an alias), an
-    active host-local reservation, or a reservation list that cannot be read."""
+    active host-local reservation, or a reservation list that is missing, unreadable or malformed anywhere."""
     now = time.time() if now is None else now
     names = host_names() if names is None else {n.lower() for n in names}
     try:
-        doc = json.loads((FLEET_RESERVATIONS if path is None else path).read_text())
-        entries, aliases = doc["reservations"], doc.get("aliases") or {}
+        doc = json.loads((fleet_reservations_path() if path is None else path).read_text())
+        if not isinstance(doc, dict):
+            raise ValueError("malformed")
+        entries, aliases = doc["reservations"], doc.get("aliases", {})
         if not isinstance(entries, list) or not isinstance(aliases, dict):
             raise ValueError("malformed")
-        for e in entries:
-            hosts = {str(h).lower() for h in e["hosts"]}
-            hosts |= {str(a).lower() for h in e["hosts"] for a in aliases.get(h, [])}
-            if names & hosts and reservation_time(e["from"]) <= now <= reservation_time(e["until"]):
-                return f"reserved for {e.get('owner', '?')} until {e['until']} ({e.get('id', '?')})"
+        alias = {str(h).lower(): {a.lower() for a in _str_list(v, "aliases")} for h, v in aliases.items()}
+        hit = ""
+        for e in entries:  # every entry is checked, so one malformed entry anywhere fails closed
+            if not isinstance(e, dict):
+                raise ValueError("malformed entry")
+            hosts = {h.lower() for h in _str_list(e["hosts"], "hosts")}
+            hosts |= {a for h in list(hosts) for a in alias.get(h, ())}
+            start, end = reservation_time(e["from"]), reservation_time(e["until"])
+            if not hit and names & hosts and start <= now <= end:
+                hit = f"reserved for {e.get('owner', '?')} until {e['until']} ({e.get('id', '?')})"
+        if hit:
+            return hit
     except (OSError, ValueError, KeyError, TypeError) as error:
         return f"fleet reservations unreadable ({type(error).__name__}); kept as reserved"
-    with contextlib.suppress(OSError, ValueError, TypeError, AttributeError):
+    with contextlib.suppress(OSError, ValueError, TypeError, AttributeError, KeyError):
         held = json.loads((HOST_RESERVATION_LOCAL if local is None else local).read_text())
         if held.get("schema") == "glaeda-reservation/v1" and int(held["since"]) <= now < int(held["until"]):
             return f"host reservation by {held.get('owner', '?')} until {held['until']}"
@@ -5359,7 +5387,8 @@ def keep_legacy_ages() -> None:
 
 
 def filesystems(fams: list[Family], low: str, target: str,
-                tmpfs_low: str = "75%", tmpfs_target: str = "90%", floor_gib: float = 0.0) -> dict[int, Fs]:
+                tmpfs_low: str = "75%", tmpfs_target: str = "90%", floor_gib: float = 0.0,
+                reserved: bool = False) -> dict[int, Fs]:
     out: dict[int, Fs] = {}
     for f in fams:
         dev = f.root.stat().st_dev
@@ -5369,9 +5398,11 @@ def filesystems(fams: list[Family], low: str, target: str,
             lo, tg = (tmpfs_low, tmpfs_target) if tmpfs else (low, target)
             lo_b, tg_b = space(lo, total), space(tg, total)
             # a runner's disk floor (runner_floor_gib) lifts both on HOME's volume, where the gate measures it,
-            # never past half the disk, as space() keeps a small disk from permanent pressure
+            # never past half the disk, as space() keeps a small disk from permanent pressure; a reserved host's
+            # pressure starts at the floor itself, not the floor plus low_margin_gib
             if floor_gib > 0 and not tmpfs and dev == HOME.stat().st_dev:
-                lo_b = max(lo_b, min(int((floor_gib + POLICY["low_margin_gib"]) * GIB), total // 2))
+                lo_margin = 0.0 if reserved else POLICY["low_margin_gib"]
+                lo_b = max(lo_b, min(int((floor_gib + lo_margin) * GIB), total // 2))
                 tg_b = max(tg_b, min(int((floor_gib + POLICY["target_margin_gib"]) * GIB), total // 2))
             out[dev] = Fs(dev, str(mount_point(f.root)), free, total, lo_b, tg_b, tmpfs)
     return out
@@ -7851,7 +7882,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         a.target = f"{a.need + POLICY['target_margin_gib']:g}"
 
     # before any family is built: a reserved host's families keep its holder's ages (keep_legacy_ages, once 12 h lands)
-    reserved = host_reservation() if role == "fleet-mini" and DARWIN and a.apply and not a.runner_caches else ""
+    reserved = host_reservation() if role == "fleet-mini" and DARWIN and a.apply else ""
     if reserved:
         keep_legacy_ages()
     global RUNNER_CACHE_PROFILE
@@ -7910,7 +7941,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
             a.low, a.target = f"{floor_gib:g}", f"{floor_gib + POLICY['target_margin_gib']:g}"
             print(f"{reserved}: only floor-pressure eviction runs here")
         fss = filesystems(fams or [Family("home", HOME, False, "")], a.low, a.target,
-                          a.tmpfs_low, a.tmpfs_target, floor_gib)
+                          a.tmpfs_low, a.tmpfs_target, floor_gib, reserved=bool(reserved))
         space(a.emergency, GIB)
     except ValueError:
         ap.error(f"--low/--target/--tmpfs-*/--emergency take GiB or N%: {a.low!r}, {a.target!r}, "

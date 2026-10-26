@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from dataclasses import replace
 from unittest import mock
@@ -6293,7 +6294,7 @@ class ActivityClockTest(unittest.TestCase):
         self.assertEqual(seen, [("54", "70", 30.0), ("55", "71", 50.0)])
 
 class HostReservationTest(unittest.TestCase):
-    """A reserved fleet mini gets floor-pressure eviction only, at the pre-2026-10-26 ages (config/fleet-reservations.json)."""
+    """A reserved fleet mini gets floor-pressure eviction only. The list lives only on the host; fixtures are made up."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -6356,18 +6357,56 @@ class HostReservationTest(unittest.TestCase):
             self.assertEqual(gd.POLICY["soft_idle_hours"], 12.0, "set explicitly, even to the new default")
             self.assertEqual(gd.POLICY["stale_marker_max_hours"], 48.0, "a wrongly typed key is not a setting")
 
-    def test_the_shipped_list_parses_and_matches_the_registry_where_it_is_checked_out(self) -> None:
-        shipped = json.loads((ROOT / "config/fleet-reservations.json").read_text())
-        for e in shipped["reservations"]:
-            gd.reservation_time(e["from"]), gd.reservation_time(e["until"])
-            self.assertTrue(e["hosts"] and e["owner"] and e["id"])
-        registry = Path(os.environ.get("GLAEDA_FLEET_REGISTRY")
-                        or Path.home() / "Projects/leo-workspace/machines/fleet-registry.json")
-        if not registry.is_file():
-            self.skipTest("leo-workspace's fleet registry is not checked out here")
-        want = [{k: e[k] for k in ("id", "owner", "hosts", "from", "until") if k in e}
-                for e in json.loads(registry.read_text()).get("reservations", [])]
-        self.assertEqual(shipped["reservations"], want, "config/fleet-reservations.json is behind the registry")
+    def test_a_malformed_list_anywhere_fails_closed(self) -> None:
+        good = {"id": "r2", "owner": "someone-else", "hosts": ["cmux40"], "from": "2026-10-25T00:00:00Z",
+                "until": "2026-10-28T00:00:00Z"}
+        bad_docs = (
+            [],  # not an object
+            {"aliases": {}},  # no reservations
+            {"reservations": {"r1": good}},
+            {"reservations": [dict(good, hosts="cmux31")]},  # a string, not a list: never matched letter by letter
+            {"reservations": [dict(good, hosts=[31])]},
+            {"reservations": ["cmux31"]},
+            {"reservations": [dict(good, until="soon")]},  # a bad time on an entry naming another host
+            {"reservations": [good], "aliases": {"cmux40": "cmux-forty"}},
+            {"reservations": [good], "aliases": []},
+        )
+        for doc in bad_docs:
+            with self.subTest(doc=doc):
+                self.list.write_text(json.dumps(doc))
+                self.assertIn("unreadable", self.reserved({"cmux31"}))
+        self.list.write_text(json.dumps({"reservations": [good]}))
+        self.assertEqual(self.reserved({"cmux31"}), "", "a well-formed list without this host")
+
+    def test_a_missing_list_is_reserved_whatever_the_host_local_file_says(self) -> None:
+        now = int(self.during)
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 600,
+                                          "until": now - 60}))
+        self.list.unlink()
+        self.assertIn("kept as reserved", self.reserved({"cmux31"}))
+
+    def test_the_list_is_read_from_the_fleet_owners_home(self) -> None:
+        owner = types.SimpleNamespace(pw_dir=os.fspath(self.root / "fleet-home"))
+        with mock.patch.object(gd, "FLEET_RESERVATIONS", None), mock.patch.object(gd, "FLEET_ROOT", self.root), \
+                mock.patch.object(gd.pwd, "getpwuid", return_value=owner) as getpwuid:
+            self.assertEqual(gd.fleet_reservations_path(),
+                             self.root / "fleet-home/.local/share/glaeda/fleet-reservations.json")
+            getpwuid.assert_called_once_with(self.root.stat().st_uid)
+            self.assertIn("kept as reserved", gd.host_reservation(self.during, None, {"cmux31"}, self.local),
+                          "nothing written there yet")
+        with mock.patch.object(gd, "FLEET_RESERVATIONS", None), \
+                mock.patch.object(gd, "FLEET_ROOT", self.root / "absent"):
+            self.assertEqual(gd.fleet_reservations_path(), gd.HOME / gd.FLEET_RESERVATIONS_NAME)
+
+    def test_a_reserved_hosts_pressure_starts_at_the_floor_itself(self) -> None:
+        fam = gd.Family("home", gd.HOME, False, "")
+        total = 1000 * gd.GIB
+        with mock.patch.object(gd, "free_bytes", return_value=(100 * gd.GIB, total)):
+            plain = next(iter(gd.filesystems([fam], "1", "1", floor_gib=30.0).values()))
+            held = next(iter(gd.filesystems([fam], "30", "50", floor_gib=30.0, reserved=True).values()))
+        self.assertEqual(plain.low, int((30 + gd.POLICY["low_margin_gib"]) * gd.GIB))
+        self.assertEqual(held.low, 30 * gd.GIB)
+        self.assertEqual(held.target, int((30 + gd.POLICY["target_margin_gib"]) * gd.GIB))
 
     def run_disk(self, *args: str, reserved: str, floor: float, free_gib: float):
         """glaeda-disk's main on a fake fleet mini; returns (exit code, output, the families' low/target it used)."""
@@ -6376,8 +6415,8 @@ class HostReservationTest(unittest.TestCase):
         self.addCleanup(lambda: [setattr(gd, n, v) for n, v in saved.items()])
         self.addCleanup(lambda policy=dict(gd.POLICY): (gd.POLICY.clear(), gd.POLICY.update(policy)))
 
-        def filesystems(fams, low, target, *rest):
-            seen.update(low=low, target=target)
+        def filesystems(fams, low, target, *rest, reserved=False):
+            seen.update(low=low, target=target, **({"reserved": True} if reserved else {}))
             run.update(gd.RUN)
             raise SystemExit(0)  # stop before any survey: the gate is what is under test
         with mock.patch.object(gd, "host_reservation", return_value=reserved), \
@@ -6405,8 +6444,12 @@ class HostReservationTest(unittest.TestCase):
         self.assertEqual(seen, {})
         code, out, seen, run = self.run_disk("--pressure", "--idle", reserved=why, floor=30.0, free_gib=50)
         margin = gd.POLICY["target_margin_gib"]
-        self.assertEqual(seen, {"low": "30", "target": f"{30 + margin:g}"})
+        self.assertEqual(seen, {"low": "30", "target": f"{30 + margin:g}", "reserved": True})
         self.assertEqual(run["reserved"], why)
+        # the runner-cache profile is held to the same rule
+        code, out, seen, run = self.run_disk("--runner-caches", reserved=why, floor=30.0, free_gib=50)
+        self.assertIn("nothing deleted", out)
+        self.assertEqual(seen, {})
         # an unreserved host keeps its policy
         self.assertEqual(gd.DEFAULT_AGE_HOURS, 24.0, "the reserved run kept the legacy ages")
         for n, v in {n: 12.0 for n in ("DEFAULT_AGE_HOURS",)}.items():
