@@ -708,7 +708,7 @@ def cmd_read(text: str) -> int:
         register(key, jobs)
         cached = read_cache(key)
         entries[key] = None if cached is None else {
-            k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs") if k in cached}
+            k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "missing") if k in cached}
     print(json.dumps({"entries": entries}, sort_keys=True))
     return EXIT_OK
 
@@ -1784,7 +1784,9 @@ class Daemon:
             fresh = e["cache"] is None or e["cache"].get("data") is None
             if full or (fresh and self.now - self.attempted.get(e["key"], float("-inf")) >= UPSTREAM_NEW):
                 due.append(e)
-        due = sorted(due, key=lambda e: (e["cache"] is not None, e["key"]))[:UPSTREAM_MAX_KEYS]
+        # New keys first, then the least recently read: past UPSTREAM_MAX_KEYS the rest rotate, none starves.
+        due = sorted(due, key=lambda e: (e["cache"] is not None and e["cache"].get("data") is not None,
+                                         self.attempted.get(e["key"], float("-inf")), e["key"]))[:UPSTREAM_MAX_KEYS]
         if full:
             self.upstream_at = self.now
         if due:
@@ -1807,9 +1809,8 @@ class Daemon:
             why = str(error) if isinstance(error, WatchError) else f"upstream: {describe(error)}"
             self.errors.append(why)
             self.upstream_status = {"state": "failing", "error": why, "at": self.now}
-            for e in due:
-                if e["cache"] is None or e["cache"].get("data") is None:
-                    self.store(e["key"], e["cache"], error=why)  # a status names the cause instead of waiting
+            for e in due:  # the data is kept; a status names the outage instead of showing it as current
+                self.store(e["key"], e["cache"], error=why)
             return
         self.upstream_status = {"state": "ok", "at": self.now, "keys": len(due)}
         for e in due:
@@ -1820,8 +1821,11 @@ class Daemon:
             error = entry.get("error") if isinstance(entry.get("error"), str) else None
             if data is None and error is None:
                 continue  # registered there, not read yet
-            at = entry.get("dataAt")
-            fields: dict[str, Any] = {"error": error[:UPSTREAM_ERROR_MAX] if error else None, "source": "upstream"}
+            at, fetched = entry.get("dataAt"), entry.get("fetchedAt")
+            fields: dict[str, Any] = {"error": error[:UPSTREAM_ERROR_MAX] if error else None, "source": "upstream",
+                                      "missing": entry.get("missing") is True}
+            if isinstance(fetched, (int, float)):
+                fields["fetchedAt"] = min(self.now, float(fetched))  # a wait rules only on reads after it began
             if data is not None:
                 fields.update(data=data, dataAt=float(at) if isinstance(at, (int, float)) else self.now)
             if isinstance(entry.get("jobs"), list):
