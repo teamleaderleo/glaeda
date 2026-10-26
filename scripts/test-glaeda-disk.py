@@ -6421,6 +6421,7 @@ class HostReservationTest(unittest.TestCase):
             self.assertEqual(gd.POLICY["stale_marker_max_hours"], 5.0, "a disk-policy.json value stays")
         self.assertEqual((gd.DEFAULT_AGE_HOURS, gd.CMUX_NEXT_CI_MIN_IDLE_HOURS, gd.RUNTIME_IDLE_DAYS), (24.0, 72.0, 14.0))
         self.assertEqual(gd.RUNNER_STALE_CHECKOUT_HOURS, float("inf"), "no above-floor checkout eviction")
+        self.assertEqual(gd.CMUX_JOB_MIRROR_HOURS, 168.0, "no 12 h mirror deletion on a reserved host")
 
     def test_the_shipped_list_parses_and_matches_the_registry_where_it_is_checked_out(self) -> None:
         shipped = json.loads((ROOT / "config/fleet-reservations.json").read_text())

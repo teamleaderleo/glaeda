@@ -5508,7 +5508,7 @@ LEGACY_AGES = {"DEFAULT_AGE_HOURS": 24.0, "KEPT_BUILD_IDLE_HOURS": 24.0, "IDLE_S
                "PARKED_NO_LOG_IDLE_HOURS": 168.0, "CMUX_NEXT_CI_MIN_IDLE_HOURS": 72.0,
                "CANONICAL_ADMISSION_IDLE_HOURS": 24.0, "IDLE_SEED_HOURS": 12.0, "RUNTIME_IDLE_DAYS": 14.0,
                "CHECKOUT_BUILD_IDLE_HOURS": 24.0, "TMP_TEST_RESIDUE_IDLE_HOURS": 48.0,
-               "RUNNER_STALE_CHECKOUT_HOURS": float("inf")}
+               "RUNNER_STALE_CHECKOUT_HOURS": float("inf"), "CMUX_JOB_MIRROR_HOURS": 168.0}
 LEGACY_POLICY = {"soft_idle_hours": 24.0, "stale_marker_max_hours": 48.0, "cmux_next_ci_host_idle_hours": 48.0}
 
 
