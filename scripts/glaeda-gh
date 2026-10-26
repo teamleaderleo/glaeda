@@ -916,18 +916,18 @@ def parse_pr(node: dict) -> dict:
         # (workflow, name), so same-named jobs in different workflows stay separate
         ident = f"{check['workflow'] or ''}\0{check['name']}"
         if ident not in latest or outranks(check, order, *reversed(latest[ident])):
-            if ident in latest and latest[ident][0] <= order:
+            if ident in latest:
                 superseded.append(latest[ident][1])
             latest[ident] = (order, check)
-        elif order <= latest[ident][0]:
+        else:
             superseded.append(check)
-        # a twin newer than the job that outranks it was not replaced by anything: it is not named
     checks = [check for _, check in latest.values()]
-    # only the ones that would have counted against the PR are worth naming, and never a job that ran
-    # nothing (GitHub stamps it started and completed at once): a twin cancelled before it began has
-    # no error to chase, whichever of the pair has the higher id
-    superseded = [brief(c) for c in superseded if (c.get("conclusion") or "").upper() not in PASSED
-                  and not (c.get("completedAt") and c.get("startedAt") == c.get("completedAt"))][:20]
+    # only the ones that would have counted against the PR are worth keeping. One that ran nothing (GitHub
+    # stamps it started and completed at once), such as a twin cancelled before it began, stays as evidence
+    # for check_verdict (the rollup still counts it) but is marked so status never names it: it has no
+    # error to chase, whichever of the pair has the higher id
+    superseded = [{**brief(c), "ranNothing": bool(c.get("completedAt") and c.get("startedAt") == c.get("completedAt"))}
+                  for c in superseded if (c.get("conclusion") or "").upper() not in PASSED][:20]
     base = node.get("baseRef") or {}
     required = set((base.get("branchProtectionRule") or {}).get("requiredStatusCheckContexts") or [])
     for rule in ((base.get("rules") or {}).get("nodes") or []):
@@ -3092,7 +3092,7 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
                    else "its run was cancelled while a job was still queued")
             lines.append(f"  held: {label(c)}{steps_note(c)}: {why}; "
                          f"pending up to {int(grace)}s for the re-run  {c.get('url') or ''}".rstrip())
-        for c in (data.get("superseded") or [])[:10]:
+        for c in [c for c in data.get("superseded") or [] if not c.get("ranNothing")][:10]:
             optional = " (not required)" if marked and not c.get("required") else ""
             lines.append(f"  superseded: {label(c)} {outcome(c.get('conclusion')) if c.get('conclusion') else 'pending'}"
                          f"{optional}, "

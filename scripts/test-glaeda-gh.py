@@ -1588,16 +1588,17 @@ class ClientTest(Base):
         self.assertEqual(gg.verdict("pr", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[twin, passed]))), 0)
         # A twin cancelled before it started does not replace the queued job either.
         cancelled = {**twin, "conclusion": "CANCELLED"}
-        data = gg.parse_pr(pr_node(1, rollup="PENDING", checks=[real, cancelled]))
-        self.assertEqual([c["status"] for c in data["checks"]], ["QUEUED"])
-        self.assertEqual(data["superseded"], [])
-        self.assertNotIn("superseded", gg.summary("pr:o/r#1", {"data": data}))
-        # Nor when the cancelled twin has the lower id.
+        # It stays as evidence (GitHub's rollup still counts it), but status never names it, whichever
+        # of the pair has the lower id.
         live = {**real, "databaseId": 121636524435}
-        for order in ([live, cancelled], [cancelled, live]):
+        for order in ([real, cancelled], [cancelled, real], [live, cancelled], [cancelled, live]):
             data = gg.parse_pr(pr_node(1, rollup="PENDING", checks=order))
             self.assertEqual([c["status"] for c in data["checks"]], ["QUEUED"])
-            self.assertEqual(data["superseded"], [])
+            self.assertEqual([c["ranNothing"] for c in data["superseded"]], [True])
+            self.assertNotIn("superseded", gg.summary("pr:o/r#1", {"data": data}))
+            # Past 100 checks GitHub's FAILURE rollup may be that twin: the queued job is waited for.
+            self.assertIsNone(gg.check_verdict({**data, "checkState": "FAILURE", "checksTruncated": True}, "done"))
+            self.assertIsNone(gg.check_verdict({**data, "checkState": "FAILURE", "checksTruncated": True}, "green"))
         # A pending check that is superseded reads as pending, never as failed.
         line = gg.summary("pr:o/r#1", {"data": {**data, "superseded": [gg.brief(data["checks"][0])]}})
         self.assertIn(f"superseded: cmux-next / {name} pending", line)
