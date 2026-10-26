@@ -732,6 +732,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
                       f" --trusted-repo {shlex.quote(ctx.member['trustedRepo'])}")
             if ctx.member.get("trustedNextNightly"):
                 scope += " --trusted-next-nightly"
+        if ctx.member.get("devCompile"):
+            scope += " --dev-compile-runner"
         else:  # PR runners: an unlocked test keychain (the login keychain is locked in the runner session)
             scope += " --test-keychain"
             # and a fresh testmanagerd for each job that takes the gui token (a wedged one hangs every XCTest run)

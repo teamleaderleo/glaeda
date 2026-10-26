@@ -490,6 +490,27 @@ class HookTest(unittest.TestCase):
                                    repo="manaflow-ai/cmux", env=environ)
             self.assertEqual(result.returncode == 0, bool(trusted), result.stdout + result.stderr)
 
+    def test_dev_compile_runner_is_exact_job_and_event(self) -> None:
+        workflow = "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next"
+        push = {"ref": "refs/heads/feat-cmux-next", "repository": CMUX}
+        args = {"event_name": "push", "ref": "refs/heads/feat-cmux-next", "repository": "manaflow-ai/cmux",
+                "event": push, "workflow_ref": workflow, "job": "cmux-scheme-compile"}
+        self.assertIsNone(hook.dev_compile_refusal(**args))
+        dispatch = {"repository": CMUX, "inputs": {"dev_daily": "true"}}
+        self.assertIsNone(hook.dev_compile_refusal(**{**args, "event_name": "workflow_dispatch", "event": dispatch}))
+        for overrides in (
+                {"job": "other"}, {"workflow_ref": workflow.replace("cmux-next.yml", "ci.yml")},
+                {"event": {"ref": "refs/heads/feat-cmux-next", "repository": {"full_name": "other/cmux"}}},
+                {"workflow_ref": workflow.replace("feat-cmux-next", "main")},
+                {"ref": "refs/heads/main"}, {"event_name": "schedule"},
+                {"event_name": "workflow_dispatch", "ref": "refs/heads/main",
+                 "event": {"repository": CMUX, "inputs": {"dev_daily": "true"}}},
+                {"event": {"repository": CMUX, "inputs": {"dev_daily": "false"}},
+                 "event_name": "workflow_dispatch"},
+                {"repository": "other/cmux"}):
+            with self.subTest(overrides=overrides):
+                self.assertIsNotNone(hook.dev_compile_refusal(**{**args, **overrides}))
+
     def test_disk_pressure_never_fails_and_is_bounded(self) -> None:
         marker = self.dir / "disk-ran"
         slow = make_executable(self.dir / "glaeda-disk-slow", "import time, pathlib, sys\n"
@@ -8196,6 +8217,15 @@ class ManifestLabelsTest(unittest.TestCase):
         with mock.patch.object(cr, "xcode_present", return_value=False):
             self.assertEqual(cr.member_labels(MANIFEST, "mini-std")[0]["labels"],
                              ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated"])
+        dev = copy.deepcopy(MANIFEST)
+        dev["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"devCompile": True}
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            summary, why = cr.member_labels(dev, "mini-std")
+        self.assertIsNone(why)
+        self.assertEqual(summary["pools"], ["glaeda-std-xcode-26.6"])
+        self.assertEqual(summary["devPools"], ["glaeda-dev-std-xcode-26.6"])
+        self.assertTrue(summary["devCompile"])
+        self.assertIn("glaeda-dev-std-xcode-26.6", summary["labels"])
         aws = copy.deepcopy(MANIFEST)
         aws["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"poolPrefix": "aws-"}
         with mock.patch.object(cr, "xcode_present", return_value=True):
@@ -8204,7 +8234,7 @@ class ManifestLabelsTest(unittest.TestCase):
         self.assertIn("glaeda-aws-std-xcode-26.6", member["labels"])
         self.assertEqual(member["rootPools"], ["glaeda-aws-root-std-xcode-26.6"])
         self.assertEqual(member["sidePools"], ["glaeda-aws-side-std-xcode-26.6", "glaeda-aws-side-light-xcode-26.6"])
-        for prefix in ("root-", "side-", "gui-", "trusted-", "std-", "light-", "xl-"):
+        for prefix in ("root-", "side-", "gui-", "trusted-", "std-", "light-", "xl-", "dev-"):
             invalid = copy.deepcopy(MANIFEST)
             invalid["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"poolPrefix": prefix}
             member, why = cr.member_labels(invalid, "mini-std")
