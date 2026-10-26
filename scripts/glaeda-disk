@@ -161,6 +161,12 @@ commits fetched by id are what the server confirms. A linked worktree must be un
 HEAD on a branch, tag or remote ref of its repository, which survives, and no commit only its
 own reflog holds. Ignored files go with it: in a temp-dir checkout they are
 build output or copies. Nested or unverifiable checkouts stay protected.
+
+A mirror family's item (cmux-job-cache, the hq build cache: mirror_idle_hours) idle DEFAULT_AGE_HOURS goes
+whole, but first archive_mirror writes every commit no remote holds, and every branch or tag only this host
+has, into git bundles under ~/archive/glaeda-disk (named <stamp>-<repo>.expires-<date>.bundle, pruned by that
+name after MIRROR_ARCHIVE_DAYS) and checks each with `git bundle verify`. A bundle that fails keeps the tree:
+the receipt says blocked:bundle-failed, the run line lists it, and stderr alerts.
 """
 
 from __future__ import annotations
@@ -2341,9 +2347,10 @@ HQ_CACHE_FAMILY = "hq-build-fleet-cache"
 # laptop, which keeps the edits. So once a unit sat idle a week, no git check keeps it. Before that, a clone
 # still has to lose nothing. Every git check kept them: 107 GiB idle since Sep 28-Oct 2 on eight minis read
 # "git-checkout (checkout below the top level)" while glaeda-disk reported 0.0 G reclaimable (2026-10-11).
-# Not DEFAULT_AGE_HOURS: past this window a checkout counts as a mirror and goes without the git-loss check, so a
-# commit only it holds would be lost unarchived; the disposable output inside it goes at DEFAULT_AGE_HOURS.
-CMUX_JOB_MIRROR_HOURS = 168.0
+# A week of whole checkouts filled the minis; what is worth keeping is a commit or ref no remote has, so past this
+# window archive_mirror bundles those into ~/archive and the tree goes (Leo, 2026-10-26: "When have we ever had
+# something useful greater than 12 hours?").
+CMUX_JOB_MIRROR_HOURS = DEFAULT_AGE_HOURS
 
 
 def transcript_candidates(root: Path, archives: bool = False) -> list[Path]:
@@ -2371,7 +2378,7 @@ def transcript_candidates(root: Path, archives: bool = False) -> list[Path]:
 # labelled the lent minis' live cmux-workspaces "RETIRED" (cmux12s, 2026-10-11).
 # A retired worker's checkouts are mirrors as a reload unit's are: cmux-workspaces/<key>/src is a clone the
 # worker synced from GitHub, swiftpm holds SwiftPM's own clones, and no person edits either. So once an entry
-# sat idle a week, no git check keeps it, and a tree too deep to search (cmux-tui-target, a cargo target dir)
+# sat idle past CMUX_JOB_MIRROR_HOURS, no git check keeps it (archive_mirror bundles what is unpushed), and a tree too deep to search (cmux-tui-target, a cargo target dir)
 # is not kept as "unchecked" either. A fleet lease or running job that names an entry still keeps it, as in
 # fleet-artifacts over the same directory. cmux14 sat at the 30 GiB floor with 0.0G reclaimable while
 # cmux-workspaces (11.6 GiB, idle 190 h), cmux-tui-target (4.2 GiB, 289 h) and swiftpm (3.9 GiB, 310 h) of
@@ -3492,9 +3499,15 @@ def derived_data(fam: Family, path: Path) -> bool:
             or (fam.id == "cmux-job-cache" and (path.name == "DerivedData" or path.parent.name == "SourcePackages")))
 
 
+def mirror_due(fam: Family, path: Path, idle_hours: float) -> bool:
+    """A mirror family's item idle past its mirror age: it goes once archive_mirror has bundled what is unpushed."""
+    return (fam.mirror_idle_hours is not None and idle_hours >= fam.mirror_idle_hours
+            and not derived_data(fam, path))
+
+
 def git_exempt(fam: Family, path: Path, idle_hours: float) -> bool:
-    """No git check applies: build output (derived_data), or a mirror family's item idle past its mirror age."""
-    return derived_data(fam, path) or (fam.mirror_idle_hours is not None and idle_hours >= fam.mirror_idle_hours)
+    """No git check applies: build output (derived_data), or a mirror (mirror_due), whose apply bundles first."""
+    return derived_data(fam, path) or mirror_due(fam, path, idle_hours)
 
 
 # A deletion interrupted after remove()'s rename (the process killed, the host rebooted) leaves the tree under
@@ -4244,13 +4257,13 @@ def git_loss(path: Path) -> str:
 
 
 def _git_dir_run(gitdir: Path, *args: str, timeout: int = 60,
-                 network: bool = False) -> str | None:
+                 network: bool = False, stdin: str | None = None) -> str | None:
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"}
     if network and "GIT_SSH_COMMAND" not in env:
         env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=10"
     try:
         r = subprocess.run(["git", "--git-dir", str(gitdir), *args], capture_output=True,
-                           text=True, timeout=timeout, env=env)
+                           text=True, timeout=timeout, env=env, input=stdin)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return r.stdout if r.returncode == 0 else None
@@ -4371,6 +4384,176 @@ def repo_loss(gitdir: Path) -> str:
     if len(unconfirmed) > 64 or not remote_has(gitdir, unconfirmed):
         return "commits no remote confirms"
     return ""
+
+
+# archive_mirror's bundles: only files this tool named so are ever pruned, only in its own directory
+MIRROR_ARCHIVE_DAYS = 30
+MIRROR_BUNDLE_RE = re.compile(r"\d{8}T\d{6}-[A-Za-z0-9._-]+\.expires-(\d{4}-\d{2}-\d{2})\.bundle")
+ARCHIVE_REF = "refs/glaeda-archive/"  # a commit only a reflog or HEAD holds is named for the bundle meanwhile
+
+
+def mirror_archive() -> Path:
+    return HOME / "archive" / "glaeda-disk"
+
+
+def prune_mirror_archive(today: str | None = None) -> int:
+    """Delete this tool's bundles whose name's expiry date has passed; nothing else in ~/archive."""
+    today = today or time.strftime("%Y-%m-%d")
+    root, gone = mirror_archive(), 0
+    if root.is_symlink() or not root.is_dir():
+        return 0
+    for e in _entries(root):
+        m = MIRROR_BUNDLE_RE.fullmatch(e.name)
+        if m and m.group(1) < today and e.is_file(follow_symlinks=False):
+            with contextlib.suppress(OSError):
+                os.unlink(e.path)
+                gone += 1
+    return gone
+
+
+def _write_bundle(gitdir: Path, name: str, revs: list[str], heads: set[str], written: list[Path]) -> str:
+    """`git bundle create` from rev-list arguments, checked by `git bundle verify` and its heads, then moved
+    to its archive name (appended to written). "" or why it failed."""
+    expires = time.strftime("%Y-%m-%d", time.localtime(time.time() + MIRROR_ARCHIVE_DAYS * 86400))
+    dest = mirror_archive() / f"{name}.expires-{expires}.bundle"
+    tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if _git_dir_run(gitdir, "bundle", "create", str(tmp), "--stdin", stdin="\n".join(revs) + "\n",
+                        timeout=600) is None or _git_dir_run(gitdir, "bundle", "verify", str(tmp), timeout=600) is None:
+            return f"git bundle create or verify failed for {gitdir}"
+        listed = _git_dir_run(gitdir, "bundle", "list-heads", str(tmp))
+        if listed is None or not heads <= {ln.split(" ", 1)[-1] for ln in listed.splitlines()}:
+            return f"bundle of {gitdir} lacks a ref"
+        os.replace(tmp, dest)
+        written.append(dest)
+        return ""
+    except OSError as e:
+        return f"bundle of {gitdir}: {e.__class__.__name__}"
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+
+
+def bundle_unpushed(gitdir: Path, stem: str, written: list[Path]) -> str:
+    """Bundle what deleting this repository loses: commits no remote holds (found as repo_loss finds them,
+    with the heads and tags the remotes advertise counted as held) and every branch or tag only it has.
+    "" or why it failed; the bundles go to written."""
+    tips = local_tips(gitdir)
+    for wt in [p for p in (gitdir / "worktrees").glob("*") if p.is_dir()] if tips is not None else []:
+        own = local_tips(wt, worktree_only=True)
+        tips = None if own is None else sorted({*tips, *own})
+    remotes = network_remotes(gitdir)
+    refs = _git_dir_run(gitdir, "for-each-ref", "--format=%(refname)%09%(objectname)%09%(*objectname)")
+    if tips is None or remotes is None or refs is None:
+        return f"unreadable refs or remotes in {gitdir}"
+    local: dict[str, tuple[str, str]] = {}  # refname -> (object, commit)
+    held: dict[str, set[str]] = {}  # refname (as the remote names it) -> objects a remote holds there
+    for line in refs.splitlines():
+        name, obj, peeled = (line.split("\t") + ["", ""])[:3]
+        r = next((r for r in remotes if name.startswith(f"refs/remotes/{r}/")), None)
+        if r is not None:
+            held.setdefault("refs/heads/" + name[len(f"refs/remotes/{r}/"):], set()).add(obj)
+        elif not name.startswith("refs/remotes/"):
+            local[name] = (obj, peeled or obj)
+    answered = not remotes
+    for r in remotes:
+        if (out := _git_dir_run(gitdir, "ls-remote", "--heads", "--tags", r, network=True, timeout=120)) is not None:
+            answered = True
+            for ln in out.splitlines():
+                obj, _, name = ln.partition("\t")
+                held.setdefault(name.removesuffix("^{}"), set()).add(obj)
+    if not answered:
+        return f"no remote of {gitdir} answered"
+    objs = sorted({o for s in held.values() for o in s})
+    have = _git_dir_run(gitdir, "cat-file", "--batch-check=%(objectname)", stdin="\n".join(objs) + "\n") \
+        if objs else ""
+    if have is None:
+        return f"unreadable objects in {gitdir}"
+    known = [ln for ln in have.splitlines() if not ln.endswith(" missing")]
+    out = _git_dir_run(gitdir, "rev-list", "--stdin", stdin="\n".join([*tips, "--not", *known]) + "\n",
+                       timeout=600)
+    if out is None:
+        return f"unreadable history in {gitdir}"
+    unpushed = set(out.split())
+    loose = [t for t in tips if t in unpushed]
+    if loose and len(loose) <= 64 and remote_has(gitdir, loose):
+        unpushed, loose = set(), []
+    # the refs to keep: every local one on an unpushed commit, and every branch or tag the remotes lack
+    keep = {n for n, (_, c) in local.items() if c in unpushed}
+    only_here = sorted(n for n, (o, _) in local.items() if n.startswith(("refs/heads/", "refs/tags/"))
+                       and n not in keep and o not in held.get(n, ()))
+    loose = sorted(set(loose) - {local[n][1] for n in keep})
+    if loose and _git_dir_run(gitdir, "update-ref", "--stdin", stdin="".join(
+            f"create {ARCHIVE_REF}{t} {t}\n" for t in loose)) is None:
+        return f"cannot name the loose commits in {gitdir}"
+    try:
+        heads = keep | {ARCHIVE_REF + t for t in loose}
+        if heads:
+            if (why := _write_bundle(gitdir, stem, [*sorted(heads), "--not", *known], heads, written)):
+                return why
+        for n in only_here:  # its commit is on a remote: the bundle holds that commit and the name
+            parents = _git_dir_run(gitdir, "rev-parse", f"{local[n][1]}^@")
+            if parents is None or (why := _write_bundle(
+                    gitdir, f"{stem}-{re.sub(r'[^A-Za-z0-9._-]+', '_', n)}", [n, "--not", *parents.split()], {n}, written)):
+                return why or f"unreadable {n} in {gitdir}"
+        return ""
+    finally:
+        if loose:
+            _git_dir_run(gitdir, "update-ref", "--stdin", stdin="".join(
+                f"delete {ARCHIVE_REF}{t}\n" for t in loose))
+
+
+def archive_mirror(path: Path) -> tuple[str, list[Path]]:
+    """Before a mirror item goes: bundle_unpushed for every repository it takes along, found as _nested_loss
+    finds them (checkouts, bare repositories, a linked worktree's repository inside it, submodule stores and
+    embedded submodules). A tree whose repositories cannot all be found or bundled is kept.
+    ("" or why it must stay, the bundles written)."""
+    roots = nested_checkouts(path)
+    if roots is None:
+        return "too deep or large to find every checkout", []
+    inside = os.path.realpath(path) + "/"
+    gitdirs: dict[str, Path] = {}
+    for root in roots:
+        where, dotgit = root.relative_to(path), root / ".git"
+        if not os.path.lexists(dotgit):
+            gitdirs[os.path.realpath(root)] = root
+        elif dotgit.is_symlink():
+            return f"{where}: .git is a symlink", []
+        elif dotgit.is_file():  # a linked worktree: bundle its repository when that goes too
+            common, own = git_common_dir(root), _git_dir_run(dotgit, "rev-parse", "--absolute-git-dir")
+            if not common or own is None:
+                return f"{where}: unreadable worktree", []
+            if (os.path.realpath(common) + "/").startswith(inside):
+                gitdirs[os.path.realpath(common)] = Path(common)
+                continue
+            tips = local_tips(Path(own.strip()), worktree_only=True)
+            left = None if tips is None else _git_dir_run(
+                Path(common), "rev-list", "-n1", *tips, "--not", "--branches", "--tags", "--remotes") if tips else ""
+            if left is None or left.strip():
+                return f"{where}: commits only this worktree's reflog holds", []
+        else:
+            gitdirs[os.path.realpath(dotgit)] = dotgit
+            if (loss := ignored_checkout_loss(root)):
+                return f"{where}: {loss}", []
+            links = _git_dir_run(dotgit, "--work-tree", str(root), "ls-files", "-s")
+            if links is None:
+                return f"{where}: unreadable index", []
+            for ln in links.splitlines():
+                if ln.startswith("160000 ") and (sub := root / ln.split("\t", 1)[1] / ".git").is_dir():
+                    gitdirs[os.path.realpath(sub)] = sub
+    for g in list(gitdirs.values()):  # submodule stores: modules/<name>, nested ones too
+        for dirpath, dirnames, _ in os.walk(g / "modules"):
+            if looks_like_repository(dirpath):
+                gitdirs[os.path.realpath(dirpath)] = Path(dirpath)
+                dirnames[:] = ["modules"] if "modules" in dirnames else []
+    stamp, bundles = time.strftime("%Y%m%dT%H%M%S"), []
+    for key, g in sorted(gitdirs.items()):
+        if any(t.exists() and not (os.path.realpath(t) + "/").startswith(inside) for t in linked_work_trees(g)):
+            return f"{key}: a worktree outside this item uses it", bundles
+        if (why := bundle_unpushed(g, f"{stamp}-{re.sub(r'[^A-Za-z0-9._-]+', '_', key).strip('_')[-120:]}", bundles)):
+            return why, bundles
+    return "", bundles
 
 
 def submodule_loss(worktree: Path, gitdir: Path, seen: set[str] | None = None,
@@ -5088,9 +5271,9 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             elif cmux_next_cap_only(fam, path, idle, idle_hours):
                 reasons.append(f"cmux-next-ci is {gib(cmux_next_ci_over()).strip()} over its size cap "
                                "(least recently used first)")
-            if (fam.mirror_idle_hours is not None and idle >= fam.mirror_idle_hours
-                    and not derived_data(fam, path)):
-                reasons.append(f"idle {fam.mirror_idle_hours:g}h+: its checkouts are mirrors")
+            if mirror_due(fam, path, idle):
+                reasons.append(f"idle {fam.mirror_idle_hours:g}h+: its checkouts are mirrors "
+                               "(unpushed commits go to a verified bundle in ~/archive first)")
         if jobs is not None and verdict in ("recent", "reclaimable"):
             reasons.append(reasons_jobs)
         if policy_note:
@@ -6121,6 +6304,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     released = 0
     _NESTED_WALKS.clear()  # re-observe every checkout right before deleting
     every = list(families.values()) if all_families is None else all_families
+    if any(f.mirror_idle_hours is not None for f in every):
+        prune_mirror_archive()
 
     def family_of(item: Item) -> Family:
         """The family that listed the item: ids repeat across roots (one interrupted-deletions family per
@@ -6287,7 +6472,15 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
               and (g := family_git_state(fam, p)) != "none"
               and (g != "git" or family_git_loss(fam, p))):
             outcome = "changed:git"  # the checkout gained something to lose since the survey
+        elif mirror_due(fam, p, idle_now) and (bundled := archive_mirror(p))[0]:
+            outcome = "blocked:bundle-failed"  # never deleted without a verified bundle of what is unpushed
+            i.reasons.append(bundled[0])
+            RUN.setdefault("bundle_failed", []).append(i.path)
+            print(f"glaeda-disk: ALERT: kept {i.path}: bundling its unpushed git work failed: {bundled[0]}",
+                  file=sys.stderr)
         else:
+            if mirror_due(fam, p, idle_now) and bundled[1]:
+                i.reasons.append("unpushed git work bundled to " + ", ".join(map(os.fspath, bundled[1])))
             whole_state = fam.id == CMUX_NEXT_CI_FAMILY and p in cmux_next_ci_state_roots(fam.root)
             try:
                 common = git_common_dir(p) if fam.git_disposable else ""
@@ -6349,7 +6542,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             except (OSError, subprocess.SubprocessError) as e:
                 outcome = f"incomplete:{e.__class__.__name__}"
         is_sweep = halt is not None if receipt_sweep is None else receipt_sweep
-        if outcome != "reclaimed" and (outcome.startswith("changed:") or outcome.startswith("incomplete:")):
+        if outcome != "reclaimed" and outcome.startswith(("changed:", "incomplete:", "blocked:")):
             # Keep the post-apply health/accounting view honest when a candidate became
             # busy or otherwise failed the final recheck after the survey.
             i.verdict = "blocked"
@@ -8248,7 +8441,8 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "reached": None if target is None or after is None else after >= target,
            "blocked": RUN.get("blocked", {}), "duration_s": round(time.time() - started, 1),
            "skipped": RUN.get("skipped"), "cmux_next_ci_over_gib": RUN.get("cmux_next_ci_over_gib"),
-           "caller": RUN.get("caller"), "evict_owner": _owner_line(RUN.get("evict_owner"))}
+           "caller": RUN.get("caller"), "evict_owner": _owner_line(RUN.get("evict_owner")),
+           "bundle_failed": RUN.get("bundle_failed", [])}
     with contextlib.suppress(OSError):
         RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
         with RUN_LOG.open("a") as f:

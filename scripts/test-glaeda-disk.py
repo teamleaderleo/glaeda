@@ -1469,12 +1469,12 @@ class GlaedaDiskTest(unittest.TestCase):
         fam = gd.hq_cache_family(cache)
         self.assertEqual(fam.reference_root, self.root)
         week = gd.CMUX_JOB_MIRROR_HOURS
-        for name, hours in (("cmux-workspaces", week + 22), ("swiftpm", week + 142), ("fresh-workspaces", 72),
+        for name, hours in (("cmux-workspaces", week + 22), ("swiftpm", week + 142), ("fresh-workspaces", 6),
                             ("leased", week + 50), ("cmux-tui-target", week + 121)):
             make(cache / name, age_hours=hours)
         for name in ("cmux-workspaces", "fresh-workspaces", "leased"):
             (cache / name / "key/src/.git").mkdir(parents=True)
-            t = time.time() - (72 if name == "fresh-workspaces" else week + 22) * 3600
+            t = time.time() - (6 if name == "fresh-workspaces" else week + 22) * 3600
             for d in (cache / name / "key/src/.git", cache / name / "key/src", cache / name / "key", cache / name):
                 os.utime(d, (t, t))
         (cache / "swiftpm/repositories/dep/.git").mkdir(parents=True)
@@ -1498,9 +1498,10 @@ class GlaedaDiskTest(unittest.TestCase):
                 live = {Path(i.path).name: i.verdict for i in gd.survey([fam], 24, 0)}
         self.assertEqual({k: i.verdict for k, i in items.items()}, {
             "cmux-workspaces": "reclaimable", "swiftpm": "reclaimable", "cmux-tui-target": "reclaimable",
-            "fresh-workspaces": "git-checkout",  # idle three days: its clone still has to lose nothing
+            "fresh-workspaces": "git-checkout",  # idle 6 h, under the mirror age: its clone has to lose nothing
             "leased": "in-use"})  # a running fleet job names it
-        self.assertIn("idle 168h+: its checkouts are mirrors", items["cmux-workspaces"].reasons)
+        self.assertIn("idle 12h+: its checkouts are mirrors (unpushed commits go to a verified bundle in ~/archive "
+                      "first)", items["cmux-workspaces"].reasons)
         self.assertIn("live lease or running job", items["leased"].reasons)
         self.assertEqual({k for k, v in live.items() if v != "report-only"}, {"leased"})
         reclaim = [i for i in items.values() if i.verdict == "reclaimable"]
@@ -1513,7 +1514,9 @@ class GlaedaDiskTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "owner_retired", return_value=True), \
                 mock.patch.object(gd, "family_git_state", git_state), \
                 mock.patch.object(gd, "process_evidence", return_value=late), \
-                mock.patch.object(gd, "command_lines", return_value=late[1]):
+                mock.patch.object(gd, "command_lines", return_value=late[1]), \
+                mock.patch.object(gd, "HOME", self.root / "home"), \
+                mock.patch.object(gd, "archive_mirror", return_value=("", [])):  # bundling: the cmux-job tests
             gd.apply(reclaim, {fam.id: fam}, receipt, None, 24)
         self.assertEqual(sorted(p.name for p in cache.iterdir()),
                          ["cmux-tui-target", "fresh-workspaces", "leased", "swiftpm"])
@@ -5499,7 +5502,7 @@ class LinuxLayoutTest(unittest.TestCase):
         # scratch clones and leaked files are judged on any filesystem, not only a tmpfs
         self.assertTrue(tmp.files and tmp.git_disposable)
 
-    def test_cmux_job_units_go_but_unpushed_checkouts_stay(self) -> None:
+    def test_cmux_job_units_go_and_unpushed_checkouts_go_to_a_bundle(self) -> None:
         job = self.home / ".cache/cmux-job"
         # as on cmux13s: SwiftPM clones inside DerivedData, and each slot's clone one level below cmux-base
         (job / "reload-cloud-ios/DerivedData/slot-1/Build").mkdir(parents=True)
@@ -5526,8 +5529,8 @@ class LinuxLayoutTest(unittest.TestCase):
             gd.process_evidence = saved
         verdicts = {Path(i.path).relative_to(self.home).as_posix(): (i.family, i.verdict) for i in items}
         self.assertEqual(verdicts[".cache/cmux-job/reload-cloud-ios/DerivedData"], ("cmux-job-cache", "reclaimable"))
-        # a commit no remote holds keeps its checkout
-        self.assertEqual(verdicts[".cache/cmux-job/reload-cloud/cmux-base"], ("cmux-job-cache", "git-checkout"))
+        # idle past 12 h: a commit no remote holds goes to a bundle, then the checkout goes
+        self.assertEqual(verdicts[".cache/cmux-job/reload-cloud/cmux-base"], ("cmux-job-cache", "reclaimable"))
         self.assertNotIn(".cache/cmux-job", verdicts)  # not listed again as a report-only tool cache
         receipt = self.home / "receipt.jsonl"
         fams_by_id = {f.id: f for f in fams}
@@ -5540,7 +5543,8 @@ class LinuxLayoutTest(unittest.TestCase):
                 gd.process_evidence = saved
         self.assertFalse((job / "reload-cloud-ios/DerivedData").exists())
         self.assertEqual([c.name for c in (job / "reload-cloud-ios").iterdir()], [])  # no half-deleted leftover
-        self.assertTrue((base / ".git").is_dir())
+        self.assertFalse(base.exists())
+        self.assertEqual(len(list((self.home / "archive/glaeda-disk").glob("*.bundle"))), 1)
         # a delete interrupted after its rename leaves a tree nothing else will ever clean up
         dead = subprocess.Popen(["true"])
         dead.wait()
@@ -5560,7 +5564,7 @@ class LinuxLayoutTest(unittest.TestCase):
             gd.process_evidence = saved
         self.assertEqual(again[str(left)], ("interrupted-deletions", "reclaimable"))
 
-    def test_idle_cmux_job_mirrors_go_after_a_week_unless_a_job_holds_them(self) -> None:
+    def test_idle_cmux_job_mirrors_go_after_12h_bundled_unless_a_job_holds_them(self) -> None:
         """2026-10-11: 107 GiB of reload-cloud trees idle since Sep 28-Oct 2 on eight minis, all kept as
         "git-checkout (checkout below the top level)", so glaeda-disk reported 0.0 G reclaimable."""
         job = self.home / ".cache/cmux-job"
@@ -5587,9 +5591,9 @@ class LinuxLayoutTest(unittest.TestCase):
             os.utime(job / rel, (t, t))
 
         age("", 8 * 24)
-        age("slots", 3 * 24)  # idle, but not a week: its local commit still keeps it
+        age("slots", 26)  # idle past 12 h and the pass window: its local commit goes to a bundle and the tree goes
         fams = [f for f in gd.default_families() if f.id == "cmux-job-cache"]
-        self.assertEqual(fams[0].mirror_idle_hours, 168.0)
+        self.assertEqual(fams[0].mirror_idle_hours, gd.DEFAULT_AGE_HOURS)
         with mock.patch.object(gd, "process_evidence",
                                return_value=([], f"rsync -a {job}/reload-cloud/work/slot-1/ x\n")):
             items = {Path(i.path).relative_to(job).as_posix(): i for i in gd.survey(fams, 24, 0)}
@@ -5599,9 +5603,10 @@ class LinuxLayoutTest(unittest.TestCase):
             "reload-cloud/work": "in-use",  # a running command names a slot in it
             "reload-cloud-ios/cmux-base": "in-use",  # its unit's work/<slot>/.lock
             "reload-cloud-ios/work": "in-use",
-            "slots/host.1": "git-checkout",
+            "slots/host.1": "reclaimable",
             "SourcePackages/host.1": "reclaimable"})
-        self.assertIn("idle 168h+: its checkouts are mirrors", items["reload-cloud/cmux-base"].reasons)
+        self.assertIn("idle 12h+: its checkouts are mirrors (unpushed commits go to a verified bundle in ~/archive "
+                      "first)", items["reload-cloud/cmux-base"].reasons)
         receipt = self.home / "receipt.jsonl"
         with contextlib.redirect_stdout(io.StringIO()), \
                 mock.patch.object(gd, "process_evidence", return_value=([], "")):
@@ -5609,8 +5614,105 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertFalse((job / "reload-cloud/cmux-base").exists())
         self.assertFalse((job / "SourcePackages/host.1").exists())
         self.assertTrue((job / "reload-cloud/work/slot-1/.git").is_dir())
-        self.assertTrue((job / "slots/host.1/.git").is_dir())
+        self.assertFalse((job / "slots/host.1").exists())
         self.assertTrue((job / "reload-cloud-ios/cmux-base/slot-2/.git").is_dir())
+        # no remote: each deleted clone's whole history is in a verified bundle
+        bundles = sorted((self.home / "archive/glaeda-disk").iterdir())
+        self.assertEqual([("cmux-base" in b.name, "host.1" in b.name) for b in bundles], [(True, False), (False, True)])
+        for b in bundles:
+            self.assertRegex(b.name, gd.MIRROR_BUNDLE_RE)
+            self.assertIn("refs/heads/", subprocess.run(["git", "bundle", "list-heads", str(b)], capture_output=True,
+                                                         text=True, check=True).stdout)
+
+
+    def mirror_unit(self, srv_commits: int = 1) -> tuple[Path, Path, dict]:
+        """A cmux-job reload unit idle a day whose clone's origin is a trusted stand-in for GitHub."""
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        srv = self.home / "srv"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(srv)], check=True, env=env)
+        for n in range(srv_commits):
+            subprocess.run(["git", "-C", str(srv), "commit", "-q", "--allow-empty", "-m", f"c{n}"], check=True, env=env)
+        unit = self.home / ".cache/cmux-job/reload-cloud/cmux-base"
+        subprocess.run(["git", "clone", "-q", str(srv), str(unit / "slot-1")], check=True, env=env)
+        saved = gd.TRUSTED_LOCAL_REMOTES
+        gd.TRUSTED_LOCAL_REMOTES = (str(srv),)
+        self.addCleanup(setattr, gd, "TRUSTED_LOCAL_REMOTES", saved)
+        return unit, unit / "slot-1", env
+
+    def apply_mirror(self, unit: Path) -> tuple[dict, str]:
+        t = time.time() - 24 * 3600
+        for dirpath, dirnames, filenames in os.walk(unit):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(unit, (t, t))
+        fams = [f for f in gd.default_families() if f.id == "cmux-job-cache"]
+        items = [i for i in gd.survey(fams, 24, 0) if i.path == os.fspath(unit)]
+        self.assertEqual([i.verdict for i in items], ["reclaimable"])
+        receipt, err = self.home / "receipt.jsonl", io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            gd.apply(items, {f.id: f for f in fams}, receipt, None, 24)
+        return json.loads(receipt.read_text().splitlines()[-1]), err.getvalue()
+
+    def bundle_heads(self) -> dict[str, str]:
+        heads = {}
+        for b in sorted((self.home / "archive/glaeda-disk").glob("*.bundle")):
+            subprocess.run(["git", "bundle", "verify", str(b)], cwd=self.home / "srv", check=True, capture_output=True)
+            out = subprocess.run(["git", "bundle", "list-heads", str(b)], capture_output=True, text=True, check=True)
+            heads.update({ln.split(" ")[1]: ln.split(" ")[0] for ln in out.stdout.splitlines()})
+        return heads
+
+    def test_a_mirrors_unpushed_commit_and_local_refs_survive_in_a_verified_bundle(self) -> None:
+        unit, clone, env = self.mirror_unit(srv_commits=2)
+        subprocess.run(["git", "-C", str(clone), "commit", "-q", "--allow-empty", "-m", "unpushed"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "tag", "only-here", "origin/main~1"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "branch", "side", "origin/main"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "checkout", "-q", "--detach", "HEAD"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "commit", "-q", "--allow-empty", "-m", "detached"], check=True, env=env)
+        detached = subprocess.run(["git", "-C", str(clone), "rev-parse", "HEAD"], capture_output=True, text=True,
+                                  check=True).stdout.strip()
+        want = {r: subprocess.run(["git", "-C", str(clone), "rev-parse", r], capture_output=True, text=True,
+                                  check=True).stdout.strip() for r in ("refs/heads/main", "refs/tags/only-here",
+                                                                       "refs/heads/side")}
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed")
+        self.assertFalse(unit.exists())
+        heads = self.bundle_heads()
+        self.assertEqual({r: heads.get(r) for r in want}, want)
+        self.assertEqual(heads.get(gd.ARCHIVE_REF + detached), detached)  # a commit only HEAD held
+        self.assertTrue(any("bundled to" in r for r in rec["reasons"]))
+
+    def test_a_mirror_whose_bundle_fails_is_kept_and_alerts(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        subprocess.run(["git", "-C", str(clone), "commit", "-q", "--allow-empty", "-m", "unpushed"], check=True, env=env)
+        (self.home / "archive").write_text("not a directory")  # the bundle cannot be written
+        gd.RUN.pop("bundle_failed", None)
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual((rec["outcome"], rec["verdict"]), ("blocked:bundle-failed", "blocked"))
+        self.assertIn("ALERT", err)
+        self.assertEqual(gd.RUN.pop("bundle_failed"), [os.fspath(unit)])
+        self.assertTrue((clone / ".git").is_dir())
+        self.assertEqual(subprocess.run(["git", "-C", str(clone), "for-each-ref", gd.ARCHIVE_REF],
+                                        capture_output=True, text=True).stdout, "")
+
+    def test_a_mirror_with_nothing_unpushed_goes_without_a_bundle(self) -> None:
+        unit, _, _ = self.mirror_unit()
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed")
+        self.assertFalse(unit.exists())
+        self.assertFalse((self.home / "archive/glaeda-disk").exists())
+
+    def test_expired_mirror_bundles_are_pruned_and_nothing_else(self) -> None:
+        archive = self.home / "archive/glaeda-disk"
+        archive.mkdir(parents=True)
+        names = ["20260901T000000-a.expires-2026-10-01.bundle", "20261020T000000-b.expires-2026-11-19.bundle",
+                 "20261026T000000-c.expires-2026-10-26.bundle", "a.expires-2026-10-01.bundle", "notes.txt"]
+        for n in names:
+            (archive / n).write_text("x")
+        (self.home / "archive/other.expires-2026-10-01.bundle").write_text("x")  # not in its own directory
+        self.assertEqual(gd.prune_mirror_archive("2026-10-26"), 1)
+        self.assertEqual(sorted(p.name for p in archive.iterdir()), sorted(names[1:]))
+        self.assertTrue((self.home / "archive/other.expires-2026-10-01.bundle").exists())
 
     def test_interrupted_deletions_finish_once_their_deleter_is_gone(self) -> None:
         """cmux8s and cmuxs-mac-mini-3, 2026-10-11: 9.3 and 7.8 GiB renamed aside by a killed glaeda-disk sat
