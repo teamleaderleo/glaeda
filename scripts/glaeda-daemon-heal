@@ -694,13 +694,17 @@ def stage_check(files: dict[str, bytes], install_dir: Path, root: bool, run=boun
         raise HealError(f"its own plan pass failed (exit {code}): {(err or out).strip()[-160:]}")
 
 
+def pair_hashes(install_dir: Path) -> dict[str, str | None]:
+    return {name: None if (data := read_bytes(install_dir / name)) is None else sha256(data) for name in MEMBERS}
+
+
 def refresh(policy: dict[str, Any], state: dict[str, Any], now: float, install_dir: Path = INSTALL_DIR,
             root: bool = True, get=fetch, run=bounded_run, python: str = SYSTEM_PYTHON) -> dict[str, Any]:
     """Bring the snapshot to the stable release's two files; returns the new state["release"]. Never raises: a
     channel or release that fails a check leaves the snapshot as it is and says why."""
     rel = dict(state.get("release") or {})
     have = {name: read_bytes(install_dir / name) for name in MEMBERS}
-    hashes = {name: None if data is None else sha256(data) for name, data in have.items()}
+    hashes = pair_hashes(install_dir)
     ident = load_json(install_dir / INSTALLED)  # what the pair is, swapped with it: never ahead of or behind it
     drifted = ident.get("files") != hashes
     if now - float(rel.get("checked") or 0) < policy["release"]["every_s"] and not (drifted and not rel.get("error")):
@@ -725,7 +729,9 @@ def refresh(policy: dict[str, Any], state: dict[str, Any], now: float, install_d
         rel["error"] = re.sub(r"\s+", " ", str(e))[:300] or type(e).__name__
     ident = load_json(install_dir / INSTALLED)
     rel.update(tag=ident.get("tag"), commit=ident.get("commit"))
-    if rel.get("wants") and rel.get("wants") != rel.get("tag"):
+    # behind: not the release the channel names, or not the bytes of the release it says it is (a repair failed)
+    rel["drifted"] = ident.get("files") != pair_hashes(install_dir)
+    if rel.get("wants") and rel.get("wants") != rel.get("tag") or rel["drifted"]:
         rel.setdefault("behind_since", now)
     else:
         rel.pop("behind_since", None)
@@ -737,7 +743,7 @@ def release_report(rel: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any
         return iso(rel[key]) if isinstance(rel.get(key), (int, float)) else None
     return {"tag": rel.get("tag"), "commit": rel.get("commit"), "wants": rel.get("wants"), "source": rel.get("source"),
             "checkedAt": at("checked"), "okAt": at("ok"), "installedAt": at("installed_at"),
-            "behindSince": at("behind_since"), "error": rel.get("error"), "staleAfterS": policy["release"]["stale_s"]}
+            "behindSince": at("behind_since"), "drifted": bool(rel.get("drifted")), "error": rel.get("error"), "staleAfterS": policy["release"]["stale_s"]}
 
 
 def parse_iso(text: Any) -> float | None:
@@ -767,9 +773,11 @@ def judge(report: Any, now: float, installed: bool) -> dict[str, Any]:
     grace = rel["staleAfterS"]
     because = f": {str(error)[:200]}" if error else ""
     behind = parse_iso(rel.get("behindSince"))
-    if wants and wants != tag and behind is not None and now - behind > grace:
-        return {"state": "stale", "reinstall": False, "why": f"runs {tag or 'an unknown release'}, its channel has named {wants} since "
-                                         f"{rel.get('behindSince')}{because}"}
+    if behind is not None and now - behind > grace and (wants and wants != tag or rel.get("drifted")):
+        what = ("it has not identified its files as any release" if not tag else
+                f"its files are not the {tag} they were installed as" if not wants or wants == tag else
+                f"runs {tag}, its channel has named {wants}")
+        return {"state": "stale", "reinstall": False, "why": f"{what} since {rel.get('behindSince')}{because}"}
     ok = parse_iso(rel.get("okAt"))
     if ok is None or now - ok > grace:
         return {"state": "stale", "reinstall": False, "why": f"has not read its release channel since {rel.get('okAt') or 'install'}"

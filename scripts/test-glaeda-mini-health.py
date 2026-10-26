@@ -1519,6 +1519,19 @@ class DaemonHealLiveness(Base):
         self.assertIn("has not read its release channel", f["evidence"])
         self.assertEqual(self.mini.did, [], "a reinstall cannot fix its channel: no sudo for it")
 
+    def test_a_current_report_from_an_unloaded_healer_is_stale(self) -> None:
+        self.mini.heal_status = self.status(loaded=False, verdict={"state": "current", "why": "runs r"})
+        f = self.run_once()["findings"][0]
+        self.assertEqual(f["id"], "daemon_heal_stale")
+        self.assertIn("not loaded", f["evidence"])
+
+    def test_a_reinstall_is_healed_only_when_its_report_says_current(self) -> None:
+        self.mini.sudo = True
+        self.mini.heal_status = self.status(verdict={"state": "missing", "reinstall": True, "why": "not installed"})
+        r = self.run_once()
+        self.assertEqual(self.mini.did, ["install daemon-heal"])
+        self.assertEqual(r["healed"], [], "the bytes are in place, but its report is not current yet")
+
 
 class ClaudeRoute(Base):
     """Claude Code on a fleet mini goes through a fleet route that answers, or capture-host admits no lease here."""

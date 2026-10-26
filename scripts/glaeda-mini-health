@@ -1070,6 +1070,8 @@ def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
         if verdict["state"] != "current":
             why = str(verdict.get("why") or verdict["state"])[:300]
             fixable = verdict.get("reinstall") is not False
+        elif status.get("loaded") is False:  # a report from before it was booted out reads current for a while
+            why = "the root daemon-heal LaunchDaemon is installed but not loaded"
     elif not status.get("installed"):
         why = "the root daemon-heal LaunchDaemon is not installed"
     elif not status.get("current"):
@@ -1538,6 +1540,9 @@ def heal_node_toolchain(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
 def heal_daemon_heal(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
     ok, what = mini.install_daemon_heal()
     status = mini.daemon_heal_status() if ok else None
+    verdict = (status or {}).get("verdict")
+    if isinstance(verdict, dict):  # healed only once its own report says so, not when the bytes are in place
+        return bool(verdict.get("state") == "current" and status.get("loaded") is not False), what
     return bool(status and status.get("current") and status.get("loaded") is not False), what
 
 

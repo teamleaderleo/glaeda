@@ -582,6 +582,19 @@ class SelfUpdate(unittest.TestCase):
         self.run_pass(POLICY["every_s"])  # drift is checked every pass, not every release.every_s
         self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES)
 
+    def test_files_that_drift_and_cannot_be_repaired_show_as_stale(self) -> None:
+        tag = self.channel.publish(2)
+        self.run_pass()
+        (self.dir / heal.SCRIPT_NAME).write_bytes(b"print('hand edit')\n")
+        url = next(u for u in self.channel.files if u.endswith(heal.ARCHIVE) and f"/{ORIGIN}/" in u)
+        del self.channel.files[url]  # the repair cannot download its release
+        report = self.run_pass(POLICY["every_s"])
+        self.assertEqual((report["release"]["tag"], report["release"]["wants"]), (tag, tag))
+        self.assertTrue(report["release"]["drifted"] and report["release"]["error"])
+        verdict = self.verdict(report, POLICY["release"]["stale_s"] + 1)
+        self.assertEqual(verdict["state"], "stale")
+        self.assertIn("not the " + tag, verdict["why"])
+
     def test_the_mirror_answers_when_the_repository_does_not(self) -> None:
         tag = self.channel.publish(2, script=SCRIPT_BYTES + b"# 2\n")
         self.channel.down.add(ORIGIN)
