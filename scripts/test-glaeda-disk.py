@@ -1516,7 +1516,7 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "process_evidence", return_value=late), \
                 mock.patch.object(gd, "command_lines", return_value=late[1]), \
                 mock.patch.object(gd, "HOME", self.root / "home"), \
-                mock.patch.object(gd, "archive_mirror", return_value=("", [])):  # bundling: the cmux-job tests
+                mock.patch.object(gd, "archive_mirror", return_value=("", [], ([], [], []))):  # bundling: the cmux-job tests
             gd.apply(reclaim, {fam.id: fam}, receipt, None, 24)
         self.assertEqual(sorted(p.name for p in cache.iterdir()),
                          ["cmux-tui-target", "fresh-workspaces", "leased", "swiftpm"])
@@ -5617,8 +5617,9 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertFalse((job / "slots/host.1").exists())
         self.assertTrue((job / "reload-cloud-ios/cmux-base/slot-2/.git").is_dir())
         # no remote: each deleted clone's whole history is in a verified bundle
-        bundles = sorted((self.home / "archive/glaeda-disk").iterdir())
-        self.assertEqual([("cmux-base" in b.name, "host.1" in b.name) for b in bundles], [(True, False), (False, True)])
+        bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
+        self.assertEqual(sorted(("cmux-base" in b.name, "host.1" in b.name) for b in bundles),
+                         [(False, True), (True, False)])
         for b in bundles:
             self.assertRegex(b.name, gd.MIRROR_BUNDLE_RE)
             self.assertIn("refs/heads/", subprocess.run(["git", "bundle", "list-heads", str(b)], capture_output=True,
@@ -5640,7 +5641,7 @@ class LinuxLayoutTest(unittest.TestCase):
         self.addCleanup(setattr, gd, "TRUSTED_LOCAL_REMOTES", saved)
         return unit, unit / "slot-1", env
 
-    def apply_mirror(self, unit: Path) -> tuple[dict, str]:
+    def apply_mirror(self, unit: Path, between=None) -> tuple[dict, str]:
         t = time.time() - 24 * 3600
         for dirpath, dirnames, filenames in os.walk(unit):
             for n in dirnames + filenames:
@@ -5649,6 +5650,8 @@ class LinuxLayoutTest(unittest.TestCase):
         fams = [f for f in gd.default_families() if f.id == "cmux-job-cache"]
         items = [i for i in gd.survey(fams, 24, 0) if i.path == os.fspath(unit)]
         self.assertEqual([i.verdict for i in items], ["reclaimable"])
+        if between is not None:
+            between()
         receipt, err = self.home / "receipt.jsonl", io.StringIO()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
             gd.apply(items, {f.id: f for f in fams}, receipt, None, 24)
@@ -5675,7 +5678,7 @@ class LinuxLayoutTest(unittest.TestCase):
                                   check=True).stdout.strip() for r in ("refs/heads/main", "refs/tags/only-here",
                                                                        "refs/heads/side")}
         rec, _ = self.apply_mirror(unit)
-        self.assertEqual(rec["outcome"], "reclaimed")
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
         self.assertFalse(unit.exists())
         heads = self.bundle_heads()
         self.assertEqual({r: heads.get(r) for r in want}, want)
@@ -5702,17 +5705,117 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertFalse(unit.exists())
         self.assertFalse((self.home / "archive/glaeda-disk").exists())
 
-    def test_expired_mirror_bundles_are_pruned_and_nothing_else(self) -> None:
+    def git(self, repo: Path, *args: str, env: dict | None = None) -> str:
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True,
+                              env=env).stdout.strip()
+
+    def test_a_branch_the_server_deleted_is_bundled_despite_its_stale_tracking_ref(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        srv = self.home / "srv"
+        self.git(srv, "checkout", "-q", "-b", "feat", env=env)
+        self.git(srv, "commit", "-q", "--allow-empty", "-m", "feat", env=env)
+        self.git(srv, "checkout", "-q", "main", env=env)
+        self.git(clone, "fetch", "-q", "origin", env=env)
+        self.git(clone, "branch", "mine", "origin/feat", env=env)
+        feat = self.git(clone, "rev-parse", "origin/feat")
+        self.git(srv, "branch", "-q", "-D", "feat", env=env)  # origin/feat in the clone is stale now
+        self.git(srv, "reflog", "expire", "--expire=now", "--all", env=env)
+        self.git(srv, "gc", "-q", "--prune=now", env=env)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed")
+        self.assertEqual(self.bundle_heads().get("refs/heads/mine"), feat)
+
+    def test_bundle_names_never_collide_or_overwrite(self) -> None:
+        self.assertNotEqual(gd._bundle_name("/a/b_c")[16:], gd._bundle_name("/a/b/c")[16:])
+        self.assertNotEqual(gd._bundle_name("/r", "refs/heads/a_b")[16:], gd._bundle_name("/r", "refs/heads/a/b")[16:])
+        _, clone, env = self.mirror_unit()
+        self.git(clone, "commit", "-q", "--allow-empty", "-m", "unpushed", env=env)
+        written: list[Path] = []
+        args = (clone / ".git", "same", ["refs/heads/main", "--not", "origin/main"], {"refs/heads/main"}, written)
+        self.assertEqual(gd._write_bundle(*args), "")
+        first = written[0].read_bytes()
+        self.git(clone, "commit", "-q", "--allow-empty", "-m", "another", env=env)
+        self.assertIn("FileExistsError", gd._write_bundle(*args))
+        self.assertEqual((written, written[0].read_bytes()), ([written[0]], first))
+
+    def test_a_mirror_with_uncommitted_work_is_kept_but_ignored_output_goes(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        with (clone / ".git/info/exclude").open("a") as f:
+            f.write("build/\n")
+        (clone / "build").mkdir()
+        (clone / "build/out.o").write_text("x")
+        (clone / "notes.txt").write_text("edited on a laptop")
+        gd.RUN.pop("bundle_failed", None)
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual((rec["outcome"], rec["verdict"]), ("blocked:uncommitted", "blocked"))
+        self.assertTrue((clone / "notes.txt").exists())
+        self.assertNotIn("bundle_failed", gd.RUN)
+        (clone / "notes.txt").unlink()
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed")
+
+    def test_a_checkout_in_ignored_files_has_its_local_refs_bundled(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        with (clone / ".git/info/exclude").open("a") as f:
+            f.write("vendor/\n")
+        dep = clone / "vendor/dep"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(dep)], check=True, env=env)
+        self.git(dep, "commit", "-q", "--allow-empty", "-m", "only here", env=env)
+        head = self.git(dep, "rev-parse", "HEAD")
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed")
+        self.assertEqual(self.bundle_heads().get("refs/heads/main"), head)
+
+    def test_an_unreadable_submodule_store_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        store = clone / ".git/modules/sub"
+        store.mkdir(parents=True)
+        try:
+            rec, _ = self.apply_mirror(unit, between=lambda: os.chmod(store, 0))
+        finally:
+            os.chmod(store, 0o755)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertIn("unreadable submodule store", " ".join(rec["reasons"]))
+        self.assertTrue(clone.is_dir())
+
+    def test_a_commit_made_while_bundling_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "commit", "-q", "--allow-empty", "-m", "unpushed", env=env)
+        real = gd.archive_mirror
+
+        def racing(path):
+            out = real(path)
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "made meanwhile", env=env)
+            return out
+        with mock.patch.object(gd, "archive_mirror", racing):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertIn("its git refs or work trees changed while they were bundled", rec["reasons"])
+        self.assertTrue(clone.is_dir())
+
+    def test_only_manifest_listed_bundles_at_their_hash_are_pruned_after_the_evidence_gate(self) -> None:
         archive = self.home / "archive/glaeda-disk"
         archive.mkdir(parents=True)
-        names = ["20260901T000000-a.expires-2026-10-01.bundle", "20261020T000000-b.expires-2026-11-19.bundle",
-                 "20261026T000000-c.expires-2026-10-26.bundle", "a.expires-2026-10-01.bundle", "notes.txt"]
-        for n in names:
-            (archive / n).write_text("x")
-        (self.home / "archive/other.expires-2026-10-01.bundle").write_text("x")  # not in its own directory
+        name = "20260901T000000-1-{:016x}-r.expires-{}.bundle".format
+        listed = {name(1, "2026-10-01"): "2026-10-01", name(2, "2026-11-19"): "2026-11-19",
+                  name(3, "2026-10-02"): "2026-10-02"}  # 3: changed since it was written
+        for n in [*listed, name(4, "2026-10-01")]:  # 4: expired by its name, but not in the manifest
+            (archive / n).write_text(n)
+        with (archive / "manifest.jsonl").open("w") as m:
+            for n, exp in listed.items():
+                m.write(json.dumps({"name": n, "sha256": gd._sha256(archive / n), "expires": exp}) + "\n")
+        (archive / name(3, "2026-10-02")).write_text("changed")
+        (self.home / "archive/other.bundle").write_text("x")
+        fams = [f for f in gd.default_families() if f.id == "cmux-job-cache"]
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(
+                gd, "process_evidence", side_effect=gd.NoEvidence("ps failed")):
+            gd.apply([], {f.id: f for f in fams}, self.home / "r.jsonl", None, 24)
+        self.assertTrue((archive / name(1, "2026-10-01")).exists())  # no evidence: nothing is deleted
         self.assertEqual(gd.prune_mirror_archive("2026-10-26"), 1)
-        self.assertEqual(sorted(p.name for p in archive.iterdir()), sorted(names[1:]))
-        self.assertTrue((self.home / "archive/other.expires-2026-10-01.bundle").exists())
+        self.assertEqual(sorted(p.name for p in archive.glob("*.bundle")),
+                         sorted([name(2, "2026-11-19"), name(3, "2026-10-02"), name(4, "2026-10-01")]))
+        self.assertNotIn(name(1, "2026-10-01"), (archive / "manifest.jsonl").read_text())
+        self.assertTrue((self.home / "archive/other.bundle").exists())
 
     def test_interrupted_deletions_finish_once_their_deleter_is_gone(self) -> None:
         """cmux8s and cmuxs-mac-mini-3, 2026-10-11: 9.3 and 7.8 GiB renamed aside by a killed glaeda-disk sat
