@@ -2965,6 +2965,12 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(sorted(Path(r).name for r in removed), ["code_sign_clone.Old1", "code_sign_clone.Old2"])
         self.assertTrue((bundle / "code_sign_clone.New").is_dir())
 
+    @staticmethod
+    def _registered_long_ago(runner_file: Path) -> None:
+        """A .runner written a day ago: no worker under an older name can still be running (enrolled_runner_roster)."""
+        old = time.time() - 24 * 3600
+        os.utime(runner_file, (old, old))
+
     def _cmux_next_runners(self) -> tuple[Path, "gd.Family"]:
         """Two enrolled runners named mini-glaeda and mini-glaeda-2, each with its cmux-next scheme state, and
         a state no enrolled runner owns, all built an hour ago."""
@@ -2973,6 +2979,7 @@ class GlaedaDiskTest(unittest.TestCase):
             (home / runner / "glaeda-hooks").mkdir(parents=True)
             # the runner writes .runner as UTF-8 with a byte order mark
             (home / runner / ".runner").write_text(json.dumps({"agentName": name}), encoding="utf-8-sig")
+            self._registered_long_ago(home / runner / ".runner")
         root = home / "Library/Caches/cmux-next-ci"
         for name in ("mini-glaeda", "mini-glaeda-2", "gone-runner"):
             make(root / "cmux-scheme" / name / "Build", age_hours=1)
@@ -3294,6 +3301,19 @@ class GlaedaDiskTest(unittest.TestCase):
             recheck()  # idle, and no floor stop applies to the cap's stale root: remove() deletes it
         self.assertTrue(doomed.is_dir())
 
+    def test_a_state_a_renamed_runner_left_stays_unknown_for_a_jobs_timeout(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        runner = home / "actions-runner-glaeda"
+        # runner 1 re-registered as another name just now: its old Runner.Worker may still use cmux-scheme/mini-glaeda
+        (runner / ".runner").write_text(json.dumps({"agentName": "renamed"}), encoding="utf-8-sig")
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "FLOOR_HOLD", {fam.root.stat().st_dev: 50 * gd.GIB}):
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda"], fam.root), gd.OWNER_UNKNOWN)
+            self.assertIn("unknown", gd.cmux_next_ci_busy(fam, st["mini-glaeda"], [], ""))
+            self.assertNotIn(st["mini-glaeda"], gd.cmux_next_ci_stale_roots(fam.root))  # on every later pass too
+            self._registered_long_ago(runner / ".runner")
+            self.assertIsNone(gd.cmux_next_ci_owner(st["mini-glaeda"], fam.root))  # a job's timeout later: gone
+
     def test_a_drain_lists_no_whole_slot(self) -> None:
         home, fam, st = self._cmux_next_cap_tree()
         with mock.patch.object(gd, "HOME", home), \
@@ -3356,6 +3376,7 @@ class GlaedaDiskTest(unittest.TestCase):
             os.rename(slot, doomed)
             # runner 1 is re-registered under another name while its old Runner.Worker still runs
             (runner / ".runner").write_text(json.dumps({"agentName": "renamed"}), encoding="utf-8-sig")
+            self._registered_long_ago(runner / ".runner")  # past the roster's own window: the vetted owner holds it
             self.assertIsNone(gd.cmux_next_ci_owner(slot, fam.root))
             with mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
                     self.assertRaises(gd.SlotTaken):
@@ -3549,6 +3570,7 @@ class GlaedaDiskTest(unittest.TestCase):
                                  ("actions-runner-glaeda-2", "mini-glaeda-2")):
                 (home / runner / "glaeda-hooks").mkdir(parents=True)
                 (home / runner / ".runner").write_text(json.dumps({"agentName": name}), encoding="utf-8-sig")
+                self._registered_long_ago(home / runner / ".runner")
         root = home / "Library/Caches/cmux-next-ci"
         xcode = "Release/xcode-2c2299e9015ce0c8"
         key1 = self._release_key("mini-glaeda", home / "actions-runner-glaeda")

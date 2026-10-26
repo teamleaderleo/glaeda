@@ -6160,11 +6160,19 @@ def runner_work_folder(runner: Path) -> Path:
 def enrolled_runner_roster() -> tuple[dict[str, Path], bool, dict[Path, Path]]:
     """From one read of each enrolled runner's .runner: agentName -> runner directory, whether every one named its
     agent (while one cannot be read, mid-write, malformed or with a blank name, a state no name matches may be its),
-    and each named runner's work folder (runner_work_folder) from that same read."""
+    and each named runner's work folder (runner_work_folder) from that same read. A .runner rewritten within a
+    job's timeout (cmux_next_ci_unowned_idle_hours) leaves the roster incomplete too: a Runner.Worker started
+    under the old name may still be on its way to the old name's state."""
     names: dict[str, Path] = {}
     work: dict[Path, Path] = {}
     complete = True
+    recent = time.time() - float(POLICY["cmux_next_ci_unowned_idle_hours"]) * 3600
     for runner in enrolled_runners():
+        try:
+            if (runner / ".runner").stat().st_mtime > recent:
+                complete = False
+        except OSError:
+            complete = False
         config = runner_config(runner)
         name = config.get("agentName")
         if isinstance(name, str) and name.strip():
