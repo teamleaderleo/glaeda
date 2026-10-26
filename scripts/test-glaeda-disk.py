@@ -3851,6 +3851,11 @@ class GlaedaDiskTest(unittest.TestCase):
             released = gd.apply([item], {fam.id: fam}, receipt, None, 6, all_families=[fam], taken=taken)
         self.assertEqual(released, 2 * 1024 * 1024)
         self.assertEqual([p.name for p in host.iterdir()], ["lock"])
+        # for the floor alone, free is read again under the lock: met by then, nothing goes
+        make(host / "src")
+        with self.assertRaises(gd.SlotNotNeeded):
+            gd.remove_cmux_next_host(host, needed=lambda: False)
+        self.assertTrue((host / "src").is_dir())
         # a host root that is a mount point is refused whole
         with mock.patch.object(gd.os.path, "ismount", return_value=True), self.assertRaises(OSError):
             gd.remove_cmux_next_host(host)
