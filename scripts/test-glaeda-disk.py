@@ -6391,6 +6391,8 @@ class HostReservationTest(unittest.TestCase):
             {"reservations": [dict(good, hosts=[31])]},
             {"reservations": ["cmux31"]},
             {"reservations": [dict(good, until="soon")]},  # a bad time on an entry naming another host
+            {"reservations": [dict(good, hosts=["cmux31"], until=good["from"])]},  # zero length
+            {"reservations": [dict(good, hosts=["cmux31"], **{"from": good["until"], "until": good["from"]})]},
             {"reservations": [good], "aliases": {"cmux40": "cmux-forty"}},
             {"reservations": [good], "aliases": []},
         )
@@ -6437,6 +6439,53 @@ class HostReservationTest(unittest.TestCase):
         self.assertEqual(plain.low, int((30 + gd.POLICY["low_margin_gib"]) * gd.GIB))
         self.assertEqual(held.low, 30 * gd.GIB)
         self.assertEqual(held.target, int((30 + gd.POLICY["target_margin_gib"]) * gd.GIB))
+
+    def test_a_local_marker_that_is_there_but_unreadable_holds_the_host(self) -> None:
+        now = int(self.during)
+        for text in ("{nope", "[]", json.dumps({"schema": "other", "since": now - 60, "until": now + 60}),
+                     json.dumps({"schema": "glaeda-reservation/v1", "since": "yesterday", "until": now + 60}),
+                     json.dumps({"schema": "glaeda-reservation/v1", "until": now + 60})):
+            with self.subTest(text=text):
+                self.local.write_text(text)
+                self.assertIn("marker unreadable", self.reserved({"cmux31"}))
+        self.local.unlink()
+        self.assertEqual(self.reserved({"cmux31"}), "", "no marker, no hold")
+
+    def test_a_reserved_pressure_pass_does_nothing_but_evict(self) -> None:
+        """Under its floor, a reserved host runs the pressure pass and nothing else: no marker clearing, paused-work
+        cleanup, test-residue reaping, clone gc or repack; and no dedupe at all."""
+        empty = self.root / "empty"
+        empty.mkdir()
+        state = self.root / "state"
+        state.mkdir()
+        why = "reserved for someone until 2026-10-28T23:59:59Z (r1)"
+        with contextlib.ExitStack() as stack:
+            for name in ("SNAPSHOT", "DEDUPE_STATE", "CMUX_NEXT_CAP_RECORD", "MEASURE_LOCK", "ACCOUNTING",
+                         "HEALTH_SUMMARY", "EVICT_LOCK", "HOOK_PASS_LOCK", "HOOK_PASS_PENDING", "EVICT_OWNER",
+                         "NESTED_KEEP"):
+                stack.enter_context(mock.patch.object(gd, name, state / name))
+            for name in ("clear_stale_build_markers", "cleanup_paused_runner_work", "reap_tmpdir_test_residue",
+                         "gc_home_clones", "repack_runner_checkouts", "dedupe_xcode", "dedupe_captures"):
+                stack.enter_context(mock.patch.object(gd, name, side_effect=AssertionError(f"{name} ran")))
+            stack.enter_context(mock.patch.object(gd, "default_families",
+                                                  return_value=[gd.Family("tmp", empty, True, "scratch")]))
+            stack.enter_context(mock.patch.object(gd, "host_reservation", return_value=why))
+            stack.enter_context(mock.patch.object(gd, "runner_floor_gib", return_value=30.0))
+            stack.enter_context(mock.patch.object(gd, "free_bytes", return_value=(20 * gd.GIB, 1000 * gd.GIB)))
+            stack.enter_context(mock.patch.object(gd, "DARWIN", True))
+            stack.enter_context(mock.patch.object(gd, "disk_off", return_value=""))
+            stack.enter_context(mock.patch.object(gd, "notify_disk"))
+            evict = stack.enter_context(mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0))
+            stack.enter_context(mock.patch.dict(gd.RUN, clear=True))
+            out = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            for args in (("--pressure",), ("--dedupe",), ("--dedupe-builds",)):
+                with self.subTest(args=args):
+                    code = gd._main_impl(["--apply", "--top", "0", "--no-snapshot",
+                                          "--receipt", os.fspath(self.root / "receipt.jsonl"), *args])
+                    self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("eviction summary", out.getvalue(), "the pressure pass itself ran")
+        evict.assert_called_once()  # the floor's last resort still runs
+        self.assertIn("no dedupe", out.getvalue())
 
     def run_disk(self, *args: str, reserved: str, floor: float, free_gib: float):
         """glaeda-disk's main on a fake fleet mini; returns (exit code, output, the families' low/target it used)."""
