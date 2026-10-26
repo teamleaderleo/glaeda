@@ -798,6 +798,22 @@ class UpstreamTest(Base):
         self.assertEqual(set(asked), set(keys), "every key is read in turn")
         self.assertTrue(all(len(r["keys"]) <= 2 for r in self.asked))
 
+    def test_keys_that_keep_failing_do_not_starve_one_with_data(self) -> None:
+        bad = [f"pr:o/r#{n}" for n in range(10, 14)]
+        for k in bad:
+            gg.register(k)
+            self.answers[k] = {"data": None, "error": "NOT_FOUND", "missing": True}
+        gg.register("pr:o/r#7")
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW}
+        with mock.patch.object(gg, "UPSTREAM_MAX_KEYS", 2):
+            for i in range(30):
+                self.daemon.tick(now=NOW + i * gg.UPSTREAM_NEW)
+        asked = [k["key"] for r in self.asked for k in r["keys"]]
+        self.assertGreaterEqual(asked.count("pr:o/r#7"), 2)
+        # a key the upstream answered with an error waits for full cycles, not UPSTREAM_NEW: one full read per
+        # UPSTREAM_EVERY, plus the reads that first fill the 5 new keys 2 at a time
+        self.assertLessEqual(len(self.asked), 30 * gg.UPSTREAM_NEW // gg.UPSTREAM_EVERY + 1 + 3)
+
     def test_a_pr_github_says_does_not_exist_fails_a_wait_instead_of_timing_out(self) -> None:
         gg.register("pr:o/r#404")
         self.answers["pr:o/r#404"] = {"data": None, "error": "NOT_FOUND", "missing": True, "fetchedAt": NOW}

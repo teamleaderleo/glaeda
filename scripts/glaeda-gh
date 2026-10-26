@@ -1781,12 +1781,11 @@ class Daemon:
                     self.store(e["key"], None, error=f"{kind} reads need a GitHub login; this host reads through "
                                                      "its upstream")
                 continue
-            fresh = e["cache"] is None or e["cache"].get("data") is None
+            fresh = e["cache"] is None  # the upstream has answered nothing for it yet, not even an error
             if full or (fresh and self.now - self.attempted.get(e["key"], float("-inf")) >= UPSTREAM_NEW):
                 due.append(e)
-        # New keys first, then the least recently read: past UPSTREAM_MAX_KEYS the rest rotate, none starves.
-        due = sorted(due, key=lambda e: (e["cache"] is not None and e["cache"].get("data") is not None,
-                                         self.attempted.get(e["key"], float("-inf")), e["key"]))[:UPSTREAM_MAX_KEYS]
+        # The least recently asked first (a key never asked is -inf): past UPSTREAM_MAX_KEYS they rotate, none starves.
+        due = sorted(due, key=lambda e: (self.attempted.get(e["key"], float("-inf")), e["key"]))[:UPSTREAM_MAX_KEYS]
         if full:
             self.upstream_at = self.now
         if due:
