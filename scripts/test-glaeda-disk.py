@@ -3841,6 +3841,19 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.apply(items, {fam.id: fam, inter.id: inter}, receipt, None, 6, all_families=[fam, inter])
         self.assertFalse(aside.exists())
         self.assertTrue((st["mini-glaeda"] / "Build").is_dir())  # the aside alone brought the cache under its cap
+        # the host root measured with that aside in it: a later pass sharing the tally counts only the rest
+        taken = {host: 3 * 1024 * 1024}
+        self._age(host, hours=49)
+        item = gd.Item(fam.id, os.fspath(host), 5 * 1024 * 1024, 49, "reclaimable", [])
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "sweep"), contextlib.redirect_stdout(io.StringIO()):
+            released = gd.apply([item], {fam.id: fam}, receipt, None, 6, all_families=[fam], taken=taken)
+        self.assertEqual(released, 2 * 1024 * 1024)
+        self.assertEqual([p.name for p in host.iterdir()], ["lock"])
+        # a host root that is a mount point is refused whole
+        with mock.patch.object(gd.os.path, "ismount", return_value=True), self.assertRaises(OSError):
+            gd.remove_cmux_next_host(host)
 
     def test_main_takes_the_per_host_cmux_next_root_after_idle_runners_checkouts(self) -> None:
         home, fam, st, host = self._cmux_next_host_tree()
