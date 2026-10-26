@@ -252,7 +252,7 @@ class PruneTest(unittest.TestCase):
         # the real glaeda-disk loads (its dataclasses need the module in sys.modules) and answers from a made-up list
         gd = fp.load_glaeda_disk(ROOT / "scripts/glaeda-disk")
         listing = Path(self.tmp.name) / "fleet-reservations.json"
-        listing.write_text(json.dumps({"reservations": [{"id": "r9", "owner": "someone", "hosts": ["cmux30"],
+        listing.write_text(json.dumps({"expires": "2999-01-01T00:00:00Z", "reservations": [{"id": "r9", "owner": "someone", "hosts": ["cmux30"],
                                                          "from": "2000-01-01T00:00:00Z",
                                                          "until": "2999-01-01T00:00:00Z"}]}))
         gd.FLEET_RESERVATIONS = listing
