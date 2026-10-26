@@ -365,6 +365,66 @@ class GovernorTest(unittest.TestCase):
         governor.set_paused(True)  # and it never signals the group again
         self.assertFalse(self.stopped())
 
+    def test_a_counter_that_raises_never_leaves_the_group_stopped(self):
+        calls = {"n": 0}
+
+        def flaky() -> int:
+            calls["n"] += 1
+            if calls["n"] > 6:
+                raise RuntimeError("counter broke")
+            return calls["n"] * 50_000_000  # far ahead of the rate every tick: paused until the counter breaks
+
+        governor = sp.Governor(self.proc.pid, 1000, lambda: "job", read_interface=lambda: None, read_own=flaky,
+                               tick=0.05)
+        governor.start()
+        governor.thread.join(5)
+        self.assertFalse(governor.thread.is_alive())
+        self.assertFalse(self.stopped(), "the loop's end continues the group it stopped")
+        governor.set_paused(True)
+        self.assertFalse(self.stopped())
+        governor.stop()
+
+    def test_a_pause_is_recorded_and_a_later_run_continues_a_group_a_killed_run_left_stopped(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        governor = sp.Governor(self.proc.pid, 1000, lambda: "job", read_interface=lambda: None,
+                               read_own=lambda: 0, tick=60, record_dir=folder)
+        governor.set_paused(True)
+        self.assertTrue(self.stopped())
+        record = folder / f"{self.proc.pid}.json"
+        self.assertTrue(record.is_file())
+        # The run is SIGKILLed here: nothing continues the group, the record stays.
+        self.assertEqual(sp.thaw_left_paused(folder), [self.proc.pid])
+        self.assertFalse(self.stopped())
+        self.assertFalse(record.exists())
+        governor.set_paused(True)
+        governor.set_paused(False)
+        self.assertFalse(self.stopped())
+        self.assertFalse(record.exists(), "continuing removes the record")
+        governor.stop()
+
+    def test_thaw_never_signals_a_reused_pid_and_drops_bad_records(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        os.killpg(self.proc.pid, signal.SIGSTOP)
+        try:
+            (folder / "a.json").write_text(json.dumps({"pgid": self.proc.pid, "started": "Mon Jan  1 00:00:00 2001"}))
+            (folder / "b.json").write_text("not json")
+            self.assertEqual(sp.thaw_left_paused(folder), [])
+            self.assertTrue(self.stopped(), "a different start time is a different process: left alone")
+            self.assertEqual(list(folder.iterdir()), [])
+        finally:
+            os.killpg(self.proc.pid, signal.SIGCONT)
+        self.assertEqual(sp.thaw_left_paused(folder / "missing"), [])
+
+    def test_no_record_means_no_pause(self):
+        governor = sp.Governor(self.proc.pid, 1000, lambda: "job", read_interface=lambda: None,
+                               read_own=lambda: 0, tick=60, record_dir=Path("/dev/null/not-a-folder"))
+        governor.set_paused(True)
+        self.assertFalse(self.stopped())
+        self.assertFalse(governor.paused)
+        governor.stop()
+
     def test_download_bytes_follows_the_curls_in_the_group_by_their_output_file(self):
         base = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, base, ignore_errors=True)

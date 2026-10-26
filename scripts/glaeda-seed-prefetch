@@ -85,6 +85,7 @@ BUCKET_URL = os.environ.get("GLAEDA_SEED_BUCKET_URL", "https://ci-cache.cmux.com
 # launchd's PATH lacks Homebrew, and without zstd cmux's r2-cache.sh cannot read a .tar.zst seed.
 TOOL_PATH = "/opt/homebrew/bin:/usr/local/bin"
 SOURCE = "seed-source.json"
+PAUSED = STATE / "seed-prefetch-paused"  # the Governor's record of each group it holds stopped (thaw_left_paused)
 DEPTH = 60  # seed_derived_data.ANCESTOR_LIMIT (50) commits of history, plus margin
 # A job or build that may be using the uplink or the seed cache right now.
 BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
@@ -767,6 +768,36 @@ def running_group_commands(pgid: int) -> list[str]:
     return commands
 
 
+def leader_start(pid: int) -> str:
+    """The start time ps gives pid (a pid with a different one is a reused pid), or '' when it is gone."""
+    out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+def thaw_left_paused(folder: Path) -> list[int]:
+    """SIGCONT each process group a killed run left paused, by its record in folder; returns the groups continued.
+
+    A Governor records a group (pgid and its leader's start time) before it stops it and removes the record when it
+    continues it. A record that outlives its run means that run died while the group was stopped (SIGKILL, a crash,
+    a power loss): the group is continued only while its leader is the same process (same pid, same start time),
+    so a reused pid is never signalled. Every record is removed."""
+    thawed = []
+    for record in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        try:
+            data = json.loads(record.read_text())
+            pgid, started = int(data["pgid"]), str(data["started"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pgid, started = 0, ""
+        if pgid > 1 and started and leader_start(pgid) == started:
+            try:
+                os.killpg(pgid, signal.SIGCONT)
+                thawed.append(pgid)
+            except OSError:
+                pass
+        record.unlink(missing_ok=True)
+    return thawed
+
+
 class Governor:
     """Paces an R2 download by the running job's own use of the network, not by the job's existence.
 
@@ -783,12 +814,19 @@ class Governor:
 
     The group is signalled only under the lock and before stop(): the caller stops the Governor before it
     reaps the group's leader, so a signal never reaches a reused process group.
+
+    A paused group is always continued before the Governor lets it go: stop() continues it, the loop continues it if
+    it dies (an exception in a counter), and with record_dir a record written before each SIGSTOP and removed after
+    each SIGCONT lets the next run continue a group this one could not (SIGKILL; thaw_left_paused).
     """
 
     def __init__(self, pgid: int, rate: int, job: Callable[[], str],
                  read_interface: Callable[[], int | None] = interface_bytes,
-                 read_own: Callable[[], int] | None = None, tick: float = 1.0) -> None:
+                 read_own: Callable[[], int] | None = None, tick: float = 1.0,
+                 record_dir: Path | None = None) -> None:
         self.pgid, self.rate, self.job, self.tick = pgid, rate, job, tick
+        self.record = record_dir / f"{pgid}.json" if record_dir is not None else None
+        self.started = ""
         self.read_interface, self.read_own = read_interface, read_own or DownloadBytes(pgid)
         self.stop_event = threading.Event()
         self.lock = threading.RLock()  # stop() may run in a signal handler on a thread inside stop()
@@ -800,13 +838,60 @@ class Governor:
         with self.lock:
             if self.stop_event.is_set() or paused == self.paused:
                 return
+            if paused and not self.write_record():
+                return  # no record, no pause: a stop nothing could undo after a SIGKILL is worse than a fast download
             try:
                 os.killpg(self.pgid, signal.SIGSTOP if paused else signal.SIGCONT)
             except OSError:
                 pass
             self.paused = paused
+            if not paused:
+                self.drop_record()
+
+    def write_record(self) -> bool:
+        if self.record is None:
+            return True
+        try:
+            self.started = self.started or leader_start(self.pgid)
+            if not self.started:
+                return False
+            self.record.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.record.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"pgid": self.pgid, "started": self.started}))
+            tmp.replace(self.record)
+            return True
+        except OSError:
+            return False
+
+    def drop_record(self) -> None:
+        if self.record is not None:
+            try:
+                self.record.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def resume(self) -> None:
+        """Continue the group if this Governor stopped it (under the lock, so no tick pauses it in between)."""
+        with self.lock:
+            if self.paused:
+                try:
+                    os.killpg(self.pgid, signal.SIGCONT)
+                except OSError:
+                    pass
+                self.paused = False
+                self.drop_record()
 
     def loop(self) -> None:
+        try:
+            self.pace()
+        finally:
+            # A counter that raised ends the loop: the group must not stay stopped until the prefetch times out.
+            with self.lock:
+                if not self.stop_event.is_set():
+                    self.resume()
+                    self.stop_event.set()
+
+    def pace(self) -> None:
         last_in, last_own, last = self.read_interface(), self.read_own(), time.monotonic()
         hot_until, job_checked, has_job, allowance = 0.0, 0.0, True, self.rate * BURST_SECONDS
         window: list[tuple[float, int | None, int]] = []
@@ -848,14 +933,11 @@ class Governor:
     def stop(self) -> None:
         """Continue the group if it is stopped, and never signal it again (one lock hold: no tick between)."""
         with self.lock:
-            if self.paused and not self.stop_event.is_set():
-                try:
-                    os.killpg(self.pgid, signal.SIGCONT)
-                except OSError:
-                    pass
-                self.paused = False
+            if not self.stop_event.is_set():
+                self.resume()
             self.stop_event.set()
-        self.thread.join(timeout=30)
+        if self.thread.is_alive() and self.thread is not threading.current_thread():
+            self.thread.join(timeout=30)
 
     def report(self) -> dict:
         return {"rate": self.rate, **{k: round(v, 1) if isinstance(v, float) else v for k, v in self.stats.items()}}
@@ -874,6 +956,7 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "")
     env = {key: value for key, value in os.environ.items()
            if key not in ("GITHUB_REPOSITORY", "GITHUB_OUTPUT", "CURL_HOME")}
     timeout = BUSY_PREFETCH_TIMEOUT if job else PREFETCH_TIMEOUT
+    thaw_left_paused(PAUSED)  # a group an earlier run stopped and then died (SIGKILL) before it could continue
     shutil.rmtree(mirror.parent / "curl-busy", ignore_errors=True)  # the old fixed-rate .curlrc
     env["CMUX_SEED_GIT_DIR"] = os.fspath(mirror)
     env["CI_CACHE_R2_PUBLIC_URL"] = BUCKET_URL
@@ -886,7 +969,7 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "")
                               os.fspath(store), head], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                              env=env, start_new_session=True)
     downloads = DownloadBytes(child.pid)
-    governor = Governor(child.pid, BUSY_RATE, busy, read_own=downloads).start()
+    governor = Governor(child.pid, BUSY_RATE, busy, read_own=downloads, record_dir=PAUSED).start()
 
     def stop_child() -> None:
         # Only while the leader is unreaped (the Governor stopped first), so the group is still ours.
