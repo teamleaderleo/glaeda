@@ -5298,17 +5298,19 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
     except (OSError, ValueError, KeyError, TypeError) as error:
         return f"fleet reservations unreadable ({type(error).__name__}); kept as reserved"
     marker = HOST_RESERVATION_LOCAL if local is None else local
-    if not os.path.lexists(marker):
-        return ""
     try:  # a marker that is there but cannot be read or understood holds the host, as host_busy reads it
-        held = json.loads(marker.read_text())
+        try:
+            text = marker.read_text()
+        except FileNotFoundError:
+            return ""  # only a marker that is certainly absent holds nothing
+        held = json.loads(text)
         since, until = held["since"], held["until"]
         if (held.get("schema") != "glaeda-reservation/v1" or not all(
                 isinstance(v, int) and not isinstance(v, bool) for v in (since, until))):
             raise ValueError("not a glaeda-reservation/v1 marker")
     except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
         return f"host reservation marker unreadable ({type(error).__name__}); kept as reserved"
-    if since <= now < until:
+    if now < until:  # the runner hook's rule: a marker holds from when it is written until until, since or not
         return f"host reservation by {held.get('owner', '?')} until {until}"
     return ""
 
