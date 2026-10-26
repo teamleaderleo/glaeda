@@ -7831,6 +7831,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
     # before any family is built: a reserved host's families keep its holder's ages (keep_legacy_ages, once 12 h lands)
     reserved = host_reservation() if role == "fleet-mini" and DARWIN and a.apply and not a.runner_caches else ""
+    if reserved:
+        keep_legacy_ages()
     global RUNNER_CACHE_PROFILE
     RUNNER_CACHE_PROFILE = bool(a.runner_caches)
     fams = runner_cache_families() if RUNNER_CACHE_PROFILE else default_families(role)
@@ -7876,7 +7878,6 @@ def _main_impl(argv: list[str] | None = None) -> int:
         floor_gib = max(runner_floor_gib(), a.floor_gib if math.isfinite(a.floor_gib) else 0.0)
         if reserved:
             RUN["reserved"] = reserved
-            keep_legacy_ages()
             a.idle = False  # no idle sweep on a reserved host
             if not a.pressure or floor_gib <= 0:
                 print(f"{reserved}: only floor-pressure eviction runs here"
