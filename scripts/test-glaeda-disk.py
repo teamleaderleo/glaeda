@@ -1518,7 +1518,8 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "process_evidence", return_value=late), \
                 mock.patch.object(gd, "command_lines", return_value=late[1]), \
                 mock.patch.object(gd, "HOME", self.root / "home"), \
-                mock.patch.object(gd, "archive_mirror", return_value=("", [], ([], [], []))):  # bundling: the cmux-job tests
+                mock.patch.object(gd, "archive_mirror", return_value=("", [], ([], [], []))), \
+                mock.patch.object(gd, "mirror_moved", return_value=""):  # bundling: the cmux-job tests
             gd.apply(reclaim, {fam.id: fam}, receipt, None, 24)
         self.assertEqual(sorted(p.name for p in cache.iterdir()),
                          ["cmux-tui-target", "fresh-workspaces", "leased", "swiftpm"])
@@ -5818,6 +5819,86 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(rec["outcome"], "changed:in-use")
         self.assertIn("its git refs or work trees changed while they were bundled", rec["reasons"])
         self.assertTrue(clone.is_dir())
+
+    def bundled_pairs(self) -> set[tuple[str, str]]:
+        pairs = set()
+        for b in (self.home / "archive/glaeda-disk").glob("*.bundle"):
+            out = subprocess.run(["git", "bundle", "list-heads", str(b)], capture_output=True, text=True, check=True)
+            pairs |= {(ln.split(" ")[1], ln.split(" ")[0]) for ln in out.stdout.splitlines()}
+        return pairs
+
+    def test_a_nested_embedded_submodules_commits_are_bundled(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        sub, nested = clone / "sub", clone / "sub/nested"
+        for repo in (sub, nested):
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True, env=env)
+        self.git(nested, "commit", "-q", "--allow-empty", "-m", "nested only", env=env)
+        head = self.git(nested, "rev-parse", "HEAD")
+        for outer, inner in ((sub, "nested"), (clone, "sub")):
+            self.git(outer, "add", inner, env=env)
+            self.git(outer, "commit", "-q", "-m", f"link {inner}", env=env)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertIn(("refs/heads/main", head), self.bundled_pairs())
+
+    def test_a_repository_created_while_bundling_keeps_the_mirror(self) -> None:
+        unit, _, env = self.mirror_unit()
+        real = gd.archive_mirror
+
+        def racing(path):
+            out = real(path)
+            subprocess.run(["git", "init", "-q", str(unit / "slot-2")], check=True, env=env)
+            self.git(unit / "slot-2", "commit", "-q", "--allow-empty", "-m", "new", env=env)
+            return out
+        with mock.patch.object(gd, "archive_mirror", racing):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue(any("repositories changed" in r for r in rec["reasons"]))
+        self.assertTrue((unit / "slot-2/.git").is_dir())
+
+    def test_a_tree_dirtied_before_its_snapshot_is_kept(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        real = gd.mirror_git_snapshot
+        calls = []
+
+        def dirtying(gitdirs, trees):
+            if not calls:  # after the clean check, before the baseline: the baseline itself is dirty
+                (clone / "notes.txt").write_text("edited")
+            calls.append(1)
+            return real(gitdirs, trees)
+        with mock.patch.object(gd, "mirror_git_snapshot", dirtying):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue((clone / "notes.txt").exists())
+
+    def test_a_mirrors_owner_and_references_are_read_again_after_bundling(self) -> None:
+        unit, _, _ = self.mirror_unit()
+        why, _, recheck = gd.archive_mirror(unit)
+        self.assertEqual(why, "")
+        retired = gd.Family("hq", unit.parent, True, "x", retired_only=True)
+        referenced = gd.Family("hq", unit.parent, True, "x", reference_root=self.home)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            with mock.patch.object(gd, "owner_retired", return_value=False):
+                self.assertIn("owner loaded", gd.mirror_moved(retired, unit, recheck))
+            with mock.patch.object(gd, "artifact_referenced", return_value=True):
+                self.assertIn("referenced", gd.mirror_moved(referenced, unit, recheck))
+            with mock.patch.object(gd, "owner_retired", return_value=True), \
+                    mock.patch.object(gd, "artifact_referenced", return_value=False):
+                self.assertEqual(gd.mirror_moved(retired, unit, recheck), "")
+
+    def test_a_locked_linked_worktree_keeps_the_mirror(self) -> None:
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        main = self.home / "main-clone"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(main)], check=True, env=env)
+        self.git(main, "commit", "-q", "--allow-empty", "-m", "c", env=env)
+        unit = self.home / ".cache/cmux-job/reload-cloud/cmux-base"
+        unit.mkdir(parents=True)
+        self.git(main, "worktree", "add", "-q", "--detach", "--lock", str(unit / "slot-1"), env=env)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue(any("locked worktree" in r for r in rec["reasons"]))
+        self.assertTrue((unit / "slot-1/.git").is_file())
 
     def test_only_manifest_listed_bundles_at_their_hash_are_pruned_after_the_evidence_gate(self) -> None:
         archive = self.home / "archive/glaeda-disk"

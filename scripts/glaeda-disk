@@ -4633,52 +4633,59 @@ def mirror_git_snapshot(gitdirs: list[Path], trees: list[Path]) -> list[str | No
     return snap
 
 
-def archive_mirror(path: Path) -> tuple[str, list[Path], tuple[list[Path], list[Path], list[str | None]]]:
-    """Before a mirror item goes: bundle_unpushed for every repository it takes along, found as _nested_loss
-    finds them (checkouts, bare repositories, a linked worktree's repository inside it, checkouts in ignored
-    directories, submodule stores and embedded submodules). A tree with uncommitted work, or whose repositories
-    cannot all be found or bundled, is kept. ("" or why it must stay, the bundles written, what to recheck)."""
-    none: tuple[list[Path], list[Path], list[str | None]] = ([], [], [])
+def mirror_repos(path: Path) -> tuple[str, dict[str, Path], list[Path]]:
+    """Every repository a mirror item takes along, found as _nested_loss finds them (checkouts, bare
+    repositories, a linked worktree's repository inside it, checkouts in ignored directories, submodule stores
+    and initialized submodules, recursively), and its work trees, each checked clean right now.
+    ("" or why it must stay, real git dir -> git dir, work trees)."""
     queue = nested_checkouts(path)
     if queue is None:
-        return "too deep or large to find every checkout", [], none
+        return "too deep or large to find every checkout", {}, []
     queue, inside = list(queue), os.path.realpath(path) + "/"
     gitdirs: dict[str, Path] = {}
     trees: list[Path] = []
+    seen: set[str] = set()
     while queue:
         root = queue.pop()
+        if (real := os.path.realpath(root)) in seen:
+            continue
+        seen.add(real)
         where, dotgit = root.relative_to(path), root / ".git"
         if not os.path.lexists(dotgit):
-            gitdirs[os.path.realpath(root)] = root
+            gitdirs[real] = root
             continue
         if dotgit.is_symlink():
-            return f"{where}: .git is a symlink", [], none
+            return f"{where}: .git is a symlink", {}, []
         if (dirty := _work_tree_dirty(root)):
-            return f"uncommitted: {where}: {dirty}", [], none
+            return f"uncommitted: {where}: {dirty}", {}, []
         trees.append(root)
         if (inner := _ignored_checkouts(root)) is None:
-            return f"{where}: too deep or large to find every checkout in its ignored files", [], none
+            return f"{where}: too deep or large to find every checkout in its ignored files", {}, []
         queue += inner
-        if dotgit.is_file():  # a linked worktree: bundle its repository when that goes too
-            common, own = git_common_dir(root), _git_dir_run(dotgit, "rev-parse", "--absolute-git-dir")
-            if not common or own is None:
-                return f"{where}: unreadable worktree", [], none
-            if (os.path.realpath(common) + "/").startswith(inside):
-                gitdirs[os.path.realpath(common)] = Path(common)
-                continue
-            tips = local_tips(Path(own.strip()), worktree_only=True)
-            left = None if tips is None else _git_dir_run(
-                Path(common), "rev-list", "-n1", *tips, "--not", "--branches", "--tags", "--remotes") if tips else ""
-            if left is None or left.strip():
-                return f"{where}: commits only this worktree's reflog holds", [], none
-            continue
-        gitdirs[os.path.realpath(dotgit)] = dotgit
+        own = _git_dir_run(dotgit, "rev-parse", "--absolute-git-dir")
         links = _git_dir_run(dotgit, "--work-tree", str(root), "ls-files", "-s")
-        if links is None:
-            return f"{where}: unreadable index", [], none
-        for ln in links.splitlines():
-            if ln.startswith("160000 ") and (sub := root / ln.split("\t", 1)[1] / ".git").is_dir():
-                gitdirs[os.path.realpath(sub)] = sub
+        if own is None or links is None:
+            return f"{where}: unreadable git dir or index", {}, []
+        # initialized submodules, embedded (.git a directory) or stored in modules/ (.git a file), and theirs
+        queue += [root / ln.split("\t", 1)[1] for ln in links.splitlines()
+                  if ln.startswith("160000 ") and os.path.lexists(root / ln.split("\t", 1)[1] / ".git")]
+        if dotgit.is_dir():
+            gitdirs[os.path.realpath(dotgit)] = dotgit
+            continue
+        # a .git file: a linked worktree, or a submodule whose repository is in its superproject's modules/
+        common = git_common_dir(root)
+        if not common:
+            return f"{where}: unreadable worktree", {}, []
+        if (os.path.realpath(common) + "/").startswith(inside):
+            gitdirs[os.path.realpath(common)] = Path(common)
+            continue
+        if os.path.lexists(os.path.join(own.strip(), "locked")):
+            return f"{where}: locked worktree", {}, []
+        tips = local_tips(Path(own.strip()), worktree_only=True)
+        left = None if tips is None else _git_dir_run(
+            Path(common), "rev-list", "-n1", *tips, "--not", "--branches", "--tags", "--remotes") if tips else ""
+        if left is None or left.strip():
+            return f"{where}: commits only this worktree's reflog holds", {}, []
     unreadable: list[str] = []
     for g in list(gitdirs.values()):  # submodule stores: modules/<name>, nested ones too
         for dirpath, dirnames, _ in os.walk(g / "modules", onerror=lambda e: unreadable.append(str(e.filename))):
@@ -4686,19 +4693,33 @@ def archive_mirror(path: Path) -> tuple[str, list[Path], tuple[list[Path], list[
                 gitdirs[os.path.realpath(dirpath)] = Path(dirpath)
                 dirnames[:] = ["modules"] if "modules" in dirnames else []
     if [u for u in unreadable if os.path.lexists(u)]:  # a missing modules/ is no submodule store
-        return f"unreadable submodule store {unreadable[0]}", [], none
+        return f"unreadable submodule store {unreadable[0]}", {}, []
+    for key, g in gitdirs.items():
+        if any(t.exists() and not (os.path.realpath(t) + "/").startswith(inside) for t in linked_work_trees(g)):
+            return f"{key}: a worktree outside this item uses it", {}, []
+    return "", gitdirs, sorted(trees)
+
+
+def archive_mirror(path: Path) -> tuple[str, list[Path], tuple[list[Path], list[Path], list[str | None]]]:
+    """Before a mirror item goes: bundle_unpushed for every repository mirror_repos finds. A tree with
+    uncommitted work, or whose repositories cannot all be found or bundled, is kept.
+    ("" or why it must stay, the bundles written, what mirror_moved rechecks)."""
+    none: tuple[list[Path], list[Path], list[str | None]] = ([], [], [])
+    why, gitdirs, trees = mirror_repos(path)
+    if why:
+        return why, [], none
     snap = mirror_git_snapshot(list(gitdirs.values()), trees)
     bundles: list[Path] = []
     for key, g in sorted(gitdirs.items()):
-        if any(t.exists() and not (os.path.realpath(t) + "/").startswith(inside) for t in linked_work_trees(g)):
-            return f"{key}: a worktree outside this item uses it", bundles, none
         if (why := bundle_unpushed(g, key, bundles)):
             return why, bundles, none
     return "", bundles, (list(gitdirs.values()), trees, snap)
 
 
 def mirror_moved(fam: Family, path: Path, recheck: tuple[list[Path], list[Path], list[str | None]]) -> str:
-    """Right before a bundled mirror goes: fresh process evidence, and its repositories as at bundle time."""
+    """Right before a bundled mirror goes, everything the bundling took time over is read again: process
+    evidence, the family's owner and artifact references, and its repositories, found afresh (the same set,
+    every work tree clean) and as at bundle time."""
     try:
         opened, cmds = process_evidence()
     except NoEvidence as e:
@@ -4706,7 +4727,16 @@ def mirror_moved(fam: Family, path: Path, recheck: tuple[list[Path], list[Path],
     if in_cwd(os.fspath(path), open_index(opened)) or named_by(os.fspath(path), cmds) or holds_socket(path) \
             or job_busy(fam, path):
         return "in use while its git work was bundled"
+    if fam.retired_only and not owner_retired(fam):
+        return "its owner loaded while its git work was bundled"
+    if fam.reference_root is not None and artifact_referenced(path, fresh_artifact_references(fam.reference_root)):
+        return "referenced while its git work was bundled"
     gitdirs, trees, snap = recheck
+    _NESTED_WALKS.pop(str(path), None)
+    why, now, now_trees = mirror_repos(path)
+    if why or {os.path.realpath(g) for g in now.values()} != {os.path.realpath(g) for g in gitdirs} \
+            or now_trees != trees:
+        return f"its repositories changed while they were bundled{': ' + why if why else ''}"
     if None in snap or mirror_git_snapshot(gitdirs, trees) != snap:
         return "its git refs or work trees changed while they were bundled"
     return ""
