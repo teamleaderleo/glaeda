@@ -3342,6 +3342,8 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
         if not fam.reclaimable or fam.id == INTERRUPTED:
             continue
         dirs = {fam.root}
+        if fam.id == CMUX_NEXT_CI_FAMILY:  # a whole state set aside leaves no candidate where it sat
+            dirs.update(cmux_next_ci_state_parents(fam.root))
         if fam.discover or fam.checkout_builds:
             dirs.update(p.parent for p in candidates(fam))
         else:  # a match family's candidates sit within depth levels too: an aside one left no candidate behind
@@ -6062,6 +6064,17 @@ def cmux_next_ci_dirs(home: Path | None = None) -> list[Path]:
     return [d for d in _children(root) if d.is_dir() and not d.is_symlink()]
 
 
+def cmux_next_ci_state_parents(root: Path) -> list[Path]:
+    """The directories cmux_next_ci_state_roots' roots sit in (cmux-scheme, each <kind>/<key>/Release), whether
+    or not a state is left in them."""
+    found = [root / "cmux-scheme"]
+    for kind in CMUX_NEXT_RELEASE_KINDS:
+        for key in _children(root / kind):
+            if not key.is_symlink() and re.fullmatch(r"[0-9a-fA-F]{8,64}", key.name):
+                found.append(key / "Release")
+    return [d for d in found if d.is_dir() and not d.is_symlink()]
+
+
 def cmux_next_ci_state_roots(root: Path) -> list[Path]:
     """Validated per-runner DerivedData roots owned by cmux-next CI.
 
@@ -6117,6 +6130,12 @@ def runner_work_folder(runner: Path) -> Path:
     return runner / (work if isinstance(work, str) and work else "_work")
 
 
+def enrolled_runner_names_complete() -> bool:
+    """Whether every enrolled runner's .runner names its agent, so a state no name or key matches is no runner's.
+    While one cannot be read (mid-write, malformed), its states would read unowned: nothing is."""
+    return all(isinstance(runner_config(r).get("agentName"), str) for r in enrolled_runners())
+
+
 def enrolled_runner_names() -> dict[str, Path]:
     """agentName -> runner directory for every enrolled runner."""
     names: dict[str, Path] = {}
@@ -6170,7 +6189,7 @@ def cmux_next_ci_stale_roots(root: Path) -> list[Path]:
     (a scheme state by name, a release state by key; cmux_next_ci_owner), idle at least a job's timeout
     (cmux_next_ci_unowned_idle_hours). Only a host with enrolled runners can say an owner is gone, so elsewhere
     there are none. An enrolled runner's states, and a younger unowned one, keep their inputs."""
-    if not enrolled_runner_names():
+    if not enrolled_runner_names() or not enrolled_runner_names_complete():
         return []
     idle_s = float(POLICY["cmux_next_ci_unowned_idle_hours"]) * 3600
     now = time.time()
@@ -6375,10 +6394,44 @@ def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str
     return cmux_next_ci_tree_busy(state)
 
 
+# The tools' own caches inside a state (Xcode's module, compilation and SDK stat caches, SwiftPM's packages): wide
+# (thousands of entries in one directory) and written only by the compiler and SwiftPM, never a socket's home.
+CMUX_NEXT_CI_TOOL_CACHES = frozenset({"ModuleCache.noindex", "SDKStatCaches.noindex", "SDKExplicitPrecompiledModules",
+                                      "CompilationCache.noindex", "SourcePackages"})
+
+
+def cmux_next_ci_holds_socket(state: Path, budget: int = 3000) -> bool:
+    """holds_socket for a cmux-next state, two levels down as holds_socket, failing closed: a tree it cannot
+    finish within `budget` entries counts as holding one. The tools' caches (CMUX_NEXT_CI_TOOL_CACHES) are not
+    listed, so a real slot's width alone never makes it busy."""
+    frontier = [state]
+    for depth in range(2):
+        nxt: list[Path] = []
+        for d in frontier:
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        budget -= 1
+                        if budget < 0:
+                            return True
+                        try:
+                            st = e.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if stat.S_ISSOCK(st.st_mode):
+                            return True
+                        if stat.S_ISDIR(st.st_mode) and not (depth == 0 and e.name in CMUX_NEXT_CI_TOOL_CACHES):
+                            nxt.append(Path(e.path))
+            except OSError:
+                continue
+        frontier = nxt
+    return False
+
+
 def cmux_next_ci_tree_busy(state: Path) -> str:
     """cmux_next_ci_busy's vetoes read from the tree itself: a socket, an activity marker in it or beside it,
     a child the family does not know. Also read on a slot's detached tree (cmux_next_ci_slot_recheck)."""
-    if holds_socket(state):
+    if cmux_next_ci_holds_socket(state):
         return "cmux-next state holds a socket"
     for ancestor in (state, state.parent):
         for entry in _children(ancestor):

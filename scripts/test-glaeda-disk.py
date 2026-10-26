@@ -3220,6 +3220,54 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertTrue(gd.cmux_active(st[key]), key)  # the generic search gives up
             self.assertFalse(gd.job_busy(fam, st[key]), key)
 
+    def test_a_socket_past_a_wide_cache_still_keeps_a_slot(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        wide = st["mini-glaeda"] / "ModuleCache.noindex"
+        wide.mkdir()
+        for n in range(3001):
+            (wide / f"m{n}.pcm").touch()
+        self.assertFalse(gd.cmux_next_ci_tree_busy(st["mini-glaeda"]))  # the cache alone is not activity
+        sock_dir = Path(tempfile.mkdtemp(dir="/tmp"))  # AF_UNIX paths are short: bind short, then move in
+        try:
+            server = socket.socket(socket.AF_UNIX)
+            server.bind(os.fspath(sock_dir / "s"))
+            os.rename(sock_dir / "s", st["mini-glaeda"] / "Build" / "s")
+            self.assertIn("socket", gd.cmux_next_ci_tree_busy(st["mini-glaeda"]))
+        finally:
+            server.close()
+            shutil.rmtree(sock_dir, ignore_errors=True)
+        crowded = st["daily"] / "Build"
+        for n in range(3001):
+            (crowded / f"f{n}").touch()
+        self.assertIn("socket", gd.cmux_next_ci_tree_busy(st["daily"]))  # a search that cannot finish fails closed
+
+    def test_an_unreadable_runner_config_makes_no_state_unowned(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        old = time.time() - 30 * 86400
+        for key in ("gone-runner", "release-old"):
+            for d in (st[key], *st[key].rglob("*")):
+                os.utime(d, (old, old))
+        with mock.patch.object(gd, "HOME", home):
+            self.assertIn(st["gone-runner"], gd.cmux_next_ci_stale_roots(fam.root))
+            (home / "actions-runner-glaeda-2/.runner").write_text("{not json")
+            self.assertEqual(gd.cmux_next_ci_stale_roots(fam.root), [])
+
+    def test_a_slot_left_aside_is_found_when_no_state_is_left_beside_it(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        scheme = st["mini-glaeda"].parent
+        for child in list(scheme.iterdir()):
+            shutil.rmtree(child)
+        aside = scheme / f"{gd.DELETING_PREFIX}mini-glaeda-999999"
+        make(aside / "Build")
+        release = st["daily"].parent
+        shutil.rmtree(st["daily"])
+        aside_release = release / f"{gd.DELETING_PREFIX}{st['daily'].name}-999999"
+        make(aside_release / "Build")
+        with mock.patch.object(gd, "HOME", home):
+            roots = {f.root for f in gd.interrupted_families([fam])}
+        self.assertIn(scheme, roots)
+        self.assertIn(release, roots)
+
     def test_a_socket_that_moves_with_the_slot_keeps_it(self) -> None:
         home, fam, st = self._cmux_next_cap_tree()
         calls = {"n": 0}
